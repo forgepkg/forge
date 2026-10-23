@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            r.id,\n            (SELECT count(*) FROM repository_privilege rp WHERE rp.role_id = r.id) AS \"grants!\",\n            (SELECT count(*) FROM user_role ur WHERE ur.role_id = r.id) AS \"users!\"\n        FROM role r\n        WHERE $1::bigint IS NULL OR r.id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "role",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "grants!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "users!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "246d0fab99b086fefbd1a5289b2dc76962bfbbead8ae5855160f594f4d115e58"
+}

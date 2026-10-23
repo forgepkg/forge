@@ -19,7 +19,7 @@
 //! token, deletes the object, then token-conditionally deletes the row. Live
 //! ingest leases make a candidate ineligible.
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use sqlx::PgPool;
 
 use crate::s3::BlobStore;
@@ -34,8 +34,11 @@ pub async fn reconcile_orphans(
     store: &BlobStore,
     grace: Duration,
 ) -> anyhow::Result<usize> {
-    let cutoff = Utc::now() - grace;
-    let stale_deletion_before = Utc::now() - crate::cas::DELETE_RESERVATION_LEASE;
+    // Both cutoffs are compared with database timestamps: take the
+    // database's clock.
+    let now = forge_db::db_now(pool).await?;
+    let cutoff = now - grace;
+    let stale_deletion_before = now - crate::cas::DELETE_RESERVATION_LEASE;
     let mut removed = 0usize;
 
     // Expired leases on live/referenced blobs might never pass through a delete
@@ -63,7 +66,10 @@ pub async fn reconcile_orphans(
                 forge_db::blob_dao::ReserveDeleteOutcome::Reserved(reservation) => reservation,
                 _ => return Ok::<bool, anyhow::Error>(false),
             };
-            if let Err(error) = store.delete(&reservation.s3_key).await {
+            if let Err(error) = store
+                .delete_blob(&reservation.sha256, &reservation.s3_key)
+                .await
+            {
                 // The failed response may hide a delete that completes later.
                 // Retain the fence until a stale-reservation takeover so this
                 // object incarnation cannot be revived underneath it.
@@ -109,7 +115,10 @@ pub async fn reconcile_orphans(
                 forge_db::blob_dao::ReserveDeleteOutcome::Reserved(reservation) => reservation,
                 _ => return Ok::<bool, anyhow::Error>(false),
             };
-            if let Err(error) = store.delete(&reservation.s3_key).await {
+            if let Err(error) = store
+                .delete_blob(&reservation.sha256, &reservation.s3_key)
+                .await
+            {
                 // Preserve the reservation on an ambiguous failure; releasing
                 // it would allow a new reference to reuse a key that a delayed
                 // delete can still remove.

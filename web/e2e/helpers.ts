@@ -38,7 +38,7 @@ export function adminBasic(): string {
 
 /**
  * Sign the page's browser context in with a password session (the only UI
- * credential since token sign-in was removed): POST /auth/login through the
+ * credential; there is no token sign-in): POST /auth/login through the
  * context's request API (so the `forge_session` cookie lands in the context's
  * cookie jar) and seed the returned CSRF token into localStorage before the
  * SPA boots — exactly what the Login screen does.
@@ -91,7 +91,7 @@ export async function addGroupMember(
 /**
  * Fetch a package's browse detail (the read endpoint the SPA's detail page
  * uses). For a proxy this also drives upstream **discovery** (it runs the
- * slice-1 read ops), so calling it stamps `first_seen_at` and surfaces a
+ * proxy read ops), so calling it stamps `first_seen_at` and surfaces a
  * still-delayed version with `delay_status = "delayed_until"`.
  */
 export async function fetchPackageDetail(
@@ -166,4 +166,20 @@ export async function waitForPackage(
     await new Promise((r) => setTimeout(r, 1000))
   }
   throw new Error(`package ${originalId} never appeared in ${repo}`)
+}
+
+/**
+ * The navigation rail (`<nav aria-label="Main">`): Browse, Your tokens, the
+ * Administration links for admins, the readable repositories and the user.
+ */
+export function rail(page: import('@playwright/test').Page) {
+  return page.getByRole('navigation', { name: 'Main' })
+}
+
+/** Navigate (client-side) through the rail to one of its links, e.g. `Repositories`. */
+export async function openFromRail(
+  page: import('@playwright/test').Page,
+  name: string,
+): Promise<void> {
+  await rail(page).getByRole('link', { name, exact: true }).click()
 }

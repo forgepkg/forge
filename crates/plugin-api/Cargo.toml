@@ -1,0 +1,20 @@
+[package]
+name = "forge-plugin-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The contract of a Forge format plugin: built in, or a WebAssembly component"
+
+# Nothing but std: a plugin crate builds against this for the server and for
+# `wasm32-wasip2` alike.
+[features]
+# `export_component!`: build the plugin crate as a WebAssembly component of
+# the `format-plugin` world (`wit/format.wit`).
+component = ["dep:wit-bindgen"]
+# `testing`: run a plugin's protocol against canned answers, without a server.
+testing = []
+
+[dependencies]
+wit-bindgen = { version = "0.63", optional = true, default-features = false, features = ["macros", "realloc", "std"] }

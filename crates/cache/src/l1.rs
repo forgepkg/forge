@@ -58,6 +58,9 @@ impl Expiry<String, L1Entry> for PerEntryExpiry {
     }
 }
 
+/// The bytes one unit of the L1's capacity stands for.
+pub const WEIGHT_UNIT_BYTES: usize = 16 * 1024;
+
 /// The L1 tier. Cheaply [`Clone`]able (moka caches share state via `Arc`).
 #[derive(Clone)]
 pub struct L1 {
@@ -71,9 +74,18 @@ impl L1 {
         self.cache.invalidate_all();
     }
 
+    /// An L1 of `max_capacity` entries, an entry larger than
+    /// [`WEIGHT_UNIT_BYTES`] counting once per started unit: small values
+    /// (verdicts, version lists) count once, and a multi-megabyte document
+    /// counts as the many entries its memory could hold, so the capacity
+    /// bounds memory as well as the entry count.
     pub fn new(max_capacity: u64) -> Self {
         let cache = MokaCache::builder()
             .max_capacity(max_capacity)
+            .weigher(|key: &String, value: &L1Entry| {
+                let bytes = key.len() + value.entry.weight_bytes();
+                u32::try_from(bytes.div_ceil(WEIGHT_UNIT_BYTES).max(1)).unwrap_or(u32::MAX)
+            })
             .expire_after(PerEntryExpiry)
             .build();
         L1 { cache }
@@ -110,11 +122,13 @@ impl L1 {
             }
         }
 
-        let expires_at = Instant::now() + ttl;
+        let started = Instant::now();
         let entry = self
             .cache
             .try_get_with(full_key, async move {
                 let entry = init().await?;
+                // A factory-chosen lifetime only ever shortens the TTL.
+                let expires_at = started + entry.lifetime().map_or(ttl, |l| l.min(ttl));
                 Ok::<L1Entry, E>(L1Entry { expires_at, entry })
             })
             .await
@@ -138,5 +152,42 @@ impl L1 {
                 self.cache.invalidate(full_key).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{StoredEntry, ENTRY_FORMAT_VERSION};
+
+    fn entry(bytes: usize) -> L1Entry {
+        L1Entry {
+            expires_at: Instant::now() + Duration::from_secs(600),
+            entry: Arc::new(StoredEntry {
+                format_version: ENTRY_FORMAT_VERSION,
+                tags: Vec::new(),
+                value: vec![0; bytes],
+                lifetime: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_capacity_bounds_memory_not_just_entries() {
+        // 64 units: 64 small entries, or 1 MiB of large ones.
+        let l1 = L1::new(64);
+        for i in 0..32 {
+            l1.cache.insert(format!("ns:{i}"), entry(256 * 1024)).await;
+        }
+        l1.cache.run_pending_tasks().await;
+        assert!(l1.cache.weighted_size() <= 64);
+        assert!(l1.cache.entry_count() <= 4, "{}", l1.cache.entry_count());
+
+        let l1 = L1::new(64);
+        for i in 0..64 {
+            l1.cache.insert(format!("ns:{i}"), entry(100)).await;
+        }
+        l1.cache.run_pending_tasks().await;
+        assert_eq!(l1.cache.entry_count(), 64, "a small entry counts once");
     }
 }

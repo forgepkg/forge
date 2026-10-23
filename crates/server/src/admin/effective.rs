@@ -1,4 +1,4 @@
-//! Admin effective-set explain endpoint (§12.4 Phase 6).
+//! Admin effective-set explain endpoint.
 //!
 //! * `GET /admin/users/{id}/effective` — the resolved effective grant set for a
 //!   user (admin flag + flat grant list), for support and the test matrix.
@@ -7,9 +7,7 @@
 //!
 //! This reads the **authoritative DB** directly (not the request cache), so it
 //! always reflects the live grant state — exactly what makes it useful for
-//! debugging a cache-vs-DB discrepancy. For a user it folds in the slice-1
-//! `app_user.is_admin` dual-read fallback, matching what the seam actually
-//! decides (`in_admin_role OR is_admin`). It does **not** apply per-token scoping
+//! debugging a cache-vs-DB discrepancy. It does **not** apply per-token scoping
 //! (that is per-token, not per-user).
 
 use axum::extract::{Path, State};
@@ -26,8 +24,7 @@ use crate::state::AppState;
 /// The computed effective set, as returned by the explain endpoint.
 #[derive(Debug, Serialize)]
 pub struct EffectiveView {
-    /// Resolves to allow-all when `true` (admin-role membership, or — for a user
-    /// — the `is_admin` dual-read fallback).
+    /// Resolves to allow-all when `true` (`admin` role membership).
     pub is_admin: bool,
     /// The flat, additive union of the principal's grants.
     pub grants: Vec<GrantView>,
@@ -68,19 +65,14 @@ fn view(rows: EffectiveRows) -> EffectiveView {
 
 /// `GET /admin/users/{id}/effective`
 pub async fn for_user(State(state): State<AppState>, Path(user_id): Path<i64>) -> Response {
-    let user = match user_dao::find_user_by_id(&state.pool, user_id).await {
-        Ok(Some(u)) => u,
+    match user_dao::find_user_by_id(&state.pool, user_id).await {
+        Ok(Some(_)) => {}
         Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
         Err(e) => return db_error(e),
-    };
+    }
 
     match authz_dao::load_user_effective(&state.pool, user_id).await {
-        Ok(mut rows) => {
-            // Fold in the slice-1 dual-read admin fallback so the explained set
-            // matches the seam's actual decision.
-            rows.is_admin = rows.is_admin || user.is_admin;
-            Json(view(rows)).into_response()
-        }
+        Ok(rows) => Json(view(rows)).into_response(),
         Err(e) => db_error(e),
     }
 }

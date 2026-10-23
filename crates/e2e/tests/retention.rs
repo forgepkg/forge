@@ -1,11 +1,11 @@
-//! E2E: retention / cleanup + policy-driven blob GC (slice 12.1, plan Phase 8).
+//! E2E: retention / cleanup + policy-driven blob GC.
 //!
-//! Full-stack scenarios on the slice-1 testcontainers harness (Postgres +
+//! Full-stack scenarios on the shared testcontainers harness (Postgres +
 //! versitygw, in-process server[s] with workers). Each scenario arms a
 //! `retention_policy` via the admin REST surface, lets the background
 //! `RetentionWorker` claim + evaluate + apply the repo, and asserts the end
 //! state: components unlisted/hard-deleted, blobs dereferenced + S3 objects
-//! removed **through the slice-1 outbox worker**, audit rows written.
+//! removed **through the outbox worker**, audit rows written.
 //!
 //! Hard rules exercised here:
 //!   * blob deletion only ever flows through `decref → blob_outbox → outbox
@@ -154,7 +154,7 @@ where
 /// Push 15 distinct versions, arm `keep_last_n = 10` + `older_than_days = 0`,
 /// run the worker, and assert the 5 oldest are hard-deleted: gone from the
 /// flat-container list, their blobs dereferenced and removed from S3 by the
-/// slice-1 outbox worker, and 5 audit rows recorded.
+/// outbox worker, and 5 audit rows recorded.
 #[tokio::test]
 async fn keep_last_n_hard_deletes_oldest_and_gcs_blobs() {
     let srv = worker_stack().await;
@@ -892,6 +892,25 @@ async fn proxy_evicts_cold_cached_versions_only() {
     .fetch_one(&srv.pool)
     .await
     .unwrap();
+
+    // Downloads are counted in batches (#119): let both pulls be written
+    // first, so a late write cannot warm the version backdated below.
+    let mut stamped = 0_i64;
+    for _ in 0..200 {
+        stamped = sqlx::query_scalar(
+            "SELECT count(*) FROM proxy_cached_version \
+             WHERE repository_id = $1 AND last_downloaded_at IS NOT NULL",
+        )
+        .bind(rid)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+        if stamped == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(stamped, 2, "both pulls were counted");
 
     // Make 1.0.0 cold: not pulled for 90 days.
     sqlx::query(

@@ -1,4 +1,4 @@
-//! Integration tests for identity-aware group resolution (Phase 9, Task 9.1).
+//! Integration tests for identity-aware group resolution.
 //!
 //! Seeds two hosted **member** repositories plus a **group** that federates
 //! them, then drives [`forge_core::repo::group::GroupRepo`] through the
@@ -6,7 +6,7 @@
 //! (over the shared Postgres) via an in-memory [`MemberOpsFactory`], with a stub
 //! [`BlobFetch`] so no S3 is needed.
 //!
-//! Coverage (per plan Phase 9):
+//! Coverage:
 //! * two members share an overlapping version → the **highest-priority** member
 //!   serves the `.nupkg`;
 //! * `list_versions` returns the **union** of both members' versions;
@@ -35,8 +35,18 @@ use forge_db::component_dao::{self, NewComponent};
 use forge_db::model::Repository;
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::user_dao::{self, NewUser};
-use forge_nuget::NugetFormat;
 use sqlx::PgPool;
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    let plugin = forge_plugin::Plugin::builtin(
+        forge_format_nuget::PLUGIN_TOML,
+        forge_format_nuget::Nuget::default(),
+    )
+    .expect("plugins/nuget/plugin.toml is valid");
+    forge_plugin::PluginFormat::new(&plugin)
+}
 
 /// In-memory blob byte store: maps `s3_key -> bytes`.
 #[derive(Default, Clone)]
@@ -46,7 +56,8 @@ struct StubBlobs {
 
 #[async_trait]
 impl BlobFetch for StubBlobs {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
+        let s3_key = &blob.s3_key;
         self.map
             .get(s3_key)
             .cloned()
@@ -55,9 +66,11 @@ impl BlobFetch for StubBlobs {
 }
 
 /// A [`MemberOpsFactory`] that builds a [`HostedRepo`] for every member, sharing
-/// the pool and the stub blob bytes. Slice-1 group members are hosted/proxy; the
-/// tests only exercise hosted members, which is sufficient for the resolution
-/// semantics (the factory seam is what the server swaps for proxy support).
+/// the pool and the stub blob bytes. The leaf members the factory is asked for
+/// are hosted or proxy repositories (nested groups are flattened by the
+/// resolver); the tests only exercise hosted members, which is sufficient for
+/// the resolution semantics (the factory seam is what the server swaps for
+/// proxy support).
 struct HostedFactory {
     pool: PgPool,
     blobs: StubBlobs,
@@ -67,7 +80,7 @@ impl MemberOpsFactory for HostedFactory {
     fn ops_for(&self, _member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
         Ok(Arc::new(HostedRepo::new(
             self.pool.clone(),
-            Arc::new(NugetFormat::new()),
+            Arc::new(nuget()),
             Arc::new(self.blobs.clone()),
         )))
     }
@@ -112,17 +125,15 @@ fn group_repo_depth(
 }
 
 /// A real (non-admin) authenticated user holding the seeded `authenticated`
-/// role — the role the §12.4 data migration assigns to preserve slice-1
-/// "any authenticated user reads/writes everywhere". This is what makes the
+/// role, which carries read/write on every repository. This is what makes the
 /// authenticated-sees-all assertions hold under fine-grained RBAC: visibility
-/// now flows through `can_read`, so the user must actually be granted read.
+/// flows through `can_read`, so the user must actually be granted read.
 async fn user(pool: &PgPool) -> Principal {
     let u = user_dao::insert_user(
         pool,
         NewUser::local(
-            format!("groupuser-{}", common::unique()),
+            format!("groupuser-{}@example.com", common::unique()),
             "x".into(),
-            false,
             true,
         ),
     )
@@ -138,7 +149,6 @@ async fn user(pool: &PgPool) -> Principal {
     Principal::User {
         user_id: u.id,
         token_id: None,
-        is_admin: false,
         method: forge_core::auth::AuthMethod::Password,
     }
 }
@@ -162,10 +172,10 @@ async fn seed_blob(pool: &PgPool, sha: &str, s3_key: &str, size: i64) {
 }
 
 /// Seed a hosted member repository. When `anonymous_read` is set, also grant the
-/// built-in `anonymous` role `read` on it — under §12.4 RBAC anonymous
-/// visibility flows through that grant (what the data migration converts the
-/// slice-1 `anonymous_read` flag into), not the column. The column is still set
-/// for parity but is no longer consulted by the seam.
+/// built-in `anonymous` role `read` on it — under RBAC anonymous visibility
+/// flows through that grant (what the RBAC data migration converted the
+/// `anonymous_read` flag into), not the column. The column is still set for
+/// parity but is not consulted by the seam.
 async fn seed_member(pool: &PgPool, anonymous_read: bool) -> Repository {
     let name = format!("member-{}", common::unique());
     let new = NewRepository {
@@ -452,7 +462,7 @@ async fn search_merges_and_dedups_highest_priority_wins() {
         .any(|h| h.original_id.eq_ignore_ascii_case("onlylow")));
 }
 
-// ── nested groups (§12.4 Phase 4) ───────────────────────────────────────────
+// ── nested groups ───────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn nested_group_flattens_leaves_through_inner_group() {
@@ -656,7 +666,11 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
     let suffix = common::unique();
     let account = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("diamond-user-{suffix}"), "x".into(), false, true),
+        NewUser::local(
+            format!("diamond-user-{suffix}@example.com"),
+            "x".into(),
+            true,
+        ),
     )
     .await
     .expect("insert user");
@@ -718,7 +732,6 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
     let principal = Principal::User {
         user_id: account.id,
         token_id: None,
-        is_admin: false,
         method: forge_core::auth::AuthMethod::Password,
     };
     let g = group_repo(&pool, blobs.clone(), principal);
@@ -1065,6 +1078,7 @@ impl RepoReadOps for FakeProxy {
             return Err(Self::err());
         }
         Ok(self.versions.contains(&version).then(|| NupkgLocation {
+            blob_sha256: format!("proxy-{version}"),
             blob_s3_key: format!("proxy/{version}"),
             size: 1,
             content_type: "application/octet-stream".into(),
@@ -1097,8 +1111,11 @@ impl RepoReadOps for FakeProxy {
             .map(|v| forge_core::repo::RegistrationEntry {
                 original_id: "Sample".into(),
                 version: (*v).into(),
+                version_original: (*v).into(),
                 listed: true,
                 package_hash_sha512_base64: None,
+                package_sha256: None,
+                package_size: None,
                 nuspec_bytes: None,
                 manifest_summary: None,
                 published: None,
@@ -1177,7 +1194,7 @@ fn mixed_group_repo(
     });
     let authz = Authz::new(pool.clone(), Cache::l1_only(16));
     GroupRepo::new(pool.clone(), principal, factory, authz, TEST_MAX_DEPTH)
-        .with_format(Arc::new(NugetFormat::new()))
+        .with_format(Arc::new(nuget()))
 }
 
 /// An unreachable proxy member must not break restores of packages another
@@ -1221,6 +1238,11 @@ async fn failing_member_is_skipped_while_others_answer() {
         g.registration(&group.name, "sample").await.unwrap().len(),
         1
     );
+    assert!(g
+        .registration_entry(&group.name, "sample", "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
     let params = SearchParams {
         q: "sample".into(),
         ..SearchParams::default()
@@ -1232,6 +1254,82 @@ async fn failing_member_is_skipped_while_others_answer() {
         .resolve_nupkg(&group.name, "sample", "9.9.9")
         .await
         .is_err());
+    assert!(g
+        .registration_entry(&group.name, "sample", "9.9.9")
+        .await
+        .is_err());
+}
+
+/// An id only the failing member could serve is "unknown", not "absent": the
+/// group returns the member's error rather than an empty answer, which the
+/// routes would turn into a 404 that clients and downstream proxies cache.
+#[tokio::test]
+async fn id_only_a_failing_member_could_serve_is_an_error() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    // The hosted member answers, but only has an internal package.
+    seed_version(&pool, &mut blobs, hosted.id, "Internal", "1.0.0", "h").await;
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    let mut proxies = HashMap::new();
+    proxies.insert(
+        proxy.id,
+        Arc::new(FakeProxy {
+            versions: vec![],
+            fail: true,
+        }),
+    );
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, proxies);
+
+    let member_error = |result: Result<_, RepoError>| matches!(result, Err(RepoError::Storage(_)));
+    assert!(member_error(
+        g.list_versions(&group.name, "sample").await.map(|_| ())
+    ));
+    assert!(member_error(
+        g.registration(&group.name, "sample").await.map(|_| ())
+    ));
+    assert!(member_error(
+        g.registration_entry(&group.name, "sample", "1.0.0")
+            .await
+            .map(|_| ())
+    ));
+    assert!(member_error(
+        g.resolve_nupkg(&group.name, "sample", "1.0.0")
+            .await
+            .map(|_| ())
+    ));
+    assert!(member_error(
+        g.resolve_nuspec(&group.name, "sample", "1.0.0")
+            .await
+            .map(|_| ())
+    ));
+
+    // Search stays lenient: the hosted member answered (with no hits).
+    let params = SearchParams {
+        q: "sample".into(),
+        ..SearchParams::default()
+    };
+    assert_eq!(g.search(&group.name, &params).await.unwrap().total_hits, 0);
+
+    // The hosted member owns its id, so the failing proxy is not consulted.
+    assert_eq!(
+        g.list_versions(&group.name, "internal")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        g.registration(&group.name, "internal").await.unwrap().len(),
+        1
+    );
 }
 
 /// Merged versions follow NuGet precedence, not string order.
@@ -1469,7 +1567,11 @@ async fn prefer_hosted_shields_internal_ids_from_selector_scoped_callers() {
     let suffix = common::unique();
     let account = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("scoped-user-{suffix}"), "x".into(), false, true),
+        NewUser::local(
+            format!("scoped-user-{suffix}@example.com"),
+            "x".into(),
+            true,
+        ),
     )
     .await
     .expect("insert user");
@@ -1499,7 +1601,6 @@ async fn prefer_hosted_shields_internal_ids_from_selector_scoped_callers() {
     let principal = Principal::User {
         user_id: account.id,
         token_id: None,
-        is_admin: false,
         method: forge_core::auth::AuthMethod::Password,
     };
 
@@ -1661,9 +1762,9 @@ struct CountingBlobs {
 
 #[async_trait]
 impl BlobFetch for CountingBlobs {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
-        self.inner.fetch_all(s3_key).await
+        self.inner.fetch_all(blob).await
     }
 }
 
@@ -1676,7 +1777,7 @@ impl MemberOpsFactory for CountingBlobsFactory {
     fn ops_for(&self, _member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
         Ok(Arc::new(HostedRepo::new(
             self.pool.clone(),
-            Arc::new(NugetFormat::new()),
+            Arc::new(nuget()),
             Arc::new(self.blobs.clone()),
         )))
     }
@@ -1726,7 +1827,7 @@ async fn group_search_enriches_only_the_final_page() {
         authz,
         TEST_MAX_DEPTH,
     )
-    .with_format(Arc::new(NugetFormat::new()));
+    .with_format(Arc::new(nuget()));
 
     let result = g
         .search(
@@ -1736,6 +1837,8 @@ async fn group_search_enriches_only_the_final_page() {
                 skip: 27,
                 take: 5,
                 prerelease: false,
+                include_semver2: true,
+                include_upstream: true,
             },
         )
         .await
@@ -1964,5 +2067,333 @@ async fn only_owner_members_claim_ids_and_serve_reserved_prefixes() {
     assert_eq!(
         sorted_versions(&g, &group.name, "acme.platform").await,
         ["2.0.0"]
+    );
+}
+
+/// A nested group keeps its own guards when it is read through an outer
+/// group, whatever the outer group's settings: its reserved prefixes, its
+/// owners and its prefer-hosted setting decide what its members serve, so
+/// nesting is never less protective than reading the inner group directly.
+#[tokio::test]
+async fn a_nested_group_keeps_its_guards_when_read_through_an_outer_group() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let releases = seed_member(&pool, false).await;
+    let dev = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let inner = seed_group(&pool).await;
+    for (member, priority) in [(&proxy, 100), (&releases, 50), (&dev, 10)] {
+        repository_dao::add_group_member(&pool, inner.id, member.id, priority)
+            .await
+            .unwrap();
+    }
+    repository_dao::set_group_member_owner(&pool, inner.id, releases.id, true)
+        .await
+        .unwrap();
+    let outer = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, outer.id, inner.id, 10)
+        .await
+        .unwrap();
+    for (group, config) in [
+        (
+            &inner,
+            r#"{"prefer_hosted": true, "reserved_prefixes": ["acme."]}"#,
+        ),
+        // The most permissive outer group: no guard of its own at all.
+        (&outer, r#"{"prefer_hosted": false}"#),
+    ] {
+        sqlx::query("UPDATE repository SET config = $2::jsonb WHERE id = $1")
+            .bind(group.id)
+            .bind(config)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    seed_version(
+        &pool,
+        &mut blobs,
+        releases.id,
+        "Contoso.Lib",
+        "1.0.0",
+        "lib",
+    )
+    .await;
+    seed_version(&pool, &mut blobs, dev.id, "Contoso.Lib", "9.0.0", "dev-lib").await;
+    seed_version(&pool, &mut blobs, dev.id, "Sample", "1.0.0", "dev-sample").await;
+
+    for flag_inner_as_owner in [false, true] {
+        repository_dao::set_group_member_owner(&pool, outer.id, inner.id, flag_inner_as_owner)
+            .await
+            .unwrap();
+        let g = mixed_group_repo(
+            &pool,
+            blobs.clone(),
+            user(&pool).await,
+            shadowing_proxy(&proxy),
+        );
+        for group in [&inner.name, &outer.name] {
+            let why = format!("through {group}, inner flagged in outer: {flag_inner_as_owner}");
+            // `dev` cannot add a version to the owner's package.
+            assert_eq!(
+                sorted_versions(&g, group, "contoso.lib").await,
+                ["1.0.0"],
+                "{why}"
+            );
+            assert!(
+                g.resolve_nupkg(group, "contoso.lib", "9.0.0")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{why}"
+            );
+            // The proxy cannot serve an id under the inner reserved prefix.
+            assert!(
+                sorted_versions(&g, group, "acme.new").await.is_empty(),
+                "{why}"
+            );
+            assert!(
+                g.resolve_nupkg(group, "acme.new", "99.0.0")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{why}"
+            );
+            // `dev` cannot take a public id away from the proxy.
+            assert_eq!(
+                sorted_versions(&g, group, "sample").await,
+                ["1.0.0", "99.0.0"],
+                "{why}"
+            );
+            let hits = g
+                .search(
+                    group,
+                    &SearchParams {
+                        q: "contoso".into(),
+                        ..SearchParams::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .hits;
+            let lib = hits
+                .iter()
+                .find(|hit| hit.original_id.eq_ignore_ascii_case("contoso.lib"))
+                .expect("the owner's package is found");
+            assert_eq!(lib.latest_version, "1.0.0", "{why}");
+            assert_eq!(lib.versions.len(), 1, "{why}: {lib:?}");
+            let hits = g
+                .search(
+                    group,
+                    &SearchParams {
+                        q: "acme".into(),
+                        ..SearchParams::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .hits;
+            assert!(
+                !hits
+                    .iter()
+                    .any(|hit| hit.original_id.to_ascii_lowercase().starts_with("acme.")),
+                "{why}: {hits:?}"
+            );
+        }
+    }
+}
+
+/// #73: an offline hosted member is a failing member: what only it could
+/// serve is an error (clients retry), never a not-found; the other members
+/// still answer.
+#[tokio::test]
+async fn an_offline_hosted_member_fails_instead_of_serving() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let a = seed_member(&pool, false).await;
+    let b = seed_member(&pool, false).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, a.id, 20)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, b.id, 10)
+        .await
+        .unwrap();
+    seed_version(&pool, &mut blobs, a.id, "Only.In.A", "1.0.0", "a").await;
+    seed_version(&pool, &mut blobs, b.id, "Only.In.B", "2.0.0", "b").await;
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let g = mixed_group_repo(&pool, blobs, user(&pool).await, HashMap::new());
+    assert!(matches!(
+        g.list_versions(&group.name, "only.in.a").await,
+        Err(forge_core::repo::RepoError::Busy(_))
+    ));
+    assert!(g
+        .resolve_nupkg(&group.name, "only.in.a", "1.0.0")
+        .await
+        .is_err());
+    assert_eq!(
+        sorted_versions(&g, &group.name, "only.in.b").await,
+        ["2.0.0"]
+    );
+}
+
+/// #106: an offline nested group is a failing member of its outer group, like
+/// an offline hosted member: nothing below it is served through the outer
+/// group (it is not descended into), what only it could serve is an error,
+/// never a not-found, and the other members still answer. An id one of its
+/// hosted leaves owns does not fall back to a public proxy meanwhile.
+#[tokio::test]
+async fn an_offline_nested_group_fails_instead_of_serving() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let inner_leaf = seed_member(&pool, false).await;
+    let other = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let inner = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, inner.id, inner_leaf.id, 10)
+        .await
+        .unwrap();
+    let outer = seed_group(&pool).await;
+    for (member, priority) in [(&inner, 30), (&other, 20), (&proxy, 10)] {
+        repository_dao::add_group_member(&pool, outer.id, member.id, priority)
+            .await
+            .unwrap();
+    }
+    set_prefer_hosted(&pool, &outer, true).await;
+    seed_version(&pool, &mut blobs, inner_leaf.id, "Only.Inner", "1.0.0", "i").await;
+    seed_version(&pool, &mut blobs, inner_leaf.id, "Sample", "1.0.0", "s").await;
+    seed_version(&pool, &mut blobs, other.id, "Only.Other", "2.0.0", "o").await;
+
+    let principal = user(&pool).await;
+    let read =
+        |blobs: StubBlobs| mixed_group_repo(&pool, blobs, principal, shadowing_proxy(&proxy));
+    let g = read(blobs.clone());
+    assert_eq!(
+        sorted_versions(&g, &outer.name, "only.inner").await,
+        ["1.0.0"],
+        "online: served through the inner group"
+    );
+
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(inner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let g = read(blobs);
+    assert!(matches!(
+        g.list_versions(&outer.name, "only.inner").await,
+        Err(forge_core::repo::RepoError::Busy(_))
+    ));
+    assert!(g
+        .resolve_nupkg(&outer.name, "only.inner", "1.0.0")
+        .await
+        .is_err());
+    assert!(g.registration(&outer.name, "only.inner").await.is_err());
+    // The inner leaf's internal id is not handed to the public proxy.
+    assert!(g.list_versions(&outer.name, "sample").await.is_err());
+    assert!(g
+        .resolve_nupkg(&outer.name, "sample", "99.0.0")
+        .await
+        .is_err());
+    // The other members still answer.
+    assert_eq!(
+        sorted_versions(&g, &outer.name, "only.other").await,
+        ["2.0.0"]
+    );
+    let hits = g
+        .search(
+            &outer.name,
+            &SearchParams {
+                q: "only".into(),
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap()
+        .hits;
+    let ids: Vec<String> = hits.iter().map(|h| h.original_id.to_lowercase()).collect();
+    assert_eq!(ids, ["only.other"], "{hits:?}");
+}
+
+/// #107: a leaf is served when one visible path admits it, also when the
+/// same inner group is reached along two paths of the same length and only
+/// the first path's group guards the id. Root → {A, B} → N → hosted leaf;
+/// A reserves `acme.` for its owners (which exclude N's leaf), B has no
+/// guard: `Acme.Lib` is served through the root and through B, not through
+/// A.
+#[tokio::test]
+async fn a_diamond_serves_what_its_unguarded_path_admits() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let leaf = seed_member(&pool, false).await;
+    let a_owner = seed_member(&pool, false).await;
+    let n = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, n.id, leaf.id, 10)
+        .await
+        .unwrap();
+    let a = seed_group(&pool).await;
+    let b = seed_group(&pool).await;
+    for (group, members) in [(&a, vec![(&n, 20), (&a_owner, 10)]), (&b, vec![(&n, 10)])] {
+        for (member, priority) in members {
+            repository_dao::add_group_member(&pool, group.id, member.id, priority)
+                .await
+                .unwrap();
+        }
+    }
+    repository_dao::set_group_member_owner(&pool, a.id, a_owner.id, true)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object(\
+         'prefer_hosted', true, 'reserved_prefixes', '[\"acme.\"]'::jsonb) WHERE id = $1",
+    )
+    .bind(a.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let root = seed_group(&pool).await;
+    // A first, so the walk reaches N through the guarded path first.
+    for (member, priority) in [(&a, 20), (&b, 10)] {
+        repository_dao::add_group_member(&pool, root.id, member.id, priority)
+            .await
+            .unwrap();
+    }
+    seed_version(&pool, &mut blobs, leaf.id, "Acme.Lib", "1.0.0", "leaf").await;
+
+    let g = group_repo(&pool, blobs, user(&pool).await);
+    for group in [&root, &b] {
+        assert_eq!(
+            sorted_versions(&g, &group.name, "acme.lib").await,
+            ["1.0.0"],
+            "through {}",
+            group.name
+        );
+        assert!(
+            g.resolve_nupkg(&group.name, "acme.lib", "1.0.0")
+                .await
+                .unwrap()
+                .is_some(),
+            "through {}",
+            group.name
+        );
+        let hits = g
+            .search(
+                &group.name,
+                &SearchParams {
+                    q: "acme".into(),
+                    ..SearchParams::default()
+                },
+            )
+            .await
+            .unwrap()
+            .hits;
+        assert_eq!(hits.len(), 1, "through {}: {hits:?}", group.name);
+    }
+    assert!(
+        sorted_versions(&g, &a.name, "acme.lib").await.is_empty(),
+        "A's guard keeps it from its non-owner"
     );
 }

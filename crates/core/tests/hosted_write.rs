@@ -1,4 +1,4 @@
-//! Integration tests for hosted-repository write ops (Phase 7, Task 7.1 / 7.2).
+//! Integration tests for hosted-repository write ops.
 //!
 //! Drives [`forge_core::repo::hosted::HostedWrite`] against real Postgres +
 //! versitygw containers: publishing the `sample.lib.1.0.0.nupkg` fixture,
@@ -13,16 +13,27 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Duration;
+use forge_core::repo::downloads::DownloadTally;
 use forge_core::repo::hosted::{BlobFetch, HostedRepo, HostedWrite};
 use forge_core::repo::{
     CacheInvalidator, DeleteOutcome, NoopCacheInvalidator, PublishOutcome, RepoError, RepoReadOps,
     SearchParams, WriteError, NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH,
 };
 use forge_db::repository_dao::{self, NewRepository};
-use forge_nuget::NugetFormat;
 use forge_storage::{BlobStore, Cas};
 use sqlx::PgPool;
 use tokio::sync::Mutex;
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    let plugin = forge_plugin::Plugin::builtin(
+        forge_format_nuget::PLUGIN_TOML,
+        forge_format_nuget::Nuget::default(),
+    )
+    .expect("plugins/nuget/plugin.toml is valid");
+    forge_plugin::PluginFormat::new(&plugin)
+}
 
 const MAX_UPLOAD: u64 = 64 * 1024 * 1024;
 
@@ -83,7 +94,13 @@ struct StoreFetch(BlobStore);
 
 #[async_trait]
 impl BlobFetch for StoreFetch {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
+        self.fetch_key(&blob.s3_key).await
+    }
+}
+
+impl StoreFetch {
+    async fn fetch_key(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
         let body = self
             .0
             .get(s3_key)
@@ -122,7 +139,7 @@ fn fixture_bytes(name: &str) -> Vec<u8> {
 async fn writer(pool: &PgPool, cas: Cas, cache: Arc<dyn CacheInvalidator>) -> HostedWrite {
     HostedWrite::new(
         pool.clone(),
-        Arc::new(NugetFormat::new()),
+        Arc::new(nuget()),
         cas,
         cache,
         Duration::seconds(0),
@@ -130,11 +147,12 @@ async fn writer(pool: &PgPool, cas: Cas, cache: Arc<dyn CacheInvalidator>) -> Ho
 }
 
 fn reader(pool: &PgPool, store: BlobStore) -> HostedRepo {
-    HostedRepo::new(
-        pool.clone(),
-        Arc::new(NugetFormat::new()),
-        Arc::new(StoreFetch(store)),
-    )
+    HostedRepo::new(pool.clone(), Arc::new(nuget()), Arc::new(StoreFetch(store)))
+        // Downloads are written in batches; write them soon in tests.
+        .with_download_tally(DownloadTally::with_interval(
+            pool.clone(),
+            std::time::Duration::from_millis(20),
+        ))
 }
 
 async fn seed_repo(pool: &PgPool, allow_redeploy: bool) -> String {
@@ -207,7 +225,7 @@ async fn publish_creates_component_assets_and_invalidates_cache() {
     );
 
     // Restore the original bytes via the flat container.
-    let fetched = StoreFetch(store).fetch_all(&loc.blob_s3_key).await.unwrap();
+    let fetched = StoreFetch(store).fetch_key(&loc.blob_s3_key).await.unwrap();
     assert_eq!(fetched, fixture_bytes("sample.lib.1.0.0.nupkg"));
 
     // packageHash (SHA-512 base64) is recorded on the registration entry.
@@ -250,6 +268,38 @@ async fn duplicate_without_redeploy_is_conflict() {
         .await
         .expect_err("duplicate must conflict");
     assert!(matches!(err, WriteError::Conflict { .. }));
+
+    // #81: a duplicate with other bytes is refused before its blob is stored.
+    // (Looked up by content hash: other tests add blobs concurrently.)
+    let id = unique_id();
+    let first = make_nupkg(&id, "1.0.0");
+    let duplicate = make_nupkg_variant(&id, "1.0.0");
+    let stored = |bytes: Vec<u8>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM blob WHERE sha256 = encode(sha256($1), 'hex')",
+            )
+            .bind(bytes)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    w.store_upload(&repo, &first[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    assert_eq!(
+        stored(first).await,
+        1,
+        "a published package's blob is found"
+    );
+    let err = w
+        .store_upload(&repo, &duplicate[..], MAX_UPLOAD)
+        .await
+        .expect_err("duplicate must conflict");
+    assert!(matches!(err, WriteError::Conflict { .. }));
+    assert_eq!(stored(duplicate).await, 0, "nothing reached the blob store");
 }
 
 /// Simultaneous *first* pushes of one (id, version): the duplicate check cannot
@@ -423,6 +473,17 @@ async fn unlist_hides_from_search_but_keeps_downloadable_and_relist_restores() {
 
     // Relisting an unknown version → NotFound.
     let nf = w.relist(&repo, "Sample.Lib", "9.9.9").await.unwrap();
+    assert_eq!(nf, DeleteOutcome::NotFound);
+    // A version that does not parse was never published: NotFound (404),
+    // not an invalid-package error (400), for unlist, delete and relist.
+    for hard in [false, true] {
+        let nf = w
+            .delete_component(&repo, "Sample.Lib", "notaversion", hard)
+            .await
+            .unwrap();
+        assert_eq!(nf, DeleteOutcome::NotFound);
+    }
+    let nf = w.relist(&repo, "Sample.Lib", "notaversion").await.unwrap();
     assert_eq!(nf, DeleteOutcome::NotFound);
 
     // Relist restores search visibility.
@@ -645,4 +706,144 @@ async fn hard_delete_removes_rows_and_decrefs_blobs() {
     // Deleting an unknown version → NotFound.
     let nf = w.delete_component(&repo, &id, "1.0.0", true).await.unwrap();
     assert_eq!(nf, DeleteOutcome::NotFound);
+}
+
+/// The `.nupkg` download counter of `(repo_id, lower, version)`.
+async fn download_count(pool: &PgPool, repo_id: i64, lower: &str, version: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT a.download_count FROM asset a JOIN component c ON c.id = a.component_id \
+         WHERE c.repository_id = $1 AND c.name = $2 AND c.version = $3 AND a.path = $4",
+    )
+    .bind(repo_id)
+    .bind(lower)
+    .bind(version)
+    .bind(NUPKG_ASSET_PATH)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// #119: downloads are counted in memory and written in batches, so a burst
+/// on one version neither queues one row update per download nor holds a
+/// pool connection per download: while another transaction holds the
+/// version's rows, a burst of downloads leaves the pool usable for other
+/// reads, and once the rows are free every download is counted.
+#[tokio::test]
+async fn a_download_burst_on_one_version_leaves_the_pool_usable() {
+    let pool = common::small_pool(4, std::time::Duration::from_secs(2)).await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, false).await;
+    let w = writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await;
+    let r = Arc::new(reader(&pool, store));
+    let id = unique_id();
+    let lower = id.to_lowercase();
+    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    let repo_id = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // A transaction holding the version's asset row, as a slow writer would.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT a.id FROM asset a JOIN component c ON c.id = a.component_id \
+         WHERE c.repository_id = $1 AND c.name = $2 FOR UPDATE",
+    )
+    .bind(repo_id)
+    .bind(&lower)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+
+    let downloads = 40;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..downloads {
+        let r = r.clone();
+        let (repo, lower) = (repo.clone(), lower.clone());
+        tasks.spawn(async move { r.resolve_nupkg(&repo, &lower, "1.0.0").await });
+    }
+    while let Some(served) = tasks.join_next().await {
+        assert!(served.unwrap().unwrap().is_some());
+    }
+    // Let the batched write start (and wait on the held row).
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Other reads still get a connection.
+    let versions = r.list_versions(&repo, &lower).await.expect("pool usable");
+    assert_eq!(versions.len(), 1);
+
+    holder.commit().await.unwrap();
+    let mut counted = 0;
+    for _ in 0..100 {
+        counted = download_count(&pool, repo_id, &lower, "1.0.0").await;
+        if counted == downloads {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(counted, downloads, "every download is counted");
+}
+
+/// #74: a `HEAD` on a `.nupkg` is not a download, and a redeploy keeps the
+/// version's download count (retention and search read it).
+#[tokio::test]
+async fn head_is_not_a_download_and_a_redeploy_keeps_the_count() {
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, true).await;
+    let w = writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await;
+    let r = reader(&pool, store);
+    let id = unique_id();
+    let lower = id.to_lowercase();
+    w.store_upload(&repo, &make_nupkg(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("publish");
+    let repo_id = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    // The bump is spawned off the response path: wait for it.
+    let settled = |expected: i64| {
+        let pool = pool.clone();
+        let lower = lower.clone();
+        async move {
+            for _ in 0..100 {
+                if download_count(&pool, repo_id, &lower, "1.0.0").await == expected {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        }
+    };
+
+    for _ in 0..3 {
+        assert!(r
+            .resolve_nupkg_head(&repo, &lower, "1.0.0")
+            .await
+            .unwrap()
+            .is_some());
+    }
+    assert!(r
+        .resolve_nupkg(&repo, &lower, "1.0.0")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(settled(1).await, "one GET, no HEADs");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(download_count(&pool, repo_id, &lower, "1.0.0").await, 1);
+
+    w.store_upload(&repo, &make_nupkg_variant(&id, "1.0.0")[..], MAX_UPLOAD)
+        .await
+        .expect("redeploy");
+    assert_eq!(
+        download_count(&pool, repo_id, &lower, "1.0.0").await,
+        1,
+        "the redeployed version keeps its count"
+    );
 }

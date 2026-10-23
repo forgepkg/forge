@@ -20,7 +20,11 @@ forge-storage = { path = "../storage" }
 forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
-forge-nuget = { path = "../format-nuget" }
+forge-plugin = { path = "../plugin" }
+# Built-in format plugins (plugins/<id>/), linked in.
+forge-format-helm = { path = "../../plugins/helm" }
+forge-oci = { path = "../format-oci" }
+forge-format-nuget = { path = "../../plugins/nuget" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
@@ -40,27 +44,53 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 http = { workspace = true }
 async-trait = { workspace = true }
-# WIF (slice 12.8): decode the unverified JWT header/payload for issuer routing
+# WIF: decode the unverified JWT header/payload for issuer routing
 # (cryptographic verification stays in forge-core's JWKS verifier) and the HTTP
 # Basic credential when a workload presents its id_token as the password.
 base64 = { workspace = true }
 sha2 = { workspace = true }
+# Nexus imports: an asset whose listing carries no SHA-256 or SHA-512 (older
+# Nexus 3 versions) is verified against its SHA-1.
+sha1 = "0.11"
+# Nexus imports: the Nexus REST API and asset downloads, through forge-core's
+# upstream client.
+reqwest = { workspace = true }
+subtle = { workspace = true }
 hex = { workspace = true }
 ipnet = { workspace = true }
 url = { workspace = true }
 argon2 = { workspace = true, features = ["password-hash"] }
 tokio-util = { workspace = true }
+# Format-plugin uploads: the named file part of a multipart body, streamed.
+multer = "3"
+# Raw repositories: the MD5 of uploads (the `.md5` sidecar), file paths in
+# URLs, HTTP dates (`Last-Modified`, `If-Modified-Since`) and content types
+# guessed from file names.
+md-5 = "0.11"
+percent-encoding = "2.3"
+httpdate = "1"
+mime_guess = "2"
+futures-util = { workspace = true }
+async-stream = "0.3"
+bytes = "1"
 uuid = { workspace = true }
+# Registry token signing key generation.
+rand = { workspace = true }
+# Outgoing email (invitations): SMTP submission.
+lettre = { workspace = true }
 
 # Config: TOML + FORGE_* env overrides.
 figment = { version = "0.10", features = ["toml", "env"] }
 
 [dev-dependencies]
+forge-plugin = { path = "../plugin", features = ["testing"] }
+# Builds chart archives for the format-plugin tests.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "test-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-reqwest = { workspace = true, features = ["multipart"] }
-forge-nuget = { path = "../format-nuget" }
+reqwest = { workspace = true, features = ["multipart", "query"] }
+forge-format-nuget = { path = "../../plugins/nuget" }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 figment = { version = "0.10", features = ["toml", "env", "test"] }
@@ -68,12 +98,15 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-# Mock OIDC IdP for the /auth route integration tests (slice 12.2 Phase 5):
-# serve discovery/JWKS/token, sign a self-issued ID token with a throwaway RSA
-# key. Mirrors the forge-core OIDC test harness.
+# Mock OIDC IdP for the /auth route integration tests: serve
+# discovery/JWKS/token, sign a self-issued ID token with a throwaway RSA key.
+# Mirrors the forge-core OIDC test harness.
 wiremock = "0.6"
 rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 sqlx = { workspace = true }
+# A throwaway CA and server certificate for the SMTP-over-TLS tests (mailpit),
+# made per run instead of a key kept in the repository.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

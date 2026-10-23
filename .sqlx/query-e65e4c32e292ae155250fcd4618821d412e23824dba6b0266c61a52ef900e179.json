@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE oci_tag SET checked_at = now()\n        WHERE repository_id = $1 AND image = $2 AND tag = $3\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e65e4c32e292ae155250fcd4618821d412e23824dba6b0266c61a52ef900e179"
+}

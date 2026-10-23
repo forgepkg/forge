@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO oci_blob_link (repository_id, image, digest, blob_sha256, size)\n        VALUES ($1, $2, $3, $4, $5)\n        ON CONFLICT (repository_id, image, digest) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ad29903cc37786f8ca322b0d2b72c1d0531bf2cafce38ccce850e3f93e6f53a1"
+}

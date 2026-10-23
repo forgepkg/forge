@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   createFileRoute,
+  Link,
   Outlet,
   redirect,
   useRouter,
@@ -12,26 +13,10 @@ import { meKeys, meQueryOptions } from '~/api/me'
 import { authKeys, authSessionQueryOptions, logout } from '~/api/auth'
 import { ApiError, onUnauthorized } from '~/lib/httpClient'
 import { clearSession, onAuthChange } from '~/lib/auth'
+import { useBrowseRepos } from '~/queries/useBrowseRepos'
 import { useMe } from '~/queries/useMe'
-import { Badge } from '~/components/catalyst/badge'
-import {
-  Navbar,
-  NavbarDivider,
-  NavbarItem,
-  NavbarLabel,
-  NavbarSection,
-  NavbarSpacer,
-} from '~/components/catalyst/navbar'
-import {
-  Sidebar,
-  SidebarBody,
-  SidebarHeader,
-  SidebarItem,
-  SidebarLabel,
-  SidebarSection,
-} from '~/components/catalyst/sidebar'
-import { StackedLayout } from '~/components/catalyst/stacked-layout'
-import { ThemeToggle } from '~/components/ThemeToggle'
+import { AppRail } from '~/components/AppRail'
+import { Icon, Logo, ToastProvider } from '~/components/ui'
 
 export const Route = createFileRoute('/_app')({
   /**
@@ -59,30 +44,28 @@ export const Route = createFileRoute('/_app')({
   component: AppLayout,
 })
 
-const NAV_ITEMS = [
-  { label: 'Browse', to: '/', adminOnly: false },
-  { label: 'Tokens', to: '/tokens', adminOnly: false },
-  { label: 'Admin', to: '/manage', adminOnly: true },
-] as const
-
-/** Whether a nav target is the current location (Browse only matches exactly). */
-function isCurrent(pathname: string, to: string): boolean {
-  if (to === '/') return pathname === '/'
-  return pathname === to || pathname.startsWith(`${to}/`)
-}
-
 /**
- * The authenticated app shell: Catalyst stacked layout with the top navbar
- * (collapsing into a sidebar drawer on mobile), theme switcher, and the
- * current-user widget. The Admin nav item is rendered **only** when
- * `is_admin` is true (the route guard in `AdminLayout` is the hard
- * enforcement; this is the cosmetic half — readers never see the link).
+ * The authenticated app shell: the navigation rail on the left (the places,
+ * Administration, the readable repositories, the current user with the theme
+ * switch and Sign out) and the content column. Below 900px the rail is a
+ * drawer behind the menu button of a top bar. The Administration section is
+ * rendered **only** when `is_admin` is true (the route guard in `AdminLayout`
+ * is the hard enforcement; this is the cosmetic half — readers never see the
+ * links).
  */
 function AppLayout() {
   const me = useMe()
   const queryClient = useQueryClient()
   const router = useRouter()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
+  const repos = useBrowseRepos()
+  // The phone drawer; closed again by every navigation.
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [drawerPath, setDrawerPath] = useState(pathname)
+  if (drawerPath !== pathname) {
+    setDrawerPath(pathname)
+    setDrawerOpen(false)
+  }
 
   // Set while a deliberate sign-out runs: its own 401s (an already-expired
   // session) must not be reported as "session expired".
@@ -126,11 +109,20 @@ function AppLayout() {
     })
   }, [queryClient, router])
 
+  // Escape closes the phone drawer (a document-level key listener while open).
+  useEffect(() => {
+    if (!drawerOpen) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setDrawerOpen(false)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [drawerOpen])
+
   // `is_admin` is the server's effective RBAC verdict (admin role or legacy
   // flag), not the raw column.
   const isAdmin = me.data?.is_admin === true
   const username = me.data?.user.username ?? null
-  const items = NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin)
 
   async function signOut() {
     // Only the server can invalidate the httpOnly cookie, so POST /auth/logout
@@ -158,81 +150,41 @@ function AppLayout() {
   }
 
   return (
-    <StackedLayout
-      navbar={
-        <Navbar>
-          <NavbarItem href="/" aria-label="envisia forge home">
-            <BrandMark />
-            <NavbarLabel className="font-semibold tracking-tight">
-              envisia&nbsp;forge
-            </NavbarLabel>
-          </NavbarItem>
-          <NavbarDivider className="max-lg:hidden" />
-          <NavbarSection className="max-lg:hidden">
-            {items.map((item) => (
-              <NavbarItem
-                key={item.to}
-                href={item.to}
-                current={isCurrent(pathname, item.to)}
-              >
-                {item.label}
-              </NavbarItem>
-            ))}
-          </NavbarSection>
-          <NavbarSpacer />
-          <NavbarSection>
-            <ThemeToggle />
-            {username && (
-              <>
-                <span className="flex items-center gap-2 px-2 text-sm/6 text-zinc-950 max-sm:hidden dark:text-white">
-                  {username}
-                  <Badge color={isAdmin ? 'emerald' : 'zinc'}>
-                    {isAdmin ? 'admin' : 'reader'}
-                  </Badge>
-                </span>
-                <NavbarItem onClick={() => void signOut()}>Sign out</NavbarItem>
-              </>
-            )}
-          </NavbarSection>
-        </Navbar>
-      }
-      sidebar={
-        <Sidebar>
-          <SidebarHeader>
-            <span className="flex items-center gap-2 px-2 py-1 font-semibold tracking-tight">
-              <BrandMark />
-              envisia&nbsp;forge
-            </span>
-          </SidebarHeader>
-          <SidebarBody>
-            <SidebarSection>
-              {items.map((item) => (
-                <SidebarItem
-                  key={item.to}
-                  href={item.to}
-                  current={isCurrent(pathname, item.to)}
-                >
-                  <SidebarLabel>{item.label}</SidebarLabel>
-                </SidebarItem>
-              ))}
-            </SidebarSection>
-          </SidebarBody>
-        </Sidebar>
-      }
-    >
-      <Outlet />
-    </StackedLayout>
-  )
-}
-
-/** Small gradient brand square so the navbar has a visual anchor. */
-function BrandMark() {
-  return (
-    <span
-      aria-hidden="true"
-      className="grid size-6 shrink-0 place-items-center rounded-md bg-gradient-to-br from-sky-500 to-indigo-600 text-[11px] font-bold text-white"
-    >
-      ef
-    </span>
+    <ToastProvider>
+      <div className="fg-app">
+        <header className="fg-topbar">
+          <button
+            type="button"
+            className="fg-topbar-btn"
+            aria-label="Open navigation"
+            aria-expanded={drawerOpen}
+            onClick={() => setDrawerOpen(true)}
+          >
+            <Icon name="Menu" size={20} />
+          </button>
+          <Link to="/" className="fg-topbar-home" aria-label="Forge home">
+            <Logo size={22} />
+          </Link>
+        </header>
+        {drawerOpen && (
+          <div className="fg-drawer-scrim" aria-hidden="true" onClick={() => setDrawerOpen(false)} />
+        )}
+        <div className={drawerOpen ? 'fg-app-rail is-open' : 'fg-app-rail'}>
+          <AppRail
+            pathname={pathname}
+            isAdmin={isAdmin}
+            username={username}
+            repos={Array.isArray(repos.data) ? repos.data : []}
+            onSignOut={() => void signOut()}
+            onClose={() => setDrawerOpen(false)}
+          />
+        </div>
+        <main className="fg-app-main">
+          <div className="fg-app-content">
+            <Outlet />
+          </div>
+        </main>
+      </div>
+    </ToastProvider>
   )
 }

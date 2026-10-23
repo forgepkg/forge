@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO oci_tag (repository_id, image, tag, manifest_id)\n                    VALUES ($1, $2, $3, $4)\n                    ON CONFLICT (repository_id, image, tag) DO NOTHING\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4e9b9648655409ff381f06e507d4051545ad072377313d364b50ed89dbea7bc6"
+}

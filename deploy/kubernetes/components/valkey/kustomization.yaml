@@ -1,0 +1,21 @@
+# An in-cluster Valkey as Forge's shared L2 cache and invalidation backplane,
+# recommended as soon as more than one Forge instance runs. Cache only, so it
+# keeps nothing on disk. Use your own Valkey or Redis instead by setting
+# FORGE_REDIS__URL in the forge-env Secret and dropping this component.
+#
+# Needs VALKEY_PASSWORD in the forge-env Secret. It is pasted into the
+# connection URL unescaped, so use a URL-safe value (`openssl rand -hex 24`).
+# Anything that can write to Valkey can write Forge's shared cache, so keep it
+# password-protected and reachable from Forge only (docs/deployment.md).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: forge
+
+resources:
+  - valkey.yaml
+
+patches:
+  - path: deployment-patch.yaml

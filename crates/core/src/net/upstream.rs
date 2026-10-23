@@ -28,7 +28,15 @@
 //!   ([`is_metadata_target`]). Resource `@id`s and redirects are chosen by the
 //!   upstream, not the admin, and such a target is never a package feed, but
 //!   it is where a malicious upstream would bounce Forge to read instance
-//!   credentials. Private and loopback upstreams stay allowed (12.7 §3.6).
+//!   credentials. Private and loopback upstreams stay allowed (see
+//!   [`super::ssrf`]).
+//!   Behind an outbound proxy (`HTTP(S)_PROXY`) the proxy resolves host names,
+//!   not this client's resolver, so a name the proxy will reach is resolved
+//!   here first and refused when any of its addresses is such a target.
+//!   Redirects are followed hop by hop for the same reason (see
+//!   [`UpstreamHttp::get`]). The proxy still resolves the name again: a name
+//!   that answers differently to Forge and to the proxy, or that only the
+//!   proxy can resolve, is not caught.
 //! * **Encoded metadata** — a metadata body sent with `Content-Encoding: gzip`
 //!   (nuget.org's `registration5-gz-*` documents always are) is inflated with
 //!   the same size cap applied to the decoded bytes.
@@ -38,6 +46,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
+use hyper_util::client::proxy::matcher::Matcher as ProxyMatcher;
 use serde_json::Value as JsonValue;
 use url::Url;
 
@@ -122,12 +132,20 @@ pub enum UpstreamError {
         #[source]
         source: serde_json::Error,
     },
-    /// The request targets a link-local / cloud-metadata endpoint
-    /// ([`is_metadata_target`]).
+    /// The request, or a redirect hop, targets a link-local / cloud-metadata
+    /// endpoint ([`is_metadata_target`], or a proxied name resolving to one).
     #[error("upstream GET {url}: refusing link-local / cloud-metadata target")]
     MetadataTarget {
+        /// The refused URL.
+        url: String,
+    },
+    /// The upstream redirected more than `max_redirects` times.
+    #[error("upstream GET {url}: more than {max} redirects")]
+    TooManyRedirects {
         /// Requested URL.
         url: String,
+        /// The configured hop cap.
+        max: usize,
     },
 }
 
@@ -172,19 +190,36 @@ pub fn is_metadata_target(url: &Url) -> bool {
     }
 }
 
-/// A redirect hop refused because it targets a metadata endpoint.
-#[derive(Debug, thiserror::Error)]
-#[error("refusing redirect to link-local / cloud-metadata target {0}")]
-struct MetadataRedirect(String);
+/// Host name lookup: system DNS in production ([`system_lookup`]), a fixed
+/// table in tests.
+type Lookup = Arc<dyn Fn(String) -> BoxFuture<'static, std::io::Result<Vec<IpAddr>>> + Send + Sync>;
 
-/// System DNS resolution (`getaddrinfo` on the blocking pool, like reqwest's
-/// default resolver) minus link-local / cloud-metadata addresses, so a host
-/// name pointing at one is refused like the literal address.
-struct MetadataGuardResolver;
+/// System DNS resolution: `getaddrinfo` on the blocking pool, like reqwest's
+/// default resolver.
+fn system_lookup() -> Lookup {
+    Arc::new(|host: String| {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                (host.as_str(), 0)
+                    .to_socket_addrs()
+                    .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    })
+}
+
+/// DNS resolution minus link-local / cloud-metadata addresses, so a host name
+/// pointing at one is refused like the literal address.
+struct MetadataGuardResolver {
+    lookup: Lookup,
+}
 
 impl reqwest::dns::Resolve for MetadataGuardResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let lookup = self.lookup.clone();
         Box::pin(async move {
             let refused = || -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::other(format!(
@@ -194,19 +229,42 @@ impl reqwest::dns::Resolve for MetadataGuardResolver {
             if is_metadata_host(&host) {
                 return Err(refused());
             }
-            let lookup = host.clone();
-            let addrs: Vec<SocketAddr> =
-                tokio::task::spawn_blocking(move || (lookup.as_str(), 0).to_socket_addrs())
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)??
-                    .filter(|addr| !is_metadata_ip(addr.ip()))
-                    .collect();
+            let addrs: Vec<SocketAddr> = lookup(host.clone())
+                .await?
+                .into_iter()
+                .filter(|ip| !is_metadata_ip(*ip))
+                .map(|ip| SocketAddr::new(ip, 0))
+                .collect();
             if addrs.is_empty() {
                 return Err(refused());
             }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
+}
+
+/// The location a redirect response points to, if it is one this client
+/// follows: a 301, 302, 303, 307 or 308 whose `Location` resolves against
+/// `from` to an `http(s)` URL. Anything else is returned to the caller as is.
+fn redirect_target(from: &Url, resp: &reqwest::Response) -> Option<Url> {
+    use reqwest::StatusCode;
+    if !matches!(
+        resp.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) {
+        return None;
+    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    let next = from.join(location).ok()?;
+    matches!(next.scheme(), "http" | "https").then_some(next)
 }
 
 /// Request class, selecting the total deadline.
@@ -253,6 +311,12 @@ impl Origin {
 pub struct UpstreamHttp {
     client: reqwest::Client,
     config: Arc<UpstreamHttpConfig>,
+    /// Which URLs go through an outbound proxy: the same selection reqwest
+    /// makes from `HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY` and the platform's
+    /// proxy settings.
+    proxies: Arc<ProxyMatcher>,
+    /// Resolves proxied host names for the metadata guard.
+    lookup: Lookup,
 }
 
 impl std::fmt::Debug for UpstreamHttp {
@@ -270,29 +334,51 @@ static DEFAULT_UPSTREAM: LazyLock<UpstreamHttp> = LazyLock::new(|| {
 });
 
 impl UpstreamHttp {
-    /// Build a client from `config`.
+    /// Build a client from `config`, using the system's outbound proxy
+    /// settings.
     pub fn new(config: UpstreamHttpConfig) -> Result<Self, reqwest::Error> {
-        // Hop-capped like `Policy::limited`, and never towards a metadata
-        // endpoint (the upstream picks redirect targets, not the admin).
-        let limited = reqwest::redirect::Policy::limited(config.max_redirects);
-        let redirect = reqwest::redirect::Policy::custom(move |attempt| {
-            if is_metadata_target(attempt.url()) {
-                let target = attempt.url().to_string();
-                return attempt.error(MetadataRedirect(target));
-            }
-            limited.redirect(attempt)
-        });
-        let client = reqwest::Client::builder()
-            .redirect(redirect)
-            .dns_resolver(MetadataGuardResolver)
+        // reqwest builds its proxy selection with this same call.
+        let proxies = ProxyMatcher::from_system();
+        Self::build(config, reqwest::Client::builder(), proxies, system_lookup())
+    }
+
+    fn build(
+        config: UpstreamHttpConfig,
+        builder: reqwest::ClientBuilder,
+        proxies: ProxyMatcher,
+        lookup: Lookup,
+    ) -> Result<Self, reqwest::Error> {
+        // Redirects are followed by `get`, which checks every hop.
+        let client = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(MetadataGuardResolver {
+                lookup: lookup.clone(),
+            })
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.read_timeout)
-            .user_agent(concat!("envisia-forge/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("forge/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(UpstreamHttp {
             client,
             config: Arc::new(config),
+            proxies: Arc::new(proxies),
+            lookup,
         })
+    }
+
+    /// A client that sends every request through the HTTP proxy at `proxy`
+    /// and resolves names with `lookup`.
+    #[cfg(test)]
+    fn with_proxy(
+        config: UpstreamHttpConfig,
+        proxy: &str,
+        lookup: Lookup,
+    ) -> Result<Self, reqwest::Error> {
+        let builder = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(proxy)?);
+        let proxies = ProxyMatcher::builder().all(proxy).build();
+        Self::build(config, builder, proxies, lookup)
     }
 
     /// The shared default client (see [`UpstreamHttpConfig::default`]).
@@ -305,36 +391,143 @@ impl UpstreamHttp {
         &self.config
     }
 
-    /// Issue a GET for `url`, attaching `auth` only when `url` shares the
-    /// credential origin. Non-success statuses are returned to the caller
-    /// (a 404 is meaningful to the proxy); only transport errors fail here.
+    /// Issue a GET for `url`, attaching `auth` to every hop that shares the
+    /// credential origin and to no other. Non-success statuses are returned
+    /// to the caller (a 404 is meaningful to the proxy); only transport
+    /// errors fail here.
+    ///
+    /// Redirects are followed here rather than by reqwest, up to
+    /// `max_redirects` hops within the request's total deadline, so that
+    /// every hop passes [`Self::refuse_metadata_target`] before it is sent.
     pub async fn get(
         &self,
         url: &str,
         class: RequestClass,
         auth: Option<&UpstreamAuth<'_>>,
     ) -> Result<reqwest::Response, UpstreamError> {
+        self.send(
+            reqwest::Method::GET,
+            url,
+            class,
+            reqwest::header::HeaderMap::new(),
+            auth,
+        )
+        .await
+    }
+
+    /// Issue `method` for `url` with extra request `headers` (an `Accept`
+    /// list, a registry's `Authorization: Bearer` token), under the same
+    /// metadata guard, redirect handling, deadline and origin-scoped Basic
+    /// `auth` as [`Self::get`]. An `Authorization` header in `headers` is
+    /// sent only to `url`'s origin: it is dropped once a redirect leaves it
+    /// (registries redirect blobs to a CDN or an object store).
+    pub async fn send(
+        &self,
+        mut method: reqwest::Method,
+        url: &str,
+        class: RequestClass,
+        mut headers: reqwest::header::HeaderMap,
+        auth: Option<&UpstreamAuth<'_>>,
+    ) -> Result<reqwest::Response, UpstreamError> {
         let timeout = match class {
             RequestClass::Metadata => self.config.metadata_timeout,
             RequestClass::Download => self.config.download_timeout,
         };
-        if Url::parse(url).is_ok_and(|u| is_metadata_target(&u)) {
-            return Err(UpstreamError::MetadataTarget {
-                url: url.to_string(),
-            });
+        let deadline = tokio::time::Instant::now() + timeout;
+        // A download may take longer than the request it serves is allowed
+        // (`server.request_timeout_seconds`): the request waits for it.
+        if class == RequestClass::Download {
+            super::deadline::extend(deadline);
         }
-        let mut req = self.client.get(url).timeout(timeout);
-        if let Some(auth) = auth {
-            if auth.origin.is_some() && auth.origin == Origin::of(url) {
-                req = req.basic_auth(auth.username, Some(auth.password));
-            } else {
-                tracing::debug!(%url, "upstream resource is off-origin; not sending proxy credentials");
+        let origin = Origin::of(url);
+        let mut hop = url.to_string();
+        let mut hops = 0;
+        loop {
+            self.refuse_metadata_target(&hop).await?;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if Origin::of(&hop) != origin {
+                headers.remove(reqwest::header::AUTHORIZATION);
+            }
+            let mut req = self
+                .client
+                .request(method.clone(), &hop)
+                .headers(headers.clone())
+                .timeout(remaining);
+            if let Some(auth) = auth {
+                if auth.origin.is_some() && auth.origin == Origin::of(&hop) {
+                    req = req.basic_auth(auth.username, Some(auth.password));
+                } else {
+                    tracing::debug!(url = %hop, "upstream resource is off-origin; not sending proxy credentials");
+                }
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|source| UpstreamError::Transport {
+                    url: hop.clone(),
+                    source,
+                })?;
+            let Some(next) = Url::parse(&hop)
+                .ok()
+                .and_then(|from| redirect_target(&from, &resp))
+            else {
+                return Ok(resp);
+            };
+            if hops == self.config.max_redirects {
+                return Err(UpstreamError::TooManyRedirects {
+                    url: url.to_string(),
+                    max: self.config.max_redirects,
+                });
+            }
+            hops += 1;
+            // A 303 is answered with a GET; the other redirects keep the
+            // method (the registry sends only GET and HEAD).
+            if resp.status() == reqwest::StatusCode::SEE_OTHER && method != reqwest::Method::HEAD {
+                method = reqwest::Method::GET;
+            }
+            tracing::debug!(from = %hop, to = %next, "following upstream redirect");
+            hop = next.into();
+        }
+    }
+
+    /// Refuse `url` when it targets a link-local / cloud-metadata endpoint:
+    /// by literal address or well-known name ([`is_metadata_target`]), or,
+    /// when an outbound proxy will carry the request, by a name that resolves
+    /// to such an address. A direct request needs no lookup here: the
+    /// client's resolver drops those addresses. Through a proxy the proxy
+    /// resolves the name, so it is resolved here first. A name this host
+    /// cannot resolve is left to the proxy.
+    async fn refuse_metadata_target(&self, url: &str) -> Result<(), UpstreamError> {
+        // An unparseable URL is reported by reqwest.
+        let Ok(parsed) = Url::parse(url) else {
+            return Ok(());
+        };
+        let refused = || UpstreamError::MetadataTarget {
+            url: url.to_string(),
+        };
+        if is_metadata_target(&parsed) {
+            return Err(refused());
+        }
+        let Some(url::Host::Domain(host)) = parsed.host() else {
+            return Ok(());
+        };
+        if !self.is_proxied(url) {
+            return Ok(());
+        }
+        match (self.lookup)(host.to_string()).await {
+            Ok(addrs) if addrs.iter().copied().any(is_metadata_ip) => Err(refused()),
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::debug!(%host, %error, "cannot resolve a proxied upstream host here; leaving it to the proxy");
+                Ok(())
             }
         }
-        req.send().await.map_err(|source| UpstreamError::Transport {
-            url: url.to_string(),
-            source,
-        })
+    }
+
+    /// Whether an outbound proxy carries requests to `url`.
+    fn is_proxied(&self, url: &str) -> bool {
+        url.parse::<http::Uri>()
+            .is_ok_and(|uri| self.proxies.intercept(&uri).is_some())
     }
 
     /// GET a JSON document. `Ok(None)` on a 404; any other non-2xx is an error.
@@ -597,7 +790,7 @@ mod tests {
         ] {
             assert!(target(bad), "{bad} must be refused");
         }
-        // Private and loopback upstreams are legitimate (12.7 §3.6).
+        // Private and loopback upstreams are legitimate.
         for ok in [
             "https://api.nuget.org/v3/index.json",
             "http://127.0.0.1:8081/repository/nuget/index.json",
@@ -623,10 +816,8 @@ mod tests {
         .await;
         let err = http.get_bytes(&redirect, None).await.unwrap_err();
         match &err {
-            UpstreamError::Transport { source, .. } => {
-                assert!(source.is_redirect(), "{err}");
-                let chain = format!("{source:?}");
-                assert!(chain.contains("MetadataRedirect"), "{chain}");
+            UpstreamError::MetadataTarget { url } => {
+                assert_eq!(url, "http://169.254.169.254/latest/meta-data/iam/");
             }
             other => panic!("expected a refused redirect, got {other}"),
         }
@@ -653,13 +844,156 @@ mod tests {
                 .unwrap_err(),
             UpstreamError::MetadataTarget { .. }
         ));
+
+        // Redirects stop after `max_redirects` hops.
+        let looping = serve_raw(
+            b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\
+              Connection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        assert!(matches!(
+            http.get_bytes(&looping, None).await.unwrap_err(),
+            UpstreamError::TooManyRedirects { max: 5, .. }
+        ));
+    }
+
+    /// A registry's Bearer token stays on its origin: a redirect to another
+    /// host (a CDN serving the blob) gets the request without it, with the
+    /// method kept.
+    #[tokio::test]
+    async fn send_drops_authorization_on_a_cross_origin_redirect() {
+        use axum_like_server::serve_recording;
+
+        let http = UpstreamHttp::new(UpstreamHttpConfig::default()).unwrap();
+        let (target, heads) = serve_recording(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+        let (hop, hop_heads) = serve_recording(
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}blob\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        )
+        .await;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            "Bearer registry-token".parse().unwrap(),
+        );
+        let resp = http
+            .send(
+                reqwest::Method::HEAD,
+                &hop,
+                RequestClass::Metadata,
+                headers,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let sent = hop_heads.lock().unwrap().clone();
+        assert!(
+            sent[0].contains("authorization: bearer registry-token"),
+            "{sent:?}"
+        );
+        let followed = heads.lock().unwrap().clone();
+        assert_eq!(followed.len(), 1);
+        assert!(followed[0].starts_with("head /blob "), "{followed:?}");
+        assert!(!followed[0].contains("authorization"), "{followed:?}");
+    }
+
+    /// A lookup table standing in for DNS: `imds.attacker.test` has a
+    /// metadata address among its answers, `feed.example.test` is ordinary,
+    /// and any other name does not resolve here.
+    fn fake_dns() -> Lookup {
+        Arc::new(|host: String| {
+            Box::pin(async move {
+                match host.as_str() {
+                    "imds.attacker.test" => Ok(vec![
+                        "203.0.113.7".parse().unwrap(),
+                        "169.254.169.254".parse().unwrap(),
+                    ]),
+                    "feed.example.test" => Ok(vec!["203.0.113.8".parse().unwrap()]),
+                    _ => Err(std::io::Error::other("no such host")),
+                }
+            })
+        })
+    }
+
+    /// #125: behind an outbound proxy the proxy resolves host names, so the
+    /// client's resolver never sees them. A name resolving to a metadata
+    /// address is refused before anything is sent to the proxy.
+    #[tokio::test]
+    async fn proxied_names_resolving_to_metadata_are_refused_before_the_proxy() {
+        use axum_like_server::serve_counting;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // The proxy answers every request it is sent with 200 "ok".
+        let (proxy, requests) = serve_counting(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+        )
+        .await;
+        let http =
+            UpstreamHttp::with_proxy(UpstreamHttpConfig::default(), &proxy, fake_dns()).unwrap();
+
+        // A resource `@id` naming such a host.
+        let err = http
+            .get_bytes("http://imds.attacker.test/latest/meta-data/", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpstreamError::MetadataTarget { .. }), "{err}");
+        assert_eq!(requests.load(SeqCst), 0, "nothing reached the proxy");
+
+        // An ordinary name goes through the proxy, and so does a name only
+        // the proxy can resolve.
+        for url in [
+            "http://feed.example.test/v3/index.json",
+            "http://proxy-only.test/v3/index.json",
+        ] {
+            assert_eq!(http.get_bytes(url, None).await.unwrap().unwrap(), b"ok");
+        }
+        assert_eq!(requests.load(SeqCst), 2);
+    }
+
+    /// #125: a redirect through the proxy to such a name is refused before
+    /// the second hop is sent.
+    #[tokio::test]
+    async fn proxied_redirects_to_metadata_names_are_refused() {
+        use axum_like_server::serve_counting;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let (proxy, requests) = serve_counting(
+            b"HTTP/1.1 302 Found\r\nLocation: http://imds.attacker.test/latest/meta-data/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let http =
+            UpstreamHttp::with_proxy(UpstreamHttpConfig::default(), &proxy, fake_dns()).unwrap();
+        let err = http
+            .get_bytes("http://feed.example.test/v3/index.json", None)
+            .await
+            .unwrap_err();
+        match &err {
+            UpstreamError::MetadataTarget { url } => {
+                assert_eq!(url, "http://imds.attacker.test/latest/meta-data/");
+            }
+            other => panic!("expected a refused redirect, got {other}"),
+        }
+        assert_eq!(requests.load(SeqCst), 1, "only the first hop was sent");
     }
 
     #[tokio::test]
     async fn resolver_drops_metadata_addresses() {
         use reqwest::dns::Resolve;
 
-        let resolve = |host: &str| MetadataGuardResolver.resolve(host.parse().unwrap());
+        let resolver = MetadataGuardResolver {
+            lookup: system_lookup(),
+        };
+        let resolve = |host: &str| resolver.resolve(host.parse().unwrap());
         let addrs: Vec<SocketAddr> = resolve("localhost").await.unwrap().collect();
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|a| a.ip().is_loopback()));
@@ -704,18 +1038,57 @@ mod tests {
 
     /// Minimal one-route HTTP server for the spool tests (no extra deps).
     mod axum_like_server {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         /// Answer every request with the fixed raw `response` bytes and return
         /// the server's URL.
         pub async fn serve_raw(response: Vec<u8>) -> String {
+            serve_counting(response).await.0
+        }
+
+        /// [`serve_raw`], also returning the head (request line and headers)
+        /// of every request it received, lowercased.
+        pub async fn serve_recording(
+            response: Vec<u8>,
+        ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = heads.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((mut sock, _)) = listener.accept().await else {
                         return;
                     };
+                    let response = response.clone();
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                        seen.lock().unwrap().push(head);
+                        let _ = sock.write_all(&response).await;
+                    });
+                }
+            });
+            (format!("http://{addr}/"), heads)
+        }
+
+        /// [`serve_raw`], also returning how many connections it accepted.
+        pub async fn serve_counting(response: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let counter = accepted.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    counter.fetch_add(1, SeqCst);
                     let response = response.clone();
                     tokio::spawn(async move {
                         let mut buf = [0u8; 4096];
@@ -724,7 +1097,7 @@ mod tests {
                     });
                 }
             });
-            format!("http://{addr}/")
+            (format!("http://{addr}/"), accepted)
         }
 
         /// Serve `body` (chunked, no Content-Length) on an ephemeral port and

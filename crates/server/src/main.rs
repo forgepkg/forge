@@ -2,18 +2,15 @@
 //! bootstrap admin, build the app, spawn background workers, and serve.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Context;
 use forge_cache::Cache;
-use forge_nuget::NugetFormat;
 use forge_server::app::{
-    build_router, ensure_auth_realms, ensure_bootstrap_admin, ensure_legacy_rbac, principal_layer,
+    build_router, ensure_auth_realms, ensure_bootstrap_admin, principal_layer,
 };
 use forge_server::config::Config;
 use forge_server::state::AppState;
 use forge_server::workers;
-use forge_storage::BlobStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -52,8 +49,13 @@ async fn main() -> anyhow::Result<()> {
     forge_db::migrate(&pool).await.context("run migrations")?;
 
     // Staging directory for pushes and proxy downloads: create it and remove
-    // what a killed process left there (files idle for an hour; a live stage
-    // writes continuously, so another instance sharing it is not affected).
+    // what killed processes left there. Each process stages in a locked
+    // subdirectory of its own, so a dead one's goes at once and another
+    // instance sharing the directory, with locks that reach it, is not
+    // affected. Loose files from older versions, and the files in a
+    // subdirectory whose lock cannot be tried, go once idle for an hour.
+    // `AppState` builds the staging that requests use; this one is dropped
+    // after the sweep.
     let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
         .with_context(|| {
             format!(
@@ -70,13 +72,13 @@ async fn main() -> anyhow::Result<()> {
         ),
         Err(e) => tracing::warn!(error = %e, "staging directory sweep failed"),
     }
+    drop(staging);
 
-    // Object store (ensure the bucket exists).
-    let blob_store = BlobStore::new(config.s3.to_storage());
-    blob_store
-        .ensure_bucket()
-        .await
-        .context("ensure S3 bucket")?;
+    // Object store, with the local blob cache in front when configured, and
+    // the bucket check. With the cache, an unreachable S3 does not stop the
+    // start: the instance serves its cache and retries in the background.
+    let blob_store = forge_server::object_store::open(&config)?;
+    forge_server::object_store::ensure_bucket(&blob_store).await?;
 
     // Cache: L2 Redis when configured, else L1-only. Redis is connected
     // lazily: an unreachable Redis delays startup by a few seconds (the first
@@ -95,21 +97,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure bootstrap admin")?;
 
-    // §12.4 Phase 5: apply the behavior-preserving RBAC legacy mapping
-    // (is_admin→admin role, anonymous_read→anonymous grants, and — only on
-    // legacy-open-access installs — authenticated for every user) ONCE per
-    // install (a forge_setting marker), so later RBAC revocations stick. Never
-    // opens a fresh install. Runs after bootstrap so a freshly-created
-    // legacy-open user inherits the `authenticated` role too.
-    ensure_legacy_rbac(&pool)
-        .await
-        .context("ensure legacy RBAC mapping")?;
-
-    // §12.5: secret encryption at rest. Building the envelope service reads
+    // Secret encryption at rest. Building the envelope service reads
     // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
     // operator who configured encryption never gets a silently-plaintext
     // instance. Bootstrap then idempotently creates the active KEK/DEK and
-    // backfills any pre-12.5 plaintext upstream passwords.
+    // backfills the secrets still stored in plaintext.
     let envelope = forge_server::crypto::build_envelope(&config, &pool)
         .context("build secret-encryption envelope service")?;
     if let (Some(env), Some(crypto_cfg)) = (&envelope, config.crypto.as_ref()) {
@@ -121,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         forge_server::crypto::refuse_sealed_secrets_without_envelope(&pool).await?;
     }
 
-    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
+    // Import of the legacy [oidc] / [auth.upstream_basic] blocks into
     // auth_realm rows (drift-detected); the DB is the authority. After the
     // crypto bootstrap so seeded realm secrets are encrypted at rest.
     ensure_auth_realms(&config, &pool, envelope.as_deref())
@@ -129,9 +121,19 @@ async fn main() -> anyhow::Result<()> {
         .context("ensure auth realms")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
-    let nuget: Arc<dyn forge_core::format::Format> =
-        Arc::new(NugetFormat::with_limits(config.nuget.limits()));
-    let state = AppState::new(pool, blob_store, cache, nuget, config).with_envelope(envelope);
+    let plugins = forge_server::plugins::load(&config.plugins).context("load format plugins")?;
+    // Registry (`/v2`) tokens are signed with one key shared by every
+    // instance: docker.token_secret, or the install's generated key.
+    let registry_keys =
+        forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
+            .await
+            .context("load the registry token key")?;
+    let state = AppState::new(pool, blob_store, cache, config)
+        .with_envelope(envelope)
+        .with_registry_keys(registry_keys)
+        .with_plugins(plugins)
+        .map_err(anyhow::Error::msg)
+        .context("install format plugins")?;
     let layer = principal_layer(&state)?;
     let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);
 
@@ -139,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
     // supervised: a panicking loop is logged and restarted.
     let workers = workers::spawn_all(&state);
 
+    let downloads = state.downloads.clone();
     let app = build_router(state, layer);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -152,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
     // step is idempotent / lease-fenced, so an interrupted pass is resumed by
     // the next instance.
     workers.abort();
+    // Download counts not written yet would be lost with the process.
+    downloads.write_pending().await;
     tracing::info!("forge-server stopped");
     Ok(())
 }

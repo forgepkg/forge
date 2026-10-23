@@ -9,7 +9,7 @@ use std::io::Cursor;
 use chrono::{Duration, Utc};
 use forge_storage::cas::Cas;
 use forge_storage::outbox_worker;
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 
 const MAX: u64 = 100 * 1024 * 1024;
 static OUTBOX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -96,8 +96,7 @@ async fn ambiguous_delete_failure_keeps_incarnation_fenced() {
         endpoint: "http://127.0.0.1:1".to_string(),
         region: "us-east-1".to_string(),
         bucket: "unreachable".to_string(),
-        access_key: "test".to_string(),
-        secret_key: "test".to_string(),
+        credentials: S3Credentials::from_keys("test", "test"),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),
@@ -217,7 +216,7 @@ async fn worker_skips_revived_blob() {
     store.delete(&key).await.unwrap();
 }
 
-/// Counter drift (the pre-0.1.0 double decrement could leave `ref_count = 0`
+/// Counter drift (the pre-release double decrement could leave `ref_count = 0`
 /// on a blob an asset still names) must never let the worker delete it: the
 /// reservation sees the asset, repairs the counter, and keeps the object.
 #[tokio::test]

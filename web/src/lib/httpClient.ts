@@ -4,8 +4,8 @@ import { authHeaders, clearSession, getCsrfToken, setSession } from './auth'
 /**
  * Centralized HTTP client. **Every** API call goes through here so the auth
  * header / cookie credentials and the base URL are injected in exactly one
- * place — switching token-header for §12.2 cookie-session touches only
- * `auth.ts`, never the call sites.
+ * place — how the SPA authenticates is known only to `auth.ts`, never to the
+ * call sites.
  */
 
 /** An API error carrying the HTTP status + the server's (text) body. */
@@ -30,6 +30,11 @@ interface RequestOptions {
   method?: string
   /** JSON body; serialized and sent with `Content-Type: application/json`. */
   json?: unknown
+  /**
+   * A `multipart/form-data` body (file uploads); the browser sets the
+   * content type with its boundary.
+   */
+  form?: FormData
   /** Extra query parameters (undefined values are dropped). */
   query?: Record<string, string | number | boolean | undefined>
   signal?: AbortSignal
@@ -120,10 +125,12 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     Accept: 'application/json',
     ...authHeaders(),
   }
-  let body: string | undefined
+  let body: string | FormData | undefined
   if (opts.json !== undefined) {
     headers['Content-Type'] = 'application/json'
     body = JSON.stringify(opts.json)
+  } else if (opts.form !== undefined) {
+    body = opts.form
   }
 
   const method = opts.method ?? 'GET'
@@ -131,8 +138,8 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     method,
     headers,
     body,
-    // Same-origin so a future §12.2 session cookie is sent automatically; no
-    // cross-origin credentials (prod is single-origin, dev uses the Vite proxy).
+    // Same-origin so the session cookie is sent automatically; no cross-origin
+    // credentials (prod is single-origin, dev uses the Vite proxy).
     credentials: 'same-origin',
     signal: opts.signal,
   })
@@ -183,6 +190,12 @@ export const httpClient = {
     request<T>(path, { ...opts, method: 'PUT', json }),
   patch: <T>(path: string, json?: unknown, opts?: Omit<RequestOptions, 'method'>) =>
     request<T>(path, { ...opts, method: 'PATCH', json }),
+  /** `POST` a `multipart/form-data` body. */
+  postForm: <T>(
+    path: string,
+    form: FormData,
+    opts?: Omit<RequestOptions, 'method' | 'json' | 'form'>,
+  ) => request<T>(path, { ...opts, method: 'POST', form }),
   delete: <T>(path: string, opts?: Omit<RequestOptions, 'method' | 'json'>) =>
     request<T>(path, { ...opts, method: 'DELETE' }),
 }

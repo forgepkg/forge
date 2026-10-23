@@ -1,4 +1,4 @@
-//! Auth-realm data access (slice 12.7).
+//! Auth-realm data access.
 //!
 //! The `auth_realm` table is the **authority** for the server's authentication
 //! configuration: the password chain and the OIDC login runtime are rebuilt
@@ -258,21 +258,73 @@ where
 
 /// Delete a realm by id. Returns whether a row was deleted. (Refusing to
 /// delete the built-in `local` realm is an API-layer rule, not enforced here.)
-pub async fn delete_realm(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
+pub async fn delete_realm<'e, E>(executor: E, id: i64) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
     let res = sqlx::query!(r#"DELETE FROM auth_realm WHERE id = $1"#, id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(res.rows_affected() > 0)
+}
+
+/// Lock the realms people sign in with interactively (`local` and `oidc`)
+/// `FOR UPDATE`, in id order, and return each one's `(id, enabled)`. An
+/// admin change that disables or deletes one of them takes this first, so
+/// two concurrent changes cannot each leave the other's realm as the last
+/// one and then both remove theirs.
+pub async fn lock_interactive_realms(
+    conn: &mut sqlx::PgConnection,
+) -> sqlx::Result<Vec<(i64, bool)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, enabled FROM auth_realm
+        WHERE kind IN ('local', 'oidc')
+        ORDER BY id
+        FOR UPDATE
+        "#
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.id, r.enabled)).collect())
+}
+
+/// What [`reorder_realms`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderOutcome {
+    /// Every realm got its new priority.
+    Reordered,
+    /// `order` does not list exactly the realms that exist (one was created
+    /// or deleted since the caller read them); nothing changed.
+    Changed,
 }
 
 /// Reassign priorities in one transaction. `order` is the full desired
 /// try-order (every realm id, first = highest precedence); each row gets
 /// `(index + 1) * 10`. The unique constraint is DEFERRABLE, so intermediate
-/// duplicates inside the transaction are fine. Ids not present in the table
-/// are ignored (the realm was deleted concurrently); extra rows not listed
-/// keep their priority — callers should pass the complete set.
-pub async fn reorder_realms(pool: &PgPool, order: &[i64]) -> sqlx::Result<()> {
+/// duplicates inside the transaction are fine.
+///
+/// The table is locked `EXCLUSIVE` (reads go on) before anything else, and
+/// `order` is compared with the realms that exist under that lock. Updating
+/// the rows in the caller's order without it deadlocked against an admin
+/// change that locks the interactive realms in id order
+/// ([`lock_interactive_realms`]), and a realm created meanwhile could take a
+/// priority the reorder assigns; both surfaced as a 500. Under the lock a
+/// concurrent change either finishes first (and then shows up as
+/// [`ReorderOutcome::Changed`]) or waits for this one.
+pub async fn reorder_realms(pool: &PgPool, order: &[i64]) -> sqlx::Result<ReorderOutcome> {
     let mut tx = pool.begin().await?;
+    sqlx::query!(r#"LOCK TABLE auth_realm IN EXCLUSIVE MODE"#)
+        .execute(&mut *tx)
+        .await?;
+    let existing = sqlx::query_scalar!(r#"SELECT id FROM auth_realm ORDER BY id"#)
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut given = order.to_vec();
+    given.sort_unstable();
+    if given != existing {
+        return Ok(ReorderOutcome::Changed);
+    }
     sqlx::query!(r#"SET CONSTRAINTS auth_realm_priority_key DEFERRED"#)
         .execute(&mut *tx)
         .await?;
@@ -286,7 +338,8 @@ pub async fn reorder_realms(pool: &PgPool, order: &[i64]) -> sqlx::Result<()> {
         .execute(&mut *tx)
         .await?;
     }
-    tx.commit().await
+    tx.commit().await?;
+    Ok(ReorderOutcome::Reordered)
 }
 
 /// A cheap change marker for the per-instance snapshot cache: `(row count,

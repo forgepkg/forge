@@ -1,0 +1,14 @@
+# A Forge format plugin: Helm chart repositories (see plugins/README.md).
+[plugin]
+id = "helm"
+name = "Helm charts"
+version = "0.1.0"
+api = "0.3.0"
+component = "forge_format_helm.wasm"
+description = "Helm chart repositories: `helm repo add` / `helm pull`, ChartMuseum-compatible push and delete; proxies of other chart repositories."
+# Proxies mirror another chart repository through the plugin's upstream side.
+kinds = ["hosted", "proxy", "group"]
+
+[limits]
+memory_mib = 64
+timeout_ms = 5000

@@ -1,14 +1,16 @@
-# Developing & running envisia-forge locally
+# Developing & running Forge locally
 
-envisia-forge is a Rust NuGet package registry. Locally it runs as a single
-`forge-server` process backed by **PostgreSQL** (metadata) and an **S3-compatible**
-object store (blobs) — both provided by `docker-compose.yml` (versitygw stands in
-for S3).
+Forge is a NuGet, Docker / OCI, Helm and raw file registry written in Rust.
+Locally it runs as a single `forge-server` process backed by **PostgreSQL**
+(metadata) and an **S3-compatible** object store (blobs) — both provided by
+`docker-compose.yml` (versitygw stands in for S3).
 
 ## Prerequisites
 
 - **Docker** (for Postgres + versitygw, and for the test suites).
-- **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`).
+- **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`), with
+  the `wasm32-wasip2` target for the format plugins' component builds and the
+  tests that load them (`rustup target add wasm32-wasip2`).
 - **Node 22 + pnpm 11** (for the web UI in `web/`; `corepack enable` activates the
   pinned `pnpm@11.5.0` from `web/package.json`).
 - *Optional:* the **.NET SDK** (`dotnet`) to drive the feed with a real client.
@@ -34,8 +36,8 @@ processes; `cargo xtask down` stops the containers.
 > `xtask` is intentionally dependency-free and `std` offers no signal-handler
 > API, so it does not trap the interrupt to suppress that message.
 
-`xtask` is a plain Rust binary (in [`xtask/`](./xtask)) that replaces the old
-Makefile + Justfile — there is nothing extra to install (no `make`, no `just`).
+`xtask` is a plain Rust binary (in [`xtask/`](./xtask)), so there is nothing
+extra to install (no `make`, no `just`).
 The `cargo xtask` alias is wired up in [`.cargo/config.toml`](./.cargo/config.toml).
 
 ### Picking where Postgres comes from (`--db`)
@@ -54,7 +56,7 @@ local PostgreSQL. `--db none` starts no infra at all. Run `cargo xtask help` for
 the full command list.
 
 > First run compiles the workspace (a minute or two) and runs DB migrations
-> automatically. A bootstrap admin **`admin` / `changeme`** is created (the server
+> automatically. A bootstrap admin **`admin@example.com` / `changeme`** is created (the server
 > logs a warning while that seeded password is in use). These placeholder
 > credentials (and the `minioadmin` S3 keys) are only accepted because the dev
 > `forge.toml` sets `server.allow_insecure_defaults = true`; without it the
@@ -68,7 +70,8 @@ With the server running, in a second terminal:
 cargo xtask seed
 ```
 
-This creates an anonymous-readable hosted repo `nuget`, mints a push token, and
+This turns anonymous reads and password Basic on (**Admin → Settings**),
+creates an anonymous-readable hosted repo `nuget`, mints a push token, and
 pushes the bundled sample package. It prints the feed URL and the available
 versions. The feed is then browsable without auth at
 `http://localhost:8421/v3/nuget/index.json`.
@@ -116,8 +119,8 @@ cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8421
 cargo xtask web-dev                 # terminal 2: Vite on :8420
 ```
 
-The Vite dev server proxies `/admin`, `/browse`, `/v3`, `/auth` to the Rust
-origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
+The Vite dev server proxies `/admin`, `/browse`, `/v2`, `/v3`, `/raw`, `/auth`
+to the Rust origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
 `web-dev` binds Vite to IPv4 all-interfaces and prints local/network portal
@@ -143,12 +146,7 @@ e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 > **Admin UI paths:** the admin screens live under **`/manage/*`**
 > (`/manage/repositories`, `/manage/users/<id>`, `/manage/realms`, ...);
 > `/admin/*` belongs to the admin REST API, which is routed before the SPA
-> fallback. (Until 0.1.0 the UI shared `/admin/*`, so a refresh, bookmark or
-> deep link of an admin screen got raw JSON, a 404 or a 405.) A browser
-> navigation (`Sec-Fetch-Dest: document`, or an `Accept` preferring
-> `text/html`) to a former UI path such as `/admin/repositories?x=1` is
-> 302-redirected to `/manage/repositories?x=1`; API requests to `/admin/*` are
-> unchanged. Covered by `web/e2e/specs/admin-deeplink.spec.ts` and
+> fallback. Covered by `web/e2e/specs/admin-deeplink.spec.ts` and
 > `crates/server/tests/web_ui.rs`. In Vite dev (`:8420`) `/manage/*` is served
 > by Vite itself; `/admin` is still proxied to the API.
 
@@ -162,7 +160,7 @@ SQLX_OFFLINE=true cargo run -p forge-server   # or: cargo xtask run
 # password over HTTP Basic. Keep the cookie and echo the CSRF token.
 CSRF=$(curl -sc /tmp/forge.jar localhost:8421/auth/login \
   -H 'content-type: application/json' \
-  -d '{"username":"admin","password":"changeme"}' | sed 's/.*"csrf_token":"\([^"]*\)".*/\1/')
+  -d '{"username":"admin@example.com","password":"changeme"}' | sed 's/.*"csrf_token":"\([^"]*\)".*/\1/')
 
 # create a hosted repo
 curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/repositories \
@@ -174,7 +172,7 @@ curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/me/
   -H 'content-type: application/json' -d '{"name":"local"}'
 # -> {"token":"<SECRET>", ...}   (shown once)
 # For scripted administration, mint one with '{"name":"ops","scope":{"actions":["admin"]}}'
-# and send it as the Basic password (curl -u admin:<SECRET>) or X-NuGet-ApiKey.
+# and send it as the Basic password (curl -u admin@example.com:<SECRET>) or X-NuGet-ApiKey.
 
 # push a package, then read it back
 curl -X PUT localhost:8421/v3/nuget/package \
@@ -207,7 +205,8 @@ password supplied to NuGet should be a **token**.
   points at on a different host — and must not be embedded in `remote_url`.
   NuGet V2-only feeds cannot be proxied. Version listings are refreshed at
   most once per `metadata_ttl_seconds`; a failing upstream degrades to what
-  is already cached.
+  is already cached, and for a minute after a listing failed, ids with
+  cached versions are answered from the cache without asking it again.
 - **group** — `{"name":"all","kind":"group"}`, then
   `POST /admin/repositories/all/members` with `{"member":"nuget","priority":100}`
   (higher priority wins ties). A member that errors (e.g. an unreachable
@@ -228,25 +227,59 @@ password supplied to NuGet should be a **token**.
   is served by the owners alone (no proxy or other hosted member adds
   versions to it), and only owners serve reserved ids. Unflag an owner (`{"owner": false}`) before removing it from
   the group or deleting it; both are refused with 409 otherwise.
+  Reading a group grants no read on its members: a caller is served from
+  the members it may read itself. The same holds for a token whose `scope`
+  lists repositories: scoped to the group alone it sees an empty feed, so
+  list the group **and** every member it should be served from, e.g.
+  `{"scope": {"actions": ["read"], "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
+
+The same three types exist for container images with `"format":"docker"`
+(`{"name":"docker-hosted","kind":"hosted","format":"docker"}`, a proxy with
+`"remote_url":"https://registry-1.docker.io"`, a group with an optional
+`"writable_member"`), served under `/v2/`. Log in with an API token as the
+password: `docker login localhost:8421 -u admin@example.com`, then
+`docker push localhost:8421/docker-hosted/team/app:1`. See
+[docs/docker.md](docs/docker.md).
+
+Raw repositories (`"format":"raw"`) hold files under arbitrary paths, served
+under `/raw/`: `curl -u admin@example.com:<token> --upload-file x.tgz
+localhost:8421/raw/binaries/tools/x.tgz`, a proxy of any HTTP(S) base URL
+(`"remote_url":"https://github.com/<owner>/<repo>/releases/download/"`), and
+groups. See [docs/raw.md](docs/raw.md).
+
+### Repositories of other formats (format plugins)
+
+Formats other than NuGet come from format plugins, crates in
+[`plugins/`](./plugins) (see [docs/format-plugins.md](./docs/format-plugins.md)).
+Helm is built in: create a repository with `"format": "helm"` (hosted, proxy or
+group; a plugin format has proxies when it implements the upstream side). It is
+served under `/repository/<name>/`, e.g.
+`helm repo add local http://localhost:8421/repository/charts`.
+
+To run a plugin as a WebAssembly component instead:
+
+```bash
+cargo xtask plugins     # builds plugins/* as components, prints the [plugins] section for forge.toml
+```
+
+A built-in plugin's component loads only under another id (rename its
+installed directory and the `id` in its `plugin.toml`).
 
 ## Configuration
 
-Everything is in [`forge.toml`](./forge.toml) (loaded by default; override the
-path with `FORGE_CONFIG`, or override individual keys with `FORGE_*` env vars
-using **double-underscore** nesting, e.g. `FORGE_AUTH__ANONYMOUS_MODE=off`).
-Key knobs:
+Deployment configuration is in [`forge.toml`](./forge.toml) (loaded by
+default; override the path with `FORGE_CONFIG`, or override individual keys
+with `FORGE_*` env vars using **double-underscore** nesting, e.g.
+`FORGE_SERVER__BIND=0.0.0.0:8080`). Key knobs:
 
 | Setting | Meaning |
 | --- | --- |
-| `auth.anonymous_mode` | `off` / `allowlist` / `all`. Makes unauthenticated requests an *anonymous principal*. |
-| repo `anonymous_read` | **Also required** for anonymous reads — set it per-repo at create time. |
-| `auth.allow_password_basic` | Allow HTTP Basic with the user password (needed to use the admin API as the bootstrap admin). |
-| `auth.bootstrap_admin` | First-run admin username (default `admin`) / password. No or a blank password means no bootstrap admin. |
+| `auth.bootstrap_admin` | First-run admin username (a UPN, default `admin@example.com`) / password. No or a blank password means no bootstrap admin. |
 | `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme` or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
-| `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
-| `server.max_upload_bytes` | Largest accepted push (default 512 MiB); streamed to disk, 413 above it. |
-| `server.max_staging_bytes` | Temp space all staged pushes and proxy downloads may use at once (default 4 × the largest item, 4 GiB; `0` = no limit); 503 + `Retry-After` above it. `server.staging_dir` picks the directory. |
+| `[blob_cache]` | Optional local disk cache for blobs (`path`, `max_bytes` = `"auto"` or bytes, `min_free_bytes`): hot downloads skip S3 and cached packages keep resolving while S3 is down. See [docs/deployment.md](./docs/deployment.md#local-blob-cache). |
+| repo `max_upload_bytes` | Largest accepted push to a hosted repository (docker: per blob), set in the web UI or admin API; streamed to disk, 413 above it. Unset: 512 MiB (docker 1 GiB). |
+| `server.max_staging_bytes` | Temp space all staged pushes and proxy downloads may use at once (default 4 × the largest item, 4 GiB; `0` = no limit); 503 + `Retry-After` above it, and the ceiling of a repository's upload limit. `server.staging_dir` picks the directory. |
 | `database.max_connections` / `database.acquire_timeout_seconds` | Pool size (default 20) and how long a request waits for a connection (default 10 s). |
 | `[proxy]` | Upstream connect/read/metadata/download timeouts (15 s / 60 s / 60 s / 30 min), size caps (32 MiB metadata, 1 GiB packages) and the 2 MiB in-memory spool threshold — see `forge.toml.example`. |
 
@@ -254,16 +287,40 @@ Key knobs:
 
 `GET /healthz` is a dependency-free liveness probe; `GET /readyz` returns 200
 only when PostgreSQL and the object store answer within 3 s (503 with
-`{"checks":{"database":…,"object_store":…}}` otherwise). The server handles
+`{"checks":{"database":…,"object_store":…}}` otherwise). With `[blob_cache]`
+an unreachable object store is not a failure: 200 with `"status":"degraded"`
+and `"object_store":"degraded"`. The server handles
 SIGTERM (as sent by `docker stop` / Kubernetes): it stops accepting
 connections, drains in-flight requests, then stops the background workers.
 
-> **Anonymous reads need both** `anonymous_mode` *and* the repo's `anonymous_read=true`
-> (authz = authenticated user **or** anonymous-and-repo-allows). For zero-auth
-> local browsing, keep `anonymous_mode = "all"` and create repos with
-> `"anonymous_read": true`.
+### Access and sign-in settings
 
-## Authentication realms (12.7)
+Anonymous access, the login screen, passwords over HTTP Basic, the session
+lifetimes and the login lockout are **not** in `forge.toml`: they are auth
+settings kept in the database, set under **Admin → Settings**
+(`/manage/settings`) or through `GET`/`PUT /admin/settings/auth`, and every
+instance applies a change without a restart (the others within
+`auth.realm_cache_ttl_seconds`). Startup refuses the `[auth]` keys that used
+to set them. See
+[docs/deployment.md](./docs/deployment.md#access-and-sign-in-settings).
+
+| Setting | Meaning |
+| --- | --- |
+| `anonymous_mode` | `off` (default) / `allowlist` / `all`. Makes unauthenticated requests an *anonymous principal*. |
+| `anonymous_ip_allowlist` | Under `allowlist`: `loopback`, `private`, `local`, networks, addresses. |
+| repo `anonymous_read` | **Also required** for anonymous reads — set it per repository. |
+| `login_mode` | `identifier_first` (default) or `combined`. |
+| `allow_password_basic` | Accept a user's password over HTTP Basic on the feeds (default off; the admin API never takes one). |
+| `session_idle_ttl_seconds` / `session_absolute_ttl_seconds` | Browser-session lifetimes (default 8 h / 7 d). |
+| `login_max_failures` / `login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
+
+> **Anonymous reads need both** the anonymous mode *and* the repo's
+> `anonymous_read=true` (authz = authenticated user **or**
+> anonymous-and-repo-allows). For zero-auth local browsing, `cargo xtask seed`
+> sets the anonymous mode to `all` (and turns password Basic on) and creates
+> an `anonymous_read` repository.
+
+## Authentication realms
 
 Authentication is driven by ordered, web-managed **auth realms** stored in the
 `auth_realm` table: the built-in `local` password realm, optional `oidc`
@@ -275,7 +332,8 @@ them under **Admin → Authentication** (`/manage/realms`) or via the `/admin/re
 `PUT /admin/realms/order`); changes apply at runtime — no redeploy. Secrets in
 a realm config (`client_secret`, `key_pepper`) are write-only: responses carry
 `<key>_set` markers, and an update that omits/blanks a secret keeps the stored
-one.
+one. An `oidc` realm can do without a client secret, authenticating with a
+[federated credential](#without-a-client-secret-a-federated-credential).
 
 For trust-policy validation, direct-token replay/cache limits, and GitHub
 Actions/GitLab CI examples, see
@@ -290,22 +348,83 @@ account everywhere — login, the lockout, the credential cache, provisioning �
 and the database enforces it with a unique index on the canonical form.
 Migration 0021 canonicalizes existing accounts; where two collide, the oldest
 keeps the name and the others are renamed `<name>#<id>` (logged as a warning).
+A name that signs in with a password must not contain `:`: HTTP Basic splits
+at the first colon, so neither a feed client nor a forwarding realm's upstream
+could carry it. Form login answers such a name with 401, and admin user
+creation and the bootstrap admin refuse it. OIDC-provisioned names may still
+contain one.
 
-A `credential_forwarding` realm forwards the **canonical** username with the
-password and, on success, signs the user in as that name. That is only safe
-when the upstream **binds the username to the secret**. Many do not: GitHub,
-Azure DevOps and GitLab accept a personal access token with *any* username,
-so anyone with a token could sign in as any Forge user. For such an upstream,
-set `identity_path` to where its JSON success response names the
-authenticated account (e.g. `login` for GitHub's `/user`): that name, in
-canonical form, must equal the username entered, or the login is rejected; a
-success without it fails closed.
+Every account is named by a UPN, `local-part@domain` (admin user creation,
+the bootstrap admin, `oidc` realm provisioning, credential-forwarding
+accounts). The rule is `is_upn` in `crates/db/src/username.rs` (mirrored by
+`upnError` in `web/src/api/users.ts`); see
+[docs/deployment.md](docs/deployment.md#usernames).
+
+A `credential_forwarding` realm creates no accounts: an administrator creates
+each one (`POST /admin/users` with `realm`, or **Admin → Users**), and a login
+signs in only an active account of that realm. It forwards the **local part**
+of the canonical username with the password (`alice` for `alice@example.com`)
+and, on success, signs in the realm's account of that name; a name that is no
+UPN is never forwarded. That is only safe when the upstream **binds the
+username to the secret**. Many do not: GitHub, Azure DevOps and GitLab accept
+a personal access token with *any* username, so anyone with a token could sign
+in as any of the realm's accounts. For such an upstream, set `identity_path`
+to where its JSON success response names the authenticated account (e.g.
+`login` for GitHub's `/user`): that name, in canonical form, must equal the
+forwarded local part, or the login is rejected; a success without it fails
+closed.
+
+Since the realm creates no accounts, deactivating one holds for every
+spelling the directory accepts: `corp\mallory@example.com` or
+`mallory@other.example` forward a name the directory may take for `mallory`,
+but sign in no account unless an administrator created one of that name.
+Names a directory could fold onto another account by Unicode alone
+(full-width letters, a soft hyphen, zero-width characters) are never
+forwarded.
 
 Every login sends the user's password to the realm's `url`, so it must be
 `https` — plain `http` only for a loopback sidecar, or with `"allow_http":
 true` set explicitly. The forwarding client ignores `HTTP(S)_PROXY` (the
 password goes straight to the configured host), follows no redirects and reads
-at most 1 MiB of a success body for `groups_path` / `identity_path`.
+at most 1 MiB of a success body for `groups_path` / `identity_path`. With the
+`local` realm ordered before it, a name that belongs to a local password
+account is never forwarded: a wrong password, or any password for a
+deactivated local account, is refused locally.
+
+### Retiring the upstream: kept password hashes
+
+A `credential_forwarding` realm stores no password by default: its verdict
+cache keeps only a peppered HMAC that expires with the TTL. To be able to
+switch the upstream off later without asking every user for a new password,
+check **Keep a password hash of successful logins** on the realm
+(`"capture_password_hash": true`). Every login the upstream accepts then keeps
+an argon2id hash of that password on the user's account (migration 0035). It
+is refreshed whenever a login actually asks the upstream (once per
+`positive_ttl_secs` per credential), never on a cache hit and never for a
+rejected password, so it is the last password the upstream accepted. The hash
+is not a local password while the realm forwards: the upstream stays in
+charge, so a password changed or revoked upstream keeps or loses access as
+before. Unchecking the option deletes the realm's kept hashes; deleting the
+realm keeps them on its (then orphaned) accounts.
+
+Two ways to stop depending on the upstream once the hashes are in place
+(the realm page shows how many of its accounts keep one):
+
+- **Stop forwarding: sign in with kept passwords only**
+  (`"captured_password_only": true`, which requires `capture_password_hash`).
+  The realm no longer contacts the upstream; it checks the password against
+  the account's kept hash, through the same verdict cache. The accounts stay
+  the realm's (same roles, tokens and admin flags). An account without a kept
+  hash can no longer sign in through the realm.
+- **Switch accounts to local passwords**: `POST
+  /admin/realms/{id}/convert-to-local` (every account of the realm with a
+  kept hash) or `POST /admin/users/{id}/convert-to-local` (one account, an
+  orphan of a deleted realm too). The kept hash becomes the account's Forge
+  password and the account becomes a `local` one with the same id, roles and
+  tokens; the upstream is never asked about it again. The `local` realm must
+  be enabled, and come before every realm that still forwards, for these
+  users to sign in. `GET /admin/realms/{id}/captured-passwords` counts the
+  realm's accounts and those that keep a hash.
 
 Legacy config import: an existing `[oidc]` or `[auth.upstream_basic]` TOML
 block is imported into realm rows on the first boot after the upgrade (one-shot,
@@ -313,8 +432,8 @@ recorded in `forge_setting`); afterwards the database is the authority.
 
 The login screen is **identifier-first** by default (username → password
 prompt, or a 302 to the IdP when the identifier's email domain matches an OIDC
-realm's `login_domains`); set `auth.login_mode = "combined"` for a classic
-combined form with per-realm OIDC buttons.
+realm's `login_domains`); set the `login_mode` setting to `combined` (Admin →
+Settings) for a classic combined form with per-realm OIDC buttons.
 
 ### Endpoints
 
@@ -325,6 +444,7 @@ combined form with per-realm OIDC buttons.
 | `POST` | `/auth/login` | Username/password through the realm chain; mints the session cookie; uniform 401 on failure. |
 | `GET` | `/auth/oidc/login?redirect_to=/path` | Start OIDC login; 302 → IdP. Writes an `oidc_flow` row (state/nonce/PKCE). |
 | `GET` | `/auth/oidc/callback` | Complete login; sets the session cookie, 302 → validated relative target. |
+| `GET` | `/.well-known/openid-configuration`, `/.well-known/jwks.json` | Public: Forge as the OIDC issuer of its own client assertions (a realm with a federated credential); 404 until it has keys. |
 | `GET` | `/auth/me` | Who-am-I for the SPA: `{user_id, username, is_admin, csrf_token}`; 401 if no session. |
 | `POST` | `/auth/logout` | Revoke the session + clear the cookie (CSRF-protected). |
 | `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens (unscoped; `/admin/me/tokens` also takes a `scope`). |
@@ -333,12 +453,12 @@ State-changing cookie endpoints (`logout`, token mint/revoke) require a
 **double-submit CSRF token**: read `csrf_token` from `/auth/me` (or the
 `/auth/login` response) and echo it in the `X-CSRF-Token` header.
 
-> **Security note (12.7 §3.6).** The slice-1 SSRF private-range guard is gone:
-> upstream URLs (proxy `remote_url`, credential-forwarding upstreams, OIDC
-> issuers) are restricted to `http`/`https` only and **may point at internal
-> addresses**. Realm/repository configuration is admin-only by design;
-> credential-forwarding sends the user's password to its configured upstream,
-> so treat realm admin rights accordingly. Configured hosts are logged on save.
+> **Security note.** There is no SSRF private-range guard: upstream URLs
+> (proxy `remote_url`, credential-forwarding upstreams, OIDC issuers) are
+> restricted to `http`/`https` only and **may point at internal addresses**.
+> Realm/repository configuration is admin-only by design; credential-forwarding
+> sends the user's password to its configured upstream, so treat realm admin
+> rights accordingly. Configured hosts are logged on save.
 
 ## OIDC / Microsoft Entra login (optional)
 
@@ -350,7 +470,9 @@ the IdP identity to an `app_user`. The cookie is `__Host-forge_session`
 `forge_session` on an http development setup; a request carrying the session
 cookie twice is treated as signed out. Ordinary NuGet clients authenticate
 with a repository token through `X-NuGet-ApiKey` or Basic; humans mint those
-keys after logging in (`POST /auth/tokens`). A validated workload JWT may
+keys after logging in (`POST /auth/tokens`). When the database cannot say
+whether a presented token or session is valid, the request is answered `503`,
+not `401`, and a Basic secret is then not tried as a password. A validated workload JWT may
 instead be supplied as the Basic password, `X-NuGet-ApiKey`, or
 `Authorization: Bearer` for the direct-token publishing flow.
 
@@ -388,8 +510,53 @@ admin_groups  = ["forge-admins"]
 admin_claim   = "roles"
 ```
 
+### Without a client secret: a federated credential
+
+Instead of a client secret, Forge can authenticate at Entra with a client
+assertion it signs itself: workload identity federation, the
+[federated-credential case](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#third-case-access-token-request-with-a-federated-credential)
+of Entra's token request. Forge is then an OpenID Connect issuer of its own,
+`server.public_base_url`: it publishes `/.well-known/openid-configuration` and
+its signing keys at `/.well-known/jwks.json`, and nothing secret is configured
+or stored besides those keys, which Forge generates and rotates itself.
+
+1. Set the realm's **Client authentication** to *Federated credential*
+   (admin API: `"client_authentication": "federated_credential"` and no
+   `client_secret`; legacy block: `client_authentication =
+   "federated_credential"`). Saving the realm publishes the issuer, and the
+   realm form shows the **issuer**, **subject identifier** and **audience** to
+   register (`federated_credential` in the API's realm view).
+2. In the app registration: *Certificates & secrets* → *Federated
+   credentials* → *Add credential* → scenario *Other issuer*, with those three
+   values. The subject is `<client id>@<the realm's issuer>`, e.g.
+   `00000000-0000-0000-0000-000000000000@https://login.microsoftonline.com/<tenant-id>/v2.0`:
+   an assertion is only accepted for the IdP and client it was signed for, so
+   pointing a realm at another issuer never yields one the real app
+   registration accepts. The audience is `api://AzureADTokenExchange` unless
+   the realm's `assertion_audience` says otherwise (sovereign clouds).
+3. Entra fetches `<public_base_url>/.well-known/openid-configuration` and
+   `/.well-known/jwks.json` from the internet over https. A Forge that is
+   otherwise internal only needs these two paths exposed.
+
+The keys are RSA-2048 (RS256, the only algorithm Entra accepts from another
+issuer), shared by every instance through the database and sealed like other
+secrets with `[crypto]`. Forge creates them when such a realm is saved or
+enabled, adds a new key every 30 days and publishes it two days before it
+signs (Entra caches an issuer's keys for up to a day), and keeps the previous
+keys published until the next rotation. An assertion is valid for five
+minutes and carries its own `jti`. Before Forge has keys, both endpoints
+answer 404.
+
+```toml
+[oidc]
+issuer                = "https://login.microsoftonline.com/<tenant-id>/v2.0"
+client_id             = "00000000-0000-0000-0000-000000000000"
+client_authentication = "federated_credential"   # no client_secret
+redirect_url          = "https://forge.example.com/auth/oidc/callback"
+```
+
 When `admin_groups` is set, admin is **recomputed on every login** from the
-current claims — both the legacy flag and the built-in `admin` role (a user
+current claims: membership in the built-in `admin` role (a user
 removed from the admin role loses admin on next login; existing sessions are not
 downgraded mid-session). With an empty `admin_groups` OIDC never touches admin.
 OIDC users are identified by the `(issuer, sub)` link. With `auto_provision =
@@ -398,6 +565,12 @@ true` (default) a first-time login creates an `app_user`;
 identity to an existing user of the same name, but never to an account that has
 a local password or is an admin, and an email claim is only used as the
 username when `email_verified` is true.
+
+The discovery document's token, JWKS and authorization endpoints must live on
+the issuer's host. An IdP that serves them elsewhere needs those hosts in the
+realm's `endpoint_hosts`: for Google (issuer `https://accounts.google.com`)
+`["oauth2.googleapis.com", "www.googleapis.com"]`; restrict it to your
+Workspace domain with `required_claims = {"hd": ["corp.example"]}`.
 
 ### Multi-instance / scale-out
 
@@ -415,24 +588,76 @@ The e2e suite (`cargo xtask e2e`) stands up an in-process mock OIDC provider
 (discovery + JWKS + a token endpoint signing a test ID token) so OIDC login can
 be exercised end-to-end without a real Entra tenant. For a real self-hosted IdP
 on a private/dev network (e.g. Keycloak over plain `http`), set
-`oidc.allow_private_issuer = true` to relax the https-issuer check. (Since the
-12.7 auth-realms slice the old SSRF private-range guard is gone entirely —
-outbound upstream/issuer URLs are only restricted to http/https.)
+`oidc.allow_private_issuer = true` to relax the https-issuer check. (There is
+no SSRF private-range guard: outbound upstream/issuer URLs are only restricted
+to http/https.)
 
 ## Tests
 
 The integration/e2e suites use **testcontainers** — they start their own
 Postgres/versitygw/Redis automatically, so you only need Docker running (you do
-**not** need `cargo xtask up`).
+**not** need `cargo xtask up`). They pull these Docker Hub images through
+Google's mirror, `mirror.gcr.io` (as do the compose files and CI), which serves
+the same images without Docker Hub's pull rate limit; name a new one the same
+way (`mirror.gcr.io/library/<name>` for an official image).
 
 ```bash
 cargo xtask test    # unit + integration (cargo test --workspace)
 cargo xtask e2e     # end-to-end suite (cargo test -p forge-e2e --features forge-e2e)
 cargo xtask check   # cargo fmt --check + clippy -D warnings
+cargo xtask plugins-check   # the format plugins' component builds: clippy and build
 ```
+
+The format-plugin tests (`crates/plugin/tests`, `crates/server/tests/plugins.rs`)
+build the Helm plugin as a component themselves into `target/plugins/`; they
+need the `wasm32-wasip2` target.
 
 The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 .NET SDK isn't installed.
+
+The registry's end-to-end check with real clients (the OCI conformance suite,
+docker buildx, crane, a `registry:2` upstream behind a proxy, cosign) is a
+script that CI's `oci-e2e` job runs. It needs docker with buildx, go, crane,
+cosign, curl and jq, a Postgres and an S3 endpoint (see the variables at the
+top of the script):
+
+```bash
+cargo build -p forge-server
+.github/scripts/oci-e2e.sh target/debug/forge-server target/oci-e2e
+```
+
+Raw repositories have one too, CI's `raw-e2e` job: curl against a live
+server (uploads, ranges and resumed downloads, checksum sidecars with
+`sha256sum -c`, path traversal sent with `--path-as-is`, a proxy of a mock
+upstream that redirects to a second host, a group, and the pdfium example
+against GitHub, skipped with `FORGE_E2E_SKIP_GITHUB=1`). It needs curl, jq
+and python3, a Postgres and an S3 endpoint:
+
+```bash
+cargo build -p forge-server
+.github/scripts/raw-e2e.sh target/debug/forge-server target/raw-e2e
+```
+
+**SMTP with OAuth against Stalwart** (#321) is a manual check: Stalwart 0.16
+is set up through its web UI's first-run wizard, which no test can drive.
+`crates/server/tests/email_oauth.rs` covers the protocol with a mock
+authorization server and an SMTP server that checks the SASL token. To check
+it against the real thing:
+
+1. `docker run -d --name stalwart -p 8080:8080 -p 443:443 -p 587:587
+   mirror.gcr.io/stalwartlabs/stalwart:v0.16.27`, and sign in at
+   `http://localhost:8080/admin` with the temporary administrator that
+   `docker logs stalwart` prints. Finish the setup with a host name and a
+   certificate Forge trusts (the system roots, or `SSL_CERT_FILE` for a test
+   CA), and create the account Forge sends as, allowed to send email.
+2. In Forge, **Admin → Email**: *SMTP server with OAuth*, the host, port 587
+   with STARTTLS, the mailbox, and Stalwart's https URL as the authorization
+   server. Save.
+3. **Register Forge** as *An account of the mail server* (Stalwart's
+   administrator), then **Authorize on another device** and enter the code
+   at Stalwart's `/device` page as the mailbox (or **Authorize in this
+   browser**, when the browser reaches Forge's callback).
+4. **Send test email**: it goes out with `OAUTHBEARER`.
 
 **Without Docker**, point the db / storage / core / server suites at running
 services instead (use a fresh database per crate run — suites share it):
@@ -443,6 +668,44 @@ export FORGE_TEST_S3_ENDPOINT=http://127.0.0.1:7070   # versitygw --access test 
 export FORGE_TEST_REDIS_URL=redis://127.0.0.1:6379    # an empty, dedicated Redis
 cargo test -p forge-server
 ```
+
+**Test timings.** CI's `test` and `e2e` jobs put the slowest test binaries and
+tests in their job summary. Every result line in the log carries its test's
+duration (`test foo ... ok <1.234s>`). Locally, run any `cargo test` through
+the same runner, then summarize:
+
+```bash
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$PWD/.github/scripts/test-timings-runner.sh
+export FORGE_TEST_TIMINGS=$(mktemp -d)
+cargo test --workspace
+.github/scripts/test-timings-summary.sh "$FORGE_TEST_TIMINGS"
+```
+
+**Test binaries in parallel.** `cargo test` runs one test binary at a time,
+and every integration-test binary starts its own containers, so CI's `test`
+job runs them side by side with `.github/scripts/test-parallel.sh`, which
+takes `cargo test`'s arguments:
+
+```bash
+.github/scripts/test-parallel.sh --workspace    # FORGE_TEST_JOBS=<n> binaries at a time, default: CPUs
+```
+
+It builds and runs the doc tests through `cargo test`, with itself as the
+target runner recording how cargo would run each test binary (working
+directory, environment, arguments). Then it runs the recorded binaries, each
+through the runner set in `CARGO_TARGET_<triple>_RUNNER` if there is one (as
+above, for the timings), prints each binary's output in one piece when it is
+done and lists the failed binaries at the end. On CI's 4-CPU runner the test
+binaries take about 150 s this way instead of about 260 s, and the CPUs are
+then busy all the time; more binaries at a time than CPUs gains little. Running side by side loads the machine more, so
+a test with a tight timing bound, or one whose test threads disturb each
+other, fails more often than under plain `cargo test` (#345, #347): give it
+slack rather than running fewer binaries at a time.
+
+The test build leaves the workspace crates unoptimized but optimizes the
+dependencies that are slow without it, `rsa` and `argon2` (`Cargo.toml`,
+`[profile.dev.package.*]`): the mock IdPs generate RSA keys, and every test
+server hashes its bootstrap admin password.
 
 ## Resetting & troubleshooting
 
@@ -462,10 +725,18 @@ cargo test -p forge-server
 `clippy` · `build` · `prepare` (regenerate sqlx offline data) · `psql` · `logs` ·
 `ps` · `clean`.
 
+Format plugins as components: `plugins` (build + install, prints the config) ·
+`plugins-check` (clippy and build).
+
 Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 (Vitest) · `web-e2e` (Playwright).
 
 Docker image: `docker-build` · `docker-run` (wired to the `Dockerfile`).
+
+Changelog: `changelog <milestone>` (fold a milestone's fragments into
+`CHANGELOG.md`) · `changelog --check` (see [Changelog entries](#changelog-entries)).
+
+Release: `release <version> [--no-tag]` (see [Releasing](#releasing)).
 
 ## Single-container Docker image
 
@@ -475,7 +746,7 @@ and the static SPA on a single port (no Node in prod):
 
 1. **web** — Node 22 + pnpm (corepack): `pnpm install --frozen-lockfile` +
    `pnpm run build` → `web/dist`.
-2. **builder** — `rust:1.95` with cargo-chef for dependency-layer caching;
+2. **builder** — `rust:1.99` with cargo-chef for dependency-layer caching;
    `cargo build --release -p forge-server` with `SQLX_OFFLINE=true` against the
    committed `.sqlx/` cache (no DB needed at build time).
 3. **runtime** — `debian:bookworm-slim` (+ `ca-certificates`) running as an
@@ -483,8 +754,33 @@ and the static SPA on a single port (no Node in prod):
    the `migrations/` dir, and a baked secret-free base config at `/app/forge.toml`
    (migrations are also embedded into the binary via `sqlx::migrate!`).
 
+The runtime image carries `LICENSE` and the third-party notices of what it
+redistributes in `/usr/share/doc/forge/`: `THIRD-PARTY-RUST.txt` for the
+crates compiled into the binary (cargo-about, configured in
+`docker/licenses/about.toml`; a crate under a license missing from its
+`accepted` list fails the build) and `THIRD-PARTY-WEB.txt` for the npm
+packages the SPA ships (`pnpm licenses list --prod`, rendered by
+`docker/licenses/web-notices.mjs`). The binary is built with `cargo auditable`,
+so it embeds its crate list for SBOM generators and image scanners, and the
+`web` and `builder` stages declare `BUILDKIT_SBOM_SCAN_STAGE`, so the release's
+SBOM attestation covers the npm packages and crates, not just Debian's.
+
+Every image the build and the deployment use is pinned by digest
+(`tag@sha256:…`): the base images, the Dockerfile frontend (`# syntax=`),
+BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Valkey
+and versitygw images in `deploy/`. `.github/scripts/image-pin-check.sh` (CI)
+fails on a reference without one; Forge's own image is exempt, since the
+release pins it. `deploy/` pulls PostgreSQL, Valkey and versitygw from
+byte-for-byte copies of their Docker Hub images on ghcr.io
+(`ghcr.io/forgepkg/forge/<name>`, the same digests), which
+`.github/workflows/mirror-images.yml` keeps in line with Docker Hub daily and
+fills with every newly pinned digest once it lands on `main`. Dependabot
+bumps the base images and the `deploy/` images (watching those ghcr.io tags);
+the frontend, BuildKit, the SBOM generator and ci.yml's `postgres` service
+are bumped by hand (tag and digest, from the registry's index of the tag).
+
 ```bash
-cargo xtask docker-build       # docker build -t envisia-forge:latest .
+cargo xtask docker-build       # docker build -t forge:latest .
 cargo xtask docker-run         # run the image against the compose db + s3 on :8421
 ```
 
@@ -492,45 +788,15 @@ cargo xtask docker-run         # run the image against the compose db + s3 on :8
 `docker-compose.app.yml` (the `app` service) and serves API + SPA on
 http://localhost:8421.
 
-### Upgrade boundary for migration 0011
-
-Migration `0011_blob_deletion_reservations.sql` changes the CAS coordination
-protocol as well as the database schema: new instances acquire `blob_ingest`
-leases and create incarnation-qualified S3 keys. Instances built before this
-migration do neither. **Do not perform a rolling upgrade across this boundary.**
-
-For the first deployment containing migration 0011:
-
-1. disable old upload traffic **and** old blob-outbox/reconciler workers;
-2. stop every pre-0011 Forge instance, wait for active uploads, and ensure every
-   S3 DELETE issued by the old workers has reached an unambiguous terminal
-   state before continuing;
-3. take a coordinated PostgreSQL and object-store backup;
-4. start only the new version and let one instance apply migrations; and
-5. verify package upload and download before restoring normal replica count.
-
-Stopping the old process is not by itself proof that an S3 DELETE did not reach
-the backend: a timed-out or disconnected request can complete later. Use the
-object store's documented operation bound/active-request observability for the
-quiescence check. If the backend cannot provide that guarantee, copy/restore
-the coordinated backup into a clean object namespace before starting the new
-version. A delayed pre-0011 DELETE must never overlap a post-0011 revival of the
-same legacy object key.
-
-Do not roll back to a pre-0011 binary after new instances have accepted writes.
-A rollback requires restoring the coordinated PostgreSQL/object-store backup.
-Later versions that use the same lease and key protocol may again be deployed
-with the operator's normal rolling strategy.
-
 **Runtime configuration.** The baked `forge.toml` carries non-secret defaults
-(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, `anonymous_mode=off` — no
-anonymous access unless you set `FORGE_AUTH__ANONYMOUS_MODE=all`/`allowlist` —,
-`allow_password_basic=false`, no bootstrap admin — that comes only from
-`FORGE_AUTH__BOOTSTRAP_ADMIN__*` env). The placeholder credentials
-(`minioadmin` S3 keys, a `changeme` password) are **refused at startup** unless
-overridden; only the dev compose stack sets
-`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin/changeme and
-`FORGE_AUTH__ALLOW_PASSWORD_BASIC=true`). Override anything via `FORGE_*`
+(`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, no bootstrap admin — that
+comes only from `FORGE_AUTH__BOOTSTRAP_ADMIN__*` env), and no S3 keys.
+Anonymous access and password Basic start off and are set under **Admin →
+Settings** (`cargo xtask seed` turns both on for a dev stack). Placeholder
+credentials (`minioadmin` S3 keys, a `changeme` password) are **refused at
+startup**; only the dev compose stack sets
+`FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin@example.com/changeme).
+Override anything via `FORGE_*`
 env vars (double-underscore nesting). Required at runtime (no safe default):
 
 | Env var | Example |
@@ -538,10 +804,368 @@ env vars (double-underscore nesting). Required at runtime (no safe default):
 | `FORGE_DATABASE__URL` | `postgres://forge:forge@db:5432/forge` |
 | `FORGE_S3__ENDPOINT` | `http://s3:8422` |
 | `FORGE_S3__BUCKET` | `forge` |
-| `FORGE_S3__ACCESS_KEY` | `…` |
+| `FORGE_S3__ACCESS_KEY` | `…` (or short-lived credentials: `FORGE_S3__CREDENTIALS`, see docs/deployment.md) |
 | `FORGE_S3__SECRET_KEY` | `…` |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | first start only: a real password (the placeholder is refused; without it no bootstrap admin is created) |
 
 Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
 URLs). For a production deployment (TLS, secret encryption, trusted proxies,
 backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
+
+## CI and the merge queue
+
+CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
+`plugins`, `test`, `docker`, `kubernetes`, `web` and `oci-e2e`, and the slow
+`e2e` and `web-e2e`, which pull requests skip: those two run in the merge
+queue and on every push to `main`. It runs on pull requests that target
+`main` only; a stacked one waits (see [Stacked pull
+requests](#stacked-pull-requests)).
+
+A job runs only when the change touches what it checks (#353, #361, #363). The
+`changes` job (`.github/scripts/ci-changes.sh`) compares:
+
+- a pull request with its base branch;
+- a merge group with the commit it is built on: `main`, or the merge group
+  ahead of it in the queue. A merge group therefore runs only the jobs its own
+  pull request needs; the pull requests ahead of it are checked by their own
+  groups, and the queue merges a group only once every group ahead of it
+  passed too (see below);
+- a push to `main` with `main`'s previous commit. With the merge queue, the
+  pushed commit is the merge group's own, which already passed;
+- a manual run given a `base` branch with the commit its branch forked off
+  that one (see [Stacked pull requests](#stacked-pull-requests)).
+
+It sorts the change into groups of paths:
+
+| Group | Paths | Jobs |
+|---|---|---|
+| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
+| Changelog | `docs/changes/` | `fmt` |
+| Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
+| Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
+| Web | `web/` | `web`, `web-e2e` |
+| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
+| Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
+
+A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
+counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
+`clippy`, `plugins`, `test`, `oci-e2e` and `e2e` in Rust; `audit` in Audit;
+`web` and `web-e2e` in Web; `docker` in Image and `kubernetes` in
+Kubernetes. A change outside the jobs (the triggers, the settings, the
+`changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
+counts for every group; blank and comment lines count for none. The
+Kubernetes group's digest-pin check reads every workflow, so any change to
+one runs `kubernetes`. A job left out is skipped, which passes a required
+check. If the `changes` job fails, every job runs. A manual run without a
+`base` (`gh workflow run ci.yml --ref main`) and the push of a release
+commit, which sets a new workspace version, run every job, which the release
+gate requires (see [Releasing](#releasing)). A file that Rust code or its
+tests read from outside the crates belongs in the Rust group, one only
+xtask's tests read in the Release group: add a new one to `ci-changes.sh`.
+A new job of `ci.yml` goes in `CI_JOB_GROUP` too.
+
+The `audit` job runs `cargo audit` only for a change to `Cargo.lock` or
+`.cargo/audit.toml`: every change to a `Cargo.toml` that adds or updates a
+dependency changes the lockfile, and the lockfile is all the job reads. A
+RustSec advisory published for a dependency no change touches is caught by
+the `Audit` workflow (`.github/workflows/audit.yml`) instead, so it does not
+fail an unrelated pull request: it audits `main` every day at 9:00 Berlin
+time, and on demand (**Actions → Audit → Run workflow**). GitHub notifies the
+user who created the workflow, or who last changed its `cron` line, of a
+failed scheduled run, on github.com and by email as their notification
+settings for Actions say; to receive them yourself, disable and re-enable the
+workflow (**Actions → Audit → ⋯**). Fix a failure as in CI: update the crate
+(`cargo update -p <crate>`), or accept the advisory in `.cargo/audit.toml`
+with a one-line rationale.
+
+The image is built only when its own inputs change: clippy, test and web
+compile the Rust code and the SPA of every other change. A change that breaks
+only the image build, such as an `include_str!` of a file `.dockerignore`
+leaves out, therefore fails in the next run that builds the image, the
+release's at the latest, rather than in the queue.
+
+`main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
+group is checked as the very commit that lands, with the jobs its changes
+need, `e2e` and `web-e2e` included.
+To turn it on, edit the ruleset (or branch protection rule) of `main`:
+
+1. Enable **Require merge queue**. Keep its **status check timeout** above
+   the run time of `e2e` and `web-e2e` (60 minutes by default).
+2. Under **Require status checks to pass**, require `fmt`, `clippy`, `audit`,
+   `test`, `docker`, `kubernetes`, `web`, `e2e` and `web-e2e` from GitHub
+   Actions. On a pull request, `e2e` and `web-e2e` are skipped, which counts
+   as passed, so the pull request can join the queue; the queue runs them and
+   merges only once they passed. Leave them out and the queue merges without
+   waiting for them.
+3. Keep **Only merge non-failing pull requests** enabled (the default). A
+   merge group runs only the jobs its own pull request needs, so a pull
+   request must not land on the strength of a later group that skipped the
+   jobs its own change needed.
+
+The push to `main` runs CI once more, for what it changed, and the release
+workflow tags only commits whose CI run on `main` passed with every job (see
+[Releasing](#releasing)).
+
+### Stacked pull requests
+
+A stacked pull request targets the branch of the pull request below it (see
+[AGENTS.md](AGENTS.md)). It must not be merged there, or its fix lands in
+that other pull request. The `Stack` workflow (`.github/workflows/stack.yml`)
+gives every pull request whose base is not `main` the commit status `stack`,
+pending and naming the branch it waits for. Once the pull request below has
+merged, GitHub retargets the stacked one to `main` and `stack` turns to
+success. A pull request opened against `main` gets no `stack` status.
+
+The ruleset that enforces it is
+`.github/rulesets/stacked-pull-requests.json`; import it under **Settings →
+Rules → Rulesets → New ruleset → Import a ruleset**. It requires `stack` on
+every branch except `main`, the merge queue's `gh-readonly-queue/` branches
+and Dependabot's:
+
+- A stacked pull request cannot be merged into the branch below it, and
+  auto-merge enabled on it does not merge it there. Once it targets `main`,
+  `main`'s own rules decide. A pull request whose branch predates the
+  workflow has no `stack` status at all, which blocks it just the same.
+- A required status check guards pushes too: a branch only moves to a
+  commit that already carries it. So repository admins, maintainers and
+  writers, and organization owners, bypass the ruleset: their pushes to a
+  pull request's branch go through as before, and they can still merge a
+  stacked pull request, but only by ticking **Merge without waiting for
+  requirements to be met (bypass rules)**. A GitHub App pushing with its own
+  token, such as the stack App below, has to be added to the bypass list.
+
+CI runs only on pull requests that target `main`, so a stacked pull request
+runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
+on every pull request above it. When a pull request is retargeted to `main`,
+the `Stack` workflow merges `main` into its branch, as the pull request's
+**Update branch** button does, and that push runs CI on the pull request.
+A retarget alone starts no CI run, and a manual run's checks would not
+count: GitHub shows a pull request only the checks of `pull_request`,
+`push` and a few other runs, and only those satisfy its required checks.
+The workflow pushes the merge with a GitHub App's token, since a push with
+a workflow's own `GITHUB_TOKEN` starts no workflow. Without the App, the
+workflow warns, and the **Update branch** button starts CI instead. When
+`main` does not merge cleanly, the `stack-status` check fails: merge `main`
+by hand and push.
+
+To set up the stack App:
+
+1. Create a GitHub App (**Settings → Developer settings → GitHub Apps → New
+   GitHub App**), without a webhook, with the repository permissions
+   **Contents**, **Pull requests** and **Workflows**, each **Read and
+   write**. Install it on this repository only.
+2. Generate a private key for it. Save the App's client ID as the repository
+   variable `STACK_APP_CLIENT_ID`, and the key as the repository secret
+   `STACK_APP_PRIVATE_KEY` (**Settings → Secrets and variables → Actions**).
+3. If the stacked pull requests ruleset is active, add the App to its bypass
+   list, or it refuses the merge on the pull request's branch.
+
+The App's merge, like the button's, dismisses the pull request's approvals
+under a rule that dismisses stale ones.
+
+To check a stacked branch before its retarget, run CI on it by hand:
+**Actions → CI → Run workflow**, or
+`gh workflow run ci.yml --ref <branch> -f base=main`. The run compares the
+branch with the commit it forked off `main`, so it runs the jobs the pull
+request's change needs; its results show under **Actions**, not on the pull
+request. A pull request from a fork gets no merge: a push to it starts CI.
+
+## Code scanning (CodeQL)
+
+CodeQL code scanning runs as an advanced setup, the `CodeQL` workflow
+(`.github/workflows/codeql.yml`) with its configuration
+`.github/codeql/codeql-config.yml`. GitHub's default setup has to stay off
+(**CodeQL analysis** under code scanning in the repository's security
+settings): while it is on, GitHub refuses the workflow's uploads.
+
+The workflow analyzes three languages, each without a build, and a language
+only when a change touches its code:
+
+| Language | Paths |
+|---|---|
+| `rust` | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `.sqlx/` |
+| `javascript-typescript` | `web/`, and every `.js`, `.cjs`, `.mjs`, `.ts` and `.tsx` file |
+| `actions` | `.github/workflows/`, and every `action.yml` and `action.yaml` |
+
+A pull request that targets `main` is compared with its base branch, and a
+push to `main` with `main`'s previous commit. A change to the workflow or to
+`.github/codeql/` analyzes every language, and so do the weekly run and a
+manual run (**Actions → CodeQL → Run workflow**), so that a newer CodeQL's
+queries also look at code no change touched. A language a push to `main`
+leaves out keeps the alerts of its last analysis there, which the Security
+tab shows. The Rust analysis is by far the slowest, so a change to the web UI
+or the docs no longer waits for it. CodeQL is not among `main`'s required
+checks (see above), and the merge queue does not run it.
+
+Tests are not analyzed. Their fixed passwords and keys and their plain-http
+URLs to local test servers are on purpose, and an alert for each would only
+be dismissed by hand. The configuration's `paths-ignore` leaves out the test
+directories (`**/tests`, `crates/e2e`, `web/e2e`), the web UI's
+`*.test.ts(x)` and test runner configuration, the `testing` helpers of
+`crates/plugin` and `crates/plugin-api`, and `fixtures/`. The unit tests
+inside the Rust source files (`#[cfg(test)] mod tests`) cannot be left out by
+path; the Rust extractor compiles the code with `cfg(test)` off instead
+(`CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES=-test`), as a release build
+does. Add a new test directory or test helper outside these to `paths-ignore`.
+The repository's one Python file, `fixtures/nuget/make_fixtures.py`, makes
+test packages, so Python is not analyzed at all.
+
+## Changelog entries
+
+A change does not edit `CHANGELOG.md`. Its entry goes in a fragment of its
+own, `docs/changes/<milestone>/<issue>.<kind>.md`, for example
+`docs/changes/1.2.0/205.fixed.md`. Here `<milestone>` is the issue's GitHub
+milestone and `<kind>` the section (`upgrade`, `feature`, `fixed`,
+`security`, `docs`, `limitation`). The file holds the entry's text; the
+release adds the `- ` and the issue's link. Pull requests merged side by side
+therefore never conflict over the changelog, and an entry never lands under a
+release it is not part of. [docs/changes/README.md](docs/changes/README.md)
+describes the format.
+
+`cargo xtask release <version>` folds `docs/changes/<version>/` into the
+changelog (see [Releasing](#releasing)). To edit the notes before that, for
+example to write the release's introduction, `cargo xtask changelog
+<milestone>` folds the milestone's fragments into `[Unreleased]` and deletes
+them; commit that in a pull request of its own. CI's `fmt` job runs `cargo
+xtask changelog --check`. It refuses a file under `docs/changes` that is not a
+fragment, and a fragment whose milestone is released already. When a pull
+request written before a release merges after it, move its fragment to the
+next milestone.
+
+## Releasing
+
+A `v<version>` tag on the default branch publishes the release: the release
+workflow (`.github/workflows/release.yml`) makes sure the dependency images
+`deploy/` pins are on ghcr.io and public (`mirror-images.yml`), builds, signs
+and pushes `ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned
+to that image's digest, pushes and signs it as
+`oci://ghcr.io/forgepkg/charts/forge`
+(version `<version>`), and creates the GitHub release from the matching
+`CHANGELOG.md` section with the chart attached. It refuses a tag unless the
+workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
+Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) and the chart's
+`version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it, and
+unless the `[Unreleased]` section of `CHANGELOG.md` is empty and
+`docs/changes/` holds no changelog fragments (entries left there would be
+missing from the release notes).
+
+`main` only accepts commits whose required checks passed, so the release
+commit goes through a pull request and the tag goes on the merge commit; a
+direct `git push origin main v1.0.1` of the release commit is refused.
+`cargo xtask release <version>` does all of it through the GitHub CLI (`gh`,
+logged in with `gh auth login`):
+
+```bash
+git switch main && git pull --ff-only   # HEAD must be origin/main, the tree clean
+cargo xtask release 1.0.1
+```
+
+It commits `release: v1.0.1` on a new `release-1.0.1` branch, pushes it, opens
+a pull request, waits for the pull request's CI run and merges the pull
+request once that run passed; with a merge queue, it adds the pull request to
+the queue and waits (up to 90 minutes) for it to land. Then it waits for the
+merge commit's CI run on `main`, **including `e2e` and `web-e2e`**, which never
+run on the pull request. A push run runs only the jobs of what the push
+changed, but a release commit sets a new workspace version, so its push run
+runs every job. Every push to `main` gets its own CI run,
+which a later push never cancels. Once that run passed, it tags the merge
+commit `v1.0.1` and pushes the tag, which starts the release workflow. The
+release workflow checks CI as well: before it builds anything, it waits (up
+to an hour) for the tagged commit's CI run on `main` and fails unless every
+job of it passed.
+
+When a step fails (the pull request's CI run, the merge, the CI run on
+`main`), nothing is tagged, and the xtask says what is left. Once the release
+pull request is merged (after a fix, or by hand), run it again on an
+up-to-date `main`: `main` already carries the version, so it commits nothing.
+`main`'s head may be a later commit whose push run skipped jobs, so the xtask
+starts a manual CI run of `main`, which runs every job, waits for it and tags
+that commit. If the release workflow refuses a tag because the commit's push
+run skipped jobs, start such a run yourself while the commit is `main`'s head
+(`gh workflow run ci.yml --ref main`) and re-run the release workflow.
+
+Without `gh`, `cargo xtask release <version> --no-tag` only prepares the
+commit, on the current branch; the rest is manual:
+
+```bash
+git switch -c release-1.0.1 origin/main   # clean and up to date
+cargo xtask release 1.0.1 --no-tag        # commits `release: v1.0.1`
+git push -u origin release-1.0.1          # open a pull request, merge it
+# once the merge commit's CI run on main passed:
+git fetch origin
+git tag -a v1.0.1 -m v1.0.1 <merge commit>
+git push origin v1.0.1
+```
+
+The xtask sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
+--workspace`), `web/package.json`, the Kubernetes base and the Helm chart. It
+folds the changelog fragments of `docs/changes/1.0.1/` into `## [Unreleased]`
+in `CHANGELOG.md` and deletes them (see [Changelog entries](#changelog-entries)).
+It renames that section to `## [1.0.1]` under a new, empty `[Unreleased]`,
+updates the links at its bottom, and commits `release: v1.0.1`. A `## [1.0.1]`
+section drafted ahead of time is kept as it is, but only while `[Unreleased]`
+and the fragments are empty; with entries in both, the release is refused. It
+also refuses a changelog with a version section whose tag does not exist (a
+section drafted for a release that then got another number): fold its
+entries into `[Unreleased]` first. Fragments under another milestone are
+refused too, because their changes are on `main` and ship in this release:
+move them to `docs/changes/1.0.1/`.
+
+**A failed release run** can simply be re-run. It never builds a version
+twice: a new build would have another digest, and pushing it would move the
+version's tags and overwrite its chart. The image and chart that the failed
+attempt already pushed are reused instead, once their signatures show that a
+release run of the tagged commit made them. Anything else it finds under the
+version (an image or chart not signed that way, a chart without its image)
+stops the run with a message saying what to delete, and so does a version
+that already has a GitHub release: publish further changes as a new version.
+
+**Protect the release tags.** A release's signatures name the release
+workflow at its tag and the commit the tag pointed to, and the published
+`cosign verify` commands check both. A tag that can be moved, or deleted and
+pushed again, would still start a release run of another commit under the
+same name, so protect `refs/tags/v*` with tag rulesets (repository
+**Settings → Rules → Rulesets**), which cannot be set from this repository's
+files:
+
+1. a ruleset targeting `refs/tags/v*` with **Restrict creations**, whose
+   bypass list holds only the maintainers who cut releases;
+2. a second ruleset targeting `refs/tags/v*` with **Restrict updates** and
+   **Restrict deletions** and an empty bypass list, so nobody moves or
+   deletes a release tag.
+
+**First release under forgepkg only.** The repository moved from
+`schmitch/forge` to `forgepkg/forge`, and the release publishes to the
+packages of the repository's owner: from 2.0.0 on `ghcr.io/forgepkg/forge`
+(the image) and `ghcr.io/forgepkg/charts/forge` (the chart), while the
+releases up to 1.1.0 stay at `ghcr.io/schmitch/forge` and
+`ghcr.io/schmitch/charts/forge`. GHCR creates a new package as **private**,
+whatever the repository's visibility, and there is no REST API to change it.
+After the first release run, open each package's settings (the
+organization's **Packages** tab → the package → **Package settings**):
+
+1. Under **Danger Zone → Change visibility**, make both **Public**.
+2. On the chart, under **Manage Actions access**, give the `forgepkg/forge`
+   repository the **Write** role if it is not listed. Without it the next
+   release's `helm push` fails after the image tags have already moved.
+
+The same goes for the dependency images' copies, which the first run of
+`mirror-images.yml` on `main` creates: `ghcr.io/forgepkg/forge/postgres`,
+`ghcr.io/forgepkg/forge/valkey` and `ghcr.io/forgepkg/forge/versitygw`. Make
+them **Public** and check that `forgepkg/forge` has the **Write** role under
+**Manage Actions access**; until then the mirror run warns, and the release
+refuses to publish a chart that pulls them. They keep Docker Hub's
+`org.opencontainers.image.source` (a byte-for-byte copy cannot change it),
+so GHCR does not link them to the repository on its own.
+
+Both packages name the repository in `org.opencontainers.image.source`: the
+image through `docker/metadata-action`, the chart because `helm push` copies
+the first `sources` entry of `Chart.yaml` into that annotation.
+
+**After every release**, check that both can be pulled without credentials
+(Helm keeps its own registry login, so log out of both):
+
+```bash
+docker logout ghcr.io; helm registry logout ghcr.io
+docker pull ghcr.io/forgepkg/forge:<version> && helm pull oci://ghcr.io/forgepkg/charts/forge --version <version>
+```

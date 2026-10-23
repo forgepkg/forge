@@ -66,7 +66,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -300,16 +300,27 @@ enum Verdict {
     Released,
 }
 
+/// The failure budget of a pair and its window, and the soft-backoff
+/// threshold that follows from them; [`LoginThrottle::set_limits`] changes
+/// them at runtime.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    max_failures: u32,
+    window: Duration,
+    /// Failures of a username (all networks) before its attempts are spaced.
+    user_soft_threshold: u32,
+}
+
 /// Fixed-window failure counter keyed by `(client network, username)`, plus a
 /// per-username soft backoff (see the [module docs](self)).
 #[derive(Debug)]
 pub struct LoginThrottle {
-    max_failures: u32,
-    window: Duration,
+    limits: RwLock<Limits>,
+    /// The soft-backoff threshold [`Self::with_user_backoff`] fixed; without
+    /// one it is three pair budgets.
+    fixed_user_soft_threshold: Option<u32>,
     max_wait: Duration,
     state: Mutex<State>,
-    /// Failures of a username (all networks) before its attempts are spaced.
-    user_soft_threshold: u32,
     /// Spacing at the threshold; doubles per further failure.
     user_backoff_base: Duration,
     /// Largest spacing.
@@ -329,11 +340,14 @@ impl LoginThrottle {
     /// `max_failures` of `0` disables throttling entirely.
     pub fn new(max_failures: u32, window: Duration) -> Self {
         Self {
-            max_failures,
-            window,
+            limits: RwLock::new(Limits {
+                max_failures,
+                window,
+                user_soft_threshold: max_failures.saturating_mul(3),
+            }),
+            fixed_user_soft_threshold: None,
             max_wait: DEFAULT_MAX_WAIT,
             state: Mutex::new(State::default()),
-            user_soft_threshold: max_failures.saturating_mul(3),
             user_backoff_base: Duration::from_secs(1),
             user_backoff_max: Duration::from_secs(30),
             users: Mutex::new(HashMap::new()),
@@ -355,17 +369,53 @@ impl LoginThrottle {
     /// doubling per further failure up to `max`. A `threshold` of `0` turns
     /// the backoff off.
     pub fn with_user_backoff(mut self, threshold: u32, base: Duration, max: Duration) -> Self {
-        self.user_soft_threshold = threshold;
+        self.fixed_user_soft_threshold = Some(threshold);
+        self.limits
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .user_soft_threshold = threshold;
         self.user_backoff_base = base;
         self.user_backoff_max = max;
         self
+    }
+
+    /// Allow `max_failures` failures per `window` from now on (`0` disables
+    /// throttling). Failures already counted stay counted; a pair's current
+    /// window is measured against the new length.
+    pub fn set_limits(&self, max_failures: u32, window: Duration) {
+        *self
+            .limits
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Limits {
+            max_failures,
+            window,
+            user_soft_threshold: self
+                .fixed_user_soft_threshold
+                .unwrap_or_else(|| max_failures.saturating_mul(3)),
+        };
+    }
+
+    /// The current limits.
+    fn limits(&self) -> Limits {
+        *self
+            .limits
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The failures allowed per pair and window, and the window
+    /// ([`Self::set_limits`]).
+    pub fn current_limits(&self) -> (u32, Duration) {
+        let limits = self.limits();
+        (limits.max_failures, limits.window)
     }
 
     /// How long the next attempt for `user` must wait (`Some(ZERO)` when it
     /// may start now), claiming that slot; `None` when the wait would exceed
     /// `max_wait` (nothing is claimed then).
     fn user_slot(&self, user: [u8; 32]) -> Option<Duration> {
-        if self.user_soft_threshold == 0 {
+        let limits = self.limits();
+        if limits.user_soft_threshold == 0 {
             return Some(Duration::ZERO);
         }
         let now = Instant::now();
@@ -373,14 +423,14 @@ impl LoginThrottle {
         let Some(entry) = users.get_mut(&user) else {
             return Some(Duration::ZERO);
         };
-        if now.duration_since(entry.window_start) >= self.window {
+        if now.duration_since(entry.window_start) >= limits.window {
             users.remove(&user);
             return Some(Duration::ZERO);
         }
-        if entry.failures < self.user_soft_threshold {
+        if entry.failures < limits.user_soft_threshold {
             return Some(Duration::ZERO);
         }
-        let doublings = (entry.failures - self.user_soft_threshold).min(16);
+        let doublings = (entry.failures - limits.user_soft_threshold).min(16);
         let backoff = self
             .user_backoff_base
             .saturating_mul(1u32 << doublings)
@@ -459,7 +509,8 @@ impl LoginThrottle {
 
     /// Whether `user` is past its soft-backoff threshold in this window.
     fn user_backing_off(&self, user: [u8; 32]) -> bool {
-        if self.user_soft_threshold == 0 {
+        let limits = self.limits();
+        if limits.user_soft_threshold == 0 {
             return false;
         }
         let now = Instant::now();
@@ -468,8 +519,8 @@ impl LoginThrottle {
             .expect("login throttle mutex poisoned")
             .get(&user)
             .is_some_and(|entry| {
-                now.duration_since(entry.window_start) < self.window
-                    && entry.failures >= self.user_soft_threshold
+                now.duration_since(entry.window_start) < limits.window
+                    && entry.failures >= limits.user_soft_threshold
             })
     }
 
@@ -508,7 +559,8 @@ impl LoginThrottle {
 
     /// Record a verdict for the username behind `user` (soft backoff).
     fn record_user(&self, user: [u8; 32], verdict: &Verdict) {
-        if self.user_soft_threshold == 0 {
+        let limits = self.limits();
+        if limits.user_soft_threshold == 0 {
             return;
         }
         let now = Instant::now();
@@ -520,7 +572,7 @@ impl LoginThrottle {
             Verdict::Released => {}
             Verdict::Failed => {
                 if !users.contains_key(&user) && users.len() >= MAX_TRACKED {
-                    let window = self.window;
+                    let window = limits.window;
                     users.retain(|_, e| now.duration_since(e.window_start) < window);
                     if users.len() >= MAX_TRACKED {
                         // Full of live entries: stay bounded, track no more.
@@ -532,7 +584,7 @@ impl LoginThrottle {
                     window_start: now,
                     next_allowed: now,
                 });
-                if now.duration_since(entry.window_start) >= self.window {
+                if now.duration_since(entry.window_start) >= limits.window {
                     entry.failures = 0;
                     entry.window_start = now;
                 }
@@ -576,7 +628,7 @@ impl LoginThrottle {
         ip: IpAddr,
         username: &str,
     ) -> Result<LoginAttempt<'_>, AttemptRefused> {
-        if self.max_failures == 0 {
+        if self.limits().max_failures == 0 {
             return Ok(LoginAttempt {
                 throttle: self,
                 key: None,
@@ -629,10 +681,11 @@ impl LoginThrottle {
     }
 
     fn try_reserve(&self, key: Key) -> Reserve {
+        let limits = self.limits();
         let now = Instant::now();
         let mut state = self.lock();
         if !state.entries.contains_key(&key) {
-            state.make_room(now, self.window);
+            state.make_room(now, limits.window);
         }
         let entry = state.entries.entry(key).or_insert_with(|| Entry {
             failures: 0,
@@ -640,14 +693,14 @@ impl LoginThrottle {
             window_start: now,
             waiters: None,
         });
-        if now.duration_since(entry.window_start) >= self.window {
+        if now.duration_since(entry.window_start) >= limits.window {
             entry.failures = 0;
             entry.window_start = now;
         }
-        if entry.failures >= self.max_failures {
+        if entry.failures >= limits.max_failures {
             return Reserve::Locked;
         }
-        if entry.failures.saturating_add(entry.in_flight) >= self.max_failures {
+        if entry.failures.saturating_add(entry.in_flight) >= limits.max_failures {
             return Reserve::Busy(entry.waiters.get_or_insert_with(Default::default).clone());
         }
         entry.in_flight += 1;
@@ -686,16 +739,17 @@ impl LoginThrottle {
 
     /// Whether the pair is currently locked out (too many recent failures).
     pub fn is_locked(&self, ip: IpAddr, username: &str) -> bool {
-        if self.max_failures == 0 {
+        if self.limits().max_failures == 0 {
             return false;
         }
         self.pair_locked(Self::key(ip, username))
     }
 
     fn pair_locked(&self, key: Key) -> bool {
+        let limits = self.limits();
         let now = Instant::now();
         self.lock().entries.get(&key).is_some_and(|e| {
-            now.duration_since(e.window_start) < self.window && e.failures >= self.max_failures
+            now.duration_since(e.window_start) < limits.window && e.failures >= limits.max_failures
         })
     }
 
@@ -1055,6 +1109,32 @@ mod tests {
         }
         assert!(!t.is_locked(a, "alice"));
         assert_eq!(t.tracked(), 0);
+    }
+
+    #[tokio::test]
+    async fn limits_change_at_runtime() {
+        let t = LoginThrottle::new(3, Duration::from_secs(60));
+        let a = ip("203.0.113.1");
+        fail(&t, a, "alice").await;
+        assert!(!t.is_locked(a, "alice"));
+        // The failure already counted fills the smaller budget.
+        t.set_limits(1, Duration::from_secs(60));
+        assert_eq!(t.current_limits(), (1, Duration::from_secs(60)));
+        assert!(t.is_locked(a, "alice"));
+        assert_eq!(
+            t.begin(a, "alice").await.unwrap_err(),
+            AttemptRefused::Locked
+        );
+        // A shorter window ends it.
+        t.set_limits(1, Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!t.is_locked(a, "alice"));
+        // `0` turns the lockout off.
+        t.set_limits(0, Duration::from_secs(60));
+        for _ in 0..5 {
+            fail(&t, a, "bob").await;
+        }
+        assert!(!t.is_locked(a, "bob"));
     }
 
     #[test]

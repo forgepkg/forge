@@ -3,16 +3,16 @@ import { httpClient } from '~/lib/httpClient'
 /**
  * Admin token management API (per-user).
  *
- * Types mirror the **real** Rust DTOs (reconciled against slice 1, not the
- * forward-looking plan):
+ * Types mirror the **real** Rust DTOs:
  *
  *  - `TokenView` (`crates/server/src/admin/tokens.rs`) is the metadata view —
  *    it carries **no secret and no hash**. Listing never returns the plaintext.
  *  - `CreatedToken` is the `POST` response and the **only** time the plaintext
  *    `token` is ever returned (flattened onto a `TokenView`). It is shown once
  *    via `ShowOnceSecret` and never re-fetched or cached.
- *  - Tokens are scoped to a user in slice 1: `GET`/`POST` are under
- *    `/admin/users/{id}/tokens`; revoke is `DELETE /admin/tokens/{id}`.
+ *  - Tokens belong to a user: `GET`/`POST` are under
+ *    `/admin/users/{id}/tokens`; revoke is `DELETE /admin/tokens/{id}`, and
+ *    an admin changes a token's scope with `PATCH /admin/tokens/{id}/scope`.
  *  - `GET /admin/users/{id}/tokens` returns a **bare array** of `TokenView`.
  *  - `revoke` is a soft-delete (sets `revoked_at`); the server replies 404 when
  *    the token is unknown or already revoked.
@@ -32,6 +32,23 @@ export interface TokenView {
   /** RFC3339 timestamp of the most recent use, else `null`. */
   last_used_at: string | null
   created_at: string
+  /**
+   * The token's privilege scope as stored, or `null` when unscoped (the
+   * owner's access without `admin`). A stored scope that does not parse is
+   * passed through as-is; the server denies such a token everything.
+   */
+  scope?: TokenScope | null
+}
+
+/**
+ * Per-token scope (`forge_core::authz::TokenScope`): it only narrows the
+ * owner's access. An absent `actions` means read/write/delete (never
+ * `admin`); an absent `repositories` means every repository the owner can
+ * reach.
+ */
+export interface TokenScope {
+  actions?: Array<'read' | 'write' | 'delete' | 'admin'> | null
+  repositories?: number[] | null
 }
 
 /** `POST /admin/users/{id}/tokens` request body (`CreateToken`). */
@@ -39,6 +56,8 @@ export interface CreateToken {
   name: string
   /** Optional RFC3339 expiry; absent → non-expiring. */
   expires_at?: string | null
+  /** Optional scope; absent → the owner's access without `admin`. */
+  scope?: TokenScope
 }
 
 /**
@@ -81,6 +100,18 @@ export function createToken(
 /** `DELETE /admin/tokens/{id}` — revoke a token (204). */
 export function revokeToken(id: number): Promise<void> {
   return httpClient.delete<void>(`/admin/tokens/${id}`)
+}
+
+/**
+ * `PATCH /admin/tokens/{id}/scope` — set a token's scope, or clear it with
+ * `null` (204; 404 for a revoked token). The next request with the token
+ * reads the new scope.
+ */
+export function setTokenScope(
+  id: number,
+  scope: TokenScope | null,
+): Promise<void> {
+  return httpClient.patch<void>(`/admin/tokens/${id}/scope`, { scope })
 }
 
 /*

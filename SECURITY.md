@@ -2,8 +2,11 @@
 
 ## Supported versions
 
-Security fixes go into the latest release. While the major version is 0, only
-the most recent minor release line (currently 0.1.x) receives them.
+Security fixes are released as a patch release of the most recent minor
+release line, the one of the
+[latest release](https://github.com/schmitch/forge/releases/latest). Older
+release lines do not receive them: upgrade to the latest release to stay
+supported.
 
 ## Reporting a vulnerability
 
@@ -31,8 +34,14 @@ The most important ones:
 
 - serve Forge only behind TLS, with an https `public_base_url`;
 - enable secret encryption at rest;
-- configure `trusted_proxy_cidrs` for your reverse proxies;
+- configure `trusted_proxy_cidrs` for your reverse proxies, and let nothing
+  else in those ranges reach Forge (on Kubernetes, a NetworkPolicy);
 - remove the bootstrap admin once real administrators exist, and its
   password from the environment;
-- verify release images before deploying them (`cosign verify` with the exact
-  workflow identity printed in each GitHub release's notes).
+- verify release images before deploying them, with the exact `cosign verify`
+  command printed in each GitHub release's notes: besides the release
+  workflow's identity at the release's tag, it pins the tagged commit
+  (`--certificate-github-workflow-sha`, the commit the notes name) and the
+  push trigger (`--certificate-github-workflow-trigger push`), so a signature
+  made for a tag that was moved or re-created on another commit does not
+  pass.

@@ -1,11 +1,10 @@
-//! The pluggable, ordered authentication-provider abstraction (slice 12.3).
+//! The pluggable, ordered authentication-provider abstraction.
 //!
-//! Slice 1 baked exactly one password check (local argon2id) into the
-//! principal middleware. This module introduces a **pluggable, ordered
-//! [`AuthProvider`] chain** so that a username/password pair can be validated
-//! by the local store, by forwarding to a configured upstream over HTTP Basic
+//! The password-style auth path is a **pluggable, ordered [`AuthProvider`]
+//! chain**, so that a username/password pair can be validated by the local
+//! store, by forwarding to a configured upstream over HTTP Basic
 //! (`upstream-basic`), or — conceptually — by any future backend, without the
-//! middleware knowing *how*.
+//! principal middleware knowing *how*.
 //!
 //! Token auth (`X-NuGet-ApiKey` / Basic-as-token) is handled *before* the chain
 //! (see [`super::token`]) and is **not** a provider: the chain is only the
@@ -36,11 +35,11 @@ use std::net::IpAddr;
 /// spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthSource {
-    /// Slice-1 local argon2id password (the `local-password` provider).
+    /// Local argon2id password (the `local-password` provider).
     Local,
     /// Credential forwarded to a configured upstream over HTTP Basic.
     UpstreamBasic,
-    /// OpenID Connect (§12.2). Not driven through this chain — OIDC is its own
+    /// OpenID Connect. Not driven through this chain — OIDC is its own
     /// interactive login path — but listed for `app_user.auth_source` symmetry.
     Oidc,
 }
@@ -60,8 +59,8 @@ impl AuthSource {
 ///
 /// Token auth is resolved before the chain and is not represented here. The
 /// `password` is plaintext only for the lifetime of the request; it is never
-/// stored or logged (see the slice 12.3 cache design, which stores only an
-/// HMAC of it).
+/// stored or logged (the validated-credential cache, [`super::cred_cache`],
+/// stores only an HMAC of it).
 ///
 /// `Debug` is implemented **manually** so the plaintext `password` field is
 /// always redacted: any future caller that logs a `PasswordCredential` with
@@ -90,10 +89,10 @@ impl fmt::Debug for PasswordCredential<'_> {
 
 /// The identity a provider vouches for after a successful authentication.
 ///
-/// `core` maps this to an `app_user` (lookup by `username`, auto-provision when
-/// the provider allows). The `groups` are the *raw, coarse* upstream
-/// groups/roles — stashed for §12.4, used here at most as an allow/deny gate;
-/// they are not authoritative forge authz.
+/// `core` maps this to an existing `app_user` (lookup by `username`; no
+/// provider creates accounts). The `groups` are the *raw, coarse* upstream
+/// groups/roles, used at most as an allow/deny gate; they are not
+/// authoritative forge authz.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenIdentity {
     /// The authenticated username (the forge `app_user.username`).
@@ -101,7 +100,8 @@ pub struct ProvenIdentity {
     /// Which provider/source vouched for this identity.
     pub source: AuthSource,
     /// Opaque upstream identifier when the source is not local. For
-    /// `upstream-basic` this is usually just the username.
+    /// `upstream-basic` this is the name sent upstream: the local part of the
+    /// username.
     pub external_subject: Option<String>,
     /// Raw upstream groups/roles (coarse). Empty for local.
     pub groups: Vec<String>,
@@ -110,19 +110,47 @@ pub struct ProvenIdentity {
     /// Whether [`Self::suggested_is_admin`] is an **authoritative** reading of
     /// the upstream's admin state: the realm configures an admin mapping AND the
     /// groups were freshly fetched for this login (not a cache hit, which
-    /// carries no groups). Only then may provisioning *revoke* admin; otherwise
-    /// the suggestion is ignored for existing users (see
+    /// carries no groups). Only then may the login grant or *revoke* admin;
+    /// otherwise the suggestion is ignored (see
     /// [`super::chain::provision_and_map`]). Always `false` for local.
     pub admin_authoritative: bool,
-    /// Whether the vouching provider is configured to auto-provision an
-    /// `app_user` for this identity on first success (12.7: per-realm — each
-    /// credential-forwarding realm carries its own flag, so the chain caller no
-    /// longer needs a chain-global setting). Always `false` for local.
-    pub auto_provision: bool,
     /// The `auth_realm.id` of the vouching realm, when the provider was built
-    /// from a realm row (12.7). Recorded as `app_user.realm_id` provenance on
-    /// provision; `None` for the built-in/static wiring.
+    /// from a realm row: only an account of that realm signs in
+    /// (`app_user.realm_id`). `None` for the built-in/static wiring.
     pub realm_id: Option<i64>,
+    /// An argon2id hash of the presented password, set only when the vouching
+    /// realm keeps password hashes (`capture_password_hash`, migration 0035)
+    /// and this login asked the upstream, which accepted it (a cache hit
+    /// carries none). The account keeps it
+    /// ([`super::chain::provision_and_map`]). Always `None` for local.
+    pub captured_password_hash: Option<CapturedPasswordHash>,
+}
+
+/// The argon2id PHC hash of a password an upstream just accepted, to be kept
+/// on the account so an administrator can later switch it to a local one.
+///
+/// `Debug` is redacted like [`PasswordCredential`]'s: a leaked hash can be
+/// attacked offline, so it must never reach a log through a `{:?}` of the
+/// identity carrying it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CapturedPasswordHash(String);
+
+impl CapturedPasswordHash {
+    /// Wrap an argon2id PHC string.
+    pub fn new(phc: String) -> Self {
+        Self(phc)
+    }
+
+    /// The PHC string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CapturedPasswordHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CapturedPasswordHash([REDACTED])")
+    }
 }
 
 impl ProvenIdentity {
@@ -135,8 +163,8 @@ impl ProvenIdentity {
             groups: Vec::new(),
             suggested_is_admin: false,
             admin_authoritative: false,
-            auto_provision: false,
             realm_id: None,
+            captured_password_hash: None,
         }
     }
 }
@@ -159,6 +187,12 @@ pub enum AuthOutcome {
     /// to a grant. If no provider authenticates, the chain surfaces that an
     /// `Unavailable` occurred so the caller can log/deny appropriately.
     Unavailable,
+    /// Forge's own store failed (a database error): nobody can decide this
+    /// credential right now, so the chain stops. Unlike an upstream outage,
+    /// which callers answer like a wrong password, this is answered as
+    /// "temporarily unavailable" (503) so clients retry instead of asking
+    /// for new credentials.
+    Failed,
 }
 
 /// An ordered authentication backend for username/password credentials.
@@ -169,7 +203,7 @@ pub enum AuthOutcome {
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
     /// Stable provider id, e.g. `"local-password"` / `"upstream-basic"`, or a
-    /// realm-scoped id like `"realm:corp-nexus"` (12.7). Keys the
+    /// realm-scoped id like `"realm:corp-nexus"`. Keys the
     /// validated-credential cache, so it must be stable for a given realm.
     fn id(&self) -> &str;
 
@@ -200,8 +234,22 @@ mod tests {
         assert!(id.groups.is_empty());
         assert!(!id.suggested_is_admin);
         assert!(!id.admin_authoritative);
-        assert!(!id.auto_provision);
         assert!(id.realm_id.is_none());
+        assert!(id.captured_password_hash.is_none());
+    }
+
+    #[test]
+    fn captured_password_hash_debug_redacts() {
+        let hash = CapturedPasswordHash::new("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into());
+        let id = ProvenIdentity {
+            captured_password_hash: Some(hash.clone()),
+            ..ProvenIdentity::local("alice")
+        };
+        for rendered in [format!("{hash:?}"), format!("{id:?}")] {
+            assert!(!rendered.contains("argon2id"), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        }
+        assert!(hash.as_str().starts_with("$argon2id$"));
     }
 
     #[test]

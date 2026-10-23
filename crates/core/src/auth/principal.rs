@@ -5,16 +5,15 @@ use std::net::IpAddr;
 /// Identity established for an authenticated user.
 ///
 /// This is the success payload of token/password verification and the body of
-/// [`Principal::User`]. The `user_id` and `token_id` fields are a **cross-slice
-/// contract**: later slices (auditing, RBAC) rely on them being present here.
+/// [`Principal::User`]. The `user_id` and `token_id` fields are a **contract**:
+/// authorization (RBAC, token scopes) and the audit log rely on them being
+/// present here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserPrincipal {
     /// `app_user.id` of the authenticated user.
     pub user_id: i64,
     /// `token.id` if authentication used an API token; `None` for password auth.
     pub token_id: Option<i64>,
-    /// Whether the user has the admin flag.
-    pub is_admin: bool,
 }
 
 /// How a [`Principal::User`] proved its identity on this request.
@@ -51,12 +50,10 @@ pub enum Principal {
         user_id: i64,
         /// `token.id` if a token was used, else `None`.
         token_id: Option<i64>,
-        /// Admin flag.
-        is_admin: bool,
         /// The kind of credential that authenticated this request.
         method: AuthMethod,
     },
-    /// A verified **workload** (slice 12.8, WIF): a non-interactive CI/automation
+    /// A verified **workload** (WIF): a non-interactive CI/automation
     /// caller authenticated by a validated OIDC `id_token` (no `app_user` row,
     /// no session). It is authorized solely by the forge **role** its realm's
     /// claim-rules mapped it to — the role id is resolved at token-validation
@@ -87,6 +84,13 @@ pub enum Principal {
         /// Validated token `iat` (Unix seconds), recorded with publish audit
         /// events. WIF validation guarantees it is fresh and not in the future.
         issued_at: i64,
+        /// `workload_api_key.id` when the workload presented a key the token
+        /// exchange issued; `None` for the CI token itself.
+        key_id: Option<i64>,
+        /// When the presented credential ends (Unix seconds): the key's
+        /// expiry, or the CI token's `exp`. Nothing derived from it (a
+        /// registry token) may outlive it.
+        expires_at: i64,
     },
 }
 
@@ -120,7 +124,6 @@ impl Principal {
         Principal::User {
             user_id: u.user_id,
             token_id: u.token_id,
-            is_admin: u.is_admin,
             method: if u.token_id.is_some() {
                 AuthMethod::Token
             } else {
@@ -152,7 +155,6 @@ mod tests {
         let user = |token_id, method| Principal::User {
             user_id: 5,
             token_id,
-            is_admin: false,
             method,
         };
         assert_eq!(
@@ -175,6 +177,8 @@ mod tests {
             subject_sha256: [0; 32],
             jti_sha256: None,
             issued_at: 0,
+            key_id: None,
+            expires_at: 0,
         };
         assert_eq!(workload.audit_label(), "workload realm:3 role:7");
     }
@@ -184,14 +188,12 @@ mod tests {
         let up = UserPrincipal {
             user_id: 7,
             token_id: Some(3),
-            is_admin: true,
         };
         assert_eq!(
             Principal::from_user(up),
             Principal::User {
                 user_id: 7,
                 token_id: Some(3),
-                is_admin: true,
                 method: AuthMethod::Token
             }
         );
@@ -202,7 +204,6 @@ mod tests {
         assert!(Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: false,
             method: AuthMethod::Password
         }
         .is_user());

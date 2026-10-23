@@ -247,6 +247,15 @@ async fn begin_ingest_attempt(
     }))
 }
 
+/// Which of `sha256s` name a blob that exists and is not being deleted (in
+/// no particular order).
+pub async fn live_among(pool: &PgPool, sha256s: &[String]) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT sha256 FROM blob WHERE sha256 = ANY($1) AND state <> 'deleting'")
+        .bind(sha256s)
+        .fetch_all(pool)
+        .await
+}
+
 /// Fetch a blob by content hash.
 pub async fn get_blob(pool: &PgPool, sha256: &str) -> sqlx::Result<Option<Blob>> {
     sqlx::query_as!(
@@ -478,19 +487,29 @@ pub async fn reserve_dangling_delete(
     .await
 }
 
-/// How many assets name the blob (under the caller's blob row lock).
+/// How many rows name the blob (under the caller's blob row lock): package
+/// assets, the Docker/OCI image links, manifests and upload chunks, and raw
+/// files, each of which holds one reference.
 async fn asset_references(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sha256: &str,
 ) -> sqlx::Result<i64> {
-    sqlx::query_scalar("SELECT count(*) FROM asset WHERE blob_sha256 = $1")
-        .bind(sha256)
-        .fetch_one(&mut **tx)
-        .await
+    sqlx::query_scalar(
+        r#"
+        SELECT (SELECT count(*) FROM asset WHERE blob_sha256 = $1)
+             + (SELECT count(*) FROM oci_blob_link WHERE blob_sha256 = $1)
+             + (SELECT count(*) FROM oci_manifest WHERE blob_sha256 = $1)
+             + (SELECT count(*) FROM oci_upload_part WHERE blob_sha256 = $1)
+             + (SELECT count(*) FROM raw_file WHERE blob_sha256 = $1)
+        "#,
+    )
+    .bind(sha256)
+    .fetch_one(&mut **tx)
+    .await
 }
 
 /// Cancel the deletion reservation of a blob that assets still name (the
-/// aftermath of the pre-0.1.0 concurrent hard-delete race): back to
+/// aftermath of the pre-release concurrent hard-delete race): back to
 /// `committed` with the true reference count. Its object may already be gone;
 /// the warning names the key to restore from backup if so.
 async fn cancel_referenced_deletion(

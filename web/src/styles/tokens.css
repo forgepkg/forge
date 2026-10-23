@@ -1,0 +1,163 @@
+/*
+ * Forge design system tokens (colour, shadow, spacing, radius, size, type),
+ * as CSS custom properties. Generated from the design system's tokens.json;
+ * keep the two in step.
+ *
+ * Three themes, selected by `data-theme` on <html> (lib/theme.ts and the
+ * bootstrap in index.html set it):
+ *   light      everything light (the default);
+ *   dark-rail  light content with a dark grey rail and dark code blocks: it
+ *              overrides only the rail-* and code-* tokens;
+ *   dark       everything dark, neutral greys.
+ *
+ * The fonts are the Fontsource builds of IBM Plex Sans and JetBrains Mono
+ * (main.tsx imports them), bundled into the built assets so the UI calls no
+ * font CDN.
+ */
+
+:root,
+[data-theme='light'] {
+  --ground: #f6f7f9;
+  --surface: #ffffff;
+  --surface-sunken: #f1f3f6;
+  --surface-hover: #f7f8fa;
+  --line: #e2e5ea;
+  --line-strong: #868f9c;
+  --ink: #12161c;
+  --ink-muted: #4b5563;
+  --ink-faint: #5f6877;
+  --heat: #c2410c;
+  --heat-strong: #9a3412;
+  --heat-soft: #fff1e8;
+  --on-heat: #ffffff;
+  --hosted: #1d5bd6;
+  --hosted-soft: #edf3ff;
+  --proxy: #0e7065;
+  --proxy-soft: #e9f6f4;
+  --group: #7036d9;
+  --group-soft: #f3effd;
+  --ok: #147a3d;
+  --ok-soft: #eaf7ef;
+  --warn: #8a5a00;
+  --warn-soft: #fdf4dd;
+  --danger: #c42121;
+  --danger-soft: #fdeeee;
+  --on-danger: #ffffff;
+  --rail: #fafbfc;
+  --rail-raised: #eef0f4;
+  --rail-line: #e2e5ea;
+  --rail-ink: #12161c;
+  --rail-muted: #566070;
+  --rail-heat: #c2410c;
+  --rail-hosted: #1d5bd6;
+  --rail-proxy: #0e7065;
+  --rail-group: #7036d9;
+  --code: #f3f5f8;
+  --code-line: #e2e5ea;
+  --code-ink: #12161c;
+  --code-muted: #5a6373;
+  --code-accent: #b13a0a;
+  --code-raised: #e6e9ee;
+  --focus: var(--heat);
+  --link: var(--heat);
+  --scrim: rgba(16, 20, 26, 0.45);
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --shadow-lg: 0 20px 40px rgba(16, 24, 40, 0.14), 0 4px 12px rgba(16, 24, 40, 0.06);
+  color-scheme: light;
+}
+
+[data-theme='dark-rail'] {
+  --rail: #232428;
+  --rail-raised: #303136;
+  --rail-line: #3a3c41;
+  --rail-ink: #ecedef;
+  --rail-muted: #a9acb3;
+  --rail-heat: #fb8a4c;
+  --rail-hosted: #86abf5;
+  --rail-proxy: #66c8b9;
+  --rail-group: #bca5f8;
+  --code: #1f2023;
+  --code-line: #1f2023;
+  --code-ink: #ecedef;
+  --code-muted: #a2a5ac;
+  --code-accent: #fda472;
+  --code-raised: #2c2d31;
+}
+
+[data-theme='dark'] {
+  --ground: #1a1b1e;
+  --surface: #222327;
+  --surface-sunken: #1c1d20;
+  --surface-hover: #2a2b30;
+  --line: #35373c;
+  --line-strong: #73777f;
+  --ink: #ecedef;
+  --ink-muted: #b2b4ba;
+  --ink-faint: #9c9fa6;
+  --heat: #fb8a4c;
+  --heat-strong: #fda472;
+  --heat-soft: #3b2a20;
+  --on-heat: #1c0d04;
+  --hosted: #86abf5;
+  --hosted-soft: #26303f;
+  --proxy: #66c8b9;
+  --proxy-soft: #213431;
+  --group: #bca5f8;
+  --group-soft: #302b40;
+  --ok: #77d095;
+  --ok-soft: #213227;
+  --warn: #ebc25c;
+  --warn-soft: #38321f;
+  --danger: #ff8f86;
+  --danger-soft: #422726;
+  --on-danger: #1f0907;
+  --rail: #1e1f22;
+  --rail-raised: #2a2b30;
+  --rail-line: #33353a;
+  --rail-ink: #ecedef;
+  --rail-muted: #a5a8af;
+  --rail-heat: #fb8a4c;
+  --rail-hosted: #86abf5;
+  --rail-proxy: #66c8b9;
+  --rail-group: #bca5f8;
+  --code: #17181a;
+  --code-line: #33353a;
+  --code-ink: #ecedef;
+  --code-muted: #9c9fa6;
+  --code-accent: #fda472;
+  --code-raised: #2a2b30;
+  --focus: var(--heat);
+  --link: var(--heat);
+  --scrim: rgba(0, 0, 0, 0.6);
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 20px 40px rgba(0, 0, 0, 0.6), 0 4px 12px rgba(0, 0, 0, 0.45);
+  color-scheme: dark;
+}
+
+:root {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-full: 999px;
+  --control-sm: 28px;
+  --control-md: 36px;
+  --row: 44px;
+  --rail-width: 240px;
+  --content-max: 1200px;
+  --font-sans: 'IBM Plex Sans Variable', 'IBM Plex Sans', 'Segoe UI', 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo,
+    Consolas, monospace;
+}

@@ -1,8 +1,10 @@
-//! Admin user-role assignment (§12.4 Phase 6).
+//! Admin user-role assignment.
 //!
 //! * `GET    /admin/users/{id}/roles` — list the roles a user holds.
 //! * `PUT    /admin/users/{id}/roles` — assign a role (idempotent).
-//! * `DELETE /admin/users/{id}/roles/{role_id}` — unassign a role.
+//! * `DELETE /admin/users/{id}/roles/{role_id}` — unassign a role. Taking the
+//!   built-in `admin` role from the last active administrator is refused
+//!   (**409**, [`super::last_admin_conflict`]).
 //!
 //! A `user_role` change affects exactly one principal, so it uses **targeted**
 //! cache invalidation ([`invalidate_user`]) rather than the epoch roll — cheaper
@@ -16,7 +18,7 @@ use forge_db::authz_dao::{self, Role};
 use forge_db::user_dao;
 use serde::{Deserialize, Serialize};
 
-use super::db_error;
+use super::{db_error, last_admin_conflict};
 use crate::state::AppState;
 
 /// A role view (same shape as [`super::roles::RoleView`]).
@@ -83,10 +85,7 @@ pub async fn assign(
         Err(resp) => return resp,
     };
 
-    if let Err(e) = authz_dao::assign_role(&state.pool, user_id, role_id).await {
-        return db_error(e);
-    }
-    let result = sync_legacy_admin_flag(&state, user_id, role_id, true).await;
+    let result = authz_dao::assign_role(&state.pool, user_id, role_id).await;
     invalidate_user(&state.cache, user_id).await;
     match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -99,38 +98,32 @@ pub async fn unassign(
     State(state): State<AppState>,
     Path((user_id, role_id)): Path<(i64, i64)>,
 ) -> Response {
-    // Clear the legacy flag first: while `app_user.is_admin` is set the user
-    // stays a global admin through the dual-read fallback, so removing only the
-    // role would silently leave the admin rights in place.
-    if let Err(e) = sync_legacy_admin_flag(&state, user_id, role_id, false).await {
-        return db_error(e);
-    }
-    let result = authz_dao::unassign_role(&state.pool, user_id, role_id).await;
+    let result = unassign_guarded(&state, user_id, role_id).await;
     invalidate_user(&state.cache, user_id).await;
     match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => db_error(e),
+        Err(resp) => resp,
     }
 }
 
-/// Keep the slice-1 `app_user.is_admin` column in step with membership of the
-/// built-in `admin` role. The authz seam still honors the column as a
-/// dual-read fallback, so the role alone cannot revoke admin: an unassign that
-/// left the flag set would be a no-op. A no-op for any other role, or for a
-/// user that no longer exists.
-async fn sync_legacy_admin_flag(
-    state: &AppState,
-    user_id: i64,
-    role_id: i64,
-    is_admin: bool,
-) -> sqlx::Result<()> {
-    if authz_dao::role_id_by_name(&state.pool, authz_dao::ADMIN_ROLE).await? != Some(role_id) {
-        return Ok(());
+/// Unassign the role in one transaction. Taking the built-in `admin` role
+/// away runs under the last-admin guard.
+async fn unassign_guarded(state: &AppState, user_id: i64, role_id: i64) -> Result<(), Response> {
+    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    let admin_role = authz_dao::role_id_by_name(&mut *tx, authz_dao::ADMIN_ROLE)
+        .await
+        .map_err(db_error)?;
+    if admin_role == Some(role_id)
+        && authz_dao::would_leave_no_admin(&mut tx, user_id)
+            .await
+            .map_err(db_error)?
+    {
+        return Err(last_admin_conflict());
     }
-    match user_dao::update_is_admin(&state.pool, user_id, is_admin).await {
-        Ok(_) | Err(sqlx::Error::RowNotFound) => Ok(()),
-        Err(e) => Err(e),
-    }
+    authz_dao::unassign_role(&mut *tx, user_id, role_id)
+        .await
+        .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)
 }
 
 /// Resolve `(role, role_id)` to a concrete role id, returning a 400/404 response
@@ -140,6 +133,14 @@ async fn resolve_role_id(
     role_name: &Option<String>,
     role_id: Option<i64>,
 ) -> Result<i64, Response> {
+    // Both given: one of them would silently win (and they may disagree).
+    if role_name.is_some() && role_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "give either role or role_id, not both",
+        )
+            .into_response());
+    }
     if let Some(id) = role_id {
         match authz_dao::find_role_by_id(&state.pool, id).await {
             Ok(Some(_)) => return Ok(id),

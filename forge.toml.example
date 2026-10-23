@@ -1,4 +1,4 @@
-# envisia-forge configuration (TOML form).
+# Forge configuration (TOML form).
 #
 # Copy this to `forge.toml` (loaded automatically if present in the working
 # directory) or point $FORGE_CONFIG at it (the file must then exist: a missing
@@ -14,27 +14,33 @@ bind = "0.0.0.0:8421"
 # Public base URL for absolute NuGet V3 service-index @id values. No trailing slash.
 public_base_url = "http://localhost:8421"
 # The placeholder credentials in this example (minioadmin S3 keys, bootstrap
-# admin/changeme) are refused at startup unless this is true. Keep it for a
+# admin@example.com/changeme) are refused at startup unless this is true. Keep it for a
 # local dev copy only; in production replace the placeholders and drop it.
 allow_insecure_defaults = true  # (default: false)
-# Largest accepted `dotnet nuget push` body. Uploads stream to a temp file
-# (never buffered in memory); larger pushes get HTTP 413.
-max_upload_bytes = 536870912    # (default: 512 MiB)
+# Upload limits are set per hosted repository in the web UI (Repositories →
+# Edit → "Maximum upload size") or the admin API (max_upload_bytes); without
+# one a repository accepts pushes of 512 MiB (docker: blobs of 1 GiB). Uploads
+# stream to a temp file (never buffered in memory); larger pushes get HTTP 413.
+# (server.max_upload_bytes is gone: startup refuses a config that sets it.)
 # Pushes and first-time proxy downloads are staged here; files a killed process
 # left behind are removed at startup. All staged files of this instance share
 # max_staging_bytes; beyond it pushes and downloads get 503 + Retry-After.
 # staging_dir = "/var/tmp/forge"  # (default: <system temp dir>/forge-staging)
-# max_staging_bytes = 4294967296  # (default: 4 x max(max_upload_bytes, proxy.max_package_bytes); 0 = no limit)
+# max_staging_bytes = 4294967296  # (default: 4 x the largest of the default upload limits, proxy.max_package_bytes, docker.max_blob_bytes; 0 = no limit)
+# It also caps the upload limit a repository may be given. Set below 1 GiB, it
+# lowers the docker defaults (upload limit, docker.max_blob_bytes) to fit.
 # Host names (port ignored) clients reach this server under besides the host of
 # public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
-# anonymous_mode = "allowlist": a request naming any other host is not served
-# anonymously by IP (DNS-rebinding guard).
+# the anonymous mode "allowlist" (Admin → Settings): a request naming any
+# other host is not served anonymously by IP (DNS-rebinding guard).
 allowed_hosts = []              # (default: [])
 # Connection and request time limits. A client that takes longer to send its
 # request headers, or whose request body stalls longer, is cut off; a handler
 # that has not answered within request_timeout_seconds gets 408 (an already
-# streaming download is not cut off). Keep request_timeout_seconds above the
-# slowest push of max_upload_bytes you expect. header_read_timeout_seconds also
+# streaming download is not cut off; a proxy's download from its upstream may
+# take [proxy] download_timeout_seconds, and the handler has
+# request_timeout_seconds again after it). Keep request_timeout_seconds above the
+# slowest push of the largest repository upload limit you expect. header_read_timeout_seconds also
 # closes an idle keep-alive connection: keep it above your reverse proxy's
 # upstream keep-alive idle timeout, or the proxy may reuse a connection Forge is
 # closing and answer 502. 0 disables a limit.
@@ -51,8 +57,20 @@ acquire_timeout_seconds = 10    # (default: 10) wait for a free connection befor
 endpoint = "http://localhost:8422"
 region = "us-east-1"            # (default: "us-east-1")
 bucket = "forge"
-access_key = "minioadmin"
-secret_key = "minioadmin"
+# Where the S3 credentials come from (default: "static"):
+#   static        access_key / secret_key below.
+#   default_chain the AWS SDK default credentials chain: AWS_* env vars (with
+#                 AWS_SESSION_TOKEN), the shared profile, web identity (IRSA:
+#                 AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE), EKS Pod
+#                 Identity / ECS task role, EC2 instance profile.
+#   web_identity  exchange token_file for temporary keys with STS
+#                 AssumeRoleWithWebIdentity ([s3.web_identity] below), against
+#                 AWS STS or MinIO / Ceph RGW.
+# Temporary credentials are refreshed before they expire. The short-lived
+# modes refuse access_key / secret_key (remove them).
+credentials = "static"
+access_key = "minioadmin"       # static only
+secret_key = "minioadmin"       # static only
 force_path_style = true         # (default: true) required for versitygw/MinIO
 multipart_threshold = 8388608   # (default: 8 MiB) switch to multipart above this many bytes
 # Dedup PUTs with `If-None-Match: *` instead of HEAD-then-PUT: auto | on | off.
@@ -61,30 +79,37 @@ multipart_threshold = 8388608   # (default: 8 MiB) switch to multipart above thi
 # S3/MinIO); "off" disables it. Pure optimization — behavior is identical.
 conditional_writes = "auto"     # (default: "auto")
 
+# credentials = "web_identity" only.
+# [s3.web_identity]
+# The role to assume (AWS requires one; none for MinIO's claim-based policies).
+# role_arn = "arn:aws:iam::123456789012:role/forge"
+# The token (a projected service-account token, any OIDC token), read again on
+# every refresh so a rotated token is picked up.
+# token_file = "/var/run/secrets/forge/s3/token"
+# Unset: AWS STS in s3.region. MinIO / Ceph RGW: their URL (usually endpoint).
+# sts_endpoint = "https://minio.example.com:9000"
+# session_name = "forge"          # (default: "forge") RoleSessionName
+# duration_seconds = 3600         # 900..43200 (default: the STS default)
+
 [auth]
-anonymous_mode = "off"          # (default: "off") off | allowlist | all
-# Tokens (loopback/private/local) or CIDRs; used only when anonymous_mode = "allowlist".
-anonymous_ip_allowlist = ["loopback"]   # (default: [])
-# CIDRs of reverse proxies whose X-Forwarded-For is trusted.
+# Anonymous access (mode and IP allowlist), the login screen, passwords over
+# HTTP Basic, the session lifetimes and the login lockout are not configured
+# here: they are auth settings, set in the web UI (Admin → Settings) or through
+# /admin/settings/auth, and every instance applies them without a restart.
+# Startup refuses the keys that used to set them (anonymous_mode,
+# anonymous_ip_allowlist, login_mode, allow_password_basic,
+# session_idle_ttl_seconds, session_absolute_ttl_seconds, login_max_failures,
+# login_failure_window_seconds). See docs/deployment.md, "Access and sign-in
+# settings".
+# CIDRs of reverse proxies whose X-Forwarded-For is trusted (the client address
+# behind them decides the anonymous allowlist and the login lockout).
 trusted_proxy_cidrs = []        # (default: [])
-allow_password_basic = false    # (default: false)
-# Password-failure lockout per (client IP, username) for /auth/login and Basic
-# password auth; 0 disables.
-login_max_failures = 10             # (default: 10)
-login_failure_window_seconds = 300  # (default: 300)
 # Most argon2 password verifications running at once (~19 MiB and a core each);
 # more queue for a few seconds, then fail as unavailable (not counted as a
 # failed password). 0 = the number of available CPUs.
 password_verify_concurrency = 0     # (default: 0)
-# 12.7 login UX: "identifier_first" (ask username, then route to a password
-# prompt or an OIDC redirect) or "combined" (always show username+password +
-# a button per enabled OIDC realm).
-login_mode = "identifier_first" # (default: "identifier_first")
-# Browser-session lifetimes (apply to local-password AND OIDC logins). When
-# unset, falls back to the legacy oidc.session_* keys, then 8h / 7d.
-# session_idle_ttl_seconds     = 28800
-# session_absolute_ttl_seconds = 604800
-# How long an instance trusts its cached snapshot of the auth_realm table.
+# How long an instance trusts its cached copy of the auth_realm table and of
+# the auth settings: other instances follow an admin's change within it.
 realm_cache_ttl_seconds = 10    # (default: 10)
 # Concurrent upstream credential forwards (verdict-cache misses) allowed per
 # credential-forwarding realm, per instance; excess logins fail closed (401).
@@ -93,9 +118,10 @@ credential_forward_max_concurrent = 32  # (default: 32)
 # Optional: bootstrap admin, created once on the first start with a password.
 # Omit the section, or leave the password empty/unset, for no bootstrap admin
 # (remove the password once real admins exist). "changeme" is refused unless
-# server.allow_insecure_defaults = true.
+# server.allow_insecure_defaults = true. The username is a UPN
+# (local-part@domain), as every account is named; default admin@example.com.
 [auth.bootstrap_admin]
-username = "admin"              # (default: "admin")
+username = "admin@example.com"
 password = "changeme"
 
 [redis]
@@ -114,7 +140,7 @@ password = "changeme"
 connect_timeout_seconds  = 15          # (default: 15)
 read_timeout_seconds     = 60          # (default: 60) max silence between two reads
 metadata_timeout_seconds = 60          # (default: 60) total, per metadata request
-download_timeout_seconds = 1800        # (default: 1800) total, per .nupkg download
+download_timeout_seconds = 1800        # (default: 1800) total, per .nupkg or layer download
 max_metadata_bytes       = 33554432    # (default: 32 MiB)
 max_package_bytes        = 1073741824  # (default: 1 GiB)
 # Metadata bodies up to this size stay in memory; larger ones spill to a
@@ -133,9 +159,49 @@ max_total_uncompressed_bytes = 17179869184  # (default: 16 GiB) total declared s
 max_nuspec_bytes             = 1048576      # (default: 1 MiB) also caps an upstream .nuspec a proxy verifies
 max_nuspec_compression_ratio = 200          # (default: 200)
 
+# Optional: WebAssembly format plugins — further package formats loaded at
+# startup (docs/format-plugins.md). The built-in ones (Helm) need nothing here.
+# Only the plugins listed under [plugins.formats] are loaded, each from
+# <dir>/<id>/ and pinned to its component's SHA-256; a mismatch, or an id a
+# built-in format holds, fails startup. `cargo xtask plugins` builds the
+# plugins of plugins/ as components and prints this section with their digests.
+# [plugins]
+# dir = "/etc/forge/plugins"
+#
+# [plugins.formats]
+# example = "sha256:<64 hex digits>"
+
+[docker]
+# The Docker / OCI registry under /v2 (see docs/docker.md).
+# max_blob_bytes              = 1073741824  # (default: 1 GiB, or what an explicit server.max_staging_bytes holds) largest layer a proxy downloads; staged on disk (pushes follow the repository's upload limit)
+token_ttl_seconds             = 300         # (default: 300) registry token lifetime, 60-3600
+# Signs registry tokens (at least 32 characters). Unset: a key generated once
+# and kept in the database, sealed when [crypto] is enabled.
+# token_secret = "…"
+upload_ttl_seconds            = 86400       # (default: 24 h) abandoned upload sessions expire
+unreferenced_blob_ttl_seconds = 86400       # (default: 24 h, at least 1 h) unused blobs no manifest references
+sweep_interval_seconds        = 300         # (default: 300)
+
 [cache]
-l1_max_capacity = 10000         # (default: 10000)
+l1_max_capacity = 10000         # (default: 10000) entries; one over 16 KiB counts once per 16 KiB
 default_ttl_seconds = 30        # (default: 30)
+
+[blob_cache]
+# Optional local disk cache for package blobs: hot downloads skip S3, and
+# cached packages keep resolving while S3 is unreachable (pushes and uncached
+# downloads then answer 503 with Retry-After, and /readyz reports the object
+# store "degraded" instead of failing). S3 stays the source of truth. Unset
+# path = no cache. Each instance needs a directory of its own.
+# Forge creates the directory (mode 0700) and refuses one another user owns,
+# such as a mounted volume's root: name a subdirectory of the volume.
+# path = "/var/cache/forge/blobs"
+# "auto": the size of the filesystem holding `path` minus min_free_bytes (and
+# server.max_staging_bytes when staging is on the same filesystem), re-read
+# every minute; or a fixed number of bytes. On a Kubernetes emptyDir, statvfs
+# sees the node's disk, not the volume's sizeLimit: set a number below it.
+# max_bytes = "auto"            # (default: "auto")
+# Free space the cache leaves on its filesystem, evicting instead of filling it.
+# min_free_bytes = 1073741824   # (default: 5 % of the filesystem)
 
 [outbox]
 batch_size = 100                # (default: 100)
@@ -147,8 +213,8 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # enabled = true                         # (default: true) run the retention worker on this instance
 # audit_retention_seconds = 7776000      # (default: 7776000 = 90 days) keep retention_audit rows this long; 0 = never prune
 
-# Optional: OpenID Connect / Microsoft Entra interactive login (slice 12.2).
-# 12.7: this block is a one-shot SEED — on first boot it is imported into an
+# Optional: OpenID Connect / Microsoft Entra interactive login.
+# This block is a one-shot SEED — on first boot it is imported into an
 # `auth_realm` row and authentication is managed in the admin UI from then on
 # (the block is ignored afterwards; the same applies to [auth.upstream_basic]).
 # All flow state and sessions live in Postgres, so any instance can complete a
@@ -159,6 +225,11 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # issuer         = "https://login.microsoftonline.com/<tenant-id>/v2.0"        # must be https
 # client_id      = "00000000-0000-0000-0000-000000000000"
 # client_secret  = "<application-client-secret>"                               # redacted from APIs/logs
+# # or no secret: Forge signs a client assertion as an OIDC issuer of its own
+# # (public_base_url, publishing /.well-known/openid-configuration + jwks.json);
+# # register it as an Entra federated credential (see DEVELOPMENT.md)
+# client_authentication = "federated_credential"                               # (default: "client_secret")
+# assertion_audience    = "api://AzureADTokenExchange"                          # (default) the assertion's aud
 # redirect_url   = "http://localhost:8421/auth/oidc/callback"                  # must match public_base_url host + this path
 # scopes         = ["openid", "profile", "email"]                              # (default) openid is always added
 # clock_skew_seconds = 60                                                      # (default: 60) exp/nbf/iat leeway
@@ -172,6 +243,6 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # # admin assignment — empty admin_groups means OIDC never grants admin (safe default)
 # admin_groups = ["forge-admins"]            # group/role values that grant is_admin
 # admin_claim  = "roles"                     # (default) claim matched against admin_groups ("roles" or "groups")
-# # session lifecycle
-# session_idle_ttl_seconds     = 28800       # (default: 8h) idle timeout
-# session_absolute_ttl_seconds = 604800      # (default: 7d) absolute lifetime
+# # IdPs that serve tokens and keys on other hosts than the issuer's (Google):
+# endpoint_hosts = ["oauth2.googleapis.com", "www.googleapis.com"]   # (default: [] = issuer host only)
+# # The session lifetimes are auth settings (Admin → Settings), not set here.

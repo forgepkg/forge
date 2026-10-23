@@ -1,14 +1,15 @@
-//! Integration tests for the static SPA serving layer (plan §12.6 Phase 1).
+//! Integration tests for the static SPA serving layer.
 //!
 //! Verifies the correctness properties the serving model depends on:
 //! * the API routers (`/admin/*`, `/browse/*`, `/v3/*`) are **not** shadowed by
 //!   the SPA fallback;
 //! * unknown (client-side) paths fall back to `index.html` so TanStack Router
 //!   can resolve deep links — including the admin UI under `/manage/*` — but a
-//!   missing hashed asset under `/assets/` is a 404;
+//!   missing hashed asset under `/assets/` and an unknown path under an API
+//!   prefix are a 404;
 //! * `index.html` is `no-cache`, hashed assets are `immutable`;
-//! * a browser navigation to a former `/admin/...` UI path is 302-redirected
-//!   to `/manage/...`, while API requests to the same paths are untouched.
+//! * every request under `/admin/...`, a browser navigation included, reaches
+//!   the admin API.
 //!
 //! Requires Docker (Postgres + versitygw via the shared harness).
 
@@ -39,7 +40,7 @@ fn build_fake_spa() -> String {
 #[tokio::test]
 async fn spa_serving_and_api_precedence() {
     let assets_dir = build_fake_spa();
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let server = start_with(
         common::pool().await,
         ServerOpts {
@@ -116,6 +117,35 @@ async fn spa_serving_and_api_precedence() {
         .expect("json");
     assert_eq!(me["is_admin"], serde_json::json!(true));
     assert_eq!(me["user"]["username"], serde_json::json!(u));
+
+    // 6. A path under an API prefix that no route matches is a 404, never the
+    //    SPA shell (a script calling a mistyped endpoint must not see 200).
+    for path in [
+        "/admin/does-not-exist",
+        "/admin/repositories/x/y/z/w",
+        "/auth/does-not-exist",
+        "/browse/does-not-exist",
+        "/v3",
+        "/v3/",
+    ] {
+        for authed in [false, true] {
+            let mut req = client.get(format!("{}{path}", server.base_url));
+            if authed {
+                req = req.basic_auth(&u, Some(&p));
+            }
+            let res = req.send().await.expect("GET unknown API path");
+            assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+            let body = res.text().await.expect("body");
+            assert!(!body.contains("forge-spa"), "{path}: {body}");
+        }
+    }
+    // A UI path that merely starts with the same letters is still the SPA.
+    let res = client
+        .get(format!("{}/administrator", server.base_url))
+        .send()
+        .await
+        .expect("GET /administrator");
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
 }
 
 /// The `Cache-Control` header of a response, as a string.
@@ -134,7 +164,7 @@ const NAV_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,
 #[tokio::test]
 async fn spa_cache_headers_missing_assets_and_admin_ui_paths() {
     let assets_dir = build_fake_spa();
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let server = start_with(
         common::pool().await,
         ServerOpts {
@@ -210,53 +240,16 @@ async fn spa_cache_headers_missing_assets_and_admin_ui_paths() {
         assert!(body.contains("forge-spa"), "{path}: {body}");
     }
 
-    // 5. A browser navigation to a former /admin UI path is redirected,
-    //    keeping the query string. Sec-Fetch-Dest or (without it) an
-    //    HTML-preferring Accept identifies the navigation.
-    let cases: [(&str, Headers, &str); 4] = [
+    // 5. Every request under /admin reaches the admin API, browser
+    //    navigations included: 401 without credentials, JSON with them.
+    let api_cases: [(&str, Headers); 5] = [
+        ("/admin/repositories", &[("accept", "application/json")]),
         (
             "/admin/repositories?tab=2",
             &[("sec-fetch-dest", "document"), ("accept", NAV_ACCEPT)],
-            "/manage/repositories?tab=2",
         ),
-        (
-            "/admin/users/5",
-            &[("accept", NAV_ACCEPT)],
-            "/manage/users/5",
-        ),
-        ("/admin", &[("sec-fetch-dest", "document")], "/manage"),
-        (
-            "/admin/repositories/all/members",
-            &[("sec-fetch-dest", "document")],
-            "/manage/repositories/all/members",
-        ),
-    ];
-    for (path, headers, location) in cases {
-        let mut req = client.get(format!("{base}{path}"));
-        for (k, v) in headers {
-            req = req.header(*k, *v);
-        }
-        let res = req.send().await.expect("GET legacy UI path");
-        assert_eq!(res.status(), reqwest::StatusCode::FOUND, "{path}");
-        assert_eq!(
-            res.headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok()),
-            Some(location),
-            "{path}"
-        );
-    }
-
-    // 6. API requests to the same paths are unaffected: no redirect, the API
-    //    answers (401 without credentials, JSON with them).
-    let api_cases: [(&str, Headers); 4] = [
-        ("/admin/repositories", &[("accept", "application/json")]),
-        (
-            "/admin/repositories",
-            &[("sec-fetch-dest", "empty"), ("accept", "text/html")],
-        ),
+        ("/admin/users/5", &[("accept", NAV_ACCEPT)]),
         ("/admin/users/5", &[("accept", "*/*")]),
-        // Never a UI path, even for a document navigation.
         ("/admin/me", &[("sec-fetch-dest", "document")]),
     ];
     for (path, headers) in api_cases {
@@ -282,14 +275,4 @@ async fn spa_cache_headers_missing_assets_and_admin_ui_paths() {
     assert_eq!(res.status(), reqwest::StatusCode::OK);
     let repos: serde_json::Value = res.json().await.expect("json");
     assert!(repos.is_array(), "API returns the repository list: {repos}");
-    // A mutation is never redirected, whatever its headers say.
-    let res = client
-        .post(format!("{base}/admin/repositories"))
-        .header("sec-fetch-dest", "document")
-        .header("accept", NAV_ACCEPT)
-        .json(&serde_json::json!({ "name": "x", "kind": "hosted" }))
-        .send()
-        .await
-        .expect("POST /admin/repositories");
-    assert_ne!(res.status(), reqwest::StatusCode::FOUND);
 }

@@ -3,7 +3,6 @@ import { ErrorComponent, type ErrorComponentProps } from '@tanstack/react-router
 
 import { isChunkLoadError, reloadOnceForStaleChunk } from '~/lib/chunkReload'
 import { reloadDocument } from '~/lib/navigation'
-import { Text } from '~/components/catalyst/text'
 import { ErrorState } from './ErrorState'
 
 /**
@@ -26,11 +25,11 @@ export function RouteError(props: ErrorComponentProps) {
   }, [stale])
 
   if (!stale) return <ErrorComponent {...props} />
-  if (reloading) return <Text>Loading the latest version of envisia forge…</Text>
+  if (reloading) return <p className="fg-text">Loading the latest version of Forge…</p>
   return (
     <ErrorState
       title="This page could not be loaded"
-      message="envisia forge may have been updated since this tab was opened. Reload the page to continue."
+      message="Forge may have been updated since this tab was opened. Reload the page to continue."
       onRetry={reloadDocument}
     />
   )

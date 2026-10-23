@@ -1,4 +1,4 @@
-//! OpenID Connect support (slice 12.2).
+//! OpenID Connect support.
 //!
 //! This module implements the IdP-facing half of interactive OIDC login:
 //!
@@ -11,13 +11,16 @@
 //!   [`flow::complete_login`] consumes that row (single-use), exchanges the code,
 //!   and verifies the ID token. All flow state lives in Postgres, so any instance
 //!   can complete a callback another instance began.
-//! * [`claims`] — pure claim → user mapping + `is_admin` derivation (§3.6).
+//! * [`assertion`] — forge as the issuer of its own client assertions: the
+//!   rotating RSA key set, its JWKS, and the signed `client_assertion` an
+//!   `oidc` realm can authenticate with instead of a client secret.
+//! * [`claims`] — pure claim → user mapping + `is_admin` derivation.
 //! * [`resolve_user`] — identity resolution: find via `external_identity`, else
 //!   auto-provision / link an existing local user / reject; recompute `is_admin`.
 //!
 //! ## Multi-instance / no-advisory-lock posture
 //!
-//! Discovery and JWKS are cached via the slice-1 [`forge_cache::Cache`]
+//! Discovery and JWKS are cached via [`forge_cache::Cache`]
 //! (L1 moka + optional Redis L2 + invalidation backplane). Request coalescing is
 //! moka's per-instance [`try_get_with`](forge_cache::Cache::get_or_try_insert_with);
 //! an occasional duplicate JWKS fetch across instances is harmless, so we use
@@ -27,6 +30,7 @@
 //! state and sessions live in Postgres (`oidc_flow` / `session`), never process
 //! memory.
 
+pub mod assertion;
 pub mod claims;
 pub mod flow;
 pub mod jwks;
@@ -36,18 +40,19 @@ use forge_db::user_dao::{self, NewUser};
 use forge_db::{authz_dao, external_identity_dao, oidc_flow_dao, session_dao};
 use sqlx::PgPool;
 
+pub use assertion::{AssertionClaims, IssuerKeySet};
 pub use claims::{map_claims, ClaimMapping, MappedClaims};
 pub use flow::{
-    begin_login, browser_binding, complete_login, BeginLogin, CallbackParams, ClientParams,
-    FlowError, ValidatedLogin,
+    begin_login, browser_binding, complete_login, BeginLogin, CallbackParams, ClientAssertion,
+    ClientAuth, ClientParams, FlowError, ValidatedLogin,
 };
 pub use jwks::{
     DiscoveryDocument, IdTokenClaims, OidcError, OidcMetadataClient, Verified, VerifyParams,
 };
 
-// Re-export the slice-1 DAOs that the server's `/auth` routes (Phase 5) drive,
-// so callers reach them through `forge_core::oidc::*` without depending on
-// `forge_db` directly for the OIDC tables.
+// Re-export the DAO types the server's `/auth` routes drive, so callers reach
+// them through `forge_core::oidc::*` without depending on `forge_db` directly
+// for the OIDC tables.
 pub use external_identity_dao::IdentityClaims;
 pub use oidc_flow_dao::NewOidcFlow;
 pub use session_dao::NewSession;
@@ -60,9 +65,15 @@ pub enum ResolveError {
     #[error("oidc user not provisioned")]
     NotProvisioned,
     /// The resolved/linked `app_user` is `active = false`: reject even though the
-    /// IdP authenticated successfully (§6 account-state check).
+    /// IdP authenticated successfully.
     #[error("oidc user is inactive")]
     Inactive,
+    /// A new account would be provisioned, but the username the claim chain
+    /// resolved is not a UPN (`local-part@domain`,
+    /// [`forge_db::username::is_upn`]). `claim` names the claim it came from,
+    /// so the operator can map one that carries a UPN.
+    #[error("the oidc {claim:?} claim does not hold a UPN, which a new account needs")]
+    NotUpn { claim: String },
     /// A database error during resolution.
     #[error("oidc resolve db error: {0}")]
     Db(String),
@@ -94,7 +105,7 @@ impl Default for ResolvePolicy {
 }
 
 /// Resolve (and, per policy, provision or link) the `app_user` for a validated
-/// login, recomputing `is_admin` from the current claims (§3.6).
+/// login, recomputing `is_admin` from the current claims.
 ///
 /// Order:
 /// 1. **Existing link** `(issuer, subject)` → load that user, recompute admin,
@@ -102,7 +113,7 @@ impl Default for ResolvePolicy {
 ///    is the identity of an OIDC user — never the username or email.
 /// 2. **No link, matching username** + `link_existing_by_username` (off by
 ///    default) → link the existing user, but **only** if no other credential
-///    owns it: no local password, not an admin (column or `admin` role), not a
+///    owns it: no local password, not an admin (`admin` role), not a
 ///    credential-forwarding (`upstream-basic`) account, and not linked to any
 ///    IdP identity yet (of this or another issuer). A colliding
 ///    `preferred_username` must never take over a password account, an
@@ -110,7 +121,8 @@ impl Default for ResolvePolicy {
 ///    Otherwise fall through (a fresh, suffixed user is provisioned
 ///    instead).
 /// 3. **No link, no linkable match** + `auto_provision` → create a no-password
-///    user, link.
+///    user, link. A new account is named by a UPN: a username that is none
+///    refuses the login ([`ResolveError::NotUpn`]).
 /// 4. **Else** → [`ResolveError::NotProvisioned`].
 ///
 /// In every path the resolved user's `active` flag is enforced
@@ -145,7 +157,8 @@ pub async fn resolve_user(
     }
 
     // 2. No link, but an existing user owns this username → link it, unless
-    //    it is a password account or an admin (never linkable by name).
+    //    it is a password account (or an invited one, whose user is to choose
+    //    a password) or an admin (never linkable by name).
     if policy.link_existing_by_username {
         if let Some(user) = user_dao::find_user_by_username(pool, &mapped.username)
             .await
@@ -158,45 +171,39 @@ pub async fn resolve_user(
                 .await
                 .map_err(|e| ResolveError::Db(e.to_string()))?;
             if user.password_hash.is_none()
-                && !user.is_admin
                 && !is_admin_role
                 && user.auth_source != "upstream-basic"
+                && user.auth_source != "local"
                 && !already_linked
             {
                 return finalize(pool, user, login, &identity_claims, mapped, false).await;
             }
             tracing::warn!(
                 username = %mapped.username,
-                "oidc login not linked by username: target has a password, is an admin, \
-                 is a credential-forwarding account or is already linked to an identity"
+                "oidc login not linked by username: target has a password, is invited, is an \
+                 admin, is a credential-forwarding account or is already linked to an identity"
             );
         }
     }
 
-    // 3. Auto-provision a fresh, password-less user, then link.
+    // 3. Auto-provision a fresh, password-less user, then link. A new
+    //    account is named by a UPN.
     if policy.auto_provision {
-        let user = match provision_oidc_user(pool, login, mapped).await? {
+        if !forge_db::username::is_upn(&mapped.username) {
+            return Err(ResolveError::NotUpn {
+                claim: mapped.username_claim.clone(),
+            });
+        }
+        return match provision_oidc_user(pool, login, mapped).await? {
             Provisioned::New(user) => {
-                finalize(pool, user, login, &identity_claims, mapped, true).await?
+                finalize(pool, user, login, &identity_claims, mapped, true).await
             }
             // A concurrent first login provisioned and linked the identity
             // while this one was still looking for a free username.
             Provisioned::AlreadyLinked(user) => {
-                finalize(pool, user, login, &identity_claims, mapped, false).await?
+                finalize(pool, user, login, &identity_claims, mapped, false).await
             }
         };
-        // §12.4 Phase 5: on a legacy-open-access (upgraded slice-1) install, a
-        // freshly auto-provisioned OIDC user must inherit the `authenticated` role
-        // immediately so it has the slice-1 "read/write everywhere" reach —
-        // `ensure_legacy_rbac` runs only once per install. The
-        // assignment is idempotent and gated on the install-wide flag, so a fresh
-        // (fail-closed) install leaves the user with no automatic grants. (When
-        // a concurrent login won the link, this is the winner's account, for
-        // which the assignment is equally due — and idempotent.)
-        authz_dao::assign_authenticated_if_legacy_open(pool, user.id)
-            .await
-            .map_err(|e| ResolveError::Db(e.to_string()))?;
-        return Ok(user);
     }
 
     // 4. No link, no match, no provisioning → reject.
@@ -227,20 +234,20 @@ async fn provision_oidc_user(
     login: &ValidatedLogin,
     mapped: &MappedClaims,
 ) -> Result<Provisioned, ResolveError> {
+    let base = mapped.username.clone();
     let mut attempt = 0;
     loop {
-        let username = unique_username(pool, &mapped.username).await?;
+        let username = unique_username(pool, &base).await?;
         let inserted = user_dao::insert_user(
             pool,
             NewUser {
                 username,
-                // No local password: slice 12.3 made password_hash nullable and
-                // records provenance instead. A NULL hash means password-basic
-                // can never authenticate this user (token.rs short-circuits on
-                // None); the (issuer, subject) link in external_identity is the
-                // authority for OIDC logins.
+                // No local password; `auth_source` records provenance instead.
+                // A NULL hash means password-basic can never authenticate this
+                // user (the local-password provider skips it); the (issuer,
+                // subject) link in external_identity is the authority for OIDC
+                // logins.
                 password_hash: None,
-                is_admin: mapped.is_admin,
                 active: true,
                 auth_source: "oidc".to_string(),
                 external_subject: Some(login.subject.clone()),
@@ -326,18 +333,10 @@ async fn finalize(
 
     // Recompute admin on every login so IdP grant/revoke takes effect — but
     // only when the realm maps admin groups; otherwise admins are managed
-    // locally and a login must not touch them. Both the legacy column and the
-    // built-in `admin` role follow the claim, so a demotion also removes the
-    // role (the column alone is only a dual-read fallback). The caller
-    // invalidates the user's cached effective set.
-    let user = if mapped.admin_managed {
-        let user = if user.is_admin != mapped.is_admin {
-            user_dao::update_is_admin(pool, user.id, mapped.is_admin)
-                .await
-                .map_err(|e| ResolveError::Db(e.to_string()))?
-        } else {
-            user
-        };
+    // locally and a login must not touch them. The built-in `admin` role
+    // follows the claim, for a new account too. The caller invalidates the
+    // user's cached effective set.
+    if mapped.admin_managed {
         let changed = authz_dao::sync_admin_role(pool, user.id, mapped.is_admin)
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?;
@@ -346,28 +345,31 @@ async fn finalize(
                 .await
                 .map_err(|e| ResolveError::Db(e.to_string()))?;
         }
-        user
-    } else {
-        user
-    };
+    }
 
     Ok(user)
 }
 
-/// Find a free username, suffixing `-2`, `-3`, … on collision so auto-provision
-/// never fails the unique constraint. (Only reached when there is no existing
-/// `(issuer, subject)` link, so a collision means a *different* account
-/// already owns the base name and was not linked.)
+/// Find a free username, suffixing `-2`, `-3`, … to the local part of the UPN
+/// (`bob-2@corp.example`) on collision so auto-provision never fails the
+/// unique constraint. (Only reached when there is no existing `(issuer,
+/// subject)` link, so a collision means a *different* account already owns
+/// the base name and was not linked.) A
+/// [reserved](forge_db::username::RESERVED_USERNAMES) base name is never
+/// free.
 async fn unique_username(pool: &PgPool, base: &str) -> Result<String, ResolveError> {
-    if user_dao::find_user_by_username(pool, base)
-        .await
-        .map_err(|e| ResolveError::Db(e.to_string()))?
-        .is_none()
+    let reserved = forge_db::username::canonical_username(base)
+        .is_ok_and(|canonical| forge_db::username::is_reserved_username(&canonical));
+    if !reserved
+        && user_dao::find_user_by_username(pool, base)
+            .await
+            .map_err(|e| ResolveError::Db(e.to_string()))?
+            .is_none()
     {
         return Ok(base.to_string());
     }
     for n in 2..1000 {
-        let candidate = format!("{base}-{n}");
+        let candidate = with_local_suffix(base, &format!("-{n}"));
         if user_dao::find_user_by_username(pool, &candidate)
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?
@@ -379,4 +381,30 @@ async fn unique_username(pool: &PgPool, base: &str) -> Result<String, ResolveErr
     Err(ResolveError::Db(
         "could not allocate a unique username".into(),
     ))
+}
+
+/// `name` with `suffix` added to the local part of the UPN
+/// (`bob@corp.example` → `bob{suffix}@corp.example`), so the result is a UPN
+/// of the same domain; appended to a name without an `@`.
+fn with_local_suffix(name: &str, suffix: &str) -> String {
+    match name.split_once('@') {
+        Some((local, domain)) => format!("{local}{suffix}@{domain}"),
+        None => format!("{name}{suffix}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_local_suffix;
+
+    #[test]
+    fn suffixes_go_into_the_local_part() {
+        assert_eq!(
+            with_local_suffix("bob@corp.example", "-2"),
+            "bob-2@corp.example"
+        );
+        let suffixed = with_local_suffix("bob@corp.example", "-17");
+        assert!(forge_db::username::is_upn(&suffixed), "{suffixed}");
+        assert_eq!(with_local_suffix("oidc", "-2"), "oidc-2");
+    }
 }

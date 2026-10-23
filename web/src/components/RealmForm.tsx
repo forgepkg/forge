@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 
 import type {
+  ClientAuthentication,
   CredentialForwardingConfig,
   OidcRealmConfig,
   RealmConfig,
@@ -8,46 +9,64 @@ import type {
   RealmView,
   WorkloadIdentityConfig,
 } from '~/api/realms'
-import { Button } from '~/components/catalyst/button'
+import { ADMIN_ROLE } from '~/api/rbac'
+import { useRoles } from '~/queries/useRbac'
 import {
+  Button,
   Checkbox,
-  CheckboxField,
-  CheckboxGroup,
-} from '~/components/catalyst/checkbox'
-import {
-  Description,
-  ErrorMessage,
-  Field,
-  FieldGroup,
-  Fieldset,
-  Label,
-  Legend,
-} from '~/components/catalyst/fieldset'
-import { Input } from '~/components/catalyst/input'
-import { Textarea } from '~/components/catalyst/textarea'
-import { Select } from '~/components/catalyst/select'
+  ChoiceCards,
+  Code,
+  Columns,
+  CopyField,
+  Dialog,
+  FormActions,
+  Icon,
+  Notice,
+  Panel,
+  SelectField,
+  Switch,
+  TextareaField,
+  TextField,
+  type ChoiceCard,
+  type IconName,
+} from '~/components/ui'
 
 /**
- * Shared auth-realm create/edit form (§12.7). Kind-conditional fields:
+ * Shared auth-realm create/edit form: a column of panels (General, then the
+ * kind's own), the buttons at its end, and a side column. Kind-conditional
+ * fields:
  *
- *  - **oidc** → issuer / client / write-only secret / claims / provisioning /
- *    login domains / button label
+ *  - **oidc** → identity provider (issuer / client / write-only secret or a
+ *    federated credential: Forge's own client assertions, no secret) /
+ *    sign-in (button label, login domains, required claims) / accounts
+ *    (claims, provisioning, admin mapping). The side column lists what to
+ *    enter in the IdP's app registration: the redirect URI and, for a
+ *    federated credential, the issuer, subject and audience it must name.
  *  - **credential_forwarding** → upstream URL / acceptance criteria /
- *    timeouts / groups / caching TTLs / write-only key pepper
+ *    write-only key pepper / groups / timeouts and caching TTLs / kept
+ *    password hashes
  *  - **workload_identity** (WIF) → public OIDC issuer / allowed audiences /
- *    bounded token lifetime / optional authorized parties / ordered
+ *    optional authorized parties / bounded token lifetime / ordered
  *    claim→role rules (no secrets, no redaction)
  *  - **local** → no config; only name + enabled are editable (built-in realm)
  *
- * On **create** the kind is selectable (local is built-in and cannot be
- * created); on **edit** it is fixed and shown read-only. Secrets follow the
- * RepositoryForm `upstream_password` pattern: never seeded from the (redacted)
- * GET, placeholder shows "set to replace" when `<key>_set` is true, and a
- * blank field keeps the stored secret on edit.
+ * On **create** the kind is chosen from cards (local is built-in and cannot
+ * be created); on **edit** it is fixed and shown read-only, and saving a realm
+ * people sign in with (local, OIDC, credential forwarding) as disabled asks
+ * first in a dialog, as the realm list's toggle does. Secrets follow the
+ * RepositoryForm `upstream_password` pattern: never seeded from the
+ * (redacted) GET, placeholder shows "set to replace" when `<key>_set` is
+ * true, and a blank field keeps the stored secret on edit — except that the
+ * server drops a stored OIDC client secret when the issuer or client ID
+ * changes, so the form then warns and requires a new one. A submit that fails
+ * validation moves focus to the first field it marks.
  *
- * String-array fields (scopes, login domains, groups, status lists) are
- * comma-separated text inputs parsed on submit; status lists parse to numbers.
- * Blank numeric fields are omitted so the server defaults apply.
+ * `PATCH` replaces the whole config, so every field is sent on each save.
+ * String-array fields (scopes, login domains, groups, audiences, claim
+ * values) are edited one entry per line: a value may contain commas (an LDAP
+ * DN such as `CN=Forge Admins,OU=Groups,DC=corp`) and must survive a save
+ * unchanged. Status lists are comma-separated numbers. Blank numeric fields
+ * are omitted so the server defaults apply.
  */
 
 /** A draft mirrors the form fields; numbers/lists stay strings while editing. */
@@ -62,6 +81,10 @@ export interface RealmFormValues {
   client_id: string
   /** Newly-typed secret; blank ⇒ "leave unchanged" on edit / invalid on create. */
   client_secret: string
+  client_authentication: ClientAuthentication
+  /** Blank ⇒ the server default, `api://AzureADTokenExchange`. */
+  assertion_audience: string
+  /** One scope per line. */
   scopes: string
   clock_skew_seconds: string
   allow_http_issuer: boolean
@@ -69,10 +92,14 @@ export interface RealmFormValues {
   email_claim: string
   display_name_claim: string
   link_existing_by_username: boolean
+  /** One group per line. */
   admin_groups: string
   admin_claim: string
+  /** One domain per line. */
   login_domains: string
-  /** One `claim = value, value` per line (parsed to a map on submit). */
+  /** One host per line. */
+  endpoint_hosts: string
+  /** One `claim = value` per line, a claim repeated per value (parsed to a map on submit). */
   required_claims: string
   button_label: string
   // credential_forwarding
@@ -82,11 +109,16 @@ export interface RealmFormValues {
   reject_status: string
   connect_timeout_ms: string
   request_timeout_ms: string
+  /** One group per line. */
   required_groups: string
   groups_path: string
   identity_path: string
   /** Credential forwarding: accept a plain-http, non-loopback URL. */
   allow_http: boolean
+  /** Credential forwarding: keep a hash of every password the upstream accepts. */
+  capture_password_hash: boolean
+  /** Credential forwarding: stop forwarding, sign in with the kept hashes. */
+  captured_password_only: boolean
   admin_group: string
   positive_ttl_secs: string
   negative_ttl_secs: string
@@ -94,17 +126,19 @@ export interface RealmFormValues {
   key_pepper: string
   // workload_identity (WIF). Reuses `issuer`, `allow_http_issuer`, and
   // `clock_skew_seconds` above since only one kind is active at a time.
-  /** Comma/newline-separated allowed audiences (parsed to string[] on submit). */
+  /** One allowed audience per line (parsed to string[] on submit). */
   allowed_audiences: string
-  /** Optional exact `azp` values for issuers that emit authorized-party claims. */
+  /** Optional exact `azp` values for issuers that emit authorized-party claims, one per line. */
   allowed_authorized_parties: string
-  /** Comma-separated extra identity claims (custom issuers). */
+  /** Extra identity claims (custom issuers), one per line. */
   identity_claims: string
   /** Maximum accepted token age and declared token lifetime. */
   max_token_age_seconds: string
   /** Expiry-bounded signature-verification cache TTL (`jti` tokens only). */
   positive_cache_seconds: string
-  /** Ordered claim→role rules; anyOf is a comma-separated string per condition. */
+  /** Lifetime of an API key the token exchange issues (blank ⇒ 3600). */
+  api_key_ttl_seconds: string
+  /** Ordered claim→role rules; anyOf holds one value per line per condition. */
   wifRules: Array<{
     role: string
     conditions: Array<{ claim: string; anyOf: string }>
@@ -124,33 +158,68 @@ export interface RealmFormProps {
   onSubmit: (values: RealmFormValues) => void
   /** Cancel affordance (navigates back to the list). */
   onCancel: () => void
+  /** The screen's panels for the side column, above the form's own. */
+  aside?: ReactNode
 }
 
-function joinList(list?: (string | number)[]): string {
+/**
+ * What stops working when a realm is disabled: the text of the confirmation
+ * the realm list and the edit form show before sending the disable. `null`
+ * for a kind that needs none.
+ */
+export function disableRealmWarning(kind: RealmKind, name: string): string | null {
+  switch (kind) {
+    case 'local':
+      return `Disabling ${name} stops every password login: browser sign-in and NuGet clients sending a password over Basic. API tokens keep working.`
+    case 'oidc':
+      return `Disabling ${name} stops sign-in through its identity provider: people who use it can no longer sign in to Forge. API tokens keep working.`
+    case 'credential_forwarding':
+      return `Disabling ${name} stops the logins it checks against its upstream: NuGet clients sending those passwords over Basic, and browser sign-in with them. API tokens keep working.`
+    case 'workload_identity':
+      return `Disabling ${name} stops its token exchange and revokes every API key it issued: CI jobs using one fail with 401 until they exchange a new token. Enabling the realm again does not bring the keys back.`
+    default:
+      return null
+  }
+}
+
+/** A string list as one entry per line (entries may contain commas). */
+function joinLines(list?: string[]): string {
+  return (list ?? []).join('\n')
+}
+
+/** Status codes as comma-separated text. */
+function joinNumbers(list?: number[]): string {
   return (list ?? []).join(', ')
 }
 
-/** `{ tid: ['a', 'b'] }` -> `tid = a, b` (one claim per line). */
+/** `{ tid: ['a', 'b'] }` -> `tid = a` and `tid = b`, one value per line. */
 export function formatClaimRules(rules?: Record<string, string[]>): string {
   return Object.entries(rules ?? {})
-    .map(([claim, values]) => `${claim} = ${values.join(', ')}`)
+    .flatMap(([claim, values]) => values.map((value) => `${claim} = ${value}`))
     .join('\n')
 }
 
-/** Parse `claim = value, value` lines into the `required_claims` map. */
+/**
+ * Parse `claim = value` lines into the `required_claims` map; a repeated
+ * claim collects its values. Only the first `=` separates, so a value may
+ * contain `=` and `,` (`groups = CN=Forge Users,OU=Groups,DC=corp`).
+ */
 export function parseClaimRules(raw: string): Record<string, string[]> {
   const rules: Record<string, string[]> = {}
-  for (const line of raw.split('\n')) {
+  for (const line of raw.split(/\r?\n/)) {
     const eq = line.indexOf('=')
     if (eq < 0) continue
     const claim = line.slice(0, eq).trim()
-    const values = parseList(line.slice(eq + 1))
-    if (claim !== '' && values.length > 0) rules[claim] = values
+    const value = line.slice(eq + 1).trim()
+    if (claim === '' || value === '') continue
+    const values = (rules[claim] ??= [])
+    if (!values.includes(value)) values.push(value)
   }
   return rules
 }
 
-function seed(existing?: RealmView): RealmFormValues {
+/** Form values for a new realm, or seeded from an existing one (edit). */
+export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
   const oidc = (existing?.kind === 'oidc' ? existing.config : {}) as OidcRealmConfig
   const fwd = (
     existing?.kind === 'credential_forwarding' ? existing.config : {}
@@ -162,13 +231,14 @@ function seed(existing?: RealmView): RealmFormValues {
     kind: existing?.kind ?? 'oidc',
     name: existing?.name ?? '',
     enabled: existing?.enabled ?? true,
-    auto_provision:
-      (existing?.kind === 'oidc' ? oidc.auto_provision : fwd.auto_provision) ?? true,
+    auto_provision: oidc.auto_provision ?? true,
     issuer: (existing?.kind === 'workload_identity' ? wif.issuer : oidc.issuer) ?? '',
     client_id: oidc.client_id ?? '',
     // Never seed secrets — they are write-only and redacted on read.
     client_secret: '',
-    scopes: joinList(oidc.scopes),
+    client_authentication: oidc.client_authentication ?? 'client_secret',
+    assertion_audience: oidc.assertion_audience ?? '',
+    scopes: joinLines(oidc.scopes),
     clock_skew_seconds:
       existing?.kind === 'workload_identity'
         ? wif.clock_skew_seconds != null
@@ -185,42 +255,91 @@ function seed(existing?: RealmView): RealmFormValues {
     email_claim: oidc.email_claim ?? '',
     display_name_claim: oidc.display_name_claim ?? '',
     link_existing_by_username: oidc.link_existing_by_username ?? false,
-    admin_groups: joinList(oidc.admin_groups),
+    admin_groups: joinLines(oidc.admin_groups),
     admin_claim: oidc.admin_claim ?? '',
-    login_domains: joinList(oidc.login_domains),
+    login_domains: joinLines(oidc.login_domains),
+    endpoint_hosts: joinLines(oidc.endpoint_hosts),
     required_claims: formatClaimRules(oidc.required_claims),
     button_label: oidc.button_label ?? '',
     url: fwd.url ?? '',
     method: fwd.method ?? '',
-    success_status: joinList(fwd.success_status),
-    reject_status: joinList(fwd.reject_status),
+    success_status: joinNumbers(fwd.success_status),
+    reject_status: joinNumbers(fwd.reject_status),
     connect_timeout_ms: fwd.connect_timeout_ms != null ? String(fwd.connect_timeout_ms) : '',
     request_timeout_ms: fwd.request_timeout_ms != null ? String(fwd.request_timeout_ms) : '',
-    required_groups: joinList(fwd.required_groups),
+    required_groups: joinLines(fwd.required_groups),
     groups_path: fwd.groups_path ?? '',
     identity_path: fwd.identity_path ?? '',
     allow_http: fwd.allow_http ?? false,
+    capture_password_hash: fwd.capture_password_hash ?? false,
+    captured_password_only: fwd.captured_password_only ?? false,
     admin_group: fwd.admin_group ?? '',
     positive_ttl_secs: fwd.positive_ttl_secs != null ? String(fwd.positive_ttl_secs) : '',
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
     key_pepper: '',
-    allowed_audiences: joinList(wif.allowed_audiences),
-    allowed_authorized_parties: joinList(wif.allowed_authorized_parties),
-    identity_claims: joinList(wif.identity_claims),
+    allowed_audiences: joinLines(wif.allowed_audiences),
+    allowed_authorized_parties: joinLines(wif.allowed_authorized_parties),
+    identity_claims: joinLines(wif.identity_claims),
     max_token_age_seconds:
       wif.max_token_age_seconds != null ? String(wif.max_token_age_seconds) : '',
     positive_cache_seconds:
       wif.positive_cache_seconds != null ? String(wif.positive_cache_seconds) : '',
+    api_key_ttl_seconds:
+      wif.api_key_ttl_seconds != null ? String(wif.api_key_ttl_seconds) : '',
     wifRules: (wif.rules ?? []).map((rule) => ({
       role: rule.role ?? '',
       conditions: (rule.conditions ?? []).map((c) => ({
         claim: c.claim ?? '',
-        anyOf: joinList(c.any_of),
+        anyOf: joinLines(c.any_of),
       })),
     })),
   }
 }
 
+/** Each realm kind in words, with its icon and one sentence on what it is for. */
+export const REALM_KINDS: Record<
+  RealmKind,
+  { label: string; icon: IconName; description: string }
+> = {
+  local: {
+    label: 'Local',
+    icon: 'Lock',
+    description: 'Usernames and passwords stored in Forge itself.',
+  },
+  oidc: {
+    label: 'OpenID Connect',
+    icon: 'Globe',
+    description:
+      'People sign in to Forge through your identity provider, such as Entra ID, Keycloak or Google.',
+  },
+  credential_forwarding: {
+    label: 'Credential forwarding',
+    icon: 'Key',
+    description:
+      'Forge checks the passwords of the accounts you create for it against an upstream HTTP endpoint.',
+  },
+  workload_identity: {
+    label: 'Workload identity',
+    icon: 'Terminal',
+    description:
+      'CI jobs, such as GitHub Actions or GitLab CI, authenticate with their OIDC token and get a role.',
+  },
+}
+
+/** The kinds a realm can be created as (local is built in). */
+const KIND_CARDS: ChoiceCard<RealmKind>[] = (
+  ['oidc', 'credential_forwarding', 'workload_identity'] as const
+).map((kind) => ({
+  id: kind,
+  title: REALM_KINDS[kind].label,
+  icon: REALM_KINDS[kind].icon,
+  description: REALM_KINDS[kind].description,
+}))
+
+/** The description of a list field edited one entry per line. */
+const ONE_PER_LINE = 'One per line.'
+
+/** The realm form itself (see the module comment above). */
 export function RealmForm({
   mode,
   existing,
@@ -228,9 +347,49 @@ export function RealmForm({
   serverError,
   onSubmit,
   onCancel,
+  aside,
 }: RealmFormProps) {
-  const [values, setValues] = useState<RealmFormValues>(() => seed(existing))
+  const [values, setValues] = useState<RealmFormValues>(() =>
+    seedRealmFormValues(existing),
+  )
   const [errors, setErrors] = useState<Record<string, string>>({})
+  const [confirmSave, setConfirmSave] = useState(false)
+  // Counts the submits that failed validation: each one moves focus to the
+  // first field marked invalid, whose error is read with it (the field errors
+  // are not live regions).
+  const [failedSubmits, setFailedSubmits] = useState(0)
+  const form = useRef<HTMLFormElement>(null)
+
+  useEffect(() => {
+    if (failedSubmits === 0) return
+    form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus()
+  }, [failedSubmits])
+
+  // Saving a realm as disabled ends the logins (or the keys) it serves, and
+  // any write to a workload-identity realm revokes the API keys it issued
+  // for good, so the save waits for an explicit confirmation, as the list's
+  // toggle does.
+  const saveWarning =
+    mode !== 'edit' || !existing?.enabled
+      ? null
+      : !values.enabled
+        ? disableRealmWarning(existing.kind, existing.name)
+        : existing.kind === 'workload_identity'
+          ? `Saving ${existing.name} revokes every API key it issued: CI jobs using one fail with 401 until they exchange a new token. The keys stay revoked.`
+          : null
+
+  // The server keeps a stored client secret only while the issuer and client
+  // ID stay the same (it must not reach another IdP), so after changing
+  // either one the save needs a new secret.
+  const storedOidc = (existing?.kind === 'oidc' ? existing.config : {}) as OidcRealmConfig
+  const usesClientSecret = values.client_authentication === 'client_secret'
+  const secretWillDrop =
+    mode === 'edit' &&
+    values.kind === 'oidc' &&
+    usesClientSecret &&
+    hasStoredSecret(existing, 'client_secret_set') &&
+    (secretBinding(values.issuer) !== secretBinding(storedOidc.issuer ?? '') ||
+      secretBinding(values.client_id) !== secretBinding(storedOidc.client_id ?? ''))
 
   function set<K extends keyof RealmFormValues>(key: K, value: RealmFormValues[K]) {
     setValues((v) => ({ ...v, [key]: value }))
@@ -248,8 +407,16 @@ export function RealmForm({
       if (values.client_id.trim() === '') {
         next.client_id = 'A client ID is required.'
       }
-      if (mode === 'create' && values.client_secret === '') {
+      if (!usesClientSecret) {
+        // Forge signs a client assertion instead: no secret.
+      } else if (
+        (mode === 'create' || !hasStoredSecret(existing, 'client_secret_set')) &&
+        values.client_secret === ''
+      ) {
         next.client_secret = 'A client secret is required.'
+      } else if (secretWillDrop && values.client_secret === '') {
+        next.client_secret =
+          'Enter the client secret for the new issuer or client ID.'
       }
       if (!isBlankNumber(values.clock_skew_seconds)) {
         next.clock_skew_seconds = 'Clock skew must be a non-negative number.'
@@ -285,7 +452,7 @@ export function RealmForm({
       } else if (!isUrlIsh(values.issuer)) {
         next.issuer = 'The issuer must be a valid URL.'
       }
-      if (parseList(values.allowed_audiences).length === 0) {
+      if (parseLines(values.allowed_audiences).length === 0) {
         next.allowed_audiences = 'At least one allowed audience is required.'
       }
       if (!isBlankNumberInRange(values.clock_skew_seconds, 0, 300)) {
@@ -296,6 +463,9 @@ export function RealmForm({
       }
       if (!isBlankNumberInRange(values.positive_cache_seconds, 0, 300)) {
         next.positive_cache_seconds = 'Positive cache TTL must be between 0 and 300 seconds.'
+      }
+      if (!isBlankNumberInRange(values.api_key_ttl_seconds, 60, 86400)) {
+        next.api_key_ttl_seconds = 'API key lifetime must be between 60 and 86400 seconds.'
       }
       if (values.wifRules.length === 0) {
         next.wifRules = 'At least one rule is required.'
@@ -321,7 +491,7 @@ export function RealmForm({
           if (cond.claim.trim() === '') {
             next[`wifRule.${ri}.cond.${ci}.claim`] = 'A claim is required.'
           }
-          if (parseList(cond.anyOf).length === 0) {
+          if (parseLines(cond.anyOf).length === 0) {
             next[`wifRule.${ri}.cond.${ci}.anyOf`] =
               'At least one value is required.'
           }
@@ -334,7 +504,23 @@ export function RealmForm({
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    if (!validate()) return
+    if (!validate()) {
+      setFailedSubmits((n) => n + 1)
+      return
+    }
+    if (saveWarning) {
+      setConfirmSave(true)
+      return
+    }
+    onSubmit(values)
+  }
+
+  function saveConfirmed() {
+    setConfirmSave(false)
+    if (!validate()) {
+      setFailedSubmits((n) => n + 1)
+      return
+    }
     onSubmit(values)
   }
 
@@ -350,6 +536,17 @@ export function RealmForm({
     setValues((v) => ({
       ...v,
       wifRules: v.wifRules.map((r, i) => (i === index ? update(r) : r)),
+    }))
+  }
+
+  function setCondition(
+    ruleIndex: number,
+    condIndex: number,
+    patch: Partial<RealmFormValues['wifRules'][number]['conditions'][number]>,
+  ) {
+    setRule(ruleIndex, (r) => ({
+      ...r,
+      conditions: r.conditions.map((c, i) => (i === condIndex ? { ...c, ...patch } : c)),
     }))
   }
 
@@ -384,750 +581,814 @@ export function RealmForm({
     }))
   }
 
+  const nameField = (
+    <TextField
+      label="Name"
+      mono
+      value={values.name}
+      onChange={(e) => set('name', e.target.value)}
+      autoFocus={mode === 'create'}
+      error={errors.name}
+    />
+  )
+
+  // The side column: the caller's panels, then what to enter at the IdP.
+  const registration = isOidc ? (
+    <AppRegistration values={values} saved={existing?.federated_credential} />
+  ) : null
+  const side =
+    aside || registration ? (
+      <>
+        {aside}
+        {registration}
+      </>
+    ) : undefined
+
   return (
-    <form onSubmit={handleSubmit} className="max-w-2xl space-y-6">
-      <Field>
-        <Label>Name</Label>
-        <Input
-          type="text"
-          value={values.name}
-          onChange={(e) => set('name', e.target.value)}
-          autoFocus={mode === 'create'}
-          invalid={!!errors.name}
-        />
-        {errors.name && <ErrorMessage role="alert">{errors.name}</ErrorMessage>}
-      </Field>
-
-      <Field>
-        <Label>Kind</Label>
-        {mode === 'create' ? (
-          <Select
-            value={values.kind}
-            onChange={(e) => set('kind', e.target.value as RealmKind)}
-          >
-            <option value="oidc">oidc</option>
-            <option value="credential_forwarding">credential_forwarding</option>
-            <option value="workload_identity">workload_identity</option>
-          </Select>
-        ) : (
-          <Input
-            type="text"
-            value={values.kind}
-            readOnly
-            aria-readonly="true"
-          />
-        )}
-        {mode === 'edit' && (
-          <Description>The kind cannot be changed after creation.</Description>
-        )}
-      </Field>
-
-      <CheckboxField>
-        <Checkbox
-          checked={values.enabled}
-          onChange={(c) => set('enabled', c)}
-        />
-        <Label>Enabled (used for sign-in / credential checks)</Label>
-      </CheckboxField>
-
-      {isLocal && (
-        <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
-          The local realm is built in (argon2 passwords); it has no
-          configuration beyond its name and enabled flag.
-        </p>
-      )}
-
-      {isOidc && (
-        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
-          <Legend>OIDC provider</Legend>
-          <FieldGroup>
-            <Field>
-              <Label>Issuer URL</Label>
-              <Input
-                type="text"
-                value={values.issuer}
-                onChange={(e) => set('issuer', e.target.value)}
-                placeholder="https://idp.example.com/realms/main"
-                invalid={!!errors.issuer}
-              />
-              {errors.issuer && (
-                <ErrorMessage role="alert">{errors.issuer}</ErrorMessage>
-              )}
-            </Field>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <Label>Client ID</Label>
-                <Input
-                  type="text"
-                  autoComplete="off"
-                  value={values.client_id}
-                  onChange={(e) => set('client_id', e.target.value)}
-                  invalid={!!errors.client_id}
+    <Columns aside={side} asideLabel="About this realm">
+      <form ref={form} onSubmit={handleSubmit} className="flex flex-col gap-6">
+        <Panel
+          title="General"
+          description={
+            isLocal
+              ? 'The local realm is built in (argon2 passwords); it has no configuration beyond its name and enabled flag.'
+              : undefined
+          }
+        >
+          <div className="fg-form">
+            {mode === 'edit' ? (
+              <div className="fg-fieldrow items-start">
+                {nameField}
+                <TextField
+                  label="Kind"
+                  value={REALM_KINDS[values.kind]?.label ?? values.kind}
+                  readOnly
+                  description="The kind cannot be changed after creation."
                 />
-                {errors.client_id && (
-                  <ErrorMessage role="alert">{errors.client_id}</ErrorMessage>
+              </div>
+            ) : (
+              nameField
+            )}
+          </div>
+          {mode === 'create' && (
+            <ChoiceCards
+              label="Kind"
+              name="realm-kind"
+              options={KIND_CARDS}
+              value={values.kind}
+              onChange={(kind) => set('kind', kind)}
+            />
+          )}
+          <Switch
+            label="Enabled"
+            aria-label="Enabled"
+            description="Used for sign-in and credential checks. A disabled realm is skipped."
+            checked={values.enabled}
+            onChange={(c) => {
+              set('enabled', c)
+              setConfirmSave(false)
+            }}
+          />
+        </Panel>
+
+        {isOidc && (
+          <>
+            <Panel
+              title="Identity provider"
+              description="The OpenID Connect provider people sign in with, and how Forge authenticates to it."
+            >
+              <div className="fg-form">
+                <TextField
+                  label="Issuer URL"
+                  mono
+                  value={values.issuer}
+                  onChange={(e) => set('issuer', e.target.value)}
+                  placeholder="https://idp.example.com/realms/main"
+                  error={errors.issuer}
+                />
+                <div className="fg-fieldrow items-start">
+                  <TextField
+                    label="Client ID"
+                    mono
+                    autoComplete="off"
+                    value={values.client_id}
+                    onChange={(e) => set('client_id', e.target.value)}
+                    error={errors.client_id}
+                  />
+                  <SelectField
+                    label="Client authentication"
+                    value={values.client_authentication}
+                    onChange={(e) =>
+                      set('client_authentication', e.target.value as ClientAuthentication)
+                    }
+                  >
+                    <option value="client_secret">Client secret</option>
+                    <option value="federated_credential">
+                      Federated credential (no secret)
+                    </option>
+                  </SelectField>
+                </div>
+                {usesClientSecret ? (
+                  <SecretField
+                    label="Client secret"
+                    error={errors.client_secret}
+                    value={values.client_secret}
+                    onChange={(v) => set('client_secret', v)}
+                    stored={mode === 'edit' && hasStoredSecret(existing, 'client_secret_set')}
+                    willDrop={secretWillDrop}
+                  />
+                ) : (
+                  <TextField
+                    label="Assertion audience"
+                    mono
+                    value={values.assertion_audience}
+                    onChange={(e) => set('assertion_audience', e.target.value)}
+                    placeholder={DEFAULT_ASSERTION_AUDIENCE}
+                    description={
+                      <>
+                        Leave blank for Entra&apos;s default. Sovereign clouds use their
+                        own (e.g. <Code>api://AzureADTokenExchangeUSGov</Code>). What the
+                        IdP&apos;s federated credential must name is under App
+                        registration.
+                      </>
+                    }
+                  />
                 )}
-              </Field>
-              <SecretField
-                label="Client secret"
-                error={errors.client_secret}
-                value={values.client_secret}
-                onChange={(v) => set('client_secret', v)}
-                stored={mode === 'edit' && hasStoredSecret(existing, 'client_secret_set')}
-              />
-            </div>
-
-            <Field>
-              <Label>Scopes</Label>
-              <Input
-                type="text"
-                value={values.scopes}
-                onChange={(e) => set('scopes', e.target.value)}
-                placeholder="openid, profile, email"
-              />
-              <ListHint />
-            </Field>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <Label>Clock skew (seconds)</Label>
-                <Input
+                {secretWillDrop && values.client_secret === '' && (
+                  <Notice tone="warn" role="status">
+                    The issuer or client ID differs from the stored one. The stored
+                    client secret will be dropped when you save, so enter the
+                    client secret for the new issuer or client ID.
+                  </Notice>
+                )}
+                <TextareaField
+                  label="Scopes"
+                  mono
+                  rows={3}
+                  value={values.scopes}
+                  onChange={(e) => set('scopes', e.target.value)}
+                  placeholder={'openid\nprofile\nemail'}
+                  description={ONE_PER_LINE}
+                />
+                <TextField
+                  label="Clock skew (seconds)"
                   type="number"
                   min={0}
+                  mono
                   value={values.clock_skew_seconds}
                   onChange={(e) => set('clock_skew_seconds', e.target.value)}
                   placeholder="60"
-                  invalid={!!errors.clock_skew_seconds}
+                  error={errors.clock_skew_seconds}
                 />
-                {errors.clock_skew_seconds && (
-                  <ErrorMessage role="alert">
-                    {errors.clock_skew_seconds}
-                  </ErrorMessage>
-                )}
-              </Field>
-              <Field>
-                <Label>Button label</Label>
-                <Input
-                  type="text"
+                <TextareaField
+                  label="Endpoint hosts"
+                  mono
+                  rows={2}
+                  value={values.endpoint_hosts}
+                  onChange={(e) => set('endpoint_hosts', e.target.value)}
+                  placeholder={'oauth2.googleapis.com\nwww.googleapis.com'}
+                  description="Hosts besides the issuer's that the IdP's token and key endpoints may use (Google, AWS Cognito). One per line; leave empty for most IdPs."
+                />
+                <Checkbox
+                  label="Allow plain-HTTP issuer (testing only)"
+                  checked={values.allow_http_issuer}
+                  onChange={(c) => set('allow_http_issuer', c)}
+                />
+              </div>
+            </Panel>
+
+            <Panel
+              title="Sign-in"
+              description="How the login screen leads people to this identity provider, and who may sign in through it."
+            >
+              <div className="fg-form">
+                <TextField
+                  label="Button label"
                   value={values.button_label}
                   onChange={(e) => set('button_label', e.target.value)}
                   placeholder="Login with SSO"
                 />
-              </Field>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-3">
-              <Field>
-                <Label>Username claim</Label>
-                <Input
-                  type="text"
-                  value={values.username_claim}
-                  onChange={(e) => set('username_claim', e.target.value)}
-                  placeholder="preferred_username"
+                <TextareaField
+                  label="Login domains"
+                  mono
+                  rows={2}
+                  value={values.login_domains}
+                  onChange={(e) => set('login_domains', e.target.value)}
+                  placeholder={'example.com\ncorp.example.com'}
+                  description="Email domains routed to this IdP by identifier-first login. One per line."
                 />
-              </Field>
-              <Field>
-                <Label>Email claim</Label>
-                <Input
-                  type="text"
-                  value={values.email_claim}
-                  onChange={(e) => set('email_claim', e.target.value)}
-                  placeholder="email"
+                <TextareaField
+                  label="Required claims"
+                  mono
+                  rows={2}
+                  value={values.required_claims}
+                  onChange={(e) => set('required_claims', e.target.value)}
+                  placeholder="tid = 00000000-0000-0000-0000-000000000000"
+                  description={
+                    <>
+                      Only tokens carrying one of the listed values may sign in. One{' '}
+                      <Code>claim = value</Code> per line; repeat the claim for each
+                      further value. Use it to restrict a multi-tenant app to your
+                      tenant (<Code>tid</Code>) or a Google Workspace domain (
+                      <Code>hd</Code>).
+                    </>
+                  }
                 />
-              </Field>
-              <Field>
-                <Label>Display-name claim</Label>
-                <Input
-                  type="text"
-                  value={values.display_name_claim}
-                  onChange={(e) => set('display_name_claim', e.target.value)}
-                  placeholder="name"
-                />
-              </Field>
-            </div>
+              </div>
+            </Panel>
 
-            <Field>
-              <Label>Login domains</Label>
-              <Input
-                type="text"
-                value={values.login_domains}
-                onChange={(e) => set('login_domains', e.target.value)}
-                placeholder="example.com, corp.example.com"
-              />
-              <Description>
-                Email domains routed to this IdP by identifier-first login.
-                Comma-separated.
-              </Description>
-            </Field>
-
-            <Field>
-              <Label>Required claims</Label>
-              <Textarea
-                rows={2}
-                value={values.required_claims}
-                onChange={(e) => set('required_claims', e.target.value)}
-                placeholder="tid = 00000000-0000-0000-0000-000000000000"
-              />
-              <Description>
-                Only tokens carrying one of the listed values may sign in, one
-                claim per line (<span className="font-mono">claim = value, value</span>).
-                Use it to restrict a multi-tenant app to your tenant
-                (<span className="font-mono">tid</span>) or a Google Workspace
-                domain (<span className="font-mono">hd</span>).
-              </Description>
-            </Field>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <Label>Admin groups</Label>
-                <Input
-                  type="text"
+            <Panel
+              title="Accounts"
+              description="How Forge names the accounts that sign in, and who becomes an administrator."
+            >
+              <div className="fg-form">
+                <div className="grid items-start gap-4 sm:grid-cols-3">
+                  <TextField
+                    label="Username claim"
+                    mono
+                    value={values.username_claim}
+                    onChange={(e) => set('username_claim', e.target.value)}
+                    placeholder="preferred_username"
+                  />
+                  <TextField
+                    label="Email claim"
+                    mono
+                    value={values.email_claim}
+                    onChange={(e) => set('email_claim', e.target.value)}
+                    placeholder="email"
+                  />
+                  <TextField
+                    label="Display-name claim"
+                    mono
+                    value={values.display_name_claim}
+                    onChange={(e) => set('display_name_claim', e.target.value)}
+                    placeholder="name"
+                  />
+                </div>
+                {/* Full width: a group may be a long LDAP DN. */}
+                <TextareaField
+                  label="Admin groups"
+                  mono
+                  rows={2}
                   value={values.admin_groups}
                   onChange={(e) => set('admin_groups', e.target.value)}
                   placeholder="forge-admins"
+                  description={ONE_PER_LINE}
                 />
-                <ListHint />
-              </Field>
-              <Field>
-                <Label>Admin claim</Label>
-                <Input
-                  type="text"
+                <TextField
+                  label="Admin claim"
+                  mono
                   value={values.admin_claim}
                   onChange={(e) => set('admin_claim', e.target.value)}
                   placeholder="roles"
                 />
-              </Field>
-            </div>
-
-            <CheckboxGroup>
-              <CheckboxField>
                 <Checkbox
+                  label="Auto-provision users on first login"
                   checked={values.auto_provision}
                   onChange={(c) => set('auto_provision', c)}
                 />
-                <Label>Auto-provision users on first login</Label>
-              </CheckboxField>
-              <CheckboxField>
                 <Checkbox
+                  label="Link existing users by username"
                   checked={values.link_existing_by_username}
                   onChange={(c) => set('link_existing_by_username', c)}
                 />
-                <Label>Link existing users by username</Label>
-              </CheckboxField>
-              <CheckboxField>
+              </div>
+            </Panel>
+          </>
+        )}
+
+        {isForwarding && (
+          <>
+            <Panel
+              title="Upstream"
+              description={
+                <>
+                  The realm signs in only the accounts created for it under{' '}
+                  <strong>Admin → Users</strong>, and sends the upstream the part of
+                  their name before the <Code>@</Code>: <Code>alice@example.com</Code>{' '}
+                  signs in as <Code>alice</Code>.
+                </>
+              }
+            >
+              <div className="fg-form">
+                <TextField
+                  label="Upstream URL"
+                  mono
+                  value={values.url}
+                  onChange={(e) => set('url', e.target.value)}
+                  placeholder="https://auth.example.com/check"
+                  error={errors.url}
+                />
+                <div className="grid items-start gap-4 sm:grid-cols-3">
+                  <TextField
+                    label="Method"
+                    mono
+                    value={values.method}
+                    onChange={(e) => set('method', e.target.value)}
+                    placeholder="GET"
+                  />
+                  <TextField
+                    label="Success statuses"
+                    mono
+                    value={values.success_status}
+                    onChange={(e) => set('success_status', e.target.value)}
+                    placeholder="200"
+                    error={errors.success_status}
+                  />
+                  <TextField
+                    label="Reject statuses"
+                    mono
+                    value={values.reject_status}
+                    onChange={(e) => set('reject_status', e.target.value)}
+                    placeholder="401, 403"
+                    error={errors.reject_status}
+                  />
+                </div>
+                <TextField
+                  label="Identity path"
+                  mono
+                  value={values.identity_path}
+                  onChange={(e) => set('identity_path', e.target.value)}
+                  placeholder="login"
+                  description="Where the upstream's success response names the account it authenticated. When set, that name must equal the username entered. Required when the upstream accepts a secret with any username (personal access tokens); leave empty only if the upstream itself binds the username to the password."
+                />
+                <SecretField
+                  label="Key pepper"
+                  error={errors.key_pepper}
+                  value={values.key_pepper}
+                  onChange={(v) => set('key_pepper', v)}
+                  stored={mode === 'edit' && hasStoredSecret(existing, 'key_pepper_set')}
+                />
                 <Checkbox
-                  checked={values.allow_http_issuer}
-                  onChange={(c) => set('allow_http_issuer', c)}
+                  label="Allow a plain-http upstream"
+                  aria-label="Allow a plain-http upstream"
+                  description="Every login sends the user's password to the upstream URL, so it must be https (or a loopback address) unless this is checked."
+                  checked={values.allow_http}
+                  onChange={(c) => set('allow_http', c)}
                 />
-                <Label>Allow plain-HTTP issuer (testing only)</Label>
-              </CheckboxField>
-            </CheckboxGroup>
-          </FieldGroup>
-        </Fieldset>
-      )}
+              </div>
+            </Panel>
 
-      {isForwarding && (
-        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
-          <Legend>Credential-forwarding upstream</Legend>
-          <FieldGroup>
-            <Field>
-              <Label>Upstream URL</Label>
-              <Input
-                type="text"
-                value={values.url}
-                onChange={(e) => set('url', e.target.value)}
-                placeholder="https://auth.example.com/check"
-                invalid={!!errors.url}
-              />
-              {errors.url && (
-                <ErrorMessage role="alert">{errors.url}</ErrorMessage>
-              )}
-            </Field>
-
-            <div className="grid gap-4 sm:grid-cols-3">
-              <Field>
-                <Label>Method</Label>
-                <Input
-                  type="text"
-                  value={values.method}
-                  onChange={(e) => set('method', e.target.value)}
-                  placeholder="GET"
-                />
-              </Field>
-              <Field>
-                <Label>Success statuses</Label>
-                <Input
-                  type="text"
-                  value={values.success_status}
-                  onChange={(e) => set('success_status', e.target.value)}
-                  placeholder="200"
-                  invalid={!!errors.success_status}
-                />
-                {errors.success_status && (
-                  <ErrorMessage role="alert">
-                    {errors.success_status}
-                  </ErrorMessage>
-                )}
-              </Field>
-              <Field>
-                <Label>Reject statuses</Label>
-                <Input
-                  type="text"
-                  value={values.reject_status}
-                  onChange={(e) => set('reject_status', e.target.value)}
-                  placeholder="401, 403"
-                  invalid={!!errors.reject_status}
-                />
-                {errors.reject_status && (
-                  <ErrorMessage role="alert">
-                    {errors.reject_status}
-                  </ErrorMessage>
-                )}
-              </Field>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <Label>Connect timeout (ms)</Label>
-                <Input
-                  type="number"
-                  min={0}
-                  value={values.connect_timeout_ms}
-                  onChange={(e) => set('connect_timeout_ms', e.target.value)}
-                  placeholder="2000"
-                  invalid={!!errors.connect_timeout_ms}
-                />
-                {errors.connect_timeout_ms && (
-                  <ErrorMessage role="alert">
-                    {errors.connect_timeout_ms}
-                  </ErrorMessage>
-                )}
-              </Field>
-              <Field>
-                <Label>Request timeout (ms)</Label>
-                <Input
-                  type="number"
-                  min={0}
-                  value={values.request_timeout_ms}
-                  onChange={(e) => set('request_timeout_ms', e.target.value)}
-                  placeholder="5000"
-                  invalid={!!errors.request_timeout_ms}
-                />
-                {errors.request_timeout_ms && (
-                  <ErrorMessage role="alert">
-                    {errors.request_timeout_ms}
-                  </ErrorMessage>
-                )}
-              </Field>
-            </div>
-
-            <div className="grid gap-4 sm:grid-cols-3">
-              <Field>
-                <Label>Required groups</Label>
-                <Input
-                  type="text"
+            <Panel
+              title="Groups"
+              description="Read from the upstream's success response at the groups path."
+            >
+              <div className="fg-form">
+                <TextareaField
+                  label="Required groups"
+                  mono
+                  rows={2}
                   value={values.required_groups}
                   onChange={(e) => set('required_groups', e.target.value)}
                   placeholder="developers"
+                  description={ONE_PER_LINE}
                 />
-                <ListHint />
-              </Field>
-              <Field>
-                <Label>Groups path</Label>
-                <Input
-                  type="text"
-                  value={values.groups_path}
-                  onChange={(e) => set('groups_path', e.target.value)}
-                  placeholder="user.groups"
-                />
-              </Field>
-              <Field>
-                <Label>Admin group</Label>
-                <Input
-                  type="text"
-                  value={values.admin_group}
-                  onChange={(e) => set('admin_group', e.target.value)}
-                />
-              </Field>
-            </div>
+                <div className="fg-fieldrow items-start">
+                  <TextField
+                    label="Groups path"
+                    mono
+                    value={values.groups_path}
+                    onChange={(e) => set('groups_path', e.target.value)}
+                    placeholder="user.groups"
+                  />
+                  <TextField
+                    label="Admin group"
+                    mono
+                    value={values.admin_group}
+                    onChange={(e) => set('admin_group', e.target.value)}
+                  />
+                </div>
+              </div>
+            </Panel>
 
-            <Field>
-              <Label>Identity path</Label>
-              <Input
-                type="text"
-                value={values.identity_path}
-                onChange={(e) => set('identity_path', e.target.value)}
-                placeholder="login"
-              />
-              <Description>
-                Where the upstream&apos;s success response names the account it
-                authenticated. When set, that name must equal the username
-                entered. Required when the upstream accepts a secret with any
-                username (personal access tokens); leave empty only if the
-                upstream itself binds the username to the password.
-              </Description>
-            </Field>
+            <Panel
+              title="Timeouts and cache"
+              description="How long Forge waits for the upstream, and how long it remembers an answer. Leave a field blank for its default."
+            >
+              <div className="fg-form">
+                <div className="fg-fieldrow items-start">
+                  <TextField
+                    label="Connect timeout (ms)"
+                    type="number"
+                    min={0}
+                    mono
+                    value={values.connect_timeout_ms}
+                    onChange={(e) => set('connect_timeout_ms', e.target.value)}
+                    placeholder="2000"
+                    error={errors.connect_timeout_ms}
+                  />
+                  <TextField
+                    label="Request timeout (ms)"
+                    type="number"
+                    min={0}
+                    mono
+                    value={values.request_timeout_ms}
+                    onChange={(e) => set('request_timeout_ms', e.target.value)}
+                    placeholder="5000"
+                    error={errors.request_timeout_ms}
+                  />
+                </div>
+                <div className="fg-fieldrow items-start">
+                  <TextField
+                    label="Positive cache TTL (seconds)"
+                    type="number"
+                    min={0}
+                    mono
+                    value={values.positive_ttl_secs}
+                    onChange={(e) => set('positive_ttl_secs', e.target.value)}
+                    placeholder="300"
+                    error={errors.positive_ttl_secs}
+                  />
+                  <TextField
+                    label="Negative cache TTL (seconds)"
+                    type="number"
+                    min={0}
+                    mono
+                    value={values.negative_ttl_secs}
+                    onChange={(e) => set('negative_ttl_secs', e.target.value)}
+                    placeholder="30"
+                    error={errors.negative_ttl_secs}
+                  />
+                </div>
+              </div>
+            </Panel>
 
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <Label>Positive cache TTL (seconds)</Label>
-                <Input
+            <Panel
+              title="Retiring the upstream"
+              description="Keep the passwords the upstream accepts, so its users can go on signing in once it is gone."
+            >
+              <div className="fg-form">
+                <Checkbox
+                  label="Keep a password hash of successful logins"
+                  aria-label="Keep a password hash of successful logins"
+                  description="Stores an argon2id hash of each password the upstream accepts on the user's account, so the users can keep signing in once the upstream is retired. The upstream stays in charge while it is asked. Unchecking deletes the kept hashes."
+                  checked={values.capture_password_hash}
+                  onChange={(c) => {
+                    set('capture_password_hash', c)
+                    // Without kept hashes there is nothing to sign in with.
+                    if (!c) set('captured_password_only', false)
+                  }}
+                />
+                <Checkbox
+                  label="Stop forwarding: sign in with kept passwords only"
+                  aria-label="Stop forwarding: sign in with kept passwords only"
+                  description="The upstream is no longer asked; users sign in with the last password it accepted for them. Users without a kept hash can no longer sign in through this realm."
+                  checked={values.captured_password_only}
+                  disabled={!values.capture_password_hash}
+                  onChange={(c) => set('captured_password_only', c)}
+                />
+              </div>
+            </Panel>
+          </>
+        )}
+
+        {isWorkloadIdentity && (
+          <>
+            <Panel
+              title="Token issuer"
+              description="The CI provider whose OIDC tokens this realm accepts."
+            >
+              <div className="fg-form">
+                <TextField
+                  label="Issuer URL"
+                  mono
+                  value={values.issuer}
+                  onChange={(e) => set('issuer', e.target.value)}
+                  placeholder="https://token.actions.githubusercontent.com"
+                  description="The OIDC issuer whose public JWKS validates incoming tokens."
+                  error={errors.issuer}
+                />
+                <TextareaField
+                  label="Allowed audiences"
+                  mono
+                  rows={2}
+                  value={values.allowed_audiences}
+                  onChange={(e) => set('allowed_audiences', e.target.value)}
+                  placeholder="https://forge.example.com"
+                  description={ONE_PER_LINE}
+                  error={errors.allowed_audiences}
+                />
+                <TextareaField
+                  label="Allowed authorized parties"
+                  mono
+                  rows={2}
+                  value={values.allowed_authorized_parties}
+                  onChange={(e) => set('allowed_authorized_parties', e.target.value)}
+                  placeholder="Optional azp values"
+                  description={
+                    <>
+                      Optional exact <Code>azp</Code> allowlist for issuers that emit it,
+                      one per line. Leave blank for GitHub Actions and GitLab CI.
+                    </>
+                  }
+                />
+                <TextareaField
+                  label="Identity claims"
+                  mono
+                  rows={2}
+                  value={values.identity_claims}
+                  onChange={(e) => set('identity_claims', e.target.value)}
+                  placeholder="Optional, e.g. pipeline_id"
+                  description={
+                    <>
+                      Claims a custom CI issuer uses as a stable workload identity, one
+                      per line. Each rule must pin one of them or a built-in identity
+                      claim (<Code>sub</Code>, <Code>repository_id</Code>,{' '}
+                      <Code>job_project_id</Code>, …). Leave blank for GitHub Actions
+                      and GitLab.
+                    </>
+                  }
+                />
+                <Checkbox
+                  label="Allow plain-HTTP issuer (testing only)"
+                  checked={values.allow_http_issuer}
+                  onChange={(c) => set('allow_http_issuer', c)}
+                />
+              </div>
+            </Panel>
+
+            <Panel
+              title="Lifetimes"
+              description="Bounds on the tokens the realm accepts and on the keys it issues. Leave a field blank for its default."
+            >
+              <div className="fg-form">
+                <TextField
+                  label="Clock skew (seconds)"
                   type="number"
                   min={0}
-                  value={values.positive_ttl_secs}
-                  onChange={(e) => set('positive_ttl_secs', e.target.value)}
-                  placeholder="300"
-                  invalid={!!errors.positive_ttl_secs}
+                  max={300}
+                  mono
+                  value={values.clock_skew_seconds}
+                  onChange={(e) => set('clock_skew_seconds', e.target.value)}
+                  placeholder="60"
+                  error={errors.clock_skew_seconds}
                 />
-                {errors.positive_ttl_secs && (
-                  <ErrorMessage role="alert">
-                    {errors.positive_ttl_secs}
-                  </ErrorMessage>
-                )}
-              </Field>
-              <Field>
-                <Label>Negative cache TTL (seconds)</Label>
-                <Input
+                <TextField
+                  label="Maximum token age (seconds)"
+                  type="number"
+                  min={1}
+                  max={86400}
+                  mono
+                  value={values.max_token_age_seconds}
+                  onChange={(e) => set('max_token_age_seconds', e.target.value)}
+                  placeholder="39600"
+                  description="Bounds both token age and declared lifetime. GitHub tokens are normally 10 minutes; GitLab tokens last as long as the job timeout. Use the shortest value your CI jobs support."
+                  error={errors.max_token_age_seconds}
+                />
+                <TextField
+                  label="Positive verification cache (seconds)"
                   type="number"
                   min={0}
-                  value={values.negative_ttl_secs}
-                  onChange={(e) => set('negative_ttl_secs', e.target.value)}
-                  placeholder="30"
-                  invalid={!!errors.negative_ttl_secs}
+                  max={300}
+                  mono
+                  value={values.positive_cache_seconds}
+                  onChange={(e) => set('positive_cache_seconds', e.target.value)}
+                  placeholder="60"
+                  description={
+                    <>
+                      Caches signature verification only for tokens with{' '}
+                      <Code>jti</Code>, never beyond <Code>exp</Code>. Claim rules and
+                      roles are still evaluated on every request. Use 0 to disable.
+                    </>
+                  }
+                  error={errors.positive_cache_seconds}
                 />
-                {errors.negative_ttl_secs && (
-                  <ErrorMessage role="alert">
-                    {errors.negative_ttl_secs}
-                  </ErrorMessage>
-                )}
-              </Field>
-            </div>
+                <TextField
+                  label="Exchanged API key lifetime (seconds)"
+                  type="number"
+                  min={60}
+                  max={86400}
+                  mono
+                  value={values.api_key_ttl_seconds}
+                  onChange={(e) => set('api_key_ttl_seconds', e.target.value)}
+                  placeholder="3600"
+                  description={
+                    <>
+                      How long a key from the token exchange (
+                      <Code>POST /api/v2/token</Code>) stays valid, whatever the CI
+                      token&apos;s own lifetime. Editing this realm revokes all of its
+                      outstanding keys.
+                    </>
+                  }
+                  error={errors.api_key_ttl_seconds}
+                />
+              </div>
+            </Panel>
 
-            <SecretField
-              label="Key pepper"
-              error={errors.key_pepper}
-              value={values.key_pepper}
-              onChange={(v) => set('key_pepper', v)}
-              stored={mode === 'edit' && hasStoredSecret(existing, 'key_pepper_set')}
-            />
-
-            <CheckboxField>
-              <Checkbox
-                checked={values.auto_provision}
-                onChange={(c) => set('auto_provision', c)}
-              />
-              <Label>Auto-provision users on first successful check</Label>
-            </CheckboxField>
-            <CheckboxField>
-              <Checkbox
-                checked={values.allow_http}
-                onChange={(c) => set('allow_http', c)}
-              />
-              <Label>Allow a plain-http upstream</Label>
-              <Description>
-                Every login sends the user&apos;s password to the upstream URL,
-                so it must be https (or a loopback address) unless this is
-                checked.
-              </Description>
-            </CheckboxField>
-          </FieldGroup>
-        </Fieldset>
-      )}
-
-      {isWorkloadIdentity && (
-        <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
-          <Legend>Workload-identity federation</Legend>
-          <FieldGroup>
-            <Field>
-              <Label>Issuer URL</Label>
-              <Input
-                type="text"
-                value={values.issuer}
-                onChange={(e) => set('issuer', e.target.value)}
-                placeholder="https://token.actions.githubusercontent.com"
-                invalid={!!errors.issuer}
-              />
-              <Description>
-                The OIDC issuer whose public JWKS validates incoming tokens.
-              </Description>
-              {errors.issuer && (
-                <ErrorMessage role="alert">{errors.issuer}</ErrorMessage>
-              )}
-            </Field>
-
-            <Field>
-              <Label>Allowed audiences</Label>
-              <Input
-                type="text"
-                value={values.allowed_audiences}
-                onChange={(e) => set('allowed_audiences', e.target.value)}
-                placeholder="https://forge.example.com"
-                invalid={!!errors.allowed_audiences}
-              />
-              <ListHint />
-              {errors.allowed_audiences && (
-                <ErrorMessage role="alert">
-                  {errors.allowed_audiences}
-                </ErrorMessage>
-              )}
-            </Field>
-
-            <Field>
-              <Label>Clock skew (seconds)</Label>
-              <Input
-                type="number"
-                min={0}
-                max={300}
-                value={values.clock_skew_seconds}
-                onChange={(e) => set('clock_skew_seconds', e.target.value)}
-                placeholder="60"
-                invalid={!!errors.clock_skew_seconds}
-              />
-              {errors.clock_skew_seconds && (
-                <ErrorMessage role="alert">
-                  {errors.clock_skew_seconds}
-                </ErrorMessage>
-              )}
-            </Field>
-
-            <Field>
-              <Label>Maximum token age (seconds)</Label>
-              <Input
-                type="number"
-                min={1}
-                max={86400}
-                value={values.max_token_age_seconds}
-                onChange={(e) => set('max_token_age_seconds', e.target.value)}
-                placeholder="3600"
-                invalid={!!errors.max_token_age_seconds}
-              />
-              <Description>
-                Bounds both token age and declared lifetime. GitHub tokens are
-                normally 10 minutes; use the shortest value your CI jobs support.
-              </Description>
-              {errors.max_token_age_seconds && (
-                <ErrorMessage role="alert">
-                  {errors.max_token_age_seconds}
-                </ErrorMessage>
-              )}
-            </Field>
-
-            <Field>
-              <Label>Allowed authorized parties</Label>
-              <Input
-                type="text"
-                value={values.allowed_authorized_parties}
-                onChange={(e) => set('allowed_authorized_parties', e.target.value)}
-                placeholder="Optional azp values"
-              />
-              <Description>
-                Optional exact <code>azp</code> allowlist for issuers that emit
-                it. Leave blank for GitHub Actions and GitLab CI.
-              </Description>
-            </Field>
-
-            <Field>
-              <Label>Identity claims</Label>
-              <Input
-                type="text"
-                value={values.identity_claims}
-                onChange={(e) => set('identity_claims', e.target.value)}
-                placeholder="Optional, e.g. pipeline_id"
-              />
-              <Description>
-                Claims a custom CI issuer uses as a stable workload identity.
-                Each rule must pin one of them or a built-in identity claim
-                (<code>sub</code>, <code>repository_id</code>,{' '}
-                <code>job_project_id</code>, …). Leave blank for GitHub Actions
-                and GitLab.
-              </Description>
-            </Field>
-
-            <Field>
-              <Label>Positive verification cache (seconds)</Label>
-              <Input
-                type="number"
-                min={0}
-                max={300}
-                value={values.positive_cache_seconds}
-                onChange={(e) => set('positive_cache_seconds', e.target.value)}
-                placeholder="60"
-                invalid={!!errors.positive_cache_seconds}
-              />
-              <Description>
-                Caches signature verification only for tokens with <code>jti</code>,
-                never beyond <code>exp</code>. Claim rules and roles are still
-                evaluated on every request. Use 0 to disable.
-              </Description>
-              {errors.positive_cache_seconds && (
-                <ErrorMessage role="alert">
-                  {errors.positive_cache_seconds}
-                </ErrorMessage>
-              )}
-            </Field>
-
-            <CheckboxField>
-              <Checkbox
-                checked={values.allow_http_issuer}
-                onChange={(c) => set('allow_http_issuer', c)}
-              />
-              <Label>Allow plain-HTTP issuer (testing only)</Label>
-            </CheckboxField>
-
-            <Field>
-              <Label>Rules</Label>
-              <Description>
-                Ordered; the first rule whose conditions all match grants its
-                role. Every rule needs a workload identity condition; ref or
-                environment alone is not enough. Public GitHub/GitLab issuers
-                require immutable numeric repository/project and owner/namespace
-                IDs. Global admin is not allowed; grant a repository-scoped role.
-              </Description>
-              {errors.wifRules && (
-                <ErrorMessage role="alert">{errors.wifRules}</ErrorMessage>
-              )}
-            </Field>
-
-            <div className="space-y-4">
+            <Panel
+              title="Rules"
+              count={values.wifRules.length}
+              description="Ordered; the first rule whose conditions all match grants its role. Every rule needs a workload identity condition; ref or environment alone is not enough. Public GitHub/GitLab issuers require immutable numeric repository/project and owner/namespace IDs. Global admin is not allowed; grant a repository-scoped role."
+            >
+              {errors.wifRules && <FormError>{errors.wifRules}</FormError>}
               {values.wifRules.map((rule, ri) => (
                 <div
                   key={ri}
-                  className="rounded-lg border border-zinc-950/10 p-4 dark:border-white/10"
+                  className="grid gap-4 rounded-md border border-line p-4"
                 >
-                  <div className="flex items-start justify-between gap-3">
-                    <Field className="flex-1">
-                      <Label>Role</Label>
-                      <Input
-                        type="text"
-                        value={rule.role}
-                        onChange={(e) =>
-                          setRule(ri, (r) => ({ ...r, role: e.target.value }))
-                        }
-                        placeholder="ci-deployer"
-                        invalid={!!errors[`wifRule.${ri}.role`]}
-                      />
-                      {errors[`wifRule.${ri}.role`] && (
-                        <ErrorMessage role="alert">
-                          {errors[`wifRule.${ri}.role`]}
-                        </ErrorMessage>
-                      )}
-                    </Field>
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="fg-subtitle">Rule {ri + 1}</h3>
                     <Button
-                      type="button"
-                      plain
+                      size="sm"
+                      variant="ghost"
+                      icon="Trash"
                       onClick={() => removeRule(ri)}
                       aria-label={`Remove rule ${ri + 1}`}
                     >
                       Remove rule
                     </Button>
                   </div>
-
-                  <div className="mt-4 space-y-3">
-                    {errors[`wifRule.${ri}.conditions`] && (
-                      <Field>
-                        <ErrorMessage role="alert">
-                          {errors[`wifRule.${ri}.conditions`]}
-                        </ErrorMessage>
-                      </Field>
-                    )}
-                    {rule.conditions.map((cond, ci) => (
-                      <div
-                        key={ci}
-                        className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end"
-                      >
-                        <Field>
-                          <Label>Claim</Label>
-                          <Input
-                            type="text"
-                            value={cond.claim}
-                            onChange={(e) =>
-                              setRule(ri, (r) => ({
-                                ...r,
-                                conditions: r.conditions.map((c, i) =>
-                                  i === ci ? { ...c, claim: e.target.value } : c,
-                                ),
-                              }))
-                            }
-                            placeholder="repository"
-                            invalid={!!errors[`wifRule.${ri}.cond.${ci}.claim`]}
-                          />
-                          {errors[`wifRule.${ri}.cond.${ci}.claim`] && (
-                            <ErrorMessage role="alert">
-                              {errors[`wifRule.${ri}.cond.${ci}.claim`]}
-                            </ErrorMessage>
-                          )}
-                        </Field>
-                        <Field>
-                          <Label>Any of</Label>
-                          <Input
-                            type="text"
-                            value={cond.anyOf}
-                            onChange={(e) =>
-                              setRule(ri, (r) => ({
-                                ...r,
-                                conditions: r.conditions.map((c, i) =>
-                                  i === ci ? { ...c, anyOf: e.target.value } : c,
-                                ),
-                              }))
-                            }
-                            placeholder="acme/api, acme/web"
-                            invalid={!!errors[`wifRule.${ri}.cond.${ci}.anyOf`]}
-                          />
-                          <ListHint />
-                          {errors[`wifRule.${ri}.cond.${ci}.anyOf`] && (
-                            <ErrorMessage role="alert">
-                              {errors[`wifRule.${ri}.cond.${ci}.anyOf`]}
-                            </ErrorMessage>
-                          )}
-                        </Field>
-                        <Button
-                          type="button"
-                          plain
-                          onClick={() => removeCondition(ri, ci)}
-                          aria-label={`Remove condition ${ci + 1} of rule ${ri + 1}`}
-                        >
-                          Remove
-                        </Button>
-                      </div>
-                    ))}
-                    <Button
-                      type="button"
-                      outline
-                      onClick={() => addCondition(ri)}
+                  <div className="fg-form">
+                    <WifRolePicker
+                      value={rule.role}
+                      onChange={(role) => setRule(ri, (r) => ({ ...r, role }))}
+                      error={errors[`wifRule.${ri}.role`]}
+                    />
+                  </div>
+                  {errors[`wifRule.${ri}.conditions`] && (
+                    <FormError>{errors[`wifRule.${ri}.conditions`]}</FormError>
+                  )}
+                  {rule.conditions.map((cond, ci) => (
+                    <div
+                      key={ci}
+                      className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-start"
                     >
+                      <TextField
+                        label="Claim"
+                        mono
+                        value={cond.claim}
+                        onChange={(e) => setCondition(ri, ci, { claim: e.target.value })}
+                        placeholder="repository"
+                        error={errors[`wifRule.${ri}.cond.${ci}.claim`]}
+                      />
+                      <TextareaField
+                        label="Any of"
+                        mono
+                        rows={2}
+                        value={cond.anyOf}
+                        onChange={(e) => setCondition(ri, ci, { anyOf: e.target.value })}
+                        placeholder={'acme/api\nacme/web'}
+                        description={ONE_PER_LINE}
+                        error={errors[`wifRule.${ri}.cond.${ci}.anyOf`]}
+                      />
+                      <Button
+                        variant="ghost"
+                        icon="X"
+                        iconOnly
+                        title="Remove condition"
+                        aria-label={`Remove condition ${ci + 1} of rule ${ri + 1}`}
+                        onClick={() => removeCondition(ri, ci)}
+                        className="sm:mt-[26px]"
+                      >
+                        Remove
+                      </Button>
+                    </div>
+                  ))}
+                  <div>
+                    <Button size="sm" icon="Plus" onClick={() => addCondition(ri)}>
                       Add condition
                     </Button>
                   </div>
                 </div>
               ))}
-              <Button type="button" outline onClick={addRule}>
-                Add rule
-              </Button>
-            </div>
-          </FieldGroup>
-        </Fieldset>
-      )}
+              <div>
+                <Button icon="Plus" onClick={addRule}>
+                  Add rule
+                </Button>
+              </div>
+            </Panel>
+          </>
+        )}
 
-      {serverError && (
-        <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-          {serverError}
-        </p>
-      )}
+        {serverError && (
+          <Notice
+            tone="danger"
+            title={mode === 'create' ? 'Could not create the realm' : 'Could not save the realm'}
+          >
+            {serverError}
+          </Notice>
+        )}
 
-      <div className="flex items-center gap-3">
-        <Button type="submit" disabled={submitting}>
-          {submitting
-            ? 'Saving…'
-            : mode === 'create'
-              ? 'Create realm'
-              : 'Save changes'}
-        </Button>
-        <Button type="button" outline onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
-    </form>
+        <FormActions>
+          <Button variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            variant="primary"
+            icon={mode === 'create' ? 'Plus' : undefined}
+            disabled={submitting}
+          >
+            {submitting
+              ? 'Saving…'
+              : mode === 'create'
+                ? 'Create realm'
+                : 'Save changes'}
+          </Button>
+        </FormActions>
+      </form>
+
+      {saveWarning && (
+        <Dialog
+          open={confirmSave}
+          onClose={() => setConfirmSave(false)}
+          title={values.enabled ? `Save ${existing?.name}?` : `Disable ${existing?.name}?`}
+          description={saveWarning}
+          icon="Alert"
+          tone="warn"
+          confirmLabel={values.enabled ? 'Save and revoke keys' : 'Disable and save'}
+          confirmVariant="danger-solid"
+          confirmDisabled={submitting}
+          onConfirm={saveConfirmed}
+        />
+      )}
+    </Columns>
+  )
+}
+
+/** The audience Entra recommends for a federated identity credential. */
+const DEFAULT_ASSERTION_AUDIENCE = 'api://AzureADTokenExchange'
+
+/** Where the IdP sends people back to after an OIDC sign-in, under Forge's public base URL. */
+const OIDC_CALLBACK_PATH = '/auth/oidc/callback'
+
+/**
+ * The subject of Forge's client assertions for a realm, as the server derives
+ * it: `<client id>@<issuer without a trailing slash>`.
+ */
+export function federatedSubject(issuer: string, clientId: string): string {
+  return `${clientId.trim()}@${issuer.trim().replace(/\/+$/, '')}`
+}
+
+/**
+ * What to enter in the app registration at the IdP, for the side column of an
+ * OIDC realm. The redirect URI is the same for every OIDC realm: Forge's
+ * public base URL (as the saved federated credential names it, else as this
+ * page was reached) plus `/auth/oidc/callback`. With a federated credential
+ * (Forge's own client assertions), also the issuer, subject and audience the
+ * IdP's credential must name (Entra: Certificates & secrets → Federated
+ * credentials → Other issuer). Subject and audience follow the form; Forge's
+ * issuer URL is known once the realm is saved.
+ */
+function AppRegistration({
+  values,
+  saved,
+}: {
+  values: RealmFormValues
+  saved?: RealmView['federated_credential']
+}) {
+  const base = (saved?.issuer ?? window.location.origin).replace(/\/+$/, '')
+  const federated = values.client_authentication === 'federated_credential'
+  const subject =
+    values.issuer.trim() !== '' && values.client_id.trim() !== ''
+      ? federatedSubject(values.issuer, values.client_id)
+      : null
+  const audience = values.assertion_audience.trim() || DEFAULT_ASSERTION_AUDIENCE
+  return (
+    <Panel
+      title="App registration"
+      description="What to enter for Forge in the app registration at the identity provider."
+    >
+      <CopyField
+        label="Redirect URI"
+        value={`${base}${OIDC_CALLBACK_PATH}`}
+        copyLabel="Copy redirect URI"
+        description={
+          <>
+            Forge&apos;s public base URL followed by <Code>{OIDC_CALLBACK_PATH}</Code>.
+          </>
+        }
+      />
+      {federated && (
+        <>
+          <hr className="fg-divider" />
+          <h3 className="fg-subtitle">Federated credential</h3>
+          <p className="fg-text fg-text--small">
+            Forge signs in at the IdP with a client assertion it signs itself, as an
+            OpenID Connect issuer publishing{' '}
+            <Code>/.well-known/openid-configuration</Code> and its keys (rotated
+            automatically). Add a federated credential for an <em>other issuer</em>{' '}
+            to the app registration with these values; the IdP must reach
+            Forge&apos;s issuer URL over https.
+          </p>
+          {saved ? (
+            <CopyField label="Issuer" value={saved.issuer} copyLabel="Copy issuer" />
+          ) : (
+            <p className="fg-text fg-text--small">
+              Forge&apos;s issuer URL is shown once the realm is saved.
+            </p>
+          )}
+          {subject && (
+            <CopyField
+              label="Subject identifier"
+              value={subject}
+              copyLabel="Copy subject identifier"
+            />
+          )}
+          <CopyField label="Audience" value={audience} copyLabel="Copy audience" />
+        </>
+      )}
+    </Panel>
   )
 }
 
@@ -1139,43 +1400,54 @@ function hasStoredSecret(
   return config?.[flag] === true
 }
 
-/** Write-only secret input mirroring RepositoryForm's upstream-password UX. */
+/**
+ * Write-only secret input mirroring RepositoryForm's upstream-password UX.
+ * `willDrop`: the save discards the stored secret, so a new one is required.
+ */
 function SecretField({
   label,
   error,
   value,
   onChange,
   stored,
+  willDrop = false,
 }: {
   label: string
   error?: string
   value: string
   onChange: (value: string) => void
   stored: boolean
+  willDrop?: boolean
 }) {
+  const keepable = stored && !willDrop
   return (
-    <Field>
-      <Label>{label}</Label>
-      <Input
-        type="password"
-        autoComplete="new-password"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={stored ? '•••••••• (set to replace)' : 'Required'}
-        invalid={!!error}
-      />
-      <Description>
-        {stored
+    <TextField
+      label={label}
+      type="password"
+      autoComplete="new-password"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={keepable ? '•••••••• (set to replace)' : 'Required'}
+      description={
+        keepable
           ? 'A secret is stored. Leave blank to keep it; type a new one to replace it.'
-          : 'Write-only. The stored secret is never shown after saving.'}
-      </Description>
-      {error && <ErrorMessage role="alert">{error}</ErrorMessage>}
-    </Field>
+          : willDrop
+            ? 'Required: the stored secret is not kept for a new issuer or client ID.'
+            : 'Write-only. The stored secret is never shown after saving.'
+      }
+      error={error}
+    />
   )
 }
 
-function ListHint() {
-  return <Description>Comma-separated.</Description>
+/** An error of no single field (the rule list, one rule's conditions), announced as it appears. */
+function FormError({ children }: { children: ReactNode }) {
+  return (
+    <p role="alert" className="fg-field-error">
+      <Icon name="Alert" size={14} />
+      <span>{children}</span>
+    </p>
+  )
 }
 
 /** "" or a parseable non-negative number. */
@@ -1194,7 +1466,7 @@ function isBlankNumberInRange(raw: string, min: number, max: number): boolean {
 
 /** "" or a comma-separated list of numbers. */
 function isBlankNumberList(raw: string): boolean {
-  return parseList(raw).every((s) => Number.isFinite(Number(s)))
+  return splitNumbers(raw).every((s) => Number.isFinite(Number(s)))
 }
 
 const GITHUB_ACTIONS_ISSUER = 'https://token.actions.githubusercontent.com'
@@ -1217,6 +1489,15 @@ const CONTEXT_ONLY_WIF_CLAIMS = new Set([
 ])
 
 function normalizedIssuer(raw: string): string {
+  return raw.trim().replace(/\/+$/, '')
+}
+
+/**
+ * An OIDC issuer or client ID as the server compares them when deciding
+ * whether a stored client secret still applies (trimmed, without trailing
+ * slashes).
+ */
+function secretBinding(raw: string): string {
   return raw.trim().replace(/\/+$/, '')
 }
 
@@ -1263,17 +1544,25 @@ function isUrlIsh(raw: string): boolean {
   }
 }
 
-/** Comma-separated text -> trimmed, non-empty entries. */
-export function parseList(raw: string): string[] {
+/**
+ * One entry per line -> trimmed, non-empty entries. Commas are kept: a value
+ * such as `CN=Forge Admins,OU=Groups,DC=corp` is one entry.
+ */
+export function parseLines(raw: string): string[] {
   return raw
-    .split(',')
+    .split(/\r?\n/)
     .map((s) => s.trim())
     .filter((s) => s !== '')
 }
 
+/** Comma- (or whitespace-) separated status codes -> non-empty entries. */
+function splitNumbers(raw: string): string[] {
+  return raw.split(/[\s,]+/).filter((s) => s !== '')
+}
+
 /** Comma-separated text -> numbers (status lists). */
 export function parseNumberList(raw: string): number[] {
-  return parseList(raw).map((s) => Number(s))
+  return splitNumbers(raw).map((s) => Number(s))
 }
 
 /** Empty string ⇒ undefined (server default); otherwise the parsed number. */
@@ -1298,8 +1587,14 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
       link_existing_by_username: values.link_existing_by_username,
       allow_http_issuer: values.allow_http_issuer,
     }
-    if (values.client_secret !== '') config.client_secret = values.client_secret
-    const scopes = parseList(values.scopes)
+    if (values.client_authentication === 'federated_credential') {
+      config.client_authentication = 'federated_credential'
+      const audience = values.assertion_audience.trim()
+      if (audience !== '') config.assertion_audience = audience
+    } else if (values.client_secret !== '') {
+      config.client_secret = values.client_secret
+    }
+    const scopes = parseLines(values.scopes)
     if (scopes.length > 0) config.scopes = scopes
     const skew = parseNumber(values.clock_skew_seconds)
     if (skew !== undefined) config.clock_skew_seconds = skew
@@ -1308,11 +1603,13 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (values.display_name_claim.trim() !== '') {
       config.display_name_claim = values.display_name_claim.trim()
     }
-    const adminGroups = parseList(values.admin_groups)
+    const adminGroups = parseLines(values.admin_groups)
     if (adminGroups.length > 0) config.admin_groups = adminGroups
     if (values.admin_claim.trim() !== '') config.admin_claim = values.admin_claim.trim()
-    const loginDomains = parseList(values.login_domains)
+    const loginDomains = parseLines(values.login_domains)
     if (loginDomains.length > 0) config.login_domains = loginDomains
+    const endpointHosts = parseLines(values.endpoint_hosts)
+    if (endpointHosts.length > 0) config.endpoint_hosts = endpointHosts
     const requiredClaims = parseClaimRules(values.required_claims)
     if (Object.keys(requiredClaims).length > 0) config.required_claims = requiredClaims
     if (values.button_label.trim() !== '') config.button_label = values.button_label.trim()
@@ -1321,7 +1618,6 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
   if (values.kind === 'credential_forwarding') {
     const config: CredentialForwardingConfig = {
       url: values.url.trim(),
-      auto_provision: values.auto_provision,
     }
     if (values.method.trim() !== '') config.method = values.method.trim().toUpperCase()
     const success = parseNumberList(values.success_status)
@@ -1332,11 +1628,15 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (connect !== undefined) config.connect_timeout_ms = connect
     const request = parseNumber(values.request_timeout_ms)
     if (request !== undefined) config.request_timeout_ms = request
-    const requiredGroups = parseList(values.required_groups)
+    const requiredGroups = parseLines(values.required_groups)
     if (requiredGroups.length > 0) config.required_groups = requiredGroups
     if (values.groups_path.trim() !== '') config.groups_path = values.groups_path.trim()
     if (values.identity_path.trim() !== '') config.identity_path = values.identity_path.trim()
     if (values.allow_http) config.allow_http = true
+    if (values.capture_password_hash) {
+      config.capture_password_hash = true
+      if (values.captured_password_only) config.captured_password_only = true
+    }
     if (values.admin_group.trim() !== '') config.admin_group = values.admin_group.trim()
     const positive = parseNumber(values.positive_ttl_secs)
     if (positive !== undefined) config.positive_ttl_secs = positive
@@ -1348,12 +1648,12 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
   if (values.kind === 'workload_identity') {
     const config: WorkloadIdentityConfig = {
       issuer: values.issuer.trim(),
-      allowed_audiences: parseList(values.allowed_audiences),
+      allowed_audiences: parseLines(values.allowed_audiences),
       allow_http_issuer: values.allow_http_issuer,
       rules: values.wifRules.map((rule) => {
         const conditions = rule.conditions.map((cond) => ({
           claim: cond.claim.trim(),
-          any_of: parseList(cond.anyOf),
+          any_of: parseLines(cond.anyOf),
         }))
         return { role: rule.role.trim(), conditions }
       }),
@@ -1362,16 +1662,72 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (skew !== undefined) config.clock_skew_seconds = skew
     const maxAge = parseNumber(values.max_token_age_seconds)
     if (maxAge !== undefined) config.max_token_age_seconds = maxAge
-    const authorizedParties = parseList(values.allowed_authorized_parties)
+    const authorizedParties = parseLines(values.allowed_authorized_parties)
     if (authorizedParties.length > 0) {
       config.allowed_authorized_parties = authorizedParties
     }
     const positiveCache = parseNumber(values.positive_cache_seconds)
     if (positiveCache !== undefined) config.positive_cache_seconds = positiveCache
-    const identityClaims = parseList(values.identity_claims)
+    const apiKeyTtl = parseNumber(values.api_key_ttl_seconds)
+    if (apiKeyTtl !== undefined) config.api_key_ttl_seconds = apiKeyTtl
+    const identityClaims = parseLines(values.identity_claims)
     if (identityClaims.length > 0) config.identity_claims = identityClaims
     return config
   }
   // local (and reserved kinds): no config.
   return {}
+}
+
+/**
+ * The role a workload-identity rule grants, picked from the roles that exist.
+ * The built-in `admin` role is not offered (the server refuses it). A rule
+ * naming a role that is not in the list (since deleted) keeps it, marked; if
+ * the roles cannot be loaded, the name is typed instead.
+ */
+function WifRolePicker({
+  value,
+  onChange,
+  error,
+}: {
+  value: string
+  onChange: (role: string) => void
+  error?: string
+}) {
+  const roles = useRoles()
+  if (roles.isError) {
+    return (
+      <TextField
+        label="Role"
+        mono
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="ci-deployer"
+        error={error}
+      />
+    )
+  }
+  const offered = (roles.data ?? []).filter((r) => r.name !== ADMIN_ROLE)
+  const missing =
+    roles.data != null && value !== '' && !offered.some((r) => r.name === value)
+  return (
+    <SelectField
+      label="Role"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={roles.isLoading}
+      error={error}
+    >
+      <option value="">{roles.isLoading ? 'Loading roles…' : 'Choose a role…'}</option>
+      {missing && (
+        <option value={value}>
+          {value === ADMIN_ROLE ? `${value} (not allowed)` : `${value} (no such role)`}
+        </option>
+      )}
+      {offered.map((r) => (
+        <option key={r.id} value={r.name}>
+          {r.name}
+        </option>
+      ))}
+    </SelectField>
+  )
 }

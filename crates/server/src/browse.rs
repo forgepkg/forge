@@ -1,13 +1,14 @@
-//! Read-side browse / search API (plan §12.6 Phase 0, §8).
+//! Read-side browse / search API.
 //!
 //! These endpoints back the SPA's browse + package-detail screens with plain
-//! JSON DTOs (not the NuGet V3 protocol shapes). They are **additive** and reuse
-//! the existing slice-1 read path:
+//! JSON DTOs (not the NuGet V3 protocol shapes). They reuse the feed's read
+//! path:
 //!
 //! * browsing requires a **signed-in user**: every `/browse/*` endpoint rejects
 //!   anonymous / unauthenticated callers with 401, regardless of any repo's
 //!   `anonymous_read` flag (which continues to apply to the `/v3` feed only);
-//! * authorization on top of that is the slice-1 [`can_read`] predicate,
+//! * authorization on top of that is the
+//!   [`Authz::can_read`](forge_core::auth::Authz::can_read) predicate,
 //!   evaluated against the request's [`Principal`];
 //! * version visibility, group member resolution, listed/prerelease filtering,
 //!   and proxy **package-delay** gating all come for free from
@@ -17,7 +18,8 @@
 //!
 //! ## Endpoints
 //! * `GET /browse/repos` — the repositories the caller may read (the SPA's
-//!   folder-view root).
+//!   folder-view root), with their format and client URL; `format` keeps
+//!   one format's.
 //! * `GET /browse/packages` — package search, paginated
 //!   (`q`, `repo`, `prerelease`, `skip`, `take`) → `{ total, items }`. The SPA
 //!   always passes `repo` (search is per repository); the merged cross-repo
@@ -25,13 +27,17 @@
 //! * `GET /browse/packages/{repo}/{id}` — package detail: visible versions with
 //!   per-version metadata + dependency groups parsed from the stored `.nuspec`.
 //!
+//! An offline hosted or group repository serves nothing here either: its
+//! package search and detail answer 503 with `Retry-After`, as its feed does,
+//! and a merged search leaves it out. An offline proxy still shows what it
+//! cached.
+//!
 //! ## Download stats
-//! Slice 1 has **no** download counters in its schema (`component` has no
-//! `downloads` column and there is no counter table). The plan's
-//! `total_downloads` / `downloads` fields are therefore **omitted** rather than
-//! emitted as misleading zeros, and the `/stats` split is not implemented. The
-//! DTOs keep room for them to be added without breaking the SPA. `published_at`
-//! maps to `component.created_at` (plan assumption (b)).
+//! Downloads are tracked ([`forge_db::download_dao`]; retention rules and the
+//! feed search's download totals read them), but this API does not expose
+//! them: the DTOs carry no `total_downloads` / `downloads` fields and there is
+//! no `/stats` endpoint. The DTOs keep room for them to be added without
+//! breaking the SPA. `published_at` maps to `component.created_at`.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -42,10 +48,11 @@ use chrono::{DateTime, Duration, Utc};
 use forge_core::auth::principal::Principal;
 use forge_core::repo::SearchParams;
 use forge_db::model::{RepoKind, Repository};
-use forge_db::{asset_dao, component_dao, repository_dao};
+use forge_db::{component_dao, repository_dao};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::db_error;
+use crate::dispatch::{offline_response, offline_serves_nothing};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -74,17 +81,46 @@ fn require_user(principal: &Principal) -> Option<Response> {
 /// One repository on the browse root (`GET /browse/repos`).
 #[derive(Debug, Serialize)]
 pub struct BrowseRepo {
+    /// Repository id, as a token's scope names repositories.
+    pub id: i64,
     /// Repository name (the folder name).
     pub name: String,
     /// Repository kind (`hosted` | `proxy` | `group`).
     pub kind: String,
+    /// Whether the repository serves requests. An offline hosted or group
+    /// repository is listed, but its packages answer 503 like its feed; an
+    /// offline proxy still shows what it cached.
+    pub online: bool,
+    /// Repository format (`nuget`, `docker`, or a plugin format's id): docker repositories are
+    /// browsed through `/browse/images`.
+    pub format: String,
+    /// The address clients use for the repository (`{public_base_url}{mount}/{name}`,
+    /// for raw `{public_base_url}/raw/{name}`), for the UI's client
+    /// snippets. Absent for docker repositories, whose registry
+    /// `/browse/images` names, and for a format not installed here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
-/// `GET /browse/repos` — the repositories the caller may read, sorted by name.
+/// Query parameters for `GET /browse/repos`.
+#[derive(Debug, Deserialize)]
+pub struct ReposQuery {
+    /// Only repositories of this format (`nuget`, `docker`, a plugin
+    /// format's id).
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// `GET /browse/repos` — the repositories the caller may read, sorted by name,
+/// optionally only those of one `format`.
 ///
 /// This is the root of the SPA's folder view: repositories are the top-level
 /// folders, their packages the entries inside.
-pub async fn list_repos(State(state): State<AppState>, req: axum::extract::Request) -> Response {
+pub async fn list_repos(
+    State(state): State<AppState>,
+    Query(query): Query<ReposQuery>,
+    req: axum::extract::Request,
+) -> Response {
     let principal = principal_of(&req);
     if let Some(denied) = require_user(&principal) {
         return denied;
@@ -97,10 +133,27 @@ pub async fn list_repos(State(state): State<AppState>, req: axum::extract::Reque
 
     let mut out = Vec::new();
     for repo in &repos {
+        if query.format.as_ref().is_some_and(|f| *f != repo.format) {
+            continue;
+        }
         if state.authz.can_read(&principal, repo).await {
             out.push(BrowseRepo {
+                id: repo.id,
                 name: repo.name.clone(),
                 kind: repo.kind.clone(),
+                online: repo.online,
+                format: repo.format.clone(),
+                url: if repo.is_raw() {
+                    Some(crate::plugins::repository_url(
+                        &state,
+                        crate::raw::MOUNT,
+                        &repo.name,
+                    ))
+                } else {
+                    state.formats.plugin(&repo.format).map(|plugin| {
+                        crate::plugins::repository_url(&state, &plugin.manifest().mount, &repo.name)
+                    })
+                },
             });
         }
     }
@@ -167,9 +220,14 @@ pub struct BrowseResult {
 /// `GET /browse/packages` — cross-repository search.
 ///
 /// Iterates every repository the principal may read (honoring
-/// `anonymous_read`), runs the slice-1 [`RepoReadOps::search`] on each, merges
-/// the hits, then sorts + paginates the merged set. A `repo` filter restricts to
-/// a single repository.
+/// `anonymous_read`), runs [`RepoReadOps::search`] on each, merges the hits,
+/// then sorts + paginates the merged set. A `repo` filter restricts to a single
+/// repository, which then pages in its backend. `total` is the sum of the
+/// backends' `total_hits` (already filtered by the caller's package selector).
+///
+/// A merged page needs every repository's first `skip + take` hits, so the
+/// merge is exact while that window stays within
+/// [`SearchParams::MAX_TAKE`]; pass `repo` to page deeper.
 pub async fn search_packages(
     State(state): State<AppState>,
     Query(query): Query<BrowseQuery>,
@@ -185,43 +243,76 @@ pub async fn search_packages(
         Err(e) => return db_error(e),
     };
 
-    // Per-repo search is bounded so a single huge repo can't starve the merge;
-    // we request enough to fill the requested window (`skip + take`, always ≥ 1
-    // because `effective_take()` is ≥ 1), capped at the read ops' own MAX_TAKE.
-    let want = query.skip.saturating_add(query.effective_take());
-    let per_repo_take = want.min(forge_core::repo::SearchParams::MAX_TAKE);
-
-    let mut all: Vec<BrowseItem> = Vec::new();
+    let mut readable: Vec<&Repository> = Vec::new();
     for repo in &repos {
         if let Some(filter) = &query.repo {
             if &repo.name != filter {
                 continue;
             }
         }
-        if !state.authz.can_read(&principal, repo).await {
+        // Package search covers the package formats; images are listed by
+        // /browse/images, raw files by their repository's listings.
+        if repo.is_docker() || repo.is_raw() {
             continue;
         }
+        if state.authz.can_read(&principal, repo).await {
+            readable.push(repo);
+        }
+    }
+
+    // An offline hosted or group repository serves nothing, here as on its
+    // feed: a search of that repository alone answers 503, and a merged
+    // search leaves it out. (Checked after authorization, so it reveals
+    // nothing to a caller who may not read it.)
+    if query.repo.is_some() && readable.iter().any(|r| offline_serves_nothing(r)) {
+        return offline_response();
+    }
+    readable.retain(|r| !offline_serves_nothing(r));
+
+    // A single repository pages in its backend, whose order (by lowered id)
+    // is the browse order. A merge asks each repository for the window it
+    // must fill (`skip + take`, always ≥ 1 because `effective_take()` is ≥ 1),
+    // capped at the read ops' own MAX_TAKE so a single huge repo can't starve
+    // it, then pages the merged set below.
+    let merged = readable.len() > 1;
+    let (skip, take) = if merged {
+        let want = query.skip.saturating_add(query.effective_take());
+        (0, want.min(SearchParams::MAX_TAKE))
+    } else {
+        (query.skip, query.effective_take())
+    };
+
+    let mut total = 0usize;
+    let mut all: Vec<BrowseItem> = Vec::new();
+    for repo in readable {
+        // A misconfigured repo (e.g. nested group, or a format that is not
+        // installed) is skipped, not fatal.
+        let Ok(format) = state.formats.for_repository(repo) else {
+            continue;
+        };
         let ops = match state.read_ops_for(repo, principal).await {
             Ok(o) => o,
-            // A misconfigured repo (e.g. nested group) is skipped, not fatal.
             Err(_) => continue,
         };
         let params = SearchParams {
             q: query.q.clone(),
-            skip: 0,
-            take: per_repo_take,
+            skip,
+            take,
             prerelease: query.prerelease,
+            // The web UI shows every version; only legacy NuGet clients
+            // need SemVer 2.0.0 hidden.
+            include_semver2: true,
+            // Browse lists what Forge holds, not a proxy upstream's catalog.
+            include_upstream: false,
         };
         match ops.search(&repo.name, &params).await {
             Ok(result) => {
+                total = total.saturating_add(result.total_hits);
                 for hit in result.hits {
                     all.push(BrowseItem {
                         repo: repo.name.clone(),
                         repo_kind: repo.kind.clone(),
-                        id: state
-                            .formats
-                            .for_repository(repo)
-                            .lower_id(&hit.original_id),
+                        id: format.lower_id(&hit.original_id),
                         original_id: hit.original_id,
                         latest_version: hit.latest_version,
                         listed: true,
@@ -236,12 +327,14 @@ pub async fn search_packages(
 
     // Stable global ordering: by id, then repo.
     all.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.repo.cmp(&b.repo)));
-    let total = all.len();
-    let items = all
-        .into_iter()
-        .skip(query.skip)
-        .take(query.effective_take())
-        .collect();
+    let items = if merged {
+        all.into_iter()
+            .skip(query.skip)
+            .take(query.effective_take())
+            .collect()
+    } else {
+        all
+    };
     Json(BrowseResult { total, items }).into_response()
 }
 
@@ -267,14 +360,17 @@ pub struct DetailVersion {
     /// `.nupkg` byte size, if a stored asset is known (None for not-yet-cached
     /// proxy versions or group-resolved versions).
     pub size: Option<i64>,
-    /// Publish/first-seen time (`component.created_at`), if known.
+    /// When the version was stored here (`component.created_at`), if it is:
+    /// the push time on a hosted repository, and on a proxy the time Forge
+    /// first downloaded it from the upstream (`None` until then), which the
+    /// web UI labels "Cached" rather than "Published".
     pub published_at: Option<DateTime<Utc>>,
     /// Proxy package-delay status (`null` for hosted/group versions).
     pub delay_status: Option<DelayStatus>,
     /// When a delayed proxy version becomes available (`first_seen_at + delay`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delayed_until: Option<DateTime<Utc>>,
-    /// Retention status — reserved for §12.1; always `null` in slice 1.
+    /// Retention status — reserved; always `null`.
     pub retention_status: Option<String>,
 }
 
@@ -317,13 +413,15 @@ pub async fn package_detail(
     }
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
-        Ok(Some(r)) => r,
+        // A docker repository holds images (`/browse/images`) and a raw one
+        // files (its listings), not packages.
+        Ok(Some(r)) if !r.is_docker() && !r.is_raw() => r,
         // An unknown name answers like an unreadable repository (no name
         // enumeration), except to a global admin.
-        Ok(None) if state.authz.is_global_admin(&principal).await => {
+        Ok(_) if state.authz.is_global_admin(&principal).await => {
             return (StatusCode::NOT_FOUND, "repository not found").into_response();
         }
-        Ok(None) => return (StatusCode::FORBIDDEN, "forbidden").into_response(),
+        Ok(_) => return (StatusCode::FORBIDDEN, "forbidden").into_response(),
         Err(e) => return db_error(e),
     };
 
@@ -332,8 +430,15 @@ pub async fn package_detail(
     if !state.authz.can_read(&principal, &repo).await {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
+    // An offline hosted or group repository serves nothing, as on its feed.
+    if offline_serves_nothing(&repo) {
+        return offline_response();
+    }
 
-    let format = state.formats.for_repository(&repo);
+    let format = match state.formats.for_repository(&repo) {
+        Ok(format) => format,
+        Err(e) => return read_err(e),
+    };
     let lower = format.lower_id(&id);
     if !state
         .authz
@@ -392,7 +497,7 @@ pub async fn package_detail(
 
     let mut dependency_groups_by_version = std::collections::BTreeMap::new();
     for entry in &registration {
-        let groups = forge_nuget::nuspec::summary_of(
+        let groups = forge_format_nuget::nuspec::summary_of(
             entry.manifest_summary.as_ref(),
             entry.nuspec_bytes.as_deref(),
         )
@@ -414,21 +519,24 @@ pub async fn package_detail(
         dependency_groups_by_version.insert(entry.version.clone(), mapped);
     }
 
-    // Per-version size / published_at from the local component row when present.
+    // Per-version size / published_at from the local component rows when
+    // present (one query for every version, not two per version).
+    let local: std::collections::HashMap<String, (DateTime<Utc>, Option<i64>)> =
+        component_dao::version_sizes(&state.pool, repo.id, &lower, NUPKG_ASSET_PATH)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "browse: version sizes lookup failed");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|(version, created_at, size)| (version, (created_at, size)))
+            .collect();
     let mut detail_versions = Vec::with_capacity(versions.len() + delayed.len());
     for v in &versions {
-        let (size, published_at) =
-            match component_dao::find_component(&state.pool, repo.id, &lower, &v.version).await {
-                Ok(Some(comp)) => {
-                    let size = asset_dao::find_asset(&state.pool, comp.id, NUPKG_ASSET_PATH)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|a| a.size);
-                    (size, Some(comp.created_at))
-                }
-                _ => (None, None),
-            };
+        let (size, published_at) = match local.get(&v.version) {
+            Some((created_at, size)) => (*size, Some(*created_at)),
+            None => (None, None),
+        };
 
         // A version returned by `list_versions` on a proxy has already cleared
         // the delay window (the ops gate it), so it is `Available`. We still
@@ -488,7 +596,8 @@ async fn delayed_proxy_versions(
     .fetch_all(&state.pool)
     .await?;
 
-    let now = Utc::now();
+    // `first_seen_at` is on the database's clock.
+    let now = forge_db::db_now(&state.pool).await?;
     let delay = Duration::seconds(i64::from(repo.package_delay_seconds));
     let mut out = Vec::new();
     for row in rows {
@@ -521,6 +630,11 @@ fn read_err(e: forge_core::repo::RepoError) -> Response {
         RepoError::Busy(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable").into_response()
         }
+        RepoError::FormatUnavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the repository's format is not installed on this server",
+        )
+            .into_response(),
         other => {
             tracing::error!(error = %other, "browse read error");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -536,4 +650,14 @@ pub fn browse_router() -> Router<AppState> {
         .route("/browse/repos", get(list_repos))
         .route("/browse/packages", get(search_packages))
         .route("/browse/packages/{repo}/{id}", get(package_detail))
+        .route("/browse/images", get(crate::browse_images::list_images))
+        .route(
+            "/browse/images/{repo}/{*image}",
+            get(crate::browse_images::image_detail),
+        )
+        .route(
+            "/browse/raw/{repo}/files",
+            axum::routing::post(crate::raw::web::browse_upload)
+                .delete(crate::raw::web::browse_delete),
+        )
 }

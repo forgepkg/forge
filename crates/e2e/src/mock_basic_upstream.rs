@@ -1,4 +1,4 @@
-//! In-process mock **HTTP Basic** upstream identity provider for the slice-12.3
+//! In-process mock **HTTP Basic** upstream identity provider for the
 //! credential-forwarding e2e scenarios (the verdaccio-nexus-auth-proxy pattern).
 //!
 //! A tiny axum app on an ephemeral loopback port that plays the upstream Nexus
@@ -20,7 +20,7 @@
 //!   be mistaken for a valid credential. The login page counts its own hits.
 //!
 //! The forge server reaches this over its outbound client; loopback upstreams
-//! are permitted since 12.7 §3.6 (scheme-only guard), so no special opt-out is
+//! are permitted (the guard checks only the scheme), so no special opt-out is
 //! needed.
 
 use std::collections::HashMap;
@@ -203,7 +203,6 @@ url = "{url}"
 method = "GET"
 success_status = [200]
 reject_status = [401, 403]
-auto_provision = true
 required_groups = [{required}]
 {groups_path}admin_group = "{admin_group}"
 

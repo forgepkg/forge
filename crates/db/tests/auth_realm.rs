@@ -1,4 +1,4 @@
-//! Integration tests for the 12.7 `auth_realm` DAO against a real Postgres
+//! Integration tests for the `auth_realm` DAO against a real Postgres
 //! testcontainer.
 //!
 //! Covers what the realm runtime hinges on:
@@ -18,6 +18,12 @@ use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm};
 use serde_json::json;
 
 use common::{pool, unique};
+
+/// `reorder_realms` renumbers every realm in the shared database and bumps its
+/// `updated_at`, so it would make a concurrent compare-and-set write see its
+/// row as changed. The reorder and compare-and-set tests hold this lock for
+/// their whole body.
+static REWRITES_ALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn new_realm(name: &str, kind: &str, priority: i32) -> NewAuthRealm {
     NewAuthRealm {
@@ -129,6 +135,7 @@ async fn duplicate_name_and_bad_slug_rejected() {
 
 #[tokio::test]
 async fn reorder_swaps_priorities_transactionally() {
+    let _rewrites_all = REWRITES_ALL.lock().await;
     let pool = pool().await;
     let n = unique();
     let a = auth_realm_dao::insert_realm(
@@ -182,12 +189,16 @@ async fn reorder_swaps_priorities_transactionally() {
 /// edit dropped or replaced.
 #[tokio::test]
 async fn compare_and_set_writes_refuse_a_changed_row_or_marker() {
+    let _rewrites_all = REWRITES_ALL.lock().await;
     let pool = pool().await;
     let n = unique();
     let name = format!("cas-{n}");
+    // Its own band: `300_000 + n` collides with the `300_000 + 2n` slots
+    // `duplicate_name_and_bad_slug_rejected` takes whenever its `n` is half
+    // of this one's.
     let realm = auth_realm_dao::insert_realm(
         &pool,
-        new_realm(&name, "credential_forwarding", 300_000 + n as i32),
+        new_realm(&name, "credential_forwarding", 400_000 + n as i32),
     )
     .await
     .expect("insert");

@@ -10,9 +10,12 @@ publish.workspace = true
 forge-db = { path = "../db" }
 forge-storage = { path = "../storage" }
 forge-cache = { path = "../cache" }
-# Secret encryption at rest (slice 12.5): the proxy upstream fetch decrypts the
+# Secret encryption at rest: the proxy upstream fetch decrypts the
 # upstream password through the envelope service (the single sanctioned site).
 forge-crypto = { path = "../crypto" }
+# The format-plugin contract: the upstream conversation of proxy repositories
+# (`Format::upstream`) speaks its types. Nothing but std.
+forge-plugin-api = { path = "../plugin-api" }
 
 tokio = { workspace = true }
 sqlx = { workspace = true }
@@ -23,8 +26,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
-# RBAC content-selector glob matching (slice 12.4 Phase 2): compile include/exclude
-# globs once into a GlobSet held behind Arc in the cached effective set.
+# RBAC content-selector glob matching: compile include/exclude globs once
+# into a GlobSet held behind Arc in the cached effective set.
 globset = { workspace = true }
 
 # Auth
@@ -39,13 +42,19 @@ http = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 
-# OIDC ID-token verification (slice 12.2 Phase 2): explicit JWT decode + RSA
+# OIDC ID-token verification: explicit JWT decode + RSA
 # JWKS key construction + iss/aud/exp/nonce validation with an alg allowlist.
 jsonwebtoken = { workspace = true }
+# Forge's own client assertions (oidc::assertion): RSA key generation, PKCS#8
+# storage and RS256 signing.
+aws-lc-rs = { workspace = true }
 
 # Networking / SSRF guard
 ipnet = { workspace = true }
 reqwest = { workspace = true }
+# The outbound proxy selection reqwest's `system-proxy` feature uses, so the
+# proxy metadata guard knows which upstream URLs a proxy will resolve.
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy", "client-proxy-system"] }
 url = { workspace = true }
 # Proxy upstream bodies: spooled (memory → temp file) metadata and streamed
 # `.nupkg` downloads into the CAS.
@@ -56,11 +65,12 @@ tokio-util = { workspace = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net", "test-util"] }
 forge-db = { path = "../db" }
-# dev-only cycle (forge-nuget depends on forge-core); Cargo permits this for the
-# version-ordering Format impl used by the hosted-read integration tests.
-forge-nuget = { path = "../format-nuget" }
+# NuGet, the format most integration tests use: the built-in plugin and its
+# Format (a dev-only cycle through forge-plugin, which Cargo permits).
+forge-format-nuget = { path = "../../plugins/nuget" }
+forge-plugin = { path = "../plugin" }
 argon2 = { workspace = true, features = ["password-hash"] }
 serde_json = { workspace = true }
 chrono = { workspace = true }

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT count(*) AS \"n!\" FROM blob b\n        WHERE b.ref_count <> (SELECT count(*) FROM asset a WHERE a.blob_sha256 = b.sha256)\n          AND EXISTS (SELECT 1 FROM asset a JOIN component c ON c.id = a.component_id\n                      JOIN repository r ON r.id = c.repository_id\n                      WHERE a.blob_sha256 = b.sha256 AND r.name = $1)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "0871946db12999233024780ca301b7dfceab454836bab116fc47a94f549e16aa"
+}

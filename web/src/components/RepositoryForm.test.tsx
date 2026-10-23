@@ -1,24 +1,44 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
-import type { RepoView } from '~/api/repositories'
+import type { FormatView, RepoView } from '~/api/repositories'
 import {
+  DOCKER_FORMAT,
+  NUGET_FORMAT,
+  RAW_FORMAT,
   RepositoryForm,
+  bytesToMib,
+  mibToBytes,
   toCreateBody,
   toUpdateBody,
+  validateDockerHost,
   validateRepoName,
   type RepoFormValues,
 } from './RepositoryForm'
 
 /**
- * RepositoryForm (plan §Phase 4 testing):
+ * RepositoryForm:
  *  - a create-hosted submission produces the right `CreateRepo` body (kind +
  *    hosted-only `allow_redeploy`, no proxy fields);
  *  - the proxy upstream password is **write-only**: never seeded from an
  *    existing repo's GET, and only sent when typed;
- *  - validation blocks an empty name and a proxy without a remote URL.
+ *  - validation blocks an empty name and a proxy without a remote URL;
+ *  - docker repositories: the format is chosen on create (read-only on edit),
+ *    the NuGet-only fields are hidden and never sent, the docker options are
+ *    sent only for docker (and only the ones the kind takes), and an edit
+ *    diffs them (an emptied host / writable member clears it with `null`).
  */
+
+const helm: FormatView = {
+  id: 'helm',
+  name: 'Helm charts',
+  builtin: true,
+  kinds: ['hosted', 'group'],
+  mount: '/repository',
+  version: '0.1.0',
+  description: 'Helm chart repositories.',
+}
 
 function lastValues(onSubmit: ReturnType<typeof vi.fn>): RepoFormValues {
   return onSubmit.mock.calls.at(-1)![0] as RepoFormValues
@@ -53,6 +73,49 @@ describe('RepositoryForm', () => {
     })
     expect(body).not.toHaveProperty('remote_url')
     expect(body).not.toHaveProperty('upstream_password')
+    // NuGet is the server's default format: not sent.
+    expect(body).not.toHaveProperty('format')
+  })
+
+  it('creates a repository of a plugin format, offering only its kinds', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[NUGET_FORMAT, helm]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+
+    // NuGet first: proxies are offered, the feed is a V3 index.
+    expect(screen.getByRole('option', { name: 'proxy' })).toBeInTheDocument()
+    expect(screen.getByText('/v3/<name>/index.json')).toBeInTheDocument()
+
+    await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
+    await user.selectOptions(screen.getByLabelText('Format'), 'helm')
+    // A plugin format has no proxies; the kind falls back to hosted.
+    expect(screen.queryByRole('option', { name: 'proxy' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Kind')).toHaveValue('hosted')
+    expect(screen.getByText('/repository/<name>/')).toBeInTheDocument()
+    expect(screen.getByText(helm.description!)).toBeInTheDocument()
+
+    await user.type(screen.getByLabelText('Name'), 'charts')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      name: 'charts',
+      kind: 'hosted',
+      format: 'helm',
+    })
+  })
+
+  it('shows a stored format read-only on edit', () => {
+    renderEdit({ ...storedProxy, kind: 'hosted', format: 'helm' })
+    expect(screen.getByLabelText('Format')).toHaveValue('helm')
+    expect(screen.getByLabelText('Format')).toHaveAttribute('readonly')
+    expect(screen.getByText('/repository/<name>/')).toBeInTheDocument()
   })
 
   it('sends prefer_hosted for groups (on by default)', async () => {
@@ -171,6 +234,11 @@ describe('RepositoryForm', () => {
       allow_redeploy: false,
       prefer_hosted: false,
       reserved_prefixes: [],
+      host: null,
+      immutable_tags: false,
+      latest_mutable: false,
+      writable_member: null,
+      max_upload_bytes: null,
     }
     const user = userEvent.setup()
     const onSubmit = vi.fn()
@@ -244,6 +312,11 @@ const storedProxy: RepoView = {
   allow_redeploy: false,
   prefer_hosted: false,
   reserved_prefixes: [],
+  host: null,
+  immutable_tags: false,
+  latest_mutable: false,
+  writable_member: null,
+  max_upload_bytes: null,
 }
 
 function renderEdit(existing: RepoView = storedProxy) {
@@ -296,7 +369,7 @@ describe('repository names (M18)', () => {
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
     expect(onSubmit).not.toHaveBeenCalled()
     expect(screen.getByRole('alert')).toHaveTextContent(/no spaces/)
-    expect(screen.getByLabelText('Name')).toHaveAttribute('data-invalid')
+    expect(screen.getByLabelText('Name')).toHaveAttribute('aria-invalid', 'true')
 
     await user.clear(screen.getByLabelText('Name'))
     await user.type(screen.getByLabelText('Name'), 'new')
@@ -423,5 +496,565 @@ describe('repository update body (M2)', () => {
     // A new password for the new host keeps (replaces) the credentials.
     await user.type(screen.getByLabelText('Upstream password'), 'new-pat')
     expect(screen.queryByText(/credentials will be dropped/)).toBeNull()
+  })
+})
+
+/** The docker options an untouched NuGet body must never carry. */
+const DOCKER_FIELDS = ['host', 'immutable_tags', 'latest_mutable', 'writable_member']
+
+function renderCreate() {
+  const onSubmit = vi.fn()
+  render(
+    <RepositoryForm
+      mode="create"
+      formats={[NUGET_FORMAT, DOCKER_FORMAT]}
+      submitting={false}
+      onSubmit={onSubmit}
+      onCancel={() => {}}
+    />,
+  )
+  return onSubmit
+}
+
+async function create(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole('button', { name: 'Create repository' }))
+}
+
+describe('docker repositories: create', () => {
+  it('a NuGet body sends no format and no docker fields', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.type(screen.getByLabelText('Name'), 'feed')
+    // A host typed while "Docker" was selected is dropped when switching back.
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Host'), 'docker.example.com')
+    await user.selectOptions(screen.getByLabelText('Format'), 'nuget')
+    expect(screen.queryByLabelText('Host')).toBeNull()
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toMatchObject({ name: 'feed', kind: 'hosted' })
+    // NuGet is the server's default format: not sent.
+    expect(body).not.toHaveProperty('format')
+    for (const field of DOCKER_FIELDS) expect(body).not.toHaveProperty(field)
+  })
+
+  it('hosted docker: hides allow_redeploy, sends host + immutable tags + latest_mutable', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    expect(screen.queryByLabelText(/Allow redeploy/)).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'docker-hosted')
+    await user.type(screen.getByLabelText('Host'), 'docker.example.com')
+
+    // "Allow moving latest" is only available with immutable tags.
+    const latest = screen.getByLabelText(/Allow moving latest/)
+    expect(latest).toBeDisabled()
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    expect(latest).toBeEnabled()
+    await user.click(latest)
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toEqual({
+      name: 'docker-hosted',
+      kind: 'hosted',
+      format: 'docker',
+      anonymous_read: false,
+      online: true,
+      host: 'docker.example.com',
+      immutable_tags: true,
+      latest_mutable: true,
+    })
+  })
+
+  it('unticking immutable tags also clears latest_mutable', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Name'), 'docker-hosted')
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    await user.click(screen.getByLabelText(/Allow moving latest/))
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    expect(screen.getByLabelText(/Allow moving latest/)).not.toBeChecked()
+    await create(user)
+
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      immutable_tags: false,
+      latest_mutable: false,
+    })
+  })
+
+  it('docker proxy: registry URL placeholder, no package delay, no empty host', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
+    expect(screen.queryByLabelText('Package delay (seconds)')).toBeNull()
+    const remote = screen.getByLabelText('Remote URL')
+    expect(remote).toHaveAttribute('placeholder', 'https://registry-1.docker.io')
+    await user.type(screen.getByLabelText('Name'), 'docker-hub')
+    await user.type(remote, 'https://registry-1.docker.io')
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toMatchObject({
+      name: 'docker-hub',
+      kind: 'proxy',
+      format: 'docker',
+      remote_url: 'https://registry-1.docker.io',
+    })
+    expect(body).not.toHaveProperty('package_delay_seconds')
+    expect(body).not.toHaveProperty('allow_redeploy')
+    for (const field of DOCKER_FIELDS) expect(body).not.toHaveProperty(field)
+  })
+
+  it('docker group: namespace prefixes and the writable member', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'group')
+    expect(screen.getByText(/namespaces such as/)).toHaveTextContent('acme/')
+    expect(screen.queryByLabelText(/Immutable tags/)).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'docker-group')
+    await user.type(screen.getByLabelText('Reserved prefixes'), 'acme/')
+    await user.type(screen.getByLabelText('Writable member'), 'docker-hosted')
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toMatchObject({
+      kind: 'group',
+      format: 'docker',
+      prefer_hosted: true,
+      reserved_prefixes: ['acme/'],
+      writable_member: 'docker-hosted',
+    })
+    expect(body).not.toHaveProperty('immutable_tags')
+    expect(body).not.toHaveProperty('host')
+  })
+
+  it('blocks an uppercase docker name and an invalid host inline', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Name'), 'Docker-Hosted')
+    await user.type(screen.getByLabelText('Host'), 'https://docker.example.com')
+    await create(user)
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByText(/must be lowercase/)).toBeInTheDocument()
+    expect(screen.getByText(/Give a DNS name/)).toBeInTheDocument()
+  })
+})
+
+describe('docker repository names and hosts', () => {
+  it('requires a lowercase OCI name component for docker only', () => {
+    for (const ok of ['docker-hosted', 'a', 'my.repo', 'a__b', 'a--b', '0day']) {
+      expect(validateRepoName(ok, 'docker')).toBeNull()
+    }
+    expect(validateRepoName('Docker', 'docker')).toMatch(/lowercase/)
+    expect(validateRepoName('a..b', 'docker')).toMatch(/separators/)
+    expect(validateRepoName('a___b', 'docker')).toMatch(/separators/)
+    expect(validateRepoName('trailing-', 'docker')).toMatch(/separators/)
+    expect(validateRepoName('new', 'docker')).toMatch(/"new" is reserved/)
+    // NuGet keeps its own (case-insensitive) rule.
+    expect(validateRepoName('Docker')).toBeNull()
+  })
+
+  it('accepts a DNS name as host and rejects schemes, ports and bare names', () => {
+    expect(validateDockerHost('')).toBeNull()
+    expect(validateDockerHost('docker.example.com')).toBeNull()
+    for (const bad of [
+      'https://docker.example.com',
+      'docker.example.com:5000',
+      'docker.example.com/path',
+      'localhost',
+      '-bad.example.com',
+    ]) {
+      expect(validateDockerHost(bad)).toMatch(/DNS name/)
+    }
+  })
+})
+
+/** A stored hosted docker repository with a host. */
+const storedDocker: RepoView = {
+  ...storedProxy,
+  id: 9,
+  name: 'docker-hosted',
+  format: 'docker',
+  kind: 'hosted',
+  remote_url: null,
+  upstream_username: null,
+  has_upstream_password: false,
+  metadata_ttl_seconds: null,
+  not_found_ttl_seconds: null,
+  host: 'docker.example.com',
+  immutable_tags: false,
+  latest_mutable: false,
+}
+
+describe('docker repositories: update body', () => {
+  it('shows the format read-only and sends nothing when untouched', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(storedDocker)
+
+    const format = screen.getByLabelText('Format') as HTMLInputElement
+    expect(format.readOnly).toBe(true)
+    expect(format).toHaveValue('Docker / OCI')
+    expect(screen.getByLabelText('Host')).toHaveValue('docker.example.com')
+    await save(user)
+
+    expect(toUpdateBody(lastValues(onSubmit), storedDocker)).toEqual({})
+  })
+
+  it('an emptied host is sent as null; a changed one as the value', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(storedDocker)
+    const host = screen.getByLabelText('Host')
+
+    await user.clear(host)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedDocker)).toEqual({ host: null })
+
+    await user.type(host, 'registry.example.com')
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedDocker)).toEqual({
+      host: 'registry.example.com',
+    })
+  })
+
+  it('diffs immutable_tags / latest_mutable', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(storedDocker)
+
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    await user.click(screen.getByLabelText(/Allow moving latest/))
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedDocker)).toEqual({
+      immutable_tags: true,
+      latest_mutable: true,
+    })
+
+    const immutable = { ...storedDocker, immutable_tags: true, latest_mutable: true }
+    expect(
+      toUpdateBody({ ...lastValues(onSubmit), immutable_tags: false }, immutable),
+    ).toEqual({ immutable_tags: false, latest_mutable: false })
+  })
+
+  it('a docker group sets and clears its writable member', async () => {
+    const group: RepoView = {
+      ...storedDocker,
+      name: 'docker-group',
+      kind: 'group',
+      host: null,
+      prefer_hosted: true,
+      writable_member: 'docker-hosted',
+    }
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(group)
+    const member = screen.getByLabelText('Writable member')
+    expect(member).toHaveValue('docker-hosted')
+
+    await user.clear(member)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), group)).toEqual({
+      writable_member: null,
+    })
+
+    await user.type(member, 'docker-releases')
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), group)).toEqual({
+      writable_member: 'docker-releases',
+    })
+  })
+
+  it('never sends NuGet-only or docker-only fields across formats', () => {
+    // A docker proxy: changing the hidden delay value sends nothing.
+    const dockerProxy: RepoView = {
+      ...storedDocker,
+      kind: 'proxy',
+      remote_url: 'https://ghcr.io',
+      host: null,
+    }
+    const values = {
+      ...lastValuesOf(dockerProxy),
+      package_delay_seconds: '3600',
+      allow_redeploy: true,
+    }
+    expect(toUpdateBody(values, dockerProxy)).toEqual({})
+
+    // A NuGet repository: docker values never reach the body.
+    expect(
+      toUpdateBody(
+        {
+          ...lastValuesOf(storedProxy),
+          host: 'docker.example.com',
+          writable_member: 'x',
+          immutable_tags: true,
+        },
+        storedProxy,
+      ),
+    ).toEqual({})
+  })
+})
+
+/** The values an untouched edit of `existing` submits. */
+function lastValuesOf(existing: RepoView): RepoFormValues {
+  const onSubmit = vi.fn()
+  const { unmount } = render(
+    <RepositoryForm
+      mode="edit"
+      existing={existing}
+      submitting={false}
+      onSubmit={onSubmit}
+      onCancel={() => {}}
+    />,
+  )
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  unmount()
+  return lastValues(onSubmit)
+}
+
+describe('repository upload limit', () => {
+  const nuget: FormatView = {
+    ...NUGET_FORMAT,
+    default_max_upload_bytes: 512 * 1024 * 1024,
+    max_upload_bytes_limit: 4 * 1024 * 1024 * 1024,
+  }
+  const storedHosted: RepoView = {
+    ...storedProxy,
+    name: 'packages',
+    kind: 'hosted',
+    remote_url: null,
+    upstream_username: null,
+    has_upstream_password: false,
+    metadata_ttl_seconds: null,
+    not_found_ttl_seconds: null,
+    max_upload_bytes: 100 * 1024 * 1024,
+  }
+
+  it('converts between bytes and MiB', () => {
+    expect(bytesToMib(512 * 1024 * 1024)).toBe('512')
+    expect(bytesToMib(1536 * 1024)).toBe('1.5')
+    expect(mibToBytes('1.5')).toBe(1536 * 1024)
+    expect(mibToBytes(' ')).toBeNull()
+    expect(mibToBytes('lots')).toBeNull()
+  })
+
+  it('shows the default and sends a typed limit in bytes on create', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[nuget]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    const field = screen.getByLabelText('Maximum upload size (MiB)')
+    expect(field).toHaveAttribute('placeholder', 'Default: 512')
+    await user.type(screen.getByLabelText('Name'), 'big-packages')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).not.toHaveProperty('max_upload_bytes')
+
+    await user.type(field, '2048')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      max_upload_bytes: 2048 * 1024 * 1024,
+    })
+  })
+
+  it('refuses a limit above what the server can stage, and a non-positive one', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[nuget]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    await user.type(screen.getByLabelText('Name'), 'too-big')
+    const field = screen.getByLabelText('Maximum upload size (MiB)')
+    await user.type(field, '8192')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent('At most 4096 MiB')
+
+    await user.clear(field)
+    await user.type(field, '0')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByRole('alert')).toHaveTextContent('positive number')
+  })
+
+  it('on edit, sends a changed limit, null for an emptied one, nothing when untouched', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="edit"
+        existing={storedHosted}
+        formats={[nuget]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    const field = screen.getByLabelText('Maximum upload size (MiB)')
+    expect(field).toHaveValue(100)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedHosted)).toEqual({})
+
+    await user.clear(field)
+    await user.type(field, '250')
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedHosted)).toEqual({
+      max_upload_bytes: 250 * 1024 * 1024,
+    })
+
+    await user.clear(field)
+    await save(user)
+    expect(toUpdateBody(lastValues(onSubmit), storedHosted)).toEqual({
+      max_upload_bytes: null,
+    })
+  })
+
+  it('is not offered for proxies and groups', () => {
+    render(
+      <RepositoryForm
+        mode="edit"
+        existing={storedProxy}
+        formats={[nuget]}
+        submitting={false}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+    )
+    expect(screen.queryByLabelText('Maximum upload size (MiB)')).toBeNull()
+  })
+})
+
+describe('raw repositories', () => {
+  function renderRawCreate() {
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[NUGET_FORMAT, DOCKER_FORMAT, RAW_FORMAT]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    return onSubmit
+  }
+
+  it('hosted: a deployment policy instead of allow_redeploy, and inline display', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderRawCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'raw')
+    expect(screen.queryByLabelText(/Allow redeploy \(re-push/)).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'binaries')
+    await user.selectOptions(screen.getByLabelText('Deployment policy'), 'allow_redeploy')
+    await user.click(screen.getByLabelText(/Display files in the browser/))
+    await create(user)
+
+    expect(toCreateBody(lastValues(onSubmit))).toEqual({
+      name: 'binaries',
+      kind: 'hosted',
+      format: 'raw',
+      anonymous_read: false,
+      online: true,
+      deployment_policy: 'allow_redeploy',
+      content_disposition: 'inline',
+    })
+  })
+
+  it('proxy: a maximum age instead of the package delay and metadata TTL', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderRawCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'raw')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
+    expect(screen.queryByLabelText('Package delay (seconds)')).toBeNull()
+    expect(screen.queryByLabelText('Metadata TTL (seconds)')).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'pdfium')
+    await user.type(
+      screen.getByLabelText('Remote URL'),
+      'https://github.com/bblanchon/pdfium-binaries/releases/download/',
+    )
+    await user.type(screen.getByLabelText('Maximum age (seconds)'), '0')
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).toMatchObject({
+      kind: 'proxy',
+      format: 'raw',
+      remote_url: 'https://github.com/bblanchon/pdfium-binaries/releases/download/',
+      max_age_seconds: 0,
+    })
+    expect(body).not.toHaveProperty('package_delay_seconds')
+    expect(body).not.toHaveProperty('metadata_ttl_seconds')
+    expect(body).not.toHaveProperty('content_disposition')
+  })
+
+  it('group: no dependency-confusion options', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderRawCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'raw')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'group')
+    expect(screen.queryByLabelText(/Prefer hosted/)).toBeNull()
+    expect(screen.queryByLabelText('Reserved prefixes')).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'all-files')
+    await create(user)
+
+    const body = toCreateBody(lastValues(onSubmit))
+    expect(body).not.toHaveProperty('prefer_hosted')
+    expect(body).not.toHaveProperty('reserved_prefixes')
+  })
+
+  it('on edit, diffs the raw options and clears an emptied maximum age', () => {
+    const storedRaw: RepoView = {
+      ...storedProxy,
+      name: 'pdfium',
+      format: 'raw',
+      metadata_ttl_seconds: null,
+      max_age_seconds: 600,
+      content_disposition: 'attachment',
+    }
+    const untouched = lastValuesOf(storedRaw)
+    expect(untouched.max_age_seconds).toBe('600')
+    expect(toUpdateBody(untouched, storedRaw)).toEqual({})
+    expect(
+      toUpdateBody(
+        { ...untouched, max_age_seconds: '', inline_content: true, package_delay_seconds: '9' },
+        storedRaw,
+      ),
+    ).toEqual({ max_age_seconds: null, content_disposition: 'inline' })
+
+    const hosted: RepoView = {
+      ...storedRaw,
+      kind: 'hosted',
+      remote_url: null,
+      max_age_seconds: null,
+      deployment_policy: 'disable_redeploy',
+    }
+    const values = lastValuesOf(hosted)
+    expect(
+      toUpdateBody({ ...values, deployment_policy: 'read_only', allow_redeploy: true }, hosted),
+    ).toEqual({ deployment_policy: 'read_only' })
   })
 })

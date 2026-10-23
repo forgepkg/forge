@@ -1,8 +1,9 @@
-//! Hosted-repository read operations (spec §6, §7 "Hosted").
+//! Hosted-repository read and write operations.
 //!
 //! Reads are served entirely from local data: `repository` → `component` →
-//! `asset` → `blob`. The `.nupkg` is located via the [`NUPKG_ASSET_PATH`]
-//! asset; the derived `.nuspec` via [`NUSPEC_ASSET_PATH`]. Version ordering and
+//! `asset` → `blob`. The package (the `.nupkg` for NuGet) is located via the
+//! format's [`Format::package_asset_path`] asset; the derived manifest (the
+//! `.nuspec`) via [`Format::manifest_asset_path`]. Version ordering and
 //! prerelease detection are delegated to the repository's [`Format`].
 //!
 //! Byte-level access to stored blobs (needed to serve `.nuspec` and to feed
@@ -24,23 +25,23 @@ use sqlx::PgPool;
 use crate::auth::principal::Principal;
 use crate::authz::PackageFilter;
 use crate::format::Format;
+use crate::repo::downloads::DownloadTally;
 use crate::repo::{
-    CacheInvalidator, DeleteOutcome, NupkgLocation, PackageMutation, PublishAuthorizationContext,
-    PublishOutcome, PublishPolicy, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
-    SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError, NUPKG_ASSET_PATH,
-    NUPKG_CONTENT_TYPE, NUSPEC_ASSET_PATH, NUSPEC_CONTENT_TYPE,
+    CacheInvalidator, DeleteOutcome, ImportOptions, ImportOutcome, NupkgLocation, PackageMutation,
+    PublishAuthorizationContext, PublishOutcome, PublishPolicy, RegistrationEntry, RepoError,
+    RepoReadOps, SearchHit, SearchParams, SearchQuery, SearchResult, VersionEntry, WriteError,
 };
 
-/// Fetch raw bytes of a stored blob by its S3 object key.
+/// Fetch raw bytes of a stored blob.
 ///
 /// Implemented over `forge_storage::BlobStore` in the server wiring; abstracted
 /// here so `forge-core` does not depend on the S3 client and so tests can stub
 /// blob bytes.
 #[async_trait]
 pub trait BlobFetch: Send + Sync {
-    /// Read the entire blob at `s3_key` into memory. Used only for small
-    /// metadata blobs (the `.nuspec`).
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError>;
+    /// Read the entire `blob` into memory (from the local blob cache, or its
+    /// S3 object). Used only for small metadata blobs (the `.nuspec`).
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError>;
 }
 
 /// Storage-backed hosted read implementation.
@@ -48,17 +49,27 @@ pub struct HostedRepo {
     pool: PgPool,
     format: Arc<dyn Format>,
     blobs: Arc<dyn BlobFetch>,
+    /// Counts `.nupkg` downloads and writes them in batches.
+    downloads: Arc<DownloadTally>,
 }
 
 impl HostedRepo {
     /// Build a hosted read facade over a pool, a package [`Format`], and a
-    /// blob-byte fetcher.
+    /// blob-byte fetcher. It counts downloads in a tally of its own unless it
+    /// is given the process's ([`Self::with_download_tally`]).
     pub fn new(pool: PgPool, format: Arc<dyn Format>, blobs: Arc<dyn BlobFetch>) -> Self {
         HostedRepo {
+            downloads: DownloadTally::new(pool.clone()),
             pool,
             format,
             blobs,
         }
+    }
+
+    /// Count downloads in `downloads`, shared with the other facades.
+    pub fn with_download_tally(mut self, downloads: Arc<DownloadTally>) -> Self {
+        self.downloads = downloads;
+        self
     }
 
     /// Resolve the repository row by name, erroring if missing.
@@ -79,11 +90,11 @@ impl HostedRepo {
     }
 
     /// Build one exact search result while applying package authorization
-    /// before paging. Hosted search currently loads its small Slice-1 corpus in
-    /// one query, so doing this here avoids reloading that corpus once per
-    /// selector page. With `enrich`, the returned page carries manifests and
-    /// download totals ([`Self::enrich_hits`]); a group searches its members
-    /// without and enriches only its own final page.
+    /// before paging: the ids that match are listed once, filtered by the
+    /// selector, counted and paged, and only the page's versions are loaded.
+    /// With `enrich`, the returned page carries manifests and download totals
+    /// ([`Self::enrich_hits`]); a group searches its members without and
+    /// enriches only its own final page.
     async fn search_filtered(
         &self,
         repo: &str,
@@ -93,29 +104,52 @@ impl HostedRepo {
     ) -> Result<SearchResult, RepoError> {
         let repo_id = self.repo_id(repo).await?;
         let query = SearchQuery::parse(&params.q);
-        let comps = match query.prefilter() {
-            Some(sub) => {
-                component_dao::list_components_for_repo_matching(&self.pool, repo_id, sub).await?
-            }
-            None => component_dao::list_components_for_repo(&self.pool, repo_id).await?,
-        };
+        // Page over ids, not versions: the filters run in SQL, the selector
+        // and the query's terms on the (much shorter) id list, and versions
+        // are loaded for the returned page only.
+        let mut names: Vec<String> = component_dao::search_names(
+            &self.pool,
+            repo_id,
+            query.prefilter().unwrap_or(""),
+            params.prerelease,
+            params.include_semver2,
+        )
+        .await?
+        .into_iter()
+        .filter(|name| filter.allows(name) && query.matches(name))
+        .collect();
+        // Byte order, as group results are ordered (SQL orders by the
+        // database collation, which may weigh punctuation differently).
+        names.sort_unstable();
+        let total_hits = names.len();
+        let page: Vec<String> = names
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
 
-        use std::collections::BTreeMap;
-        let mut by_id: BTreeMap<String, Vec<forge_db::model::Component>> = BTreeMap::new();
-        for c in comps {
-            if !filter.allows(&c.name) || !query.matches(&c.name) {
-                continue;
-            }
+        use std::collections::HashMap;
+        let mut by_id: HashMap<String, Vec<forge_db::model::Component>> = HashMap::new();
+        for c in component_dao::search_versions(
+            &self.pool,
+            repo_id,
+            &page,
+            params.prerelease,
+            params.include_semver2,
+        )
+        .await?
+        {
             by_id.entry(c.name.clone()).or_default().push(c);
         }
-
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for (_name, comps) in by_id {
-            let comps = self.sort_versions(comps);
-            let versions: Vec<VersionEntry> = comps
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(page.len());
+        for name in &page {
+            let Some(comps) = by_id.remove(name) else {
+                // Changed between the two queries.
+                continue;
+            };
+            let versions: Vec<VersionEntry> = self
+                .sort_versions(comps)
                 .into_iter()
-                .filter(|c| c.listed)
-                .filter(|c| params.prerelease || !is_prerelease(&c.version))
                 .map(|c| VersionEntry {
                     original_id: c.original_id,
                     version: c.version,
@@ -123,9 +157,6 @@ impl HostedRepo {
                     listed: c.listed,
                 })
                 .collect();
-            if versions.is_empty() {
-                continue;
-            }
             let latest = versions.last().expect("non-empty versions");
             hits.push(SearchHit {
                 original_id: latest.original_id.clone(),
@@ -134,17 +165,6 @@ impl HostedRepo {
                 ..Default::default()
             });
         }
-
-        hits.sort_by(|a, b| {
-            crate::format::lower_invariant(&a.original_id)
-                .cmp(&crate::format::lower_invariant(&b.original_id))
-        });
-        let total_hits = hits.len();
-        let mut hits: Vec<SearchHit> = hits
-            .into_iter()
-            .skip(params.skip.min(total_hits))
-            .take(params.effective_take())
-            .collect();
         if enrich {
             self.enrich_hits(repo_id, &mut hits).await?;
         }
@@ -246,8 +266,11 @@ impl HostedRepo {
         Ok(RegistrationEntry {
             original_id: row.original_id,
             version: row.version,
+            version_original: row.version_original,
             listed: row.listed,
             package_hash_sha512_base64: row.package_hash_sha512_base64,
+            package_sha256: row.package_sha256,
+            package_size: row.package_size,
             nuspec_bytes,
             manifest_summary,
             published: Some(row.created_at),
@@ -271,38 +294,58 @@ impl HostedRepo {
     /// The stored `.nuspec` of a component, if any.
     async fn nuspec_of_component(&self, component_id: i64) -> Result<Option<Vec<u8>>, RepoError> {
         let Some(asset) =
-            asset_dao::find_asset(&self.pool, component_id, NUSPEC_ASSET_PATH).await?
+            asset_dao::find_asset(&self.pool, component_id, self.format.manifest_asset_path())
+                .await?
         else {
             return Ok(None);
         };
         match forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? {
-            Some(blob) => Ok(Some(self.blobs.fetch_all(&blob.s3_key).await?)),
+            Some(blob) => Ok(Some(self.blobs.fetch_all(&blob).await?)),
             None => Ok(None),
         }
     }
 }
 
-/// A normalized NuGet version is prerelease iff it carries a `-label` suffix.
-fn is_prerelease(version: &str) -> bool {
-    version.contains('-')
-}
+impl HostedRepo {
+    /// The `.nupkg` of `(id, version)` in `repo`, counted as a download when
+    /// `count` ([`RepoReadOps::resolve_nupkg`] / [`RepoReadOps::resolve_nupkg_head`]).
+    async fn locate_nupkg(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+        count: bool,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        let Some(comp) = component_dao::find_component(&self.pool, repo_id, id, version).await?
+        else {
+            return Ok(None);
+        };
+        let Some(asset) =
+            asset_dao::find_asset(&self.pool, comp.id, self.format.package_asset_path()).await?
+        else {
+            return Ok(None);
+        };
+        let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
+            return Ok(None);
+        };
 
-/// Fire a best-effort download-tracking bump for a served hosted `.nupkg`,
-/// off the response hot path (slice 12.1 §3.7).
-///
-/// Spawned so the tracking write — `asset.download_count` /
-/// `last_downloaded_at` + `component.last_downloaded_at` — never blocks the
-/// download response and a failure is logged rather than propagated. The data
-/// is non-authoritative (only feeds retention's download-sensitive criteria),
-/// so an occasional lost increment under load is acceptable.
-fn spawn_download_bump(pool: PgPool, asset_id: i64, component_id: i64) {
-    tokio::spawn(async move {
-        if let Err(e) =
-            forge_db::download_dao::bump_hosted_download(&pool, asset_id, component_id).await
-        {
-            tracing::warn!(error = %e, asset_id, component_id, "download tracking bump failed");
+        // Download tracking: best-effort, off the hot path.
+        // A resolved `.nupkg` is a download (a `HEAD` is not); it is counted
+        // in memory and written in a batch, so a tracking write never blocks
+        // (or fails) the response, and a burst on one version never queues
+        // on its rows. Non-authoritative — failures are logged.
+        if count {
+            self.downloads.count_hosted(asset.id, comp.id);
         }
-    });
+
+        Ok(Some(NupkgLocation {
+            blob_sha256: blob.sha256,
+            blob_s3_key: blob.s3_key,
+            size: asset.size,
+            content_type: asset.content_type,
+        }))
+    }
 }
 
 #[async_trait]
@@ -328,30 +371,16 @@ impl RepoReadOps for HostedRepo {
         id: &str,
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
-        let repo_id = self.repo_id(repo).await?;
-        let Some(comp) = component_dao::find_component(&self.pool, repo_id, id, version).await?
-        else {
-            return Ok(None);
-        };
-        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUPKG_ASSET_PATH).await?
-        else {
-            return Ok(None);
-        };
-        let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
-            return Ok(None);
-        };
+        self.locate_nupkg(repo, id, version, true).await
+    }
 
-        // Download tracking (slice 12.1 §3.7): best-effort, off the hot path.
-        // A resolved `.nupkg` is a download; bump asynchronously so a tracking
-        // write never blocks (or fails) the response. Non-authoritative —
-        // failures are logged, not propagated.
-        spawn_download_bump(self.pool.clone(), asset.id, comp.id);
-
-        Ok(Some(NupkgLocation {
-            blob_s3_key: blob.s3_key,
-            size: asset.size,
-            content_type: asset.content_type,
-        }))
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        self.locate_nupkg(repo, id, version, false).await
     }
 
     async fn resolve_nuspec(
@@ -365,14 +394,15 @@ impl RepoReadOps for HostedRepo {
         else {
             return Ok(None);
         };
-        let Some(asset) = asset_dao::find_asset(&self.pool, comp.id, NUSPEC_ASSET_PATH).await?
+        let Some(asset) =
+            asset_dao::find_asset(&self.pool, comp.id, self.format.manifest_asset_path()).await?
         else {
             return Ok(None);
         };
         let Some(blob) = forge_db::blob_dao::get_blob(&self.pool, &asset.blob_sha256).await? else {
             return Ok(None);
         };
-        let bytes = self.blobs.fetch_all(&blob.s3_key).await?;
+        let bytes = self.blobs.fetch_all(&blob).await?;
         Ok(Some(bytes))
     }
 
@@ -385,10 +415,48 @@ impl RepoReadOps for HostedRepo {
         // One query for every version's listing state, hash and stored
         // manifest summary; only versions published before summaries were
         // stored need their manifest fetched (once — see `entry_of_row`).
-        let mut rows =
-            component_dao::list_registration_rows(&self.pool, repo_id, id, NUPKG_ASSET_PATH)
-                .await?;
+        let mut rows = component_dao::list_registration_rows(
+            &self.pool,
+            repo_id,
+            id,
+            self.format.package_asset_path(),
+        )
+        .await?;
         rows.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
+        use futures_util::StreamExt;
+        futures_util::stream::iter(rows.into_iter().map(|row| self.entry_of_row(row)))
+            .buffered(16)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        // The same rows `registration` lists, without their metadata.
+        Ok(self
+            .list_versions(repo, id)
+            .await?
+            .into_iter()
+            .map(|v| v.version)
+            .collect())
+    }
+
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        let rows = component_dao::list_registration_rows_for_versions(
+            &self.pool,
+            repo_id,
+            id,
+            versions,
+            self.format.package_asset_path(),
+        )
+        .await?;
         use futures_util::StreamExt;
         futures_util::stream::iter(rows.into_iter().map(|row| self.entry_of_row(row)))
             .buffered(16)
@@ -410,7 +478,7 @@ impl RepoReadOps for HostedRepo {
             repo_id,
             id,
             version,
-            NUPKG_ASSET_PATH,
+            self.format.package_asset_path(),
         )
         .await?
         {
@@ -536,7 +604,7 @@ impl HostedWrite {
 
     /// Publish (or redeploy) a package read from `reader`.
     ///
-    /// Pipeline (spec §6/§7, plan 7.1):
+    /// Pipeline:
     /// 1. Stage and hash the bytes locally, enforcing `max_upload_bytes`.
     /// 2. Parse the temp `.nupkg` into a [`ParsedUpload`](crate::ParsedUpload),
     ///    authorize its canonical id, then promote it into CAS. A parse failure
@@ -563,6 +631,108 @@ impl HostedWrite {
         // but deliberately does not touch the database or S3: authorization
         // needs the canonical identity extracted by the format parser first.
         let staged_nupkg = self.cas.stage(reader, max_upload_bytes).await?;
+        let (_, _, published) = self
+            .publish_staged(&repo_row, staged_nupkg, max_upload_bytes, None)
+            .await?;
+        match published {
+            Published::Created => Ok(PublishOutcome::Created),
+            Published::Replaced => Ok(PublishOutcome::Replaced),
+            other => Err(WriteError::Repo(RepoError::Storage(format!(
+                "a publish reported the import outcome {other:?}"
+            )))),
+        }
+    }
+
+    /// Import a package a migration staged from another registry (and
+    /// verified against that registry's checksums) through the same path as
+    /// a publish: parsing, the publish policy, CAS, the repository's
+    /// upload limit. Unlike a publish, a version that exists is not an
+    /// error: with the same bytes it is [`ImportOutcome::Identical`], with
+    /// other bytes it is replaced only with [`ImportOptions::overwrite`]
+    /// (even where the repository refuses redeploys) and otherwise reported
+    /// as [`ImportOutcome::Conflict`]. A stored version takes the source's
+    /// publish and last-download times, so retention judges it by its real
+    /// age.
+    pub async fn import_staged(
+        &self,
+        repo: &str,
+        staged: forge_storage::StagedBlob,
+        max_upload_bytes: u64,
+        options: &ImportOptions,
+    ) -> Result<ImportOutcome, WriteError> {
+        let repo_row = self.hosted_repo(repo).await?;
+        if staged.size > max_upload_bytes {
+            return Err(WriteError::TooLarge {
+                limit: max_upload_bytes,
+            });
+        }
+        let (id, version, published) = self
+            .publish_staged(&repo_row, staged, max_upload_bytes, Some(options))
+            .await?;
+        Ok(match published {
+            Published::Created => ImportOutcome::Created { id, version },
+            Published::Replaced => ImportOutcome::Replaced { id, version },
+            Published::Identical => ImportOutcome::Identical { id, version },
+            Published::Conflict => ImportOutcome::Conflict { id, version },
+            Published::Planned { replaces } => ImportOutcome::Planned {
+                id,
+                version,
+                replaces,
+            },
+        })
+    }
+
+    /// The SHA-256 of the package file of `(id, version)` in the hosted
+    /// repository `repository_id`, if the version exists: what an import
+    /// compares the source's checksum with before downloading anything.
+    pub async fn package_sha256(
+        &self,
+        repository_id: i64,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<String>, WriteError> {
+        let Ok(version) = self.format.normalize_version(version) else {
+            return Ok(None);
+        };
+        let lower = self.format.lower_id(id);
+        let Some(comp) = component_dao::find_component(&self.pool, repository_id, &lower, &version)
+            .await
+            .map_err(RepoError::from)?
+        else {
+            return Ok(None);
+        };
+        self.stored_package_sha256(&self.pool, comp.id).await
+    }
+
+    /// The SHA-256 of a component's package file.
+    async fn stored_package_sha256<'e, E>(
+        &self,
+        executor: E,
+        component_id: i64,
+    ) -> Result<Option<String>, WriteError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        Ok(
+            asset_dao::find_asset(executor, component_id, self.format.package_asset_path())
+                .await
+                .map_err(RepoError::from)?
+                .map(|asset| asset.blob_sha256),
+        )
+    }
+
+    /// Steps 2 to 5 of [`Self::store_upload`] for a staged package; with
+    /// `import`, an existing version is compared instead of refused (see
+    /// [`Self::import_staged`]). Returns the package's id (original casing)
+    /// and normalized version with the outcome.
+    async fn publish_staged(
+        &self,
+        repo_row: &forge_db::model::Repository,
+        staged_nupkg: forge_storage::StagedBlob,
+        max_upload_bytes: u64,
+        import: Option<&ImportOptions>,
+    ) -> Result<(String, String, Published), WriteError> {
+        let repo = repo_row.name.as_str();
 
         // 2. Parse the package from the temp file. parse_upload is sync and a
         //    package may be hundreds of MiB, so it runs on the blocking pool.
@@ -570,17 +740,26 @@ impl HostedWrite {
         //    never re-parse the manifest) is computed here too.
         let (parsed, manifest_summary) = {
             let format = self.format.clone();
-            let path = staged_nupkg.temp_path.to_path_buf();
+            let path = staged_nupkg.read_path();
             tokio::task::spawn_blocking(move || {
-                let mut file = std::fs::File::open(&path).map_err(|e| {
-                    WriteError::Repo(RepoError::Storage(format!("reopen temp upload: {e}")))
-                })?;
-                let parsed = format.parse_upload(&mut file).map_err(WriteError::from)?;
+                if let Err(e) = std::fs::metadata(&path) {
+                    return Err(WriteError::Repo(RepoError::Storage(format!(
+                        "reopen temp upload: {e}"
+                    ))));
+                }
+                let parsed = format.parse_upload_file(&path).map_err(WriteError::from)?;
                 let summary = format.manifest_summary(&parsed.nuspec_bytes);
                 Ok::<_, WriteError>((parsed, summary))
             })
             .await
             .map_err(|e| WriteError::Repo(RepoError::Storage(format!("parse upload: {e}"))))??
+        };
+        let done = |published: Published| {
+            Ok((
+                parsed.original_id.clone(),
+                parsed.version.clone(),
+                published,
+            ))
         };
 
         let publish_context =
@@ -596,6 +775,40 @@ impl HostedWrite {
             (self.publish_policy.as_ref(), publish_context.as_ref())
         {
             policy.authorize(context).await?;
+        }
+
+        // A duplicate without redeploy is answered before anything reaches
+        // S3: a CI job that re-pushes an unchanged version with
+        // `--skip-duplicate` on every build would otherwise upload it each
+        // time. The check in the transaction below stays the authority (a
+        // concurrent first push). An import compares the bytes instead.
+        let existing =
+            component_dao::find_component(&self.pool, repo_row.id, &parsed.id, &parsed.version)
+                .await
+                .map_err(RepoError::from)?;
+        match (import, existing) {
+            (Some(options), Some(comp)) => {
+                let stored = self.stored_package_sha256(&self.pool, comp.id).await?;
+                if stored.as_deref() == Some(staged_nupkg.sha256.as_str()) {
+                    return done(Published::Identical);
+                }
+                if !options.overwrite {
+                    return done(Published::Conflict);
+                }
+                if options.dry_run {
+                    return done(Published::Planned { replaces: true });
+                }
+            }
+            (Some(options), None) if options.dry_run => {
+                return done(Published::Planned { replaces: false });
+            }
+            (None, Some(_)) if !repo_row.allow_redeploy => {
+                return Err(WriteError::Conflict {
+                    id: parsed.original_id.clone(),
+                    version: parsed.version.clone(),
+                });
+            }
+            _ => {}
         }
 
         // Authorization succeeded: the staged bytes may now be promoted into
@@ -642,13 +855,26 @@ impl HostedWrite {
         let mut component_id = existing.as_ref().map(|c| c.id);
         let replaced = match existing {
             Some(comp) => {
-                if !repo_row.allow_redeploy {
-                    // Duplicate and redeploy disabled → 409. Drop the tx; the
-                    // pending blobs become orphans the reconciler cleans up.
-                    return Err(WriteError::Conflict {
-                        id: parsed.original_id.clone(),
-                        version: parsed.version.clone(),
-                    });
+                match import {
+                    // Stored concurrently since the check above.
+                    Some(options) if !options.overwrite => {
+                        let stored = self.stored_package_sha256(&mut *tx, comp.id).await?;
+                        return done(if stored.as_deref() == Some(nupkg_sha.as_str()) {
+                            Published::Identical
+                        } else {
+                            Published::Conflict
+                        });
+                    }
+                    Some(_) => {}
+                    None if !repo_row.allow_redeploy => {
+                        // Duplicate and redeploy disabled → 409. Drop the tx; the
+                        // pending blobs become orphans the reconciler cleans up.
+                        return Err(WriteError::Conflict {
+                            id: parsed.original_id.clone(),
+                            version: parsed.version.clone(),
+                        });
+                    }
+                    None => {}
                 }
                 // Replacing the bytes destroys the old ones: the caller must
                 // also be allowed to delete this version (refusal drops the
@@ -678,7 +904,7 @@ impl HostedWrite {
         };
 
         let outcome = if replaced {
-            PublishOutcome::Replaced
+            Published::Replaced
         } else {
             let inserted = self
                 .insert_new_in_tx(
@@ -701,6 +927,9 @@ impl HostedWrite {
                 // did not exist yet, so the unique index decides. Report it as
                 // the documented conflict, not an internal error.
                 Err(WriteError::Repo(RepoError::Db(e))) if is_unique_violation(&e) => {
+                    if import.is_some() {
+                        return done(Published::Conflict);
+                    }
                     return Err(WriteError::Conflict {
                         id: parsed.original_id.clone(),
                         version: parsed.version.clone(),
@@ -708,13 +937,24 @@ impl HostedWrite {
                 }
                 Err(e) => return Err(e),
             }
-            PublishOutcome::Created
+            Published::Created
         };
 
         if let (Some(id), Some(summary)) = (component_id, manifest_summary.as_ref()) {
             component_dao::set_manifest_summary(&mut *tx, id, summary)
                 .await
                 .map_err(RepoError::from)?;
+        }
+        if let (Some(id), Some(options)) = (component_id, import) {
+            component_dao::set_imported_times(
+                &mut tx,
+                id,
+                self.format.package_asset_path(),
+                options.published_at,
+                options.downloaded_at,
+            )
+            .await
+            .map_err(RepoError::from)?;
         }
 
         if let (Some((_, policy)), Some(context)) =
@@ -724,23 +964,38 @@ impl HostedWrite {
         }
 
         tx.commit().await.map_err(RepoError::from)?;
-        tracing::info!(
-            target: "forge::audit",
-            repo,
-            id = %parsed.id,
-            version = %parsed.version,
-            outcome = ?outcome,
-            principal = %self
-                .publish_policy
-                .as_ref()
-                .map_or_else(|| "internal".to_string(), |(p, _)| p.audit_label()),
-            "package published"
-        );
+        let principal = self
+            .publish_policy
+            .as_ref()
+            .map_or_else(|| "internal".to_string(), |(p, _)| p.audit_label());
+        match import {
+            Some(options) => tracing::info!(
+                target: "forge::audit",
+                action = "import",
+                repo,
+                id = %parsed.id,
+                version = %parsed.version,
+                outcome = ?outcome,
+                principal = %principal,
+                source = %options.source,
+                uploader = options.uploader.as_deref().unwrap_or(""),
+                "package imported"
+            ),
+            None => tracing::info!(
+                target: "forge::audit",
+                repo,
+                id = %parsed.id,
+                version = %parsed.version,
+                outcome = ?outcome,
+                principal = %principal,
+                "package published"
+            ),
+        }
 
         // 5. Invalidate the per-(repo,id) cache namespace.
         self.cache.invalidate_package(repo, &parsed.id).await;
 
-        Ok(outcome)
+        done(outcome)
     }
 
     /// Insert a brand-new component + `.nupkg`/`.nuspec` assets, increfing both
@@ -839,11 +1094,27 @@ impl HostedWrite {
             .map_err(RepoError::from)?;
 
         // Capture the old blob shas, delete the asset rows, decref the old blobs.
-        for path in [NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH] {
+        // The `.nupkg`'s download counters carry over to the new row: a
+        // redeploy is the same version, and retention and search
+        // (`totalDownloads`) read them.
+        let mut downloads = None;
+        let package_path = self.format.package_asset_path();
+        for path in [package_path, self.format.manifest_asset_path()] {
             if let Some(old) = asset_dao::find_asset(&mut **tx, comp.id, path)
                 .await
                 .map_err(RepoError::from)?
             {
+                if path == package_path {
+                    downloads = Some(
+                        sqlx::query!(
+                            r#"SELECT download_count, last_downloaded_at FROM asset WHERE id = $1"#,
+                            old.id
+                        )
+                        .fetch_one(&mut **tx)
+                        .await
+                        .map_err(RepoError::from)?,
+                    );
+                }
                 sqlx::query!(r#"DELETE FROM asset WHERE id = $1"#, old.id)
                     .execute(&mut **tx)
                     .await
@@ -881,10 +1152,26 @@ impl HostedWrite {
             nuspec_size,
         )
         .await?;
+        if let Some(downloads) = downloads {
+            sqlx::query!(
+                r#"
+                UPDATE asset SET download_count = $3, last_downloaded_at = $4
+                WHERE component_id = $1 AND path = $2
+                "#,
+                comp.id,
+                package_path,
+                downloads.download_count,
+                downloads.last_downloaded_at,
+            )
+            .execute(&mut **tx)
+            .await
+            .map_err(RepoError::from)?;
+        }
         Ok(true)
     }
 
-    /// Insert the canonical `.nupkg` and `.nuspec` asset rows for a component.
+    /// Insert the package and manifest asset rows (the `.nupkg` and `.nuspec`
+    /// for NuGet) for a component, at the format's asset paths.
     #[allow(clippy::too_many_arguments)]
     async fn insert_assets_in_tx(
         &self,
@@ -902,8 +1189,8 @@ impl HostedWrite {
             &mut **tx,
             NewAsset {
                 component_id,
-                path: NUPKG_ASSET_PATH.to_string(),
-                content_type: NUPKG_CONTENT_TYPE.to_string(),
+                path: self.format.package_asset_path().to_string(),
+                content_type: self.format.package_content_type().to_string(),
                 blob_sha256: nupkg_sha.to_string(),
                 size: nupkg_size,
                 sha512_base64: Some(nupkg_hash512.to_string()),
@@ -916,8 +1203,8 @@ impl HostedWrite {
             &mut **tx,
             NewAsset {
                 component_id,
-                path: NUSPEC_ASSET_PATH.to_string(),
-                content_type: NUSPEC_CONTENT_TYPE.to_string(),
+                path: self.format.manifest_asset_path().to_string(),
+                content_type: self.format.manifest_content_type().to_string(),
                 blob_sha256: nuspec_sha.to_string(),
                 size: nuspec_size,
                 sha512_base64: None,
@@ -929,7 +1216,7 @@ impl HostedWrite {
         Ok(())
     }
 
-    /// Soft- or hard-delete a specific package version (plan 7.2 / A12).
+    /// Soft- or hard-delete a specific package version.
     ///
     /// * `hard == false` (unlist): flips `component.listed = false`. The version
     ///   stays downloadable by exact version and present in flat-container
@@ -948,7 +1235,11 @@ impl HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         let repo_row = self.hosted_repo(repo).await?;
         let lower = self.format.lower_id(id);
-        let norm_ver = self.format.normalize_version(version)?;
+        // A version that does not parse was never published: 404, as NuGet
+        // clients expect for an unknown version, not 400.
+        let Ok(norm_ver) = self.format.normalize_version(version) else {
+            return Ok(DeleteOutcome::NotFound);
+        };
         if !self.mutation_filter.allows(&lower) {
             return Ok(DeleteOutcome::NotFound);
         }
@@ -1086,7 +1377,10 @@ impl HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         let repo_row = self.hosted_repo(repo).await?;
         let lower = self.format.lower_id(id);
-        let norm_ver = self.format.normalize_version(version)?;
+        // Unparsable: never published (404), as in `delete_component`.
+        let Ok(norm_ver) = self.format.normalize_version(version) else {
+            return Ok(DeleteOutcome::NotFound);
+        };
         if !self.mutation_filter.allows(&lower) {
             return Ok(DeleteOutcome::NotFound);
         }
@@ -1131,6 +1425,21 @@ impl crate::repo::RepoWriteOps for HostedWrite {
     ) -> Result<DeleteOutcome, WriteError> {
         HostedWrite::relist(self, repo, id, version).await
     }
+}
+
+/// What [`HostedWrite::publish_staged`] did with a package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Published {
+    Created,
+    Replaced,
+    /// Import only: the version exists with the same bytes.
+    Identical,
+    /// Import only: the version exists with other bytes and stays.
+    Conflict,
+    /// Import dry run only: what would be stored.
+    Planned {
+        replaces: bool,
+    },
 }
 
 /// Whether a `sqlx::Error` is a Postgres unique violation (SQLSTATE 23505).

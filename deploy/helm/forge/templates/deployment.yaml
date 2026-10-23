@@ -1,0 +1,213 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "forge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+    {{- with .Values.deploymentLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with include "forge.annotations" (dict "ctx" . "annotations" .Values.deploymentAnnotations) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- /* Helm merges a user's `type: Recreate` into the default's
+    rollingUpdate, which the API server refuses next to Recreate. */}}
+    {{- if eq (.type | default "") "Recreate" }}
+    {{- toYaml (omit . "rollingUpdate") | nindent 4 }}
+    {{- else }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "forge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "forge.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the pods when the configuration or the chart's Secret
+        # (secretEnv, forge.secretEnvName) changes; secretEnv is hashed with
+        # a salt (forge.secretEnvChecksum).
+        checksum/config: {{ include "forge.config" . | sha256sum }}
+        checksum/secret-env: {{ include "forge.secretEnvChecksum" . }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "forge.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.schedulerName }}
+      schedulerName: {{ . }}
+      {{- end }}
+      {{- with .Values.runtimeClassName }}
+      runtimeClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hostAliases }}
+      hostAliases:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        {{- $constraint := deepCopy . }}
+        {{- if not $constraint.labelSelector }}
+        {{- $_ := set $constraint "labelSelector" (dict "matchLabels" (include "forge.selectorLabels" $ | fromYaml)) }}
+        {{- end }}
+        - {{ toYaml $constraint | nindent 10 | trim }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- tpl (toYaml .) $ | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: forge
+          image: {{ include "forge.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          env:
+            {{- include "forge.env" . | nindent 12 }}
+          {{- if or .Values.secretEnv .Values.existingSecret .Values.envFrom }}
+          envFrom:
+            {{- if .Values.secretEnv }}
+            - secretRef:
+                name: {{ include "forge.secretEnvName" . }}
+            {{- end }}
+            {{- with .Values.existingSecret }}
+            {{- $existing := tpl . $ }}
+            {{- if eq $existing (include "forge.secretEnvName" $) }}
+            {{- fail (printf "existingSecret %q is the name of the Secret the chart creates from secretEnv; give your Secret another name" $existing) }}
+            {{- end }}
+            - secretRef:
+                name: {{ $existing }}
+            {{- end }}
+            {{- with .Values.envFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- with .Values.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/forge
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if include "forge.s3ProjectedToken" . }}
+            - name: s3-token
+              mountPath: {{ include "forge.s3TokenDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "forge.fullname" . }}
+        # Pushes and first-time proxy downloads are staged in
+        # /tmp/forge-staging; large proxy metadata spills to /tmp.
+        - name: tmp
+          {{- if .Values.tmpVolume.ephemeral }}
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                labels:
+                  {{- include "forge.selectorLabels" . | nindent 18 }}
+              spec:
+                {{- toYaml .Values.tmpVolume.ephemeral | nindent 16 }}
+          {{- else }}
+          emptyDir:
+            {{- toYaml (default dict .Values.tmpVolume.emptyDir) | nindent 12 }}
+          {{- end }}
+        {{- if include "forge.s3ProjectedToken" . }}
+        # The token Forge exchanges for S3 credentials (s3.webIdentity): for
+        # the STS audience only, not a Kubernetes API token.
+        - name: s3-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.s3.webIdentity.projectedToken.audience | quote }}
+                  expirationSeconds: {{ int .Values.s3.webIdentity.projectedToken.expirationSeconds }}
+                  path: token
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- tpl (toYaml .) $ | nindent 8 }}
+        {{- end }}

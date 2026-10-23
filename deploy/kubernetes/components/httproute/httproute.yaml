@@ -1,0 +1,19 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: forge
+  labels:
+    app.kubernetes.io/name: forge
+    app.kubernetes.io/component: server
+spec:
+  parentRefs:
+    # Your Gateway (and its HTTPS listener).
+    - name: gateway
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - forge.example.com
+  rules:
+    - backendRefs:
+        - name: forge
+          port: 8421

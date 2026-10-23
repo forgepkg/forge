@@ -1,0 +1,17 @@
+{{- if .Values.secretEnv }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "forge.checksumSaltName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+  {{- with include "forge.annotations" (dict "ctx" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+type: Opaque
+data:
+  # Salts the checksum/secret-env pod annotation (forge.secretEnvChecksum).
+  salt: {{ include "forge.checksumSalt" . | b64enc | quote }}
+{{- end }}

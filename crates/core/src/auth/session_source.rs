@@ -1,6 +1,6 @@
-//! Session-cookie principal source (slice 12.2, §3.7 / Phase 5).
+//! Session-cookie principal source.
 //!
-//! This is the integration point that lets the slice-1 ordered
+//! This is the integration point that lets the ordered
 //! [`PrincipalSource`] chain authenticate **browser** callers carrying a
 //! `forge_session` cookie, *in addition to* the existing token-header / HTTP
 //! Basic sources. It is appended to the chain in
@@ -14,20 +14,25 @@
 //! `Cookie` header, validate it against the shared Postgres via
 //! [`SessionService::validate`] (the session row is the authority — an unknown
 //! or tampered cookie simply hashes to a missing row), and on a hit yield a
-//! [`Principal::User`] reflecting the session's user + *current* `is_admin`.
+//! [`Principal::User`] for the session's user.
 //!
 //! ## Security semantics
 //!
 //! * A **missing** `forge_session` cookie ⇒ [`SourceOutcome::NoCredentials`]
 //!   (so token/basic still get their turn, and the anonymous policy applies if
 //!   nothing authenticates).
-//! * A **present but invalid/expired/revoked** cookie ⇒ [`SourceOutcome::Invalid`]
-//!   — bad credentials are never downgraded to anonymous (mirrors the token
-//!   path; [`resolve_principal`](super::token::resolve_principal) turns any
-//!   `Invalid` into a 401).
-//! * The `is_admin` flag comes from the **live `app_user` row** looked up by the
-//!   session's `user_id`, not a value cached on the session, so an admin
-//!   grant/revoke takes effect without re-login (a deactivated user is rejected).
+//! * A **present but invalid/expired/revoked** cookie, or one whose user is gone
+//!   or deactivated ⇒ [`SourceOutcome::Stale`]: the browser attaches it on its
+//!   own, so it proves nothing; the request continues as anonymous /
+//!   unauthenticated and the dead cookie is cleared.
+//! * A database error while checking the cookie ⇒ [`SourceOutcome::Unavailable`]
+//!   — fail closed with 503 (mirrors the token path), never a 401 for a session
+//!   that may well be live.
+//! * The user's `active` flag comes from the **live `app_user` row** looked up
+//!   by the session's `user_id`, so a deactivated user is rejected without
+//!   waiting for the session to end. What the user may do is never cached on
+//!   the session either: the authz seam reads its roles, so an admin
+//!   grant/revoke takes effect without re-login.
 
 use std::net::IpAddr;
 
@@ -67,7 +72,7 @@ pub struct SessionCookieSource {
 
 impl SessionCookieSource {
     /// Build a source over the session service + pool (the pool is used to read
-    /// the live `app_user` row for the current `is_admin`/`active` flags).
+    /// the live `app_user` row for the current `active` flag).
     /// `secure` selects the cookie name ([`session_cookie_name`]).
     pub fn new(sessions: SessionService, pool: PgPool, secure: bool) -> Self {
         Self {
@@ -114,10 +119,11 @@ impl PrincipalSource for SessionCookieSource {
             // cleared by the middleware), not a 401 that would lock the user out
             // of the login page itself.
             Ok(None) => return SourceOutcome::Stale,
-            // Infrastructure failure: fail closed.
+            // Infrastructure failure: fail closed (503, not a 401 for a
+            // session that may well be live).
             Err(e) => {
                 tracing::warn!(error = %e, "session validation failed");
-                return SourceOutcome::Invalid;
+                return SourceOutcome::Unavailable;
             }
         };
 
@@ -127,7 +133,6 @@ impl PrincipalSource for SessionCookieSource {
             Ok(Some(user)) if user.active => SourceOutcome::Authenticated(Principal::User {
                 user_id: user.id,
                 token_id: None,
-                is_admin: user.is_admin,
                 method: crate::auth::AuthMethod::Session,
             }),
             // The session points at a vanished or deactivated user: it grants
@@ -135,7 +140,7 @@ impl PrincipalSource for SessionCookieSource {
             Ok(_) => SourceOutcome::Stale,
             Err(e) => {
                 tracing::warn!(error = %e, "session user lookup failed");
-                SourceOutcome::Invalid
+                SourceOutcome::Unavailable
             }
         }
     }
@@ -242,6 +247,32 @@ mod tests {
     fn first_match_wins_on_duplicate() {
         let h = headers_with_cookie("forge_session=first; forge_session=second");
         assert_eq!(cookie_value(&h, SESSION_COOKIE).as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn session_lookup_error_is_unavailable_not_invalid() {
+        // A closed pool fails every query, as an exhausted or unreachable one
+        // does: the cookie could not be checked, so fail closed with 503
+        // rather than a 401 for a session that may be live.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://forge@localhost/forge")
+            .expect("lazy pool");
+        pool.close().await;
+        let sessions = SessionService::new(
+            pool.clone(),
+            chrono::Duration::hours(1),
+            chrono::Duration::hours(8),
+        );
+        let source = SessionCookieSource::new(sessions, pool, false);
+        assert_eq!(
+            source
+                .resolve(
+                    &headers_with_cookie("forge_session=secret-xyz"),
+                    "127.0.0.1".parse().unwrap()
+                )
+                .await,
+            SourceOutcome::Unavailable
+        );
     }
 
     #[test]

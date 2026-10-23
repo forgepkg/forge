@@ -1,12 +1,11 @@
-//! E2E: workload-identity federation (WIF) auth realm (slice 12.8, design
-//! 2026-06-03 §4/§5).
+//! E2E: workload-identity federation (WIF) auth realm.
 //!
 //! Drives the **real** forge server over HTTP against a Postgres testcontainer
 //! plus an in-process mock OIDC issuer (`MockOidc`: discovery + JWKS + arbitrary
 //! token signing). A simulated CI job presents its `id_token` — as the
 //! `X-NuGet-ApiKey`, an `Authorization: Bearer`, and the HTTP Basic password —
 //! and pushes/restores against a NuGet repo it is authorized for by a mapped
-//! forge role. Covers the §5 12.8 scenarios:
+//! forge role. Covers these scenarios:
 //!
 //! 1. a valid token (right `iss`/`aud`, matching claim rule) authenticates and
 //!    its mapped role authorizes push + restore — via all three transports;
@@ -430,13 +429,14 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
         .encode(json!({"iss": issuer, "sub": "workload-1"}).to_string());
     let token = format!("{header}.{payload}.signature");
 
-    // If WIF declined this token, the forwarding realm would accept the exact
-    // same username/password pair. The request must instead terminate at WIF.
+    // If WIF declined this token, the forwarding realm would forward the
+    // same password for `ci@example.com` as `ci`, which the upstream accepts.
+    // The request must instead terminate at WIF.
     let upstream = MockBasicUpstream::start(vec![("ci", token.as_str(), vec![])]).await;
     let block =
         upstream.upstream_basic_block(&["local-password", "upstream-basic"], 300, 30, &[], "");
     let srv = StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_upstream_basic(block)
         .start()
         .await;
@@ -459,7 +459,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let malformed_patch = srv
         .client()
         .patch(format!("{}/admin/realms/{broken_id}", srv.base_url))
-        .basic_auth("root", srv.admin_scoped_token.as_deref())
+        .basic_auth("root@example.com", srv.admin_scoped_token.as_deref())
         .json(&json!({"name": "still-broken-wif"}))
         .send()
         .await
@@ -480,7 +480,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let invalidate = srv
         .client()
         .patch(format!("{}/admin/realms/{local_id}", srv.base_url))
-        .basic_auth("root", srv.admin_scoped_token.as_deref())
+        .basic_auth("root@example.com", srv.admin_scoped_token.as_deref())
         .json(&json!({"enabled": true}))
         .send()
         .await
@@ -490,7 +490,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let response = srv
         .client()
         .get(format!("{}/admin/me", srv.base_url))
-        .basic_auth("ci", Some(&token))
+        .basic_auth("ci@example.com", Some(&token))
         .send()
         .await
         .unwrap();

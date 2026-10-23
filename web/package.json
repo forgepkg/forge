@@ -2,10 +2,10 @@
   "name": "forge-web",
   "private": true,
   "type": "module",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "license": "(AGPL-3.0-only OR LicenseRef-envisia)",
   "packageManager": "pnpm@11.5.0",
-  "description": "envisia-forge admin + browse SPA (TanStack Router, SPA mode, served by the Rust server).",
+  "description": "Forge admin + browse SPA (TanStack Router, SPA mode, served by the Rust server).",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
@@ -20,32 +20,32 @@
     "e2e:install": "playwright install --with-deps chromium"
   },
   "dependencies": {
-    "@headlessui/react": "2.2.10",
-    "@tanstack/react-query": "5.104.0",
-    "@tanstack/react-router": "1.170.39",
+    "@fontsource-variable/ibm-plex-sans": "5.3.0",
+    "@fontsource-variable/jetbrains-mono": "5.3.0",
+    "@tanstack/react-query": "5.104.3",
+    "@tanstack/react-router": "1.170.44",
     "clsx": "2.1.1",
-    "motion": "14.2.0",
-    "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   },
   "devDependencies": {
-    "@playwright/test": "1.63.0",
+    "@playwright/test": "1.64.1",
     "@tailwindcss/vite": "4.3.3",
-    "@tanstack/react-query-devtools": "5.104.0",
+    "@tanstack/react-query-devtools": "5.104.3",
     "@tanstack/react-router-devtools": "1.167.2",
-    "@tanstack/router-plugin": "1.168.40",
+    "@tanstack/router-plugin": "1.168.46",
     "@tanstack/virtual-file-routes": "1.162.0",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",
-    "@testing-library/user-event": "^14.6.7",
-    "@types/node": "26.6.3",
+    "@testing-library/user-event": "^14.6.8",
+    "@types/node": "26.6.5",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
-    "@vitejs/plugin-react": "6.1.1",
-    "jsdom": "30.1.1",
+    "@vitejs/plugin-react": "6.1.2",
+    "jsdom": "30.1.3",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
-    "vite": "8.3.1",
-    "vitest": "5.0.2"
+    "vite": "8.3.4",
+    "vitest": "5.0.5"
   }
 }

@@ -1,4 +1,4 @@
-//! Database access layer for envisia-forge.
+//! Database access layer for Forge.
 //!
 //! Provides the connection pool, the migration runner, the row models, and a
 //! DAO module per table. DAOs use sqlx **compile-time-checked** queries
@@ -13,14 +13,20 @@ pub mod authz_dao;
 pub mod blob_dao;
 pub mod component_dao;
 pub mod download_dao;
+pub mod email_oauth_flow_dao;
+pub mod email_settings_dao;
 pub mod encryption_key_dao;
 pub mod external_identity_dao;
 pub mod ids;
+pub mod import_dao;
+pub mod invitation_dao;
 pub mod login_network_dao;
 pub mod model;
+pub mod oci_dao;
 pub mod oidc_flow_dao;
 pub mod outbox_dao;
 pub mod proxy_dao;
+pub mod raw_dao;
 pub mod repository_dao;
 pub mod retention_dao;
 pub mod secret_dao;
@@ -30,5 +36,6 @@ pub mod trusted_publish_audit_dao;
 pub mod user_dao;
 pub mod username;
 pub mod validated_credential_dao;
+pub mod workload_api_key_dao;
 
-pub use pool::{connect, connect_with, migrate};
+pub use pool::{connect, connect_with, db_now, migrate};

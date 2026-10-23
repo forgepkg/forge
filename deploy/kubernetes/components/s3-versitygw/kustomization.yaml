@@ -1,0 +1,20 @@
+# An in-cluster S3 gateway (versitygw, posix backend on a PersistentVolume)
+# for evaluation and small installations, wired into Forge. For production
+# point FORGE_S3__* at a real object store instead (AWS S3, Ceph RGW, …) and
+# drop this component.
+#
+# The gateway's root credentials are Forge's own: FORGE_S3__ACCESS_KEY and
+# FORGE_S3__SECRET_KEY from the forge-env Secret. Forge creates the bucket on
+# its first start.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: forge
+
+resources:
+  - versitygw.yaml
+
+patches:
+  - path: deployment-patch.yaml

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE component c\n        SET last_downloaded_at = now()\n        FROM UNNEST($1::bigint[], $2::text[], $3::text[]) AS d(repository_id, name, version)\n        WHERE c.repository_id = d.repository_id\n          AND c.name = d.name\n          AND c.version = d.version\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "011795abb0a7672ac36bc4929d130bbdef94e5f10cd69a46a63d262af59a9ee3"
+}

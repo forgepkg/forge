@@ -2,7 +2,7 @@
  * In-process mock upstream NuGet V3 feed for the proxy-delay e2e scenario.
  *
  * This is the Node twin of the Rust `crates/e2e/src/mock_upstream.rs`: it serves
- * the same three shapes the slice-1 proxy client consumes —
+ * the same shapes the proxy client consumes —
  *
  *  - `GET /index.json` — a service index advertising `PackageBaseAddress/3.0.0`,
  *    `RegistrationsBaseUrl`, and `SearchQueryService`;
@@ -13,8 +13,8 @@
  *  - `GET /registration/{id}/index.json` — the registration index.
  *
  * It listens on an ephemeral **loopback** port so the forge-server (running on
- * the same host in the harness) can reach it; the proxy repo is therefore
- * created with `allow_private_upstream: true` to clear the SSRF guard.
+ * the same host in the harness) can reach it; upstream URLs are only checked
+ * for an http/https scheme, so the proxy repo needs no extra setting for it.
  *
  * The corpus is `lowerId -> { version -> nupkg bytes }`; unknown ids 404 (a
  * genuine upstream miss). No Node proxy of the forge API is involved — this is a

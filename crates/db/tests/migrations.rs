@@ -9,9 +9,9 @@ use testcontainers_modules::{
     testcontainers::{runners::AsyncRunner, ImageExt},
 };
 
-/// Every table the migrations are expected to create.
-/// `0001_init.sql` creates the slice-1 tables; `0002_retention.sql` adds the
-/// two retention coordination tables.
+/// Every table the migrations are expected to create. The unlabelled head of
+/// the list comes from `0001_init.sql`; every later group is labelled with the
+/// migration that creates it.
 const EXPECTED_TABLES: &[&str] = &[
     "repository",
     "group_member",
@@ -61,7 +61,8 @@ const _OIDC_UNIQUE_DOC: &[(&str, &str)] = &[
     ("session", "(token_hash)"),
 ];
 
-/// Columns `0002_retention.sql` adds to existing slice-1 tables: (table, column).
+/// Columns `0002_retention.sql` adds to the `0001_init.sql` tables:
+/// (table, column).
 const EXPECTED_RETENTION_COLUMNS: &[(&str, &str)] = &[
     ("repository", "retention_policy"),
     ("repository", "retention_last_run_at"),
@@ -83,6 +84,7 @@ async fn migrations_create_all_expected_tables() {
                 .with_db_name("forge")
                 .with_user("forge")
                 .with_password("forge")
+                .with_name("mirror.gcr.io/library/postgres")
                 .with_tag("17")
                 .start()
                 .await
@@ -126,7 +128,7 @@ async fn migrations_create_all_expected_tables() {
         );
     }
 
-    // Assert the retention columns added to slice-1 tables exist.
+    // Assert the retention columns added to `0001_init.sql` tables exist.
     for (table, column) in EXPECTED_RETENTION_COLUMNS {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (\
@@ -296,7 +298,7 @@ async fn migrations_create_all_expected_tables() {
     );
 
     // oidc_flow: text `state` PK is the single-use auth-code-flow row. A DELETE
-    // ... RETURNING consumes it exactly once (the slice's cross-instance crux).
+    // ... RETURNING consumes it exactly once, even across instances.
     sqlx::query(
         "INSERT INTO oidc_flow (state, nonce, pkce_verifier, redirect_to, expires_at) \
          VALUES ('state-xyz', 'nonce-1', 'verifier-1', '/', now() + interval '10 minutes')",
@@ -527,7 +529,7 @@ async fn migrations_create_all_expected_tables() {
     .expect("count anonymous grants");
     assert_eq!(
         anon_grant_count, 0,
-        "anonymous role seeds no grants in the additive phase-1 migration"
+        "anonymous role seeds no grants in 0005_rbac.sql"
     );
 
     // The COALESCE-based unique index collapses (role, ANY, action, no-selector)

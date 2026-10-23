@@ -1,4 +1,4 @@
-//! Claim → `app_user` mapping and `is_admin` derivation (slice 12.2, §3.6).
+//! Claim → `app_user` mapping and `is_admin` derivation.
 //!
 //! Pure functions over an already-verified [`IdTokenClaims`] set and a small
 //! [`ClaimMapping`] config. No I/O — identity resolution / provisioning lives in
@@ -87,6 +87,11 @@ pub struct MappedClaims {
     /// The resolved username (username claim → email claim when verified →
     /// `sub`).
     pub username: String,
+    /// The claim [`Self::username`] came from: the realm's username claim,
+    /// its email claim or `sub`. A new account must be named by a UPN, and a
+    /// login whose username is none is refused with a message that names
+    /// this claim.
+    pub username_claim: String,
     /// Email, if the configured email claim was a non-empty string.
     pub email: Option<String>,
     /// Display name, if the configured display-name claim was a non-empty string.
@@ -113,21 +118,24 @@ pub fn map_claims(claims: &IdTokenClaims, mapping: &ClaimMapping) -> MappedClaim
     let canonical = |raw: String| forge_db::username::canonical_username(&raw).ok();
     let username_is_email =
         mapping.username_claim == mapping.email_claim || mapping.username_claim == "email";
-    let username = string_claim(claims, &mapping.username_claim)
+    let (username, username_claim) = string_claim(claims, &mapping.username_claim)
         .filter(|_| !username_is_email || email_verified(claims))
         .and_then(canonical)
+        .map(|u| (u, mapping.username_claim.clone()))
         .or_else(|| {
             email
                 .clone()
                 .filter(|_| email_verified(claims))
                 .and_then(canonical)
+                .map(|u| (u, mapping.email_claim.clone()))
         })
-        .or_else(|| canonical(claims.sub.clone()))
-        .unwrap_or_else(|| "oidc-user".to_string());
+        .or_else(|| canonical(claims.sub.clone()).map(|u| (u, "sub".to_string())))
+        .unwrap_or_else(|| ("oidc-user".to_string(), "sub".to_string()));
     let display_name = string_claim(claims, &mapping.display_name_claim);
     let is_admin = derive_is_admin(claims, mapping);
     MappedClaims {
         username,
+        username_claim,
         email,
         display_name,
         is_admin,

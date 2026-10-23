@@ -1,6 +1,5 @@
-//! Admin grant management (§12.4 Phase 6): the `repository_privilege` edges that
-//! give a role `<action>` on `<repo|ANY>`, optionally scoped by a content
-//! selector.
+//! Admin grant management: the `repository_privilege` edges that give a role
+//! `<action>` on `<repo|ANY>`, optionally scoped by a content selector.
 //!
 //! * `GET    /admin/roles/{id}/grants` — list a role's grants.
 //! * `PUT    /admin/roles/{id}/grants` — add a grant (idempotent).
@@ -10,6 +9,9 @@
 //! * `repository` omitted/`null` ⇒ **ANY** repo (wildcard grant).
 //! * `action` is one of `read`/`write`/`delete`/`admin` (validated against the
 //!   pure [`Action`] parser so an unknown verb is a 400, never a silent widen).
+//!   `admin` is refused with a repository (400): administration is global
+//!   (every `/admin` operation needs the built-in `admin` role), so such a
+//!   grant would be stored and listed but delegate nothing.
 //! * `selector_id` optionally narrows the grant to packages matching a content
 //!   selector. The repo-level gate ignores the selector; it only filters which
 //!   packages are visible.
@@ -105,6 +107,17 @@ pub async fn add(
                 .into_response();
         }
     };
+
+    // Administration is global: an `admin` grant on one repository would be
+    // stored and listed but change nothing.
+    if action == Action::Admin && (body.repository.is_some() || body.repository_id.is_some()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "repository admin is not supported: administration is global; \
+             assign the admin role instead",
+        )
+            .into_response();
+    }
 
     // The role must exist.
     match authz_dao::find_role_by_id(&state.pool, role_id).await {

@@ -1,5 +1,5 @@
-//! E2E: admin retention REST surface (slice 12.1, plan Phase 7). Requires Docker
-//! (Postgres + versitygw via the shared harness).
+//! E2E: admin retention REST surface. Requires Docker (Postgres + versitygw
+//! via the shared harness).
 //!
 //! Covers the six endpoints under `/admin/repositories/{name}/retention`:
 //! admin gating (401/403), PUT validation (400) + GET round-trip, DELETE
@@ -100,7 +100,6 @@ async fn seed_hosted_with_versions(
 #[tokio::test]
 async fn retention_admin_gated() {
     let srv = common::start().await;
-    let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let s = common::unique();
     let name = format!("ret{s}");
@@ -118,22 +117,16 @@ async fn retention_admin_gated() {
     assert_eq!(resp.status(), 401, "anonymous retention GET must be 401");
 
     // Non-admin user → 403.
-    let username = format!("plain{s}");
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    let username = format!("plain{s}@example.com");
+    srv.create_user(&username, "pw123456-retention", "reader")
+        .await;
 
     let resp = client
         .get(format!(
             "{}/admin/repositories/{name}/retention",
             srv.base_url
         ))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-retention"))
         .send()
         .await
         .unwrap();
@@ -221,6 +214,102 @@ async fn put_validates_then_get_round_trips() {
         "arming a policy must create a ledger run row"
     );
     assert_eq!(body["last_run"]["state"], json!("idle"));
+}
+
+/// A misspelled field anywhere in a PUT body is refused, not dropped: every
+/// default it would fall back to is the unsafe one (`dry_run` for
+/// `dry_run_only` stored a live policy, `package_prefix` matched every id,
+/// `keep_last` protected nothing). A stored policy still parses: GET's policy
+/// PUT back is accepted and preview evaluates it.
+#[tokio::test]
+async fn put_rejects_unknown_fields() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("retu{s}");
+    seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let put = |body: Value| client.put(&url).basic_auth(&u, Some(&p)).json(&body).send();
+
+    let rule = |extra: Value| {
+        let mut rule = json!({
+            "id": "old", "action": "hard_delete",
+            "criteria": { "older_than_days": 30, "keep_last_n": 5 }
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            rule[k] = v.clone();
+        }
+        rule
+    };
+    for (body, field) in [
+        // The example from the bug report, as sent.
+        (
+            json!({"policy": {"version": 1, "dry_run": true, "rules": [{
+                "id": "old", "action": "hard_delete", "package_prefix": "Acme.Experimental",
+                "criteria": { "older_than_days": 30, "keep_last": 5 }
+            }]}}),
+            "dry_run",
+        ),
+        (
+            json!({"policy": {"version": 1, "enable": false, "rules": [rule(json!({}))]}}),
+            "enable",
+        ),
+        (
+            json!({"policy": {"version": 1, "rules": [rule(json!({"package_prefix": "Acme."}))]}}),
+            "package_prefix",
+        ),
+        (
+            json!({"policy": {"version": 1, "rules": [rule(json!({
+                "criteria": { "older_than_days": 30, "keep_last": 5 }
+            }))]}}),
+            "keep_last",
+        ),
+        (
+            json!({"policy": keep_one_policy(), "dry_run_only": true}),
+            "dry_run_only",
+        ),
+    ] {
+        let resp = put(body.clone()).await.unwrap();
+        assert_eq!(resp.status(), 422, "{body}");
+        let msg = resp.text().await.unwrap();
+        assert!(
+            msg.contains(&format!("unknown field `{field}`")),
+            "the error names {field}: {msg}"
+        );
+    }
+    let resp = client
+        .get(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["policy"].is_null(), "nothing stored: {body}");
+
+    // The stored (canonical) form round-trips.
+    let resp = put(json!({"policy": keep_one_policy()})).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .get(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    let stored = resp.json::<Value>().await.unwrap()["policy"].clone();
+    // Serialized with every field, including the defaulted ones.
+    assert_eq!(stored["rules"][0]["scope"], json!("hosted"), "{stored}");
+    assert!(stored["rules"][0]["package_name_prefix"].is_null());
+    let resp = put(json!({"policy": stored})).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .post(format!("{url}/preview"))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
 }
 
 /// A hosted-scope rule (scope omitted ⇒ hosted) on a proxy repo is rejected

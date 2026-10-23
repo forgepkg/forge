@@ -1,6 +1,6 @@
-//! E2E: §12.4 Phase 6 — admin REST API for fine-grained RBAC.
+//! E2E: admin REST API for fine-grained RBAC.
 //!
-//! Covers (plan §4 Phase 6 test list):
+//! Covers:
 //! * role CRUD round-trip + built-in protections (can't delete `admin`);
 //! * non-admin caller is 403 on every RBAC endpoint;
 //! * editing a role's grants invalidates the cache and changes a subsequent
@@ -11,10 +11,8 @@
 //! * user-role assign/unassign with targeted invalidation;
 //! * per-token scoping narrows (read-only scoped token cannot write).
 //!
-//! The test harness defaults to a **fresh (closed)** install (`legacy_open_access`
-//! unset ⇒ false), so a brand-new non-admin user holds no roles and is denied by
-//! default — exactly the deny-by-default baseline against which a grant's effect
-//! is observable.
+//! A brand-new non-admin user holds no roles and is denied by default — exactly
+//! the deny-by-default baseline against which a grant's effect is observable.
 
 mod common;
 
@@ -22,21 +20,9 @@ use serde_json::{json, Value};
 
 /// Create a non-admin user, returning `(id, username, password)`.
 async fn make_user(srv: &common::TestServer) -> (i64, String, String) {
-    let (au, ap) = srv.admin_basic();
-    let username = format!("rbac{}", common::unique());
-    let password = "pw12345678".to_string();
-    let created: Value = srv
-        .client()
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": password, "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let id = created["id"].as_i64().expect("user id");
+    let username = format!("rbac{}@example.com", common::unique());
+    let password = "pw12345678-rbac".to_string();
+    let id = srv.create_user(&username, &password, "reader").await;
     (id, username, password)
 }
 
@@ -179,11 +165,17 @@ async fn non_admin_forbidden_on_rbac_endpoints() {
 
     for (method, path) in [
         ("GET", "/admin/roles"),
+        ("GET", "/admin/roles/1/users"),
         ("GET", "/admin/content-selectors"),
+        ("GET", "/admin/content-selectors/1/grants"),
+        ("POST", "/admin/content-selectors/match"),
         ("GET", "/admin/anonymous/effective"),
     ] {
         let req = match method {
             "GET" => client.get(format!("{}{}", srv.base_url, path)),
+            "POST" => client
+                .post(format!("{}{}", srv.base_url, path))
+                .json(&json!({"name": "x"})),
             _ => unreachable!(),
         };
         let resp = req
@@ -238,6 +230,17 @@ async fn grant_changes_decision_and_invalidates_cache() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
+
+    // #84: both `role` and `role_id` is refused, never silently resolved to
+    // one of them (here a name that differs from the id's role).
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "admin", "role_id": role_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 
     // Assign the role to the user (targeted invalidation).
     let resp = client
@@ -353,6 +356,22 @@ async fn rbac_bodies_reject_unknown_fields() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+    // `admin` on one repository delegates nothing (administration is
+    // global), so it is refused rather than stored, by name or by id.
+    for body in [
+        json!({"repository": repo, "action": "admin"}),
+        json!({"repository_id": repo_id, "action": "admin"}),
+    ] {
+        let resp = put(body).await.unwrap();
+        assert_eq!(resp.status(), 400);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("repository admin is not supported"), "{text}");
+    }
+    // The table refuses one written past the API as well.
+    let role_id = role["id"].as_i64().unwrap();
+    let direct =
+        forge_db::authz_dao::add_grant(&srv.pool, role_id, Some(repo_id), "admin", None).await;
+    assert!(direct.is_err(), "the CHECK constraint refuses it");
 
     let grants: Value = client
         .get(&grants_url)
@@ -534,6 +553,238 @@ async fn content_selector_crud_and_invalid_glob() {
     assert_eq!(resp.status(), 204);
 }
 
+/// A role view counts the role's grants and users, `GET /admin/roles/{id}/users`
+/// lists its members, and the user list names each user's roles: what the
+/// role screens and the user list show.
+#[tokio::test]
+async fn role_counts_members_and_user_roles() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let repo = make_repo(&srv).await;
+    let (user_id, username, _) = make_user(&srv).await;
+    let role_name = format!("pushers-{}", common::unique());
+
+    let role: Value = client
+        .post(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": role_name}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let role_id = role["id"].as_i64().unwrap();
+    assert_eq!(role["grant_count"], json!(0));
+    assert_eq!(role["user_count"], json!(0));
+
+    for action in ["read", "write"] {
+        let resp = client
+            .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"repository": repo, "action": action}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role_id": role_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // Counted in the list and on the role itself.
+    let roles: Value = client
+        .get(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = roles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(role_id))
+        .expect("role listed");
+    assert_eq!(listed["grant_count"], json!(2));
+    assert_eq!(listed["user_count"], json!(1));
+    let one: Value = client
+        .get(format!("{}/admin/roles/{role_id}", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["grant_count"], json!(2));
+    assert_eq!(one["user_count"], json!(1));
+
+    // The members.
+    let members: Value = client
+        .get(format!("{}/admin/roles/{role_id}/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        members,
+        json!([{"id": user_id, "username": username, "auth_source": "local", "active": true}])
+    );
+    let resp = client
+        .get(format!("{}/admin/roles/{}/users", srv.base_url, i64::MAX))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "an unknown role has no member list");
+
+    // The user list names the user's roles.
+    let users: Value = client
+        .get(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == json!(user_id))
+        .expect("user listed");
+    assert_eq!(listed["roles"], json!([role_name]));
+    let admin = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == json!(au))
+        .expect("bootstrap admin listed");
+    assert!(
+        admin["roles"].as_array().unwrap().contains(&json!("admin")),
+        "the bootstrap admin holds the admin role: {admin}"
+    );
+}
+
+/// `GET /admin/content-selectors/{id}/grants` lists the grants a selector
+/// scopes, and `POST /admin/content-selectors/match` tests a package name with
+/// the evaluator's own globs.
+#[tokio::test]
+async fn content_selector_grants_and_match() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let repo = make_repo(&srv).await;
+
+    let sel: Value = client
+        .post(format!("{}/admin/content-selectors", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({
+            "name": format!("acme-{}", common::unique()),
+            "includes": ["acme.*"],
+            "excludes": ["acme.internal.*"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sel_id = sel["id"].as_i64().unwrap();
+    let role: Value = client
+        .post(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": format!("acme-readers-{}", common::unique())}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let role_id = role["id"].as_i64().unwrap();
+    let resp = client
+        .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"repository": repo, "action": "read", "selector_id": sel_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let grants: Value = client
+        .get(format!(
+            "{}/admin/content-selectors/{sel_id}/grants",
+            srv.base_url
+        ))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grants = grants.as_array().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0]["role_id"], json!(role_id));
+    assert_eq!(grants[0]["action"], json!("read"));
+    assert_eq!(grants[0]["selector_id"], json!(sel_id));
+    let resp = client
+        .get(format!(
+            "{}/admin/content-selectors/{}/grants",
+            srv.base_url,
+            i64::MAX
+        ))
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    for (includes, name, expected) in [
+        (json!(["acme.*"]), "Acme.Core", true),
+        (json!(["acme.*"]), "acme.internal.tools", false),
+        (json!(["acme.*"]), "other.lib", false),
+        (json!([]), "anything", true),
+        (json!([]), "acme.internal.tools", false),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/content-selectors/match", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"includes": includes, "excludes": ["acme.internal.*"], "name": name}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body, json!({"matches": expected}), "{includes} vs {name}");
+    }
+    let resp = client
+        .post(format!("{}/admin/content-selectors/match", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"includes": ["[unterminated"], "name": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an invalid glob is refused as on a write"
+    );
+}
+
 /// A redeploy replaces a version's bytes, so with `allow_redeploy` on it takes
 /// the delete permission as well as write: a push-only token can publish a new
 /// version but not overwrite a released one.
@@ -599,6 +850,118 @@ async fn redeploy_needs_delete_as_well_as_write() {
     assert_eq!(push().await, 403, "replacing it needs delete too");
     assert_eq!(grant("delete").await.unwrap().status(), 201);
     assert!(push().await.is_success(), "write + delete may redeploy");
+}
+
+/// #318: the built-in `writer` role reads and publishes on every repository,
+/// one created after the role was assigned too, and a package id the
+/// repository does not have yet. It unlists nothing (no `delete`) and
+/// administers nothing: every `/admin/*` route but `/admin/me` is closed. A
+/// token the writer mints for itself is limited the same way.
+#[tokio::test]
+async fn the_writer_role_publishes_everywhere_but_deletes_and_administers_nothing() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let (user_id, username, password) = make_user(&srv).await;
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "writer"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let repo = make_repo(&srv).await;
+
+    // The writer mints its own token from a browser session.
+    let session = srv.login(&username, &password).await;
+    let created: Value = session
+        .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
+        .json(&json!({"name": "ci"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = created["token"].as_str().expect("token").to_string();
+
+    let id = format!("Writer.Pkg{}", common::unique());
+    assert_eq!(
+        publish_with_token(&srv, &repo, &token, &id, "1.0.0").await,
+        201,
+        "a new package id"
+    );
+    assert_eq!(
+        publish_with_token(&srv, &repo, &token, &id, "1.1.0").await,
+        201,
+        "a new version of it"
+    );
+    let resp = client
+        .get(format!(
+            "{}/v3/{repo}/flat/{}/index.json",
+            srv.base_url,
+            id.to_lowercase()
+        ))
+        .header("X-NuGet-ApiKey", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "and reads it back");
+    let resp = client
+        .delete(format!("{}/v3/{repo}/package/{id}/1.0.0", srv.base_url))
+        .header("X-NuGet-ApiKey", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "unlisting needs delete");
+
+    for credentials in [token.as_str(), password.as_str()] {
+        for path in [
+            "/admin/users",
+            "/admin/repositories",
+            "/admin/roles",
+            "/admin/realms",
+        ] {
+            let resp = client
+                .get(format!("{}{path}", srv.base_url))
+                .basic_auth(&username, Some(credentials))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 403, "{path}");
+        }
+        let resp = client
+            .get(format!("{}/admin/me", srv.base_url))
+            .basic_auth(&username, Some(credentials))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "/admin/me answers");
+    }
+    // Nor from the browser session: no repository, user, role or realm.
+    for (path, body) in [
+        (
+            "/admin/repositories",
+            json!({"name": format!("w{}", common::unique()), "kind": "hosted"}),
+        ),
+        (
+            "/admin/users",
+            json!({"username": format!("w{}@example.com", common::unique())}),
+        ),
+        (
+            "/admin/roles",
+            json!({"name": format!("w{}", common::unique())}),
+        ),
+    ] {
+        let resp = session
+            .apply(client.post(format!("{}{path}", srv.base_url)))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{path}");
+    }
 }
 
 /// A read-only scoped token cannot write even though its owner can.
@@ -687,6 +1050,85 @@ async fn token_scope_narrows_to_read_only() {
 
     let status = publish_with_token(&srv, &repo, &token, "ScopeTest", "1.0.0").await;
     assert_eq!(status, 201, "unscoped token may write; got {status}");
+}
+
+/// #32: reading a group grants no read on its members, and a token scope is
+/// no exception. Scoped to the group alone a token sees an empty feed; with
+/// the member listed too, the group serves it. (Documented behavior.)
+#[tokio::test]
+async fn a_token_scoped_to_a_group_reads_only_the_members_it_lists() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let hosted = make_repo(&srv).await;
+    let id = format!("Scoped.Group{}", common::unique());
+    let admin_token = srv.admin_token().await;
+    assert_eq!(
+        publish_with_token(&srv, &hosted, &admin_token, &id, "1.0.0").await,
+        201
+    );
+    let group = format!("grp{}", common::unique());
+    for (url, body) in [
+        (
+            format!("{}/admin/repositories", srv.base_url),
+            json!({"name": group, "kind": "group"}),
+        ),
+        (
+            format!("{}/admin/repositories/{group}/members", srv.base_url),
+            json!({"member": hosted, "priority": 100}),
+        ),
+    ] {
+        let resp = client
+            .post(url)
+            .basic_auth(&au, Some(&ap))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "{}", resp.status());
+    }
+    let repo_id = |name: String| {
+        let pool = srv.pool.clone();
+        async move {
+            forge_db::repository_dao::find_repository_by_name(&pool, &name)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        }
+    };
+    let (group_id, hosted_id) = (repo_id(group.clone()).await, repo_id(hosted.clone()).await);
+    let admin_id = forge_db::user_dao::find_user_by_username(&srv.pool, &au)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let listing = |repositories: Vec<i64>| {
+        let (client, srv_url) = (client.clone(), srv.base_url.clone());
+        let (au, ap, group, lower) = (au.clone(), ap.clone(), group.clone(), id.to_lowercase());
+        async move {
+            let created: Value = client
+                .post(format!("{srv_url}/admin/users/{admin_id}/tokens"))
+                .basic_auth(&au, Some(&ap))
+                .json(&json!({"name": "ci", "scope": {"actions": ["read"],
+                                                       "repositories": repositories}}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            client
+                .get(format!("{srv_url}/v3/{group}/flat/{lower}/index.json"))
+                .header("X-NuGet-ApiKey", created["token"].as_str().unwrap())
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(listing(vec![group_id]).await, 404, "the group alone: empty");
+    assert_eq!(listing(vec![group_id, hosted_id]).await, 200);
 }
 
 /// M1: `PATCH /admin/content-selectors/{id}` is a true PATCH — an omitted
@@ -779,14 +1221,18 @@ async fn content_selector_patch_keeps_omitted_fields() {
 #[tokio::test]
 async fn signed_in_user_reads_anonymous_read_repo() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
-            anonymous_mode: "all".into(),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let (user_id, username, password) = make_user(&srv).await;
@@ -855,4 +1301,64 @@ async fn signed_in_user_reads_anonymous_read_repo() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403, "scope still bounds the public reach");
+}
+
+/// #84: turning `anonymous_read` off drops the read grant for everyone who
+/// holds the `anonymous` role, also a user assigned it (cached under the
+/// user's own key), not only the anonymous principal.
+#[tokio::test]
+async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let repo = format!("anonrole{s}");
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": repo, "kind": "hosted", "anonymous_read": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    // The anonymous role's read grant on the repository (what migration 0007
+    // synthesized for repositories that were anonymous-readable).
+    let anon_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")
+        .await
+        .unwrap()
+        .unwrap();
+    let resp = client
+        .put(format!("{}/admin/roles/{anon_role}/grants", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"repository": repo, "action": "read"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let username = format!("anonuser{s}@example.com");
+    let user_id = srv.create_user(&username, "pw-anon-role-1", "reader").await;
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "anonymous"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let session = srv.login(&username, "pw-anon-role-1").await;
+    let index = format!("{}/v3/{repo}/index.json", srv.base_url);
+    let resp = session.apply(client.get(&index)).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "read through the anonymous role");
+
+    let resp = client
+        .put(format!("{}/admin/repositories/{repo}", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"anonymous_read": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = session.apply(client.get(&index)).send().await.unwrap();
+    assert_eq!(resp.status(), 403, "the cached grant is gone at once");
 }

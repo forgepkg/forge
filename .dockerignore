@@ -4,6 +4,7 @@
 
 # Rust build artifacts (the builder stage runs its own `cargo build`).
 /target
+/plugins/*/target
 **/*.rs.bk
 
 # Node / pnpm (the web build stage runs `pnpm install` fresh from the lockfile).
@@ -24,16 +25,17 @@ web/e2e/.harness-facts.json
 .git
 .gitignore
 .github
-.gitlab-ci.yml
 .env
 .env.*
 forge.toml
 *.local
 .DS_Store
 
-# Docs / compose / the Dockerfile itself aren't needed inside the build.
+# Docs / compose / Kubernetes manifests / the Dockerfile itself aren't needed
+# inside the build (deploy/ may hold an overlay's local forge.env secrets).
 *.md
 docs
+deploy
 docker-compose*.yml
 Dockerfile
 .dockerignore

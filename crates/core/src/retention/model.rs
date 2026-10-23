@@ -1,6 +1,6 @@
 //! Retention policy model + validation (the `repository.retention_policy` jsonb).
 //!
-//! The shape mirrors the design doc (§2) and the `0002_retention.sql` migration:
+//! The shape mirrors the `0002_retention.sql` migration:
 //! a policy is a list of **rules**; a component is acted on if **any** rule
 //! selects it (union), but `keep_last_n` / `keep_n_most_downloaded` protections
 //! always win (a protected version is never deleted — see [`crate::retention::evaluate`]).
@@ -28,6 +28,7 @@ pub const POLICY_VERSION: u32 = 1;
 /// `None` policy column ⇒ no retention. An `enabled = false` policy is parsed
 /// and stored but produces no decisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionPolicy {
     /// Policy schema version (must equal [`POLICY_VERSION`]).
     pub version: u32,
@@ -39,7 +40,8 @@ pub struct RetentionPolicy {
     #[serde(default)]
     pub dry_run_only: bool,
     /// Minimum seconds between automatic runs for this repo (advisory scheduling
-    /// floor used by the worker; a manual trigger bypasses it).
+    /// floor used by the worker; a manual trigger bypasses it). The worker
+    /// never schedules runs less than 60 s apart, whatever this says.
     #[serde(default = "default_min_run_interval")]
     pub min_run_interval_seconds: u64,
     /// The ordered list of rules. Must be non-empty.
@@ -57,6 +59,7 @@ fn default_min_run_interval() -> u64 {
 /// A single retention rule. Criteria within a rule are ANDed; a component is
 /// acted on if **any** rule selects it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionRule {
     /// Stable, human-chosen id, recorded on every audit row this rule produces.
     pub id: String,
@@ -141,6 +144,7 @@ pub enum ReleaseType {
 /// are then **unioned**: a version protected by any rule is never unlisted or
 /// deleted by any rule.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Criteria {
     /// Protection: the newest N **listed** versions (by format version order)
     /// of each package id in this rule's pool. Unlisted versions neither count
@@ -391,7 +395,7 @@ fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), Policy
 mod tests {
     use super::*;
 
-    /// The §2 example policy (hosted keep-recent + a proxy evict rule), built in
+    /// An example policy (hosted keep-recent + a proxy evict rule), built in
     /// code so tests can mutate it.
     fn example_hosted_rule() -> RetentionRule {
         RetentionRule {

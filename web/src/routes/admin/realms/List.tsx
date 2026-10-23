@@ -1,39 +1,56 @@
 import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
-import type { RealmView } from '~/api/realms'
+import type {
+  CredentialForwardingConfig,
+  OidcRealmConfig,
+  RealmView,
+  WorkloadIdentityConfig,
+} from '~/api/realms'
 import {
   useDeleteRealm,
   useRealms,
   useReorderRealms,
   useUpdateRealm,
 } from '~/queries/useRealms'
-import { Badge } from '~/components/catalyst/badge'
-import { Button } from '~/components/catalyst/button'
-import { Checkbox } from '~/components/catalyst/checkbox'
-import { Heading } from '~/components/catalyst/heading'
-import { Text } from '~/components/catalyst/text'
+import { ErrorState } from '~/components/ErrorState'
+import { EmptyState } from '~/components/EmptyState'
+import { disableRealmWarning, REALM_KINDS } from '~/components/RealmForm'
 import {
+  Button,
+  CellActions,
+  CellStack,
+  Chip,
+  Dialog,
+  Icon,
+  Notice,
+  Page,
+  PageHeader,
+  Panel,
+  Skeleton,
+  Switch,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from '~/components/catalyst/table'
-import { ErrorState } from '~/components/ErrorState'
-import { EmptyState } from '~/components/EmptyState'
+} from '~/components/ui'
 
 export const Route = createFileRoute('/_app/manage/realms')({
   component: RealmsList,
 })
 
 /**
- * Admin authentication-realms screen (§12.7). Lists realms in priority order
+ * Admin authentication-realms screen. Lists realms in priority order
  * (lower = tried/listed first) with up/down reordering (the full new id order
- * is PUT to `/admin/realms/order`), an enable/disable toggle, edit links, and
- * delete-with-confirm. The built-in `local` realm cannot be deleted — only
- * disabled.
+ * is PUT to `/admin/realms/order`), an enable/disable switch, edit links, and
+ * delete-with-confirm (a dialog). The built-in `local` realm cannot be
+ * deleted — only disabled. Disabling a realm people sign in with (local,
+ * OIDC, credential forwarding) asks first in a dialog and says whose logins
+ * stop. The server refuses (409) a disable or delete that would leave no
+ * enabled realm to sign in with interactively (local or OIDC); its reason is
+ * shown inline.
  */
 function RealmsList() {
   const realms = useRealms()
@@ -57,27 +74,28 @@ function RealmsList() {
   }
 
   const mutationError = reorder.error ?? del.error
+  const list = realms.data ?? []
+  const deleting = list.find((r) => r.id === pendingDelete)
 
   return (
-    <section className="space-y-6">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <Heading>Authentication</Heading>
-          <Text className="mt-1">
-            Realms are tried in this order when checking credentials and
-            routing sign-ins.
-          </Text>
-        </div>
-        <Button href="/manage/realms/new">New realm</Button>
-      </div>
+    <Page>
+      <PageHeader
+        title="Authentication"
+        description="Realms are tried in this order when checking credentials and routing sign-ins."
+        actions={
+          <Button variant="primary" icon="Plus" href="/manage/realms/new">
+            New realm
+          </Button>
+        }
+      />
 
       {mutationError && (
-        <p
-          role="alert"
-          className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
+        <Notice
+          tone="danger"
+          title={reorder.error ? 'Could not reorder the realms' : 'Could not delete the realm'}
         >
           {mutationError.body || mutationError.message}
-        </p>
+        </Notice>
       )}
 
       {realms.isError ? (
@@ -87,186 +105,220 @@ function RealmsList() {
           onRetry={() => void realms.refetch()}
         />
       ) : realms.isLoading ? (
-        <Text>Loading realms…</Text>
-      ) : (realms.data?.length ?? 0) === 0 ? (
-        <EmptyState title="No realms configured">
+        <Skeleton variant="table" rows={3} columns={4} label="Loading realms…" />
+      ) : list.length === 0 ? (
+        <EmptyState title="No realms configured" icon="Shield">
           Create an OIDC or credential-forwarding realm with the button above.
         </EmptyState>
       ) : (
-        <Table striped>
-          <TableHead>
-            <TableRow>
-              <TableHeader>Order</TableHeader>
+        <Panel title="Realms" count={list.length} flush>
+          <Table caption="Authentication realms, in the order they are tried">
+            <TableHead>
+              <TableHeader width="128px">Order</TableHeader>
               <TableHeader>Name</TableHeader>
-              <TableHeader>Kind</TableHeader>
-              <TableHeader>Enabled</TableHeader>
-              <TableHeader>Actions</TableHeader>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {realms.data!.map((realm, index) => (
-              <RealmRow
-                key={realm.id}
-                realm={realm}
-                isFirst={index === 0}
-                isLast={index === realms.data!.length - 1}
-                reordering={reorder.isPending}
-                onMoveUp={() => move(index, -1)}
-                onMoveDown={() => move(index, 1)}
-                isDeleting={del.isPending && pendingDelete === realm.id}
-                pendingDelete={pendingDelete === realm.id}
-                onRequestDelete={() => setPendingDelete(realm.id)}
-                onCancelDelete={() => setPendingDelete(null)}
-                onConfirmDelete={() => confirmDelete(realm.id)}
-              />
-            ))}
-          </TableBody>
-        </Table>
+              <TableHeader width="200px">Kind</TableHeader>
+              <TableHeader width="120px">Enabled</TableHeader>
+              {/* `relative` keeps the visually hidden name inside the table's
+                  scroll box, so it never widens the page on a phone. */}
+              <TableHeader align="right" width="200px" className="relative">
+                <span className="fg-sr">Actions</span>
+              </TableHeader>
+            </TableHead>
+            <TableBody>
+              {list.map((realm, index) => (
+                <RealmRow
+                  key={realm.id}
+                  realm={realm}
+                  position={index + 1}
+                  isFirst={index === 0}
+                  isLast={index === list.length - 1}
+                  reordering={reorder.isPending}
+                  onMoveUp={() => move(index, -1)}
+                  onMoveDown={() => move(index, 1)}
+                  onRequestDelete={() => setPendingDelete(realm.id)}
+                />
+              ))}
+            </TableBody>
+          </Table>
+        </Panel>
       )}
-    </section>
+
+      <Dialog
+        open={deleting !== undefined}
+        onClose={() => setPendingDelete(null)}
+        title={`Delete ${deleting?.name}?`}
+        description="Forge stops using it for sign-in and credential checks, and its settings are lost. This cannot be undone."
+        icon="Trash"
+        tone="danger"
+        confirmLabel={del.isPending ? 'Deleting…' : `Delete ${deleting?.name}`}
+        confirmVariant="danger-solid"
+        confirmIcon="Trash"
+        confirmDisabled={del.isPending}
+        onConfirm={() => deleting && confirmDelete(deleting.id)}
+      />
+    </Page>
   )
 }
 
+/**
+ * One realm in the list: its place in the order with move up / down, its
+ * name (linking to the edit screen) over what it connects to, its kind, the
+ * enabled switch (asking first before disabling a realm people sign in
+ * with), and the edit and delete actions.
+ */
 function RealmRow({
   realm,
+  position,
   isFirst,
   isLast,
   reordering,
   onMoveUp,
   onMoveDown,
-  isDeleting,
-  pendingDelete,
   onRequestDelete,
-  onCancelDelete,
-  onConfirmDelete,
 }: {
   realm: RealmView
+  position: number
   isFirst: boolean
   isLast: boolean
   reordering: boolean
   onMoveUp: () => void
   onMoveDown: () => void
-  isDeleting: boolean
-  pendingDelete: boolean
   onRequestDelete: () => void
-  onCancelDelete: () => void
-  onConfirmDelete: () => void
 }) {
   const update = useUpdateRealm(realm.id)
+  // Disabling a realm people sign in with ends their logins (in the browser,
+  // over NuGet Basic, or both), and disabling a workload-identity realm
+  // revokes the API keys it issued for good, so it waits for an explicit
+  // confirmation.
+  const disableWarning = disableRealmWarning(realm.kind, realm.name)
+  const [confirmDisable, setConfirmDisable] = useState(false)
+
+  function toggle(checked: boolean) {
+    if (!checked && disableWarning) {
+      setConfirmDisable(true)
+      return
+    }
+    update.mutate({ enabled: checked })
+  }
+
+  function disableConfirmed() {
+    update.mutate(
+      { enabled: false },
+      { onSettled: () => setConfirmDisable(false) },
+    )
+  }
 
   return (
     <TableRow>
-      <TableCell>
+      <TableCell nowrap>
         <span className="flex items-center gap-1">
+          <span className="fg-prio-num mr-1">{position}</span>
           <Button
-            plain
+            size="sm"
+            variant="ghost"
+            icon="ArrowUp"
+            iconOnly
+            title="Move up"
+            aria-label={`Move ${realm.name} up`}
             onClick={onMoveUp}
             disabled={isFirst || reordering}
-            aria-label={`Move ${realm.name} up`}
-            title="Move up"
           >
-            ↑
+            Move up
           </Button>
           <Button
-            plain
+            size="sm"
+            variant="ghost"
+            icon="ArrowDown"
+            iconOnly
+            title="Move down"
+            aria-label={`Move ${realm.name} down`}
             onClick={onMoveDown}
             disabled={isLast || reordering}
-            aria-label={`Move ${realm.name} down`}
-            title="Move down"
           >
-            ↓
+            Move down
           </Button>
         </span>
       </TableCell>
-      <TableCell>
-        <Link
-          to="/manage/realms/$realmId"
-          params={{ realmId: String(realm.id) }}
-          className="font-medium text-sky-600 hover:underline dark:text-sky-400"
-        >
-          {realm.name}
-        </Link>
-      </TableCell>
-      <TableCell>
-        <RealmKindBadge kind={realm.kind} />
-      </TableCell>
-      <TableCell>
-        <span className="flex items-center gap-2 text-zinc-600 dark:text-zinc-400">
-          <Checkbox
-            checked={realm.enabled}
-            disabled={update.isPending}
-            onChange={(checked) => update.mutate({ enabled: checked })}
-            aria-label={`${realm.name} enabled`}
-          />
-          {realm.enabled ? 'enabled' : 'disabled'}
-        </span>
-        {/* The server can refuse a toggle (e.g. disabling the last realm an
-            admin can sign in with); the checkbox stays at the stored state,
-            so say why instead of silently snapping back. */}
-        {update.isError && (
-          <p
-            role="alert"
-            className="mt-1 max-w-xs text-sm/6 whitespace-normal text-red-600 dark:text-red-400"
-          >
-            Could not {update.variables?.enabled ? 'enable' : 'disable'}{' '}
-            {realm.name}: {update.error.body || update.error.message}
-          </p>
-        )}
-      </TableCell>
-      <TableCell>
-        <span className="flex items-center gap-3">
+      <TableCell lead>
+        <CellStack sub={realmSummary(realm)}>
           <Link
             to="/manage/realms/$realmId"
             params={{ realmId: String(realm.id) }}
-            className="text-sky-600 hover:underline dark:text-sky-400"
+            className="fg-link-strong"
           >
-            Edit
+            {realm.name}
           </Link>
-          {realm.kind !== 'local' &&
-            (pendingDelete ? (
-              <span className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={onConfirmDelete}
-                  disabled={isDeleting}
-                  className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
-                >
-                  {isDeleting ? 'Deleting…' : 'Confirm'}
-                </button>
-                <button
-                  type="button"
-                  onClick={onCancelDelete}
-                  className="text-zinc-500 hover:underline dark:text-zinc-400"
-                >
-                  Cancel
-                </button>
-              </span>
-            ) : (
-              <button
-                type="button"
-                onClick={onRequestDelete}
-                className="font-medium text-red-600 hover:underline dark:text-red-400"
-              >
-                Delete
-              </button>
-            ))}
-        </span>
+        </CellStack>
+      </TableCell>
+      <TableCell>
+        <Chip>{realm.kind}</Chip>
+      </TableCell>
+      <TableCell>
+        <Switch
+          label={`${realm.name} enabled`}
+          hideLabel
+          checked={realm.enabled}
+          disabled={update.isPending || confirmDisable}
+          onChange={toggle}
+        />
+        {/* The server refuses a toggle that would leave no enabled realm to
+            sign in with interactively (local or OIDC); the switch stays at
+            the stored state, so say why instead of silently snapping back. */}
+        {update.isError && (
+          <p role="alert" className="fg-field-error mt-2 max-w-xs whitespace-normal">
+            <Icon name="Alert" size={14} />
+            <span>
+              Could not {update.variables?.enabled ? 'enable' : 'disable'}{' '}
+              {realm.name}: {update.error.body || update.error.message}
+            </span>
+          </p>
+        )}
+        {disableWarning && (
+          <Dialog
+            open={confirmDisable}
+            onClose={() => setConfirmDisable(false)}
+            title={`Disable ${realm.name}?`}
+            description={disableWarning}
+            icon="Alert"
+            tone="warn"
+            confirmLabel={update.isPending ? 'Disabling…' : `Disable ${realm.name}`}
+            confirmVariant="danger-solid"
+            confirmDisabled={update.isPending}
+            onConfirm={disableConfirmed}
+          />
+        )}
+      </TableCell>
+      <TableCell align="right">
+        <CellActions>
+          <Button size="sm" variant="ghost" icon="Pencil" href={`/manage/realms/${realm.id}`}>
+            Edit
+          </Button>
+          {realm.kind !== 'local' && (
+            <Button size="sm" variant="ghost" icon="Trash" onClick={onRequestDelete}>
+              Delete
+            </Button>
+          )}
+        </CellActions>
       </TableCell>
     </TableRow>
   )
 }
 
-/** Color-coded kind badge (local = built-in, oidc, credential_forwarding). */
-const KIND_COLORS: Record<
-  string,
-  React.ComponentProps<typeof Badge>['color']
-> = {
-  local: 'zinc',
-  oidc: 'sky',
-  credential_forwarding: 'violet',
-  workload_identity: 'amber',
-}
-
-function RealmKindBadge({ kind }: { kind: RealmView['kind'] }) {
-  return <Badge color={KIND_COLORS[kind] ?? 'zinc'}>{kind}</Badge>
+/**
+ * The line under a realm's name: what it connects to (the IdP's or CI
+ * provider's issuer, the upstream URL), or what the built-in local realm is.
+ */
+function realmSummary(realm: RealmView): string | undefined {
+  switch (realm.kind) {
+    case 'local':
+      return REALM_KINDS.local.description
+    case 'oidc':
+      return (realm.config as OidcRealmConfig).issuer || undefined
+    case 'credential_forwarding':
+      return (realm.config as CredentialForwardingConfig).url || undefined
+    case 'workload_identity':
+      return (realm.config as WorkloadIdentityConfig).issuer || undefined
+    default:
+      return undefined
+  }
 }

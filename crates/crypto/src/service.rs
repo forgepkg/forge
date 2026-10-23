@@ -1,12 +1,12 @@
 //! The envelope service: key bootstrap, seal/open, per-layer rotation, and the
-//! bounded zeroizing cache of unwrapped keys (plan §2.4–§2.7).
+//! bounded zeroizing cache of unwrapped keys.
 //!
 //! ```text
 //! seal(pt, binding):  active DEK ──(cache)── unwrap via KEK via root ── AEAD encrypt
 //! open(blob, binding): blob.dek_version ──(cache)── unwrap ───────────── AEAD decrypt
 //! ```
 //!
-//! ## The unwrapped-key cache and §2.1
+//! ## The unwrapped-key cache and stateless instances
 //!
 //! Unwrapping a KEK (a root-provider call — a KMS round-trip in production) or
 //! a DEK (an AEAD under a KEK) on every secret read would be slow, so unwrapped
@@ -20,7 +20,7 @@
 //! (default 300 s) — acceptable because `revoked` is only ever applied to keys
 //! nothing references anymore.
 //!
-//! ## Rotation (plan §2.7) — each layer re-wraps only its own rows
+//! ## Rotation — each layer re-wraps only its own rows
 //!
 //! * [`EnvelopeService::rotate_dek`] — new active DEK for new writes; old
 //!   ciphertext is re-encrypted lazily by the data-access sweep (which calls
@@ -72,12 +72,6 @@ pub struct EnvelopeServiceConfig {
     pub unwrapped_key_ttl: Duration,
     /// Max entries in the unwrapped-key cache.
     pub unwrapped_key_max: u64,
-    /// Also open secrets sealed by pre-release builds, which bound a secret to
-    /// its row but not to where it is sent ([`AeadBinding::row_only`]), so the
-    /// re-seal sweep can move them to the destination binding. Off by default:
-    /// while on, someone who can write to the database can replay such a blob
-    /// into a row they repointed.
-    pub accept_row_bound_secrets: bool,
 }
 
 impl Default for EnvelopeServiceConfig {
@@ -87,7 +81,6 @@ impl Default for EnvelopeServiceConfig {
             scope: "default".to_string(),
             unwrapped_key_ttl: Duration::from_secs(300),
             unwrapped_key_max: 64,
-            accept_row_bound_secrets: false,
         }
     }
 }
@@ -138,12 +131,6 @@ impl EnvelopeService {
     /// The configured key scope.
     pub fn scope(&self) -> &str {
         &self.config.scope
-    }
-
-    /// Whether secrets sealed under [`AeadBinding::row_only`] by pre-release
-    /// builds may still be opened (`crypto.accept_row_bound_secrets`).
-    pub fn accepts_row_bound_secrets(&self) -> bool {
-        self.config.accept_row_bound_secrets
     }
 
     // ── Bootstrap ────────────────────────────────────────────────────────────
@@ -274,7 +261,7 @@ impl EnvelopeService {
         version_i32(envelope::parse_header(blob)?.key_version)
     }
 
-    // ── Rotation (plan §2.7) ─────────────────────────────────────────────────
+    // ── Rotation ─────────────────────────────────────────────────────────────
 
     /// Mint a new **active DEK** (wrapped under the active KEK); the previous
     /// active DEK flips to `retiring` and keeps decrypting old ciphertext until

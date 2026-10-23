@@ -3,7 +3,8 @@
 # rationale; remove the entry as soon as an update makes it unnecessary.
 [advisories]
 ignore = [
-    # rsa 0.9 Marvin timing side channel (no fixed release): used only by the
-    # forge-e2e test crate's mock OIDC issuer to sign test JWTs; not in forge-server.
+    # rsa 0.9 Marvin timing side channel (no fixed release): a dev-dependency
+    # only (forge-core, forge-server and forge-e2e tests sign test JWTs with
+    # it); not in the shipped forge-server binary.
     "RUSTSEC-2023-0071",
 ]

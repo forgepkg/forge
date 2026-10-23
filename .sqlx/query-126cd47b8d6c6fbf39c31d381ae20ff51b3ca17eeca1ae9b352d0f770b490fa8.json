@@ -1,0 +1,198 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT m.id, m.image, m.digest, m.media_type, m.artifact_type, m.subject_digest,\n               m.size, m.blob_sha256, b.s3_key, m.summary, m.created_at,\n               m.untagged_since, m.last_pulled_at,\n               t.checked_at, t.updated_at\n        FROM oci_tag t\n        JOIN oci_manifest m ON m.id = t.manifest_id\n        JOIN blob b ON b.sha256 = m.blob_sha256\n        WHERE t.repository_id = $1 AND t.image = $2 AND t.tag = $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "image",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "image"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "digest"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "media_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "media_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "artifact_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "artifact_type"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "subject_digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "subject_digest"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "blob_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "blob_sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "s3_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob",
+            "name": "s3_key"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "summary",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "summary"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "untagged_since",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "untagged_since"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "last_pulled_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "last_pulled_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "checked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_tag",
+            "name": "checked_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "oci_tag",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "126cd47b8d6c6fbf39c31d381ae20ff51b3ca17eeca1ae9b352d0f770b490fa8"
+}

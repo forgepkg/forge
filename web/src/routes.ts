@@ -10,10 +10,16 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  *
  *   root.tsx
  *     /login            -> Login.tsx            (user+password or realm login)
+ *     /invite           -> Invite.tsx           (an invited user chooses a password;
+ *                                                the token is the URL fragment)
  *     layout 'app'      -> AppLayout.tsx        (login-gated nav shell)
  *       index           -> Browse.tsx           (folder view root: repositories)
- *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages + search)
+ *       /repos/$repo    -> RepoBrowse.tsx       (per-repo packages or images + search;
+ *                                                a raw repository's file tree)
  *       /packages/...   -> PackageDetail.tsx    (versions + dependencies)
+ *       /images/$repo/$ -> ImageDetail.tsx      (docker image: tags + manifests;
+ *                                                the splat is the image name,
+ *                                                which may contain `/`)
  *       /tokens         -> Tokens.tsx           (self-service registry tokens)
  *       /manage         -> AdminLayout.tsx      (beforeLoad: require is_admin)
  *
@@ -25,10 +31,12 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  */
 export const routes = rootRoute('root.tsx', [
   route('/login', 'Login.tsx'),
+  route('/invite', 'Invite.tsx'),
   layout('app', 'AppLayout.tsx', [
     index('Browse.tsx'),
     route('/repos/$repo', 'RepoBrowse.tsx'),
     route('/packages/$repo/$id', 'PackageDetail.tsx'),
+    route('/images/$repo/$', 'ImageDetail.tsx'),
     route('/tokens', 'Tokens.tsx'),
     route('/manage', 'AdminLayout.tsx', [
       index('admin/AdminHome.tsx'),
@@ -39,11 +47,21 @@ export const routes = rootRoute('root.tsx', [
         '/repositories/$repo/members',
         'admin/repositories/GroupMembers.tsx',
       ),
+      route('/repositories/$repo/import', 'admin/repositories/Import.tsx'),
       route('/users', 'admin/users/List.tsx'),
+      route('/users/new', 'admin/users/Create.tsx'),
       route('/users/$userId', 'admin/users/Edit.tsx'),
+      route('/roles', 'admin/roles/List.tsx'),
+      route('/roles/$roleId', 'admin/roles/Edit.tsx'),
+      route('/content-selectors', 'admin/selectors/List.tsx'),
+      route('/content-selectors/new', 'admin/selectors/Create.tsx'),
+      route('/content-selectors/$selectorId', 'admin/selectors/Edit.tsx'),
       route('/realms', 'admin/realms/List.tsx'),
       route('/realms/new', 'admin/realms/Create.tsx'),
       route('/realms/$realmId', 'admin/realms/Edit.tsx'),
+      route('/settings', 'admin/settings/Settings.tsx'),
+      route('/settings/email', 'admin/settings/Email.tsx'),
+      route('/system', 'admin/system/System.tsx'),
     ]),
   ]),
 ])

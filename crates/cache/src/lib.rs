@@ -1,4 +1,4 @@
-//! `forge-cache` — a HybridCache analogue (design spec §2.1).
+//! `forge-cache` — a HybridCache analogue.
 //!
 //! A two-tier cache that is **generic over value types via `serde`**:
 //!
@@ -6,7 +6,7 @@
 //!   per-entry TTL). Always present.
 //! * **L2** — an *optional* Redis cache (shared across instances). When absent
 //!   the cache is still fully correct — it just rebuilds from the factory more
-//!   often (the "default-correct" mode from the spec).
+//!   often.
 //! * **Backplane** — an *optional* Redis pub/sub channel that broadcasts tag
 //!   generations so every instance immediately observes logical invalidations.
 //!   Only present when L2 is.
@@ -20,6 +20,10 @@
 //! compare-and-set script so an older fill can never republish stale data after
 //! invalidation. This follows FusionCache's passive tag-expiration model without
 //! scanning every tagged key.
+//!
+//! A generation far beyond anything a tag can reach by counting (2^48) is
+//! forged: it counts as an invalidation but raises the barrier by one only, so
+//! no barrier is ever left without room to advance.
 //!
 //! ## Coalescing / stampede protection
 //!
@@ -132,6 +136,15 @@ const MAX_LOAD_ATTEMPTS: usize = 3;
 
 const ENTRY_FORMAT_VERSION: u8 = 1;
 
+/// The highest tag generation a barrier adopts from Redis or the backplane.
+/// Generations count one tag's invalidations one at a time, so a genuine one
+/// never comes near this: a larger one was forged by someone who can write to
+/// Redis. Adopting it (`u64::MAX` in particular) would leave the barrier no
+/// room to advance, so every later invalidation of the tag would be ignored.
+/// It stays well below 2^53, where the Redis scripts' (double-precision)
+/// arithmetic stops counting exactly.
+const MAX_GENERATION: u64 = 1 << 48;
+
 /// One tag generation captured when an entry was produced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TagStamp {
@@ -146,9 +159,24 @@ pub(crate) struct StoredEntry {
     format_version: u8,
     tags: Vec<TagStamp>,
     value: Vec<u8>,
+    /// A lifetime shorter than the caller's TTL that the factory chose for
+    /// this value ([`Cache::get_or_try_insert_local_with_tags_expiring`]).
+    /// In-process only: an entry read back from Redis carries the remaining
+    /// Redis TTL instead.
+    #[serde(skip)]
+    lifetime: Option<Duration>,
 }
 
 impl StoredEntry {
+    pub(crate) fn lifetime(&self) -> Option<Duration> {
+        self.lifetime
+    }
+
+    /// About how much memory the entry holds (its value and tags).
+    pub(crate) fn weight_bytes(&self) -> usize {
+        self.value.len() + self.tags.iter().map(|t| t.tag.len() + 8).sum::<usize>()
+    }
+
     fn has_tags(&self, expected: &[String]) -> bool {
         self.format_version == ENTRY_FORMAT_VERSION
             && self.tags.len() == expected.len()
@@ -202,14 +230,52 @@ fn tcp_settings() -> redis::io::tcp::TcpSettings {
         .set_keepalive(keepalive)
 }
 
+/// The most tags whose barriers an instance keeps ([`TagVersions`]). Real
+/// invalidations name few distinct tags; anything that can publish to Redis
+/// can name endless ones, and every instance kept them all.
+pub(crate) const MAX_TAGS: usize = 100_000;
+
 /// Locally observed tag generations. Redis is authoritative when configured;
 /// pub/sub eagerly advances this map so L1 lookups need no Redis round-trip.
-#[derive(Clone, Default)]
+///
+/// The map holds at most [`MAX_TAGS`] tags. A barrier cannot simply be
+/// forgotten (an L1 entry stamped before the invalidation it records would
+/// pass as current again), so at the cap the whole L1 is emptied first and
+/// the map starts over: what is cached afterwards is stamped afresh.
+#[derive(Clone)]
 pub(crate) struct TagVersions {
     inner: Arc<Mutex<HashMap<String, u64>>>,
+    /// The L1 the barriers guard, emptied when the map is reset.
+    l1: L1,
+    cap: usize,
 }
 
 impl TagVersions {
+    pub(crate) fn new(l1: L1) -> Self {
+        Self::with_cap(l1, MAX_TAGS)
+    }
+
+    pub(crate) fn with_cap(l1: L1, cap: usize) -> Self {
+        TagVersions {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            l1,
+            cap,
+        }
+    }
+
+    /// Make room for `tag` in `versions`: at the cap, empty the L1 and forget
+    /// every barrier (see the type docs).
+    fn make_room(&self, versions: &mut HashMap<String, u64>, tag: &str) {
+        if versions.len() >= self.cap && !versions.contains_key(tag) {
+            tracing::warn!(
+                max_tags = self.cap,
+                "cache tag barriers reached their cap; emptying the local cache and starting over"
+            );
+            self.l1.invalidate_all();
+            versions.clear();
+        }
+    }
+
     pub(crate) fn current(&self, tag: &str) -> u64 {
         self.inner
             .lock()
@@ -251,14 +317,54 @@ impl TagVersions {
             .collect()
     }
 
+    /// Raise each tag's barrier to its stamp. A generation above
+    /// [`MAX_GENERATION`] is forged: it still reports an invalidation of the
+    /// tag, so the barrier advances, but by one rather than to that value.
     pub(crate) fn observe(&self, stamps: &[TagStamp]) {
         let mut versions = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for stamp in stamps {
+            self.make_room(&mut versions, &stamp.tag);
             let current = versions.entry(stamp.tag.clone()).or_default();
-            *current = (*current).max(stamp.generation);
+            if stamp.generation > MAX_GENERATION {
+                tracing::warn!(
+                    tag = %stamp.tag,
+                    generation = stamp.generation,
+                    "implausible cache tag generation; advancing the barrier by one instead"
+                );
+                *current = current.saturating_add(1);
+            } else {
+                *current = (*current).max(stamp.generation);
+            }
+        }
+    }
+
+    /// A peer's invalidation of `tag` at `generation`: the barrier moves past
+    /// what this instance has seen even when `generation` is not above it.
+    /// A peer's generations restart low once Redis lost the tag's key (a
+    /// restart without persistence, an LRU eviction) and that peer starts
+    /// afresh; taken as a plain maximum, its invalidations would be ignored
+    /// until its counter caught up. A forged, implausibly large generation
+    /// still advances the barrier by one only.
+    pub(crate) fn observe_invalidation(&self, tag: &str, generation: u64) {
+        let mut versions = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.make_room(&mut versions, tag);
+        let current = versions.entry(tag.to_string()).or_default();
+        let next = current.saturating_add(1);
+        if generation > MAX_GENERATION {
+            tracing::warn!(
+                tag,
+                generation,
+                "implausible cache tag generation; advancing the barrier by one instead"
+            );
+            *current = next;
+        } else {
+            *current = next.max(generation);
         }
     }
 
@@ -291,17 +397,20 @@ fn install_tls_crypto_provider() {
 }
 
 impl Cache {
-    /// Build an **L1-only** cache. No Redis calls are ever made; this is the
-    /// default-correct mode from the spec.
+    /// Build an **L1-only** cache. No Redis calls are ever made; the cache is
+    /// still fully correct, it just rebuilds from the factory more often.
     ///
     /// `l1_max_capacity` bounds the number of entries held in process.
     pub fn l1_only(l1_max_capacity: u64) -> Self {
         Cache {
-            inner: Arc::new(Inner {
-                l1: L1::new(l1_max_capacity),
-                l2: None,
-                backplane: None,
-                tag_versions: TagVersions::default(),
+            inner: Arc::new({
+                let l1 = L1::new(l1_max_capacity);
+                Inner {
+                    tag_versions: TagVersions::new(l1.clone()),
+                    l1,
+                    l2: None,
+                    backplane: None,
+                }
             }),
         }
     }
@@ -325,7 +434,7 @@ impl Cache {
         timeouts: RedisTimeouts,
     ) -> Result<Self, CacheError> {
         let l1 = L1::new(l1_max_capacity);
-        let tag_versions = TagVersions::default();
+        let tag_versions = TagVersions::new(l1.clone());
         if redis_url.starts_with("rediss://") {
             install_tls_crypto_provider();
         }
@@ -443,6 +552,41 @@ impl Cache {
         self.load(ns, key, tags, ttl, factory, false).await
     }
 
+    /// [`Cache::get_or_try_insert_local_with_tags`] for a value whose own
+    /// lifetime the factory knows: it returns the value with how long it may
+    /// live, and the entry expires after the shorter of that and `ttl` (counted
+    /// from the start of the fill). For a value copied from a record that
+    /// expires on its own (a stored verdict nearer its expiry than `ttl`), or
+    /// for values of one kind that deserve different TTLs.
+    pub async fn get_or_try_insert_local_with_tags_expiring<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        tags: &[String],
+        ttl: Duration,
+        factory: F,
+    ) -> Result<T, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(T, Duration), E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        self.load_with_lifetime(
+            ns,
+            key,
+            tags,
+            ttl,
+            || async move {
+                factory()
+                    .await
+                    .map(|(value, lifetime)| (value, Some(lifetime)))
+            },
+            false,
+        )
+        .await
+    }
+
     /// The shared lookup: L1 → (L2, when `shared` and configured) → factory.
     async fn load<T, F, Fut, E>(
         &self,
@@ -457,6 +601,33 @@ impl Cache {
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
+        E: Clone + Send + Sync + 'static,
+    {
+        self.load_with_lifetime(
+            ns,
+            key,
+            tags,
+            ttl,
+            || async move { factory().await.map(|value| (value, None)) },
+            shared,
+        )
+        .await
+    }
+
+    /// [`Cache::load`] for a factory that may cap its value's lifetime.
+    async fn load_with_lifetime<T, F, Fut, E>(
+        &self,
+        ns: &str,
+        key: &str,
+        tags: &[String],
+        ttl: Duration,
+        factory: F,
+        shared: bool,
+    ) -> Result<T, E>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(T, Option<Duration>), E>>,
         E: Clone + Send + Sync + 'static,
     {
         let full_key = make_key(ns, key);
@@ -520,7 +691,7 @@ impl Cache {
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        Fut: Future<Output = Result<(T, Option<Duration>), E>>,
         E: Clone + Send + Sync + 'static,
     {
         let entry_tags = entry_tags.clone();
@@ -592,11 +763,12 @@ impl Cache {
                                     // below simply replaces it.
                                 }
                                 Ok(_) | Err(_) => {
-                                    // Rolling upgrades can encounter the former raw-value
-                                    // format. Treat it as a miss; the next successful fill
-                                    // replaces it with a tagged envelope.
+                                    // Not a current-format envelope (another format
+                                    // version, or a value that is no envelope). Treat
+                                    // it as a miss; the next successful fill replaces it
+                                    // with a tagged envelope.
                                     if let Err(err) = l2.del(&key_for_l2).await {
-                                        tracing::warn!(error = %err, key = %key_for_l2, "legacy L2 entry cleanup failed");
+                                        tracing::warn!(error = %err, key = %key_for_l2, "unreadable L2 entry cleanup failed");
                                     }
                                 }
                             }
@@ -639,24 +811,28 @@ impl Cache {
                 };
 
                 // Factory: errors propagate (and are NOT cached by moka).
-                let value = factory().await?;
+                let (value, lifetime) = factory().await?;
                 let value = serde_json::to_vec(&value)
                     .expect("cache value must serialize to JSON");
+                let lifetime = lifetime.filter(|lifetime| *lifetime < ttl);
                 let entry = Arc::new(StoredEntry {
                     format_version: ENTRY_FORMAT_VERSION,
                     tags: stamps,
                     value,
+                    lifetime,
                 });
+                let l2_ttl = lifetime.unwrap_or(ttl);
 
                 // Redis compares every captured tag generation atomically before
                 // writing. If an invalidation raced the factory, the stale value
                 // is returned to the already-running caller but is not persisted.
-                if redis_generations_available {
+                // A value with no lifetime left is not written at all.
+                if redis_generations_available && !l2_ttl.is_zero() {
                     if let Some(l2) = &l2 {
                         let encoded = serde_json::to_vec(entry.as_ref())
                             .expect("tagged cache entry must serialize to JSON");
                         match l2
-                            .set_if_tag_versions(&key_for_l2, &encoded, ttl, &entry.tags)
+                            .set_if_tag_versions(&key_for_l2, &encoded, l2_ttl, &entry.tags)
                             .await
                         {
                             Ok(true) => {}
@@ -754,4 +930,48 @@ fn entry_tags(ns: &str, key: &str, custom: &[String]) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// #126: forged invalidations naming ever new tags keep the barrier map
+    /// at its cap. At the cap the L1 is emptied before the barriers are
+    /// forgotten, so no entry stamped before a forgotten barrier is served
+    /// again, and a real invalidation still applies afterwards.
+    #[tokio::test]
+    async fn tag_barriers_stay_bounded_and_flush_the_l1_at_the_cap() {
+        let cache = Cache::l1_only(100);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let read = || {
+            let (cache, calls) = (cache.clone(), calls.clone());
+            async move {
+                cache
+                    .get_or_try_insert_local::<usize, _, _, ()>(
+                        "ns",
+                        "key",
+                        Duration::from_secs(600),
+                        || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(read().await, 0);
+        assert_eq!(read().await, 0, "cached");
+
+        let versions = &cache.inner.tag_versions;
+        for i in 0..1_000_000 {
+            versions.observe_invalidation(&format!("forged-{i}"), 1);
+        }
+        assert!(versions.inner.lock().unwrap().len() <= MAX_TAGS);
+        assert_eq!(read().await, 1, "the L1 was emptied at the cap");
+        assert_eq!(read().await, 1, "and caches again");
+
+        cache.invalidate_ns("ns").await;
+        assert_eq!(read().await, 2, "a real invalidation still applies");
+    }
 }

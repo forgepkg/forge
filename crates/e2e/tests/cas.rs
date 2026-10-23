@@ -1,14 +1,14 @@
 //! E2E: content-addressed storage — dedup + refcount transitions (2→1→0) with
 //! the outbox worker performing the deferred S3 delete, and the orphan
-//! reconciler reclaiming a never-committed `pending` blob (spec §9). Gated
-//! behind `forge-e2e`.
+//! reconciler reclaiming a never-committed `pending` blob. Gated behind
+//! `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 
 use std::time::Duration;
 
 use forge_e2e::{make_nupkg, StackBuilder, S3_ACCESS, S3_BUCKET, S3_SECRET};
-use forge_storage::{BlobStore, Cas, S3Config};
+use forge_storage::{BlobStore, Cas, S3Config, S3Credentials};
 use sha2::{Digest, Sha256};
 
 /// SHA-256 identity of `bytes` (the blob-table key; S3 adds an incarnation).
@@ -109,7 +109,7 @@ async fn dedup_refcount_2_to_1_to_0_with_outbox_delete() {
 
     // The worker (poll 1s, grace 0) removes the blob row + S3 object AND marks
     // every outbox row processed. Poll all three together: the outbox finalize
-    // (set processed_at) happens in a short tx *after* the blob-row delete (A7),
+    // (set processed_at) happens in a short tx *after* the blob-row delete,
     // so `pending == 0` is the authoritative "fully drained" signal.
     let mut gone = false;
     for _ in 0..40 {
@@ -144,8 +144,7 @@ async fn orphan_reconciler_reclaims_pending_blob() {
         endpoint: srv.state.config.s3.endpoint.clone(),
         region: "us-east-1".into(),
         bucket: S3_BUCKET.into(),
-        access_key: S3_ACCESS.into(),
-        secret_key: S3_SECRET.into(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),

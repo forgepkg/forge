@@ -15,7 +15,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: envisia-forge:latest
+    image: forge:latest
     depends_on:
       db:
         condition: service_healthy
@@ -32,17 +32,14 @@ services:
       FORGE_S3__FORCE_PATH_STYLE: "true"
       FORGE_SERVER__PUBLIC_BASE_URL: "http://localhost:8421"
       # DEV ONLY: accept the placeholder credentials (minioadmin S3 keys, the
-      # bootstrap admin/changeme below); a real deployment overrides them and
+      # bootstrap admin@example.com/changeme below); a real deployment overrides them and
       # leaves this unset.
       FORGE_SERVER__ALLOW_INSECURE_DEFAULTS: "true"
       # The image bakes no bootstrap admin (env only): the dev stack creates
-      # admin/changeme and, like ./forge.toml, accepts user passwords over
-      # Basic so `cargo xtask seed` and `curl -u admin:changeme` work.
-      FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME: "admin"
+      # admin@example.com/changeme. Anonymous reads and passwords over Basic start
+      # off; `cargo xtask seed` turns both on (Admin → Settings in the web UI).
+      FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME: "admin@example.com"
       FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: "changeme"
-      FORGE_AUTH__ALLOW_PASSWORD_BASIC: "true"
-      # The image defaults to no anonymous access; the dev stack opens reads.
-      FORGE_AUTH__ANONYMOUS_MODE: "all"
       RUST_LOG: "info"
     ports:
       - "8421:8421"

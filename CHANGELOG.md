@@ -2,27 +2,541 @@
 
 All notable changes to envisia-forge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/). While the major version is 0, a
-minor release may contain breaking changes; each one is called out under
-**Upgrade notes**.
+[Semantic Versioning](https://semver.org/): breaking changes come only in a
+major release, and each one is called out under **Upgrade notes**.
 
 The release workflow publishes the section whose heading matches the tag
-(`## [0.1.0]` for `v0.1.0`) as the GitHub release notes.
+(`## [1.0.0]` for `v1.0.0`) as the GitHub release notes. Entries for changes
+not released yet are fragments under [docs/changes/](docs/changes/README.md)
+until the release folds them in.
 
 ## [Unreleased]
 
-### Changed
+### Upgrade notes
 
-- **License**: envisia-forge is now dual-licensed under the GNU AGPL v3
-  (`AGPL-3.0-only`, see `LICENSE`) or the envisia license, at the user's
-  choice.
-- **Contributions**: pull requests now require signing the Contributor
-  License Agreement (`CLA.md`), checked by the `CLA` workflow. See
-  `CONTRIBUTING.md`.
+- Migration 0036 adds the `nexus_import` and `nexus_import_item` tables for
+  imports from Nexus; it changes no existing data.
+  ([#183](https://github.com/schmitch/forge/issues/183))
 
-## [0.1.0]
+### Features
 
-First production release.
+- Credential forwarding: a realm can keep an argon2id hash of every password
+  its upstream (e.g. a Nexus) accepts (**Keep a password hash of successful
+  logins**, `capture_password_hash`, off by default; unchecking it deletes the
+  hashes). Once the hashes are in place the realm can stop asking the upstream
+  and sign its users in with them (`captured_password_only`), and its accounts
+  can be switched to local accounts with the same password, one by one or all
+  at once (`POST /admin/users/{id}/convert-to-local`,
+  `POST /admin/realms/{id}/convert-to-local`), so the upstream can be retired
+  without asking every user for a new password.
+- **OIDC login without a client secret**: an `oidc` realm can authenticate
+  at Microsoft Entra with a federated identity credential instead
+  (`client_authentication = "federated_credential"`). Forge signs a
+  short-lived client assertion itself, as an OpenID Connect issuer of its
+  own (`server.public_base_url`), publishing
+  `/.well-known/openid-configuration` and its keys at
+  `/.well-known/jwks.json`. The keys are RSA-2048, shared by every instance
+  through the database (sealed with `[crypto]`), and rotated every 30 days,
+  each new key published two days before it signs. The realm shows the
+  issuer, subject (`<client id>@<realm issuer>`) and audience to register.
+  See [DEVELOPMENT.md](https://github.com/schmitch/forge/blob/main/DEVELOPMENT.md#without-a-client-secret-a-federated-credential).
+  ([#302](https://github.com/schmitch/forge/pull/302))
+- Helm: `extraObjects` can also be a map, whose keys only name its entries.
+  Helm merges a map across values files, so each file can add its own
+  objects, and a later one replaces an entry by its key or drops it with
+  `null`; a list in a later file replaces the whole list. Lists keep
+  working.
+  ([#288](https://github.com/schmitch/forge/pull/288))
+- **Import from Nexus**: copy a Nexus 3 hosted repository into a Forge hosted
+  repository of the same format, one repository at a time: NuGet packages,
+  Helm charts, and Docker images with their digests, multi-platform
+  indexes, signatures and SBOMs. In the web UI (a hosted repository's
+  **Import from Nexus**) or the admin API
+  (`/admin/repositories/{name}/imports`). The source is checked before an
+  import starts; a dry run reports the counts, the size and the conflicts
+  without writing. Packages are verified against Nexus' checksums and
+  written through the normal push path, keep their publish dates, last
+  downloads and uploaders, and are audited as imports. A version Forge has
+  with other bytes is skipped and reported, overwritten, or fails the
+  import, as chosen. An import resumes after a restart, a failure or a
+  cancel, failed items can be retried on their own, and running it again
+  copies only what is new. The Nexus password is sealed with the secret
+  encryption and deleted when the import completes. See
+  [docs/nexus-import.md](docs/nexus-import.md).
+  ([#183](https://github.com/schmitch/forge/issues/183))
+
+### Fixed
+
+- A database failure while checking a browser session or its CSRF token
+  answered 500; it answers 503 with `Retry-After`, like the token and
+  password checks, which now send `Retry-After` too.
+  ([#205](https://github.com/schmitch/forge/issues/205))
+- Trusted publishing: a workload token answered 401 "invalid credentials"
+  while its issuer's discovery document or keys could not be fetched and
+  were not cached yet (after a restart, on a new replica, at the hourly key
+  refresh), so CI jobs failed instead of retrying. It answers 503 with
+  `Retry-After`, at the token exchange too.
+  ([#202](https://github.com/schmitch/forge/issues/202))
+- Trusted publishing: after a realm edit, the other instances refused the
+  workload keys the editing instance issued under the new configuration
+  for up to `auth.realm_cache_ttl_seconds`, and could refuse an exchange
+  with 401 "realm changed during the exchange". An instance now reloads
+  the realms when a key names a configuration it does not have yet.
+  ([#203](https://github.com/schmitch/forge/issues/203))
+- Trusted publishing: an instance whose clock ran behind the database's
+  could exchange a CI token a second time just after the record of its
+  first exchange was cleaned up. Whether a token has expired is decided on
+  the database's clock, and the record is kept 15 minutes past the token's
+  expiry. ([#204](https://github.com/schmitch/forge/issues/204))
+- Docker registry: a registry token got with a workload key
+  (`docker login -u oidc`) worked again once the key's record was cleaned
+  up, and one got with a CI token directly stopped working when a key
+  exchanged from that CI token ended. A registry token stands and falls
+  with the credential it was got with, and expires no later than it.
+  Registry tokens issued before the upgrade are refused once, and clients
+  ask for a new one. ([#201](https://github.com/schmitch/forge/issues/201))
+- S3 `default_chain` credentials: an STS or container credentials endpoint
+  that could not be reached counted as a refusal, so requests answered 500
+  instead of 503, and with the blob cache an instance restarted during the
+  outage failed to start instead of starting degraded.
+  ([#208](https://github.com/schmitch/forge/issues/208))
+- Blob cache: making room deleted the evicted files while every cache hit
+  on the instance waited, on the threads that serve requests, and each
+  miss read the disk's free space. Evicted files are deleted in the
+  background, and the free space is read once a minute.
+  ([#212](https://github.com/schmitch/forge/issues/212))
+- Blob cache: after a restart, concurrent downloads of a cached blob each
+  read and hashed the whole file before serving it; each file is checked
+  once. ([#210](https://github.com/schmitch/forge/issues/210))
+- Blob cache: a blob garbage collection deleted stayed in the other
+  instances' caches until it was evicted. Every instance drops such blobs
+  at startup and every 10 minutes.
+  ([#211](https://github.com/schmitch/forge/issues/211))
+- Docker registry: while S3 was unavailable, uncached pulls, pushes and the
+  finish of a chunked upload answered 500 instead of 503 with
+  `Retry-After`, and an upload whose body the client aborted answered 500
+  instead of 400. ([#209](https://github.com/schmitch/forge/issues/209))
+- Blob cache: a docker blob pushed in several chunks was cached about twice:
+  every chunk was written through to the cache next to the assembled blob,
+  and evicted as much content that is downloaded. Only the blob is cached.
+  ([#213](https://github.com/schmitch/forge/issues/213))
+- Blob cache: with several replicas, `GET /admin/blob-cache` answered with
+  the statistics of whichever replica served the request, without saying
+  which one. The response names it in `instance` (host name and start
+  time), and the deployment guide says the numbers are per instance.
+  ([#214](https://github.com/schmitch/forge/issues/214))
+- Docker image retention kept deleting what a run had decided after its
+  policy was disabled, switched to dry run or changed, after the run lost
+  its lease, and when the image changed meanwhile: it deleted a tag pulled
+  since, older tags after the newest were deleted, and the signature of an
+  image tagged again. Like package retention, a run now stops when its
+  policy or lease changes, and applies an image's decisions only after
+  evaluating its current state again.
+  ([#215](https://github.com/schmitch/forge/issues/215))
+- Docker proxies: a tag list was cut short, without a link to the next
+  page, when the upstream paged its tags (`Link: rel="next"`, as Quay
+  does) or refused a large `n` (then only the cached tags were listed), so
+  Renovate, Flux or `skopeo list-tags` missed tags; groups inherited it. A
+  proxy follows the upstream's pages, asks again without `n` when one is
+  refused, and links to its next page when the upstream has more. A group
+  ends its page where a member left tags out.
+  ([#216](https://github.com/schmitch/forge/issues/216))
+- Docker proxies: a fetch from the previous upstream that was still running
+  when the proxy was pointed at another `remote_url` cached its tag,
+  manifest or layer after the repoint had emptied the cache, so the
+  previous upstream's tag was served for `metadata_ttl_seconds`. Such a
+  fetch caches nothing; its client is asked to retry (503).
+  ([#217](https://github.com/schmitch/forge/issues/217))
+- Docker registry: the sweeper could release a layer a client had just
+  confirmed, so the manifest push answered `MANIFEST_BLOB_UNKNOWN`: a pull
+  or `HEAD` of a blob recorded its use at most hourly, which with
+  `docker.unreferenced_blob_ttl_seconds = 3600` left no time, and pushing
+  or mounting a blob the image already had recorded none. Pushes and
+  mounts record the use, and pulls record it every tenth of the TTL.
+  ([#218](https://github.com/schmitch/forge/issues/218))
+- Docker groups named their `writable_member` by name: renaming that
+  repository broke group pushes, and a repository created later under the
+  old name silently became the push target. The member is stored by id
+  (migration 0037 converts existing groups; a name no hosted docker
+  repository has any more is dropped), and the admin API and web UI show
+  its current name. Downgrading to 1.1.0 leaves docker groups without a
+  writable member until it is set again.
+  ([#219](https://github.com/schmitch/forge/issues/219))
+
+## [1.1.0]
+
+The Docker / OCI registry, format plugins (Helm built in, NuGet ported to
+one), the trusted-publishing token exchange, short-lived S3 credentials and a
+local blob cache, and the fixes for the findings of the 1.0.0 release review.
+The 1.0.0 known limitations still apply, except where an entry below says
+otherwise.
+
+### Upgrade notes
+
+- Startup refuses a `server.staging_dir` that does not belong to Forge's
+  user, or that group or others can write unless it is sticky like `/tmp`.
+  The container image and the Kubernetes manifests are not affected.
+  ([#127](https://github.com/schmitch/forge/issues/127))
+- Durations above 100 years (`outbox.grace_seconds`,
+  `retention.default_run_interval_seconds`, `retention.lease_seconds`,
+  `crypto.cache.unwrapped_key_ttl_secs`,
+  `crypto.rotation.dek_max_age_days`, `crypto.rotation.kek_max_age_days`,
+  and the new `docker.upload_ttl_seconds`,
+  `docker.unreferenced_blob_ttl_seconds` and `docker.sweep_interval_seconds`)
+  fail validation instead of panicking later.
+  ([#128](https://github.com/schmitch/forge/issues/128))
+- Migration 0032 deletes grants of the `admin` action on a single
+  repository, which never had an effect, and the grants API refuses them
+  with 400. Administration stays global.
+  ([#124](https://github.com/schmitch/forge/issues/124))
+- While a credential-forwarding realm is enabled, an account that an OIDC
+  realm provisions is named `<claim>@<realm>`. Existing accounts keep their
+  names. ([#123](https://github.com/schmitch/forge/issues/123))
+- Proxy search now calls the upstream's search service, which may live on
+  another host than the feed (on nuget.org, `azuresearch-*.nuget.org`).
+  Where outbound traffic is restricted, allow that host, or proxy search
+  keeps answering from the cache only.
+  ([#112](https://github.com/schmitch/forge/issues/112))
+- The production kustomize overlay adds a NetworkPolicy that admits only
+  the ingress controller's namespace (set it in the overlay), and the Helm
+  chart renders one as soon as `networkPolicy.from` lists a peer.
+  ([#129](https://github.com/schmitch/forge/issues/129))
+- Helm: the first upgrade rolls the Forge pods (when `secretEnv` is set)
+  and restarts the in-cluster Redis once, because the checksum annotations
+  are now salted. ([#133](https://github.com/schmitch/forge/issues/133))
+- The published `cosign verify` commands also pin the tagged commit and the
+  push trigger; use the commands of the release you verify.
+  ([#130](https://github.com/schmitch/forge/issues/130))
+- Migration 0033 adds the Docker / OCI registry's tables; it changes no
+  existing data. To push images through a reverse proxy, allow request
+  bodies of a docker repository's upload limit (1 GiB by default: docker
+  sends a whole layer in one request) on `/v2`, and serve `/v2` at the root
+  of the host. The shipped Ingress now allows 1 GiB. The default
+  `server.max_staging_bytes` (four times the largest item) grows with it to
+  4 GiB; size the staging volume for it.
+  ([#40](https://github.com/schmitch/forge/issues/40))
+- An explicit `server.max_staging_bytes` keeps working as it is. When it is
+  below the new 1 GiB docker defaults, they shrink to fit it (less
+  `nuget.max_nuspec_bytes`): docker repositories without an upload limit of
+  their own accept layers up to that size, and so do docker proxy
+  downloads unless `docker.max_blob_bytes` is set; startup logs a warning.
+  Raise the budget for larger layers. A budget too small for the package
+  limits is refused as before, with an error that names the setting that
+  decides the minimum. ([#198](https://github.com/schmitch/forge/issues/198))
+- The container image's baked `forge.toml` no longer holds the placeholder
+  `minioadmin` S3 keys. An image started without `FORGE_S3__ACCESS_KEY` /
+  `FORGE_S3__SECRET_KEY` (and without short-lived credentials) still
+  refuses to start, now with an error that names the missing keys.
+  ([#60](https://github.com/schmitch/forge/issues/60))
+- `server.max_upload_bytes` is deprecated: upload limits are now set per
+  hosted repository, in the web UI or the admin API. The setting still
+  works as the default of package repositories without a limit of their own,
+  and startup logs a warning while it is set; give the repositories that
+  need it their own limit, then remove it. A repository's limit may be at
+  most `server.max_staging_bytes` (less `nuget.max_nuspec_bytes`); raise the
+  staging budget first if a repository needs more.
+- A workload identity realm's `max_token_age_seconds` defaults to 39600
+  (11 hours) instead of 3600, so GitLab jobs with a timeout over an hour
+  can publish. Existing realms keep the value they were saved with; to
+  use the new default, clear the field in the realm form (or drop the key
+  from the config) and save.
+- The username `oidc` is reserved for workload identity (trusted
+  publishing), and 1.0.0 allowed it. An account named `oidc` can no longer
+  sign in with its password, in the browser or over Basic, and its API
+  tokens work only as `X-NuGet-ApiKey`, no longer as the Basic password;
+  startup logs a warning that names it. A config with
+  `auth.bootstrap_admin.username = "oidc"` refuses to start. Rename the
+  account before upgrading; there is no API for it, so use SQL:
+  `UPDATE app_user SET username = 'oidc-admin' WHERE username = 'oidc';`
+  (the account keeps its id, password, roles and tokens). Then set
+  `auth.bootstrap_admin.username` to the new name if it was `oidc`.
+  ([#199](https://github.com/schmitch/forge/issues/199))
+- Migration 0034 adds the `workload_api_key` table for the trusted-publishing
+  token exchange; it changes no existing data. `/api/v2/token` is a new
+  route, so a reverse proxy that only forwards known prefixes needs `/api`.
+  ([#169](https://github.com/schmitch/forge/issues/169))
+- `cache.l1_max_capacity` counts an entry over 16 KiB once per started
+  16 KiB, so it bounds the in-process cache's memory as well as its entry
+  count (about 160 MiB of large entries at the default 10000). Small
+  entries count once, as before.
+
+### Features
+
+- **Format plugins** (preview): further package formats, served under
+  `/repository/{repo}/` (or a mount the plugin names) with the same
+  storage, RBAC and package selectors, hosted, proxy and group
+  repositories, retention, ranged downloads and audit log as NuGet. A
+  plugin is a crate implementing one contract (`forge-plugin-api`'s
+  `FormatPlugin`, mirrored by the `forge:format@0.3.0` WIT package; a
+  plugin's `upstream` side tells the host what to fetch for its proxies) and
+  runs either built into the server or as a WebAssembly component run by
+  Wasmtime. Components are loaded from `[plugins]` only when pinned by
+  SHA-256, and each call runs with fuel, memory and time limits and no WASI
+  capabilities. **Helm chart repositories** (`plugins/helm`) are built in:
+  `index.yaml`, chart downloads and ChartMuseum-compatible push, delete and
+  listing, and proxies of other chart repositories. The index lists chart
+  metadata with the types Helm reads, so a Chart.yaml with `appVersion: 2`
+  or an annotation `false` does not break it
+  ([#206](https://github.com/schmitch/forge/issues/206)). A Helm proxy
+  parses its upstream's index once while the upstream serves the same
+  document, one parse at a time, instead of once per operation
+  ([#207](https://github.com/schmitch/forge/issues/207)). Parsed indexes
+  are kept up to 128 MiB per instance, shared by all Helm proxies: about
+  60 MB of `index.yaml`, enough for every upstream of a typical group. Past
+  that, the indexes in use stay kept and only the others are parsed again
+  for each operation
+  ([#279](https://github.com/schmitch/forge/issues/279),
+  [#284](https://github.com/schmitch/forge/issues/284)). **NuGet** is a built-in plugin too (`plugins/nuget`), served at
+  `/v3/{repo}/` by the same dispatcher with the same paths, responses and
+  proxy behaviour as before; its proxies read the upstream feed through the
+  plugin's upstream side. `GET /admin/formats` lists the installed
+  formats; the web UI offers them when creating a repository. See
+  [docs/format-plugins.md](https://github.com/schmitch/forge/blob/main/docs/format-plugins.md).
+- **Docker / OCI registry** under `/v2/` (OCI Distribution Spec v1.1,
+  passing its conformance suite), for container images, Helm charts and
+  other OCI artifacts, as a native format next to NuGet (`"format":
+  "docker"`, listed by `GET /admin/formats`) with all three repository
+  kinds:
+  - **hosted**: monolithic, chunked and cross-repository-mount pushes,
+    deletes, the referrers API for cosign signatures and attestations, and
+    optional immutable tags (with a `latest` exception);
+  - **proxy**: a pull-through cache of Docker Hub (with its `library/`
+    names), GHCR, Quay or any distribution-spec registry, with upstream
+    credentials, tag re-validation by `HEAD` after `metadata_ttl_seconds`,
+    and stale serving while the upstream is down or rate limits;
+  - **group**: members by priority, pushes to a `writable_member`, and the
+    `prefer_hosted` / `reserved_prefixes` / owner guards of NuGet groups.
+
+  `docker login` goes through a Bearer token service (API tokens, passwords
+  where allowed, or a workload OIDC token), anonymous pulls follow the
+  repository's anonymous read, and repositories are addressed by path or by
+  an optional host name of their own. Image retention rules (keep the last N
+  tags, stale tags, untagged manifests; a `HEAD` of a manifest counts as a
+  pull, [#197](https://github.com/schmitch/forge/issues/197)) and a sweeper
+  release layers only when no image references them. The web UI lists images, tags, manifests,
+  platforms and referrers. New `[docker]` settings; see
+  [docs/docker.md](https://github.com/schmitch/forge/blob/main/docs/docker.md).
+  ([#40](https://github.com/schmitch/forge/issues/40))
+- **Per-repository upload limits**: every hosted repository (NuGet, Helm,
+  docker or a WebAssembly plugin format) has its own upload limit, the
+  largest push it accepts (docker: per blob), editable as *Maximum upload
+  size* in the web UI and as `max_upload_bytes` in the admin API. Without
+  one, a repository accepts 512 MiB (docker 1 GiB per blob).
+  `docker.max_blob_bytes` now bounds proxy downloads only.
+- **Browse by format**: `GET /browse/repos` takes `format` and names each
+  repository's client URL; the web UI's *Browse* screen filters by format,
+  and NuGet and Helm repositories show their `dotnet nuget` and `helm`
+  commands (other plugin formats, their URL) like docker ones show theirs.
+  ([#38](https://github.com/schmitch/forge/issues/38))
+- **Short-lived S3 credentials** from the platform's workload identity, so
+  no long-lived S3 key has to be stored or rotated. `s3.credentials`
+  (`FORGE_S3__CREDENTIALS`) is `static` (the default, `s3.access_key` /
+  `s3.secret_key` as before), `default_chain` (the AWS SDK chain: IRSA, EKS
+  Pod Identity, ECS task roles, EC2 instance profiles, `AWS_*` variables),
+  or `web_identity`: a token file exchanged with STS
+  `AssumeRoleWithWebIdentity` against AWS or MinIO / Ceph RGW
+  (`[s3.web_identity]`: `token_file`, `role_arn`, `sts_endpoint`,
+  `session_name`, `duration_seconds`). Credentials are refreshed before they
+  expire and the token file is read again on each refresh. A failed fetch
+  names the credential source and the STS error code, never the token. The
+  short-lived modes refuse S3 keys, and startup warns about a plain-http
+  `sts_endpoint` (the token and the temporary keys would cross the network
+  in clear text). The Helm chart has `s3.credentials` and
+  `s3.webIdentity` (with an optional projected service-account token), and
+  the kustomize component `s3-workload-identity` mounts one. See
+  [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md#short-lived-s3-credentials).
+  ([#60](https://github.com/schmitch/forge/issues/60))
+- **Trusted-publishing token exchange**: `POST /api/v2/token` (nuget.org's
+  path and request/response shape, so `NuGet/login` works with
+  `token-service-url`) exchanges a CI job's OIDC token, validated by a
+  `workload_identity` realm, for a short-lived workload API key
+  (`forge_wif.…`). Each token is redeemed once (its `jti` is required), the
+  key lives for the realm's new `api_key_ttl_seconds` (default an hour)
+  whatever the token's lifetime, it authorizes and is audited as the
+  token's workload, and any edit, disabling or deletion of the realm
+  revokes its keys for good.
+  `dotnet nuget push --source <feed>/v3/<repo>/package --no-service-endpoint
+  --api-key <key>` publishes with the key alone; restore takes it as the
+  Basic password of the username `oidc`.
+  ([#169](https://github.com/schmitch/forge/issues/169))
+- **Reserved account names**: `oidc` is the workload-identity Basic
+  username. Basic `oidc:<secret>` is only ever checked as a workload
+  credential (an OIDC token or a workload key), never as a user token or a
+  password and never forwarded to a credential-forwarding upstream, and no
+  account can be created, bootstrapped or provisioned under the name (an
+  OIDC login whose username claim is `oidc` gets `oidc-2`).
+  ([#169](https://github.com/schmitch/forge/issues/169))
+- **Proxy cache invalidation**: `POST
+  /admin/repositories/{name}/proxy-cache/invalidate`, and *Invalidate
+  cache* on a proxy's page in the web UI, make a NuGet, Helm or docker proxy
+  ask its upstream again before its TTLs run out, for example once a package
+  it answered "not found" for is published upstream. The proxy forgets the
+  upstream's "not found" answers (of one package with `{"package": "<id>"}`,
+  or of all) and the listings and documents it cached from the upstream, on
+  every instance; invalidating the whole repository also refreshes the
+  upstream's service index, and a docker proxy re-validates its tags (of one
+  image, or of all) on their next pull. Downloaded packages, blobs and
+  manifests stay cached, and so does the package-delay clock.
+
+- **Local blob cache** (optional, `[blob_cache]`): a copy of downloaded and
+  pushed blobs on a local disk, sized from the disk (`max_bytes = "auto"`)
+  or fixed, with FIFO eviction that survives a restart. Hot downloads skip
+  S3, concurrent misses of one blob share a single S3 read, and cached
+  packages keep resolving while S3 is unreachable: uncached downloads and
+  pushes then answer 503 with `Retry-After` at once (a circuit breaker),
+  `/readyz` stays 200 and reports the object store `degraded`, and an
+  instance starts without S3. With the cache, package downloads also answer
+  `Range` requests. Statistics at `GET /admin/blob-cache`; Kubernetes
+  components `local-cache` (emptyDir) and `local-cache-persistent` (a
+  PersistentVolume). The cache directory must belong to Forge's user and be
+  writable by no one else (startup refuses it otherwise; a directory a
+  Kubernetes `fsGroup` pass made group-writable is restored instead), and
+  its entries are readable by that user alone. The kustomize base and the
+  Helm chart set `fsGroupChangePolicy: OnRootMismatch`
+  ([#195](https://github.com/schmitch/forge/issues/195)). See
+  [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md#local-blob-cache).
+
+### Fixed
+
+- Proxy and group search find packages nobody has restored through Forge
+  yet: a proxy forwards the search to its upstream's search service,
+  applies the caller's package filter, not-found markers and the package
+  delay, and answers from its cache when the upstream search fails. The
+  browse UI keeps listing what Forge holds.
+  ([#112](https://github.com/schmitch/forge/issues/112))
+- A proxy pointed back to its previous upstream within the metadata TTL
+  served empty version listings.
+  ([#105](https://github.com/schmitch/forge/issues/105))
+- A proxied package id's casing could flip between reads; it is the
+  newest version's, as on nuget.org.
+  ([#108](https://github.com/schmitch/forge/issues/108))
+- The package delay held back old unlisted upstream versions, such as ones
+  a lockfile pins, for the whole delay. They now count from when the
+  upstream created them, and old versions of large packages are dated at
+  their first sighting too.
+  ([#111](https://github.com/schmitch/forge/issues/111))
+- A push with a version longer than 64 characters answered 500; it is
+  refused with 400. ([#134](https://github.com/schmitch/forge/issues/134))
+- An offline nested group was still served through its outer group; it now
+  fails like an offline hosted member.
+  ([#106](https://github.com/schmitch/forge/issues/106))
+- When a group was reachable along two paths, a guard on one path hid
+  packages the other path admits.
+  ([#107](https://github.com/schmitch/forge/issues/107))
+- Downloads are counted in memory and written in batches every few
+  seconds. A burst of downloads of one version no longer queues on its row
+  and holds every database connection.
+  ([#119](https://github.com/schmitch/forge/issues/119))
+- Creating a missing S3 bucket failed on AWS outside us-east-1, and a
+  bucket name owned by another account counted as created.
+  ([#113](https://github.com/schmitch/forge/issues/113))
+- Unknown paths under `/admin`, `/auth`, `/browse` and `/v3` answered 200
+  with the web UI's page; they answer 404.
+  ([#121](https://github.com/schmitch/forge/issues/121))
+- `PUT /admin/realms/order` answered 500 when it raced another realm
+  change; it answers 409. ([#117](https://github.com/schmitch/forge/issues/117))
+- The browse API served offline hosted and group repositories; it answers
+  503 like the feed, and the web UI says the repository is offline.
+  ([#120](https://github.com/schmitch/forge/issues/120))
+- A failed OIDC sign-in ended on a plain-text page; it returns to the
+  login page with a message and a way to try again.
+  ([#109](https://github.com/schmitch/forge/issues/109))
+- Web UI: a proxy's version times are labelled "Cached", not "Published"
+  ([#110](https://github.com/schmitch/forge/issues/110)); disabling a
+  sign-in realm asks first
+  ([#104](https://github.com/schmitch/forge/issues/104)); unflagging a
+  group's last owner and removing a member ask first
+  ([#122](https://github.com/schmitch/forge/issues/122)); the user list
+  shows how each user signs in
+  ([#123](https://github.com/schmitch/forge/issues/123)).
+
+### Security
+
+- Behind an outbound `HTTP(S)_PROXY`, a proxy refuses an upstream host
+  name that resolves to a link-local or cloud-metadata address, and checks
+  every redirect hop the same way.
+  ([#125](https://github.com/schmitch/forge/issues/125))
+- Forged Redis invalidations can no longer grow every instance's memory:
+  the invalidation bookkeeping is bounded.
+  ([#126](https://github.com/schmitch/forge/issues/126))
+- The staging directory is private to Forge's user, and a staged package
+  is parsed and uploaded from the file that was hashed, not reopened by
+  name. ([#127](https://github.com/schmitch/forge/issues/127))
+- An OIDC-provisioned account can no longer take a credential-forwarding
+  user's username. ([#123](https://github.com/schmitch/forge/issues/123))
+- Only the ingress proxies can reach Forge when it trusts
+  `X-Forwarded-For` from a pod network (NetworkPolicy, see above).
+  ([#129](https://github.com/schmitch/forge/issues/129))
+- Release: every `cosign verify` pins the tagged commit
+  ([#130](https://github.com/schmitch/forge/issues/130)); re-running a
+  release reuses what it already pushed instead of moving the tags to a
+  new build ([#131](https://github.com/schmitch/forge/issues/131)); the
+  build helpers and the dependency images are pinned by digest
+  ([#132](https://github.com/schmitch/forge/issues/132)); the Helm
+  checksum annotations are salted
+  ([#133](https://github.com/schmitch/forge/issues/133)).
+- Docker registry tokens are HS256 JWTs bound to `public_base_url`, live
+  for `docker.token_ttl_seconds` (5 minutes), grant only the scopes the
+  caller held when they were issued, and are accepted under `/v2` only. A
+  token request names at most 32 repositories
+  ([#200](https://github.com/schmitch/forge/issues/200)).
+  Every registry request is authorized again against current permissions
+  and content selectors, the user and API token behind a token must still
+  be active, and a browser session never pushes or deletes. The token
+  endpoint takes the same Basic credentials as the feeds, so it adds no new
+  password path. The signing key is `docker.token_secret`, or a generated
+  key kept in the database, sealed when `[crypto]` is enabled and re-sealed
+  by DEK rotation; an instance replaces it only when it can never be opened,
+  and the others pick the new key up within 30 seconds
+  ([#196](https://github.com/schmitch/forge/issues/196)).
+- Registry digests are verified on every upload and every proxied blob and
+  manifest. Blobs are linked per image: knowing a layer digest grants no
+  read on another image's copy, and a mount needs read on the source image.
+  A docker proxy sends upstream credentials only to its `remote_url` origin
+  and the token realm the upstream's challenge names (over https when the
+  upstream is https), and drops `Authorization` on a redirect to another
+  host. Registry responses carry the feeds' hardening headers and
+  `Vary: Authorization, Cookie, Accept`.
+
+### Documentation
+
+- The deployment guide lists the S3 permissions and the PostgreSQL role
+  Forge needs, and an S3 delete that is denied names the missing
+  `s3:DeleteObject`. ([#114](https://github.com/schmitch/forge/issues/114))
+
+### Known limitations
+
+- With a package delay, proxy search shows a version only once the proxy
+  has recorded it and the delay has passed, because a search answer names
+  no publish times. Totals of a proxy search are the upstream's, less the
+  ids dropped from the returned page; for a caller whose content selectors
+  hide packages, they count what it sees, plus one while more may follow.
+- Behind an outbound proxy, a host name that resolves differently for the
+  proxy than for Forge, or that only the proxy can resolve, still gets
+  past the metadata guard; block those addresses on the proxy as well.
+- Format plugins receive no request bodies other than the published
+  package (which must be the whole body or one multipart part), accept only
+  Basic credentials, and treat a version with a `-` as a prerelease; a
+  response of a plugin may load at most 2,048 query answers. Helm refuses a
+  `Chart.yaml` or `index.yaml` whose YAML aliases would add more than
+  100,000 nodes, or that nests deeper than 64 levels. Their proxies
+  read the upstream with plain GETs of whole documents (Basic credentials
+  only, no token exchange).
+- A docker proxy downloads a blob completely and verifies it before it
+  answers, so a client waits for a large layer's first fetch; concurrent
+  pulls of one layer share a download per instance only. A registry upload
+  of several chunks is assembled into a new blob when it finishes (one-chunk
+  uploads, what docker, podman and containerd send, are stored once). The
+  registry has no catalog API (`/v2/_catalog`) and no per-repository
+  connector ports.
+
+## [1.0.0]
+
+First production release. envisia-forge is dual-licensed under the GNU AGPL
+v3 (`AGPL-3.0-only`, see `LICENSE`) or the envisia license, at the user's
+choice. Install it on an empty PostgreSQL database;
+[docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md)
+lists the required settings.
 
 ### Features
 
@@ -47,545 +561,198 @@ First production release.
   [docs/trusted-publishing.md](https://github.com/schmitch/forge/blob/main/docs/trusted-publishing.md).
 - **Retention**: policies with preview, run and audit, and download tracking.
 - **Secret encryption at rest**: double-envelope encryption of upstream
-  passwords and realm secrets, with key rotation and backfill.
+  passwords and realm secrets, with key rotation.
 - **Web UI**: browse, repository and package detail, self-service tokens, and
   administration of repositories, users, tokens and realms. It is served by
   the same process on the same origin.
 - **Operations**: `/healthz`, `/readyz` and `/version`, graceful SIGTERM,
-  supervised background workers, and an optional Redis L2 cache with
-  cross-instance invalidation.
-- **Release**: a signed container image with an SBOM and provenance
-  attestation; see [docs/deployment.md](https://github.com/schmitch/forge/blob/main/docs/deployment.md).
+  supervised background workers, an audit log of every package change and
+  admin action (the `forge::audit` log target), and an optional Redis L2
+  cache with cross-instance invalidation.
+- **Container image**: signed with cosign, with a provenance attestation and
+  an SBOM that lists the Debian packages, Rust crates and npm packages it
+  ships. The image carries `LICENSE` and the third-party notices in
+  `/usr/share/doc/forge/`. Each release's notes print the exact
+  verification command.
+- **Kubernetes manifests** in `deploy/kubernetes`: a kustomize base for the
+  server, components for an Ingress or Gateway API HTTPRoute, in-cluster
+  Redis, PostgreSQL and S3 (versitygw), two replicas with a
+  PodDisruptionBudget, and following `:latest`; plus a production and an
+  evaluation overlay. The base pins the image to the release it is tagged
+  with.
+- **Helm chart** in `deploy/helm/forge`, published with every release to
+  `oci://ghcr.io/schmitch/charts/forge` (same version as the image, signed
+  with cosign, and attached to the GitHub release). The published chart pulls
+  the release image by the digest the release workflow signed. Forge's whole
+  configuration is settable as `config` (rendered to `forge.toml`), secrets
+  through a chart-managed (`<fullname>-secret-env`) or existing Secret;
+  routing through a Gateway API HTTPRoute and an optional ListenerSet (plus
+  a cert-manager Certificate); PodDisruptionBudget, HorizontalPodAutoscaler,
+  NetworkPolicy and `extraObjects`; and optional in-cluster PostgreSQL,
+  Redis and versitygw dependencies.
 
 ### Security
 
-- CSRF protection on every cookie-authenticated mutation. In addition,
-  cross-site browser mutations are refused (`Sec-Fetch-Site`/`Origin`), which
-  also covers Basic credentials a browser cached from the feed's login prompt.
-- An expired or revoked session cookie is cleared and treated as signed out,
-  instead of blocking every page including the login.
-- Removing the built-in `admin` role revokes admin rights, including for
-  accounts that carry the legacy admin flag.
-- The bootstrap admin is created once and stays deleted after removal, also
-  for accounts that existed before that rule. Boot logs a security warning
-  while the bootstrap account still accepts the placeholder password.
+**Signing in**
+
+- Passwords are verified behind a bounded queue
+  (`auth.password_verify_concurrency`). A memory-bounded login lockout
+  refuses usernames over 256 bytes, keys IPv6 clients by their /64, and backs
+  off a username guessed from many networks, except from networks it signed
+  in from in the last 30 days. Unknown and federated usernames take the same
+  time, so response timing does not reveal which accounts exist.
+- Usernames are canonical (trimmed, Unicode NFC, lowercased) in every login
+  path, the lockout, provisioning and admin user creation. Empty names,
+  control characters and `:` are refused.
+- Browser sessions: a CSRF token on every cookie-authenticated mutation, and
+  cross-site browser mutations are refused (`Sec-Fetch-Site`/`Origin`),
+  which also covers Basic credentials a browser cached from the feed's login
+  prompt. On https the session and OIDC flow cookies carry the `__Host-`
+  prefix, and a request that carries either cookie twice is not
+  authenticated by it. An expired or revoked session cookie is cleared.
+- OIDC login uses the authorization-code flow with PKCE (S256), a nonce and
+  a flow bound to the browser. Only RSA signatures are accepted, and `iss`,
+  `aud`, `exp` and `nbf` are checked. Discovery, key-set and token requests
+  use https and follow no redirects. A realm can require claims
+  (`required_claims`, e.g. a tenant id), an email claim becomes a username
+  only with `email_verified`, `link_existing_by_username` never takes over
+  an account another credential owns, and a realm's client secret is dropped
+  when its `issuer` or `client_id` changes. Login starts are rate-limited per
+  client network (`auth.oidc_login_starts_per_minute`).
+- Credential forwarding requires https unless the upstream is a loopback
+  address or the realm sets `allow_http`. It follows no redirects, ignores
+  `HTTP(S)_PROXY`, holds no database connection during the upstream call,
+  and is bounded per realm (`auth.credential_forward_max_concurrent`) and by
+  the realm's timeouts. Set `identity_path` for upstreams that accept a
+  secret under any username (GitHub, Azure DevOps or GitLab personal access
+  tokens): without it, any token holder can sign in as any user. Forge sends
+  the canonical, lowercased username, so an upstream that compares names
+  case-sensitively (an htpasswd file, for example) must know its users in
+  lowercase. Names that Unicode compatibility normalization (NFKC) would
+  change, or that hold invisible characters, are never forwarded.
+- The users of a deleted credential-forwarding realm are never adopted by
+  another realm. Upstream and IdP admin-group verdicts apply in both
+  directions, and a demotion ends the user's browser sessions.
+- Users can be deactivated (`PATCH /admin/users/{id}` with
+  `{"active": false}`): their sessions and cached verdicts are revoked and
+  their tokens refused. A forced re-authentication
+  (`POST /admin/users/{id}/reauth`) ends their sessions and revokes the
+  tokens they minted from a credential-forwarding session. The last active
+  administrator cannot be removed, and the last enabled realm people sign in
+  with interactively cannot be disabled or deleted.
+- The bootstrap admin is created once and stays deleted after removal. Boot
+  logs a security warning while it still accepts the placeholder password.
+  Startup refuses placeholder credentials, including a secret that still
+  holds a `<…>` placeholder of the example env files, and warns about a
+  non-https or loopback `public_base_url` and about disabled secret
+  encryption.
+
+**Tokens and the admin API**
+
+- The admin API accepts a browser session or an admin-scoped token
+  (`{"actions": ["admin"]}`), never a password sent over Basic, and minting
+  tokens (`/admin/me/tokens`) takes a session. An unscoped token of an admin
+  can push and restore but gets 403 on `/admin/*`, so a leaked CI token
+  cannot mint tokens or create admins. An administrator's password still
+  signs in through `/auth/login`: give administrators an OIDC realm, and
+  NuGet clients tokens.
+- An expired or revoked API token, or one of a deactivated user, sent as the
+  Basic password is refused and never tried as a password. A token typed
+  into the web login's password field is refused the same way, live or not.
+- Admin request bodies refuse unknown fields (422 naming the field), and a
+  realm's `config` refuses unknown keys (400), as do the `[oidc]` and
+  `[auth.upstream_basic]` config sections that seed realms (at startup), so
+  a typo never falls back to an unsafe default. Token listings show each
+  token's scope.
+- Every package change (push, redeploy, unlist, relist) and every admin
+  change is logged at INFO under the `forge::audit` target with the
+  principal's ids.
+
+**Reading and publishing**
+
+- RBAC applies on every feed, browse and admin path. A repository name that
+  does not exist answers like one the caller may not read (401 or 403), so
+  names cannot be enumerated.
+- With `anonymous_mode = "all"`, signed-in users can also read what
+  anonymous callers can; under `off` and `allowlist` they hold only their own
+  grants. Under `allowlist`, the anonymous grant requires a `Host` that
+  matches `public_base_url` or `server.allowed_hosts` (a DNS-rebinding
+  guard), so the reverse proxy must preserve the `Host` header.
+  `X-Forwarded-For` is honoured only from `auth.trusted_proxy_cidrs`, and a
+  malformed hop leaves the client unknown, never allowlisted.
+- With `allow_redeploy` on, replacing an existing version needs the delete
+  permission as well as write, so a push-only token cannot overwrite a
+  released version.
+- Groups guard against dependency confusion: `prefer_hosted` decides over
+  every hosted member, whatever the caller can read; ids under
+  `reserved_prefixes` are never served from a proxy member; and once a group
+  flags owner members, only owners claim ids. A nested group keeps its own
+  guards when it is read through an outer group.
+- Packages are read the way NuGet reads them: exactly one `.nuspec` at the
+  package root, found with percent-decoded entry names and `\` as a
+  separator, and one `<id>` and `<version>`. Archives with repeated entry
+  names, Info-ZIP Unicode path fields, a `<!DOCTYPE>` manifest, inconsistent
+  ZIP64 records, or a version NuGet clients cannot read are refused, so
+  Forge and a NuGet client never see different identities for one package.
+- Feed responses are inert in a browser (`Content-Security-Policy:
+  default-src 'none'; sandbox`, `Content-Disposition: attachment`,
+  `nosniff`). Package ids are validated against the NuGet id grammar on
+  every route and before a proxy builds an upstream URL. Search `q` is
+  capped at 256 bytes and 8 terms.
+
+**Proxies, secrets and caches**
+
+- A proxy refuses upstream redirects to, and resolutions of, link-local and
+  cloud-metadata addresses, sends its credentials only to the origin of its
+  `remote_url`, drops them when `remote_url` moves to another origin, and
+  serves an upstream `.nuspec` only if it names the requested package.
+  Inside the package-delay window it does not download a version at all.
+- Encrypted secrets are bound to where they are sent: a proxy password to
+  the origin of `remote_url`, an OIDC client secret to the realm's issuer and
+  client id. Key rotations are serialized across instances, key material is
+  wiped from memory after use, and an instance without `[crypto]` refuses to
+  start on a database that holds encrypted secrets. Config errors and the
+  `Debug` output of the configuration never contain secrets.
+- Redis is a trust boundary: authorization sets, credential verdicts, OIDC
+  discovery documents and signing keys, workload-identity verdicts and a
+  proxy's upstream metadata are cached in each instance's memory only, and
+  Redis only relays their invalidations. `rediss://` (TLS) URLs are
+  supported.
+- Trusted publishing: a rule for a custom issuer must pin a stable identity
+  claim, or one the realm lists in `identity_claims`. Unlist, relist and
+  delete by a workload pass the same checks as a publish and are recorded in
+  `trusted_publish_audit`.
+
+**HTTP and supply chain**
+
 - Responses carry `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Content-Security-Policy: frame-ancestors 'none'` and
-  `Referrer-Policy: same-origin`.
-- Startup refuses placeholder credentials. It warns about a non-https or
-  loopback `public_base_url` and about disabled secret encryption.
-- API tokens carry admin rights only when their scope lists `admin`
-  (`{"actions": ["admin"]}`). An unscoped token of an admin can still push
-  and restore, but gets 403 on `/admin/*`, so a leaked CI token cannot mint
-  tokens or create admins.
-- A group's `prefer_hosted` guard now decides over every hosted member,
-  whether or not the caller can read it. A public package can no longer
-  replace an internal id for anonymous or selector-scoped callers; they get
-  404 instead.
-- The login lockout is memory-bounded: usernames over 256 bytes are refused,
-  entries have a fixed size and expire, and parallel guesses cannot outrun
-  the lockout. Password hashing runs behind a bounded queue
-  (`auth.password_verify_concurrency`).
-- Credential forwarding holds no database connection during the upstream
-  call, is bounded per realm (`auth.credential_forward_max_concurrent`),
-  never follows redirects (any 3xx counts as "unavailable"), and now applies
-  the realm's connect/request timeouts.
-- Users can be deactivated (`PATCH /admin/users/{id}` with
-  `{"active": false}`): their sessions and cached upstream verdicts are
-  revoked and their tokens refused. Re-authentication also ends sessions.
-- A proxy drops its stored upstream credentials when its `remote_url` moves
-  to another origin, and credentials can now be cleared.
-- Content-selector `PATCH` keeps fields it does not mention (it used to widen
-  a selector to "every package"). Token scopes reject unknown fields, and
-  token listings show each token's scope.
-- `X-Forwarded-For` is read across all header lines, and IPv4-mapped IPv6
-  peers match IPv4 CIDRs. Under `anonymous_mode = "allowlist"` the anonymous
-  grant requires a `Host` matching `public_base_url` or `server.allowed_hosts`
-  (DNS-rebinding guard).
-- The proxy refuses upstream redirects and resolutions to link-local and
-  cloud-metadata addresses, and serves an upstream `.nuspec` only if it names
-  the requested package.
-- Secret encryption: enabling it later now removes the plaintext copies, and
-  key rotations are serialized (a second rotation answers 409) with
-  compare-and-swap re-wrapping, so a race cannot strand keys.
-- Config errors never echo secret values, and secret environment values are
-  read verbatim.
-- Release images are signed by digest before any tag points at them; the
-  verification command pins the exact release workflow; actions and base
-  images are pinned by digest; CI audits the Rust and shipped web
-  dependencies, and Dependabot keeps them current. The RUSTSEC advisories in
-  the AWS SDK's legacy HTTP stack are gone from the dependency tree.
-- With `anonymous_mode = "all"`, signed-in users can read what anonymous
-  callers can; under `off` and `allowlist` they hold only their own grants
-  (the allowlist depends on the caller's network, which a signed-in user or
-  token must not carry elsewhere).
-- Unknown and federated usernames take the same time in the password chain,
-  so response timing no longer reveals which upstream users exist.
-- Allowlist and trusted-proxy entries written as IPv4-mapped IPv6
-  (`::ffff:10.0.0.1`) match as the IPv4 address they denote.
-- A cancelled admin key rotation can no longer leave the rotation lock held
-  on a pooled connection.
-- Feed responses (`/v3/...`) are inert in a browser: every one carries
-  `Content-Security-Policy: default-src 'none'; sandbox`,
-  `Content-Disposition: attachment` and `nosniff`. Before, a published
-  `.nuspec` was served as `application/xml` on the admin UI's origin, so an
-  XHTML `<script>` in it ran with the viewer's session (stored XSS).
-- The web UI is served with a real Content Security Policy: scripts only from
-  the server's own origin plus the inline theme bootstrap, allowed by its
-  SHA-256 hash (taken from the served `index.html` at startup); no `eval`,
-  plugins, `<base>` or framing, and fetches only to the same origin.
-- Usernames are canonical (trimmed, Unicode NFC, lowercased; empty names and
-  control characters are refused) in every login path, the lockout, the
-  credential cache, provisioning and admin user creation, with a unique
-  index on the canonical form. Credential forwarding sends the canonical name
-  upstream and signs in as exactly that account, so case or spacing variants
-  can no longer split one upstream identity into several Forge accounts
-  (or lockout budgets). An upstream that compares usernames case-sensitively
-  (an htpasswd file, for example) now receives the lowercased name: such
-  users must be known to it in lowercase.
-- Credential-forwarding realms take an optional `identity_path`: the account
-  the upstream's JSON success response names must equal the username
-  entered. Set it for upstreams that accept a secret with any username
-  (GitHub, Azure DevOps or GitLab personal access tokens); without it such an
-  upstream lets any token holder sign in as any user. A success without the
-  field fails closed. The docs now state that the upstream must bind the
-  username to the secret.
-- Package ids in feed URLs are validated against the NuGet id grammar on
-  every read and unlist/relist route (404 otherwise), and again before a
-  proxy builds an upstream URL. A percent-encoded `..%2F`, `?` or `#` in an
-  id could steer the proxy's credentialed upstream requests to other paths
-  and queries of the upstream host, and planted bogus names in the proxy's
-  version table.
-- Redis is treated as a trust boundary: authorization sets, credential
-  verdicts, OIDC discovery documents and key sets, and workload-identity
-  verdicts are cached in each instance's memory only and never read from or
-  written to Redis (which still relays their invalidations). Before, anyone
-  able to write to Redis could plant an admin authorization set, mark a
-  password valid or substitute an IdP signing key for every instance.
-  `rediss://` (TLS) Redis URLs are now supported, and the deployment guide
-  documents how to isolate Redis.
-- The principal records how it authenticated (token, password over Basic,
-  or browser session). The admin API accepts a session or an admin-scoped
-  token, never a password replayed over Basic; minting tokens
-  (`/admin/me/tokens`) takes a session. Before, every feed request a NuGet
-  client sent with a stored password — with credential forwarding, the
-  directory password — could also call the admin API and mint tokens
-  outliving that password. The password itself still signs in through
-  `/auth/login`, so an administrator's password remains an admin
-  credential: give administrators an OIDC realm, and NuGet clients tokens.
-  An admin-forced reauth (`POST /admin/users/{id}/reauth`) now
-  also revokes the tokens a user minted from a credential-forwarding session.
-- Deleting a credential-forwarding realm no longer lets another realm adopt
-  its users: their missing realm was treated as a wildcard, so the next realm
-  whose directory knew the same username took over the account with its
-  roles and tokens. Such accounts are now flagged as orphans and never
-  matched again.
-- OIDC `link_existing_by_username` links only an account that no other
-  credential owns: never a credential-forwarding account or one already
-  linked to an IdP identity (before, a colliding `preferred_username` at the
-  same or another IdP took it over). An email claim is used as a username
-  only with `email_verified`, also when `username_claim` names it.
-- Registration and search no longer fetch and re-parse every version's
-  `.nuspec` per request (an unauthenticated CPU and storage amplifier on
-  public feeds): the manifest summary is stored at publish and when a proxy
-  caches a package (migration 0024; older versions are summarized once and
-  backfilled), a proxy reads every cached version's registration data in
-  one query, proxy search pages over package ids in SQL and loads versions
-  for the returned page only (an empty query used to load every cached
-  version of every package), the registration index
-  is paged (64 versions per page, inlined up to 128 versions, beyond that
-  served from `/registration/{id}/page/{lower}/{upper}.json`, which answers
-  with the versions in that range, so a page URL from a cached index keeps
-  working after a push or delete), hosted leaf and catalog documents look up
-  one version instead of all, rendering runs on
-  the blocking pool, and the `.nuspec` parser tracks `<metadata>` in O(1) and
-  rejects nesting deeper than 32 levels (it was quadratic in depth).
-- Proxy (completing the 0.1.0 "not found" marker fix): a version deleted
-  upstream leaves the listings at the next refresh (migration 0025) instead
-  of reappearing every `not_found_ttl`; the package-level not-found marker
-  is pruned once expired and cleared by a download of the package; a 404
-  never hides a version a listing confirmed after the request started; and
-  inside the package-delay window the proxy no longer downloads a version
-  at all, so a reader cannot prefetch a quarantined release that would later
-  be served from the cache. Proxy TTLs and the delay are validated
-  (0 to 7 days; delay up to a year).
-- The password lockout keys IPv6 clients by their /64 (one host owns a whole
-  /64, so per-address keys gave it unlimited fresh budgets), and a username
-  guessed from many networks is backed off: past three pair budgets of
-  failures in a window its attempts are spaced (1 s, doubling to 30 s; an
-  attempt that would wait more than 10 s is refused). Attempts from a
-  network the username signed in from in the last 30 days are not backed
-  off, and attempts already refused by a pair lockout take no slot, so a
-  guesser cannot keep the owner out of their usual networks. A success
-  clears it.
-- OIDC hardening: a realm's stored client secret is dropped when its
-  `issuer` or `client_id` changes (the update must supply a new one, so the
-  old IdP's secret is never sent to a new issuer); discovery, JWKS and token
-  requests follow no redirects (a 307 would replay the client secret) and
-  must use https unless the realm allows a development http issuer; token
-  responses are capped at 1 MiB; `redirect_to` is capped at 2 KiB; login
-  starts are rate-limited per client network
-  (`auth.oidc_login_starts_per_minute`, default 30); a callback's IdP error
-  is only surfaced after the browser binding is checked and is logged
-  bounded and escaped. Realms take an optional allow-gate,
-  `required_claims` (e.g. `{"tid": ["<tenant>"]}` or `{"hd": ["corp.example"]}`):
-  a token without an allowed value is refused.
-- Workload identity (trusted publishing): for a custom issuer, a rule's
-  identity anchor must be one of the known stable identity claims or one the
-  realm declares in `identity_claims` (before, any claim not on a short
-  denylist counted, so a rule on `actor` or `event_name` trusted every
-  workload that carried it). Unlist, relist and delete by a workload now run
-  the same commit-time realm fence as a publish and are recorded in
-  `trusted_publish_audit` with an `action` column (migration 0026); before,
-  a principal from a stale realm snapshot could still unlist, and those
-  changes left no record. The docs recommend pinning `job_workflow_ref` and
-  `event_name`.
-- Session and OIDC flow cookies carry the `__Host-` prefix when
-  `public_base_url` is https (the flow cookie moves to `Path=/`, which the
-  prefix requires), so a sibling subdomain or a plain-http response can no
-  longer plant one. A request carrying the session (or flow) cookie more than
-  once is not authenticated by it, and neither copy is cleared — before, the
-  first one won, which let a cookie planted for a narrower path or a parent
-  domain fix the browser's session.
-- Admin changes from an identity source take effect at once: a NuGet
-  client's Basic login that re-reads the upstream's groups now drops the
-  user's cached authorization set (as the browser login already did), so a
-  demoted admin is not served as an admin until the cache expires; and a
-  demotion by an upstream or an IdP ends the user's browser sessions. Editing
-  a credential-forwarding realm retires the credential verdicts cached under
-  its old config (they are keyed by it), so e.g. a newly required group
-  applies to the next request rather than after `positive_ttl_secs`.
-- A repository name that does not exist answers like one the caller may not
-  read (401 anonymously, 403 signed in) on the feed (`/v3/{repo}/…`) and in
-  the browse API, so repository names can no longer be enumerated; a global
-  admin still gets 404.
-- Groups take optional `reserved_prefixes` (API and UI, e.g. `["Acme."]`):
-  package ids under a reserved prefix are never served from a proxy member.
-  `prefer_hosted` only shields ids a hosted member already has, so an
-  internal name was open to a public look-alike until its first publish (or
-  after its last version was deleted).
-- HTTP hardening: API responses (`/admin`, `/auth`, `/browse`) and feed
-  responses to a request with credentials are `Cache-Control: private,
-  no-store`, and feed responses carry `Vary: Authorization, Cookie,
-  X-NuGet-ApiKey`, so a shared cache can neither store a private package nor
-  serve one caller's answer to another; an https deployment sends HSTS. The
-  server now enforces a header-read timeout (`server.header_read_timeout_seconds`,
-  default 150 s, counted from accept — `axum::serve` never armed hyper's, so a
-  client trickling headers, or sending nothing at all, held a connection
-  forever; connections are HTTP/1 only, h2c is no longer accepted), a
-  request-body idle timeout
+  `Referrer-Policy: same-origin`; an https deployment sends HSTS. The web UI
+  has a strict Content Security Policy: scripts only from its own origin plus
+  the hashed inline theme bootstrap, no `eval`, and fetches only to the same
+  origin.
+- API responses (`/admin`, `/auth`, `/browse`) and feed responses to a
+  request with credentials are `Cache-Control: private, no-store`, and feed
+  responses carry `Vary: Authorization, Cookie, X-NuGet-ApiKey` (for
+  `anonymous_mode = "allowlist"` see Known limitations).
+- Slow clients are bounded by a header-read timeout
+  (`server.header_read_timeout_seconds`, 150 s), a request-body idle timeout
   (`body_idle_timeout_seconds`, 60 s) and a response timeout
-  (`request_timeout_seconds`, 900 s, answered with 408).
-- The `Debug` output of the database, S3 and Redis configuration no longer
-  contains secrets: connection-URL passwords and query strings and the S3
-  secret key are redacted, so a logged config cannot leak them.
-- Release workflow: only version tags on the default branch decide whether a
-  release moves `:latest` / `:<major>.<minor>` (a stray tag pushed on another
-  branch — never released — kept every later release from moving them).
-- Package manifests must have the one shape NuGet reads: exactly one
-  `.nuspec` at the package root, a root `<package>` with a single
-  `<metadata>`, and in it one text-only `<id>` and `<version>` (and at most
-  one `<dependencies>`). Repeated `<id>` elements were joined, and a nested
-  `.nuspec` or `<metadata>` could be taken for the manifest, so Forge and a
-  NuGet client could see different identities for one package — enough to
-  publish past an id-scoped grant.
-- Request bounds on the feed: a search `q` is cut to 256 bytes and at most
-  8 distinct terms (each term costs a substring scan per candidate id, and
-  `q` was unbounded), and a push whose multipart body does not reach its
-  package part's headers within 64 KiB is refused with 400 (the parser
-  buffered everything before the first boundary in memory, up to the whole
-  upload limit).
-- Package archives: a ZIP64 locator that does not point at a ZIP64 record
-  is refused (the pre-parse limit check skipped such archives, and the zip
-  reader then went looking for an unvetted record whose entry count sizes an
-  allocation), and archives are read at offset 0. Versions NuGet clients
-  cannot read as a package's own are refused at publish: a component above
-  `int32`, a numeric prerelease identifier with a leading zero (stored
-  under a normalized URL no client requests) and malformed build metadata.
-- Credential forwarding: the upstream `url` must be https unless it is a
-  loopback address or the realm sets `allow_http` (before, a plain-http URL
-  was accepted with a log line, so every login sent a password in the clear
-  and a network attacker could also forge the groups that grant admin); the
-  forwarding client ignores `HTTP(S)_PROXY`; and at most 1 MiB of a success
-  body is read for `groups_path` / `identity_path` (larger answers fail
-  closed).
+  (`request_timeout_seconds`, 900 s). Connections are HTTP/1 only.
+- Release images are signed by digest before any tag points at them, and
+  the verification command pins the exact release workflow. Actions and base
+  images are pinned by digest, CI audits the Rust and shipped web
+  dependencies, and Dependabot keeps them current.
 
-- Redis is a trust boundary for proxied content too: a proxy's upstream
-  service index, manifests and registrations are cached in each instance's
-  memory only. Before, a forged service index planted in Redis made other
-  instances download packages from the forger's host, and the planted
-  package then stayed cached.
-- Admin request bodies for grants, roles, role assignments, content
-  selectors, user creation and group members, and `POST /auth/tokens`,
-  refuse unknown fields. Before, a grant sent as `{"repository_id": 3, ...}`
-  (the shape the grant listing returns) ignored the id and granted the
-  action on **every** repository, a selector with a mistyped `include`
-  matched every package, and `/auth/tokens` dropped a `scope` and minted
-  an unscoped token. A grant now also takes `repository_id`.
-- With `allow_redeploy` on, replacing an existing version needs the delete
-  permission (and passes the delete selectors) as well as write, so a
-  push-only token can no longer overwrite a released version.
-- Every package mutation (push, redeploy, unlist, relist) and every admin
-  change is logged at INFO under the `forge::audit` target with the
-  principal's ids (`user:5 token:12`, `user:5 session`,
-  `workload realm:3 role:7`).
-- An instance without `[crypto]` refuses to start on a database holding
-  encrypted secrets, instead of running with every sealed credential
-  unusable and storing new secrets in plaintext.
-- On installs with `legacy_open_access`, removing a credential-forwarding
-  user's `authenticated` role is no longer undone by the user's next login.
-- Encrypted secrets are bound to where they are sent: a proxy password to
-  the origin of the repository's `remote_url`, an OIDC client secret to the
-  realm's issuer and client id. Before, someone who could write to the
-  database but not read secrets could point `remote_url` at their own host,
-  and the proxy decrypted the password and sent it there. Secrets sealed
-  under the old binding are opened only while
-  `crypto.accept_row_bound_secrets` is on (see Upgrade notes), so an old
-  blob replayed into a repointed row is refused too.
-- The marker that records whether a realm imported from `[oidc]` /
-  `[auth.upstream_basic]` was edited no longer hashes the realm's secrets.
-  It was an unsalted SHA-256 next to the plaintext config, so a database
-  dump allowed offline guessing of an encrypted `client_secret` or
-  `key_pepper`. A changed block is re-applied only while neither the row
-  nor the marker changed since startup read them, so a boot that races an
-  admin edit of the realm no longer overwrites it.
-- The AES-GCM and XChaCha20-Poly1305 key schedules and the decoded root key
-  are wiped from memory after use.
-- With `auto_provision = false`, a credential-forwarding realm that maps an
-  admin group now applies the upstream admin verdict to existing accounts
-  in both directions, as with auto-provisioning: a user removed from the
-  admin group upstream loses the flag and the `admin` role and is signed
-  out; before, they kept signing in as an admin. A user added to that group
-  upstream becomes an admin at their next login, where before they did not.
-- A group can name the members that own its package ids
-  (`group_member.owner`). Once any member is flagged, only owners claim ids:
-  with `prefer_hosted`, an id an owner has is served by the owners alone (no
-  proxy or other hosted member adds versions to it), and only owners serve
-  ids under `reserved_prefixes`. A writer of a developer feed in the same
-  group can no longer publish an internal name, add a version to an owner's
-  package, or take a public id away from the proxy. An owner must be
-  unflagged before it can be removed from the group or deleted, so a group
-  never falls back to trusting every member unnoticed; the web UI marks
-  owners.
-### Fixed
+### Good to know
 
-- Overlapping hard deletes (admin or NuGet `DELETE`) and repository deletes
-  decrement shared blobs exactly once; the losing request gets 404 and
-  `blob.ref_count` can no longer go negative. Before, a retry could delete a
-  blob another repository still served. Garbage collection also refuses to
-  delete any blob an asset still names, repairing a drifted counter instead,
-  and a redeploy that races a delete publishes the version afresh.
-- Writers lock shared blob rows in one order, and a repository delete that
-  Postgres aborts as a deadlock victim is retried.
-- A repository delete is atomic with its emptiness check or proxy purge, and
-  a publish racing garbage collection retries instead of failing.
-- Retention: hosted-scope rules on a proxy repository are rejected (they
-  broke restores); `keep_last_n` and `keep_n_most_downloaded` protect
-  versions within each rule's own filters, and `keep_last_n` counts only
-  listed versions; proxy eviction keeps the version's listing and
-  `first_seen_at`; an unlist rule no longer re-touches unlisted versions; a
-  panicking run is recorded as failed and releases its lease.
-- Proxy: a "not found" marker hides a version only for `not_found_ttl` and is
-  cleared when the upstream lists the version; a failed download no longer
-  lists a phantom version; a missing local copy is fetched again;
-  registration carries the upstream's dependency groups, listing state and
-  publish date for versions not yet downloaded; a rejected package is not
-  re-downloaded on every retry; rows created only by requests for versions
-  the upstream never had are pruned after the not-found window.
-- Large packages with big native payloads publish and proxy: size and ratio
-  caps apply to the `.nuspec` only, the ZIP directory the reader will use is
-  checked before parsing, and the limits are configurable under `[nuget]`.
-- Package ids, search terms, selectors and retention prefixes are lowercased
-  character by character like .NET's `ToLowerInvariant`, so ids with
-  non-ASCII letters resolve as NuGet clients request them.
-- Group search enriches only the page it returns.
-- Nested-group depth counts the levels above the new member too.
-- OIDC issuers whose identifier ends in `/` validate; concurrent first
-  sign-ins for one identity resolve to one account, with no orphans or
-  errors.
-- Secret encryption: enabling it later removes plaintext copies only after
-  checking the ciphertext holds the same password; a stale or undecryptable
-  ciphertext is replaced from the plaintext instead.
-- Boot warns about an account that still accepts the placeholder password
-  `changeme` even when no bootstrap admin is configured.
-- The Redis L1 cache is flushed on the first backplane subscription, so an
-  instance that starts while Redis is slow does not serve stale entries.
-- Interrupted multipart uploads are aborted. Garbage-collection tables are
-  indexed, and processed outbox rows are pruned.
-- Web UI: an expired session sends the user to the sign-in page instead of
-  looping requests; admin pages work on refresh and from bookmarks;
-  `index.html` is never cached and assets are immutable; sign-out clears
-  cached data; lockouts and realm errors are shown; Back works on repository
-  search; repository names are validated.
-
-- Retention `not_downloaded_for_days` counts a never-downloaded version
-  from its publication (as proxy rules count from `first_seen_at`). It
-  treated such a version as always cold, so a policy with this trigger
-  hard-deleted a version pushed minutes before the next run.
-- A blob left `deleting` while an asset still names it (aftermath of the
-  pre-release concurrent hard-delete race) is restored to `committed`
-  instead of having its object deleted on every re-push of the same bytes;
-  a warning names the S3 key to restore if the object is already gone.
-- The garbage-collection outbox decides which deletions are due on the
-  database clock, so an instance whose clock runs ahead no longer deletes
-  objects before the grace period.
-- Retention re-checks every decision when it applies it. A run stops when
-  its policy was edited, disabled or switched to `dry_run_only`, or when it
-  lost its lease. A decision the package's current versions no longer
-  produce is skipped: with `keep_last_n: 1`, unlisting 2.0.0 mid-run no
-  longer lets the run delete 1.0.0 and leave no listed version. A
-  package's decisions are applied in transactions of up to 100, each
-  re-checking the package once, so packages with thousands of versions do
-  not pay for a full re-check per version.
-- `retention_audit` is indexed for component deletes, which scanned the
-  whole table while holding locks, and rows older than
-  `retention.audit_retention_seconds` (default 90 days) are pruned.
-- Redis no longer takes an instance down with it:
-  - an instance starts while Redis is unreachable;
-  - an invalidation stalled on Redis no longer blocks every lookup in its
-    namespace;
-  - a subscription that goes silent without a reset is detected by a ping
-    within about 15 s, L1 is flushed, and the instance resubscribes.
-
-  Pushes, deletes and retention runs no longer pay for a Redis
-  invalidation of a cache nobody read.
-- Temp space for pushes and first-time proxy downloads is bounded per
-  instance (`server.max_staging_bytes`, answered `503` with `Retry-After`
-  when full), and files a killed process left in `server.staging_dir` are
-  removed at startup. Before, concurrent downloads of large packages could
-  fill the disk and get the pod evicted.
-- The networks a username signed in from, which exempt the owner from that
-  username's login backoff during a password spray, are stored in the
-  database. Before, they were lost on restart and known only to the
-  instance that saw the sign-in.
-### Changed
-
-- The admin UI lives under `/manage/*`. Browser navigations to the former
-  `/admin/...` UI paths are redirected; the `/admin/*` API is unchanged.
-- The image bakes no bootstrap admin: set
-  `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` for the first start. Without a
-  password no bootstrap admin is created (startup no longer fails).
-- The image sets `allow_password_basic = false` (credential-forwarding realms
-  still enable the wire Basic path) and runs as UID 10001.
-- `FORGE_CONFIG` must name an existing file. A blank `FORGE_REDIS__URL`
-  disables Redis. Secret environment values are never type-converted;
-  surrounding whitespace and one pair of surrounding double quotes are
-  removed, as before.
 - Repository names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`; `new` is
-  reserved.
-- Repository updates: an absent field keeps its value, JSON `null` clears it.
-- New settings: `auth.password_verify_concurrency`,
-  `auth.credential_forward_max_concurrent`, `server.allowed_hosts`,
-  `crypto.accept_row_bound_secrets`,
-  `outbox.processed_retention_seconds`, `retention.audit_retention_seconds`,
-  `server.staging_dir`, `server.max_staging_bytes`, and the `[nuget]`
-  archive limits. New endpoints: `PATCH /admin/users/{id}`,
-  `PATCH /admin/repositories/{name}/members/{member}` (`owner`) and
-  `GET`/`PUT /admin/settings/legacy-open-access`. Group members have an
-  `owner` field.
+  reserved. In repository updates, an absent field keeps its value and JSON
+  `null` clears it.
+- The retention worker runs a repository automatically at most once a
+  minute, whatever `default_run_interval_seconds` and a policy's
+  `min_run_interval_seconds` say.
 
-### Upgrade notes
-
-- This is the first release; install it on an empty database.
-- Installs that ran pre-release builds: on the first start, the legacy RBAC
-  mapping runs once more. On a database that already had users when
-  migration 0007 ran (`legacy_open_access = true`), that assigns the built-in
-  `authenticated` role (read and write on every repository) to every
-  existing user again, re-adds the `admin` role for accounts with the legacy
-  admin flag, and re-adds anonymous-read grants for repositories with
-  `anonymous_read` set, including grants revoked since migration 0007.
-  Review role assignments after upgrading, and switch legacy open access off
-  with `PUT /admin/settings/legacy-open-access {"enabled": false}` so new
-  users are no longer given `authenticated`. Migration 0011 changes the
-  storage protocol; the upgrade procedure is in
-  [DEVELOPMENT.md](https://github.com/schmitch/forge/blob/main/DEVELOPMENT.md).
-- Pre-release installs, continued: migration 0017 adds
-  `CHECK (ref_count >= 0)` and leaves it `NOT VALID` with a warning if a
-  blob's count has already drifted below zero; migration 0019 re-lowers
-  package ids with non-ASCII capitals. Migration 0017 builds its indexes
-  without `CONCURRENTLY`, which briefly blocks writes on large tables.
-- A stored retention policy with hosted-scope (or scope-less) rules on a
-  proxy repository now fails every run until it uses `"scope":
-  "proxy_cached"`. Preview other policies after upgrading: protections now
-  follow each rule's own filters.
-- Automation that calls `/admin/*` with an unscoped token must use a token
-  scoped `{"actions": ["admin"]}`.
-- With `anonymous_mode = "allowlist"`, preserve the `Host` header at the
-  reverse proxy (`proxy_set_header Host $host`) or list the names clients
-  use in `server.allowed_hosts`.
-- Pre-release installs: a repository whose `anonymous_read` was switched off
-  *before* this upgrade may still carry its synthesized anonymous read grant
-  (only switches made from now on remove it). Check
-  `GET /admin/anonymous/effective` and delete grants you did not intend.
-- Pre-release installs on a database whose `LC_CTYPE` is `C` (the
-  CloudNativePG default): Postgres cannot lowercase non-ASCII letters there,
-  so migration 0019 leaves package ids with non-ASCII capitals as they were;
-  delete and re-push such packages.
-- Migration 0021 rewrites existing usernames into canonical form. Accounts
-  whose names differ only in case, surrounding spaces or Unicode composition
-  are not merged: the oldest keeps the name, the others are renamed
-  `<name>#<id>` and a warning names each one. Review and delete them (there
-  is no rename API); their tokens keep working. Because SQL `lower()` follows
-  the database collation (a `C` ctype lowercases ASCII only), the server then
-  re-canonicalizes every stored name at startup and logs each rename. Two
-  cases it cannot undo, because 0021 already folded them under a non-`C`
-  collation: a capital `İ` (stored as `i`) and a final `Σ` (stored as `σ`);
-  such accounts must be recreated.
-- A password sent over HTTP Basic no longer reaches the admin API or token
-  minting, even for an administrator (403). Scripts that ran
-  `curl -u admin:<password> …/admin/…` must sign in through `/auth/login`
-  (session cookie + `X-CSRF-Token`) or use an admin-scoped token
-  (`{"scope": {"actions": ["admin"]}}`, sent as the Basic password or
-  `X-NuGet-ApiKey`). `cargo xtask seed` and DEVELOPMENT.md show both.
-- Migration 0023 flags existing credential-forwarding accounts that have no
-  realm (`realm_orphaned`): they can no longer be signed in by any realm.
-  Delete such an account to let its owner's next upstream login provision a
-  fresh one.
-- Workload-identity realms for an issuer other than GitHub Actions or
-  GitLab.com: every rule must now pin a stable identity claim (`sub`,
-  `repository_id`, `job_project_id`, `project_path`, … — see
-  docs/trusted-publishing.md) or a claim the realm lists in the new
-  `identity_claims`. A realm with a stored rule that pins neither no longer
-  loads at all (an error names it in the log), so every one of its rules
-  refuses tokens until the realm is edited.
-- A credential-forwarding realm (or `[auth.upstream_basic]` block) whose `url`
-  is plain `http` to anything but a loopback address no longer loads until it
-  is switched to https or sets `allow_http = true` explicitly. Credential
-  forwarding no longer honours `HTTP(S)_PROXY`.
-- On an https deployment the session and OIDC flow cookies are renamed
-  `__Host-forge_session` / `__Host-forge_oidc_flow`: everyone signs in once
-  more after the upgrade.
-
-- Automation calling the admin API must not send fields the endpoint does
-  not document (they are now refused with 422), and `POST /auth/tokens`
-  refuses a `scope` (use `POST /admin/me/tokens` for scoped tokens).
-- A CI token or workload role that redeploys existing versions needs the
-  `delete` action on the repository as well as `write`.
-- Retention policies with `not_downloaded_for_days` select fewer versions
-  on their first runs: a never-downloaded version only qualifies once it is
-  that many days old.
-- Retention audit rows older than 90 days are deleted after the upgrade. To
-  keep them, set `retention.audit_retention_seconds = 0` (or a longer
-  window) before upgrading. Migration 0027 indexes `retention_audit` without
-  `CONCURRENTLY`, which briefly blocks writes to a large table.
-- Pre-release installs with secret encryption: secrets sealed by earlier
-  builds are bound only to their row and do not decrypt by default. Start
-  all instances at once with `crypto.accept_row_bound_secrets = true`
-  (`FORGE_CRYPTO__ACCEPT_ROW_BOUND_SECRETS=true`): startup re-seals them for
-  their destination, which older instances cannot read. Then remove the
-  setting and restart. A secret that is still logged as undecryptable (its
-  row was changed outside the admin API) must be entered again.
-- Pre-release installs with a realm imported from `[oidc]` or
-  `[auth.upstream_basic]`: do not edit that realm through an instance of
-  the older build once a new instance has started. The older build does not
-  drop the import marker, so the next start would apply the TOML block over
-  a changed secret.
-- Staging is limited to 4 GiB per instance by default (four times the
-  larger of `server.max_upload_bytes` and `proxy.max_package_bytes`), in
-  `<temp dir>/forge-staging`. Set `server.max_staging_bytes` (`0` for no
-  limit) and `server.staging_dir` to match your volume; a budget below the
-  larger of those two limits plus `nuget.max_nuspec_bytes` is refused at
-  startup.
 ### Known limitations
 
 - NuGet is the only package format.
@@ -601,8 +768,15 @@ First production release.
   Only the env/file root-key providers exist; AWS KMS is not supported yet.
 - A proxy fetches a new package version once per instance. Several instances
   that miss the same version at the same time each download it.
+- The package delay is dated from the upstream publish time only for the
+  versions in the newest 10 pages (640 versions on nuget.org) of a
+  package's upstream registration; older versions, and versions of an
+  upstream without a registration, count from the proxy's first sighting.
 - A group's search is capped at 1,000 results per member, so totals and
   paging are exact only below that.
+- A token whose scope lists a group's repository id reads through the group
+  only from the members it lists as well: reading a group grants no read on
+  its members.
 - Retention has no per-run delete cap.
 - No metrics endpoint, request IDs or JSON log output. Shutdown drains
   in-flight requests without a deadline.
@@ -615,7 +789,9 @@ First production release.
   the upstream names, also to private or plain-http addresses (credentials
   go only to the upstream's own origin), and parses its metadata documents
   (up to `proxy.max_metadata_bytes`, 32 MiB) in memory. Point proxies only
-  at upstreams you trust.
+  at upstreams you trust. Behind an outbound proxy (`HTTP(S)_PROXY`) the
+  proxy resolves host names, so Forge refuses only literal cloud-metadata
+  addresses and the well-known metadata host names there.
 - Unless a group flags owner members, it trusts all its hosted members
   equally: anyone who can push to any hosted member can publish under the
   group's `reserved_prefixes`, and with `prefer_hosted` can claim any
@@ -623,8 +799,37 @@ First production release.
   when a group mixes feeds with different writers. Owners claim only the
   ids they have: an id no owner has is still served by every member, so
   reserve the internal prefixes as well.
+- With `prefer_hosted`, a caller who cannot read a group's hosted members
+  still learns whether one of them has a package id the upstream also has:
+  they get 404 instead of the public package.
+- A role grant of the `admin` action on one repository has no effect: every
+  `/admin` operation needs a global administrator.
+- An OIDC realm that provisions accounts can take a username before a
+  credential-forwarding user of that name first signs in, where users choose
+  their own username claim at the IdP. That user is then refused until an
+  administrator removes the other account.
+- Under `anonymous_mode = "allowlist"`, anonymous feed responses carry no
+  `Cache-Control: no-store`, and whether one is served depends on the
+  client's address, which a cache does not key on. A shared cache in front
+  of Forge that stores responses without caching headers (Varnish's default
+  does) can serve a package an allowlisted client fetched to a client
+  outside the allowlist. Do not let such a cache store `/v3` responses.
 - While Redis is unreachable, an instance hears no invalidations from the
-  others and converges by TTL (60 s for authorization).
+  others and converges by TTL (60 s for authorization). Anything that can
+  publish to Redis can grow every instance's memory: the invalidation
+  bookkeeping is not bounded.
+- Every `.nupkg` download updates its version's download counters in
+  PostgreSQL, unthrottled. Hundreds of downloads of one version per second
+  queue on those rows and can hold every database connection.
+- Forge does not check the owner or permissions of `server.staging_dir`. On
+  a host shared with other users, use a directory only Forge's user can
+  write (the container image and the Kubernetes manifests are not affected).
+- The Helm chart rolls the pods on a change of `secretEnv` (and of the
+  in-cluster Redis `auth`) through an unsalted SHA-256 of the values in a pod
+  annotation: whoever can read the Deployment can test guesses of a weak
+  secret against it.
+- The release build pulls the Dockerfile frontend, BuildKit and the SBOM
+  scanner images by tag, not by digest.
 - Login lockouts and failure counts are per instance and lost on restart
   (the networks a username signed in from are kept in the database).
 - A first download through a proxy runs inside the request, so
@@ -632,5 +837,6 @@ First production release.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/schmitch/forge/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/schmitch/forge/releases/tag/v0.1.0
+[Unreleased]: https://github.com/schmitch/forge/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/schmitch/forge/releases/tag/v1.1.0
+[1.0.0]: https://github.com/schmitch/forge/releases/tag/v1.0.0

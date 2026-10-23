@@ -5,7 +5,7 @@ import { ApiError } from '~/lib/httpClient'
 
 export const Route = createFileRoute('/_app/manage')({
   /**
-   * Hard admin gate (plan §5). Runs before any `/manage/*` screen loads:
+   * Hard admin gate. Runs before any `/manage/*` screen loads:
    *   - no/invalid credential (401/403) -> /login (with an "expired" notice and
    *     a redirect back to the attempted admin URL),
    *   - authenticated but not an admin   -> Browse (`/`), readers have no admin

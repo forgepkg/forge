@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -47,6 +47,7 @@ async fn pg_endpoint() -> &'static str {
         .with_db_name("forge")
         .with_user("forge")
         .with_password("forge")
+        .with_name("mirror.gcr.io/library/postgres")
         .with_tag("17")
         .start()
         .await
@@ -112,7 +113,7 @@ async fn s3_endpoint() -> &'static str {
     // (always present in the image) rather than `/data` (which the image does
     // not create). We wait for the "listening" banner on stdout, then retry
     // `ensure_bucket` below to absorb any residual startup lag.
-    let container = GenericImage::new("versity/versitygw", "v1.4.1")
+    let container = GenericImage::new("mirror.gcr.io/versity/versitygw", "v1.4.1")
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on"))
         .with_cmd([
@@ -144,8 +145,7 @@ pub async fn blob_store() -> BlobStore {
         endpoint,
         region: "us-east-1".to_string(),
         bucket: S3_BUCKET.to_string(),
-        access_key: S3_ACCESS.to_string(),
-        secret_key: S3_SECRET.to_string(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),
@@ -174,8 +174,7 @@ pub async fn blob_store_with_threshold(threshold: u64) -> BlobStore {
         endpoint,
         region: "us-east-1".to_string(),
         bucket: S3_BUCKET.to_string(),
-        access_key: S3_ACCESS.to_string(),
-        secret_key: S3_SECRET.to_string(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: threshold,
         conditional_writes: Default::default(),

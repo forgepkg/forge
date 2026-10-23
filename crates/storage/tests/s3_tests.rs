@@ -99,7 +99,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 
 /// A minimal in-process S3 endpoint that speaks just enough of the multipart
 /// protocol to inject the faults versitygw cannot: `CompleteMultipartUpload`
@@ -134,8 +134,7 @@ impl FakeS3 {
             endpoint: format!("http://{addr}"),
             region: "us-east-1".into(),
             bucket: "fake".into(),
-            access_key: "ak".into(),
-            secret_key: "sk".into(),
+            credentials: S3Credentials::from_keys("ak", "sk"),
             force_path_style: true,
             multipart_threshold: 1,
             conditional_writes: Default::default(),

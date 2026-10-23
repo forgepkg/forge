@@ -83,7 +83,7 @@ async fn group_members_ordered_by_priority_desc() {
         .await
         .expect("members");
 
-    // Highest priority first (wins ties per spec §7).
+    // Highest priority first (the highest-priority member wins ties).
     let priorities: Vec<i32> = members.iter().map(|(_, p)| *p).collect();
     assert_eq!(priorities, vec![100, 50, 1], "must be priority DESC");
     assert_eq!(members[0].0.id, high.id);
@@ -101,7 +101,7 @@ async fn group_members_ordered_by_priority_desc() {
     assert_eq!(after.len(), 2);
 }
 
-// ── nested groups: cycle + depth guard (§12.4 Phase 4) ──────────────────────
+// ── nested groups: cycle + depth guard ──────────────────────────────────────
 
 #[tokio::test]
 async fn add_group_member_checked_allows_valid_nesting() {
@@ -326,7 +326,7 @@ async fn blob_upsert_pending_returns_true_then_false() {
     assert_eq!(blob.size, 123);
 }
 
-/// The aftermath of the pre-0.1.0 concurrent hard-delete race: a blob left
+/// The aftermath of the pre-release concurrent hard-delete race: a blob left
 /// `deleting` with `ref_count` 0 that an asset still names. Neither the outbox
 /// nor a re-push of the same bytes may delete its object (a re-push used to
 /// take the stale reservation over and delete the object every 60 s); the
@@ -1134,11 +1134,11 @@ async fn user_and_token_round_trip() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
-    let username = format!("user-{n}");
+    let username = format!("user-{n}@example.com");
 
     let user = user_dao::insert_user(
         pool,
-        NewUser::local(username.clone(), "argon2-hash".to_string(), true, true),
+        NewUser::local(username.clone(), "argon2-hash".to_string(), true),
     )
     .await
     .expect("user");
@@ -1188,14 +1188,27 @@ async fn user_and_token_round_trip() {
     assert_eq!(by_hash.id, token.id);
     assert_eq!(by_hash.user_id, user.id);
 
-    token_dao::touch_last_used(pool, token.id)
+    assert!(token_dao::touch_last_used(pool, token.id, 60)
         .await
-        .expect("touch");
+        .expect("touch"));
     let touched = token_dao::find_token_by_hash(pool, &hash)
         .await
         .expect("by hash")
         .expect("present");
     assert!(touched.last_used_at.is_some());
+    // Throttled: a second use within the interval writes nothing...
+    assert!(!token_dao::touch_last_used(pool, token.id, 60)
+        .await
+        .expect("touch"));
+    // ...and one after it does.
+    sqlx::query("UPDATE token SET last_used_at = now() - interval '2 minutes' WHERE id = $1")
+        .bind(token.id)
+        .execute(pool)
+        .await
+        .expect("backdate");
+    assert!(token_dao::touch_last_used(pool, token.id, 60)
+        .await
+        .expect("touch"));
 }
 
 #[tokio::test]
@@ -1203,16 +1216,15 @@ async fn upstream_basic_user_has_no_local_password() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
-    let username = format!("nexus-{n}");
+    let username = format!("nexus-{n}@example.com");
 
-    // An upstream-basic user is provisioned with NO local password hash and
-    // carries provenance (source + external subject).
+    // An upstream-basic user has NO local password hash and carries
+    // provenance (source + external subject).
     let user = user_dao::insert_user(
         pool,
         NewUser {
             username: username.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".to_string(),
             external_subject: Some(username.clone()),
@@ -1235,80 +1247,96 @@ async fn upstream_basic_user_has_no_local_password() {
     assert_eq!(reread.external_subject.as_deref(), Some(username.as_str()));
 }
 
+/// A credential-forwarding realm row for the account tests.
+async fn forwarding_realm(pool: &sqlx::PgPool) -> i64 {
+    forge_db::auth_realm_dao::insert_realm(
+        pool,
+        forge_db::auth_realm_dao::NewAuthRealm {
+            kind: "credential_forwarding".into(),
+            name: format!("fwd-{}", unique()),
+            enabled: false,
+            priority: 6_000_000 + (unique() % 1_000_000) as i32,
+            config: serde_json::json!({ "url": "https://nexus.test/status" }),
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+/// #317: a credential-forwarding realm creates no accounts; an administrator
+/// creates each one for it. It is named by a UPN, has no local password, and
+/// keeps the local part, the name sent upstream, as its external subject.
 #[tokio::test]
-async fn provision_upstream_user_inserts_then_tracks_authoritative_admin() {
+async fn forwarded_accounts_are_created_for_a_realm() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
-    let username = format!("up-prov-{n}");
+    let realm = forwarding_realm(pool).await;
+    let other_realm = forwarding_realm(pool).await;
+    let username = format!("Up-Fwd-{n}@Example.com");
 
-    // First call inserts a passwordless upstream-basic user (non-admin).
-    let u1 = user_dao::provision_upstream_user(pool, &username, false, true, None)
+    let user = user_dao::insert_forwarded_user(pool, &username, realm, true)
         .await
-        .expect("provision")
-        .expect("row");
-    assert_eq!(u1.auth_source, "upstream-basic");
-    assert!(u1.password_hash.is_none());
-    assert!(u1.active);
-    assert!(!u1.is_admin);
-    assert_eq!(u1.external_subject.as_deref(), Some(username.as_str()));
+        .expect("created");
+    assert_eq!(user.username, format!("up-fwd-{n}@example.com"));
+    assert_eq!(user.auth_source, "upstream-basic");
+    assert!(user.password_hash.is_none());
+    assert_eq!(user.external_subject, Some(format!("up-fwd-{n}")));
 
-    // Authoritative admin suggestion reuses the row AND grants admin.
-    let u2 = user_dao::provision_upstream_user(pool, &username, true, true, None)
+    let found = user_dao::find_upstream_user(pool, &username, Some(realm))
         .await
-        .expect("re-provision grants admin")
-        .expect("row");
-    assert_eq!(u2.id, u1.id, "same row");
-    assert!(u2.is_admin, "admin granted on refresh");
+        .unwrap()
+        .expect("the realm's account");
+    assert_eq!(found.id, user.id);
+    // Only that realm's account.
+    assert!(
+        user_dao::find_upstream_user(pool, &username, Some(other_realm))
+            .await
+            .unwrap()
+            .is_none()
+    );
 
-    // A non-authoritative reading never changes the stored admin flag.
-    let u3 = user_dao::provision_upstream_user(pool, &username, false, false, None)
+    // A UPN, like every account's.
+    let err = user_dao::insert_forwarded_user(pool, &format!("up-fwd-{n}"), realm, true)
         .await
-        .expect("re-provision")
-        .expect("row");
-    assert_eq!(u3.id, u1.id);
-    assert!(u3.is_admin, "non-authoritative: admin untouched");
-
-    // An authoritative non-admin reading revokes it.
-    let u4 = user_dao::provision_upstream_user(pool, &username, false, true, None)
-        .await
-        .expect("re-provision")
-        .expect("row");
-    assert!(!u4.is_admin, "authoritative: admin revoked");
+        .unwrap_err();
+    assert!(matches!(err, sqlx::Error::InvalidArgument(_)), "{err:?}");
 }
 
 #[tokio::test]
-async fn provision_upstream_user_does_not_clobber_local_user() {
+async fn a_local_account_is_never_a_forwarded_one() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
-    let username = format!("up-prov-local-{n}");
+    let realm = forwarding_realm(pool).await;
+    let username = format!("up-prov-local-{n}@example.com");
 
-    // Pre-existing LOCAL user with a password.
     user_dao::insert_user(
         pool,
-        NewUser::local(username.clone(), "$argon2id$dummy".to_string(), false, true),
+        NewUser::local(username.clone(), "$argon2id$dummy".to_string(), true),
     )
     .await
     .expect("insert local");
 
-    // An upstream provision for the same username returns no row (deny) and
-    // must NOT null the password, flip auth_source or grant admin.
-    let u = user_dao::provision_upstream_user(pool, &username, true, true, None)
-        .await
-        .expect("provision over local");
-    assert!(u.is_none(), "local user is never taken over");
-    assert!(user_dao::find_upstream_user(pool, &username, None)
+    assert!(user_dao::find_upstream_user(pool, &username, Some(realm))
         .await
         .unwrap()
         .is_none());
+    // Nor can the name be taken for the realm.
+    let err = user_dao::insert_forwarded_user(pool, &username, realm, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")),
+        "{err:?}"
+    );
     let local = user_dao::find_user_by_username(pool, &username)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(local.auth_source, "local", "local provenance preserved");
     assert!(local.password_hash.is_some(), "local password preserved");
-    assert!(!local.is_admin, "no admin grant through upstream");
 }
 
 // ── proxy_dao ─────────────────────────────────────────────────────────────────
@@ -1617,22 +1645,22 @@ async fn usernames_are_unique_in_canonical_form() {
     let n = common::unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("  Dora{n} "), "x".into(), false, true),
+        NewUser::local(format!("  Dora{n}@Example.COM "), "x".into(), true),
     )
     .await
     .unwrap();
-    assert_eq!(user.username, format!("dora{n}"));
-    let found = user_dao::find_user_by_username(&pool, &format!("DORA{n}"))
+    assert_eq!(user.username, format!("dora{n}@example.com"));
+    let found = user_dao::find_user_by_username(&pool, &format!("DORA{n}@example.com"))
         .await
         .unwrap()
         .expect("any spelling finds the account");
     assert_eq!(found.id, user.id);
 
     let raw = sqlx::query(
-        "INSERT INTO app_user (username, password_hash, is_admin, active, auth_source) \
-         VALUES ($1, 'x', false, true, 'local')",
+        "INSERT INTO app_user (username, password_hash, active, auth_source) \
+         VALUES ($1, 'x', true, 'local')",
     )
-    .bind(format!("DORA{n}"))
+    .bind(format!("DORA{n}@example.com"))
     .execute(&pool)
     .await;
     let err = raw.expect_err("a case variant must violate the canonical unique index");
@@ -1641,12 +1669,16 @@ async fn usernames_are_unique_in_canonical_form() {
         "{err}"
     );
 
-    let invalid = user_dao::insert_user(
-        &pool,
-        NewUser::local("bad\nname".into(), "x".into(), false, true),
-    )
-    .await;
+    let invalid =
+        user_dao::insert_user(&pool, NewUser::local("bad\nname".into(), "x".into(), true)).await;
     assert!(matches!(invalid, Err(sqlx::Error::InvalidArgument(_))));
+    // Every account is named by a UPN (#317).
+    let legacy =
+        user_dao::insert_user(&pool, NewUser::local(format!("dora{n}"), "x".into(), true)).await;
+    assert!(
+        matches!(&legacy, Err(sqlx::Error::InvalidArgument(m)) if m.contains("UPN")),
+        "{legacy:?}"
+    );
 }
 
 /// Names migration 0021 left non-canonical (its SQL `lower()` follows the
@@ -1654,13 +1686,13 @@ async fn usernames_are_unique_in_canonical_form() {
 /// the form every lookup uses, so their accounts can sign in again.
 #[tokio::test]
 async fn stored_usernames_are_brought_into_canonical_form() {
-    use forge_db::user_dao::{self, NewUser};
+    use forge_db::user_dao;
     let pool = common::pool().await;
     let n = common::unique();
     let raw = |name: String| {
         sqlx::query_scalar::<_, i64>(
-            "INSERT INTO app_user (username, password_hash, is_admin, active, auth_source) \
-             VALUES ($1, 'x', false, true, 'local') RETURNING id",
+            "INSERT INTO app_user (username, password_hash, active, auth_source) \
+             VALUES ($1, 'x', true, 'local') RETURNING id",
         )
         .bind(name)
         .fetch_one(&pool)
@@ -1669,12 +1701,7 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     let spaced = raw(format!("erin{n}\u{a0}")).await.unwrap();
     let upper = raw(format!("Ünal{n}")).await.unwrap();
     // A twin of an account that already holds the canonical name.
-    let holder = user_dao::insert_user(
-        &pool,
-        NewUser::local(format!("fritz{n}"), "x".into(), false, true),
-    )
-    .await
-    .unwrap();
+    let holder = raw(format!("fritz{n}")).await.unwrap();
     let twin = raw(format!("fritz{n}\u{2003}")).await.unwrap();
 
     let repairs = user_dao::canonicalize_stored_usernames(&pool)
@@ -1684,16 +1711,12 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     assert_eq!(renamed(spaced), Some(format!("erin{n}")));
     assert_eq!(renamed(upper), Some(format!("ünal{n}")));
     assert_eq!(renamed(twin), Some(format!("fritz{n}#{twin}")));
-    assert_eq!(
-        renamed(holder.id),
-        None,
-        "the canonical holder keeps its name"
-    );
+    assert_eq!(renamed(holder), None, "the canonical holder keeps its name");
 
     for (spelling, id) in [
         (format!(" ERIN{n} "), spaced),
         (format!("ÜNAL{n}"), upper),
-        (format!("Fritz{n}"), holder.id),
+        (format!("Fritz{n}"), holder),
     ] {
         let found = user_dao::find_user_by_username(&pool, &spelling)
             .await
@@ -1707,4 +1730,71 @@ async fn stored_usernames_are_brought_into_canonical_form() {
         .await
         .unwrap();
     assert!(again.iter().all(|r| ![spaced, upper, twin].contains(&r.id)));
+}
+
+/// Migration 0037 stores a docker group's writable member by id: the name
+/// a group held becomes the id of the hosted docker repository so named,
+/// and a name no such repository has is dropped. The migration's statement
+/// only touches groups still holding a name, so it runs again here on
+/// groups seeded as before it.
+#[tokio::test]
+async fn migration_0037_stores_a_writable_member_by_id() {
+    let pool = pool().await;
+    let n = unique();
+    let insert = |name: String, kind: &'static str, config: serde_json::Value| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO repository (name, format, kind, config) \
+                 VALUES ($1, 'docker', $2, $3) RETURNING id",
+            )
+            .bind(name)
+            .bind(kind)
+            .bind(config)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let member = insert(format!("wm-hosted-{n}"), "hosted", serde_json::json!({})).await;
+    let named = insert(
+        format!("wm-group-{n}"),
+        "group",
+        serde_json::json!({"writable_member": format!("wm-hosted-{n}")}),
+    )
+    .await;
+    let dangling = insert(
+        format!("wm-dangling-{n}"),
+        "group",
+        serde_json::json!({"writable_member": format!("wm-gone-{n}"), "prefer_hosted": false}),
+    )
+    .await;
+
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0037_docker_writable_member_id.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let config = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT config FROM repository WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        config(named).await,
+        serde_json::json!({"writable_member_id": member})
+    );
+    assert_eq!(
+        config(dangling).await,
+        serde_json::json!({"prefer_hosted": false})
+    );
 }

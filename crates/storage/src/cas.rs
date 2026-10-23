@@ -18,12 +18,22 @@
 //! dropped, and a stage that would exceed the budget fails with
 //! [`CasError::StagingFull`] instead of filling the disk (a burst of
 //! first-time proxy downloads of large packages would otherwise get the pod
-//! evicted). Files a killed process left there are removed by
-//! [`Staging::sweep_stale`] at startup.
+//! evicted). Each process stages in a subdirectory of its own, locked while
+//! the process lives, so [`Staging::sweep_stale`] removes what a killed
+//! process left there at startup, however recent, instead of letting it take
+//! up space beside the new process's budget.
+//!
+//! The staging directory must belong to the process's user and must not be
+//! writable by others (unless sticky, like `/tmp`), and Forge creates it and
+//! its process subdirectories with mode `0700`: whoever owns the directory can
+//! swap the files in it. A staged file is read back (to parse it, to upload
+//! it) through the handle staging wrote it with ([`StagedBlob::read_path`]),
+//! never by its name, so what is parsed and uploaded is the file that was
+//! hashed.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use sqlx::PgPool;
@@ -71,6 +81,23 @@ pub enum CasError {
     Db(#[from] sqlx::Error),
 }
 
+impl CasError {
+    /// Whether S3 could not be reached (see [`S3Error::Unavailable`]): the
+    /// caller should answer "try again later". That includes staging a
+    /// stream read from S3 whose read failed so (the [`S3Error`] inside the
+    /// I/O error).
+    pub fn is_unavailable(&self) -> bool {
+        match self {
+            CasError::S3(e) => e.is_unavailable(),
+            CasError::Io(e) => e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<S3Error>())
+                .is_some_and(S3Error::is_unavailable),
+            _ => false,
+        }
+    }
+}
+
 /// Locally staged bytes and their content hashes.
 ///
 /// Staging is intentionally mutation-free so a format parser and authorization
@@ -81,8 +108,13 @@ pub struct StagedBlob {
     pub sha512_base64: String,
     pub size: u64,
     pub temp_path: TempPath,
+    /// The handle the bytes were written and hashed through.
+    file: std::fs::File,
     /// The temp-space reservation, released with the temp file.
     reservation: Option<Reservation>,
+    /// Keeps the process's staging subdirectory (and its lock) alive while
+    /// the temp file is in it.
+    own_dir: Option<Arc<OwnDir>>,
 }
 
 /// Result of ingesting content: its content address, integrity hash, size, and
@@ -98,6 +130,8 @@ pub struct StoredBlob {
     /// The temp file holding the content. Kept alive so callers can re-read it
     /// (e.g. parse the package) before it is dropped/unlinked.
     pub temp_path: TempPath,
+    /// The handle the bytes were written and hashed through.
+    file: std::fs::File,
     /// The S3 key the object was stored under.
     pub s3_key: String,
     /// Whether this ingest performed a fresh S3 upload (`false` = dedup hit).
@@ -107,6 +141,8 @@ pub struct StoredBlob {
     _lease_guard: IngestLeaseGuard,
     /// The temp-space reservation, released with the temp file.
     _reservation: Option<Reservation>,
+    /// Keeps the staging subdirectory alive while the temp file is in it.
+    _own_dir: Option<Arc<OwnDir>>,
 }
 
 /// Bytes reserved from a staging budget, given back when dropped. Counted in
@@ -143,11 +179,16 @@ impl IngestLeaseGuard {
                 tokio::select! {
                     _ = &mut stopped => break,
                     _ = ticker.tick() => {
-                        match forge_db::blob_dao::refresh_ingest(
-                            &heartbeat_pool,
-                            token,
-                            chrono::Utc::now() + INGEST_LEASE,
-                        ).await {
+                        // The lease end is compared with the database's clock.
+                        let renewed = match forge_db::db_now(&heartbeat_pool).await {
+                            Ok(now) => forge_db::blob_dao::refresh_ingest(
+                                &heartbeat_pool,
+                                token,
+                                now + INGEST_LEASE,
+                            ).await,
+                            Err(error) => Err(error),
+                        };
+                        match renewed {
                             Ok(true) => {}
                             Ok(false) => break,
                             Err(error) => tracing::warn!(
@@ -195,15 +236,194 @@ impl Drop for IngestLeaseGuard {
 /// Where staged bytes are written and how many may be staged at once.
 #[derive(Clone, Debug)]
 pub struct Staging {
+    /// The staging directory, possibly shared with other processes.
     dir: PathBuf,
+    /// This process's own subdirectory of `dir`, where it stages (`None` only
+    /// for the fallback of [`Staging::default`], which stages in `dir`).
+    /// Shared by every clone, so a replacement ([`Staging::own_dir`]) is
+    /// seen by all of them.
+    own: Option<Arc<Mutex<Arc<OwnDir>>>>,
     /// One permit per byte; `None` = no budget.
     budget: Option<Arc<Semaphore>>,
     limit: u64,
 }
 
+/// A process's own staging subdirectory, removed with the last handle to it.
+/// Its lock file stays locked (`flock`) while the directory is in use, and
+/// the kernel releases the lock when the process dies: that is how
+/// [`Staging::sweep_stale`] tells a live process's directory, however old,
+/// from one a killed process left, however recent. On a file system without
+/// working locks there is no lock (`None`); sweeps then go by idle time.
+#[derive(Debug)]
+struct OwnDir {
+    path: PathBuf,
+    lock: Option<std::fs::File>,
+}
+
+impl OwnDir {
+    /// Create and lock a new subdirectory of `dir`. It is locked under a
+    /// hidden name and only then renamed to one a sweep looks at, so no sweep
+    /// ever finds it unlocked.
+    fn create(dir: &Path) -> std::io::Result<Arc<Self>> {
+        let name = format!(
+            "{}{}",
+            Staging::OWN_DIR_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        let pending = dir.join(format!(".{name}"));
+        let path = dir.join(name);
+        create_private_dir(&pending, false)?;
+        let locked = (|| {
+            let lock = std::fs::File::create(pending.join(Staging::LOCK_FILE))?;
+            let lock = match lock.try_lock() {
+                Ok(()) => Some(lock),
+                // A file system without working locks (`flock` unsupported,
+                // NFS without lockd): stage anyway. Sweeps cannot try this
+                // lock either, so they remove only files idle past their
+                // threshold here, never a stage in flight.
+                Err(std::fs::TryLockError::Error(error)) => {
+                    tracing::warn!(
+                        %error,
+                        dir = %dir.display(),
+                        "the staging directory does not support file locks; staging without one"
+                    );
+                    None
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+            };
+            std::fs::rename(&pending, &path)?;
+            Ok(lock)
+        })();
+        match locked {
+            Ok(lock) => Ok(Arc::new(OwnDir { path, lock })),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&pending);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for OwnDir {
+    fn drop(&mut self) {
+        // Close the lock first: on NFS an open file that is unlinked is
+        // renamed to `.nfsXXXX` instead, and the directory could not go.
+        drop(self.lock.take());
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+impl StagedBlob {
+    /// A path that opens the staged bytes' own file: on Linux
+    /// `/proc/self/fd/<n>` of the handle they were written and hashed
+    /// through, so whatever replaces the file or its directory in between
+    /// cannot change what is parsed or uploaded; elsewhere (or without
+    /// `/proc`) the temp file's path in the private staging directory.
+    pub fn read_path(&self) -> PathBuf {
+        handle_path(&self.file, &self.temp_path)
+    }
+}
+
+impl StoredBlob {
+    /// Like [`StagedBlob::read_path`].
+    pub fn read_path(&self) -> PathBuf {
+        handle_path(&self.file, &self.temp_path)
+    }
+}
+
+/// [`StagedBlob::read_path`] of `file`, whose name is `fallback`.
+fn handle_path(file: &std::fs::File, fallback: &Path) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        if path.exists() {
+            return path;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+    fallback.to_path_buf()
+}
+
+/// Create `dir` (and, with `parents`, its missing parents) with mode `0700`.
+pub(crate) fn create_private_dir(dir: &Path, parents: bool) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(parents);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Refuse a staging directory another local user could tamper with: one that
+/// is not this process's user's, or that group or others can write to
+/// without the sticky bit (which keeps them from renaming what is not
+/// theirs). Whoever can rename the process's subdirectory can swap a staged
+/// package between its hashing and its upload, and through content-addressed
+/// dedup that would poison every repository holding the package.
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    ensure_owned_dir(dir, "staging directory", "server.staging_dir", true)
+}
+
+/// Refuse `dir` (the `what` that `setting` names) unless it is this
+/// process's user's and neither group nor others can write to it; with
+/// `sticky_ok`, a sticky directory others can write (like `/tmp`) passes.
+pub(crate) fn ensure_owned_dir(
+    dir: &Path,
+    what: &str,
+    setting: &str,
+    sticky_ok: bool,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let refuse = |why: String| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{what} {} {why}; use a directory only Forge's user can write ({setting})",
+                    dir.display()
+                ),
+            ))
+        };
+        let meta = std::fs::metadata(dir)?;
+        if !meta.is_dir() {
+            return refuse("is not a directory".into());
+        }
+        let euid = rustix::process::geteuid().as_raw();
+        if meta.uid() != euid {
+            return refuse(format!(
+                "belongs to uid {}, not to this process's user (uid {euid})",
+                meta.uid()
+            ));
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o022 != 0 && !(sticky_ok && mode & 0o1000 != 0) {
+            return refuse(format!(
+                "is writable by group or others (mode {:o})",
+                mode & 0o7777
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, what, setting, sticky_ok);
+    Ok(())
+}
+
 impl Staging {
-    /// File-name prefix of staged files (what [`Self::sweep_stale`] removes).
+    /// File-name prefix of staged files.
     const PREFIX: &'static str = "forge-staging-";
+
+    /// Name prefix of a process's own subdirectory ([`OwnDir`]).
+    const OWN_DIR_PREFIX: &'static str = "forge-staging-proc-";
+
+    /// The lock file in such a subdirectory.
+    const LOCK_FILE: &'static str = ".lock";
 
     /// The default staging directory: `forge-staging` under the system temp
     /// directory.
@@ -211,11 +431,20 @@ impl Staging {
         std::env::temp_dir().join("forge-staging")
     }
 
-    /// Stage under `dir` (created if missing) with at most `max_bytes` in use
-    /// at once (`None`: no budget).
+    /// Stage under `dir` (created if missing), in a new subdirectory of this
+    /// process's own, with at most `max_bytes` in use at once (`None`: no
+    /// budget).
+    ///
+    /// The directory must belong to this process's user and must not be
+    /// writable by group or others unless it is sticky
+    /// ([`ensure_private_dir`]); it is created with mode `0700` and resolved
+    /// once, so a symbolic link to it cannot be repointed later.
     pub fn new(dir: impl Into<PathBuf>, max_bytes: Option<u64>) -> std::io::Result<Self> {
         let dir = dir.into();
-        std::fs::create_dir_all(&dir)?;
+        create_private_dir(&dir, true)?;
+        let dir = std::fs::canonicalize(&dir)?;
+        ensure_private_dir(&dir)?;
+        let own = Some(Arc::new(Mutex::new(OwnDir::create(&dir)?)));
         let limit = max_bytes.unwrap_or(0);
         let budget = max_bytes.map(|bytes| {
             let permits = usize::try_from(bytes)
@@ -223,7 +452,12 @@ impl Staging {
                 .min(Semaphore::MAX_PERMITS);
             Arc::new(Semaphore::new(permits))
         });
-        Ok(Staging { dir, budget, limit })
+        Ok(Staging {
+            dir,
+            own,
+            budget,
+            limit,
+        })
     }
 
     /// The staging directory.
@@ -231,30 +465,136 @@ impl Staging {
         &self.dir
     }
 
-    /// Remove staged files not modified for `older_than`: what a process left
-    /// behind when it was killed mid-request (a running stage writes its file
-    /// continuously and holds it for seconds after, so a long-idle one is
-    /// orphaned, also when several instances share the directory). Returns
-    /// how many were removed.
+    /// This process's own subdirectory, and the handle that keeps it alive
+    /// while a staged file is in it (`None`: stage in `dir` itself). One that
+    /// has disappeared is replaced by a new one: a sweep on another host,
+    /// whose locks this host's do not reach, can remove it while this process
+    /// lives, and only the stages in flight then should fail.
+    fn own_dir(&self) -> std::io::Result<Option<Arc<OwnDir>>> {
+        let Some(own) = &self.own else {
+            return Ok(None);
+        };
+        let mut current = own.lock().unwrap_or_else(PoisonError::into_inner);
+        if !current.path.is_dir() {
+            tracing::warn!(
+                dir = %current.path.display(),
+                "staging subdirectory disappeared; staging in a new one"
+            );
+            std::fs::create_dir_all(&self.dir)?;
+            *current = OwnDir::create(&self.dir)?;
+        }
+        Ok(Some(Arc::clone(&current)))
+    }
+
+    /// Remove what killed processes left in the staging directory. Returns
+    /// how many staged files were removed. Run it at startup, before the
+    /// process makes another [`Staging`] in the same directory: on NFS,
+    /// whose locks are per process, the sweep could take that one's lock.
+    ///
+    /// - A process subdirectory goes whenever its lock is free, whatever its
+    ///   age: a live process (this one, or another instance sharing the
+    ///   directory) holds its lock until it exits. If the lock cannot be
+    ///   tried at all (a file system without working locks), only its staged
+    ///   files idle for `older_than` go, by the rule below.
+    /// - Loose staged files (from versions that staged in the directory
+    ///   itself) go once not modified for `older_than`: a running stage writes
+    ///   its file continuously and holds it for seconds after, so a long-idle
+    ///   one is orphaned. So do subdirectories whose creation was cut short.
     pub fn sweep_stale(&self, older_than: std::time::Duration) -> std::io::Result<usize> {
         let now = std::time::SystemTime::now();
+        let idle = |meta: &std::fs::Metadata| {
+            meta.modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or_default()
+        };
+        let is_staged = |name: &str| name.starts_with(Self::PREFIX);
+        let remove_if_idle = |path: &Path, name: &str, meta: &std::fs::Metadata| {
+            meta.is_file()
+                && is_staged(name)
+                && idle(meta) >= older_than
+                && std::fs::remove_file(path).is_ok()
+        };
+        // Never this staging's own subdirectory: on NFS its lock, an `fcntl`
+        // lock, does not stop this same process from taking it again.
+        let own = self.own.as_ref().map(|own| {
+            own.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .path
+                .clone()
+        });
         let mut removed = 0;
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(Self::PREFIX)
-            {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Ok(meta) = entry.metadata() else { continue };
+            let path = entry.path();
+            if own.as_ref() == Some(&path) {
                 continue;
             }
-            let Ok(meta) = entry.metadata() else { continue };
-            let idle = meta
-                .modified()
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .unwrap_or_default();
-            if meta.is_file() && idle >= older_than && std::fs::remove_file(entry.path()).is_ok() {
+            if meta.is_dir() && name.starts_with(Self::OWN_DIR_PREFIX) {
+                // Taking the lock proves its process gone; held until removed.
+                // Opened for writing: NFS emulates `flock` with `fcntl` locks,
+                // and an exclusive one needs a writable file.
+                let lock = std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open(path.join(Self::LOCK_FILE))
+                    .map_err(std::fs::TryLockError::Error)
+                    .and_then(|lock| lock.try_lock().map(|()| lock));
+                match lock {
+                    Ok(lock) => {
+                        let staged = std::fs::read_dir(&path).map_or(0, |entries| {
+                            entries
+                                .filter_map(Result::ok)
+                                .filter(|entry| is_staged(&entry.file_name().to_string_lossy()))
+                                .count()
+                        });
+                        // Closed before the removal, as in `OwnDir::drop`.
+                        drop(lock);
+                        if std::fs::remove_dir_all(&path).is_ok() {
+                            removed += staged;
+                        }
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {}
+                    // No lock file: a directory is locked under a hidden name
+                    // before it gets this one, so it was left by a process
+                    // that removed its lock on exit but not the directory
+                    // (NFS renames an open file on unlink). Gone once idle.
+                    Err(std::fs::TryLockError::Error(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        if idle(&meta) >= older_than {
+                            let _ = std::fs::remove_dir_all(&path);
+                        }
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        tracing::warn!(
+                            %error,
+                            dir = %path.display(),
+                            "cannot try a staging subdirectory's lock; removing only its idle staged files"
+                        );
+                        for entry in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+                            if let Ok(meta) = entry.metadata() {
+                                let name = entry.file_name();
+                                removed += usize::from(remove_if_idle(
+                                    &entry.path(),
+                                    &name.to_string_lossy(),
+                                    &meta,
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else if meta.is_dir()
+                && name
+                    .strip_prefix('.')
+                    .is_some_and(|name| name.starts_with(Self::OWN_DIR_PREFIX))
+                && idle(&meta) >= older_than
+            {
+                let _ = std::fs::remove_dir_all(&path);
+            } else if remove_if_idle(&path, &name, &meta) {
                 removed += 1;
             }
         }
@@ -268,6 +608,7 @@ impl Default for Staging {
     fn default() -> Self {
         Staging::new(Self::default_dir(), None).unwrap_or_else(|_| Staging {
             dir: std::env::temp_dir(),
+            own: None,
             budget: None,
             limit: 0,
         })
@@ -324,9 +665,10 @@ impl Cas {
     {
         // Hold a NamedTempFile; convert to TempPath only on success. Until then,
         // dropping it (on any early return) unlinks the file.
+        let own_dir = self.staging.own_dir()?;
         let temp = tempfile::Builder::new()
             .prefix(Staging::PREFIX)
-            .tempfile_in(&self.staging.dir)?;
+            .tempfile_in(own_dir.as_ref().map_or(&self.staging.dir, |own| &own.path))?;
 
         // Cap the body while streaming so we never buffer an oversized
         // payload to disk in full, and reserve temp space as it arrives.
@@ -337,7 +679,9 @@ impl Cas {
             exhausted: false,
         };
         let (sha256, sha512_base64, size) = {
-            let file = tokio::fs::File::create(temp.path()).await?;
+            // Through the file `tempfile` created (`O_EXCL`), never reopened
+            // by its name.
+            let file = tokio::fs::File::from_std(temp.as_file().try_clone()?);
             let mut writer = HashingWriter::new(file);
             match copy(&mut reader, &mut writer).await {
                 Ok(_) => {}
@@ -362,13 +706,15 @@ impl Cas {
             writer.finalize().await?
         };
 
-        let temp_path = temp.into_temp_path();
+        let (file, temp_path) = temp.into_parts();
         Ok(StagedBlob {
             sha256,
             sha512_base64,
             size,
             temp_path,
+            file,
             reservation: reader.reservation,
+            own_dir,
         })
     }
 
@@ -378,7 +724,24 @@ impl Cas {
     /// an ingest lease both lock the same blob row, so a deletion can neither
     /// start after this method observes the old object nor run before the
     /// caller consumes `ingest_token` in its reference transaction.
+    ///
+    /// The staged file is written through to the local blob cache.
     pub async fn commit(&self, staged: StagedBlob) -> Result<StoredBlob, CasError> {
+        self.promote(staged, true).await
+    }
+
+    /// [`Self::commit`] without the write-through to the local blob cache,
+    /// for bytes nobody downloads as they are: the chunks of a docker
+    /// upload, which are read back once to assemble the blob.
+    pub async fn commit_uncached(&self, staged: StagedBlob) -> Result<StoredBlob, CasError> {
+        self.promote(staged, false).await
+    }
+
+    async fn promote(
+        &self,
+        staged: StagedBlob,
+        write_through: bool,
+    ) -> Result<StoredBlob, CasError> {
         let size_i64 =
             i64::try_from(staged.size).map_err(|_| CasError::SizeOverflow { size: staged.size })?;
         let candidate_s3_key = format!(
@@ -388,7 +751,9 @@ impl Cas {
         );
 
         let (ingest_token, s3_key) = loop {
-            let now = chrono::Utc::now();
+            // The lease end and the staleness cutoff are compared with the
+            // database's clock, so they are computed from it.
+            let now = forge_db::db_now(&self.pool).await?;
             match forge_db::blob_dao::begin_ingest(
                 &self.pool,
                 &staged.sha256,
@@ -406,7 +771,11 @@ impl Cas {
                     tokio::time::sleep(DELETION_WAIT).await;
                 }
                 forge_db::blob_dao::BeginIngestOutcome::CompleteStaleDeletion(reservation) => {
-                    if let Err(error) = self.store.delete(&reservation.s3_key).await {
+                    if let Err(error) = self
+                        .store
+                        .delete_blob(&reservation.sha256, &reservation.s3_key)
+                        .await
+                    {
                         // A failed response can be ambiguous: the delete may
                         // still complete after this call returns. Keep the
                         // reservation fenced instead of making its key
@@ -427,7 +796,7 @@ impl Cas {
 
         // Content addressing guarantees an existing object is byte-identical.
         // The live ingest lease prevents a deleter from racing this check/put.
-        let uploaded = match self.store.put_if_absent(&s3_key, &staged.temp_path).await {
+        let uploaded = match self.store.put_if_absent(&s3_key, &staged.read_path()).await {
             Ok(uploaded) => uploaded,
             Err(error) => {
                 let _ = forge_db::blob_dao::abort_ingest(&self.pool, ingest_token).await;
@@ -435,16 +804,26 @@ impl Cas {
             }
         };
 
+        // Write-through: S3 has the object now, so the staged copy may join
+        // the local blob cache instead of only being deleted.
+        if let Some(cache) = self.store.cache().filter(|_| write_through) {
+            cache
+                .insert_staged(&staged.sha256, staged.size, &staged.temp_path)
+                .await;
+        }
+
         Ok(StoredBlob {
             sha256: staged.sha256,
             sha512_base64: staged.sha512_base64,
             size: staged.size,
             temp_path: staged.temp_path,
+            file: staged.file,
             s3_key,
             uploaded,
             ingest_token,
             _lease_guard: lease_guard,
             _reservation: staged.reservation,
+            _own_dir: staged.own_dir,
         })
     }
 

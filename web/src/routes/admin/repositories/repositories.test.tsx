@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -15,12 +15,17 @@ import type { MemberView, RepoView } from '~/api/repositories'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Admin repositories screens (plan §Phase 4 testing), driven against the **real**
- * route tree + query hooks so the admin guard, routing, and mutations are all
- * exercised:
- *  - the list renders repositories;
- *  - create-hosted POSTs the right body to `/admin/repositories`;
- *  - the group members editor prevents a duplicate priority before any request.
+ * Admin repositories screens, driven against the **real** route tree + query
+ * hooks so the admin guard, routing, and mutations are all exercised:
+ *  - the list renders repositories with their format;
+ *  - create-hosted POSTs the right body to `/admin/repositories`, and a docker
+ *    create sends the format and docker options (no NuGet-only fields);
+ *  - the group members editor prevents a duplicate priority before any request,
+ *    toggles a member's owner flag, asks before removing a member or
+ *    unflagging the last owner, explains a refused owner removal, and offers
+ *    other groups (of the same format) as (nested) members;
+ *  - a proxy's edit screen invalidates its cache, of one package or of all,
+ *    and a hosted one offers no such thing.
  */
 
 const adminMe: Me = {
@@ -46,6 +51,11 @@ function repo(over: Partial<RepoView>): RepoView {
     allow_redeploy: false,
     prefer_hosted: false,
     reserved_prefixes: [],
+    host: null,
+    immutable_tags: false,
+    latest_mutable: false,
+    writable_member: null,
+    max_upload_bytes: null,
     ...over,
   }
 }
@@ -61,10 +71,15 @@ const fetchMock = vi.fn()
 
 interface ApiHandlers {
   repositories?: RepoView[]
+  /** `GET /admin/formats`; unanswered (404) when absent. */
+  formats?: unknown[]
   members?: MemberView[]
   onCreate?: (body: unknown) => Response
   onUpdate?: (name: string, body: unknown) => Response
   onAddMember?: (body: unknown) => Response
+  onPatchMember?: (member: string, body: unknown) => Response
+  onRemoveMember?: (member: string) => Response
+  onInvalidate?: (name: string, body: unknown) => Response
 }
 
 /** Route the mock by method + pathname against the admin API. */
@@ -78,6 +93,9 @@ function mockApi(h: ApiHandlers) {
 
       if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
 
+      if (path.endsWith('/admin/formats') && h.formats) {
+        return Promise.resolve(json(h.formats))
+      }
       if (path.endsWith('/admin/repositories') && method === 'GET') {
         return Promise.resolve(json(h.repositories ?? []))
       }
@@ -94,6 +112,33 @@ function mockApi(h: ApiHandlers) {
         const body = init?.body ? JSON.parse(init.body as string) : {}
         return Promise.resolve(
           h.onAddMember ? h.onAddMember(body) : json(null, 201),
+        )
+      }
+      const memberMatch = path.match(/\/members\/([^/]+)$/)
+      if (memberMatch && method === 'PATCH') {
+        const member = decodeURIComponent(memberMatch[1])
+        const body = init?.body ? JSON.parse(init.body as string) : {}
+        return Promise.resolve(
+          h.onPatchMember
+            ? h.onPatchMember(member, body)
+            : new Response(null, { status: 204 }),
+        )
+      }
+      if (memberMatch && method === 'DELETE') {
+        const member = decodeURIComponent(memberMatch[1])
+        return Promise.resolve(
+          h.onRemoveMember
+            ? h.onRemoveMember(member)
+            : new Response(null, { status: 204 }),
+        )
+      }
+      const invalidateMatch = path.match(
+        /\/admin\/repositories\/([^/]+)\/proxy-cache\/invalidate$/,
+      )
+      if (invalidateMatch && method === 'POST' && h.onInvalidate) {
+        const body = init?.body ? JSON.parse(init.body as string) : {}
+        return Promise.resolve(
+          h.onInvalidate(decodeURIComponent(invalidateMatch[1]), body),
         )
       }
       // A single repo GET (edit screen) — return the first repo.
@@ -179,6 +224,122 @@ describe('admin repositories', () => {
     expect(posted).not.toHaveProperty('remote_url')
   })
 
+  it('creates a repository of a built-in format plugin', async () => {
+    let posted: unknown = null
+    mockApi({
+      repositories: [],
+      formats: [
+        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+        { id: 'helm', name: 'Helm charts', builtin: true, kinds: ['hosted', 'group'], mount: '/repository' },
+        { id: 'acme', name: 'Acme packages', builtin: false, kinds: ['hosted', 'group'], mount: '/repository' },
+      ],
+      onCreate: (body) => {
+        posted = body
+        return json(repo({ name: (body as RepoView).name, format: 'helm' }), 201)
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/new')
+
+    await user.type(await screen.findByLabelText('Name'), 'charts')
+    await screen.findByRole('option', { name: 'Helm charts' })
+    // A WebAssembly plugin is named with its id.
+    expect(screen.getByRole('option', { name: 'Acme packages (plugin acme)' })).toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('Format'), 'helm')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toMatchObject({ name: 'charts', kind: 'hosted', format: 'helm' })
+  })
+
+  it('lists the format of each repository', async () => {
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'hosted-1', kind: 'hosted' }),
+        repo({ id: 2, name: 'docker-hosted', kind: 'hosted', format: 'docker' }),
+      ],
+    })
+
+    await renderAt('/manage/repositories')
+
+    expect(
+      await screen.findByRole('columnheader', { name: 'Format' }),
+    ).toBeInTheDocument()
+    const dockerRow = screen.getByText('docker-hosted').closest('tr') as HTMLElement
+    expect(within(dockerRow).getByText('Docker')).toBeInTheDocument()
+    const nugetRow = screen.getByText('hosted-1').closest('tr') as HTMLElement
+    expect(within(nugetRow).getByText('NuGet')).toBeInTheDocument()
+  })
+
+  it('create-docker POSTs the format and docker options', async () => {
+    let posted: Record<string, unknown> | null = null
+    mockApi({
+      repositories: [],
+      formats: [
+        { id: 'docker', name: 'Docker / OCI', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
+        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+      ],
+      onCreate: (body) => {
+        posted = body as Record<string, unknown>
+        return json(repo({ ...(body as Partial<RepoView>) }), 201)
+      },
+    })
+
+    const user = userEvent.setup()
+    const router = await renderAt('/manage/repositories/new')
+
+    await screen.findByRole('option', { name: 'Docker / OCI' })
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Name'), 'docker-hosted')
+    await user.click(screen.getByLabelText(/Immutable tags/))
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toEqual({
+      name: 'docker-hosted',
+      kind: 'hosted',
+      format: 'docker',
+      anonymous_read: false,
+      online: true,
+      immutable_tags: true,
+      latest_mutable: false,
+    })
+    // On success the new repository's edit screen opens.
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe(
+        '/manage/repositories/docker-hosted',
+      ),
+    )
+  })
+
+  it('create-docker surfaces the server refusal inline', async () => {
+    mockApi({
+      repositories: [],
+      formats: [
+        { id: 'docker', name: 'Docker / OCI', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
+        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+      ],
+      onCreate: () =>
+        new Response('another docker repository already answers on this host', {
+          status: 409,
+        }),
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/new')
+
+    await screen.findByRole('option', { name: 'Docker / OCI' })
+    await user.selectOptions(screen.getByLabelText('Format'), 'docker')
+    await user.type(screen.getByLabelText('Name'), 'docker-hosted')
+    await user.type(screen.getByLabelText('Host'), 'docker.example.com')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'another docker repository already answers on this host',
+    )
+  })
+
   it('create blocks an invalid repository name before requesting', async () => {
     let posted = false
     mockApi({
@@ -248,6 +409,79 @@ describe('admin repositories', () => {
     expect(screen.getByLabelText('Upstream username')).toBeEnabled()
   })
 
+  it('invalidates a proxy cache, of one package or of the whole repository', async () => {
+    const posts: [string, unknown][] = []
+    mockApi({
+      repositories: [
+        repo({
+          name: 'nuget-org',
+          kind: 'proxy',
+          remote_url: 'https://api.nuget.org/v3/index.json',
+        }),
+        repo({ name: 'hosted-1' }),
+      ],
+      onInvalidate: (name, body) => {
+        posts.push([name, body])
+        return json({ not_found_cleared: posts.length, tags_expired: 0 })
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/nuget-org')
+
+    await user.type(await screen.findByLabelText(/Package id/), ' Late.Pkg ')
+    await user.click(screen.getByRole('button', { name: 'Invalidate cache' }))
+    expect(
+      await screen.findByText(/Invalidated Late\.Pkg: 1 “not found” answer forgotten/),
+    ).toBeInTheDocument()
+
+    await user.clear(screen.getByLabelText(/Package id/))
+    await user.click(screen.getByRole('button', { name: 'Invalidate cache' }))
+    expect(
+      await screen.findByText(/Invalidated the whole cache: 2 “not found” answers/),
+    ).toBeInTheDocument()
+    expect(posts).toEqual([
+      ['nuget-org', { package: 'Late.Pkg' }],
+      ['nuget-org', {}],
+    ])
+  })
+
+  it('a docker proxy invalidates the tags of an image', async () => {
+    mockApi({
+      repositories: [
+        repo({
+          name: 'dockerhub',
+          kind: 'proxy',
+          format: 'docker',
+          remote_url: 'https://registry-1.docker.io',
+        }),
+      ],
+      onInvalidate: () => json('package is not a valid image name', 400),
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/dockerhub')
+
+    await user.type(await screen.findByLabelText(/Image/), 'Nginx')
+    await user.click(screen.getByRole('button', { name: 'Invalidate cache' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'package is not a valid image name',
+    )
+  })
+
+  it('a hosted repository has no proxy cache', async () => {
+    mockApi({ repositories: [repo({ name: 'hosted-1' })] })
+
+    await renderAt('/manage/repositories/hosted-1')
+
+    expect(
+      await screen.findByRole('button', { name: 'Save changes' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Invalidate cache' }),
+    ).toBeNull()
+  })
+
   it('group members editor blocks a duplicate priority before requesting', async () => {
     let addCalled = false
     mockApi({
@@ -270,7 +504,8 @@ describe('admin repositories', () => {
 
     // The existing member is shown with its priority, and an owner is marked.
     expect(await screen.findByText('existing')).toBeInTheDocument()
-    expect(screen.getAllByText('owner')).toHaveLength(1)
+    expect(screen.getByRole('checkbox', { name: 'existing owner' })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'releases owner' })).toBeChecked()
 
     // Pick the candidate and reuse the existing priority (100) → blocked.
     await user.selectOptions(screen.getByLabelText('Repository'), 'inner')
@@ -313,5 +548,254 @@ describe('admin repositories', () => {
 
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toEqual({ member: 'inner', priority: 50 })
+  })
+
+  it('the owner toggle PATCHes the member and re-fetches the list', async () => {
+    const patches: Array<{ member: string; body: unknown }> = []
+    const members: MemberView[] = [
+      { name: 'existing', kind: 'hosted', priority: 100, owner: false },
+      { name: 'releases', kind: 'hosted', priority: 50, owner: true },
+      { name: 'nuget-org', kind: 'proxy', priority: 10, owner: false },
+    ]
+    const handlers: ApiHandlers = {
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members,
+      onPatchMember: (member, body) => {
+        patches.push({ member, body })
+        mockApi({
+          ...handlers,
+          members: members.map((m) =>
+            m.name === member ? { ...m, ...(body as { owner: boolean }) } : m,
+          ),
+        })
+        return new Response(null, { status: 204 })
+      },
+    }
+    mockApi(handlers)
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'existing owner' })
+    // A proxy cannot own package ids, so its toggle is off.
+    expect(screen.getByRole('checkbox', { name: 'nuget-org owner' })).toBeDisabled()
+
+    await user.click(toggle)
+    await waitFor(() =>
+      expect(patches).toEqual([{ member: 'existing', body: { owner: true } }]),
+    )
+    await waitFor(() => expect(toggle).toBeChecked())
+
+    await user.click(screen.getByRole('checkbox', { name: 'releases owner' }))
+    await waitFor(() =>
+      expect(patches[1]).toEqual({ member: 'releases', body: { owner: false } }),
+    )
+  })
+
+  it('shows the server error when the owner toggle is refused', async () => {
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members: [{ name: 'existing', kind: 'hosted', priority: 100, owner: false }],
+      onPatchMember: () => new Response('membership not found', { status: 404 }),
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'existing owner' })
+    await user.click(toggle)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not flag existing as owner: membership not found',
+    )
+    expect(toggle).not.toBeChecked()
+  })
+
+  it('removing an owner shows the 409 reason with a hint to unflag it', async () => {
+    let removed: string | null = null
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members: [{ name: 'releases', kind: 'hosted', priority: 50, owner: true }],
+      onRemoveMember: (member) => {
+        removed = member
+        return new Response(
+          "this member owns the group's package ids; unflag it as owner before removing it",
+          { status: 409 },
+        )
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    await user.click(await screen.findByRole('button', { name: 'Remove' }))
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove releases' }),
+    )
+
+    await waitFor(() => expect(removed).toBe('releases'))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "this member owns the group's package ids; unflag it as owner before removing it Clear the owner box of releases first, then remove it.",
+    )
+    expect(screen.getByText('releases')).toBeInTheDocument()
+  })
+
+  it('asks before unflagging the last owner; sends nothing until confirmed', async () => {
+    const patches: Array<{ member: string; body: unknown }> = []
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members: [
+        { name: 'existing', kind: 'hosted', priority: 100, owner: false },
+        { name: 'releases', kind: 'hosted', priority: 50, owner: true },
+      ],
+      onPatchMember: (member, body) => {
+        patches.push({ member, body })
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const toggle = await screen.findByRole('checkbox', { name: 'releases owner' })
+    await user.click(toggle)
+
+    // The confirmation is a dialog naming the member.
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByText(/is the last owner/)).toHaveTextContent(
+      'the group trusts every hosted member equally',
+    )
+    expect(toggle).toBeChecked()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(toggle).toBeChecked()
+    expect(patches).toEqual([])
+
+    await user.click(toggle)
+    expect(patches).toEqual([])
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Unflag releases' }),
+    )
+
+    await waitFor(() =>
+      expect(patches).toEqual([{ member: 'releases', body: { owner: false } }]),
+    )
+  })
+
+  it('asks before removing a member; cancelling sends nothing', async () => {
+    const removed: string[] = []
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
+      members: [
+        { name: 'existing', kind: 'hosted', priority: 100, owner: false },
+        { name: 'nuget-org', kind: 'proxy', priority: 10, owner: false },
+      ],
+      onRemoveMember: (member) => {
+        removed.push(member)
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const row = (await screen.findByText('nuget-org')).closest('li')!
+    await user.click(within(row).getByRole('button', { name: 'Remove' }))
+    expect(removed).toEqual([])
+
+    // The confirmation is a dialog naming the member.
+    const dialog = screen.getByRole('dialog')
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(within(row).getByRole('button', { name: 'Remove' })).toBeInTheDocument()
+    expect(removed).toEqual([])
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'DELETE',
+      ),
+    ).toBe(false)
+
+    await user.click(within(row).getByRole('button', { name: 'Remove' }))
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove nuget-org' }),
+    )
+
+    await waitFor(() => expect(removed).toEqual(['nuget-org']))
+  })
+
+  it('offers other groups as members and shows a refused nesting', async () => {
+    let posted: unknown = null
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'grp', kind: 'group' }),
+        repo({ id: 2, name: 'inner', kind: 'hosted' }),
+        repo({ id: 3, name: 'outer', kind: 'group' }),
+      ],
+      members: [],
+      onAddMember: (body) => {
+        posted = body
+        return new Response(
+          'adding this member would create a cycle in the group graph',
+          { status: 409 },
+        )
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const select = await screen.findByLabelText('Repository')
+    await waitFor(() =>
+      expect(
+        Array.from((select as HTMLSelectElement).options).map((o) => o.value),
+      ).toEqual(['', 'inner', 'outer']),
+    )
+    // The group itself is never a candidate.
+    expect(screen.queryByRole('option', { name: 'grp (group)' })).toBeNull()
+
+    await user.selectOptions(select, 'outer')
+    await user.click(screen.getByRole('button', { name: 'Add member' }))
+
+    await waitFor(() => expect(posted).toEqual({ member: 'outer', priority: 100 }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'adding this member would create a cycle in the group graph',
+    )
+  })
+
+  it('offers only repositories of the group\'s format as members', async () => {
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'docker-group', kind: 'group', format: 'docker' }),
+        repo({ id: 2, name: 'docker-hosted', kind: 'hosted', format: 'docker' }),
+        repo({ id: 3, name: 'nuget-hosted', kind: 'hosted', format: 'nuget' }),
+      ],
+      members: [],
+    })
+
+    await renderAt('/manage/repositories/docker-group/members')
+
+    const select = await screen.findByLabelText('Repository')
+    await waitFor(() =>
+      expect(
+        Array.from((select as HTMLSelectElement).options).map((o) => o.value),
+      ).toEqual(['', 'docker-hosted']),
+    )
+  })
+
+  it('says why no repository can be added, without claiming groups cannot nest', async () => {
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'grp', kind: 'group' }),
+        repo({ id: 2, name: 'inner', kind: 'hosted' }),
+      ],
+      members: [{ name: 'inner', kind: 'hosted', priority: 100, owner: false }],
+    })
+
+    await renderAt('/manage/repositories/grp/members')
+
+    expect(
+      await screen.findByText(/No eligible repositories to add/),
+    ).not.toHaveTextContent(/nested/)
   })
 })

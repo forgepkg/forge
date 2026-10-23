@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM oci_tag\n        WHERE repository_id = $1 AND image = $2 AND tag = $3\n        RETURNING manifest_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "manifest_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_tag",
+            "name": "manifest_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bd11e89708df4663314af84667715d889067f33e3860ad783fc155c6164eda7b"
+}

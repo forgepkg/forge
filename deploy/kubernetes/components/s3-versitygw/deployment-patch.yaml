@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge
+spec:
+  template:
+    spec:
+      containers:
+        - name: forge
+          env:
+            - name: FORGE_S3__ENDPOINT
+              value: http://forge-s3:8422
+            - name: FORGE_S3__BUCKET
+              value: forge
+            - name: FORGE_S3__FORCE_PATH_STYLE
+              value: "true"

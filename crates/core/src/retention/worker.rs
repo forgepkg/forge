@@ -1,4 +1,4 @@
-//! The retention background worker (design §3.5, §3.6 steps 1–10; plan Phase 5).
+//! The retention background worker.
 //!
 //! The worker runs on **every** instance of a horizontally-scaled deployment
 //! with **no Postgres advisory locks**. Each [`tick`](RetentionWorker::tick)
@@ -17,9 +17,9 @@
 //! 5. records the run summary + schedules the next run on the ledger;
 //! 6. invalidates the read cache for every affected package.
 //!
-//! All S3 deletion still flows through the slice-1 outbox; this worker never
-//! touches S3. A `dry_run_only` policy (or a disabled one) audits/no-ops but
-//! never mutates.
+//! All S3 deletion flows through the transactional blob outbox; this worker
+//! never touches S3. A `dry_run_only` policy (or a disabled one) audits/no-ops
+//! but never mutates.
 
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
@@ -39,13 +39,18 @@ use crate::retention::apply::{apply, ApplyContext, RunFence};
 use crate::retention::evaluate::{evaluate, evaluate_proxy, CandidateComponent, ProxyCandidate};
 use crate::retention::model::{validate_policy, RetentionPolicy};
 
+/// The shortest interval the worker ever schedules between two automatic runs
+/// of a repository, whatever the config and the policy say (both accept 0).
+pub const MIN_RUN_INTERVAL_SECONDS: i64 = 60;
+
 /// Tuning for the retention worker, mirrored from the server config.
 #[derive(Debug, Clone)]
 pub struct RetentionConfig {
     /// How often each instance polls for a due repository.
     pub poll_interval: StdDuration,
     /// Floor on the next-run interval (a per-repo `min_run_interval_seconds`
-    /// larger than this wins). Bounds how often a repo is re-evaluated.
+    /// larger than this wins). Bounds how often a repo is re-evaluated; values
+    /// below [`MIN_RUN_INTERVAL_SECONDS`] are raised to it.
     pub default_run_interval: Duration,
     /// Crash-safe lease held while a repo is being evaluated.
     pub lease: Duration,
@@ -64,27 +69,48 @@ impl Default for RetentionConfig {
     }
 }
 
+/// Resolves a repository's [`Format`] from its `repository.format` id.
+pub trait FormatResolver: Send + Sync {
+    /// The format named `id`, or `None` when it is not installed.
+    fn resolve(&self, id: &str) -> Option<Arc<dyn Format>>;
+}
+
+/// One format for every repository, whatever its `format` column says.
+impl FormatResolver for Arc<dyn Format> {
+    fn resolve(&self, _id: &str) -> Option<Arc<dyn Format>> {
+        Some(Arc::clone(self))
+    }
+}
+
 /// The retention worker. Cheap to clone (everything inside is `Arc`/clone-cheap).
 #[derive(Clone)]
 pub struct RetentionWorker {
     pool: PgPool,
-    format: Arc<dyn Format>,
+    formats: Arc<dyn FormatResolver>,
     cache: Arc<dyn CacheInvalidator>,
     config: RetentionConfig,
 }
 
 impl RetentionWorker {
-    /// Build a worker over a pool, a version-ordering [`Format`], a cache
-    /// invalidator, and tuning.
+    /// Build a worker over a pool, the version-ordering [`Format`]s (resolved
+    /// per repository), a cache invalidator, and tuning.
     pub fn new(
         pool: PgPool,
-        format: Arc<dyn Format>,
+        formats: impl FormatResolver + 'static,
         cache: Arc<dyn CacheInvalidator>,
-        config: RetentionConfig,
+        mut config: RetentionConfig,
     ) -> Self {
+        // The config and a policy's `min_run_interval_seconds` both accept 0.
+        // With both at 0 a finished run would be due again at once, and the
+        // drain loop in `spawn_loop` would re-claim the same repository
+        // back-to-back forever. Raising the default also spaces out the
+        // retries of a failing run, which are rescheduled by it alone.
+        config.default_run_interval = config
+            .default_run_interval
+            .max(Duration::seconds(MIN_RUN_INTERVAL_SECONDS));
         RetentionWorker {
             pool,
-            format,
+            formats: Arc::new(formats),
             cache,
             config,
         }
@@ -94,7 +120,8 @@ impl RetentionWorker {
     /// sweep). The claim query already tolerates expired leases; this is a
     /// belt-and-suspenders cleanup. Returns the number reclaimed.
     pub async fn release_stale_leases(&self) -> sqlx::Result<u64> {
-        retention_dao::release_stale_leases(&self.pool, Utc::now()).await
+        let now = forge_db::db_now(&self.pool).await?;
+        retention_dao::release_stale_leases(&self.pool, now).await
     }
 
     /// Run one tick: claim at most one due repository and evaluate it.
@@ -122,16 +149,16 @@ impl RetentionWorker {
     /// Shared claim-then-process body for [`Self::tick`] / [`Self::tick_repo`].
     async fn tick_inner(&self, only_repo: Option<i64>) -> Result<Option<RunSummary>, WorkerError> {
         // Claim inside a short tx; the row is leased on commit so the network/CPU
-        // work below happens with NO transaction held (mirrors the proxy A7 rule).
+        // work below happens with NO transaction held (the same rule as the
+        // proxy fetch).
         let claimed = {
             let mut tx = self.pool.begin().await?;
-            let claimed = retention_dao::claim_next_due_repo(
-                &mut tx,
-                Utc::now(),
-                self.config.lease,
-                only_repo,
-            )
-            .await?;
+            // Due-ness and the lease (checked by the run fence against
+            // `now()`) run on the database's clock.
+            let now = forge_db::db_now(&mut *tx).await?;
+            let claimed =
+                retention_dao::claim_next_due_repo(&mut tx, now, self.config.lease, only_repo)
+                    .await?;
             tx.commit().await?;
             claimed
         };
@@ -167,7 +194,10 @@ impl RetentionWorker {
             Err(e) => {
                 tracing::error!(error = %e, repo = %repo.name, %run_id, "retention run failed");
                 // Release the lease, record the error, reschedule.
-                let next = Utc::now() + self.config.default_run_interval;
+                let now = forge_db::db_now(&self.pool)
+                    .await
+                    .unwrap_or_else(|_| Utc::now());
+                let next = now + self.config.default_run_interval;
                 if let Err(e2) = retention_dao::fail_run(
                     &self.pool,
                     repo.repository_id,
@@ -193,6 +223,12 @@ impl RetentionWorker {
         run_id: uuid::Uuid,
     ) -> Result<RunSummary, WorkerError> {
         let kind = RepoKind::from(repo.kind.as_str());
+        if repo.format == forge_db::model::DOCKER_FORMAT {
+            return self.process_images(repo, kind, run_id).await;
+        }
+        if repo.format == forge_db::model::RAW_FORMAT {
+            return self.process_files(repo, kind, run_id).await;
+        }
 
         // Parse + validate the policy. A malformed or repo-kind-incoherent policy
         // is a configuration error: record it and reschedule (do not mutate).
@@ -204,8 +240,16 @@ impl RetentionWorker {
             .map_err(|e| WorkerError::Policy(format!("parse retention_policy: {e}")))?;
         validate_policy(&policy, kind)
             .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
+        // A repository of a format that is not installed (a plugin removed
+        // from the configuration) cannot order its versions: fail the run
+        // without mutating anything until the format is back.
+        let format = self.formats.resolve(&repo.format).ok_or_else(|| {
+            WorkerError::Policy(format!("format {:?} is not installed", repo.format))
+        })?;
 
-        let now = Utc::now();
+        // The database's clock: `next_run_at` is compared with it, and the
+        // ages evaluated below are of timestamps it wrote.
+        let now = forge_db::db_now(&self.pool).await?;
         let next_run_at = now + self.next_interval(&policy);
 
         // Disabled policy ⇒ no-op run (still advance the schedule).
@@ -228,18 +272,22 @@ impl RetentionWorker {
         let hosted: Vec<CandidateComponent> = if kind == RepoKind::Proxy {
             Vec::new()
         } else {
-            retention_dao::load_candidate_components(&self.pool, repo.repository_id)
-                .await?
-                .into_iter()
-                .map(|(r, _sha)| CandidateComponent {
-                    component_id: r.component_id,
-                    package_name: r.name,
-                    version: r.version,
-                    listed: r.listed,
-                    created_at: r.created_at,
-                    last_downloaded_at: r.last_downloaded_at,
-                })
-                .collect()
+            retention_dao::load_candidate_components(
+                &self.pool,
+                repo.repository_id,
+                format.package_asset_path(),
+            )
+            .await?
+            .into_iter()
+            .map(|(r, _sha)| CandidateComponent {
+                component_id: r.component_id,
+                package_name: r.name,
+                version: r.version,
+                listed: r.listed,
+                created_at: r.created_at,
+                last_downloaded_at: r.last_downloaded_at,
+            })
+            .collect()
         };
 
         let proxy: Vec<ProxyCandidate> = if kind == RepoKind::Proxy {
@@ -258,9 +306,26 @@ impl RetentionWorker {
             Vec::new()
         };
 
-        // ── Pure evaluation. ──
-        let hosted_decisions = evaluate(self.format.as_ref(), now, &policy, &hosted);
-        let proxy_decisions = evaluate_proxy(now, &policy, &proxy);
+        // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
+        // with the repository, so it must not stall a runtime worker thread. ──
+        let evaluation = {
+            let format = Arc::clone(&format);
+            let policy = policy.clone();
+            tokio::task::spawn_blocking(move || {
+                (
+                    evaluate(format.as_ref(), now, &policy, &hosted),
+                    evaluate_proxy(now, &policy, &proxy),
+                )
+            })
+        };
+        // A panic there (e.g. a panicking `Format`) fails the run like a panic
+        // anywhere else in `process`.
+        let (hosted_decisions, proxy_decisions) = evaluation.await.map_err(|e| {
+            WorkerError::Panicked(match e.try_into_panic() {
+                Ok(panic) => panic_message(&*panic),
+                Err(e) => e.to_string(), // cancelled: the runtime is shutting down
+            })
+        })?;
 
         // Affected package names (for cache invalidation after the run).
         let mut affected: BTreeSet<String> = BTreeSet::new();
@@ -283,7 +348,7 @@ impl RetentionWorker {
             fence: Some(RunFence {
                 stored_policy: &repo.policy,
                 policy: &policy,
-                format: self.format.as_ref(),
+                format: format.as_ref(),
             }),
         };
         let summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
@@ -316,8 +381,125 @@ impl RetentionWorker {
         Ok(summary)
     }
 
+    /// [`Self::process`] for a docker repository: image tags and manifests
+    /// (see [`crate::retention::images`]).
+    async fn process_images(
+        &self,
+        repo: &retention_dao::ClaimedRepo,
+        kind: RepoKind,
+        run_id: uuid::Uuid,
+    ) -> Result<RunSummary, WorkerError> {
+        use crate::retention::images;
+        let policy: images::ImageRetentionPolicy = serde_json::from_value(repo.policy.clone())
+            .map_err(|e| WorkerError::Policy(format!("parse retention_policy: {e}")))?;
+        images::validate_image_policy(&policy, kind)
+            .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
+        let now = forge_db::db_now(&self.pool).await?;
+        let secs = policy
+            .min_run_interval_seconds
+            .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
+        let next_run_at = now
+            + Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+                .max(self.config.default_run_interval);
+        let mut summary = RunSummary::default();
+        if policy.enabled {
+            let (decisions, evaluated) =
+                images::evaluate_repository(&self.pool, repo.repository_id, now, &policy).await?;
+            let fence = images::ImageRunFence {
+                stored_policy: &repo.policy,
+                policy: &policy,
+                evaluated_at: now,
+            };
+            summary = images::apply_images(
+                &self.pool,
+                repo.repository_id,
+                run_id,
+                &decisions,
+                self.config.delete_grace,
+                policy.dry_run_only,
+                Some(&fence),
+            )
+            .await?;
+            summary.evaluated = evaluated;
+        }
+        if !retention_dao::finish_run(
+            &self.pool,
+            repo.repository_id,
+            Some(run_id),
+            &summary,
+            next_run_at,
+        )
+        .await?
+        {
+            tracing::warn!(repo = %repo.name, %run_id, "retention lease lost before the run finished; another instance owns the schedule");
+        }
+        if let Err(e) = retention_dao::mark_repo_last_run(&self.pool, repo.repository_id, now).await
+        {
+            tracing::warn!(error = %e, repo = %repo.name, "failed to stamp retention_last_run_at");
+        }
+        Ok(summary)
+    }
+
+    async fn process_files(
+        &self,
+        repo: &retention_dao::ClaimedRepo,
+        kind: RepoKind,
+        run_id: uuid::Uuid,
+    ) -> Result<RunSummary, WorkerError> {
+        use crate::retention::files;
+        let policy: files::FileRetentionPolicy = serde_json::from_value(repo.policy.clone())
+            .map_err(|e| WorkerError::Policy(format!("parse retention_policy: {e}")))?;
+        files::validate_file_policy(&policy, kind)
+            .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
+        let now = forge_db::db_now(&self.pool).await?;
+        let secs = policy
+            .min_run_interval_seconds
+            .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
+        let next_run_at = now
+            + Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+                .max(self.config.default_run_interval);
+        let mut summary = RunSummary::default();
+        if policy.enabled {
+            let (decisions, evaluated) =
+                files::evaluate_repository(&self.pool, repo.repository_id, now, &policy).await?;
+            let fence = files::FileRunFence {
+                stored_policy: &repo.policy,
+                policy: &policy,
+                evaluated_at: now,
+            };
+            summary = files::apply_files(
+                &self.pool,
+                repo.repository_id,
+                run_id,
+                &decisions,
+                self.config.delete_grace,
+                policy.dry_run_only,
+                Some(&fence),
+            )
+            .await?;
+            summary.evaluated = evaluated;
+        }
+        if !retention_dao::finish_run(
+            &self.pool,
+            repo.repository_id,
+            Some(run_id),
+            &summary,
+            next_run_at,
+        )
+        .await?
+        {
+            tracing::warn!(repo = %repo.name, %run_id, "retention lease lost before the run finished; another instance owns the schedule");
+        }
+        if let Err(e) = retention_dao::mark_repo_last_run(&self.pool, repo.repository_id, now).await
+        {
+            tracing::warn!(error = %e, repo = %repo.name, "failed to stamp retention_last_run_at");
+        }
+        Ok(summary)
+    }
+
     /// The next-run interval for a policy: the larger of the repo's
-    /// `min_run_interval_seconds` and the global default.
+    /// `min_run_interval_seconds` and the global default (which [`Self::new`]
+    /// raised to at least [`MIN_RUN_INTERVAL_SECONDS`]).
     fn next_interval(&self, policy: &RetentionPolicy) -> Duration {
         // Clamped defensively: validation already bounds the policy value, and
         // an out-of-range interval must never panic the worker loop.
@@ -396,9 +578,13 @@ fn spawn_lease_heartbeat(
         ticker.tick().await; // the first tick completes immediately
         loop {
             ticker.tick().await;
-            match retention_dao::renew_run_lease(&pool, repository_id, run_id, Utc::now() + lease)
-                .await
-            {
+            let renewed = match forge_db::db_now(&pool).await {
+                Ok(now) => {
+                    retention_dao::renew_run_lease(&pool, repository_id, run_id, now + lease).await
+                }
+                Err(e) => Err(e),
+            };
+            match renewed {
                 Ok(true) => {}
                 Ok(false) => {
                     tracing::warn!(repository_id, %run_id, "retention lease lost; heartbeat stopped");
@@ -422,7 +608,7 @@ const AUDIT_PRUNE_MAX_BATCHES: usize = 50;
 /// Delete `retention_audit` rows older than `keep`, in short batches. Returns
 /// the number of rows deleted. Safe on every instance at once.
 pub async fn prune_audit(pool: &PgPool, keep: Duration) -> sqlx::Result<u64> {
-    let cutoff = Utc::now() - keep;
+    let cutoff = forge_db::db_now(pool).await? - keep;
     let mut total = 0u64;
     for _ in 0..AUDIT_PRUNE_MAX_BATCHES {
         let deleted = retention_dao::prune_audit(pool, cutoff, AUDIT_PRUNE_BATCH).await?;

@@ -11,6 +11,11 @@
 //! * **Bad credentials are never downgraded to anonymous.** If any source
 //!   reports credentials were present but invalid, [`resolve_principal`]
 //!   returns `Unauthorized` even when anonymous access would otherwise apply.
+//! * **A credential that could not be checked fails closed.** A database error
+//!   while looking up a token or a session is [`AuthError::Unavailable`]
+//!   (503), never `Unauthorized` (a client would take its credential for
+//!   wrong) nor "not a token": the secret is not run through the password
+//!   chain, whose credential-forwarding realm could send it upstream.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -24,10 +29,14 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
 use super::chain::{provision_and_map, Chain, ChainOutcome, ChainSource, StaticChainSource};
-use super::local_password::{LocalPasswordProvider, PasswordHashLimiter};
+use super::local_password::PasswordHashLimiter;
 use super::login_throttle::{username_for_log, AttemptRefused, LoginThrottle, MAX_USERNAME_BYTES};
 use super::principal::{Principal, UserPrincipal};
 use super::provider::PasswordCredential;
+
+/// A token's `last_used_at` is written at most this often (seconds), so the
+/// parallel requests of one restore do not all write the token's row.
+const TOKEN_TOUCH_INTERVAL_SECS: i64 = 60;
 
 /// Hash a token secret into the lowercase-hex SHA-256 form stored in the DB.
 pub fn hash_token(secret: &str) -> String {
@@ -46,16 +55,47 @@ pub fn generate_token_secret() -> String {
 
 /// Verify an API token secret.
 ///
-/// Returns `Some(UserPrincipal)` only if the token exists, is neither expired
-/// nor revoked, and belongs to an active user. Best-effort updates
-/// `last_used_at` (failure there does not fail authentication).
-pub async fn verify_token(pool: &PgPool, secret: &str) -> Option<UserPrincipal> {
+/// Returns `Ok(Some(UserPrincipal))` only if the token exists, is neither
+/// expired nor revoked, and belongs to an active user; `Ok(None)` when the
+/// secret is not such a token. `Err` only on a database failure: the secret may
+/// still be a live token, so the caller must fail closed and must not treat it
+/// as anything else (e.g. a password). Best-effort updates `last_used_at`, at
+/// most once a minute (failure there does not fail authentication).
+/// [`check_token`] also tells an unusable token from a secret that is no token
+/// at all.
+pub async fn verify_token(pool: &PgPool, secret: &str) -> sqlx::Result<Option<UserPrincipal>> {
+    Ok(match check_token(pool, secret).await? {
+        TokenCheck::Live(up) => Some(up),
+        TokenCheck::Unusable | TokenCheck::Unknown => None,
+    })
+}
+
+/// What an API token secret is ([`check_token`]).
+#[derive(Debug)]
+pub enum TokenCheck {
+    /// A live token of an active user.
+    Live(UserPrincipal),
+    /// A token Forge issued that cannot be used now: expired, revoked, or
+    /// owned by an inactive (or deleted) user. It is still a secret, and a
+    /// deactivated user's tokens work again on reactivation, so it must not
+    /// be tried as anything else either (e.g. sent upstream as a password).
+    Unusable,
+    /// Not a token Forge issued.
+    Unknown,
+}
+
+/// [`verify_token`], telling a token that exists but cannot be used
+/// ([`TokenCheck::Unusable`]) from a secret that is no token
+/// ([`TokenCheck::Unknown`]).
+pub async fn check_token(pool: &PgPool, secret: &str) -> sqlx::Result<TokenCheck> {
     let hash = hash_token(secret);
 
-    let token = forge_db::token_dao::find_token_by_hash(pool, &hash)
+    let Some(token) = forge_db::token_dao::find_token_by_hash(pool, &hash)
         .await
-        .map_err(|e| tracing::warn!(error = %e, "token lookup failed"))
-        .ok()??;
+        .inspect_err(|e| tracing::warn!(error = %e, "token lookup failed"))?
+    else {
+        return Ok(TokenCheck::Unknown);
+    };
 
     // Defense in depth: constant-time compare of stored vs recomputed hash.
     // (The DB lookup matched on `hash`, but we never want a timing side channel
@@ -67,37 +107,40 @@ pub async fn verify_token(pool: &PgPool, secret: &str) -> Option<UserPrincipal> 
         .unwrap_u8()
         != 1
     {
-        return None;
+        return Ok(TokenCheck::Unknown);
     }
 
     let now = Utc::now();
     if let Some(exp) = token.expires_at {
         if exp <= now {
-            return None;
+            return Ok(TokenCheck::Unusable);
         }
     }
     if token.revoked_at.is_some() {
-        return None;
+        return Ok(TokenCheck::Unusable);
     }
 
-    let user = forge_db::user_dao::find_user_by_id(pool, token.user_id)
+    let Some(user) = forge_db::user_dao::find_user_by_id(pool, token.user_id)
         .await
-        .map_err(|e| tracing::warn!(error = %e, "user lookup failed"))
-        .ok()??;
+        .inspect_err(|e| tracing::warn!(error = %e, "token user lookup failed"))?
+    else {
+        return Ok(TokenCheck::Unusable);
+    };
     if !user.active {
-        return None;
+        return Ok(TokenCheck::Unusable);
     }
 
-    // Best-effort touch; ignore errors.
-    if let Err(e) = forge_db::token_dao::touch_last_used(pool, token.id).await {
+    // Best-effort touch, at most once a minute per token; ignore errors.
+    if let Err(e) =
+        forge_db::token_dao::touch_last_used(pool, token.id, TOKEN_TOUCH_INTERVAL_SECS).await
+    {
         tracing::debug!(error = %e, token_id = token.id, "touch_last_used failed");
     }
 
-    Some(UserPrincipal {
+    Ok(TokenCheck::Live(UserPrincipal {
         user_id: user.id,
         token_id: Some(token.id),
-        is_admin: user.is_admin,
-    })
+    }))
 }
 
 /// Verify a username/password pair against the stored argon2 PHC hash.
@@ -134,7 +177,6 @@ pub async fn verify_password(
     Some(UserPrincipal {
         user_id: user.id,
         token_id: None,
-        is_admin: user.is_admin,
     })
 }
 
@@ -167,6 +209,15 @@ pub enum SourceOutcome {
     /// Otherwise a stale cookie would lock the user out of every route,
     /// including the login endpoint and the SPA itself.
     Stale,
+    /// The source could not check the credential it was handed (a database
+    /// error looking up the token or the session). **Fail closed** and, like
+    /// [`Self::Reject`], terminal: the request is refused with
+    /// [`AuthError::Unavailable`] (503) and no later source is tried. Not
+    /// [`Self::Invalid`]: a 401 would tell the client its possibly valid
+    /// credential is wrong, and a later source could reinterpret the secret
+    /// (an unchecked token must never reach the password chain, whose
+    /// credential-forwarding realm would send it upstream).
+    Unavailable,
 }
 
 /// Errors from principal resolution.
@@ -175,6 +226,10 @@ pub enum AuthError {
     /// Credentials were supplied but rejected.
     #[error("unauthorized")]
     Unauthorized,
+    /// Credentials were supplied but could not be checked (a database error).
+    /// Fail closed: the caller answers 503, not 401.
+    #[error("authentication unavailable")]
+    Unavailable,
 }
 
 /// A way to derive a principal from request headers (token header, basic auth, …).
@@ -222,37 +277,33 @@ impl PrincipalSource for TokenHeaderSource {
             return SourceOutcome::NoCredentials;
         }
         match verify_token(&self.pool, secret).await {
-            Some(up) => SourceOutcome::Authenticated(Principal::from_user(up)),
-            None => SourceOutcome::Invalid,
+            Ok(Some(up)) => SourceOutcome::Authenticated(Principal::from_user(up)),
+            Ok(None) => SourceOutcome::Invalid,
+            Err(_) => SourceOutcome::Unavailable,
         }
     }
 }
 
 /// Resolves HTTP Basic auth. The basic secret is tried as a **token** first,
 /// then (only if password-basic is enabled) as a **password** for the supplied
-/// username — and the password path now runs through the
-/// [`crate::auth::Chain`] of [`crate::auth::AuthProvider`]s.
-///
-/// ## Slice 12.3 refactor (phase 2)
-/// Slice 1 inlined a single argon2id check here (`verify_password`). That check
-/// is now the [`crate::auth::LocalPasswordProvider`], invoked via the chain.
-/// With the default chain (`["local-password"]`) this is **byte-for-byte** the
-/// slice-1 behaviour:
-/// * token-as-basic still wins first and is unchanged;
-/// * the password path is still gated — when no chain is configured (slice-1
-///   `allow_password_basic = false`) the password path is skipped entirely;
-/// * a present-but-wrong / unknown password still yields
+/// username, run through the [`crate::auth::Chain`] of
+/// [`crate::auth::AuthProvider`]s:
+/// * token-as-basic always wins first;
+/// * the password path is gated — when no chain is configured (neither
+///   `allow_password_basic` nor an enabled credential-forwarding realm) the
+///   password path is skipped entirely;
+/// * a present-but-wrong / unknown password yields
 ///   [`SourceOutcome::Invalid`] (→ 401, never downgraded to anonymous).
 ///
-/// The chain lets `upstream-basic` (phase 4) slot in behind the local provider
-/// without any change to this source.
+/// The local argon2id check is the [`crate::auth::LocalPasswordProvider`];
+/// `upstream-basic` providers slot in behind it without any change to this
+/// source.
 pub struct BasicAuthSource {
     pool: PgPool,
     /// Where the *current* password chain comes from. A [`StaticChainSource`]
-    /// reproduces the slice-12.3 startup-built chain; the realm-driven server
-    /// wiring (12.7) plugs in a snapshot-cached source rebuilt from the
-    /// `auth_realm` table. `password_chain() == None` reproduces slice-1
-    /// `allow_password_basic = false` (password path disabled).
+    /// holds a fixed chain; the realm-driven server wiring plugs in a
+    /// snapshot-cached source rebuilt from the `auth_realm` table.
+    /// `password_chain() == None` means the password path is disabled.
     chain: Arc<dyn ChainSource>,
     /// Password-failure lockout per `(client IP, username)`, shared with the
     /// browser login endpoint. Disabled unless wired via
@@ -264,35 +315,16 @@ pub struct BasicAuthSource {
 }
 
 impl BasicAuthSource {
-    /// Build a source over the given pool, reproducing the slice-1
-    /// `allow_password_basic` flag: when `true`, the password path is enabled
-    /// with the default chain (`["local-password"]`); when `false`, only the
-    /// token-as-basic path runs.
-    ///
-    /// Preserved for slice-1 / existing callers and tests. Newer wiring should
-    /// use [`BasicAuthSource::with_chain`] / [`BasicAuthSource::with_source`].
-    pub fn new(pool: PgPool, allow_password_basic: bool) -> Self {
-        let chain = if allow_password_basic {
-            Some(Arc::new(Chain::new(vec![
-                Box::new(LocalPasswordProvider::new(pool.clone()))
-                    as Box<dyn super::provider::AuthProvider>,
-            ])))
-        } else {
-            None
-        };
-        Self::with_chain(pool, chain)
-    }
-
     /// Build a source with an explicit, fixed password-auth chain. Pass `None`
-    /// to disable the password path entirely. Auto-provisioning of
-    /// upstream-vouched users is decided per identity (the vouching provider
-    /// stamps its realm's flag onto the [`crate::auth::ProvenIdentity`]).
+    /// to disable the password path entirely. An upstream-vouched login maps
+    /// only onto an existing account of its realm
+    /// ([`crate::auth::provision_and_map`]).
     pub fn with_chain(pool: PgPool, chain: Option<Arc<Chain>>) -> Self {
         Self::with_source(pool, Arc::new(StaticChainSource(chain)))
     }
 
-    /// Build a source whose chain is re-resolved per attempt (12.7: the
-    /// realm-driven server wiring hands in its snapshot-cached source).
+    /// Build a source whose chain is re-resolved per attempt (the realm-driven
+    /// server wiring hands in its snapshot-cached source).
     pub fn with_source(pool: PgPool, chain: Arc<dyn ChainSource>) -> Self {
         Self {
             pool,
@@ -357,16 +389,37 @@ impl PrincipalSource for BasicAuthSource {
         if secret.is_empty() {
             return SourceOutcome::Invalid;
         }
+        // The workload-identity username (`oidc`) and workload API keys belong
+        // to the workload-identity source, which claims them first. Should one
+        // reach this source anyway it is refused here: never a user token,
+        // never a password, never forwarded upstream.
+        let reserved = forge_db::username::canonical_username(&username)
+            .is_ok_and(|name| forge_db::username::is_reserved_username(&name));
+        if reserved || super::workload_key::is_workload_key(&secret) {
+            return SourceOutcome::Invalid;
+        }
 
-        // Try the secret as a token first (unchanged from slice 1, runs ahead
-        // of the password chain).
-        if let Some(up) = verify_token(&self.pool, &secret).await {
-            return SourceOutcome::Authenticated(Principal::from_user(up));
+        // Try the secret as a token first, ahead of the password chain. A
+        // token Forge issued is never a password, even one that cannot be
+        // used now, and a lookup that failed has not ruled out a live token:
+        // neither is run through the password chain (a credential-forwarding
+        // realm would send it upstream).
+        match check_token(&self.pool, &secret).await {
+            Ok(TokenCheck::Live(up)) => {
+                return SourceOutcome::Authenticated(Principal::from_user(up))
+            }
+            Ok(TokenCheck::Unusable) => return SourceOutcome::Invalid,
+            Ok(TokenCheck::Unknown) => {}
+            Err(_) => return SourceOutcome::Unavailable,
         }
         // Then, if a password chain is configured, run the secret as a password
         // through the AuthProvider chain. The chain is re-resolved per attempt
-        // so runtime realm edits (12.7) take effect without a restart.
-        if let Some(chain) = self.chain.password_chain().await {
+        // so runtime realm edits take effect without a restart.
+        let chain = match self.chain.password_chain().await {
+            Ok(chain) => chain,
+            Err(_) => return SourceOutcome::Unavailable,
+        };
+        if let Some(chain) = chain {
             // The lockout, the chain and the account lookup all key on the
             // canonical username, so `Alice`/`alice ` share one budget and
             // one account. A name that cannot be canonical is a bad login.
@@ -398,9 +451,9 @@ impl PrincipalSource for BasicAuthSource {
             };
             match chain.authenticate(&cred).await {
                 ChainOutcome::Authenticated { identity, .. } => {
-                    // Map the vouched-for username back to a concrete principal,
-                    // auto-provisioning an upstream-vouched user on first login
-                    // when configured (phase 5).
+                    // Map the vouched-for username back to a concrete principal
+                    // (an upstream-vouched login only to an existing account of
+                    // its realm).
                     match provision_and_map(&self.pool, &identity).await {
                         Ok(Some(up)) => {
                             attempt.succeeded();
@@ -414,24 +467,25 @@ impl PrincipalSource for BasicAuthSource {
                             }
                             return SourceOutcome::Authenticated(Principal::from_user(up));
                         }
-                        // Vouched-for but no (active) app_user row, or a DB
-                        // error during mapping: fail closed. Basic creds were
-                        // presented, so this is an attempted-but-failed login
-                        // (Invalid → 401), never a downgrade to anonymous.
+                        // Vouched-for but no (active) app_user row: fail closed.
+                        // Basic creds were presented, so this is an
+                        // attempted-but-failed login (Invalid → 401), never a
+                        // downgrade to anonymous.
                         Ok(None) => {
                             attempt.failed();
                             return SourceOutcome::Invalid;
                         }
+                        // A DB error during mapping: denied too, but as
+                        // temporarily unavailable (503), so clients retry.
                         Err(e) => {
                             tracing::warn!(error = %e, "principal mapping failed");
                             attempt.released();
-                            return SourceOutcome::Invalid;
+                            return SourceOutcome::Unavailable;
                         }
                     }
                 }
                 // A definitive rejection (wrong local password) means:
-                // credentials were presented and not accepted. Slice 1 mapped a
-                // failed password verify to Invalid (→ 401); we preserve that.
+                // credentials were presented and not accepted → Invalid (401).
                 ChainOutcome::Rejected => {
                     attempt.failed();
                     return SourceOutcome::Invalid;
@@ -443,11 +497,15 @@ impl PrincipalSource for BasicAuthSource {
                     attempt.released();
                     return SourceOutcome::Invalid;
                 }
+                // Forge's own database failed: 503, so clients retry instead
+                // of asking for new credentials.
+                ChainOutcome::Failed => {
+                    attempt.released();
+                    return SourceOutcome::Unavailable;
+                }
                 // No provider had anything to say (e.g. unknown user that no
                 // provider owns). Basic creds *were* presented, so this is still
-                // an attempted-but-invalid login — exactly slice 1, where an
-                // unknown username made `verify_password` return `None` and the
-                // basic source fell through to `Invalid`.
+                // an attempted-but-invalid login (401), never anonymous.
                 ChainOutcome::NoCredentials => {
                     attempt.failed();
                     return SourceOutcome::Invalid;
@@ -468,6 +526,9 @@ pub use crate::auth::client_ip::AnonPolicy;
 ///   `Err(Unauthorized)` — the source has positively claimed the credential and
 ///   no later source may reinterpret it (WIF uses this so a rejected workload
 ///   JWT is never forwarded to a password provider).
+/// * An `Unavailable` (a credential that could not be checked) likewise stops
+///   the chain, with `Err(Unavailable)`: fail closed, and no 401 for a
+///   credential that may be valid.
 /// * If no source authenticates or rejects but **any** reported `Invalid`,
 ///   return `Err(Unauthorized)`. Bad credentials are *never* downgraded to
 ///   anonymous.
@@ -519,6 +580,8 @@ pub async fn resolve_principal_with_origin(
             }
             // Terminal: the source owns this credential and rejected it.
             SourceOutcome::Reject => return Err(AuthError::Unauthorized),
+            // Terminal: the credential could not be checked (fail closed).
+            SourceOutcome::Unavailable => return Err(AuthError::Unavailable),
             SourceOutcome::Invalid => saw_invalid = true,
             SourceOutcome::Stale => saw_stale = true,
             SourceOutcome::NoCredentials => {}
@@ -667,7 +730,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: Some(2),
-            is_admin: false,
             method: crate::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
@@ -687,7 +749,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: true,
             method: crate::auth::AuthMethod::Password,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
@@ -696,6 +757,34 @@ mod tests {
         ];
         let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
         assert_eq!(res, Err(AuthError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn unavailable_is_terminal_and_never_anonymous_nor_unauthorized() {
+        // A credential the source could not check (a lookup error) fails
+        // closed as `Unavailable` (503): not anonymous even when anonymous
+        // access is open, not a 401 that would condemn a possibly valid
+        // credential, and no later source gets to reinterpret it.
+        let authed = Principal::User {
+            user_id: 1,
+            token_id: None,
+            method: crate::auth::AuthMethod::Password,
+        };
+        for sources in [
+            vec![Box::new(StubSource(SourceOutcome::Unavailable)) as Box<dyn PrincipalSource>],
+            vec![
+                Box::new(StubSource(SourceOutcome::NoCredentials)),
+                Box::new(StubSource(SourceOutcome::Unavailable)),
+                Box::new(StubSource(SourceOutcome::Authenticated(authed))),
+            ],
+            vec![
+                Box::new(StubSource(SourceOutcome::Invalid)),
+                Box::new(StubSource(SourceOutcome::Unavailable)),
+            ],
+        ] {
+            let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::All).await;
+            assert_eq!(res, Err(AuthError::Unavailable));
+        }
     }
 
     #[tokio::test]
@@ -724,7 +813,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: false,
             method: crate::auth::AuthMethod::Password,
         };
         // An explicit credential wins before the cookie source: not ambient.

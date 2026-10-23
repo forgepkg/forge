@@ -1,11 +1,13 @@
-//! envisia-forge task runner — the single entry point for local dev + CI-adjacent
+//! Forge task runner — the single entry point for local dev + CI-adjacent
 //! chores. Replaces the former Makefile + Justfile.
 //!
 //! Run `cargo xtask help` (or `cargo xtask` with no args) for the command list.
 //! Every subcommand shells out to docker / cargo / pnpm / sqlx and streams their
 //! output; a non-zero child exit makes `xtask` exit non-zero too.
 
+mod changelog;
 mod proc;
+mod release;
 
 use proc::{Cmd, RunningCmd};
 use std::env;
@@ -35,7 +37,7 @@ const DEFAULT_FORGE_PORT: u16 = 8421;
 const VITE_DEV_PORT: u16 = 8420;
 
 /// Default bootstrap admin credentials from forge.toml (used by `seed`).
-const DEFAULT_ADMIN: &str = "admin:changeme";
+const DEFAULT_ADMIN: &str = "admin@example.com:changeme";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -74,9 +76,15 @@ fn main() -> ExitCode {
         "prepare" => prepare(),
         "prepare-check" => prepare_check(),
         "clean" => clean(),
-        // Docker image (Dockerfile lands in phase 2; thin wrappers now)
+        // Format plugins (WebAssembly components in plugins/)
+        "plugins" => plugins(),
+        "plugins-check" => plugins_check(),
+        // Docker image (build it; run it against the dev infra)
         "docker-build" => docker_build(),
         "docker-run" => docker_run(),
+        // Release
+        "changelog" => changelog::changelog(rest),
+        "release" => release::release(rest),
         other => {
             eprintln!("xtask: unknown command `{other}`\n");
             print_help();
@@ -97,7 +105,7 @@ fn main() -> ExitCode {
 
 fn print_help() {
     print!(
-        r#"envisia-forge task runner (cargo xtask <command>)
+        r#"Forge task runner (cargo xtask <command>)
 
 One-command dev:
   dev [--db local|docker|none]  Bring up infra, run forge-server + Vite HMR.
@@ -117,8 +125,9 @@ Infrastructure (docker compose):
 
 Server:
   run           Run forge-server (expects `up` first; loads ./forge.toml).
-  seed          Demo data: anonymous-readable repo + token, push the sample fixture
-                (server must already be running). Honors FORGE_URL / ADMIN env vars.
+  seed          Demo data: anonymous reads + password Basic on, anonymous-readable repo
+                + token, push the sample fixture (server must already be running).
+                Honors FORGE_URL / ADMIN env vars.
 
 Web UI (TanStack Router SPA in web/):
   web           Build the SPA into web/dist/ (run before `run` for single-origin prod-like).
@@ -139,11 +148,43 @@ Rust build & quality:
   prepare-check Migrate, then verify the committed .sqlx/ cache is in sync (CI's drift guard).
   clean         Remove build artifacts (cargo clean).
 
+Format plugins as WebAssembly components (plugins/<id>/; the workspace builds
+them natively, these need the wasm32-wasip2 target: `rustup target add wasm32-wasip2`):
+  plugins       Build every plugin as a component and install it under
+                target/plugins/installed/<id>/, printing the [plugins]
+                configuration that loads them (with digests).
+  plugins-check clippy -D warnings of every plugin's component build, and the build.
+
 Docker image (single container: web SPA + Rust server):
   docker-build  Build the application image from ./Dockerfile (multi-stage:
                 pnpm builds the SPA, cargo builds forge-server release).
   docker-run    Run the built image against the dev Postgres + versitygw
                 (docker-compose.yml + docker-compose.app.yml), API + SPA on :8421.
+
+Changelog (a fragment per change, docs/changes/<milestone>/<ref>.<kind>.md;
+see docs/changes/README.md):
+  changelog <milestone>
+                Fold the milestone's fragments into CHANGELOG.md's [Unreleased]
+                and delete them, to edit the notes in a pull request before the
+                release.
+  changelog --check
+                Check that every file under docs/changes is a fragment and that
+                no fragment's milestone is released already (CI).
+
+Release:
+  release <version> [--no-tag]
+                Set <version> in Cargo.toml/Cargo.lock, web/package.json, the
+                Kubernetes base's image tag and the Helm chart, fold the fragments
+                of docs/changes/<version>/ into CHANGELOG.md's [Unreleased] and
+                delete them, turn [Unreleased] into its section and commit on
+                release-<version> (HEAD must be origin/main). Then, with `gh`:
+                open a pull request, wait for its CI run, merge it, wait for the
+                merge commit's CI run on main, tag the merge commit v<version> and
+                push the tag. When main already carries <version>, tags main's
+                head once its CI passed. Refuses a changelog with an untagged
+                version section, entries under [Unreleased] or fragments next to
+                a drafted <version> section, and fragments of another milestone.
+                --no-tag: only commit, on the current branch; never pushes.
 
   help          Show this help.
 "#
@@ -495,6 +536,18 @@ fn seed() -> Result<(), String> {
         ])
     };
 
+    // A dev stack reads anonymously and takes passwords over Basic (so
+    // `curl -u admin@example.com:changeme` works on the feeds). These are
+    // auth settings now, set in the web UI (Admin → Settings) rather than in
+    // forge.toml.
+    println!("Opening anonymous reads and password Basic (Admin → Settings)…");
+    session(
+        "PUT",
+        "/admin/settings/auth",
+        r#"{"anonymous_mode":"all","allow_password_basic":true}"#,
+    )
+    .output_string()?;
+
     println!("Creating hosted repo 'nuget' (anonymous_read=true)…");
     // Repo creation: ignore failure (likely already exists).
     let _ = session(
@@ -548,9 +601,8 @@ fn json_escape(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Minimal extractor for `"<key>":"<value>"` from a JSON blob (matches the old
-/// Makefile's `sed`). Good enough for the single-field token response; avoids a
-/// JSON dependency in the runner.
+/// Minimal extractor for `"<key>":"<value>"` from a JSON blob. Good enough for
+/// the single-field token response; avoids a JSON dependency in the runner.
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let start = json.find(&needle)? + needle.len();
@@ -653,8 +705,8 @@ fn migrate() -> Result<(), String> {
 }
 
 /// Regenerate the committed .sqlx/ offline cache from a live DB. Applies
-/// migrations first (mirrors the old `just prepare`), then runs `cargo sqlx
-/// prepare`. Needs `up` (or a reachable DATABASE_URL) + sqlx-cli.
+/// migrations first, then runs `cargo sqlx prepare`. Needs `up` (or a reachable
+/// DATABASE_URL) + sqlx-cli.
 fn prepare() -> Result<(), String> {
     migrate()?;
     sqlx_prepare(&[])
@@ -682,6 +734,153 @@ fn clean() -> Result<(), String> {
     Cmd::new("cargo").arg("clean").run()
 }
 
+// ── Format plugins ───────────────────────────────────────────────────────────
+
+/// Format plugins: one workspace crate per directory (`plugins/<id>/`).
+const PLUGINS: &str = "plugins";
+
+/// Where the components are built and installed (apart from `target/`, so a
+/// wasm build never invalidates the host's).
+const PLUGINS_TARGET: &str = "target/plugins";
+
+/// The plugin directories with a component build (`plugins/<id>/` whose
+/// `plugin.toml` names a `component`), sorted. A plugin without one is built
+/// in only.
+fn plugin_dirs() -> Result<Vec<std::path::PathBuf>, String> {
+    let mut dirs: Vec<_> = std::fs::read_dir(PLUGINS)
+        .map_err(|e| format!("read {PLUGINS}/: {e}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join("plugin.toml").is_file() && plugin_component(dir).is_ok())
+        .collect();
+    dirs.sort();
+    Ok(dirs)
+}
+
+/// The `component = "…"` of a plugin.toml (a plain line scan: xtask has no
+/// TOML parser, and the key is a single string).
+fn plugin_component(dir: &std::path::Path) -> Result<String, String> {
+    let manifest = dir.join("plugin.toml");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("read {}: {e}", manifest.display()))?;
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("component"))
+        .filter_map(|rest| rest.trim().strip_prefix('='))
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .next()
+        .ok_or_else(|| format!("{} has no component", manifest.display()))
+}
+
+/// Whether the server links the plugin in `dir` (a path dependency of
+/// forge-server): its id is then taken by the built-in plugin.
+fn plugin_is_builtin(dir: &std::path::Path) -> bool {
+    let server = std::fs::read_to_string("crates/server/Cargo.toml").unwrap_or_default();
+    let path = format!("\"../../{}\"", dir.display()).replace('\\', "/");
+    server.contains(&path)
+}
+
+/// The SHA-256 of `file` (`sha256sum`, or `shasum -a 256` on macOS).
+fn sha256_of(file: &std::path::Path) -> Option<String> {
+    let tools: [(&str, &[&str]); 2] = [("sha256sum", &[]), ("shasum", &["-a", "256"])];
+    tools.iter().find_map(|(tool, args)| {
+        let out = std::process::Command::new(tool)
+            .args(*args)
+            .arg(file)
+            .output()
+            .ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        out.status
+            .success()
+            .then(|| text.split_whitespace().next().map(str::to_string))?
+    })
+}
+
+/// `cargo <sub>` of the plugin crate in `dir` for wasm32-wasip2 with its
+/// `component` feature, into [`PLUGINS_TARGET`].
+fn plugin_cargo(sub: &str, dir: &std::path::Path) -> Cmd {
+    Cmd::new("cargo")
+        .args([sub, "--locked", "--target", "wasm32-wasip2"])
+        .args(["--features", "component", "--manifest-path"])
+        .arg(dir.join("Cargo.toml"))
+        .args(["--target-dir", PLUGINS_TARGET])
+}
+
+/// Build the component of the plugin in `dir` (the crate as a `cdylib`, with
+/// the `plugin` profile); returns its path.
+fn build_component(dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    plugin_cargo("rustc", dir)
+        .args(["--lib", "--crate-type", "cdylib", "--profile", "plugin"])
+        .run()?;
+    Ok(std::path::Path::new(PLUGINS_TARGET)
+        .join("wasm32-wasip2/plugin")
+        .join(plugin_component(dir)?))
+}
+
+/// Build every plugin as a component and install it as an operator would
+/// (plugin.toml plus component under `target/plugins/installed/<id>/`).
+fn plugins() -> Result<(), String> {
+    let mut pins = Vec::new();
+    for dir in plugin_dirs()? {
+        let id = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("plugin directory name is not UTF-8")?
+            .to_string();
+        let component = plugin_component(&dir)?;
+        let built = build_component(&dir)?;
+        let installed = std::path::Path::new(PLUGINS_TARGET)
+            .join("installed")
+            .join(&id);
+        std::fs::create_dir_all(&installed)
+            .map_err(|e| format!("create {}: {e}", installed.display()))?;
+        std::fs::copy(dir.join("plugin.toml"), installed.join("plugin.toml"))
+            .map_err(|e| format!("copy plugin.toml: {e}"))?;
+        std::fs::copy(&built, installed.join(&component))
+            .map_err(|e| format!("copy {}: {e}", built.display()))?;
+        let pin = sha256_of(&installed.join(&component)).map_or_else(
+            || "<sha256 of the component>".to_string(),
+            |sha| format!("sha256:{sha}"),
+        );
+        pins.push((id, pin, plugin_is_builtin(&dir)));
+    }
+    let dir = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join(PLUGINS_TARGET)
+        .join("installed");
+    println!(
+        "\nInstalled into {}. To load them, add to forge.toml:\n",
+        dir.display()
+    );
+    println!(
+        "[plugins]\ndir = {:?}\n\n[plugins.formats]",
+        dir.display().to_string()
+    );
+    for (id, pin, builtin) in pins {
+        if builtin {
+            println!(
+                "# {id} is built into the server: its component loads only under another id\n\
+                 # (rename its directory, `id` in its plugin.toml and the key here).\n\
+                 # {id} = \"{pin}\""
+            );
+        } else {
+            println!("{id} = \"{pin}\"");
+        }
+    }
+    Ok(())
+}
+
+/// What CI checks of every plugin beyond the workspace's own fmt, clippy and
+/// tests: that it lints clean and builds as a WebAssembly component.
+fn plugins_check() -> Result<(), String> {
+    for dir in plugin_dirs()? {
+        plugin_cargo("clippy", &dir)
+            .args(["--", "-D", "warnings"])
+            .run()?;
+        build_component(&dir)?;
+    }
+    Ok(())
+}
+
 // ── Docker image (single-container web SPA + Rust server) ────────────────────
 
 /// Build the single application image from the root Dockerfile (multi-stage:
@@ -690,14 +889,7 @@ fn clean() -> Result<(), String> {
 /// not need a live DB.
 fn docker_build() -> Result<(), String> {
     Cmd::new("docker")
-        .args([
-            "build",
-            "-t",
-            "envisia-forge:latest",
-            "-f",
-            "Dockerfile",
-            ".",
-        ])
+        .args(["build", "-t", "forge:latest", "-f", "Dockerfile", "."])
         .run()
 }
 

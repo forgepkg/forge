@@ -1,4 +1,4 @@
-//! Open-redirect guard for the post-login `redirect_to` target (slice 12.2, §6).
+//! Open-redirect guard for the post-login `redirect_to` target.
 //!
 //! After login we 302 the browser to a caller-supplied path. To prevent an
 //! **open redirect** (`?redirect_to=https://evil.example`), we only ever honor a
@@ -81,8 +81,7 @@ mod tests {
             "/admin/repositories?tab=2"
         );
         // The admin UI's own paths (`/manage/*`) are ordinary same-origin
-        // targets; a legacy `/admin/...` UI target is passed through and then
-        // 302-redirected to `/manage/...` by `web_ui::legacy_admin_ui_redirect`.
+        // targets.
         assert_eq!(
             sanitize_redirect_to(Some("/manage/repositories/feed?tab=2")),
             "/manage/repositories/feed?tab=2"

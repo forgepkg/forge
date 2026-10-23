@@ -1,25 +1,26 @@
-//! Integration tests for the §12.4 Phase 5 behavior-preserving data migration
+//! Integration tests for the behavior-preserving RBAC data migration
 //! (`0007_rbac_migrate.sql`) against a real Postgres testcontainer.
 //!
 //! Two properties matter and are both proven here:
 //!
-//!   * **Upgrade preserves slice-1 behavior.** A DB that already had users +
+//!   * **Upgrade preserves pre-RBAC access.** A DB that already had users +
 //!     `anonymous_read` repos *before* RBAC existed must keep working after the
 //!     migration: existing users still read/write everywhere (the
 //!     `authenticated` role), `is_admin` users are still admin (the `admin`
 //!     role), and each `anonymous_read` repo becomes an anonymous read grant.
-//!     `legacy_open_access` is recorded `true`.
+//!     Migration 0038 then removes the mapping routine and its settings and
+//!     leaves those assignments alone.
 //!
 //!   * **Fresh install fails closed.** An empty DB migrating 0001..0007 in
 //!     sequence (the bootstrap admin is inserted by the server *after*
-//!     migrations) records `legacy_open_access = false`, assigns no roles, and a
-//!     roleless user has an empty effective set (deny-all).
+//!     migrations) assigns no roles, and a roleless user has an empty effective
+//!     set (deny-all).
 //!
 //! The upgrade case is exercised faithfully: migrations 0001..0006 are applied
 //! first, pre-RBAC rows are seeded, then 0007 runs — reproducing exactly what an
 //! upgrading deployment experiences (a non-empty `app_user` at 0007 time).
 
-use forge_db::authz_dao::{self, ADMIN_ROLE, ANONYMOUS_ROLE, AUTHENTICATED_ROLE};
+use forge_db::authz_dao::{self, ADMIN_ROLE, AUTHENTICATED_ROLE};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -42,6 +43,7 @@ async fn fresh_pool() -> (PgPool, Option<ContainerAsync<Postgres>>) {
         .with_db_name("forge")
         .with_user("forge")
         .with_password("forge")
+        .with_name("mirror.gcr.io/library/postgres")
         .with_tag("17")
         .start()
         .await
@@ -115,7 +117,7 @@ async fn migrator_up_to(target: i64) -> Migrator {
 const RBAC_MIGRATE_VERSION: i64 = 7;
 
 #[tokio::test]
-async fn upgrade_preserves_slice1_behavior() {
+async fn upgrade_preserves_pre_rbac_access() {
     let (pool, _container) = fresh_pool().await;
 
     // 1. Bring the DB up to *before* the data migration (schema through 0006:
@@ -126,8 +128,8 @@ async fn upgrade_preserves_slice1_behavior() {
         .await
         .expect("migrate 0001..0006");
 
-    // 2. Seed pre-RBAC rows exactly as a slice-1 deployment would have: a normal
-    //    user, an admin user, a public (anonymous_read) repo, and a private one.
+    // 2. Seed the rows a pre-RBAC deployment would have: a normal user, an
+    //    admin user, a public (anonymous_read) repo, and a private one.
     let normal_user: i64 = sqlx::query_scalar(
         "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('normal', 'x', false) RETURNING id",
     )
@@ -157,16 +159,23 @@ async fn upgrade_preserves_slice1_behavior() {
     //    must detect an UPGRADE and open access.
     migrator().await.run(&pool).await.expect("migrate 0007");
 
-    // legacy_open_access recorded true (upgrade detected).
-    assert!(
-        authz_dao::legacy_open_access(&pool)
+    // 0038 dropped the mapping routine and its install-wide settings.
+    for key in ["legacy_open_access", "legacy_rbac_synced"] {
+        assert_eq!(
+            authz_dao::get_setting(&pool, key).await.expect("setting"),
+            None,
+            "{key} is gone"
+        );
+    }
+    let routine: Option<String> =
+        sqlx::query_scalar("SELECT to_regprocedure('forge_rbac_apply_legacy_migration()')::text")
+            .fetch_one(&pool)
             .await
-            .expect("read flag"),
-        "upgrade must record legacy_open_access = true"
-    );
+            .expect("look up routine");
+    assert_eq!(routine, None, "the mapping routine is dropped");
 
-    // Every existing user holds `authenticated` ⇒ read/write everywhere (slice-1
-    // open access preserved).
+    // Every existing user holds `authenticated` ⇒ read/write everywhere (the
+    // pre-RBAC open access is preserved).
     for uid in [normal_user, admin_user] {
         assert!(
             authz_dao::user_has_role(&pool, uid, AUTHENTICATED_ROLE)
@@ -239,13 +248,6 @@ async fn fresh_install_fails_closed() {
     // created by the server after migrations). 0007 must detect a fresh install.
     migrator().await.run(&pool).await.expect("migrate all");
 
-    assert!(
-        !authz_dao::legacy_open_access(&pool)
-            .await
-            .expect("read flag"),
-        "fresh install must record legacy_open_access = false"
-    );
-
     // No anonymous grants on a fresh install ⇒ anonymous is denied everything.
     let anon = authz_dao::load_anonymous_effective(&pool)
         .await
@@ -264,12 +266,6 @@ async fn fresh_install_fails_closed() {
     .await
     .expect("insert user");
 
-    // Re-running the idempotent routine (as the boot path does) must NOT open
-    // access on a fresh install: the user stays roleless.
-    authz_dao::apply_legacy_migration(&pool)
-        .await
-        .expect("re-apply legacy migration");
-
     assert!(
         !authz_dao::user_has_role(&pool, user, AUTHENTICATED_ROLE)
             .await
@@ -285,351 +281,162 @@ async fn fresh_install_fails_closed() {
     );
 }
 
+/// `0042_writer_role.sql` carries version 42.
+const WRITER_ROLE_VERSION: i64 = 42;
+
+/// The `(action, ANY repository)` grants of the role named `name`, sorted.
+async fn any_repo_grants(pool: &PgPool, name: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT rp.action FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+         WHERE r.name = $1 AND rp.repository_id IS NULL AND rp.selector_id IS NULL \
+         ORDER BY rp.action",
+    )
+    .bind(name)
+    .fetch_all(pool)
+    .await
+    .expect("read grants")
+}
+
+/// #318: every install gets the built-in `writer` role, with read and write on
+/// every repository and nothing else.
 #[tokio::test]
-async fn apply_legacy_migration_is_idempotent() {
+async fn writer_role_is_seeded_built_in() {
     let (pool, _container) = fresh_pool().await;
-    migrator_up_to(RBAC_MIGRATE_VERSION - 1)
-        .await
-        .run(&pool)
-        .await
-        .expect("migrate 0001..0006");
+    migrator().await.run(&pool).await.expect("migrate all");
 
-    let admin_user: i64 = sqlx::query_scalar(
-        "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('a', 'x', true) RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("seed admin");
-    sqlx::query(
-        "INSERT INTO repository (name, kind, anonymous_read) VALUES ('pub', 'hosted', true)",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed repo");
-
-    migrator().await.run(&pool).await.expect("migrate 0007");
-
-    // Capture row counts after the one-shot migration.
-    let user_role_count = |pool: PgPool| async move {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM user_role")
+    let (builtin, description): (bool, String) =
+        sqlx::query_as("SELECT builtin, description FROM role WHERE name = $1")
+            .bind(authz_dao::WRITER_ROLE)
             .fetch_one(&pool)
             .await
-            .expect("count user_role")
-    };
-    let grant_count = |pool: PgPool| async move {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM repository_privilege rp JOIN role r ON r.id = rp.role_id WHERE r.name = 'anonymous'",
-        )
+            .expect("the writer role exists");
+    assert!(builtin);
+    assert_eq!(
+        description,
+        "Read and publish packages on every repository; no administration."
+    );
+    assert_eq!(
+        any_repo_grants(&pool, authz_dao::WRITER_ROLE).await,
+        vec!["read".to_string(), "write".to_string()]
+    );
+    let grants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+         WHERE r.name = $1",
+    )
+    .bind(authz_dao::WRITER_ROLE)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(grants, 2, "no delete, no admin");
+}
+
+/// #318: a custom role an install already named `writer` is renamed
+/// `writer#<id>`, keeping its grants and assignments, and a workload-identity
+/// rule that named it follows the rename instead of handing out the new
+/// built-in role.
+#[tokio::test]
+async fn an_existing_writer_role_is_renamed() {
+    let (pool, _container) = fresh_pool().await;
+    migrator_up_to(WRITER_ROLE_VERSION - 1)
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0001..0039");
+
+    let custom: i64 = sqlx::query_scalar(
+        "INSERT INTO role (name, description) VALUES ('writer', 'ours') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let repo: i64 = sqlx::query_scalar(
+        "INSERT INTO repository (name, format, kind) VALUES ('ci', 'nuget', 'hosted') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO repository_privilege (role_id, repository_id, action) VALUES ($1, $2, 'read')",
+    )
+    .bind(custom)
+    .bind(repo)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('w@example.com', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    authz_dao::assign_role(&pool, user, custom).await.unwrap();
+    let rules = serde_json::json!([
+        {"role": "ci"},
+        {"role": "writer", "conditions": [{"claim": "repository", "any_of": ["g/p"]}]},
+    ]);
+    let realm: i64 = sqlx::query_scalar(
+        "INSERT INTO auth_realm (kind, name, enabled, priority, config) \
+         VALUES ('workload_identity', 'ci-wif', true, 500, \
+                 jsonb_build_object('issuer', 'https://ci.example', 'rules', $1::jsonb)) \
+         RETURNING id",
+    )
+    .bind(&rules)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    migrator().await.run(&pool).await.expect("migrate 0042");
+
+    let renamed = format!("writer#{custom}");
+    let name: String = sqlx::query_scalar("SELECT name FROM role WHERE id = $1")
+        .bind(custom)
         .fetch_one(&pool)
         .await
-        .expect("count anon grants")
-    };
-
-    let ur_before = user_role_count(pool.clone()).await;
-    let ag_before = grant_count(pool.clone()).await;
-    assert!(
-        ur_before > 0 && ag_before > 0,
-        "migration applied something"
-    );
-
-    // Re-run the boot path twice: counts must not change (pure upserts).
-    authz_dao::apply_legacy_migration(&pool)
+        .unwrap();
+    assert_eq!(name, renamed);
+    let roles: Vec<String> = authz_dao::list_roles_for_user(&pool, user)
         .await
-        .expect("rerun");
-    authz_dao::apply_legacy_migration(&pool)
-        .await
-        .expect("rerun");
-
+        .unwrap()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    assert_eq!(roles, vec![renamed.clone()], "the assignment stays with it");
+    let kept: Vec<(Option<i64>, String)> =
+        sqlx::query_as("SELECT repository_id, action FROM repository_privilege WHERE role_id = $1")
+            .bind(custom)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(
-        ur_before,
-        user_role_count(pool.clone()).await,
-        "re-running must not duplicate user_role rows"
+        kept,
+        vec![(Some(repo), "read".to_string())],
+        "and its grants"
     );
+
+    // The built-in role takes the name.
     assert_eq!(
-        ag_before,
-        grant_count(pool.clone()).await,
-        "re-running must not duplicate anonymous grants"
+        any_repo_grants(&pool, authz_dao::WRITER_ROLE).await,
+        vec!["read".to_string(), "write".to_string()]
+    );
+    assert_ne!(
+        authz_dao::role_id_by_name(&pool, authz_dao::WRITER_ROLE)
+            .await
+            .unwrap(),
+        Some(custom)
     );
 
-    // The admin user is admin and the anonymous role exists (sanity).
-    assert!(authz_dao::user_has_role(&pool, admin_user, ADMIN_ROLE)
-        .await
-        .expect("query"));
-    assert!(authz_dao::role_id_by_name(&pool, ANONYMOUS_ROLE)
-        .await
-        .expect("query")
-        .is_some());
-}
-
-/// P1.2: the boot hook applies the legacy mapping only ONCE per install, so an
-/// admin role an operator revokes through RBAC is not silently re-synthesized
-/// from the legacy `is_admin` column on the next restart.
-#[tokio::test]
-async fn boot_sync_runs_once_so_revocations_stick() {
-    let (pool, _container) = fresh_pool().await;
-    migrator_up_to(RBAC_MIGRATE_VERSION - 1)
-        .await
-        .run(&pool)
-        .await
-        .expect("migrate 0001..0006");
-    let admin_user: i64 = sqlx::query_scalar(
-        "INSERT INTO app_user (username, password_hash, is_admin) VALUES ('a', 'x', true) RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("seed admin");
-    migrator().await.run(&pool).await.expect("migrate all");
-
-    // First boot: runs (the marker is absent) and records the marker.
-    assert!(authz_dao::apply_legacy_migration_once(&pool)
-        .await
-        .expect("first boot"));
+    let config: serde_json::Value =
+        sqlx::query_scalar("SELECT config FROM auth_realm WHERE id = $1")
+            .bind(realm)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
-        authz_dao::get_setting(&pool, authz_dao::LEGACY_RBAC_SYNCED_KEY)
-            .await
-            .expect("setting")
-            .as_deref(),
-        Some("true")
+        config["rules"],
+        serde_json::json!([
+            {"role": "ci"},
+            {"role": renamed, "conditions": [{"claim": "repository", "any_of": ["g/p"]}]},
+        ])
     );
-
-    // The operator revokes the synthesized admin role.
-    let admin_role = authz_dao::role_id_by_name(&pool, ADMIN_ROLE)
-        .await
-        .expect("query")
-        .expect("admin role");
-    authz_dao::unassign_role(&pool, admin_user, admin_role)
-        .await
-        .expect("revoke");
-
-    // Later boots are no-ops: the revocation sticks.
-    assert!(!authz_dao::apply_legacy_migration_once(&pool)
-        .await
-        .expect("second boot"));
-    assert!(!authz_dao::user_has_role(&pool, admin_user, ADMIN_ROLE)
-        .await
-        .expect("query"));
-}
-
-/// §12.4 Phase 5 per-creation semantics: on an UPGRADED (legacy_open_access)
-/// install a user created *after* boot — by the admin API, OIDC/upstream
-/// auto-provision — must inherit the `authenticated` role *immediately* via
-/// [`authz_dao::assign_authenticated_if_legacy_open`], not only at the next
-/// restart. Without this, a freshly-created user on a slice-1-compatible install
-/// would silently lose its read/write reach until the server restarts.
-#[tokio::test]
-async fn legacy_open_assigns_authenticated_to_new_user() {
-    let (pool, _container) = fresh_pool().await;
-    migrator_up_to(RBAC_MIGRATE_VERSION - 1)
-        .await
-        .run(&pool)
-        .await
-        .expect("migrate 0001..0006");
-
-    // Seed a pre-existing user so 0007 detects an UPGRADE (opens access).
-    sqlx::query("INSERT INTO app_user (username, password_hash) VALUES ('old', 'x')")
-        .execute(&pool)
-        .await
-        .expect("seed pre-existing user");
-    migrator().await.run(&pool).await.expect("migrate 0007");
-    assert!(
-        authz_dao::legacy_open_access(&pool)
-            .await
-            .expect("read flag"),
-        "precondition: this is an upgraded (open) install"
-    );
-
-    // A user created AFTER the migration ran (the bug scenario: post-boot create).
-    let new_user: i64 = sqlx::query_scalar(
-        "INSERT INTO app_user (username, password_hash) VALUES ('post-boot', 'x') RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("insert post-boot user");
-
-    // Before the per-creation hook runs it holds no role (proves the hook, not the
-    // one-shot migration, is what grants it).
-    assert!(
-        !authz_dao::user_has_role(&pool, new_user, AUTHENTICATED_ROLE)
-            .await
-            .expect("query"),
-        "freshly inserted user has no role until the creation hook runs"
-    );
-
-    // The creation hook every user-create path invokes.
-    let assigned = authz_dao::assign_authenticated_if_legacy_open(&pool, new_user)
-        .await
-        .expect("assign on legacy-open install");
-    assert!(assigned, "must report it assigned the authenticated role");
-
-    assert!(
-        authz_dao::user_has_role(&pool, new_user, AUTHENTICATED_ROLE)
-            .await
-            .expect("query"),
-        "new user must hold authenticated immediately, not after a restart"
-    );
-    let eff = authz_dao::load_user_effective(&pool, new_user)
-        .await
-        .expect("effective");
-    let has = |action: &str| {
-        eff.grants
-            .iter()
-            .any(|g| g.action == action && g.repository_id.is_none())
-    };
-    assert!(
-        has("read") && has("write"),
-        "new user reads/writes everywhere"
-    );
-
-    // Idempotent: a second call is a harmless no-op (still true, no dup row).
-    assert!(
-        authz_dao::assign_authenticated_if_legacy_open(&pool, new_user)
-            .await
-            .expect("idempotent re-call")
-    );
-    let role_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM user_role ur JOIN role r ON r.id = ur.role_id WHERE ur.user_id = $1 AND r.name = 'authenticated'",
-    )
-    .bind(new_user)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
-    assert_eq!(role_rows, 1, "no duplicate authenticated assignment");
-}
-
-/// On a FRESH (fail-closed) install the per-creation hook must be a no-op: a new
-/// user gets no automatic role, preserving deny-by-default.
-#[tokio::test]
-async fn fresh_install_create_hook_is_noop() {
-    let (pool, _container) = fresh_pool().await;
-    migrator().await.run(&pool).await.expect("migrate all");
-    assert!(
-        !authz_dao::legacy_open_access(&pool)
-            .await
-            .expect("read flag"),
-        "precondition: fresh install is closed"
-    );
-
-    let user: i64 = sqlx::query_scalar(
-        "INSERT INTO app_user (username, password_hash) VALUES ('fresh', 'x') RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("insert user");
-
-    let assigned = authz_dao::assign_authenticated_if_legacy_open(&pool, user)
-        .await
-        .expect("hook on closed install");
-    assert!(!assigned, "closed install must not auto-assign anything");
-    assert!(
-        !authz_dao::user_has_role(&pool, user, AUTHENTICATED_ROLE)
-            .await
-            .expect("query"),
-        "fresh-install new user stays roleless (deny-by-default)"
-    );
-    assert!(
-        authz_dao::load_user_effective(&pool, user)
-            .await
-            .expect("effective")
-            .grants
-            .is_empty(),
-        "fresh-install new user has an empty effective set"
-    );
-}
-
-/// M20: on an upgraded install, `legacy_open_access` can be switched off
-/// ([`authz_dao::set_legacy_open_access`]): new users then get no automatic
-/// `authenticated` role (neither from the creation hook nor from a re-run of
-/// the legacy mapping), while existing assignments are left alone. And
-/// removing a repository's synthesized anonymous grant (what turning its
-/// `anonymous_read` off does) sticks across a re-run of the mapping.
-#[tokio::test]
-async fn legacy_open_access_can_be_switched_off() {
-    let (pool, _container) = fresh_pool().await;
-    migrator_up_to(RBAC_MIGRATE_VERSION - 1)
-        .await
-        .run(&pool)
-        .await
-        .expect("migrate 0001..0006");
-    let old_user: i64 = sqlx::query_scalar(
-        "INSERT INTO app_user (username, password_hash) VALUES ('old', 'x') RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("seed pre-existing user");
-    let public_repo: i64 = sqlx::query_scalar(
-        "INSERT INTO repository (name, kind, anonymous_read) VALUES ('pub', 'hosted', true) RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("seed public repo");
-    migrator().await.run(&pool).await.expect("migrate all");
-    assert!(
-        authz_dao::legacy_open_access(&pool).await.expect("flag"),
-        "precondition: upgraded (open) install"
-    );
-    let anon_grant = |pool: PgPool| async move {
-        authz_dao::load_anonymous_effective(&pool)
-            .await
-            .expect("anonymous effective")
-            .grants
-            .iter()
-            .any(|g| g.action == "read" && g.repository_id == Some(public_repo))
-    };
-    assert!(anon_grant(pool.clone()).await, "0007 synthesized the grant");
-
-    // Switch the flag off; it reads back as off.
-    authz_dao::set_legacy_open_access(&pool, false)
-        .await
-        .expect("switch off");
-    assert!(!authz_dao::legacy_open_access(&pool).await.expect("flag"));
-
-    // A user created now gets no automatic role…
-    let new_user: i64 = sqlx::query_scalar(
-        "INSERT INTO app_user (username, password_hash) VALUES ('new', 'x') RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("insert user");
-    assert!(
-        !authz_dao::assign_authenticated_if_legacy_open(&pool, new_user)
-            .await
-            .expect("hook")
-    );
-
-    // …and the repository's anonymous_read is switched off with its grant.
-    sqlx::query("UPDATE repository SET anonymous_read = false WHERE id = $1")
-        .bind(public_repo)
-        .execute(&pool)
-        .await
-        .expect("flag off");
-    assert!(authz_dao::delete_anonymous_read_grant(&pool, public_repo)
-        .await
-        .expect("delete grant"));
-
-    // Re-running the mapping re-adds neither.
-    authz_dao::apply_legacy_migration(&pool)
-        .await
-        .expect("re-run");
-    assert!(
-        !authz_dao::user_has_role(&pool, new_user, AUTHENTICATED_ROLE)
-            .await
-            .expect("query"),
-        "no authenticated role once the flag is off"
-    );
-    assert!(
-        !anon_grant(pool.clone()).await,
-        "the revoked grant stays gone"
-    );
-    assert!(
-        authz_dao::user_has_role(&pool, old_user, AUTHENTICATED_ROLE)
-            .await
-            .expect("query"),
-        "existing assignments are not revoked by the switch"
-    );
-
-    // The switch works both ways.
-    authz_dao::set_legacy_open_access(&pool, true)
-        .await
-        .expect("switch on");
-    assert!(authz_dao::legacy_open_access(&pool).await.expect("flag"));
+    assert_eq!(config["issuer"], "https://ci.example");
 }

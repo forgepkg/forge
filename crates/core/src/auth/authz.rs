@@ -1,4 +1,4 @@
-//! Authorization seam (§12.4: the single fine-grained-RBAC decision point).
+//! Authorization seam: the single fine-grained-RBAC decision point.
 //!
 //! ## The seam
 //! Authorization is decided by the [`Authz`] service. It owns the data handles a
@@ -16,18 +16,16 @@
 //! Every gate (request dispatch in `server::dispatch`, the browse read
 //! endpoints, the admin `require_admin` middleware, and identity-aware group
 //! resolution in `core::repo::group`) calls these methods. Keeping them on one
-//! service is what lets §12.4 answer them from the cached RBAC evaluator
-//! **without touching any call site**.
+//! service lets the cached RBAC evaluator answer them all, so **no call site
+//! evaluates policy itself**.
 //!
-//! ## Behavior (fine-grained RBAC, §12.4 Phase 3)
+//! ## Behavior (fine-grained RBAC)
 //! Each predicate resolves the principal's **effective set** (the additive union
 //! of its roles' grants) and asks the pure evaluator:
 //!
 //! * **User** — its `user_role`-derived grants, loaded once per user and cached
-//!   ([`crate::authz::cache`]). The slice-1 `app_user.is_admin` flag is folded in
-//!   as a **dual-read** admin fallback (`in_admin_role OR is_admin`) so existing
-//!   admins keep working during the migration window — it can only ever *grant*
-//!   admin, never remove it.
+//!   ([`crate::authz::cache`]). Membership in the built-in `admin` role makes it
+//!   an admin.
 //! * **Anonymous** — exactly the built-in `anonymous` role's grants (cached under
 //!   one shared key). On an un-migrated install that role has no grants ⇒ deny.
 //! * **Public read** — for `read` (the [`Authz::can_read`] gate and the read
@@ -46,11 +44,14 @@
 //! * **Unauthenticated** — always denied.
 //!
 //! ## Fail-closed
-//! The methods return `bool` (preserving the slice-1 call sites). Any evaluation
-//! error — a DB load failure, a selector that won't compile, a malformed token
-//! scope — is **logged and denied**: an error never grants. The repo-level gate
+//! The methods return a plain `bool`, never an error. Any evaluation error — a
+//! DB load failure, a selector that won't compile, a malformed token scope — is
+//! **logged and denied**: an error never grants. The repo-level gate
 //! is a fast in-memory set test over the (warm-cache) effective set; selector
 //! filtering happens separately via [`Authz::package_filter`].
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use forge_cache::Cache;
 use forge_db::authz_dao;
@@ -61,7 +62,7 @@ use super::principal::Principal;
 use crate::authz::cache as authz_cache;
 use crate::authz::{parse_token_scope, Action, EffectiveSet, PackageFilter, TokenScope};
 
-/// The authorization decision service (§12.4 seam).
+/// The authorization decision service (the single RBAC decision point).
 ///
 /// Cheaply cloneable: the [`PgPool`] and [`Cache`] inside are both `Arc`-backed.
 /// Constructed once during server wiring and held in app state / threaded into
@@ -72,8 +73,9 @@ pub struct Authz {
     cache: Cache,
     /// Whether authenticated principals also hold the public read reach (see
     /// [`Self::can_read`]). Off unless the server reads anonymously for
-    /// everyone (`anonymous_mode = "all"`).
-    public_read_for_signed_in: bool,
+    /// everyone (anonymous mode `all`). Shared by every clone, so
+    /// [`Self::set_public_read_for_signed_in`] reaches them all.
+    public_read_for_signed_in: Arc<AtomicBool>,
 }
 
 impl Authz {
@@ -84,31 +86,39 @@ impl Authz {
         Authz {
             pool,
             cache,
-            public_read_for_signed_in: false,
+            public_read_for_signed_in: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Give authenticated principals the public read reach as well. The server
-    /// enables this only for `anonymous_mode = "all"`, where anyone may read
+    /// enables this only for anonymous mode `all`, where anyone may read
     /// those repositories anyway. Under `off` the reach is inert for everyone,
     /// and under `allowlist` it depends on the caller's address and `Host`,
     /// which authorization does not see — granting it there would let a
     /// signed-in user (or their token, or a workload) read from anywhere what
     /// only allowlisted networks may read anonymously.
-    pub fn with_public_read_for_signed_in(mut self, enabled: bool) -> Self {
-        self.public_read_for_signed_in = enabled;
+    pub fn with_public_read_for_signed_in(self, enabled: bool) -> Self {
+        self.set_public_read_for_signed_in(enabled);
         self
+    }
+
+    /// [`Self::with_public_read_for_signed_in`] at runtime, for this service
+    /// and every clone of it: the server follows the anonymous mode an
+    /// administrator sets.
+    pub fn set_public_read_for_signed_in(&self, enabled: bool) {
+        self.public_read_for_signed_in
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// May `principal` read (download / list / search) `repo`?
     ///
     /// `repo.anonymous_read` is a first-class toggle (exposed by the admin
     /// API/UI and honored independently of RBAC grants): when set, the anonymous
-    /// principal may read the repo. This preserves slice-1 semantics for repos
-    /// created with `anonymous_read = true` even on a fresh, default-deny RBAC
+    /// principal may read the repo. A repo created with `anonymous_read = true`
+    /// is therefore anonymously readable even on a fresh, default-deny RBAC
     /// install. RBAC grants are still consulted for everything else.
     ///
-    /// With [`Self::with_public_read_for_signed_in`] (`anonymous_mode = "all"`),
+    /// With [`Self::with_public_read_for_signed_in`] (anonymous mode `all`),
     /// authenticated principals (users, tokens, workloads) hold the same public
     /// reach — the flag and the `anonymous` role's `read` grants — on top of
     /// their own grants, so a signed-in user without grants is not denied a repo
@@ -142,14 +152,14 @@ impl Authz {
 
     /// May `principal` perform admin operations on `repo`?
     ///
-    /// Admin is the `admin`-role short-circuit (or the `is_admin` dual-read
-    /// fallback); a per-repo `admin` grant also satisfies it. Fail-closed.
+    /// Admin is the `admin`-role short-circuit; a per-repo `admin` grant also
+    /// satisfies it. Fail-closed.
     pub async fn can_admin(&self, principal: &Principal, repo: &Repository) -> bool {
         self.allows(principal, Action::Admin, repo.id).await
     }
 
     /// Is `principal` a **global admin** — i.e. a member of the built-in `admin`
-    /// role (or the slice-1 `is_admin` dual-read fallback)?
+    /// role?
     ///
     /// This is the repo-less admin gate used by the privilege-management admin
     /// API (`/admin/roles`, `/admin/users/{id}/roles`, …), which has no single
@@ -160,6 +170,18 @@ impl Authz {
     pub async fn is_global_admin(&self, principal: &Principal) -> bool {
         match self.effective(principal).await {
             Ok(eff) => eff.is_admin(),
+            Err(()) => false,
+        }
+    }
+
+    /// May `principal` write (publish) to **every** repository, ones created
+    /// later included, with no package scope? True for the `admin` role and
+    /// for an unscoped `write` grant on ANY repository, such as the built-in
+    /// `writer` role's; a token scope narrows it like every other check.
+    /// Fail-closed.
+    pub async fn can_write_every_repository(&self, principal: &Principal) -> bool {
+        match self.effective(principal).await {
+            Ok(eff) => eff.allows_every_repo(Action::Write),
             Err(()) => false,
         }
     }
@@ -269,20 +291,14 @@ impl Authz {
                 })
             }
             Principal::User {
-                user_id,
-                token_id,
-                is_admin,
-                ..
+                user_id, token_id, ..
             } => {
-                let mut owner = authz_cache::load_user_effective(
-                    &self.pool,
-                    &self.cache,
-                    *user_id,
-                    *is_admin, // dual-read admin fallback (grant-only)
-                )
-                .await
-                .map_err(|e| tracing::error!(error = %e, user_id, "authz user load failed"))?;
-                if let Some(flag) = public_read.filter(|_| self.public_read_for_signed_in) {
+                let mut owner = authz_cache::load_user_effective(&self.pool, &self.cache, *user_id)
+                    .await
+                    .map_err(|e| tracing::error!(error = %e, user_id, "authz user load failed"))?;
+                if let Some(flag) =
+                    public_read.filter(|_| self.public_read_for_signed_in.load(Ordering::Relaxed))
+                {
                     owner = self.add_public_read(owner, flag).await;
                 }
 
@@ -291,11 +307,10 @@ impl Authz {
                     Some(tid) => self.apply_token_scope(owner, *tid).await,
                 }
             }
-            // WIF (slice 12.8): a workload is authorized purely by the single
+            // WIF: a workload is authorized purely by the single
             // forge role its realm's claim-rules mapped it to (plus, for reads,
             // the public reach every principal holds). No `app_user`, no token
-            // scope, no dual-read admin fallback — a deleted role resolves to
-            // deny-all.
+            // scope — a deleted role resolves to deny-all.
             Principal::Workload { role_id, .. } => {
                 let role = authz_cache::load_role_effective(&self.pool, &self.cache, *role_id)
                     .await
@@ -303,7 +318,9 @@ impl Authz {
                         |e| tracing::error!(error = %e, role_id, "authz workload role load failed"),
                     )?;
                 Ok(
-                    match public_read.filter(|_| self.public_read_for_signed_in) {
+                    match public_read
+                        .filter(|_| self.public_read_for_signed_in.load(Ordering::Relaxed))
+                    {
                         Some(flag) => self.add_public_read(role, flag).await,
                         None => role,
                     },
@@ -356,11 +373,10 @@ fn deny_all_scope() -> TokenScope {
 mod tests {
     use super::*;
 
-    fn user(is_admin: bool) -> Principal {
+    fn user() -> Principal {
         Principal::User {
             user_id: 42,
             token_id: None,
-            is_admin,
             method: crate::auth::AuthMethod::Password,
         }
     }
@@ -401,7 +417,7 @@ mod tests {
 
     #[test]
     fn principals_distinguish_user_anon() {
-        assert!(user(true).is_user());
+        assert!(user().is_user());
         assert!(!anon().is_user());
     }
 }

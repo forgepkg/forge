@@ -1,0 +1,71 @@
+# Production example: external PostgreSQL and S3, an in-cluster Valkey, two
+# instances behind an Ingress, reachable only through the ingress controller.
+# Copy this directory into your deployment repository and adjust it; there,
+# reference the base and components by the release tag so the image and the
+# manifests stay in step:
+#
+#   resources:
+#     - namespace.yaml
+#     - https://github.com/schmitch/forge//deploy/kubernetes/base?ref=v1.0.0
+#   components:
+#     - https://github.com/schmitch/forge//deploy/kubernetes/components/ingress?ref=v1.0.0
+#     - …
+#
+# Secrets: copy forge.env.example to forge.env (git-ignored) and fill it in.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: forge
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+components:
+  - ../../components/ingress
+  - ../../components/network-policy
+  - ../../components/valkey
+  - ../../components/high-availability
+
+configMapGenerator:
+  - name: forge-config
+    behavior: merge
+    literals:
+      - FORGE_SERVER__PUBLIC_BASE_URL=https://forge.example.com
+      # The ingress controller's pod network. Every pod in it can choose the
+      # client IP Forge sees (login lockout, anonymous allowlist): narrow it
+      # to the ingress pods where you can; the NetworkPolicy (patched below)
+      # lets only the ingress controller reach Forge.
+      - FORGE_AUTH__TRUSTED_PROXY_CIDRS=[10.0.0.0/8]
+      - FORGE_S3__ENDPOINT=https://s3.eu-central-1.amazonaws.com
+      - FORGE_S3__REGION=eu-central-1
+      - FORGE_S3__BUCKET=forge
+      - FORGE_S3__FORCE_PATH_STYLE=false
+
+secretGenerator:
+  - name: forge-env
+    envs:
+      - forge.env
+
+patches:
+  - target:
+      kind: Ingress
+      name: forge
+    patch: |-
+      - op: replace
+        path: /spec/rules/0/host
+        value: forge.example.com
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: forge.example.com
+  # The namespace of your ingress controller: the only peer that reaches Forge.
+  - target:
+      kind: NetworkPolicy
+      name: forge
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from
+        value:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: ingress-nginx

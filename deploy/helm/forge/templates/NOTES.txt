@@ -1,0 +1,70 @@
+Forge {{ include "forge.imageTag" . }} is deployed as {{ include "forge.fullname" . }} in namespace {{ .Release.Namespace }}.
+
+Image: {{ include "forge.image" . }}
+Public URL: {{ include "forge.publicBaseUrl" . }}
+{{- if hasPrefix "http://localhost" (include "forge.publicBaseUrl" .) }}
+
+  Set `host` (or config.server.public_base_url) to the https URL clients use:
+  Forge builds every absolute NuGet URL from it and marks cookies Secure only
+  for https.
+
+  Until then, reach it through a port-forward:
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "forge.fullname" . }} {{ .Values.containerPort }}:{{ .Values.service.port }}
+{{- end }}
+
+Watch the rollout (the first start of a version runs the migrations):
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "forge.fullname" . }}
+{{- if not (or .Values.secretEnv .Values.existingSecret .Values.env .Values.envFrom (and .Values.postgresql.enabled .Values.versitygw.enabled)) }}
+
+WARNING: no secrets are configured. Forge needs FORGE_DATABASE__URL and the S3
+credentials (secretEnv, existingSecret or env; or postgresql.enabled and
+versitygw.enabled) and refuses to start without them.
+{{- end }}
+{{- $secretKeys := list "database.url" "redis.url" "s3.access_key" "s3.secret_key" "auth.bootstrap_admin.password" "auth.upstream_basic.cache.key_pepper" "oidc.client_secret" "docker.token_secret" }}
+{{- range $secretKeys }}
+{{- $value := $.Values.config }}
+{{- range splitList "." . }}
+{{- if kindIs "map" $value }}{{ $value = index $value . }}{{ else }}{{ $value = "" }}{{ end }}
+{{- end }}
+{{- if $value }}
+
+WARNING: config.{{ . }} is a secret but config is stored in a ConfigMap. Move it
+to secretEnv (FORGE_{{ . | upper | replace "." "__" }}) or existingSecret.
+{{- end }}
+{{- end }}
+{{- $trusted := (default dict .Values.config.auth).trusted_proxy_cidrs }}
+{{- if hasKey .Values.secretEnv "FORGE_AUTH__TRUSTED_PROXY_CIDRS" }}{{ $trusted = true }}{{ end }}
+{{- range .Values.env }}
+{{- if eq (toString .name) "FORGE_AUTH__TRUSTED_PROXY_CIDRS" }}{{ $trusted = true }}{{ end }}
+{{- end }}
+{{- if and $trusted (not (and (include "forge.networkPolicyEnabled" .) .Values.networkPolicy.from)) }}
+
+WARNING: Forge believes X-Forwarded-For from every peer in
+auth.trusted_proxy_cidrs, but no NetworkPolicy restricts who reaches it: any
+pod in those ranges can claim any client address, past the login lockout and
+the anonymous-IP allowlist. List the pods that proxy to Forge (your gateway's
+data plane or ingress controller) in networkPolicy.from.
+{{- end }}
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.valkey.enabled) }}
+
+Several replicas share caches and invalidations through Valkey or Redis:
+enable valkey.enabled or set FORGE_REDIS__URL, or they converge only by TTL.
+{{- end }}
+{{- if or .Values.postgresql.enabled .Values.versitygw.enabled }}
+
+The in-cluster PostgreSQL / S3 gateway are single instances without backups,
+meant for evaluation and small installs.
+{{- end }}
+{{- $crypto := or .Values.config.crypto .Values.existingSecret }}
+{{- range $name, $_ := .Values.secretEnv }}
+{{- if hasPrefix "FORGE_CRYPTO__" $name }}{{ $crypto = true }}{{ end }}
+{{- end }}
+{{- range .Values.env }}
+{{- if hasPrefix "FORGE_CRYPTO__" (toString .name) }}{{ $crypto = true }}{{ end }}
+{{- end }}
+{{- if not $crypto }}
+
+Turn on secret encryption at rest (config.crypto.root.provider and
+FORGE_ROOT_KEY) before you configure proxy repositories or auth realms; see
+docs/deployment.md.
+{{- end }}

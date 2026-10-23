@@ -1,4 +1,6 @@
 /target
+# Format plugins build in their own workspaces (`cargo xtask plugins`).
+/plugins/*/target
 **/*.rs.bk
 Cargo.lock.orig
 .env
@@ -6,3 +8,6 @@ forge.toml
 .DS_Store
 node_modules
 .claude/
+# Kubernetes overlay secrets (copy forge.env.example to forge.env).
+deploy/kubernetes/overlays/*/forge.env
+deploy/kubernetes/.check.*

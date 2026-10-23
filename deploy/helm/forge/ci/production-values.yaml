@@ -1,0 +1,97 @@
+# CI: external PostgreSQL and S3, in-cluster Valkey, several replicas behind a
+# Gateway API HTTPRoute on the release's own ListenerSet, and most knobs set.
+host: forge.example.com
+replicaCount: 2
+config:
+  server:
+    max_staging_bytes: 8589934592
+    allowed_hosts: [forge.internal.example.com]
+  auth:
+    trusted_proxy_cidrs: [10.0.0.0/8, 192.168.0.0/16]
+    password_verify_concurrency: null
+  database:
+    max_connections: 15
+  s3:
+    endpoint: https://s3.eu-central-1.amazonaws.com
+    region: eu-central-1
+    bucket: forge
+    force_path_style: false
+  crypto:
+    root:
+      provider: env
+  oidc:
+    issuer: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0
+    client_id: 00000000-0000-0000-0000-000000000000
+    redirect_url: https://forge.example.com/auth/oidc/callback
+    scopes: [openid, profile, email]
+    admin_groups: [forge-admins]
+    required_claims:
+      "tid": ["00000000-0000-0000-0000-000000000000"]
+existingSecret: forge-credentials
+secretEnv:
+  FORGE_ROOT_KEY: check-only
+env:
+  - name: FORGE_DATABASE__URL
+    valueFrom:
+      secretKeyRef:
+        name: forge-db-app
+        key: uri
+  - name: RUST_LOG
+    value: info,forge::audit=info
+valkey:
+  enabled: true
+  extraArgs: [--maxmemory, 200mb, --maxmemory-policy, allkeys-lru]
+podDisruptionBudget:
+  enabled: true
+autoscaling:
+  enabled: true
+  targetMemoryUtilizationPercentage: 80
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+tmpVolume:
+  ephemeral:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 10Gi
+httpRoute:
+  enabled: true
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      timeouts:
+        request: 900s
+listenerSet:
+  enabled: true
+certificate:
+  enabled: true
+  issuerRef:
+    name: letsencrypt
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: gateway-system
+podAnnotations:
+  example.com/scrape: "false"
+commonLabels:
+  team: platform
+extraObjects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: '{{ include "forge.fullname" . }}-extra'
+    data:
+      host: "{{ .Values.host }}"
+  - |
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: {{ .Release.Name }}-extra-string
+    data:
+      replicas: "{{ .Values.replicaCount }}"

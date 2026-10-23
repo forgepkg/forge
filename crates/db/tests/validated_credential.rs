@@ -1,5 +1,5 @@
-//! Integration tests for the slice-12.3 `validated_credential` DAO against a
-//! real Postgres testcontainer.
+//! Integration tests for the `validated_credential` DAO against a real
+//! Postgres testcontainer.
 //!
 //! Covers the durable-cache properties the credential-forwarding design hinges
 //! on:
@@ -406,17 +406,25 @@ async fn singleflight_lease_admits_one_winner_and_fences_stale_writes() {
             .await
             .unwrap()
     );
-    assert_eq!(
-        vc::claim_state(pool, PROVIDER, &user, &hmac).await.unwrap(),
-        vc::ClaimState::Fresh(true)
+    // A fresh verdict comes with the time its row has left (300 s here).
+    let vc::ClaimState::Fresh(fresh) = vc::claim_state(pool, PROVIDER, &user, &hmac).await.unwrap()
+    else {
+        panic!("a fresh verdict landed");
+    };
+    assert!(fresh.verdict);
+    assert!(
+        fresh.remaining > std::time::Duration::from_secs(290)
+            && fresh.remaining <= std::time::Duration::from_secs(300),
+        "{:?}",
+        fresh.remaining
     );
-    assert_eq!(
-        vc::claim_singleflight(pool, PROVIDER, &user, &hmac, lease)
-            .await
-            .unwrap(),
-        vc::Claim::Verdict(true),
-        "a fresh verdict is returned instead of a new lease"
-    );
+    let vc::Claim::Verdict(fresh) = vc::claim_singleflight(pool, PROVIDER, &user, &hmac, lease)
+        .await
+        .unwrap()
+    else {
+        panic!("a fresh verdict is returned instead of a new lease");
+    };
+    assert!(fresh.verdict);
     assert_eq!(
         vc::list_auth_successes(pool, &user).await.unwrap().len(),
         1,

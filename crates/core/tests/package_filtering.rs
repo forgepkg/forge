@@ -36,6 +36,7 @@ impl RepoReadOps for FixtureReads {
         _version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
         Ok(Some(NupkgLocation {
+            blob_sha256: "blob".to_string(),
             blob_s3_key: "blob".to_string(),
             size: 4,
             content_type: "application/octet-stream".to_string(),
@@ -59,8 +60,11 @@ impl RepoReadOps for FixtureReads {
         Ok(vec![RegistrationEntry {
             original_id: id.to_string(),
             version: "1.0.0".to_string(),
+            version_original: "1.0.0".to_string(),
             listed: true,
             package_hash_sha512_base64: None,
+            package_sha256: None,
+            package_size: None,
             nuspec_bytes: None,
             manifest_summary: None,
             published: None,
@@ -156,6 +160,8 @@ async fn search_filters_before_paging_and_total_count() {
                 skip: 1,
                 take: 1,
                 prerelease: false,
+                include_semver2: true,
+                include_upstream: true,
             },
         )
         .await

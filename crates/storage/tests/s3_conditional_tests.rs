@@ -1,7 +1,6 @@
 //! Conditional-write (`If-None-Match: *`) behavior of `BlobStore::put_if_absent`
-//! against a scripted fake S3 — covers both code paths from the design spec
-//! (§3.7: "a fake S3 returning 412 vs. not") without Docker, unlike
-//! `s3_tests.rs` which needs a live versitygw.
+//! against a scripted fake S3 — covers both code paths (a fake S3 returning 412
+//! vs. not) without Docker, unlike `s3_tests.rs` which needs a live versitygw.
 //!
 //! The fake is a minimal HTTP/1.1 responder: it records every request (method +
 //! whether `If-None-Match` was sent), answers from a per-test script keyed on
@@ -10,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use forge_storage::{BlobStore, ConditionalWrites, S3Config};
+use forge_storage::{BlobStore, ConditionalWrites, S3Config, S3Credentials};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -156,8 +155,7 @@ fn store(endpoint: &str, mode: ConditionalWrites) -> BlobStore {
         endpoint: endpoint.to_string(),
         region: "us-east-1".into(),
         bucket: "forge-test".into(),
-        access_key: "test".into(),
-        secret_key: "test".into(),
+        credentials: S3Credentials::from_keys("test", "test"),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: mode,

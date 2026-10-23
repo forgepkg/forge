@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE nexus_import SET password = $2, password_enc = NULL WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1783f850e48f02f234fc9261b69b95b0f29f304d7e45fba75d5ec20b5d6a00c1"
+}

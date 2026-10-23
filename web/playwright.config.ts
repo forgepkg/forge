@@ -3,12 +3,12 @@ import { defineConfig, devices } from '@playwright/test'
 import { BASE_URL } from './e2e/harness'
 
 /**
- * Playwright config for the envisia-forge SPA e2e suite.
+ * Playwright config for the Forge SPA e2e suite.
  *
  * The suite drives a **real `forge-server`** serving the **built** SPA against
- * the slice-1 infra (Postgres + versitygw), brought up in globalSetup. The
- * browser therefore exercises the production single-origin model: relative API
- * URLs, no Node proxy, no CORS.
+ * its infra (Postgres + versitygw), brought up in globalSetup. The browser
+ * therefore exercises the production single-origin model: relative API URLs,
+ * no Node proxy, no CORS.
  *
  * Requirements to run locally / in CI:
  *   - Docker (for Postgres + versitygw containers)

@@ -3,21 +3,29 @@ import { httpClient } from '~/lib/httpClient'
 /**
  * Admin repository CRUD + group-membership API.
  *
- * Types mirror the **real** Rust DTOs (reconciled against slice 1, not the
- * forward-looking plan):
+ * Types mirror the **real** Rust DTOs:
  *
  *  - `RepoView` (`crates/server/src/admin/repositories.rs`) is the password-free
  *    response shape. `upstream_password` is **never** returned; the boolean
  *    `has_upstream_password` reports whether one is stored, so the edit form can
  *    show a "set new password" affordance without ever populating the value.
  *  - `GET /admin/repositories` returns a **bare array** of `RepoView` (no
- *    `{ total, items }` envelope — slice-1 admin list is unpaginated).
+ *    `{ total, items }` envelope — the admin list is unpaginated).
  *  - `CreateRepo` / `UpdateRepo` are the request bodies. On update an absent
  *    field keeps the stored value; the nullable proxy fields (credentials,
  *    TTLs) are cleared by an explicit `null`. `kind` / `format` are not
  *    updatable.
- *  - `MemberView` / `AddMember` (`crates/server/src/admin/members.rs`) drive the
- *    group editor; `priority` is unique within a group (a duplicate → 409).
+ *  - Docker repositories (`format: "docker"`, served at `/v2/`) carry their
+ *    own options — `host`, `immutable_tags`, `latest_mutable`,
+ *    `writable_member` — which the server refuses on a NuGet repository (and
+ *    `package_delay_seconds` / `allow_redeploy` on a docker one). Raw
+ *    repositories (`format: "raw"`, served at `/raw/`) likewise —
+ *    `deployment_policy`, `content_disposition`, `max_age_seconds`. Both
+ *    bodies reject unknown fields.
+ *  - `MemberView` / `AddMember` / `UpdateMember`
+ *    (`crates/server/src/admin/members.rs`) drive the group editor; `priority`
+ *    is unique within a group (a duplicate → 409). A member may itself be a
+ *    group; an add that would create a cycle or nest too deep → 409.
  *
  * All endpoints are admin-gated by the server; the UI only reaches them after
  * the `_app/admin` route guard confirms `is_admin`.
@@ -57,14 +65,44 @@ export interface RepoView {
   /**
    * Group: package id prefixes (lowercase, e.g. `acme.`) never served from a
    * proxy member, even before a hosted member has the id. Empty otherwise.
+   * A docker group's prefixes may name namespaces (`acme/`).
    */
   reserved_prefixes: string[]
+  /**
+   * Docker: a DNS name (e.g. `docker.example.com`) the repository also
+   * answers on at the root (`<host>/<image>`). `null` when unset / NuGet.
+   */
+  host: string | null
+  /** Hosted docker: a pushed tag may not be moved to another manifest. */
+  immutable_tags: boolean
+  /** Hosted docker with `immutable_tags`: `latest` may still be moved. */
+  latest_mutable: boolean
+  /** Docker group: the hosted member a push to the group goes to. */
+  writable_member: string | null
+  /**
+   * Hosted: the largest push it accepts in bytes (docker: the largest blob);
+   * `null` for its format's default (`FormatView.default_max_upload_bytes`).
+   */
+  max_upload_bytes: number | null
+  /** Hosted raw: what an upload to an existing path does. `null` otherwise. */
+  deployment_policy?: DeploymentPolicy | null
+  /** Raw: files download (`attachment`) or display (`inline`). */
+  content_disposition?: 'attachment' | 'inline' | null
+  /**
+   * Raw proxy: seconds a cached file is served before the upstream is asked
+   * whether it changed (`0`: never). `null` otherwise.
+   */
+  max_age_seconds?: number | null
 }
+
+/** A hosted raw repository's deployment policy, as Nexus'. */
+export type DeploymentPolicy = 'allow_redeploy' | 'disable_redeploy' | 'read_only'
 
 /** `POST /admin/repositories` request body (`CreateRepo`). */
 export interface CreateRepo {
   name: string
   kind: RepoKind
+  /** A format id of `GET /admin/formats`; defaults to `nuget` server-side. */
   format?: string
   anonymous_read?: boolean
   online?: boolean
@@ -80,6 +118,24 @@ export interface CreateRepo {
   // Group fields:
   prefer_hosted?: boolean
   reserved_prefixes?: string[]
+  // Docker fields (refused for NuGet repositories):
+  /** Any docker kind: a DNS name the repository answers on by itself. */
+  host?: string
+  /** Hosted docker only. */
+  immutable_tags?: boolean
+  /** Hosted docker only (meaningful with `immutable_tags`). */
+  latest_mutable?: boolean
+  /** Docker group only: name of a hosted docker repository pushes go to. */
+  writable_member?: string
+  /** Hosted only: the largest push it accepts, in bytes. Absent: the default. */
+  max_upload_bytes?: number
+  // Raw fields (refused for other formats):
+  /** Hosted raw only. Absent: `disable_redeploy`. */
+  deployment_policy?: DeploymentPolicy
+  /** Raw only. Absent: `attachment`. */
+  content_disposition?: 'attachment' | 'inline'
+  /** Raw proxy only. Absent: a day. */
+  max_age_seconds?: number
 }
 
 /**
@@ -89,7 +145,9 @@ export interface CreateRepo {
  * absent = keep, `null` = clear (a TTL reverts to the server default), a value
  * = set. Changing `remote_url` to a different origin without a new
  * `upstream_password` makes the server drop the stored credentials. `kind` /
- * `format` are identity columns and are not updatable.
+ * `format` are identity columns and are not updatable. The docker options
+ * follow the same rules (`host` / `writable_member`: `null` clears) and are a
+ * 400 on a NuGet repository.
  */
 export interface UpdateRepo {
   name?: string
@@ -105,6 +163,68 @@ export interface UpdateRepo {
   prefer_hosted?: boolean
   /** Replaces the whole list; `[]` clears it. */
   reserved_prefixes?: string[]
+  /** Docker only; `null` clears it. */
+  host?: string | null
+  /** Hosted docker only. */
+  immutable_tags?: boolean
+  /** Hosted docker only. */
+  latest_mutable?: boolean
+  /** Docker group only; `null` clears it (pushes to the group are refused). */
+  writable_member?: string | null
+  /** Hosted only; `null` clears it (the format's default applies). */
+  max_upload_bytes?: number | null
+  /** Hosted raw only. */
+  deployment_policy?: DeploymentPolicy
+  /** Raw only. */
+  content_disposition?: 'attachment' | 'inline'
+  /** Raw proxy only; `null` clears it (a day). */
+  max_age_seconds?: number | null
+}
+
+/**
+ * An installed package format (`FormatView` of `GET /admin/formats`): the
+ * built-in format plugins (NuGet, Helm) and every loaded WebAssembly plugin.
+ */
+export interface FormatView {
+  /** The format id (`RepoView.format`). */
+  id: string
+  /** Display name. */
+  name: string
+  /** Built into the server rather than a WebAssembly plugin. */
+  builtin: boolean
+  /** The repository kinds it supports (proxy only with a host-side upstream, e.g. NuGet). */
+  kinds: RepoKind[]
+  /** Where its repositories are served: `{mount}/{repository}`. */
+  mount: string
+  /** Plugin version. */
+  version?: string
+  /** Plugin description. */
+  description?: string
+  /** SHA-256 of a WebAssembly plugin's component. */
+  sha256?: string
+  /** The upload limit of its hosted repositories without one of their own. */
+  default_max_upload_bytes?: number
+  /** The largest upload limit a repository may be given; `null`: unbounded. */
+  max_upload_bytes_limit?: number | null
+}
+
+/**
+ * `POST /admin/repositories/{name}/proxy-cache/invalidate` request body
+ * (`InvalidateBody`): without `package`, the whole proxy's cache.
+ */
+export interface InvalidateProxyCache {
+  /** A package id (a docker proxy: an image name, e.g. `library/nginx`). */
+  package?: string
+}
+
+/** What a proxy cache invalidation removed (`Invalidated`). */
+export interface ProxyCacheInvalidated {
+  /** Remembered upstream "not found" answers removed (NuGet, Helm). */
+  not_found_cleared: number
+  /** Cached tags due for re-validation against the upstream (docker). */
+  tags_expired: number
+  /** Cached files due for re-validation against the upstream (raw). */
+  files_expired?: number
 }
 
 /** A group member view (`MemberView`). */
@@ -115,7 +235,9 @@ export interface MemberView {
   /**
    * Owns the group's package ids: once any member is an owner, only owners
    * hide proxy versions (`prefer_hosted`) and serve reserved prefixes. Set
-   * through the admin API; an owner must be unflagged before removal.
+   * with `PATCH .../members/{member}` (the members screen's owner toggle); a
+   * proxy cannot be an owner (400), and an owner must be unflagged before
+   * it can be removed (409).
    */
   owner: boolean
 }
@@ -124,6 +246,11 @@ export interface MemberView {
 export interface AddMember {
   member: string
   priority: number
+}
+
+/** `PATCH /admin/repositories/{name}/members/{member}` body (`UpdateMember`). */
+export interface UpdateMember {
+  owner: boolean
 }
 
 /**
@@ -135,6 +262,16 @@ export const repoKeys = {
   list: () => ['repositories', 'list'] as const,
   detail: (name: string) => ['repositories', 'detail', name] as const,
   members: (name: string) => ['repositories', 'members', name] as const,
+}
+
+/** Query key of the installed formats. */
+export const formatKeys = {
+  list: () => ['formats'] as const,
+}
+
+/** `GET /admin/formats` — the formats repositories can be created with. */
+export function fetchFormats(signal?: AbortSignal): Promise<FormatView[]> {
+  return httpClient.get<FormatView[]>('/admin/formats', { signal })
 }
 
 /** `GET /admin/repositories` — bare array of all repositories. */
@@ -176,6 +313,22 @@ export function deleteRepository(name: string): Promise<void> {
   )
 }
 
+/**
+ * `POST /admin/repositories/{name}/proxy-cache/invalidate` — make a proxy ask
+ * its upstream again: forgets its "not found" answers (of one package, or of
+ * all), its cached listings and documents, and re-validates docker tags.
+ * Downloaded packages stay cached.
+ */
+export function invalidateProxyCache(
+  name: string,
+  body: InvalidateProxyCache,
+): Promise<ProxyCacheInvalidated> {
+  return httpClient.post<ProxyCacheInvalidated>(
+    `/admin/repositories/${encodeURIComponent(name)}/proxy-cache/invalidate`,
+    body,
+  )
+}
+
 /** `GET /admin/repositories/{name}/members` — a group's ordered members. */
 export function fetchMembers(
   name: string,
@@ -199,5 +352,17 @@ export function addMember(name: string, body: AddMember): Promise<void> {
 export function removeMember(name: string, member: string): Promise<void> {
   return httpClient.delete<void>(
     `/admin/repositories/${encodeURIComponent(name)}/members/${encodeURIComponent(member)}`,
+  )
+}
+
+/** `PATCH /admin/repositories/{name}/members/{member}` — set `owner` (204). */
+export function updateMember(
+  name: string,
+  member: string,
+  body: UpdateMember,
+): Promise<void> {
+  return httpClient.patch<void>(
+    `/admin/repositories/${encodeURIComponent(name)}/members/${encodeURIComponent(member)}`,
+    body,
   )
 }

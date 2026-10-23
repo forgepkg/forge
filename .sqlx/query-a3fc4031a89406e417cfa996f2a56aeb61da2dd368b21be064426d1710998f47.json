@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE proxy_cached_version p\n        SET last_downloaded_at = now()\n        FROM UNNEST($1::bigint[], $2::text[], $3::text[]) AS d(repository_id, name, version)\n        WHERE p.repository_id = d.repository_id\n          AND p.name = d.name\n          AND p.version = d.version\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a3fc4031a89406e417cfa996f2a56aeb61da2dd368b21be064426d1710998f47"
+}

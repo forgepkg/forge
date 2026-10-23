@@ -1,0 +1,9 @@
+# A Valkey for Forge's shared L2 cache and invalidation backplane (cache
+# only, nothing on disk). Enabled with `valkey.enabled` in the forge chart,
+# which then sets FORGE_REDIS__URL; off by default.
+apiVersion: v2
+name: valkey
+description: Password-protected, cache-only Valkey for Forge
+type: application
+version: 1.0.0
+appVersion: "9.1"

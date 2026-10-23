@@ -1,6 +1,7 @@
 //! E2E: admin API gating, bootstrap admin, repository/user/token/member CRUD,
-//! password redaction, SSRF rejection, nested-group + duplicate-priority
-//! rejection (plan 10.4). Requires Docker (Postgres + versitygw).
+//! password redaction, the scheme-only `remote_url` guard, and group-member
+//! validation (nested groups accepted, cycles and duplicate priorities
+//! rejected). Requires Docker (Postgres + versitygw).
 
 mod common;
 
@@ -44,25 +45,17 @@ async fn bootstrap_admin_and_gating() {
 #[tokio::test]
 async fn non_admin_forbidden() {
     let srv = common::start().await;
-    let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let suffix = common::unique();
-    let username = format!("plain{suffix}");
+    let username = format!("plain{suffix}@example.com");
 
-    // Admin creates a non-admin user.
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    // Admin creates a non-admin user, who chooses a password.
+    srv.create_user(&username, "pw123456-plain", "reader").await;
 
     // That user authenticates (password basic) but is forbidden from admin.
     let resp = client
         .get(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-plain"))
         .send()
         .await
         .unwrap();
@@ -185,24 +178,29 @@ async fn usernames_are_canonical() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let lower = format!("carol{}", common::unique());
+    let lower = format!("carol{}@example.com", common::unique());
     let typed = format!("  {} ", lower.to_uppercase());
 
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": typed, "password": "pw123456", "is_admin": false}))
+        .json(&json!({"username": typed}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
     let created: Value = resp.json().await.unwrap();
     assert_eq!(created["username"], json!(lower), "stored canonical");
+    let link = created["invitation"]["link"].as_str().unwrap();
+    let resp = srv
+        .accept_invitation(link.split_once('#').unwrap().1, "pw123456-carol")
+        .await;
+    assert_eq!(resp.status(), 200);
 
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": lower, "password": "other-pw", "is_admin": false}))
+        .json(&json!({"username": lower}))
         .send()
         .await
         .unwrap();
@@ -213,9 +211,7 @@ async fn usernames_are_canonical() {
             .post(format!("{}/admin/users", srv.base_url))
             .basic_auth(&au, Some(&ap))
             .header("content-type", "application/json")
-            .body(format!(
-                r#"{{"username": "{bad}", "password": "pw123456"}}"#
-            ))
+            .body(format!(r#"{{"username": "{bad}"}}"#))
             .send()
             .await
             .unwrap();
@@ -225,7 +221,7 @@ async fn usernames_are_canonical() {
     for spelling in [lower.to_uppercase(), format!(" {lower}")] {
         let resp = client
             .post(format!("{}/auth/login", srv.base_url))
-            .json(&json!({"username": spelling, "password": "pw123456"}))
+            .json(&json!({"username": spelling, "password": "pw123456-carol"}))
             .send()
             .await
             .unwrap();
@@ -239,29 +235,90 @@ async fn usernames_are_canonical() {
     }
 }
 
-/// `POST /admin/users/{id}/reauth` (slice 12.3): admin-only, 204 on a known
-/// user (idempotent even with no cached verdicts), 404 for an unknown id, 403
-/// for a non-admin caller.
+/// Review 2026-10-20 M2: a local account signs in with a password, and no
+/// password login accepts a name containing `:` (HTTP Basic splits at the
+/// first colon), so such an account is refused at creation.
+#[tokio::test]
+async fn usernames_with_a_colon_are_refused() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+
+    for bad in [
+        format!("mallory{s}:abc"),
+        format!(":dave{s}"),
+        format!("erin{s}:"),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"username": bad}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{bad:?}");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "invalid username: username must not contain ':'"
+        );
+        let stored = forge_db::user_dao::find_user_by_username(&srv.pool, &bad)
+            .await
+            .unwrap();
+        assert!(stored.is_none(), "{bad:?} was not created");
+    }
+}
+
+/// #317: every account is named by a UPN (`POST /admin/users` answers 400
+/// otherwise).
+#[tokio::test]
+async fn new_accounts_need_a_upn() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+
+    for bad in [
+        format!("dave{s}"),
+        format!("dave{s}@corp"),
+        format!("dave{s}@corp.example."),
+        format!("dave{s}@corp@example.com"),
+        format!("@corp{s}.example"),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"username": bad}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{bad:?}");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "invalid username: username must be a UPN such as alice@example.com"
+        );
+        assert!(forge_db::user_dao::find_user_by_username(&srv.pool, &bad)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+/// `POST /admin/users/{id}/reauth`: admin-only, 204 on a known user
+/// (idempotent even with no cached verdicts), 404 for an unknown id, 403 for a
+/// non-admin caller.
 #[tokio::test]
 async fn reauth_endpoint_admin_only_and_idempotent() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let suffix = common::unique();
-    let username = format!("reauth{suffix}");
+    let username = format!("reauth{suffix}@example.com");
 
     // Admin creates a non-admin user and discovers its id.
-    let created: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let user_id = created["id"].as_i64().expect("user id");
+    let user_id = srv
+        .create_user(&username, "pw123456-reauth", "reader")
+        .await;
 
     // Admin reauth → 204 (no cached verdicts, but still succeeds idempotently).
     let resp = client
@@ -284,7 +341,7 @@ async fn reauth_endpoint_admin_only_and_idempotent() {
     // Non-admin caller → 403 (gated by require_admin).
     let resp = client
         .post(format!("{}/admin/users/{user_id}/reauth", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-reauth"))
         .send()
         .await
         .unwrap();
@@ -332,9 +389,9 @@ async fn proxy_password_is_write_only_and_redacted() {
     assert_eq!(body["has_upstream_password"], json!(true));
 }
 
-/// 12.7 §3.6: a proxy `remote_url` is only scheme-checked — a non-http(s)
-/// scheme is rejected (400), while a private/loopback address is accepted
-/// (the slice-1 SSRF range guard is gone; upstream config is admin-only).
+/// A proxy `remote_url` is only scheme-checked — a non-http(s) scheme is
+/// rejected (400), while a private/loopback address is accepted (upstream
+/// config is admin-only).
 #[tokio::test]
 async fn remote_url_scheme_guarded_private_accepted() {
     let srv = common::start().await;
@@ -515,9 +572,8 @@ async fn unscoped_admin_token_cannot_use_admin_api() {
             .post(format!("{}/admin/users", srv.base_url))
             .header("X-NuGet-ApiKey", &token)
             .json(&json!({
-                "username": format!("evil{}", common::unique()),
-                "password": "pw123456",
-                "is_admin": true
+                "username": format!("evil{}@example.com", common::unique()),
+                "role": "admin"
             }))
             .send()
             .await
@@ -595,9 +651,7 @@ async fn admin_scoped_token_can_use_admin_api() {
         .post(format!("{}/admin/users", srv.base_url))
         .header("X-NuGet-ApiKey", &token)
         .json(&json!({
-            "username": format!("automated{}", common::unique()),
-            "password": "pw123456",
-            "is_admin": false
+            "username": format!("automated{}@example.com", common::unique())
         }))
         .send()
         .await
@@ -724,6 +778,60 @@ async fn token_scope_is_listed_and_unknown_keys_rejected() {
         Some(json!({"actions": ["read"]})),
         "scope unchanged"
     );
+}
+
+/// L5: `PATCH /admin/tokens/{id}/scope` needs the `scope` key. `{}` (what
+/// `JSON.stringify({scope: undefined})` sends) is refused with 400 instead of
+/// clearing the scope, which would widen the token to its owner's full reach;
+/// only an explicit `"scope": null` clears it.
+#[tokio::test]
+async fn token_scope_patch_clears_only_on_explicit_null() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let id = admin_id(&srv).await;
+
+    let created: Value = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(
+            &json!({"name": format!("narrow{}", common::unique()), "scope": {"actions": ["read"]}}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token_id = created["id"].as_i64().unwrap();
+    let patch = |body: Value| {
+        client
+            .patch(format!("{}/admin/tokens/{token_id}/scope", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    let stored = || async {
+        forge_db::token_dao::find_token_by_id(&srv.pool, token_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .scope
+    };
+
+    let resp = patch(json!({})).await.unwrap();
+    assert_eq!(resp.status(), 400, "an empty body must not clear the scope");
+    assert_eq!(stored().await, Some(json!({"actions": ["read"]})));
+
+    let resp = patch(json!({"scope": {"actions": ["read", "write"]}}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(stored().await, Some(json!({"actions": ["read", "write"]})));
+
+    let resp = patch(json!({"scope": null})).await.unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(stored().await, None, "an explicit null clears the scope");
 }
 
 /// Deleting a **proxy** repository that has cached packages must decrement the
@@ -875,9 +983,9 @@ async fn delete_hosted_repo_with_packages_refused() {
         .is_some());
 }
 
-/// Group membership (§12.4 Phase 4): a hosted member and a **nested group**
-/// member are accepted; an edge that would create a cycle is rejected with 409;
-/// duplicate priorities are rejected with 409.
+/// Group membership: a hosted member and a **nested group** member are
+/// accepted; an edge that would create a cycle is rejected with 409; duplicate
+/// priorities are rejected with 409.
 #[tokio::test]
 async fn group_member_validation() {
     let srv = common::start().await;
@@ -930,7 +1038,7 @@ async fn group_member_validation() {
 
     // Hosted member at priority 10 → created.
     assert_eq!(add(group.clone(), hosted.clone(), 10).await, 201);
-    // Nested group member is now ALLOWED (§12.4): group2 nested under group.
+    // A nested group member is ALLOWED: group2 nested under group.
     assert_eq!(
         add(group.clone(), group2.clone(), 20).await,
         201,
@@ -1096,10 +1204,13 @@ async fn group_member_owner_flag() {
     assert_eq!(remove.status(), 204);
 }
 
-// ── §12.5: secret encryption at rest ────────────────────────────────────────
+// ── secret encryption at rest ───────────────────────────────────────────────
 
 /// Serializes the crypto-enabled tests of this binary: they share the
-/// cluster-wide rotation advisory lock (and the `default` key scope).
+/// cluster-wide rotation advisory lock (and the `default` key scope). Each
+/// runs on a database of its own (`common::fresh_pool`): a server with
+/// `[crypto]` seals install-wide secrets, such as the registry token key,
+/// that a server without it refuses to open or replace.
 static CRYPTO_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Root-key env var for the crypto-enabled server below. One fixed key for the
@@ -1125,9 +1236,9 @@ async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
         "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
          [crypto.rotation]\nenabled = false\n"
     );
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin, "adminpw".into())),
             crypto_block: Some(crypto_block),
@@ -1282,9 +1393,9 @@ async fn crypto_rotation_is_serialized_with_the_rotation_worker() {
         "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
          [crypto.rotation]\nenabled = false\n"
     );
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin, "adminpw".into())),
             crypto_block: Some(crypto_block),
@@ -1350,8 +1461,139 @@ async fn crypto_rotation_is_serialized_with_the_rotation_worker() {
     assert_eq!(resp.status(), 200, "the admin rotation released the lock");
 }
 
+/// The generated registry token key survives DEK rotation (#196): rotation
+/// re-seals it, and its DEK stays until then. An instance that starts after
+/// the old DEK is revoked loads the same key, so it accepts the tokens the
+/// running instances sign, instead of generating a key of its own.
+#[tokio::test]
+async fn registry_token_key_survives_dek_rotation() {
+    let _serial = CRYPTO_SERIAL.lock().await;
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let admin = format!("admin{}@example.com", common::unique());
+    // A database of its own: the key and the DEKs are install-wide.
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((admin, "adminpw".into())),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let stored = || async {
+        forge_db::authz_dao::get_setting(&srv.pool, forge_server::registry::TOKEN_KEY_SETTING)
+            .await
+            .unwrap()
+            .expect("the generated key is stored")
+    };
+    let before = stored().await;
+    assert!(before.starts_with("sealed:"), "{before}");
+
+    let resp = client
+        .post(format!("{}/admin/crypto/rotate/dek", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let rot: Value = resp.json().await.unwrap();
+    assert!(rot["revoked_deks"].as_u64().unwrap() >= 1, "{rot}");
+    let after = stored().await;
+    assert_ne!(after, before, "re-sealed under the new DEK");
+
+    let restarted = forge_server::registry::load_token_keys(
+        &srv.state.config,
+        &srv.pool,
+        srv.state.envelope.as_deref(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored().await, after, "not replaced");
+    let now = chrono::Utc::now().timestamp();
+    let claims = forge_oci::token::Claims {
+        iss: forge_oci::token::issuer("https://forge.example.com"),
+        aud: "forge.example.com".into(),
+        sub: "anonymous".into(),
+        iat: now,
+        nbf: now,
+        exp: now + 300,
+        jti: "j".into(),
+        access: Vec::new(),
+        fp: forge_oci::token::TokenPrincipal::Anonymous,
+    };
+    let token = forge_oci::token::issue(&srv.state.registry_keys, &claims).unwrap();
+    assert!(
+        forge_oci::token::verify(&restarted, &token, &claims.iss, &claims.aud).is_some(),
+        "a restarted instance accepts the running instance's tokens"
+    );
+}
+
+/// The OIDC issuer keys are sealed like every other secret and survive DEK
+/// rotation: rotation re-seals them, and an instance that starts afterwards
+/// publishes and signs with the same keys instead of generating its own.
+#[tokio::test]
+async fn oidc_issuer_keys_are_sealed_and_survive_dek_rotation() {
+    let _serial = CRYPTO_SERIAL.lock().await;
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let admin = format!("admin{}@example.com", common::unique());
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((admin, "adminpw".into())),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let kids = |keys: &forge_core::oidc::IssuerKeySet| {
+        keys.keys()
+            .iter()
+            .map(|k| k.kid().to_string())
+            .collect::<Vec<_>>()
+    };
+    let created = srv.state.assertion_issuer.ensure().await.unwrap();
+    let stored = || async {
+        forge_db::authz_dao::get_setting(&srv.pool, forge_server::auth::ISSUER_KEYS_SETTING)
+            .await
+            .unwrap()
+            .expect("the issuer keys are stored")
+    };
+    let before = stored().await;
+    assert!(before.starts_with("sealed:"), "{before}");
+
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/crypto/rotate/dek", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let after = stored().await;
+    assert_ne!(after, before, "re-sealed under the new DEK");
+
+    let restarted = forge_server::auth::AssertionIssuer::new(
+        srv.pool.clone(),
+        srv.state.envelope.clone(),
+        srv.state.config.public_base_url(),
+    );
+    assert_eq!(kids(&restarted.ensure().await.unwrap()), kids(&created));
+    assert_eq!(stored().await, after, "not replaced");
+}
+
 /// Without `[crypto]`, rotation is a 409 and `/admin/crypto/keys` reports
-/// disabled (slice-1 plaintext behavior stays untouched).
+/// disabled.
 #[tokio::test]
 async fn crypto_disabled_reports_and_rejects() {
     let srv = common::start().await;
@@ -1384,19 +1626,8 @@ async fn create_and_login(
     username: &str,
     password: &str,
 ) -> (i64, String, String) {
-    let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let created: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": password, "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let user_id = created["id"].as_i64().expect("user id");
+    let user_id = srv.create_user(username, password, "reader").await;
     let resp = client
         .post(format!("{}/auth/login", srv.base_url))
         .json(&json!({"username": username, "password": password}))
@@ -1429,8 +1660,8 @@ async fn deactivate_cuts_off_sessions_tokens_and_passwords() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let username = format!("deact{}", common::unique());
-    let password = "pw123456";
+    let username = format!("deact{}@example.com", common::unique());
+    let password = "pw123456-login";
     let (user_id, cookie, csrf) = create_and_login(&srv, &username, password).await;
 
     // The user mints a token from its session.
@@ -1552,13 +1783,174 @@ async fn deactivate_cuts_off_sessions_tokens_and_passwords() {
     assert_eq!(resp.status(), 401, "a revoked session stays revoked");
 }
 
+/// `(active, holds the built-in admin role)` of a user.
+async fn admin_state(pool: &sqlx::PgPool, id: i64) -> (bool, bool) {
+    sqlx::query_as(
+        "SELECT u.active, EXISTS (
+             SELECT 1 FROM user_role ur JOIN role r ON r.id = ur.role_id
+             WHERE ur.user_id = u.id AND r.name = 'admin')
+         FROM app_user u WHERE u.id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Create an active admin through the API, returning its id.
+async fn create_admin(srv: &common::TestServer, username: &str, password: &str) -> i64 {
+    srv.create_user(username, password, "admin").await
+}
+
+/// L4: nothing takes admin away from the last active administrator, not
+/// deactivating or deleting the account and not unassigning its `admin`
+/// role, since getting an administrator back would take SQL (a deleted
+/// bootstrap admin is never re-created). Each path answers 409 and changes
+/// nothing. An inactive admin does not count.
+#[tokio::test]
+async fn the_last_active_admin_cannot_lose_admin() {
+    // Its own database: the shared one holds every other test's admins.
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let boot = admin_id(&srv).await;
+    let admin_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "admin")
+        .await
+        .unwrap()
+        .unwrap();
+    let req = |method: reqwest::Method, path: &str, body: &Option<Value>| {
+        let rb = client.request(method, format!("{}{path}", srv.base_url));
+        match body {
+            Some(body) => rb.json(body),
+            None => rb,
+        }
+    };
+    let removals = |id: i64| {
+        [
+            (
+                reqwest::Method::PATCH,
+                format!("/admin/users/{id}"),
+                Some(json!({"active": false})),
+            ),
+            (
+                reqwest::Method::DELETE,
+                format!("/admin/users/{id}/roles/{admin_role}"),
+                None,
+            ),
+            (reqwest::Method::DELETE, format!("/admin/users/{id}"), None),
+        ]
+    };
+
+    // The bootstrap admin removes itself.
+    let dormant = create_admin(&srv, "dormant@example.com", "pw-dormant-admin").await;
+    forge_db::user_dao::set_active(&srv.pool, dormant, false)
+        .await
+        .unwrap();
+    for (method, path, body) in removals(boot) {
+        let resp = req(method, &path, &body)
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "{path}");
+    }
+    assert_eq!(admin_state(&srv.pool, boot).await, (true, true));
+
+    // With a second admin, the bootstrap admin may step down, and the second
+    // one is then the last.
+    let second = create_admin(&srv, "second@example.com", "pw-second-admin").await;
+    let resp = req(
+        reqwest::Method::DELETE,
+        &format!("/admin/users/{boot}/roles/{admin_role}"),
+        &None,
+    )
+    .basic_auth(&u, Some(&p))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 204, "another active admin remains");
+
+    let session = srv.login("second@example.com", "pw-second-admin").await;
+    for (method, path, body) in removals(second) {
+        let resp = session
+            .apply(req(method, &path, &body))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "{path}");
+    }
+    assert_eq!(admin_state(&srv.pool, second).await, (true, true));
+    let resp = session
+        .apply(req(
+            reqwest::Method::DELETE,
+            &format!("/admin/users/{boot}"),
+            &None,
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204, "a former admin can be deleted");
+}
+
+/// L4: the last-admin guard is race-safe. Two admins deactivated at once
+/// would each still see the other as an admin; the guard runs them one at a
+/// time on the built-in `admin` role row, so the second is refused (409) and
+/// one active admin remains.
+#[tokio::test]
+async fn concurrent_admin_deactivations_leave_one_admin() {
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (u, p) = srv.admin_basic();
+    let boot = admin_id(&srv).await;
+    let second = create_admin(&srv, "second@example.com", "pw-second-admin").await;
+
+    // Hold the role row so both requests park inside the guard.
+    let mut holder = srv.pool.begin().await.unwrap();
+    let pid = backend_pid(&mut holder).await;
+    sqlx::query("SELECT 1 FROM role WHERE name = 'admin' FOR NO KEY UPDATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let deactivate = |id: i64| {
+        let (client, url, u, p) = (
+            srv.client(),
+            format!("{}/admin/users/{id}", srv.base_url),
+            u.clone(),
+            p.clone(),
+        );
+        tokio::spawn(async move {
+            client
+                .patch(url)
+                .basic_auth(u, Some(p))
+                .json(&json!({"active": false}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        })
+    };
+    let (a, b) = (deactivate(boot), deactivate(second));
+    wait_blocked_behind(&srv.pool, pid, 2).await;
+    holder.commit().await.unwrap();
+
+    let mut statuses = vec![a.await.unwrap(), b.await.unwrap()];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 409]);
+    let (boot_active, ..) = admin_state(&srv.pool, boot).await;
+    let (second_active, ..) = admin_state(&srv.pool, second).await;
+    assert!(
+        boot_active != second_active,
+        "exactly one admin stays active"
+    );
+}
+
 /// `POST /auth/tokens` mints unscoped tokens only: a `scope` in the body is
 /// refused, never dropped (which would hand back an unscoped token).
 #[tokio::test]
 async fn auth_tokens_refuses_a_scope_it_would_drop() {
     let srv = common::start().await;
-    let username = format!("scoped{}", common::unique());
-    let (_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456").await;
+    let username = format!("scoped{}@example.com", common::unique());
+    let (_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456-login").await;
     let resp = srv
         .client()
         .post(format!("{}/auth/tokens", srv.base_url))
@@ -1580,8 +1972,8 @@ async fn auth_tokens_refuses_a_scope_it_would_drop() {
 async fn auth_tokens_refuse_inactive_user_with_live_session() {
     let srv = common::start().await;
     let client = srv.client();
-    let username = format!("inact{}", common::unique());
-    let (user_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456").await;
+    let username = format!("inact{}@example.com", common::unique());
+    let (user_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456-login").await;
 
     let resp = client
         .post(format!("{}/auth/tokens", srv.base_url))
@@ -1648,8 +2040,8 @@ async fn reauth_revokes_sessions() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let username = format!("reauthsess{}", common::unique());
-    let (user_id, cookie, _csrf) = create_and_login(&srv, &username, "pw123456").await;
+    let username = format!("reauthsess{}@example.com", common::unique());
+    let (user_id, cookie, _csrf) = create_and_login(&srv, &username, "pw123456-login").await;
 
     let me = || {
         client
@@ -1748,6 +2140,86 @@ async fn put_repo(srv: &common::TestServer, name: &str, body: Value) -> reqwest:
         .send()
         .await
         .unwrap()
+}
+
+/// #65: changing a proxy's `remote_url` forgets what it learned from the
+/// previous upstream: versions never downloaded (and the not-found markers)
+/// are dropped, downloaded ones lose their not-found and missing flags. An
+/// update that keeps the URL leaves the rows alone.
+#[tokio::test]
+async fn repointing_a_proxy_resets_its_cached_version_rows() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let name = format!("repoint{}", common::unique());
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": name, "kind": "proxy",
+                      "remote_url": "https://feed-a.example/v3/index.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let seed = || async {
+        sqlx::query("DELETE FROM proxy_cached_version WHERE repository_id = $1")
+            .bind(id)
+            .execute(&srv.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO proxy_cached_version \
+                 (repository_id, name, version, listed, downloaded, not_found, not_found_at, \
+                  upstream_missing, metadata_refreshed_at) VALUES \
+             ($1, 'contoso.lib', '*', false, false, true, now(), false, NULL), \
+             ($1, 'contoso.lib', '1.0.0', true, false, false, NULL, false, now()), \
+             ($1, 'sample', '2.0.0', true, true, true, now(), true, now())",
+        )
+        .bind(id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    };
+    let rows = || async {
+        sqlx::query_as::<_, (String, String, bool, bool, bool)>(
+            "SELECT name, version, downloaded, not_found, upstream_missing \
+             FROM proxy_cached_version WHERE repository_id = $1 ORDER BY name, version",
+        )
+        .bind(id)
+        .fetch_all(&srv.pool)
+        .await
+        .unwrap()
+    };
+
+    seed().await;
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://feed-a.example/v3/index.json"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(rows().await.len(), 3, "the same URL keeps every row");
+
+    let resp = put_repo(
+        &srv,
+        &name,
+        json!({"remote_url": "https://feed-b.example/v3/index.json"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        rows().await,
+        [(
+            "sample".to_string(),
+            "2.0.0".to_string(),
+            true,
+            false,
+            false
+        )],
+        "only the downloaded version stays, with its flags cleared"
+    );
 }
 
 /// M2: update body semantics — absent keeps, `null` clears (TTLs fall back to
@@ -1916,9 +2388,12 @@ async fn repo_update_with_encryption_never_keeps_plaintext() {
          [crypto.rotation]\nenabled = false\n"
     );
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             crypto_block: Some(crypto_block),
             ..Default::default()
         },
@@ -1982,6 +2457,111 @@ async fn repo_update_with_encryption_never_keeps_plaintext() {
     put_repo(&srv, &name, json!({"upstream_password": null})).await;
     let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
     assert_eq!((pw, enc), (None, false));
+}
+
+/// An OIDC realm whose sealed client secret no longer decrypts (its issuer
+/// was changed in SQL) is repaired through `PATCH`: the stored secret counts
+/// as absent, so an update without one is a 400 naming it (never a 500, and
+/// the sealed copy is left alone), and one that carries it re-seals it.
+#[tokio::test]
+async fn realm_with_undecryptable_secrets_is_repaired_through_patch() {
+    let var = ensure_crypto_root_env();
+    let crypto_block = format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    );
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            crypto_block: Some(crypto_block),
+            ..Default::default()
+        },
+    )
+    .await;
+    let envelope = srv.state.envelope.as_ref().expect("envelope enabled");
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "kind": "oidc",
+            "name": format!("repairidp{}", common::unique()),
+            "enabled": false,
+            "config": {
+                "issuer": "https://login.example.com/tenant/v2.0",
+                "client_id": "forge",
+                "client_secret": "first-secret",
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let issuer = "https://login.example.org/tenant/v2.0";
+    sqlx::query("UPDATE auth_realm SET config = jsonb_set(config, '{issuer}', to_jsonb($2::text)) WHERE id = $1")
+        .bind(id)
+        .bind(issuer)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    let sealed = || forge_db::auth_realm_dao::find_realm_by_id(&srv.pool, id);
+    let broken = sealed().await.unwrap().unwrap();
+    assert!(
+        forge_db::secret_dao::realm_config(Some(envelope), &broken)
+            .await
+            .is_err(),
+        "the secret is bound to the old issuer"
+    );
+
+    let patch = |body: Value| {
+        client
+            .patch(format!("{}/admin/realms/{id}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    for body in [
+        json!({"enabled": false}),
+        json!({"config": {"issuer": issuer, "client_id": "forge"}}),
+    ] {
+        let resp = patch(body.clone()).await.unwrap();
+        assert_eq!(resp.status(), 400, "{body}");
+        let msg = resp.text().await.unwrap();
+        assert!(msg.contains("client_secret"), "{body}: {msg}");
+    }
+    let unchanged = sealed().await.unwrap().unwrap();
+    assert_eq!(unchanged.secrets_enc, broken.secrets_enc, "left alone");
+
+    let resp = patch(json!({"config": {
+        "issuer": issuer,
+        "client_id": "forge",
+        "client_secret": "second-secret",
+    }}))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["config"]["client_secret_set"], json!(true));
+    let repaired = sealed().await.unwrap().unwrap();
+    let config = forge_db::secret_dao::realm_config(Some(envelope), &repaired)
+        .await
+        .expect("re-sealed for the new issuer");
+    assert_eq!(config["client_secret"], json!("second-secret"));
+    assert_eq!(config["issuer"], json!(issuer));
+
+    let resp = client
+        .delete(format!("{}/admin/realms/{id}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
 }
 
 /// M18: repository names are URL path segments: anything outside
@@ -2050,20 +2630,144 @@ async fn repository_names_are_validated() {
     assert_eq!(resp.status(), 200);
 }
 
+/// Repository and realm bodies refuse a misspelled field instead of dropping
+/// it: a dropped `reserved_prefixes` turned a group's dependency-confusion
+/// guard off, and a dropped `anonymous_read` left a repository public.
+#[tokio::test]
+async fn repository_and_realm_bodies_reject_unknown_fields() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let post = |path: &str, body: Value| {
+        client
+            .post(format!("{}{path}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+
+    let resp = post(
+        "/admin/repositories",
+        json!({"name": format!("strictgrp{s}"), "kind": "group", "reserved_prefix": ["acme."]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 422);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("unknown field `reserved_prefix`"), "{msg}");
+    let name = format!("strict{s}");
+    let resp = post(
+        "/admin/repositories",
+        json!({"name": name, "kind": "hosted", "anonymous_read": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = put_repo(&srv, &name, json!({"anonymous": false})).await;
+    assert_eq!(resp.status(), 422);
+    let resp = put_repo(&srv, &name, json!({"anonymous_read": false})).await;
+    assert_eq!(resp.status(), 200);
+
+    let config = json!({"url": "https://nexus.internal/status", "key_pepper": "pepper"});
+    let realm = json!({
+        "kind": "credential_forwarding",
+        "name": format!("strict{s}"),
+        "enabled": false,
+        "config": config,
+    });
+    let mut with_priority = realm.clone();
+    with_priority["priority"] = json!(1);
+    let resp = post("/admin/realms", with_priority).await.unwrap();
+    assert_eq!(resp.status(), 422);
+    for (kind, config, typo) in [
+        (
+            "credential_forwarding",
+            json!({"url": "https://nexus.internal/status", "key_pepper": "p", "identity_pth": "login"}),
+            "identity_pth",
+        ),
+        (
+            "oidc",
+            json!({
+                "issuer": "https://login.example.com", "client_id": "forge",
+                "client_secret": "s", "required_claim": {"hd": ["corp.example"]}
+            }),
+            "required_claim",
+        ),
+    ] {
+        let resp = post(
+            "/admin/realms",
+            json!({"kind": kind, "name": format!("typo{typo}{s}"), "enabled": false, "config": config}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 400, "{kind}");
+        let msg = resp.text().await.unwrap();
+        assert!(msg.contains(&format!("unknown field `{typo}`")), "{msg}");
+    }
+    let resp = post("/admin/realms", realm).await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let realm_url = format!(
+        "{}/admin/realms/{}",
+        srv.base_url,
+        resp.json::<Value>().await.unwrap()["id"]
+    );
+    let patch = |body: Value| {
+        client
+            .patch(&realm_url)
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    assert_eq!(patch(json!({"enable": true})).await.unwrap().status(), 422);
+    assert_eq!(
+        patch(json!({"enabled": false})).await.unwrap().status(),
+        200
+    );
+    // A misspelled key inside `config` is refused too: a dropped
+    // `identity_path` let any token holder sign in as any account.
+    let resp = patch(json!({"config": {
+        "url": "https://nexus.internal/status", "identity_pth": "login"
+    }}))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 400);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("unknown field `identity_pth`"), "{msg}");
+    // The redaction marker a client echoes back is not an unknown field.
+    let resp = patch(json!({"config": {
+        "url": "https://nexus.internal/status", "key_pepper_set": true, "identity_path": "login"
+    }}))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .delete(&realm_url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
 /// M20: turning `anonymous_read` off also deletes the anonymous role's
 /// unscoped read grant on the repository (what migration 0007 synthesized),
 /// while an update that leaves the flag off does not touch explicit grants.
 #[tokio::test]
 async fn anonymous_read_off_deletes_the_synthesized_grant() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
-            anonymous_mode: "all".into(),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
     let anon_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")
@@ -2128,69 +2832,6 @@ async fn anonymous_read_off_deletes_the_synthesized_grant() {
     .await;
     assert_eq!(resp.status(), 200);
     assert!(anon_grant(explicit_id).await, "explicit RBAC grant kept");
-}
-
-/// M20: `legacy_open_access` is readable and can be switched off through the
-/// admin API (admin-only). The shared test DB is a fresh install (`false`), so
-/// only the idempotent "off" direction is exercised here; both directions and
-/// the effect on new users are covered by `forge-db`'s `rbac_migrate` tests
-/// and the e2e upgrade scenario.
-#[tokio::test]
-async fn legacy_open_access_setting_endpoint() {
-    let srv = common::start().await;
-    let (u, p) = srv.admin_basic();
-    let client = srv.client();
-    let url = format!("{}/admin/settings/legacy-open-access", srv.base_url);
-
-    let resp = client
-        .get(&url)
-        .basic_auth(&u, Some(&p))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.json::<Value>().await.unwrap(),
-        json!({"enabled": false})
-    );
-
-    let resp = client
-        .put(&url)
-        .basic_auth(&u, Some(&p))
-        .json(&json!({"enabled": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.json::<Value>().await.unwrap(),
-        json!({"enabled": false})
-    );
-
-    let resp = client
-        .put(&url)
-        .basic_auth(&u, Some(&p))
-        .json(&json!({"enable": false}))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_client_error(), "unknown key rejected");
-
-    // Admin-only.
-    assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
-    let token = admin_token_with_scope(&srv, None).await;
-    let resp = client
-        .put(&url)
-        .header("X-NuGet-ApiKey", &token)
-        .json(&json!({"enabled": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        403,
-        "an unscoped token cannot change settings"
-    );
 }
 
 // ── delete concurrency (review 2026-10-02 B1 / L3) ──────────────────────────
@@ -2546,4 +3187,133 @@ async fn hosted_repo_delete_refuses_inflight_publish() {
         "the published package survives"
     );
     assert_eq!(ref_count(&srv.pool, &sha).await, 1);
+}
+
+/// Deleting a proxy repository while a first download is being finalized:
+/// the download holds its cached-version row and then takes the foreign-key
+/// lock on the repository row (inserting the component). The delete used to
+/// lock the repository row first and then wait for the cached version, a
+/// lock cycle Postgres broke by aborting one side (a 500 for the download).
+/// It now waits for the cached versions first, so the download's
+/// foreign-key lock is granted at once.
+#[tokio::test]
+async fn deleting_a_proxy_waits_for_an_in_flight_download_instead_of_deadlocking() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let name = format!("px{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"name": name, "kind": "proxy",
+                      "remote_url": "https://api.nuget.org/v3/index.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo_id: i64 = sqlx::query_scalar("SELECT id FROM repository WHERE name = $1")
+        .bind(&name)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO proxy_cached_version (repository_id, name, version) \
+         VALUES ($1, 'contoso.lib', '1.0.0')",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    // The download: holds its cached version...
+    let mut download = srv.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM proxy_cached_version WHERE repository_id = $1 FOR UPDATE")
+        .bind(repo_id)
+        .execute(&mut *download)
+        .await
+        .unwrap();
+    // ...while the delete starts.
+    let delete = tokio::spawn({
+        let client = client.clone();
+        let url = format!("{}/admin/repositories/{name}", srv.base_url);
+        async move {
+            client
+                .delete(url)
+                .basic_auth(&au, Some(&ap))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    // The delete waits: for the cached version (or, in the old lock order,
+    // holding the repository row, in the cascade to it).
+    common::wait_for_lock_wait(
+        &srv.pool,
+        &[
+            "%FROM proxy_cached_version%FOR UPDATE%",
+            "%DELETE FROM repository%",
+        ],
+    )
+    .await;
+    // The component insert's foreign-key lock, well before Postgres' 1 s
+    // deadlock check would break a cycle.
+    sqlx::query("SET LOCAL lock_timeout = '300ms'")
+        .execute(&mut *download)
+        .await
+        .unwrap();
+    sqlx::query("SELECT id FROM repository WHERE id = $1 FOR KEY SHARE")
+        .bind(repo_id)
+        .execute(&mut *download)
+        .await
+        .expect("the download's foreign-key lock waited on the delete");
+    download.commit().await.unwrap();
+
+    assert_eq!(delete.await.unwrap(), 204);
+}
+
+/// Each instance has a blob cache of its own: `GET /admin/blob-cache` names
+/// the instance its numbers come from, with or without a cache.
+#[tokio::test]
+async fn blob_cache_statistics_name_their_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let with_cache = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            plugins_block: Some(format!(
+                "[blob_cache]\npath = {:?}\n",
+                dir.path().join("cache").display().to_string()
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+    let without_cache = common::start().await;
+    for (srv, enabled) in [(&with_cache, true), (&without_cache, false)] {
+        let (u, p) = srv.admin_basic();
+        let stats: Value = srv
+            .client()
+            .get(format!("{}/admin/blob-cache", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stats["enabled"], enabled, "{stats}");
+        let instance = &stats["instance"];
+        assert_eq!(instance["host"], json!(srv.state.instance.host), "{stats}");
+        let started: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(instance["started_at"].clone()).expect("a start time");
+        assert_eq!(started, srv.state.instance.started_at, "{stats}");
+    }
+    assert!(
+        with_cache.state.instance.host.is_some(),
+        "this host has a name (HOSTNAME or the kernel's)"
+    );
 }

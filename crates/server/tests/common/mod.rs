@@ -8,17 +8,15 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use forge_cache::Cache;
-use forge_nuget::NugetFormat;
 use forge_server::app::{build_router, ensure_bootstrap_admin, principal_layer};
 use forge_server::config::Config;
 use forge_server::state::AppState;
 use forge_server::workers::{self, WorkerHandles};
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -55,6 +53,7 @@ async fn pg_endpoint() -> &'static str {
         .with_db_name("forge")
         .with_user("forge")
         .with_password("forge")
+        .with_name("mirror.gcr.io/library/postgres")
         .with_tag("17")
         .start()
         .await
@@ -82,7 +81,7 @@ async fn s3_endpoint() -> &'static str {
         S3_ENDPOINT.set(endpoint).ok();
         return S3_ENDPOINT.get().unwrap();
     }
-    let container = GenericImage::new("versity/versitygw", "v1.4.1")
+    let container = GenericImage::new("mirror.gcr.io/versity/versitygw", "v1.4.1")
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on"))
         .with_cmd([
@@ -120,10 +119,30 @@ pub async fn pool() -> PgPool {
         let _guard = INIT_LOCK.lock().await;
         if MIGRATED.get().is_none() {
             forge_db::migrate(&pool).await.expect("migrate");
+            seed_auth_settings(&pool).await;
             MIGRATED.set(()).ok();
         }
     }
     pool
+}
+
+/// The auth settings every test database starts with: password Basic on
+/// (tests sign in over Basic), everything else at its default (anonymous
+/// access off). A test that needs others changes them on a database of its
+/// own ([`fresh_pool`], [`TestServer::set_auth_settings`]): the shared one
+/// serves every test of the binary at once.
+async fn seed_auth_settings(pool: &PgPool) {
+    let settings = forge_server::auth::AuthSettings {
+        allow_password_basic: true,
+        ..Default::default()
+    };
+    forge_db::authz_dao::set_setting(
+        pool,
+        forge_server::auth::AUTH_SETTINGS_KEY,
+        &serde_json::to_string(&settings).expect("settings serialize"),
+    )
+    .await
+    .expect("seed auth settings");
 }
 
 /// A migrated pool over a fresh, uniquely named database on the same Postgres
@@ -148,6 +167,7 @@ pub async fn fresh_pool() -> PgPool {
         .await
         .expect("connect fresh database");
     forge_db::migrate(&pool).await.expect("migrate");
+    seed_auth_settings(&pool).await;
     pool
 }
 
@@ -157,8 +177,7 @@ async fn blob_store() -> BlobStore {
         endpoint,
         region: "us-east-1".into(),
         bucket: S3_BUCKET.into(),
-        access_key: S3_ACCESS.into(),
-        secret_key: S3_SECRET.into(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),
@@ -177,21 +196,26 @@ async fn blob_store() -> BlobStore {
 }
 
 /// A built TOML config string for the harness, parameterized by the bootstrap
-/// admin credentials and anonymous mode.
+/// admin credentials.
 fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
     let admin = opts
         .bootstrap_admin
         .as_ref()
         .map(|(u, p)| (u.as_str(), p.as_str()));
-    let anon = &opts.anonymous_mode;
     let web_assets_dir = opts.web_assets_dir.as_deref();
     let oidc_block = opts.oidc_block.as_deref();
     let crypto_block = opts.crypto_block.as_deref();
+    let plugins_block = opts.plugins_block.as_deref();
+    let s3_credentials = opts
+        .s3_credentials
+        .clone()
+        .unwrap_or_else(|| format!("access_key = \"{S3_ACCESS}\"\nsecret_key = \"{S3_SECRET}\""));
     let public_base_url = opts
         .public_base_url
         .as_deref()
         .unwrap_or("http://test.local");
     let server_extra = opts.server_extra.as_deref().unwrap_or("");
+    let auth_extra = opts.auth_extra.as_deref().unwrap_or("");
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
         None => String::new(),
@@ -216,13 +240,11 @@ url = "{db_url}"
 [s3]
 endpoint = "{s3_endpoint}"
 bucket = "{bucket}"
-access_key = "{access}"
-secret_key = "{secret}"
 force_path_style = true
+{s3_credentials}
 
 [auth]
-anonymous_mode = "{anon}"
-allow_password_basic = true
+{auth_extra}
 {bootstrap}
 
 [cache]
@@ -237,12 +259,12 @@ poll_interval_seconds = 1
 {web}
 {oidc}
 {crypto}
+{plugins}
 "#,
         bucket = S3_BUCKET,
-        access = S3_ACCESS,
-        secret = S3_SECRET,
         oidc = oidc_block.unwrap_or(""),
         crypto = crypto_block.unwrap_or(""),
+        plugins = plugins_block.unwrap_or(""),
     )
 }
 
@@ -273,36 +295,51 @@ impl Drop for TestServer {
 /// Options for spinning up a test server.
 pub struct ServerOpts {
     pub bootstrap_admin: Option<(String, String)>,
-    pub anonymous_mode: String,
     pub spawn_workers: bool,
     /// When set, the static SPA is served from this directory; otherwise the
     /// web UI is disabled for the test.
     pub web_assets_dir: Option<String>,
     /// When set, this raw TOML is appended as the `[oidc]` section so the server
-    /// builds an `OidcRuntime` + mounts the `/auth/oidc/*` routes (slice 12.2).
+    /// builds an `OidcRuntime` + mounts the `/auth/oidc/*` routes.
     pub oidc_block: Option<String>,
     /// When set, this raw TOML is appended as the `[crypto]` section so the
-    /// server builds the secret-encryption envelope service (slice 12.5). The
-    /// caller is responsible for exporting the root-key env var it references.
+    /// server builds the secret-encryption envelope service. The caller is
+    /// responsible for exporting the root-key env var it references.
     pub crypto_block: Option<String>,
     /// `server.public_base_url` (default `http://test.local`); an `https://`
     /// URL makes the server issue `Secure` (`__Host-`) cookies.
     pub public_base_url: Option<String>,
     /// Extra raw TOML lines for the `[server]` section (e.g. timeouts).
     pub server_extra: Option<String>,
+    /// Extra raw TOML lines for the `[auth]` section (e.g.
+    /// `realm_cache_ttl_seconds`).
+    pub auth_extra: Option<String>,
+    /// When set, this raw TOML is appended last (the `[plugins]` section, or
+    /// any other), and the format plugins it lists are loaded.
+    pub plugins_block: Option<String>,
+    /// Format plugins installed next to the built-in ones, as if built in.
+    pub extra_plugins: Vec<std::sync::Arc<forge_plugin::Plugin>>,
+    /// When set, this raw TOML replaces the static keys at the end of the
+    /// `[s3]` section (e.g. `credentials = "web_identity"` and its
+    /// `[s3.web_identity]` table), and the object store is built from the
+    /// config as `main` does, without the startup bucket check.
+    pub s3_credentials: Option<String>,
 }
 
 impl Default for ServerOpts {
     fn default() -> Self {
         ServerOpts {
-            bootstrap_admin: Some(("admin".into(), "adminpw".into())),
-            anonymous_mode: "off".into(),
+            bootstrap_admin: Some(("admin@example.com".into(), "adminpw".into())),
             spawn_workers: false,
             web_assets_dir: None,
             oidc_block: None,
             crypto_block: None,
             public_base_url: None,
             server_extra: None,
+            auth_extra: None,
+            plugins_block: None,
+            extra_plugins: Vec::new(),
+            s3_credentials: None,
         }
     }
 }
@@ -317,7 +354,6 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
             format!("postgres://forge:forge@{endpoint}/forge")
         }
     };
-    let store = blob_store().await;
     let s3 = s3_endpoint().await;
 
     let toml = config_toml(&db_url, s3, &opts);
@@ -326,12 +362,26 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         figment::Figment::new().merge(figment::providers::Toml::string(&toml)),
     )
     .expect("valid config");
+    let store = match opts.s3_credentials {
+        // Built from the config as `main` does (blob cache included).
+        Some(_) => forge_server::object_store::open(&config).expect("open the object store"),
+        None => {
+            let store = blob_store().await;
+            // As in `main`: the local blob cache in front of S3 when configured.
+            match config.blob_cache() {
+                Some(cache) => store.with_cache(
+                    forge_storage::BlobCache::open(cache).expect("open the blob cache"),
+                ),
+                None => store,
+            }
+        }
+    };
 
     ensure_bootstrap_admin(&config, &pool)
         .await
         .expect("bootstrap admin");
 
-    // §12.5: build + bootstrap the envelope service when the test enabled the
+    // Build + bootstrap the envelope service when the test enabled the
     // [crypto] block (no-op otherwise).
     let envelope =
         forge_server::crypto::build_envelope(&config, &pool).expect("build envelope service");
@@ -341,15 +391,24 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
             .expect("bootstrap secret encryption");
     }
 
-    // 12.7: import any [oidc]/[auth.upstream_basic] block into auth_realm rows
+    // Import any [oidc]/[auth.upstream_basic] block into auth_realm rows
     // (drift-detected) so the realm-driven runtime sees them.
     forge_server::app::ensure_auth_realms(&config, &pool, envelope.as_deref())
         .await
         .expect("seed auth realms");
 
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
-    let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
-    let state = AppState::new(pool.clone(), store, cache, nuget, config).with_envelope(envelope);
+    let mut plugins = forge_server::plugins::load(&config.plugins).expect("load format plugins");
+    plugins.extend(opts.extra_plugins.iter().cloned());
+    let registry_keys =
+        forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
+            .await
+            .expect("registry token key");
+    let state = AppState::new(pool.clone(), store, cache, config)
+        .with_envelope(envelope)
+        .with_registry_keys(registry_keys)
+        .with_plugins(plugins)
+        .expect("install format plugins");
     let layer = principal_layer(&state).expect("principal layer");
 
     let workers = if opts.spawn_workers {
@@ -418,7 +477,7 @@ pub async fn mint_admin_scoped_token(pool: &PgPool, username: &str) -> Option<St
 /// the one Postgres container don't collide on the `admin` username), anonymous
 /// off, no workers.
 pub async fn start() -> TestServer {
-    let admin = format!("admin{}", unique());
+    let admin = format!("admin{}@example.com", unique());
     start_with(
         pool().await,
         ServerOpts {
@@ -447,6 +506,30 @@ impl BrowserSession {
 }
 
 impl TestServer {
+    /// Change the auth settings ([`forge_server::auth::AuthSettings`]) the
+    /// way `PUT /admin/settings/auth` does: the fields `update` names, for
+    /// this server at once. They are stored in the server's database, so
+    /// only a server with a database of its own ([`fresh_pool`]) may change
+    /// them: the shared one serves every test of the binary at once.
+    pub async fn set_auth_settings(
+        &self,
+        update: serde_json::Value,
+    ) -> forge_server::auth::AuthSettings {
+        let update: forge_server::auth::AuthSettingsUpdate =
+            serde_json::from_value(update).expect("an auth settings update");
+        let current = forge_server::auth::load_auth_settings(&self.pool)
+            .await
+            .expect("stored auth settings");
+        let next = update.apply_to(&current).expect("valid auth settings");
+        self.state
+            .auth_settings
+            .save(next)
+            .await
+            .expect("save auth settings")
+            .settings
+            .clone()
+    }
+
     /// Sign `username` in through `/auth/login` (password realms).
     pub async fn login(&self, username: &str, password: &str) -> BrowserSession {
         let resp = self
@@ -507,6 +590,44 @@ impl TestServer {
             self.admin_user.clone().expect("admin user"),
             self.admin_scoped_token.clone().expect("admin token"),
         )
+    }
+
+    /// Create a local account the way an administrator and its user do
+    /// (#322): the admin invites it as a `role` (`reader`, `writer` or
+    /// `admin`) and, with no email service configured, gets the invitation
+    /// link; the user then chooses `password` (at least 12 characters) from
+    /// it. Returns the account's id.
+    pub async fn create_user(&self, username: &str, password: &str, role: &str) -> i64 {
+        let (u, p) = self.admin_basic();
+        let resp = self
+            .client()
+            .post(format!("{}/admin/users", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({"username": username, "role": role}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(status, 201, "{body}");
+        let link = body["invitation"]["link"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no invitation link: {body}"));
+        let token = link.split_once('#').expect("a fragment").1;
+        let resp = self.accept_invitation(token, password).await;
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        body["id"].as_i64().unwrap()
+    }
+
+    /// Choose `password` with the invitation `token`
+    /// (`POST /auth/invitations/accept`).
+    pub async fn accept_invitation(&self, token: &str, password: &str) -> reqwest::Response {
+        self.client()
+            .post(format!("{}/auth/invitations/accept", self.base_url))
+            .json(&serde_json::json!({"token": token, "password": password}))
+            .send()
+            .await
+            .unwrap()
     }
 
     /// The bootstrap admin's username and real password.
@@ -607,4 +728,29 @@ pub fn make_nupkg_with_payload(id: &str, version: &str, payload_len: usize) -> V
         zw.write_all(&buf).unwrap();
     }
     zw.finish().unwrap().into_inner()
+}
+
+/// Wait until a database session is blocked on a lock while running a
+/// statement matching one of the SQL `LIKE` `patterns` (a request that
+/// reached the row another transaction holds). Only sessions on `pool`'s own
+/// database count, so a test on a fresh database never sees another test's
+/// waits. Panics after 10 s.
+pub async fn wait_for_lock_wait(pool: &PgPool, patterns: &[&str]) {
+    let patterns: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+    for _ in 0..500 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query LIKE ANY($1) \
+             AND datname = current_database()",
+        )
+        .bind(&patterns)
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no statement like {patterns:?} waited for a lock");
 }

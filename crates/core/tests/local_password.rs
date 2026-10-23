@@ -1,13 +1,12 @@
-//! Integration tests for the slice-12.3 **phase 2** `local-password` provider
-//! and the refactored [`BasicAuthSource`], against a real Postgres
-//! testcontainer.
+//! Integration tests for the `local-password` provider and the
+//! [`BasicAuthSource`] that runs it, against a real Postgres testcontainer.
 //!
-//! The point of phase 2 is a **zero-behavior-change** refactor: slice 1's
-//! inline argon2id password check is now [`LocalPasswordProvider`] invoked
-//! through the [`Chain`], but the observable auth behaviour — token-as-basic
-//! first, gated password fallback, invalid-creds → 401 — is unchanged. These
-//! tests assert both the provider's outcomes directly and that the slice-1
-//! `BasicAuthSource` semantics are preserved end-to-end.
+//! The argon2id password check is the [`LocalPasswordProvider`], invoked
+//! through the [`Chain`]. [`BasicAuthSource`] tries a token presented as the
+//! basic secret first, then falls back to the password chain only when
+//! password-basic is enabled; invalid credentials → 401. These tests assert
+//! both the provider's outcomes directly and the `BasicAuthSource` semantics
+//! end-to-end.
 //!
 //! Requires Docker.
 
@@ -28,6 +27,7 @@ use forge_core::auth::login_throttle::{LoginThrottle, MAX_USERNAME_BYTES};
 use forge_core::auth::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential};
 use forge_core::auth::token::{
     generate_token_secret, hash_token, BasicAuthSource, PrincipalSource, SourceOutcome,
+    TokenHeaderSource,
 };
 use forge_core::auth::Principal;
 use forge_db::token_dao::{self, NewToken};
@@ -48,15 +48,37 @@ fn hash(password: &str) -> String {
 }
 
 /// Insert a local (argon2 password) user with a unique username.
-async fn insert_local(pool: &PgPool, password: &str, is_admin: bool, active: bool) -> String {
-    let username = format!("alice-{}", common::unique());
+async fn insert_local(pool: &PgPool, password: &str, active: bool) -> String {
+    let username = format!("alice-{}@example.com", common::unique());
     user_dao::insert_user(
         pool,
-        NewUser::local(username.clone(), hash(password), is_admin, active),
+        NewUser::local(username.clone(), hash(password), active),
     )
     .await
     .expect("insert local user");
     username
+}
+
+/// Make `username` an administrator: a member of the built-in `admin` role.
+async fn make_admin(pool: &PgPool, username: &str) {
+    let user = user_dao::find_user_by_username(pool, username)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(forge_db::authz_dao::sync_admin_role(pool, user.id, true)
+        .await
+        .unwrap());
+}
+
+/// A Basic source whose password path is the local provider (`password`), or
+/// off, so that only the token-as-Basic path runs.
+fn basic_source(pool: &PgPool, password: bool) -> BasicAuthSource {
+    let chain = password.then(|| {
+        Arc::new(Chain::new(vec![
+            Box::new(LocalPasswordProvider::new(pool.clone())) as Box<dyn AuthProvider>,
+        ]))
+    });
+    BasicAuthSource::with_chain(pool.clone(), chain)
 }
 
 fn cred<'a>(username: &'a str, password: &'a str) -> PasswordCredential<'a> {
@@ -82,7 +104,7 @@ fn basic_header(username: &str, secret: &str) -> HeaderMap {
 #[tokio::test]
 async fn local_provider_authenticates_correct_password() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "s3cr3t", false, true).await;
+    let username = insert_local(&pool, "s3cr3t", true).await;
     let provider = LocalPasswordProvider::new(pool.clone());
 
     let out = provider.authenticate(&cred(&username, "s3cr3t")).await;
@@ -105,7 +127,7 @@ async fn local_provider_rejects_wrong_password() {
     // A known local user with a wrong password is a definitive Rejected, not a
     // Skip — the account exists, the credential is simply wrong.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "right", false, true).await;
+    let username = insert_local(&pool, "right", true).await;
     let provider = LocalPasswordProvider::new(pool.clone());
 
     assert_eq!(
@@ -128,14 +150,47 @@ async fn local_provider_skips_unknown_user() {
 }
 
 #[tokio::test]
-async fn local_provider_skips_inactive_user() {
+async fn local_provider_rejects_inactive_user() {
+    // A deactivated local account never authenticates, and its name is still
+    // a local password account's: a definitive Rejected (never a Skip that
+    // would hand the password to a later provider), whatever the password.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, false).await;
-    let provider = LocalPasswordProvider::new(pool.clone());
-    assert_eq!(
-        provider.authenticate(&cred(&username, "pw")).await,
-        AuthOutcome::Skip
-    );
+    let username = insert_local(&pool, "pw", false).await;
+    for forwarding_follows in [false, true] {
+        let provider =
+            LocalPasswordProvider::new(pool.clone()).forwarding_follows(forwarding_follows);
+        for password in ["pw", "a-guess"] {
+            assert_eq!(
+                provider.authenticate(&cred(&username, password)).await,
+                AuthOutcome::Rejected,
+                "{password} (forwarding follows: {forwarding_follows})"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_provider_rejects_an_invited_account() {
+    // #322: an invited local account has no password until its user chooses
+    // one. The name is still the local realm's: Rejected whatever the
+    // password, never a Skip that would let a later (forwarding) provider
+    // take it over.
+    let pool = common::pool().await;
+    let username = format!("invited-{}@example.com", common::unique());
+    forge_db::invitation_dao::insert_invited_user(&pool, &username, &username)
+        .await
+        .expect("insert invited user");
+    for forwarding_follows in [false, true] {
+        let provider =
+            LocalPasswordProvider::new(pool.clone()).forwarding_follows(forwarding_follows);
+        for password in ["", "a-guess"] {
+            assert_eq!(
+                provider.authenticate(&cred(&username, password)).await,
+                AuthOutcome::Rejected,
+                "{password:?} (forwarding follows: {forwarding_follows})"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -143,13 +198,12 @@ async fn local_provider_skips_user_without_local_password() {
     // An upstream-basic / oidc provisioned user has no local password_hash and
     // must never be acceptable by the local provider — it's not ours.
     let pool = common::pool().await;
-    let username = format!("upstream-{}", common::unique());
+    let username = format!("upstream-{}@example.com", common::unique());
     user_dao::insert_user(
         &pool,
         NewUser {
             username: username.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".to_string(),
             external_subject: Some(username.clone()),
@@ -170,7 +224,8 @@ async fn local_provider_admin_flag_is_not_in_identity() {
     // The provider only vouches for the username; admin-ness is resolved by the
     // mapping step from the app_user row, not carried in ProvenIdentity.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", true, true).await;
+    let username = insert_local(&pool, "pw", true).await;
+    make_admin(&pool, &username).await;
     let provider = LocalPasswordProvider::new(pool.clone());
     match provider.authenticate(&cred(&username, "pw")).await {
         AuthOutcome::Authenticated(id) => assert!(!id.suggested_is_admin),
@@ -181,9 +236,9 @@ async fn local_provider_admin_flag_is_not_in_identity() {
 // ── Chain (local-only) → mapping to a concrete principal ─────────────────────
 
 #[tokio::test]
-async fn chain_local_only_maps_to_principal_with_admin_flag() {
+async fn chain_local_only_maps_to_principal() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", true, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let user = user_dao::find_user_by_username(&pool, &username)
         .await
         .unwrap()
@@ -201,7 +256,6 @@ async fn chain_local_only_maps_to_principal_with_admin_flag() {
                 .expect("map")
                 .expect("active user exists");
             assert_eq!(principal.user_id, user.id);
-            assert!(principal.is_admin);
             // Password auth never carries a token id.
             assert!(principal.token_id.is_none());
         }
@@ -209,16 +263,16 @@ async fn chain_local_only_maps_to_principal_with_admin_flag() {
     }
 }
 
-// ── BasicAuthSource end-to-end: slice-1 behavior is preserved ────────────────
+// ── BasicAuthSource end-to-end ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn basic_password_authenticates_when_enabled() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
-    let src = BasicAuthSource::new(pool.clone(), /* allow_password_basic */ true);
+    let username = insert_local(&pool, "pw", true).await;
+    let src = basic_source(&pool, true);
 
     match src.resolve(&basic_header(&username, "pw"), ip()).await {
-        SourceOutcome::Authenticated(Principal::User { is_admin, .. }) => assert!(!is_admin),
+        SourceOutcome::Authenticated(Principal::User { .. }) => {}
         other => panic!("expected Authenticated User, got {other:?}"),
     }
 }
@@ -226,10 +280,10 @@ async fn basic_password_authenticates_when_enabled() {
 #[tokio::test]
 async fn basic_password_disabled_does_not_authenticate() {
     // allow_password_basic = false → password path is entirely off; a valid
-    // password is treated as an invalid basic credential (slice-1 behaviour).
+    // password is treated as an invalid basic credential.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
-    let src = BasicAuthSource::new(pool.clone(), false);
+    let username = insert_local(&pool, "pw", true).await;
+    let src = basic_source(&pool, false);
 
     assert_eq!(
         src.resolve(&basic_header(&username, "pw"), ip()).await,
@@ -240,8 +294,8 @@ async fn basic_password_disabled_does_not_authenticate() {
 #[tokio::test]
 async fn basic_wrong_password_is_invalid_not_anonymous() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "right", false, true).await;
-    let src = BasicAuthSource::new(pool.clone(), true);
+    let username = insert_local(&pool, "right", true).await;
+    let src = basic_source(&pool, true);
 
     assert_eq!(
         src.resolve(&basic_header(&username, "wrong"), ip()).await,
@@ -252,7 +306,7 @@ async fn basic_wrong_password_is_invalid_not_anonymous() {
 #[tokio::test]
 async fn basic_unknown_user_is_invalid() {
     let pool = common::pool().await;
-    let src = BasicAuthSource::new(pool.clone(), true);
+    let src = basic_source(&pool, true);
     assert_eq!(
         src.resolve(
             &basic_header(&format!("ghost-{}", common::unique()), "pw"),
@@ -266,10 +320,10 @@ async fn basic_unknown_user_is_invalid() {
 #[tokio::test]
 async fn basic_token_in_basic_wins_before_password_chain() {
     // A token presented as the basic secret authenticates via the token path,
-    // which runs *ahead* of the password chain — unchanged from slice 1.
+    // which runs *ahead* of the password chain.
     let pool = common::pool().await;
     // Make a user + a token for them.
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let user = user_dao::find_user_by_username(&pool, &username)
         .await
         .unwrap()
@@ -289,7 +343,7 @@ async fn basic_token_in_basic_wins_before_password_chain() {
     .expect("insert token");
 
     // Even with password-basic OFF, the token-as-basic path still works.
-    let src = BasicAuthSource::new(pool.clone(), false);
+    let src = basic_source(&pool, false);
     match src.resolve(&basic_header(&username, &secret), ip()).await {
         SourceOutcome::Authenticated(Principal::User {
             user_id, token_id, ..
@@ -304,7 +358,7 @@ async fn basic_token_in_basic_wins_before_password_chain() {
 #[tokio::test]
 async fn basic_no_authorization_header_is_no_credentials() {
     let pool = common::pool().await;
-    let src = BasicAuthSource::new(pool.clone(), true);
+    let src = basic_source(&pool, true);
     assert_eq!(
         src.resolve(&HeaderMap::new(), ip()).await,
         SourceOutcome::NoCredentials
@@ -312,11 +366,11 @@ async fn basic_no_authorization_header_is_no_credentials() {
 }
 
 #[tokio::test]
-async fn basic_revoked_token_falls_through_to_password_chain() {
-    // A revoked token used as the basic secret is not a valid token; the secret
-    // then runs as a password. If it isn't a valid password either → Invalid.
+async fn basic_revoked_token_is_invalid_and_never_tried_as_a_password() {
+    // A revoked token used as the basic secret is not a valid token, and a
+    // token Forge issued is never run through the password chain (#71).
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let user = user_dao::find_user_by_username(&pool, &username)
         .await
         .unwrap()
@@ -338,7 +392,7 @@ async fn basic_revoked_token_falls_through_to_password_chain() {
         .await
         .expect("revoke");
 
-    let src = BasicAuthSource::new(pool.clone(), true);
+    let src = basic_source(&pool, true);
     // The revoked secret is neither a valid token nor the user's password.
     assert_eq!(
         src.resolve(&basic_header(&username, &secret), ip()).await,
@@ -350,7 +404,7 @@ async fn basic_revoked_token_falls_through_to_password_chain() {
 #[tokio::test]
 async fn basic_with_explicit_chain_matches_default() {
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let chain = Arc::new(Chain::new(vec![Box::new(LocalPasswordProvider::new(
         pool.clone(),
     ))]));
@@ -427,13 +481,12 @@ async fn foreign_names_cost_the_same_as_each_other() {
     // chain both pay the dummy verification (they need a slot, so here they
     // come back Unavailable). Inactive local accounts always pay it.
     let pool = common::pool().await;
-    let federated = format!("federated-{}", common::unique());
+    let federated = format!("federated-{}@example.com", common::unique());
     user_dao::insert_user(
         &pool,
         NewUser {
             username: federated.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".to_string(),
             external_subject: Some(federated.clone()),
@@ -441,8 +494,8 @@ async fn foreign_names_cost_the_same_as_each_other() {
     )
     .await
     .expect("insert federated user");
-    let inactive = insert_local(&pool, "pw", false, false).await;
-    let ghost = format!("ghost-{}", common::unique());
+    let inactive = insert_local(&pool, "pw", false).await;
+    let ghost = format!("ghost-{}@example.com", common::unique());
 
     let forwarding = LocalPasswordProvider::with_limiter(pool.clone(), saturated_limiter())
         .forwarding_follows(true);
@@ -468,12 +521,56 @@ async fn foreign_names_cost_the_same_as_each_other() {
     }
 }
 
+/// Review 2026-10-20 L2: in a local → credential-forwarding chain, a
+/// deactivated local account's password (its owner's, or an attacker's
+/// guesses) is never forwarded, even to an upstream that would vouch for the
+/// name. It is a failed attempt like any wrong password.
+#[tokio::test]
+async fn inactive_local_account_is_never_forwarded() {
+    let pool = common::pool().await;
+    let username = insert_local(&pool, "pw", false).await;
+    let (upstream, upstream_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Authenticated(forge_core::auth::ProvenIdentity {
+            source: AuthSource::UpstreamBasic,
+            external_subject: Some(username.clone()),
+            ..forge_core::auth::ProvenIdentity::local(username.clone())
+        }),
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![
+        Box::new(LocalPasswordProvider::new(pool.clone()).forwarding_follows(true)),
+        Box::new(upstream),
+    ]));
+    for password in ["pw", "a-guess"] {
+        assert_eq!(
+            chain.authenticate(&cred(&username, password)).await,
+            ChainOutcome::Rejected,
+            "{password}"
+        );
+    }
+
+    let throttle = Arc::new(LoginThrottle::new(5, Duration::from_secs(60)));
+    let src =
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone());
+    assert_eq!(
+        src.resolve(&basic_header(&username, "pw"), ip()).await,
+        SourceOutcome::Invalid
+    );
+    assert_eq!(throttle.tracked(), 1, "counted like a wrong password");
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "an inactive local account's password never reaches the upstream"
+    );
+}
+
 #[tokio::test]
 async fn argon2_overload_is_unavailable_never_counted_nor_forwarded() {
     // M4(b): with every argon2 slot busy, a local account's correct password
     // is neither a failure (no lockout) nor forwarded to a later provider.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let (upstream, upstream_calls) = CountingProvider::new(
         AuthSource::UpstreamBasic,
         AuthOutcome::Rejected,
@@ -510,6 +607,53 @@ async fn argon2_overload_is_unavailable_never_counted_nor_forwarded() {
         0,
         "a local account's password never reaches the upstream"
     );
+}
+
+/// Review 2026-10-20 L3: a token lookup that fails (pool exhausted, short
+/// acquire timeout) has not ruled out a live token. It is `Unavailable` (503),
+/// not "not a token": the secret never runs through the password chain, whose
+/// credential-forwarding realm would send it upstream.
+#[tokio::test]
+async fn token_lookup_error_is_unavailable_and_never_reaches_the_password_chain() {
+    // A closed pool fails every query, like an exhausted one.
+    let pool = common::pool().await;
+    pool.close().await;
+    let secret = generate_token_secret();
+    assert!(forge_core::auth::verify_token(&pool, &secret)
+        .await
+        .is_err());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        TokenHeaderSource::HEADER,
+        HeaderValue::from_str(&secret).unwrap(),
+    );
+    assert_eq!(
+        TokenHeaderSource::new(pool.clone())
+            .resolve(&headers, ip())
+            .await,
+        SourceOutcome::Unavailable
+    );
+
+    let (upstream, upstream_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Rejected,
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![Box::new(upstream)]));
+    let throttle = Arc::new(LoginThrottle::default());
+    let src = BasicAuthSource::with_chain(pool, Some(chain)).with_throttle(throttle.clone());
+    assert_eq!(
+        src.resolve(&basic_header("nuget-user", &secret), ip())
+            .await,
+        SourceOutcome::Unavailable
+    );
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "an unchecked token is never forwarded as a password"
+    );
+    assert_eq!(throttle.tracked(), 0, "nor counted as a failed password");
 }
 
 #[tokio::test]
@@ -555,7 +699,7 @@ async fn concurrent_correct_passwords_are_serialized_not_locked_out() {
     // parallel requests than the budget (a NuGet restore over Basic): the
     // extra attempts wait for a slot and then succeed.
     let pool = common::pool().await;
-    let username = insert_local(&pool, "pw", false, true).await;
+    let username = insert_local(&pool, "pw", true).await;
     let (provider, calls) = CountingProvider::new(
         AuthSource::Local,
         AuthOutcome::Authenticated(forge_core::auth::ProvenIdentity::local(username.clone())),
@@ -616,4 +760,87 @@ async fn oversized_basic_username_is_invalid_and_never_tracked() {
     );
     assert_eq!(throttle.tracked(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// #70: Forge's own database failing is "temporarily unavailable" (503), not
+/// "invalid credentials", so NuGet clients and CI jobs retry instead of asking
+/// for new credentials. An upstream outage still answers like a wrong
+/// password (upstream health stays in the logs).
+#[tokio::test]
+async fn database_failures_on_the_password_path_are_unavailable() {
+    let pool = common::pool().await;
+    let username = insert_local(&pool, "pw", true).await;
+
+    // The local provider on a failing database (a closed pool fails every
+    // query, like an exhausted one).
+    let closed = common::pool().await;
+    closed.close().await;
+    assert_eq!(
+        LocalPasswordProvider::new(closed)
+            .authenticate(&cred(&username, "pw"))
+            .await,
+        AuthOutcome::Failed
+    );
+
+    // A provider whose store failed stops the chain.
+    let (failed, _) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Failed,
+        Duration::ZERO,
+    );
+    let (later, later_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Rejected,
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![Box::new(failed), Box::new(later)]));
+    assert_eq!(
+        chain.authenticate(&cred("someone", "pw")).await,
+        ChainOutcome::Failed
+    );
+    assert_eq!(later_calls.load(Ordering::SeqCst), 0);
+    let throttle = Arc::new(LoginThrottle::new(2, Duration::from_secs(60)));
+    let src =
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone());
+    for _ in 0..3 {
+        assert_eq!(
+            src.resolve(&basic_header("someone", "pw"), ip()).await,
+            SourceOutcome::Unavailable
+        );
+    }
+    assert!(
+        !throttle.is_locked(ip(), "someone"),
+        "an outage is not a failed password"
+    );
+
+    // An upstream outage answers like a wrong password.
+    let (down, _) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Unavailable,
+        Duration::ZERO,
+    );
+    let src = BasicAuthSource::with_chain(
+        pool.clone(),
+        Some(Arc::new(Chain::new(vec![Box::new(down)]))),
+    );
+    assert_eq!(
+        src.resolve(&basic_header("someone", "pw"), ip()).await,
+        SourceOutcome::Invalid
+    );
+
+    // Realms that cannot be read.
+    struct Unreadable;
+    #[async_trait::async_trait]
+    impl forge_core::auth::ChainSource for Unreadable {
+        async fn password_chain(
+            &self,
+        ) -> Result<Option<Arc<Chain>>, forge_core::auth::ChainUnavailable> {
+            Err(forge_core::auth::ChainUnavailable)
+        }
+    }
+    let src = BasicAuthSource::with_source(pool.clone(), Arc::new(Unreadable));
+    assert_eq!(
+        src.resolve(&basic_header(&username, "pw"), ip()).await,
+        SourceOutcome::Unavailable
+    );
 }

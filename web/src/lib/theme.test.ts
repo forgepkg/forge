@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { getTheme, initTheme, resolvesDark, setTheme } from './theme'
+import { getTheme, initTheme, resolveTheme, resolvesDark, setTheme } from './theme'
 
 /**
  * Behavior tests for the theme module: the preference round-trips through
- * localStorage, `.dark` lands on <html>, and `system` follows the (mocked)
- * prefers-color-scheme media query.
+ * localStorage, `data-theme` lands on <html>, and `system` follows the
+ * (mocked) prefers-color-scheme media query between light and dark.
  */
 describe('theme', () => {
   /** Install a matchMedia stub reporting the given system preference. */
@@ -21,33 +21,45 @@ describe('theme', () => {
     )
   }
 
+  const shown = () => document.documentElement.dataset.theme
+
   beforeEach(() => {
     localStorage.clear()
-    document.documentElement.classList.remove('dark')
+    delete document.documentElement.dataset.theme
     mockSystemDark(false)
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
     localStorage.clear()
-    document.documentElement.classList.remove('dark')
+    delete document.documentElement.dataset.theme
   })
 
   it('defaults to system', () => {
     expect(getTheme()).toBe('system')
   })
 
-  it('setTheme(dark) persists and applies the dark class', () => {
+  it('setTheme(dark) persists and applies the dark theme', () => {
     setTheme('dark')
     expect(getTheme()).toBe('dark')
-    expect(document.documentElement.classList.contains('dark')).toBe(true)
+    expect(shown()).toBe('dark')
     expect(document.documentElement.style.colorScheme).toBe('dark')
   })
 
-  it('setTheme(light) clears the dark class even on a dark OS', () => {
+  it('setTheme(light) shows the light theme even on a dark OS', () => {
     mockSystemDark(true)
     setTheme('light')
-    expect(document.documentElement.classList.contains('dark')).toBe(false)
+    expect(shown()).toBe('light')
+    expect(document.documentElement.style.colorScheme).toBe('light')
+  })
+
+  it('setTheme(dark-rail) persists the light theme with the dark rail', () => {
+    mockSystemDark(true)
+    setTheme('dark-rail')
+    expect(getTheme()).toBe('dark-rail')
+    expect(localStorage.getItem('forge.theme')).toBe('dark-rail')
+    expect(shown()).toBe('dark-rail')
+    // The content stays light: native controls render light.
     expect(document.documentElement.style.colorScheme).toBe('light')
   })
 
@@ -57,20 +69,27 @@ describe('theme', () => {
     setTheme('system')
     expect(localStorage.getItem('forge.theme')).toBeNull()
     expect(getTheme()).toBe('system')
-    expect(document.documentElement.classList.contains('dark')).toBe(true)
+    expect(shown()).toBe('dark')
   })
 
-  it('resolvesDark mirrors the preference + OS state', () => {
+  it('ignores an unknown stored value', () => {
+    localStorage.setItem('forge.theme', 'sepia')
+    expect(getTheme()).toBe('system')
+  })
+
+  it('resolveTheme and resolvesDark mirror the preference + OS state', () => {
     expect(resolvesDark('dark')).toBe(true)
     expect(resolvesDark('light')).toBe(false)
-    expect(resolvesDark('system')).toBe(false)
+    expect(resolvesDark('dark-rail')).toBe(false)
+    expect(resolveTheme('system')).toBe('light')
     mockSystemDark(true)
     expect(resolvesDark('system')).toBe(true)
+    expect(resolveTheme('system')).toBe('dark')
   })
 
   it('initTheme applies the stored preference on startup', () => {
-    localStorage.setItem('forge.theme', 'dark')
+    localStorage.setItem('forge.theme', 'dark-rail')
     initTheme()
-    expect(document.documentElement.classList.contains('dark')).toBe(true)
+    expect(shown()).toBe('dark-rail')
   })
 })

@@ -1,0 +1,17 @@
+# A local disk cache for blobs (FORGE_BLOB_CACHE__*): hot downloads skip S3,
+# and packages in the cache keep resolving while S3 is unreachable. S3 stays
+# the source of truth; the cache only ever holds copies.
+#
+# The cache is an emptyDir, so it lives as long as the pod: it helps through
+# an S3 outage only while the pod keeps running. Works with any number of
+# replicas (each pod caches on its own). For a cache that survives a restart,
+# use ../local-cache-persistent instead; for a dedicated disk per pod, see
+# the generic ephemeral volume in ../../README.md.
+#
+# statvfs on an emptyDir reports the node's filesystem, not the volume's
+# sizeLimit, so the cache gets a fixed size below it. Raise both together.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - path: deployment-patch.yaml

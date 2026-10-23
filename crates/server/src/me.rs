@@ -1,21 +1,22 @@
-//! `GET /admin/me` — the authenticated principal's identity + capability flags
-//! (plan §12.6 Phase 0, §8).
+//! `GET /admin/me` — the authenticated principal's identity + capability flags.
 //!
 //! This endpoint is mounted **outside** the admin module's [`require_admin`]
 //! gate: it is reachable by any *authenticated* user (admin or not) so the SPA
 //! can decide which navigation/management screens to show. It still requires an
-//! authenticated principal — an anonymous or unauthenticated caller gets `401`,
-//! matching the plan's "401 if no/invalid principal" contract.
+//! authenticated principal — an anonymous or unauthenticated caller gets `401`.
 //!
 //! ## Capabilities
 //! `is_admin` and the capability list come from the **effective RBAC** verdict
 //! ([`forge_core::auth::authz::Authz::is_global_admin`]: the built-in `admin`
-//! role, or the legacy `app_user.is_admin` dual-read fallback) for the calling
-//! principal — the same check the admin API's `require_admin` gate uses, so the
+//! role) for the calling principal — the same check the admin API's `require_admin` gate uses, so the
 //! SPA never hides screens from an RBAC admin nor shows them to a demoted one.
 //! A token-scoped principal reports what that token may do.
 //! * every authenticated user can read (`repo.read`);
-//! * an admin additionally gets `repo.admin` / `user.admin` / `token.admin`.
+//! * a principal that may publish to every repository (the built-in `writer`
+//!   role, or any unscoped `write` grant on every repository) gets
+//!   `repo.write`, so the SPA can show push instructions;
+//! * an admin additionally gets `repo.admin` / `user.admin` / `token.admin`
+//!   (and `repo.write`).
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -47,10 +48,19 @@ pub struct MeView {
     pub capabilities: Vec<&'static str>,
 }
 
-/// Derive the capability list for a principal from its effective admin verdict.
-fn capabilities_for(is_admin: bool) -> Vec<&'static str> {
+/// Derive the capability list for a principal from its effective admin
+/// verdict and whether it may write to every repository.
+fn capabilities_for(is_admin: bool, writes_everywhere: bool) -> Vec<&'static str> {
     if is_admin {
-        vec!["repo.read", "repo.admin", "user.admin", "token.admin"]
+        vec![
+            "repo.read",
+            "repo.write",
+            "repo.admin",
+            "user.admin",
+            "token.admin",
+        ]
+    } else if writes_everywhere {
+        vec!["repo.read", "repo.write"]
     } else {
         vec!["repo.read"]
     }
@@ -79,9 +89,10 @@ pub async fn me(State(state): State<AppState>, req: axum::extract::Request) -> R
     match user_dao::find_user_by_id(&state.pool, user_id).await {
         Ok(Some(u)) => {
             let is_admin = state.authz.is_global_admin(&principal).await;
+            let writes_everywhere = state.authz.can_write_every_repository(&principal).await;
             let view = MeView {
                 is_admin,
-                capabilities: capabilities_for(is_admin),
+                capabilities: capabilities_for(is_admin, writes_everywhere),
                 user: MeUser {
                     id: u.id,
                     username: u.username,
@@ -104,13 +115,21 @@ mod tests {
 
     #[test]
     fn admin_capabilities_superset_of_reader() {
-        let reader = capabilities_for(false);
-        let admin = capabilities_for(true);
+        let reader = capabilities_for(false, false);
+        let admin = capabilities_for(true, true);
         assert!(reader.contains(&"repo.read"));
         assert!(!reader.contains(&"repo.admin"));
         for cap in &reader {
             assert!(admin.contains(cap), "admin must include reader cap {cap}");
         }
         assert!(admin.contains(&"repo.admin"));
+    }
+
+    #[test]
+    fn writers_get_repo_write_but_no_administration() {
+        let writer = capabilities_for(false, true);
+        assert_eq!(writer, vec!["repo.read", "repo.write"]);
+        assert!(capabilities_for(true, false).contains(&"repo.write"));
+        assert!(!capabilities_for(false, false).contains(&"repo.write"));
     }
 }

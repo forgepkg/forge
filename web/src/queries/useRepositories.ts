@@ -9,15 +9,22 @@ import {
   addMember,
   createRepository,
   deleteRepository,
+  fetchFormats,
   fetchMembers,
   fetchRepositories,
   fetchRepository,
+  formatKeys,
+  invalidateProxyCache,
   removeMember,
   repoKeys,
+  updateMember,
   updateRepository,
   type AddMember,
   type CreateRepo,
+  type FormatView,
+  type InvalidateProxyCache,
   type MemberView,
+  type ProxyCacheInvalidated,
   type RepoView,
   type UpdateRepo,
 } from '~/api/repositories'
@@ -35,6 +42,16 @@ export function useRepositories() {
   return useQuery<RepoView[], ApiError>({
     queryKey: repoKeys.list(),
     queryFn: ({ signal }) => fetchRepositories(signal),
+  })
+}
+
+/** The installed package formats (`GET /admin/formats`). */
+export function useFormats() {
+  return useQuery<FormatView[], ApiError>({
+    queryKey: formatKeys.list(),
+    queryFn: ({ signal }) => fetchFormats(signal),
+    // Formats change only when the server restarts with other plugins.
+    staleTime: 5 * 60 * 1000,
   })
 }
 
@@ -87,6 +104,16 @@ export function useDeleteRepository() {
   })
 }
 
+/**
+ * Invalidate a proxy's cache. Nothing to re-fetch: the repository's view does
+ * not change.
+ */
+export function useInvalidateProxyCache(name: string) {
+  return useMutation<ProxyCacheInvalidated, ApiError, InvalidateProxyCache>({
+    mutationFn: (body) => invalidateProxyCache(name, body),
+  })
+}
+
 /** A group's ordered members (`GET /admin/repositories/{name}/members`). */
 export function useMembers(name: string) {
   return useQuery<MemberView[], ApiError>({
@@ -111,6 +138,17 @@ export function useRemoveMember(name: string) {
   const queryClient = useQueryClient()
   return useMutation<void, ApiError, string>({
     mutationFn: (member) => removeMember(name, member),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
+    },
+  })
+}
+
+/** Flag or unflag a member as owner; invalidates that group's member list. */
+export function useUpdateMember(name: string) {
+  const queryClient = useQueryClient()
+  return useMutation<void, ApiError, { member: string; owner: boolean }>({
+    mutationFn: ({ member, owner }) => updateMember(name, member, { owner }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
     },

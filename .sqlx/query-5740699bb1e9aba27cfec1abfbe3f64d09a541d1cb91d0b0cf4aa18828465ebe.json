@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT count(DISTINCT image) AS \"count!\"\n        FROM oci_manifest\n        WHERE repository_id = $1 AND strpos(image, $2) > 0\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5740699bb1e9aba27cfec1abfbe3f64d09a541d1cb91d0b0cf4aa18828465ebe"
+}

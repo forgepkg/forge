@@ -1,7 +1,8 @@
 # Dependency update PRs (review L12). Security updates are raised as soon as an
 # advisory lands; version updates are batched weekly and grouped per ecosystem
 # so the queue stays reviewable. CI's `audit` job (cargo-audit) is the gate for
-# Rust advisories; accepted ones are listed in .cargo/audit.toml.
+# Rust advisories, and the daily Audit workflow (audit.yml) reports one for an
+# unchanged lockfile; accepted ones are listed in .cargo/audit.toml.
 version: 2
 updates:
   # Rust workspace (Cargo.toml / Cargo.lock at the root).
@@ -11,6 +12,12 @@ updates:
       interval: weekly
     open-pull-requests-limit: 10
     groups:
+      # wasmtime-wasi of a major builds only against the wasmtime of the same
+      # major, so a major update of one alone fails to compile. Every update
+      # of the Wasmtime crates comes as one pull request; listed first, since
+      # a dependency joins the first group it matches.
+      wasmtime:
+        patterns: ["wasmtime", "wasmtime-*"]
       cargo-minor-and-patch:
         update-types: [minor, patch]
 
@@ -44,11 +51,44 @@ updates:
       interval: weekly
     ignore:
       # The Rust image must match rust-toolchain.toml, which Dependabot cannot
-      # edit: bump both (and the rust image in .gitlab-ci.yml) by hand. A newer
-      # image builds only because rustup downloads the pinned toolchain at
-      # build time. Digest updates of the pinned tag still come.
+      # edit: bump both by hand. A newer image builds only because rustup
+      # downloads the pinned toolchain at build time. Digest updates of the
+      # pinned tag still come.
       - dependency-name: rust
         update-types:
           - version-update:semver-major
           - version-update:semver-minor
           - version-update:semver-patch
+
+  # Images of the in-cluster dependencies (PostgreSQL, Valkey, versitygw),
+  # pinned by digest: the kustomize components' manifests and the Helm
+  # sub-charts' values.yaml (`image.tag: <tag>@sha256:…`, the form Dependabot
+  # updates). Tag and digest are bumped together. They name the Docker Hub
+  # images' copies on ghcr.io, whose tags mirror-images.yml keeps in line with
+  # Docker Hub daily, so the updates are Docker Hub's. Dependabot does not see the
+  # other pinned images, so they are bumped by hand: the Dockerfile's
+  # `# syntax=` frontend, BuildKit and the SBOM generator (release.yml,
+  # ci.yml) and ci.yml's postgres service. .github/scripts/image-pin-check.sh
+  # (CI) keeps every reference pinned.
+  - package-ecosystem: docker
+    directories:
+      - /deploy/kubernetes/components/postgres
+      - /deploy/kubernetes/components/valkey
+      - /deploy/kubernetes/components/s3-versitygw
+      - /deploy/helm/forge/charts/postgresql
+      - /deploy/helm/forge/charts/valkey
+      - /deploy/helm/forge/charts/versitygw
+    schedule:
+      interval: weekly
+    groups:
+      deploy-images:
+        patterns: ["*"]
+    ignore:
+      # A new PostgreSQL major cannot open the old one's data directory
+      # (that takes pg_upgrade), so the in-cluster database stays on its
+      # major until someone moves it by hand. The manifests name the image
+      # `postgres`, the chart `library/postgres`.
+      - dependency-name: postgres
+        update-types: [version-update:semver-major]
+      - dependency-name: library/postgres
+        update-types: [version-update:semver-major]

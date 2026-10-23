@@ -1,4 +1,4 @@
-//! The retention **apply** path (design §3.6 step 9, §3.4 outbox integration).
+//! The retention **apply** path (blob GC through the transactional outbox).
 //!
 //! Turns the pure evaluator's [`Decision`] / [`ProxyDecision`] sets into durable
 //! mutations in small transactions: one per proxy eviction, and one per batch
@@ -204,19 +204,23 @@ async fn decided_now(
     fence: &RunFence<'_>,
     package_name: &str,
 ) -> Result<HashMap<i64, Action>, sqlx::Error> {
-    let candidates: Vec<CandidateComponent> =
-        retention_dao::lock_package_candidates(tx, ctx.repository_id, package_name)
-            .await?
-            .into_iter()
-            .map(|r| CandidateComponent {
-                component_id: r.component_id,
-                package_name: r.name,
-                version: r.version,
-                listed: r.listed,
-                created_at: r.created_at,
-                last_downloaded_at: r.last_downloaded_at,
-            })
-            .collect();
+    let candidates: Vec<CandidateComponent> = retention_dao::lock_package_candidates(
+        tx,
+        ctx.repository_id,
+        package_name,
+        fence.format.package_asset_path(),
+    )
+    .await?
+    .into_iter()
+    .map(|r| CandidateComponent {
+        component_id: r.component_id,
+        package_name: r.name,
+        version: r.version,
+        listed: r.listed,
+        created_at: r.created_at,
+        last_downloaded_at: r.last_downloaded_at,
+    })
+    .collect();
     let now = ctx.evaluated_at.unwrap_or_else(chrono::Utc::now);
     Ok(evaluate(fence.format, now, fence.policy, &candidates)
         .into_iter()

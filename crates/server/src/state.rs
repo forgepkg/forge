@@ -1,4 +1,4 @@
-//! Application state shared across all requests (spec §8, plan 10.1/10.3).
+//! Application state shared across all requests.
 //!
 //! [`AppState`] holds the database pool, the S3 blob store + content-addressed
 //! store, the hybrid cache, the package-format registry, and the parsed
@@ -10,10 +10,11 @@
 //! implementations:
 //!
 //! * [`BlobBytes`] implements both [`forge_core::repo::hosted::BlobFetch`] and
-//!   [`forge_nuget::routes::NupkgBytes`] over a [`forge_storage::BlobStore`].
+//!   [`crate::feed::PackageBytes`] over a [`forge_storage::BlobStore`].
 //! * [`MemberFactory`] implements [`forge_core::repo::group::MemberOpsFactory`]
 //!   by branching on a member repository's `kind`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -22,18 +23,21 @@ use forge_core::auth::authz::Authz;
 use forge_core::auth::principal::Principal;
 use forge_core::format::Format;
 use forge_core::net::upstream::UpstreamHttp;
+use forge_core::repo::downloads::DownloadTally;
 use forge_core::repo::group::{GroupRepo, MemberOpsFactory};
 use forge_core::repo::hosted::{BlobFetch, HostedRepo};
 use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::{
-    CacheInvalidator, NoopCacheInvalidator, PackageFilteredReadOps, RepoError, RepoReadOps,
+    CacheInvalidator, NoopCacheInvalidator, NupkgLocation, PackageFilteredReadOps, RepoError,
+    RepoReadOps,
 };
+use forge_core::retention::FormatResolver;
 use forge_core::session::SessionService;
-use forge_db::model::{RepoKind, Repository};
-use forge_storage::{BlobStore, Cas};
+use forge_db::model::{RepoKind, Repository, DOCKER_FORMAT, RAW_FORMAT};
+use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
-use crate::auth::RealmAuth;
+use crate::auth::{AssertionIssuer, AuthSettingsCache, RealmAuth};
 use crate::config::Config;
 
 /// Shared, cheaply-cloneable application state.
@@ -47,29 +51,39 @@ pub struct AppState {
     pub cas: Cas,
     /// Two-tier read cache (L1 always; L2 Redis when configured).
     pub cache: Cache,
-    /// Authorization decision service (§12.4 seam): every read/write/admin gate
-    /// routes through this.
+    /// Authorization decision service: every read/write/admin gate routes
+    /// through this.
     pub authz: Authz,
-    /// Package-format registry. Slice 1 ships a single NuGet format; the map is
-    /// keyed by `Format::id()` so additional formats slot in without a refactor.
+    /// Package-format registry, keyed by `Format::id()`: the built-in format
+    /// plugins (NuGet, Helm) and any loaded WebAssembly plugins.
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
-    /// DB-backed auth realms (12.7): the snapshot cache the password chain,
-    /// the OIDC login runtime and the login UX endpoints are built from.
+    /// DB-backed auth realms: the snapshot cache the password chain, the OIDC
+    /// login runtime and the login UX endpoints are built from.
     pub realms: Arc<RealmAuth>,
-    /// Browser-session lifecycle, shared by local-password login and OIDC.
+    /// Browser-session lifecycle, shared by local-password login and OIDC;
+    /// its lifetimes follow [`Self::auth_settings`].
     pub sessions: SessionService,
+    /// The sign-in and anonymous-access policy administrators set at runtime
+    /// (the anonymous mode, the login mode, password Basic, session lifetimes
+    /// and the lockout), as this instance last read it.
+    pub auth_settings: Arc<AuthSettingsCache>,
     /// Whether session cookies carry `Secure` (https `public_base_url`).
     pub cookie_secure: bool,
     /// Password-failure lockout per `(client IP, username)`, shared by
-    /// `POST /auth/login` and the wire Basic password path.
+    /// `POST /auth/login` and the wire Basic password path; its limits follow
+    /// [`Self::auth_settings`].
     pub login_throttle: Arc<forge_core::auth::LoginThrottle>,
+    /// Failed invitation lookups and acceptances per client network (#322),
+    /// with the login lockout's budget and window, which follow
+    /// [`Self::auth_settings`].
+    pub invitation_throttle: Arc<forge_core::auth::LoginThrottle>,
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
     pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
-    /// Secret encryption at rest (slice 12.5). `None` ⇒ disabled: secrets use
-    /// the legacy plaintext columns and `/admin/crypto/*` reports disabled.
+    /// Secret encryption at rest. `None` ⇒ disabled: secrets use the legacy
+    /// plaintext columns and `/admin/crypto/*` reports disabled.
     /// Built fallibly by [`crate::crypto::build_envelope`] **before**
     /// [`AppState::new`] (a configured-but-broken root key must abort startup)
     /// and attached via [`AppState::with_envelope`].
@@ -77,29 +91,201 @@ pub struct AppState {
     /// Pooled, timeout- and size-bounded client for proxy upstream traffic,
     /// built once from `[proxy]` and shared by every proxy repository.
     pub upstream: UpstreamHttp,
+    /// Download counts of every hosted and proxy repository, written in
+    /// batches (#119).
+    pub downloads: Arc<DownloadTally>,
+    /// Signing keys of registry Bearer tokens (`/v2/token`). [`AppState::new`]
+    /// starts with a random per-process key; startup replaces it with the
+    /// install's shared one ([`crate::registry::load_token_keys`] via
+    /// [`AppState::with_registry_keys`]) so every instance accepts every
+    /// instance's tokens.
+    pub registry_keys: forge_oci::token::TokenKeys,
+    /// This process among the instances of an install, as per-instance
+    /// reports (the local blob cache's statistics) name it.
+    pub instance: Arc<Instance>,
+    /// Forge's own OIDC issuer: the keys a `federated_credential` OIDC realm
+    /// signs its client assertions with, published under `/.well-known/`.
+    pub assertion_issuer: AssertionIssuer,
+    /// The email service (`/admin/settings/email`): sends invitations and
+    /// test messages with the settings stored in the database.
+    pub mailer: Arc<crate::email::Mailer>,
 }
 
-/// Format registry: maps a format id (e.g. `"nuget"`) to its [`Format`].
+/// One instance of Forge: each replica of an install has state of its own
+/// (the local blob cache), and what reports it names the instance.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Instance {
+    /// The host name: `HOSTNAME` (a container's name, a pod's on
+    /// Kubernetes), else the kernel's; `None` when neither is known.
+    pub host: Option<String>,
+    /// When this process built its state, i.e. started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Instance {
+    /// This process, starting now.
+    pub fn current() -> Self {
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|h| !h.trim().is_empty())
+            .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty());
+        Instance {
+            host,
+            started_at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// Format registry: maps a format id (the `repository.format` column) to its
+/// [`Format`] and its plugin. The built-in format plugins
+/// ([`crate::plugins::builtin`]: NuGet, Helm), Docker and raw are always
+/// there; WebAssembly plugins are added at startup
+/// ([`FormatRegistry::with_plugin`]).
+///
+/// Docker ([`DOCKER_FORMAT`]) and raw ([`RAW_FORMAT`]) are installed but have
+/// no [`Format`]: their repositories hold images (manifests and blobs) or
+/// files under paths, not package versions, and are served by the registry
+/// under `/v2` ([`crate::registry`]) and under `/raw` ([`crate::raw`]), so
+/// none of the package seams (parsing, version order, the read ops) apply to
+/// them.
 pub struct FormatRegistry {
-    nuget: Arc<dyn Format>,
+    formats: BTreeMap<String, Arc<dyn Format>>,
+    /// Every format's plugin (built in or WebAssembly), by format id: its
+    /// client protocol.
+    plugins: BTreeMap<String, Arc<forge_plugin::Plugin>>,
 }
 
 impl FormatRegistry {
-    /// Build a registry from the NuGet format implementation.
-    pub fn new(nuget: Arc<dyn Format>) -> Self {
-        FormatRegistry { nuget }
+    /// A registry holding the built-in format plugins, NuGet reading
+    /// archives and upstream manifests under `nuget_limits`.
+    pub fn new(nuget_limits: forge_format_nuget::NupkgLimits) -> Self {
+        let mut registry = FormatRegistry {
+            formats: BTreeMap::new(),
+            plugins: BTreeMap::new(),
+        };
+        for plugin in crate::plugins::builtin(nuget_limits) {
+            registry = registry
+                .with_plugin(plugin)
+                .expect("built-in format ids are distinct");
+        }
+        registry
     }
 
-    /// Resolve the format for a repository by its `format` column. Slice 1 only
-    /// knows `"nuget"`; any other value falls back to it (no other formats
-    /// exist yet).
-    pub fn for_repository(&self, _repo: &Repository) -> Arc<dyn Format> {
-        self.nuget.clone()
+    /// Add `format` under its [`Format::id`]. An id that is already taken
+    /// (NuGet's and Docker's included) is refused: a plugin never shadows
+    /// another format.
+    pub fn with_format(mut self, format: Arc<dyn Format>) -> Result<Self, String> {
+        let id = format.id().to_string();
+        if self.is_installed(&id) {
+            let built_in =
+                Self::is_native(&id) || self.plugins.get(&id).is_some_and(|p| p.is_builtin());
+            return Err(if built_in {
+                format!("format {id:?} is built into this server")
+            } else {
+                format!("format {id:?} is already registered")
+            });
+        }
+        self.formats.insert(id, format);
+        Ok(self)
     }
 
-    /// The NuGet format.
-    pub fn nuget(&self) -> Arc<dyn Format> {
-        self.nuget.clone()
+    /// Add a format plugin: its [`Format`] and its client protocol. Its id
+    /// must be free: a WebAssembly plugin never replaces a built-in format.
+    pub fn with_plugin(mut self, plugin: Arc<forge_plugin::Plugin>) -> Result<Self, String> {
+        let format = Arc::new(forge_plugin::PluginFormat::new(&plugin));
+        self = self.with_format(format)?;
+        self.plugins.insert(plugin.id().to_string(), plugin);
+        Ok(self)
+    }
+
+    /// The format with id `id`, if installed.
+    pub fn get(&self, id: &str) -> Option<Arc<dyn Format>> {
+        self.formats.get(id).cloned()
+    }
+
+    /// The plugin serving format `id`, if it is a plugin format.
+    pub fn plugin(&self, id: &str) -> Option<Arc<forge_plugin::Plugin>> {
+        self.plugins.get(id).cloned()
+    }
+
+    /// The plugin formats (built in and WebAssembly), by format id.
+    pub fn plugins(&self) -> impl Iterator<Item = &Arc<forge_plugin::Plugin>> {
+        self.plugins.values()
+    }
+
+    /// Whether format `id` is one served natively, without a [`Format`]:
+    /// Docker and raw.
+    pub fn is_native(id: &str) -> bool {
+        id == DOCKER_FORMAT || id == RAW_FORMAT
+    }
+
+    /// Whether format `id` is installed: Docker, raw, or a format plugin.
+    pub fn is_installed(&self, id: &str) -> bool {
+        Self::is_native(id) || self.formats.contains_key(id)
+    }
+
+    /// The mounts plugin formats are served under, sorted and distinct
+    /// (`/repository`, and any other a plugin names).
+    pub fn mounts(&self) -> Vec<&str> {
+        let mut mounts: Vec<&str> = self
+            .plugins
+            .values()
+            .map(|p| p.manifest().mount.as_str())
+            .collect();
+        mounts.sort_unstable();
+        mounts.dedup();
+        mounts
+    }
+
+    /// The installed format ids, sorted.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        let mut ids: Vec<&str> = self.formats.keys().map(String::as_str).collect();
+        ids.push(DOCKER_FORMAT);
+        ids.push(RAW_FORMAT);
+        ids.sort_unstable();
+        ids.into_iter()
+    }
+
+    /// The repository kinds format `id` supports, `None` when it is not
+    /// installed. Docker and raw have every kind; a format plugin serves the
+    /// kinds its `plugin.toml` names (NuGet's all three).
+    pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
+        if Self::is_native(id) {
+            return Some(vec!["hosted", "proxy", "group"]);
+        }
+        let plugin = self.plugins.get(id)?;
+        Some(
+            plugin
+                .manifest()
+                .kinds
+                .iter()
+                .map(|kind| match kind {
+                    forge_plugin::api::RepositoryKind::Hosted => "hosted",
+                    forge_plugin::api::RepositoryKind::Proxy => "proxy",
+                    forge_plugin::api::RepositoryKind::Group => "group",
+                })
+                .collect(),
+        )
+    }
+
+    /// Resolve the format for a repository by its `format` column. A format
+    /// that is not installed is an error ([`RepoError::FormatUnavailable`]),
+    /// never a fallback to another format: a repository is only ever read and
+    /// written by the format that created it.
+    pub fn for_repository(&self, repo: &Repository) -> Result<Arc<dyn Format>, RepoError> {
+        self.get(&repo.format)
+            .ok_or_else(|| RepoError::FormatUnavailable(repo.format.clone()))
+    }
+}
+
+/// [`FormatResolver`] over the shared registry (the retention worker's view).
+pub struct RegistryResolver(pub Arc<FormatRegistry>);
+
+impl FormatResolver for RegistryResolver {
+    fn resolve(&self, id: &str) -> Option<Arc<dyn Format>> {
+        self.0.get(id)
     }
 }
 
@@ -108,15 +294,11 @@ impl AppState {
     ///
     /// Authentication runtimes (the password chain, the OIDC login flow) are
     /// **not** built here: they live behind [`RealmAuth`], which rebuilds them
-    /// from the `auth_realm` table on demand (12.7). The session service and
-    /// cookie security bit are config-derived and shared by every login path.
-    pub fn new(
-        pool: PgPool,
-        blob_store: BlobStore,
-        cache: Cache,
-        nuget: Arc<dyn Format>,
-        config: Config,
-    ) -> Self {
+    /// from the `auth_realm` table on demand. The session service is
+    /// shared by every login path; it, the lockout and authorization's public
+    /// read follow the auth settings ([`AuthSettingsCache`]), read from the
+    /// database on demand too.
+    pub fn new(pool: PgPool, blob_store: BlobStore, cache: Cache, config: Config) -> Self {
         let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
             .unwrap_or_else(|e| {
                 // main() already created the directory at startup; this only
@@ -126,73 +308,175 @@ impl AppState {
             });
         let cas = Cas::new(blob_store.clone(), pool.clone()).with_staging(staging);
         // Signed-in callers share the public read reach only where everyone
-        // may read anonymously (see `Authz::with_public_read_for_signed_in`).
-        let authz = Authz::new(pool.clone(), cache.clone())
-            .with_public_read_for_signed_in(config.auth.anonymous_mode.eq_ignore_ascii_case("all"));
+        // may read anonymously (see `Authz::with_public_read_for_signed_in`):
+        // the auth settings turn it on and off.
+        let authz = Authz::new(pool.clone(), cache.clone());
         let config = Arc::new(config);
 
-        let (idle, absolute) = config.session_ttls();
-        let sessions = SessionService::new(
-            pool.clone(),
-            chrono::Duration::seconds(idle as i64),
-            chrono::Duration::seconds(absolute as i64),
+        let login_throttle = Arc::new(
+            forge_core::auth::LoginThrottle::default().with_known_network_store(Arc::new(
+                forge_core::auth::PgKnownNetworks::new(pool.clone()),
+            )),
         );
+        let invitation_throttle = Arc::new(forge_core::auth::LoginThrottle::default());
+        let auth_settings = Arc::new(
+            AuthSettingsCache::new(
+                pool.clone(),
+                std::time::Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1)),
+            )
+            .with_authz(authz.clone())
+            .with_login_throttle(login_throttle.clone())
+            .with_login_throttle(invitation_throttle.clone()),
+        );
+        let sessions = auth_settings.sessions().clone();
         let cookie_secure = config.public_base_url().starts_with("https://");
-        let realms = Arc::new(RealmAuth::new(pool.clone(), cache.clone(), config.clone()));
+        let assertion_issuer = AssertionIssuer::new(pool.clone(), None, config.public_base_url());
+        let realms = Arc::new(RealmAuth::new(
+            pool.clone(),
+            cache.clone(),
+            config.clone(),
+            assertion_issuer.clone(),
+            auth_settings.clone(),
+        ));
         let upstream = UpstreamHttp::new(config.proxy.upstream_http()).unwrap_or_else(|e| {
             tracing::error!(error = %e, "failed to build the configured proxy upstream client; using defaults");
             UpstreamHttp::shared_default()
         });
-        let login_throttle = Arc::new(
-            forge_core::auth::LoginThrottle::new(
-                config.auth.login_max_failures,
-                std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
-            )
-            .with_known_network_store(Arc::new(
-                forge_core::auth::PgKnownNetworks::new(pool.clone()),
-            )),
-        );
         let oidc_login_starts = Arc::new(forge_core::auth::WindowLimiter::new(
             config.auth.oidc_login_starts_per_minute,
             std::time::Duration::from_secs(60),
         ));
 
+        let (pool_for_mailer, config_for_mailer) = (pool.clone(), config.clone());
         AppState {
+            downloads: DownloadTally::new(pool.clone()),
             pool,
             blob_store,
             cas,
             cache,
             authz,
-            formats: Arc::new(FormatRegistry::new(nuget)),
+            formats: Arc::new(FormatRegistry::new(config.nuget.limits())),
             config,
             realms,
             sessions,
+            auth_settings,
             cookie_secure,
             login_throttle,
+            invitation_throttle,
             oidc_login_starts,
             envelope: None,
             upstream,
+            registry_keys: forge_oci::token::TokenKeys::new(vec![{
+                use rand::Rng;
+                let mut key = vec![0u8; 32];
+                rand::rng().fill_bytes(&mut key);
+                key
+            }]),
+            instance: Arc::new(Instance::current()),
+            mailer: Arc::new(crate::email::Mailer::new(
+                pool_for_mailer,
+                None,
+                assertion_issuer.clone(),
+                &config_for_mailer,
+            )),
+            assertion_issuer,
         }
     }
 
-    /// Attach the secret-encryption envelope service (slice 12.5). Kept out of
+    /// Use `keys` to sign and verify registry tokens.
+    pub fn with_registry_keys(mut self, keys: forge_oci::token::TokenKeys) -> Self {
+        self.registry_keys = keys;
+        self
+    }
+
+    /// The Docker / OCI registry service, wired to this state.
+    pub fn registry(&self) -> forge_oci::Registry {
+        forge_oci::Registry::new(forge_oci::RegistryParts {
+            pool: self.pool.clone(),
+            cas: self.cas.clone(),
+            store: self.blob_store.clone(),
+            cache: self.cache.clone(),
+            authz: self.authz.clone(),
+            http: self.upstream.clone(),
+            envelope: self.envelope.clone(),
+            config: forge_oci::RegistryConfig {
+                public_base_url: self.config.public_base_url(),
+                max_blob_bytes: self.config.docker_max_blob_bytes(),
+                default_max_upload_bytes: self.config.default_upload_limit(DOCKER_FORMAT),
+                token_ttl_seconds: self.config.docker.token_ttl_seconds,
+                delete_grace: self.config.outbox.grace(),
+                max_group_depth: self.config.groups.max_nesting_depth.max(0) as u32,
+                // Validated to at most 100 years.
+                unreferenced_blob_ttl: chrono::Duration::seconds(
+                    self.config.docker.unreferenced_blob_ttl_seconds as i64,
+                ),
+            },
+            keys: self.registry_keys.clone(),
+            recorder: Some(Arc::new(crate::registry::LedgerRecorder)),
+            workloads: Some(Arc::new(crate::registry::WorkloadLiveness {
+                realms: self.realms.clone(),
+                pool: self.pool.clone(),
+            })),
+        })
+    }
+
+    /// Attach the secret-encryption envelope service. Kept out of
     /// [`AppState::new`] because building it reads the root key and must be
     /// able to fail startup; `None` keeps encryption disabled.
     pub fn with_envelope(
         mut self,
         envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
     ) -> Self {
-        // Realm secrets may be encrypted too (P1.5): rebuild the (still
-        // unshared, empty) realm snapshot cache with the envelope attached.
-        self.realms = Arc::new(
-            RealmAuth::new(self.pool.clone(), self.cache.clone(), self.config.clone())
-                .with_envelope(envelope.clone()),
+        // Realm secrets may be encrypted too (P1.5), and so are the issuer
+        // keys: rebuild both (still unshared and empty) with the envelope
+        // attached.
+        self.assertion_issuer = AssertionIssuer::new(
+            self.pool.clone(),
+            envelope.clone(),
+            self.config.public_base_url(),
         );
+        self.realms = Arc::new(
+            RealmAuth::new(
+                self.pool.clone(),
+                self.cache.clone(),
+                self.config.clone(),
+                self.assertion_issuer.clone(),
+                self.auth_settings.clone(),
+            )
+            .with_envelope(envelope.clone()),
+        );
+        // The email settings' secrets are sealed with it too.
+        self.mailer = Arc::new(crate::email::Mailer::new(
+            self.pool.clone(),
+            envelope.clone(),
+            self.assertion_issuer.clone(),
+            &self.config,
+        ));
         self.envelope = envelope;
         self
     }
 
-    /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`NupkgBytes`).
+    /// Install the loaded WebAssembly plugins (see [`crate::plugins::load`])
+    /// next to the built-in formats. A plugin whose format id is taken
+    /// (a built-in plugin, or another plugin) is an error.
+    pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
+        let mut registry = FormatRegistry::new(self.config.nuget.limits());
+        for plugin in plugins {
+            registry = registry.with_plugin(plugin)?;
+        }
+        self.formats = Arc::new(registry);
+        Ok(self)
+    }
+
+    /// The largest push `repo` accepts (for docker, the largest blob): its
+    /// own limit, else the default of its format
+    /// ([`Config::default_upload_limit`]).
+    pub fn upload_limit(&self, repo: &Repository) -> u64 {
+        repo.max_upload_bytes()
+            .unwrap_or_else(|| self.config.default_upload_limit(&repo.format))
+    }
+
+    /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`PackageBytes`).
     pub fn blob_bytes(&self) -> Arc<BlobBytes> {
         Arc::new(BlobBytes {
             store: self.blob_store.clone(),
@@ -217,14 +501,13 @@ impl AppState {
         repo: &Repository,
         principal: Principal,
     ) -> Result<Arc<dyn RepoReadOps>, RepoError> {
-        let format = self.formats.for_repository(repo);
+        let format = self.formats.for_repository(repo)?;
         let filter = self.authz.package_filter(&principal, repo).await;
         let inner: Arc<dyn RepoReadOps> = match repo.kind() {
-            RepoKind::Hosted => Arc::new(HostedRepo::new(
-                self.pool.clone(),
-                format,
-                self.blob_bytes(),
-            )),
+            RepoKind::Hosted => Arc::new(
+                HostedRepo::new(self.pool.clone(), format, self.blob_bytes())
+                    .with_download_tally(self.downloads.clone()),
+            ),
             RepoKind::Proxy => Arc::new(self.proxy_repo(format)),
             RepoKind::Group => Arc::new(
                 GroupRepo::new(
@@ -241,8 +524,7 @@ impl AppState {
     }
 
     /// A fully wired proxy read facade: shared upstream client, local blob
-    /// access, and (§12.5) the envelope service for encrypted upstream
-    /// passwords.
+    /// access, and the envelope service for encrypted upstream passwords.
     pub fn proxy_repo(&self, format: Arc<dyn Format>) -> ProxyRepo {
         ProxyRepo::new(
             self.pool.clone(),
@@ -253,6 +535,7 @@ impl AppState {
         .with_envelope(self.envelope.clone())
         .with_http(self.upstream.clone())
         .with_blob_fetch(self.blob_bytes())
+        .with_download_tally(self.downloads.clone())
     }
 
     /// A member-ops factory for group resolution (hosted/proxy members only).
@@ -265,51 +548,67 @@ impl AppState {
             formats: self.formats.clone(),
             envelope: self.envelope.clone(),
             upstream: self.upstream.clone(),
+            downloads: self.downloads.clone(),
         }
     }
 }
 
-/// Reads blobs from the S3 store: whole small metadata blobs (`BlobFetch`,
-/// the `.nuspec`) and streamed packages (`NupkgBytes`).
+/// Reads blobs through the blob store (and its local cache, when enabled):
+/// whole small metadata blobs (`BlobFetch`, the `.nuspec`) and streamed
+/// packages (`PackageBytes`).
 pub struct BlobBytes {
     store: BlobStore,
 }
 
-impl BlobBytes {
-    async fn read_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
-        let stream = self.store.get(s3_key).await.map_err(|e| {
-            tracing::error!(error = %e, %s3_key, "s3 get failed");
-            RepoError::Storage(format!("s3 get {s3_key}: {e}"))
-        })?;
-        let bytes = stream
-            .collect()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, %s3_key, "s3 body read failed");
-                RepoError::Storage(format!("read blob {s3_key}: {e}"))
-            })?
-            .into_bytes();
-        Ok(bytes.to_vec())
+/// A storage error as a [`RepoError`]: S3 being down is "try again later"
+/// (503), anything else a server error.
+fn storage_error(error: S3Error, s3_key: &str) -> RepoError {
+    if error.is_unavailable() {
+        tracing::warn!(error = %error, %s3_key, "object store unavailable; blob not in the local cache");
+        RepoError::Busy(format!("object store unavailable: {error}"))
+    } else {
+        tracing::error!(error = %error, %s3_key, "s3 get failed");
+        RepoError::Storage(format!("s3 get {s3_key}: {error}"))
     }
 }
 
 #[async_trait]
 impl BlobFetch for BlobBytes {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
-        self.read_all(s3_key).await
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
+        let blob_ref = BlobRef {
+            sha256: &blob.sha256,
+            s3_key: &blob.s3_key,
+            size: u64::try_from(blob.size).unwrap_or(0),
+        };
+        self.store
+            .read_all(blob_ref)
+            .await
+            .map_err(|e| storage_error(e, &blob.s3_key))
     }
 }
 
 #[async_trait]
-impl forge_nuget::routes::NupkgBytes for BlobBytes {
-    async fn open(&self, s3_key: &str) -> Result<forge_nuget::routes::BlobByteStream, RepoError> {
-        let stream = self.store.get(s3_key).await.map_err(|e| {
-            tracing::error!(error = %e, %s3_key, "s3 get failed");
-            RepoError::Storage(format!("s3 get {s3_key}: {e}"))
-        })?;
-        Ok(Box::pin(tokio_util::io::ReaderStream::new(
-            stream.into_async_read(),
-        )))
+impl crate::feed::PackageBytes for BlobBytes {
+    async fn open(
+        &self,
+        loc: &NupkgLocation,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<crate::feed::BlobByteStream, RepoError> {
+        let blob = BlobRef {
+            sha256: &loc.blob_sha256,
+            s3_key: &loc.blob_s3_key,
+            size: u64::try_from(loc.size).unwrap_or(0),
+        };
+        self.store
+            .open(blob, range)
+            .await
+            .map_err(|e| storage_error(e, &loc.blob_s3_key))
+    }
+
+    /// Ranges are served with the local blob cache only, so a server
+    /// without one answers downloads exactly as before it existed.
+    fn serves_ranges(&self) -> bool {
+        self.store.cache().is_some()
     }
 }
 
@@ -323,23 +622,28 @@ pub struct MemberFactory {
     cas: Cas,
     cache: Cache,
     formats: Arc<FormatRegistry>,
-    /// §12.5: proxy members decrypt their upstream password through this.
+    /// Proxy members decrypt their upstream password through this.
     envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
     /// Shared proxy upstream client.
     upstream: UpstreamHttp,
+    /// Shared download counts.
+    downloads: Arc<DownloadTally>,
 }
 
 impl MemberOpsFactory for MemberFactory {
     fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
-        let format = self.formats.for_repository(member);
+        let format = self.formats.for_repository(member)?;
         match member.kind() {
-            RepoKind::Hosted => Ok(Arc::new(HostedRepo::new(
-                self.pool.clone(),
-                format,
-                Arc::new(BlobBytes {
-                    store: self.blob_store.clone(),
-                }),
-            ))),
+            RepoKind::Hosted => Ok(Arc::new(
+                HostedRepo::new(
+                    self.pool.clone(),
+                    format,
+                    Arc::new(BlobBytes {
+                        store: self.blob_store.clone(),
+                    }),
+                )
+                .with_download_tally(self.downloads.clone()),
+            )),
             RepoKind::Proxy => Ok(Arc::new(
                 ProxyRepo::new(
                     self.pool.clone(),
@@ -351,12 +655,84 @@ impl MemberOpsFactory for MemberFactory {
                 .with_http(self.upstream.clone())
                 .with_blob_fetch(Arc::new(BlobBytes {
                     store: self.blob_store.clone(),
-                })),
+                }))
+                .with_download_tally(self.downloads.clone()),
             )),
             RepoKind::Group => Err(RepoError::WrongKind {
                 name: member.name.clone(),
                 kind: member.kind.clone(),
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_core::domain::{FormatError, ParsedUpload};
+    use forge_core::format::ReadSeek;
+
+    /// A format that only has an id.
+    struct Named(&'static str);
+
+    impl Format for Named {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn parse_upload(&self, _: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
+            Err(FormatError::InvalidPackage("none".into()))
+        }
+        fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
+            Ok(raw.to_string())
+        }
+        fn compare_versions(&self, a: &str, b: &str) -> std::cmp::Ordering {
+            a.cmp(b)
+        }
+        fn lower_id(&self, id: &str) -> String {
+            id.to_lowercase()
+        }
+    }
+
+    #[test]
+    fn docker_is_installed_without_a_package_format() {
+        let registry = FormatRegistry::new(Default::default());
+        assert!(registry.is_installed(DOCKER_FORMAT));
+        assert!(registry.get(DOCKER_FORMAT).is_none());
+        assert_eq!(
+            registry.ids().collect::<Vec<_>>(),
+            ["docker", "helm", "nuget", "raw"]
+        );
+        assert!(registry.is_installed(RAW_FORMAT));
+        assert!(registry.get(RAW_FORMAT).is_none());
+        assert_eq!(
+            registry.kinds(RAW_FORMAT),
+            Some(vec!["hosted", "proxy", "group"])
+        );
+        assert_eq!(
+            registry.kinds(DOCKER_FORMAT),
+            Some(vec!["hosted", "proxy", "group"])
+        );
+        assert_eq!(
+            registry.kinds("nuget"),
+            Some(vec!["hosted", "proxy", "group"])
+        );
+        assert_eq!(
+            registry.kinds("helm"),
+            Some(vec!["hosted", "proxy", "group"])
+        );
+        assert_eq!(registry.kinds("npm"), None);
+        assert!(!registry.is_installed("npm"));
+    }
+
+    #[test]
+    fn a_plugin_cannot_take_dockers_or_raws_id() {
+        for id in ["docker", "raw"] {
+            let registry = FormatRegistry::new(Default::default());
+            let err = registry
+                .with_format(Arc::new(Named(id)))
+                .err()
+                .expect("refused");
+            assert!(err.contains("built into this server"), "{err}");
         }
     }
 }

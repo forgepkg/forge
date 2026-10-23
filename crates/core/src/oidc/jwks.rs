@@ -90,6 +90,17 @@ pub enum OidcError {
     NonceMismatch,
 }
 
+impl OidcError {
+    /// Whether the issuer could not be asked rather than refusing the token:
+    /// its discovery document or JWKS could not be fetched (a transport error,
+    /// a timeout, a non-success status) or read (too large, not the expected
+    /// JSON). Such an error is no verdict on the token, so a caller answers
+    /// "try again later" instead of "invalid credentials".
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, OidcError::Http { .. } | OidcError::Parse { .. })
+    }
+}
+
 /// The subset of the OIDC discovery document we use.
 ///
 /// Cached as JSON via [`forge_cache::Cache`], so it is `Serialize`/`Deserialize`.
@@ -123,9 +134,9 @@ pub struct WorkloadDiscoveryDocument {
     pub jwks_uri: String,
 }
 
-/// The ID-token claims we extract after a successful verification. Format-
-/// specific claim → user mapping happens in a later phase (`claims.rs`); here we
-/// keep the raw values plus the full claim set for that step.
+/// The ID-token claims we extract after a successful verification. The claim →
+/// user mapping happens afterwards ([`super::claims`]); here we keep the raw
+/// values plus the full claim set for that step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verified {
     /// `sub` — the stable, issuer-scoped subject identifier.
@@ -139,7 +150,7 @@ pub struct Verified {
 
 /// Decoded ID-token claims. Registered claims are typed; everything else (the
 /// IdP-specific claims used for username/email/groups/roles mapping) is kept in
-/// `additional` for the claim-mapping phase.
+/// `additional` for the claim mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdTokenClaims {
     /// Subject.
@@ -201,12 +212,16 @@ pub struct OidcMetadataClient {
     /// Outbound HTTP client (no redirects, https only; built by the caller via
     /// [`crate::net::ssrf::outbound_metadata_client`]).
     http: reqwest::Client,
-    /// Slice-1 hybrid cache for discovery + JWKS.
+    /// Hybrid cache for discovery + JWKS.
     cache: Cache,
     /// Discovery TTL.
     discovery_ttl: Duration,
     /// JWKS TTL.
     jwks_ttl: Duration,
+    /// Hosts besides the issuer's that the advertised endpoints may use
+    /// (lowercase), for IdPs that serve tokens and keys elsewhere (Google,
+    /// AWS Cognito).
+    endpoint_hosts: Vec<String>,
 }
 
 impl OidcMetadataClient {
@@ -219,7 +234,15 @@ impl OidcMetadataClient {
             cache,
             discovery_ttl: DEFAULT_DISCOVERY_TTL,
             jwks_ttl: DEFAULT_JWKS_TTL,
+            endpoint_hosts: Vec::new(),
         }
+    }
+
+    /// Also accept advertised endpoints on these hosts (compared
+    /// case-insensitively). The issuer's own host is always accepted.
+    pub fn with_endpoint_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.endpoint_hosts = hosts.into_iter().map(|h| h.to_ascii_lowercase()).collect();
+        self
     }
 
     /// Override the discovery/JWKS TTLs (mainly for tests).
@@ -246,12 +269,14 @@ impl OidcMetadataClient {
     /// The well-known URL is derived from the **configured** issuer (trusted),
     /// never from any IdP-supplied value, and the returned document's own
     /// `issuer` must equal the configured issuer. The advertised endpoints are
-    /// sanity-checked to be https and to live on the issuer's host (SSRF
-    /// defense-in-depth on top of the guarded client).
+    /// sanity-checked to use the issuer's scheme and to live on the issuer's
+    /// host or one of the configured endpoint hosts (SSRF defense-in-depth on
+    /// top of the guarded client).
     pub async fn discovery(&self) -> Result<DiscoveryDocument, OidcError> {
         let url = discovery_url(&self.issuer);
         let http = self.http.clone();
         let expected_issuer = self.issuer.clone();
+        let endpoint_hosts = self.endpoint_hosts.clone();
 
         let doc: DiscoveryDocument = self
             .cache
@@ -261,11 +286,14 @@ impl OidcMetadataClient {
                 self.discovery_ttl,
                 || async move {
                     let doc: DiscoveryDocument = fetch_json(&http, &url, "discovery").await?;
-                    validate_discovery(&doc, &expected_issuer)?;
+                    validate_discovery(&doc, &expected_issuer, &endpoint_hosts)?;
                     Ok(doc)
                 },
             )
             .await?;
+        // The cache is per issuer: a document another client (with other
+        // endpoint hosts) stored must pass this client's check too.
+        validate_discovery(&doc, &self.issuer, &self.endpoint_hosts)?;
         Ok(doc)
     }
 
@@ -312,16 +340,43 @@ impl OidcMetadataClient {
             .await
     }
 
-    /// Force a cache-bypassing JWKS refetch: drop the cached entry (which also
-    /// broadcasts an invalidation to peer instances via the cache backplane,
-    /// when Redis is configured), then repopulate it.
+    /// Refetch the JWKS after a `kid` miss (an early IdP key rotation),
+    /// bypassing the cache; `cached` is the set that missed.
     ///
-    /// Per-instance coalescing means a rotation storm refetches at most once per
-    /// instance; we deliberately use **no** advisory lock — an occasional
-    /// duplicate JWKS fetch is harmless.
-    async fn refetch_jwks(&self, jwks_uri: &str) -> Result<JwkSet, OidcError> {
+    /// The fetch comes first. When it fails, `cached` stays in place and keeps
+    /// verifying tokens signed with its keys: the token that triggered the
+    /// refresh needs no valid signature, so dropping the keys first would let
+    /// anyone empty every instance's cache during an IdP outage. Only a set
+    /// that differs from `cached` replaces it, through an invalidation that
+    /// also reaches the peer instances (via the cache backplane, when Redis is
+    /// configured) so they pick up the rotated keys; a refresh that finds the
+    /// same keys changes nothing anywhere.
+    ///
+    /// We deliberately use **no** advisory lock: an occasional duplicate JWKS
+    /// fetch is harmless.
+    async fn refetch_jwks(&self, jwks_uri: &str, cached: JwkSet) -> JwkSet {
+        let fresh = match fetch_json::<JwkSet>(&self.http, jwks_uri, "jwks").await {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                tracing::warn!(
+                    issuer = %self.issuer,
+                    error = %e,
+                    "jwks refresh after an unknown kid failed; keeping the cached keys"
+                );
+                return cached;
+            }
+        };
+        if fresh == cached {
+            return cached;
+        }
         self.cache.invalidate(NS_JWKS, &self.issuer).await;
-        self.fetch_jwks_cached(jwks_uri).await
+        let stored = fresh.clone();
+        self.cache
+            .get_or_try_insert_local(NS_JWKS, &self.issuer, self.jwks_ttl, || async move {
+                Ok::<JwkSet, Infallible>(stored)
+            })
+            .await
+            .unwrap_or_else(|never| match never {})
     }
 
     /// Claim the issuer's single unknown-`kid` refresh slot for the cooldown
@@ -346,8 +401,8 @@ impl OidcMetadataClient {
     /// Verify an ID token: signature (against the cached JWKS, with a single
     /// kid-miss refetch), then `iss`/`aud`/`exp`/`nbf` (with leeway) and `nonce`.
     ///
-    /// Returns the validated subject + full claim set for the claim-mapping
-    /// phase. Rejects `alg: none`, HMAC, and any non-RSA key family.
+    /// Returns the validated subject + full claim set for the claim mapping.
+    /// Rejects `alg: none`, HMAC, and any non-RSA key family.
     pub async fn verify_id_token(
         &self,
         token: &str,
@@ -365,7 +420,7 @@ impl OidcMetadataClient {
     }
 
     /// Verify a JWT against this issuer, accepting **any** of `audiences`
-    /// (slice 12.8, WIF: a workload realm trusts a set of allowed audiences and
+    /// (WIF: a workload realm trusts a set of allowed audiences and
     /// presents no nonce). This is the shared core of [`verify_id_token`]:
     /// signature against the cached JWKS (one kid-miss refetch), the RSA-only
     /// algorithm allowlist, `iss` = configured issuer, `aud` ∈ `audiences`,
@@ -465,7 +520,7 @@ impl OidcMetadataClient {
         let mut jwks = self.fetch_jwks_cached(&jwks_uri).await?;
         let mut jwk = find_key(&jwks, kid.as_deref());
         if jwk.is_none() && self.acquire_unknown_kid_refresh().await {
-            jwks = self.refetch_jwks(&jwks_uri).await?;
+            jwks = self.refetch_jwks(&jwks_uri, jwks.clone()).await;
             jwk = find_key(&jwks, kid.as_deref());
         }
         let jwk = jwk.ok_or_else(|| OidcError::UnknownKid(kid.clone()))?;
@@ -646,12 +701,18 @@ fn discovery_url(issuer: &str) -> String {
 }
 
 /// Validate the discovery document: its `issuer` must equal the configured
-/// issuer, and the advertised token/jwks endpoints must be https and share the
-/// issuer's host (SSRF sanity on top of the guarded client).
-fn validate_discovery(doc: &DiscoveryDocument, expected_issuer: &str) -> Result<(), OidcError> {
+/// issuer, and the advertised token/jwks endpoints must use the issuer's
+/// scheme and live on the issuer's host or one of `endpoint_hosts` (SSRF
+/// sanity on top of the guarded client).
+fn validate_discovery(
+    doc: &DiscoveryDocument,
+    expected_issuer: &str,
+    endpoint_hosts: &[String],
+) -> Result<(), OidcError> {
     validate_discovery_identity_and_endpoints(
         &doc.issuer,
         expected_issuer,
+        endpoint_hosts,
         &[
             ("jwks_uri", doc.jwks_uri.as_str()),
             ("token_endpoint", doc.token_endpoint.as_str()),
@@ -670,6 +731,7 @@ fn validate_workload_discovery(
     validate_discovery_identity_and_endpoints(
         &doc.issuer,
         expected_issuer,
+        &[],
         &[("jwks_uri", doc.jwks_uri.as_str())],
     )
 }
@@ -677,6 +739,7 @@ fn validate_workload_discovery(
 fn validate_discovery_identity_and_endpoints(
     document_issuer: &str,
     expected_issuer: &str,
+    endpoint_hosts: &[String],
     endpoints: &[(&'static str, &str)],
 ) -> Result<(), OidcError> {
     if normalize_issuer(document_issuer.to_string()) != expected_issuer {
@@ -694,8 +757,8 @@ fn validate_discovery_identity_and_endpoints(
         .to_string();
     // Endpoints must use the **same scheme as the trusted issuer** (https in
     // production — the config loader requires an https issuer; http only for the
-    // loopback mock in tests) and share the issuer's host (SSRF sanity on top of
-    // the guarded client).
+    // loopback mock in tests) and share the issuer's host, or use one the realm
+    // names in `endpoint_hosts` (SSRF sanity on top of the guarded client).
     let issuer_scheme = issuer_url.scheme();
 
     for (label, endpoint) in endpoints {
@@ -708,7 +771,11 @@ fn validate_discovery_identity_and_endpoints(
             )));
         }
         match url.host_str() {
-            Some(host) if host == issuer_host => {}
+            Some(host)
+                if host == issuer_host
+                    || endpoint_hosts
+                        .iter()
+                        .any(|allowed| host.eq_ignore_ascii_case(allowed)) => {}
             other => {
                 return Err(OidcError::DiscoveryMismatch(format!(
                     "{label} host {other:?} does not match issuer host {issuer_host:?}"
@@ -1079,6 +1146,7 @@ mod tests {
             .await
             .expect_err("metadata over one MiB must be rejected before full buffering");
         assert!(matches!(err, OidcError::Parse { .. }), "got {err:?}");
+        assert!(err.is_unavailable(), "no verdict on any token: {err:?}");
     }
 
     #[tokio::test]
@@ -1108,6 +1176,37 @@ mod tests {
             .await
             .expect_err("slow metadata response must honor the client deadline");
         assert!(matches!(err, OidcError::Http { .. }), "got {err:?}");
+        assert!(err.is_unavailable(), "no verdict on any token: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_jwks_is_unavailable_not_a_verdict_on_the_token() {
+        // Discovery answers, the JWKS endpoint fails with a 5xx, and nothing
+        // is cached: the token could not be checked, which callers must tell
+        // apart from a token that failed its check.
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let signer = TestSigner::new("k1");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(discovery_json(&issuer, &issuer)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let token = signer.sign(&workload_claims(&issuer, "forge-ci"));
+        let err = client_for(&issuer, &server)
+            .verify_workload_jwt(&token, &["forge-ci"], &[], 60, 3600)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OidcError::Http { .. }), "got {err:?}");
+        assert!(err.is_unavailable());
     }
 
     #[tokio::test]
@@ -1189,7 +1288,7 @@ mod tests {
                 .unwrap(),
             "alice@example.com"
         );
-        // `roles` flows through for the later admin-mapping phase.
+        // `roles` flows through for the admin mapping (`claims.rs`).
         assert!(verified.claims.additional.contains_key("roles"));
     }
 
@@ -1227,6 +1326,7 @@ mod tests {
         };
         let err = client.verify_id_token(&token, &params).await.unwrap_err();
         assert!(matches!(err, OidcError::InvalidToken(_)), "got {err:?}");
+        assert!(!err.is_unavailable(), "a verdict on the token: {err:?}");
     }
 
     #[tokio::test]
@@ -1457,6 +1557,7 @@ mod tests {
         };
         let err = client.verify_id_token(&token, &params).await.unwrap_err();
         assert_eq!(err, OidcError::UnknownKid(Some("absent-kid".into())));
+        assert!(!err.is_unavailable(), "a verdict on the token: {err:?}");
         // Cold load + one refetch, then give up — no infinite refetch loop.
         assert_eq!(jwks_hits.load(Ordering::SeqCst), 2);
 
@@ -1474,6 +1575,58 @@ mod tests {
             2,
             "random kid spray must not refetch once per request"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_kid_miss_refresh_keeps_the_cached_keys() {
+        // A token with a made-up kid (no valid signature needed) while the
+        // IdP's JWKS endpoint is down must not cost the cached keys: tokens
+        // signed with them keep verifying until the endpoint recovers.
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let present = TestSigner::new("present-kid");
+        let made_up = TestSigner::new("made-up-kid");
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(discovery_json(&issuer, &issuer)),
+            )
+            .mount(&server)
+            .await;
+        let jwks_hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(FirstThenDown {
+                body: json!({ "keys": [present.jwk] }),
+                hits: jwks_hits.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let client = client_for(&issuer, &server);
+        let params = VerifyParams {
+            audience: "client-abc".into(),
+            nonce: Some("n".into()),
+            leeway_seconds: 60,
+        };
+        let good = present.sign(&good_claims(&issuer, "client-abc", "n"));
+        client
+            .verify_id_token(&good, &params)
+            .await
+            .expect("cold load");
+
+        let bogus = made_up.sign(&good_claims(&issuer, "client-abc", "n"));
+        let err = client.verify_id_token(&bogus, &params).await.unwrap_err();
+        assert_eq!(err, OidcError::UnknownKid(Some("made-up-kid".into())));
+        // The refresh was tried, and failed.
+        assert_eq!(jwks_hits.load(Ordering::SeqCst), 2);
+
+        // The cached keys survived: no fetch needed (the endpoint is down).
+        client
+            .verify_id_token(&good, &params)
+            .await
+            .expect("cached key still verifies");
+        assert_eq!(jwks_hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1498,6 +1651,38 @@ mod tests {
         assert!(
             matches!(err, OidcError::DiscoveryMismatch(_)),
             "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_accepts_endpoints_on_configured_hosts_only() {
+        // Google serves its token endpoint and keys on other hosts than the
+        // issuer's. The realm names them; nothing else is accepted.
+        let issuer = "https://accounts.google.com";
+        let doc = DiscoveryDocument {
+            issuer: issuer.into(),
+            authorization_endpoint: format!("{issuer}/o/oauth2/v2/auth"),
+            token_endpoint: "https://oauth2.googleapis.com/token".into(),
+            jwks_uri: "https://www.googleapis.com/oauth2/v3/certs".into(),
+            end_session_endpoint: None,
+        };
+        assert!(matches!(
+            validate_discovery(&doc, issuer, &[]),
+            Err(OidcError::DiscoveryMismatch(_))
+        ));
+        let hosts = vec![
+            "oauth2.googleapis.com".to_string(),
+            "WWW.googleapis.com".to_string(),
+        ];
+        assert_eq!(validate_discovery(&doc, issuer, &hosts), Ok(()));
+        let mut attacker = doc.clone();
+        attacker.jwks_uri = "https://attacker.example/certs".into();
+        assert!(validate_discovery(&attacker, issuer, &hosts).is_err());
+        let mut http = doc.clone();
+        http.token_endpoint = "http://oauth2.googleapis.com/token".into();
+        assert!(
+            validate_discovery(&http, issuer, &hosts).is_err(),
+            "scheme still checked"
         );
     }
 
@@ -1544,6 +1729,21 @@ mod tests {
     /// JWKS responder that serves `[old]` on the first hit and `[old, new]`
     /// afterwards — simulating an IdP that rolled in a new signing key.
     #[derive(Clone)]
+    /// Serves `body` once, then answers 503 (an IdP outage).
+    struct FirstThenDown {
+        body: serde_json::Value,
+        hits: Arc<AtomicUsize>,
+    }
+    impl Respond for FirstThenDown {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            if self.hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(self.body.clone())
+            } else {
+                ResponseTemplate::new(503)
+            }
+        }
+    }
+
     struct RotatingJwks {
         hits: Arc<AtomicUsize>,
         old: serde_json::Value,

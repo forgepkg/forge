@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH seen AS (\n            SELECT id,\n                   CASE WHEN version = ANY($3::text[]) THEN NULL\n                        ELSE coalesce(missing_since, now()) END AS missing_since\n            FROM proxy_cached_version\n            WHERE repository_id = $1 AND name = $2 AND version <> '*' AND confirmed\n        ), next AS (\n            SELECT id, missing_since,\n                   coalesce(missing_since <= now() - make_interval(secs => $4), false)\n                       AS upstream_missing\n            FROM seen\n        )\n        UPDATE proxy_cached_version p\n        SET missing_since = next.missing_since,\n            upstream_missing = next.upstream_missing\n        FROM next\n        WHERE p.id = next.id\n          AND (p.missing_since IS DISTINCT FROM next.missing_since\n               OR p.upstream_missing IS DISTINCT FROM next.upstream_missing)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "TextArray",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "66bd2cf35cfbab89dca18722d1dbad425eb5f45fb4e55995fffaced0bc5e83a5"
+}

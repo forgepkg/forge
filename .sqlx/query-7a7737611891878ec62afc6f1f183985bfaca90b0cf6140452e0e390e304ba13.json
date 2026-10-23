@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM oci_upload_part p\n        USING oci_upload u\n        WHERE p.upload_id = u.id AND u.repository_id = $1\n        RETURNING p.blob_sha256\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "blob_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_upload_part",
+            "name": "blob_sha256"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7a7737611891878ec62afc6f1f183985bfaca90b0cf6140452e0e390e304ba13"
+}

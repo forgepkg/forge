@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: forge
+  labels:
+    app.kubernetes.io/name: forge
+    app.kubernetes.io/component: server
+  annotations:
+    # ingress-nginx spelling; other controllers ignore these. Pushes are up to
+    # the largest repository upload limit (set in the web UI; by default
+    # 512 MiB, and 1 GiB per image layer: docker sends a layer in one request)
+    # and slow; downloads are streamed.
+    nginx.ingress.kubernetes.io/proxy-body-size: 1g
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "900"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "900"
+spec:
+  tls:
+    - hosts:
+        - forge.example.com
+      secretName: forge-tls
+  rules:
+    - host: forge.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: forge
+                port:
+                  name: http

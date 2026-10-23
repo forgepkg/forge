@@ -1,0 +1,90 @@
+# Valkey for Forge (forge chart: `valkey:`). Anything that can write to
+# Valkey can write Forge's shared cache, so keep it password-protected and
+# reachable from Forge only (docs/deployment.md).
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Docker Hub's valkey/valkey, mirrored to ghcr.io under the same digests
+  # (.github/workflows/mirror-images.yml). `registry: docker.io` and
+  # `repository: valkey/valkey` pull the original.
+  registry: ghcr.io
+  repository: forgepkg/forge/valkey
+  # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
+  # Dependabot bumps together with the tag; `digest`, when set, replaces it.
+  tag: 9.2-alpine@sha256:cdcb7b1c7b6f1c9cb9442c71ac6275e78184657448407b2c1fdde7ee8024f4fb
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+auth:
+  enabled: true
+  # Generated on install and kept when empty. Forge pastes it into its
+  # FORGE_REDIS__URL (Valkey speaks the Redis protocol) unescaped: use a
+  # URL-safe value (`openssl rand -hex 24`).
+  password: ""
+  # An existing Secret holding the password instead of the chart's.
+  existingSecret: ""
+  secretKey: password
+  # A change of auth.password restarts Valkey through a pod annotation that
+  # holds its SHA-256 salted with a random value, so the annotation (which
+  # anyone who can read the pods sees) cannot be tested against guesses. The
+  # salt is generated on install and kept in the chart's Secret (key
+  # checksum-salt). Tools that render without a cluster (Argo CD, `helm
+  # template`) would generate a new one, and restart Valkey, on every render:
+  # set one here for them (`openssl rand -hex 16`).
+  checksumSalt: ""
+
+service:
+  type: ClusterIP
+  port: 6379
+  annotations: {}
+  labels: {}
+
+# Further valkey-server arguments, e.g. ["--maxmemory", "200mb",
+# "--maxmemory-policy", "allkeys-lru"]. The chart already turns persistence
+# off (--save "" --appendonly no).
+extraArgs: []
+extraEnv: []
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podSecurityContext:
+  # The image's `valkey` user.
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Probe timing; the handler is a TCP check of the valkey port.
+readinessProbe:
+  periodSeconds: 5
+livenessProbe:
+  periodSeconds: 10
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# Only Forge reaches Valkey (where the CNI enforces NetworkPolicy).
+networkPolicy:
+  enabled: true
+  extraFrom: []

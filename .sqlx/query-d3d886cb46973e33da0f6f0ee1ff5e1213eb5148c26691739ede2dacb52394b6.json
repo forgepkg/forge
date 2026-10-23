@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT (EXISTS (SELECT 1 FROM oci_tag WHERE manifest_id = $1)\n             OR EXISTS (\n                 SELECT 1\n                 FROM oci_manifest p\n                 JOIN oci_manifest_ref r ON r.manifest_id = p.id\n                 WHERE p.repository_id = $2 AND p.image = $3 AND p.id <> $1\n                   AND r.kind = 'manifest' AND r.digest = $4\n             )) AS \"kept!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kept!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "d3d886cb46973e33da0f6f0ee1ff5e1213eb5148c26691739ede2dacb52394b6"
+}

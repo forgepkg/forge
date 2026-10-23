@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use forge_storage::{BlobStore, Cas, S3Config};
+use forge_storage::{BlobStore, Cas, S3Config, S3Credentials};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -44,6 +44,7 @@ async fn endpoint() -> &'static str {
         .with_db_name("forge")
         .with_user("forge")
         .with_password("forge")
+        .with_name("mirror.gcr.io/library/postgres")
         .with_tag("17")
         .start()
         .await
@@ -83,6 +84,32 @@ pub async fn small_pool(max_connections: u32, acquire_timeout: Duration) -> PgPo
         .max_connections(max_connections)
         .acquire_timeout(acquire_timeout)
         .connect(&database_url().await)
+        .await
+        .expect("connect")
+}
+
+/// A pool on the same database whose clock runs one hour **ahead** of this
+/// process's: unqualified `now()` in its queries resolves to
+/// `forge_skew.now()` (search_path puts that schema before `pg_catalog`), the
+/// way a database host with a skewed clock would answer. Column defaults keep
+/// the real clock.
+#[allow(dead_code)]
+pub async fn pool_with_clock_ahead() -> PgPool {
+    let pool = pool().await;
+    sqlx::raw_sql(
+        "CREATE SCHEMA IF NOT EXISTS forge_skew; \
+         CREATE OR REPLACE FUNCTION forge_skew.now() RETURNS timestamptz \
+         LANGUAGE sql STABLE AS $$ SELECT pg_catalog.now() + interval '1 hour' $$;",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the skewed clock");
+    pool.close().await;
+    let options: sqlx::postgres::PgConnectOptions =
+        database_url().await.parse().expect("database url");
+    PgPoolOptions::new()
+        .max_connections(8)
+        .connect_with(options.options([("search_path", "forge_skew,public,pg_catalog")]))
         .await
         .expect("connect")
 }
@@ -132,7 +159,7 @@ async fn s3_endpoint() -> &'static str {
 
     // versitygw posix backend (see storage harness): root must already exist,
     // so we point it at `/tmp` and use a named bucket subdir we create below.
-    let container = GenericImage::new("versity/versitygw", "v1.4.1")
+    let container = GenericImage::new("mirror.gcr.io/versity/versitygw", "v1.4.1")
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on"))
         .with_cmd([
@@ -163,8 +190,7 @@ pub async fn blob_store() -> BlobStore {
         endpoint,
         region: "us-east-1".to_string(),
         bucket: S3_BUCKET.to_string(),
-        access_key: S3_ACCESS.to_string(),
-        secret_key: S3_SECRET.to_string(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),

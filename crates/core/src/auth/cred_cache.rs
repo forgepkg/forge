@@ -1,4 +1,4 @@
-//! The validated-credential cache (slice 12.3, Phase 3) — security-critical.
+//! The validated-credential cache — security-critical.
 //!
 //! NuGet clients send HTTP Basic credentials on **every** request, so a
 //! credential-forwarding provider that hit the upstream once per request would
@@ -30,7 +30,8 @@
 //!
 //! `cred_key = hex(HMAC-SHA256(pepper, len(provider) ‖ provider ‖ len(user) ‖
 //! user ‖ password))`, where `pepper` is a server-held secret
-//! ([`CredKeyPepper`], redacted in `Debug`, §12.5-encryptable).
+//! ([`CredKeyPepper`], redacted in `Debug`; kept with the realm's secrets,
+//! which are encrypted at rest when that is enabled).
 //!
 //! * **No plaintext at rest.** Only the HMAC is ever stored / cached.
 //! * **Pepper, not a bare hash.** A bare hash of the password would be offline-
@@ -86,7 +87,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::Utc;
 use forge_cache::Cache;
 use forge_db::validated_credential_dao::{self as vc_dao, Claim, ClaimState, NewVerdict};
 use hmac::{Hmac, KeyInit, Mac};
@@ -135,10 +135,11 @@ fn user_cache_tag(username: &str) -> String {
 
 /// A server-held secret keying the credential-cache HMAC.
 ///
-/// Treated like Slice 1's `upstream_password`: **redacted** in `Debug` so it can
-/// never leak through a log line or error body, and stored in a dedicated secret
-/// slot ready for §12.5 encryption. Rotating it invalidates the whole cache
-/// (every key changes), which merely causes re-forwards — acceptable.
+/// Treated like a repository's `upstream_password`: **redacted** in `Debug` so
+/// it can never leak through a log line or error body, and kept with the
+/// realm's secrets, which are encrypted at rest when that is enabled. Rotating
+/// it invalidates the whole cache (every key changes), which merely causes
+/// re-forwards — acceptable.
 #[derive(Clone)]
 pub struct CredKeyPepper(Vec<u8>);
 
@@ -361,7 +362,7 @@ impl ValidatedCredentialCache {
     /// the credential is valid; `Ok(false)` means definitively rejected;
     /// [`CredCacheError::Unavailable`] means fail-closed (deny; do not grant).
     ///
-    /// `forward` is the actual upstream HTTP Basic call (Phase 4). It is invoked
+    /// `forward` is the actual upstream HTTP Basic call. It is invoked
     /// **at most once** per credential per TTL window per cluster (singleflight),
     /// and only on a genuine miss. No database connection is held while it runs.
     /// It receives nothing but its own captured state — the plaintext password
@@ -381,13 +382,13 @@ impl ValidatedCredentialCache {
         let key = cred_key(&self.pepper, provider_id, username, password);
         let user_tag = user_cache_tag(username);
 
-        // The cache value's TTL must depend on the verdict (positive vs
-        // negative), but `get_or_try_insert_with` takes a single `ttl`. We pass
-        // the longer positive TTL to the cache layer (so a positive lives its
-        // full window) and rely on the absolute `expires_at` written to Postgres
-        // — and re-checked on read — for the authoritative, per-verdict bound.
-        // A negative entry that out-lives its DB expiry is re-derived on the next
-        // Postgres read (the DAO treats an expired row as a miss).
+        // The in-memory entry lives no longer than the verdict behind it: a
+        // fresh forward's verdict for its own TTL (positive or negative), a
+        // verdict read from Postgres only for what its row has left. An L1
+        // hit never goes back to Postgres, so without this a rejection would
+        // stick for the positive TTL, and an instance that read a peer's row
+        // near its expiry would keep accepting the credential for a whole
+        // further window.
         let fill = Fill {
             pool: self.pool.clone(),
             provider_id: provider_id.to_string(),
@@ -401,11 +402,11 @@ impl ValidatedCredentialCache {
 
         let verdict: CachedVerdict = self
             .cache
-            .get_or_try_insert_local_with_tags(
+            .get_or_try_insert_local_with_tags_expiring(
                 NS_CRED,
                 &key,
                 std::slice::from_ref(&user_tag),
-                self.positive_ttl,
+                self.positive_ttl.max(self.negative_ttl),
                 || async move { fill.load_or_forward(forward).await },
             )
             .await?;
@@ -490,18 +491,24 @@ impl Fill {
     /// definitive verdict. No connection or transaction is held across the
     /// forward or across a loser's waits.
     ///
+    /// Returns the verdict with how long it may be cached: what its row has
+    /// left, or the verdict's own TTL after a fresh forward.
+    ///
     /// Returns `Err(Unavailable)` (never cached) when the upstream is down, the
     /// provider's forward limit is exhausted, the verdict was fenced by a
     /// concurrent revocation, or a peer's forward did not settle in time —
     /// fail-closed in every case.
-    async fn load_or_forward<F, Fut>(&self, forward: F) -> Result<CachedVerdict, CredCacheError>
+    async fn load_or_forward<F, Fut>(
+        &self,
+        forward: F,
+    ) -> Result<(CachedVerdict, Duration), CredCacheError>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = UpstreamVerdict>,
     {
         // 1. Authoritative read: a non-expired row short-circuits the forward
         //    (this is what a cold/Redis-less instance relies on).
-        if let Some(row) = vc_dao::get_verdict(
+        if let ClaimState::Fresh(fresh) = vc_dao::claim_state(
             &self.pool,
             &self.provider_id,
             &self.username,
@@ -509,7 +516,7 @@ impl Fill {
         )
         .await?
         {
-            return Ok(CachedVerdict { valid: row.verdict });
+            return Ok(fresh_verdict(fresh));
         }
 
         // A loser waits at most two leases overall: long enough for a stalled
@@ -538,7 +545,7 @@ impl Fill {
             )
             .await?
             {
-                Claim::Verdict(valid) => return Ok(CachedVerdict { valid }),
+                Claim::Verdict(fresh) => return Ok(fresh_verdict(fresh)),
                 Claim::Won { token } => {
                     let forward = forward.take().expect("a fill wins its lease at most once");
                     return self.forward_as_winner(token, permit, forward).await;
@@ -568,7 +575,7 @@ impl Fill {
                 )
                 .await?
                 {
-                    ClaimState::Fresh(valid) => return Ok(CachedVerdict { valid }),
+                    ClaimState::Fresh(fresh) => return Ok(fresh_verdict(fresh)),
                     ClaimState::Claimed => continue,
                     ClaimState::Open => break,
                 }
@@ -584,7 +591,7 @@ impl Fill {
         token: Uuid,
         permit: OwnedSemaphorePermit,
         forward: F,
-    ) -> Result<CachedVerdict, CredCacheError>
+    ) -> Result<(CachedVerdict, Duration), CredCacheError>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = UpstreamVerdict>,
@@ -637,7 +644,8 @@ impl Fill {
             }
         };
 
-        let expires_at = Utc::now()
+        // The row's expiry is compared with the database's clock.
+        let expires_at = forge_db::db_now(&self.pool).await?
             + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
         // On a store error the lease stays and lapses on its own.
         guard.disarm();
@@ -665,8 +673,18 @@ impl Fill {
             return Err(CredCacheError::Unavailable);
         }
 
-        Ok(CachedVerdict { valid })
+        Ok((CachedVerdict { valid }, ttl))
     }
+}
+
+/// A verdict read from its row, cached for no longer than the row has left.
+fn fresh_verdict(fresh: vc_dao::FreshVerdict) -> (CachedVerdict, Duration) {
+    (
+        CachedVerdict {
+            valid: fresh.verdict,
+        },
+        fresh.remaining,
+    )
 }
 
 /// Releases a won lease from a background task when the winning fill is

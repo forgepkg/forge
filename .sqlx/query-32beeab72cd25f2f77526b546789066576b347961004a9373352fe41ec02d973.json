@@ -1,0 +1,51 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT verdict,\n               expires_at > now() AS \"fresh!\",\n               GREATEST(EXTRACT(EPOCH FROM expires_at - now()), 0)::float8 AS \"remaining_secs!\",\n               COALESCE(claimed_until > now(), false) AS \"claimed!\"\n        FROM validated_credential\n        WHERE provider_id = $1 AND username = $2 AND cred_hmac = $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "verdict",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "validated_credential",
+            "name": "verdict"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "fresh!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "remaining_secs!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "claimed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "32beeab72cd25f2f77526b546789066576b347961004a9373352fe41ec02d973"
+}

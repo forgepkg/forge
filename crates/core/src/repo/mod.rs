@@ -1,13 +1,14 @@
 //! Repository read/write operations, organized by repository kind.
 //!
-//! Slice 1 implements the **hosted** read path here (Phase 6); proxy and group
-//! read paths arrive in later phases. The neutral DTOs in this module are the
-//! contract between the storage-backed implementations and the protocol crates
-//! (`forge-nuget`): they are format-agnostic and carry exactly what a NuGet
-//! route handler needs to render Appendix A JSON, **plus** the raw `.nuspec`
-//! bytes so the format layer can extract dependency groups itself (keeping
-//! `forge-core` free of NuGet-specific manifest parsing).
+//! The [`hosted`], [`proxy`] and [`group`] read paths live in their submodules.
+//! The neutral DTOs in this module are the contract between the storage-backed
+//! implementations and the format plugins (served by the server's plugin
+//! dispatcher): they are format-agnostic and carry exactly what a feed needs
+//! to render its JSON responses, **plus** the raw
+//! manifest bytes so the format layer can extract dependency groups itself
+//! (keeping `forge-core` free of NuGet-specific manifest parsing).
 
+pub mod downloads;
 pub mod group;
 pub mod hosted;
 pub mod proxy;
@@ -23,9 +24,11 @@ use crate::authz::PackageFilter;
 /// it without depending on `forge-db` directly.
 pub use forge_db::model::RepoKind;
 
-/// Canonical asset path of the stored `.nupkg` blob within a component.
+/// Canonical asset path of the stored `.nupkg` blob within a component
+/// (NuGet's [`crate::format::Format::package_asset_path`]).
 pub const NUPKG_ASSET_PATH: &str = "package.nupkg";
-/// Canonical asset path of the derived `.nuspec` blob within a component.
+/// Canonical asset path of the derived `.nuspec` blob within a component
+/// (NuGet's [`crate::format::Format::manifest_asset_path`]).
 pub const NUSPEC_ASSET_PATH: &str = "package.nuspec";
 
 /// Content type stored/served for the `.nupkg` asset.
@@ -52,14 +55,21 @@ pub enum RepoError {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
     /// A storage/I-O error while fetching blob bytes (e.g. an S3 failure).
-    /// The concrete blob fetcher (Phase 10) surfaces transport errors here
+    /// The concrete blob fetcher surfaces transport errors here
     /// rather than overloading [`RepoError::RepoNotFound`].
     #[error("storage error: {0}")]
     Storage(String),
-    /// A local resource is exhausted for now (the temp-space budget for
-    /// staging uploads and downloads); the client should retry later → 503.
+    /// A resource is unavailable for now (the temp-space budget for staging
+    /// uploads and downloads is exhausted, a member repository is offline,
+    /// the object store is down while the local blob cache serves reads);
+    /// the client should retry later → 503.
     #[error("temporarily unavailable: {0}")]
     Busy(String),
+    /// The repository's format is not installed on this server (a format
+    /// plugin missing from the configuration) → 503: nothing of it is served
+    /// until the format is back, and it is never read as another format.
+    #[error("format {0:?} is not installed")]
+    FormatUnavailable(String),
 }
 
 /// Errors surfaced by the hosted **write** path (publish / delete / relist).
@@ -112,6 +122,7 @@ impl From<forge_storage::CasError> for WriteError {
             e @ forge_storage::CasError::StagingFull { .. } => {
                 WriteError::Repo(RepoError::Busy(e.to_string()))
             }
+            e if e.is_unavailable() => WriteError::Repo(RepoError::Busy(e.to_string())),
             other => WriteError::Repo(RepoError::Storage(other.to_string())),
         }
     }
@@ -124,6 +135,46 @@ pub enum PublishOutcome {
     Created,
     /// An existing `(id, version)` was redeployed (assets swapped) → HTTP 201.
     Replaced,
+}
+
+/// How an import writes one package version
+/// ([`hosted::HostedWrite::import_staged`]).
+#[derive(Debug, Clone, Default)]
+pub struct ImportOptions {
+    /// Replace a version that exists with other bytes (otherwise it is
+    /// reported as [`ImportOutcome::Conflict`]), even where the repository
+    /// does not allow redeploys.
+    pub overwrite: bool,
+    /// Decide what would happen, and write nothing.
+    pub dry_run: bool,
+    /// When the source published the version: becomes its creation time,
+    /// which retention's age rules read.
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the source last served the version: becomes its last download.
+    pub downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Who published it at the source, for the audit trail.
+    pub uploader: Option<String>,
+    /// Where it came from, for the audit trail (`<nexus url> <repository>`).
+    pub source: String,
+}
+
+/// What an import did with one package version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportOutcome {
+    /// The version is new and was stored.
+    Created { id: String, version: String },
+    /// The version existed with other bytes and was replaced.
+    Replaced { id: String, version: String },
+    /// The version exists with the same bytes; nothing was written.
+    Identical { id: String, version: String },
+    /// The version exists with other bytes and was left alone.
+    Conflict { id: String, version: String },
+    /// Dry run: the version would be stored (`replaces`: over other bytes).
+    Planned {
+        id: String,
+        version: String,
+        replaces: bool,
+    },
 }
 
 /// Outcome of a delete / relist operation.
@@ -177,6 +228,8 @@ pub struct VersionEntry {
 /// A package blob resolved for download (the `.nupkg`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NupkgLocation {
+    /// Content hash of the blob: its key in the local blob cache.
+    pub blob_sha256: String,
     /// S3 object key of the blob, for streaming from the [`forge_storage`]
     /// blob store.
     pub blob_s3_key: String,
@@ -198,10 +251,18 @@ pub struct RegistrationEntry {
     pub original_id: String,
     /// Normalized version.
     pub version: String,
+    /// Version exactly as published (the normalized one when unknown, e.g.
+    /// a proxied version not cached yet).
+    pub version_original: String,
     /// Whether listed.
     pub listed: bool,
     /// SHA-512 of the `.nupkg`, base64-encoded (from `asset.sha512_base64`).
     pub package_hash_sha512_base64: Option<String>,
+    /// SHA-256 of the package, lowercase hex (the CAS key of its blob), when
+    /// the package is stored locally.
+    pub package_sha256: Option<String>,
+    /// Byte size of the package, when it is stored locally.
+    pub package_size: Option<i64>,
     /// Raw `.nuspec` bytes for this version, if a nuspec asset is stored and
     /// no [`Self::manifest_summary`] is (older versions).
     pub nuspec_bytes: Option<Vec<u8>>,
@@ -339,6 +400,16 @@ pub struct SearchParams {
     pub take: usize,
     /// Include prerelease versions.
     pub prerelease: bool,
+    /// Include SemVer 2.0.0 versions ([`is_semver2`]). Applied with the other
+    /// version filters, before counting and paging, so an id left with only
+    /// such versions is neither a hit nor counted. The NuGet route sets it
+    /// from `semVerLevel`; it defaults to `true`.
+    pub include_semver2: bool,
+    /// Let a proxy forward the search to its upstream's search service, so
+    /// packages it has not cached yet are found too (see
+    /// [`proxy`](crate::repo::proxy)). The NuGet search route sets it; the
+    /// browse UI, which lists what Forge holds, does not. Defaults to `true`.
+    pub include_upstream: bool,
 }
 
 impl Default for SearchParams {
@@ -348,6 +419,8 @@ impl Default for SearchParams {
             skip: 0,
             take: SearchParams::DEFAULT_TAKE,
             prerelease: false,
+            include_semver2: true,
+            include_upstream: true,
         }
     }
 }
@@ -367,6 +440,19 @@ impl SearchParams {
     }
 }
 
+/// Whether `version` (as published) is a SemVer 2.0.0 version in NuGet's
+/// sense: it carries build metadata or a dotted prerelease label. Clients that
+/// do not send `semVerLevel=2.0.0` must not be shown these.
+pub fn is_semver2(version: &str) -> bool {
+    let version = version.trim();
+    if version.contains('+') {
+        return true;
+    }
+    version
+        .split_once('-')
+        .is_some_and(|(_, prerelease)| prerelease.contains('.'))
+}
+
 /// Read operations a NuGet route handler needs, abstracted so handlers can be
 /// unit-tested against an in-memory mock instead of a live database.
 ///
@@ -381,13 +467,25 @@ pub trait RepoReadOps: Send + Sync {
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError>;
 
     /// Resolve the `.nupkg` blob for an exact `(id, version)`, or `None` if
-    /// that version is absent.
+    /// that version is absent. A resolved `.nupkg` counts as a download.
     async fn resolve_nupkg(
         &self,
         repo: &str,
         id: &str,
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError>;
+
+    /// [`Self::resolve_nupkg`] for a `HEAD` request: the same answer, but not
+    /// counted as a download (a probe must not keep a version "warm" for
+    /// retention).
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        self.resolve_nupkg(repo, id, version).await
+    }
 
     /// Resolve the stored `.nuspec` bytes for an exact `(id, version)`, or
     /// `None` if absent.
@@ -402,6 +500,38 @@ pub trait RepoReadOps: Send + Sync {
     /// version precedence. Empty when the id is unknown.
     async fn registration(&self, repo: &str, id: &str)
         -> Result<Vec<RegistrationEntry>, RepoError>;
+
+    /// The versions [`Self::registration`] lists for `id` (including
+    /// unlisted), ascending by version precedence, without their metadata:
+    /// what a registration index needs when it does not inline its leaves.
+    /// The default derives them from [`Self::registration`]; backends that
+    /// can list the versions alone override it.
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        Ok(self
+            .registration(repo, id)
+            .await?
+            .into_iter()
+            .map(|e| e.version)
+            .collect())
+    }
+
+    /// The registration entries of `id` for `versions` (normalized), in no
+    /// particular order; versions it does not have are left out. What a
+    /// registration page needs. The default filters [`Self::registration`];
+    /// backends that can load a few versions directly override it.
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        Ok(self
+            .registration(repo, id)
+            .await?
+            .into_iter()
+            .filter(|e| versions.iter().any(|v| v.eq_ignore_ascii_case(&e.version)))
+            .collect())
+    }
 
     /// The registration entry of one `(id, version)` — what a registration
     /// leaf or catalog document needs. The default scans
@@ -556,6 +686,18 @@ impl RepoReadOps for PackageFilteredReadOps {
         self.inner.resolve_nupkg(repo, id, version).await
     }
 
+    async fn resolve_nupkg_head(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        if !self.allows(id) {
+            return Ok(None);
+        }
+        self.inner.resolve_nupkg_head(repo, id, version).await
+    }
+
     async fn resolve_nuspec(
         &self,
         repo: &str,
@@ -589,6 +731,25 @@ impl RepoReadOps for PackageFilteredReadOps {
             return Ok(None);
         }
         self.inner.registration_entry(repo, id, version).await
+    }
+
+    async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
+        if !self.allows(id) {
+            return Ok(Vec::new());
+        }
+        self.inner.registration_versions(repo, id).await
+    }
+
+    async fn registration_entries(
+        &self,
+        repo: &str,
+        id: &str,
+        versions: &[String],
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        if !self.allows(id) {
+            return Ok(Vec::new());
+        }
+        self.inner.registration_entries(repo, id, versions).await
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {
@@ -753,7 +914,15 @@ pub trait RepoWriteOps: Send + Sync {
 
 #[cfg(test)]
 mod search_query_tests {
-    use super::SearchQuery;
+    use super::{is_semver2, SearchQuery};
+
+    #[test]
+    fn semver2_detection() {
+        assert!(is_semver2("1.0.0-beta.1"));
+        assert!(is_semver2("1.0.0+sha.abc"));
+        assert!(!is_semver2("1.0.0-beta1"));
+        assert!(!is_semver2("1.0.0"));
+    }
 
     #[test]
     fn parses_client_syntax() {

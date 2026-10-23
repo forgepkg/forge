@@ -1,59 +1,88 @@
 import { useState } from 'react'
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
+import { createFileRoute, Link } from '@tanstack/react-router'
 
-import type { UserView } from '~/api/users'
-import { useCreateUser, useDeleteUser, useUsers } from '~/queries/useUsers'
-import { Badge } from '~/components/catalyst/badge'
-import { Button } from '~/components/catalyst/button'
-import { Checkbox, CheckboxField } from '~/components/catalyst/checkbox'
-import { Field, Label } from '~/components/catalyst/fieldset'
-import { Heading, Subheading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Text } from '~/components/catalyst/text'
+import { accessLevel, ADMIN_ROLE, WRITER_ROLE } from '~/api/rbac'
+import { authSourceLabel, type UserStatus, type UserView } from '~/api/users'
+import { useDeleteUser, useUsers } from '~/queries/useUsers'
+import { useRoles } from '~/queries/useRbac'
+import { AccessBadge } from '~/components/AccessBadge'
 import {
+  Avatar,
+  Button,
+  CellActions,
+  Dialog,
+  Page,
+  PageHeader,
+  Panel,
+  Skeleton,
+  StatusBadge,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from '~/components/catalyst/table'
+  type Tone,
+} from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
+import { InlineError } from '~/components/RbacLabels'
 
 export const Route = createFileRoute('/_app/manage/users')({
   component: UsersList,
 })
 
 /**
- * Admin users screen (plan §Phase 5). Lists every user with their admin / active
- * flags, offers an inline create form (`CreateUser`), links each user to its
- * token-management screen, and deletes with a confirm step. Slice 1 has no
- * update-user endpoint, so there is no edit-in-place beyond create/delete + the
- * per-user token screen.
+ * Admin users screen. Lists every user with how they sign in (password,
+ * identity provider, credential forwarding: look-alike usernames from
+ * different sources are different accounts), their built-in access level
+ * (admin, writer or reader, from their role assignments), the other roles
+ * they hold and their status (active, inactive, or invited: their user has
+ * not chosen a password yet), links to the create page
+ * (`/manage/users/new`) and each user's roles-and-tokens screen, and deletes
+ * after a confirmation dialog. Every account is named by a UPN.
  */
 function UsersList() {
   const users = useUsers()
+  const roles = useRoles()
+  const roleIds = new Map((roles.data ?? []).map((r) => [r.name, r.id]))
   const del = useDeleteUser()
   const [pendingDelete, setPendingDelete] = useState<number | null>(null)
+  const doomed = users.data?.find((u) => u.id === pendingDelete)
 
   function confirmDelete(id: number) {
     del.mutate(id, { onSettled: () => setPendingDelete(null) })
   }
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Heading>Users</Heading>
-        <Text className="mt-1">
-          Create and remove users, and manage each user&apos;s API tokens.
-        </Text>
-      </div>
-
-      <CreateUserForm />
+    <Page>
+      <PageHeader
+        title="Users"
+        description="Invite and remove users, assign their roles, and manage each user's API tokens."
+        actions={
+          <Button variant="primary" icon="Plus" href="/manage/users/new">
+            New user
+          </Button>
+        }
+      />
 
       {del.isError && (
         <InlineError>{del.error.body || del.error.message}</InlineError>
+      )}
+
+      {doomed && (
+        <Dialog
+          open
+          onClose={() => setPendingDelete(null)}
+          icon="Trash"
+          tone="danger"
+          title={`Delete ${doomed.username}?`}
+          description="Their sessions, tokens and role assignments go with the account, and clients that use its tokens start failing. This cannot be undone."
+          confirmLabel={del.isPending ? 'Deleting…' : 'Delete user'}
+          confirmVariant="danger-solid"
+          confirmDisabled={del.isPending}
+          onConfirm={() => confirmDelete(doomed.id)}
+        />
       )}
 
       {users.isError ? (
@@ -63,206 +92,153 @@ function UsersList() {
           onRetry={() => void users.refetch()}
         />
       ) : users.isLoading ? (
-        <Text>Loading users…</Text>
+        <Skeleton variant="table" rows={4} columns={5} label="Loading users…" />
       ) : (users.data?.length ?? 0) === 0 ? (
-        <EmptyState title="No users yet">
-          Create the first user with the form above.
+        <EmptyState title="No users yet" icon="Users">
+          Invite the first one with <strong>New user</strong>.
         </EmptyState>
       ) : (
-        <Table striped>
-          <TableHead>
-            <TableRow>
+        <Panel title="All users" count={users.data!.length} flush>
+          <Table caption="Users">
+            <TableHead>
               <TableHeader>Username</TableHeader>
-              <TableHeader>Role</TableHeader>
-              <TableHeader>Status</TableHeader>
-              <TableHeader>Actions</TableHeader>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {users.data!.map((user) => (
-              <UserRow
-                key={user.id}
-                user={user}
-                isDeleting={del.isPending && pendingDelete === user.id}
-                pendingDelete={pendingDelete === user.id}
-                onRequestDelete={() => setPendingDelete(user.id)}
-                onCancelDelete={() => setPendingDelete(null)}
-                onConfirmDelete={() => confirmDelete(user.id)}
-              />
-            ))}
-          </TableBody>
-        </Table>
+              <TableHeader>Sign-in</TableHeader>
+              <TableHeader width="110px">Access</TableHeader>
+              <TableHeader>Roles</TableHeader>
+              <TableHeader width="110px">Status</TableHeader>
+              <TableHeader align="right">
+                <span className="fg-sr">Actions</span>
+              </TableHeader>
+            </TableHead>
+            <TableBody>
+              {users.data!.map((user) => (
+                <UserRow
+                  key={user.id}
+                  user={user}
+                  roleIds={roleIds}
+                  onRequestDelete={() => setPendingDelete(user.id)}
+                />
+              ))}
+            </TableBody>
+          </Table>
+        </Panel>
       )}
-    </section>
+    </Page>
   )
 }
 
-function InlineError({ children }: { children: React.ReactNode }) {
+const STATUS: Record<UserStatus, { tone: Tone; label: string }> = {
+  active: { tone: 'ok', label: 'active' },
+  inactive: { tone: 'neutral', label: 'inactive' },
+  invited: { tone: 'neutral', label: 'invited' },
+  invitation_expired: { tone: 'warn', label: 'invitation expired' },
+}
+
+/** A user's status; an older server's view without one falls back to `active`. */
+export function UserStatusBadge({ status }: { status: UserStatus | undefined }) {
+  const { tone, label } = STATUS[status ?? 'active'] ?? STATUS.active
   return (
-    <p
-      role="alert"
-      className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-    >
-      {children}
-    </p>
+    <StatusBadge tone={tone} icon={status === 'invited' ? 'Mail' : undefined}>
+      {label}
+    </StatusBadge>
   )
 }
 
 function UserRow({
   user,
-  isDeleting,
-  pendingDelete,
+  roleIds,
   onRequestDelete,
-  onCancelDelete,
-  onConfirmDelete,
 }: {
   user: UserView
-  isDeleting: boolean
-  pendingDelete: boolean
+  roleIds: ReadonlyMap<string, number>
   onRequestDelete: () => void
-  onCancelDelete: () => void
-  onConfirmDelete: () => void
 }) {
-  const navigate = useNavigate()
   return (
     <TableRow>
-      <TableCell>
-        <button
-          type="button"
-          onClick={() =>
-            void navigate({
-              to: '/manage/users/$userId',
-              params: { userId: String(user.id) },
-            })
-          }
-          className="font-medium text-sky-600 hover:underline dark:text-sky-400"
-        >
-          {user.username}
-        </button>
-      </TableCell>
-      <TableCell className="text-zinc-500 dark:text-zinc-400">
-        {user.is_admin ? 'admin' : 'reader'}
-      </TableCell>
-      <TableCell>
-        {user.active ? (
-          <Badge color="emerald">active</Badge>
-        ) : (
-          <Badge color="zinc">inactive</Badge>
-        )}
-      </TableCell>
-      <TableCell>
-        <span className="flex items-center gap-3">
+      <TableCell lead>
+        <span className="fg-cell-user">
+          <Avatar name={user.username} decorative />
           <Link
             to="/manage/users/$userId"
             params={{ userId: String(user.id) }}
-            className="text-sky-600 hover:underline dark:text-sky-400"
+            className="fg-link-strong"
           >
-            Tokens
+            {user.username}
           </Link>
-          {pendingDelete ? (
-            <span className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={onConfirmDelete}
-                disabled={isDeleting}
-                className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
-              >
-                {isDeleting ? 'Deleting…' : 'Confirm'}
-              </button>
-              <button
-                type="button"
-                onClick={onCancelDelete}
-                className="text-zinc-500 hover:underline dark:text-zinc-400"
-              >
-                Cancel
-              </button>
-            </span>
-          ) : (
-            <button
-              type="button"
-              onClick={onRequestDelete}
-              className="font-medium text-red-600 hover:underline dark:text-red-400"
-            >
-              Delete
-            </button>
-          )}
         </span>
+      </TableCell>
+      <TableCell>{authSourceLabel(user.auth_source)}</TableCell>
+      <TableCell>
+        <AccessBadge level={accessLevel(user.roles, user.is_admin)} />
+      </TableCell>
+      <TableCell>
+        <RoleBadges user={user} roleIds={roleIds} />
+      </TableCell>
+      <TableCell>
+        <UserStatusBadge status={user.status} />
+      </TableCell>
+      <TableCell align="right" nowrap>
+        <CellActions>
+          <Button size="sm" variant="ghost" href={`/manage/users/${user.id}`}>
+            Roles &amp; tokens
+          </Button>
+          <Button size="sm" variant="ghost" icon="Trash" onClick={onRequestDelete}>
+            Delete
+          </Button>
+        </CellActions>
       </TableCell>
     </TableRow>
   )
 }
 
 /**
- * Inline create-user form. Controlled state (matching the codebase's Login /
- * RepositoryForm pattern); on success the fields reset so several users can be
- * added in a row. The username/password requirements mirror the server's 400s.
+ * The roles a user holds besides the access level's (`admin`, `writer`),
+ * each linked to its role page. A user with the legacy `is_admin` flag but
+ * without the `admin` role is still an administrator (the server reads
+ * both), so that shows too.
  */
-function CreateUserForm() {
-  const create = useCreateUser()
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [isAdmin, setIsAdmin] = useState(false)
-  const [active, setActive] = useState(true)
-
-  function submit(e: React.FormEvent) {
-    e.preventDefault()
-    if (!username.trim() || !password) return
-    create.mutate(
-      { username: username.trim(), password, is_admin: isAdmin, active },
-      {
-        onSuccess: () => {
-          setUsername('')
-          setPassword('')
-          setIsAdmin(false)
-          setActive(true)
-        },
-      },
-    )
+function RoleBadges({
+  user,
+  roleIds,
+}: {
+  user: UserView
+  roleIds: ReadonlyMap<string, number>
+}) {
+  const legacyAdmin = user.is_admin && !user.roles.includes(ADMIN_ROLE)
+  const others = user.roles.filter(
+    (name) => name !== ADMIN_ROLE && name !== WRITER_ROLE,
+  )
+  if (others.length === 0 && !legacyAdmin) {
+    return <span className="text-ink-faint">—</span>
   }
-
   return (
-    <form
-      onSubmit={submit}
-      className="space-y-4 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
-    >
-      <Subheading>New user</Subheading>
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Field>
-          <Label>Username</Label>
-          <Input
-            type="text"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-          />
-        </Field>
-        <Field>
-          <Label>Password</Label>
-          <Input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
-        </Field>
-      </div>
-      <div className="flex items-center gap-6">
-        <CheckboxField>
-          <Checkbox checked={isAdmin} onChange={(c) => setIsAdmin(c)} />
-          <Label>Administrator</Label>
-        </CheckboxField>
-        <CheckboxField>
-          <Checkbox checked={active} onChange={(c) => setActive(c)} />
-          <Label>Active</Label>
-        </CheckboxField>
-      </div>
-      {create.isError && (
-        <InlineError>{create.error.body || create.error.message}</InlineError>
+    <span className="fg-cell-badges">
+      {legacyAdmin && (
+        <StatusBadge
+          tone="heat"
+          dot={false}
+          title="The legacy is_admin flag, without the admin role"
+        >
+          admin (flag)
+        </StatusBadge>
       )}
-      <Button
-        type="submit"
-        disabled={create.isPending || !username.trim() || !password}
-      >
-        {create.isPending ? 'Creating…' : 'Create user'}
-      </Button>
-    </form>
+      {others.map((name) => {
+        const id = roleIds.get(name)
+        return id == null ? (
+          <span key={name} className="fg-chip">
+            {name}
+          </span>
+        ) : (
+          <Link
+            key={name}
+            to="/manage/roles/$roleId"
+            params={{ roleId: String(id) }}
+            className="fg-chip fg-link"
+          >
+            {name}
+          </Link>
+        )
+      })}
+    </span>
   )
 }

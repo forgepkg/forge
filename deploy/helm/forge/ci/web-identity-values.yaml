@@ -1,0 +1,19 @@
+# CI: short-lived S3 credentials from a projected service-account token
+# exchanged at MinIO's STS (s3.credentials: web_identity), no S3 keys.
+config:
+  server:
+    public_base_url: https://forge.example.com
+  s3:
+    endpoint: http://minio.storage.svc:9000
+    bucket: forge
+    force_path_style: true
+s3:
+  credentials: web_identity
+  webIdentity:
+    roleArn: arn:minio:iam:::role/forge-ci
+    stsEndpoint: http://minio.storage.svc:9000
+    durationSeconds: 3600
+    projectedToken:
+      audience: forge-s3
+      expirationSeconds: 7200
+existingSecret: forge-credentials

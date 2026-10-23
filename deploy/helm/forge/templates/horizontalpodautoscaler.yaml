@@ -1,0 +1,36 @@
+{{- if .Values.autoscaling.enabled }}
+{{- $hpa := .Values.autoscaling }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "forge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+  {{- with include "forge.annotations" (dict "ctx" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "forge.fullname" . }}
+  minReplicas: {{ $hpa.minReplicas }}
+  maxReplicas: {{ $hpa.maxReplicas }}
+  {{- $metrics := list }}
+  {{- if $hpa.targetCPUUtilizationPercentage }}
+  {{- $metrics = append $metrics (dict "type" "Resource" "resource" (dict "name" "cpu" "target" (dict "type" "Utilization" "averageUtilization" (int $hpa.targetCPUUtilizationPercentage)))) }}
+  {{- end }}
+  {{- if $hpa.targetMemoryUtilizationPercentage }}
+  {{- $metrics = append $metrics (dict "type" "Resource" "resource" (dict "name" "memory" "target" (dict "type" "Utilization" "averageUtilization" (int $hpa.targetMemoryUtilizationPercentage)))) }}
+  {{- end }}
+  {{- with concat $metrics (default list $hpa.metrics) }}
+  metrics:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $hpa.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

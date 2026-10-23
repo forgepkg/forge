@@ -1,4 +1,4 @@
-//! E2E: `GET /admin/me` identity + capabilities (plan §12.6 Phase 0).
+//! E2E: `GET /admin/me` identity + capabilities.
 //!
 //! Verifies the endpoint is reachable by *any* authenticated user (not only
 //! admins — it lives outside the admin `require_admin` gate), returns the right
@@ -44,23 +44,15 @@ async fn me_returns_admin_identity() {
 #[tokio::test]
 async fn me_reachable_by_non_admin() {
     let srv = common::start().await;
-    let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let username = format!("plain{}", common::unique());
+    let username = format!("plain{}@example.com", common::unique());
 
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    srv.create_user(&username, "pw123456-me12", "reader").await;
 
     // The non-admin is forbidden from the admin API but CAN read /admin/me.
     let resp = client
         .get(format!("{}/admin/me", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-me12"))
         .send()
         .await
         .unwrap();
@@ -78,34 +70,24 @@ async fn me_reachable_by_non_admin() {
     // Sanity: the same user is still 403 on the admin API.
     let resp = client
         .get(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-me12"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
 }
 
-/// `/admin/me` reports the **effective** RBAC verdict: a user whose legacy
-/// `is_admin` column is false but who holds the built-in `admin` role is an
-/// admin to the SPA too (the admin API already treats it as one).
+/// `/admin/me` reports the **effective** RBAC verdict: a user created as a
+/// non-admin and given the built-in `admin` role afterwards is an admin to
+/// the SPA too (the admin API already treats it as one).
 #[tokio::test]
-async fn me_reflects_admin_role_not_legacy_column() {
+async fn me_reflects_the_admin_role() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let username = format!("rbacadmin{}", common::unique());
+    let username = format!("rbacadmin{}@example.com", common::unique());
 
-    let created: Value = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&au, Some(&ap))
-        .json(&json!({"username": username, "password": "pw123456", "is_admin": false}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let id = created["id"].as_i64().expect("user id");
+    let id = srv.create_user(&username, "pw123456-me12", "reader").await;
     let resp = client
         .put(format!("{}/admin/users/{id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -117,7 +99,7 @@ async fn me_reflects_admin_role_not_legacy_column() {
 
     let body: Value = client
         .get(format!("{}/admin/me", srv.base_url))
-        .basic_auth(&username, Some("pw123456"))
+        .basic_auth(&username, Some("pw123456-me12"))
         .send()
         .await
         .unwrap()
@@ -129,6 +111,39 @@ async fn me_reflects_admin_role_not_legacy_column() {
         .as_array()
         .unwrap()
         .contains(&json!("user.admin")));
+}
+
+/// #318: a holder of the built-in `writer` role may publish to every
+/// repository, which `/admin/me` reports as `repo.write` (no admin
+/// capability), so the SPA can show push instructions.
+#[tokio::test]
+async fn me_shows_repo_write_to_a_writer() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let username = format!("writer{}@example.com", common::unique());
+
+    let id = srv.create_user(&username, "pw123456-me12", "reader").await;
+    let resp = client
+        .put(format!("{}/admin/users/{id}/roles", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"role": "writer"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "assign writer role");
+
+    let body: Value = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&username, Some("pw123456-me12"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["is_admin"], json!(false));
+    assert_eq!(body["capabilities"], json!(["repo.read", "repo.write"]));
 }
 
 /// An unauthenticated caller (no credentials, anon mode off) gets 401.
@@ -149,14 +164,18 @@ async fn me_unauthenticated_is_401() {
 #[tokio::test]
 async fn me_anonymous_is_401() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
-            anonymous_mode: "all".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let resp = srv
         .client()
         .get(format!("{}/admin/me", srv.base_url))

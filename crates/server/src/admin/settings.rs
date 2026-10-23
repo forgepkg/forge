@@ -1,65 +1,73 @@
-//! Install-wide admin settings (`forge_setting` rows).
+//! Admin auth settings (#294). **Admin-only** (mounted behind
+//! [`super::require_admin`]).
 //!
-//! * `GET /admin/settings/legacy-open-access` → `{"enabled": bool}`.
-//! * `PUT /admin/settings/legacy-open-access` with `{"enabled": bool}` → the
-//!   new value.
+//! `GET /admin/settings/auth` answers the sign-in and anonymous-access policy
+//! ([`AuthSettings`]); `PUT` changes it, for every instance: the fields a body
+//! names, the others keep their value. A value out of range, a mode that does
+//! not exist or an allowlist entry that does not parse is refused with 400 and
+//! what is wrong. This instance applies a change at once; the others within
+//! `auth.realm_cache_ttl_seconds` ([`crate::auth::AuthSettingsCache`]).
 //!
-//! `legacy_open_access` is recorded by migration 0007: `true` on a database
-//! that already had users when RBAC arrived (an upgrade of a pre-release
-//! install), `false` on a fresh install. While it is `true`, every newly
-//! created user — admin API, OIDC and credential-forwarding auto-provisioning —
-//! is assigned the built-in `authenticated` role (read + write on every
-//! repository), reproducing the pre-RBAC "any signed-in user may do anything"
-//! rule. Switching it off is how an upgraded install moves to deny-by-default
-//! for new accounts. It is a live switch (the flag is read at each user
-//! creation), so no restart is needed.
-//!
-//! Switching it off does **not** revoke the role from existing users: review
-//! them with `GET /admin/users/{id}/roles` and remove it with
-//! `DELETE /admin/users/{id}/roles/{role_id}` (or remove the `authenticated`
-//! role's grants) to close access for them too.
+//! Both read the stored row rather than this instance's copy, so a change
+//! another instance took a moment ago is never answered stale or undone.
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use forge_db::authz_dao;
-use serde::{Deserialize, Serialize};
+use forge_core::auth::principal::Principal;
 
-use super::db_error;
+use crate::auth::{load_auth_settings, AuthSettings, AuthSettingsUpdate, SaveError};
 use crate::state::AppState;
 
-/// The `legacy_open_access` switch, as read and written by the admin API.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyOpenAccess {
-    /// `true` ⇒ new users are auto-assigned the `authenticated` role.
-    pub enabled: bool,
-}
-
-/// `GET /admin/settings/legacy-open-access`
-pub async fn get_legacy_open_access(State(state): State<AppState>) -> Response {
-    match authz_dao::legacy_open_access(&state.pool).await {
-        Ok(enabled) => Json(LegacyOpenAccess { enabled }).into_response(),
-        Err(e) => db_error(e),
-    }
-}
-
-/// `PUT /admin/settings/legacy-open-access`
-///
-/// No authz cache invalidation is needed: the flag affects only *future* role
-/// assignments, and each of those invalidates the user it touches.
-pub async fn put_legacy_open_access(
-    State(state): State<AppState>,
-    Json(body): Json<LegacyOpenAccess>,
-) -> Response {
-    if let Err(e) = authz_dao::set_legacy_open_access(&state.pool, body.enabled).await {
-        return db_error(e);
-    }
-    tracing::info!(
-        enabled = body.enabled,
-        "legacy_open_access changed by an administrator"
-    );
-    Json(LegacyOpenAccess {
-        enabled: body.enabled,
+/// The stored settings, or the 500 answer when they cannot be read.
+async fn stored(state: &AppState) -> Result<AuthSettings, Response> {
+    load_auth_settings(&state.pool).await.map_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "cannot read the auth settings");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot read the auth settings",
+        )
+            .into_response()
     })
-    .into_response()
+}
+
+/// `GET /admin/settings/auth`
+pub async fn get_auth(State(state): State<AppState>) -> Response {
+    match stored(&state).await {
+        Ok(settings) => Json(settings).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `PUT /admin/settings/auth` — change the fields the body names.
+pub async fn put_auth(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Json(update): Json<AuthSettingsUpdate>,
+) -> Response {
+    let current = match stored(&state).await {
+        Ok(settings) => settings,
+        Err(resp) => return resp,
+    };
+    let next = match update.apply_to(&current) {
+        Ok(next) => next,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let changed = current.changed_keys(&next);
+    match state.auth_settings.save(next).await {
+        Ok(saved) => {
+            if !changed.is_empty() {
+                tracing::info!(
+                    target: "forge::audit",
+                    changed = %changed.join(", "),
+                    settings = ?saved.settings,
+                    principal = %principal.audit_label(),
+                    "auth settings changed"
+                );
+            }
+            Json(&saved.settings).into_response()
+        }
+        Err(SaveError::Invalid(msg)) => (StatusCode::BAD_REQUEST, msg).into_response(),
+        Err(SaveError::Db(e)) => super::db_error(e),
+    }
 }

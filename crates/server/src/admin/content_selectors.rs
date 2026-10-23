@@ -1,4 +1,4 @@
-//! Admin content-selector management (§12.4 Phase 6).
+//! Admin content-selector management.
 //!
 //! A content selector is a reusable named include/exclude glob set on the
 //! (lowercased) package name. It scopes a grant down to matching packages.
@@ -9,6 +9,10 @@
 //! * `PATCH  /admin/content-selectors/{id}`   — update description/includes/excludes
 //!   (true PATCH: an omitted field keeps its stored value).
 //! * `DELETE /admin/content-selectors/{id}`   — delete (cascades scoped grants).
+//! * `GET    /admin/content-selectors/{id}/grants` — the grants the selector
+//!   scopes, in every role: what a delete removes.
+//! * `POST   /admin/content-selectors/match`  — test a package name against
+//!   include/exclude patterns (saved or not) with the evaluator's own globs.
 //!
 //! Globs are validated at write time by compiling them: an invalid pattern is a
 //! **400**, never persisted (a selector that can't compile would fail-closed at
@@ -24,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::db_error;
+use super::grants::GrantView;
 use crate::state::AppState;
 
 /// A content-selector view.
@@ -98,6 +103,25 @@ fn glob_error(includes: &[String], excludes: &[String]) -> Option<Response> {
                 .into_response(),
         ),
     }
+}
+
+/// Selector-test request: patterns as an [`UpdateSelector`] or a stored
+/// selector holds them, and the package name to match.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchRequest {
+    #[serde(default)]
+    pub includes: Vec<String>,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+    pub name: String,
+}
+
+/// Selector-test response.
+#[derive(Debug, Serialize)]
+pub struct MatchView {
+    /// Whether a grant scoped by these patterns covers the package.
+    pub matches: bool,
 }
 
 /// `GET /admin/content-selectors`
@@ -180,6 +204,41 @@ pub async fn update(
         }
         Ok(None) => (StatusCode::NOT_FOUND, "content selector not found").into_response(),
         Err(e) => db_error(e),
+    }
+}
+
+/// `GET /admin/content-selectors/{id}/grants` — the grants the selector
+/// scopes, which deleting it removes.
+pub async fn grants(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match authz_dao::find_content_selector_by_id(&state.pool, id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "content selector not found").into_response(),
+        Err(e) => return db_error(e),
+    }
+    match authz_dao::list_grants_for_selector(&state.pool, id).await {
+        Ok(grants) => {
+            let views: Vec<GrantView> = grants.into_iter().map(GrantView::from).collect();
+            Json(views).into_response()
+        }
+        Err(e) => db_error(e),
+    }
+}
+
+/// `POST /admin/content-selectors/match` — whether `name` matches the
+/// patterns: the names are lowercased, excludes win, and an empty include
+/// list matches every package. An invalid glob is a 400, as on a write.
+pub async fn test_match(Json(body): Json<MatchRequest>) -> Response {
+    let patterns = SelectorPatterns {
+        includes: body.includes,
+        excludes: body.excludes,
+    };
+    match patterns.matches(&body.name) {
+        Ok(matches) => Json(MatchView { matches }).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            format!("invalid content-selector glob: {e}"),
+        )
+            .into_response(),
     }
 }
 

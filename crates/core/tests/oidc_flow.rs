@@ -1,7 +1,7 @@
-//! Integration tests for the slice-12.2 OIDC **core service layer** (Phases 3 &
-//! 4) against a real Postgres testcontainer plus an in-process mock IdP
-//! (wiremock serving discovery / JWKS / token endpoints, signing self-issued ID
-//! tokens with a throwaway RSA key).
+//! Integration tests for the OIDC **core service layer** against a real
+//! Postgres testcontainer plus an in-process mock IdP (wiremock serving
+//! discovery / JWKS / token endpoints, signing self-issued ID tokens with a
+//! throwaway RSA key).
 //!
 //! These exercise the logic above the DAOs (the single-use / nonce properties of
 //! the DAOs themselves are covered by `forge-db`'s `oidc.rs`):
@@ -11,7 +11,7 @@
 //!     fails), exchanges the code, and verifies the ID token (nonce mismatch is
 //!     rejected);
 //!   * `resolve_user` provisions on first login, links by username, recomputes
-//!     `is_admin` from the group/role claim, and rejects inactive users;
+//!     the `admin` role from the group/role claim, and rejects inactive users;
 //!   * concurrent first logins for one identity all resolve to the single
 //!     linked account and leave no orphan accounts behind (review L7(c));
 //!   * `SessionService` round-trips create → validate → revoke and rotates.
@@ -24,8 +24,8 @@ use base64::Engine;
 use chrono::Duration as ChronoDuration;
 use forge_cache::Cache;
 use forge_core::oidc::{
-    self, begin_login, complete_login, map_claims, CallbackParams, ClaimMapping, ClientParams,
-    FlowError, OidcMetadataClient, ResolvePolicy,
+    self, begin_login, complete_login, map_claims, CallbackParams, ClaimMapping, ClientAssertion,
+    ClientAuth, ClientParams, FlowError, OidcMetadataClient, ResolvePolicy,
 };
 use forge_core::session::SessionService;
 use forge_db::oidc_flow_dao;
@@ -35,7 +35,7 @@ use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{pool, unique};
@@ -152,7 +152,7 @@ impl MockIdp {
     fn client(&self) -> ClientParams {
         ClientParams {
             client_id: "client-abc".into(),
-            client_secret: "shh-secret".into(),
+            auth: ClientAuth::Secret("shh-secret".into()),
             redirect_url: "https://forge.test/auth/oidc/callback".into(),
             scopes: vec!["openid".into(), "profile".into(), "email".into()],
             leeway_seconds: 60,
@@ -286,6 +286,107 @@ async fn complete_login_happy_path_then_replay_fails() {
         matches!(replay, Err(FlowError::UnknownState)),
         "got {replay:?}"
     );
+}
+
+/// A client assertion signer that hands out a fixed assertion, or fails.
+struct FixedAssertion(Result<&'static str, &'static str>);
+
+#[async_trait::async_trait]
+impl ClientAssertion for FixedAssertion {
+    async fn client_assertion(&self) -> Result<String, String> {
+        self.0.map(str::to_string).map_err(str::to_string)
+    }
+}
+
+#[tokio::test]
+async fn complete_login_authenticates_with_a_client_assertion_instead_of_a_secret() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let client = ClientParams {
+        auth: ClientAuth::Assertion(std::sync::Arc::new(FixedAssertion(Ok(
+            "signed.client.assertion",
+        )))),
+        ..idp.client()
+    };
+
+    let begun = begin_login(&pool, &idp.meta(), &client, "/")
+        .await
+        .expect("begin");
+    let nonce = peek_nonce(&pool, &begun.state).await;
+    // Only a request carrying the assertion gets an ID token.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains(
+            "client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
+        ))
+        .and(body_string_contains("client_assertion=signed.client.assertion"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": idp.signer.sign(&id_claims(
+                &idp.issuer,
+                &format!("sub-{n}"),
+                &format!("carol-{n}"),
+                &nonce,
+                json!([]),
+            )),
+        })))
+        .mount(&idp.server)
+        .await;
+
+    let validated = complete_login(
+        &pool,
+        &idp.meta(),
+        &client,
+        &CallbackParams {
+            code: Some("the-code".into()),
+            state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("complete_login with a client assertion");
+    assert_eq!(validated.subject, format!("sub-{n}"));
+
+    let requests = idp.server.received_requests().await.expect("recorded");
+    let token_request = requests
+        .iter()
+        .find(|r| r.url.path() == "/token")
+        .expect("token request");
+    let body = String::from_utf8_lossy(&token_request.body);
+    assert!(!body.contains("client_secret"), "{body}");
+}
+
+#[tokio::test]
+async fn complete_login_fails_without_calling_the_idp_when_the_assertion_cannot_be_signed() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let client = ClientParams {
+        auth: ClientAuth::Assertion(std::sync::Arc::new(FixedAssertion(Err("no keys")))),
+        ..idp.client()
+    };
+    let begun = begin_login(&pool, &idp.meta(), &client, "/")
+        .await
+        .expect("begin");
+
+    let result = complete_login(
+        &pool,
+        &idp.meta(),
+        &client,
+        &CallbackParams {
+            code: Some("the-code".into()),
+            state: Some(begun.state.clone()),
+            browser_binding: Some(oidc::browser_binding(&begun.state)),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(FlowError::ClientAssertion(e)) if e == "no keys"),
+        "got {result:?}"
+    );
+    let requests = idp.server.received_requests().await.expect("recorded");
+    assert!(requests.iter().all(|r| r.url.path() != "/token"));
 }
 
 #[tokio::test]
@@ -453,7 +554,7 @@ async fn resolve_user_auto_provisions_then_relinks_same_user() {
     let idp = MockIdp::start().await;
     let n = unique();
     let sub = format!("sub-{n}");
-    let username = format!("newbie-{n}");
+    let username = format!("newbie-{n}@example.com");
 
     let validated = run_login(&pool, &idp, &sub, &username, json!(["forge-admins"])).await;
     let mapped = map_claims(&validated.claims, &admin_mapping());
@@ -463,7 +564,9 @@ async fn resolve_user_auto_provisions_then_relinks_same_user() {
         .await
         .expect("provision");
     assert_eq!(user.username, username);
-    assert!(user.is_admin);
+    assert!(forge_db::authz_dao::user_has_role(&pool, user.id, "admin")
+        .await
+        .unwrap());
     let first_id = user.id;
 
     // A second login for the same (issuer, sub) loads the SAME user (no dup),
@@ -475,7 +578,12 @@ async fn resolve_user_auto_provisions_then_relinks_same_user() {
         .await
         .expect("relink");
     assert_eq!(user2.id, first_id, "same app_user, not a duplicate");
-    assert!(!user2.is_admin, "admin recomputed/revoked on login");
+    assert!(
+        !forge_db::authz_dao::user_has_role(&pool, user2.id, "admin")
+            .await
+            .unwrap(),
+        "admin recomputed/revoked on login"
+    );
 }
 
 #[tokio::test]
@@ -483,15 +591,18 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
     let n = unique();
-    let username = format!("bootstrap-admin-{n}");
+    let username = format!("bootstrap-admin-{n}@example.com");
 
     // Pre-create a local user (a bootstrap admin) with this username.
     let local = user_dao::insert_user(
         &pool,
-        NewUser::local(username.clone(), "argon2-hash".into(), true, true),
+        NewUser::local(username.clone(), "argon2-hash".into(), true),
     )
     .await
     .expect("local user");
+    forge_db::authz_dao::sync_admin_role(&pool, local.id, true)
+        .await
+        .unwrap();
 
     let validated = run_login(
         &pool,
@@ -522,12 +633,79 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
     assert!(still_local.password_hash.is_some());
 }
 
+/// #317: every account is named by a UPN. A username claim that is none
+/// refuses the login and names the claim; an identity linked to an account
+/// keeps signing in to it, whatever its claim says.
+#[tokio::test]
+async fn provisioning_needs_a_upn_and_names_the_claim() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let username = format!("legacy-{n}");
+
+    let validated = run_login(&pool, &idp, &format!("sub-{n}"), &username, json!([])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    assert_eq!(mapped.username, username);
+    assert_eq!(mapped.username_claim, "preferred_username");
+    let err = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default())
+        .await
+        .expect_err("no account for a non-UPN name");
+    assert!(
+        matches!(&err, oidc::ResolveError::NotUpn { claim } if claim == "preferred_username"),
+        "{err:?}"
+    );
+    assert!(user_dao::find_user_by_username(&pool, &username)
+        .await
+        .unwrap()
+        .is_none());
+
+    // The same identity, once linked to an account, still resolves to it.
+    let legacy_id: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash, active, auth_source, external_subject) \
+         VALUES ($1, NULL, true, 'oidc', $2) RETURNING id",
+    )
+    .bind(format!("{username}@example.com"))
+    .bind(format!("sub-{n}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    forge_db::external_identity_dao::link(
+        &pool,
+        legacy_id,
+        &validated.issuer,
+        &validated.subject,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let user = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default())
+        .await
+        .expect("the linked account signs in");
+    assert_eq!(user.id, legacy_id);
+
+    // A claim chain that falls back to `sub` names it.
+    let mapping = ClaimMapping {
+        username_claim: "upn".into(),
+        ..admin_mapping()
+    };
+    let other = run_login(&pool, &idp, &format!("sub-other-{n}"), &username, json!([])).await;
+    let mapped = map_claims(&other.claims, &mapping);
+    assert_eq!(mapped.username_claim, "sub");
+    let err = oidc::resolve_user(&pool, &other, &mapped, &ResolvePolicy::default())
+        .await
+        .expect_err("`sub` is no UPN either");
+    assert!(
+        matches!(&err, oidc::ResolveError::NotUpn { claim } if claim == "sub"),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn resolve_user_links_passwordless_non_admin_when_enabled() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
     let n = unique();
-    let username = format!("linkable-{n}");
+    let username = format!("linkable-{n}@example.com");
 
     // A passwordless, non-admin account no other credential owns (an OIDC
     // account whose identity link was removed).
@@ -536,7 +714,6 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
         NewUser {
             username: username.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "oidc".into(),
             external_subject: None,
@@ -573,6 +750,42 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
     );
 }
 
+/// #322: an invited local account (no password yet: its user is to choose
+/// one from the invitation) is never linked by username, so an IdP account
+/// claiming its name cannot take it over with its role.
+#[tokio::test]
+async fn resolve_user_never_links_an_invited_account() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let name = format!("invited-{n}@example.com");
+    let invited = forge_db::invitation_dao::insert_invited_user(&pool, &name, &name)
+        .await
+        .expect("invited user");
+    let validated = run_login(&pool, &idp, &format!("sub-i-{n}"), &name, json!([])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    let user = oidc::resolve_user(
+        &pool,
+        &validated,
+        &mapped,
+        &ResolvePolicy {
+            auto_provision: true,
+            link_existing_by_username: true,
+        },
+    )
+    .await
+    .expect("provisioned separately");
+    assert_ne!(
+        user.id, invited.id,
+        "an invited account is never linked by name"
+    );
+    assert!(
+        !forge_db::external_identity_dao::user_has_identity(&pool, invited.id)
+            .await
+            .unwrap()
+    );
+}
+
 /// Linking by username never takes over an account another credential owns:
 /// a credential-forwarding account, or an account already linked to an IdP
 /// identity (of another person, possibly at another issuer).
@@ -586,13 +799,12 @@ async fn resolve_user_never_links_upstream_or_already_linked_accounts() {
         link_existing_by_username: true,
     };
 
-    let upstream_name = format!("directory-{n}");
+    let upstream_name = format!("directory-{n}@example.com");
     let upstream = user_dao::insert_user(
         &pool,
         NewUser {
             username: upstream_name.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".into(),
             external_subject: Some(upstream_name.clone()),
@@ -619,7 +831,7 @@ async fn resolve_user_never_links_upstream_or_already_linked_accounts() {
 
     // Victim signs in once (linked to sub-victim); an attacker whose IdP
     // account claims the same preferred_username gets a separate account.
-    let victim_name = format!("victim-{n}");
+    let victim_name = format!("victim-{n}@example.com");
     let v = run_login(
         &pool,
         &idp,
@@ -654,7 +866,7 @@ async fn resolve_user_demotion_removes_admin_role() {
     let idp = MockIdp::start().await;
     let n = unique();
     let sub = format!("sub-demote-{n}");
-    let username = format!("demote-{n}");
+    let username = format!("demote-{n}@example.com");
 
     let validated = run_login(&pool, &idp, &sub, &username, json!(["forge-admins"])).await;
     let mapped = map_claims(&validated.claims, &admin_mapping());
@@ -670,12 +882,11 @@ async fn resolve_user_demotion_removes_admin_role() {
     let user2 = oidc::resolve_user(&pool, &validated2, &mapped2, &ResolvePolicy::default())
         .await
         .expect("relogin");
-    assert!(!user2.is_admin);
     assert!(
         !forge_db::authz_dao::user_has_role(&pool, user2.id, "admin")
             .await
             .unwrap(),
-        "demotion removes the admin role, not just the column"
+        "demotion removes the admin role"
     );
 }
 
@@ -716,7 +927,7 @@ async fn resolve_user_rejects_inactive_linked_user() {
     let idp = MockIdp::start().await;
     let n = unique();
     let sub = format!("sub-{n}");
-    let username = format!("disabled-{n}");
+    let username = format!("disabled-{n}@example.com");
 
     // Provision via a first login, then deactivate the account locally; the
     // (issuer, subject) link finds it and the active check rejects the login.
@@ -752,7 +963,7 @@ async fn concurrent_first_logins_resolve_to_the_linked_account_without_orphans()
     for round in 0..3 {
         let n = unique();
         let sub = format!("sub-race-{n}");
-        let username = format!("racer-{n}");
+        let username = format!("racer-{n}@example.com");
         let validated = run_login(&pool, &idp, &sub, &username, json!([])).await;
         let mapped = map_claims(&validated.claims, &admin_mapping());
 
@@ -806,7 +1017,7 @@ async fn session_create_validate_revoke_round_trip() {
     let n = unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("sess-user-{n}"), "x".into(), false, true),
+        NewUser::local(format!("sess-user-{n}@example.com"), "x".into(), true),
     )
     .await
     .expect("user");
@@ -855,7 +1066,7 @@ async fn session_rotate_issues_new_and_revokes_old() {
     let n = unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("rot-user-{n}"), "x".into(), false, true),
+        NewUser::local(format!("rot-user-{n}@example.com"), "x".into(), true),
     )
     .await
     .expect("user");

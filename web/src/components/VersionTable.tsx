@@ -1,52 +1,67 @@
-import clsx from 'clsx'
-
 import type { DetailVersion } from '~/api/packages'
-import { Badge } from '~/components/catalyst/badge'
 import {
+  StatusBadge,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from '~/components/catalyst/table'
+  Version,
+} from '~/components/ui'
 import { DelayBadge } from './DelayBadge'
 import { RetentionBadge } from './RetentionBadge'
 
 /**
  * Per-version table for the package-detail view. Columns: version, published
- * time, size, listed/unlisted, and proxy delay + retention badges. Download
- * counts are intentionally absent — slice 1 has no counters (see
+ * time, size, and the listed / proxy delay / retention badges. Download
+ * counts are intentionally absent — the browse API does not expose them (see
  * `src/api/packages.ts`).
+ *
+ * `published_at` is when the version reached Forge. On a proxy that is when
+ * Forge first downloaded it from the upstream, not when it was published
+ * there (and unknown for versions not downloaded yet), so the column is
+ * labelled "Cached" for a proxy repository.
  */
-export function VersionTable({ versions }: { versions: DetailVersion[] }) {
+export function VersionTable({
+  versions,
+  repoKind,
+  caption,
+}: {
+  versions: DetailVersion[]
+  /** The package's repository kind: `hosted` | `proxy` | `group`. */
+  repoKind: string
+  caption?: string
+}) {
   return (
-    <Table striped>
+    <Table caption={caption}>
       <TableHead>
-        <TableRow>
-          <TableHeader>Version</TableHeader>
+        <TableHeader>Version</TableHeader>
+        {repoKind === 'proxy' ? (
+          <TableHeader hint="When Forge first downloaded this version from the upstream">
+            Cached
+          </TableHeader>
+        ) : (
           <TableHeader>Published</TableHeader>
-          <TableHeader>Size</TableHeader>
-          <TableHeader>Status</TableHeader>
-        </TableRow>
+        )}
+        <TableHeader align="right" width="110px">
+          Size
+        </TableHeader>
+        <TableHeader>Status</TableHeader>
       </TableHead>
       <TableBody>
         {versions.map((v) => (
           <TableRow key={v.version}>
-            <TableCell className="font-mono">
-              <span className={clsx(!v.listed && 'text-zinc-400 dark:text-zinc-500')}>
-                {v.version_original}
-              </span>
+            <TableCell lead>
+              <Version value={v.version_original} listed={v.listed} />
             </TableCell>
-            <TableCell className="text-zinc-500 dark:text-zinc-400">
-              {formatDate(v.published_at)}
-            </TableCell>
-            <TableCell className="text-zinc-500 dark:text-zinc-400">
+            <TableCell nowrap>{formatDate(v.published_at)}</TableCell>
+            <TableCell align="right" nowrap>
               {formatSize(v.size)}
             </TableCell>
             <TableCell>
-              <span className="flex flex-wrap items-center gap-1.5">
-                {!v.listed && <Badge color="zinc">unlisted</Badge>}
+              <span className="fg-cell-badges">
+                {!v.listed && <StatusBadge>unlisted</StatusBadge>}
                 <DelayBadge status={v.delay_status} delayedUntil={v.delayed_until} />
                 <RetentionBadge status={v.retention_status} />
               </span>
@@ -61,13 +76,16 @@ export function VersionTable({ versions }: { versions: DetailVersion[] }) {
 function formatDate(iso: string | null): string {
   if (!iso) return '—'
   const d = new Date(iso)
-  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString()
+  return Number.isNaN(d.getTime())
+    ? '—'
+    : d.toLocaleDateString(undefined, { dateStyle: 'medium' })
 }
 
+/** Binary units with one decimal (`4.2 MiB`), as the design system writes sizes. */
 function formatSize(bytes: number | null): string {
   if (bytes == null) return '—'
   if (bytes < 1024) return `${bytes} B`
-  const kb = bytes / 1024
-  if (kb < 1024) return `${kb.toFixed(1)} KB`
-  return `${(kb / 1024).toFixed(1)} MB`
+  const kib = bytes / 1024
+  if (kib < 1024) return `${kib.toFixed(1)} KiB`
+  return `${(kib / 1024).toFixed(1)} MiB`
 }

@@ -60,7 +60,7 @@ async fn redis_url() -> String {
         return url.clone();
     }
 
-    let container = GenericImage::new("redis", "7")
+    let container = GenericImage::new("mirror.gcr.io/library/redis", "7")
         .with_exposed_port(REDIS_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
         .start()
@@ -407,32 +407,46 @@ async fn tag_generation_keys_carry_a_ttl() {
     );
 }
 
+/// A re-sync message recovers an invalidation whose tag message was lost: the
+/// tag's generation was bumped in Redis, but no peer heard of it until the
+/// re-sync message makes them re-read it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn legacy_backplane_message_is_promoted_to_a_tag_generation() {
+async fn a_resync_message_recovers_a_lost_tag_invalidation() {
     let url = redis_url().await;
     let cache = connect(&url).await;
 
     let old: String = cache
-        .get_or_try_insert_with("legacy", "item", Duration::from_secs(300), || async {
+        .get_or_try_insert_with("resync", "item", Duration::from_secs(300), || async {
             Ok::<_, TestError>("OLD".to_string())
         })
         .await
         .unwrap();
     assert_eq!(old, "OLD");
 
-    // Simulate a pre-tag-version node. A new subscriber must turn this legacy
-    // namespace event into a durable Redis tag bump and apply it locally.
+    // A peer bumped the namespace's tag generation, but its tag publish was
+    // lost: the local barrier does not know yet.
     let client = redis::Client::open(url).unwrap();
     let mut publisher = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let _: u64 = publisher
+        .incr("forge:cache:tag:@ns:resync", 1u64)
+        .await
+        .unwrap();
+    let stale: String = cache
+        .get_or_try_insert_with("resync", "item", Duration::from_secs(300), || async {
+            Ok::<_, TestError>("FRESH".to_string())
+        })
+        .await
+        .unwrap();
+    assert_eq!(stale, "OLD", "without a message the bump goes unnoticed");
     let _: () = publisher
-        .publish("forge:cache:invalidate", "424242|n|legacy")
+        .publish("forge:cache:invalidate", "424242|n|resync")
         .await
         .unwrap();
 
     let deadline = Instant::now() + DELIVERY_DEADLINE;
     loop {
         let value = cache
-            .get_or_try_insert_with("legacy", "item", Duration::from_secs(300), || async {
+            .get_or_try_insert_with("resync", "item", Duration::from_secs(300), || async {
                 Ok::<_, TestError>("FRESH".to_string())
             })
             .await
@@ -441,7 +455,7 @@ async fn legacy_backplane_message_is_promoted_to_a_tag_generation() {
             break;
         }
         if Instant::now() >= deadline {
-            panic!("legacy invalidation was not promoted to a tag barrier");
+            panic!("the re-sync message did not advance the tag barrier");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -587,6 +601,152 @@ async fn local_entries_are_invalidated_across_instances() {
         assert!(
             Instant::now() < deadline,
             "backplane never evicted the local entry"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Issue #29: anyone who can write to Redis can publish a tag generation of
+/// `u64::MAX`. Adopted, it left the barrier nowhere to go: every later
+/// invalidation was ignored, so a locally cached authorization or credential
+/// verdict outlived its revocation until TTL. Forged generations and
+/// malformed messages may at most evict early; a peer's later invalidation
+/// must still evict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_tag_generations_do_not_stop_later_invalidations() {
+    let url = redis_url().await;
+    let a = connect(&url).await;
+    let b = connect(&url).await;
+    let ns = format!("forged-{}", std::process::id());
+    let sentinel = format!("{ns}-sentinel");
+    let read = |cache: &Cache, ns: &str, calls: &Arc<AtomicUsize>| {
+        let (cache, ns, calls) = (cache.clone(), ns.to_string(), calls.clone());
+        async move {
+            cache
+                .get_or_try_insert_local::<usize, _, _, TestError>(
+                    &ns,
+                    "verdict",
+                    Duration::from_secs(600),
+                    || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let a_calls = Arc::new(AtomicUsize::new(0));
+    let a_sentinel = Arc::new(AtomicUsize::new(0));
+    let b_sentinel = Arc::new(AtomicUsize::new(0));
+    assert_eq!(read(&a, &ns, &a_calls).await, 0);
+    assert_eq!(read(&a, &sentinel, &a_sentinel).await, 0);
+    assert_eq!(read(&b, &sentinel, &b_sentinel).await, 0);
+
+    let client = redis::Client::open(url).unwrap();
+    let mut publisher = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let max = u64::MAX;
+    let huge = 1u64 << 60;
+    for message in [
+        format!("1|t|{ns}|{max}|@ns:{ns}"),
+        format!("1|t|{ns}|{max}|@key:{ns}:verdict"),
+        format!("1|t|{ns}|{huge}|@ns:{ns}"),
+        // Malformed: each is dropped and must not end the subscription.
+        "garbage".to_string(),
+        format!("x|t|{ns}|1|@ns:{ns}"),
+        format!("1|t|{ns}"),
+        format!("1|t|{ns}|-1|@ns:{ns}"),
+        format!("1|t|{ns}|18446744073709551616|@ns:{ns}"),
+        "1|k|no-colon".to_string(),
+        "1|zz|whatever".to_string(),
+        // Delivered in order: once this applies, so has everything above.
+        format!("1|t|{sentinel}|1|@ns:{sentinel}"),
+    ] {
+        let _: () = publisher
+            .publish("forge:cache:invalidate", message)
+            .await
+            .unwrap();
+    }
+    // A forged generation may sit in Redis too (the Lua bump then overflows).
+    let _: () = publisher
+        .set(format!("forge:cache:tag:@ns:{ns}"), max)
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    for (cache, calls) in [(&a, &a_sentinel), (&b, &b_sentinel)] {
+        while read(cache, &sentinel, calls).await == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the subscriber stopped applying messages after malformed ones"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // The forged generations counted as an invalidation (evicting early), and
+    // the refill is cached again.
+    assert_eq!(read(&a, &ns, &a_calls).await, 1);
+    assert_eq!(read(&a, &ns, &a_calls).await, 1);
+
+    // A revocation on b must still reach a's local entry.
+    b.invalidate_ns(&ns).await;
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    while read(&a, &ns, &a_calls).await == 1 {
+        assert!(
+            Instant::now() < deadline,
+            "after a forged tag generation, a peer's invalidation was ignored"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// #67: after Redis loses a tag's key (a restart without persistence, an LRU
+/// eviction) a fresh instance's generations restart low. Its invalidation
+/// must still reach peers whose barrier is higher: they used to keep the
+/// stale entry (e.g. a revoked admin set) until its TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidations_after_redis_lost_the_tag_still_reach_peers() {
+    let url = redis_url().await;
+    let a = connect(&url).await;
+    let b = connect(&url).await;
+    let ns = format!("restart-{}", std::process::id());
+    let read = |cache: &Cache, calls: &Arc<AtomicUsize>| {
+        let (cache, ns, calls) = (cache.clone(), ns.clone(), calls.clone());
+        async move {
+            cache
+                .get_or_try_insert_local::<usize, _, _, TestError>(
+                    &ns,
+                    "verdict",
+                    Duration::from_secs(600),
+                    || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    // The key's generation climbs on both instances.
+    for _ in 0..3 {
+        a.invalidate(&ns, "verdict").await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let b_calls = Arc::new(AtomicUsize::new(0));
+    assert_eq!(read(&b, &b_calls).await, 0);
+    assert_eq!(read(&b, &b_calls).await, 0, "cached");
+
+    // Redis loses the tag key; a new instance starts with a fresh map.
+    let client = redis::Client::open(url.clone()).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let _: () = redis::cmd("DEL")
+        .arg(format!("forge:cache:tag:@key:{ns}:verdict"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let c = connect(&url).await;
+    c.invalidate(&ns, "verdict").await;
+
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    while read(&b, &b_calls).await == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the fresh instance's invalidation was ignored"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -779,4 +939,51 @@ async fn a_silently_dead_subscription_is_detected_and_l1_flushed() {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_backplane_messages_are_dropped() {
+    let url = redis_url().await;
+    let cache = connect(&url).await;
+    let ns = format!("oversized-{}", std::process::id());
+    let sentinel = format!("{ns}-sentinel");
+    let read = |ns: &str, calls: &Arc<AtomicUsize>| {
+        let (cache, ns, calls) = (cache.clone(), ns.to_string(), calls.clone());
+        async move {
+            cache
+                .get_or_try_insert_local::<usize, _, _, TestError>(
+                    &ns,
+                    "verdict",
+                    Duration::from_secs(600),
+                    || async move { Ok(calls.fetch_add(1, Ordering::SeqCst)) },
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sentinel_calls = Arc::new(AtomicUsize::new(0));
+    assert_eq!(read(&ns, &calls).await, 0);
+    assert_eq!(read(&sentinel, &sentinel_calls).await, 0);
+
+    // An invalidation of the entry's key padded past the size limit (in its
+    // namespace field, which tag messages ignore) is dropped whole.
+    let padded = format!("{ns}{}", "x".repeat(64 * 1024));
+    let client = redis::Client::open(url).unwrap();
+    let mut publisher = redis::aio::ConnectionManager::new(client).await.unwrap();
+    for message in [
+        format!("1|t|{padded}|1|@key:{ns}:verdict"),
+        format!("1|t|{sentinel}|1|@ns:{sentinel}"),
+    ] {
+        let _: () = publisher
+            .publish("forge:cache:invalidate", message)
+            .await
+            .unwrap();
+    }
+    let deadline = Instant::now() + DELIVERY_DEADLINE;
+    while read(&sentinel, &sentinel_calls).await == 0 {
+        assert!(Instant::now() < deadline, "sentinel never delivered");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(read(&ns, &calls).await, 0, "the entry was not invalidated");
 }

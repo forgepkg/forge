@@ -1,4 +1,4 @@
-//! Integration tests for secret encryption at rest (slice 12.5): the Postgres
+//! Integration tests for secret encryption at rest: the Postgres
 //! [`PgKeyStore`], the encrypted `repository.upstream_password_enc` column,
 //! the plaintext backfill, and the DEK-rotation re-encrypt sweep.
 //!
@@ -17,6 +17,7 @@ use forge_crypto::service::{EnvelopeService, EnvelopeServiceConfig};
 use forge_crypto::store::{KeyLayer, KeyState, KeyStore, NewKeyRecord};
 use forge_crypto::{ExposeSecret, KeyBytes, PlaintextSecret};
 use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm};
+use forge_db::authz_dao;
 use forge_db::encryption_key_dao::PgKeyStore;
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::secret_dao;
@@ -49,6 +50,7 @@ async fn database_url() -> &'static str {
                 .with_db_name("forge")
                 .with_user("forge")
                 .with_password("forge")
+                .with_name("mirror.gcr.io/library/postgres")
                 .with_tag("17")
                 .start()
                 .await
@@ -627,10 +629,10 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
         .unwrap();
 }
 
-/// The full §12.5 data path against real Postgres: encrypted set/get, envelope
-/// (not plaintext) at rest, tamper + AAD-swap rejection at the DB layer, the
-/// plaintext backfill, and the DEK-rotation sweep. One serial test because the
-/// backfill/sweep helpers operate on the whole `repository` table.
+/// The full encryption data path against real Postgres: encrypted set/get,
+/// envelope (not plaintext) at rest, tamper + AAD-swap rejection at the DB
+/// layer, the plaintext backfill, and the DEK-rotation sweep. One serial test
+/// because the backfill/sweep helpers operate on the whole `repository` table.
 #[tokio::test]
 async fn upstream_password_end_to_end() {
     let _serial = TABLE_WIDE.lock().await;
@@ -752,87 +754,21 @@ async fn upstream_password_end_to_end() {
     .await
     .unwrap();
 
-    // ── plaintext backfill (slice-1 rows) ────────────────────────────────────
+    // ── plaintext backfill ───────────────────────────────────────────────────
     let mut legacy = NewRepository::proxy("crypt-legacy");
     legacy.upstream_password = Some("legacy-pw".to_string());
     let legacy = repository_dao::insert_repository(&pool, legacy)
         .await
         .unwrap();
-    // A row 0.1.0's backfill left behind: envelope written, plaintext kept.
-    let mut leftover = NewRepository::proxy("crypt-leftover");
-    leftover.upstream_password = Some("leftover-pw".to_string());
-    let leftover = repository_dao::insert_repository(&pool, leftover)
-        .await
-        .unwrap();
-    let leftover_blob = envelope
-        .seal(
-            &secret("leftover-pw"),
-            forge_crypto::envelope::AeadBinding {
-                table: secret_dao::UPSTREAM_PASSWORD_TABLE,
-                column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
-                row_pk: leftover.id,
-                destination: None,
-            },
-        )
-        .await
-        .unwrap();
-    sqlx::query!(
-        r#"UPDATE repository SET upstream_password_enc = $2 WHERE id = $1"#,
-        leftover.id,
-        &leftover_blob
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    // A row whose envelope is stale (the password was changed while
-    // encryption was off) and one whose envelope does not decrypt: in both
-    // the plaintext is the copy to keep, so it is sealed afresh.
-    let mut stale = NewRepository::proxy("crypt-stale");
-    stale.upstream_password = Some("new-pw".to_string());
-    let stale = repository_dao::insert_repository(&pool, stale)
-        .await
-        .unwrap();
-    let stale_blob = envelope
-        .seal(
-            &secret("old-pw"),
-            forge_crypto::envelope::AeadBinding {
-                table: secret_dao::UPSTREAM_PASSWORD_TABLE,
-                column: secret_dao::UPSTREAM_PASSWORD_COLUMN,
-                row_pk: stale.id,
-                destination: None,
-            },
-        )
-        .await
-        .unwrap();
-    let mut broken = NewRepository::proxy("crypt-broken");
-    broken.upstream_password = Some("broken-pw".to_string());
-    let broken = repository_dao::insert_repository(&pool, broken)
-        .await
-        .unwrap();
-    for (id, blob) in [
-        (stale.id, stale_blob),
-        (broken.id, b"not an envelope".to_vec()),
-    ] {
-        sqlx::query!(
-            r#"UPDATE repository SET upstream_password_enc = $2 WHERE id = $1"#,
-            id,
-            &blob
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
     assert!(secret_dao::plaintext_passwords_pending(&pool)
         .await
         .unwrap());
 
-    // One pass seals the plaintext-only row, clears the verified leftover
-    // copy and re-seals the stale and the undecryptable rows.
+    // One pass seals the plaintext row.
     let done = secret_dao::backfill_upstream_passwords(&pool, &envelope, 100)
         .await
         .expect("backfill");
-    assert_eq!(done, 4);
-    // Every plaintext copy is gone, not just the un-sealed ones.
+    assert_eq!(done, 1);
     assert!(!secret_dao::plaintext_passwords_pending(&pool)
         .await
         .unwrap());
@@ -853,28 +789,21 @@ async fn upstream_password_end_to_end() {
             .unwrap(),
         0
     );
-    // The original plaintexts survive the round trip, now only as envelopes.
-    for (id, expected) in [
-        (legacy.id, "legacy-pw"),
-        (leftover.id, "leftover-pw"),
-        (stale.id, "new-pw"),
-        (broken.id, "broken-pw"),
-    ] {
-        let got = secret_dao::get_upstream_password(&pool, &envelope, id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(got.expose_secret(), expected);
-        let row = sqlx::query!(
-            r#"SELECT upstream_password, upstream_password_enc FROM repository WHERE id = $1"#,
-            id
-        )
-        .fetch_one(&pool)
+    // The original plaintext survives the round trip, now only as an envelope.
+    let got = secret_dao::get_upstream_password(&pool, &envelope, legacy.id)
         .await
+        .unwrap()
         .unwrap();
-        assert!(row.upstream_password.is_none(), "plaintext cleared");
-        assert!(row.upstream_password_enc.is_some());
-    }
+    assert_eq!(got.expose_secret(), "legacy-pw");
+    let row = sqlx::query!(
+        r#"SELECT upstream_password, upstream_password_enc FROM repository WHERE id = $1"#,
+        legacy.id
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.upstream_password.is_none(), "plaintext cleared");
+    assert!(row.upstream_password_enc.is_some());
 
     // ── DEK rotation + lazy re-encrypt sweep ─────────────────────────────────
     let old_dek = EnvelopeService::blob_dek_version(&blob).unwrap();
@@ -892,10 +821,7 @@ async fn upstream_password_end_to_end() {
             None => break,
         }
     }
-    assert_eq!(
-        resealed, 5,
-        "repo1 + legacy + leftover + stale + broken re-encrypted under the new DEK"
-    );
+    assert_eq!(resealed, 2, "repo1 + legacy re-encrypted under the new DEK");
 
     // Everything still decrypts and now references the active DEK.
     for (id, expected) in [(repo1.id, "hunter2"), (legacy.id, "legacy-pw")] {
@@ -1103,13 +1029,375 @@ async fn realm_secrets_end_to_end() {
     }
 }
 
+/// The server's realm secret keys (`forge_server::auth::secret_keys`).
+fn realm_secret_keys(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "oidc" => &["client_secret"],
+        "credential_forwarding" => &["key_pepper"],
+        _ => &[],
+    }
+}
+
+/// A priority no other test of this binary uses (the column is unique).
+fn race_priority(offset: i32) -> i32 {
+    5_000_000 + (std::process::id() % 100_000) as i32 * 10 + offset
+}
+
+/// Wait until some backend is blocked behind the locks `holder_pid` holds.
+async fn wait_blocked_behind(pool: &PgPool, holder_pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(holder_pid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing ever blocked behind pid {holder_pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The realm backfill writes a realm back only while it is still the row it
+/// read: an admin edit that commits between the backfill's read and its write
+/// is kept, not overwritten with the name and secret read before it.
+#[tokio::test]
+async fn realm_backfill_never_undoes_a_concurrent_edit() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let scope = format!("realm-race-{}", uuid::Uuid::new_v4());
+    let envelope = Arc::new(envelope_with_scope(&pool, &scope));
+    envelope.ensure_active_keys().await.unwrap();
+    let realm = auth_realm_dao::insert_realm(
+        &pool,
+        NewAuthRealm {
+            kind: "credential_forwarding".into(),
+            name: format!("race-{}", uuid::Uuid::new_v4().simple()),
+            enabled: false,
+            priority: race_priority(0),
+            config: serde_json::json!({ "url": "https://nexus.test/s", "key_pepper": "old-pepper" }),
+        },
+    )
+    .await
+    .unwrap();
+
+    // An admin edit on another instance renames the realm and enters a new
+    // pepper; it holds the row until it commits.
+    let mut edit = pool.begin().await.unwrap();
+    let edit_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *edit)
+        .await
+        .unwrap();
+    let edited = secret_dao::update_realm_with_secrets_if_unchanged(
+        &mut edit,
+        Some(&*envelope),
+        &realm,
+        AuthRealmUpdate {
+            name: format!("{}-edited", realm.name),
+            enabled: false,
+            priority: realm.priority,
+            config: serde_json::json!({ "url": "https://nexus.test/s", "key_pepper": "new-pepper" }),
+        },
+        realm_secret_keys(&realm.kind),
+    )
+    .await
+    .unwrap()
+    .expect("the edit applies");
+
+    // The backfill reads the committed plaintext row, then waits for the edit.
+    let backfill = tokio::spawn({
+        let (pool, envelope) = (pool.clone(), envelope.clone());
+        async move { secret_dao::backfill_realm_secrets(&pool, &envelope, realm_secret_keys).await }
+    });
+    wait_blocked_behind(&pool, edit_pid).await;
+    edit.commit().await.unwrap();
+    backfill.await.unwrap().expect("backfill");
+
+    let now = auth_realm_dao::find_realm_by_id(&pool, realm.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(now.name, edited.name, "the edit's name is kept");
+    assert_eq!(now.secrets_enc, edited.secrets_enc);
+    assert_eq!(
+        secret_dao::realm_config(Some(&*envelope), &now)
+            .await
+            .unwrap()["key_pepper"],
+        "new-pepper"
+    );
+    auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+}
+
+/// A realm whose `secrets_enc` does not decrypt but whose `config` holds a
+/// plaintext secret (an OIDC realm "repaired" in SQL with a new issuer and
+/// client secret) does not fail the backfill, and is left as is: an
+/// administrator enters its secrets again through the admin API.
+#[tokio::test]
+async fn realm_backfill_leaves_an_undecryptable_realm_alone() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("realm-fix-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    let realm = secret_dao::insert_realm_with_secrets(
+        &pool,
+        Some(&envelope),
+        NewAuthRealm {
+            kind: "oidc".into(),
+            name: format!("sqlfix-{}", uuid::Uuid::new_v4().simple()),
+            enabled: false,
+            priority: race_priority(1),
+            config: serde_json::json!({
+                "issuer": "https://login.example/old/v2.0",
+                "client_id": "forge",
+                "client_secret": "old-secret",
+            }),
+        },
+        realm_secret_keys("oidc"),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE auth_realm SET config = config || $2::jsonb WHERE id = $1")
+        .bind(realm.id)
+        .bind(
+            serde_json::json!({
+                "issuer": "https://login.example/new/v2.0",
+                "client_secret": "new-secret",
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repaired = auth_realm_dao::find_realm_by_id(&pool, realm.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        secret_dao::realm_config(Some(&envelope), &repaired).await,
+        Err(secret_dao::SecretDbError::Crypto(
+            forge_crypto::CryptoError::DecryptFailed
+        ))
+    ));
+
+    secret_dao::backfill_realm_secrets(&pool, &envelope, realm_secret_keys)
+        .await
+        .expect("an undecryptable realm does not fail the backfill");
+    let now = auth_realm_dao::find_realm_by_id(&pool, realm.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(now.secrets_enc, repaired.secrets_enc);
+    assert_eq!(now.config, repaired.config);
+    auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+}
+
+/// #82: one malformed sealed secret (a botched restore, a manual edit) does
+/// not stop the passes over every row: the startup re-seal and backfill, and
+/// the key-reference scan behind DEK revocation, warn about it and go on.
+#[tokio::test]
+async fn a_malformed_sealed_secret_does_not_stop_the_sweeps() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("malformed-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+
+    let mut repo = NewRepository::proxy(format!("malformed{}", uuid::Uuid::new_v4().simple()));
+    repo.remote_url = Some("https://feed.example/v3/index.json".into());
+    let repo = repository_dao::insert_repository(&pool, repo)
+        .await
+        .unwrap();
+    let realm = secret_dao::insert_realm_with_secrets(
+        &pool,
+        Some(&envelope),
+        NewAuthRealm {
+            kind: "oidc".into(),
+            name: format!("malformed-{}", uuid::Uuid::new_v4().simple()),
+            enabled: false,
+            priority: race_priority(2),
+            config: serde_json::json!({
+                "issuer": "https://login.example/v2.0",
+                "client_id": "forge",
+                "client_secret": "secret",
+            }),
+        },
+        realm_secret_keys("oidc"),
+    )
+    .await
+    .unwrap();
+    for blob in [&b"\x00"[..], &b"\x01\x02\x03"[..]] {
+        sqlx::query("UPDATE repository SET upstream_password_enc = $2 WHERE id = $1")
+            .bind(repo.id)
+            .bind(blob)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE auth_realm SET secrets_enc = $2 WHERE id = $1")
+            .bind(realm.id)
+            .bind(blob)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut after_id = 0;
+        loop {
+            let batch =
+                secret_dao::reseal_upstream_passwords_batch(&pool, &envelope, after_id, 100)
+                    .await
+                    .expect("the upstream password sweep goes on");
+            match batch.next_after_id {
+                Some(next) => after_id = next,
+                None => break,
+            }
+        }
+        secret_dao::reseal_realm_secrets(&pool, &envelope)
+            .await
+            .expect("the realm re-seal goes on");
+        secret_dao::referenced_dek_versions(&pool)
+            .await
+            .expect("the reference scan goes on");
+        secret_dao::backfill_realm_secrets(&pool, &envelope, realm_secret_keys)
+            .await
+            .expect("the realm backfill goes on");
+    }
+    auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+    sqlx::query("DELETE FROM repository WHERE id = $1")
+        .bind(repo.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// The generated registry-token key in `forge_setting` is a secret like the
+/// secret columns (#196): the DEK it is sealed under is not revoked while it
+/// is, DEK rotation re-seals it, the backfill seals one stored in plaintext,
+/// and only a value that can never be opened counts as unreadable.
+#[tokio::test]
+async fn secret_settings_follow_dek_rotation() {
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("settings-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    // DEK versions no other test's ciphertext uses, so that the reference
+    // scan alone decides whether this one's DEKs are revoked.
+    for _ in 0..6 {
+        envelope.rotate_dek().await.unwrap();
+    }
+    let key = secret_dao::REGISTRY_TOKEN_KEY_SETTING;
+    sqlx::query("DELETE FROM forge_setting WHERE key = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let open = |value: String| {
+        let envelope = &envelope;
+        async move { secret_dao::open_secret_setting(Some(envelope), key, &value).await }
+    };
+
+    let stored = secret_dao::store_secret_setting(&pool, Some(&envelope), key, &secret("k1"), None)
+        .await
+        .unwrap()
+        .expect("stored");
+    assert!(stored.starts_with("sealed:") && !stored.contains("k1"));
+    assert!(secret_dao::sealed_secrets_present(&pool).await.unwrap());
+    assert!(
+        secret_dao::store_secret_setting(&pool, Some(&envelope), key, &secret("k9"), None)
+            .await
+            .unwrap()
+            .is_none(),
+        "stored only while unset"
+    );
+    assert_eq!(open(stored.clone()).await.unwrap().expose_secret(), "k1");
+
+    // Its DEK stays while the key is sealed under it.
+    envelope.rotate_dek().await.unwrap();
+    secret_dao::revoke_unreferenced_deks(&pool, &envelope)
+        .await
+        .unwrap();
+    assert_eq!(open(stored.clone()).await.unwrap().expose_secret(), "k1");
+
+    // The sweep re-seals it under the active DEK; then the old one goes.
+    assert_eq!(
+        secret_dao::reseal_secret_settings(&pool, &envelope)
+            .await
+            .unwrap(),
+        1
+    );
+    let resealed = authz_dao::get_setting(&pool, key).await.unwrap().unwrap();
+    assert_ne!(resealed, stored);
+    assert_eq!(
+        secret_dao::reseal_secret_settings(&pool, &envelope)
+            .await
+            .unwrap(),
+        0,
+        "converged"
+    );
+    assert!(
+        secret_dao::revoke_unreferenced_deks(&pool, &envelope)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(open(resealed.clone()).await.unwrap().expose_secret(), "k1");
+    let err = open(stored).await.unwrap_err();
+    assert!(secret_dao::is_unreadable_setting(&err), "{err}");
+    for malformed in ["sealed:***", "sealed:AAAA", "bogus"] {
+        let err = open(malformed.to_string()).await.unwrap_err();
+        assert!(
+            secret_dao::is_unreadable_setting(&err),
+            "{malformed}: {err}"
+        );
+    }
+
+    // Without the envelope a sealed value fails closed, and that is no
+    // reason to replace it: a plaintext value never overwrites it.
+    let err = secret_dao::open_secret_setting(None, key, &resealed)
+        .await
+        .unwrap_err();
+    assert!(!secret_dao::is_unreadable_setting(&err), "{err}");
+    assert!(matches!(
+        secret_dao::store_secret_setting(&pool, None, key, &secret("k3"), Some(&resealed)).await,
+        Err(secret_dao::SecretDbError::SettingSealedWithoutEnvelope(_))
+    ));
+
+    // A key stored before `[crypto]` was enabled is sealed by the backfill.
+    sqlx::query("UPDATE forge_setting SET value = 'plain:k2' WHERE key = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(open("plain:k2".into()).await.unwrap().expose_secret(), "k2");
+    assert!(secret_dao::plaintext_settings_pending(&pool).await.unwrap());
+    assert_eq!(
+        secret_dao::backfill_secret_settings(&pool, &envelope)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!secret_dao::plaintext_settings_pending(&pool).await.unwrap());
+    let backfilled = authz_dao::get_setting(&pool, key).await.unwrap().unwrap();
+    assert!(backfilled.starts_with("sealed:"));
+    assert_eq!(open(backfilled).await.unwrap().expose_secret(), "k2");
+
+    sqlx::query("DELETE FROM forge_setting WHERE key = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 /// The upstream password is bound to the origin of its row's `remote_url`
 /// (review: "the ciphertext is not bound to where the secret is sent"). A
 /// row repointed at another host outside the API no longer decrypts, so the
 /// proxy can never send the password there; a path change on the same origin
-/// keeps it. A blob a pre-release build sealed under the row-only binding
-/// opens only with `crypto.accept_row_bound_secrets`, and is then moved to
-/// the origin binding by the re-encrypt sweep.
+/// keeps it. A blob sealed under the row-only binding (as pre-release builds
+/// did) does not decrypt either, and the sweep leaves it.
 #[tokio::test]
 async fn upstream_password_is_bound_to_the_remote_origin() {
     let pool = pool().await;
@@ -1177,8 +1465,8 @@ async fn upstream_password_is_bound_to_the_remote_origin() {
     set_url("https://nexus.example/index.json").await;
     assert_eq!(read().await.unwrap().unwrap().secret.expose_secret(), "pw");
 
-    // A blob sealed by a pre-release build (row-only binding) is refused by
-    // default, and the sweep leaves it alone …
+    // A blob sealed under the row-only binding (as pre-release builds did)
+    // is refused, and the sweep leaves it alone.
     let legacy = envelope
         .seal(
             &secret("legacy-pw"),
@@ -1207,46 +1495,6 @@ async fn upstream_password_is_bound_to_the_remote_origin() {
         .await
         .unwrap();
     assert_eq!(swept.resealed, 0);
-    // … but an instance started with `crypto.accept_row_bound_secrets` opens
-    // it, and its sweep re-seals it for the current origin, once.
-    let migrating = EnvelopeService::new(
-        Arc::new(PgKeyStore::new(pool.clone())),
-        Arc::new(StaticRootProvider::new(
-            "env",
-            Algorithm::Aes256Gcm,
-            KeyBytes::from_slice(root.expose()).unwrap(),
-            vec![],
-        )),
-        EnvelopeServiceConfig {
-            scope: scope.clone(),
-            accept_row_bound_secrets: true,
-            ..Default::default()
-        },
-    );
-    assert_eq!(
-        secret_dao::get_upstream_credential(&pool, &migrating, repo.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .secret
-            .expose_secret(),
-        "legacy-pw"
-    );
-    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &migrating, repo.id - 1, 1)
-        .await
-        .unwrap();
-    assert_eq!(swept.resealed, 1);
-    let swept = secret_dao::reseal_upstream_passwords_batch(&pool, &migrating, repo.id - 1, 1)
-        .await
-        .unwrap();
-    assert_eq!(swept.resealed, 0, "converged");
-    // The re-sealed blob opens without the switch.
-    assert_eq!(
-        read().await.unwrap().unwrap().secret.expose_secret(),
-        "legacy-pw"
-    );
-    set_url("https://attacker.example/index.json").await;
-    assert!(read().await.is_err(), "now bound to the origin");
 }
 
 /// An OIDC realm's client secret is bound to its issuer and client id: a
@@ -1307,4 +1555,347 @@ async fn oidc_client_secret_is_bound_to_the_issuer() {
         "s3cret"
     );
     auth_realm_dao::delete_realm(&pool, realm.id).await.unwrap();
+}
+
+/// #319: the email settings' transport secret (the SMTP password) is sealed
+/// into `email_settings.secrets_enc` and stripped from `config`, bound to the
+/// transport's host and username, follows DEK rotation (the sweep re-seals
+/// it, the reference scan protects its DEK), fails closed without the
+/// envelope, and a password stored before `[crypto]` was enabled is sealed by
+/// the backfill, which never undoes a concurrent edit.
+#[tokio::test]
+async fn email_settings_secrets_are_sealed_bound_and_rotated() {
+    use forge_db::email_settings_dao;
+    use serde_json::json;
+
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("email-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    for _ in 0..6 {
+        envelope.rotate_dek().await.unwrap();
+    }
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let logical = json!({
+        "from_address": "forge@example.com",
+        "invitation_ttl_hours": 72,
+        "transport": {
+            "kind": "smtp", "host": "smtp.example.com", "tls": "starttls",
+            "username": "forge", "password": "smtp-secret-1",
+        },
+    });
+
+    let row = secret_dao::store_email_settings(&pool, Some(&envelope), true, &logical)
+        .await
+        .unwrap();
+    assert!(row.config["transport"].get("password").is_none());
+    let blob = row.secrets_enc.clone().expect("sealed");
+    assert!(!String::from_utf8_lossy(&blob).contains("smtp-secret-1"));
+    assert!(secret_dao::sealed_secrets_present(&pool).await.unwrap());
+    assert!(!secret_dao::plaintext_email_secrets_pending(&pool)
+        .await
+        .unwrap());
+    let opened = secret_dao::email_config(Some(&envelope), &row)
+        .await
+        .unwrap();
+    assert_eq!(opened, logical);
+
+    // Bound to the host (and username): a row repointed outside the API no
+    // longer decrypts, so the password never goes to the other server.
+    sqlx::query(
+        "UPDATE email_settings SET config = jsonb_set(config, '{transport,host}', '\"evil.example\"')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let moved = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    assert!(secret_dao::email_config(Some(&envelope), &moved)
+        .await
+        .is_err());
+    sqlx::query("UPDATE email_settings SET config = $1")
+        .bind(&row.config)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Without the envelope the sealed secret fails closed.
+    assert!(matches!(
+        secret_dao::email_config(None, &row).await,
+        Err(secret_dao::SecretDbError::EmailSecrets(_))
+    ));
+
+    // Its DEK stays while the secret is sealed under it; the sweep re-seals
+    // it under the active DEK, and then the old one goes.
+    envelope.rotate_dek().await.unwrap();
+    secret_dao::revoke_unreferenced_deks(&pool, &envelope)
+        .await
+        .unwrap();
+    let current = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &current)
+            .await
+            .unwrap(),
+        logical
+    );
+    assert_eq!(
+        secret_dao::reseal_email_secrets(&pool, &envelope)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        secret_dao::reseal_email_secrets(&pool, &envelope)
+            .await
+            .unwrap(),
+        0,
+        "converged"
+    );
+    let resealed = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    assert_ne!(resealed.secrets_enc, current.secrets_enc);
+    assert!(
+        secret_dao::revoke_unreferenced_deks(&pool, &envelope)
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &resealed)
+            .await
+            .unwrap(),
+        logical
+    );
+
+    // A password stored without encryption is sealed by the backfill.
+    let plain = secret_dao::store_email_settings(&pool, None, true, &logical)
+        .await
+        .unwrap();
+    assert_eq!(plain.config, logical);
+    assert!(plain.secrets_enc.is_none());
+    assert!(secret_dao::plaintext_email_secrets_pending(&pool)
+        .await
+        .unwrap());
+    // ... but never over a concurrent edit.
+    let edited = json!({
+        "from_address": "noreply@example.com",
+        "invitation_ttl_hours": 24,
+        "transport": {"kind": "smtp", "host": "localhost", "tls": "none"},
+    });
+    email_settings_dao::put(&pool, true, &edited, None)
+        .await
+        .unwrap();
+    assert!(
+        email_settings_dao::put_if_unchanged(&pool, &plain, &edited, None)
+            .await
+            .unwrap()
+            .is_none(),
+        "the row changed since it was read"
+    );
+    secret_dao::store_email_settings(&pool, None, true, &logical)
+        .await
+        .unwrap();
+    assert!(secret_dao::backfill_email_secrets(&pool, &envelope)
+        .await
+        .unwrap());
+    assert!(!secret_dao::plaintext_email_secrets_pending(&pool)
+        .await
+        .unwrap());
+    let backfilled = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    assert!(backfilled.config["transport"].get("password").is_none());
+    assert!(backfilled.secrets_enc.is_some());
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &backfilled)
+            .await
+            .unwrap(),
+        logical
+    );
+    assert!(!secret_dao::backfill_email_secrets(&pool, &envelope)
+        .await
+        .unwrap());
+
+    // A transport without a secret seals nothing.
+    let relay = secret_dao::store_email_settings(&pool, Some(&envelope), true, &edited)
+        .await
+        .unwrap();
+    assert!(relay.secrets_enc.is_none());
+    assert_eq!(relay.config, edited);
+
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// #320: a Microsoft Graph app's client secret is sealed like the SMTP
+/// password, bound to the tenant and the client id: a row repointed to
+/// another tenant or app outside the API no longer decrypts.
+#[tokio::test]
+async fn the_graph_client_secret_is_sealed_and_bound_to_the_app() {
+    use forge_db::email_settings_dao;
+    use serde_json::json;
+
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("graph-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let logical = json!({
+        "from_address": "forge@contoso.com",
+        "invitation_ttl_hours": 72,
+        "transport": {
+            "kind": "microsoft_graph",
+            "tenant_id": "contoso.onmicrosoft.com",
+            "client_id": "00000000-1111-2222-3333-444444444444",
+            "client_authentication": "client_secret",
+            "client_secret": "graph-secret-1",
+        },
+    });
+
+    let row = secret_dao::store_email_settings(&pool, Some(&envelope), true, &logical)
+        .await
+        .unwrap();
+    assert!(row.config["transport"].get("client_secret").is_none());
+    let blob = row.secrets_enc.clone().expect("sealed");
+    assert!(!String::from_utf8_lossy(&blob).contains("graph-secret-1"));
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &row)
+            .await
+            .unwrap(),
+        logical
+    );
+
+    for (field, value) in [
+        ("tenant_id", "fabrikam.onmicrosoft.com"),
+        ("client_id", "55555555-1111-2222-3333-444444444444"),
+    ] {
+        sqlx::query("UPDATE email_settings SET config = jsonb_set(config, $1, $2)")
+            .bind(vec!["transport", field])
+            .bind(json!(value))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let moved = email_settings_dao::get(&pool).await.unwrap().unwrap();
+        assert!(
+            secret_dao::email_config(Some(&envelope), &moved)
+                .await
+                .is_err(),
+            "{field}"
+        );
+        sqlx::query("UPDATE email_settings SET config = $1")
+            .bind(&row.config)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// The `smtp_oauth` transport's secrets (#321), the client secret, the
+/// registration access token and the refresh token, are sealed, and bound to
+/// the issuer, the client and the mailbox; a compare-and-set update reseals
+/// them and refuses a row that changed meanwhile.
+#[tokio::test]
+async fn the_smtp_oauth_secrets_are_sealed_and_bound_to_the_authorization() {
+    use forge_db::email_settings_dao;
+    use serde_json::json;
+
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("oauth-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let secrets = ["client-s3cret", "reg-token-1", "refresh-1"];
+    let logical = json!({
+        "from_address": "forge@example.com",
+        "invitation_ttl_hours": 72,
+        "transport": {
+            "kind": "smtp_oauth",
+            "host": "mail.example.com",
+            "tls": "starttls",
+            "issuer": "https://mail.example.com",
+            "username": "forge@example.com",
+            "client_id": "forge-client",
+            "client_secret": secrets[0],
+            "registration_access_token": secrets[1],
+            "grant": "refresh_token",
+            "refresh_token": secrets[2],
+        },
+    });
+
+    let row = secret_dao::store_email_settings(&pool, Some(&envelope), true, &logical)
+        .await
+        .unwrap();
+    let blob = row.secrets_enc.clone().expect("sealed");
+    for secret in secrets {
+        assert!(!row.config.to_string().contains(secret), "{secret}");
+        assert!(!String::from_utf8_lossy(&blob).contains(secret), "{secret}");
+    }
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &row)
+            .await
+            .unwrap(),
+        logical
+    );
+
+    for (field, value) in [
+        ("issuer", "https://evil.example"),
+        ("client_id", "other-client"),
+        ("username", "other@example.com"),
+    ] {
+        sqlx::query("UPDATE email_settings SET config = jsonb_set(config, $1, $2)")
+            .bind(vec!["transport", field])
+            .bind(json!(value))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let moved = email_settings_dao::get(&pool).await.unwrap().unwrap();
+        assert!(
+            secret_dao::email_config(Some(&envelope), &moved)
+                .await
+                .is_err(),
+            "{field}"
+        );
+        sqlx::query("UPDATE email_settings SET config = $1")
+            .bind(&row.config)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // A rotated refresh token, stored over the row as read.
+    let row = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    let mut rotated = logical.clone();
+    rotated["transport"]["refresh_token"] = json!("refresh-2");
+    let updated = secret_dao::update_email_settings(&pool, Some(&envelope), &row, &rotated)
+        .await
+        .unwrap()
+        .expect("unchanged row");
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &updated)
+            .await
+            .unwrap(),
+        rotated
+    );
+    // The row as read before is stale now.
+    assert!(
+        secret_dao::update_email_settings(&pool, Some(&envelope), &row, &logical)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
 }

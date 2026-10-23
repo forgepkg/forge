@@ -1,9 +1,9 @@
-name: envisia-forge-dev
+name: forge-dev
 
 services:
   # PostgreSQL 17 — metadata store
   db:
-    image: postgres:17
+    image: mirror.gcr.io/library/postgres:17
     environment:
       POSTGRES_DB: forge
       POSTGRES_USER: forge
@@ -41,7 +41,7 @@ services:
   #     --endpoint-url http://localhost:8422 \
   #     --region us-east-1
   s3:
-    image: versity/versitygw:v1.4.1
+    image: mirror.gcr.io/versity/versitygw:v1.4.1
     command: ["--port", ":8422", "--access", "minioadmin", "--secret", "minioadmin", "posix", "/data"]
     ports:
       - "8422:8422"

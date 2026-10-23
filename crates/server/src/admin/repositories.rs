@@ -1,4 +1,4 @@
-//! Admin repository CRUD + package hard-delete (plan 10.4, A12).
+//! Admin repository CRUD + package hard-delete.
 //!
 //! `upstream_password` is **write-only**: accepted on create/update, never
 //! returned (responses carry a [`RepoView`] with no password field). The update
@@ -6,7 +6,7 @@
 //! credential drop on an origin change are documented on [`UpdateRepo`].
 //!
 //! `remote_url` on a proxy is **scheme-validated** at create/update time
-//! (http/https only — 12.7 §3.6 dropped the private-range restriction) so a bad
+//! (http/https only; private and loopback addresses are allowed) so a bad
 //! upstream is rejected before any fetch. The configured host is logged on save
 //! for operator visibility (the URL may point at internal addresses).
 //!
@@ -14,17 +14,24 @@
 //! `/repositories/{name}`), so they are validated on create and rename (see
 //! [`validate_repo_name`]).
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_core::net::ssrf::validate_url;
-use forge_db::component_dao;
-use forge_db::model::{RepoKind, Repository, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY};
+use forge_db::model::{
+    DeploymentPolicy, RepoKind, Repository, CONTENT_DISPOSITION_KEY, DEPLOYMENT_POLICY_KEY,
+    DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY,
+    MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RAW_FORMAT, RESERVED_PREFIXES_KEY,
+    WRITABLE_MEMBER_ID_KEY,
+};
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
+use forge_db::{component_dao, oci_dao, raw_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::db_error;
+use super::{db_error, double_option};
 use crate::state::AppState;
 
 /// Public, password-free view of a repository (REDACTED secrets).
@@ -50,10 +57,32 @@ pub struct RepoView {
     /// Group: id prefixes never served from a proxy member (see
     /// [`Repository::reserved_prefixes`]).
     pub reserved_prefixes: Vec<String>,
+    /// Docker: the host name this repository also answers on by itself
+    /// (see [`Repository::docker_host`]).
+    pub host: Option<String>,
+    /// Hosted docker: pushed tags may not be moved.
+    pub immutable_tags: bool,
+    /// Hosted docker with immutable tags: `latest` may still be moved.
+    pub latest_mutable: bool,
+    /// Docker group: the hosted member pushes to the group go to, by its
+    /// current name (it is stored by id).
+    pub writable_member: Option<String>,
+    /// Hosted: the largest push it accepts (for docker, the largest blob),
+    /// `None` for the default of its format (`GET /admin/formats`).
+    pub max_upload_bytes: Option<u64>,
+    /// Hosted raw: `allow_redeploy` | `disable_redeploy` | `read_only`.
+    pub deployment_policy: Option<&'static str>,
+    /// Raw: `attachment` (files download) | `inline` (files display).
+    pub content_disposition: Option<&'static str>,
+    /// Raw proxy: seconds a cached file is served before the upstream is
+    /// asked whether it changed (`0`: never).
+    pub max_age_seconds: Option<u64>,
 }
 
-impl From<&Repository> for RepoView {
-    fn from(r: &Repository) -> Self {
+impl RepoView {
+    /// The view of `r`, naming its writable member as `names` (repository
+    /// names by id) does.
+    fn new(r: &Repository, names: &HashMap<i64, String>) -> Self {
         RepoView {
             id: r.id,
             name: r.name.clone(),
@@ -64,19 +93,50 @@ impl From<&Repository> for RepoView {
             remote_url: r.remote_url.clone(),
             package_delay_seconds: r.package_delay_seconds,
             upstream_username: r.upstream_username.clone(),
-            // §12.5: true for an encrypted blob OR a (pre-backfill) plaintext.
+            // True for an encrypted blob OR a (pre-backfill) plaintext.
             has_upstream_password: r.has_upstream_password(),
             metadata_ttl_seconds: r.metadata_ttl_seconds,
             not_found_ttl_seconds: r.not_found_ttl_seconds,
             allow_redeploy: r.allow_redeploy,
             prefer_hosted: r.prefer_hosted(),
             reserved_prefixes: r.reserved_prefixes(),
+            host: r.docker_host().map(str::to_string),
+            immutable_tags: r.immutable_tags(),
+            latest_mutable: r.immutable_tags() && r.latest_mutable(),
+            writable_member: r
+                .writable_member_id()
+                .and_then(|id| names.get(&id).cloned()),
+            max_upload_bytes: r.max_upload_bytes(),
+            deployment_policy: (r.is_raw() && r.kind() == RepoKind::Hosted)
+                .then(|| r.deployment_policy().as_str()),
+            content_disposition: r.is_raw().then(|| {
+                if r.inline_content() {
+                    "inline"
+                } else {
+                    "attachment"
+                }
+            }),
+            max_age_seconds: (r.is_raw() && r.kind() == RepoKind::Proxy)
+                .then(|| r.max_age_seconds()),
         }
     }
 }
 
-/// Create-repository request body.
+/// The view of `r`, its writable member's current name looked up.
+async fn view(pool: &sqlx::PgPool, r: &Repository) -> sqlx::Result<RepoView> {
+    let mut names = HashMap::new();
+    if let Some(id) = r.writable_member_id() {
+        if let Some(member) = repository_dao::find_repository_by_id(pool, id).await? {
+            names.insert(id, member.name);
+        }
+    }
+    Ok(RepoView::new(r, &names))
+}
+
+/// Create-repository request body. Unknown fields are rejected: a misspelled
+/// `anonymous_read` or `reserved_prefixes` must not fall back to its default.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRepo {
     pub name: String,
     /// `hosted` | `proxy` | `group`.
@@ -108,6 +168,34 @@ pub struct CreateRepo {
     /// Group only: id prefixes (e.g. `Acme.`) never served from a proxy member.
     #[serde(default)]
     pub reserved_prefixes: Option<Vec<String>>,
+    /// Docker only: a host name the repository answers on by itself
+    /// (host-based routing: `<host>/<image>` instead of `<server>/<repo>/<image>`).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Hosted docker only: refuse to move an existing tag (default off).
+    #[serde(default)]
+    pub immutable_tags: Option<bool>,
+    /// Hosted docker only: with `immutable_tags`, `latest` may still move.
+    #[serde(default)]
+    pub latest_mutable: Option<bool>,
+    /// Docker group only: the hosted member a push to the group goes to.
+    #[serde(default)]
+    pub writable_member: Option<String>,
+    /// Hosted only: the largest push it accepts, in bytes (for docker, the
+    /// largest blob). Absent: the default of its format.
+    #[serde(default)]
+    pub max_upload_bytes: Option<u64>,
+    /// Hosted raw only: `allow_redeploy`, `disable_redeploy` (default) or
+    /// `read_only`.
+    #[serde(default)]
+    pub deployment_policy: Option<String>,
+    /// Raw only: `attachment` (default) or `inline`.
+    #[serde(default)]
+    pub content_disposition: Option<String>,
+    /// Raw proxy only: seconds before a cached file is re-validated (`0`:
+    /// never). Absent: a day.
+    #[serde(default)]
+    pub max_age_seconds: Option<u64>,
 }
 
 /// Update-repository request body (`PUT /admin/repositories/{name}`).
@@ -134,7 +222,18 @@ pub struct CreateRepo {
 /// * Turning `anonymous_read` off also deletes the anonymous role's unscoped
 ///   `read` grant on the repository (the grant migration 0007 synthesized from
 ///   the flag), so anonymous access really ends.
+/// * Docker options (`host`, `immutable_tags`, `latest_mutable`,
+///   `writable_member`) follow the same rules (`host` and `writable_member`:
+///   `null` clears) and are refused on NuGet repositories.
+/// * `max_upload_bytes` (hosted only): `null` clears it, back to the default
+///   of the repository's format.
+/// * Raw options (`deployment_policy`, `content_disposition`,
+///   `max_age_seconds`) are refused on other formats; `max_age_seconds:
+///   null` goes back to the default.
+/// * Unknown fields are rejected (a misspelled field would otherwise keep the
+///   stored value).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateRepo {
     pub name: Option<String>,
     pub anonymous_read: Option<bool>,
@@ -154,6 +253,26 @@ pub struct UpdateRepo {
     pub prefer_hosted: Option<bool>,
     /// Group only; replaces the whole list (`[]` clears it).
     pub reserved_prefixes: Option<Vec<String>>,
+    /// Docker only; `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub host: Option<Option<String>>,
+    /// Hosted docker only.
+    pub immutable_tags: Option<bool>,
+    /// Hosted docker only.
+    pub latest_mutable: Option<bool>,
+    /// Docker group only; `null` clears it (pushes to the group are refused).
+    #[serde(default, deserialize_with = "double_option")]
+    pub writable_member: Option<Option<String>>,
+    /// Hosted only; `null` clears it (the format's default applies).
+    #[serde(default, deserialize_with = "double_option")]
+    pub max_upload_bytes: Option<Option<u64>>,
+    /// Hosted raw only.
+    pub deployment_policy: Option<String>,
+    /// Raw only.
+    pub content_disposition: Option<String>,
+    /// Raw proxy only; `null` clears it (a day).
+    #[serde(default, deserialize_with = "double_option")]
+    pub max_age_seconds: Option<Option<u64>>,
 }
 
 /// Update response: the [`RepoView`] plus whether this update dropped the
@@ -165,17 +284,6 @@ pub struct UpdatedRepoView {
     /// `true` iff `remote_url` moved to another origin without a new
     /// `upstream_password`, and stored credentials were removed.
     pub upstream_credentials_dropped: bool,
-}
-
-/// Deserialize a field that distinguishes *absent* (`None`, through
-/// `#[serde(default)]`) from JSON `null` (`Some(None)`) and a value
-/// (`Some(Some(v))`).
-fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(de).map(Some)
 }
 
 /// The longest accepted repository name.
@@ -193,7 +301,9 @@ fn validate_repo_name(name: &str) -> Result<(), String> {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if !valid {
         return Err(format!(
-            "invalid repository name {name:?}: use 1-{MAX_REPO_NAME_LEN} characters from              A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit              (the name is part of the feed URL)"
+            "invalid repository name {name:?}: use 1-{MAX_REPO_NAME_LEN} characters from \
+             A-Z, a-z, 0-9, '.', '_' and '-', starting with a letter or digit \
+             (the name is part of the feed URL)"
         ));
     }
     if name.eq_ignore_ascii_case("new") {
@@ -224,7 +334,7 @@ enum PasswordChange {
 }
 
 fn default_format() -> String {
-    "nuget".into()
+    NUGET_FORMAT.into()
 }
 fn default_true() -> bool {
     true
@@ -236,8 +346,8 @@ fn bad_request(msg: impl Into<String>) -> Response {
 
 /// Scheme-validate a proxy `remote_url` (http/https only). `None` is OK at this
 /// layer (proxy-without-url is rejected separately). Logs the configured host
-/// (12.7 §3.6: the URL may legitimately point at internal addresses; the log
-/// line gives operators an audit trail of where forge was pointed).
+/// (the URL may legitimately point at internal addresses; the log line gives
+/// operators an audit trail of where forge was pointed).
 #[allow(clippy::result_large_err)] // the Err is a ready-made axum Response
 fn validate_remote_url(url: &str) -> Result<(), Response> {
     validate_url(url).map_err(|e| bad_request(format!("invalid remote_url: {e}")))?;
@@ -269,8 +379,9 @@ const MAX_RESERVED_PREFIXES: usize = 100;
 
 /// Validate and normalize a group's reserved id prefixes: each is a NuGet id
 /// prefix (`A-Z a-z 0-9 . _ -`, at most 100 bytes, an optional trailing `*`
-/// dropped), stored lowercase, deduplicated.
-fn normalize_prefixes(raw: &[String]) -> Result<Vec<String>, String> {
+/// dropped), stored lowercase, deduplicated. A docker group's prefixes are
+/// image-name prefixes and may contain `/` (a namespace such as `acme/`).
+fn normalize_prefixes(raw: &[String], docker: bool) -> Result<Vec<String>, String> {
     if raw.len() > MAX_RESERVED_PREFIXES {
         return Err(format!(
             "at most {MAX_RESERVED_PREFIXES} reserved_prefixes are allowed"
@@ -282,13 +393,21 @@ fn normalize_prefixes(raw: &[String]) -> Result<Vec<String>, String> {
         let prefix = prefix.strip_suffix('*').unwrap_or(prefix);
         let valid = !prefix.is_empty()
             && prefix.len() <= 100
-            && prefix
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            && prefix.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(b, b'.' | b'_' | b'-')
+                    || (docker && b == b'/')
+            });
         if !valid {
-            return Err(format!(
-                "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
-            ));
+            return Err(if docker {
+                format!(
+                    "reserved_prefixes: {prefix:?} is not an image name prefix (letters, digits, '.', '_', '-', '/')"
+                )
+            } else {
+                format!(
+                    "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
+                )
+            });
         }
         let prefix = prefix.to_ascii_lowercase();
         if !out.contains(&prefix) {
@@ -296,6 +415,78 @@ fn normalize_prefixes(raw: &[String]) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+/// Validate and normalize a docker repository's `host`: a lowercase DNS name
+/// (no port, no scheme) other than the server's own public host.
+fn normalize_docker_host(raw: &str, public_base_url: &str) -> Result<String, String> {
+    let host = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if host.len() > 253 || !host.contains('.') || !host.split('.').all(label_ok) {
+        return Err(format!(
+            "invalid host {raw:?}: give a DNS name such as docker.example.com (no scheme or port)"
+        ));
+    }
+    let public_host = url::Url::parse(public_base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    if public_host.as_deref() == Some(host.as_str()) {
+        return Err(
+            "host must differ from the server's own host (repositories are reachable there by path)"
+                .into(),
+        );
+    }
+    Ok(host)
+}
+
+/// A docker group's `writable_member`: an existing hosted docker
+/// repository, whose id is stored.
+async fn validate_writable_member(state: &AppState, name: &str) -> Result<i64, Response> {
+    match repository_dao::find_repository_by_name(&state.pool, name).await {
+        Ok(Some(r)) if r.is_docker() && r.kind() == RepoKind::Hosted => Ok(r.id),
+        Ok(_) => Err(bad_request(format!(
+            "writable_member {name:?} must be a hosted docker repository (and a member of the group)"
+        ))),
+        Err(e) => Err(db_error(e)),
+    }
+}
+
+/// The unique violation of a docker host already in use.
+fn is_host_conflict(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db)
+        if db.code().as_deref() == Some("23505")
+            && db.constraint() == Some("repository_docker_host_idx"))
+}
+
+/// Validate a repository upload limit for a repository of `kind`: hosted
+/// only, more than 0, and at most what a push can stage
+/// ([`crate::config::Config::max_repository_upload_bytes`]).
+#[allow(clippy::result_large_err)]
+fn validate_upload_limit(state: &AppState, kind: RepoKind, bytes: u64) -> Result<u64, Response> {
+    if kind != RepoKind::Hosted {
+        return Err(bad_request(
+            "max_upload_bytes is only valid for hosted repositories",
+        ));
+    }
+    if bytes == 0 {
+        return Err(bad_request("max_upload_bytes must be greater than 0"));
+    }
+    if let Some(ceiling) = state.config.max_repository_upload_bytes() {
+        if bytes > ceiling {
+            return Err(bad_request(format!(
+                "max_upload_bytes ({bytes}) is larger than a push can be staged ({ceiling} \
+                 bytes: server.max_staging_bytes less nuget.max_nuspec_bytes); raise \
+                 server.max_staging_bytes first"
+            )));
+        }
+    }
+    Ok(bytes)
 }
 
 /// Reject negative or absurd proxy timings. A negative TTL made every
@@ -328,7 +519,9 @@ fn validate_timings(
 pub async fn list(State(state): State<AppState>) -> Response {
     match repository_dao::list_repositories(&state.pool).await {
         Ok(repos) => {
-            let views: Vec<RepoView> = repos.iter().map(RepoView::from).collect();
+            let names: HashMap<i64, String> =
+                repos.iter().map(|r| (r.id, r.name.clone())).collect();
+            let views: Vec<RepoView> = repos.iter().map(|r| RepoView::new(r, &names)).collect();
             Json(views).into_response()
         }
         Err(e) => db_error(e),
@@ -338,7 +531,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
 /// `GET /admin/repositories/{name}`
 pub async fn get(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     match repository_dao::find_repository_by_name(&state.pool, &name).await {
-        Ok(Some(r)) => Json(RepoView::from(&r)).into_response(),
+        Ok(Some(r)) => match view(&state.pool, &r).await {
+            Ok(view) => Json(view).into_response(),
+            Err(e) => db_error(e),
+        },
         Ok(None) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => db_error(e),
     }
@@ -353,15 +549,76 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
     };
-    // Only NuGet is implemented; any other value would silently behave as
-    // NuGet (the format registry has a single module).
-    if body.format != "nuget" {
+    // The format must be installed: Docker, a built-in format plugin (NuGet,
+    // Helm) or a loaded WebAssembly one (`GET /admin/formats`), and support
+    // the kind. It is fixed for the repository's lifetime.
+    let Some(kinds) = state.formats.kinds(&body.format) else {
+        let available: Vec<&str> = state.formats.ids().collect();
         return bad_request(format!(
-            "unsupported format {:?}: only \"nuget\" is available",
+            "unsupported format {:?}: available formats are {available:?}",
+            body.format
+        ));
+    };
+    // Docker serves every kind; a plugin format serves the kinds its plugin
+    // names (NuGet's all three).
+    if !kinds.contains(&kind.as_str()) {
+        return bad_request(format!(
+            "{kind} repositories are not available for format {:?}",
             body.format
         ));
     }
+    let docker = body.format == DOCKER_FORMAT;
     let parsed_kind = RepoKind::from(kind.as_str());
+    let docker_config = match docker_options(
+        &state,
+        docker,
+        parsed_kind,
+        &body.name,
+        DockerOptions {
+            host: body.host.clone().map(Some),
+            immutable_tags: body.immutable_tags,
+            latest_mutable: body.latest_mutable,
+            writable_member: body.writable_member.clone().map(Some),
+        },
+        &serde_json::Map::new(),
+    )
+    .await
+    {
+        Ok(config) => config,
+        Err(resp) => return resp,
+    };
+    if docker && body.package_delay_seconds != 0 {
+        return bad_request("package_delay_seconds is not supported for docker repositories");
+    }
+    if docker && body.allow_redeploy {
+        return bad_request(
+            "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
+        );
+    }
+    let raw = body.format == RAW_FORMAT;
+    if raw {
+        if let Err(resp) = refuse_for_raw(
+            Some(body.package_delay_seconds),
+            Some(body.allow_redeploy),
+            Some(body.metadata_ttl_seconds),
+            body.prefer_hosted.is_some() || body.reserved_prefixes.is_some(),
+        ) {
+            return resp;
+        }
+    }
+    let docker_config = match raw_options(
+        raw,
+        parsed_kind,
+        RawOptions {
+            deployment_policy: body.deployment_policy.clone(),
+            content_disposition: body.content_disposition.clone(),
+            max_age_seconds: body.max_age_seconds.map(Some),
+        },
+        docker_config,
+    ) {
+        Ok(config) => config,
+        Err(resp) => return resp,
+    };
 
     // Proxy must carry a remote_url; SSRF-validate it. Non-proxies must not.
     if parsed_kind == RepoKind::Proxy {
@@ -370,6 +627,11 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         };
         if let Err(resp) = validate_remote_url(url) {
             return resp;
+        }
+        if raw {
+            if let Err(resp) = validate_raw_remote_url(url) {
+                return resp;
+            }
         }
     } else if body.remote_url.is_some() {
         return bad_request("remote_url is only valid for proxy repositories");
@@ -380,7 +642,11 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     if body.reserved_prefixes.is_some() && parsed_kind != RepoKind::Group {
         return bad_request("reserved_prefixes is only valid for group repositories");
     }
-    let reserved_prefixes = match body.reserved_prefixes.as_deref().map(normalize_prefixes) {
+    let reserved_prefixes = match body
+        .reserved_prefixes
+        .as_deref()
+        .map(|p| normalize_prefixes(p, docker))
+    {
         Some(Err(msg)) => return bad_request(&msg),
         Some(Ok(prefixes)) => Some(prefixes),
         None => None,
@@ -392,7 +658,13 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     ) {
         return resp;
     }
-    let mut config = json!({});
+    let mut config = serde_json::Value::Object(docker_config);
+    if let Some(bytes) = body.max_upload_bytes {
+        match validate_upload_limit(&state, parsed_kind, bytes) {
+            Ok(bytes) => config[MAX_UPLOAD_BYTES_KEY] = json!(bytes),
+            Err(resp) => return resp,
+        }
+    }
     if parsed_kind == RepoKind::Group {
         config[PREFER_HOSTED_KEY] = json!(body.prefer_hosted.unwrap_or(true));
         if let Some(prefixes) = reserved_prefixes {
@@ -400,9 +672,9 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         }
     }
 
-    // §12.5: with encryption enabled the password is NOT inserted as plaintext;
-    // the row is created first (the AAD binds the ciphertext to the row id,
-    // which does not exist before the INSERT) and the secret is sealed below.
+    // With encryption enabled the password is NOT inserted as plaintext; the
+    // row is created first (the AAD binds the ciphertext to the row id, which
+    // does not exist before the INSERT) and the secret is sealed below.
     let encrypting = state.envelope.is_some();
     let new = NewRepository {
         name: body.name.clone(),
@@ -432,6 +704,13 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     };
     let repo = match repository_dao::insert_repository(&mut *tx, new).await {
         Ok(r) => r,
+        Err(e) if is_host_conflict(&e) => {
+            return (
+                StatusCode::CONFLICT,
+                "another docker repository already answers on this host",
+            )
+                .into_response()
+        }
         Err(e) if is_unique_violation(&e) => {
             return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
@@ -451,14 +730,229 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     if let Err(e) = tx.commit().await {
         return db_error(e);
     }
-    if !sealed {
-        return (StatusCode::CREATED, Json(RepoView::from(&repo))).into_response();
-    }
-    // Re-fetch so the view reflects the sealed secret.
-    match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
-        Ok(Some(r)) => (StatusCode::CREATED, Json(RepoView::from(&r))).into_response(),
-        Ok(None) => db_error(sqlx::Error::RowNotFound),
+    // Re-fetched so the view reflects the sealed secret.
+    let repo = if sealed {
+        match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return db_error(sqlx::Error::RowNotFound),
+            Err(e) => return db_error(e),
+        }
+    } else {
+        repo
+    };
+    match view(&state.pool, &repo).await {
+        Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
         Err(e) => db_error(e),
+    }
+}
+
+/// The docker options of a create or update request (`None`: not sent;
+/// `Some(None)`: cleared).
+struct DockerOptions {
+    host: Option<Option<String>>,
+    immutable_tags: Option<bool>,
+    latest_mutable: Option<bool>,
+    writable_member: Option<Option<String>>,
+}
+
+impl DockerOptions {
+    fn any(&self) -> bool {
+        self.host.is_some()
+            || self.immutable_tags.is_some()
+            || self.latest_mutable.is_some()
+            || self.writable_member.is_some()
+    }
+}
+
+/// Validate the docker options against the repository's format and kind
+/// and merge them into `existing` (its stored config object). Returns the
+/// config object to store.
+#[allow(clippy::result_large_err)]
+async fn docker_options(
+    state: &AppState,
+    docker: bool,
+    kind: RepoKind,
+    name: &str,
+    options: DockerOptions,
+    existing: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
+    let mut config = existing.clone();
+    if !docker {
+        if options.any() {
+            return Err(bad_request(
+                "host, immutable_tags, latest_mutable and writable_member are only valid for docker repositories",
+            ));
+        }
+        return Ok(config);
+    }
+    if !forge_oci::reference::valid_name_component(name) {
+        return Err(bad_request(format!(
+            "invalid docker repository name {name:?}: image names start with it, so use \
+             lowercase letters and digits, separated by '.', '_', '__' or '-'"
+        )));
+    }
+    if (options.immutable_tags.is_some() || options.latest_mutable.is_some())
+        && kind != RepoKind::Hosted
+    {
+        return Err(bad_request(
+            "immutable_tags and latest_mutable are only valid for hosted repositories",
+        ));
+    }
+    if options.writable_member.is_some() && kind != RepoKind::Group {
+        return Err(bad_request(
+            "writable_member is only valid for group repositories",
+        ));
+    }
+    match options.host {
+        Some(Some(host)) => {
+            let host = normalize_docker_host(&host, &state.config.public_base_url())
+                .map_err(bad_request)?;
+            config.insert(DOCKER_HOST_KEY.into(), json!(host));
+        }
+        Some(None) => {
+            config.remove(DOCKER_HOST_KEY);
+        }
+        None => {}
+    }
+    if let Some(immutable) = options.immutable_tags {
+        config.insert(IMMUTABLE_TAGS_KEY.into(), json!(immutable));
+    }
+    if let Some(latest) = options.latest_mutable {
+        config.insert(LATEST_MUTABLE_KEY.into(), json!(latest));
+    }
+    match options.writable_member {
+        Some(Some(member)) => {
+            let member = validate_writable_member(state, &member).await?;
+            config.insert(WRITABLE_MEMBER_ID_KEY.into(), json!(member));
+        }
+        Some(None) => {
+            config.remove(WRITABLE_MEMBER_ID_KEY);
+        }
+        None => {}
+    }
+    Ok(config)
+}
+
+/// The raw options of a create or update request (`None`: not sent; for
+/// `max_age_seconds`, `Some(None)`: cleared).
+struct RawOptions {
+    deployment_policy: Option<String>,
+    content_disposition: Option<String>,
+    max_age_seconds: Option<Option<u64>>,
+}
+
+impl RawOptions {
+    fn any(&self) -> bool {
+        self.deployment_policy.is_some()
+            || self.content_disposition.is_some()
+            || self.max_age_seconds.is_some()
+    }
+}
+
+/// Longest accepted `max_age_seconds`: ten years.
+const MAX_RAW_MAX_AGE_SECONDS: u64 = 10 * 366 * 24 * 60 * 60;
+
+/// Validate the raw options against the repository's format and kind and
+/// merge them into `config` (the config object to store).
+#[allow(clippy::result_large_err)]
+fn raw_options(
+    raw: bool,
+    kind: RepoKind,
+    options: RawOptions,
+    mut config: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
+    if !raw {
+        if options.any() {
+            return Err(bad_request(
+                "deployment_policy, content_disposition and max_age_seconds are only valid for raw repositories",
+            ));
+        }
+        return Ok(config);
+    }
+    if let Some(policy) = options.deployment_policy {
+        if kind != RepoKind::Hosted {
+            return Err(bad_request(
+                "deployment_policy is only valid for hosted repositories",
+            ));
+        }
+        let Some(policy) = DeploymentPolicy::parse(&policy) else {
+            return Err(bad_request(
+                "deployment_policy must be allow_redeploy, disable_redeploy or read_only",
+            ));
+        };
+        config.insert(DEPLOYMENT_POLICY_KEY.into(), json!(policy.as_str()));
+    }
+    if let Some(disposition) = options.content_disposition {
+        if !matches!(disposition.as_str(), "attachment" | "inline") {
+            return Err(bad_request(
+                "content_disposition must be attachment or inline",
+            ));
+        }
+        config.insert(CONTENT_DISPOSITION_KEY.into(), json!(disposition));
+    }
+    if let Some(max_age) = options.max_age_seconds {
+        if kind != RepoKind::Proxy {
+            return Err(bad_request(
+                "max_age_seconds is only valid for proxy repositories",
+            ));
+        }
+        match max_age {
+            Some(seconds) if seconds > MAX_RAW_MAX_AGE_SECONDS => {
+                return Err(bad_request(format!(
+                    "max_age_seconds must be at most {MAX_RAW_MAX_AGE_SECONDS} (0: never re-validate)"
+                )));
+            }
+            Some(seconds) => {
+                config.insert(MAX_AGE_SECONDS_KEY.into(), json!(seconds));
+            }
+            None => {
+                config.remove(MAX_AGE_SECONDS_KEY);
+            }
+        }
+    }
+    Ok(config)
+}
+
+/// The options of other formats a raw repository refuses.
+#[allow(clippy::result_large_err)]
+fn refuse_for_raw(
+    package_delay_seconds: Option<i32>,
+    allow_redeploy: Option<bool>,
+    metadata_ttl_seconds: Option<Option<i32>>,
+    group_guard: bool,
+) -> Result<(), Response> {
+    if package_delay_seconds.is_some_and(|d| d != 0) {
+        return Err(bad_request(
+            "package_delay_seconds is not supported for raw repositories",
+        ));
+    }
+    if allow_redeploy == Some(true) {
+        return Err(bad_request(
+            "allow_redeploy is a NuGet option; raw repositories have deployment_policy",
+        ));
+    }
+    if matches!(metadata_ttl_seconds, Some(Some(_))) {
+        return Err(bad_request(
+            "metadata_ttl_seconds is not used by raw proxies; set max_age_seconds",
+        ));
+    }
+    if group_guard {
+        return Err(bad_request(
+            "a raw group serves a path from its first member that has it; prefer_hosted and reserved_prefixes do not apply",
+        ));
+    }
+    Ok(())
+}
+
+/// A raw proxy's `remote_url` is the base its paths are appended to: no
+/// query or fragment.
+#[allow(clippy::result_large_err)]
+fn validate_raw_remote_url(url: &str) -> Result<(), Response> {
+    match url::Url::parse(url) {
+        Ok(parsed) if parsed.query().is_some() || parsed.fragment().is_some() => Err(bad_request(
+            "a raw proxy's remote_url is the base URL files are under: no query or fragment",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -522,11 +1016,67 @@ pub async fn update(
                 if let Err(resp) = validate_remote_url(url) {
                     return resp;
                 }
+                if existing.is_raw() {
+                    if let Err(resp) = validate_raw_remote_url(url) {
+                        return resp;
+                    }
+                }
             }
         }
     }
+    if existing.is_raw() {
+        if let Err(resp) = refuse_for_raw(
+            body.package_delay_seconds,
+            body.allow_redeploy,
+            body.metadata_ttl_seconds,
+            body.prefer_hosted.is_some() || body.reserved_prefixes.is_some(),
+        ) {
+            return resp;
+        }
+    }
 
-    let mut config = existing.config.clone();
+    let docker = existing.is_docker();
+    let final_name = body.name.clone().unwrap_or_else(|| existing.name.clone());
+    if docker && body.package_delay_seconds.is_some_and(|d| d != 0) {
+        return bad_request("package_delay_seconds is not supported for docker repositories");
+    }
+    if docker && body.allow_redeploy == Some(true) {
+        return bad_request(
+            "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
+        );
+    }
+    let stored_config = existing.config.as_object().cloned().unwrap_or_default();
+    let config = match docker_options(
+        &state,
+        docker,
+        existing.kind(),
+        &final_name,
+        DockerOptions {
+            host: body.host.clone(),
+            immutable_tags: body.immutable_tags,
+            latest_mutable: body.latest_mutable,
+            writable_member: body.writable_member.clone(),
+        },
+        &stored_config,
+    )
+    .await
+    {
+        Ok(config) => config,
+        Err(resp) => return resp,
+    };
+    let mut config = match raw_options(
+        existing.is_raw(),
+        existing.kind(),
+        RawOptions {
+            deployment_policy: body.deployment_policy.clone(),
+            content_disposition: body.content_disposition.clone(),
+            max_age_seconds: body.max_age_seconds,
+        },
+        config,
+    ) {
+        Ok(config) => serde_json::Value::Object(config),
+        Err(resp) => return resp,
+    };
     if let Some(prefer_hosted) = body.prefer_hosted {
         if existing.kind() != RepoKind::Group {
             return bad_request("prefer_hosted is only valid for group repositories");
@@ -540,7 +1090,7 @@ pub async fn update(
         if existing.kind() != RepoKind::Group {
             return bad_request("reserved_prefixes is only valid for group repositories");
         }
-        let prefixes = match normalize_prefixes(prefixes) {
+        let prefixes = match normalize_prefixes(prefixes, docker) {
             Ok(prefixes) => prefixes,
             Err(msg) => return bad_request(&msg),
         };
@@ -548,6 +1098,23 @@ pub async fn update(
             config = json!({});
         }
         config[RESERVED_PREFIXES_KEY] = json!(prefixes);
+    }
+    match body.max_upload_bytes {
+        Some(Some(bytes)) => match validate_upload_limit(&state, existing.kind(), bytes) {
+            Ok(bytes) => {
+                if !config.is_object() {
+                    config = json!({});
+                }
+                config[MAX_UPLOAD_BYTES_KEY] = json!(bytes);
+            }
+            Err(resp) => return resp,
+        },
+        Some(None) => {
+            if let Some(map) = config.as_object_mut() {
+                map.remove(MAX_UPLOAD_BYTES_KEY);
+            }
+        }
+        None => {}
     }
 
     // Stored credentials belong to the upstream origin they were entered for:
@@ -571,7 +1138,7 @@ pub async fn update(
         None => PasswordChange::Keep,
     };
     // The plaintext column value, and whether the sealed blob is cleared too.
-    // §12.5: with encryption enabled the plaintext column is always NULL after
+    // With encryption enabled the plaintext column is always NULL after
     // an update — a new password is sealed below, and a kept legacy plaintext
     // value is sealed as well (it is not carried forward).
     let (upstream_password, clear_upstream_password_enc) = match (&state.envelope, &password) {
@@ -621,11 +1188,56 @@ pub async fn update(
     let updated = match repository_dao::update_repository(&mut *tx, existing.id, upd).await {
         Ok(Some(r)) => r,
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Err(e) if is_host_conflict(&e) => {
+            return (
+                StatusCode::CONFLICT,
+                "another docker repository already answers on this host",
+            )
+                .into_response()
+        }
         Err(e) if is_unique_violation(&e) => {
             return (StatusCode::CONFLICT, "repository name already exists").into_response()
         }
         Err(e) => return db_error(e),
     };
+
+    // #65: what the proxy learned from its previous upstream (not-found
+    // markers, listings, the package-delay clock) must not decide for the new
+    // one.
+    if existing.kind() == RepoKind::Proxy && updated.remote_url != existing.remote_url {
+        if let Err(e) = forge_db::proxy_dao::reset_for_new_upstream(&mut tx, updated.id).await {
+            return db_error(e);
+        }
+        // A docker proxy's tags name what the previous upstream served:
+        // the repointed proxy starts with an empty cache. Locked first, as
+        // the purge requires: a fetch from the previous upstream still
+        // inserting commits before the purge (which removes it), and one
+        // inserting later finds the new upstream and caches nothing
+        // (`oci_dao::lock_proxy_upstream`).
+        if existing.is_docker() {
+            match repository_dao::lock_repository(&mut *tx, updated.id).await {
+                Ok(_) => {}
+                Err(e) => return db_error(e),
+            }
+            if let Err(e) =
+                oci_dao::purge_repository(&mut tx, updated.id, state.config.outbox.grace()).await
+            {
+                return db_error(e);
+            }
+        }
+        // A raw proxy's files are the previous upstream's: likewise.
+        if existing.is_raw() {
+            match repository_dao::lock_repository(&mut *tx, updated.id).await {
+                Ok(_) => {}
+                Err(e) => return db_error(e),
+            }
+            if let Err(e) =
+                raw_dao::purge_repository(&mut tx, updated.id, state.config.outbox.grace()).await
+            {
+                return db_error(e);
+            }
+        }
+    }
 
     // M20: the seam honours `anonymous_read` *and* the anonymous role's grants,
     // so switching the flag off must also remove the grant migration 0007
@@ -639,8 +1251,8 @@ pub async fn update(
         false
     };
 
-    // §12.5: seal a new password through the envelope, or re-seal a kept
-    // legacy plaintext one (the update above nulled its column).
+    // Seal a new password through the envelope, or re-seal a kept legacy
+    // plaintext one (the update above nulled its column).
     let to_seal = match (&state.envelope, password) {
         (Some(envelope), PasswordChange::Set(pw)) => Some((envelope, pw)),
         (Some(envelope), PasswordChange::Keep) if existing.upstream_password_enc.is_none() => {
@@ -657,8 +1269,11 @@ pub async fn update(
     if let Err(e) = tx.commit().await {
         return db_error(e);
     }
+    // Not only the anonymous principal reads through the anonymous role: a
+    // user or workload assigned that role holds its grants too, cached under
+    // its own key. Drop every cached set (as other grant mutations do).
     if anonymous_revoked {
-        forge_core::authz::invalidate_anonymous(&state.cache).await;
+        forge_core::authz::invalidate_all(&state.cache).await;
     }
     if credentials_dropped {
         tracing::warn!(
@@ -668,19 +1283,22 @@ pub async fn update(
         );
     }
 
-    let respond = |r: &Repository| {
-        Json(UpdatedRepoView {
-            repo: RepoView::from(r),
+    // Re-fetched so the view reflects the sealed secret.
+    let updated = if sealed {
+        match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return db_error(sqlx::Error::RowNotFound),
+            Err(e) => return db_error(e),
+        }
+    } else {
+        updated
+    };
+    match view(&state.pool, &updated).await {
+        Ok(repo) => Json(UpdatedRepoView {
+            repo,
             upstream_credentials_dropped: credentials_dropped,
         })
-        .into_response()
-    };
-    if !sealed {
-        return respond(&updated);
-    }
-    match repository_dao::find_repository_by_id(&state.pool, updated.id).await {
-        Ok(Some(r)) => respond(&r),
-        Ok(None) => db_error(sqlx::Error::RowNotFound),
+        .into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -724,6 +1342,16 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
     match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
         Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
         Ok(RepoDelete::NotFound) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        Ok(RepoDelete::HasPackages) if existing.is_docker() => (
+            StatusCode::CONFLICT,
+            "repository still has images; delete their manifests first",
+        )
+            .into_response(),
+        Ok(RepoDelete::HasPackages) if existing.is_raw() => (
+            StatusCode::CONFLICT,
+            "repository still has files; delete them first (DELETE /admin/repositories/<name>/files?path=)",
+        )
+            .into_response(),
         Ok(RepoDelete::HasPackages) => (
             StatusCode::CONFLICT,
             "repository still has packages; hard-delete them first",
@@ -761,11 +1389,11 @@ async fn delete_repository_locked(
     kind: RepoKind,
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
-    // A proxy delete locks the repository row before its cached versions,
-    // while a concurrent cache fill or retention eviction holds a cached
-    // version and then needs the repository row: Postgres resolves that
-    // deadlock by aborting one side. The whole transaction rolled back, so
-    // retrying the delete is safe.
+    // A proxy delete locks its cached versions before the repository row,
+    // the order a cache fill or retention eviction takes them in (see
+    // `proxy_dao::lock_cached_versions`). A version a fill creates between
+    // the two locks can still deadlock; Postgres then aborts one side. The
+    // whole transaction rolled back, so retrying the delete is safe.
     let mut attempt = 0;
     loop {
         match delete_repository_once(state, repo_id, kind, grace).await {
@@ -787,6 +1415,11 @@ async fn delete_repository_once(
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
     let mut tx = state.pool.begin().await?;
+    if kind != RepoKind::Hosted {
+        // Before the repository row: an in-flight first download holds its
+        // cached version and then needs the repository row.
+        forge_db::proxy_dao::lock_cached_versions(&mut *tx, repo_id).await?;
+    }
     if !repository_dao::lock_repository(&mut *tx, repo_id).await? {
         return Ok(RepoDelete::NotFound);
     }
@@ -796,9 +1429,13 @@ async fn delete_repository_once(
     }
 
     if kind == RepoKind::Hosted {
-        // Hosted repos may still own (non-reproducible) components; require them
-        // gone first so the deletion is an explicit admin action.
-        if component_dao::repository_has_components(&mut *tx, repo_id).await? {
+        // Hosted repos may still own (non-reproducible) components or image
+        // manifests; require them gone first so the deletion is an explicit
+        // admin action.
+        if component_dao::repository_has_components(&mut *tx, repo_id).await?
+            || oci_dao::repository_has_images(&mut *tx, repo_id).await?
+            || raw_dao::repository_has_files(&mut *tx, repo_id).await?
+        {
             return Ok(RepoDelete::HasPackages);
         }
     } else {
@@ -807,6 +1444,11 @@ async fn delete_repository_once(
         // before the cascade could drop them unaccounted.
         component_dao::hard_delete_all_components(&mut tx, repo_id, grace).await?;
     }
+    // Image rows (a proxy's cache; a hosted repository's leftover blobs and
+    // upload sessions) and a raw proxy's files release their blob references
+    // before the cascade.
+    oci_dao::purge_repository(&mut tx, repo_id, grace).await?;
+    raw_dao::purge_repository(&mut tx, repo_id, grace).await?;
 
     let deleted = repository_dao::delete_repository(&mut *tx, repo_id).await?;
     tx.commit().await?;
@@ -817,8 +1459,8 @@ async fn delete_repository_once(
     })
 }
 
-/// `DELETE /admin/repositories/{name}/packages/{id}/{version}` — **hard delete**
-/// (A12): remove the component + its assets and decrement the referenced blobs'
+/// `DELETE /admin/repositories/{name}/packages/{id}/{version}` — **hard delete**:
+/// remove the component + its assets and decrement the referenced blobs'
 /// ref-counts (enqueuing outbox deletes at zero) in one transaction.
 pub async fn hard_delete_package(
     State(state): State<AppState>,
@@ -836,8 +1478,25 @@ pub async fn hard_delete_package(
         )
             .into_response();
     }
+    if repo.is_docker() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "delete image manifests and tags through the registry API (DELETE /v2/<name>/manifests/<reference>)",
+        )
+            .into_response();
+    }
+    if repo.is_raw() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "delete files through DELETE /admin/repositories/<name>/files?path=<path>",
+        )
+            .into_response();
+    }
 
-    let format = state.formats.for_repository(&repo);
+    let format = match state.formats.for_repository(&repo) {
+        Ok(format) => format,
+        Err(e) => return super::format_unavailable(e),
+    };
     let lower = format.lower_id(&id);
     let norm_ver = match format.normalize_version(&version) {
         Ok(v) => v,
@@ -875,4 +1534,17 @@ async fn hard_delete(
 /// Whether a `sqlx::Error` is a Postgres unique-violation (23505).
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_name_error_reads_as_one_sentence() {
+        let msg = validate_repo_name("bad name").unwrap_err();
+        assert!(!msg.contains("  "), "{msg}");
+        assert!(msg.contains("characters from A-Z"), "{msg}");
+        assert!(validate_repo_name("nuget-hosted.v3_x").is_ok());
+    }
 }

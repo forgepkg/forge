@@ -1,0 +1,20 @@
+# A single-instance PostgreSQL 17 StatefulSet for evaluation and small
+# installations, wired into Forge. It has no backups, replication or
+# failover: for production use a managed PostgreSQL or an operator
+# (CloudNativePG, …) and set FORGE_DATABASE__URL in the forge-env Secret
+# instead of using this component.
+#
+# Needs POSTGRES_PASSWORD in the forge-env Secret. It is pasted into the
+# connection URL unescaped, so use a URL-safe value (`openssl rand -hex 24`).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: forge
+
+resources:
+  - postgres.yaml
+
+patches:
+  - path: deployment-patch.yaml

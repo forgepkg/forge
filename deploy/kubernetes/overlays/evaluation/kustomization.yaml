@@ -1,0 +1,31 @@
+# Self-contained evaluation install: Forge plus an in-cluster PostgreSQL and
+# S3 gateway, no Ingress. Not for production (no backups, single instances).
+#
+#   cp forge.env.example forge.env      # and fill it in
+#   kubectl apply -k .
+#   kubectl -n forge-eval port-forward svc/forge 8421
+#   # http://localhost:8421, sign in as admin@example.com with the bootstrap password
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: forge-eval
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+components:
+  - ../../components/postgres
+  - ../../components/s3-versitygw
+
+configMapGenerator:
+  - name: forge-config
+    behavior: merge
+    literals:
+      # Through `kubectl port-forward`; Forge warns that it is not https.
+      - FORGE_SERVER__PUBLIC_BASE_URL=http://localhost:8421
+
+secretGenerator:
+  - name: forge-env
+    envs:
+      - forge.env

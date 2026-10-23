@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  template:
+    spec:
+      containers:
+        - name: forge
+          env:
+            # A directory Forge creates in the volume: the cache refuses
+            # one its user does not own (the volume's root is root's).
+            - name: FORGE_BLOB_CACHE__PATH
+              value: /var/cache/forge/blobs
+          volumeMounts:
+            - name: blob-cache
+              mountPath: /var/cache/forge
+      volumes:
+        - name: blob-cache
+          persistentVolumeClaim:
+            claimName: forge-blob-cache

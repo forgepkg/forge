@@ -4,9 +4,9 @@ import { httpClient, ApiError, onUnauthorized } from './httpClient'
 import { setSession, clearSession, getCsrfToken } from './auth'
 
 /**
- * Smoke tests (plan §Testing): the shared `httpClient` injects the CSRF header
- * for the cookie session, resolves the (relative, single-origin) base URL, and
- * clears the stored session on a 401.
+ * Smoke tests: the shared `httpClient` injects the CSRF header for the cookie
+ * session, resolves the (relative, single-origin) base URL, and clears the
+ * stored session on a 401.
  */
 describe('httpClient', () => {
   const fetchMock = vi.fn()

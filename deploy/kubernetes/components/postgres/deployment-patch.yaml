@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge
+spec:
+  template:
+    spec:
+      containers:
+        - name: forge
+          env:
+            # $(POSTGRES_PASSWORD) expands from the forge-env Secret (envFrom).
+            - name: FORGE_DATABASE__URL
+              value: postgres://forge:$(POSTGRES_PASSWORD)@forge-postgres:5432/forge

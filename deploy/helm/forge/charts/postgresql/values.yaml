@@ -1,0 +1,102 @@
+# PostgreSQL for Forge (forge chart: `postgresql:`). Forge connects as
+# auth.username to auth.database through the Service.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Docker Hub's library/postgres, mirrored to ghcr.io under the same digests
+  # (.github/workflows/mirror-images.yml). `registry: docker.io` and
+  # `repository: library/postgres` pull the original.
+  registry: ghcr.io
+  repository: forgepkg/forge/postgres
+  # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
+  # Dependabot bumps together with the tag; `digest`, when set, replaces it.
+  tag: "18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6"
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+auth:
+  database: forge
+  username: forge
+  # Generated on install and kept (also across `helm uninstall`, with the
+  # data) when empty. Forge pastes it into its connection URL unescaped: use a
+  # URL-safe value (`openssl rand -hex 24`).
+  password: ""
+  # An existing Secret holding the password instead of the chart's.
+  existingSecret: ""
+  secretKey: password
+
+service:
+  type: ClusterIP
+  port: 5432
+  annotations: {}
+  labels: {}
+
+persistence:
+  # Without persistence the data lives in an emptyDir and is lost with the pod.
+  enabled: true
+  # null: the cluster's default StorageClass.
+  storageClassName: null
+  accessModes: [ReadWriteOnce]
+  size: 10Gi
+  annotations: {}
+  labels: {}
+  # persistentVolumeClaimRetentionPolicy of the StatefulSet (whenDeleted,
+  # whenScaled); Kubernetes keeps the claims by default.
+  retentionPolicy: {}
+
+# Server settings, passed as `-c name=value`, e.g. { max_connections: "200" }.
+# Every Forge instance opens up to database.max_connections (20) connections.
+parameters: {}
+extraArgs: []
+extraEnv: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# /dev/shm: parallel queries use POSIX shared memory; the runtime default is
+# 64 MiB.
+shmSizeLimit: 256Mi
+
+podSecurityContext:
+  # The image's `postgres` user.
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Probe timing; the handler is `pg_isready` for auth.username / auth.database.
+readinessProbe:
+  periodSeconds: 5
+livenessProbe:
+  periodSeconds: 10
+  failureThreshold: 6
+
+terminationGracePeriodSeconds: 30
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# Only Forge reaches the database (where the CNI enforces NetworkPolicy).
+networkPolicy:
+  enabled: true
+  # Further peers (NetworkPolicyPeer objects), e.g. a backup job.
+  extraFrom: []

@@ -1,0 +1,23 @@
+# Run ghcr.io/forgepkg/forge:latest instead of the release the base pins.
+#
+# `:latest` moves to every new stable release, but nothing restarts the pods
+# when it does: a pod picks it up only when it is recreated (`kubectl rollout
+# restart deployment/forge`, a node drain, an image-automation tool). Releases
+# migrate the database forward only, so an unattended upgrade cannot be rolled
+# back without restoring a backup; read the changelog first. Prefer the pinned
+# base for production.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+images:
+  - name: ghcr.io/forgepkg/forge
+    newTag: latest
+
+patches:
+  - target:
+      kind: Deployment
+      name: forge
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always

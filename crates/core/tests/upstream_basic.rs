@@ -1,8 +1,8 @@
-//! Integration tests for the slice-12.3 `upstream-basic` AuthProvider (Phase 4)
-//! against an in-process mock HTTP upstream (`wiremock`) + a real Postgres
-//! testcontainer backing the validated-credential cache.
+//! Integration tests for the `upstream-basic` AuthProvider against an
+//! in-process mock HTTP upstream (`wiremock`) + a real Postgres testcontainer
+//! backing the validated-credential cache.
 //!
-//! These exercise the plan §3 Phase-4 behaviours:
+//! These exercise:
 //!   * 200 → `Authenticated`, positive cached;
 //!   * 401/403 → `Rejected`, negative cached;
 //!   * a second identical credential → **no** second upstream call (cache hit);
@@ -15,7 +15,10 @@
 //!   * a redirect (an SSO front 302-ing to a login page that answers 200) is
 //!     not followed and is `Unavailable` — even when 302 is listed as a
 //!     success status — never `Authenticated` (review M3);
-//!   * a stalled upstream is cut off by the configured `request_timeout`.
+//!   * a stalled upstream is cut off by the configured `request_timeout`;
+//!   * the upstream is asked about the local part of the UPN, a name that is
+//!     no UPN is never forwarded, and a login signs in only an account an
+//!     administrator created for the realm.
 //!
 //! Requires Docker (Postgres testcontainer) on the host.
 
@@ -36,9 +39,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{pool, unique};
 
-/// A process-unique username for the given prefix (collision-free across tests).
+/// A process-unique username for the given prefix (collision-free across
+/// tests): a UPN, as every account name is.
 fn unique_user(prefix: &str) -> String {
-    format!("{prefix}-{}", unique())
+    format!("{prefix}-{}@example.com", unique())
+}
+
+/// The name the upstream is asked about: the local part of `user`.
+fn local_part(user: &str) -> &str {
+    forge_db::username::upn_local_part(user).expect("a UPN")
 }
 
 fn pepper() -> CredKeyPepper {
@@ -84,9 +93,26 @@ fn config_for(url: String) -> UpstreamBasicConfig {
         identity_path: String::new(),
         admin_group: String::new(),
         provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
-        auto_provision: true,
         realm_id: None,
+        capture_password_hash: false,
     }
+}
+
+/// A disabled credential-forwarding realm row, for the accounts a test creates.
+async fn realm(pool: &sqlx::PgPool) -> i64 {
+    forge_db::auth_realm_dao::insert_realm(
+        pool,
+        forge_db::auth_realm_dao::NewAuthRealm {
+            kind: "credential_forwarding".into(),
+            name: format!("fwd-{}", unique()),
+            enabled: false,
+            priority: 8_000_000 + (unique() % 1_000_000) as i32,
+            config: serde_json::json!({}),
+        },
+    )
+    .await
+    .unwrap()
+    .id
 }
 
 fn cred<'a>(username: &'a str, password: &'a str) -> PasswordCredential<'a> {
@@ -118,7 +144,7 @@ async fn success_authenticates_and_caches() {
         AuthOutcome::Authenticated(id) => {
             assert_eq!(id.username, user);
             assert_eq!(id.source, AuthSource::UpstreamBasic);
-            assert_eq!(id.external_subject.as_deref(), Some(user.as_str()));
+            assert_eq!(id.external_subject.as_deref(), Some(local_part(&user)));
             assert!(!id.suggested_is_admin);
         }
         other => panic!("expected Authenticated, got {other:?}"),
@@ -321,10 +347,10 @@ async fn admin_group_sets_suggested_is_admin() {
 #[tokio::test]
 async fn unreachable_upstream_is_unavailable() {
     // An upstream that refuses connections (an unbound port on loopback):
-    // forward errors → Unavailable (fail-closed), nothing cached. (The slice-1
-    // SSRF private-range test lived here; 12.7 §3.6 dropped that restriction —
-    // only the scheme is checked, and scheme rejection is covered by the ssrf
-    // module's unit tests + config validation.)
+    // forward errors → Unavailable (fail-closed), nothing cached. (Upstream
+    // URLs are not restricted to public addresses — only the scheme is checked,
+    // and scheme rejection is covered by the ssrf module's unit tests + config
+    // validation.)
     let config = config_for("http://127.0.0.1:1/status".to_string());
     let provider = make_provider(config, Duration::from_secs(300)).await;
     let user = unique_user("up-unreachable");
@@ -432,15 +458,19 @@ fn basic(username: &str, password: &str) -> String {
 }
 
 /// The chain canonicalizes the typed username (trim, NFC, lowercase) and the
-/// upstream is asked about exactly that name, so `Alice `, `ALICE` and
-/// `alice` are one identity — one forward, one account.
+/// upstream is asked about the local part of exactly that name, so
+/// `Alice@Example.com `, `ALICE@EXAMPLE.COM` and `alice@example.com` are one
+/// identity — one forward (as `alice`), one account.
 #[tokio::test]
 async fn chain_forwards_and_maps_the_canonical_username() {
     let server = MockServer::start().await;
     let user = unique_user("canon");
     Mock::given(method("GET"))
         .and(path("/status"))
-        .and(header("authorization", basic(&user, "pw").as_str()))
+        .and(header(
+            "authorization",
+            basic(local_part(&user), "pw").as_str(),
+        ))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&server)
@@ -452,11 +482,13 @@ async fn chain_forwards_and_maps_the_canonical_username() {
         .mount(&server)
         .await;
     let pool = pool().await;
-    let provider = make_provider(
-        config_for(format!("{}/status", server.uri())),
-        Duration::from_secs(60),
-    )
-    .await;
+    let realm_id = realm(&pool).await;
+    let account = forge_db::user_dao::insert_forwarded_user(&pool, &user, realm_id, true)
+        .await
+        .unwrap();
+    let mut config = config_for(format!("{}/status", server.uri()));
+    config.realm_id = Some(realm_id);
+    let provider = make_provider(config, Duration::from_secs(60)).await;
     let chain = Chain::new(vec![Box::new(provider)]);
 
     let mut ids = Vec::new();
@@ -470,11 +502,83 @@ async fn chain_forwards_and_maps_the_canonical_username() {
         let principal = provision_and_map(&pool, &identity)
             .await
             .unwrap()
-            .expect("provisioned");
+            .expect("the account signs in");
         ids.push(principal.user_id);
     }
-    assert_eq!(ids[0], ids[1], "one account for every spelling");
+    assert_eq!(
+        ids,
+        [account.id, account.id],
+        "one account for every spelling"
+    );
     // The second spelling was a cache hit (the mock expects exactly one call).
+}
+
+/// Credential forwarding creates no accounts, and the domain does not reach
+/// the upstream: another domain's name with the same local part is accepted
+/// upstream but signs in no account of the realm.
+#[tokio::test]
+async fn a_name_without_an_account_signs_in_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let pool = pool().await;
+    let realm_id = realm(&pool).await;
+    let user = unique_user("only");
+    forge_db::user_dao::insert_forwarded_user(&pool, &user, realm_id, true)
+        .await
+        .unwrap();
+    let mut config = config_for(format!("{}/status", server.uri()));
+    config.realm_id = Some(realm_id);
+    let provider = make_provider(config, Duration::from_secs(60)).await;
+    let chain = Chain::new(vec![Box::new(provider)]);
+
+    let other = format!("{}@other.example", local_part(&user));
+    let ChainOutcome::Authenticated { identity, .. } =
+        chain.authenticate(&cred(&other, "pw")).await
+    else {
+        panic!("the upstream accepts the local part");
+    };
+    assert_eq!(identity.username, other);
+    assert!(
+        provision_and_map(&pool, &identity).await.unwrap().is_none(),
+        "no account of that name: denied"
+    );
+    assert!(forge_db::user_dao::find_user_by_username(&pool, &other)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A name that is no UPN names no account and never reaches the upstream.
+#[tokio::test]
+async fn a_name_that_is_no_upn_is_rejected_without_forwarding() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider = make_provider(
+        config_for(format!("{}/status", server.uri())),
+        Duration::from_secs(60),
+    )
+    .await;
+    for typed in [
+        "alice",
+        "alice@",
+        "@example.com",
+        "alice@localhost",
+        "a@b@example.com",
+    ] {
+        assert_eq!(
+            provider.authenticate(&cred(typed, "pw")).await,
+            AuthOutcome::Rejected,
+            "{typed:?}"
+        );
+    }
 }
 
 /// A username with no canonical form never reaches the upstream.
@@ -499,6 +603,52 @@ async fn chain_rejects_empty_and_control_character_usernames_without_forwarding(
             "{typed:?}"
         );
     }
+}
+
+/// Review 2026-10-20 M2: Basic splits `user:password` at the first colon, so
+/// `mallory:abc` / `def` would be checked upstream as `mallory` / `abc:def`
+/// while Forge signs in `mallory:abc`. Such a name is never forwarded, and a
+/// verdict cached for it is never used.
+#[tokio::test]
+async fn username_with_a_colon_is_rejected_without_forwarding() {
+    let server = MockServer::start().await;
+    // An upstream that would accept the split reading of the credential.
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let config = config_for(format!("{}/status", server.uri()));
+    let cache = ValidatedCredentialCache::new(
+        Cache::l1_only(256),
+        pool().await,
+        pepper(),
+        Duration::from_secs(300),
+        Duration::from_secs(30),
+    );
+    let user = format!("{}:abc", unique_user("mallory"));
+    // A positive verdict for the exact credential is already cached.
+    let seeded = cache
+        .check(&config.provider_id, &user, "def", || async {
+            forge_core::auth::UpstreamVerdict::Valid
+        })
+        .await;
+    assert_eq!(seeded, Ok(true));
+    let client = credential_forward_client(config.connect_timeout).expect("forwarding client");
+    let provider = UpstreamBasicProvider::new(config, client, cache);
+
+    assert!(matches!(
+        provider.authenticate(&cred(&user, "def")).await,
+        AuthOutcome::Rejected
+    ));
+    // Through the chain it is a rejection, never "no credentials" (which
+    // would fall back to anonymous access).
+    let chain = Chain::new(vec![Box::new(provider)]);
+    assert_eq!(
+        chain.authenticate(&cred(&user, "def")).await,
+        ChainOutcome::Rejected
+    );
+    // `server` drops at end of test and verifies `.expect(0)`.
 }
 
 /// An upstream that accepts a secret with any username (a personal access
@@ -528,9 +678,15 @@ async fn identity_path_binds_the_username_to_the_secret() {
         chain.authenticate(&cred(&victim, "mallorys-pat")).await,
         ChainOutcome::Rejected
     );
-    // With her own name (any case) it authenticates — as her.
-    match chain.authenticate(&cred("MALLORY", "mallorys-pat")).await {
-        ChainOutcome::Authenticated { identity, .. } => assert_eq!(identity.username, "mallory"),
+    // With her own name (any case) it authenticates — as her: the upstream
+    // reports the local part it was asked about.
+    match chain
+        .authenticate(&cred("MALLORY@Example.com", "mallorys-pat"))
+        .await
+    {
+        ChainOutcome::Authenticated { identity, .. } => {
+            assert_eq!(identity.username, "mallory@example.com")
+        }
         other => panic!("expected Authenticated, got {other:?}"),
     }
 }
@@ -553,4 +709,37 @@ async fn identity_path_missing_from_the_response_fails_closed() {
         provider.authenticate(&cred(&user, "pw")).await,
         AuthOutcome::Unavailable
     ));
+}
+
+/// #69: a name a folding directory could map onto another account (full-width
+/// letters, a soft hyphen) is never forwarded: the upstream would vouch for
+/// the plain name's account while Forge signs in the one of this spelling.
+#[tokio::test]
+async fn names_a_directory_could_fold_onto_another_account_are_not_forwarded() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider = make_provider(
+        config_for(format!("{}/status", server.uri())),
+        Duration::from_secs(60),
+    )
+    .await;
+    let chain = Chain::new(vec![Box::new(provider)]);
+    for typed in [
+        "ｍａｌｌｏｒｙ",
+        "mal\u{00AD}lory",
+        "mal\u{200B}lory",
+        "ﬁona",
+    ] {
+        let canonical =
+            forge_db::username::canonical_username(&format!("{typed}@example.com")).unwrap();
+        assert_eq!(
+            chain.authenticate(&cred(&canonical, "pw")).await,
+            ChainOutcome::Rejected,
+            "{typed:?}"
+        );
+    }
 }

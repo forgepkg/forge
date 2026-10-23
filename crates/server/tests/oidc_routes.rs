@@ -1,4 +1,4 @@
-//! Route-level integration tests for the slice-12.2 `/auth` surface (Phase 5).
+//! Route-level integration tests for the `/auth` surface.
 //!
 //! Drives the **real** forge server over HTTP against a real Postgres
 //! testcontainer + an in-process mock OIDC IdP (wiremock serving
@@ -11,7 +11,7 @@
 //!     302s to the validated relative target; the cookie authenticates
 //!     `GET /admin/me` (proving `SessionCookieSource` is wired into the
 //!     principal chain);
-//!   * an unknown `state` is rejected (400);
+//!   * an unknown `state` is rejected (302 to `/login?error=oidc_failed`);
 //!   * `POST /auth/logout` clears the cookie + revokes the session (CSRF
 //!     enforced), after which the cookie no longer authenticates;
 //!   * an IdP whose issuer ends in `/` (Auth0-style) completes the login
@@ -32,7 +32,7 @@ use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{start_with, ServerOpts};
@@ -142,6 +142,22 @@ admin_claim = "roles"
         )
     }
 
+    /// The `[oidc]` block of a client that authenticates with forge's own
+    /// client assertions (an Entra federated identity credential).
+    fn federated_oidc_block(&self) -> String {
+        format!(
+            r#"
+[oidc]
+issuer = "{issuer}"
+client_id = "{CLIENT_ID}"
+client_authentication = "federated_credential"
+redirect_url = "http://test.local/auth/oidc/callback"
+allow_private_issuer = true
+"#,
+            issuer = self.issuer,
+        )
+    }
+
     /// Mount a one-shot token endpoint returning an ID token with `claims`.
     async fn mount_token_with_claims(&self, claims: Value) {
         let id_token = self.signer.sign(&claims);
@@ -183,6 +199,16 @@ fn no_redirect_client() -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("client")
+}
+
+/// A refused callback answers 302 to the SPA's login page with a generic
+/// error code (never a bare text body, never the IdP's error detail).
+fn assert_login_error(resp: &reqwest::Response, code: &str) {
+    assert_eq!(resp.status(), 302, "refused sign-in redirects");
+    assert_eq!(
+        resp.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some(format!("/login?error={code}").as_str())
+    );
 }
 
 /// Peek the nonce stored on a live `oidc_flow` row (without consuming it).
@@ -239,8 +265,10 @@ async fn login_redirects_to_idp_and_writes_flow_row() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -297,7 +325,10 @@ async fn login_rejects_open_redirect_target() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -333,15 +364,17 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
     let srv = start_with(
         pool.clone(),
         ServerOpts {
-            anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
     )
     .await;
     let n = common::unique();
-    let username = format!("alice-{n}");
+    let username = format!("alice-{n}@example.com");
     let sub = format!("sub-{n}");
 
     // 1. Login → authorize URL + state.
@@ -407,6 +440,199 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
     assert_eq!(body["is_admin"], json!(true), "roles claim granted admin");
 }
 
+/// #317: a first OIDC login whose username claim holds no UPN creates no
+/// account; the browser is sent to the login page with the reason and the
+/// claim it came from.
+#[tokio::test]
+async fn callback_refuses_a_new_account_without_a_upn_and_names_the_claim() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let n = common::unique();
+    let username = format!("bare-{n}");
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/login?redirect_to=/browse",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let state = state_from_url(location);
+    let flow = flow_cookie_header(&resp);
+    let nonce = peek_nonce(&srv.pool, &state).await;
+    idp.mount_token_with_claims(id_claims(
+        &idp.issuer,
+        &format!("sub-{n}"),
+        &username,
+        &nonce,
+        json!([]),
+    ))
+    .await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/callback?code=the-code&state={state}",
+            srv.base_url
+        ))
+        .header("cookie", &flow)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/login?error=username_not_upn&claim=preferred_username"
+    );
+    assert!(resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .all(|c| !c.to_str().unwrap().starts_with("forge_session=")));
+    assert!(
+        forge_db::user_dao::find_user_by_username(&srv.pool, &username)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A realm with `client_authentication = "federated_credential"` signs in
+/// without a client secret: the token request carries a client assertion
+/// that verifies against the JWKS forge publishes as its issuer, and names
+/// the subject and audience an Entra federated credential expects.
+#[tokio::test]
+async fn federated_credential_login_presents_a_forge_signed_client_assertion() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start().await;
+    // Its own database: the issuer keys are install-wide.
+    let srv = start_with(
+        common::fresh_pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            oidc_block: Some(idp.federated_oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = no_redirect_client();
+    let n = common::unique();
+
+    let resp = client
+        .get(format!(
+            "{}/auth/oidc/login?redirect_to=/browse",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    let state = state_from_url(resp.headers().get("location").unwrap().to_str().unwrap());
+    let flow = flow_cookie_header(&resp);
+    let nonce = peek_nonce(&srv.pool, &state).await;
+    // Only a token request authenticated by a client assertion gets a token.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains(
+            "client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": idp.signer.sign(&id_claims(
+                &idp.issuer,
+                &format!("sub-{n}"),
+                &format!("dora-{n}@example.com"),
+                &nonce,
+                json!([]),
+            )),
+        })))
+        .mount(&idp.server)
+        .await;
+
+    let resp = client
+        .get(format!(
+            "{}/auth/oidc/callback?code=the-code&state={state}",
+            srv.base_url
+        ))
+        .header("cookie", &flow)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302);
+    assert_eq!(resp.headers().get("location").unwrap(), "/browse");
+    assert!(resp.headers().get("set-cookie").is_some(), "signed in");
+
+    // The assertion the IdP received.
+    let requests = idp.server.received_requests().await.expect("recorded");
+    let body = &requests
+        .iter()
+        .find(|r| r.url.path() == "/token")
+        .expect("token request")
+        .body;
+    let form: std::collections::HashMap<String, String> =
+        url::form_urlencoded::parse(body).into_owned().collect();
+    assert!(!form.contains_key("client_secret"), "{form:?}");
+    assert_eq!(form["client_id"], CLIENT_ID);
+    let assertion = &form["client_assertion"];
+
+    // Verified as the IdP does: discovery → JWKS → the key named by `kid`.
+    let discovery: Value = client
+        .get(format!("{}/.well-known/openid-configuration", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(discovery["issuer"], json!("http://test.local"));
+    let jwks: Value = client
+        .get(format!("{}/.well-known/jwks.json", srv.base_url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let kid = jsonwebtoken::decode_header(assertion)
+        .unwrap()
+        .kid
+        .expect("kid");
+    let jwk = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["kid"] == json!(kid))
+        .expect("signing key published");
+    let key = jsonwebtoken::DecodingKey::from_rsa_components(
+        jwk["n"].as_str().unwrap(),
+        jwk["e"].as_str().unwrap(),
+    )
+    .unwrap();
+    let mut validation = jsonwebtoken::Validation::new(Algorithm::RS256);
+    validation.set_issuer(&["http://test.local"]);
+    validation.set_audience(&["api://AzureADTokenExchange"]);
+    validation.sub = Some(format!("{CLIENT_ID}@{}", idp.issuer.trim_end_matches('/')));
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    let claims = jsonwebtoken::decode::<Value>(assertion, &key, &validation)
+        .expect("the assertion verifies against forge's JWKS")
+        .claims;
+    assert!(claims["jti"].as_str().is_some_and(|j| !j.is_empty()));
+}
+
 /// Review L7(b): an issuer that ends in `/` (Auth0: `https://tenant.auth0.com/`)
 /// used to fail every login — the verifier compared the token's `iss` against
 /// the slash-stripped cache-key form. The full browser flow must now succeed
@@ -419,14 +645,17 @@ async fn callback_accepts_trailing_slash_issuer() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
     )
     .await;
     let n = common::unique();
-    let username = format!("slash-{n}");
+    let username = format!("slash-{n}@example.com");
     let sub = format!("sub-slash-{n}");
 
     let resp = no_redirect_client()
@@ -491,7 +720,10 @@ async fn callback_rejects_unknown_state() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -506,7 +738,7 @@ async fn callback_rejects_unknown_state() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400, "unknown state is rejected");
+    assert_login_error(&resp, "oidc_failed");
     assert!(resp.headers().get("set-cookie").is_none());
 }
 
@@ -520,7 +752,10 @@ async fn callback_from_another_browser_is_rejected() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -543,7 +778,7 @@ async fn callback_from_another_browser_is_rejected() {
             req = req.header("cookie", c);
         }
         let resp = req.send().await.unwrap();
-        assert_eq!(resp.status(), 400, "unbound callback rejected");
+        assert_login_error(&resp, "oidc_failed");
         assert!(resp
             .headers()
             .get_all("set-cookie")
@@ -569,7 +804,10 @@ async fn logout_revokes_session_and_clears_cookie() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -590,7 +828,7 @@ async fn logout_revokes_session_and_clears_cookie() {
     idp.mount_token_with_claims(id_claims(
         &idp.issuer,
         &format!("sub-{n}"),
-        &format!("loguser-{n}"),
+        &format!("loguser-{n}@example.com"),
         &nonce,
         json!([]),
     ))
@@ -721,15 +959,17 @@ async fn auth_me_returns_identity_and_csrf_token() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
     )
     .await;
     let n = common::unique();
-    let username = format!("meuser-{n}");
+    let username = format!("meuser-{n}@example.com");
 
     // Unauthenticated /auth/me → 401.
     let resp = no_redirect_client()
@@ -763,8 +1003,10 @@ async fn session_can_mint_and_revoke_repository_token() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -775,7 +1017,7 @@ async fn session_can_mint_and_revoke_repository_token() {
         &idp,
         &srv,
         &format!("sub-{n}"),
-        &format!("minter-{n}"),
+        &format!("minter-{n}@example.com"),
         json!([]),
     )
     .await;
@@ -860,8 +1102,9 @@ async fn auth_routes_absent_when_oidc_disabled() {
 }
 
 /// The realm's allow-gate: a token that does not carry an allowed value of a
-/// required claim (here: another tenant of a multi-tenant app) is refused
-/// with 403 and no session; an allowed one signs in.
+/// required claim (here: another tenant of a multi-tenant app) is refused —
+/// sent back to the login page with `not_permitted` and no session; an
+/// allowed one signs in.
 #[tokio::test]
 async fn required_claims_gate_the_callback() {
     let _serial = SERIAL.lock().await;
@@ -869,8 +1112,10 @@ async fn required_claims_gate_the_callback() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(format!(
                 "{}[oidc.required_claims]\ntid = [\"tenant-a\"]\n",
                 idp.oidc_block()
@@ -880,7 +1125,7 @@ async fn required_claims_gate_the_callback() {
     )
     .await;
 
-    for (tid, expected) in [("tenant-b", 403), ("tenant-a", 302)] {
+    for (tid, allowed) in [("tenant-b", false), ("tenant-a", true)] {
         let n = common::unique();
         let resp = no_redirect_client()
             .get(format!("{}/auth/oidc/login", srv.base_url))
@@ -894,7 +1139,7 @@ async fn required_claims_gate_the_callback() {
         let mut claims = id_claims(
             &idp.issuer,
             &format!("sub-{n}"),
-            &format!("guest-{n}"),
+            &format!("guest-{n}@example.com"),
             &nonce,
             json!([]),
         );
@@ -909,13 +1154,16 @@ async fn required_claims_gate_the_callback() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), expected, "tid = {tid}");
+        if !allowed {
+            assert_login_error(&resp, "not_permitted");
+        }
+        assert_eq!(resp.status(), 302, "tid = {tid}");
         let sets_session = resp
             .headers()
             .get_all("set-cookie")
             .iter()
             .any(|v| v.to_str().unwrap_or("").starts_with("forge_session="));
-        assert_eq!(sets_session, expected == 302, "tid = {tid}");
+        assert_eq!(sets_session, allowed, "tid = {tid}");
     }
 }
 
@@ -950,15 +1198,17 @@ async fn idp_demotion_ends_sessions_opened_as_admin() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
     )
     .await;
     let n = common::unique();
-    let (sub, username) = (format!("sub-{n}"), format!("demoted-{n}"));
+    let (sub, username) = (format!("sub-{n}"), format!("demoted-{n}@example.com"));
     let me = |cookie: String| {
         let req = no_redirect_client()
             .get(format!("{}/auth/me", srv.base_url))

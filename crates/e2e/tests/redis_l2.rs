@@ -1,7 +1,7 @@
 //! E2E (optional): Redis L2 invalidation backplane. Two server instances share
 //! a Redis L2; an `invalidate` on instance A drops the corresponding stale L1
-//! entry on instance B via the pub/sub backplane (spec §9). Gated behind
-//! `forge-e2e`; additionally boots a Redis container.
+//! entry on instance B via the pub/sub backplane. Gated behind `forge-e2e`;
+//! additionally boots a Redis container.
 
 #![cfg(feature = "forge-e2e")]
 
@@ -87,9 +87,8 @@ async fn a_planted_redis_authz_entry_is_never_trusted() {
     let user = user_dao::insert_user(
         &a.pool,
         NewUser::local(
-            format!("plain{}", forge_e2e_unique()),
+            format!("plain{}@example.com", forge_e2e_unique()),
             "x".into(),
-            false,
             true,
         ),
     )
@@ -118,7 +117,6 @@ async fn a_planted_redis_authz_entry_is_never_trusted() {
     let principal = Principal::User {
         user_id: user.id,
         token_id: None,
-        is_admin: false,
         method: forge_core::auth::AuthMethod::Password,
     };
     assert!(
@@ -133,7 +131,7 @@ async fn a_planted_redis_authz_entry_is_never_trusted() {
 /// id/version check and then stay cached for good).
 #[tokio::test]
 async fn proxy_upstream_index_is_not_read_from_redis() {
-    use forge_core::repo::proxy::{UpstreamResources, NS_UPSTREAM_INDEX};
+    use forge_core::repo::proxy::{ProxyRepo, NS_UPSTREAM_INDEX};
     use forge_e2e::{make_nupkg_with_desc, MockUpstream, UpstreamPackage};
 
     let genuine_bytes = make_nupkg_with_desc("Contoso.Lib", "1.0.0", "genuine");
@@ -168,19 +166,20 @@ async fn proxy_upstream_index_is_not_read_from_redis() {
         .unwrap();
 
     // Plant the forger's resources under the key the proxy caches its index.
-    let key = format!("{}/{}/{}", repo.name, repo.id, genuine.index_url());
+    let key = ProxyRepo::upstream_scope(&repo);
     a.state
         .cache
-        .get_or_try_insert_with::<UpstreamResources, _, _, std::convert::Infallible>(
+        .get_or_try_insert_with::<String, _, _, std::convert::Infallible>(
             NS_UPSTREAM_INDEX,
             &key,
             Duration::from_secs(600),
             || async {
-                Ok(UpstreamResources {
-                    package_base_address: Some(format!("{}/flat/", forger.base())),
-                    registrations_base_url: None,
-                    search_query_service: None,
+                Ok(serde_json::json!({
+                    "package_base_address": format!("{}/flat/", forger.base()),
+                    "registrations_base_url": null,
+                    "search_query_service": null,
                 })
+                .to_string())
             },
         )
         .await

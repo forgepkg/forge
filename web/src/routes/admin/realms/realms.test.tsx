@@ -12,23 +12,43 @@ import { makeQueryClient } from '~/lib/queryClient'
 import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { RealmView } from '~/api/realms'
+import type { RoleView } from '~/api/rbac'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Admin authentication-realms screens (§12.7), driven against the real route
- * tree + query hooks so the admin guard, routing, and mutations are exercised:
+ * Admin authentication-realms screens, driven against the real route tree +
+ * query hooks so the admin guard, routing, and mutations are exercised:
  *  - the list renders realms in priority order with kind badges and hides the
- *    delete affordance for the built-in local realm;
+ *    delete affordance for the built-in local realm; a delete is confirmed in
+ *    a dialog;
  *  - reordering PUTs the **full** new id order to /admin/realms/order;
- *  - the enabled toggle PATCHes the realm;
+ *  - the enabled switch PATCHes the realm; disabling a realm people sign in
+ *    with (local, OIDC, credential forwarding) asks first in a dialog, and a
+ *    server refusal (409) is shown with its reason;
  *  - the create form validates required fields per kind (no POST when
- *    invalid) and POSTs the parsed config when valid.
+ *    invalid) and POSTs the parsed config when valid;
+ *  - the edit form sends list values containing commas back unchanged,
+ *    requires a new client secret once the issuer or client ID changes, and
+ *    asks before saving a sign-in realm as disabled or saving a
+ *    workload-identity realm at all.
  */
 
 const adminMe: Me = {
   user: { id: 1, username: 'root', is_admin: true, active: true },
   is_admin: true,
   capabilities: ['repo.read', 'repo.admin'],
+}
+
+function role(over: Partial<RoleView>): RoleView {
+  return {
+    id: 1,
+    name: 'role',
+    description: '',
+    builtin: false,
+    grant_count: 0,
+    user_count: 0,
+    ...over,
+  }
 }
 
 function realm(over: Partial<RealmView>): RealmView {
@@ -44,6 +64,26 @@ function realm(over: Partial<RealmView>): RealmView {
     ...over,
   }
 }
+
+const ciRealm = realm({
+  id: 7,
+  kind: 'workload_identity',
+  name: 'github-actions',
+  priority: 3,
+  config: {
+    issuer: 'https://token.actions.githubusercontent.com',
+    allowed_audiences: ['https://forge.example.com'],
+    rules: [
+      {
+        role: 'ci-deployer',
+        conditions: [
+          { claim: 'repository_id', any_of: ['987654321'] },
+          { claim: 'repository_owner_id', any_of: ['1234567'] },
+        ],
+      },
+    ],
+  },
+})
 
 const threeRealms: RealmView[] = [
   realm({ id: 1, kind: 'local', name: 'local', priority: 0 }),
@@ -83,6 +123,10 @@ interface ApiHandlers {
   onPatch?: (id: number, body: unknown) => Response
   onDelete?: (id: number) => Response
   onReorder?: (body: unknown) => Response
+  capturedPasswords?: () => { accounts: number; captured: number }
+  onConvert?: (id: number) => Response
+  /** `GET /admin/roles`; absent → 404 (the rule's role is typed instead). */
+  roles?: RoleView[]
 }
 
 /** Route the mock by method + pathname against the realms admin API. */
@@ -100,6 +144,20 @@ function mockApi(h: ApiHandlers) {
       if (path.endsWith('/admin/realms/order') && method === 'PUT') {
         return Promise.resolve(
           h.onReorder ? h.onReorder(body()) : json(h.realms ?? []),
+        )
+      }
+
+      const keptMatch = path.match(/\/admin\/realms\/(\d+)\/captured-passwords$/)
+      if (keptMatch && method === 'GET') {
+        return Promise.resolve(
+          json(h.capturedPasswords?.() ?? { accounts: 0, captured: 0 }),
+        )
+      }
+      const convertMatch = path.match(/\/admin\/realms\/(\d+)\/convert-to-local$/)
+      if (convertMatch && method === 'POST') {
+        const id = Number(convertMatch[1])
+        return Promise.resolve(
+          h.onConvert ? h.onConvert(id) : json({ converted: 0, remaining: 0 }),
         )
       }
 
@@ -122,6 +180,10 @@ function mockApi(h: ApiHandlers) {
             h.onDelete ? h.onDelete(id) : new Response(null, { status: 204 }),
           )
         }
+      }
+
+      if (path.endsWith('/admin/roles') && method === 'GET' && h.roles) {
+        return Promise.resolve(json(h.roles))
       }
 
       if (path.endsWith('/admin/realms') && method === 'GET') {
@@ -221,7 +283,7 @@ describe('admin realms list', () => {
     await renderAt('/manage/realms')
 
     await u.click(
-      await screen.findByRole('checkbox', { name: 'legacy-auth enabled' }),
+      await screen.findByRole('switch', { name: 'legacy-auth enabled' }),
     )
 
     await waitFor(() =>
@@ -229,27 +291,200 @@ describe('admin realms list', () => {
     )
   })
 
-  it('shows the server error when the enabled toggle is refused', async () => {
+  it('asks before disabling local; cancelling sends nothing', async () => {
+    const patches: unknown[] = []
     mockApi({
       realms: threeRealms,
-      onPatch: () =>
-        new Response('cannot disable the last enabled password realm', {
-          status: 409,
-        }),
+      onPatch: (_id, body) => {
+        patches.push(body)
+        return json(realm({ id: 1, enabled: false }))
+      },
     })
 
     const u = userEvent.setup()
     await renderAt('/manage/realms')
 
-    const toggle = await screen.findByRole('checkbox', { name: 'local enabled' })
+    const toggle = await screen.findByRole('switch', { name: 'local enabled' })
     await u.click(toggle)
 
-    const row = toggle.closest('tr')!
-    expect(await within(row).findByRole('alert')).toHaveTextContent(
-      'Could not disable local: cannot disable the last enabled password realm',
+    const dialog = screen.getByRole('dialog', { name: 'Disable local?' })
+    expect(
+      within(dialog).getByText(/stops every password login/),
+    ).toHaveTextContent(
+      'browser sign-in and NuGet clients sending a password over Basic',
     )
-    // The checkbox still shows the stored state.
     expect(toggle).toBeChecked()
+
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText(/stops every password login/)).toBeNull()
+    expect(toggle).toBeChecked()
+    expect(patches).toEqual([])
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'PATCH',
+      ),
+    ).toBe(false)
+  })
+
+  it('asks before disabling an OIDC realm; sends nothing until confirmed', async () => {
+    const patches: Array<{ id: number; body: unknown }> = []
+    mockApi({
+      realms: threeRealms,
+      onPatch: (id, body) => {
+        patches.push({ id, body })
+        return json(realm({ id: 5, kind: 'oidc', enabled: false }))
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('switch', { name: 'corp-sso enabled' })
+    await u.click(toggle)
+
+    const dialog = screen.getByRole('dialog', { name: 'Disable corp-sso?' })
+    expect(
+      within(dialog).getByText(/stops sign-in through its identity provider/),
+    ).toHaveTextContent('people who use it can no longer sign in to Forge')
+    expect(toggle).toBeChecked()
+
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByText(/stops sign-in/)).toBeNull()
+    expect(patches).toEqual([])
+
+    await u.click(toggle)
+    expect(patches).toEqual([])
+    await u.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Disable corp-sso' }),
+    )
+
+    await waitFor(() =>
+      expect(patches).toEqual([{ id: 5, body: { enabled: false } }]),
+    )
+  })
+
+  it('asks before disabling a credential-forwarding realm', async () => {
+    mockApi({
+      realms: [
+        realm({ id: 1, kind: 'local', name: 'local', priority: 0 }),
+        realm({
+          id: 3,
+          kind: 'credential_forwarding',
+          name: 'legacy-auth',
+          priority: 1,
+          config: { url: 'https://auth.example.com/check', key_pepper_set: true },
+        }),
+      ],
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('switch', { name: 'legacy-auth enabled' })
+    await u.click(toggle)
+
+    const dialog = screen.getByRole('dialog', { name: 'Disable legacy-auth?' })
+    expect(
+      within(dialog).getByText(/stops the logins it checks against its upstream/),
+    ).toHaveTextContent('NuGet clients sending those passwords over Basic')
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === 'PATCH',
+      ),
+    ).toBe(false)
+  })
+
+  it('asks before disabling a workload-identity realm: its keys are revoked for good', async () => {
+    const patches: Array<{ id: number; body: unknown }> = []
+    mockApi({
+      realms: [...threeRealms, ciRealm],
+      onPatch: (id, body) => {
+        patches.push({ id, body })
+        return json({ ...ciRealm, enabled: false })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('switch', { name: 'github-actions enabled' })
+    await u.click(toggle)
+
+    const dialog = screen.getByRole('dialog', { name: 'Disable github-actions?' })
+    expect(
+      within(dialog).getByText(/revokes every API key it issued/),
+    ).toHaveTextContent('Enabling the realm again does not bring the keys back.')
+    expect(toggle).toBeChecked()
+    expect(patches).toEqual([])
+
+    await u.click(within(dialog).getByRole('button', { name: 'Disable github-actions' }))
+
+    await waitFor(() =>
+      expect(patches).toEqual([{ id: 7, body: { enabled: false } }]),
+    )
+  })
+
+  it('shows the server refusal after disabling local is confirmed', async () => {
+    let patched: { id: number; body: unknown } | null = null
+    mockApi({
+      realms: threeRealms,
+      onPatch: (id, body) => {
+        patched = { id, body }
+        return new Response(
+          'no enabled realm to sign in with would remain (local or OIDC); enable another one first',
+          { status: 409 },
+        )
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const toggle = await screen.findByRole('switch', { name: 'local enabled' })
+    await u.click(toggle)
+    const row = toggle.closest('tr')!
+    await u.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Disable local' }),
+    )
+
+    await waitFor(() =>
+      expect(patched).toEqual({ id: 1, body: { enabled: false } }),
+    )
+    expect(await within(row).findByRole('alert')).toHaveTextContent(
+      'Could not disable local: no enabled realm to sign in with would remain (local or OIDC); enable another one first',
+    )
+    // The switch still shows the stored state, and the question is gone.
+    expect(toggle).toBeChecked()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText(/stops every password login/)).toBeNull()
+  })
+
+  it('shows the server refusal when a delete would leave no sign-in realm', async () => {
+    mockApi({
+      realms: threeRealms,
+      onDelete: () =>
+        new Response(
+          'no enabled realm to sign in with would remain (local or OIDC); enable another one first',
+          { status: 409 },
+        ),
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms')
+
+    const row = (await screen.findByText('corp-sso')).closest('tr')!
+    await u.click(within(row).getByRole('button', { name: 'Delete' }))
+    await u.click(
+      within(screen.getByRole('dialog', { name: 'Delete corp-sso?' })).getByRole('button', {
+        name: 'Delete corp-sso',
+      }),
+    )
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'no enabled realm to sign in with would remain (local or OIDC); enable another one first',
+    )
+    expect(screen.getByText('corp-sso')).toBeInTheDocument()
   })
 
   it('delete asks for confirmation then DELETEs', async () => {
@@ -267,13 +502,19 @@ describe('admin realms list', () => {
 
     const row = (await screen.findByText('legacy-auth')).closest('tr')!
     await u.click(within(row).getByRole('button', { name: 'Delete' }))
-    await u.click(within(row).getByRole('button', { name: 'Confirm' }))
+    expect(deleted).toBeNull()
+    await u.click(
+      within(screen.getByRole('dialog', { name: 'Delete legacy-auth?' })).getByRole('button', {
+        name: 'Delete legacy-auth',
+      }),
+    )
 
     await waitFor(() => expect(deleted).toBe(3))
   })
 })
 
-describe('admin realms create', () => {
+// Typing-heavy form tests can outlast the 5 s default on a loaded machine.
+describe('admin realms create', { timeout: 20_000 }, () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
@@ -324,7 +565,10 @@ describe('admin realms create', () => {
     await u.type(screen.getByLabelText('Issuer URL'), 'https://idp.example.com')
     await u.type(screen.getByLabelText('Client ID'), 'forge')
     await u.type(screen.getByLabelText('Client secret'), 's3cret')
-    await u.type(screen.getByLabelText('Login domains'), 'example.com, corp.example.com')
+    await u.type(
+      screen.getByLabelText('Login domains'),
+      'example.com{Enter}corp.example.com',
+    )
     await u.click(screen.getByRole('button', { name: 'Create realm' }))
 
     await waitFor(() => expect(posted).not.toBeNull())
@@ -360,13 +604,18 @@ describe('admin realms create', () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms/new')
 
-    await u.selectOptions(await screen.findByLabelText('Kind'), 'credential_forwarding')
+    await u.click(await screen.findByRole('radio', { name: /^Credential forwarding/ }))
     expect(screen.queryByLabelText('Issuer URL')).not.toBeInTheDocument()
 
     await u.type(screen.getByLabelText('Name'), 'legacy')
     await u.type(screen.getByLabelText('Upstream URL'), 'https://auth.example.com/check')
     await u.type(screen.getByLabelText('Success statuses'), '200, 204')
     await u.type(screen.getByLabelText('Key pepper'), 'pepper-1')
+    // It creates no accounts: the form says where they come from.
+    expect(
+      screen.queryByRole('checkbox', { name: /Auto-provision/ }),
+    ).toBeNull()
+    expect(screen.getByText(/signs in only the accounts created for it/)).toBeInTheDocument()
     await u.click(screen.getByRole('button', { name: 'Create realm' }))
 
     await waitFor(() => expect(posted).not.toBeNull())
@@ -376,7 +625,6 @@ describe('admin realms create', () => {
       enabled: true,
       config: {
         url: 'https://auth.example.com/check',
-        auto_provision: true,
         success_status: [200, 204],
         key_pepper: 'pepper-1',
       },
@@ -387,6 +635,11 @@ describe('admin realms create', () => {
     let posted: unknown = null
     mockApi({
       realms: [],
+      roles: [
+        role({ id: 1, name: 'admin', builtin: true }),
+        role({ id: 4, name: 'ci-deployer' }),
+        role({ id: 5, name: 'readers' }),
+      ],
       onCreate: (body) => {
         posted = body
         return json(realm({ id: 9, kind: 'workload_identity' }), 201)
@@ -396,10 +649,7 @@ describe('admin realms create', () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms/new')
 
-    await u.selectOptions(
-      await screen.findByLabelText('Kind'),
-      'workload_identity',
-    )
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
     expect(screen.queryByLabelText('Client ID')).not.toBeInTheDocument()
 
     await u.type(screen.getByLabelText('Name'), 'wif')
@@ -414,7 +664,13 @@ describe('admin realms create', () => {
 
     // A newly added rule starts with one mandatory condition.
     await u.click(screen.getByRole('button', { name: 'Add rule' }))
-    await u.type(screen.getByLabelText('Role'), 'ci-deployer')
+    // The rule's role is picked from the roles; the global admin is not offered.
+    const rolePicker = screen.getByLabelText('Role')
+    await waitFor(() =>
+      expect(within(rolePicker).getByRole('option', { name: 'ci-deployer' })).toBeInTheDocument(),
+    )
+    expect(within(rolePicker).queryByRole('option', { name: 'admin' })).toBeNull()
+    await u.selectOptions(rolePicker, 'ci-deployer')
     await u.type(screen.getByLabelText('Claim'), 'repository_id')
     await u.type(screen.getByLabelText('Any of'), '987654321')
     await u.click(screen.getByRole('button', { name: 'Add condition' }))
@@ -458,10 +714,7 @@ describe('admin realms create', () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms/new')
 
-    await u.selectOptions(
-      await screen.findByLabelText('Kind'),
-      'workload_identity',
-    )
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
     await u.click(screen.getByRole('button', { name: 'Create realm' }))
 
     expect(
@@ -485,10 +738,7 @@ describe('admin realms create', () => {
 
     const u = userEvent.setup()
     await renderAt('/manage/realms/new')
-    await u.selectOptions(
-      await screen.findByLabelText('Kind'),
-      'workload_identity',
-    )
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
     await u.type(screen.getByLabelText('Name'), 'github-actions')
     await u.type(
       screen.getByLabelText('Issuer URL'),
@@ -529,6 +779,345 @@ describe('admin realms create', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'invalid config: key_pepper is required',
+    )
+  })
+})
+
+describe('admin realms edit', { timeout: 20_000 }, () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockReset()
+    setSession('admin-csrf')
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    clearSession()
+  })
+
+  const adminsDn = 'CN=Forge Admins,OU=Groups,DC=corp'
+  const usersDn = 'CN=Forge Users,OU=Groups,DC=corp'
+  const corpSso = realm({
+    id: 5,
+    kind: 'oidc',
+    name: 'corp-sso',
+    priority: 1,
+    config: {
+      issuer: 'https://idp.example.com',
+      client_id: 'forge',
+      client_secret_set: true,
+      auto_provision: true,
+      link_existing_by_username: false,
+      allow_http_issuer: false,
+      admin_groups: [adminsDn, 'forge-ops'],
+      required_claims: { groups: [usersDn] },
+    },
+  })
+
+  it('saves list values containing commas unchanged', async () => {
+    let patched: unknown = null
+    mockApi({
+      realms: [corpSso],
+      onPatch: (_id, body) => {
+        patched = body
+        return json(corpSso)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/5')
+
+    expect(await screen.findByLabelText('Admin groups')).toHaveValue(
+      `${adminsDn}\nforge-ops`,
+    )
+    expect(screen.getByLabelText('Required claims')).toHaveValue(
+      `groups = ${usersDn}`,
+    )
+
+    // Edit an unrelated field, then save.
+    await u.type(screen.getByLabelText('Button label'), 'Corp SSO')
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched).toEqual({
+      name: 'corp-sso',
+      enabled: true,
+      config: {
+        issuer: 'https://idp.example.com',
+        client_id: 'forge',
+        auto_provision: true,
+        link_existing_by_username: false,
+        allow_http_issuer: false,
+        admin_groups: [adminsDn, 'forge-ops'],
+        required_claims: { groups: [usersDn] },
+        button_label: 'Corp SSO',
+      },
+    })
+  })
+
+  const nexus = realm({
+    id: 3,
+    kind: 'credential_forwarding',
+    name: 'nexus',
+    priority: 2,
+    config: {
+      url: 'https://nexus.example.com/status',
+      key_pepper_set: true,
+      capture_password_hash: true,
+    },
+  })
+
+  it('stops forwarding only while hashes are kept', async () => {
+    let patched: { config?: Record<string, unknown> } | null = null
+    mockApi({
+      realms: [nexus],
+      onPatch: (_id, body) => {
+        patched = body as typeof patched
+        return json(nexus)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/3')
+
+    const keep = await screen.findByRole('checkbox', {
+      name: 'Keep a password hash of successful logins',
+    })
+    const only = screen.getByRole('checkbox', {
+      name: 'Stop forwarding: sign in with kept passwords only',
+    })
+    expect(keep).toBeChecked()
+    await u.click(only)
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched!.config).toMatchObject({
+      capture_password_hash: true,
+      captured_password_only: true,
+    })
+
+    // Without kept hashes there is nothing to sign in with.
+    await u.click(keep)
+    expect(only).not.toBeChecked()
+    expect(only).toBeDisabled()
+  })
+
+  it('switches the accounts with a kept password to local ones after confirming', async () => {
+    let counts = { accounts: 3, captured: 2 }
+    let converted: number | null = null
+    mockApi({
+      realms: [nexus],
+      capturedPasswords: () => counts,
+      onConvert: (id) => {
+        converted = id
+        counts = { accounts: 1, captured: 0 }
+        return json({ converted: 2, remaining: 1 })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/3')
+
+    expect(
+      await screen.findByText(/2 of 3 accounts keep a password hash/),
+    ).toBeInTheDocument()
+    await u.click(
+      screen.getByRole('button', { name: 'Switch accounts to local passwords…' }),
+    )
+    expect(converted).toBeNull()
+    await u.click(screen.getByRole('button', { name: 'Switch 2 to local passwords' }))
+
+    await waitFor(() => expect(converted).toBe(3))
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Switched 2 to local passwords; 1 left on this realm.',
+    )
+    expect(
+      await screen.findByText(/0 of 1 account keeps a password hash/),
+    ).toBeInTheDocument()
+  })
+
+  it('requires a new client secret after the issuer changes', async () => {
+    let patched: unknown = null
+    mockApi({
+      realms: [corpSso],
+      onPatch: (_id, body) => {
+        patched = body
+        return json(corpSso)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/5')
+
+    const secret = await screen.findByLabelText('Client secret')
+    expect(secret).toHaveAttribute('placeholder', '•••••••• (set to replace)')
+    expect(screen.queryByRole('status')).toBeNull()
+
+    // A trailing slash is not a different issuer.
+    await u.type(screen.getByLabelText('Issuer URL'), '/')
+    expect(screen.queryByRole('status')).toBeNull()
+
+    const issuer = screen.getByLabelText('Issuer URL')
+    await u.clear(issuer)
+    await u.type(issuer, 'https://login.example.org')
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'The stored client secret will be dropped when you save',
+    )
+    expect(secret).toHaveAttribute('placeholder', 'Required')
+    expect(screen.queryByText(/Leave blank to keep it/)).toBeNull()
+
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    expect(
+      await screen.findByText(
+        'Enter the client secret for the new issuer or client ID.',
+      ),
+    ).toBeInTheDocument()
+    expect(patched).toBeNull()
+
+    await u.type(secret, 'new-s3cret')
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched).toMatchObject({
+      config: {
+        issuer: 'https://login.example.org',
+        client_id: 'forge',
+        client_secret: 'new-s3cret',
+      },
+    })
+  })
+
+  it('asks before saving local disabled; sends nothing until confirmed', async () => {
+    const local = realm({ id: 1, kind: 'local', name: 'local' })
+    const patches: unknown[] = []
+    mockApi({
+      realms: [local],
+      onPatch: (_id, body) => {
+        patches.push(body)
+        return json({ ...local, enabled: false })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/1')
+
+    await u.click(await screen.findByRole('switch', { name: /Enabled/ }))
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Disable local?' })
+    expect(within(dialog).getByText(/stops every password login/)).toBeInTheDocument()
+    expect(patches).toEqual([])
+
+    // Cancel keeps the form as it is and sends nothing.
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByText(/stops every password login/)).toBeNull()
+    expect(screen.getByRole('switch', { name: /Enabled/ })).not.toBeChecked()
+    expect(patches).toEqual([])
+
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await u.click(screen.getByRole('button', { name: 'Disable and save' }))
+
+    await waitFor(() =>
+      expect(patches).toEqual([{ name: 'local', enabled: false }]),
+    )
+  })
+
+  it('asks before saving an OIDC realm disabled', async () => {
+    let patched: unknown = null
+    mockApi({
+      realms: [corpSso],
+      onPatch: (_id, body) => {
+        patched = body
+        return json({ ...corpSso, enabled: false })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/5')
+
+    await u.click(await screen.findByRole('switch', { name: /Enabled/ }))
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(
+      within(screen.getByRole('dialog', { name: 'Disable corp-sso?' })).getByText(
+        /stops sign-in through its identity provider/,
+      ),
+    ).toBeInTheDocument()
+    expect(patched).toBeNull()
+
+    await u.click(screen.getByRole('button', { name: 'Disable and save' }))
+
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched).toMatchObject({ name: 'corp-sso', enabled: false })
+  })
+
+  it('asks before saving a workload-identity realm, which revokes its keys', async () => {
+    const patches: unknown[] = []
+    mockApi({
+      realms: [ciRealm],
+      roles: [role({ id: 4, name: 'ci-deployer' })],
+      onPatch: (_id, body) => {
+        patches.push(body)
+        return json(ciRealm)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/7')
+
+    await u.click(await screen.findByRole('button', { name: 'Save changes' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Save github-actions?' })
+    expect(
+      within(dialog).getByText(/Saving github-actions revokes every API key it issued/),
+    ).toHaveTextContent('The keys stay revoked.')
+    expect(patches).toEqual([])
+
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByText(/revokes every API key/)).toBeNull()
+    expect(patches).toEqual([])
+
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await u.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Save and revoke keys' }),
+    )
+
+    await waitFor(() => expect(patches).toHaveLength(1))
+    expect(patches[0]).toMatchObject({ name: 'github-actions', enabled: true })
+  })
+
+  it('saves a disabled workload-identity realm without asking', async () => {
+    const disabled = { ...ciRealm, enabled: false }
+    let patched: unknown = null
+    mockApi({
+      realms: [disabled],
+      roles: [role({ id: 4, name: 'ci-deployer' })],
+      onPatch: (_id, body) => {
+        patched = body
+        return json(disabled)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/7')
+
+    await u.click(await screen.findByRole('button', { name: 'Save changes' }))
+
+    await waitFor(() => expect(patched).toMatchObject({ enabled: false }))
+    expect(screen.queryByText(/revokes every API key/)).toBeNull()
+  })
+
+  it('requires a new client secret after the client ID changes', async () => {
+    mockApi({ realms: [corpSso] })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/5')
+
+    await u.type(await screen.findByLabelText('Client ID'), '-v2')
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'The issuer or client ID differs from the stored one.',
+    )
+    expect(screen.getByLabelText('Client secret')).toHaveAttribute(
+      'placeholder',
+      'Required',
     )
   })
 })

@@ -7,7 +7,9 @@
 
 use std::cmp::Ordering;
 
-use crate::domain::{DependencyGroup, FormatError, ParsedUpload};
+use forge_plugin_api::{FetchResult, Remote, UpstreamOp, UpstreamStep};
+
+use crate::domain::{FormatError, ParsedUpload};
 
 /// A reader that supports seeking and is movable across threads.
 ///
@@ -47,6 +49,15 @@ pub trait Format: Send + Sync {
     /// Parse an uploaded package into format-neutral [`ParsedUpload`] data.
     fn parse_upload(&self, file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError>;
 
+    /// [`Self::parse_upload`] for a package staged on disk at `path` (what
+    /// the hosted publish path parses). The default opens the file and reads
+    /// it through `parse_upload`; a format that needs the file itself (a
+    /// format plugin lends it to its sandbox) overrides it.
+    fn parse_upload_file(&self, path: &std::path::Path) -> Result<ParsedUpload, FormatError> {
+        let mut file = std::fs::File::open(path)?;
+        self.parse_upload(&mut file)
+    }
+
     /// Normalize a raw version string into the canonical form used for storage
     /// and lookups (e.g. SemVer normalization for NuGet).
     fn normalize_version(&self, raw: &str) -> Result<String, FormatError>;
@@ -56,6 +67,29 @@ pub trait Format: Send + Sync {
 
     /// Lowercase / canonicalize a package id for case-insensitive lookups.
     fn lower_id(&self, id: &str) -> String;
+
+    /// The asset path a version's package archive is stored under (the
+    /// `asset.path` of its component). Internal to the repository: clients
+    /// never see it. NuGet keeps `package.nupkg`.
+    fn package_asset_path(&self) -> &str {
+        "package"
+    }
+
+    /// The content type stored and served for the package archive.
+    fn package_content_type(&self) -> &str {
+        "application/octet-stream"
+    }
+
+    /// The asset path of the manifest the parser extracted
+    /// ([`ParsedUpload::nuspec_bytes`]). NuGet keeps `package.nuspec`.
+    fn manifest_asset_path(&self) -> &str {
+        "manifest"
+    }
+
+    /// The content type stored for the manifest asset.
+    fn manifest_content_type(&self) -> &str {
+        "application/octet-stream"
+    }
 
     /// A summary of `manifest` to store with the version at publish, so that
     /// metadata endpoints render it without fetching and re-parsing the
@@ -89,32 +123,23 @@ pub trait Format: Send + Sync {
         }
     }
 
-    /// The identity a standalone manifest (e.g. a `.nuspec`) declares, as
-    /// `(lower_id, normalized version)`. A proxy verifies a manifest fetched
-    /// from its upstream with this before serving or caching it. The default
-    /// rejects every manifest, so a format without manifest support never has
-    /// an unverified upstream manifest served.
-    fn manifest_identity(&self, manifest: &[u8]) -> Result<(String, String), FormatError> {
-        let _ = manifest;
-        Err(FormatError::MalformedManifest(format!(
-            "{} manifests cannot be verified",
+    /// One step of the upstream side of a proxy repository
+    /// ([`forge_plugin_api::FormatPlugin::upstream`]): what to fetch from
+    /// `remote` for `op`, or what came of it. The proxy read path
+    /// ([`crate::repo::proxy::ProxyRepo`]) performs the fetches and calls
+    /// again with everything fetched so far. The default has no upstream: a
+    /// format without proxy repositories never gets here.
+    fn upstream(
+        &self,
+        remote: &Remote,
+        op: &UpstreamOp,
+        fetched: &[FetchResult],
+    ) -> Result<UpstreamStep, FormatError> {
+        let _ = (remote, op, fetched);
+        Err(FormatError::InvalidPackage(format!(
+            "{} has no proxy repositories",
             self.id()
         )))
-    }
-
-    /// Render a minimal manifest declaring `id`, `version` and `deps`, for a
-    /// version whose metadata is known only from an upstream index (a proxied
-    /// version that is not downloaded yet), so it is read back through the
-    /// same manifest parsing as a stored one. `None` (the default) when the
-    /// format cannot express one.
-    fn synthesize_manifest(
-        &self,
-        id: &str,
-        version: &str,
-        deps: &[DependencyGroup],
-    ) -> Option<Vec<u8>> {
-        let _ = (id, version, deps);
-        None
     }
 }
 

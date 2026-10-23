@@ -95,14 +95,14 @@ pub struct Repository {
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
     /// Plaintext upstream password: the storage of deployments **without**
-    /// secret encryption at rest. With `[crypto]` enabled (slice 12.5) it is
+    /// secret encryption at rest. With `[crypto]` enabled it is
     /// superseded by [`Self::upstream_password_enc`]: new writes go through
     /// the envelope service (which clears this column), and the backfill pass
     /// moves existing values into the envelope and NULLs this column in the
     /// same guarded UPDATE. Until a row is backfilled it remains that row's
     /// read fallback.
     pub upstream_password: Option<String>,
-    /// Envelope-encrypted upstream password (slice 12.5): an opaque AEAD blob
+    /// Envelope-encrypted upstream password: an opaque AEAD blob
     /// bound to this row. Decrypted **only** via
     /// [`crate::secret_dao::get_upstream_password`] at the proxy upstream
     /// fetch; everywhere else only its presence matters.
@@ -196,6 +196,178 @@ impl Repository {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+/// `repository.format` of NuGet repositories (the column default).
+pub const NUGET_FORMAT: &str = "nuget";
+
+/// `repository.format` of Docker / OCI registry repositories.
+pub const DOCKER_FORMAT: &str = "docker";
+
+/// `repository.config` key of [`Repository::docker_host`].
+pub const DOCKER_HOST_KEY: &str = "host";
+
+/// `repository.config` key of [`Repository::immutable_tags`].
+pub const IMMUTABLE_TAGS_KEY: &str = "immutable_tags";
+
+/// `repository.config` key of [`Repository::latest_mutable`].
+pub const LATEST_MUTABLE_KEY: &str = "latest_mutable";
+
+/// `repository.config` key of [`Repository::writable_member_id`].
+pub const WRITABLE_MEMBER_ID_KEY: &str = "writable_member_id";
+
+/// `repository.config` key of [`Repository::max_upload_bytes`].
+pub const MAX_UPLOAD_BYTES_KEY: &str = "max_upload_bytes";
+
+impl Repository {
+    /// Whether this is a Docker / OCI registry repository.
+    pub fn is_docker(&self) -> bool {
+        self.format == DOCKER_FORMAT
+    }
+
+    /// Docker option (`config.host`): the host name this repository answers
+    /// on by itself (host-based routing), so its images keep short names.
+    pub fn docker_host(&self) -> Option<&str> {
+        self.config
+            .get(DOCKER_HOST_KEY)
+            .and_then(|v| v.as_str())
+            .filter(|h| !h.is_empty())
+    }
+
+    /// Hosted docker option (`config.immutable_tags`, default off): a pushed
+    /// tag may not be moved to another manifest.
+    pub fn immutable_tags(&self) -> bool {
+        self.kind() == RepoKind::Hosted
+            && self
+                .config
+                .get(IMMUTABLE_TAGS_KEY)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+    }
+
+    /// Hosted docker option (`config.latest_mutable`, default off): with
+    /// immutable tags, `latest` may still be moved.
+    pub fn latest_mutable(&self) -> bool {
+        self.config
+            .get(LATEST_MUTABLE_KEY)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
+    /// Hosted option (`config.max_upload_bytes`): the largest package push
+    /// (for docker, the largest blob) this repository accepts. `None`: the
+    /// server's default for the repository's format.
+    pub fn max_upload_bytes(&self) -> Option<u64> {
+        if self.kind() != RepoKind::Hosted {
+            return None;
+        }
+        self.config
+            .get(MAX_UPLOAD_BYTES_KEY)
+            .and_then(|v| v.as_u64())
+            .filter(|&bytes| bytes > 0)
+    }
+
+    /// Docker group option (`config.writable_member_id`): the id of the
+    /// hosted member a push to the group goes to, so renaming it keeps it
+    /// and a repository created later under its old name never becomes it.
+    /// `None`: pushes are refused.
+    pub fn writable_member_id(&self) -> Option<i64> {
+        if self.kind() != RepoKind::Group {
+            return None;
+        }
+        self.config
+            .get(WRITABLE_MEMBER_ID_KEY)
+            .and_then(|v| v.as_i64())
+    }
+}
+
+/// `repository.format` of raw (generic file) repositories.
+pub const RAW_FORMAT: &str = "raw";
+
+/// `repository.config` key of [`Repository::deployment_policy`].
+pub const DEPLOYMENT_POLICY_KEY: &str = "deployment_policy";
+
+/// `repository.config` key of [`Repository::inline_content`].
+pub const CONTENT_DISPOSITION_KEY: &str = "content_disposition";
+
+/// `repository.config` key of [`Repository::max_age_seconds`].
+pub const MAX_AGE_SECONDS_KEY: &str = "max_age_seconds";
+
+/// How long a raw proxy serves a cached file before it asks its upstream
+/// whether the file changed, when the repository sets no `max_age_seconds`:
+/// a day.
+pub const DEFAULT_RAW_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+
+/// What a hosted raw repository does with an upload to a path it has
+/// (`config.deployment_policy`), as Nexus' deployment policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeploymentPolicy {
+    /// Replace the file.
+    AllowRedeploy,
+    /// Refuse it (the same content again is accepted, as a no-op).
+    #[default]
+    DisableRedeploy,
+    /// Refuse every upload and delete.
+    ReadOnly,
+}
+
+impl DeploymentPolicy {
+    /// The stored and API spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeploymentPolicy::AllowRedeploy => "allow_redeploy",
+            DeploymentPolicy::DisableRedeploy => "disable_redeploy",
+            DeploymentPolicy::ReadOnly => "read_only",
+        }
+    }
+
+    /// Parse the stored and API spelling.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "allow_redeploy" => Some(DeploymentPolicy::AllowRedeploy),
+            "disable_redeploy" => Some(DeploymentPolicy::DisableRedeploy),
+            "read_only" => Some(DeploymentPolicy::ReadOnly),
+            _ => None,
+        }
+    }
+}
+
+impl Repository {
+    /// Whether this is a raw (generic file) repository.
+    pub fn is_raw(&self) -> bool {
+        self.format == RAW_FORMAT
+    }
+
+    /// Hosted raw option (`config.deployment_policy`, default
+    /// [`DeploymentPolicy::DisableRedeploy`]).
+    pub fn deployment_policy(&self) -> DeploymentPolicy {
+        self.config
+            .get(DEPLOYMENT_POLICY_KEY)
+            .and_then(|v| v.as_str())
+            .and_then(DeploymentPolicy::parse)
+            .unwrap_or_default()
+    }
+
+    /// Raw option (`config.content_disposition = "inline"`, default
+    /// `"attachment"`): files are served for display in the browser rather
+    /// than as downloads.
+    pub fn inline_content(&self) -> bool {
+        self.config
+            .get(CONTENT_DISPOSITION_KEY)
+            .and_then(|v| v.as_str())
+            == Some("inline")
+    }
+
+    /// Raw proxy option (`config.max_age_seconds`): how long a cached file
+    /// is served before the upstream is asked whether it changed; `0` never
+    /// asks (the upstream's files are immutable). Default
+    /// [`DEFAULT_RAW_MAX_AGE_SECONDS`].
+    pub fn max_age_seconds(&self) -> u64 {
+        self.config
+            .get(MAX_AGE_SECONDS_KEY)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_RAW_MAX_AGE_SECONDS)
     }
 }
 
@@ -299,8 +471,9 @@ pub struct ProxyUpstreamIndex {
 /// A row of `app_user`.
 ///
 /// `password_hash` is `None` for users with no local password (auth_source
-/// `'upstream-basic'` or `'oidc'`); a `'local'` user always has one (DB CHECK
-/// `app_user_local_password_hash_check`, slice 12.3). `auth_source` records how
+/// `'upstream-basic'` or `'oidc'`); a `'local'` user has one unless it is
+/// invited and has not set it yet (DB CHECK
+/// `app_user_local_password_hash_check`, [`crate::invitation_dao`]). `auth_source` records how
 /// the user last authenticated / was provisioned; `external_subject` is the
 /// opaque upstream identifier for non-local sources.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -308,7 +481,6 @@ pub struct AppUser {
     pub id: i64,
     pub username: String,
     pub password_hash: Option<String>,
-    pub is_admin: bool,
     pub active: bool,
     pub auth_source: String,
     pub external_subject: Option<String>,
@@ -327,12 +499,12 @@ pub struct Token {
     pub revoked_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-    /// The per-token privilege scope jsonb (§12.4), exactly as stored; `None`
+    /// The per-token privilege scope jsonb, exactly as stored; `None`
     /// for an unscoped token. Evaluated by `forge-core`'s `parse_token_scope`.
     pub scope: Option<JsonValue>,
 }
 
-/// A row of `external_identity` (slice 12.2).
+/// A row of `external_identity`.
 ///
 /// Maps an IdP identity `(issuer, subject)` to an `app_user`. The denormalized
 /// claim columns are for display/debugging only and carry no authority — the
@@ -351,7 +523,7 @@ pub struct ExternalIdentity {
     pub updated_at: DateTime<Utc>,
 }
 
-/// A row of `session` (slice 12.2).
+/// A row of `session`.
 ///
 /// Server-side login session — the authority behind the opaque `forge_session`
 /// cookie. `token_hash` is `sha256(cookie_secret)` (mirrors `token.token_hash`);
@@ -372,7 +544,7 @@ pub struct Session {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-/// A row of `oidc_flow` (slice 12.2).
+/// A row of `oidc_flow`.
 ///
 /// Ephemeral authorization-code-flow state, shared across instances so any
 /// instance can complete a callback started by another. Rows are single-use:
@@ -388,7 +560,7 @@ pub struct OidcFlow {
     pub expires_at: DateTime<Utc>,
 }
 
-/// A row of `validated_credential` (slice 12.3): the durable, authoritative
+/// A row of `validated_credential`: the durable, authoritative
 /// record of one forwarded credential-validation decision.
 ///
 /// The plaintext password is **never** stored — `cred_hmac` is
@@ -412,13 +584,13 @@ pub struct ValidatedCredential {
     pub created_at: DateTime<Utc>,
 }
 
-/// A configured authentication realm (slice 12.7, design doc 2026-06-03 §3).
+/// A configured authentication realm.
 ///
 /// One row per authentication mechanism instance: the built-in `local`
-/// password realm, an `oidc` IdP, a `credential_forwarding` upstream, or (12.8,
-/// reserved) a `workload_identity` issuer. `priority` orders the realms — LOWER
-/// tries/lists first; `config` is kind-specific jsonb whose secrets are
-/// write-only at the API layer (redacted from every response).
+/// password realm, an `oidc` IdP, a `credential_forwarding` upstream, or a
+/// `workload_identity` (trusted-publishing) issuer. `priority` orders the
+/// realms — LOWER tries/lists first; `config` is kind-specific jsonb whose
+/// secrets are write-only at the API layer (redacted from every response).
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuthRealm {
     pub id: i64,

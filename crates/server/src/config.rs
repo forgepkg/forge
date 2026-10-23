@@ -1,9 +1,9 @@
-//! Server configuration (spec §8).
+//! Server configuration.
 //!
 //! Configuration is layered: a TOML file (optional) is the base, and `FORGE_*`
 //! environment variables override individual keys. Nested keys use `__` as the
 //! separator, e.g. `FORGE_SERVER__BIND`, `FORGE_S3__ACCESS_KEY`,
-//! `FORGE_AUTH__ANONYMOUS_MODE`.
+//! `FORGE_AUTH__TRUSTED_PROXY_CIDRS`.
 //!
 //! Secret string keys ([`SECRET_KEYS`]: database/Redis URLs, S3 keys, the
 //! bootstrap-admin password, the OIDC client secret, the credential-forwarding
@@ -12,8 +12,11 @@
 //! never echo their values.
 //!
 //! The raw deserialized shape ([`Config`]) is validated into typed runtime
-//! values where useful (e.g. the anonymous policy + trusted-proxy CIDRs are
-//! parsed once via [`Config::anon_policy`] / [`Config::trusted_proxy_cidrs`]).
+//! values where useful (e.g. the trusted-proxy CIDRs are parsed once via
+//! [`Config::trusted_proxy_cidrs`]).
+//!
+//! Sign-in and anonymous-access policy is not configured here: it is set at
+//! runtime and kept in the database ([`crate::auth::AuthSettings`]).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -21,9 +24,8 @@ use std::time::Duration;
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
-use forge_core::auth::client_ip::AnonPolicy;
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level server configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -34,7 +36,10 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// S3 / versitygw object store.
     pub s3: S3Config,
-    /// Authentication / anonymous-access policy.
+    /// Authentication bootstrap and per-instance sizing. Every key has a
+    /// default, so the section may be left out (e.g. an install configured
+    /// through `FORGE_*` variables without any `FORGE_AUTH__*`).
+    #[serde(default)]
     pub auth: AuthConfig,
     /// Optional Redis L2 cache.
     #[serde(default)]
@@ -48,7 +53,7 @@ pub struct Config {
     /// Background retention worker tuning.
     #[serde(default)]
     pub retention: RetentionConfig,
-    /// Group-repository nesting limits (slice 12.4).
+    /// Group-repository nesting limits.
     #[serde(default)]
     pub groups: GroupsConfig,
     /// Proxy-repository upstream HTTP tuning (timeouts, size caps, spooling).
@@ -58,21 +63,34 @@ pub struct Config {
     /// proxied packages.
     #[serde(default)]
     pub nuget: NugetConfig,
+    /// WebAssembly format plugins: further package formats loaded at startup
+    /// (see `docs/format-plugins.md`). None are loaded by default; the
+    /// built-in plugins (Helm) need no configuration.
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+    /// Docker / OCI registry (`/v2`): size limits, registry tokens, upload
+    /// and blob-link expiry.
+    #[serde(default)]
+    pub docker: DockerConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
-    /// Optional OpenID Connect / Microsoft Entra interactive login (slice 12.2).
-    /// Absent ⇒ OIDC disabled, no `/auth/oidc/*` routes.
+    /// Optional OpenID Connect / Microsoft Entra interactive login: a **seed**
+    /// for an `oidc` auth realm (see [`OidcConfig`]).
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
-    /// Optional secret encryption at rest (slice 12.5). Absent/disabled ⇒
-    /// slice-1 behavior (secrets stay in the legacy plaintext columns; no key
-    /// bootstrap, rotation worker, or backfill). Present + enabled ⇒ proxy
-    /// `upstream_password` writes are envelope-encrypted under the root → KEK
-    /// → DEK hierarchy, existing plaintext is backfilled at startup, and the
-    /// `/admin/crypto/*` endpoints are live.
+    /// Optional secret encryption at rest. Absent/disabled ⇒ secrets stay in
+    /// the legacy plaintext columns (no key bootstrap, rotation worker, or
+    /// backfill). Present + enabled ⇒ proxy `upstream_password` writes are
+    /// envelope-encrypted under the root → KEK → DEK hierarchy, existing
+    /// plaintext is backfilled at startup, and the `/admin/crypto/*` endpoints
+    /// are live.
     #[serde(default)]
     pub crypto: Option<CryptoConfig>,
+    /// Optional local disk cache for blobs. Absent (no `path`) ⇒ every
+    /// download reads S3.
+    #[serde(default)]
+    pub blob_cache: BlobCacheConfig,
 }
 
 /// `server.*`
@@ -83,11 +101,14 @@ pub struct ServerConfig {
     /// Public base URL used to build absolute NuGet `@id`s (no trailing slash
     /// required; it is trimmed). e.g. `https://forge.example.com`.
     pub public_base_url: String,
-    /// Largest accepted package upload (`dotnet nuget push`) in bytes. Uploads
-    /// are streamed to a temp file, never buffered in memory; exceeding the
-    /// limit yields HTTP 413. Default 512 MiB.
-    #[serde(default = "default_max_upload_bytes")]
-    pub max_upload_bytes: u64,
+    /// The removed `server.max_upload_bytes`, kept only to refuse it: each
+    /// hosted repository has its own upload limit, set in the admin UI or
+    /// API ([`forge_db::model::Repository::max_upload_bytes`]). `ServerConfig`
+    /// accepts unknown keys, so without this a leftover setting would be
+    /// ignored and package repositories would quietly fall back to
+    /// [`DEFAULT_MAX_UPLOAD_BYTES`].
+    #[serde(default, rename = "max_upload_bytes")]
+    removed_max_upload_bytes: Option<serde::de::IgnoredAny>,
     /// Directory pushes and first-time proxy downloads are staged in. Files a
     /// killed process left there are removed at startup. Default:
     /// `forge-staging` under the system temp directory.
@@ -95,13 +116,17 @@ pub struct ServerConfig {
     pub staging_dir: Option<std::path::PathBuf>,
     /// Temp space all staged pushes and proxy downloads of this instance may
     /// use at once, in bytes; a stage that would exceed it is answered `503`
-    /// with `Retry-After`. Default: four times the larger of
-    /// `max_upload_bytes` and `proxy.max_package_bytes` (4 GiB with the
-    /// defaults). `0` removes the limit. Size the staging volume above it.
+    /// with `Retry-After`. Default: four times the largest item staged by
+    /// default: a push under the default upload limits, or a proxy download
+    /// (`proxy.max_package_bytes`, `docker.max_blob_bytes`), so 4 GiB. `0`
+    /// removes the limit. Size the staging volume above it. A repository's
+    /// upload limit may not exceed it (less `nuget.max_nuspec_bytes`), and
+    /// an explicit budget lowers the docker defaults to fit it.
     #[serde(default)]
     pub max_staging_bytes: Option<u64>,
     /// Permit starting with **known-insecure placeholder credentials** (the
-    /// `changeme` bootstrap-admin password, `minioadmin` S3 keys).
+    /// `changeme` bootstrap-admin password, `minioadmin` S3 keys, an unedited
+    /// `<…>` value of an example env file).
     /// Default `false`: such a config refuses to start, so a copied dev config
     /// or the image's baked defaults never reach production unnoticed. Set
     /// `true` only for local development / compose stacks.
@@ -109,8 +134,8 @@ pub struct ServerConfig {
     pub allow_insecure_defaults: bool,
     /// Extra `Host` names (an optional `:port` is ignored) under which the
     /// server is legitimately reached, besides the host of
-    /// [`Self::public_base_url`]. Only consulted for the
-    /// `auth.anonymous_mode = "allowlist"` grant: an unauthenticated request
+    /// [`Self::public_base_url`]. Only consulted for the anonymous mode
+    /// `allowlist` ([`crate::auth::AuthSettings`]): an unauthenticated request
     /// whose `Host` matches neither is not served anonymously by IP (a
     /// DNS-rebinding page in an internal user's browser presents its own host
     /// name). Add the names a reverse proxy rewrites `Host` to, or that
@@ -133,14 +158,20 @@ pub struct ServerConfig {
     /// Seconds a handler has to produce its response (`408` after that); a
     /// response body already streaming, such as a package download, is not cut
     /// off. Covers reading an upload, so keep it above the slowest expected
-    /// push of `max_upload_bytes`. `0` disables. Default 900.
+    /// push of the largest repository upload limit. A proxy's download from
+    /// its upstream, bounded by `proxy.download_timeout_seconds`, extends it:
+    /// the handler has this long again after that download's deadline. `0`
+    /// disables. Default 900.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
 }
 
-fn default_max_upload_bytes() -> u64 {
-    512 * 1024 * 1024
-}
+/// The upload limit of a package repository without one of its own: 512 MiB.
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The upload limit, per blob, of a docker repository without one of its
+/// own: 1 GiB.
+pub const DEFAULT_DOCKER_MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn default_header_read_timeout_seconds() -> u64 {
     150
@@ -216,15 +247,32 @@ fn default_db_acquire_timeout() -> u64 {
 pub struct S3Config {
     /// S3 endpoint URL (e.g. `http://localhost:8422` for versitygw).
     pub endpoint: String,
-    /// AWS region (any value for versitygw; `us-east-1` is fine).
+    /// AWS region (any value for versitygw; `us-east-1` is fine). Also the
+    /// region STS and the AWS default credentials chain are asked in.
     #[serde(default = "default_region")]
     pub region: String,
     /// Bucket name holding all blobs.
     pub bucket: String,
-    /// Access key id.
-    pub access_key: String,
-    /// Secret access key.
-    pub secret_key: String,
+    /// Where the credentials come from: `static` (default) uses
+    /// [`Self::access_key`] / [`Self::secret_key`]; `default_chain` the AWS
+    /// SDK default credentials chain (env vars with `AWS_SESSION_TOKEN`,
+    /// profile, IRSA web identity, EKS Pod Identity, ECS task role, EC2
+    /// instance metadata); `web_identity` exchanges a token file for
+    /// temporary keys via STS `AssumeRoleWithWebIdentity` ([`Self::web_identity`]).
+    #[serde(default)]
+    pub credentials: S3CredentialsMode,
+    /// Access key id. Required with `credentials = "static"`, refused with
+    /// the other modes.
+    #[serde(default)]
+    pub access_key: Option<String>,
+    /// Secret access key. Required with `credentials = "static"`, refused
+    /// with the other modes.
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// `s3.web_identity.*`: required with `credentials = "web_identity"`,
+    /// refused with the other modes.
+    #[serde(default)]
+    pub web_identity: Option<S3WebIdentityConfig>,
     /// Use path-style addressing (required for versitygw/MinIO).
     #[serde(default = "default_true")]
     pub force_path_style: bool,
@@ -246,11 +294,85 @@ impl std::fmt::Debug for S3Config {
             .field("endpoint", &redacted_url(&self.endpoint))
             .field("region", &self.region)
             .field("bucket", &self.bucket)
+            .field("credentials", &self.credentials)
             .field("access_key", &self.access_key)
-            .field("secret_key", &"<redacted>")
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("web_identity", &self.web_identity)
             .field("force_path_style", &self.force_path_style)
             .field("multipart_threshold", &self.multipart_threshold)
             .field("conditional_writes", &self.conditional_writes)
+            .finish()
+    }
+}
+
+/// `s3.credentials` values (snake_case in TOML/env).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum S3CredentialsMode {
+    /// `s3.access_key` / `s3.secret_key`.
+    #[default]
+    Static,
+    /// The AWS SDK default credentials chain.
+    DefaultChain,
+    /// STS `AssumeRoleWithWebIdentity` with `[s3.web_identity]`.
+    WebIdentity,
+}
+
+impl S3CredentialsMode {
+    /// The value as `s3.credentials` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::DefaultChain => "default_chain",
+            Self::WebIdentity => "web_identity",
+        }
+    }
+}
+
+/// `s3.web_identity.*`: a token file exchanged for temporary S3 keys via
+/// STS `AssumeRoleWithWebIdentity`. `Debug` shows the token's path, never a
+/// token (none is held here).
+#[derive(Clone, Deserialize)]
+pub struct S3WebIdentityConfig {
+    /// The role to assume. AWS requires it; MinIO takes none for its
+    /// claim-based policies (its `RoleArn` for a role policy otherwise).
+    #[serde(default)]
+    pub role_arn: Option<String>,
+    /// The file holding the web identity token (e.g. a projected
+    /// service-account token). Read again on every refresh, so a token the
+    /// kubelet rotated is picked up.
+    pub token_file: std::path::PathBuf,
+    /// STS endpoint URL. Unset: AWS STS in `s3.region`. Set it for MinIO or
+    /// Ceph RGW (usually the S3 endpoint).
+    #[serde(default)]
+    pub sts_endpoint: Option<String>,
+    /// `RoleSessionName` (AWS CloudTrail records it). Default `forge`.
+    #[serde(default = "default_s3_session_name")]
+    pub session_name: String,
+    /// Lifetime of the temporary credentials asked of STS, 900..=43200
+    /// seconds. Unset: the STS default (one hour on AWS).
+    #[serde(default)]
+    pub duration_seconds: Option<u32>,
+}
+
+fn default_s3_session_name() -> String {
+    "forge".into()
+}
+
+impl std::fmt::Debug for S3WebIdentityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3WebIdentityConfig")
+            .field("role_arn", &self.role_arn)
+            .field("token_file", &self.token_file)
+            .field(
+                "sts_endpoint",
+                &self.sts_endpoint.as_deref().map(redacted_url),
+            )
+            .field("session_name", &self.session_name)
+            .field("duration_seconds", &self.duration_seconds)
             .finish()
     }
 }
@@ -270,14 +392,14 @@ pub enum ConditionalWritesMode {
 }
 
 impl S3Config {
-    /// Convert into the storage crate's S3 config.
+    /// Convert into the storage crate's S3 config. Call on a validated
+    /// config: `static` then has both keys.
     pub fn to_storage(&self) -> forge_storage::S3Config {
         forge_storage::S3Config {
             endpoint: self.endpoint.clone(),
             region: self.region.clone(),
             bucket: self.bucket.clone(),
-            access_key: self.access_key.clone(),
-            secret_key: self.secret_key.clone(),
+            credentials: self.storage_credentials(),
             force_path_style: self.force_path_style,
             multipart_threshold: self.multipart_threshold,
             conditional_writes: match self.conditional_writes {
@@ -287,76 +409,168 @@ impl S3Config {
             },
         }
     }
+
+    fn storage_credentials(&self) -> forge_storage::S3Credentials {
+        match (self.credentials, &self.web_identity) {
+            (S3CredentialsMode::DefaultChain, _) => forge_storage::S3Credentials::DefaultChain,
+            (S3CredentialsMode::WebIdentity, Some(wi)) => {
+                forge_storage::S3Credentials::WebIdentity(forge_storage::WebIdentity {
+                    role_arn: wi.role_arn.clone(),
+                    token_file: wi.token_file.clone(),
+                    sts_endpoint: wi.sts_endpoint.clone(),
+                    session_name: wi.session_name.clone(),
+                    duration_seconds: wi.duration_seconds,
+                })
+            }
+            // `static`, or an unvalidated `web_identity` without its block
+            // (whose keys are then empty and S3 refuses them).
+            _ => forge_storage::S3Credentials::from_keys(
+                self.access_key.clone().unwrap_or_default(),
+                self.secret_key.clone().unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Blank optional values mean unset (`FORGE_S3__ACCESS_KEY=` in an env
+    /// file or a chart that renders every variable).
+    fn normalize(&mut self) {
+        fn blank_is_none(value: &mut Option<String>) {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                *value = None;
+            }
+        }
+        blank_is_none(&mut self.access_key);
+        blank_is_none(&mut self.secret_key);
+        if let Some(wi) = self.web_identity.as_mut() {
+            blank_is_none(&mut wi.role_arn);
+            blank_is_none(&mut wi.sts_endpoint);
+        }
+    }
+
+    /// The credential source has exactly the settings it uses: both keys for
+    /// `static`, `[s3.web_identity]` for `web_identity`, neither for
+    /// `default_chain`. A setting the chosen source would ignore is refused
+    /// rather than silently left unused (a long-lived key kept in a Secret
+    /// after the switch to short-lived credentials, or the wrong mode).
+    fn validate(&self) -> Result<(), ConfigError> {
+        let mode = self.credentials.as_str();
+        let keys_set = self.access_key.is_some() || self.secret_key.is_some();
+        match self.credentials {
+            S3CredentialsMode::Static => {
+                if self.access_key.is_none() || self.secret_key.is_none() {
+                    return Err(ConfigError::Invalid(
+                        "s3.access_key and s3.secret_key are required with s3.credentials = \
+                         \"static\" (the default): set FORGE_S3__ACCESS_KEY and \
+                         FORGE_S3__SECRET_KEY, or set s3.credentials to \"default_chain\" or \
+                         \"web_identity\" for short-lived credentials"
+                            .into(),
+                    ));
+                }
+            }
+            S3CredentialsMode::DefaultChain | S3CredentialsMode::WebIdentity => {
+                if keys_set {
+                    return Err(ConfigError::Invalid(format!(
+                        "s3.access_key / s3.secret_key are set, but s3.credentials = \
+                         \"{mode}\" does not use them: remove them (FORGE_S3__ACCESS_KEY / \
+                         FORGE_S3__SECRET_KEY) or set s3.credentials = \"static\""
+                    )));
+                }
+            }
+        }
+        match (self.credentials, &self.web_identity) {
+            (S3CredentialsMode::WebIdentity, None) => Err(ConfigError::Invalid(
+                "s3.credentials = \"web_identity\" needs [s3.web_identity] with at least \
+                 token_file (FORGE_S3__WEB_IDENTITY__TOKEN_FILE)"
+                    .into(),
+            )),
+            (S3CredentialsMode::WebIdentity, Some(wi)) => wi.validate(),
+            (_, Some(_)) => Err(ConfigError::Invalid(format!(
+                "[s3.web_identity] is set, but s3.credentials = \"{mode}\" does not use it: \
+                 set s3.credentials = \"web_identity\" (FORGE_S3__CREDENTIALS) or remove it"
+            ))),
+            (_, None) => Ok(()),
+        }
+    }
+}
+
+impl S3WebIdentityConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |msg: String| Err(ConfigError::Invalid(format!("s3.web_identity.{msg}")));
+        if self.token_file.as_os_str().is_empty() {
+            return invalid("token_file must not be empty".into());
+        }
+        if let Some(endpoint) = &self.sts_endpoint {
+            let ok = url::Url::parse(endpoint)
+                .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some());
+            if !ok {
+                return invalid(format!(
+                    "sts_endpoint must be an http(s) URL, got {:?}",
+                    redacted_url(endpoint)
+                ));
+            }
+        }
+        // AWS's limits; MinIO and Ceph RGW apply the same ones.
+        let name = &self.session_name;
+        let name_ok = (2..=64).contains(&name.len())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c));
+        if !name_ok {
+            return invalid(format!(
+                "session_name must be 2 to 64 characters of letters, digits and _+=,.@- \
+                 (got {name:?})"
+            ));
+        }
+        if let Some(seconds) = self.duration_seconds {
+            if !(900..=43_200).contains(&seconds) {
+                return invalid(format!(
+                    "duration_seconds must be between 900 and 43200, got {seconds}"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `auth.*`
+///
+/// The access and sign-in policy that used to live here (the anonymous mode
+/// and its allowlist, the login mode, password Basic, the session lifetimes
+/// and the lockout) is set in the web UI and kept in the database
+/// ([`crate::auth::AuthSettings`]); its keys are refused ([`REMOVED_AUTH_KEYS`]).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
-    /// Global anonymous mode: `off` | `allowlist` | `all`.
-    #[serde(default = "default_anonymous_mode")]
-    pub anonymous_mode: String,
-    /// Allowlist tokens for `anonymous_mode = allowlist`
-    /// (`loopback` / `private` / `local` / explicit CIDRs / hosts).
-    #[serde(default)]
-    pub anonymous_ip_allowlist: Vec<String>,
     /// CIDRs of proxies whose `X-Forwarded-For` we trust.
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
-    /// Allow HTTP Basic password auth (token-in-basic always allowed). Defaults
-    /// off; intended for the admin API.
-    #[serde(default)]
-    pub allow_password_basic: bool,
     /// First-run bootstrap admin credentials.
     #[serde(default)]
     pub bootstrap_admin: Option<BootstrapAdmin>,
-    /// Ordered password-style auth provider chain (slice 12.3). Each entry is a
-    /// provider id; the chain is walked in order and the first to authenticate
-    /// wins. Known ids: `local-password`, `upstream-basic`. The default keeps the
-    /// local provider first so a locally-created admin survives an upstream
-    /// outage. An entry of `upstream-basic` requires `[auth.upstream_basic]` to be
+    /// Ordered password-style auth provider chain. Each entry is a provider id;
+    /// the chain is walked in order and the first to authenticate wins. Known
+    /// ids: `local-password`, `upstream-basic`. The default keeps the local
+    /// provider first so a locally-created admin survives an upstream outage.
+    /// An entry of `upstream-basic` requires `[auth.upstream_basic]` to be
     /// present and enabled (validated at startup).
     #[serde(default = "default_providers")]
     pub providers: Vec<String>,
-    /// Optional credential-forwarding upstream-basic provider (slice 12.3).
-    /// Present + enabled ⇒ the `upstream-basic` provider can appear in
+    /// Optional credential-forwarding upstream-basic provider. Present +
+    /// enabled ⇒ the `upstream-basic` provider can appear in
     /// [`Self::providers`].
     ///
-    /// Since 12.7 this block (like `[oidc]`) is a **seed**: on first boot it is
-    /// imported into an `auth_realm` row and the database becomes the
-    /// authority (edit realms in the admin UI; the block is ignored afterwards).
+    /// This block (like `[oidc]`) is a **seed**: on first boot it is imported
+    /// into an `auth_realm` row. A changed block re-applies on later boots only
+    /// until the realm is edited in the admin UI; from then on the database is
+    /// the authority and the block is ignored.
     #[serde(default)]
     pub upstream_basic: Option<UpstreamBasicAuthConfig>,
-    /// Login-screen behavior (12.7 §3.4): `identifier_first` (default — ask for
-    /// the username, then route to a password prompt or an OIDC redirect) or
-    /// `combined` (always show username+password plus a button per enabled
-    /// OIDC realm).
-    #[serde(default = "default_login_mode")]
-    pub login_mode: String,
-    /// Idle timeout (seconds) for browser sessions: a session expires this long
-    /// after its last use. Applies to ALL sessions (local-password logins and
-    /// OIDC). When unset, falls back to the legacy `oidc.session_idle_ttl_seconds`
-    /// if an `[oidc]` block is present, else 8h.
-    #[serde(default)]
-    pub session_idle_ttl_seconds: Option<u64>,
-    /// Absolute lifetime (seconds) for browser sessions, regardless of
-    /// activity. Fallback mirrors [`Self::session_idle_ttl_seconds`]; default 7d.
-    #[serde(default)]
-    pub session_absolute_ttl_seconds: Option<u64>,
     /// How long (seconds) an instance trusts its in-process snapshot of the
-    /// `auth_realm` table before re-reading it. Admin realm edits invalidate
-    /// the local snapshot immediately; OTHER instances converge within this
-    /// window. Keep small — the rebuild is two cheap queries.
+    /// `auth_realm` table and of the auth settings before re-reading them.
+    /// Admin edits replace the local copy immediately; OTHER instances
+    /// converge within this window. Keep small — the rebuild is a few cheap
+    /// queries.
     #[serde(default = "default_realm_cache_ttl")]
     pub realm_cache_ttl_seconds: u64,
-    /// Failed password attempts allowed per `(client IP, username)` within
-    /// [`Self::login_failure_window_seconds`] before further attempts are
-    /// refused until the window lapses (browser login and Basic password auth;
-    /// per instance, in memory). `0` disables the lockout.
-    #[serde(default = "default_login_max_failures")]
-    pub login_max_failures: u32,
-    /// Length (seconds) of the password-failure window / lockout.
-    #[serde(default = "default_login_failure_window")]
-    pub login_failure_window_seconds: u64,
     /// OIDC login starts (`GET /auth/oidc/login`) allowed per client network
     /// (IPv6: per /64) and minute, per instance. Each start stores a flow
     /// row. `0` disables the limit.
@@ -377,26 +591,80 @@ pub struct AuthConfig {
     /// (default) means the number of available CPUs.
     #[serde(default)]
     pub password_verify_concurrency: usize,
+    /// The keys [`REMOVED_AUTH_KEYS`] names, kept only to refuse them:
+    /// `AuthConfig` accepts unknown keys, so a leftover setting would
+    /// otherwise be ignored without a word.
+    #[serde(default, rename = "anonymous_mode")]
+    removed_anonymous_mode: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "anonymous_ip_allowlist")]
+    removed_anonymous_ip_allowlist: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "login_mode")]
+    removed_login_mode: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "allow_password_basic")]
+    removed_allow_password_basic: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "session_idle_ttl_seconds")]
+    removed_session_idle_ttl_seconds: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "session_absolute_ttl_seconds")]
+    removed_session_absolute_ttl_seconds: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "login_max_failures")]
+    removed_login_max_failures: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "login_failure_window_seconds")]
+    removed_login_failure_window_seconds: Option<serde::de::IgnoredAny>,
 }
+
+/// The `[auth]` keys whose settings moved to the database (#294): the web UI's
+/// **Admin → Settings** and `/admin/settings/auth` set them for every
+/// instance. A configuration that still sets one is refused at startup.
+pub const REMOVED_AUTH_KEYS: [&str; 8] = [
+    "anonymous_mode",
+    "anonymous_ip_allowlist",
+    "login_mode",
+    "allow_password_basic",
+    "session_idle_ttl_seconds",
+    "session_absolute_ttl_seconds",
+    "login_max_failures",
+    "login_failure_window_seconds",
+];
+
+impl AuthConfig {
+    /// The keys of [`REMOVED_AUTH_KEYS`] this configuration sets.
+    fn removed_keys(&self) -> Vec<&'static str> {
+        [
+            self.removed_anonymous_mode.is_some(),
+            self.removed_anonymous_ip_allowlist.is_some(),
+            self.removed_login_mode.is_some(),
+            self.removed_allow_password_basic.is_some(),
+            self.removed_session_idle_ttl_seconds.is_some(),
+            self.removed_session_absolute_ttl_seconds.is_some(),
+            self.removed_login_max_failures.is_some(),
+            self.removed_login_failure_window_seconds.is_some(),
+        ]
+        .into_iter()
+        .zip(REMOVED_AUTH_KEYS)
+        .filter_map(|(set, key)| set.then_some(key))
+        .collect()
+    }
+}
+
+impl Default for AuthConfig {
+    /// Every key at its serde default, as for an empty `[auth]` table.
+    fn default() -> Self {
+        serde_json::from_value(serde_json::json!({})).expect("every auth key has a default")
+    }
+}
+
+/// Longest accepted worker and key-cache duration (100 years). Larger values
+/// panic in the duration arithmetic (chrono above about 9.2e15 seconds, moka
+/// TTLs above 1000 years, timestamps past year 262143) instead of failing
+/// validation, and are a configuration mistake anyway.
+const MAX_DURATION_SECONDS: i64 = 100 * 365 * 24 * 60 * 60;
 
 fn default_credential_forward_max_concurrent() -> usize {
     forge_core::auth::DEFAULT_MAX_CONCURRENT_FORWARDS
 }
 
-fn default_login_max_failures() -> u32 {
-    10
-}
-
-fn default_login_failure_window() -> u64 {
-    300
-}
-
 fn default_oidc_login_starts_per_minute() -> u32 {
     30
-}
-
-fn default_login_mode() -> String {
-    "identifier_first".into()
 }
 
 fn default_realm_cache_ttl() -> u64 {
@@ -407,15 +675,21 @@ fn default_providers() -> Vec<String> {
     vec!["local-password".to_string()]
 }
 
-/// `auth.upstream_basic.*` — credential-forwarding authentication (slice 12.3).
+/// `auth.upstream_basic.*` — credential-forwarding authentication.
 ///
 /// Forwards a user's `username:password` to a configured upstream over HTTP
 /// Basic (the verdaccio-nexus-auth-proxy pattern; for a Nexus this is the
 /// status/whoami endpoint). The `key_pepper` is a **secret**: it keys the
 /// validated-credential cache HMAC and is **redacted** from `Debug` (and any
-/// config dump), mirroring the slice-1 `upstream_password` / OIDC `client_secret`
-/// treatment, and is forward-compatible with §12.5 encryption at rest.
+/// config dump), like the proxy `upstream_password` and the OIDC
+/// `client_secret`; once seeded into a realm it is encrypted at rest when
+/// `[crypto]` is enabled.
+///
+/// Unknown keys are refused, like in a realm config set through the admin
+/// API: a misspelled `identity_path` or `required_groups` would otherwise
+/// seed the realm with that gate turned off.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamBasicAuthConfig {
     /// Master switch. When `false`, the provider is not built even if it appears
     /// in `auth.providers` (that combination is a startup error — see validate).
@@ -459,13 +733,14 @@ pub struct UpstreamBasicAuthConfig {
     #[serde(default)]
     pub allow_http: bool,
     /// Optional upstream group that maps to forge admin. Every login that
-    /// fetches the groups re-applies it (grants and demotes), with or without
-    /// `auto_provision`.
+    /// fetches the groups re-applies it (grants and demotes).
     #[serde(default)]
     pub admin_group: String,
-    /// Auto-provision an `app_user` on first successful upstream login.
-    #[serde(default = "default_true")]
-    pub auto_provision: bool,
+    /// Ignored since 2.0: credential forwarding creates no accounts (an
+    /// administrator creates each one). Still accepted so an existing block
+    /// keeps loading.
+    #[serde(default)]
+    pub auto_provision: Option<bool>,
     /// Validated-credential cache TTLs + the secret pepper.
     #[serde(default)]
     pub cache: CredCacheConfig,
@@ -508,14 +783,17 @@ impl UpstreamBasicAuthConfig {
             identity_path: self.identity_path.clone(),
             admin_group: self.admin_group.clone(),
             provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
-            auto_provision: self.auto_provision,
             realm_id: None,
+            // Kept hashes are bound to a realm row; the legacy block has none.
+            capture_password_hash: false,
         }
     }
 }
 
 /// `auth.upstream_basic.cache.*` — the validated-credential cache tuning.
+/// Unknown keys are refused (see [`UpstreamBasicAuthConfig`]).
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredCacheConfig {
     /// How long a *good* credential is trusted without re-forwarding (seconds).
     #[serde(default = "default_positive_ttl")]
@@ -583,7 +861,8 @@ fn default_negative_ttl() -> u64 {
 /// exist is a normal configuration, not a startup error.
 #[derive(Clone, Deserialize)]
 pub struct BootstrapAdmin {
-    /// Admin username to create on first run if absent. Default `admin`.
+    /// Admin username to create on first run if absent: a UPN, like every
+    /// account's. Default `admin@example.com`.
     #[serde(default = "default_bootstrap_username")]
     pub username: String,
     /// Plaintext password (hashed with argon2id on creation). Required for the
@@ -592,8 +871,11 @@ pub struct BootstrapAdmin {
     pub password: String,
 }
 
+/// The bootstrap admin's default name.
+pub const DEFAULT_BOOTSTRAP_USERNAME: &str = "admin@example.com";
+
 fn default_bootstrap_username() -> String {
-    "admin".into()
+    DEFAULT_BOOTSTRAP_USERNAME.into()
 }
 
 /// Manual `Debug` that **redacts the password**.
@@ -649,10 +931,72 @@ impl RedisConfig {
     }
 }
 
+/// `blob_cache.*` (optional): a copy of downloaded blobs on a local disk, so
+/// hot downloads skip S3 and cached packages keep resolving while S3 is down.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BlobCacheConfig {
+    /// The cache directory (created if missing). Unset or blank ⇒ no cache.
+    /// Each instance needs a directory of its own.
+    #[serde(default)]
+    pub path: Option<std::path::PathBuf>,
+    /// `"auto"` (default): the size of the filesystem holding `path`, minus
+    /// `min_free_bytes` (and `server.max_staging_bytes` when staging is on
+    /// the same filesystem), re-read periodically; or a fixed byte count.
+    /// Either way capped so the filesystem keeps `min_free_bytes` free.
+    #[serde(default)]
+    pub max_bytes: BlobCacheMaxBytes,
+    /// Free space the cache leaves on its filesystem, evicting instead of
+    /// filling it. Default: 5 % of the filesystem.
+    #[serde(default)]
+    pub min_free_bytes: Option<u64>,
+}
+
+/// `blob_cache.max_bytes`: `"auto"` or a byte count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlobCacheMaxBytes {
+    /// Sized from the disk.
+    #[default]
+    Auto,
+    /// A fixed limit in bytes.
+    Bytes(u64),
+}
+
+impl<'de> Deserialize<'de> for BlobCacheMaxBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = BlobCacheMaxBytes;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"auto\" or a number of bytes")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(BlobCacheMaxBytes::Bytes(v))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                u64::try_from(v)
+                    .map(BlobCacheMaxBytes::Bytes)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                let v = v.trim();
+                if v.eq_ignore_ascii_case("auto") {
+                    Ok(BlobCacheMaxBytes::Auto)
+                } else {
+                    v.parse()
+                        .map(BlobCacheMaxBytes::Bytes)
+                        .map_err(|_| E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// `cache.*`
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
-    /// Max number of L1 entries.
+    /// Max number of L1 entries; an entry over 16 KiB counts once per
+    /// started 16 KiB, so this bounds the L1's memory too.
     #[serde(default = "default_l1_capacity")]
     pub l1_max_capacity: u64,
     /// Default TTL (seconds) for cached read responses.
@@ -728,11 +1072,11 @@ impl OutboxConfig {
     }
 }
 
-/// `retention.*` — background retention worker tuning (slice 12.1).
+/// `retention.*` — background retention worker tuning.
 ///
 /// The worker runs on every instance, claims one due repository per tick via
 /// `FOR UPDATE SKIP LOCKED` + a lease, evaluates its policy, and applies
-/// decisions through the slice-1 blob outbox. `default_run_interval` is the
+/// decisions through the blob outbox. `default_run_interval` is the
 /// floor between automatic runs (a larger per-repo `min_run_interval_seconds`
 /// in the policy wins); `lease_seconds` is the crash-safe lease; `delete_grace`
 /// defaults to the outbox grace when unset and is the deferral before a
@@ -748,7 +1092,9 @@ pub struct RetentionConfig {
     /// How often each instance polls for a due repository (seconds).
     #[serde(default = "default_retention_poll")]
     pub poll_interval_seconds: u64,
-    /// Default floor between automatic runs per repo (seconds).
+    /// Default floor between automatic runs per repo (seconds). The worker
+    /// never schedules runs less than 60 s apart, so `0` leaves the interval
+    /// to each policy's `min_run_interval_seconds`.
     #[serde(default = "default_retention_run_interval")]
     pub default_run_interval_seconds: i64,
     /// Crash-safe lease held while a repo is evaluated (seconds).
@@ -800,7 +1146,7 @@ impl RetentionConfig {
     }
 }
 
-/// `groups.*` — nested group-repository limits (slice 12.4 Phase 4).
+/// `groups.*` — nested group-repository limits.
 ///
 /// Nested group repositories (a group whose member is itself a group) are
 /// allowed, but the graph must stay an acyclic DAG of bounded depth. The
@@ -851,7 +1197,9 @@ pub struct ProxyConfig {
     /// `.nuspec`). Default 60 s.
     #[serde(default = "default_proxy_metadata_timeout")]
     pub metadata_timeout_seconds: u64,
-    /// Total deadline for a `.nupkg` download. Default 30 min.
+    /// Total deadline for a download (a `.nupkg`, a docker layer). It
+    /// extends the deadline of the request it serves
+    /// (`server.request_timeout_seconds`). Default 30 min.
     #[serde(default = "default_proxy_download_timeout")]
     pub download_timeout_seconds: u64,
     /// Largest accepted upstream metadata document. Default 32 MiB.
@@ -989,9 +1337,9 @@ impl Default for NugetConfig {
 }
 
 impl NugetConfig {
-    /// The limits handed to [`forge_nuget::NugetFormat::with_limits`].
-    pub fn limits(&self) -> forge_nuget::model::NupkgLimits {
-        forge_nuget::model::NupkgLimits {
+    /// The limits handed to [`forge_format_nuget::Nuget::with_limits`].
+    pub fn limits(&self) -> forge_format_nuget::NupkgLimits {
+        forge_format_nuget::NupkgLimits {
             max_entries: self.max_entries,
             max_central_directory_bytes: self.max_central_directory_bytes,
             max_total_uncompressed: self.max_total_uncompressed_bytes,
@@ -1027,20 +1375,189 @@ impl NugetConfig {
     }
 }
 
+/// `[docker]`: the Docker / OCI registry served under `/v2`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockerConfig {
+    /// Largest blob (image layer) a docker proxy downloads from its
+    /// upstream. Staged on disk while it arrives, so it counts towards
+    /// `server.max_staging_bytes`. Pushes follow the repository's upload
+    /// limit instead. Default 1 GiB, or less with an explicit staging budget
+    /// that is smaller ([`Config::docker_max_blob_bytes`]).
+    #[serde(default)]
+    pub max_blob_bytes: Option<u64>,
+    /// Lifetime of a registry Bearer token from `/v2/token` (60–3600 s).
+    /// Default 300.
+    #[serde(default = "default_docker_token_ttl_seconds")]
+    pub token_ttl_seconds: u64,
+    /// Secret the registry tokens are signed with (at least 32 characters).
+    /// Unset: a random key is generated once and kept in the database (sealed
+    /// with `[crypto]` when that is enabled), shared by every instance.
+    #[serde(default)]
+    pub token_secret: Option<String>,
+    /// An upload session idle this long is abandoned and removed. Default
+    /// 24 h.
+    #[serde(default = "default_docker_upload_ttl_seconds")]
+    pub upload_ttl_seconds: u64,
+    /// A blob pushed into an image that no manifest of the image references
+    /// is released after this long unused (the time a client has between
+    /// pushing layers and pushing their manifest). Default 24 h, at least 1 h.
+    #[serde(default = "default_docker_unreferenced_blob_ttl_seconds")]
+    pub unreferenced_blob_ttl_seconds: u64,
+    /// How often expired uploads and unreferenced blob links are swept.
+    /// Default 300.
+    #[serde(default = "default_docker_sweep_interval_seconds")]
+    pub sweep_interval_seconds: u64,
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        DockerConfig {
+            max_blob_bytes: None,
+            token_ttl_seconds: default_docker_token_ttl_seconds(),
+            token_secret: None,
+            upload_ttl_seconds: default_docker_upload_ttl_seconds(),
+            unreferenced_blob_ttl_seconds: default_docker_unreferenced_blob_ttl_seconds(),
+            sweep_interval_seconds: default_docker_sweep_interval_seconds(),
+        }
+    }
+}
+
+impl DockerConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_blob_bytes == Some(0) {
+            return Err(ConfigError::Invalid(
+                "docker.max_blob_bytes must be greater than 0".into(),
+            ));
+        }
+        if !(60..=3600).contains(&self.token_ttl_seconds) {
+            return Err(ConfigError::Invalid(
+                "docker.token_ttl_seconds must be between 60 and 3600".into(),
+            ));
+        }
+        if self
+            .token_secret
+            .as_deref()
+            .is_some_and(|s| s.chars().count() < 32)
+        {
+            return Err(ConfigError::Invalid(
+                "docker.token_secret must be at least 32 characters (or unset to generate a key)"
+                    .into(),
+            ));
+        }
+        if self.upload_ttl_seconds == 0 || self.sweep_interval_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "docker.upload_ttl_seconds and docker.sweep_interval_seconds must be greater than 0"
+                    .into(),
+            ));
+        }
+        if self.unreferenced_blob_ttl_seconds < 3600 {
+            return Err(ConfigError::Invalid(
+                "docker.unreferenced_blob_ttl_seconds must be at least 3600: a client needs time \
+                 between pushing an image's layers and its manifest"
+                    .into(),
+            ));
+        }
+        for (key, seconds) in [
+            ("docker.upload_ttl_seconds", self.upload_ttl_seconds),
+            (
+                "docker.unreferenced_blob_ttl_seconds",
+                self.unreferenced_blob_ttl_seconds,
+            ),
+            ("docker.sweep_interval_seconds", self.sweep_interval_seconds),
+        ] {
+            at_most_100_years(key, i128::from(seconds))?;
+        }
+        Ok(())
+    }
+}
+
+/// The largest blob a docker proxy downloads unless `docker.max_blob_bytes`
+/// says otherwise: 1 GiB.
+pub const DEFAULT_DOCKER_MAX_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
+fn default_docker_token_ttl_seconds() -> u64 {
+    300
+}
+fn default_docker_upload_ttl_seconds() -> u64 {
+    24 * 3600
+}
+fn default_docker_unreferenced_blob_ttl_seconds() -> u64 {
+    24 * 3600
+}
+fn default_docker_sweep_interval_seconds() -> u64 {
+    300
+}
+
 fn default_nuget_max_entries() -> usize {
-    forge_nuget::model::NupkgLimits::default().max_entries
+    forge_format_nuget::NupkgLimits::default().max_entries
 }
 fn default_nuget_max_central_directory_bytes() -> u64 {
-    forge_nuget::model::NupkgLimits::default().max_central_directory_bytes
+    forge_format_nuget::NupkgLimits::default().max_central_directory_bytes
 }
 fn default_nuget_max_total_uncompressed_bytes() -> u64 {
-    forge_nuget::model::NupkgLimits::default().max_total_uncompressed
+    forge_format_nuget::NupkgLimits::default().max_total_uncompressed
 }
 fn default_nuget_max_nuspec_bytes() -> u64 {
-    forge_nuget::model::NupkgLimits::default().max_nuspec_bytes
+    forge_format_nuget::NupkgLimits::default().max_nuspec_bytes
 }
 fn default_nuget_max_nuspec_compression_ratio() -> u64 {
-    forge_nuget::model::NupkgLimits::default().max_nuspec_compression_ratio
+    forge_format_nuget::NupkgLimits::default().max_nuspec_compression_ratio
+}
+
+/// `plugins.*` — WebAssembly format plugins.
+///
+/// The format plugins built into the server (Helm) are always installed.
+/// Further ones are WebAssembly components, each listed explicitly with the
+/// SHA-256 of its component: a directory under `dir` that is not listed is
+/// never loaded, and a listed one whose component does not match its pin, or
+/// whose id is taken by a built-in format, fails startup. Every instance must
+/// therefore load the same plugins (the same configuration and files), since
+/// a repository of a format an instance lacks is unavailable there.
+///
+/// ```toml
+/// [plugins]
+/// dir = "/etc/forge/plugins"     # holds <id>/plugin.toml + its component
+///
+/// [plugins.formats]
+/// example = "sha256:3f1c…"       # format id → pinned component digest
+/// ```
+///
+/// As environment variables: `FORGE_PLUGINS__DIR`,
+/// `FORGE_PLUGINS__FORMATS__EXAMPLE`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsConfig {
+    /// Directory with one subdirectory per plugin, named by its format id.
+    #[serde(default)]
+    pub dir: Option<std::path::PathBuf>,
+    /// The plugins to load: format id → SHA-256 of its component (lowercase
+    /// hex, optionally prefixed `sha256:`).
+    #[serde(default)]
+    pub formats: std::collections::BTreeMap<String, String>,
+}
+
+impl PluginsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.formats.is_empty() {
+            return Ok(());
+        }
+        if self.dir.is_none() {
+            return Err(ConfigError::Invalid(
+                "plugins.formats lists plugins but plugins.dir is not set".into(),
+            ));
+        }
+        for (id, sha256) in &self.formats {
+            forge_plugin::manifest::validate_id(id)
+                .map_err(|e| ConfigError::Invalid(format!("plugins.formats.{id}: {e}")))?;
+            let hex = sha256.trim();
+            let hex = hex.strip_prefix("sha256:").unwrap_or(hex);
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(ConfigError::Invalid(format!(
+                    "plugins.formats.{id} must be the component's SHA-256 (64 hex digits)"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `web.*` — static SPA serving.
@@ -1078,20 +1595,26 @@ fn default_web_assets_dir() -> String {
     "web/dist".into()
 }
 
-/// `oidc.*` — OpenID Connect / Microsoft Entra interactive login (slice 12.2).
+/// `oidc.*` — OpenID Connect / Microsoft Entra interactive login.
 ///
-/// The whole `[oidc]` section is **optional**: when it is absent the feature is
-/// off and the server mounts no `/auth/oidc/*` routes. When present, it
-/// configures the authorization-code + PKCE flow against a single OIDC provider
-/// (Entra-first, but generic OIDC). All ephemeral flow state and sessions live
-/// in Postgres (`oidc_flow` / `session`), never in process memory, so any
-/// instance can complete a callback another instance started.
+/// The whole `[oidc]` section is **optional**. Like `[auth.upstream_basic]` it
+/// is a **seed** (see [`AuthConfig::upstream_basic`]): when present and
+/// enabled, it is imported into an `oidc` auth realm, which configures the
+/// authorization-code + PKCE flow against a single OIDC provider (Entra-first,
+/// but generic OIDC). All ephemeral flow state and sessions live in Postgres
+/// (`oidc_flow` / `session`), never in process memory, so any instance can
+/// complete a callback another instance started.
 ///
 /// `client_secret` is read from env/file and **redacted** from the `Debug`
-/// impl (and must be redacted from any admin API that echoes config), mirroring
-/// the slice-1 proxy `upstream_password` treatment. Encrypting it at rest is
-/// slice 12.5.
+/// impl (and must be redacted from any admin API that echoes config), like
+/// the proxy `upstream_password`; once seeded into a realm it is encrypted at
+/// rest when `[crypto]` is enabled.
+///
+/// Unknown keys are refused, like in a realm config set through the admin
+/// API: a misspelled `required_claims` or `auto_provision` would otherwise
+/// seed the realm with that gate turned off.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// Master switch. When `false`, the section parses but the feature stays off
     /// (lets an operator keep the block while disabling login).
@@ -1103,8 +1626,19 @@ pub struct OidcConfig {
     pub issuer: String,
     /// OAuth client (application) id.
     pub client_id: String,
-    /// OAuth client secret. **Redacted** from `Debug`/API output.
+    /// OAuth client secret. **Redacted** from `Debug`/API output. Required
+    /// with `client_authentication = "client_secret"` (the default), unused
+    /// with `"federated_credential"`.
+    #[serde(default)]
     pub client_secret: String,
+    /// How forge authenticates at the IdP's token endpoint (see
+    /// [`ClientAuthentication`]).
+    #[serde(default)]
+    pub client_authentication: ClientAuthentication,
+    /// `aud` of forge's client assertions with `"federated_credential"`.
+    /// Unset: Entra's `api://AzureADTokenExchange`.
+    #[serde(default)]
+    pub assertion_audience: Option<String>,
     /// Absolute redirect URL registered with the IdP; must equal
     /// `{public_base_url}/auth/oidc/callback` (host is validated against
     /// `server.public_base_url`).
@@ -1118,9 +1652,9 @@ pub struct OidcConfig {
     pub clock_skew_seconds: u64,
     /// Permit a plain-`http` issuer URL. Off by default — a production issuer
     /// must be `https`. Set `true` only for a self-hosted/dev IdP without TLS
-    /// (this is what the integration tests' in-process mock IdP uses). Since
-    /// 12.7 §3.6 dropped the private-range SSRF restriction, this flag no
-    /// longer affects which *addresses* are reachable — only the scheme rule.
+    /// (this is what the integration tests' in-process mock IdP uses). The
+    /// flag governs only the scheme rule: private and loopback *addresses* are
+    /// reachable either way.
     #[serde(default)]
     pub allow_private_issuer: bool,
 
@@ -1163,15 +1697,42 @@ pub struct OidcConfig {
     /// tenant, `hd` for a Google Workspace domain, `groups`). Empty ⇒ off.
     #[serde(default)]
     pub required_claims: std::collections::BTreeMap<String, Vec<String>>,
+    /// Hosts besides the issuer's that the discovery document's token, JWKS
+    /// and authorization endpoints may use, for IdPs that serve them elsewhere
+    /// (Google: `oauth2.googleapis.com`, `www.googleapis.com`). Empty ⇒ the
+    /// issuer's host only.
+    #[serde(default)]
+    pub endpoint_hosts: Vec<String>,
 
-    // ---- session lifecycle ----
-    /// Idle timeout (seconds): a session expires this long after its last use.
-    #[serde(default = "default_session_idle_ttl")]
-    pub session_idle_ttl_seconds: u64,
-    /// Absolute lifetime (seconds): a session expires this long after creation
-    /// regardless of activity.
-    #[serde(default = "default_session_absolute_ttl")]
-    pub session_absolute_ttl_seconds: u64,
+    /// The session lifetimes this block once set, kept only to refuse them
+    /// with a message naming their new place (they are auth settings now,
+    /// [`crate::auth::AuthSettings`]); as unknown keys they would be refused
+    /// without one.
+    #[serde(default, rename = "session_idle_ttl_seconds")]
+    pub(crate) removed_session_idle_ttl_seconds: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "session_absolute_ttl_seconds")]
+    pub(crate) removed_session_absolute_ttl_seconds: Option<serde::de::IgnoredAny>,
+}
+
+/// How an OIDC client authenticates at the IdP's token endpoint (an `oidc`
+/// realm's `client_authentication`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthentication {
+    /// The client secret the IdP issued (`client_secret`).
+    #[default]
+    ClientSecret,
+    /// A client assertion forge signs itself as an OIDC issuer (its public
+    /// base URL, publishing `/.well-known/openid-configuration` and a JWKS):
+    /// a Microsoft Entra federated identity credential. No secret is stored.
+    FederatedCredential,
+}
+
+impl ClientAuthentication {
+    /// Whether this is the default, [`ClientAuthentication::ClientSecret`].
+    pub fn is_client_secret(&self) -> bool {
+        *self == ClientAuthentication::ClientSecret
+    }
 }
 
 /// Manual `Debug` that **redacts `client_secret`** so it never lands in logs.
@@ -1182,6 +1743,8 @@ impl std::fmt::Debug for OidcConfig {
             .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
+            .field("client_authentication", &self.client_authentication)
+            .field("assertion_audience", &self.assertion_audience)
             .field("redirect_url", &self.redirect_url)
             .field("scopes", &self.scopes)
             .field("clock_skew_seconds", &self.clock_skew_seconds)
@@ -1193,24 +1756,12 @@ impl std::fmt::Debug for OidcConfig {
             .field("link_existing_by_username", &self.link_existing_by_username)
             .field("admin_groups", &self.admin_groups)
             .field("admin_claim", &self.admin_claim)
-            .field("session_idle_ttl_seconds", &self.session_idle_ttl_seconds)
-            .field(
-                "session_absolute_ttl_seconds",
-                &self.session_absolute_ttl_seconds,
-            )
+            .field("endpoint_hosts", &self.endpoint_hosts)
             .finish()
     }
 }
 
 impl OidcConfig {
-    /// Idle timeout as a [`Duration`].
-    pub fn session_idle_ttl(&self) -> Duration {
-        Duration::from_secs(self.session_idle_ttl_seconds)
-    }
-    /// Absolute lifetime as a [`Duration`].
-    pub fn session_absolute_ttl(&self) -> Duration {
-        Duration::from_secs(self.session_absolute_ttl_seconds)
-    }
     /// Clock-skew leeway as a [`Duration`].
     pub fn clock_skew(&self) -> Duration {
         Duration::from_secs(self.clock_skew_seconds)
@@ -1244,14 +1795,8 @@ fn default_display_name_claim() -> String {
 fn default_admin_claim() -> String {
     "roles".into()
 }
-fn default_session_idle_ttl() -> u64 {
-    8 * 60 * 60 // 8h
-}
-fn default_session_absolute_ttl() -> u64 {
-    7 * 24 * 60 * 60 // 7d
-}
 
-/// `crypto.*` — secret encryption at rest (slice 12.5).
+/// `crypto.*` — secret encryption at rest.
 ///
 /// No field here is itself a secret: the **env provider** stores the *name* of
 /// the environment variable holding the base64 root key and the **file
@@ -1277,13 +1822,6 @@ pub struct CryptoConfig {
     /// Rotation worker tuning.
     #[serde(default)]
     pub rotation: CryptoRotationConfig,
-    /// Also open secrets sealed by pre-release builds, which were bound to
-    /// their row but not to where they are sent, and re-seal them for their
-    /// destination at startup. Turn it on for one start after upgrading such
-    /// an installation, then off again: while on, someone who can write to
-    /// the database can replay such a blob into a repointed row.
-    #[serde(default)]
-    pub accept_row_bound_secrets: bool,
 }
 
 /// `crypto.root.*` — the root-key provider.
@@ -1297,7 +1835,8 @@ pub struct CryptoRootConfig {
     pub root_key_env: String,
     /// env provider: optional env var holding the **previous** root key,
     /// reachable during a root-rotation window (until the KEK re-wrap sweep
-    /// completes; see the rotation runbook in the plan).
+    /// completes; see "Rotating the root key on a running cluster" in
+    /// `docs/deployment.md`).
     #[serde(default)]
     pub root_key_env_previous: Option<String>,
     /// file provider: path of the file holding the base64 32-byte root key
@@ -1309,7 +1848,7 @@ pub struct CryptoRootConfig {
     pub root_key_path_previous: Option<String>,
 }
 
-/// `crypto.cache.*` — the bounded, zeroizing L1 of unwrapped keys (§2.6).
+/// `crypto.cache.*` — the bounded, zeroizing L1 of unwrapped keys.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CryptoCacheConfig {
     /// TTL (seconds) of unwrapped key bytes in RAM. Bounds both root-provider
@@ -1373,6 +1912,16 @@ impl CryptoConfig {
     }
 }
 
+/// Refuse a duration setting above [`MAX_DURATION_SECONDS`], naming the key.
+fn at_most_100_years(key: &str, seconds: i128) -> Result<(), ConfigError> {
+    if seconds > i128::from(MAX_DURATION_SECONDS) {
+        return Err(ConfigError::Invalid(format!(
+            "{key} must be at most {MAX_DURATION_SECONDS} (100 years), got {seconds}"
+        )));
+    }
+    Ok(())
+}
+
 fn default_crypto_algorithm() -> String {
     "aes-256-gcm".into()
 }
@@ -1406,9 +1955,6 @@ fn default_true() -> bool {
 }
 fn default_multipart_threshold() -> u64 {
     8 * 1024 * 1024
-}
-fn default_anonymous_mode() -> String {
-    "off".into()
 }
 fn default_l1_capacity() -> u64 {
     10_000
@@ -1454,6 +2000,7 @@ pub const SECRET_KEYS: &[&str] = &[
     "auth.bootstrap_admin.password",
     "auth.upstream_basic.cache.key_pepper",
     "oidc.client_secret",
+    "docker.token_secret",
 ];
 
 /// Whether an error at config key `path` must not echo its value: one of
@@ -1545,6 +2092,23 @@ fn normalize_secret_env(value: &str) -> String {
         .to_string()
 }
 
+/// Whether a secret is still a `<…>` placeholder of an example env file
+/// (`<initial admin password>`, `<secret key>`), copied without filling it in.
+fn is_placeholder(value: &str) -> bool {
+    let value = value.trim();
+    value.len() > 2 && value.starts_with('<') && value.ends_with('>')
+}
+
+/// [`is_placeholder`] for the password of a connection URL, as the example
+/// env files write it (`postgres://forge:<password>@host/forge`).
+fn url_password_is_placeholder(url: &str) -> bool {
+    url.split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .and_then(|authority| authority.rsplit_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .is_some_and(|(_, password)| is_placeholder(password))
+}
+
 /// Configuration load / validation errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -1607,7 +2171,18 @@ impl Config {
     ///   is configured purely through env, and removing the password after
     ///   the first start is the documented flow);
     /// * a blank `redis.url` (e.g. `FORGE_REDIS__URL=`) means no Redis.
+    ///
+    /// It also trims `server.public_base_url` and lowercases its scheme:
+    /// session cookies are `Secure` and HSTS is sent when it starts with
+    /// `https://`, and `HTTPS://host` or ` https://host` (which validation
+    /// accepts) must not turn them off.
     fn normalize(&mut self) {
+        self.s3.normalize();
+        let base = self.server.public_base_url.trim();
+        self.server.public_base_url = match base.split_once("://") {
+            Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
+            None => base.to_string(),
+        };
         if self
             .auth
             .bootstrap_admin
@@ -1621,8 +2196,12 @@ impl Config {
             self.auth.bootstrap_admin = None;
         }
         // The account is stored and looked up by its canonical username;
-        // `validate` reports a name that has none.
+        // `validate` reports a name that has none. A blank name is the
+        // default.
         if let Some(ba) = self.auth.bootstrap_admin.as_mut() {
+            if ba.username.trim().is_empty() {
+                ba.username = default_bootstrap_username();
+            }
             if let Ok(canonical) = forge_core::auth::canonical_username(&ba.username) {
                 ba.username = canonical;
             }
@@ -1635,57 +2214,215 @@ impl Config {
         {
             self.redis.url = None;
         }
+        // `FORGE_BLOB_CACHE__PATH=` turns the blob cache off.
+        if self
+            .blob_cache
+            .path
+            .as_deref()
+            .is_some_and(|p| p.as_os_str().to_string_lossy().trim().is_empty())
+        {
+            self.blob_cache.path = None;
+        }
     }
 
     /// Validate cross-cutting invariants that serde cannot express.
     fn validate(&self) -> Result<(), ConfigError> {
         self.server.bind_addr()?;
-        // Eagerly validate the anon policy + trusted CIDRs so a bad value fails
-        // at startup rather than mid-request.
-        self.anon_policy()?;
+        self.validate_public_base_url()?;
+        // The DNS-rebinding guard's host list, checked before migrations run
+        // rather than when the router is built.
+        crate::middleware::principal::allowed_hosts(
+            &self.public_base_url(),
+            &self.server.allowed_hosts,
+        )
+        .map_err(|e| ConfigError::Invalid(format!("server.allowed_hosts: {e}")))?;
+        self.validate_removed_auth_keys()?;
+        // Eagerly validate the trusted CIDRs so a bad value fails at startup
+        // rather than mid-request.
         self.trusted_proxy_cidrs()?;
         self.validate_oidc()?;
         self.validate_auth_providers()?;
         if let Some(ba) = &self.auth.bootstrap_admin {
-            forge_core::auth::canonical_username(&ba.username)
-                .map_err(|e| ConfigError::Invalid(format!("auth.bootstrap_admin.username: {e}")))?;
+            // A local password account: a UPN, like every account's, that a
+            // password login accepts (no `:`), and not a reserved protocol
+            // name.
+            forge_core::auth::canonical_account_username(&ba.username, true).map_err(|e| {
+                ConfigError::Invalid(match e {
+                    forge_core::auth::InvalidUsername::Reserved => format!(
+                        "auth.bootstrap_admin.username: {:?} is reserved for workload identity",
+                        ba.username.trim()
+                    ),
+                    forge_core::auth::InvalidUsername::NotUpn => format!(
+                        "auth.bootstrap_admin.username: {:?} is not a UPN: every account is \
+                         named by one, such as admin@example.com",
+                        ba.username.trim(),
+                    ),
+                    e => format!("auth.bootstrap_admin.username: {e}"),
+                })
+            })?;
         }
-        match self.auth.login_mode.as_str() {
-            "identifier_first" | "combined" => {}
-            other => {
-                return Err(ConfigError::Invalid(format!(
-                    "unknown auth.login_mode {other:?} (expected identifier_first|combined)"
-                )))
-            }
-        }
+        self.s3.validate()?;
         self.validate_crypto()?;
         self.proxy.validate()?;
         self.nuget.validate()?;
+        self.plugins.validate()?;
+        self.docker.validate()?;
         self.validate_workers()?;
         self.validate_insecure_defaults()?;
-        if self.server.max_upload_bytes == 0 {
+        if self.server.removed_max_upload_bytes.is_some() {
             return Err(ConfigError::Invalid(
-                "server.max_upload_bytes must be greater than 0".into(),
+                "server.max_upload_bytes was removed: set each repository's upload limit \
+                 instead (Maximum upload size in the web UI, max_upload_bytes in the admin \
+                 API), then remove the setting. A package repository without a limit of its \
+                 own accepts pushes of 512 MiB"
+                    .into(),
+            ));
+        }
+        if self.blob_cache.path.is_some()
+            && self.blob_cache.max_bytes == BlobCacheMaxBytes::Bytes(0)
+        {
+            return Err(ConfigError::Invalid(
+                "blob_cache.max_bytes must be greater than 0 (or \"auto\"); unset \
+                 blob_cache.path to turn the cache off"
+                    .into(),
             ));
         }
         if let Some(budget) = self.staging_budget() {
             let needed = self.largest_staged_set();
             if budget < needed {
+                let (item, setting) = self.largest_staged_item_and_setting();
                 return Err(ConfigError::Invalid(format!(
-                    "server.max_staging_bytes ({budget}) must be at least the larger of \
-                     server.max_upload_bytes and proxy.max_package_bytes plus \
-                     nuget.max_nuspec_bytes ({needed}), or 0 for no limit"
+                    "server.max_staging_bytes ({budget}) must be at least {setting} ({item}) \
+                     plus nuget.max_nuspec_bytes ({}), {needed} in all: raise it, lower \
+                     {setting}, or set it to 0 for no limit",
+                    self.nuget.max_nuspec_bytes
                 )));
             }
         }
         Ok(())
     }
 
-    /// The largest single item staged in the temp directory.
+    /// The largest single item staged in the temp directory by default: a
+    /// push under the default upload limits, or a proxy download of a
+    /// package or an image blob. (A repository's own upload limit may be
+    /// larger, up to [`Self::max_repository_upload_bytes`].)
     fn largest_staged_item(&self) -> u64 {
-        self.server
-            .max_upload_bytes
-            .max(self.proxy.max_package_bytes)
+        self.largest_staged_item_and_setting().0
+    }
+
+    /// [`Self::largest_staged_item`], and the setting that decides it. The
+    /// docker defaults fit an explicit staging budget by construction
+    /// ([`Self::docker_default`]), so only settings an operator can change
+    /// decide it then.
+    fn largest_staged_item_and_setting(&self) -> (u64, &'static str) {
+        [
+            (
+                self.default_upload_limit(forge_db::model::NUGET_FORMAT),
+                "the default upload limit of package repositories",
+            ),
+            (self.proxy.max_package_bytes, "proxy.max_package_bytes"),
+            (
+                self.default_upload_limit(forge_db::model::DOCKER_FORMAT),
+                "the default upload limit of docker repositories",
+            ),
+            (self.docker_max_blob_bytes(), "docker.max_blob_bytes"),
+        ]
+        .into_iter()
+        .fold(
+            (0, ""),
+            |largest, item| {
+                if item.0 > largest.0 {
+                    item
+                } else {
+                    largest
+                }
+            },
+        )
+    }
+
+    /// A docker default (`default` bytes): with an explicit staging budget
+    /// smaller than it, what fits the budget (less `nuget.max_nuspec_bytes`,
+    /// like a repository's own limit). An operator who sizes the budget
+    /// below the docker defaults gets smaller defaults rather than a refusal
+    /// to start; [`Self::deployment_warnings`] says so.
+    fn docker_default(&self, default: u64) -> u64 {
+        match self.server.max_staging_bytes {
+            Some(budget) if budget > 0 => {
+                default.min(budget.saturating_sub(self.nuget.max_nuspec_bytes))
+            }
+            _ => default,
+        }
+    }
+
+    /// The largest blob a docker proxy downloads: `docker.max_blob_bytes`,
+    /// else [`DEFAULT_DOCKER_MAX_BLOB_BYTES`] as far as an explicit staging
+    /// budget allows ([`Self::docker_default`]).
+    pub fn docker_max_blob_bytes(&self) -> u64 {
+        self.docker
+            .max_blob_bytes
+            .unwrap_or_else(|| self.docker_default(DEFAULT_DOCKER_MAX_BLOB_BYTES))
+    }
+
+    /// The upload limit of a hosted repository of `format` without one of
+    /// its own: for docker [`DEFAULT_DOCKER_MAX_UPLOAD_BYTES`] per blob (as
+    /// far as an explicit staging budget allows, [`Self::docker_default`]),
+    /// for a package format [`DEFAULT_MAX_UPLOAD_BYTES`].
+    pub fn default_upload_limit(&self, format: &str) -> u64 {
+        if format == forge_db::model::DOCKER_FORMAT {
+            self.docker_default(DEFAULT_DOCKER_MAX_UPLOAD_BYTES)
+        } else {
+            DEFAULT_MAX_UPLOAD_BYTES
+        }
+    }
+
+    /// The largest upload limit a repository may be given: what a push can
+    /// stage, the staging budget less the manifest staged with the package.
+    /// `None` without a staging budget (`server.max_staging_bytes = 0`).
+    pub fn max_repository_upload_bytes(&self) -> Option<u64> {
+        self.staging_budget()
+            .map(|budget| budget.saturating_sub(self.nuget.max_nuspec_bytes))
+    }
+
+    /// Refuse the access and sign-in policy keys that moved to the database
+    /// ([`REMOVED_AUTH_KEYS`], and the session lifetimes `[oidc]` once set),
+    /// naming where they are set now.
+    fn validate_removed_auth_keys(&self) -> Result<(), ConfigError> {
+        let mut keys: Vec<String> = self
+            .auth
+            .removed_keys()
+            .into_iter()
+            .map(|key| format!("auth.{key}"))
+            .collect();
+        if let Some(oidc) = &self.oidc {
+            for (set, key) in [
+                (
+                    oidc.removed_session_idle_ttl_seconds.is_some(),
+                    "session_idle_ttl_seconds",
+                ),
+                (
+                    oidc.removed_session_absolute_ttl_seconds.is_some(),
+                    "session_absolute_ttl_seconds",
+                ),
+            ] {
+                if set {
+                    keys.push(format!("oidc.{key}"));
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "{} {} removed: anonymous access, the login mode, password Basic \
+             authentication, the session lifetimes and the login lockout are set in the \
+             web UI (Admin → Settings) or through /admin/settings/auth, for every \
+             instance at once. Remove {} from the configuration (FORGE_AUTH__* and \
+             FORGE_OIDC__* variables included); an install starts with anonymous access \
+             off and password Basic authentication off",
+            keys.join(", "),
+            if keys.len() == 1 { "was" } else { "were" },
+            if keys.len() == 1 { "it" } else { "them" },
+        )))
     }
 
     /// What one push or download stages at once at most: the package, and
@@ -1702,6 +2439,23 @@ impl Config {
             .staging_dir
             .clone()
             .unwrap_or_else(forge_storage::Staging::default_dir)
+    }
+
+    /// The local blob cache's configuration, `None` when it is off
+    /// (`blob_cache.path` unset).
+    pub fn blob_cache(&self) -> Option<forge_storage::BlobCacheConfig> {
+        let path = self.blob_cache.path.clone()?;
+        Some(forge_storage::BlobCacheConfig {
+            path,
+            max_bytes: match self.blob_cache.max_bytes {
+                BlobCacheMaxBytes::Auto => forge_storage::CacheLimit::Auto,
+                BlobCacheMaxBytes::Bytes(bytes) => forge_storage::CacheLimit::Bytes(bytes),
+            },
+            min_free_bytes: self.blob_cache.min_free_bytes,
+            staging: self
+                .staging_budget()
+                .map(|budget| (self.staging_dir(), budget)),
+        })
     }
 
     /// The temp-space budget for staging, or `None` for no limit
@@ -1750,6 +2504,16 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "retention.default_run_interval_seconds must not be negative".into(),
             ));
+        }
+        for (key, seconds) in [
+            ("outbox.grace_seconds", self.outbox.grace_seconds),
+            (
+                "retention.default_run_interval_seconds",
+                self.retention.default_run_interval_seconds,
+            ),
+            ("retention.lease_seconds", self.retention.lease_seconds),
+        ] {
+            at_most_100_years(key, i128::from(seconds))?;
         }
         positive(
             "groups.max_nesting_depth",
@@ -1808,23 +2572,106 @@ impl Config {
                     .to_string(),
             );
         }
+        let plain_sts = self.s3.credentials == S3CredentialsMode::WebIdentity
+            && self
+                .s3
+                .web_identity
+                .as_ref()
+                .and_then(|wi| wi.sts_endpoint.as_deref())
+                .is_some_and(|endpoint| {
+                    endpoint.trim().to_ascii_lowercase().starts_with("http://")
+                });
+        if plain_sts {
+            warnings.push(
+                "s3.web_identity.sts_endpoint is plain http: the service-account token and the \
+                 temporary S3 keys STS returns cross the network in clear text; use https"
+                    .to_string(),
+            );
+        }
+        let docker_push = self.default_upload_limit(forge_db::model::DOCKER_FORMAT);
+        if docker_push < DEFAULT_DOCKER_MAX_UPLOAD_BYTES
+            || (self.docker.max_blob_bytes.is_none()
+                && self.docker_max_blob_bytes() < DEFAULT_DOCKER_MAX_BLOB_BYTES)
+        {
+            warnings.push(format!(
+                "server.max_staging_bytes ({}) leaves no room for the 1 GiB docker defaults: \
+                 docker repositories without an upload limit of their own accept layers up \
+                 to {docker_push} bytes, and docker proxies download blobs up to {} bytes; \
+                 raise server.max_staging_bytes for larger layers",
+                self.server.max_staging_bytes.unwrap_or_default(),
+                self.docker_max_blob_bytes()
+            ));
+        }
         warnings
     }
 
     /// Refuse known-insecure placeholder credentials unless
     /// `server.allow_insecure_defaults` opts in (dev/compose only): a
-    /// `changeme` bootstrap-admin password, or `minioadmin` S3 keys. (A blank
+    /// `changeme` bootstrap-admin password, `minioadmin` S3 keys, or a secret
+    /// still holding a `<…>` placeholder of the example env files
+    /// (`<initial admin password>`, `postgres://forge:<password>@…`). (A blank
     /// bootstrap password is not a placeholder: it means "no bootstrap admin",
     /// see [`Self::normalize`].)
     fn validate_insecure_defaults(&self) -> Result<(), ConfigError> {
-        let mut found = Vec::new();
+        let mut found: Vec<String> = Vec::new();
         if let Some(ba) = &self.auth.bootstrap_admin {
             if ba.password.trim().eq_ignore_ascii_case("changeme") {
-                found.push("auth.bootstrap_admin.password is the \"changeme\" placeholder");
+                found.push("auth.bootstrap_admin.password is the \"changeme\" placeholder".into());
             }
         }
-        if self.s3.access_key == "minioadmin" || self.s3.secret_key == "minioadmin" {
-            found.push("s3.access_key/secret_key are the \"minioadmin\" defaults");
+        // Only static keys can be placeholders (the other modes have none).
+        let static_keys = self.s3.credentials == S3CredentialsMode::Static;
+        let s3_key = |key: &Option<String>, check: fn(&str) -> bool| {
+            static_keys && key.as_deref().is_some_and(check)
+        };
+        if s3_key(&self.s3.access_key, |k| k == "minioadmin")
+            || s3_key(&self.s3.secret_key, |k| k == "minioadmin")
+        {
+            found.push("s3.access_key/secret_key are the \"minioadmin\" defaults".into());
+        }
+        let unedited: Vec<&str> = [
+            (
+                "auth.bootstrap_admin.password",
+                self.auth
+                    .bootstrap_admin
+                    .as_ref()
+                    .is_some_and(|ba| is_placeholder(&ba.password)),
+            ),
+            ("s3.access_key", s3_key(&self.s3.access_key, is_placeholder)),
+            ("s3.secret_key", s3_key(&self.s3.secret_key, is_placeholder)),
+            (
+                "the database.url password",
+                url_password_is_placeholder(&self.database.url),
+            ),
+            (
+                "the redis.url password",
+                self.redis
+                    .url
+                    .as_deref()
+                    .is_some_and(url_password_is_placeholder),
+            ),
+            (
+                "auth.upstream_basic.cache.key_pepper",
+                self.auth
+                    .upstream_basic
+                    .as_ref()
+                    .is_some_and(|ub| is_placeholder(&ub.cache.key_pepper)),
+            ),
+            (
+                "oidc.client_secret",
+                self.oidc
+                    .as_ref()
+                    .is_some_and(|o| is_placeholder(&o.client_secret)),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(key, hit)| hit.then_some(key))
+        .collect();
+        if !unedited.is_empty() {
+            found.push(format!(
+                "{} still hold a \"<…>\" placeholder of an example file",
+                unedited.join(", ")
+            ));
         }
         if found.is_empty() {
             return Ok(());
@@ -1844,18 +2691,40 @@ impl Config {
         )))
     }
 
-    /// Validate the optional `[crypto]` section when present and enabled
-    /// (slice 12.5): the algorithm name must parse and the root provider must
-    /// be a supported kind with the fields it needs. The root key **bytes**
-    /// are deliberately not read here — that happens once at startup when the
-    /// provider is built, so a missing/short key still refuses to boot, just
-    /// with the more precise root-provider error.
+    /// Validate the optional `[crypto]` section when present and enabled: the
+    /// algorithm name must parse and the root provider must be a supported
+    /// kind with the fields it needs. The root key **bytes** are deliberately
+    /// not read here — that happens once at startup when the provider is
+    /// built, so a missing/short key still refuses to boot, just with the more
+    /// precise root-provider error.
     fn validate_crypto(&self) -> Result<(), ConfigError> {
         let Some(crypto) = &self.crypto else {
             return Ok(());
         };
         if !crypto.enabled {
             return Ok(());
+        }
+
+        at_most_100_years(
+            "crypto.cache.unwrapped_key_ttl_secs",
+            i128::from(crypto.cache.unwrapped_key_ttl_secs),
+        )?;
+        for (key, days) in [
+            (
+                "crypto.rotation.dek_max_age_days",
+                crypto.rotation.dek_max_age_days,
+            ),
+            (
+                "crypto.rotation.kek_max_age_days",
+                crypto.rotation.kek_max_age_days,
+            ),
+        ] {
+            if i128::from(days) * 86_400 > i128::from(MAX_DURATION_SECONDS) {
+                return Err(ConfigError::Invalid(format!(
+                    "{key} must be at most {} (100 years), got {days}",
+                    MAX_DURATION_SECONDS / 86_400
+                )));
+            }
         }
 
         forge_crypto::Algorithm::parse(&crypto.algorithm).map_err(|_| {
@@ -1903,9 +2772,9 @@ impl Config {
         Ok(())
     }
 
-    /// Validate the slice-12.3 provider chain + `[auth.upstream_basic]` block.
+    /// Validate the provider chain + `[auth.upstream_basic]` block.
     ///
-    /// Checks (plan §2.3 startup validation):
+    /// Checks:
     /// * every `auth.providers` id is known (`local-password` / `upstream-basic`)
     ///   and not duplicated;
     /// * if `upstream-basic` is in the chain, `[auth.upstream_basic]` is present
@@ -1988,11 +2857,13 @@ impl Config {
 
     /// Validate the optional `[oidc]` section when present and enabled.
     ///
-    /// Checks (per plan §3.5/§4 Phase 0): issuer is a non-empty `https` URL,
-    /// `client_id`/`client_secret`/`redirect_url` are non-empty, and the
-    /// `redirect_url` shares scheme+host (+port) with `server.public_base_url`
-    /// and ends in the canonical `/auth/oidc/callback` path. A disabled section
-    /// is not validated (an operator may keep an incomplete block while off).
+    /// Checks: issuer is a non-empty `https` URL (plain `http` only with
+    /// `allow_private_issuer`), `client_id`/`redirect_url` are non-empty, so is
+    /// `client_secret` unless the client authenticates with a federated
+    /// credential, and the `redirect_url` shares scheme+host (+port) with
+    /// `server.public_base_url` and ends in the canonical `/auth/oidc/callback`
+    /// path. A disabled section is not validated (an operator may keep an
+    /// incomplete block while off).
     fn validate_oidc(&self) -> Result<(), ConfigError> {
         let Some(oidc) = &self.oidc else {
             return Ok(());
@@ -2007,8 +2878,7 @@ impl Config {
         // The issuer must be https — except when `allow_private_issuer` is set,
         // which signals a trusted IdP on a private/dev network (e.g. a
         // self-hosted Keycloak or the in-process test IdP) where plain http is
-        // acceptable. This mirrors the relaxed SSRF posture that flag also
-        // enables, so the two knobs move together.
+        // acceptable.
         if issuer.scheme() != "https" && !(oidc.allow_private_issuer && issuer.scheme() == "http") {
             return Err(ConfigError::Invalid(format!(
                 "oidc.issuer must be https, got {:?}",
@@ -2020,9 +2890,9 @@ impl Config {
                 "oidc.client_id must not be empty".into(),
             ));
         }
-        if oidc.client_secret.trim().is_empty() {
+        if oidc.client_authentication.is_client_secret() && oidc.client_secret.trim().is_empty() {
             return Err(ConfigError::Invalid(
-                "oidc.client_secret must not be empty".into(),
+                "oidc.client_secret must not be empty (or set oidc.client_authentication = \"federated_credential\")".into(),
             ));
         }
 
@@ -2053,20 +2923,9 @@ impl Config {
                 redirect.path()
             )));
         }
+        crate::auth::normalize_endpoint_hosts(&oidc.endpoint_hosts)
+            .map_err(|e| ConfigError::Invalid(format!("oidc.{e}")))?;
         Ok(())
-    }
-
-    /// Build the [`AnonPolicy`] from `auth.anonymous_mode` + allowlist tokens.
-    pub fn anon_policy(&self) -> Result<AnonPolicy, ConfigError> {
-        match self.auth.anonymous_mode.to_ascii_lowercase().as_str() {
-            "off" => Ok(AnonPolicy::Off),
-            "all" => Ok(AnonPolicy::All),
-            "allowlist" => AnonPolicy::allowlist_from_tokens(&self.auth.anonymous_ip_allowlist)
-                .map_err(|e| ConfigError::Invalid(e.to_string())),
-            other => Err(ConfigError::Invalid(format!(
-                "unknown auth.anonymous_mode {other:?} (expected off|allowlist|all)"
-            ))),
-        }
     }
 
     /// Parse `auth.trusted_proxy_cidrs` into [`IpNet`]s. A bare IP is accepted
@@ -2100,23 +2959,29 @@ impl Config {
         Ok(out)
     }
 
-    /// Resolve the browser-session TTLs `(idle, absolute)` in seconds.
-    ///
-    /// Precedence: explicit `auth.session_*` → legacy `oidc.session_*` (when an
-    /// `[oidc]` block is present — preserves pre-12.7 deployments that tuned
-    /// them there) → defaults (8h idle / 7d absolute).
-    pub fn session_ttls(&self) -> (u64, u64) {
-        let idle = self
-            .auth
-            .session_idle_ttl_seconds
-            .or_else(|| self.oidc.as_ref().map(|o| o.session_idle_ttl_seconds))
-            .unwrap_or_else(default_session_idle_ttl);
-        let absolute = self
-            .auth
-            .session_absolute_ttl_seconds
-            .or_else(|| self.oidc.as_ref().map(|o| o.session_absolute_ttl_seconds))
-            .unwrap_or_else(default_session_absolute_ttl);
-        (idle, absolute)
+    /// `server.public_base_url` must be an absolute http(s) URL with a host
+    /// and without query or fragment: it builds every absolute `@id` in NuGet
+    /// responses, the same-origin and allowlist host checks, and the cookie
+    /// security decision.
+    fn validate_public_base_url(&self) -> Result<(), ConfigError> {
+        let raw = &self.server.public_base_url;
+        let invalid =
+            |why: &str| ConfigError::Invalid(format!("server.public_base_url {raw:?} {why}"));
+        let url = url::Url::parse(raw.trim()).map_err(|e| {
+            invalid(&format!(
+                "is not an absolute URL ({e}), e.g. https://nuget.example.com"
+            ))
+        })?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(invalid("must use http or https"));
+        }
+        if url.host_str().is_none_or(str::is_empty) {
+            return Err(invalid("must name a host"));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(invalid("must not have a query or fragment"));
+        }
+        Ok(())
     }
 
     /// Public base URL with any trailing slash removed.
@@ -2206,7 +3071,7 @@ mod tests {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
         assert_eq!(
             cfg.nuget.limits(),
-            forge_nuget::model::NupkgLimits::default()
+            forge_format_nuget::NupkgLimits::default()
         );
         assert_eq!(cfg.nuget.max_nuspec_bytes, 1024 * 1024);
 
@@ -2232,8 +3097,6 @@ mod tests {
         // Defaults applied.
         assert_eq!(cfg.s3.region, "us-east-1");
         assert!(cfg.s3.force_path_style);
-        assert_eq!(cfg.auth.anonymous_mode, "off");
-        assert!(!cfg.auth.allow_password_basic);
         assert!(cfg.redis.url.is_none());
         assert_eq!(cfg.cache.l1_max_capacity, 10_000);
         assert_eq!(cfg.outbox.batch_size, 100);
@@ -2242,7 +3105,6 @@ mod tests {
         assert_eq!(cfg.retention.poll_interval_seconds, 30);
         assert_eq!(cfg.retention.default_run_interval_seconds, 3600);
         assert_eq!(cfg.retention.lease_seconds, 300);
-        assert!(matches!(cfg.anon_policy().unwrap(), AnonPolicy::Off));
         // Web UI: enabled by default, served from `web/dist`.
         assert!(cfg.web.enabled);
         assert_eq!(cfg.web.assets_dir, "web/dist");
@@ -2267,11 +3129,11 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.create_file("forge.toml", MINIMAL)?;
             jail.set_env("FORGE_SERVER__BIND", "127.0.0.1:9999");
-            jail.set_env("FORGE_AUTH__ALLOW_PASSWORD_BASIC", "true");
+            jail.set_env("FORGE_AUTH__REALM_CACHE_TTL_SECONDS", "3");
             jail.set_env("FORGE_REDIS__URL", "redis://localhost:6379");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
             assert_eq!(cfg.server.bind, "127.0.0.1:9999");
-            assert!(cfg.auth.allow_password_basic);
+            assert_eq!(cfg.auth.realm_cache_ttl_seconds, 3);
             assert_eq!(cfg.redis.url.as_deref(), Some("redis://localhost:6379"));
             Ok(())
         });
@@ -2294,10 +3156,11 @@ mod tests {
             jail.set_env("FORGE_S3__SECRET_KEY", "sk");
             jail.set_env("FORGE_S3__FORCE_PATH_STYLE", "false");
             jail.set_env("FORGE_S3__MULTIPART_THRESHOLD", "1048576");
-            jail.set_env("FORGE_AUTH__ANONYMOUS_MODE", "allowlist");
-            jail.set_env("FORGE_AUTH__ANONYMOUS_IP_ALLOWLIST", "[loopback,private]");
-            jail.set_env("FORGE_AUTH__ALLOW_PASSWORD_BASIC", "true");
-            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", "root");
+            jail.set_env(
+                "FORGE_AUTH__TRUSTED_PROXY_CIDRS",
+                "[10.0.0.0/8,192.168.1.1]",
+            );
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", "root@corp.example");
             jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "s3cret");
             jail.set_env("FORGE_REDIS__URL", "redis://localhost:6379");
             jail.set_env("FORGE_CACHE__L1_MAX_CAPACITY", "42");
@@ -2328,8 +3191,6 @@ mod tests {
             jail.set_env("FORGE_OIDC__LINK_EXISTING_BY_USERNAME", "false");
             jail.set_env("FORGE_OIDC__ADMIN_GROUPS", "[forge-admins]");
             jail.set_env("FORGE_OIDC__ADMIN_CLAIM", "groups");
-            jail.set_env("FORGE_OIDC__SESSION_IDLE_TTL_SECONDS", "3600");
-            jail.set_env("FORGE_OIDC__SESSION_ABSOLUTE_TTL_SECONDS", "86400");
 
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
 
@@ -2337,22 +3198,20 @@ mod tests {
             assert_eq!(cfg.public_base_url(), "https://forge.test");
             assert_eq!(cfg.database.url, "postgres://u:p@db/forge");
             assert_eq!(cfg.s3.endpoint, "http://s3.test:7070");
-            assert_eq!(cfg.s3.access_key, "ak");
-            assert_eq!(cfg.s3.secret_key, "sk");
+            assert_eq!(cfg.s3.access_key.as_deref(), Some("ak"));
+            assert_eq!(cfg.s3.secret_key.as_deref(), Some("sk"));
             assert!(!cfg.s3.force_path_style);
             assert_eq!(cfg.s3.multipart_threshold, 1_048_576);
-            assert_eq!(cfg.auth.anonymous_mode, "allowlist");
             assert_eq!(
-                cfg.auth.anonymous_ip_allowlist,
-                vec!["loopback".to_string(), "private".to_string()]
+                cfg.auth.trusted_proxy_cidrs,
+                vec!["10.0.0.0/8".to_string(), "192.168.1.1".to_string()]
             );
-            assert!(cfg.auth.allow_password_basic);
             let ba = cfg
                 .auth
                 .bootstrap_admin
                 .as_ref()
                 .expect("bootstrap admin set via env");
-            assert_eq!(ba.username, "root");
+            assert_eq!(ba.username, "root@corp.example");
             assert_eq!(ba.password, "s3cret");
             assert_eq!(cfg.redis.url.as_deref(), Some("redis://localhost:6379"));
             assert_eq!(cfg.cache.l1_max_capacity, 42);
@@ -2380,8 +3239,6 @@ mod tests {
             assert!(!oidc.link_existing_by_username);
             assert_eq!(oidc.admin_groups, vec!["forge-admins".to_string()]);
             assert_eq!(oidc.admin_claim, "groups");
-            assert_eq!(oidc.session_idle_ttl_seconds, 3600);
-            assert_eq!(oidc.session_absolute_ttl_seconds, 86400);
             Ok(())
         });
     }
@@ -2412,35 +3269,54 @@ mod tests {
         assert!(err.to_string().contains("server.bind"), "{err}");
     }
 
+    /// The access and sign-in policy is set in the web UI: its old keys are
+    /// refused, naming where they went, whatever their value.
     #[test]
-    fn anonymous_mode_allowlist_parses_tokens() {
-        let toml = r#"
-            [server]
-            bind = "0.0.0.0:8080"
-            public_base_url = "https://x"
-            [database]
-            url = "postgres://x"
-            [s3]
-            endpoint = "http://localhost:7070"
-            bucket = "forge"
-            access_key = "a"
-            secret_key = "b"
-            [auth]
-            anonymous_mode = "allowlist"
-            anonymous_ip_allowlist = ["loopback", "10.0.0.0/8"]
-        "#;
-        let cfg = Config::from_figment(fig_from_toml(toml)).expect("valid");
-        let policy = cfg.anon_policy().unwrap();
-        assert!(policy.allows("127.0.0.1".parse().unwrap()));
-        assert!(policy.allows("10.1.2.3".parse().unwrap()));
-        assert!(!policy.allows("8.8.8.8".parse().unwrap()));
+    fn removed_auth_policy_keys_are_refused() {
+        for key in REMOVED_AUTH_KEYS {
+            let toml = MINIMAL.replace("[auth]", &format!("[auth]\n{key} = 1"));
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("auth.{key} was removed"))
+                    && msg.contains("Admin → Settings")
+                    && msg.contains("/admin/settings/auth"),
+                "{msg}"
+            );
+        }
+        let both = MINIMAL.replace(
+            "[auth]",
+            "[auth]\nanonymous_mode = \"all\"\nallow_password_basic = true",
+        );
+        let err = Config::from_figment(fig_from_toml(&both)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("auth.anonymous_mode, auth.allow_password_basic were removed"),
+            "{err}"
+        );
+        for key in ["session_idle_ttl_seconds", "session_absolute_ttl_seconds"] {
+            let toml = minimal_with_oidc(&format!("{key} = 600\n"));
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("oidc.{key} was removed")),
+                "{err}"
+            );
+        }
     }
 
     #[test]
-    fn unknown_anonymous_mode_rejected() {
-        let toml = MINIMAL.replace("[auth]", "[auth]\nanonymous_mode = \"sometimes\"");
-        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
-        assert!(err.to_string().contains("anonymous_mode"), "{err}");
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn removed_auth_policy_variables_are_refused() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_AUTH__ANONYMOUS_MODE", "off");
+            let err = Config::load(Some(std::path::Path::new("forge.toml"))).unwrap_err();
+            assert!(
+                err.to_string().contains("auth.anonymous_mode was removed"),
+                "{err}"
+            );
+            Ok(())
+        });
     }
 
     #[test]
@@ -2478,6 +3354,293 @@ mod tests {
             assert_eq!(cfg.s3.conditional_writes, mode, "{value}");
             assert_eq!(cfg.s3.to_storage().conditional_writes, storage, "{value}");
         }
+    }
+
+    /// `MINIMAL` with its static keys replaced by `credentials` settings.
+    fn without_s3_keys(credentials: &str) -> String {
+        MINIMAL.replace(
+            "access_key = \"test\"\n        secret_key = \"test\"",
+            credentials,
+        )
+    }
+
+    #[test]
+    fn s3_credentials_default_to_static_keys() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert_eq!(cfg.s3.credentials, S3CredentialsMode::Static);
+        assert_eq!(
+            cfg.s3.to_storage().credentials,
+            forge_storage::S3Credentials::from_keys("test", "test")
+        );
+        // Spelled out, the same.
+        let toml = MINIMAL.replace(
+            "secret_key = \"test\"",
+            "secret_key = \"test\"\ncredentials = \"static\"",
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(cfg.s3.credentials, S3CredentialsMode::Static);
+    }
+
+    #[test]
+    fn s3_static_credentials_need_both_keys() {
+        for keys in ["", "access_key = \"ak\"", "secret_key = \"sk\""] {
+            let err = Config::from_figment(fig_from_toml(&without_s3_keys(keys))).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("s3.access_key and s3.secret_key"), "{msg}");
+            assert!(msg.contains("FORGE_S3__ACCESS_KEY"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn s3_default_chain_needs_no_keys() {
+        let cfg = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"default_chain\"",
+        )))
+        .expect("valid");
+        assert_eq!(cfg.s3.credentials, S3CredentialsMode::DefaultChain);
+        assert_eq!(cfg.s3.access_key, None);
+        assert_eq!(
+            cfg.s3.to_storage().credentials,
+            forge_storage::S3Credentials::DefaultChain
+        );
+    }
+
+    #[test]
+    fn a_plain_http_sts_endpoint_is_warned_about() {
+        let sts = |endpoint: &str| {
+            let toml = without_s3_keys(&format!(
+                "credentials = \"web_identity\"\n[s3.web_identity]\ntoken_file = \"/token\"\n\
+                 sts_endpoint = \"{endpoint}\""
+            ));
+            Config::from_figment(fig_from_toml(&toml))
+                .expect("valid")
+                .deployment_warnings()
+        };
+        let warned = |w: &[String]| w.iter().any(|w| w.contains("sts_endpoint is plain http"));
+        assert!(warned(&sts("http://minio:9000")));
+        assert!(!warned(&sts("https://minio:9000")));
+    }
+
+    #[test]
+    fn docker_durations_are_at_most_100_years() {
+        for key in [
+            "upload_ttl_seconds",
+            "unreferenced_blob_ttl_seconds",
+            "sweep_interval_seconds",
+        ] {
+            let toml = format!("{MINIMAL}\n[docker]\n{key} = {}\n", i64::MAX);
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains(&format!("docker.{key}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn s3_web_identity_from_toml() {
+        let toml = without_s3_keys(
+            r#"credentials = "web_identity"
+        [s3.web_identity]
+        role_arn = "arn:aws:iam::123456789012:role/forge"
+        token_file = "/var/run/secrets/forge/s3/token"
+        sts_endpoint = "https://minio.example.com:9000"
+        session_name = "forge-eu"
+        duration_seconds = 3600"#,
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(cfg.s3.credentials, S3CredentialsMode::WebIdentity);
+        assert_eq!(
+            cfg.s3.to_storage().credentials,
+            forge_storage::S3Credentials::WebIdentity(forge_storage::WebIdentity {
+                role_arn: Some("arn:aws:iam::123456789012:role/forge".into()),
+                token_file: "/var/run/secrets/forge/s3/token".into(),
+                sts_endpoint: Some("https://minio.example.com:9000".into()),
+                session_name: "forge-eu".into(),
+                duration_seconds: Some(3600),
+            })
+        );
+
+        // Only the token file is required: no role (MinIO claim-based
+        // policies), AWS STS, the default session name and lifetime.
+        let toml = without_s3_keys(
+            "credentials = \"web_identity\"\n[s3.web_identity]\ntoken_file = \"/token\"",
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        let wi = cfg.s3.web_identity.as_ref().expect("web_identity");
+        assert_eq!(wi.role_arn, None);
+        assert_eq!(wi.sts_endpoint, None);
+        assert_eq!(wi.session_name, "forge");
+        assert_eq!(wi.duration_seconds, None);
+    }
+
+    #[test]
+    fn s3_web_identity_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", &without_s3_keys(""))?;
+            jail.set_env("FORGE_S3__CREDENTIALS", "web_identity");
+            jail.set_env(
+                "FORGE_S3__WEB_IDENTITY__ROLE_ARN",
+                "arn:aws:iam::123456789012:role/forge",
+            );
+            jail.set_env(
+                "FORGE_S3__WEB_IDENTITY__TOKEN_FILE",
+                "/var/run/secrets/forge/s3/token",
+            );
+            jail.set_env(
+                "FORGE_S3__WEB_IDENTITY__STS_ENDPOINT",
+                "http://minio.forge.svc:9000",
+            );
+            jail.set_env("FORGE_S3__WEB_IDENTITY__SESSION_NAME", "forge-1");
+            jail.set_env("FORGE_S3__WEB_IDENTITY__DURATION_SECONDS", "900");
+            // A chart that renders every variable leaves the keys blank.
+            jail.set_env("FORGE_S3__ACCESS_KEY", "");
+            jail.set_env("FORGE_S3__SECRET_KEY", " ");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.s3.credentials, S3CredentialsMode::WebIdentity);
+            assert_eq!(cfg.s3.access_key, None);
+            assert_eq!(cfg.s3.secret_key, None);
+            let wi = cfg.s3.web_identity.as_ref().expect("web_identity");
+            assert_eq!(
+                wi.role_arn.as_deref(),
+                Some("arn:aws:iam::123456789012:role/forge")
+            );
+            assert_eq!(
+                wi.token_file,
+                std::path::Path::new("/var/run/secrets/forge/s3/token")
+            );
+            assert_eq!(
+                wi.sts_endpoint.as_deref(),
+                Some("http://minio.forge.svc:9000")
+            );
+            assert_eq!(wi.session_name, "forge-1");
+            assert_eq!(wi.duration_seconds, Some(900));
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", &without_s3_keys(""))?;
+            jail.set_env("FORGE_S3__CREDENTIALS", "default_chain");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.s3.credentials, S3CredentialsMode::DefaultChain);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn s3_credential_modes_refuse_settings_they_do_not_use() {
+        let web_identity = "[s3.web_identity]\ntoken_file = \"/token\"";
+        for (toml, expected) in [
+            // Long-lived keys left over next to short-lived credentials.
+            (
+                MINIMAL.replace(
+                    "secret_key = \"test\"",
+                    "secret_key = \"test\"\ncredentials = \"default_chain\"",
+                ),
+                "does not use them",
+            ),
+            (
+                format!(
+                    "{}\n{web_identity}",
+                    MINIMAL.replace(
+                        "secret_key = \"test\"",
+                        "secret_key = \"test\"\ncredentials = \"web_identity\"",
+                    )
+                ),
+                "does not use them",
+            ),
+            // A web identity block the mode ignores.
+            (format!("{MINIMAL}\n{web_identity}"), "does not use it"),
+            (
+                format!(
+                    "{}\n{web_identity}",
+                    without_s3_keys("credentials = \"default_chain\"")
+                ),
+                "does not use it",
+            ),
+            // web_identity without its block.
+            (
+                without_s3_keys("credentials = \"web_identity\""),
+                "FORGE_S3__WEB_IDENTITY__TOKEN_FILE",
+            ),
+        ] {
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains(expected), "{expected}: {err}");
+        }
+    }
+
+    #[test]
+    fn s3_web_identity_settings_are_validated() {
+        let web_identity = |extra: &str| {
+            without_s3_keys(&format!(
+                "credentials = \"web_identity\"\n[s3.web_identity]\ntoken_file = \"/token\"\n{extra}"
+            ))
+        };
+        for (extra, expected) in [
+            ("sts_endpoint = \"minio:9000\"", "sts_endpoint"),
+            ("sts_endpoint = \"ftp://minio:9000\"", "sts_endpoint"),
+            ("session_name = \"x\"", "session_name"),
+            ("session_name = \"forge server\"", "session_name"),
+            ("duration_seconds = 899", "duration_seconds"),
+            ("duration_seconds = 43201", "duration_seconds"),
+        ] {
+            let err = Config::from_figment(fig_from_toml(&web_identity(extra))).unwrap_err();
+            assert!(err.to_string().contains(expected), "{extra}: {err}");
+        }
+        let err = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"web_identity\"\n[s3.web_identity]\ntoken_file = \"\"",
+        )))
+        .unwrap_err();
+        assert!(err.to_string().contains("token_file"), "{err}");
+        let err = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"web_identity\"\n[s3.web_identity]\nrole_arn = \"arn:x\"",
+        )))
+        .unwrap_err();
+        assert!(err.to_string().contains("token_file"), "{err}");
+        let err = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"instance_profile\"",
+        )))
+        .unwrap_err();
+        assert!(err.to_string().contains("instance_profile"), "{err}");
+    }
+
+    #[test]
+    fn s3_debug_shows_the_credential_source_but_no_secret() {
+        let toml = without_s3_keys(
+            r#"credentials = "web_identity"
+        [s3.web_identity]
+        role_arn = "arn:aws:iam::123456789012:role/forge"
+        token_file = "/var/run/secrets/forge/s3/token"
+        sts_endpoint = "https://sts-user:sts-pw@minio.example.com:9000/""#,
+        );
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        let shown = format!("{:?}", cfg.s3);
+        for part in [
+            "WebIdentity",
+            "arn:aws:iam::123456789012:role/forge",
+            "/var/run/secrets/forge/s3/token",
+            "minio.example.com:9000",
+        ] {
+            assert!(shown.contains(part), "{part} missing: {shown}");
+        }
+        assert!(!shown.contains("sts-pw"), "{shown}");
+        let storage = format!("{:?}", cfg.s3.to_storage());
+        assert!(
+            storage.contains("/var/run/secrets/forge/s3/token"),
+            "{storage}"
+        );
+    }
+
+    #[test]
+    fn insecure_s3_key_checks_apply_only_to_static_keys() {
+        // The same check that refuses `minioadmin` static keys has nothing to
+        // look at with short-lived credentials.
+        let cfg = Config::from_figment(fig_from_toml(&without_s3_keys(
+            "credentials = \"default_chain\"",
+        )))
+        .expect("valid");
+        assert!(cfg.validate_insecure_defaults().is_ok());
+        let err = Config::from_figment(fig_from_toml(
+            &MINIMAL.replace("access_key = \"test\"", "access_key = \"minioadmin\""),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("minioadmin"), "{err}");
     }
 
     #[test]
@@ -2559,8 +3722,6 @@ mod tests {
         );
         assert!(oidc.admin_groups.is_empty());
         assert_eq!(oidc.admin_claim, "roles");
-        assert_eq!(oidc.session_idle_ttl_seconds, 8 * 60 * 60);
-        assert_eq!(oidc.session_absolute_ttl_seconds, 7 * 24 * 60 * 60);
         // effective_scopes keeps openid; idempotent when already present.
         assert_eq!(oidc.effective_scopes(), vec!["openid", "profile", "email"]);
     }
@@ -2591,6 +3752,74 @@ mod tests {
         let toml = minimal_with_oidc("").replace("client_id = \"abc-123\"", "client_id = \"\"");
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("oidc.client_id"), "{err}");
+    }
+
+    #[test]
+    fn oidc_client_secret_is_required_unless_a_federated_credential_is_used() {
+        let without_secret = minimal_with_oidc("").replace("client_secret = \"shhh-secret\"\n", "");
+        let err = Config::from_figment(fig_from_toml(&without_secret)).unwrap_err();
+        assert!(err.to_string().contains("oidc.client_secret"), "{err}");
+
+        let cfg = Config::from_figment(fig_from_toml(&format!(
+            "{without_secret}\nclient_authentication = \"federated_credential\"\nassertion_audience = \"api://AzureADTokenExchangeUSGov\""
+        )))
+        .expect("valid without a secret");
+        let oidc = cfg.oidc.expect("present");
+        assert_eq!(
+            oidc.client_authentication,
+            ClientAuthentication::FederatedCredential
+        );
+        assert_eq!(
+            oidc.assertion_audience.as_deref(),
+            Some("api://AzureADTokenExchangeUSGov")
+        );
+        assert_eq!(
+            Config::from_figment(fig_from_toml(&minimal_with_oidc("")))
+                .expect("valid")
+                .oidc
+                .expect("present")
+                .client_authentication,
+            ClientAuthentication::ClientSecret,
+            "a client secret by default"
+        );
+
+        let unknown = format!("{without_secret}\nclient_authentication = \"certificate\"");
+        assert!(Config::from_figment(fig_from_toml(&unknown)).is_err());
+    }
+
+    #[test]
+    fn public_base_url_must_be_an_absolute_http_url() {
+        for bad in [
+            "nuget.example.com",
+            "ftp://nuget.example.com",
+            "https://nuget.example.com/?x=1",
+            "https://nuget.example.com/#top",
+            "",
+        ] {
+            let toml = MINIMAL.replace("https://forge.example.com/", bad);
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(
+                err.to_string().contains("server.public_base_url"),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in ["http://localhost:8421", "https://nuget.example.com/feeds/"] {
+            let toml = MINIMAL.replace("https://forge.example.com/", good);
+            Config::from_figment(fig_from_toml(&toml)).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    #[test]
+    fn auth_section_may_be_left_out_and_allowed_hosts_are_checked_early() {
+        let toml = MINIMAL.replace("[auth]", "");
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("no [auth] table");
+        assert!(cfg.auth.bootstrap_admin.is_none());
+        let toml = MINIMAL.replace(
+            "public_base_url = \"https://forge.example.com/\"",
+            "public_base_url = \"https://forge.example.com/\"\nallowed_hosts = [\"https://bad/\"]",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(err.to_string().contains("server.allowed_hosts"), "{err}");
     }
 
     #[test]
@@ -2687,7 +3916,7 @@ mod tests {
         });
     }
 
-    // ── slice 12.3: auth.providers + [auth.upstream_basic] ──────────────────
+    // ── auth.providers + [auth.upstream_basic] ───────────────────────────────
 
     /// A minimal valid upstream-basic block + matching provider chain appended.
     fn minimal_with_upstream(extra: &str) -> String {
@@ -2708,10 +3937,111 @@ mod tests {
         assert!(cfg.auth.upstream_basic.is_none());
     }
 
+    /// The `[auth.upstream_basic]` and `[oidc]` seeds refuse a misspelled key
+    /// instead of seeding the realm with that gate turned off, as a realm
+    /// config set through the admin API does.
+    #[test]
+    fn legacy_realm_seeds_refuse_misspelled_keys() {
+        let upstream = minimal_with_upstream("").replace(
+            "[auth.upstream_basic.cache]",
+            "identity_pth = \"login\"\n[auth.upstream_basic.cache]",
+        );
+        let err = Config::from_figment(fig_from_toml(&upstream)).unwrap_err();
+        assert!(err.to_string().contains("identity_pth"), "{err}");
+
+        let cache = minimal_with_upstream("negative_ttl = 5\n");
+        let err = Config::from_figment(fig_from_toml(&cache)).unwrap_err();
+        assert!(err.to_string().contains("negative_ttl"), "{err}");
+
+        let oidc = minimal_with_oidc("\nrequired_claim = { tid = [\"tenant\"] }");
+        let err = Config::from_figment(fig_from_toml(&oidc)).unwrap_err();
+        assert!(err.to_string().contains("required_claim"), "{err}");
+
+        // The correctly spelled keys still load.
+        let oidc = minimal_with_oidc("\nrequired_claims = { tid = [\"tenant\"] }");
+        let cfg = Config::from_figment(fig_from_toml(&oidc)).expect("valid");
+        assert_eq!(cfg.oidc.unwrap().required_claims["tid"], vec!["tenant"]);
+    }
+
+    /// `HTTPS://` and surrounding whitespace pass validation, so they must
+    /// count as https for the cookie and HSTS decision (`starts_with`).
+    #[test]
+    fn public_base_url_scheme_case_and_whitespace_still_count_as_https() {
+        for base in [
+            "HTTPS://forge.example.com/",
+            "  https://forge.example.com/ ",
+        ] {
+            let toml = MINIMAL.replace("https://forge.example.com/", base);
+            let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+            assert_eq!(
+                cfg.public_base_url(),
+                "https://forge.example.com",
+                "{base:?}"
+            );
+            assert!(
+                !cfg.deployment_warnings()
+                    .iter()
+                    .any(|w| w.contains("not https")),
+                "{base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_blob_cache_is_off_unless_a_path_is_set() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert!(cfg.blob_cache().is_none());
+
+        let blank = format!("{MINIMAL}\n[blob_cache]\npath = \" \"\nmax_bytes = 0\n");
+        let cfg = Config::from_figment(fig_from_toml(&blank)).expect("blank path: off");
+        assert!(cfg.blob_cache().is_none());
+    }
+
+    #[test]
+    fn blob_cache_max_bytes_is_auto_or_a_byte_count() {
+        let auto = format!("{MINIMAL}\n[blob_cache]\npath = \"/var/cache/forge\"\n");
+        let cache = Config::from_figment(fig_from_toml(&auto))
+            .expect("valid")
+            .blob_cache()
+            .expect("on");
+        assert_eq!(cache.path, std::path::PathBuf::from("/var/cache/forge"));
+        assert_eq!(cache.max_bytes, forge_storage::CacheLimit::Auto);
+        assert_eq!(cache.min_free_bytes, None);
+        let (staging_dir, budget) = cache.staging.expect("staging budget");
+        assert_eq!(staging_dir, forge_storage::Staging::default_dir());
+        assert_eq!(budget, 4 * 1024 * 1024 * 1024);
+
+        for (value, expected) in [
+            ("\"AUTO\"", forge_storage::CacheLimit::Auto),
+            ("10737418240", forge_storage::CacheLimit::Bytes(10 << 30)),
+            ("\"1048576\"", forge_storage::CacheLimit::Bytes(1 << 20)),
+        ] {
+            let toml = format!(
+                "{MINIMAL}\n[blob_cache]\npath = \"/c\"\nmax_bytes = {value}\nmin_free_bytes = 1024\n"
+            );
+            let cache = Config::from_figment(fig_from_toml(&toml))
+                .expect(value)
+                .blob_cache()
+                .expect("on");
+            assert_eq!(cache.max_bytes, expected, "{value}");
+            assert_eq!(cache.min_free_bytes, Some(1024));
+        }
+
+        for (value, message) in [
+            ("0", "blob_cache.max_bytes"),
+            ("\"lots\"", "auto"),
+            ("-1", "auto"),
+        ] {
+            let toml = format!("{MINIMAL}\n[blob_cache]\npath = \"/c\"\nmax_bytes = {value}\n");
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(err.to_string().contains(message), "{value}: {err}");
+        }
+    }
+
     #[test]
     fn staging_budget_defaults_to_four_of_the_largest_item_and_is_validated() {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
-        let largest = cfg.server.max_upload_bytes.max(cfg.proxy.max_package_bytes);
+        let largest = DEFAULT_DOCKER_MAX_UPLOAD_BYTES.max(cfg.proxy.max_package_bytes);
         assert_eq!(cfg.staging_budget(), Some(4 * largest));
         assert_eq!(cfg.staging_dir(), forge_storage::Staging::default_dir());
 
@@ -2739,6 +4069,106 @@ mod tests {
         assert!(Config::from_figment(fig_from_toml(&exact)).is_err());
     }
 
+    /// An explicit staging budget below the 1 GiB docker defaults starts:
+    /// they shrink to fit it, with a warning, and only settings the operator
+    /// can change decide the minimum, which the error names.
+    #[test]
+    fn an_explicit_staging_budget_bounds_the_docker_defaults() {
+        const MIB: u64 = 1024 * 1024;
+        let budget = MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 805306368")
+            + "\n[proxy]\nmax_package_bytes = 268435456\n";
+        let cfg = Config::from_figment(fig_from_toml(&budget)).expect("a small budget starts");
+        let fits = 768 * MIB - cfg.nuget.max_nuspec_bytes;
+        assert_eq!(cfg.default_upload_limit("docker"), fits);
+        assert_eq!(cfg.docker_max_blob_bytes(), fits);
+        assert_eq!(cfg.max_repository_upload_bytes(), Some(fits));
+        let warnings = cfg.deployment_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("1 GiB docker defaults")),
+            "{warnings:?}"
+        );
+
+        // An explicit docker.max_blob_bytes is the operator's and must fit;
+        // the error names it.
+        let explicit = format!("{budget}\n[docker]\nmax_blob_bytes = 1073741824\n");
+        let err = Config::from_figment(fig_from_toml(&explicit)).unwrap_err();
+        assert!(
+            err.to_string().contains("lower docker.max_blob_bytes"),
+            "{err}"
+        );
+        // Too small for the package default: the error names that, not
+        // settings that cannot help.
+        let small = MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 314572800")
+            + "\n[proxy]\nmax_package_bytes = 268435456\n";
+        let err = Config::from_figment(fig_from_toml(&small))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the default upload limit of package repositories (536870912)"),
+            "{err}"
+        );
+        assert!(!err.contains("docker"), "{err}");
+
+        // Without an explicit budget, or with one that holds them, the
+        // docker defaults stay 1 GiB and nothing is logged.
+        for toml in [
+            MINIMAL.to_string(),
+            MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 2147483648"),
+            MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 0"),
+        ] {
+            let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+            assert_eq!(
+                cfg.default_upload_limit("docker"),
+                DEFAULT_DOCKER_MAX_UPLOAD_BYTES
+            );
+            assert_eq!(cfg.docker_max_blob_bytes(), DEFAULT_DOCKER_MAX_BLOB_BYTES);
+            assert!(
+                !cfg.deployment_warnings()
+                    .iter()
+                    .any(|w| w.contains("docker defaults")),
+                "{toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_upload_limits_and_the_repository_ceiling() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert_eq!(cfg.default_upload_limit("helm"), DEFAULT_MAX_UPLOAD_BYTES);
+        assert_eq!(cfg.default_upload_limit("nuget"), DEFAULT_MAX_UPLOAD_BYTES);
+        assert_eq!(
+            cfg.default_upload_limit("docker"),
+            DEFAULT_DOCKER_MAX_UPLOAD_BYTES
+        );
+        // A repository may hold up to what a push can stage.
+        assert_eq!(
+            cfg.max_repository_upload_bytes(),
+            Some(cfg.staging_budget().unwrap() - cfg.nuget.max_nuspec_bytes)
+        );
+        let unlimited = MINIMAL.replace("[server]", "[server]\nmax_staging_bytes = 0");
+        let cfg = Config::from_figment(fig_from_toml(&unlimited)).expect("valid");
+        assert_eq!(cfg.max_repository_upload_bytes(), None);
+
+        // The removed server-wide limit refuses to start, whatever its
+        // value, and the error names what replaces it.
+        for value in ["4096", "0", "\"512MiB\""] {
+            let removed =
+                MINIMAL.replace("[server]", &format!("[server]\nmax_upload_bytes = {value}"));
+            let err = Config::from_figment(fig_from_toml(&removed))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("server.max_upload_bytes was removed")
+                    && err.contains("Maximum upload size"),
+                "{err}"
+            );
+        }
+
+        // `[plugins.max_upload_bytes]` is gone: limits are per repository.
+        let per_format = format!("{MINIMAL}\n[plugins.max_upload_bytes]\nhelm = 4096\n");
+        assert!(Config::from_figment(fig_from_toml(&per_format)).is_err());
+    }
+
     #[test]
     fn upstream_basic_block_parses_with_defaults() {
         let cfg = Config::from_figment(fig_from_toml(&minimal_with_upstream(""))).expect("valid");
@@ -2750,7 +4180,7 @@ mod tests {
         assert_eq!(ub.reject_status, vec![401, 403]);
         assert_eq!(ub.connect_timeout_ms, 2000);
         assert_eq!(ub.request_timeout_ms, 5000);
-        assert!(ub.auto_provision);
+        assert_eq!(ub.auto_provision, None, "ignored since 2.0");
         assert_eq!(ub.cache.positive_ttl_secs, 300);
         assert_eq!(ub.cache.negative_ttl_secs, 30);
         // to_core mirrors the block.
@@ -2868,13 +4298,60 @@ mod tests {
     fn bootstrap_admin_parsed() {
         let toml = MINIMAL.replace(
             "[auth]",
-            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"s3cret-Pw!\"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \" Admin@Example.COM \"\npassword = \"s3cret-Pw!\"",
         );
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
         let ba = cfg.auth.bootstrap_admin.expect("present");
-        assert_eq!(ba.username, "admin");
+        assert_eq!(ba.username, "admin@example.com");
         assert_eq!(ba.password, "s3cret-Pw!");
         assert!(!cfg.server.allow_insecure_defaults, "off by default");
+    }
+
+    /// Review 2026-10-20 M2: the bootstrap admin signs in with a password, so
+    /// its name must not contain `:`.
+    #[test]
+    fn bootstrap_admin_username_with_a_colon_refused() {
+        let toml = MINIMAL.replace(
+            "[auth]",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"ad:min\"\npassword = \"s3cret-Pw!\"",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("auth.bootstrap_admin.username: username must not contain ':'"),
+            "{err}"
+        );
+    }
+
+    /// #317: every account is named by a UPN, the bootstrap admin too.
+    #[test]
+    fn bootstrap_admin_without_a_upn_refused() {
+        let toml = MINIMAL.replace(
+            "[auth]",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"Root\"\npassword = \"s3cret-Pw!\"",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"root\" is not a UPN"), "{err}");
+        assert!(err.contains("such as admin@example.com"), "{err}");
+    }
+
+    /// A bootstrap admin named `oidc`, in any case and padding: the error
+    /// says the name is reserved.
+    #[test]
+    fn bootstrap_admin_with_a_reserved_name_refused() {
+        let toml = MINIMAL.replace(
+            "[auth]",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \" OIDC \"\npassword = \"s3cret-Pw!\"",
+        );
+        let err = Config::from_figment(fig_from_toml(&toml))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"oidc\" is reserved for workload identity"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2882,10 +4359,22 @@ mod tests {
         for (from, to) in [
             (
                 "[auth]",
-                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"changeme\"",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin@example.com\"\npassword = \"changeme\"",
             ),
             ("access_key = \"test\"", "access_key = \"minioadmin\""),
             ("secret_key = \"test\"", "secret_key = \"minioadmin\""),
+            // The `<…>` placeholders of the example env files, left unedited.
+            (
+                "[auth]",
+                "[auth]\n[auth.bootstrap_admin]\nusername = \"admin@example.com\"\n\
+                 password = \"<initial admin password>\"",
+            ),
+            ("secret_key = \"test\"", "secret_key = \"<secret key>\""),
+            ("forge:forge@localhost", "forge:<password>@localhost"),
+            (
+                "[auth]",
+                "[redis]\nurl = \"redis://:<redis password>@forge-redis:6379\"\n\n[auth]",
+            ),
         ] {
             let toml = MINIMAL.replace(from, to);
             let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
@@ -2908,9 +4397,9 @@ mod tests {
     #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
     fn missing_or_blank_bootstrap_password_means_no_bootstrap_admin() {
         for block in [
-            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"\"",
-            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"   \"",
-            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin@example.com\"\npassword = \"\"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin@example.com\"\npassword = \"   \"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin@example.com\"",
         ] {
             let toml = MINIMAL.replace("[auth]", block);
             let cfg = Config::from_figment(fig_from_toml(&toml)).expect("starts");
@@ -2920,23 +4409,28 @@ mod tests {
             jail.create_file("forge.toml", MINIMAL)?;
             // Username without a password (the password was removed after the
             // first start, as docs/deployment.md tells operators to do).
-            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", "admin");
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", "admin@example.com");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("starts");
             assert!(cfg.auth.bootstrap_admin.is_none());
-            // Password only: the username defaults to `admin`.
+            // Password only: the username defaults to `admin@example.com`,
+            // and so does a blank one.
             jail.clear_env();
             jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "Real-Pw-1");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("starts");
             let ba = cfg.auth.bootstrap_admin.expect("bootstrap admin from env");
-            assert_eq!(ba.username, "admin");
+            assert_eq!(ba.username, "admin@example.com");
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", " ");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("starts");
+            let ba = cfg.auth.bootstrap_admin.expect("bootstrap admin from env");
+            assert_eq!(ba.username, "admin@example.com");
             assert_eq!(ba.password, "Real-Pw-1");
             assert!(!format!("{ba:?}").contains("Real-Pw-1"), "Debug redacts");
             Ok(())
         });
     }
 
-    /// The image's baked config carries no bootstrap admin and no
-    /// `allow_password_basic`, and loads with only the required env set.
+    /// The image's baked config carries no bootstrap admin and loads with
+    /// only the required env set.
     #[test]
     #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
     fn docker_image_config_starts_without_a_bootstrap_password() {
@@ -2949,7 +4443,6 @@ mod tests {
             let cfg = Config::load(Some(std::path::Path::new("forge.toml")))
                 .expect("the image starts without any bootstrap password");
             assert!(cfg.auth.bootstrap_admin.is_none());
-            assert!(!cfg.auth.allow_password_basic);
             assert!(!cfg.server.allow_insecure_defaults);
 
             jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "First-Run-Pw");
@@ -2960,8 +4453,33 @@ mod tests {
                 .expect("env-driven bootstrap admin");
             assert_eq!(
                 (ba.username.as_str(), ba.password.as_str()),
-                ("admin", "First-Run-Pw")
+                ("admin@example.com", "First-Run-Pw")
             );
+            Ok(())
+        });
+    }
+
+    /// The image's baked config names no S3 keys: they come from the
+    /// environment, or short-lived credentials replace them, configured
+    /// through the environment alone.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn docker_image_config_takes_s3_keys_or_short_lived_credentials_from_env() {
+        let baked = include_str!("../../../docker/forge.docker.toml");
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", baked)?;
+            jail.set_env("FORGE_DATABASE__URL", "postgres://forge:pw@db/forge");
+            let err = Config::load(Some(std::path::Path::new("forge.toml"))).unwrap_err();
+            assert!(err.to_string().contains("FORGE_S3__ACCESS_KEY"), "{err}");
+
+            jail.set_env("FORGE_S3__CREDENTIALS", "web_identity");
+            jail.set_env(
+                "FORGE_S3__WEB_IDENTITY__TOKEN_FILE",
+                "/var/run/secrets/forge/s3/token",
+            );
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.s3.credentials, S3CredentialsMode::WebIdentity);
+            assert_eq!(cfg.s3.access_key, None);
             Ok(())
         });
     }
@@ -2990,8 +4508,8 @@ mod tests {
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
             let ba = cfg.auth.bootstrap_admin.as_ref().expect("bootstrap admin");
             assert_eq!(ba.password, "1234567890");
-            assert_eq!(cfg.s3.access_key, "true");
-            assert_eq!(cfg.s3.secret_key, "[not-a-list]");
+            assert_eq!(cfg.s3.access_key.as_deref(), Some("true"));
+            assert_eq!(cfg.s3.secret_key.as_deref(), Some("[not-a-list]"));
             assert_eq!(cfg.database.url, "postgres://u:{p}@db/forge");
             assert_eq!(cfg.oidc.as_ref().expect("oidc").client_secret, "0x1F");
             assert_eq!(cfg.cache.l1_max_capacity, 42);
@@ -2999,9 +4517,6 @@ mod tests {
         });
     }
 
-    /// Secret env values keep their pre-0.1.0 normalization: surrounding
-    /// whitespace (a trailing newline from a secret file) is trimmed and one
-    /// pair of surrounding double quotes is removed.
     #[test]
     fn trusted_proxy_cidrs_accept_ipv4_mapped_entries() {
         let mut cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
@@ -3017,6 +4532,9 @@ mod tests {
         );
     }
 
+    /// Secret env values are normalized: surrounding whitespace (a trailing
+    /// newline from a secret file) is trimmed and one pair of surrounding
+    /// double quotes is removed.
     #[test]
     fn secret_env_values_are_trimmed_and_unquoted() {
         figment::Jail::expect_with(|jail| {
@@ -3027,7 +4545,7 @@ mod tests {
                 "\"pw with \"inner\" quotes\"",
             );
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
-            assert_eq!(cfg.s3.secret_key, "s3-secret");
+            assert_eq!(cfg.s3.secret_key.as_deref(), Some("s3-secret"));
             let ba = cfg.auth.bootstrap_admin.as_ref().expect("bootstrap admin");
             assert_eq!(ba.password, "pw with \"inner\" quotes");
             Ok(())
@@ -3117,7 +4635,7 @@ mod tests {
         });
     }
 
-    // ── slice 12.5: [crypto] secret encryption at rest ───────────────────────
+    // ── [crypto] secret encryption at rest ───────────────────────────────────
 
     #[test]
     fn crypto_absent_means_disabled() {
@@ -3171,6 +4689,41 @@ mod tests {
         );
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("crypto.algorithm"), "{err}");
+    }
+
+    /// Durations past the arithmetic's limits used to panic at startup or in
+    /// a worker loop; they fail validation instead, naming the key.
+    #[test]
+    fn oversized_durations_fail_validation_naming_the_key() {
+        let max = i64::MAX;
+        for (section, key) in [
+            ("outbox", "grace_seconds"),
+            ("retention", "default_run_interval_seconds"),
+            ("retention", "lease_seconds"),
+        ] {
+            let toml = format!("{MINIMAL}\n[{section}]\n{key} = {max}\n");
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("{section}.{key}")),
+                "{err}"
+            );
+            let toml = format!("{MINIMAL}\n[{section}]\n{key} = 3153600000\n");
+            Config::from_figment(fig_from_toml(&toml)).expect("100 years is accepted");
+        }
+        for (section, key) in [
+            ("cache", "unwrapped_key_ttl_secs"),
+            ("rotation", "dek_max_age_days"),
+            ("rotation", "kek_max_age_days"),
+        ] {
+            let toml = format!(
+                "{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"env\"\n[crypto.{section}]\n{key} = {max}\n"
+            );
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("crypto.{section}.{key}")),
+                "{err}"
+            );
+        }
     }
 
     #[test]

@@ -7,27 +7,28 @@ use std::time::Duration;
 use crate::auth::WorkloadIdentitySource;
 use anyhow::Context;
 use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::any;
 use axum::Router;
 use forge_core::auth::session_source::SessionCookieSource;
 use forge_core::auth::token::{BasicAuthSource, PrincipalSource, TokenHeaderSource};
+use forge_core::net::deadline::HandlerDeadline;
 use forge_db::authz_dao;
 use forge_db::model::AppUser;
 use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
+use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use crate::admin::admin_router;
 use crate::auth::auth_router;
 use crate::browse::browse_router;
 use crate::config::Config;
-use crate::dispatch::dispatch;
 use crate::me::me_router;
 use crate::me_tokens::me_tokens_router;
-use crate::middleware::{attach_principal, PrincipalLayer};
+use crate::middleware::{attach_principal, AnonSource, PrincipalLayer};
 use crate::state::AppState;
-use crate::web_ui::{legacy_admin_ui_redirect, spa_service};
+use crate::web_ui::spa_service;
 
 /// Build the principal middleware layer from the assembled [`AppState`].
 ///
@@ -40,17 +41,19 @@ use crate::web_ui::{legacy_admin_ui_redirect, spa_service};
 /// as no credentials and cleared on the response (a 401 there would lock the
 /// browser out of the login page itself).
 ///
-/// 12.7: the Basic source's password path asks [`crate::auth::RealmAuth`] for
-/// the chain on every attempt, so admin realm edits apply without a restart
-/// (and the wire path stays disabled unless `auth.allow_password_basic` or an
-/// enabled credential-forwarding realm allows it). The session source is
+/// The Basic source's password path asks [`crate::auth::RealmAuth`] for the
+/// chain on every attempt, so admin realm edits apply without a restart
+/// (and the wire path stays disabled unless the `allow_password_basic` auth
+/// setting or an enabled credential-forwarding realm allows it). The
+/// anonymous policy comes from the auth settings on every request too
+/// ([`AnonSource::Settings`]). The session source is
 /// always mounted — local password logins mint sessions too — and every
 /// state-changing request it authenticates must carry the session's CSRF
 /// token (enforced by [`attach_principal`]).
 pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
     let pool = &state.pool;
     let sources: Vec<Box<dyn PrincipalSource>> = vec![
-        // WIF first (slice 12.8): a presented JWT whose `iss` names a configured
+        // WIF first: a presented JWT whose `iss` names a configured
         // workload_identity realm is claimed here — including one passed as the
         // `X-NuGet-ApiKey` or the Basic password — so it is never treated as an
         // opaque token or forwarded upstream as a password. A non-WIF secret
@@ -72,7 +75,6 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         )),
     ];
 
-    let anon = state.config.anon_policy().context("anonymous policy")?;
     let trusted = state
         .config
         .trusted_proxy_cidrs()
@@ -80,7 +82,7 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
     Ok(PrincipalLayer {
         sources: Arc::new(sources),
         trusted_proxies: Arc::new(trusted),
-        anon: Arc::new(anon),
+        anon: AnonSource::Settings(state.auth_settings.clone()),
         // Cookie-authenticated mutations must carry the session's CSRF token.
         sessions: Some(state.sessions.clone()),
         cookie_secure: state.cookie_secure,
@@ -104,7 +106,9 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 /// * `/admin/...` — admin REST API (admin-only).
 /// * `/browse/...` — read-side browse / search (signed-in users only; per-repo
 ///   read authz enforced inside the handlers).
-/// * `/v3/{repo}/...` — NuGet V3 repository dispatch.
+/// * `{mount}/{repo}/...` — repositories, under their format's mount (NuGet:
+///   `/v3`; Helm and other plugins: `/repository` unless their plugin names
+///   another), each served by its format's plugin ([`crate::plugins`]).
 /// * everything else — the SPA (when `web.enabled`), whose admin screens live
 ///   under `/manage/*` (see [`crate::web_ui`]).
 ///
@@ -119,6 +123,20 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let admin = admin_router(state.clone());
 
+    let mounts: Vec<String> = state
+        .formats
+        .mounts()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    // Raw repositories are feeds too, for the response policy.
+    let feeds: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
+        mounts
+            .iter()
+            .cloned()
+            .chain([crate::raw::MOUNT.to_string()])
+            .collect(),
+    );
     let mut app = Router::new()
         // Liveness / readiness probes (unauthenticated, dependency-light).
         .merge(crate::health::health_router())
@@ -128,28 +146,49 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         .merge(me_tokens_router())
         .nest("/admin", admin)
         .merge(browse_router())
-        // Login / session surface (12.7): always mounted — local-password
+        // Login / session surface: always mounted — local-password
         // login and sessions exist independent of OIDC; the `/auth/oidc/*`
         // endpoints answer 404 themselves when no enabled oidc realm exists.
         .merge(auth_router())
-        // Everything under /v3/{repo} is handled by the dispatcher (which builds
-        // the per-repo NuGet router internally). `any` covers GET/HEAD/PUT/POST
-        // /DELETE; the dispatcher enforces authz per method.
-        .route("/v3/{repo}", any(dispatch))
-        .route("/v3/{repo}/{*rest}", any(dispatch));
+        // Trusted publishing: a CI job's OIDC token for a short-lived API key
+        // (`POST /api/v2/token`, nuget.org's path and shape).
+        .merge(crate::auth::token_exchange_router())
+        // Forge's own OIDC issuer (discovery + JWKS), public: what an IdP
+        // verifies the client assertions of a `federated_credential` realm
+        // against. 404 until forge has signing keys.
+        .merge(crate::auth::issuer_router())
+        // The Docker / OCI registry: clients always talk to `/v2/` at the
+        // host root; the registry resolves repositories from the name (or
+        // the host) itself.
+        .route("/v2", any(crate::registry::registry))
+        .route("/v2/", any(crate::registry::registry))
+        .route("/v2/{*rest}", any(crate::registry::registry))
+        // Raw (generic file) repositories: `/raw/<repo>/<path>`.
+        .route("/raw/{repo}", any(crate::raw::handle))
+        .route("/raw/{repo}/", any(crate::raw::handle))
+        .route("/raw/{repo}/{*rest}", any(crate::raw::handle));
+    // Repositories, each served by its format's plugin under the format's
+    // mount (`crate::plugins`; NuGet at `/v3`). `any` covers
+    // GET/HEAD/PUT/POST/DELETE; the dispatcher authorizes per method.
+    for mount in mounts.iter() {
+        app = app
+            .route(&format!("{mount}/{{repo}}"), any(crate::plugins::dispatch))
+            .route(
+                &format!("{mount}/{{repo}}/{{*rest}}"),
+                any(crate::plugins::dispatch),
+            );
+    }
 
     // Static SPA fallback, installed LAST so the API routers above always win
     // and only genuine UI paths fall through to `index.html`. Skipped for a
     // headless deployment (`web.enabled = false`). The admin UI lives under
-    // `/manage/*`; a browser navigation to one of its former `/admin/...`
-    // paths is 302-redirected there (API requests to `/admin/*` are untouched).
+    // `/manage/*`; `/admin/*` is the admin API's.
     if state.config.web.enabled {
-        app = app
-            .fallback_service(spa_service(&state.config.web))
-            .layer(axum::middleware::from_fn(legacy_admin_ui_redirect));
+        app = app.fallback_service(spa_service(&state.config.web));
     }
 
     let hsts = state.cookie_secure;
+    let public_base_url = state.config.public_base_url();
     let server = state.config.server.clone();
     let app = app
         .layer(axum::middleware::from_fn_with_state(
@@ -159,7 +198,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Caching and transport policy for every response, including the
         // ones the principal middleware answers itself.
         .layer(axum::middleware::from_fn(move |req, next| {
-            response_policy(hsts, req, next)
+            response_policy(hsts, feeds.clone(), public_base_url.clone(), req, next)
         }));
     // A stalled upload or a handler that never answers must not pin a task
     // and a connection forever (header reads are bounded in `serve`).
@@ -170,10 +209,18 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     } else {
         app
     };
+    // A proxy's first download of a package or layer may take longer
+    // (`proxy.download_timeout_seconds`): it extends its request's deadline
+    // (`forge_core::net::deadline`).
     let app = if server.request_timeout_seconds > 0 {
-        app.layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(server.request_timeout_seconds),
+        let timeout = Duration::from_secs(server.request_timeout_seconds);
+        app.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                HandlerDeadline::new(timeout)
+                    .run(next.run(req))
+                    .await
+                    .unwrap_or_else(|| StatusCode::REQUEST_TIMEOUT.into_response())
+            },
         ))
     } else {
         app
@@ -208,35 +255,49 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
 /// URL, so a shared cache never hands one caller's answer to another.
 const FEED_VARY: &str = "Authorization, Cookie, X-NuGet-ApiKey";
 
+/// `Vary` of every registry (`/v2`) response.
+const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
+
 /// Response caching and transport policy:
 ///
 /// * API responses (`/admin`, `/auth`, `/browse`) are `Cache-Control:
 ///   private, no-store` — they carry user data, tokens and CSRF secrets;
-/// * feed responses (`/v3/...`) carry [`FEED_VARY`], and are `private,
-///   no-store` whenever the request presented credentials, so a private
-///   package is never stored by a shared cache or served to someone else;
+/// * feed responses (under the formats' mounts, `feeds`: `/v3/...`,
+///   `/repository/...`)
+///   carry [`FEED_VARY`], and are `private,
+///   no-store` whenever the request presented credentials, so a package
+///   fetched with credentials is never stored by a shared cache or served to
+///   someone else; registry responses (`/v2/...`) likewise, with
+///   [`REGISTRY_VARY`], and a 401 the authentication middleware answered
+///   there gets the registry's Bearer challenge; Anonymous responses carry no `Cache-Control`; under
+///   `anonymous_mode = "allowlist"` the deployment guide tells operators to
+///   keep shared caches off `/v3`, since the allowlist decision is keyed on
+///   the client address, which no cache varies on;
 /// * with an `https` public URL every response carries HSTS.
 ///
 /// The SPA keeps its own cache headers (hashed assets are immutable).
 async fn response_policy(
     hsts: bool,
+    feeds: std::sync::Arc<Vec<String>>,
+    public_base_url: String,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path();
-    let under = |prefix: &str| {
-        path.strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-    };
-    let api = under("/admin") || under("/auth") || under("/browse");
-    let feed = under("/v3");
+    let under = |prefix: &str| crate::web_ui::is_under(path, prefix);
+    let api = under("/admin") || under("/auth") || under("/browse") || under("/api");
+    let feed = feeds.iter().any(|mount| under(mount));
+    let registry = under("/v2");
     let headers = req.headers();
     let credentials = headers.contains_key(header::AUTHORIZATION)
         || headers.contains_key("x-nuget-apikey")
         || headers.contains_key(header::COOKIE);
     let mut resp = next.run(req).await;
+    if registry {
+        resp = crate::registry::amend_registry_rejection(&public_base_url, resp);
+    }
     let out = resp.headers_mut();
-    if api || (feed && credentials) {
+    if api || ((feed || registry) && credentials) {
         out.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
@@ -244,6 +305,9 @@ async fn response_policy(
     }
     if feed {
         out.append(header::VARY, HeaderValue::from_static(FEED_VARY));
+    }
+    if registry {
+        out.append(header::VARY, HeaderValue::from_static(REGISTRY_VARY));
     }
     if hsts && !out.contains_key(header::STRICT_TRANSPORT_SECURITY) {
         out.insert(
@@ -275,12 +339,15 @@ const PLACEHOLDER_BOOTSTRAP_PASSWORD: &str = "changeme";
 /// restart. A concurrent instance creating the account at the same moment is
 /// handled the same way.
 ///
+/// The name is a UPN (config validation): `admin@example.com` by default.
+///
 /// Logs a warning while the bootstrap password remains in use (the admin should
 /// rotate it), and a loud one when the existing account still has the
 /// placeholder password [`PLACEHOLDER_BOOTSTRAP_PASSWORD`]. When
 /// `auth.bootstrap_admin` is unset (the documented production state once the
 /// account exists) nothing is created, but the placeholder check still runs
-/// for the default `admin` account and every account a marker names.
+/// for the default `admin@example.com` account and every account a marker
+/// names.
 pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
     let Some(ba) = &config.auth.bootstrap_admin else {
         warn_on_placeholder_accounts(pool).await;
@@ -326,9 +393,12 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
     .context("hashing task")?
     .map_err(|e| anyhow::anyhow!("argon2 hash failed: {e}"))?;
 
+    // The account and its `admin` role in one transaction: an account left
+    // without the role would not be an administrator.
+    let mut tx = pool.begin().await.context("begin bootstrap admin")?;
     let user = match user_dao::insert_user(
-        pool,
-        NewUser::local(ba.username.clone(), password_hash, true, true),
+        &mut *tx,
+        NewUser::local(ba.username.clone(), password_hash, true),
     )
     .await
     {
@@ -336,6 +406,7 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
         // A peer instance booting concurrently created it first: adopt that
         // account (it does the role grant) and make sure the marker exists.
         Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+            drop(tx);
             let existing = user_dao::find_user_by_username(pool, &ba.username)
                 .await
                 .context("bootstrap admin lookup")?
@@ -346,17 +417,14 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
         Err(e) => return Err(anyhow::Error::new(e).context("insert bootstrap admin")),
     };
 
-    // §12.4 Phase 5: the bootstrap admin is granted the built-in `admin` role,
-    // not just the slice-1 `is_admin` flag, so it is an admin under fine-grained
-    // RBAC even after the `is_admin` column is eventually dropped. Idempotent.
-    if let Some(admin_role_id) = authz_dao::role_id_by_name(pool, authz_dao::ADMIN_ROLE)
+    let admin_role_id = authz_dao::role_id_by_name(&mut *tx, authz_dao::ADMIN_ROLE)
         .await
         .context("look up admin role")?
-    {
-        authz_dao::assign_role(pool, user.id, admin_role_id)
-            .await
-            .context("grant admin role to bootstrap admin")?;
-    }
+        .context("the built-in admin role is missing")?;
+    authz_dao::assign_role(&mut *tx, user.id, admin_role_id)
+        .await
+        .context("grant admin role to bootstrap admin")?;
+    tx.commit().await.context("commit bootstrap admin")?;
     // A crash before this line leaves the account without the marker; the
     // next boot records it (see the existing-account branch above).
     record_bootstrap_marker(pool, &marker, user.id).await?;
@@ -407,7 +475,8 @@ pub async fn has_placeholder_password(user: &AppUser) -> bool {
 }
 
 /// Boot-time placeholder check when no bootstrap admin is configured: the
-/// default `admin` account and every account a "created once" marker names.
+/// default `admin@example.com` account and every account a "created once"
+/// marker names.
 /// Best effort — a lookup failure is logged, never fatal.
 async fn warn_on_placeholder_accounts(pool: &PgPool) {
     let pattern = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:%");
@@ -429,7 +498,7 @@ async fn warn_on_placeholder_accounts(pool: &PgPool) {
         .iter()
         .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
         .collect();
-    usernames.push("admin".to_string());
+    usernames.push(crate::config::DEFAULT_BOOTSTRAP_USERNAME.to_string());
     usernames.sort();
     usernames.dedup();
     for username in usernames {
@@ -459,12 +528,13 @@ fn warn_placeholder(username: &str) {
     );
 }
 
-/// One-shot import of the legacy `[oidc]` / `[auth.upstream_basic]` config
-/// blocks into `auth_realm` rows (12.7). Delegates to
-/// [`crate::auth::seed_auth_realms`]; call on every boot — a `forge_setting`
-/// marker makes it a no-op after the first import. Pass the (bootstrapped)
-/// envelope service when secret encryption is enabled so seeded realm secrets
-/// are encrypted at rest.
+/// Import the legacy `[oidc]` / `[auth.upstream_basic]` config blocks into
+/// `auth_realm` rows. Delegates to [`crate::auth::seed_auth_realms`]; call on
+/// every boot — the first boot inserts the realms, later boots re-apply a
+/// changed block only while its seeded row is untouched by the admin API (see
+/// there for the drift detection). Pass the (bootstrapped) envelope service
+/// when secret encryption is enabled so seeded realm secrets are encrypted at
+/// rest.
 pub async fn ensure_auth_realms(
     config: &Config,
     pool: &PgPool,
@@ -473,24 +543,4 @@ pub async fn ensure_auth_realms(
     crate::auth::seed_auth_realms(config, pool, envelope)
         .await
         .context("seed auth realms")
-}
-
-/// Apply the behavior-preserving RBAC legacy mapping **once** per install
-/// (§12.4 Phase 5).
-///
-/// Migration `0007` ran it and recorded the install-wide `legacy_open_access`
-/// default (open on upgrade, closed on a fresh install). This boot hook runs it
-/// one more time for installs that upgraded before the one-shot marker existed,
-/// then records the `legacy_rbac_synced` marker: re-running it on every boot
-/// would re-grant admin roles / anonymous grants an operator has since revoked
-/// through RBAC (the routine only ever adds). It never *opens* a fresh install:
-/// the `authenticated` auto-assignment is gated on `legacy_open_access`.
-pub async fn ensure_legacy_rbac(pool: &PgPool) -> anyhow::Result<()> {
-    if authz_dao::apply_legacy_migration_once(pool)
-        .await
-        .context("apply legacy RBAC migration")?
-    {
-        tracing::info!("applied the one-shot legacy RBAC mapping");
-    }
-    Ok(())
 }

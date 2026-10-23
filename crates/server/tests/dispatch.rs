@@ -1,5 +1,5 @@
 //! E2E: repository dispatch + authorization + hosted publish/read round-trip
-//! through the full HTTP stack (plan 10.3). Requires Docker.
+//! through the full HTTP stack. Requires Docker.
 
 mod common;
 
@@ -54,9 +54,8 @@ async fn unknown_repo_answers_like_a_denied_one() {
     let user = forge_db::user_dao::insert_user(
         &srv.pool,
         forge_db::user_dao::NewUser::local(
-            format!("nogrants{}", common::unique()),
+            format!("nogrants{}@example.com", common::unique()),
             "$argon2id$unused".into(),
-            false,
             true,
         ),
     )
@@ -283,6 +282,64 @@ async fn hosted_publish_and_restore() {
     assert_eq!(downloaded.as_ref(), bytes.as_slice(), "round-trip bytes");
 }
 
+/// A version longer than NuGet's 64 characters is refused with 400 at push
+/// (it used to fail the database insert and answer 500), nothing is stored,
+/// and such a version in a request path answers 404.
+#[tokio::test]
+async fn push_of_an_overlong_version_is_400_and_stores_nothing() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("longver{}", common::unique());
+    let id = format!("Long.Ver{}", common::unique());
+    let lower = id.to_lowercase();
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({"name": repo, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let version = format!("1.0.0-{}", "a".repeat(1000));
+    let part = reqwest::multipart::Part::bytes(common::make_nupkg(&id, &version))
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let resp = client
+        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .header("X-NuGet-ApiKey", srv.admin_token().await)
+        .multipart(reqwest::multipart::Form::new().part("package", part))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("longer than 64 characters"), "{body}");
+
+    let resp = client
+        .get(format!(
+            "{}/v3/{repo}/flat/{lower}/index.json",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "nothing was stored");
+    let resp = client
+        .get(format!(
+            "{}/v3/{repo}/flat/{lower}/{version}/{lower}.{version}.nupkg",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
 /// A browser/password session is valid for the admin UI but is not a NuGet
 /// publishing credential. An unrelated Authorization scheme must not satisfy
 /// the route's wire-credential check while the cookie supplies the principal.
@@ -373,14 +430,18 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
 #[tokio::test]
 async fn anonymous_read_when_allowed() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         ServerOpts {
-            anonymous_mode: "all".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
     let repo = format!("anon{}", common::unique());
@@ -393,8 +454,8 @@ async fn anonymous_read_when_allowed() {
         .await
         .unwrap();
 
-    // Under §12.4 RBAC, anonymous read flows through a grant on the built-in
-    // `anonymous` role (what the data migration converts the slice-1
+    // Under RBAC, anonymous read flows through a grant on the built-in
+    // `anonymous` role (what the RBAC data migration converted the
     // `anonymous_read` flag into), not the column. Seed that grant directly,
     // mirroring the migration, so the seam permits the anonymous read.
     let repo_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, &repo)
@@ -501,4 +562,86 @@ async fn health_endpoints() {
     let body: Value = ready.json().await.unwrap();
     assert_eq!(body["checks"]["database"], true);
     assert_eq!(body["checks"]["object_store"], true);
+}
+
+/// #73: an offline hosted or group repository answers every feed request with
+/// 503 (pushes included); an offline proxy still serves locally (here its
+/// service index). Unauthorized callers still get 401, not the 503.
+#[tokio::test]
+async fn offline_hosted_and_group_repositories_answer_503() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let hosted = format!("offh{s}");
+    let group = format!("offg{s}");
+    let proxy = format!("offp{s}");
+    for body in [
+        serde_json::json!({"name": hosted, "kind": "hosted"}),
+        serde_json::json!({"name": group, "kind": "group"}),
+        serde_json::json!({"name": proxy, "kind": "proxy",
+                           "remote_url": "https://api.nuget.org/v3/index.json"}),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{body}");
+    }
+    let index = |repo: &str| format!("{}/v3/{repo}/index.json", srv.base_url);
+    for repo in [&hosted, &group, &proxy] {
+        let resp = client
+            .get(index(repo))
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{repo} online");
+        let resp = client
+            .put(format!("{}/admin/repositories/{repo}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&serde_json::json!({"online": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    for repo in [&hosted, &group] {
+        let resp = client
+            .get(index(repo))
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503, "{repo} offline");
+        assert!(resp.headers().contains_key("retry-after"));
+        let resp = client.get(index(repo)).send().await.unwrap();
+        assert_eq!(resp.status(), 401, "{repo}: authorization first");
+    }
+    let part = reqwest::multipart::Part::bytes(common::make_nupkg(&format!("Off.Pkg{s}"), "1.0.0"))
+        .file_name("package.nupkg")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let resp = client
+        .put(format!("{}/v3/{hosted}/package", srv.base_url))
+        .header("X-NuGet-ApiKey", srv.admin_token().await)
+        .multipart(reqwest::multipart::Form::new().part("package", part))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503, "no push into an offline repository");
+    let resp = client
+        .get(index(&proxy))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "an offline proxy serves what it has locally"
+    );
 }

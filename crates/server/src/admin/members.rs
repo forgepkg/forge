@@ -1,8 +1,8 @@
-//! Admin group-membership management (plan 10.4, nested groups in §12.4 Phase 4).
+//! Admin group-membership management, including nested groups.
 //!
-//! Validation (spec §7 + §12.4):
+//! Validation:
 //! * The `{name}` repository must be a **group**.
-//! * A member must exist. It **may** itself be a group (nested groups, §12.4) —
+//! * A member must exist. It **may** itself be a group (nested groups) —
 //!   but the resulting group graph must stay an acyclic DAG of bounded depth.
 //! * A member cannot be the group itself.
 //! * Adding an edge that would create a **cycle** or exceed
@@ -67,6 +67,17 @@ pub struct UpdateMember {
 /// group whose only flagged member is a proxy would serve its reserved ids
 /// from nowhere.
 fn owner_kind_error(member: &forge_db::model::Repository) -> Option<Response> {
+    if member.is_raw() {
+        // Owners guard package ids; a raw group serves a path from its first
+        // member that has it.
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                "raw groups have no owner members: a path is served by the first member that has it",
+            )
+                .into_response(),
+        );
+    }
     (member.kind() == RepoKind::Proxy).then(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -137,13 +148,25 @@ pub async fn add(
     if member.id == group.id {
         return (StatusCode::BAD_REQUEST, "a group cannot contain itself").into_response();
     }
+    // A group serves one protocol: every member is of the group's format
+    // (a repository's format never changes, so checking here suffices).
+    if member.format != group.format {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "member format {:?} differs from the group's format {:?}",
+                member.format, group.format
+            ),
+        )
+            .into_response();
+    }
     if body.owner {
         if let Some(resp) = owner_kind_error(&member) {
             return resp;
         }
     }
-    // Nested groups are allowed (§12.4); the checked insert runs the cycle +
-    // depth guard in the same transaction.
+    // Nested groups are allowed; the checked insert runs the cycle + depth
+    // guard in the same transaction.
     let max_depth = state.config.groups.max_nesting_depth;
 
     match repository_dao::add_group_member_checked(

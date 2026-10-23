@@ -1,12 +1,12 @@
-//! Secret-encryption wiring (slice 12.5): build the envelope service from
-//! config, bootstrap the key hierarchy at startup, and run the
-//! cluster-coordinated rotation/backfill worker.
+//! Secret-encryption wiring: build the envelope service from config, bootstrap
+//! the key hierarchy at startup, and run the cluster-coordinated
+//! rotation/backfill worker.
 //!
 //! ## Enable story
 //!
-//! Encryption is **opt-in** via the `[crypto]` config section (§8 TOML +
-//! `FORGE_CRYPTO__*` env). Absent/disabled ⇒ slice-1 plaintext behavior is
-//! unchanged. Enabled ⇒
+//! Encryption is **opt-in** via the `[crypto]` config section (TOML +
+//! `FORGE_CRYPTO__*` env). Absent/disabled ⇒ secrets are stored in plaintext.
+//! Enabled ⇒
 //!
 //! 1. startup builds the root provider (env/file) and **refuses to boot** on a
 //!    missing/short root key (fail closed, never silently plaintext);
@@ -24,15 +24,15 @@
 //! The worker pass **and** the admin `POST /admin/crypto/rotate/*` endpoints
 //! run under one Postgres **session advisory lock** ([`ROTATION_LOCK_KEY`],
 //! [`try_rotation_lock`]) held on a dedicated connection, so exactly one
-//! rotation runs cluster-wide at a time (the plan §2.7 pattern — deliberately
-//! different from the slice-1 lease-based workers because a rotation pass
-//! spans several tables). A worker tick that finds the lock taken skips its
-//! pass; an admin request gets 409. Every step inside is idempotent and
-//! resumable, so a crashed pass is simply finished by the next holder. The
-//! lock is the first line of defence only: the key store's compare-and-swap
-//! re-wraps and commit-time-checked revocations (`forge-crypto` /
-//! `forge-db`) keep the hierarchy consistent even when rotations do overlap
-//! (e.g. a mixed-version rolling deploy, or the unlocked startup bootstrap).
+//! rotation runs cluster-wide at a time (deliberately different from the
+//! lease-based workers because a rotation pass spans several tables). A worker
+//! tick that finds the lock taken skips its pass; an admin request gets 409.
+//! Every step inside is idempotent and resumable, so a crashed pass is simply
+//! finished by the next holder. The lock is the first line of defence only:
+//! the key store's compare-and-swap re-wraps and commit-time-checked
+//! revocations (`forge-crypto` / `forge-db`) keep the hierarchy consistent
+//! even when rotations do overlap (e.g. a mixed-version rolling deploy, or the
+//! unlocked startup bootstrap).
 
 use std::sync::Arc;
 
@@ -192,15 +192,8 @@ pub fn build_envelope(
             scope: "default".to_string(),
             unwrapped_key_ttl: std::time::Duration::from_secs(crypto.cache.unwrapped_key_ttl_secs),
             unwrapped_key_max: crypto.cache.unwrapped_key_max,
-            accept_row_bound_secrets: crypto.accept_row_bound_secrets,
         },
     );
-    if crypto.accept_row_bound_secrets {
-        tracing::warn!(
-            "crypto.accept_row_bound_secrets is on: secrets sealed by pre-release builds are \
-             accepted without their destination binding; turn it off once startup has re-sealed them"
-        );
-    }
     tracing::info!(
         provider = %crypto.root.provider,
         algorithm = %algorithm,
@@ -225,9 +218,9 @@ pub async fn bootstrap(
         .await
         .context("bootstrap encryption keys")?;
 
-    // Readiness check (plan §6.5): every non-revoked KEK's recorded root
-    // version must be reachable, otherwise decryption of some DEKs would fail
-    // later. `rewrap_keks` doubles as the check — it unwraps with the recorded
+    // Readiness check: every non-revoked KEK's recorded root version must be
+    // reachable, otherwise decryption of some DEKs would fail later.
+    // `rewrap_keks` doubles as the check — it unwraps with the recorded
     // version and re-wraps under the current root (no-op when already current).
     envelope
         .rewrap_keks()
@@ -257,6 +250,27 @@ pub async fn bootstrap(
     if realms > 0 {
         tracing::info!(realms, "encrypted plaintext auth-realm secrets at rest");
     }
+    let settings = secret_dao::backfill_secret_settings(pool, envelope)
+        .await
+        .context("backfill plaintext secret settings")?;
+    if settings > 0 {
+        tracing::info!(settings, "encrypted plaintext secret settings at rest");
+    }
+    let imports = secret_dao::backfill_import_passwords(pool, envelope)
+        .await
+        .context("backfill plaintext import passwords")?;
+    if imports > 0 {
+        tracing::info!(
+            imports,
+            "encrypted plaintext Nexus import passwords at rest"
+        );
+    }
+    if secret_dao::backfill_email_secrets(pool, envelope)
+        .await
+        .context("backfill plaintext email settings secrets")?
+    {
+        tracing::info!("encrypted the plaintext email settings secrets at rest");
+    }
 
     // Secrets sealed by earlier builds are bound to their row only: re-seal
     // them for the destination they are sent to (the rotation worker repeats
@@ -273,8 +287,9 @@ pub async fn bootstrap(
     Ok(())
 }
 
-/// Run both re-encrypt sweeps to the end; returns how many rows were
-/// re-sealed.
+/// Run the re-encrypt sweeps (upstream passwords, realm secrets, secret
+/// settings, import passwords, email settings secrets) to the end; returns
+/// how many rows were re-sealed.
 async fn reseal_all(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -292,6 +307,9 @@ async fn reseal_all(
         }
     }
     resealed += secret_dao::reseal_realm_secrets(pool, envelope).await?;
+    resealed += secret_dao::reseal_secret_settings(pool, envelope).await?;
+    resealed += secret_dao::reseal_import_passwords(pool, envelope).await?;
+    resealed += secret_dao::reseal_email_secrets(pool, envelope).await?;
     Ok(resealed)
 }
 
@@ -336,7 +354,7 @@ async fn locked_rotation_pass(
     result
 }
 
-/// One idempotent convergence pass (plan §2.7/§2.8). Order matters:
+/// One idempotent convergence pass. Order matters:
 /// 1. **age-based rotation** first, so the sweeps below converge on the new
 ///    keys within the same pass;
 /// 2. **root re-wrap** (no-op unless the operator rotated the root);
@@ -392,9 +410,17 @@ async fn rotation_pass(
     secret_dao::backfill_realm_secrets(pool, envelope, crate::auth::secret_keys)
         .await
         .context("realm secrets backfill")?;
+    secret_dao::backfill_secret_settings(pool, envelope)
+        .await
+        .context("secret settings backfill")?;
+    secret_dao::backfill_import_passwords(pool, envelope)
+        .await
+        .context("import passwords backfill")?;
+    secret_dao::backfill_email_secrets(pool, envelope)
+        .await
+        .context("email settings secrets backfill")?;
 
-    // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns),
-    //    which also moves row-only bindings to destination bindings.
+    // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns).
     reseal_all(pool, envelope, batch)
         .await
         .context("DEK re-encrypt sweep")?;

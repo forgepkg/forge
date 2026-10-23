@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Secret encryption at rest (slice 12.5): the Postgres KeyStore over
+# Secret encryption at rest: the Postgres KeyStore over
 # `encryption_key` and the encrypted-column helpers go through forge-crypto.
 forge-crypto = { path = "../crypto" }
 
@@ -23,6 +23,8 @@ tracing = { workspace = true }
 unicode-normalization = "0.1"
 # The `remote_url` origin a sealed upstream password is bound to.
 url = { workspace = true }
+# Secret `forge_setting` values (`sealed:<base64 envelope>`).
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

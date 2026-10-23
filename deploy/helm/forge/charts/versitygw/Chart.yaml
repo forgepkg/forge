@@ -1,0 +1,9 @@
+# An S3 gateway for Forge (versitygw, posix backend on a PersistentVolume), for
+# evaluation and small installs. Enabled with `versitygw.enabled` in the forge
+# chart, which then points Forge's s3 settings and credentials at it.
+apiVersion: v2
+name: versitygw
+description: Single-instance S3 gateway (versitygw) for Forge (evaluation / small installs)
+type: application
+version: 1.0.0
+appVersion: "v1.4.1"

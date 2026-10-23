@@ -1,6 +1,11 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { createFileRoute, useRouter, useSearch } from '@tanstack/react-router'
+import {
+  createFileRoute,
+  Link,
+  useRouter,
+  useSearch,
+} from '@tanstack/react-router'
 
 import {
   fetchLoginOptions,
@@ -14,12 +19,8 @@ import { ApiError } from '~/lib/httpClient'
 import { setSession } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
 import { safeReturnTo } from '~/lib/returnTo'
-import { AuthLayout } from '~/components/catalyst/auth-layout'
-import { Button } from '~/components/catalyst/button'
-import { Field, Label } from '~/components/catalyst/fieldset'
-import { Heading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Text } from '~/components/catalyst/text'
+import { AuthCard } from '~/components/AuthCard'
+import { Button, Code, Icon, Notice, Skeleton, TextField } from '~/components/ui'
 
 interface LoginSearch {
   /**
@@ -32,6 +33,54 @@ interface LoginSearch {
   expired?: boolean
   /** Set when sign-out could not be confirmed by the server. */
   logout_failed?: boolean
+  /** Set when the server's OIDC callback sent the browser back here. */
+  error?: LoginError
+  /**
+   * With `username_not_upn`: the realm claim the username came from. Shown
+   * only when it looks like a claim name (the URL is anyone's to craft).
+   */
+  claim?: string
+  /** A username to start with: an invited user who just chose a password. */
+  username?: string
+  /** Set when the user just chose their password from an invitation. */
+  invited?: boolean
+}
+
+/**
+ * Why an OIDC sign-in ended back here (`/login?error=...`): `oidc_failed`
+ * when the callback did not validate (or the IdP returned an error),
+ * `not_permitted` when the account may not sign in, `username_not_upn` when
+ * a new account would be named by a claim that does not hold a UPN. Any
+ * other value is `other`; the raw parameter is never shown.
+ */
+type LoginError = 'oidc_failed' | 'not_permitted' | 'username_not_upn' | 'other'
+
+/** Generic on purpose: IdP details stay in the server log. */
+const loginErrorMessages: Record<LoginError, string> = {
+  oidc_failed:
+    'Sign-in with your identity provider did not complete. Try again; if it keeps failing, ask your administrator.',
+  not_permitted:
+    'Your account is not permitted to sign in to Forge. Ask your administrator for access.',
+  username_not_upn:
+    'Forge names new accounts by a UPN such as alice@example.com, and your identity provider did not send one. Ask your administrator to map a claim that holds it.',
+  other:
+    'Sign-in did not complete. Try again; if it keeps failing, ask your administrator.',
+}
+
+function parseLoginError(raw: unknown): LoginError | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined
+  return raw === 'oidc_failed' ||
+    raw === 'not_permitted' ||
+    raw === 'username_not_upn'
+    ? raw
+    : 'other'
+}
+
+/** A claim name worth showing: short, and nothing but name characters. */
+function parseClaim(raw: unknown): string | undefined {
+  return typeof raw === 'string' && /^[A-Za-z0-9_.:/-]{1,64}$/.test(raw)
+    ? raw
+    : undefined
 }
 
 const passwordFallbackOptions: LoginOptions = {
@@ -47,12 +96,19 @@ export const Route = createFileRoute('/login')({
     expired: search.expired === true || search.expired === 'true',
     logout_failed:
       search.logout_failed === true || search.logout_failed === 'true',
+    error: parseLoginError(search.error),
+    claim: parseClaim(search.claim),
+    username:
+      typeof search.username === 'string' && search.username.length <= 256
+        ? search.username
+        : undefined,
+    invited: search.invited === true || search.invited === 'true',
   }),
 })
 
 /**
- * Sign-in screen (§12.7 realms). On load it fetches `GET /auth/login-options`
- * and renders one of two layouts:
+ * Sign-in screen. On load it fetches `GET /auth/login-options` and renders one
+ * of two layouts:
  *
  *  - **identifier-first** (default): step 1 asks only for the username and
  *    calls `POST /auth/identify`; depending on the realm decision step 2 shows
@@ -63,12 +119,16 @@ export const Route = createFileRoute('/login')({
  *
  * A successful password login sets the `forge_session` cookie; we persist the
  * returned CSRF token (session mode) and navigate to the `redirect` target.
+ * A failed OIDC callback lands here with `?error=<code>`: a short, generic
+ * message is shown above the form with a "Try again" link that clears it.
  * Signing in with a registry token is intentionally not offered: the UI always
  * authenticates with username+password or via a realm. Tokens are minted on
  * the Tokens screen for NuGet clients only.
  */
 function Login() {
-  const { redirect, expired, logout_failed } = useSearch({ from: '/login' })
+  const { redirect, expired, logout_failed, error, claim, username, invited } = useSearch({
+    from: '/login',
+  })
   const options = useQuery<LoginOptions, ApiError>({
     queryKey: authKeys.loginOptions(),
     queryFn: ({ signal }) => fetchLoginOptions(signal),
@@ -80,56 +140,67 @@ function Login() {
     options.data ?? (options.isError ? passwordFallbackOptions : undefined)
 
   return (
-    <AuthLayout>
-      <div className="w-full max-w-sm space-y-8">
-        <div className="space-y-2 text-center">
-          <span
-            aria-hidden="true"
-            className="mx-auto grid size-12 place-items-center rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 text-lg font-bold text-white shadow-lg shadow-sky-500/20"
-          >
-            ef
-          </span>
-          <Heading className="!text-2xl">envisia&nbsp;forge</Heading>
-          <Text>Sign in to the package registry</Text>
-        </div>
+    <AuthCard
+      title="Sign in to Forge"
+      subtitle={
+        loginOptions?.mode === 'combined'
+          ? 'Use your username and password, or your organization’s sign-in.'
+          : 'Enter your username to continue.'
+      }
+    >
+      {error && (
+        <Notice
+          tone="danger"
+          action={
+            <Link to="/login" search={{ redirect }} className="fg-notice-action">
+              Try again
+            </Link>
+          }
+        >
+          <p>{loginErrorMessages[error]}</p>
+          {error === 'username_not_upn' && claim && (
+            <p>
+              The username came from the <Code>{claim}</Code> claim.
+            </p>
+          )}
+        </Notice>
+      )}
 
-        {expired && (
-          <p
-            role="alert"
-            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
-          >
-            Your session expired. Sign in again to continue.
-          </p>
-        )}
+      {invited && <Notice tone="ok">Your password is set. Sign in with it.</Notice>}
 
-        {logout_failed && (
-          <p
-            role="alert"
-            className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm/6 text-red-700 dark:text-red-400"
-          >
-            Sign-out could not be confirmed by the server, so your session may
-            still be active. Sign in and sign out again, or close the browser.
-          </p>
-        )}
+      {expired && (
+        <Notice tone="warn">Your session expired. Sign in again to continue.</Notice>
+      )}
 
-        {options.isError && (
-          <p
-            role="status"
-            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm/6 text-amber-700 dark:text-amber-400"
-          >
-            Sign-in options could not be loaded. Password sign-in is available.
-          </p>
-        )}
+      {logout_failed && (
+        <Notice tone="danger">
+          Sign-out could not be confirmed by the server, so your session may
+          still be active. Sign in and sign out again, or close the browser.
+        </Notice>
+      )}
 
-        {!loginOptions ? (
-          <Text>Loading sign-in options…</Text>
-        ) : loginOptions.mode === 'combined' ? (
-          <CombinedLogin options={loginOptions} redirect={redirect} />
-        ) : (
-          <IdentifierFirstLogin redirect={redirect} />
-        )}
-      </div>
-    </AuthLayout>
+      {options.isError && (
+        <Notice tone="warn" role="status">
+          Sign-in options could not be loaded. Password sign-in is available.
+        </Notice>
+      )}
+
+      {!loginOptions ? (
+        <Skeleton lines={2} label="Loading sign-in options…" />
+      ) : loginOptions.mode === 'combined' ? (
+        <CombinedLogin options={loginOptions} redirect={redirect} initialUsername={username} />
+      ) : (
+        <IdentifierFirstLogin redirect={redirect} initialUsername={username} />
+      )}
+
+      {loginOptions?.mode !== 'combined' && (
+        <p className="fg-text fg-text--small border-t border-line pt-4">
+          Forge checks which sign-in your account uses. With your
+          organization’s single sign-on you continue at its sign-in page;
+          otherwise Forge asks for your password next.
+        </p>
+      )}
+    </AuthCard>
   )
 }
 
@@ -200,8 +271,9 @@ function usePasswordLogin(redirect?: string) {
 /** Inline form error, kept as `role="alert"` for tests + screen readers. */
 function FormError({ children }: { children: React.ReactNode }) {
   return (
-    <p role="alert" className="text-sm/6 text-red-600 dark:text-red-400">
-      {children}
+    <p role="alert" className="fg-field-error">
+      <Icon name="Alert" size={14} />
+      <span>{children}</span>
     </p>
   )
 }
@@ -211,9 +283,15 @@ function FormError({ children }: { children: React.ReactNode }) {
  * realm decision either reveals the password field (step 2, username shown
  * with a back link) or navigates the browser to the IdP.
  */
-function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
+function IdentifierFirstLogin({
+  redirect,
+  initialUsername,
+}: {
+  redirect?: string
+  initialUsername?: string
+}) {
   const [step, setStep] = useState<'identify' | 'password'>('identify')
-  const [username, setUsername] = useState('')
+  const [username, setUsername] = useState(initialUsername ?? '')
   const [password, setPassword] = useState('')
   const { signIn, error, setError, submitting, setSubmitting } =
     usePasswordLogin(redirect)
@@ -231,12 +309,14 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
       const decision = await identify(trimmed)
       if (decision.mode === 'oidc_redirect' && decision.login_url) {
         assignLocation(oidcUrl(decision.login_url, redirect))
-        return // the browser is leaving; keep "submitting" until it does
+        // The browser is leaving: keep "submitting" (and Continue disabled)
+        // until it does, so a second click cannot start another flow.
+        return
       }
       setStep('password')
+      setSubmitting(false)
     } catch (err) {
       setError(signInErrorMessage(err))
-    } finally {
       setSubmitting(false)
     }
   }
@@ -252,19 +332,17 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
 
   if (step === 'identify') {
     return (
-      <form onSubmit={onIdentify} className="space-y-6">
-        <Field>
-          <Label>Username</Label>
-          <Input
-            type="text"
-            autoComplete="username"
-            autoFocus
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-          />
-        </Field>
+      <form onSubmit={onIdentify} className="flex flex-col gap-4">
+        <TextField
+          label="Username"
+          type="text"
+          autoComplete="username"
+          autoFocus
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+        />
         {error && <FormError>{error}</FormError>}
-        <Button type="submit" disabled={submitting} className="w-full">
+        <Button type="submit" variant="primary" block disabled={submitting}>
           {submitting ? 'Checking…' : 'Continue'}
         </Button>
       </form>
@@ -272,9 +350,9 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
   }
 
   return (
-    <form onSubmit={onPassword} className="space-y-6">
-      <Text>
-        Signing in as <span className="font-medium">{username.trim()}</span>{' '}
+    <form onSubmit={onPassword} className="flex flex-col gap-4">
+      <p className="fg-text">
+        Signing in as <span className="fg-strong">{username.trim()}</span>{' '}
         <button
           type="button"
           onClick={() => {
@@ -282,23 +360,21 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
             setPassword('')
             setError(null)
           }}
-          className="text-sky-600 hover:underline dark:text-sky-400"
+          className="fg-link cursor-pointer border-0 bg-transparent p-0"
         >
           Change
         </button>
-      </Text>
-      <Field>
-        <Label>Password</Label>
-        <Input
-          type="password"
-          autoComplete="current-password"
-          autoFocus
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-        />
-      </Field>
+      </p>
+      <TextField
+        label="Password"
+        type="password"
+        autoComplete="current-password"
+        autoFocus
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+      />
       {error && <FormError>{error}</FormError>}
-      <Button type="submit" disabled={submitting} className="w-full">
+      <Button type="submit" variant="primary" block disabled={submitting}>
         {submitting ? 'Signing in…' : 'Sign in'}
       </Button>
     </form>
@@ -312,11 +388,13 @@ function IdentifierFirstLogin({ redirect }: { redirect?: string }) {
 function CombinedLogin({
   options,
   redirect,
+  initialUsername,
 }: {
   options: LoginOptions
   redirect?: string
+  initialUsername?: string
 }) {
-  const [username, setUsername] = useState('')
+  const [username, setUsername] = useState(initialUsername ?? '')
   const [password, setPassword] = useState('')
   const { signIn, error, setError, submitting } = usePasswordLogin(redirect)
 
@@ -330,33 +408,37 @@ function CombinedLogin({
   }
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-4">
       {options.password && (
-        <form onSubmit={onSubmit} className="space-y-6">
-          <Field>
-            <Label>Username</Label>
-            <Input
-              type="text"
-              autoComplete="username"
-              autoFocus
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-            />
-          </Field>
-          <Field>
-            <Label>Password</Label>
-            <Input
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-          </Field>
+        <form onSubmit={onSubmit} className="flex flex-col gap-4">
+          <TextField
+            label="Username"
+            type="text"
+            autoComplete="username"
+            autoFocus
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+          <TextField
+            label="Password"
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
           {error && <FormError>{error}</FormError>}
-          <Button type="submit" disabled={submitting} className="w-full">
+          <Button type="submit" variant="primary" block disabled={submitting}>
             {submitting ? 'Signing in…' : 'Sign in'}
           </Button>
         </form>
+      )}
+
+      {options.password && options.oidc.length > 0 && (
+        <div className="flex items-center gap-3 text-xs text-ink-faint" aria-hidden="true">
+          <span className="h-px flex-1 bg-line" />
+          or
+          <span className="h-px flex-1 bg-line" />
+        </div>
       )}
 
       {options.oidc.map((idp) => (
@@ -375,8 +457,8 @@ function OidcButton({
 }) {
   return (
     <Button
-      outline
-      className="w-full"
+      block
+      icon="Shield"
       onClick={() => assignLocation(oidcUrl(idp.login_url, redirect))}
     >
       Login with {idp.label}

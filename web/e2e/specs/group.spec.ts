@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 
 import {
+  openFromRail,
   createRepo,
   fetchPackageDetail,
   pushNupkg,
@@ -10,14 +11,13 @@ import {
 } from '../helpers'
 
 /**
- * Group + priority (plan §Testing #6).
+ * Group + priority.
  *
  * An admin creates a group of two members and sets their priorities through the
  * `PriorityList` editor (the Members screen). Both members publish the SAME
  * package id + version, but with a DISTINCT dependency, so the group's resolved
- * package detail reveals which member won: per slice-1 §7 the highest-priority
- * member wins ties, and the group's registration surfaces that member's
- * dependency group.
+ * package detail reveals which member won: the highest-priority member wins
+ * ties, and the group's registration surfaces that member's dependency group.
  *
  * Member fixtures:
  *   - winner  → `sample.lib.winner.1.0.0.nupkg`  (dep `WinnerMarker.Dependency`)
@@ -59,8 +59,7 @@ test('a group resolves the highest-priority member for an overlapping id+version
 
   // 2. Create the group via the UI (client-side navigation only).
   await page.goto('/')
-  await page.getByRole('link', { name: /^admin$/i }).click()
-  await page.getByRole('link', { name: /repositor/i }).first().click()
+  await openFromRail(page, 'Repositories')
   await expect(page).toHaveURL(/\/manage\/repositories$/)
   await page.getByRole('link', { name: /new repository/i }).click()
   await page.getByLabel(/^name$/i).fill(group)
@@ -80,12 +79,12 @@ test('a group resolves the highest-priority member for an overlapping id+version
   await page.getByRole('spinbutton', { name: /^priority$/i }).fill('200')
   await page.getByRole('button', { name: /add member/i }).click()
   // The winner row appears in the priority list.
-  await expect(page.getByText(winner, { exact: false })).toBeVisible()
+  await expect(page.getByRole('main').getByText(winner, { exact: false })).toBeVisible()
 
   await page.getByLabel(/^repository$/i).selectOption(loser)
   await page.getByRole('spinbutton', { name: /^priority$/i }).fill('100')
   await page.getByRole('button', { name: /add member/i }).click()
-  await expect(page.getByText(loser, { exact: false })).toBeVisible()
+  await expect(page.getByRole('main').getByText(loser, { exact: false })).toBeVisible()
 
   // The PriorityList orders members by descending priority — winner first.
   const priorities = page.locator('[aria-label="priority"]')

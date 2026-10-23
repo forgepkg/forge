@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test'
 
 import {
   facts,
+  openFromRail,
   pushNupkg,
   readFixture,
   signInSession,
@@ -9,7 +10,7 @@ import {
 } from '../helpers'
 
 /**
- * Create-a-repo flow + push-then-see-package (plan §Testing #4, #5).
+ * Create-a-repo flow + push-then-see-package.
  *
  * An admin creates a hosted repo through the UI; it appears in the repositories
  * list and its V3 index advertises PackagePublish. A `.nupkg` pushed via the
@@ -27,8 +28,7 @@ test.beforeEach(async ({ page }) => {
  */
 async function gotoRepositoriesList(page: import('@playwright/test').Page) {
   await page.goto('/')
-  await page.getByRole('link', { name: /^admin$/i }).click()
-  await page.getByRole('link', { name: /repositor/i }).first().click()
+  await openFromRail(page, 'Repositories')
   await expect(page).toHaveURL(/\/manage\/repositories$/)
 }
 
@@ -61,7 +61,7 @@ test('admin creates a hosted repo via the UI and it appears in the list', async 
 
   // It shows in the repositories list.
   await gotoRepositoriesList(page)
-  await expect(page.getByRole('cell', { name, exact: true })).toBeVisible()
+  await expect(page.getByRole('main').getByRole('link', { name, exact: true })).toBeVisible()
 
   // And the V3 service index advertises PackagePublish (verified via the API).
   const idx = await request.get(`${f.baseUrl}/v3/${name}/index.json`)
@@ -86,7 +86,11 @@ test('a pushed package appears in the repo folder view and in package detail', a
   // Folder view: open the repository from the Browse root, then search within
   // it — search is per repository now, so there is no cross-repo ambiguity.
   await page.goto('/')
-  await page.getByRole('link', { name: new RegExp(`\\b${repo}\\b`) }).click()
+  // (The rail lists the repository too; open it from the page.)
+  await page
+    .getByRole('main')
+    .getByRole('link', { name: new RegExp(`\\b${repo}\\b`) })
+    .click()
   await expect(page).toHaveURL(new RegExp(`/repos/${repo}`))
   await page.getByRole('searchbox').fill('Sample.Lib')
   const pkgLink = page.getByRole('link', { name: /Sample\.Lib/ })

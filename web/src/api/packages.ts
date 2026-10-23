@@ -1,27 +1,63 @@
-import { httpClient } from '~/lib/httpClient'
+import { queryOptions } from '@tanstack/react-query'
+
+import { ApiError, httpClient } from '~/lib/httpClient'
 
 /**
  * Read-side browse / package-detail API.
  *
- * Types mirror the **real** Rust DTOs in `crates/server/src/browse.rs`
- * (reconciled against slice 1, not the forward-looking plan):
+ * Types mirror the **real** Rust DTOs in `crates/server/src/browse.rs`:
  *
- *  - The plan's `total_downloads` / per-version `downloads` fields are **absent**:
- *    slice 1 has no download counters, so the backend omits them rather than
- *    emitting misleading zeros. The UI therefore does not render download stats.
+ *  - There are **no** `total_downloads` / per-version `downloads` fields:
+ *    downloads are tracked server-side, but the browse API does not expose
+ *    them. The UI therefore does not render download stats.
  *  - `delay_status` is `"available" | "delayed_until" | null` (snake_case enum).
- *  - `retention_status` is always `null` in slice 1 (reserved for §12.1).
+ *  - `retention_status` is reserved and always `null`.
  *
  * Every `/browse/*` endpoint requires a signed-in user (401 otherwise); the
  * `_app` layout's login gate ensures these are only called with a session.
+ * An offline hosted or group repository answers its package detail and its
+ * per-repository search with 503 (see {@link isRepositoryOffline}).
  */
 
 /** One readable repository (`GET /browse/repos` item) — a folder-view root. */
 export interface BrowseRepo {
+  /** Repository id, as a token's scope names repositories. */
+  id: number
   /** Repository name. */
   name: string
   /** Repository kind: `hosted` | `proxy` | `group`. */
   kind: string
+  /**
+   * `false` while the repository is offline: a proxy still browses what it
+   * cached, a hosted or group repository answers 503.
+   */
+  online: boolean
+  /**
+   * Repository format: `nuget`, `docker`, or a plugin format's id. A docker
+   * repository holds images, browsed through `/browse/images` (see
+   * `~/api/images`), not packages.
+   */
+  format: string
+  /**
+   * The address clients use for the repository (`<server><mount>/<name>`,
+   * e.g. `https://forge.example.com/v3/internal`), for the connect snippets.
+   * Absent for a docker repository (its registry comes with its images) and
+   * for a format this server does not have installed.
+   */
+  url?: string
+}
+
+/**
+ * The 503 an offline hosted or group repository answers browse requests with
+ * during a maintenance window (`repository is offline`, with `Retry-After`).
+ * Other 503s, such as a busy database, are not this.
+ */
+export function isRepositoryOffline(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 503 &&
+    /offline/i.test(error.body)
+  )
 }
 
 /** One cross-repository search hit (`GET /browse/packages` item). */
@@ -61,13 +97,16 @@ export interface DetailVersion {
   listed: boolean
   /** `.nupkg` byte size, if a stored asset is known (null when not cached). */
   size: number | null
-  /** Publish / first-seen time (`component.created_at`), if known. */
+  /**
+   * When the version reached Forge (`component.created_at`), if known: the
+   * push time on a hosted repository, the first download on a proxy.
+   */
   published_at: string | null
   /** Proxy package-delay status (`null` for hosted / group versions). */
   delay_status: DelayStatus | null
   /** When a delayed proxy version becomes available (`first_seen + delay`). */
   delayed_until?: string | null
-  /** Retention status — reserved for §12.1; always `null` in slice 1. */
+  /** Retention status — reserved; always `null`. */
   retention_status: string | null
 }
 
@@ -136,6 +175,16 @@ function normalizeSearchKey(params: SearchParams) {
 export function fetchBrowseRepos(signal?: AbortSignal): Promise<BrowseRepo[]> {
   return httpClient.get<BrowseRepo[]>('/browse/repos', { signal })
 }
+
+/**
+ * Shared TanStack Query options for the browsable repositories. Reused by the
+ * `useBrowseRepos` hook and the repository screen's loader (which needs a
+ * repository's format before it renders), so both read one cache entry.
+ */
+export const browseReposQueryOptions = queryOptions<BrowseRepo[], ApiError>({
+  queryKey: pkgKeys.repos(),
+  queryFn: ({ signal }) => fetchBrowseRepos(signal),
+})
 
 /** Fetch a page of cross-repository search hits. */
 export function fetchPackages(

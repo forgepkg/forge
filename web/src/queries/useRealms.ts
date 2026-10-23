@@ -2,22 +2,27 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type { ApiError } from '~/lib/httpClient'
 import {
+  convertRealmToLocal,
   createRealm,
   deleteRealm,
+  fetchCapturedPasswords,
   fetchRealm,
   fetchRealms,
   realmKeys,
   reorderRealms,
   updateRealm,
+  type CapturedPasswords,
+  type ConvertToLocal,
   type CreateRealm,
   type RealmView,
   type UpdateRealm,
 } from '~/api/realms'
+import { userKeys } from '~/api/users'
 
 /**
- * TanStack Query hooks for the admin auth-realm resource (§12.7). Reads use
- * `useQuery`; mutations invalidate the realm queries on success so the UI
- * re-fetches the authoritative server state (order, redacted config, ...).
+ * TanStack Query hooks for the admin auth-realm resource. Reads use `useQuery`;
+ * mutations invalidate the realm queries on success so the UI re-fetches the
+ * authoritative server state (order, redacted config, ...).
  */
 
 /** List all realms in priority order (`GET /admin/realms`). */
@@ -76,6 +81,32 @@ export function useReorderRealms() {
     mutationFn: (order) => reorderRealms(order),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: realmKeys.all() })
+    },
+  })
+}
+
+/**
+ * How many of a credential-forwarding realm's accounts keep a password hash
+ * (`GET /admin/realms/{id}/captured-passwords`).
+ */
+export function useCapturedPasswords(id: number) {
+  return useQuery<CapturedPasswords, ApiError>({
+    queryKey: realmKeys.capturedPasswords(id),
+    queryFn: ({ signal }) => fetchCapturedPasswords(id, signal),
+  })
+}
+
+/**
+ * Switch every account of a realm that keeps a password hash to a local one;
+ * invalidates the realm's counts and the user list on success.
+ */
+export function useConvertRealmToLocal(id: number) {
+  const queryClient = useQueryClient()
+  return useMutation<ConvertToLocal, ApiError, void>({
+    mutationFn: () => convertRealmToLocal(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: realmKeys.capturedPasswords(id) })
+      void queryClient.invalidateQueries({ queryKey: userKeys.list() })
     },
   })
 }

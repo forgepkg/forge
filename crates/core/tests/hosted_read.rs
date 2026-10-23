@@ -1,4 +1,4 @@
-//! Integration tests for hosted-repository read ops (Phase 6, Task 6.1).
+//! Integration tests for hosted-repository read ops.
 //!
 //! Seeds `repository` + `blob` + `component` + `asset` rows via the DAOs, then
 //! drives [`forge_core::repo::hosted::HostedRepo`] through the [`RepoReadOps`]
@@ -16,8 +16,18 @@ use forge_db::asset_dao::{self, NewAsset};
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::{blob_dao, model::Repository};
-use forge_nuget::NugetFormat;
 use sqlx::PgPool;
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    let plugin = forge_plugin::Plugin::builtin(
+        forge_format_nuget::PLUGIN_TOML,
+        forge_format_nuget::Nuget::default(),
+    )
+    .expect("plugins/nuget/plugin.toml is valid");
+    forge_plugin::PluginFormat::new(&plugin)
+}
 
 /// In-memory blob byte store: maps `s3_key -> bytes`.
 #[derive(Default, Clone)]
@@ -27,7 +37,8 @@ struct StubBlobs {
 
 #[async_trait]
 impl BlobFetch for StubBlobs {
-    async fn fetch_all(&self, s3_key: &str) -> Result<Vec<u8>, RepoError> {
+    async fn fetch_all(&self, blob: &forge_db::model::Blob) -> Result<Vec<u8>, RepoError> {
+        let s3_key = &blob.s3_key;
         self.map
             .get(s3_key)
             .cloned()
@@ -37,7 +48,7 @@ impl BlobFetch for StubBlobs {
 
 /// Build a `HostedRepo` over the pool with NuGet ordering and the stub blobs.
 fn hosted(pool: &PgPool, blobs: StubBlobs) -> HostedRepo {
-    HostedRepo::new(pool.clone(), Arc::new(NugetFormat::new()), Arc::new(blobs))
+    HostedRepo::new(pool.clone(), Arc::new(nuget()), Arc::new(blobs))
 }
 
 /// Insert a committed blob (pending → commit_and_incref) and return its sha.
@@ -503,6 +514,60 @@ async fn search_filters_listed_and_prerelease_with_paging() {
     assert!(res.hits.is_empty());
 }
 
+/// Without `include_semver2` (a client sending no `semVerLevel`), SemVer 2.0.0
+/// versions are dropped before counting and paging: an id left with none is
+/// not a hit, pages stay full and `total_hits` counts only what is shown.
+#[tokio::test]
+async fn search_drops_semver2_before_paging() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let repo = seed_repo(&pool).await;
+    for (id, version) in [
+        ("Sv.A", "1.0.0"),
+        ("Sv.B", "1.0.0-beta.1"),
+        ("Sv.C", "1.0.0"),
+        ("Sv.C", "2.0.0-rc.1"),
+        ("Sv.D", "2.0.0-alpha.2"),
+        ("Sv.E", "1.0.0-beta1"),
+    ] {
+        let lower = id.to_lowercase();
+        seed_version(&pool, &mut blobs, repo.id, id, &lower, version, true, "s").await;
+    }
+    let h = hosted(&pool, blobs);
+    let search = |skip: usize, include_semver2: bool| SearchParams {
+        skip,
+        take: 2,
+        prerelease: true,
+        include_semver2,
+        ..SearchParams::default()
+    };
+
+    let res = h.search(&repo.name, &search(0, false)).await.unwrap();
+    assert_eq!(res.total_hits, 3, "Sv.B and Sv.D have only SemVer 2.0.0");
+    let ids: Vec<&str> = res.hits.iter().map(|h| h.original_id.as_str()).collect();
+    assert_eq!(ids, ["Sv.A", "Sv.C"], "a full first page");
+    let vs: Vec<&str> = res.hits[1]
+        .versions
+        .iter()
+        .map(|v| v.version.as_str())
+        .collect();
+    assert_eq!(vs, ["1.0.0"]);
+    assert_eq!(res.hits[1].latest_version, "1.0.0");
+
+    let res = h.search(&repo.name, &search(2, false)).await.unwrap();
+    assert_eq!(res.total_hits, 3);
+    let ids: Vec<&str> = res.hits.iter().map(|h| h.original_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["Sv.E"],
+        "the next page continues where the first ended"
+    );
+
+    let res = h.search(&repo.name, &search(0, true)).await.unwrap();
+    assert_eq!(res.total_hits, 5);
+    assert_eq!(res.hits[1].original_id, "Sv.B");
+}
+
 #[tokio::test]
 async fn search_take_is_clamped() {
     let p = SearchParams {
@@ -515,4 +580,106 @@ async fn search_take_is_clamped() {
         ..SearchParams::default()
     };
     assert_eq!(z.effective_take(), SearchParams::DEFAULT_TAKE);
+}
+
+/// #66: search pages over ids: `totalHits` counts every matching id, the
+/// selector applies before paging, and the page's versions are complete.
+#[tokio::test]
+async fn search_pages_over_ids_with_a_selector() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let repo = seed_repo(&pool).await;
+    for i in 0..6 {
+        let id = format!("Pkg.{i}");
+        let lower = id.to_lowercase();
+        for (n, version) in ["1.0.0", "1.1.0"].into_iter().enumerate() {
+            seed_version(
+                &pool,
+                &mut blobs,
+                repo.id,
+                &id,
+                &lower,
+                version,
+                true,
+                &format!("p{i}{n}"),
+            )
+            .await;
+        }
+    }
+    let h = hosted(&pool, blobs);
+    let page = |skip, take| SearchParams {
+        q: "pkg".into(),
+        skip,
+        take,
+        ..SearchParams::default()
+    };
+    let res = h.search(&repo.name, &page(2, 2)).await.unwrap();
+    assert_eq!(res.total_hits, 6);
+    let ids: Vec<&str> = res.hits.iter().map(|h| h.original_id.as_str()).collect();
+    assert_eq!(ids, ["Pkg.2", "Pkg.3"]);
+    let versions: Vec<&str> = res.hits[0]
+        .versions
+        .iter()
+        .map(|v| v.version.as_str())
+        .collect();
+    assert_eq!(versions, ["1.0.0", "1.1.0"]);
+    assert_eq!(res.hits[0].latest_version, "1.1.0");
+
+    let filter = forge_core::authz::PackageFilter::Predicate(Arc::new(|id: &str| id != "pkg.3"));
+    let res = h
+        .search_with_package_filter(&repo.name, &page(2, 2), &filter)
+        .await
+        .unwrap();
+    assert_eq!(res.total_hits, 5);
+    let ids: Vec<&str> = res.hits.iter().map(|h| h.original_id.as_str()).collect();
+    assert_eq!(ids, ["Pkg.2", "Pkg.4"]);
+}
+
+/// #81: a registration index above the inline limit needs only versions, and
+/// a page only its own versions' entries; both agree with `registration`.
+#[tokio::test]
+async fn registration_versions_and_entries_agree_with_registration() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let repo = seed_repo(&pool).await;
+    for (n, (version, listed)) in [("1.0.0", true), ("1.10.0", false), ("1.9.0", true)]
+        .into_iter()
+        .enumerate()
+    {
+        seed_version(
+            &pool,
+            &mut blobs,
+            repo.id,
+            "Reg.Pkg",
+            "reg.pkg",
+            version,
+            listed,
+            &format!("r{n}"),
+        )
+        .await;
+    }
+    let h = hosted(&pool, blobs);
+    let full = h.registration(&repo.name, "reg.pkg").await.unwrap();
+    let versions = h
+        .registration_versions(&repo.name, "reg.pkg")
+        .await
+        .unwrap();
+    assert_eq!(
+        versions,
+        full.iter().map(|e| e.version.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(versions, ["1.0.0", "1.9.0", "1.10.0"]);
+    let mut some = h
+        .registration_entries(&repo.name, "reg.pkg", &["1.10.0".into(), "9.9.9".into()])
+        .await
+        .unwrap();
+    assert_eq!(some.len(), 1);
+    let entry = some.remove(0);
+    let expected = full.iter().find(|e| e.version == "1.10.0").unwrap();
+    assert_eq!(entry.version, expected.version);
+    assert_eq!(entry.listed, expected.listed);
+    assert_eq!(
+        entry.package_hash_sha512_base64,
+        expected.package_hash_sha512_base64
+    );
 }

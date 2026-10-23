@@ -1,19 +1,22 @@
-//! Server-side login sessions (slice 12.2, §3.7).
+//! Server-side login sessions.
 //!
 //! The `session` row is the **authority**; the `forge_session` cookie carries
 //! only an opaque 256-bit secret, and the DB stores only its `sha256`
-//! (`token_hash`) — mirroring the slice-1 token model, so a DB read yields no
+//! (`token_hash`) — mirroring the API-token model, so a DB read yields no
 //! usable credential. A session is valid iff
 //! `revoked_at IS NULL AND now() < idle_expiry AND now() < absolute_expiry`
 //! (the predicate is enforced in SQL by [`session_dao::find_valid_by_hash`]).
 //!
-//! This service is the cross-instance-correct seam Phase 5's cookie middleware
-//! and `/auth` routes build on: every operation is a single DB round-trip
-//! against the shared Postgres, so a session created on instance A is
-//! immediately visible (and revocable) on instance B.
+//! This service is the cross-instance-correct seam the session-cookie source
+//! ([`crate::auth::session_source`]) and the server's `/auth` routes build on:
+//! every operation is a single DB round-trip against the shared Postgres, so a
+//! session created on instance A is immediately visible (and revocable) on
+//! instance B.
+
+use std::sync::{Arc, RwLock};
 
 use base64::Engine;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Duration as ChronoDuration;
 use forge_db::model::Session;
 use forge_db::session_dao::{self, NewSession};
 use rand::Rng;
@@ -22,7 +25,7 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
 /// Default throttle (seconds) for refreshing `last_seen_at` on use — avoids a
-/// write per request, like slice-1 `token.last_used_at`.
+/// write per request, like `token.last_used_at`.
 const DEFAULT_TOUCH_THROTTLE_SECS: i64 = 60;
 
 /// Errors from the session service.
@@ -46,15 +49,23 @@ pub struct IssuedSession {
     pub cookie_secret: String,
 }
 
+/// A session's idle timeout and absolute lifetime.
+#[derive(Debug, Clone, Copy)]
+struct Lifetimes {
+    idle: ChronoDuration,
+    absolute: ChronoDuration,
+}
+
 /// Create/validate/rotate/revoke sessions over a shared Postgres.
 ///
-/// Cheaply [`Clone`]able (just a pool + a couple of durations). TTLs come from
-/// the OIDC config; the server builds one of these at startup.
+/// Cheaply [`Clone`]able (a pool and the shared lifetimes). The server builds
+/// one at startup and follows the lifetimes an administrator sets
+/// ([`Self::set_ttls`]).
 #[derive(Clone)]
 pub struct SessionService {
     pool: PgPool,
-    idle_ttl: ChronoDuration,
-    absolute_ttl: ChronoDuration,
+    /// Shared by every clone, so [`Self::set_ttls`] reaches them all.
+    lifetimes: Arc<RwLock<Lifetimes>>,
     touch_throttle_secs: i64,
 }
 
@@ -63,10 +74,35 @@ impl SessionService {
     pub fn new(pool: PgPool, idle_ttl: ChronoDuration, absolute_ttl: ChronoDuration) -> Self {
         Self {
             pool,
-            idle_ttl,
-            absolute_ttl,
+            lifetimes: Arc::new(RwLock::new(Lifetimes {
+                idle: idle_ttl,
+                absolute: absolute_ttl,
+            })),
             touch_throttle_secs: DEFAULT_TOUCH_THROTTLE_SECS,
         }
+    }
+
+    /// Change the idle / absolute TTLs, for this service and every clone of
+    /// it. A session created afterwards gets them; an existing one keeps its
+    /// absolute expiry, and its idle window slides by the new idle TTL on
+    /// its next use.
+    pub fn set_ttls(&self, idle_ttl: ChronoDuration, absolute_ttl: ChronoDuration) {
+        *self
+            .lifetimes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Lifetimes {
+            idle: idle_ttl,
+            absolute: absolute_ttl,
+        };
+    }
+
+    /// The current idle / absolute TTLs.
+    pub fn ttls(&self) -> (ChronoDuration, ChronoDuration) {
+        let lifetimes = *self
+            .lifetimes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (lifetimes.idle, lifetimes.absolute)
     }
 
     /// Override the `last_seen_at` touch throttle (mainly for tests).
@@ -77,7 +113,7 @@ impl SessionService {
 
     /// Create a fresh session for `user_id`, returning the row + the one-time
     /// cookie secret. A new CSRF secret is generated and stored on the row for
-    /// the double-submit defense (§3.8).
+    /// the double-submit defense.
     pub async fn create_for_user(
         &self,
         user_id: i64,
@@ -87,7 +123,12 @@ impl SessionService {
         let cookie_secret = random_secret();
         let token_hash = sha256_hex(&cookie_secret);
         let csrf_secret = random_secret();
-        let now = Utc::now();
+        // The expiries are compared with the database's clock (`now()` in the
+        // validity check), so they are computed on it too.
+        let now = forge_db::db_now(&self.pool)
+            .await
+            .map_err(|e| SessionError::Db(e.to_string()))?;
+        let (idle_ttl, absolute_ttl) = self.ttls();
 
         let session = session_dao::create(
             &self.pool,
@@ -97,8 +138,8 @@ impl SessionService {
                 token_hash,
                 csrf_secret,
                 user_agent_hash,
-                idle_expiry: now + self.idle_ttl,
-                absolute_expiry: now + self.absolute_ttl,
+                idle_expiry: now + idle_ttl,
+                absolute_expiry: now + absolute_ttl,
             },
         )
         .await
@@ -129,7 +170,7 @@ impl SessionService {
         };
 
         // Defense in depth: constant-time compare of stored vs recomputed hash,
-        // matching the slice-1 token path (no timing side channel on near-miss).
+        // matching the API-token path (no timing side channel on near-miss).
         if session
             .token_hash
             .as_bytes()
@@ -145,7 +186,7 @@ impl SessionService {
             &self.pool,
             session.id,
             self.touch_throttle_secs,
-            self.idle_ttl.num_seconds(),
+            self.ttls().0.num_seconds(),
         )
         .await
         {
@@ -158,7 +199,7 @@ impl SessionService {
     /// Rotate a session: create a brand-new session for the same user/identity
     /// and **revoke the old one**. Returns the new [`IssuedSession`] (with a new
     /// cookie secret to set). Used right after login and on privilege change to
-    /// prevent session fixation (§3.7).
+    /// prevent session fixation.
     pub async fn rotate(&self, old: &Session) -> Result<IssuedSession, SessionError> {
         let issued = self
             .create_for_user(
@@ -190,7 +231,8 @@ impl SessionService {
     }
 
     /// Delete sessions that are no longer usable (revoked / expired). Returns the
-    /// number reaped. Driven by the Phase-6 background reaper.
+    /// number reaped. (The server's background reaper calls
+    /// [`session_dao::reap_expired`] directly.)
     pub async fn reap_expired(&self) -> Result<u64, SessionError> {
         session_dao::reap_expired(&self.pool)
             .await
@@ -199,7 +241,7 @@ impl SessionService {
 }
 
 /// Constant-time compare of a presented CSRF token against a session's stored
-/// `csrf_secret` (double-submit defense, §3.8). `false` on any length/byte
+/// `csrf_secret` (double-submit defense). `false` on any length/byte
 /// mismatch, with no early-exit timing leak.
 pub fn csrf_token_matches(presented: &str, session_csrf_secret: &str) -> bool {
     presented
@@ -217,7 +259,7 @@ fn random_secret() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Lowercase-hex SHA-256, matching the slice-1 `token_hash` form.
+/// Lowercase-hex SHA-256, matching the API token's `token_hash` form.
 fn sha256_hex(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }

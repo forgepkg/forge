@@ -1,4 +1,4 @@
-//! The **pure** fine-grained-RBAC evaluator (§12.4 Phase 2).
+//! The **pure** fine-grained-RBAC evaluator.
 //!
 //! This module is deliberately free of any database, cache, or async concern.
 //! It defines the in-memory shape of a principal's resolved authorization —
@@ -14,7 +14,7 @@
 //!   is visible iff at least one held `read` grant covering the repo either has
 //!   no selector or matches the package name.
 //!
-//! ## Model (plan §3 "The permission model")
+//! ## Model
 //!
 //! A principal holds a flat, **additive** set of [`Grant`]s (the union of all
 //! its roles' grants). Each grant is `(action, repo|ANY, selector?)`. There are
@@ -29,7 +29,7 @@
 //! the owner's set (cached); the token scope is intersected **after** the cache
 //! lookup so the owner set stays shared across that user's tokens.
 //!
-//! ## Selector semantics (plan §3 "Content scoping")
+//! ## Selector semantics (content scoping)
 //!
 //! Selectors are glob include/exclude lists matched against the **lowercased**
 //! package name (NuGet ids are case-insensitive). An empty include list means
@@ -53,7 +53,8 @@ pub enum Action {
     Write,
     /// Unlist / delete.
     Delete,
-    /// Repository config + privilege management.
+    /// Repository config + privilege management. Administration is global:
+    /// the grants API and the table refuse an `admin` grant on one repository.
     Admin,
 }
 
@@ -132,6 +133,13 @@ impl SelectorPatterns {
     /// at evaluation, so persisting one is never useful).
     pub fn compile_check(&self) -> Result<(), SelectorCompileError> {
         self.compile().map(|_| ())
+    }
+
+    /// Compile the patterns and match `package_name` against them, exactly as
+    /// a grant scoped by this selector would. Used by the admin API's selector
+    /// test, so an admin checks a pattern against the evaluator's own globs.
+    pub fn matches(&self, package_name: &str) -> Result<bool, SelectorCompileError> {
+        self.compile().map(|c| c.matches(package_name))
     }
 }
 
@@ -302,6 +310,18 @@ impl EffectiveSet {
             return true;
         }
         self.grants.iter().any(|g| g.covers_repo(action, repo_id))
+    }
+
+    /// Whether this principal may perform `action` on **every** repository,
+    /// including ones created later and every package in them: the `admin`
+    /// role, or an unscoped grant of `action` on ANY repository (what the
+    /// built-in `writer` role holds for `write`).
+    pub fn allows_every_repo(&self, action: Action) -> bool {
+        self.is_admin
+            || self
+                .grants
+                .iter()
+                .any(|g| g.action == action && g.repo.is_none() && g.selector.is_none())
     }
 
     /// **Package-level filter** for `action` on `repo_id`.
@@ -568,7 +588,9 @@ pub struct TokenScope {
     /// (never `admin`, which must be listed explicitly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<Action>>,
-    /// Allowed repository ids; `None` ⇒ all repos the owner can touch.
+    /// Allowed repository ids; `None` ⇒ all repos the owner can touch. A group
+    /// listed here grants no read on its members (as for any principal): to
+    /// read through a group, list the members it should serve from as well.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repositories: Option<Vec<i64>>,
 }
@@ -671,6 +693,26 @@ mod tests {
             !s.allows_repo(Action::Read, 1),
             "write ANY does not grant read"
         );
+    }
+
+    #[test]
+    fn only_an_unscoped_any_repo_grant_covers_every_repo_ever() {
+        let writer = set(
+            false,
+            &[(Action::Read, None, None), (Action::Write, None, None)],
+        );
+        assert!(writer.allows_every_repo(Action::Write));
+        assert!(writer.allows_every_repo(Action::Read));
+        assert!(!writer.allows_every_repo(Action::Delete));
+        assert!(!writer.allows_every_repo(Action::Admin));
+        assert!(set(true, &[]).allows_every_repo(Action::Write), "admin");
+        // One repository, or a package scope, is not every repository.
+        assert!(!set(false, &[(Action::Write, Some(1), None)]).allows_every_repo(Action::Write));
+        assert!(
+            !set(false, &[(Action::Write, None, Some(sel(&["acme.*"], &[])))])
+                .allows_every_repo(Action::Write)
+        );
+        assert!(!EffectiveSet::empty().allows_every_repo(Action::Write));
     }
 
     #[test]

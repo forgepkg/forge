@@ -1,4 +1,4 @@
-//! The versioned AEAD envelope format (plan §2.3).
+//! The versioned AEAD envelope format.
 //!
 //! Every encrypted value stored in a database column is a self-describing
 //! binary blob:
@@ -45,7 +45,7 @@ const SECRET_AAD_V2_PREFIX: &[u8] = b"forge.secret.v2";
 /// Domain-separation prefix for DEK-wrapped-by-KEK AADs (versioned).
 const KEY_WRAP_AAD_PREFIX: &[u8] = b"forge.key.wrap.v1";
 
-/// AAD under which the static root provider wraps KEK bytes (plan §2.5).
+/// AAD under which the static root provider wraps KEK bytes.
 pub const ROOT_WRAP_AAD: &[u8] = b"forge.root.wrap";
 
 /// Field separator inside AADs (ASCII Unit Separator — cannot appear in
@@ -116,7 +116,7 @@ impl std::fmt::Display for Algorithm {
     }
 }
 
-/// The row identity a secret ciphertext is bound to via AAD (plan §2.4).
+/// The row identity a secret ciphertext is bound to via AAD.
 ///
 /// Kept **explicit** at every call site (rather than hidden in a sqlx codec)
 /// because the row-pk binding is the whole security property and must not be
@@ -134,7 +134,7 @@ pub struct AeadBinding<'a> {
     /// origin, an OIDC issuer. Binding it means a row repointed elsewhere
     /// (by a database write that bypasses the API, which drops or replaces
     /// the secret) no longer decrypts, so the secret is never sent to the
-    /// new destination. `None` is the row-only binding of earlier builds.
+    /// new destination. `None` binds the row alone.
     pub destination: Option<&'a str>,
 }
 
@@ -166,15 +166,6 @@ impl AeadBinding<'_> {
         aad.extend_from_slice(&self.row_pk.to_be_bytes());
         aad.extend_from_slice(destination.as_bytes());
         aad
-    }
-
-    /// The same row without its destination: the binding earlier builds
-    /// sealed under.
-    pub fn row_only(self) -> Self {
-        AeadBinding {
-            destination: None,
-            ..self
-        }
     }
 }
 
@@ -421,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn destination_is_bound_and_distinct_from_the_row_only_binding() {
+    fn destination_is_bound() {
         let key = KeyBytes::generate();
         let to = |destination| AeadBinding {
             destination: Some(destination),
@@ -439,26 +430,15 @@ mod tests {
             &*open_with_key(&key, &blob, &to("https://nexus.example").aad()).unwrap(),
             b"pw"
         );
-        // Repointed elsewhere, or read under the row-only binding: no plaintext.
-        for aad in [
-            to("https://attacker.example").aad(),
-            to("").aad(),
-            to("https://nexus.example").row_only().aad(),
-        ] {
+        // Repointed elsewhere: no plaintext.
+        for aad in [to("https://attacker.example").aad(), to("").aad()] {
             assert!(matches!(
                 open_with_key(&key, &blob, &aad).unwrap_err(),
                 CryptoError::DecryptFailed
             ));
         }
-        // An empty destination is still a destination binding, not the v1 one.
+        // An empty destination is still a destination binding.
         assert_ne!(to("").aad(), binding(7).aad());
-        // The row-only binding is byte-for-byte what earlier builds used.
-        let mut v1 = b"forge.secret.v1repository".to_vec();
-        v1.push(0x1F);
-        v1.extend_from_slice(b"upstream_password_enc");
-        v1.push(0x1F);
-        v1.extend_from_slice(&7i64.to_be_bytes());
-        assert_eq!(binding(7).aad(), v1);
     }
 
     #[test]

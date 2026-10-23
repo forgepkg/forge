@@ -1,4 +1,4 @@
-//! E2E: read-side browse / search endpoints (plan §12.6 Phase 0, §8).
+//! E2E: read-side browse / search endpoints.
 //!
 //! Exercises the full HTTP stack: publish a package, then browse + view detail;
 //! the signed-in-users-only rule (anonymous browse is 401 even for
@@ -35,10 +35,10 @@ async fn publish_one(
         resp.status()
     );
 
-    // Under §12.4 RBAC, anonymous read flows through a grant on the built-in
-    // `anonymous` role (what the data migration converts the slice-1
+    // Under RBAC, anonymous read flows through a grant on the built-in
+    // `anonymous` role (what the RBAC data migration converted the
     // `anonymous_read` flag into), not the column. Seed that grant directly,
-    // mirroring the migration, so anonymous browse/search honors it.
+    // mirroring the migration, so the `/v3` feed serves the repo anonymously.
     if anonymous_read {
         let repo_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, repo)
             .await
@@ -137,6 +137,75 @@ async fn browse_search_and_detail() {
     assert!(deps[0]["range"].is_string());
 }
 
+/// With more packages than `take`, `total` counts all of them, not just the
+/// requested window, so the SPA's paginator can move past the first page. A
+/// single repository pages in its backend; a cross-repo search merges, and
+/// its totals add up across repositories.
+#[tokio::test]
+async fn browse_pages_past_take() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let suffix = common::unique();
+    let repo = format!("pg{suffix}");
+    let other = format!("pgo{suffix}");
+    let prefix = format!("Paged{suffix}");
+    for n in 0..7 {
+        publish_one(&srv, &repo, &format!("{prefix}.P{n}"), "1.0.0", false).await;
+    }
+    for n in 0..3 {
+        publish_one(&srv, &other, &format!("{prefix}.Q{n}"), "1.0.0", false).await;
+    }
+
+    let page = |query: String| {
+        let srv = &srv;
+        let (u, p) = (u.clone(), p.clone());
+        async move {
+            let resp = srv
+                .client()
+                .get(format!("{}/browse/packages?{query}", srv.base_url))
+                .basic_auth(&u, Some(&p))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            let ids: Vec<String> = body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["original_id"].as_str().unwrap().to_string())
+                .collect();
+            (body["total"].as_u64().unwrap(), ids)
+        }
+    };
+    let ids =
+        |names: &[&str]| -> Vec<String> { names.iter().map(|n| format!("{prefix}.{n}")).collect() };
+
+    // One repository (the SPA's case).
+    assert_eq!(
+        page(format!("repo={repo}&take=3")).await,
+        (7, ids(&["P0", "P1", "P2"]))
+    );
+    assert_eq!(
+        page(format!("repo={repo}&skip=3&take=3")).await,
+        (7, ids(&["P3", "P4", "P5"]))
+    );
+    assert_eq!(
+        page(format!("repo={repo}&skip=6&take=3")).await,
+        (7, ids(&["P6"]))
+    );
+
+    // Across repositories: the merged window spans both.
+    assert_eq!(
+        page(format!("q={prefix}&take=3")).await,
+        (10, ids(&["P0", "P1", "P2"]))
+    );
+    assert_eq!(
+        page(format!("q={prefix}&skip=5&take=3")).await,
+        (10, ids(&["P5", "P6", "Q0"]))
+    );
+}
+
 /// An unknown package id returns 404 from the detail endpoint.
 #[tokio::test]
 async fn browse_detail_unknown_package_404() {
@@ -186,14 +255,18 @@ async fn browse_detail_unknown_repo_404() {
 #[tokio::test]
 async fn browse_requires_login() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         ServerOpts {
-            anonymous_mode: "all".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (u, p) = srv.admin_basic();
     let suffix = common::unique();
     let pub_repo = format!("pub{suffix}");
@@ -260,12 +333,95 @@ async fn browse_repos_folder_root() {
         .find(|r| r["name"] == json!(repo))
         .expect("created repo listed in /browse/repos");
     assert_eq!(entry["kind"], json!("hosted"));
+    assert_eq!(entry["online"], json!(true));
+    // The id, which a token's scope names repositories by.
+    let admin: Value = srv
+        .client()
+        .get(format!("{}/admin/repositories/{repo}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(entry["id"], admin["id"]);
 
     // Sorted by name.
     let names: Vec<&str> = repos.iter().map(|r| r["name"].as_str().unwrap()).collect();
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "repo folder list is sorted by name");
+}
+
+/// `/browse/repos` names each repository's client URL under its format's
+/// mount, and `format` keeps one format's repositories.
+#[tokio::test]
+async fn browse_repos_by_format_with_client_urls() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let suffix = common::unique();
+    let created: Vec<(String, &str)> = vec![
+        (format!("nu{suffix}"), "nuget"),
+        (format!("charts{suffix}"), "helm"),
+        (format!("images{suffix}"), "docker"),
+    ];
+    for (name, format) in &created {
+        let resp = srv
+            .client()
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({"name": name, "kind": "hosted", "format": format}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "create {format} repository");
+    }
+    let list = |query: &'static str| {
+        let srv = &srv;
+        let (u, p) = (u.clone(), p.clone());
+        async move {
+            let resp = srv
+                .client()
+                .get(format!("{}/browse/repos{query}", srv.base_url))
+                .basic_auth(&u, Some(&p))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+    let all = list("").await;
+    let entry = |name: &str| {
+        all.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == json!(name))
+            .cloned()
+            .expect("listed")
+    };
+    let nuget = entry(&created[0].0);
+    assert_eq!(nuget["format"], "nuget");
+    assert_eq!(
+        nuget["url"],
+        format!("http://test.local/v3/{}", created[0].0)
+    );
+    let helm = entry(&created[1].0);
+    assert_eq!(helm["format"], "helm");
+    assert_eq!(
+        helm["url"],
+        format!("http://test.local/repository/{}", created[1].0)
+    );
+    let docker = entry(&created[2].0);
+    assert_eq!(docker["format"], "docker");
+    assert!(docker.get("url").is_none(), "{docker}");
+
+    let charts = list("?format=helm").await;
+    let charts = charts.as_array().unwrap();
+    assert!(charts.iter().all(|r| r["format"] == "helm"), "{charts:?}");
+    assert!(charts.iter().any(|r| r["name"] == json!(created[1].0)));
+    assert!(list("?format=npm").await.as_array().unwrap().is_empty());
 }
 
 /// A group repository merges its members: a package published into a hosted
@@ -332,6 +488,117 @@ async fn browse_group_merges_members() {
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0]["version"], json!("2.0.0"));
     let _ = lower;
+}
+
+/// An offline hosted or group repository serves nothing through browse either,
+/// as on its feed (#73): its search and package detail answer 503 with
+/// `Retry-After`, a merged search leaves it out, and `/browse/repos` flags it.
+/// An offline proxy still browses what it cached.
+#[tokio::test]
+async fn browse_offline_hosted_and_group_answer_503() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let hosted = format!("boffh{s}");
+    let group = format!("boffg{s}");
+    let proxy = format!("boffp{s}");
+    let id = format!("Off.Browse{s}");
+
+    publish_one(&srv, &hosted, &id, "1.0.0", false).await;
+    for body in [
+        json!({"name": group, "kind": "group"}),
+        json!({"name": proxy, "kind": "proxy",
+               "remote_url": "https://api.nuget.org/v3/index.json"}),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{body}");
+    }
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{group}/members",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"member": hosted, "priority": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    let get = |path: String| {
+        client
+            .get(format!("{}{path}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .send()
+    };
+    let merged_has_id = |body: &Value| {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["original_id"] == json!(id))
+    };
+    let merged: Value = get(format!("/browse/packages?q={id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(merged_has_id(&merged), "online: {merged}");
+
+    for repo in [&hosted, &group, &proxy] {
+        let resp = client
+            .put(format!("{}/admin/repositories/{repo}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({"online": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    for repo in [&hosted, &group] {
+        for path in [
+            format!("/browse/packages?repo={repo}"),
+            format!("/browse/packages/{repo}/{id}"),
+        ] {
+            let resp = get(path.clone()).await.unwrap();
+            assert_eq!(resp.status(), 503, "{path}");
+            assert!(resp.headers().contains_key("retry-after"), "{path}");
+        }
+    }
+    let merged: Value = get(format!("/browse/packages?q={id}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(!merged_has_id(&merged), "offline repos left out: {merged}");
+    let resp = get(format!("/browse/packages?repo={proxy}")).await.unwrap();
+    assert_eq!(resp.status(), 200, "an offline proxy browses its cache");
+
+    let repos: Value = get("/browse/repos".into())
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for repo in [&hosted, &group, &proxy] {
+        let entry = repos
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == json!(repo))
+            .expect("offline repositories are still listed");
+        assert_eq!(entry["online"], json!(false), "{repo}");
+    }
 }
 
 /// Mounting `/browse` and `/admin/me` must not shadow the admin-only `/admin/*`

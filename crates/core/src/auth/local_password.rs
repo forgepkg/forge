@@ -1,14 +1,20 @@
-//! The `local-password` [`AuthProvider`] (slice 12.3, phase 2).
+//! The `local-password` [`AuthProvider`].
 //!
-//! This is the refactor of slice 1's password-basic path
-//! ([`super::token::verify_password`]) into the pluggable [`AuthProvider`]
-//! chain. Its behaviour is **byte-for-byte** the slice-1 logic:
+//! Local argon2id password authentication against `app_user.password_hash`,
+//! as one provider of the pluggable [`AuthProvider`] chain:
 //!
 //! * Look up the user by username.
-//! * An inactive user, an unknown user, or a user without a local
-//!   `password_hash` (i.e. an `upstream-basic` / `oidc` provisioned account)
-//!   can never authenticate here — they are [`AuthOutcome::Skip`] ("not my
-//!   user"), so a later provider may still accept them.
+//! * An unknown user, or a user without a local `password_hash` (i.e. an
+//!   `upstream-basic` / `oidc` provisioned account) can never authenticate
+//!   here — they are [`AuthOutcome::Skip`] ("not my user"), so a later
+//!   provider may still accept them.
+//! * An inactive local account (one with a `password_hash`) can never
+//!   authenticate either, but its username is still owned by a local password
+//!   account: it is [`AuthOutcome::Rejected`], like a wrong password, so no
+//!   password typed for it is ever forwarded to a later (upstream) provider.
+//! * So is an invited local account (`auth_source = 'local'`, no password
+//!   yet, #322): its user has not chosen the password, and no later provider
+//!   may take the name over.
 //! * argon2id PHC verification runs on a blocking thread (CPU-bound), behind a
 //!   process-wide [`PasswordHashLimiter`]: at most N verifications run at once
 //!   (each holds ~19 MiB and a core for tens of milliseconds), and one that finds
@@ -16,34 +22,35 @@
 //!   (an overload, not a wrong password: never counted towards the lockout).
 //! * A present-but-wrong password is [`AuthOutcome::Rejected`] (terminal in
 //!   the chain: the password is never forwarded upstream).
-//! * The unknown-user and inactive-user `Skip` paths still run one argon2
-//!   verification against a static dummy hash, so they cost the same time as a
-//!   known local account (no timing-based enumeration of local accounts). A
-//!   federated account (no local `password_hash`) skips at once — see
-//!   [`LocalPasswordProvider::authenticate`] for that trade-off.
+//! * The unknown-user `Skip` path and the inactive-account rejection still run
+//!   one argon2 verification against a static dummy hash, so they cost the
+//!   same time as a known local account (no timing-based enumeration of local
+//!   accounts). A federated account (no local `password_hash`) skips at once —
+//!   see [`LocalPasswordProvider::authenticate`] for that trade-off.
 //! * A correct password yields [`AuthOutcome::Authenticated`] with a
 //!   [`ProvenIdentity::local`].
 //!
 //! The provider only *vouches for* the username; mapping that identity back to
 //! a concrete [`UserPrincipal`] (user id, admin flag) is the chain caller's job
 //! (see [`super::chain`] mapping helpers). This keeps providers free of the
-//! `UserPrincipal` shape and lets §12.4 reshape authz without touching them.
+//! `UserPrincipal` shape, so authorization can change without touching them.
 //!
 //! ## Skip vs Rejected — why it matters for the chain
-//! Slice 1's [`super::token::verify_password`] returned `None` for *both*
-//! "unknown user" and "wrong password". In the chain those must differ:
-//! * unknown / no-local-hash / inactive → **Skip** (a later provider, e.g.
+//! A plain yes/no check such as [`super::token::verify_password`] returns
+//! `None` for *both* "unknown user" and "wrong password". In the chain those
+//! must differ:
+//! * unknown / no-local-hash → **Skip** (a later provider, e.g.
 //!   `upstream-basic`, may own this username);
-//! * known local user, wrong password → **Rejected** (definitive "no"; the
-//!   chain stops here — a username owned by a local account with a password is
-//!   never forwarded to an upstream realm).
+//! * known local user, wrong password, or an inactive local account with any
+//!   password → **Rejected** (definitive "no"; the chain stops here — a
+//!   username owned by a local account with a password is never forwarded to
+//!   an upstream realm).
 //!
 //! When the chain is just `["local-password"]` this distinction is invisible on
-//! the wire: both `Skip` (→ `NoCredentials` → anon policy) and `Rejected`
-//! (→ 401) reproduce slice-1 behaviour, because slice 1's `BasicAuthSource`
-//! turned a `None` password verify into `SourceOutcome::Invalid` only when the
-//! basic header was present (creds were attempted), which is exactly what the
-//! refactored `BasicAuthSource` still does. See the phase-2 tests.
+//! the wire: Basic credentials were presented either way, so `BasicAuthSource`
+//! answers both `Skip` (→ `NoCredentials`) and `Rejected` with
+//! `SourceOutcome::Invalid` (→ 401), never anonymous. See the `basic_*` tests
+//! in `crates/core/tests/local_password.rs`.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -129,8 +136,31 @@ impl PasswordHashLimiter {
 
     /// Burn one verification against the static dummy hash (timing
     /// equalization); never accepts.
-    async fn verify_dummy(&self, candidate: String) -> Result<bool, LimiterSaturated> {
+    pub async fn verify_dummy(&self, candidate: String) -> Result<bool, LimiterSaturated> {
         self.run(None, candidate).await
+    }
+
+    /// Hash `password` into a fresh argon2id PHC string (default parameters,
+    /// random salt) on a blocking thread, in a slot of its own: hashing costs
+    /// what a verification does. Unlike a verification it never queues: with
+    /// every slot busy it fails at once, so a caller that can do without the
+    /// hash (see `capture_password_hash`) never makes a request wait for a
+    /// slot. `Ok(None)` when hashing failed.
+    pub async fn try_hash(&self, password: String) -> Result<Option<String>, LimiterSaturated> {
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| LimiterSaturated)?;
+        Ok(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Argon2::default()
+                .hash_password(password.as_bytes())
+                .map(|h| h.to_string())
+                .ok()
+        })
+        .await
+        .unwrap_or(None))
     }
 
     async fn run(
@@ -165,7 +195,7 @@ impl PasswordHashLimiter {
     }
 }
 
-/// Slice-1 local argon2id password authentication, as an [`AuthProvider`].
+/// Local argon2id password authentication, as an [`AuthProvider`].
 pub struct LocalPasswordProvider {
     pool: PgPool,
     limiter: Arc<PasswordHashLimiter>,
@@ -213,17 +243,17 @@ impl LocalPasswordProvider {
         if self.forwarding_follows {
             AuthOutcome::Skip
         } else {
-            self.skip_after_dummy_verify(candidate).await
+            self.after_dummy_verify(candidate, AuthOutcome::Skip).await
         }
     }
 
-    /// Burn one argon2 verification on the dummy hash, then report `Skip`: the
-    /// caller learns "not ours" in the same time a wrong password would take.
-    /// A saturated limiter answers `Unavailable`, exactly as it does for a real
+    /// Burn one argon2 verification on the dummy hash, then report `outcome`:
+    /// the caller learns it in the same time a wrong password would take. A
+    /// saturated limiter answers `Unavailable`, exactly as it does for a real
     /// account, so an overload does not reveal which usernames exist either.
-    async fn skip_after_dummy_verify(&self, candidate: &str) -> AuthOutcome {
+    async fn after_dummy_verify(&self, candidate: &str, outcome: AuthOutcome) -> AuthOutcome {
         match self.limiter.verify_dummy(candidate.to_string()).await {
-            Ok(_) => AuthOutcome::Skip,
+            Ok(_) => outcome,
             Err(LimiterSaturated) => saturated(),
         }
     }
@@ -275,22 +305,32 @@ impl AuthProvider for LocalPasswordProvider {
                 // A DB error is an infrastructure failure: fail closed, never
                 // grant — but let the chain decide the wire verdict.
                 tracing::warn!(error = %e, "local-password user lookup failed");
-                return AuthOutcome::Unavailable;
+                return AuthOutcome::Failed;
             }
         };
 
         // Users with no local password (auth_source upstream-basic / oidc) can
         // never authenticate via the local store — this username is not ours.
+        // A local account without one is invited (its user has not chosen the
+        // password yet): ours, and refused like an inactive one.
         let Some(stored) = user.password_hash.clone() else {
+            if user.auth_source == "local" {
+                return self
+                    .after_dummy_verify(cred.password, AuthOutcome::Rejected)
+                    .await;
+            }
             return self.skip_foreign(cred.password).await;
         };
 
-        // Inactive users never authenticate locally. Slice 1 returned `None`
-        // here; in the chain this is Skip (the account exists but isn't ours to
-        // accept — and an inactive user shouldn't be forwarded upstream either,
-        // but that is the upstream provider's own active-check concern).
+        // Inactive users never authenticate locally. The name still belongs to
+        // a local password account, so this is a terminal rejection, not a
+        // Skip: neither the owner's password nor a guess may reach a later
+        // (upstream) realm. It costs a (dummy) verification and answers like a
+        // wrong password, so it does not show that the account is deactivated.
         if !user.active {
-            return self.skip_after_dummy_verify(cred.password).await;
+            return self
+                .after_dummy_verify(cred.password, AuthOutcome::Rejected)
+                .await;
         }
 
         match self.limiter.verify(stored, cred.password.to_string()).await {
@@ -363,9 +403,31 @@ mod tests {
             limiter.verify_dummy("x".into()).await,
             Err(LimiterSaturated)
         );
+        assert_eq!(limiter.try_hash("x".into()).await, Err(LimiterSaturated));
         drop(held);
         assert_eq!(limiter.verify_dummy("x".into()).await, Ok(false));
         assert_eq!(permits.available_permits(), 1, "permit returned after use");
+    }
+
+    #[tokio::test]
+    async fn try_hash_makes_a_verifiable_argon2id_phc() {
+        let limiter = PasswordHashLimiter::new(1, DEFAULT_QUEUE_TIMEOUT);
+        let hashed = limiter.try_hash("right".into()).await.unwrap().unwrap();
+        let parsed = PasswordHash::new(&hashed).expect("valid PHC string");
+        assert_eq!(parsed.algorithm.as_str(), "argon2id");
+        assert_eq!(
+            limiter.verify(hashed.clone(), "right".into()).await,
+            Ok(true)
+        );
+        assert_eq!(
+            limiter.verify(hashed.clone(), "wrong".into()).await,
+            Ok(false)
+        );
+        // A fresh salt each time.
+        assert_ne!(
+            limiter.try_hash("right".into()).await.unwrap().unwrap(),
+            hashed
+        );
     }
 
     #[test]

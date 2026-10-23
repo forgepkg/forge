@@ -1,0 +1,475 @@
+# Values for the Forge chart. docs/deployment.md explains every
+# Forge setting; deploy/helm/forge/README.md explains how this chart maps them.
+
+nameOverride: ""
+fullnameOverride: ""
+# Added to every object the chart renders (not to the optional dependencies).
+commonLabels: {}
+commonAnnotations: {}
+
+image:
+  registry: ghcr.io
+  repository: forgepkg/forge
+  # Defaults to the chart's appVersion: the release this chart belongs to.
+  # While tag and digest are empty, the published chart pulls that release by
+  # the digest the release workflow signed (the Chart.yaml annotation
+  # forge/image-digest).
+  tag: ""
+  # Pull by this digest (the tag is kept for readability).
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The host name clients use, e.g. forge.example.com. It is the default for
+# config.server.public_base_url (https://<host>), the HTTPRoute's hostnames,
+# the ListenerSet listener's hostname and the Certificate's DNS names.
+host: ""
+
+# Forge's configuration file (forge.toml), as YAML: every key of
+# forge.toml.example, nested by section. It is rendered into a ConfigMap and
+# loaded through FORGE_CONFIG; FORGE_* environment variables (secretEnv, env)
+# still override it. Keep secrets out of it: use secretEnv or existingSecret.
+# A key set to null removes a chart default.
+#
+# The chart adds server.bind (from containerPort), server.public_base_url
+# (from `host`) and, with the in-cluster dependencies, the s3 endpoint and
+# bucket; a (non-empty) value set here wins.
+config:
+  auth:
+    # Each concurrent argon2 password check takes ~19 MiB. The default (0 = one
+    # per CPU) counts the node's CPUs when the pod has no CPU limit, which can
+    # outgrow the memory limit on a large node.
+    password_verify_concurrency: 4
+  # server:
+  #   public_base_url: https://forge.example.com
+  #   # Upload limits are set per repository in the web UI; this caps them.
+  #   max_staging_bytes: 4294967296
+  # auth:
+  #   # The pod network of your gateway / ingress controller, so Forge sees the
+  #   # real client IP (anonymous-IP allowlists, login lockout). Admit only
+  #   # the gateway with networkPolicy.from.
+  #   trusted_proxy_cidrs: [10.0.0.0/8]
+  #   # The first administrator, created on the first start while
+  #   # FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD is set: a UPN, default
+  #   # admin@example.com.
+  #   bootstrap_admin:
+  #     username: admin@example.com
+  # s3:
+  #   endpoint: https://s3.eu-central-1.amazonaws.com
+  #   region: eu-central-1
+  #   bucket: forge
+  #   force_path_style: false
+  # crypto:
+  #   root:
+  #     provider: env        # with FORGE_ROOT_KEY in secretEnv
+  # oidc:
+  #   issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
+  #   client_id: 00000000-0000-0000-0000-000000000000
+  #   redirect_url: https://forge.example.com/auth/oidc/callback
+  #   # no FORGE_OIDC__CLIENT_SECRET: an Entra federated credential instead
+  #   # (Forge's /.well-known/* must be reachable by Entra)
+  #   client_authentication: federated_credential
+
+# RUST_LOG (tracing filter), e.g. "info,forge::audit=info,sqlx=warn".
+logLevel: info
+
+# Secret settings as environment variables, stored in a Secret the chart
+# creates (<fullname>-secret-env) and loaded with envFrom: FORGE_DATABASE__URL,
+# FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY, FORGE_REDIS__URL,
+# FORGE_ROOT_KEY, FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD,
+# FORGE_OIDC__CLIENT_SECRET, ... The bootstrap admin's name is not secret:
+# config.auth.bootstrap_admin.username, a UPN (default admin@example.com).
+secretEnv: {}
+#   FORGE_DATABASE__URL: postgres://forge:<password>@postgres.example.internal:5432/forge
+#   FORGE_S3__ACCESS_KEY: <access key>
+#   FORGE_S3__SECRET_KEY: <secret key>
+#   FORGE_ROOT_KEY: <openssl rand -base64 32>
+#   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: <first start only>
+
+# A change of secretEnv rolls the pods through a pod annotation that holds
+# its SHA-256 salted with a random value, so the annotation (which anyone who
+# can read the pods sees) cannot be tested against guessed secrets. The salt
+# is generated on install and kept in the Secret <fullname>-checksum-salt
+# (looked up in the cluster). Tools that render without a cluster (Argo CD,
+# `helm template`) would generate a new one, and roll the pods, on every
+# render: set one here for them (`openssl rand -hex 16`).
+secretEnvChecksumSalt: ""
+
+# An existing Secret loaded with envFrom (the same keys as secretEnv), for
+# secrets managed elsewhere: External Secrets, Sealed Secrets, SOPS, ...
+# Both can be set (for a key in both, existingSecret's value wins). Any name
+# but <fullname>-secret-env, the chart's own, e.g. forge-credentials.
+existingSecret: ""
+
+# Where Forge's S3 credentials come from (s3.credentials, see
+# docs/deployment.md → Short-lived S3 credentials). The chart writes the
+# choice into the configuration file.
+s3:
+  # static: FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY in secretEnv or
+  #   existingSecret (or versitygw's root credentials with versitygw.enabled).
+  # default_chain: the AWS SDK default credentials chain. For IRSA annotate
+  #   the service account (serviceAccount.annotations:
+  #   eks.amazonaws.com/role-arn: <role ARN>); for EKS Pod Identity create a
+  #   Pod Identity association for it. Nothing else to set here.
+  # web_identity: STS AssumeRoleWithWebIdentity with the token below, against
+  #   AWS STS or the STS of MinIO / Ceph RGW (webIdentity.stsEndpoint).
+  # Both short-lived modes refuse S3 keys in secretEnv / existingSecret.
+  credentials: static
+  # s3.web_identity, with credentials: web_identity.
+  webIdentity:
+    # The role to assume: on AWS, or the ARN MinIO logs for its role policy.
+    # Empty sends none (MinIO's claim-based policies).
+    roleArn: ""
+    # Empty: AWS STS in config.s3.region. MinIO / Ceph RGW: their URL,
+    # usually the S3 endpoint.
+    stsEndpoint: ""
+    sessionName: forge
+    # 900 to 43200; null leaves the lifetime to STS (one hour on AWS).
+    durationSeconds: null
+    # A projected service-account token for the STS, mounted at
+    # /var/run/secrets/forge/s3/token and used as the token file. It is not a
+    # Kubernetes API token: automountServiceAccountToken stays false.
+    projectedToken:
+      enabled: true
+      # What the STS expects in the token's `aud`: sts.amazonaws.com for AWS,
+      # MINIO_IDENTITY_OPENID_CLIENT_ID for MinIO.
+      audience: sts.amazonaws.com
+      # The kubelet replaces the token at 80 % of this (at least 600).
+      expirationSeconds: 3600
+    # Without projectedToken: the path of a token mounted otherwise
+    # (extraVolumes / extraVolumeMounts).
+    tokenFile: ""
+
+# Extra environment variables (Kubernetes EnvVar objects), after the chart's
+# own; `valueFrom` reads single keys, e.g. a CloudNativePG app Secret:
+#   - name: FORGE_DATABASE__URL
+#     valueFrom:
+#       secretKeyRef: { name: forge-db-app, key: uri }
+env: []
+# Extra envFrom sources (Kubernetes EnvFromSource objects).
+envFrom: []
+
+replicaCount: 1
+revisionHistoryLimit: 5
+# Pods that start while others still serve; maxUnavailable 0 keeps the old
+# pods until the new ones are ready. Do not roll back to an older image once a
+# newer one has migrated the database. A ReadWriteOnce cache volume needs
+# `type: Recreate`, which leaves rollingUpdate out.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# Annotations and labels of the Deployment itself.
+deploymentAnnotations: {}
+deploymentLabels: {}
+podAnnotations: {}
+podLabels: {}
+
+serviceAccount:
+  create: true
+  # Defaults to the fullname when created, to "default" otherwise.
+  name: ""
+  # e.g. eks.amazonaws.com/role-arn for IRSA (s3.credentials: default_chain).
+  annotations: {}
+  labels: {}
+  # Forge never talks to the Kubernetes API.
+  automountServiceAccountToken: false
+
+# Mount a service account token into the pod (Forge does not need one). The
+# S3 credential tokens are separate projected volumes: the chart's own
+# (s3.webIdentity.projectedToken) and those the EKS IRSA / Pod Identity
+# webhook injects, which it adds whatever this says.
+automountServiceAccountToken: false
+# A Service named like the release would otherwise inject FORGE_PORT=tcp://...
+# and friends into Forge's own FORGE_* configuration namespace.
+enableServiceLinks: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  # Without it the kubelet makes every directory on a mounted volume
+  # group-writable at each pod start, and Forge refuses a blob cache
+  # directory its group can write. With it, only a volume whose root does
+  # not match yet (a new one) is walked.
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# The port Forge listens on (server.bind); the API, the feeds, the registry
+# and the web UI share it.
+containerPort: 8421
+
+# On SIGTERM Forge stops accepting connections and drains in-flight requests;
+# this bounds the drain (the largest download you expect).
+terminationGracePeriodSeconds: 300
+
+# Let the Service / gateway stop routing here before Forge stops accepting
+# connections; a push refused in that gap is not retried by the client.
+lifecycle:
+  preStop:
+    sleep:
+      seconds: 10
+
+# Forge listens only after migrations and the startup checks, which can take a
+# while on the first start of a new version: up to five minutes here before
+# the liveness probe takes over.
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 5
+  failureThreshold: 60
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 10
+# 503 while PostgreSQL or S3 is unreachable.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+    ephemeral-storage: 1Gi
+  limits:
+    memory: 1Gi
+
+# /tmp (the root filesystem is read-only). Pushes and first-time proxy
+# downloads are staged there, up to server.max_staging_bytes (4 GiB by
+# default): keep the volume above it and raise both together. An emptyDir
+# unless `ephemeral` holds a volumeClaimTemplate spec (a PVC per pod), e.g.
+#   ephemeral:
+#     accessModes: [ReadWriteOnce]
+#     storageClassName: fast
+#     resources: { requests: { storage: 10Gi } }
+tmpVolume:
+  emptyDir:
+    sizeLimit: 6Gi
+  ephemeral: {}
+
+extraVolumes: []
+extraVolumeMounts: []
+initContainers: []
+# Sidecar containers, appended after the forge container.
+extraContainers: []
+# Extra container args (forge-server takes none today).
+args: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+# A constraint without a labelSelector selects this release's Forge pods, e.g.
+#   - maxSkew: 1
+#     topologyKey: kubernetes.io/hostname
+#     whenUnsatisfiable: ScheduleAnyway
+topologySpreadConstraints: []
+priorityClassName: ""
+schedulerName: ""
+runtimeClassName: ""
+hostAliases: []
+dnsPolicy: ""
+dnsConfig: {}
+
+service:
+  type: ClusterIP
+  port: 8421
+  annotations: {}
+  labels: {}
+  # Only for type NodePort / LoadBalancer.
+  nodePort: null
+  clusterIP: ""
+  loadBalancerClass: ""
+  loadBalancerSourceRanges: []
+  externalTrafficPolicy: ""
+  internalTrafficPolicy: ""
+  ipFamilyPolicy: ""
+  ipFamilies: []
+  sessionAffinity: ""
+  trafficDistribution: ""
+  extraPorts: []
+
+# Gateway API HTTPRoute (gateway.networking.k8s.io/v1). There is no Ingress:
+# route through a Gateway, or bring an Ingress with extraObjects.
+#
+# Request size limits and timeouts are implementation-specific (Envoy Gateway
+# BackendTrafficPolicy / ClientTrafficPolicy, Istio, Cilium, ...; add those
+# with extraObjects). Allow pushes of the largest repository upload limit
+# (set per repository in the web UI; by default 512 MiB, and 1 GiB per image
+# layer), and keep the upstream idle timeout below
+# server.header_read_timeout_seconds (150 s): Envoy and Istio default to one
+# hour, which makes the proxy reuse connections Forge is closing (502). List the gateway's pod network in
+# config.auth.trusted_proxy_cidrs, and its namespace in networkPolicy.from.
+httpRoute:
+  enabled: false
+  apiVersion: gateway.networking.k8s.io/v1
+  annotations: {}
+  labels: {}
+  # The Gateways (or ListenerSets) to attach to. With listenerSet.enabled the
+  # chart's ListenerSet is attached as well.
+  parentRefs: []
+  #  - name: gateway
+  #    namespace: gateway-system
+  #    sectionName: https
+  # Defaults to [host].
+  hostnames: []
+  # Rules (HTTPRouteRule objects). A rule without backendRefs routes to the
+  # forge Service.
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      # Extended support; the largest push a repository accepts must fit.
+      # timeouts:
+      #   request: 900s
+
+# Gateway API ListenerSet (gateway.networking.k8s.io/v1, Gateway API 1.5+):
+# adds this release's own HTTPS listener to a shared Gateway, so the Gateway's
+# owner does not have to add one per application. The Gateway must allow it
+# (spec.allowedListeners.namespaces.from: Same / Selector / All). The
+# HTTPRoute attaches to it automatically.
+listenerSet:
+  enabled: false
+  apiVersion: gateway.networking.k8s.io/v1
+  annotations: {}
+  labels: {}
+  parentRef:
+    name: gateway
+    namespace: gateway-system
+    # group: gateway.networking.k8s.io
+    # kind: Gateway
+  # Listeners (ListenerEntry objects). An empty hostname defaults to `host`,
+  # an HTTPS listener without tls terminates with the Secret <fullname>-tls
+  # (see certificate).
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: ""
+      allowedRoutes:
+        namespaces:
+          from: Same
+
+# A cert-manager Certificate for the listener's TLS Secret (<fullname>-tls),
+# for gateways whose certificates cert-manager does not create from
+# annotations.
+certificate:
+  enabled: false
+  apiVersion: cert-manager.io/v1
+  annotations: {}
+  labels: {}
+  # Defaults to <fullname>-tls.
+  secretName: ""
+  # Defaults to [host].
+  dnsNames: []
+  issuerRef:
+    name: ""
+    kind: ClusterIssuer
+    group: cert-manager.io
+  # Further Certificate spec fields (duration, privateKey, usages, ...).
+  extraSpec: {}
+
+# Several replicas need Valkey or Redis (valkey.enabled or FORGE_REDIS__URL)
+# so caches and invalidations converge immediately, and replicas x
+# database.max_connections (20) must fit PostgreSQL's max_connections.
+podDisruptionBudget:
+  enabled: false
+  # minAvailable is used when set, maxUnavailable otherwise.
+  maxUnavailable: 1
+  minAvailable: null
+  unhealthyPodEvictionPolicy: ""
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: null
+  # Further metrics (MetricSpec objects) and scaling behavior.
+  metrics: []
+  behavior: {}
+
+# A NetworkPolicy for the Forge pods (enforced where the CNI supports it).
+# Forge believes the X-Forwarded-For header of every peer in
+# config.auth.trusted_proxy_cidrs, usually the whole pod network: without a
+# policy any pod in the cluster can reach the Service with a forged client
+# address, past the login lockout and the anonymous-IP allowlist. List the
+# pods that proxy to Forge (your gateway's data plane or ingress controller)
+# in `from`.
+networkPolicy:
+  # null: rendered as soon as `from` lists a peer.
+  enabled: null
+  # Peers (NetworkPolicyPeer objects) allowed to reach the http port, e.g.
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: gateway-system
+  # Empty allows every source.
+  from: []
+  # Further ingress rules.
+  extraIngress: []
+  # Egress rules. Empty leaves egress unrestricted; once set, allow DNS,
+  # PostgreSQL, S3, Valkey (or Redis) and every proxy upstream / OIDC issuer,
+  # and for short-lived S3 credentials the STS (EKS Pod Identity: the node's
+  # agent at 169.254.170.23, TCP 80).
+  egress: []
+
+# Further objects to render with the release, as YAML or as strings; both are
+# passed through tpl, so they can use the chart's values and helpers. A list,
+# or a map whose keys only name the entries (rendered in key order). Helm
+# merges a map across values files: each file can add its own objects, and a
+# later one replaces an entry by its key or drops it with null. A list in a
+# later file replaces the whole list. Null by default: Helm warns when a
+# values file gives a list over a map default, or a map over a list. E.g.
+#   envoy-policy:
+#     apiVersion: gateway.envoyproxy.io/v1alpha1
+#     kind: BackendTrafficPolicy
+#     metadata:
+#       name: '{{ include "forge.fullname" . }}'
+#     spec: ...
+extraObjects: null
+
+# ── Optional in-cluster dependencies (charts/) ──────────────────────────────
+# Single-instance backing services for evaluation and small installs, wired
+# into Forge when enabled. None has backups, replication or failover: in
+# production use a managed PostgreSQL / object store (or an operator) and set
+# FORGE_DATABASE__URL / FORGE_S3__* instead. Every value of a dependency is
+# listed in its own values.yaml (deploy/helm/forge/charts/<name>).
+#
+# Generated passwords are kept across upgrades (looked up in the cluster) and
+# survive `helm uninstall` with the data. Tools that render without a cluster
+# (Argo CD, `helm template`) generate a new one on every render: set
+# auth.password or auth.existingSecret there (and, for Valkey with
+# auth.password, auth.checksumSalt).
+
+# PostgreSQL 17 StatefulSet; sets FORGE_DATABASE__URL.
+postgresql:
+  enabled: false
+
+# Valkey (cache only, no persistence); sets FORGE_REDIS__URL. Recommended as
+# soon as more than one Forge instance runs. Leave it disabled to run without
+# a shared cache (one instance) or to use your own Valkey or Redis through
+# FORGE_REDIS__URL in secretEnv or existingSecret.
+valkey:
+  enabled: false
+
+# versitygw S3 gateway on a PersistentVolume; sets FORGE_S3__ACCESS_KEY /
+# FORGE_S3__SECRET_KEY (its root credentials) and the s3 endpoint and bucket.
+versitygw:
+  enabled: false

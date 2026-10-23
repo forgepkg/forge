@@ -5,7 +5,9 @@
 //! * `GET /readyz` — readiness: PostgreSQL answers `SELECT 1` and the S3 bucket
 //!   is reachable, each within a short deadline. Returns 503 with the failing
 //!   check names otherwise, so traffic is routed away from an instance that
-//!   cannot serve.
+//!   cannot serve. With the local blob cache (`[blob_cache]`) an unreachable
+//!   S3 is not a failure: the instance still serves what it has cached, so it
+//!   answers 200 with `"status": "degraded"` and `"object_store": "degraded"`.
 //!
 //! * `GET /version` — the running build: crate version and, when the image was
 //!   built with `FORGE_GIT_SHA`, the source revision.
@@ -62,16 +64,24 @@ async fn readyz(State(state): State<AppState>) -> Response {
     if !s3_ok {
         tracing::warn!(result = ?s3.map(|r| r.map(|_| ())), "readiness: object-store check failed");
     }
-    let status = if db_ok && s3_ok {
-        StatusCode::OK
+    // With the local blob cache, cached packages keep resolving while S3 is
+    // down: stay in the Service and report the object store degraded.
+    let degraded = !s3_ok && state.blob_store.cache().is_some();
+    let (status, label) = match (db_ok, s3_ok || degraded) {
+        (true, true) if degraded => (StatusCode::OK, "degraded"),
+        (true, true) => (StatusCode::OK, "ok"),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+    };
+    let object_store = if degraded {
+        json!("degraded")
     } else {
-        StatusCode::SERVICE_UNAVAILABLE
+        json!(s3_ok)
     };
     (
         status,
         Json(json!({
-            "status": if status == StatusCode::OK { "ok" } else { "unavailable" },
-            "checks": { "database": db_ok, "object_store": s3_ok },
+            "status": label,
+            "checks": { "database": db_ok, "object_store": object_store },
         })),
     )
         .into_response()

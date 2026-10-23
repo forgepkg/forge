@@ -1,10 +1,9 @@
-//! E2E regressions for the 0.1.0 release blockers:
+//! E2E regressions for the first release's blockers:
 //! * a dead session cookie never locks the browser out (login, pages) and is
 //!   cleared on the response;
 //! * a cross-site browser mutation is refused even with cached Basic
 //!   credentials (which the CSRF token does not cover);
-//! * removing the built-in `admin` role actually revokes admin, including for
-//!   users that also carry the legacy `is_admin` flag;
+//! * removing the built-in `admin` role actually revokes admin;
 //! * a deleted bootstrap admin is not re-created on restart — including one
 //!   whose account existed before the "created once" marker was recorded;
 //! * an existing bootstrap account still using the placeholder password is
@@ -167,7 +166,10 @@ async fn https_deployments_use_host_prefixed_cookies() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             public_base_url: Some("https://forge.example".into()),
             ..Default::default()
         },
@@ -276,7 +278,10 @@ async fn https_deployments_send_hsts() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             public_base_url: Some("https://forge.example".into()),
             ..Default::default()
         },
@@ -304,7 +309,10 @@ async fn slow_headers_and_stalled_bodies_are_cut_off() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             server_extra: Some(
                 "header_read_timeout_seconds = 1\nbody_idle_timeout_seconds = 1".into(),
             ),
@@ -382,18 +390,9 @@ async fn removing_the_admin_role_revokes_admin() {
     let (admin, password) = srv.admin_basic();
     let client = srv.client();
 
-    // A user created as admin holds the role and the legacy flag.
-    let username = format!("second-admin{}", common::unique());
-    let resp = client
-        .post(format!("{}/admin/users", srv.base_url))
-        .basic_auth(&admin, Some(&password))
-        .json(&json!({ "username": username, "password": "pw-second", "is_admin": true }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-    let user: Value = resp.json().await.unwrap();
-    let user_id = user["id"].as_i64().unwrap();
+    // A user created as admin holds the role.
+    let username = format!("second-admin{}@example.com", common::unique());
+    let user_id = srv.create_user(&username, "pw-second-admin", "admin").await;
 
     let roles: Vec<Value> = client
         .get(format!("{}/admin/users/{user_id}/roles", srv.base_url))
@@ -410,7 +409,7 @@ async fn removing_the_admin_role_revokes_admin() {
         .expect("admin created via the API holds the admin role");
     let admin_role_id = admin_role["id"].as_i64().unwrap();
 
-    let session = srv.login(&username, "pw-second").await;
+    let session = srv.login(&username, "pw-second-admin").await;
     let as_user = |path: &str| {
         session
             .apply(client.get(format!("{}{path}", srv.base_url)))
@@ -434,14 +433,8 @@ async fn removing_the_admin_role_revokes_admin() {
         403,
         "admin rights are gone once the admin role is removed"
     );
-    let flag = forge_db::user_dao::find_user_by_id(&srv.pool, user_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .is_admin;
-    assert!(!flag, "legacy is_admin flag cleared with the role");
 
-    // Re-assigning the role restores admin (and the flag stays in step).
+    // Re-assigning the role restores admin.
     let resp = client
         .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
         .basic_auth(&admin, Some(&password))
@@ -455,7 +448,7 @@ async fn removing_the_admin_role_revokes_admin() {
 
 #[tokio::test]
 async fn deleted_bootstrap_admin_is_not_recreated_on_restart() {
-    let name = format!("boot{}", common::unique());
+    let name = format!("boot{}@example.com", common::unique());
     let opts = || common::ServerOpts {
         bootstrap_admin: Some((name.clone(), "bootpw".into())),
         ..Default::default()
@@ -487,12 +480,12 @@ async fn deleted_bootstrap_admin_is_not_recreated_on_restart() {
 /// deleting the account afterwards still sticks across restarts.
 #[tokio::test]
 async fn bootstrap_marker_is_recorded_for_a_preexisting_account() {
-    let name = format!("bootpre{}", common::unique());
+    let name = format!("bootpre{}@example.com", common::unique());
     let pool = common::pool().await;
     // The account exists, but no marker was ever written for it.
     let user = forge_db::user_dao::insert_user(
         &pool,
-        forge_db::user_dao::NewUser::local(name.clone(), "$argon2id$unused".into(), true, true),
+        forge_db::user_dao::NewUser::local(name.clone(), "$argon2id$unused".into(), true),
     )
     .await
     .unwrap();
@@ -545,7 +538,6 @@ async fn placeholder_bootstrap_password_is_detected() {
         id: 1,
         username: "admin".into(),
         password_hash,
-        is_admin: true,
         active: true,
         auth_source: "local".into(),
         external_subject: None,
@@ -558,11 +550,11 @@ async fn placeholder_bootstrap_password_is_detected() {
     assert!(!forge_server::app::has_placeholder_password(&user(Some("garbage".into()))).await);
 
     // An existing placeholder account does not stop the server from booting.
-    let name = format!("bootph{}", common::unique());
+    let name = format!("bootph{}@example.com", common::unique());
     let pool = common::pool().await;
     forge_db::user_dao::insert_user(
         &pool,
-        forge_db::user_dao::NewUser::local(name.clone(), hash("changeme"), true, true),
+        forge_db::user_dao::NewUser::local(name.clone(), hash("changeme"), true),
     )
     .await
     .unwrap();
@@ -584,12 +576,60 @@ async fn placeholder_bootstrap_password_is_detected() {
     assert_eq!(resp.status(), 200, "startup is not refused");
 }
 
+/// A config whose only bootstrap-admin setting is `block` (the lines under
+/// `[auth.bootstrap_admin]`), for calling `ensure_bootstrap_admin` directly.
+fn bootstrap_config(block: &str) -> forge_server::config::Config {
+    use figment::providers::Format as _;
+    let toml = format!(
+        "[server]\nbind = \"127.0.0.1:0\"\npublic_base_url = \"http://test.local\"\n\
+         [database]\nurl = \"postgres://forge:forge@localhost/forge\"\n\
+         [s3]\nendpoint = \"http://localhost:7070\"\nbucket = \"forge\"\n\
+         access_key = \"test\"\nsecret_key = \"test\"\n\
+         [auth]\n[auth.bootstrap_admin]\n{block}\n"
+    );
+    forge_server::config::Config::from_figment(
+        figment::Figment::new().merge(figment::providers::Toml::string(&toml)),
+    )
+    .expect("valid config")
+}
+
+/// #317: the bootstrap admin is named by a UPN, `admin@example.com` unless
+/// the config names another (a name that is no UPN is refused by config
+/// validation).
+#[tokio::test]
+async fn the_bootstrap_admin_is_named_by_a_upn() {
+    let pool = common::fresh_pool().await;
+    forge_server::app::ensure_bootstrap_admin(&bootstrap_config("password = \"bootpw\""), &pool)
+        .await
+        .expect("the default name");
+    let admin = forge_db::user_dao::find_user_by_username(&pool, "admin@example.com")
+        .await
+        .unwrap()
+        .expect("created");
+    assert!(forge_db::authz_dao::user_has_role(&pool, admin.id, "admin")
+        .await
+        .unwrap());
+
+    let upn = format!("Root{}@Example.com", common::unique());
+    forge_server::app::ensure_bootstrap_admin(
+        &bootstrap_config(&format!("username = \"{upn}\"\npassword = \"bootpw\"")),
+        &pool,
+    )
+    .await
+    .expect("a UPN is created");
+    let user = forge_db::user_dao::find_user_by_username(&pool, &upn)
+        .await
+        .unwrap()
+        .expect("created");
+    assert_eq!(user.username, upn.to_lowercase());
+}
+
 /// Review M15: following the deployment guide ("remove the password from the
 /// environment") leaves a bootstrap-admin block without a password. That must
 /// start normally and simply create no bootstrap admin.
 #[tokio::test]
 async fn bootstrap_block_without_password_starts_without_a_bootstrap_admin() {
-    let name = format!("nopw{}", common::unique());
+    let name = format!("nopw{}@example.com", common::unique());
     let pool = common::pool().await;
     let srv = common::start_with(
         pool.clone(),
@@ -643,7 +683,7 @@ async fn responses_carry_browser_hardening_headers_and_version_is_exposed() {
 }
 
 #[tokio::test]
-async fn repository_formats_other_than_nuget_are_rejected() {
+async fn repository_formats_that_are_not_installed_are_rejected() {
     let srv = common::start().await;
     let (admin, password) = srv.admin_basic();
     let resp = srv

@@ -1,6 +1,5 @@
-//! Data access for fine-grained RBAC (slice 12.4): reading a principal's
-//! effective grant set and the small CRUD surface the admin API (later phase)
-//! and the evaluator need.
+//! Data access for fine-grained RBAC: reading a principal's effective grant
+//! set and the small CRUD surface the admin API and the evaluator need.
 //!
 //! The hot path is [`load_user_effective`] / [`load_anonymous_effective`]: a
 //! single indexed query joining `user_role → repository_privilege` (left-joined
@@ -16,8 +15,8 @@
 //!
 //! Multi-instance correctness: these are plain reads; no advisory locks, no
 //! in-memory-only state. Authoritative privilege data lives entirely in these
-//! tables and the `forge-cache` layer (later phase) sits in front of the
-//! resolved set with explicit cross-node invalidation.
+//! tables and the `forge-cache` layer sits in front of the resolved set with
+//! explicit cross-node invalidation.
 
 use serde_json::Value as JsonValue;
 use sqlx::{PgExecutor, PgPool};
@@ -26,8 +25,13 @@ use sqlx::{PgExecutor, PgPool};
 pub const ADMIN_ROLE: &str = "admin";
 /// The fixed slug of the built-in anonymous role (applied to anonymous callers).
 pub const ANONYMOUS_ROLE: &str = "anonymous";
-/// The fixed slug of the built-in legacy-open-access role.
+/// The fixed slug of the built-in `authenticated` role (read and write on
+/// every repository), for an administrator to assign.
 pub const AUTHENTICATED_ROLE: &str = "authenticated";
+/// The fixed slug of the built-in `writer` role (migration 0042): read and
+/// publish packages on every repository, without deleting them or any right
+/// to administer the instance.
+pub const WRITER_ROLE: &str = "writer";
 
 /// Shared shape of the effective-set query rows (user + anonymous variants).
 /// The two `sqlx::query!` calls generate distinct anonymous structs with the
@@ -137,11 +141,6 @@ pub struct EffectiveRows {
 /// are the union of every `repository_privilege` of every role the user holds,
 /// each with its content selector (if any). A user with no roles yields an empty
 /// set (fail-closed deny-all).
-///
-/// Note: this reads **role-derived** privileges only. The slice-1 `is_admin`
-/// column on `app_user` is intentionally *not* consulted here — the dual-read
-/// fallback during the migration window is layered on by the caller (later
-/// phase), keeping this query a clean single-source read.
 pub async fn load_user_effective(pool: &PgPool, user_id: i64) -> sqlx::Result<EffectiveRows> {
     let is_admin = sqlx::query_scalar!(
         r#"
@@ -187,8 +186,8 @@ pub async fn load_user_effective(pool: &PgPool, user_id: i64) -> sqlx::Result<Ef
 ///
 /// On a fresh / un-migrated install the `anonymous` role has no grants, so this
 /// returns an empty set (deny-all) — anonymous access is opened by granting the
-/// `anonymous` role `read` on specific repos (the data migration converts the
-/// slice-1 `anonymous_read` flag into exactly these grants).
+/// `anonymous` role `read` on specific repos (the data migration converts each
+/// repository's `anonymous_read` flag into exactly these grants).
 pub async fn load_anonymous_effective(pool: &PgPool) -> sqlx::Result<EffectiveRows> {
     let rows = sqlx::query!(
         r#"
@@ -221,7 +220,7 @@ pub async fn load_anonymous_effective(pool: &PgPool) -> sqlx::Result<EffectiveRo
 /// Load the effective set granted by a **single role** (`role.id = role_id`).
 ///
 /// Unlike [`load_user_effective`], this resolves a role directly — used by the
-/// workload-identity (WIF) auth path (slice 12.8), where a validated CI token
+/// workload-identity (WIF) auth path, where a validated CI token
 /// is mapped to exactly one forge role and authorized by that role's grants
 /// (no `app_user` row, no `user_role` membership). `is_admin` is true iff the
 /// role *is* the built-in `admin` role. A non-existent `role_id` yields an empty
@@ -282,7 +281,7 @@ fn map_grant_row(r: EffectiveQueryRow) -> EffectiveGrantRow {
 }
 
 /// Load a token's raw `scope` jsonb by token id, for per-token privilege
-/// scoping (§12.4 Phase 3).
+/// scoping.
 ///
 /// Returns `Ok(None)` when the token does not exist **or** its `scope` column is
 /// NULL — both mean "no scoping" to the caller, which then uses the owner's full
@@ -315,8 +314,8 @@ where
         .await
 }
 
-/// Whether a user holds a given role (by role name). Used by the dual-read admin
-/// check and tests.
+/// Whether a user holds a given role (by role name), e.g. whether it is an
+/// administrator ([`ADMIN_ROLE`]).
 pub async fn user_has_role<'e, E>(executor: E, user_id: i64, role_name: &str) -> sqlx::Result<bool>
 where
     E: PgExecutor<'e>,
@@ -373,10 +372,10 @@ where
 /// Make the built-in `admin` role membership of `user_id` match `is_admin`
 /// (assign when true, remove when false) — used where an external identity
 /// source is authoritative for admin (an OIDC realm with `admin_groups`, a
-/// credential-forwarding realm with an `admin_group`), so a demotion revokes
-/// the role too and not only the legacy `app_user.is_admin` column. Returns
-/// whether the membership changed (the caller invalidates the user's cached
-/// effective set). A missing built-in role is a no-op.
+/// credential-forwarding realm with an `admin_group`), so a demotion there
+/// takes effect here. Returns whether the membership changed (the caller
+/// invalidates the user's cached effective set). A missing built-in role is a
+/// no-op.
 pub async fn sync_admin_role(pool: &PgPool, user_id: i64, is_admin: bool) -> sqlx::Result<bool> {
     let Some(role_id) = role_id_by_name(pool, ADMIN_ROLE).await? else {
         return Ok(false);
@@ -405,6 +404,50 @@ pub async fn sync_admin_role(pool: &PgPool, user_id: i64, is_admin: bool) -> sql
         .rows_affected()
     };
     Ok(changed > 0)
+}
+
+/// The last-admin guard: whether taking `user_id`'s admin rights away
+/// (deactivating, deleting, or unassigning its `admin` role) would leave no
+/// active administrator. `true` iff `user_id` is an active admin and no other
+/// active user is: a member of the built-in `admin` role.
+///
+/// Call it in the transaction that applies the change, and apply it only on
+/// `false`. It first locks the built-in `admin` role row (`FOR NO KEY UPDATE`,
+/// which the `FOR KEY SHARE` of a concurrent role assignment's foreign-key
+/// check does not wait for) until that transaction ends, so guarded changes
+/// run one at a time across instances. The count is a later statement, which
+/// under `READ COMMITTED` sees what the previous lock holder committed: two
+/// admins demoting each other at once cannot both pass. Changes that only add
+/// admins need no lock.
+pub async fn would_leave_no_admin(
+    conn: &mut sqlx::PgConnection,
+    user_id: i64,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
+        r#"SELECT id FROM role WHERE name = $1 FOR NO KEY UPDATE"#,
+        ADMIN_ROLE,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    sqlx::query_scalar!(
+        r#"
+        WITH active_admin AS (
+            SELECT u.id FROM app_user u
+            WHERE u.active
+              AND EXISTS (
+                  SELECT 1 FROM user_role ur
+                  JOIN role r ON r.id = ur.role_id
+                  WHERE ur.user_id = u.id AND r.name = $2
+              )
+        )
+        SELECT EXISTS (SELECT 1 FROM active_admin WHERE id = $1)
+           AND NOT EXISTS (SELECT 1 FROM active_admin WHERE id <> $1) AS "last!"
+        "#,
+        user_id,
+        ADMIN_ROLE,
+    )
+    .fetch_one(&mut *conn)
+    .await
 }
 
 /// Insert a repository-privilege grant for a role. `repository_id = None` ⇒ ANY
@@ -464,7 +507,7 @@ where
     .await
 }
 
-// --- admin REST CRUD surface (§12.4 Phase 6) --------------------------------
+// --- admin REST CRUD surface ------------------------------------------------
 
 /// A `role` row, as returned to the admin API.
 #[derive(Debug, Clone)]
@@ -475,7 +518,8 @@ pub struct Role {
     pub name: String,
     /// Human description.
     pub description: String,
-    /// `true` for the seeded built-in roles (`admin`/`authenticated`/`anonymous`);
+    /// `true` for the seeded built-in roles
+    /// (`admin`/`writer`/`authenticated`/`anonymous`);
     /// they cannot be deleted and their grants are protected by the admin API.
     pub builtin: bool,
 }
@@ -771,6 +815,125 @@ pub async fn delete_content_selector(pool: &PgPool, id: i64) -> sqlx::Result<boo
     Ok(res.rows_affected() > 0)
 }
 
+/// How many grants and users a role holds, as the admin role views show it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RoleCounts {
+    /// `role.id`.
+    pub role_id: i64,
+    /// The role's `repository_privilege` rows.
+    pub grants: i64,
+    /// The users assigned the role (`user_role` rows).
+    pub users: i64,
+}
+
+/// Count the grants and users of every role, or of the one role `role_id`.
+pub async fn role_counts(pool: &PgPool, role_id: Option<i64>) -> sqlx::Result<Vec<RoleCounts>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            r.id,
+            (SELECT count(*) FROM repository_privilege rp WHERE rp.role_id = r.id) AS "grants!",
+            (SELECT count(*) FROM user_role ur WHERE ur.role_id = r.id) AS "users!"
+        FROM role r
+        WHERE $1::bigint IS NULL OR r.id = $1
+        "#,
+        role_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RoleCounts {
+            role_id: r.id,
+            grants: r.grants,
+            users: r.users,
+        })
+        .collect())
+}
+
+/// A user holding a role, as the role's member list shows it.
+#[derive(Debug, Clone)]
+pub struct RoleMember {
+    /// `app_user.id`.
+    pub id: i64,
+    /// Canonical username.
+    pub username: String,
+    /// How the account signs in (`local`, `oidc`, `upstream-basic`).
+    pub auth_source: String,
+    /// `false` for a deactivated account.
+    pub active: bool,
+}
+
+/// List the users who hold a role, ordered by username.
+pub async fn list_users_for_role(pool: &PgPool, role_id: i64) -> sqlx::Result<Vec<RoleMember>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT u.id, u.username, u.auth_source, u.active
+        FROM user_role ur
+        JOIN app_user u ON u.id = ur.user_id
+        WHERE ur.role_id = $1
+        ORDER BY u.username
+        "#,
+        role_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RoleMember {
+            id: r.id,
+            username: r.username,
+            auth_source: r.auth_source,
+            active: r.active,
+        })
+        .collect())
+}
+
+/// Every `(user id, role name)` assignment, ordered by role name: the roles
+/// column of the admin user list, read in one query.
+pub async fn list_user_role_names(pool: &PgPool) -> sqlx::Result<Vec<(i64, String)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT ur.user_id, r.name
+        FROM user_role ur
+        JOIN role r ON r.id = ur.role_id
+        ORDER BY r.name
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.user_id, r.name)).collect())
+}
+
+/// List the grants scoped by a content selector (every role's), ordered for
+/// stable display: what deleting the selector removes.
+pub async fn list_grants_for_selector(
+    pool: &PgPool,
+    selector_id: i64,
+) -> sqlx::Result<Vec<GrantRow>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, role_id, repository_id, action, selector_id
+        FROM repository_privilege
+        WHERE selector_id = $1
+        ORDER BY role_id, id
+        "#,
+        selector_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| GrantRow {
+            id: r.id,
+            role_id: r.role_id,
+            repository_id: r.repository_id,
+            action: r.action,
+            selector_id: r.selector_id,
+        })
+        .collect())
+}
+
 /// List the roles a user holds, ordered by name.
 pub async fn list_roles_for_user(pool: &PgPool, user_id: i64) -> sqlx::Result<Vec<Role>> {
     let rows = sqlx::query!(
@@ -796,17 +959,7 @@ pub async fn list_roles_for_user(pool: &PgPool, user_id: i64) -> sqlx::Result<Ve
         .collect())
 }
 
-// --- install-wide settings + legacy behavior-preserving migration (Phase 5) --
-
-/// The `forge_setting` key recording whether this install defaults to the
-/// slice-1 "open access" behavior. `true` ⇒ upgrade (existing users keep
-/// read/write everywhere and NEW users are auto-assigned the `authenticated`
-/// role); `false`/absent ⇒ fresh install, fail-closed default.
-///
-/// Stored in `forge_setting` (migration 0007 writes it once). Operators switch
-/// it off with `PUT /admin/settings/legacy-open-access {"enabled": false}`
-/// ([`set_legacy_open_access`]).
-pub const LEGACY_OPEN_ACCESS_KEY: &str = "legacy_open_access";
+// --- install-wide settings ---------------------------------------------------
 
 /// Read a `forge_setting` value by key. Returns `None` when the key is unset.
 /// Accepts any executor so it composes inside a transaction.
@@ -828,7 +981,7 @@ pub async fn delete_setting(pool: &PgPool, key: &str) -> sqlx::Result<bool> {
 }
 
 /// Upsert a `forge_setting` value by key (e.g. one-shot import markers like
-/// the 12.7 `auth_realms_seeded` flag).
+/// the `auth_realms_seeded` flag).
 pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<()> {
     sqlx::query!(
         r#"
@@ -842,6 +995,23 @@ pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Insert a `forge_setting` value unless the key exists. Returns whether this
+/// call inserted it (`false`: another writer was first; read theirs).
+pub async fn insert_setting_if_absent(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<bool> {
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO forge_setting (key, value)
+        VALUES ($1, $2)
+        ON CONFLICT (key) DO NOTHING
+        "#,
+        key,
+        value,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Replace a `forge_setting` value only while it is still `expected`.
@@ -867,31 +1037,6 @@ where
     .execute(executor)
     .await?;
     Ok(result.rows_affected() > 0)
-}
-
-/// Whether this install opted into legacy open access (slice-1 behavior). A
-/// missing key is treated as `false` (fail-closed): a corrupted/old DB without
-/// the setting defaults to the secure, closed behavior.
-pub async fn legacy_open_access(pool: &PgPool) -> sqlx::Result<bool> {
-    Ok(get_setting(pool, LEGACY_OPEN_ACCESS_KEY).await? == Some("true".to_string()))
-}
-
-/// Switch [`LEGACY_OPEN_ACCESS_KEY`] on or off (the admin
-/// `PUT /admin/settings/legacy-open-access` endpoint).
-///
-/// The flag is read live by [`assign_authenticated_if_legacy_open`] (every
-/// user-creation path) and by step 3 of [`apply_legacy_migration`], so turning
-/// it off stops *new* users from receiving the built-in `authenticated` role
-/// (read + write on every repository) from the next creation on. It does not
-/// touch existing assignments: users that already hold `authenticated` keep it
-/// until it is unassigned (or the role's grants are removed).
-pub async fn set_legacy_open_access(pool: &PgPool, enabled: bool) -> sqlx::Result<()> {
-    set_setting(
-        pool,
-        LEGACY_OPEN_ACCESS_KEY,
-        if enabled { "true" } else { "false" },
-    )
-    .await
 }
 
 /// Delete the unscoped `(anonymous role, repository, read)` grant — the grant
@@ -926,93 +1071,6 @@ where
     .execute(executor)
     .await?;
     Ok(res.rows_affected() > 0)
-}
-
-/// Re-apply the idempotent behavior-preserving legacy mapping (the same
-/// PL/pgSQL routine migration 0007 installs and runs once): is_admin→admin
-/// role, anonymous_read→anonymous read grants, and — only when
-/// `legacy_open_access` is set — the `authenticated` role for every user. All
-/// writes are upserts.
-///
-/// **Not for the boot path**: re-running it would re-grant anything an
-/// operator revoked through RBAC since (the routine only ever adds). Boot uses
-/// [`apply_legacy_migration_once`].
-pub async fn apply_legacy_migration(pool: &PgPool) -> sqlx::Result<()> {
-    sqlx::query!(r#"SELECT forge_rbac_apply_legacy_migration()"#)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// The `forge_setting` key marking the legacy RBAC synthesis as done.
-pub const LEGACY_RBAC_SYNCED_KEY: &str = "legacy_rbac_synced";
-
-/// Run [`apply_legacy_migration`] exactly once per install, then record
-/// [`LEGACY_RBAC_SYNCED_KEY`] so later boots never re-synthesize grants an
-/// operator has since revoked. Returns whether the mapping ran now.
-///
-/// Rows that arrive later need no re-sync: `anonymous_read` is honored
-/// directly by the authz seam, the `is_admin` column is a dual-read fallback,
-/// and new users on a legacy-open install get `authenticated` at creation
-/// ([`assign_authenticated_if_legacy_open`]). Two instances booting together
-/// may both apply it — harmless, every write is an idempotent upsert.
-pub async fn apply_legacy_migration_once(pool: &PgPool) -> sqlx::Result<bool> {
-    if get_setting(pool, LEGACY_RBAC_SYNCED_KEY).await?.as_deref() == Some("true") {
-        return Ok(false);
-    }
-    apply_legacy_migration(pool).await?;
-    set_setting(pool, LEGACY_RBAC_SYNCED_KEY, "true").await?;
-    Ok(true)
-}
-
-/// Per-creation half of the `legacy_open_access` rule: when this install opted
-/// into slice-1 open access, a freshly-created user must inherit the
-/// `authenticated` role *immediately* — not only at the next boot when
-/// [`apply_legacy_migration`] re-runs. Every user-creation path (admin
-/// `POST /admin/users`, OIDC auto-provision, upstream-basic auto-provision)
-/// calls this right after inserting the user so the new principal has the same
-/// read/write reach a slice-1 authenticated user had, with no restart gap.
-///
-/// On a fresh (fail-closed) install the flag is `false` and this is a no-op, so
-/// new users default to deny-by-default. The assignment is idempotent
-/// ([`assign_role`] upserts), so a redundant call (e.g. the user already holds
-/// the role) is harmless. Returns `true` when the role was (or already would
-/// be) assigned, `false` when the install is closed and nothing was done — the
-/// boolean lets callers decide whether to invalidate any cached effective set.
-///
-/// Fails closed on a missing built-in role: if `legacy_open_access` is set but
-/// the `authenticated` role is somehow absent, this errors rather than silently
-/// leaving the user without the legacy grant.
-pub async fn assign_authenticated_if_legacy_open(
-    pool: &PgPool,
-    user_id: i64,
-) -> sqlx::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    assign_authenticated_if_legacy_open_in(&mut conn, user_id).await
-}
-
-/// [`assign_authenticated_if_legacy_open`] on a given connection, so it can
-/// run in the transaction that creates the user.
-pub async fn assign_authenticated_if_legacy_open_in(
-    conn: &mut sqlx::PgConnection,
-    user_id: i64,
-) -> sqlx::Result<bool> {
-    if get_setting(&mut *conn, LEGACY_OPEN_ACCESS_KEY)
-        .await?
-        .as_deref()
-        != Some("true")
-    {
-        return Ok(false);
-    }
-    let role_id = role_id_by_name(&mut *conn, AUTHENTICATED_ROLE)
-        .await?
-        .ok_or_else(|| {
-            sqlx::Error::Protocol(
-                "legacy_open_access is set but the built-in `authenticated` role is missing".into(),
-            )
-        })?;
-    assign_role(&mut *conn, user_id, role_id).await?;
-    Ok(true)
 }
 
 #[cfg(test)]

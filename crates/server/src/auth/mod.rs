@@ -1,4 +1,5 @@
-//! Browser login + session surface (slice 12.2 OIDC, reworked by 12.7 realms).
+//! Browser login + session surface: local-password and OIDC logins through the
+//! DB-backed auth realms.
 //!
 //! This module wires the `core` OIDC flow + session service into the server
 //! and owns the login UX endpoints:
@@ -11,7 +12,7 @@
 //! * [`auth_router`] — the `/auth/...` browser endpoints, always mounted:
 //!   * `POST /auth/login`         — username/password through the realm chain;
 //!     mints the session cookie (uniform 401 — no user-exists oracle).
-//!   * `POST /auth/identify`      — identifier-first routing (12.7 §3.4),
+//!   * `POST /auth/identify`      — identifier-first routing,
 //!     decided ONLY by public realm config (anti-enumeration).
 //!   * `GET  /auth/login-options` — what the login screen should render.
 //!   * `GET  /auth/oidc/login`    — start the auth-code+PKCE flow (302 → IdP);
@@ -20,6 +21,9 @@
 //!     validated relative target.
 //!   * `POST /auth/logout`        — revoke the session + clear the cookie (CSRF
 //!     protected via the per-session double-submit secret).
+//!   * `POST /auth/invitations/lookup` / `…/accept` — an invited user's link
+//!     (#322, [`crate::invitations`]): whose account it is, and choosing its
+//!     password. Failures are throttled per client network.
 //!
 //! All ephemeral flow state and the sessions live in Postgres (`oidc_flow` /
 //! `session`), so any instance can complete a callback another started, and a
@@ -41,12 +45,12 @@ use forge_core::auth::chain::{provision_and_map, ChainOutcome};
 use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip};
 use forge_core::auth::login_throttle::{username_for_log, AttemptRefused, MAX_USERNAME_BYTES};
 use forge_core::auth::session_source::{session_cookie_name, unique_cookie_value};
-use forge_core::auth::token::{generate_token_secret, hash_token};
+use forge_core::auth::token::{check_token, generate_token_secret, hash_token, TokenCheck};
 use forge_core::auth::PasswordCredential;
 use forge_core::net::ssrf::outbound_metadata_client;
 use forge_core::oidc::{
     begin_login, browser_binding, complete_login, map_claims, resolve_user, CallbackParams,
-    ClaimMapping, ClientParams, OidcMetadataClient, ResolvePolicy,
+    ClaimMapping, ClientAuth, ClientParams, OidcMetadataClient, ResolveError, ResolvePolicy,
 };
 use forge_core::session::{csrf_token_matches, IssuedSession, SessionService};
 use forge_db::model::{AppUser, Session};
@@ -55,34 +59,48 @@ use forge_db::user_dao;
 use serde::{Deserialize, Serialize};
 
 use crate::config::OidcConfig;
+use crate::middleware::principal::auth_unavailable;
 use crate::state::AppState;
 
+mod issuer;
 mod realms;
 mod redirect;
+mod settings;
+mod token_exchange;
 mod wif;
 
+pub use issuer::{
+    issuer_router, spawn_issuer_refresh, AssertionIssuer, DISCOVERY_PATH, ISSUER_KEYS_SETTING,
+    JWKS_PATH,
+};
+pub(crate) use realms::normalize_endpoint_hosts;
 pub use realms::{
-    forget_seed, merge_secrets, redact_config, secret_keys, seed_auth_realms, validate_config,
-    OidcRealmRuntime, RealmAuth, RealmSnapshot, KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC,
-    KIND_WORKLOAD_IDENTITY,
+    federated_credential, forget_seed, merge_secrets, redact_config, secret_keys, seed_auth_realms,
+    validate_config, FederatedCredential, OidcRealmRuntime, RealmAuth, RealmSnapshot,
+    KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
-pub(crate) use wif::workload_identity_config_sha256;
+pub use settings::{
+    load as load_auth_settings, AnonymousMode, AuthSettings, AuthSettingsCache, AuthSettingsUpdate,
+    CurrentAuthSettings, LoginMode, SaveError, AUTH_SETTINGS_KEY,
+};
+pub use token_exchange::{token_exchange_router, TOKEN_EXCHANGE_PATH};
 pub use wif::WorkloadIdentitySource;
+pub(crate) use wif::{realm_current_now, workload_identity_config_sha256};
 
 /// Everything the `/auth` handlers need, assembled once at startup. Cheap to
 /// clone (the metadata client + session service are `Arc`/pool-backed).
 #[derive(Clone)]
 pub struct OidcRuntime {
-    /// Discovery/JWKS fetcher + ID-token verifier (Phase 2).
+    /// Discovery/JWKS fetcher + ID-token verifier.
     meta: OidcMetadataClient,
-    /// Static OAuth client params for the flow (Phase 3).
+    /// Static OAuth client params for the flow.
     client: ClientParams,
-    /// Claim → user mapping config (Phase 3).
+    /// Claim → user mapping config.
     mapping: ClaimMapping,
-    /// Provision / link policy (Phase 3).
+    /// Provision / link policy.
     policy: ResolvePolicy,
-    /// Server-side session lifecycle (Phase 4).
+    /// Server-side session lifecycle.
     sessions: SessionService,
     /// Whether the session cookie is marked `Secure` (driven by the public
     /// base URL scheme — `https` ⇒ secure).
@@ -90,26 +108,30 @@ pub struct OidcRuntime {
 }
 
 impl OidcRuntime {
-    /// Build the runtime from the validated `[oidc]` config + the DB pool + the
-    /// public base URL (which decides the cookie `Secure` attribute) + the
-    /// shared cache.
+    /// Build the runtime from the validated `[oidc]` config + how the client
+    /// authenticates at the token endpoint (`auth`; the config's
+    /// `client_secret` is not read) + the session service a login signs in
+    /// with + the public base URL (which decides the cookie `Secure`
+    /// attribute) + the shared cache.
     ///
     /// The HTTP client follows no redirects and is https-only unless the realm
     /// allows a plain-http development issuer (see
     /// [`outbound_metadata_client`]); it serves discovery/JWKS/token calls.
     pub fn build(
         oidc: &OidcConfig,
-        pool: sqlx::PgPool,
+        auth: ClientAuth,
+        sessions: SessionService,
         public_base_url: &str,
         cache: Cache,
     ) -> anyhow::Result<Self> {
         let http = outbound_metadata_client(oidc.allow_private_issuer)
             .map_err(|e| anyhow::anyhow!("build oidc http client: {e}"))?;
-        let meta = OidcMetadataClient::new(oidc.issuer.clone(), http, cache);
+        let meta = OidcMetadataClient::new(oidc.issuer.clone(), http, cache)
+            .with_endpoint_hosts(oidc.endpoint_hosts.clone());
 
         let client = ClientParams {
             client_id: oidc.client_id.clone(),
-            client_secret: oidc.client_secret.clone(),
+            auth,
             redirect_url: oidc.redirect_url.clone(),
             scopes: oidc.effective_scopes(),
             leeway_seconds: oidc.clock_skew_seconds,
@@ -127,11 +149,6 @@ impl OidcRuntime {
             link_existing_by_username: oidc.link_existing_by_username,
         };
         let cookie_secure = public_base_url.trim().starts_with("https://");
-        let sessions = SessionService::new(
-            pool,
-            chrono::Duration::seconds(oidc.session_idle_ttl_seconds as i64),
-            chrono::Duration::seconds(oidc.session_absolute_ttl_seconds as i64),
-        );
 
         Ok(Self {
             meta,
@@ -157,7 +174,7 @@ pub struct LoginQuery {
     pub redirect_to: Option<String>,
 }
 
-/// Build the `/auth` router. Always mounted (12.7): sessions exist for local
+/// Build the `/auth` router. Always mounted: sessions exist for local
 /// password logins too, and the OIDC endpoints answer 404/503 by themselves
 /// when no enabled `oidc` realm is configured.
 pub fn auth_router() -> Router<AppState> {
@@ -168,6 +185,8 @@ pub fn auth_router() -> Router<AppState> {
         .route("/auth/oidc/login", get(oidc_login))
         .route("/auth/oidc/callback", get(oidc_callback))
         .route("/auth/logout", post(logout))
+        .route("/auth/invitations/lookup", post(lookup_invitation))
+        .route("/auth/invitations/accept", post(accept_invitation))
         .route("/auth/me", get(me))
         .route("/auth/tokens", get(list_tokens).post(create_token))
         .route("/auth/tokens/{id}", delete(revoke_token))
@@ -177,11 +196,7 @@ pub fn auth_router() -> Router<AppState> {
 async fn snapshot_or_resp(state: &AppState) -> Result<Arc<realms::RealmSnapshot>, Response> {
     state.realms.snapshot().await.map_err(|e| {
         tracing::error!(error = %e, "realm snapshot failed");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "authentication temporarily unavailable",
-        )
-            .into_response()
+        auth_unavailable()
     })
 }
 
@@ -261,7 +276,8 @@ pub struct CallbackQuery {
     pub error_description: Option<String>,
 }
 
-/// `GET /auth/oidc/callback` — complete the flow, set the cookie, 302 to target.
+/// `GET /auth/oidc/callback` — complete the flow, set the cookie, 302 to target
+/// (or, when the sign-in is refused, to the login page with an error code).
 ///
 /// The browser must present the pre-auth flow cookie set by
 /// `GET /auth/oidc/login` (login-CSRF defense); it is cleared on every outcome.
@@ -283,6 +299,51 @@ async fn oidc_callback(
         }
     }
     resp
+}
+
+/// Why an OIDC sign-in was refused, as the SPA's login page names it.
+#[derive(Debug, Clone)]
+enum LoginFailure {
+    /// The callback did not validate (state, binding, code exchange, token),
+    /// or the IdP answered with an error such as a cancelled sign-in.
+    OidcFailed,
+    /// The token was valid but the user may not sign in: the realm's required
+    /// claims are missing, auto-provisioning is off, or the account is
+    /// inactive.
+    NotPermitted,
+    /// A new account would be provisioned, but the username the realm's claim
+    /// chain resolved is not a UPN. The claim it came from is passed on
+    /// (`&claim=`): it names realm configuration, not anything the user or the
+    /// IdP's token chose.
+    UsernameNotUpn { claim: String },
+}
+
+impl LoginFailure {
+    fn code(&self) -> &'static str {
+        match self {
+            LoginFailure::OidcFailed => "oidc_failed",
+            LoginFailure::NotPermitted => "not_permitted",
+            LoginFailure::UsernameNotUpn { .. } => "username_not_upn",
+        }
+    }
+}
+
+/// Send a refused OIDC sign-in back to the SPA's login page,
+/// `/login?error=<code>`, which explains it and offers to try again. The
+/// browser arrives at the callback straight from the IdP, so a bare text
+/// body left the user on a dead end. The code is generic: the IdP's
+/// `error_description` is never passed on (it is only logged, bounded).
+fn login_failed(failure: LoginFailure) -> Response {
+    let mut location = url::form_urlencoded::Serializer::new(String::new());
+    location.append_pair("error", failure.code());
+    if let LoginFailure::UsernameNotUpn { claim } = &failure {
+        location.append_pair("claim", claim);
+    }
+    (
+        StatusCode::FOUND,
+        [(header::LOCATION, format!("/login?{}", location.finish()))],
+    )
+        .into_response()
 }
 
 /// The callback proper; [`oidc_callback`] wraps it to clear the flow cookie.
@@ -316,7 +377,7 @@ async fn oidc_callback_inner(
             // supplied `error_description`: bounded and `?`-escaped, so it
             // cannot forge log lines or flood the log.
             tracing::warn!(error = ?bounded_for_log(&e.to_string()), "oidc callback failed");
-            return (StatusCode::BAD_REQUEST, "oidc login failed").into_response();
+            return login_failed(LoginFailure::OidcFailed);
         }
     };
 
@@ -326,15 +387,22 @@ async fn oidc_callback_inner(
             issuer = %validated.issuer,
             "oidc login refused: the token does not carry the realm's required claims"
         );
-        return (StatusCode::FORBIDDEN, "login not permitted").into_response();
+        return login_failed(LoginFailure::NotPermitted);
     }
 
     let mapped = map_claims(&validated.claims, &rt.mapping);
     let user = match resolve_user(&state.pool, &validated, &mapped, &rt.policy).await {
         Ok(u) => u,
+        Err(ResolveError::NotUpn { claim }) => {
+            tracing::warn!(
+                %claim,
+                "oidc login refused: a new account needs a UPN, and the claim does not hold one"
+            );
+            return login_failed(LoginFailure::UsernameNotUpn { claim });
+        }
         Err(e) => {
             tracing::warn!(error = %e, "oidc user resolution failed");
-            return (StatusCode::FORBIDDEN, "login not permitted").into_response();
+            return login_failed(LoginFailure::NotPermitted);
         }
     };
     if mapped.admin_managed {
@@ -348,7 +416,7 @@ async fn oidc_callback_inner(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "session creation failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+            return auth_unavailable();
         }
     };
 
@@ -378,11 +446,11 @@ struct LogoutResult {
 /// `POST /auth/logout` — revoke the current session + clear the cookie.
 ///
 /// CSRF-protected: the caller must echo the session's `csrf_secret` in the
-/// `X-CSRF-Token` header (double-submit, §3.8). A request without a session
+/// `X-CSRF-Token` header (double-submit). A request without a session
 /// cookie is a no-op `204`.
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    // Sessions are minted by BOTH the local login endpoint and OIDC (12.7),
-    // so logout works whenever sessions do — independent of any oidc realm.
+    // Sessions are minted by BOTH the local login endpoint and OIDC, so
+    // logout works whenever sessions do — independent of any oidc realm.
     let rt = SessionAuthCtx::of(&state);
 
     let Ok(Some(secret)) = unique_cookie_value(&headers, session_cookie_name(rt.cookie_secure))
@@ -404,7 +472,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         }
         Err(e) => {
             tracing::warn!(error = %e, "logout session validate failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+            return auth_unavailable();
         }
     };
 
@@ -419,7 +487,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
     // Revoke server-side BEFORE clearing the cookie. If the DB revoke fails the
     // session is still live cluster-wide, so we must NOT tell the client it has
-    // logged out (and must not clear its cookie as if it had): surface a 500 so
+    // logged out (and must not clear its cookie as if it had): surface a 503 so
     // the client knows the logout did not take effect and can retry. Silently
     // returning 200 here would leave a live session an attacker holding the
     // cookie could keep using.
@@ -427,7 +495,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Ok(revoked) => revoked,
         Err(e) => {
             tracing::error!(error = %e, session_id = session.id, "logout session revoke failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+            return auth_unavailable();
         }
     };
 
@@ -454,8 +522,8 @@ enum SessionAuthError {
     Unauthorized,
     /// Cookie valid but the `X-CSRF-Token` is missing or wrong → 403.
     CsrfFailed,
-    /// A backend error while validating → 500.
-    Internal,
+    /// The database failed while validating → 503 with `Retry-After`.
+    Unavailable,
 }
 
 impl IntoResponse for SessionAuthError {
@@ -467,17 +535,15 @@ impl IntoResponse for SessionAuthError {
             SessionAuthError::CsrfFailed => {
                 (StatusCode::FORBIDDEN, "missing or invalid csrf token").into_response()
             }
-            SessionAuthError::Internal => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response()
-            }
+            SessionAuthError::Unavailable => auth_unavailable(),
         }
     }
 }
 
 /// What the session-authenticated endpoints need: the shared session service,
 /// the pool (to read the session user's live account state) and the
-/// cookie-security bit. OIDC-independent since 12.7 (local password logins
-/// mint sessions too).
+/// cookie-security bit. OIDC-independent (local password logins mint sessions
+/// too).
 struct SessionAuthCtx {
     sessions: SessionService,
     pool: sqlx::PgPool,
@@ -522,7 +588,7 @@ async fn require_session(
         Ok(None) => return Err(SessionAuthError::Unauthorized),
         Err(e) => {
             tracing::warn!(error = %e, "session validate failed");
-            return Err(SessionAuthError::Internal);
+            return Err(SessionAuthError::Unavailable);
         }
     };
     match user_dao::find_user_by_id(&rt.pool, session.user_id).await {
@@ -530,14 +596,14 @@ async fn require_session(
         Ok(_) => Err(SessionAuthError::Unauthorized),
         Err(e) => {
             tracing::warn!(error = %e, "session user lookup failed");
-            Err(SessionAuthError::Internal)
+            Err(SessionAuthError::Unavailable)
         }
     }
 }
 
 /// Like [`require_session`] but also enforces the double-submit CSRF token
 /// (`X-CSRF-Token` must equal the session's stored `csrf_secret`). Use on every
-/// state-changing cookie-authenticated endpoint (§3.8).
+/// state-changing cookie-authenticated endpoint.
 async fn require_session_csrf(
     rt: &SessionAuthCtx,
     headers: &HeaderMap,
@@ -554,7 +620,7 @@ async fn require_session_csrf(
 }
 
 /// `GET /auth/me` who-am-I body for the SPA. Carries the per-session
-/// `csrf_token` the UI must echo on mutating requests (§3.8).
+/// `csrf_token` the UI must echo on mutating requests.
 #[derive(Debug, Serialize)]
 struct AuthMe {
     user_id: i64,
@@ -571,8 +637,7 @@ struct AuthMe {
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let rt = SessionAuthCtx::of(&state);
     // `require_session` reflects the live user row (deactivation); report the
-    // effective RBAC admin verdict (admin role or legacy flag), not the raw
-    // column.
+    // effective RBAC admin verdict (the `admin` role).
     let ActiveSession { session, user: u } = match require_session(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -582,7 +647,6 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .is_global_admin(&forge_core::auth::Principal::User {
             user_id: u.id,
             token_id: None,
-            is_admin: u.is_admin,
             method: forge_core::auth::AuthMethod::Session,
         })
         .await;
@@ -659,10 +723,9 @@ async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
-/// `POST /auth/tokens` — mint a slice-1 repository token for the **session's**
-/// user (CSRF-protected; refused for a deactivated user). Delegates to the
-/// same hash-only token model the admin API uses; the plaintext is returned
-/// once.
+/// `POST /auth/tokens` — mint an API token for the **session's** user
+/// (CSRF-protected; refused for a deactivated user). Delegates to the same
+/// hash-only token model the admin API uses; the plaintext is returned once.
 async fn create_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -735,7 +798,7 @@ async fn revoke_token(
     }
 }
 
-// ── password login + identifier-first UX (12.7 §3.4) ────────────────────────
+// ── password login + identifier-first UX ────────────────────────────────────
 
 /// `POST /auth/login` request body.
 #[derive(Debug, Deserialize)]
@@ -753,8 +816,9 @@ struct LoginBody {
 /// `auth.allow_password_basic` (that flag governs API Basic auth only). The
 /// response mirrors `/auth/me` so the SPA can bootstrap immediately; failures
 /// are a uniform 401 (no username-exists oracle). A username over
-/// [`MAX_USERNAME_BYTES`] is refused the same way before any lookup or lockout
-/// bookkeeping (it is never counted, so it cannot grow the lockout map).
+/// [`MAX_USERNAME_BYTES`], or one containing `:`, is refused the same way
+/// before any lookup or lockout bookkeeping (it is never counted, so it cannot
+/// grow the lockout map).
 async fn password_login(
     State(state): State<AppState>,
     connect: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -774,8 +838,10 @@ async fn password_login(
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     }
     // The lockout, the chain and the account lookup all key on the canonical
-    // username (trimmed, NFC, lowercased).
-    let Ok(username) = forge_core::auth::canonical_username(&body.username) else {
+    // username (trimmed, NFC, lowercased). A name with a `:` cannot sign in
+    // with a password (a forwarding realm's upstream would split it, and Basic
+    // cannot carry one); like an oversized one it is never counted.
+    let Ok(username) = forge_core::auth::canonical_password_username(&body.username) else {
         return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
     };
 
@@ -793,7 +859,7 @@ async fn password_login(
             let retry_after = match refused {
                 AttemptRefused::Locked => {
                     tracing::warn!(%username, ip = %client_ip, "password login throttled");
-                    state.config.auth.login_failure_window_seconds.max(1)
+                    state.login_throttle.current_limits().1.as_secs().max(1)
                 }
                 AttemptRefused::Busy => {
                     tracing::warn!(%username, ip = %client_ip, "password login: too many concurrent attempts");
@@ -808,6 +874,26 @@ async fn password_login(
                 .into_response();
         }
     };
+    // A token Forge issued is never a password, even one that cannot be used
+    // now. As on the wire Basic path it is not run through the chain (a
+    // credential-forwarding realm would send it upstream), and it does not
+    // sign in either: a session carries its owner's rights, not the token's
+    // scope. The same holds for a workload API key.
+    if forge_core::auth::is_workload_key(&body.password) {
+        attempt.failed();
+        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    }
+    match check_token(&state.pool, &body.password).await {
+        Ok(TokenCheck::Unknown) => {}
+        Ok(TokenCheck::Live(_) | TokenCheck::Unusable) => {
+            attempt.failed();
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        Err(_) => {
+            attempt.released();
+            return auth_unavailable();
+        }
+    }
     let cred = PasswordCredential {
         username: &username,
         password: &body.password,
@@ -822,6 +908,11 @@ async fn password_login(
         ChainOutcome::Unavailable => {
             attempt.released();
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        // Forge's own database failed: not a verdict on the credentials.
+        ChainOutcome::Failed => {
+            attempt.released();
+            return auth_unavailable();
         }
         ChainOutcome::Rejected | ChainOutcome::NoCredentials => {
             attempt.failed();
@@ -838,7 +929,7 @@ async fn password_login(
         Err(e) => {
             tracing::error!(error = %e, "login principal mapping failed");
             attempt.released();
-            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            return auth_unavailable();
         }
     };
     attempt.succeeded();
@@ -857,7 +948,7 @@ async fn password_login(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "session creation failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response();
+            return auth_unavailable();
         }
     };
 
@@ -878,6 +969,153 @@ async fn password_login(
         }),
     )
         .into_response()
+}
+
+/// The key the invitation throttle counts a client network's failures under
+/// (the throttle is the login lockout's, keyed by network and this).
+const INVITATION_THROTTLE_KEY: &str = "\u{0}invitation";
+
+/// `POST /auth/invitations/lookup` and `…/accept` body: the token from the
+/// link's fragment (and the password to choose).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvitationBody {
+    token: String,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// The one answer for a token that does not work.
+fn invalid_invitation() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": crate::invitations::INVALID_INVITATION})),
+    )
+        .into_response()
+}
+
+fn invitation_throttled(state: &AppState) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(
+            header::RETRY_AFTER,
+            state
+                .invitation_throttle
+                .current_limits()
+                .1
+                .as_secs()
+                .max(1)
+                .to_string(),
+        )],
+        "too many failed attempts; try again later",
+    )
+        .into_response()
+}
+
+/// `POST /auth/invitations/lookup`: whose account a live invitation is
+/// for, so the page can name it. **400** with the generic answer otherwise.
+async fn lookup_invitation(
+    State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(body): Json<InvitationBody>,
+) -> Response {
+    let client_ip = login_client_ip(&state, connect, &headers);
+    let Ok(attempt) = state
+        .invitation_throttle
+        .begin(client_ip, INVITATION_THROTTLE_KEY)
+        .await
+    else {
+        return invitation_throttled(&state);
+    };
+    let hash = crate::invitations::token_hash(&body.token);
+    match forge_db::invitation_dao::find_live(&state.pool, &hash).await {
+        Ok(Some((username, expires_at))) => {
+            attempt.released();
+            Json(serde_json::json!({"username": username, "expires_at": expires_at}))
+                .into_response()
+        }
+        Ok(None) => {
+            attempt.failed();
+            invalid_invitation()
+        }
+        Err(e) => {
+            attempt.released();
+            tracing::error!(error = %e, "invitation lookup failed");
+            auth_unavailable()
+        }
+    }
+}
+
+/// `POST /auth/invitations/accept`: choose the invited account's password.
+/// **200** `{"username"}` (the page then sends the browser to sign in);
+/// **400** for a password that is too short or too long, or with the generic
+/// answer for a token that does not work.
+async fn accept_invitation(
+    State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(body): Json<InvitationBody>,
+) -> Response {
+    let Some(password) = body.password else {
+        return (StatusCode::BAD_REQUEST, "a password is required").into_response();
+    };
+    if let Err(why) = crate::invitations::check_password(&password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": why})),
+        )
+            .into_response();
+    }
+    let client_ip = login_client_ip(&state, connect, &headers);
+    let Ok(attempt) = state
+        .invitation_throttle
+        .begin(client_ip, INVITATION_THROTTLE_KEY)
+        .await
+    else {
+        return invitation_throttled(&state);
+    };
+    let hash = crate::invitations::token_hash(&body.token);
+    // Before the argon2 work: an unknown token costs none.
+    match forge_db::invitation_dao::find_live(&state.pool, &hash).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            attempt.failed();
+            return invalid_invitation();
+        }
+        Err(e) => {
+            attempt.released();
+            tracing::error!(error = %e, "invitation lookup failed");
+            return auth_unavailable();
+        }
+    }
+    let password_hash = match crate::admin::hash_password(password).await {
+        Ok(hash) => hash,
+        Err(resp) => {
+            attempt.released();
+            return resp;
+        }
+    };
+    match forge_db::invitation_dao::accept(&state.pool, &hash, &password_hash).await {
+        Ok(Some(user)) => {
+            attempt.released();
+            tracing::info!(
+                user_id = user.id,
+                "invitation accepted: the password is set"
+            );
+            Json(serde_json::json!({"username": user.username})).into_response()
+        }
+        // Accepted, replaced or revoked meanwhile.
+        Ok(None) => {
+            attempt.failed();
+            invalid_invitation()
+        }
+        Err(e) => {
+            attempt.released();
+            tracing::error!(error = %e, "invitation acceptance failed");
+            auth_unavailable()
+        }
+    }
 }
 
 /// Resolve the client IP for the lockout key and the login audit trail: honors
@@ -917,7 +1155,7 @@ struct IdentifyResult {
     login_url: Option<String>,
 }
 
-/// `POST /auth/identify` — identifier-first routing (12.7 §3.4).
+/// `POST /auth/identify` — identifier-first routing.
 ///
 /// **Anti-enumeration:** the decision is a pure function of *public realm
 /// configuration* (an OIDC realm's `login_domains` rule), never of whether an
@@ -982,11 +1220,11 @@ struct OidcLoginOption {
 /// `GET /auth/login-options` response: what the login screen should render.
 #[derive(Debug, Serialize)]
 struct LoginOptions {
-    /// `identifier_first` | `combined` (`auth.login_mode`).
-    mode: String,
+    /// `identifier_first` | `combined` (the `login_mode` auth setting).
+    mode: &'static str,
     /// Whether any password-capable realm is enabled (show the password form).
     password: bool,
-    /// Enabled OIDC realm buttons (at most one in 12.7).
+    /// Enabled OIDC realm buttons (at most one).
     oidc: Vec<OidcLoginOption>,
 }
 
@@ -1009,7 +1247,13 @@ async fn login_options(State(state): State<AppState>) -> Response {
         })
         .unwrap_or_default();
     Json(LoginOptions {
-        mode: state.config.auth.login_mode.clone(),
+        mode: state
+            .auth_settings
+            .current()
+            .await
+            .settings
+            .login_mode
+            .as_str(),
         password: snap.chain.is_some(),
         oidc,
     })

@@ -100,36 +100,50 @@ pub async fn list_versions(
     .await
 }
 
-/// List every component (all ids, all versions) in a repository, ordered by
-/// `(name, id)`. Used by hosted search, which groups in memory.
-pub async fn list_components_for_repo(
-    pool: &PgPool,
-    repository_id: i64,
-) -> sqlx::Result<Vec<Component>> {
-    sqlx::query_as!(
-        Component,
-        r#"
-        SELECT
-            id, repository_id, name, original_id, version, version_original,
-            listed, created_at, updated_at
-        FROM component
-        WHERE repository_id = $1
-        ORDER BY name, id
-        "#,
-        repository_id,
-    )
-    .fetch_all(pool)
-    .await
-}
-
-/// Like [`list_components_for_repo`], restricted in SQL to ids containing
-/// `name_substring` (lowercased) — a prefilter for search so a large
-/// repository is not loaded whole.
-pub async fn list_components_for_repo_matching(
+/// The ids (lowercase names) of `repository_id` with at least one version a
+/// search shows: listed, a release unless `prerelease`, and not SemVer 2.0.0
+/// (build metadata, or a `.` in the prerelease label of `version_original`)
+/// unless `include_semver2`. With a non-empty `name_substring`, only ids
+/// containing it. Ordered by name; hosted search pages over this list and
+/// loads versions for the page only ([`search_versions`]).
+pub async fn search_names(
     pool: &PgPool,
     repository_id: i64,
     name_substring: &str,
+    prerelease: bool,
+    include_semver2: bool,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT DISTINCT name AS "name!"
+        FROM component
+        WHERE repository_id = $1 AND listed
+          AND ($2 = '' OR strpos(name, $2) > 0)
+          AND ($3 OR strpos(version, '-') = 0)
+          AND ($4 OR version_original !~ '[+]|-.*[.]')
+        ORDER BY name
+        "#,
+        repository_id,
+        name_substring,
+        prerelease,
+        include_semver2,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// The versions of `names` in `repository_id` that [`search_names`] counts
+/// (same filters), ordered by `(name, id)`.
+pub async fn search_versions(
+    pool: &PgPool,
+    repository_id: i64,
+    names: &[String],
+    prerelease: bool,
+    include_semver2: bool,
 ) -> sqlx::Result<Vec<Component>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
     sqlx::query_as!(
         Component,
         r#"
@@ -137,33 +151,38 @@ pub async fn list_components_for_repo_matching(
             id, repository_id, name, original_id, version, version_original,
             listed, created_at, updated_at
         FROM component
-        WHERE repository_id = $1 AND strpos(name, $2) > 0
+        WHERE repository_id = $1 AND name = ANY($2::text[]) AND listed
+          AND ($3 OR strpos(version, '-') = 0)
+          AND ($4 OR version_original !~ '[+]|-.*[.]')
         ORDER BY name, id
         "#,
         repository_id,
-        name_substring,
+        names,
+        prerelease,
+        include_semver2,
     )
     .fetch_all(pool)
     .await
 }
 
-/// The subset of `names` (lowercased package ids) that have at least one
-/// component row — any version, listed or not — in any of `repository_ids`.
+/// The `(repository_id, name)` pairs of `repository_ids` × `names`
+/// (lowercased package ids) with at least one component row — any version,
+/// listed or not.
 ///
 /// One batched existence query, used by group resolution's dependency-confusion
-/// guard to decide whether a hosted leaf owns an id regardless of who asks.
-/// Each returned name appears once; order is unspecified.
-pub async fn names_present_in_repositories(
+/// guard to decide which hosted leaves own an id regardless of who asks. Each
+/// pair appears once; order is unspecified.
+pub async fn repositories_having_names(
     pool: &PgPool,
     repository_ids: &[i64],
     names: &[String],
-) -> sqlx::Result<Vec<String>> {
+) -> sqlx::Result<Vec<(i64, String)>> {
     if repository_ids.is_empty() || names.is_empty() {
         return Ok(Vec::new());
     }
-    sqlx::query_scalar!(
+    let rows = sqlx::query!(
         r#"
-        SELECT DISTINCT name AS "name!"
+        SELECT DISTINCT repository_id, name
         FROM component
         WHERE repository_id = ANY($1) AND name = ANY($2)
         "#,
@@ -171,7 +190,11 @@ pub async fn names_present_in_repositories(
         names,
     )
     .fetch_all(pool)
-    .await
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.repository_id, row.name))
+        .collect())
 }
 
 /// Set the `listed` flag on a specific component version. Returns whether a row
@@ -356,10 +379,15 @@ pub struct RegistrationRow {
     pub id: i64,
     pub original_id: String,
     pub version: String,
+    pub version_original: String,
     pub listed: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub manifest_summary: Option<serde_json::Value>,
     pub package_hash_sha512_base64: Option<String>,
+    /// SHA-256 (lowercase hex) of the package asset's blob.
+    pub package_sha256: Option<String>,
+    /// Byte size of the package asset.
+    pub package_size: Option<i64>,
 }
 
 /// Every version of `name` with its registration data, in one query (the
@@ -374,8 +402,9 @@ pub async fn list_registration_rows(
         RegistrationRow,
         r#"
         SELECT
-            c.id, c.original_id, c.version, c.listed, c.created_at,
-            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?"
+            c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
         FROM component c
         LEFT JOIN asset a ON a.component_id = c.id AND a.path = $3
         WHERE c.repository_id = $1 AND c.name = $2
@@ -383,6 +412,67 @@ pub async fn list_registration_rows(
         "#,
         repository_id,
         name,
+        nupkg_path,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Every version of `name` in `repository_id` with its publication time and
+/// the size of its asset at `nupkg_path` (`None` without one): what a package
+/// detail page shows per version, in one query.
+pub async fn version_sizes(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    nupkg_path: &str,
+) -> sqlx::Result<Vec<(String, chrono::DateTime<chrono::Utc>, Option<i64>)>> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT c.version, c.created_at, a.size AS "size?"
+        FROM component c
+        LEFT JOIN asset a ON a.component_id = c.id AND a.path = $3
+        WHERE c.repository_id = $1 AND c.name = $2
+        "#,
+        repository_id,
+        name,
+        nupkg_path,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.version, r.created_at, r.size))
+        .collect())
+}
+
+/// [`list_registration_rows`] for `versions` (normalized) only: a
+/// registration page loads its own versions' summaries, not every version's.
+pub async fn list_registration_rows_for_versions(
+    pool: &PgPool,
+    repository_id: i64,
+    name: &str,
+    versions: &[String],
+    nupkg_path: &str,
+) -> sqlx::Result<Vec<RegistrationRow>> {
+    if versions.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as!(
+        RegistrationRow,
+        r#"
+        SELECT
+            c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
+        FROM component c
+        LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4
+        WHERE c.repository_id = $1 AND c.name = $2 AND c.version = ANY($3::text[])
+        ORDER BY c.id
+        "#,
+        repository_id,
+        name,
+        versions,
         nupkg_path,
     )
     .fetch_all(pool)
@@ -401,8 +491,9 @@ pub async fn find_registration_row(
         RegistrationRow,
         r#"
         SELECT
-            c.id, c.original_id, c.version, c.listed, c.created_at,
-            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?"
+            c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
+            c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
         FROM component c
         LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4
         WHERE c.repository_id = $1 AND c.name = $2 AND c.version = $3
@@ -479,5 +570,44 @@ where
     )
     .execute(executor)
     .await?;
+    Ok(())
+}
+
+/// Give an imported component the times its source recorded: `published_at`
+/// becomes its creation time, and `downloaded_at` its (and its package
+/// asset's, at `package_path`) last download unless Forge saw a later one.
+pub async fn set_imported_times(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    component_id: i64,
+    package_path: &str,
+    published_at: Option<chrono::DateTime<chrono::Utc>>,
+    downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE component
+        SET created_at = coalesce($2, created_at),
+            last_downloaded_at = greatest(last_downloaded_at, $3)
+        WHERE id = $1
+        "#,
+        component_id,
+        published_at,
+        downloaded_at,
+    )
+    .execute(&mut **tx)
+    .await?;
+    if downloaded_at.is_some() {
+        sqlx::query!(
+            r#"
+            UPDATE asset SET last_downloaded_at = greatest(last_downloaded_at, $3)
+            WHERE component_id = $1 AND path = $2
+            "#,
+            component_id,
+            package_path,
+            downloaded_at,
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }

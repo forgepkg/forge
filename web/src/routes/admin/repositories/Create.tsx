@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
-import { useCreateRepository } from '~/queries/useRepositories'
-import { Heading } from '~/components/catalyst/heading'
+import { useCreateRepository, useFormats } from '~/queries/useRepositories'
+import { Page, PageHeader } from '~/components/ui'
 import {
   RepositoryForm,
   toCreateBody,
@@ -13,7 +13,7 @@ export const Route = createFileRoute('/_app/manage/repositories/new')({
 })
 
 /**
- * Create-repository screen (plan §Phase 4). Renders the shared kind-conditional
+ * Create-repository screen. Renders the shared kind-conditional
  * `RepositoryForm`, posts a `CreateRepo` body, and on success navigates to the
  * new repository's edit page. Server errors (e.g. 409 name conflict, 400 invalid
  * remote URL) are surfaced inline by the form.
@@ -21,6 +21,8 @@ export const Route = createFileRoute('/_app/manage/repositories/new')({
 function CreateRepository() {
   const navigate = useNavigate()
   const create = useCreateRepository()
+  // Without the list (loading, or an older server) the form offers NuGet.
+  const formats = useFormats()
 
   function handleSubmit(values: RepoFormValues) {
     create.mutate(toCreateBody(values), {
@@ -34,10 +36,18 @@ function CreateRepository() {
   }
 
   return (
-    <section className="space-y-6">
-      <Heading>New repository</Heading>
+    <Page>
+      <PageHeader
+        title="New repository"
+        crumbs={[
+          { label: 'Repositories', to: '/manage/repositories' },
+          { label: 'New repository' },
+        ]}
+        description="Choose what the repository serves and where its contents come from. The format and the kind cannot be changed later."
+      />
       <RepositoryForm
         mode="create"
+        formats={formats.data}
         submitting={create.isPending}
         serverError={
           create.isError ? create.error.body || create.error.message : null
@@ -45,6 +55,6 @@ function CreateRepository() {
         onSubmit={handleSubmit}
         onCancel={() => void navigate({ to: '/manage/repositories' })}
       />
-    </section>
+    </Page>
   )
 }

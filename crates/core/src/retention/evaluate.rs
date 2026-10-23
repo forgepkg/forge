@@ -1,4 +1,4 @@
-//! The **pure** retention evaluator (design §3.6).
+//! The **pure** retention evaluator.
 //!
 //! Given a policy and a snapshot of a repository's components (or a proxy repo's
 //! cached versions), [`evaluate`] / [`evaluate_proxy`] compute the set of
@@ -36,6 +36,8 @@
 //! `first_seen_at`. Only versions whose bytes are cached locally are
 //! candidates. Proxy entries are never unlisted — eviction always deletes the
 //! cached bytes (the version stays listed and re-caches on the next pull).
+
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
@@ -265,7 +267,10 @@ fn protected_indices(policy: &RetentionPolicy, ordered: &[&CandidateComponent]) 
 /// Evaluate a hosted retention policy over a component snapshot, producing the
 /// ordered set of decisions to apply. **Pure**: no I/O, `now` is injected.
 ///
-/// `format` is used only to order versions within a package group.
+/// `format` is used only to order versions within a package group. The cost is
+/// linear in the snapshot plus sorting each package's versions, but it is
+/// still CPU-bound on a large repository, so async callers run it on the
+/// blocking pool.
 pub fn evaluate(
     format: &dyn Format,
     now: DateTime<Utc>,
@@ -276,22 +281,22 @@ pub fn evaluate(
         return Vec::new();
     }
 
-    // Group candidates by package name, preserving deterministic group order.
-    let mut group_names: Vec<&str> = Vec::new();
+    // Group candidates by package name in one pass, in the order the packages
+    // first appear (each group keeps its candidates' snapshot order).
+    let mut groups: Vec<Vec<&CandidateComponent>> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
     for cand in candidates {
-        if !group_names.contains(&cand.package_name.as_str()) {
-            group_names.push(&cand.package_name);
-        }
+        let i = *index.entry(cand.package_name.as_str()).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[i].push(cand);
     }
 
     let mut decisions = Vec::new();
 
-    for name in group_names {
-        // Collect this group's components, newest-first by version.
-        let mut group: Vec<&CandidateComponent> = candidates
-            .iter()
-            .filter(|c| c.package_name == name)
-            .collect();
+    for mut group in groups {
+        // This group's components, newest-first by version.
         group.sort_by(|a, b| format.compare_versions(&b.version, &a.version)); // desc
 
         let protected = protected_indices(policy, &group);
@@ -413,7 +418,7 @@ mod tests {
 
     /// A self-contained [`Format`] for the evaluator's pure unit tests.
     ///
-    /// We deliberately do **not** depend on `forge-nuget` here: pulling it in as
+    /// We deliberately do **not** depend on `forge-format-nuget` here: pulling it in as
     /// a dev-dependency would create two copies of `forge-core` in the test
     /// graph (the cycle the lib's `tests/` integration crate tolerates but a
     /// `#[cfg(test)]` module cannot). Ordering only needs to be a correct
@@ -1080,6 +1085,104 @@ mod tests {
         )]);
         let d = evaluate(&fmt(), now(), &p, &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0", "1.2.0"]);
+    }
+
+    // ---- scale ----
+
+    #[test]
+    fn large_interleaved_snapshot_decides_as_each_package_alone() {
+        // Regression (#24): grouping re-scanned the whole snapshot once per
+        // package (O(N·G)). 100k versions over 5,000 packages, interleaved so
+        // no package's versions are adjacent, each package's arriving out of
+        // version order, and first-appearance order differing from name
+        // order. The single-pass grouping must decide exactly what evaluating
+        // each package on its own decides, package by package in the order
+        // the packages first appear.
+        const PACKAGES: usize = 5_000;
+        const VERSIONS: usize = 20;
+        let mut all = Vec::with_capacity(PACKAGES * VERSIONS);
+        let mut by_package: Vec<Vec<CandidateComponent>> = vec![Vec::new(); PACKAGES];
+        for round in 0..VERSIONS {
+            let v = (round * 7) % VERSIONS;
+            for (p, group) in by_package.iter_mut().enumerate() {
+                let name = format!("pkg{:04}", (p * 7919) % PACKAGES);
+                let version = if v % 5 == 4 {
+                    format!("1.{v}.0-beta")
+                } else {
+                    format!("1.{v}.0")
+                };
+                let last_dl = v.is_multiple_of(3).then_some(((v + p) % 60) as i64);
+                let mut c = comp((p * VERSIONS + v) as i64, &name, &version, 100, last_dl);
+                c.listed = !(v + p).is_multiple_of(7);
+                all.push(c.clone());
+                group.push(c);
+            }
+        }
+        let p = policy_with(vec![
+            RetentionRule {
+                release_type: ReleaseType::Releases,
+                ..rule(
+                    "releases",
+                    Action::HardDelete,
+                    Criteria {
+                        keep_last_n: Some(3),
+                        older_than_days: Some(30),
+                        ..Default::default()
+                    },
+                )
+            },
+            RetentionRule {
+                release_type: ReleaseType::Prereleases,
+                ..rule(
+                    "prereleases",
+                    Action::Unlist,
+                    Criteria {
+                        keep_n_most_downloaded: Some(1),
+                        not_downloaded_for_days: Some(30),
+                        ..Default::default()
+                    },
+                )
+            },
+            RetentionRule {
+                package_name_prefix: Some("PKG1".into()),
+                ..rule(
+                    "prefix",
+                    Action::HardDelete,
+                    Criteria {
+                        not_downloaded_for_days: Some(45),
+                        ..Default::default()
+                    },
+                )
+            },
+        ]);
+
+        let decisions = evaluate(&fmt(), now(), &p, &all);
+        let expected: Vec<Decision> = by_package
+            .iter()
+            .flat_map(|group| evaluate(&fmt(), now(), &p, group))
+            .collect();
+        assert_eq!(decisions.len(), expected.len());
+        assert!(
+            decisions == expected,
+            "decisions differ from per-package evaluation"
+        );
+
+        // Sanity: the policy did real work, and each package's three newest
+        // listed releases survived.
+        assert!(decisions.iter().any(|d| d.action == Action::Unlist));
+        assert!(decisions.iter().any(|d| d.rule_id == "prefix"));
+        let decided: std::collections::HashSet<i64> =
+            decisions.iter().map(|d| d.component_id).collect();
+        for group in &by_package {
+            let mut releases: Vec<&CandidateComponent> = group
+                .iter()
+                .filter(|c| c.listed && !is_prerelease(&c.version))
+                .collect();
+            releases.sort_by(|a, b| fmt().compare_versions(&b.version, &a.version));
+            for kept in releases.iter().take(3) {
+                assert!(!decided.contains(&kept.component_id), "{kept:?}");
+            }
+        }
     }
 
     // ---- proxy ----

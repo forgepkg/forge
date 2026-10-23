@@ -2,17 +2,15 @@
 //! axum server (with optional peer instances sharing the same DB + S3 + Redis).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use forge_cache::Cache;
-use forge_nuget::NugetFormat;
 use forge_server::app::{build_router, ensure_bootstrap_admin, principal_layer};
 use forge_server::config::Config;
 use forge_server::state::AppState;
 use forge_server::workers::{self, WorkerHandles};
-use forge_storage::{BlobStore, S3Config};
+use forge_storage::{BlobStore, S3Config, S3Credentials};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -55,6 +53,7 @@ async fn pg_endpoint() -> &'static str {
         .with_db_name("forge")
         .with_user("forge")
         .with_password("forge")
+        .with_name("mirror.gcr.io/library/postgres")
         .with_tag("17")
         .start()
         .await
@@ -69,6 +68,11 @@ async fn pg_endpoint() -> &'static str {
     PG_ENDPOINT.get().unwrap()
 }
 
+/// The shared versitygw's endpoint (booted on first use).
+pub(crate) async fn shared_s3_endpoint() -> &'static str {
+    s3_endpoint().await
+}
+
 async fn s3_endpoint() -> &'static str {
     if let Some(e) = S3_ENDPOINT.get() {
         return e;
@@ -77,7 +81,7 @@ async fn s3_endpoint() -> &'static str {
     if let Some(e) = S3_ENDPOINT.get() {
         return e;
     }
-    let container = GenericImage::new("versity/versitygw", "v1.4.1")
+    let container = GenericImage::new("mirror.gcr.io/versity/versitygw", "v1.4.1")
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stdout("listening on"))
         .with_cmd([
@@ -107,6 +111,7 @@ async fn redis_url() -> &'static str {
         return u;
     }
     let container = Redis::default()
+        .with_name("mirror.gcr.io/library/redis")
         .start()
         .await
         .expect("start redis testcontainer (is Docker running?)");
@@ -150,65 +155,13 @@ async fn connect_migrated(db_url: &str) -> PgPool {
     pool
 }
 
-/// A [`Migrator`] over the workspace `migrations/` dir, optionally truncated to
-/// migrations with `version <= target`.
-async fn migrator_up_to(target: Option<i64>) -> sqlx::migrate::Migrator {
-    let mut m = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../migrations"
-    )))
-    .await
-    .expect("load migrations");
-    if let Some(t) = target {
-        let subset: Vec<_> = m.iter().filter(|mig| mig.version <= t).cloned().collect();
-        m.migrations = std::borrow::Cow::Owned(subset);
-    }
-    m
-}
-
-/// `0007_rbac_migrate.sql` (the behavior-preserving data migration) carries
-/// version 7; bringing a DB up to 6 leaves the RBAC schema present but inert,
-/// exactly the state an upgrading slice-1 deployment is in before 0007 runs.
-const RBAC_MIGRATE_VERSION: i64 = 7;
-
-/// Bring a fresh DB up to the pre-RBAC-data schema (migrations `0001..0006`),
-/// run `seed` to inject slice-1-shaped rows (users with `is_admin`, repos with
-/// `anonymous_read`), then run the remaining migrations (`0007`). Because
-/// `app_user` is **non-empty** when `0007` runs, the data migration detects an
-/// UPGRADE and preserves slice-1 open-access behavior — faithfully reproducing
-/// what an upgrading deployment experiences, end-to-end through a real server.
-async fn connect_migrated_upgrade<F, Fut>(db_url: &str, seed: F) -> PgPool
-where
-    F: FnOnce(PgPool) -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(db_url)
-        .await
-        .expect("connect fresh db");
-    migrator_up_to(Some(RBAC_MIGRATE_VERSION - 1))
-        .await
-        .run(&pool)
-        .await
-        .expect("migrate 0001..0006");
-    seed(pool.clone()).await;
-    migrator_up_to(None)
-        .await
-        .run(&pool)
-        .await
-        .expect("migrate 0007 (upgrade)");
-    pool
-}
-
 async fn blob_store() -> BlobStore {
     let endpoint = s3_endpoint().await.to_string();
     let store = BlobStore::new(S3Config {
         endpoint,
         region: "us-east-1".into(),
         bucket: S3_BUCKET.into(),
-        access_key: S3_ACCESS.into(),
-        secret_key: S3_SECRET.into(),
+        credentials: S3Credentials::from_keys(S3_ACCESS, S3_SECRET),
         force_path_style: true,
         multipart_threshold: 8 * 1024 * 1024,
         conditional_writes: Default::default(),
@@ -228,32 +181,27 @@ async fn blob_store() -> BlobStore {
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
-/// Anonymous-access mode for a stack.
+/// Anonymous-access mode for a stack (the `anonymous_mode` auth setting).
 #[derive(Debug, Clone)]
 pub enum AnonMode {
-    /// `anonymous_mode = "off"` — every read requires authentication.
+    /// `off` — every read requires authentication.
     Off,
-    /// `anonymous_mode = "allowlist"` with the given allowlist tokens.
+    /// `allowlist` with the given allowlist tokens.
     Allowlist(Vec<String>),
-    /// `anonymous_mode = "all"` — anonymous reads of `anonymous_read` repos.
+    /// `all` — anonymous reads of `anonymous_read` repos.
     All,
 }
 
 impl AnonMode {
-    fn mode(&self) -> &'static str {
+    /// The auth settings update that selects this mode.
+    fn settings(&self) -> serde_json::Value {
         match self {
-            AnonMode::Off => "off",
-            AnonMode::Allowlist(_) => "allowlist",
-            AnonMode::All => "all",
-        }
-    }
-    fn allowlist_toml(&self) -> String {
-        match self {
-            AnonMode::Allowlist(tokens) => {
-                let quoted: Vec<String> = tokens.iter().map(|t| format!("{t:?}")).collect();
-                format!("anonymous_ip_allowlist = [{}]\n", quoted.join(", "))
-            }
-            _ => String::new(),
+            AnonMode::Off => serde_json::json!({"anonymous_mode": "off"}),
+            AnonMode::Allowlist(tokens) => serde_json::json!({
+                "anonymous_mode": "allowlist",
+                "anonymous_ip_allowlist": tokens,
+            }),
+            AnonMode::All => serde_json::json!({"anonymous_mode": "all"}),
         }
     }
 }
@@ -263,14 +211,31 @@ fn config_toml(
     db_url: &str,
     s3_endpoint: &str,
     admin: Option<(&str, &str)>,
-    anon: &AnonMode,
     redis: Option<&str>,
     trusted_proxies: &[String],
     cache_ttl_seconds: u64,
     public_base_url: &str,
     oidc_block: &str,
     auth_block: &str,
+    blob_cache: Option<&BlobCacheSetup>,
+    s3_credentials: Option<&str>,
 ) -> String {
+    let s3_credentials = s3_credentials.map_or_else(
+        || format!("access_key = \"{S3_ACCESS}\"\nsecret_key = \"{S3_SECRET}\""),
+        str::to_string,
+    );
+    let blob_cache_block = match blob_cache {
+        // No free-space reserve: whether the cache may grow must not depend
+        // on how full the test host's disk is.
+        Some(cache) => format!(
+            "[blob_cache]\npath = {:?}\nmax_bytes = {}\nmin_free_bytes = 0\n",
+            cache.path.display().to_string(),
+            cache
+                .max_bytes
+                .map_or_else(|| "\"auto\"".to_string(), |b| b.to_string())
+        ),
+        None => String::new(),
+    };
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
         None => String::new(),
@@ -295,14 +260,11 @@ url = "{db_url}"
 [s3]
 endpoint = "{s3_endpoint}"
 bucket = "{bucket}"
-access_key = "{access}"
-secret_key = "{secret}"
 force_path_style = true
+{s3_credentials}
 
 [auth]
-anonymous_mode = "{anon_mode}"
-allow_password_basic = true
-{allowlist}{trusted}{auth_block}{bootstrap}
+{trusted}{auth_block}{bootstrap}
 {redis_block}
 [cache]
 l1_max_capacity = 1000
@@ -319,16 +281,21 @@ poll_interval_seconds = 1
 default_run_interval_seconds = 3600
 lease_seconds = 30
 {oidc_block}
+{blob_cache_block}
 "#,
         bucket = S3_BUCKET,
-        access = S3_ACCESS,
-        secret = S3_SECRET,
-        anon_mode = anon.mode(),
-        allowlist = anon.allowlist_toml(),
     )
 }
 
 // ── Stack builder ───────────────────────────────────────────────────────────
+
+/// The `[blob_cache]` of a stack.
+#[derive(Debug, Clone)]
+struct BlobCacheSetup {
+    path: std::path::PathBuf,
+    /// `None`: `"auto"`.
+    max_bytes: Option<u64>,
+}
 
 /// Produces the `[oidc]` TOML block from the (post-bind) public base URL, so the
 /// `redirect_url` can embed the ephemeral address the server actually binds to.
@@ -337,6 +304,8 @@ type OidcBlockFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 /// Builder for a stack ([`start_stack`] is the common case with defaults).
 pub struct StackBuilder {
     anon: AnonMode,
+    /// Further auth settings to store (an `/admin/settings/auth` update).
+    auth_settings: Option<serde_json::Value>,
     bootstrap_admin: Option<(String, String)>,
     spawn_workers: bool,
     use_redis: bool,
@@ -344,17 +313,24 @@ pub struct StackBuilder {
     cache_ttl_seconds: u64,
     /// `None` ⇒ OIDC disabled.
     oidc_block_fn: Option<OidcBlockFn>,
-    /// `None` ⇒ default local-only provider chain (slice 12.3 disabled). When
-    /// set, this is the `providers = [...]` line plus the `[auth.upstream_basic]`
-    /// table injected into the `[auth]` config section.
+    /// `None` ⇒ default local-only provider chain (no credential forwarding).
+    /// When set, this is the `providers = [...]` line plus the
+    /// `[auth.upstream_basic]` table injected into the `[auth]` config section.
     auth_block: Option<String>,
+    /// `None` ⇒ the shared versitygw.
+    s3_endpoint: Option<String>,
+    /// `None` ⇒ no local blob cache.
+    blob_cache: Option<BlobCacheSetup>,
+    /// `None` ⇒ the static test keys.
+    s3_credentials: Option<String>,
 }
 
 impl Default for StackBuilder {
     fn default() -> Self {
         StackBuilder {
             anon: AnonMode::Off,
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            auth_settings: None,
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             spawn_workers: false,
             use_redis: false,
             // Trust loopback so XFF-driven anon-allowlist tests can spoof the
@@ -363,6 +339,9 @@ impl Default for StackBuilder {
             cache_ttl_seconds: 5,
             oidc_block_fn: None,
             auth_block: None,
+            s3_endpoint: None,
+            blob_cache: None,
+            s3_credentials: None,
         }
     }
 }
@@ -371,6 +350,13 @@ impl StackBuilder {
     /// Set the anonymous-access mode (default [`AnonMode::Off`]).
     pub fn anon(mut self, anon: AnonMode) -> Self {
         self.anon = anon;
+        self
+    }
+    /// Store these auth settings too (fields of a `PUT
+    /// /admin/settings/auth` body, e.g. `{"session_idle_ttl_seconds": 1}`).
+    /// Every stack has password Basic on and its [`Self::anon`] mode.
+    pub fn auth_settings(mut self, update: serde_json::Value) -> Self {
+        self.auth_settings = Some(update);
         self
     }
     /// Override the bootstrap admin (default a unique `adminN`/`adminpw`).
@@ -411,13 +397,54 @@ impl StackBuilder {
         self
     }
 
-    /// Enable the slice-12.3 credential-forwarding auth chain. `block` is the
+    /// Enable the credential-forwarding auth chain. `block` is the
     /// `providers = [...]` line plus the `[auth.upstream_basic]` table (typically
     /// `mock.upstream_basic_block(...)`). Injected into the `[auth]` config
     /// section so the server builds the real `AuthProvider` chain at startup.
     pub fn with_upstream_basic(mut self, block: impl Into<String>) -> Self {
         self.auth_block = Some(block.into());
         self
+    }
+
+    /// Talk to S3 at `endpoint` (e.g. an [`S3Gate`](crate::S3Gate) in front
+    /// of the shared versitygw) instead of the shared versitygw directly.
+    pub fn s3_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.s3_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Replace the static test keys with `toml` at the end of the `[s3]`
+    /// section: further `s3.*` keys, then e.g. `credentials = "web_identity"`
+    /// and its `[s3.web_identity]` table. Combine with [`Self::s3_endpoint`].
+    pub fn s3_credentials(mut self, toml: impl Into<String>) -> Self {
+        self.s3_credentials = Some(toml.into());
+        self
+    }
+
+    /// Enable the local blob cache at `path`, `max_bytes` bytes large
+    /// (`None`: `"auto"`). The server then starts even while S3 is down.
+    pub fn blob_cache(
+        mut self,
+        path: impl Into<std::path::PathBuf>,
+        max_bytes: Option<u64>,
+    ) -> Self {
+        self.blob_cache = Some(BlobCacheSetup {
+            path: path.into(),
+            max_bytes,
+        });
+        self
+    }
+
+    /// Boot a server over an existing stack's database (e.g. an instance
+    /// restarted on its persistent blob cache), without creating the
+    /// bootstrap admin or minting tokens.
+    pub async fn start_on(self, db_url: &str) -> TestServer {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(db_url)
+            .await
+            .expect("connect existing db");
+        self.serve(db_url.to_string(), pool, false).await
     }
 
     /// Boot a fresh stack: a new database + a server instance.
@@ -427,31 +454,11 @@ impl StackBuilder {
         self.serve(db_url, pool, true).await
     }
 
-    /// Boot a stack over a DB that was migrated as an **upgrade** from a slice-1
-    /// deployment: migrations `0001..0006` run, then `seed` injects slice-1-shaped
-    /// rows (users with `is_admin`, repos with `anonymous_read`) while RBAC is
-    /// still inert, then `0007` runs and — seeing a non-empty `app_user` — detects
-    /// an upgrade and preserves slice-1 open access. Used by the
-    /// UPGRADE-PRESERVES-BEHAVIOR e2e scenario.
-    ///
-    /// `seed` receives a pool over the upgrading DB. The bootstrap admin is still
-    /// created normally afterwards (and additionally inherits the `admin` role via
-    /// the now-applied migration).
-    pub async fn start_upgrade_seeded<F, Fut>(self, seed: F) -> TestServer
-    where
-        F: FnOnce(PgPool) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        let db_url = fresh_database().await;
-        let pool = connect_migrated_upgrade(&db_url, seed).await;
-        self.serve(db_url, pool, true).await
-    }
-
     /// Build the config + server for `pool`, optionally creating the bootstrap
     /// admin and minting an admin token.
     async fn serve(self, db_url: String, pool: PgPool, mint_token: bool) -> TestServer {
-        let store = blob_store().await;
-        let s3 = s3_endpoint().await;
+        let shared_s3 = s3_endpoint().await;
+        let s3 = self.s3_endpoint.as_deref().unwrap_or(shared_s3);
         let redis = if self.use_redis {
             Some(redis_url().await.to_string())
         } else {
@@ -482,13 +489,14 @@ impl StackBuilder {
             &db_url,
             s3,
             admin_ref,
-            &self.anon,
             redis.as_deref(),
             &self.trusted_proxies,
             self.cache_ttl_seconds,
             &base_url,
             &oidc_block,
             self.auth_block.as_deref().unwrap_or_default(),
+            self.blob_cache.as_ref(),
+            self.s3_credentials.as_deref(),
         );
         use figment::providers::Format as _;
         let config = Config::from_figment(
@@ -496,23 +504,66 @@ impl StackBuilder {
         )
         .expect("valid config");
 
+        // A stack with its own S3 endpoint or a blob cache builds its store
+        // the way `main` does (degraded start while S3 is down, with the
+        // cache); the others share the readiness-checked versitygw store.
+        let store = if self.s3_endpoint.is_some()
+            || self.blob_cache.is_some()
+            || self.s3_credentials.is_some()
+        {
+            let store = forge_server::object_store::open(&config).expect("object store");
+            forge_server::object_store::ensure_bucket(&store)
+                .await
+                .expect("ensure bucket");
+            store
+        } else {
+            blob_store().await
+        };
+
         ensure_bootstrap_admin(&config, &pool)
             .await
             .expect("bootstrap admin");
 
-        // 12.7: one-shot import of [oidc]/[auth.upstream_basic] into realms.
+        // Seed auth realms from the [oidc]/[auth.upstream_basic] config blocks.
         forge_server::app::ensure_auth_realms(&config, &pool, None)
             .await
             .expect("seed auth realms");
 
-        let nuget: Arc<dyn forge_core::format::Format> = Arc::new(NugetFormat::default());
         let cache = match &redis {
             Some(url) => Cache::with_redis(config.cache.l1_max_capacity, url)
                 .await
                 .expect("connect redis L2"),
             None => Cache::l1_only(config.cache.l1_max_capacity),
         };
-        let state = AppState::new(pool.clone(), store, cache, nuget, config);
+        let registry_keys = forge_server::registry::load_token_keys(&config, &pool, None)
+            .await
+            .expect("registry token key");
+        let state =
+            AppState::new(pool.clone(), store, cache, config).with_registry_keys(registry_keys);
+        // The access policy is stored in the database: password Basic on
+        // (tests sign in over Basic), the stack's anonymous mode, and any
+        // further settings. A peer on the same database stores the same.
+        let mut update = serde_json::json!({"allow_password_basic": true});
+        for extra in [Some(self.anon.settings()), self.auth_settings.clone()]
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(update), serde_json::Value::Object(extra)) =
+                (update.as_object_mut(), extra)
+            {
+                update.extend(extra);
+            }
+        }
+        let update: forge_server::auth::AuthSettingsUpdate =
+            serde_json::from_value(update).expect("an auth settings update");
+        let current = forge_server::auth::load_auth_settings(&pool)
+            .await
+            .expect("stored auth settings");
+        state
+            .auth_settings
+            .save(update.apply_to(&current).expect("valid auth settings"))
+            .await
+            .expect("store auth settings");
         let layer = principal_layer(&state).expect("principal layer");
 
         let worker_handles = if self.spawn_workers {
@@ -741,8 +792,8 @@ impl TestServer {
     }
 
     /// Like [`spawn_peer`](Self::spawn_peer) but the peer also enables the
-    /// slice-12.3 credential-forwarding chain with the same `[auth.upstream_basic]`
-    /// block, so a first-time login can be raced across both instances (the
+    /// credential-forwarding chain with the same `[auth.upstream_basic]` block,
+    /// so a first-time login can be raced across both instances (the
     /// scale-out singleflight scenario) and a reauth on one instance invalidates
     /// the cached verdict on the other (the shared validated_credential table +
     /// cache backplane).
@@ -810,12 +861,12 @@ impl TestServer {
     }
 
     /// Grant the built-in `anonymous` role `read` on `repo` directly in the DB,
-    /// mirroring the §12.4 data migration that converts the slice-1
-    /// `anonymous_read` flag into an anonymous-role grant. Under fine-grained
-    /// RBAC, anonymous read flows through this grant (not the column), so a test
-    /// that wants an anonymously-readable repo creates it with
-    /// `anonymous_read: true` **and** calls this. Done before any anonymous
-    /// request, so the (cold) anonymous cache entry loads the grant on first use.
+    /// mirroring the RBAC data migration that converted the `anonymous_read`
+    /// flag into an anonymous-role grant. Under fine-grained RBAC, anonymous
+    /// read flows through this grant (not the column), so a test that wants an
+    /// anonymously-readable repo creates it with `anonymous_read: true` **and**
+    /// calls this. Done before any anonymous request, so the (cold) anonymous
+    /// cache entry loads the grant on first use.
     pub async fn grant_anonymous_read(&self, repo: &str) {
         let repo_id = forge_db::repository_dao::find_repository_by_name(&self.pool, repo)
             .await
@@ -863,24 +914,41 @@ impl TestServer {
             .unwrap()
     }
 
-    // ── §12.4 RBAC admin helpers (Phase 7 e2e) ───────────────────────────────
+    // ── RBAC admin helpers ───────────────────────────────────────────────────
 
-    /// Create a non-admin user via the admin API and return its numeric id.
+    /// Create a non-admin local user the way an administrator and its user
+    /// do (#322): the admin invites it and, with no email service
+    /// configured, gets the invitation link; the user then chooses
+    /// `password` (at least 12 characters) from it. Returns its numeric id.
     pub async fn create_user(&self, username: &str, password: &str) -> i64 {
         let (u, p) = self.admin_basic();
         let body: serde_json::Value = self
             .client()
             .post(format!("{}/admin/users", self.base_url))
             .basic_auth(&u, Some(&p))
-            .json(&serde_json::json!({
-                "username": username, "password": password, "is_admin": false
-            }))
+            .json(&serde_json::json!({"username": username}))
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
+        let link = body["invitation"]["link"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no invitation link: {body}"));
+        let token = link.split_once('#').expect("a fragment").1;
+        let resp = self
+            .client()
+            .post(format!("{}/auth/invitations/accept", self.base_url))
+            .json(&serde_json::json!({"token": token, "password": password}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "invitation accepted: {}",
+            resp.text().await.unwrap()
+        );
         body["id"].as_i64().expect("created user id")
     }
 

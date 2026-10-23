@@ -1,4 +1,4 @@
-//! Admin REST API (spec §5/§8, plan 10.4). **Admin-only.**
+//! Admin REST API. **Admin-only.**
 //!
 //! Mounted under `/admin`. Every route is gated by [`require_admin`], which
 //! reads the [`Principal`] the principal middleware attached and returns:
@@ -9,15 +9,25 @@
 //! Sub-modules:
 //! * [`repositories`] — repository CRUD (incl. proxy fields; `upstream_password`
 //!   is write-only and REDACTED in responses; `remote_url` is SSRF-validated;
-//!   nested-group members and duplicate priorities are rejected) and package
-//!   hard-delete (A12).
-//! * [`users`] — user CRUD with argon2id password hashing.
+//!   duplicate member priorities are rejected, nested groups only when they
+//!   would form a cycle or exceed the depth limit) and package hard-delete.
+//! * [`users`] — user CRUD: local accounts are invited to choose their
+//!   password ([`crate::invitations`]), never given one here.
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
 //!   stored) + revoke + list.
 //! * [`members`] — group membership management.
-//! * [`crypto`] — §12.5 secret-encryption key **metadata** + per-layer rotation
+//! * [`crypto`] — secret-encryption key **metadata** + per-layer rotation
 //!   triggers (never returns key bytes or decrypted secrets).
-//! * [`settings`] — install-wide switches (`legacy_open_access`).
+//! * [`blob_cache`] — the local blob cache's statistics.
+//! * [`proxy_cache`] — invalidating what a proxy repository cached from its
+//!   upstream (its "not found" answers, listings and documents).
+//! * [`imports`] — importing a Nexus hosted repository into a hosted
+//!   repository (start with a preflight, progress, cancel, resume, retry).
+//! * [`email`] — the email service's settings and a test send.
+//! * [`email_oauth`] — registering and authorizing Forge for the email
+//!   service's SMTP with OAuth.
+//! * [`settings`] — the sign-in and anonymous-access policy (anonymous mode,
+//!   login mode, password Basic, session lifetimes, lockout).
 //!
 //! **API tokens and `/admin/*`.** A token is a feed credential, not an admin
 //! login: a token-authenticated caller passes [`require_admin`] only when the
@@ -32,11 +42,17 @@
 //! the upstream directory's password. Administration takes a browser session
 //! (sign in through `/auth/login` or OIDC) or an admin-scoped token.
 
+pub mod blob_cache;
 pub mod content_selectors;
 pub mod crypto;
 pub mod effective;
+pub mod email;
+pub mod email_oauth;
+pub mod formats;
 pub mod grants;
+pub mod imports;
 pub mod members;
+pub mod proxy_cache;
 pub mod realms;
 pub mod repositories;
 pub mod retention;
@@ -61,11 +77,8 @@ use crate::state::AppState;
 /// Middleware: allow only **global admins** past. Non-admins → 403,
 /// unauthenticated/anonymous → 401.
 ///
-/// §12.4: admin is now decided by RBAC via [`Authz::is_global_admin`] — a member
-/// of the built-in `admin` role (with the slice-1 `app_user.is_admin` column as a
-/// dual-read fallback, folded into the effective set). This means a user made
-/// admin **only** via the `admin` role (no `is_admin` column) is correctly
-/// allowed, and an admin demoted by removing the role is correctly rejected
+/// Admin is decided by RBAC via [`Authz::is_global_admin`] — a member of the
+/// built-in `admin` role. An admin demoted by removing the role is rejected
 /// (within the cache TTL / on invalidation). Fail-closed: an evaluation error
 /// denies. A 401 (vs 403) distinction is kept for anonymous/unauthenticated so a
 /// client knows to authenticate.
@@ -153,6 +166,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
                 .put(repositories::update)
                 .delete(repositories::delete),
         )
+        .route("/formats", get(formats::list))
         .route(
             "/repositories/{name}/packages/{id}/{version}",
             axum::routing::delete(repositories::hard_delete_package),
@@ -176,6 +190,34 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             get(retention::audit),
         )
         .route(
+            "/repositories/{name}/files",
+            axum::routing::delete(crate::raw::web::admin_delete),
+        )
+        .route(
+            "/repositories/{name}/proxy-cache/invalidate",
+            axum::routing::post(proxy_cache::invalidate),
+        )
+        .route(
+            "/repositories/{name}/imports",
+            get(imports::list).post(imports::create),
+        )
+        .route(
+            "/repositories/{name}/imports/{id}",
+            get(imports::get).delete(imports::delete),
+        )
+        .route(
+            "/repositories/{name}/imports/{id}/items",
+            get(imports::items),
+        )
+        .route(
+            "/repositories/{name}/imports/{id}/cancel",
+            axum::routing::post(imports::cancel),
+        )
+        .route(
+            "/repositories/{name}/imports/{id}/resume",
+            axum::routing::post(imports::resume),
+        )
+        .route(
             "/repositories/{name}/members",
             get(members::list).post(members::add),
         )
@@ -190,16 +232,25 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         )
         .route("/users/{id}/reauth", axum::routing::post(users::reauth))
         .route(
+            "/users/{id}/invitation",
+            axum::routing::post(users::invite).delete(users::revoke_invitation),
+        )
+        .route(
+            "/users/{id}/convert-to-local",
+            axum::routing::post(users::convert_to_local),
+        )
+        .route(
             "/users/{id}/tokens",
             get(tokens::list_for_user).post(tokens::create),
         )
         .route("/tokens/{id}", axum::routing::delete(tokens::revoke))
-        // --- §12.4 Phase 6: RBAC management ---------------------------------
+        // --- RBAC management -----------------------------------------------
         .route("/roles", get(roles::list).post(roles::create))
         .route(
             "/roles/{id}",
             get(roles::get).patch(roles::update).delete(roles::delete),
         )
+        .route("/roles/{id}/users", get(roles::users))
         .route("/roles/{id}/grants", get(grants::list).put(grants::add))
         .route(
             "/roles/{id}/grants/{grant_id}",
@@ -218,12 +269,20 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             get(content_selectors::list).post(content_selectors::create),
         )
         .route(
+            "/content-selectors/match",
+            axum::routing::post(content_selectors::test_match),
+        )
+        .route(
             "/content-selectors/{id}",
             get(content_selectors::get)
                 .patch(content_selectors::update)
                 .delete(content_selectors::delete),
         )
-        // --- 12.7: auth realm management -------------------------------------
+        .route(
+            "/content-selectors/{id}/grants",
+            get(content_selectors::grants),
+        )
+        // --- auth realm management -----------------------------------------
         .route("/realms", get(realms::list).post(realms::create))
         .route("/realms/order", axum::routing::put(realms::reorder))
         .route(
@@ -232,15 +291,49 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
                 .patch(realms::update)
                 .delete(realms::delete),
         )
-        .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
         .route(
-            "/settings/legacy-open-access",
-            get(settings::get_legacy_open_access).put(settings::put_legacy_open_access),
+            "/realms/{id}/captured-passwords",
+            get(realms::captured_passwords),
         )
+        .route(
+            "/realms/{id}/convert-to-local",
+            axum::routing::post(realms::convert_to_local),
+        )
+        // --- sign-in and anonymous-access policy (#294) -----------------------
+        .route(
+            "/settings/auth",
+            get(settings::get_auth).put(settings::put_auth),
+        )
+        .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
         .route("/users/{id}/effective", get(effective::for_user))
         .route("/anonymous/effective", get(effective::for_anonymous))
-        // --- §12.5: secret encryption at rest -------------------------------
+        // --- secret encryption at rest -------------------------------------
         .route("/crypto/keys", get(crypto::list_keys))
+        // --- local blob cache ----------------------------------------------
+        .route("/blob-cache", get(blob_cache::stats))
+        // --- the email service ---------------------------------------------
+        .route(
+            "/settings/email",
+            get(email::get).put(email::put).delete(email::delete),
+        )
+        .route("/settings/email/test", axum::routing::post(email::test))
+        .route(
+            "/settings/email/oauth/register",
+            axum::routing::post(email_oauth::register),
+        )
+        .route(
+            "/settings/email/oauth/client",
+            axum::routing::delete(email_oauth::forget_client),
+        )
+        .route(
+            "/settings/email/oauth/authorize",
+            axum::routing::post(email_oauth::authorize),
+        )
+        .route("/settings/email/oauth/callback", get(email_oauth::callback))
+        .route(
+            "/settings/email/oauth/device/{id}",
+            axum::routing::post(email_oauth::poll_device),
+        )
         .route(
             "/crypto/rotate/{layer}",
             axum::routing::post(crypto::rotate),
@@ -276,4 +369,40 @@ pub(crate) async fn hash_password(password: String) -> Result<String, Response> 
 pub(crate) fn db_error(e: sqlx::Error) -> Response {
     tracing::error!(error = %e, "admin db error");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+/// The **503** answer for a repository whose format is not installed (a
+/// format plugin missing from the configuration): it cannot be read or
+/// changed until the format is back.
+pub(crate) fn format_unavailable(e: forge_core::repo::RepoError) -> Response {
+    tracing::warn!(error = %e, "repository format unavailable");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the repository's format is not installed on this server",
+    )
+        .into_response()
+}
+
+/// The **409** answer to a change refused by the last-admin guard
+/// ([`forge_db::authz_dao::would_leave_no_admin`]): deactivating, deleting or
+/// unassigning the `admin` role of the last active administrator. Without it
+/// the install would need direct SQL to get an administrator back: a deleted
+/// bootstrap admin is never re-created.
+pub(crate) fn last_admin_conflict() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "this would leave no active administrator; make another user an admin first",
+    )
+        .into_response()
+}
+
+/// Deserialize a field that distinguishes *absent* (`None`, through
+/// `#[serde(default)]`) from JSON `null` (`Some(None)`) and a value
+/// (`Some(Some(v))`).
+pub(crate) fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(de).map(Some)
 }

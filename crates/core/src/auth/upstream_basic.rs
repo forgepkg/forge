@@ -1,4 +1,4 @@
-//! The `upstream-basic` [`AuthProvider`] (slice 12.3, phase 4).
+//! The `upstream-basic` [`AuthProvider`].
 //!
 //! Forwards a presented `username:password` to a configured upstream over HTTP
 //! Basic — the `github.com/schmitch/verdaccio-nexus-auth-proxy` pattern (for a
@@ -18,24 +18,34 @@
 //!
 //! ## Identity binding
 //!
-//! Forge maps the login to the account named by the **canonical** username
-//! (trimmed, NFC, lowercased — the chain canonicalizes it before this provider
-//! runs) and forwards exactly that name, so the upstream verifies the very
-//! name Forge will act on. That is only sound when the upstream **binds the
-//! username to the secret**. Many do not: a GitHub, Azure DevOps or GitLab
-//! personal access token is accepted with *any* username. For such an
-//! upstream, set `identity_path`: the name the upstream reports in its JSON
-//! response (e.g. `login`) must equal the canonical username, or the
+//! Every account is named by a UPN. Forge maps the login to the account named
+//! by the **canonical** username (trimmed, NFC, lowercased — the chain
+//! canonicalizes it before this provider runs) and forwards its **local
+//! part**: `alice@example.com` signs in as the upstream's `alice`. A name that
+//! is not a UPN is rejected without forwarding. That is only sound when the
+//! upstream **binds the username to the secret**. Many do not: a GitHub, Azure
+//! DevOps or GitLab personal access token is accepted with *any* username. For
+//! such an upstream, set `identity_path`: the name the upstream reports in its
+//! JSON response (e.g. `login`) must equal the forwarded name, or the
 //! credential is rejected. A success without that field is treated as an
 //! outage (fail closed).
+//!
+//! Only the account's own UPN signs it in: the realm creates no accounts
+//! ([`super::chain::provision_and_map`]), so `alice@other.example`, which
+//! forwards the same `alice`, is denied unless an administrator created an
+//! account of that name for the realm.
+//!
+//! A username containing `:` is rejected without forwarding: HTTP Basic
+//! splits at the first colon, so the upstream would verify a different name
+//! ([`forge_db::username::canonical_password_username`]).
 //!
 //! ## Why this is safe on the hot path
 //!
 //! NuGet clients send Basic credentials on *every* request. This provider never
 //! forwards unconditionally: it goes through the [`ValidatedCredentialCache`]
 //! ([`super::cred_cache`]), so the steady state of a repeated credential is a
-//! cache hit (L1 → L2 → Postgres) and the upstream is hit at most once per
-//! credential per TTL window per cluster (the cache's lease singleflight —
+//! cache hit (in-process L1 → Postgres) and the upstream is hit at most once
+//! per credential per TTL window per cluster (the cache's lease singleflight —
 //! **no `pg_advisory_*`**, and no database connection held while the upstream
 //! answers). The plaintext password leaves the process only here, over the
 //! outbound `Authorization: Basic` header; it is never persisted.
@@ -46,17 +56,28 @@
 //! the scheme is restricted to http/https (pre-validated at config time via
 //! [`crate::net::ssrf::validate_url`]), redirects are **not followed**, and
 //! every forward carries the configured total `request_timeout`. Private /
-//! loopback upstreams are permitted — the upstream URL is admin-only config
-//! (12.7 §3.6), and an internal Nexus on RFC1918 is the common case.
+//! loopback upstreams are permitted — the upstream URL is admin-only config,
+//! and an internal Nexus on RFC1918 is the common case.
 //!
-//! ## Auto-provision
+//! ## Accounts
 //!
 //! This provider only *vouches for* a [`ProvenIdentity`] (the username + coarse
-//! groups + an admin suggestion). Mapping that to an `app_user` — creating one on
-//! first success with `auth_source = 'upstream-basic'` and **no** local password
-//! — is the chain caller's job ([`super::chain::provision_and_map`], phase 5), so
-//! this file stays free of the DB-provision policy.
+//! groups + an admin suggestion). Mapping that to the realm's existing
+//! `app_user` is the chain caller's job ([`super::chain::provision_and_map`]);
+//! no account is created on a login.
+//!
+//! ## Keeping a password hash (opt-in)
+//!
+//! With `capture_password_hash` set, a login that asked the upstream and was
+//! accepted also carries an argon2id hash of the password on its
+//! [`ProvenIdentity`], which the account keeps (migration
+//! 0035) so an administrator can later switch the account to a local one and
+//! retire the upstream. A cache hit carries none: the hash is refreshed once
+//! per positive-TTL window, like the verdict. Hashing never queues for an
+//! argon2 slot ([`PasswordHashLimiter::try_hash`]); when none is free the
+//! login goes ahead without a hash and a later one keeps it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -64,7 +85,10 @@ use base64::Engine;
 use reqwest::Client;
 
 use super::cred_cache::{CredCacheError, UpstreamVerdict, ValidatedCredentialCache};
-use super::provider::{AuthOutcome, AuthProvider, AuthSource, PasswordCredential, ProvenIdentity};
+use super::local_password::{LimiterSaturated, PasswordHashLimiter};
+use super::provider::{
+    AuthOutcome, AuthProvider, AuthSource, CapturedPasswordHash, PasswordCredential, ProvenIdentity,
+};
 
 /// The stable provider id (matches the config chain spelling + the
 /// `app_user.auth_source` value).
@@ -77,9 +101,9 @@ pub const MAX_SUCCESS_BODY_BYTES: usize = 1024 * 1024;
 
 /// How to read the user's groups/roles from the upstream JSON body.
 ///
-/// Kept deliberately small (plan §6 risk #4: avoid a JSONPath dependency for a
-/// status-code-first scheme). A path is a `.`-separated sequence of object keys;
-/// the value it points at is interpreted as a list of group strings:
+/// Kept deliberately small (no JSONPath dependency for a status-code-first
+/// scheme). A path is a `.`-separated sequence of object keys; the value it
+/// points at is interpreted as a list of group strings:
 ///
 /// * a JSON array of strings → those strings;
 /// * a single JSON string → a one-element list;
@@ -118,8 +142,8 @@ fn extract_identity(body: &serde_json::Value, path: &str) -> Option<String> {
 }
 
 /// Static configuration for the upstream-basic provider, assembled by the server
-/// from the `[auth.upstream_basic]` config block (phase 5). Built once at
-/// startup; cheaply cloned into the provider.
+/// from a credential-forwarding realm's config (or the `[auth.upstream_basic]`
+/// config block); cheaply cloned into the provider.
 #[derive(Debug, Clone)]
 pub struct UpstreamBasicConfig {
     /// Upstream endpoint hit with the user's Basic credentials (validated through
@@ -147,27 +171,28 @@ pub struct UpstreamBasicConfig {
     pub groups_path: String,
     /// `.`-separated path into the JSON success body naming the account the
     /// upstream authenticated (e.g. `login`). When set, that name
-    /// (canonicalized) must equal the canonical username presented, or the
-    /// credential is rejected. Empty ⇒ the upstream is trusted to bind the
-    /// username to the secret (see the [module docs](self)).
+    /// (canonicalized) must equal the forwarded name (the local part of the
+    /// canonical username), or the credential is rejected. Empty ⇒ the
+    /// upstream is trusted to bind the username to the secret (see the
+    /// [module docs](self)).
     pub identity_path: String,
     /// Optional upstream group that maps to forge admin. When set (with a
     /// `groups_path`), every login that freshly fetched the groups is
     /// authoritative: membership grants admin and its absence revokes it for
-    /// `upstream-basic` users (see chain provisioning). Empty ⇒ never suggests
-    /// admin and never touches an existing user's admin state.
+    /// `upstream-basic` users (see [`super::chain::provision_and_map`]).
+    /// Empty ⇒ never suggests admin and never touches a user's admin state.
     pub admin_group: String,
     /// Stable provider id keying the validated-credential cache and logged as
     /// the chain winner. The static-config wiring uses [`UPSTREAM_BASIC_ID`];
-    /// realm-driven wiring (12.7) uses a realm-scoped id (`"realm:<name>"`).
+    /// realm-driven wiring uses a realm-scoped id (`"realm:<name>"`).
     pub provider_id: String,
-    /// Auto-provision an `app_user` on first successful upstream login.
-    /// Stamped onto every [`ProvenIdentity`] this provider vouches for (the
-    /// chain caller acts on it — per-realm since 12.7).
-    pub auto_provision: bool,
-    /// The `auth_realm.id` this provider was built from, recorded as
-    /// provenance on provisioned users. `None` for static-config wiring.
+    /// The `auth_realm.id` this provider was built from: only that realm's
+    /// accounts sign in through it. `None` for static-config wiring.
     pub realm_id: Option<i64>,
+    /// Hash every password the upstream accepts, for the account to keep
+    /// (see the [module docs](self)). Needs a `realm_id`: the hash is kept
+    /// only while the realm row opts in.
+    pub capture_password_hash: bool,
 }
 
 /// Credential-forwarding authentication as an [`AuthProvider`].
@@ -178,6 +203,7 @@ pub struct UpstreamBasicProvider {
     config: UpstreamBasicConfig,
     client: Client,
     cache: ValidatedCredentialCache,
+    hash_limiter: Arc<PasswordHashLimiter>,
 }
 
 impl UpstreamBasicProvider {
@@ -195,6 +221,34 @@ impl UpstreamBasicProvider {
             config,
             client,
             cache,
+            hash_limiter: PasswordHashLimiter::shared_default(),
+        }
+    }
+
+    /// Hash kept passwords (`capture_password_hash`) in the slots of
+    /// `limiter` — the server shares one with local password verification —
+    /// instead of the process-wide default.
+    pub fn with_hash_limiter(mut self, limiter: Arc<PasswordHashLimiter>) -> Self {
+        self.hash_limiter = limiter;
+        self
+    }
+
+    /// Hash a password the upstream just accepted, for the account to keep.
+    /// Best effort: without a free argon2 slot, or when hashing fails, the
+    /// login goes ahead without one.
+    async fn capture(&self, password: &str) -> Option<CapturedPasswordHash> {
+        match self.hash_limiter.try_hash(password.to_string()).await {
+            Ok(Some(phc)) => Some(CapturedPasswordHash::new(phc)),
+            Ok(None) => {
+                tracing::warn!("upstream-basic: password hash could not be computed; not kept");
+                None
+            }
+            Err(LimiterSaturated) => {
+                tracing::debug!(
+                    "upstream-basic: no free argon2 slot; password hash not kept this time"
+                );
+                None
+            }
         }
     }
 
@@ -203,8 +257,8 @@ impl UpstreamBasicProvider {
     /// once per credential per TTL window per cluster.
     ///
     /// Returns the verdict plus, on success, the coarse groups parsed from the
-    /// body (so the cache can stash them for the provisioning step). A network
-    /// error / timeout / unexpected status is `Unavailable` (fail-closed).
+    /// body (for the vouched identity). A network error / timeout /
+    /// unexpected status is `Unavailable` (fail-closed).
     async fn forward(&self, username: &str, password: &str) -> ForwardResult {
         let method = match reqwest::Method::from_bytes(self.config.method.as_bytes()) {
             Ok(m) => m,
@@ -395,14 +449,36 @@ impl AuthProvider for UpstreamBasicProvider {
     }
 
     async fn authenticate(&self, cred: &PasswordCredential<'_>) -> AuthOutcome {
+        // The upstream splits `user:password` at the first colon (RFC 7617),
+        // so for `mallory:abc` / `def` it would check `mallory` / `abc:def`
+        // while Forge signs in the account `mallory:abc`. Such a name is never
+        // forwarded nor answered from the cache. A rejection, not a skip: the
+        // chain still lets a later local realm decide, but never falls back to
+        // anonymous access.
+        //
+        // Likewise a name a folding directory could map onto another account
+        // (full-width letters, a soft hyphen, ...): the upstream would vouch
+        // for that account while Forge signs in the one of this spelling,
+        // which gets around a deactivation of the plain name (#69).
+        if cred.username.contains(':') || forge_db::username::may_alias_upstream(cred.username) {
+            return AuthOutcome::Rejected;
+        }
+        // Every account is named by a UPN, and the upstream gets its local
+        // part (`alice` of `alice@example.com`); a name that is no UPN names
+        // no account of the realm. The cache keys on the account's name (the
+        // UPN), which revocation purges by.
+        let Some(forwarded) = forge_db::username::upn_local_part(cred.username) else {
+            return AuthOutcome::Rejected;
+        };
+
         // The cache stashes only a boolean verdict (never the groups — they are
         // not security-critical and re-deriving them on a cold cache is cheap and
         // correct). On a cache miss the factory runs `forward`, whose `groups`
-        // we capture here for the provisioning identity. Because the factory may
+        // we capture here for the vouched identity. Because the factory may
         // be coalesced away (a peer wins the singleflight), `captured_groups`
-        // stays empty for the loser; that only means a refreshed login provisions
+        // stays empty for the loser; that only means a refreshed login carries
         // groups, which matches the "coarse, best-effort" contract.
-        let username = cred.username.to_string();
+        let username = forwarded.to_string();
         let password = cred.password.to_string();
         // The factory future must be `Send` (moka coalesces it across tasks), so
         // we hand the captured groups out through an `Arc<Mutex<_>>` rather than a
@@ -433,18 +509,28 @@ impl AuthProvider for UpstreamBasicProvider {
                 // group AND this login actually saw the upstream's groups; a
                 // cache hit must never demote an upstream admin.
                 let admin_authoritative = admin_mapped && fetched.is_some();
+                // Likewise only a login the upstream itself accepted refreshes
+                // the kept password hash.
+                let captured_password_hash = if self.config.capture_password_hash
+                    && self.config.realm_id.is_some()
+                    && fetched.is_some()
+                {
+                    self.capture(cred.password).await
+                } else {
+                    None
+                };
                 let groups = fetched.unwrap_or_default();
                 let suggested_is_admin =
                     admin_mapped && groups.iter().any(|g| g == &self.config.admin_group);
                 AuthOutcome::Authenticated(ProvenIdentity {
                     username: cred.username.to_string(),
                     source: AuthSource::UpstreamBasic,
-                    external_subject: Some(cred.username.to_string()),
+                    external_subject: Some(forwarded.to_string()),
                     groups,
                     suggested_is_admin,
                     admin_authoritative,
-                    auto_provision: self.config.auto_provision,
                     realm_id: self.config.realm_id,
+                    captured_password_hash,
                 })
             }
             Ok(false) => AuthOutcome::Rejected,
@@ -453,7 +539,7 @@ impl AuthProvider for UpstreamBasicProvider {
                 // A store error talking to Postgres is infrastructure: fail
                 // closed (deny), never grant.
                 tracing::warn!(error = %e, "upstream-basic: credential cache store error (fail-closed)");
-                AuthOutcome::Unavailable
+                AuthOutcome::Failed
             }
         }
     }

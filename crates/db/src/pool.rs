@@ -43,3 +43,19 @@ pub async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
     }
     Ok(())
 }
+
+/// The database's clock (`now()`).
+///
+/// A timestamp the database compares with its own `now()` — a lease's or
+/// backoff's end, a staleness cutoff — must be computed from this, not from
+/// this process's clock: with the two minutes apart, failing outbox rows were
+/// retried every poll, a retention run failed its own lease fence, and live
+/// delete reservations looked stale.
+pub async fn db_now<'e, E>(executor: E) -> sqlx::Result<chrono::DateTime<chrono::Utc>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar!(r#"SELECT now() AS "now!""#)
+        .fetch_one(executor)
+        .await
+}

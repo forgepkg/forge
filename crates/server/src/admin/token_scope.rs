@@ -1,12 +1,16 @@
-//! Admin per-token privilege scoping (§12.4 Phase 6).
+//! Admin per-token privilege scoping.
 //!
-//! `PATCH /admin/tokens/{id}/scope` sets (or clears) a token's `scope` jsonb. A
-//! scope can only ever **narrow** its owner's effective set; the intersection is
-//! computed live at request time (see [`forge_core::auth::authz`]), so a scope
-//! that names an action/repo the owner lacks simply contributes nothing — it can
-//! never widen. We still validate the JSON shape here (a malformed scope would
-//! fail-closed at evaluation, denying the token everything — better to reject the
-//! write with a 400).
+//! `PATCH /admin/tokens/{id}/scope` sets (or, on an explicit `null`, clears) a
+//! token's `scope` jsonb. A scope can only ever **narrow** its owner's
+//! effective set; the intersection is computed live at request time (see
+//! [`forge_core::auth::authz`]), so a scope that names an action/repo the owner
+//! lacks simply contributes nothing — it can never widen. We still validate the
+//! JSON shape here (a malformed scope would fail-closed at evaluation, denying
+//! the token everything — better to reject the write with a 400).
+//!
+//! A group in `repositories` reaches only the members also listed: reading a
+//! group never grants read on its members, so a token scoped to the group
+//! alone sees an empty feed.
 //!
 //! The token `scope` is read **outside** the per-user effective-set cache (the
 //! seam loads it per request and intersects after the cache lookup), so a scope
@@ -19,19 +23,22 @@ use forge_core::authz::TokenScope;
 use forge_db::token_dao;
 use serde::Deserialize;
 
-use super::db_error;
+use super::{db_error, double_option};
 use crate::state::AppState;
 
-/// Set-scope request. `scope = null` (or omitted) **clears** the scope (the
-/// token then inherits its owner's effective set **without `admin`**); a
-/// present object is validated against [`TokenScope`] (which rejects unknown
-/// keys) before persisting. Unknown top-level keys are rejected too, so a
-/// mistyped `"scop"` cannot clear the scope by accident.
+/// Set-scope request. The `scope` key is required: an object sets the scope
+/// (validated against [`TokenScope`], which rejects unknown keys, before
+/// persisting) and an explicit `"scope": null` **clears** it (the token then
+/// inherits its owner's effective set **without `admin`**). A body without the
+/// key (`{}`) is refused with 400 rather than read as "clear", because clearing
+/// widens the token. Unknown top-level keys are rejected too, so a mistyped
+/// `"scop"` cannot pass for a missing key either.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetScope {
-    #[serde(default)]
-    pub scope: Option<TokenScope>,
+    /// Absent = refused, `null` = clear, object = set.
+    #[serde(default, deserialize_with = "double_option")]
+    pub scope: Option<Option<TokenScope>>,
 }
 
 /// `PATCH /admin/tokens/{id}/scope`
@@ -40,9 +47,16 @@ pub async fn set(
     Path(id): Path<i64>,
     Json(body): Json<SetScope>,
 ) -> Response {
+    let Some(scope) = body.scope else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "scope is required (expected {\"scope\": {...}}, or {\"scope\": null} to clear it)",
+        )
+            .into_response();
+    };
     // Re-serialize the validated scope to the canonical jsonb we store; `None`
     // clears the column.
-    let scope_json = match &body.scope {
+    let scope_json = match &scope {
         None => None,
         Some(scope) => match serde_json::to_value(scope) {
             Ok(v) => Some(v),

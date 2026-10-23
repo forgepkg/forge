@@ -1,0 +1,38 @@
+# Forge — Kubernetes base.
+#
+# The Forge server on its own: Deployment, Service, ServiceAccount and a
+# ConfigMap of non-secret FORGE_* settings. Secrets come from a Secret named
+# `forge-env` (FORGE_DATABASE__URL, FORGE_S3__*, …) that this base does not
+# create: the overlays generate it from a local, git-ignored env file, or
+# bring your own (External Secrets, Sealed Secrets, …) under that name.
+# Optional parts are kustomize components in ../components. See ../README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: forge
+
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+
+# Non-secret settings, read by the container through envFrom. Overlays add to
+# it with `behavior: merge` (FORGE_SERVER__PUBLIC_BASE_URL at least).
+configMapGenerator:
+  - name: forge-config
+    literals:
+      - RUST_LOG=info
+      # Each concurrent argon2 password check takes ~19 MiB. The default (0 =
+      # one per CPU) counts the node's CPUs when the pod has no CPU limit,
+      # which can outgrow the memory limit below on a large node.
+      - FORGE_AUTH__PASSWORD_VERIFY_CONCURRENCY=4
+
+# The release this commit belongs to. `cargo xtask release <version>` rewrites
+# newTag before it creates the tag, and the release workflow refuses a tag
+# whose manifest names another version, so this base at ref vX.Y.Z always
+# deploys the X.Y.Z image.
+images:
+  - name: ghcr.io/forgepkg/forge
+    newTag: 1.1.0

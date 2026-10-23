@@ -1,0 +1,97 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            c.id            AS component_id,\n            c.name          AS name,\n            c.version       AS version,\n            c.listed        AS listed,\n            c.created_at    AS created_at,\n            c.last_downloaded_at AS last_downloaded_at,\n            EXISTS (\n                SELECT 1 FROM asset a\n                WHERE a.component_id = c.id AND (a.path = $3 OR a.path LIKE '%.nupkg')\n            ) AS \"has_nupkg!\"\n        FROM component c\n        WHERE c.repository_id = $1 AND c.name = $2\n        ORDER BY c.id\n        FOR UPDATE OF c\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "component_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "version",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "listed",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "listed"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "last_downloaded_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "last_downloaded_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "has_nupkg!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "bf35532a9387bd2cd0d4cd2fb29a69907e0ac61291df8190250afbe0afebfb2d"
+}

@@ -1,4 +1,4 @@
-//! Principal-resolution middleware (spec §5, plan 10.2).
+//! Principal-resolution middleware.
 //!
 //! Runs an **ordered** list of [`PrincipalSource`]s (token header, then HTTP
 //! Basic) against each request, resolves the client IP behind trusted proxies,
@@ -10,10 +10,19 @@
 //! * If any source reports credentials were **present but invalid**, the request
 //!   is rejected with **401** — bad credentials are never downgraded to
 //!   anonymous.
+//! * If a source could not **check** the credentials (a database error looking
+//!   up a token or session, a workload token's issuer that cannot be
+//!   reached), the request fails closed with **503** and `Retry-After`: not
+//!   anonymous, and not a 401 that would make a client discard a credential
+//!   that may be valid. The CSRF check of a cookie-authenticated mutation
+//!   answers the same when the session cannot be read.
 //! * With no credentials, the anonymous policy decides between
 //!   [`Principal::Anonymous`] and [`Principal::Unauthenticated`]; the latter is
 //!   still passed downstream (authorization, not authentication, returns 401/403
-//!   for protected resources).
+//!   for protected resources). The policy is the one administrators set
+//!   ([`crate::auth::AuthSettings`]): every request asks for it, which also
+//!   keeps this instance's copy of the auth settings current
+//!   ([`AnonSource::Settings`]).
 //!
 //! ## CSRF (cookie-authenticated mutations)
 //! A request authenticated by an **ambient** credential (the `forge_session`
@@ -34,8 +43,9 @@
 //! ## Client IP and DNS rebinding
 //! The client IP is resolved from the socket peer and **every**
 //! `X-Forwarded-For` line behind the trusted proxies, with IPv4-mapped IPv6
-//! addresses canonicalized ([`forge_core::auth::client_ip`]). The IP-allowlist
-//! anonymous grant (`anonymous_mode = "allowlist"`) additionally requires the
+//! addresses canonicalized ([`forge_core::auth::client_ip`]). A client whose
+//! forwarded address is malformed is unknown and never allowlisted. The IP-allowlist
+//! anonymous grant (anonymous mode `allowlist`) additionally requires the
 //! request's `Host` to name this server (the host of `server.public_base_url`
 //! or an entry of `server.allowed_hosts`): a DNS-rebinding page in an internal
 //! user's browser reaches the server from an allowlisted IP but under its own
@@ -55,12 +65,14 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use forge_core::auth::client_ip::{forwarded_for, resolve_client_ip, AnonPolicy};
+use forge_core::auth::client_ip::{forwarded_for, resolve_client, AnonPolicy};
 use forge_core::auth::principal::Principal;
 use forge_core::auth::session_source::{session_cookie_name, unique_cookie_value};
 use forge_core::auth::token::{resolve_principal_with_origin, AuthError, PrincipalSource};
 use forge_core::session::{csrf_token_matches, SessionService};
 use ipnet::IpNet;
+
+use crate::auth::AuthSettingsCache;
 
 /// The header carrying the per-session double-submit CSRF token.
 pub const CSRF_HEADER: &str = "x-csrf-token";
@@ -69,7 +81,12 @@ pub const CSRF_HEADER: &str = "x-csrf-token";
 /// login from the request body and never act on the presented session, so a
 /// stale cookie in the browser must not block signing in again. (Both require
 /// a JSON body, which a cross-site form cannot send without a CORS preflight.)
-pub const CSRF_EXEMPT_PATHS: &[&str] = &["/auth/login", "/auth/identify"];
+pub const CSRF_EXEMPT_PATHS: &[&str] = &[
+    "/auth/login",
+    "/auth/identify",
+    "/auth/invitations/lookup",
+    "/auth/invitations/accept",
+];
 
 /// Everything the middleware needs, shared via the router layer.
 ///
@@ -81,7 +98,7 @@ pub struct PrincipalLayer {
     /// Trusted proxy CIDRs for `X-Forwarded-For` resolution.
     pub trusted_proxies: Arc<Vec<IpNet>>,
     /// Anonymous-access policy.
-    pub anon: Arc<AnonPolicy>,
+    pub anon: AnonSource,
     /// Session service used to check the CSRF token of cookie-authenticated
     /// mutations. `None` ⇒ such requests are refused (fail closed).
     pub sessions: Option<SessionService>,
@@ -94,6 +111,22 @@ pub struct PrincipalLayer {
     /// Normalized host names ([`allowed_hosts`]) a request's `Host` must name
     /// for the IP-allowlist anonymous grant to apply (DNS-rebinding guard).
     pub allowed_hosts: Arc<Vec<String>>,
+}
+
+/// Where [`attach_principal`] gets the anonymous-access policy.
+#[derive(Clone)]
+pub enum AnonSource {
+    /// This policy, always.
+    Fixed(Arc<AnonPolicy>),
+    /// The auth settings' anonymous mode and allowlist, as this instance has
+    /// them; asking re-reads them once they are due.
+    Settings(Arc<AuthSettingsCache>),
+}
+
+impl From<AnonPolicy> for AnonSource {
+    fn from(policy: AnonPolicy) -> Self {
+        AnonSource::Fixed(Arc::new(policy))
+    }
 }
 
 /// The lowercase host of an authority (`host[:port]`, IPv6 in brackets),
@@ -230,11 +263,22 @@ pub async fn attach_principal(
     }
 
     let xff = forwarded_for(req.headers());
-    let client_ip = resolve_client_ip(peer, xff.as_deref(), &layer.trusted_proxies);
+    let client = resolve_client(peer, xff.as_deref(), &layer.trusted_proxies);
+    let client_ip = client.ip;
 
+    let settings;
+    let policy = match &layer.anon {
+        AnonSource::Fixed(policy) => policy.as_ref(),
+        AnonSource::Settings(cache) => {
+            settings = cache.current().await;
+            &settings.anon
+        }
+    };
     // DNS-rebinding guard: the IP-allowlist grant applies only to requests
-    // addressing this server by one of its own host names.
-    let anon = match &*layer.anon {
+    // addressing this server by one of its own host names. It never applies to
+    // a client whose address a malformed `X-Forwarded-For` hid: its `ip` is
+    // the proxy's own.
+    let anon = match policy.for_client(client) {
         AnonPolicy::Allowlist(_) if !host_is_allowed(&req, &layer.allowed_hosts) => {
             &AnonPolicy::Off
         }
@@ -247,6 +291,7 @@ pub async fn attach_principal(
             Err(AuthError::Unauthorized) => {
                 return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
             }
+            Err(AuthError::Unavailable) => return auth_unavailable(),
         };
 
     if resolved.ambient && !req.method().is_safe() && !CSRF_EXEMPT_PATHS.contains(&req.uri().path())
@@ -295,9 +340,24 @@ async fn check_csrf(
         Ok(_) => Err(forbidden()),
         Err(e) => {
             tracing::warn!(error = %e, "csrf session validate failed");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "session error").into_response())
+            Err(auth_unavailable())
         }
     }
+}
+
+/// `Retry-After` (seconds) of [`auth_unavailable`].
+const AUTH_RETRY_AFTER_SECS: &str = "10";
+
+/// The **503** answer when authentication could not reach what it depends on
+/// (the database, a workload token's issuer): no verdict on the credentials,
+/// so a client retries instead of discarding them as wrong.
+pub(crate) fn auth_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, AUTH_RETRY_AFTER_SECS)],
+        "authentication temporarily unavailable",
+    )
+        .into_response()
 }
 
 /// Extractor-free helper: read the [`Principal`] a prior `attach_principal`
@@ -345,7 +405,7 @@ mod tests {
         async fn echo(req: Request<Body>) -> Response {
             let p = principal_of(&req);
             let label = match p {
-                Principal::User { is_admin, .. } => format!("user:{is_admin}"),
+                Principal::User { user_id, .. } => format!("user:{user_id}"),
                 Principal::Workload { role_id, .. } => format!("workload:{role_id}"),
                 Principal::Anonymous { .. } => "anonymous".to_string(),
                 Principal::Unauthenticated => "unauthenticated".to_string(),
@@ -365,7 +425,7 @@ mod tests {
         PrincipalLayer {
             sources: Arc::new(sources),
             trusted_proxies: Arc::new(vec![]),
-            anon: Arc::new(anon),
+            anon: anon.into(),
             sessions: None,
             cookie_secure: false,
             public_origin: Some("https://forge.example".into()),
@@ -386,7 +446,6 @@ mod tests {
                 SourceOutcome::Authenticated(Principal::User {
                     user_id: 1,
                     token_id: None,
-                    is_admin: true,
                     method: forge_core::auth::AuthMethod::Password,
                 })
             } else {
@@ -473,7 +532,6 @@ mod tests {
                 outcome: SourceOutcome::Authenticated(Principal::User {
                     user_id: 2,
                     token_id: Some(9),
-                    is_admin: false,
                     method: forge_core::auth::AuthMethod::Token,
                 }),
                 require_header: true,
@@ -576,7 +634,6 @@ mod tests {
             outcome: SourceOutcome::Authenticated(Principal::User {
                 user_id: 1,
                 token_id: None,
-                is_admin: true,
                 method: forge_core::auth::AuthMethod::Password,
             }),
             require_header: true,
@@ -712,7 +769,6 @@ mod tests {
                 outcome: SourceOutcome::Authenticated(Principal::User {
                     user_id: 1,
                     token_id: Some(2),
-                    is_admin: false,
                     method: forge_core::auth::AuthMethod::Token,
                 }),
                 require_header: true,
@@ -730,7 +786,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(body_string(resp).await, "user:false");
+        assert_eq!(body_string(resp).await, "user:1");
     }
 
     /// Echoes the resolved principal's IP (anonymous) for the XFF tests.
@@ -800,7 +856,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: Some(2),
-            is_admin: true,
             method: forge_core::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StubSource {
@@ -819,7 +874,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_string(resp).await, "user:true");
+        assert_eq!(body_string(resp).await, "user:1");
     }
 
     #[tokio::test]
@@ -841,6 +896,71 @@ mod tests {
             .unwrap();
         // Even though anon=All would otherwise allow anonymous, bad creds → 401.
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unavailable_credential_check_yields_503_not_401() {
+        // A token or session lookup that failed fails closed with 503, even
+        // with anonymous access open; no later source (here a session cookie
+        // that would authenticate) is consulted and the handler never runs.
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![
+            Box::new(StubSource {
+                outcome: SourceOutcome::Unavailable,
+                require_header: true,
+            }),
+            Box::new(AmbientStub),
+        ];
+        let resp = app(layer(sources, AnonPolicy::All))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(AUTHORIZATION, "Basic x")
+                    .header(header::COOKIE, "forge_session=s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], AUTH_RETRY_AFTER_SECS);
+        assert_eq!(
+            body_string(resp).await,
+            "authentication temporarily unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn csrf_check_with_the_database_down_yields_503_not_500() {
+        // The session's CSRF secret cannot be read: no verdict on the token,
+        // so the mutation answers the same 503 as any other credential check
+        // the database could not answer, and the handler never runs.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://forge:forge@127.0.0.1:1/forge")
+            .unwrap();
+        let sessions =
+            SessionService::new(pool, chrono::Duration::hours(1), chrono::Duration::hours(8));
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(AmbientStub)];
+        let mut layer = layer(sources, AnonPolicy::Off);
+        layer.sessions = Some(sessions);
+        let resp = post_app(layer)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/thing")
+                    .header("cookie", "forge_session=s")
+                    .header(CSRF_HEADER, "whatever")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], AUTH_RETRY_AFTER_SECS);
+        assert_eq!(
+            body_string(resp).await,
+            "authentication temporarily unavailable"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE proxy_upstream_index SET fetched_at = 'epoch' WHERE repository_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0692bc0de18478adfa031d5c1853de9524a73a0d670b128db43c8da5f03fbf1a"
+}

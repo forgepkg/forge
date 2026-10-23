@@ -1,17 +1,74 @@
 @import 'tailwindcss';
+@import './styles/tokens.css';
+@import './styles/forge-ui.css';
 
 /*
- * Class-driven dark mode: `lib/theme.ts` (and the inline bootstrap script in
- * index.html, which runs before first paint) toggles `.dark` on <html>. This
- * variant makes every `dark:` utility — including all of Catalyst's — follow
- * that class instead of the OS media query, so the in-app theme switch can
- * force either appearance regardless of the OS preference ("system" simply
- * mirrors the media query onto the class).
+ * The Forge design system on top of Tailwind 4. Every colour, font, radius
+ * and shadow is a design token (styles/tokens.css); the theme below maps them
+ * into Tailwind so layout utilities stay available while `bg-surface`,
+ * `text-ink-muted`, `border-line` and friends draw from the tokens. Tailwind's
+ * own palette is switched off, so a stray `zinc-*` or `sky-*` renders nothing.
+ *
+ * `@theme inline` keeps the `var(--…)` references, so a utility follows the
+ * theme `data-theme` on <html> selects (lib/theme.ts).
  */
-@custom-variant dark (&:where(.dark, .dark *));
+@theme inline {
+  --color-*: initial;
+  --color-ground: var(--ground);
+  --color-surface: var(--surface);
+  --color-surface-sunken: var(--surface-sunken);
+  --color-surface-hover: var(--surface-hover);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-heat: var(--heat);
+  --color-heat-strong: var(--heat-strong);
+  --color-heat-soft: var(--heat-soft);
+  --color-on-heat: var(--on-heat);
+  --color-hosted: var(--hosted);
+  --color-hosted-soft: var(--hosted-soft);
+  --color-proxy: var(--proxy);
+  --color-proxy-soft: var(--proxy-soft);
+  --color-group: var(--group);
+  --color-group-soft: var(--group-soft);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-code: var(--code);
+  --color-code-ink: var(--code-ink);
+  --color-transparent: transparent;
+  --color-current: currentColor;
+
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+
+  --radius-xs: var(--radius-xs);
+  --radius-sm: var(--radius-sm);
+  --radius-md: var(--radius-md);
+  --radius-lg: var(--radius-lg);
+
+  --shadow-xs: var(--shadow-xs);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+}
+
+/* The Dark theme, for the odd `dark:` utility. */
+@custom-variant dark (&:where([data-theme='dark'], [data-theme='dark'] *));
 
 @layer base {
   body {
-    @apply bg-white text-zinc-950 antialiased dark:bg-zinc-900 dark:text-white;
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 20px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 }

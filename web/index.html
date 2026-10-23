@@ -3,20 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>envisia forge</title>
+    <title>Forge</title>
+    <link rel="icon" type="image/svg+xml" href="/src/assets/forge-mark.svg" />
     <script>
-      // Apply the persisted theme before first paint to avoid a light flash.
-      // Mirrors lib/theme.ts: 'dark' | 'light' | 'system' (default) from
-      // localStorage, with 'system' following prefers-color-scheme.
+      // Apply the persisted theme before first paint to avoid a flash.
+      // Mirrors lib/theme.ts: 'light' | 'dark-rail' | 'dark' | 'system'
+      // (default) from localStorage, with 'system' following
+      // prefers-color-scheme between light and dark.
       ;(function () {
         try {
           var t = localStorage.getItem('forge.theme')
-          var dark =
-            t === 'dark' ||
-            ((t === null || t === 'system') &&
-              window.matchMedia('(prefers-color-scheme: dark)').matches)
-          document.documentElement.classList.toggle('dark', dark)
-          document.documentElement.style.colorScheme = dark ? 'dark' : 'light'
+          if (t !== 'light' && t !== 'dark-rail' && t !== 'dark') {
+            t = window.matchMedia('(prefers-color-scheme: dark)').matches
+              ? 'dark'
+              : 'light'
+          }
+          document.documentElement.setAttribute('data-theme', t)
+          document.documentElement.style.colorScheme = t === 'dark' ? 'dark' : 'light'
         } catch (e) {
           /* no storage / no matchMedia: stay light */
         }

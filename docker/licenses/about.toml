@@ -1,0 +1,35 @@
+# cargo-about: the third-party notices for the Rust crates compiled into
+# forge-server, rendered with about.hbs by the Dockerfile into
+# /usr/share/doc/forge/THIRD-PARTY-RUST.txt of the image. Locally (cargo-about
+# 0.9, installed with `--features cli`):
+#
+#   cargo about generate --locked --fail -c docker/licenses/about.toml \
+#     -m crates/server/Cargo.toml docker/licenses/about.hbs
+
+# The licenses the crates may be used under, in order of preference (for a
+# crate offering a choice); cargo-about refuses a crate whose license
+# expression these do not satisfy. All are permissive and AGPL-compatible;
+# check that a new one is before adding it.
+accepted = [
+    "Apache-2.0",
+    # Apache-2.0 plus an additional permission (the LLVM exception, waiving
+    # attribution for compiled-in code): Wasmtime and Cranelift, the runtime
+    # of format plugins.
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "ISC",
+    "BSD-3-Clause",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    # Zero-clause BSD, public-domain-like with no attribution required:
+    # quoted_printable, lettre's encoder for email bodies.
+    "0BSD",
+]
+
+# What the image ships: forge-server's normal dependencies on Linux.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# Our own workspace crates (publish = false) are covered by LICENSE.
+private = { ignore = true }

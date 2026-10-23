@@ -1,32 +1,66 @@
-import { createFileRoute, Link } from '@tanstack/react-router'
+import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import { useBrowseRepos } from '~/queries/useBrowseRepos'
-import { Heading } from '~/components/catalyst/heading'
-import { Text } from '~/components/catalyst/text'
-import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
+import {
+  CellStack,
+  FormatTag,
+  Icon,
+  KindBadge,
+  Page,
+  PageHeader,
+  Panel,
+  SegmentedControl,
+  Skeleton,
+  StatusBadge,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+  Toolbar,
+  formatIcon,
+  formatLabel,
+} from '~/components/ui'
+
+/** The browse root's URL state: an optional format filter. */
+interface BrowseSearch {
+  format?: string
+}
 
 export const Route = createFileRoute('/_app/')({
+  validateSearch: (search: Record<string, unknown>): BrowseSearch =>
+    typeof search.format === 'string' && search.format.length > 0
+      ? { format: search.format }
+      : {},
   component: Browse,
 })
 
 /**
  * Browse root: the repositories the signed-in user may read, rendered as the
- * top level of the folder view (repository → packages → versions). Search is
- * per repository and lives on the repository screen, not here.
+ * top level of the folder view (repository → packages → versions, or for a
+ * docker repository: repository → images → tags). Each row shows the kind and
+ * the format; with repositories of several formats, a filter keeps one
+ * format's (in the URL, so it is shareable). Search is per repository and
+ * lives on the repository screen, not here. An offline repository carries an
+ * "offline" badge.
  */
 function Browse() {
   const repos = useBrowseRepos()
+  const { format } = Route.useSearch()
+  const navigate = useNavigate({ from: Route.fullPath })
+  const all = repos.data ?? []
+  const formats = [...new Set([...all.map((r) => r.format), ...(format ? [format] : [])])].sort()
+  const shown = all.filter((r) => !format || r.format === format)
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Heading>Browse</Heading>
-        <Text className="mt-1">
-          Open a repository to browse and search its packages.
-        </Text>
-      </div>
+    <Page>
+      <PageHeader
+        title="Browse"
+        description="The repositories you can read. Open one to browse and search its packages, images or files, and to get its connection commands."
+      />
 
       {repos.isError ? (
         <ErrorState
@@ -35,64 +69,90 @@ function Browse() {
           onRetry={() => void repos.refetch()}
         />
       ) : repos.isLoading ? (
-        <Text>Loading repositories…</Text>
-      ) : (repos.data?.length ?? 0) === 0 ? (
-        <EmptyState title="No repositories">
+        <Skeleton variant="table" rows={4} columns={4} label="Loading repositories…" />
+      ) : all.length === 0 ? (
+        <EmptyState title="No repositories" icon="Repository">
           You have no readable repositories yet. Ask an administrator to grant
           you access.
         </EmptyState>
       ) : (
-        <ul className="divide-y divide-zinc-950/5 overflow-hidden rounded-xl ring-1 ring-zinc-950/5 dark:divide-white/5 dark:ring-white/10">
-          {repos.data!.map((repo) => (
-            <li key={repo.name}>
-              <Link
-                to="/repos/$repo"
-                params={{ repo: repo.name }}
-                className="group flex items-center gap-3 px-4 py-3.5 transition hover:bg-zinc-950/[2.5%] dark:hover:bg-white/[2.5%]"
-              >
-                <FolderIcon />
-                <span className="font-medium text-zinc-950 group-hover:text-sky-700 dark:text-white dark:group-hover:text-sky-400">
-                  {repo.name}
-                </span>
-                <RepoKindBadge kind={repo.kind} />
-                <ChevronIcon />
-              </Link>
-            </li>
-          ))}
-        </ul>
+        <Panel title="Repositories" count={shown.length} flush>
+          {formats.length > 1 && (
+            <Toolbar>
+              <SegmentedControl
+                label="Filter by format"
+                value={format ?? ''}
+                onChange={(f) => void navigate({ search: f ? { format: f } : {} })}
+                items={[
+                  { id: '', label: 'All', count: all.length },
+                  ...formats.map((f) => ({
+                    id: f,
+                    label: formatLabel(f),
+                    count: all.filter((r) => r.format === f).length,
+                  })),
+                ]}
+              />
+            </Toolbar>
+          )}
+          {shown.length === 0 ? (
+            <EmptyState
+              title={`No ${formatLabel(format ?? '')} repositories`}
+              bordered={false}
+            >
+              None of the repositories you may read has this format.
+            </EmptyState>
+          ) : (
+            <Table caption="Repositories you can read">
+              <TableHead>
+                <TableHeader>Repository</TableHeader>
+                <TableHeader width="120px">Kind</TableHeader>
+                <TableHeader width="120px">Format</TableHeader>
+                <TableHeader width="140px">Status</TableHeader>
+              </TableHead>
+              <TableBody>
+                {shown.map((repo) => (
+                  <TableRow key={repo.name}>
+                    <TableCell lead>
+                      <CellStack sub={repo.url}>
+                        <Link
+                          to="/repos/$repo"
+                          params={{ repo: repo.name }}
+                          className="fg-link-strong"
+                        >
+                          <Icon name={formatIcon(repo.format)} size={16} />
+                          <span>{repo.name}</span>
+                        </Link>
+                      </CellStack>
+                    </TableCell>
+                    <TableCell>
+                      <KindBadge kind={repo.kind} />
+                    </TableCell>
+                    <TableCell>
+                      <FormatTag format={repo.format} />
+                    </TableCell>
+                    <TableCell>
+                      {repo.online === false ? (
+                        <StatusBadge
+                          tone="neutral"
+                          title={
+                            repo.kind === 'proxy'
+                              ? 'Offline: shows only the packages Forge has cached'
+                              : 'Offline for maintenance'
+                          }
+                        >
+                          offline
+                        </StatusBadge>
+                      ) : (
+                        <StatusBadge tone="ok">online</StatusBadge>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </Panel>
       )}
-    </section>
-  )
-}
-
-/** A small folder glyph reinforcing the file-browser metaphor. */
-export function FolderIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 20 20"
-      fill="currentColor"
-      className="h-5 w-5 shrink-0 text-amber-500 dark:text-amber-400"
-    >
-      <path d="M2 5.5A1.5 1.5 0 0 1 3.5 4h4.086a1.5 1.5 0 0 1 1.06.44l1.415 1.414a.5.5 0 0 0 .353.146H16.5A1.5 1.5 0 0 1 18 7.5v7A1.5 1.5 0 0 1 16.5 16h-13A1.5 1.5 0 0 1 2 14.5v-9Z" />
-    </svg>
-  )
-}
-
-/** Right-pointing chevron shown at the end of folder rows. */
-export function ChevronIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 20 20"
-      fill="currentColor"
-      className="ml-auto h-4 w-4 shrink-0 text-zinc-400 transition group-hover:translate-x-0.5 group-hover:text-zinc-600 dark:text-zinc-500 dark:group-hover:text-zinc-300"
-    >
-      <path
-        fillRule="evenodd"
-        d="M7.21 14.77a.75.75 0 0 1 .02-1.06L11.168 10 7.23 6.29a.75.75 0 1 1 1.04-1.08l4.5 4.25a.75.75 0 0 1 0 1.08l-4.5 4.25a.75.75 0 0 1-1.06-.02Z"
-        clipRule="evenodd"
-      />
-    </svg>
+    </Page>
   )
 }

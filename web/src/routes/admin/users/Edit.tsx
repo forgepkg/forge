@@ -2,94 +2,460 @@ import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import type { CreatedToken, TokenView } from '~/api/tokens'
-import { useUsers } from '~/queries/useUsers'
+import {
+  ACCESS_ROLES,
+  accessLevel,
+  ADMIN_ROLE,
+  WRITER_ROLE,
+  type AccessLevel,
+} from '~/api/rbac'
+import { ApiError } from '~/lib/httpClient'
+import { authSourceLabel, type IssuedInvitation, type UserView } from '~/api/users'
+import {
+  useConvertUserToLocal,
+  useInviteUser,
+  useRevokeInvitation,
+  useUsers,
+} from '~/queries/useUsers'
 import {
   useCreateToken,
   useRevokeToken,
+  useSetTokenScope,
   useTokens,
 } from '~/queries/useTokens'
-import { Badge } from '~/components/catalyst/badge'
-import { Button } from '~/components/catalyst/button'
-import { Field, Label } from '~/components/catalyst/fieldset'
-import { Heading } from '~/components/catalyst/heading'
-import { Input } from '~/components/catalyst/input'
-import { Text } from '~/components/catalyst/text'
+import { useRepositories } from '~/queries/useRepositories'
 import {
+  useAssignRole,
+  useRoles,
+  useSelectors,
+  useUnassignRole,
+  useUserEffective,
+  useUserRoles,
+} from '~/queries/useRbac'
+import {
+  Button,
+  CellActions,
+  Code,
+  Columns,
+  Dialog,
+  Notice,
+  Page,
+  PageHeader,
+  Panel,
+  SelectField,
+  Skeleton,
+  StatusBadge,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-} from '~/components/catalyst/table'
+} from '~/components/ui'
+import { AccessBadge } from '~/components/AccessBadge'
+import { UserStatusBadge } from './List'
+import { AccessLevelFields } from '~/components/AccessLevelFields'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
+import {
+  ActionBadge,
+  byId,
+  InlineError,
+  RepositoryLabel,
+  repoNames,
+  SelectorLabel,
+} from '~/components/RbacLabels'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
+import { TokenCreateForm } from '~/components/TokenCreateForm'
+import { TokenScopeBadges, TokenStatusBadge } from '~/components/TokenBadges'
+import {
+  draftFromScope,
+  draftProblem,
+  scopeFromDraft,
+  TokenScopeFields,
+  type ScopeDraft,
+} from '~/components/TokenScopeFields'
 
 export const Route = createFileRoute('/_app/manage/users/$userId')({
-  component: UserTokens,
+  component: UserPage,
 })
 
 /**
- * Per-user token management (plan §Phase 5). Slice 1 scopes tokens to a user
- * (`/admin/users/{id}/tokens`), so this is the user's "edit" screen: it lists
- * the user's tokens (metadata only — the secret is never returned), issues new
- * tokens (the plaintext is shown **once** via `ShowOnceSecret`), and revokes
- * existing ones. The plaintext is held in transient component state and never
- * written into a query cache.
+ * The add form at the top of a flush panel, above its table (a role):
+ * padded like the panel body, ruled off from the table.
  */
-function UserTokens() {
+const ADD_STRIP = 'grid gap-4 border-b border-line px-5 py-4'
+
+/**
+ * One user: their built-in access level (reader, writer or admin), which
+ * admins switch here (in the side column); the roles they hold, which admins
+ * assign and remove here (taking `admin` from the last active administrator
+ * is refused with the server's reason); their effective access, the union of
+ * those roles' grants with repository and selector names; and their tokens.
+ * Tokens are listed as metadata only (the secret is never returned), issued
+ * with an optional scope (the plaintext is shown **once** via
+ * `ShowOnceSecret`, held in transient component state and never written into
+ * a query cache), re-scoped and revoked (after a confirmation dialog). The
+ * header says how the user signs in, so a role or token does not go to a
+ * look-alike account by mistake. A credential-forwarding account whose realm
+ * kept its password hash can be switched to a local account with that
+ * password from here. An invited account (its user has not chosen a password
+ * yet) shows its invitation, which can be resent, copied as a link (shown
+ * once) or revoked.
+ */
+function UserPage() {
   const { userId } = Route.useParams()
   const id = Number(userId)
 
-  // The username comes from the cached users list (no per-user GET in slice 1).
+  // The username comes from the cached users list (there is no per-user GET).
   const users = useUsers()
   const user = users.data?.find((u) => u.id === id)
+  const name = user ? user.username : `User #${id}`
 
-  const tokens = useTokens(id)
-  const create = useCreateToken(id)
-  const revoke = useRevokeToken(id)
+  return (
+    <Page>
+      <PageHeader
+        title={name}
+        crumbs={[{ label: 'Users', to: '/manage/users' }, { label: name }]}
+        meta={
+          user
+            ? [
+                <>
+                  Sign-in:{' '}
+                  <span className="fg-strong">{authSourceLabel(user.auth_source)}</span>
+                </>,
+              ]
+            : undefined
+        }
+      >
+        {user && <UserStatusBadge status={user.status} />}
+      </PageHeader>
 
-  const [name, setName] = useState('')
+      {user && (user.status === 'invited' || user.status === 'invitation_expired') && (
+        <UserInvitation user={user} />
+      )}
+      {user?.captured_password_at && <KeptPassword user={user} />}
+
+      <Columns asideLabel="Access" aside={<UserAccess userId={id} />}>
+        <UserRoles userId={id} legacyAdmin={user?.is_admin ?? false} />
+        <EffectiveAccess userId={id} />
+        <UserTokens userId={id} />
+      </Columns>
+    </Page>
+  )
+}
+
+/**
+ * The user's built-in access level: reader (no built-in role), writer (the
+ * `writer` role) or admin (the `admin` role), switched through
+ * `/admin/users/{id}/roles`. A switch assigns the new level's role first and
+ * then takes the other one, so a refused step (the last active
+ * administrator keeps `admin`: 409, with the server's reason) never leaves
+ * the user with less access than before.
+ */
+function UserAccess({ userId }: { userId: number }) {
+  const held = useUserRoles(userId)
+  const roles = useRoles()
+  const assign = useAssignRole()
+  const unassign = useUnassignRole()
+  const current = accessLevel((held.data ?? []).map((r) => r.name))
+  const [choice, setChoice] = useState<AccessLevel | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const chosen = choice ?? current
+
+  async function save() {
+    if (chosen === current) return
+    setSaving(true)
+    setError(null)
+    try {
+      if (chosen !== 'reader') {
+        const name = ACCESS_ROLES[chosen]
+        const role = (roles.data ?? []).find((r) => r.name === name)
+        if (!role) throw new Error(`The built-in role ${name} is missing.`)
+        await assign.mutateAsync({ userId, roleId: role.id })
+      }
+      for (const role of held.data ?? []) {
+        const level = role.name === ADMIN_ROLE || role.name === WRITER_ROLE
+        if (level && (chosen === 'reader' || role.name !== ACCESS_ROLES[chosen])) {
+          await unassign.mutateAsync({ userId, roleId: role.id })
+        }
+      }
+      setChoice(null)
+    } catch (e) {
+      setError(
+        e instanceof ApiError ? e.body || e.message : (e as Error).message,
+      )
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const loaded = !held.isError && !roles.isError && !held.isLoading && !roles.isLoading
+
+  return (
+    <Panel
+      title="Access"
+      description="The user's built-in role. Their other roles add to it."
+      actions={
+        loaded && (
+          <span className="flex items-center gap-2 text-ink-muted">
+            Now: <AccessBadge level={current} />
+          </span>
+        )
+      }
+    >
+      {held.isError || roles.isError ? (
+        <ErrorState
+          title="Could not load the user's access"
+          message={(held.error ?? roles.error)?.message}
+          onRetry={() => {
+            void held.refetch()
+            void roles.refetch()
+          }}
+        />
+      ) : held.isLoading || roles.isLoading ? (
+        <Skeleton lines={3} label="Loading access…" />
+      ) : (
+        <form
+          aria-label="Change access"
+          onSubmit={(e) => {
+            e.preventDefault()
+            void save()
+          }}
+          className="grid gap-4"
+        >
+          <AccessLevelFields value={chosen} onChange={setChoice} disabled={saving} />
+          {error && <InlineError>{error}</InlineError>}
+          <div>
+            <Button type="submit" disabled={saving || chosen === current}>
+              {saving ? 'Saving…' : 'Change access'}
+            </Button>
+          </div>
+        </form>
+      )}
+    </Panel>
+  )
+}
+
+/** The roles the user holds; admins assign and remove them here. */
+function UserRoles({
+  userId,
+  legacyAdmin,
+}: {
+  userId: number
+  legacyAdmin: boolean
+}) {
+  const held = useUserRoles(userId)
+  const roles = useRoles()
+  const assign = useAssignRole()
+  const unassign = useUnassignRole()
+  const [roleId, setRoleId] = useState('')
+
+  const heldIds = new Set((held.data ?? []).map((r) => r.id))
+  const candidates = (roles.data ?? []).filter((r) => !heldIds.has(r.id))
+  const holdsAdmin = (held.data ?? []).some((r) => r.name === ADMIN_ROLE)
+
+  return (
+    <Panel
+      title="Roles"
+      count={held.data?.length}
+      description="What the user may do follows from the roles they hold."
+      flush
+    >
+      <form
+        aria-label="Assign role"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (roleId === '') return
+          assign.mutate(
+            { userId, roleId: Number(roleId) },
+            { onSuccess: () => setRoleId('') },
+          )
+        }}
+        className={ADD_STRIP}
+      >
+        {legacyAdmin && held.data && !holdsAdmin && (
+          <Notice>
+            The user is an administrator through the legacy <Code>is_admin</Code>{' '}
+            flag, without the admin role.
+          </Notice>
+        )}
+        <div className="flex flex-wrap items-end gap-3">
+          <SelectField
+            label="Role"
+            className="min-w-0 flex-[1_1_240px]"
+            value={roleId}
+            onChange={(e) => setRoleId(e.target.value)}
+          >
+            <option value="">Choose a role…</option>
+            {candidates.map((r) => (
+              <option key={r.id} value={String(r.id)}>
+                {r.name}
+              </option>
+            ))}
+          </SelectField>
+          <Button type="submit" icon="Plus" disabled={assign.isPending || roleId === ''}>
+            {assign.isPending ? 'Assigning…' : 'Assign role'}
+          </Button>
+        </div>
+        {assign.isError && (
+          <InlineError>{assign.error.body || assign.error.message}</InlineError>
+        )}
+        {unassign.isError && (
+          <InlineError>{unassign.error.body || unassign.error.message}</InlineError>
+        )}
+      </form>
+
+      {held.isError ? (
+        <ErrorState
+          title="Could not load the user's roles"
+          message={held.error?.message}
+          onRetry={() => void held.refetch()}
+        />
+      ) : held.isLoading ? (
+        <Skeleton lines={3} label="Loading roles…" />
+      ) : (held.data?.length ?? 0) === 0 ? (
+        <EmptyState title="The user holds no role" icon="Lock" bordered={false} />
+      ) : (
+        <Table caption="Roles the user holds">
+          <TableHead>
+            <TableHeader>Role</TableHeader>
+            <TableHeader>Description</TableHeader>
+            <TableHeader align="right" width="96px">
+              <span className="fg-sr">Actions</span>
+            </TableHeader>
+          </TableHead>
+          <TableBody>
+            {held.data!.map((r) => (
+              <TableRow key={r.id}>
+                <TableCell lead>
+                  <Link
+                    to="/manage/roles/$roleId"
+                    params={{ roleId: String(r.id) }}
+                    className="fg-link-strong"
+                  >
+                    {r.name}
+                  </Link>
+                </TableCell>
+                <TableCell>{r.description || '—'}</TableCell>
+                <TableCell align="right">
+                  <CellActions>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={unassign.isPending}
+                      aria-label={`Remove role ${r.name}`}
+                      onClick={() => unassign.mutate({ userId, roleId: r.id })}
+                    >
+                      Remove
+                    </Button>
+                  </CellActions>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </Panel>
+  )
+}
+
+/**
+ * The user's effective access (`/admin/users/{id}/effective`): every grant of
+ * every role they hold, with repository and selector names. Reads of what
+ * anonymous callers may read, and token scopes, are not part of it.
+ */
+function EffectiveAccess({ userId }: { userId: number }) {
+  const effective = useUserEffective(userId)
+  const repos = useRepositories()
+  const selectors = useSelectors()
+  const names = repoNames(repos.data)
+  const selectorMap = byId(selectors.data)
+
+  return (
+    <Panel
+      title="Effective access"
+      description="The grants of all the user's roles together. Signed-in users can also read what anonymous callers may read; a token can narrow this further."
+      flush
+    >
+      {effective.isError ? (
+        <ErrorState
+          title="Could not load the user's access"
+          message={effective.error?.message}
+          onRetry={() => void effective.refetch()}
+        />
+      ) : effective.isLoading || !effective.data ? (
+        <Skeleton lines={3} label="Loading access…" />
+      ) : (
+        <>
+          {effective.data.is_admin && (
+            <Notice>
+              <StatusBadge tone="heat">administrator</StatusBadge> May do
+              everything, on every repository, whatever the grants below say.
+            </Notice>
+          )}
+          {effective.data.grants.length === 0 ? (
+            !effective.data.is_admin && (
+              <EmptyState title="The user may do nothing" icon="Lock" bordered={false} />
+            )
+          ) : (
+            <Table caption="Effective grants">
+              <TableHead>
+                <TableHeader>Repository</TableHeader>
+                <TableHeader width="120px">Action</TableHeader>
+                <TableHeader>Packages</TableHeader>
+              </TableHead>
+              <TableBody>
+                {effective.data.grants.map((g, i) => (
+                  <TableRow key={i}>
+                    <TableCell lead>
+                      <RepositoryLabel id={g.repository_id} names={names} />
+                    </TableCell>
+                    <TableCell>
+                      <ActionBadge action={g.action} />
+                    </TableCell>
+                    <TableCell>
+                      <SelectorLabel
+                        id={g.selector_id}
+                        selectors={selectorMap}
+                        includes={g.includes}
+                        excludes={g.excludes}
+                      />
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </>
+      )}
+    </Panel>
+  )
+}
+
+/**
+ * The user's tokens: the New token panel (issue, with a scope), the scope
+ * editor of the token being re-scoped, and the Tokens table (re-scope and
+ * revoke, after a confirmation dialog).
+ */
+function UserTokens({ userId }: { userId: number }) {
+  const tokens = useTokens(userId)
+  const create = useCreateToken(userId)
+  const revoke = useRevokeToken(userId)
+  const repos = useRepositories()
+
   const [created, setCreated] = useState<CreatedToken | null>(null)
   const [pendingRevoke, setPendingRevoke] = useState<number | null>(null)
-
-  function issue(e: React.FormEvent) {
-    e.preventDefault()
-    if (!name.trim()) return
-    create.mutate(
-      { name: name.trim() },
-      {
-        onSuccess: (token) => {
-          setCreated(token)
-          setName('')
-        },
-      },
-    )
-  }
+  const [editing, setEditing] = useState<TokenView | null>(null)
+  const revoking = tokens.data?.find((t) => t.id === pendingRevoke)
 
   function confirmRevoke(tokenId: number) {
     revoke.mutate(tokenId, { onSettled: () => setPendingRevoke(null) })
   }
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Link
-          to="/manage/users"
-          className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
-        >
-          ← Users
-        </Link>
-        <Heading className="mt-1">
-          Tokens{user ? ` — ${user.username}` : ''}
-        </Heading>
-        <Text className="mt-1">
-          API tokens authenticate this user against the registry. The secret is
-          shown only at creation time.
-        </Text>
-      </div>
-
+    <>
       {created && (
         <ShowOnceSecret
           secret={created.token}
@@ -98,23 +464,19 @@ function UserTokens() {
         />
       )}
 
-      <form
-        onSubmit={issue}
-        className="flex items-end gap-3 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
-      >
-        <Field className="flex-1">
-          <Label>Token name</Label>
-          <Input
-            type="text"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. ci-pipeline"
-          />
-        </Field>
-        <Button type="submit" disabled={create.isPending || !name.trim()}>
-          {create.isPending ? 'Creating…' : 'Create token'}
-        </Button>
-      </form>
+      <TokenCreateForm
+        repositories={repos.data ?? []}
+        submitting={create.isPending}
+        placeholder="e.g. ci-pipeline"
+        onSubmit={(body, reset) =>
+          create.mutate(body, {
+            onSuccess: (token) => {
+              setCreated(token)
+              reset()
+            },
+          })
+        }
+      />
 
       {create.isError && (
         <InlineError>{create.error.body || create.error.message}</InlineError>
@@ -123,56 +485,270 @@ function UserTokens() {
         <InlineError>{revoke.error.body || revoke.error.message}</InlineError>
       )}
 
-      {tokens.isError ? (
-        <ErrorState
-          title="Could not load tokens"
-          message={tokens.error?.message}
-          onRetry={() => void tokens.refetch()}
+      {editing && (
+        <ScopeEditor
+          key={editing.id}
+          userId={userId}
+          token={editing}
+          repositories={repos.data ?? []}
+          onDone={() => setEditing(null)}
         />
-      ) : tokens.isLoading ? (
-        <Text>Loading tokens…</Text>
-      ) : (tokens.data?.length ?? 0) === 0 ? (
-        <EmptyState title="No tokens yet">
-          Create a token above to let this user authenticate.
-        </EmptyState>
-      ) : (
-        <Table striped>
-          <TableHead>
-            <TableRow>
+      )}
+
+      {revoking && (
+        <Dialog
+          open
+          onClose={() => setPendingRevoke(null)}
+          icon="Trash"
+          tone="danger"
+          title={`Revoke ${revoking.name}?`}
+          description="Clients that use it can no longer authenticate until they are given a new token. This cannot be undone."
+          confirmLabel={revoke.isPending ? 'Revoking…' : 'Revoke token'}
+          confirmVariant="danger-solid"
+          confirmDisabled={revoke.isPending}
+          onConfirm={() => confirmRevoke(revoking.id)}
+        />
+      )}
+
+      <Panel
+        title="Tokens"
+        count={tokens.data?.length}
+        description="API tokens authenticate this user against the registry. The secret is shown only at creation time."
+        flush
+      >
+        {tokens.isError ? (
+          <ErrorState
+            title="Could not load tokens"
+            message={tokens.error?.message}
+            onRetry={() => void tokens.refetch()}
+          />
+        ) : tokens.isLoading ? (
+          <Skeleton lines={3} label="Loading tokens…" />
+        ) : (tokens.data?.length ?? 0) === 0 ? (
+          <EmptyState title="No tokens yet" icon="Key" bordered={false}>
+            Create a token above to let this user authenticate.
+          </EmptyState>
+        ) : (
+          <Table caption="Tokens of the user">
+            <TableHead>
               <TableHeader>Name</TableHeader>
               <TableHeader>Created</TableHeader>
               <TableHeader>Last used</TableHeader>
-              <TableHeader>Status</TableHeader>
-              <TableHeader>Actions</TableHeader>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {tokens.data!.map((token) => (
-              <TokenRow
-                key={token.id}
-                token={token}
-                isRevoking={revoke.isPending && pendingRevoke === token.id}
-                pendingRevoke={pendingRevoke === token.id}
-                onRequestRevoke={() => setPendingRevoke(token.id)}
-                onCancelRevoke={() => setPendingRevoke(null)}
-                onConfirmRevoke={() => confirmRevoke(token.id)}
-              />
-            ))}
-          </TableBody>
-        </Table>
-      )}
-    </section>
+              <TableHeader>Scope</TableHeader>
+              <TableHeader width="100px">Status</TableHeader>
+              <TableHeader align="right">
+                <span className="fg-sr">Actions</span>
+              </TableHeader>
+            </TableHead>
+            <TableBody>
+              {tokens.data!.map((token) => (
+                <TokenRow
+                  key={token.id}
+                  token={token}
+                  onEditScope={() => setEditing(token)}
+                  onRequestRevoke={() => setPendingRevoke(token.id)}
+                />
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </Panel>
+    </>
   )
 }
 
-function InlineError({ children }: { children: React.ReactNode }) {
+/**
+ * Change a token's scope, in a panel above the tokens table. The next
+ * request with the token reads it; there is no cache to wait for.
+ */
+function ScopeEditor({
+  userId,
+  token,
+  repositories,
+  onDone,
+}: {
+  userId: number
+  token: TokenView
+  repositories: ReadonlyArray<{ id: number; name: string }>
+  onDone: () => void
+}) {
+  const save = useSetTokenScope(userId)
+  const [draft, setDraft] = useState<ScopeDraft>(() =>
+    draftFromScope(token.scope),
+  )
+  const problem = draftProblem(draft)
+
   return (
-    <p
-      role="alert"
-      className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
+    <Panel
+      as="form"
+      onSubmit={(e) => {
+        e.preventDefault()
+        if (problem) return
+        save.mutate(
+          { id: token.id, scope: scopeFromDraft(draft) },
+          { onSuccess: onDone },
+        )
+      }}
+      title={
+        <>
+          Scope of <span className="font-mono">{token.name}</span>
+        </>
+      }
+      description="The next request with the token uses the new scope."
+      footer={
+        <>
+          {problem && <p className="fg-field-desc mr-auto self-center">{problem}</p>}
+          <Button variant="ghost" onClick={onDone}>
+            Cancel
+          </Button>
+          <Button type="submit" variant="primary" disabled={save.isPending || !!problem}>
+            {save.isPending ? 'Saving…' : 'Save scope'}
+          </Button>
+        </>
+      }
     >
-      {children}
-    </p>
+      <TokenScopeFields value={draft} onChange={setDraft} repositories={repositories} />
+      {save.isError && (
+        <InlineError>{save.error.body || save.error.message}</InlineError>
+      )}
+    </Panel>
+  )
+}
+
+/**
+ * An invited account's invitation: where it went and until when, sending a
+ * new one (the old link stops working), making a link to copy instead (shown
+ * once, like a token), and revoking it.
+ */
+function UserInvitation({ user }: { user: UserView }) {
+  const invite = useInviteUser()
+  const revoke = useRevokeInvitation()
+  // The answer of the last resend or copy: its link is shown once, held
+  // here and never cached.
+  const [issued, setIssued] = useState<IssuedInvitation | null>(null)
+  const invitation = user.invitation
+  const live = user.status === 'invited'
+
+  function make(sendEmail: boolean) {
+    setIssued(null)
+    invite.mutate(
+      { id: user.id, send_email: sendEmail },
+      { onSuccess: (made) => setIssued(made) },
+    )
+  }
+
+  return (
+    <Panel
+      title="Invitation"
+      description={
+        live && invitation
+          ? `${user.username} has not chosen a password yet. The invitation ${
+              invitation.sent_at ? `went to ${invitation.email}` : 'link was handed over'
+            } and works until ${formatTs(invitation.expires_at)}.`
+          : `${user.username} has not chosen a password yet, and no invitation link works: send a new one.`
+      }
+      footer={
+        <>
+          {live && (
+            <Button
+              variant="ghost"
+              disabled={revoke.isPending}
+              onClick={() => {
+                setIssued(null)
+                revoke.mutate(user.id)
+              }}
+            >
+              Revoke invitation
+            </Button>
+          )}
+          <Button icon="Copy" disabled={invite.isPending} onClick={() => make(false)}>
+            Copy invitation link
+          </Button>
+          <Button
+            variant="primary"
+            icon="Mail"
+            disabled={invite.isPending}
+            onClick={() => make(true)}
+          >
+            Resend invitation
+          </Button>
+        </>
+      }
+    >
+      {(invite.isError || revoke.isError) && (
+        <InlineError>
+          {invite.error?.body || invite.error?.message || revoke.error?.body || revoke.error?.message}
+        </InlineError>
+      )}
+      {issued?.email_sent && (
+        <Notice tone="ok">
+          Sent a new invitation to {issued.email}; the previous link no longer works.
+        </Notice>
+      )}
+      {issued && !issued.email_sent && issued.link && (
+        <>
+          {issued.error && (
+            <p className="fg-text">
+              {issued.error === 'no email service is configured'
+                ? 'No email service is configured,'
+                : `The invitation email was not sent (${issued.error}),`}{' '}
+              so give the user this link.
+            </p>
+          )}
+          <ShowOnceSecret
+            secret={issued.link}
+            label="Invitation link"
+            onDismiss={() => setIssued(null)}
+          />
+        </>
+      )}
+      {!issued && !invite.isError && !revoke.isError && (
+        <p className="fg-text fg-text--small">
+          Resending makes a new link; the one sent before stops working.
+        </p>
+      )}
+    </Panel>
+  )
+}
+
+/**
+ * A credential-forwarding account's kept password hash, and the switch of the
+ * account to a local one with that password (asks for a confirmation first,
+ * in a dialog).
+ */
+function KeptPassword({ user }: { user: UserView }) {
+  const convert = useConvertUserToLocal()
+  const [confirming, setConfirming] = useState(false)
+  return (
+    <>
+      <Notice
+        action={
+          <Button size="sm" onClick={() => setConfirming(true)}>
+            Switch to a local account…
+          </Button>
+        }
+      >
+        Password kept {formatTs(user.captured_password_at)}: the last password
+        the upstream accepted for this user. Switching to a local account makes
+        it the user&apos;s Forge password; the upstream is never asked about
+        this user again.
+      </Notice>
+      {convert.isError && (
+        <InlineError>{convert.error.body || convert.error.message}</InlineError>
+      )}
+      <Dialog
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        icon="Key"
+        title={`Switch ${user.username} to a local account?`}
+        description="The kept password becomes the user's Forge password, and the upstream is never asked about this user again."
+        confirmLabel={convert.isPending ? 'Switching…' : 'Switch to a local account'}
+        confirmDisabled={convert.isPending}
+        onConfirm={() =>
+          convert.mutate(user.id, { onSettled: () => setConfirming(false) })
+        }
+      />
+    </>
   )
 }
 
@@ -184,65 +760,45 @@ function formatTs(ts: string | null): string {
 
 function TokenRow({
   token,
-  isRevoking,
-  pendingRevoke,
+  onEditScope,
   onRequestRevoke,
-  onCancelRevoke,
-  onConfirmRevoke,
 }: {
   token: TokenView
-  isRevoking: boolean
-  pendingRevoke: boolean
+  onEditScope: () => void
   onRequestRevoke: () => void
-  onCancelRevoke: () => void
-  onConfirmRevoke: () => void
 }) {
   const revoked = token.revoked_at != null
   return (
     <TableRow>
-      <TableCell className="font-medium">{token.name}</TableCell>
-      <TableCell className="text-zinc-500 dark:text-zinc-400">
-        {formatTs(token.created_at)}
+      <TableCell lead className="font-mono">
+        {token.name}
       </TableCell>
-      <TableCell className="text-zinc-500 dark:text-zinc-400">
-        {formatTs(token.last_used_at)}
+      <TableCell nowrap>{formatTs(token.created_at)}</TableCell>
+      <TableCell nowrap>{formatTs(token.last_used_at)}</TableCell>
+      <TableCell>
+        <TokenScopeBadges scope={token.scope} />
       </TableCell>
       <TableCell>
-        {revoked ? (
-          <Badge color="zinc">revoked</Badge>
-        ) : (
-          <Badge color="emerald">active</Badge>
-        )}
+        <TokenStatusBadge token={token} />
       </TableCell>
-      <TableCell>
+      <TableCell align="right" nowrap>
         {revoked ? (
-          <span className="text-zinc-400 dark:text-zinc-500">—</span>
-        ) : pendingRevoke ? (
-          <span className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onConfirmRevoke}
-              disabled={isRevoking}
-              className="font-medium text-red-600 hover:underline disabled:opacity-60 dark:text-red-400"
-            >
-              {isRevoking ? 'Revoking…' : 'Confirm'}
-            </button>
-            <button
-              type="button"
-              onClick={onCancelRevoke}
-              className="text-zinc-500 hover:underline dark:text-zinc-400"
-            >
-              Cancel
-            </button>
-          </span>
+          <span className="text-ink-faint">—</span>
         ) : (
-          <button
-            type="button"
-            onClick={onRequestRevoke}
-            className="font-medium text-red-600 hover:underline dark:text-red-400"
-          >
-            Revoke
-          </button>
+          <CellActions>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon="Pencil"
+              aria-label={`Edit scope of ${token.name}`}
+              onClick={onEditScope}
+            >
+              Edit scope
+            </Button>
+            <Button size="sm" variant="ghost" icon="Trash" onClick={onRequestRevoke}>
+              Revoke
+            </Button>
+          </CellActions>
         )}
       </TableCell>
     </TableRow>

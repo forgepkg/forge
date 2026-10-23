@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oci_manifest SET untagged_since = NULL WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ff2662dfd4a9877e2c55cee32fd71e9f3fa9a57155e4c43990f52569683ec07a"
+}

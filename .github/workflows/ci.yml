@@ -1,20 +1,43 @@
 name: CI
 
 # One run per change: pull requests are checked via `pull_request` (which tests
-# the merge result), and only the default branch runs on `push` (post-merge +
-# the main-only e2e jobs). Pushing to a PR branch no longer triggers a second,
-# identical `push` run. Branches without a PR can be checked on demand via
-# `workflow_dispatch`.
+# the merge result), a merge queue's merge groups via `merge_group` (the commit
+# that lands; without this trigger a queue waits forever for its required
+# checks), and only the default branch runs on `push` (post-merge). Pushing to
+# a PR branch no longer triggers a second, identical `push` run. Branches
+# without a PR can be checked on demand via `workflow_dispatch`.
+#
+# Only a pull request that targets the default branch runs CI. A stacked pull
+# request, which targets the branch of the one below it, runs the Stack
+# workflow alone; once GitHub retargets it to the default branch, stack.yml
+# merges the default branch into it, and that push runs this workflow. A
+# `workflow_dispatch` run of a pull request's branch would not do: GitHub
+# neither shows its checks on the pull request nor counts them as its
+# required checks.
 on:
   push:
     branches: [main, master]
   pull_request:
+    branches: [main, master]
+  merge_group:
   workflow_dispatch:
+    inputs:
+      base:
+        description: Run only the jobs the branch's change since it forked off this branch needs (empty runs every job)
+        type: string
+        default: ""
 
-# A newer commit on the same PR / branch supersedes the running check.
-# Default-branch runs are never cancelled, so every merge is fully verified.
+# Pull requests: a newer commit on the same PR supersedes (cancels) the running
+# check. Every other run (a merge group, a push to the default branch, a manual
+# run) has a group of its own commit: a concurrency group holds at most one
+# pending run and cancels it when a newer one queues, even with
+# cancel-in-progress: false, so one group for the default branch would drop
+# the run of a commit merged while another was in progress, e2e jobs included,
+# and one for the merge queue would leave a queued group without its checks.
+# Per commit, every merge gets its own run, and the release workflow can
+# require it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Read-only token for every job; nothing in CI writes to the repository.
@@ -25,6 +48,22 @@ permissions:
 # resolved from is in the trailing comment); Dependabot
 # (.github/dependabot.yml) proposes updates.
 
+# Docker Hub images come through Google's mirror, mirror.gcr.io (the same
+# images under the same digests, without Docker Hub's pull rate limit): the
+# service, job and pre-pulled images by name, as the testcontainers harnesses
+# name them in their code, and the Dockerfile's through BuildKit's registry
+# mirror (docker job).
+
+# Build caches. A repository's Actions caches share a 10 GB quota, and an
+# entry past it evicts the least recently used. So:
+#   - the cargo caches (Swatinem/rust-cache) hold the registry and the
+#     dependencies' build output only, not the workspace crates or the test
+#     binaries, which every run rebuilds anyway (~19 GB of test binaries);
+#   - only pushes to the default branch save them (and the docker job's
+#     layer cache), in the jobs a push runs, that is when what they build
+#     from changed (#361); pull requests and the merge queue restore those,
+#     and their own copies, which no other ref can read, would evict them.
+
 env:
   CARGO_TERM_COLOR: always
   # Keep target/ small enough for a hosted runner's disk: a full-debuginfo
@@ -34,75 +73,101 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # Used by sqlx for compile-time query verification from the cached .sqlx/ dir.
-  # The `prepare` job overrides this when it needs a live database.
+  # The clippy job's drift guard unsets it to check against a live database.
   SQLX_OFFLINE: "true"
 
 jobs:
-  # ── Formatting ─────────────────────────────────────────────────────────────
+  # ── What the change touches ────────────────────────────────────────────────
+  # A job runs only when the change touches what it checks (#353, #361):
+  # ci-changes.sh compares the commit with its base (a pull request with its
+  # base branch, a merge group with the group ahead of it in the queue or
+  # main, a push with the branch's previous commit, a manual run given a
+  # `base` branch with the commit it forked off that branch) and sets one
+  # output per group of paths (rust, changelog, release, audit, web, image,
+  # kubernetes), and a job whose groups are all `false` is skipped, which
+  # passes a required check. A change to this file counts for the groups of
+  # the jobs it changes (#365), or for every group when it changes anything
+  # outside them (the triggers, the settings, this job). A push to main
+  # repeats its merge group's run on the same commit, so it runs only what
+  # that push changed; a push that sets a new workspace version (a release
+  # commit) and a manual run without a `base` set every group, which the
+  # release gate needs. The conditions run a job unless its output is
+  # `false`, so if this job fails, every job runs.
+  # Every job waits for this one, a second turn in the runner queue for a few
+  # seconds of work (see fmt); in exchange most changes leave most jobs out.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
+      changelog: ${{ steps.changes.outputs.changelog }}
+      release: ${{ steps.changes.outputs.release }}
+      audit: ${{ steps.changes.outputs.audit }}
+      web: ${{ steps.changes.outputs.web }}
+      image: ${{ steps.changes.outputs.image }}
+      kubernetes: ${{ steps.changes.outputs.kubernetes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A pull request's merge commit and its first parent, the base
+          # branch; the script fetches a merge group's base commit, and a
+          # push's previous commit when it is not the parent, itself.
+          fetch-depth: 2
+      - name: Which jobs does the change need?
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DISPATCH_BASE: ${{ inputs.base }}
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/ci-changes.sh
+
+  # ── Formatting, the changelog fragments and xtask's tests ──────────────────
+  # The fragment check and the tests build only xtask, which has no
+  # dependencies. On a pull request the fragment check sees the merge with
+  # the base, so a fragment under a milestone that was released after the
+  # pull request was written fails. xtask's tests run in `test` as well; here
+  # they also run for a change to the files they read outside xtask (the
+  # release group), which leaves the rest of the Rust jobs out.
+  # No job waits for this one (`needs: [fmt]`): a job behind `needs` joins
+  # the runner queue only once fmt is done, so when the runners are busy the
+  # long jobs would queue twice (#337).
   fmt:
     name: fmt
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.changelog != 'false' || needs.changes.outputs.release != 'false') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain (rust-toolchain.toml) (with rustfmt)
-        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           components: rustfmt
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
+      - name: Changelog fragments (docs/changes)
+        run: cargo xtask changelog --check
+      - name: cargo test -p xtask
+        run: cargo test -p xtask
 
-  # ── Clippy ─────────────────────────────────────────────────────────────────
+  # ── Clippy, and the sqlx offline-cache drift guard ─────────────────────────
+  # Both are check builds; the drift guard runs here rather than in `test`,
+  # whose build it shares nothing with (--all-features), to keep it off the
+  # longest job's path.
   clippy:
     name: clippy
     runs-on: ubuntu-latest
-    needs: [fmt]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain (rust-toolchain.toml) (with clippy)
-        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
-        with:
-          components: clippy
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-${{ hashFiles('rust-toolchain.toml') }}-
-      - name: cargo clippy --workspace --all-targets
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-  # ── Dependency advisories (RustSec) ────────────────────────────────────────
-  # Fails on any known vulnerability in Cargo.lock. Accepted advisories, each
-  # with a one-line rationale, live in .cargo/audit.toml. Reads only the
-  # lockfile (no build), so it is quick and needs no toolchain cache.
-  audit:
-    name: audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install cargo-audit (prebuilt, pinned)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-audit@0.22.2
-      - name: cargo audit
-        run: cargo audit
-
-  # ── Unit tests (no containers required) ────────────────────────────────────
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    needs: [fmt]
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
 
     services:
-      # Postgres is provisioned here so we can run `cargo sqlx prepare --check`
-      # against a live DB to catch drift between migrations/ and the committed
-      # .sqlx/ cache. Unit tests themselves use SQLX_OFFLINE=true.
+      # For `cargo sqlx prepare --check`: the migrations run against it, then
+      # the check verifies that the committed .sqlx/ cache matches the
+      # queries and schema. Pinned by digest; Dependabot does not see
+      # workflow images, so bump it with deploy/kubernetes/components/postgres.
       postgres:
-        image: postgres:17
+        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
         env:
           POSTGRES_DB: forge
           POSTGRES_USER: forge
@@ -117,36 +182,22 @@ jobs:
 
     env:
       DATABASE_URL: postgres://forge:forge@localhost:5432/forge
-      FORGE_DATABASE_URL: postgres://forge:forge@localhost:5432/forge
-      SQLX_OFFLINE: "true"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
-          df -h /
-      - name: Install Rust toolchain (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Install Rust toolchain (rust-toolchain.toml) (with clippy)
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-test-${{ hashFiles('rust-toolchain.toml') }}-
-      - name: cargo build --workspace
-        run: cargo build --workspace
-      - name: cargo test --workspace
-        # forge-e2e feature is intentionally excluded here — unit tests only.
-        run: cargo test --workspace
+          components: clippy
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - name: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # sqlx cache drift guard (A1). Runs migrations against the live Postgres
-      # service, then verifies the committed .sqlx/ dir matches the current
-      # queries + schema. SQLX_OFFLINE is unset here so the check talks to the DB.
+      # sqlx cache drift guard (A1). SQLX_OFFLINE is unset so the check talks
+      # to the database.
       - name: Install sqlx-cli (prebuilt, no source compile)
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
@@ -160,16 +211,122 @@ jobs:
           SQLX_OFFLINE: ""
         run: cargo sqlx prepare --check --workspace -- --all-targets --all-features
 
+  # ── Dependency advisories (RustSec) ────────────────────────────────────────
+  # Fails on any known vulnerability in Cargo.lock. Accepted advisories, each
+  # with a one-line rationale, live in .cargo/audit.toml. Reads only the
+  # lockfile (no build), so it is quick and needs no toolchain cache. Runs
+  # only for a change to either file; an advisory published for a dependency
+  # no change touches fails the daily run of audit.yml instead.
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.audit != 'false' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cargo-audit (prebuilt, pinned)
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-audit@0.22.2
+      - name: cargo audit
+        run: cargo audit
+
+  # ── Format plugins as WebAssembly components (plugins/<id>/) ──────────────
+  # The plugins are workspace crates (fmt, clippy and their tests run with the
+  # workspace); this checks that each one also lints clean and builds as a
+  # component for wasm32-wasip2. The tests that load a component run in `test`.
+  plugins:
+    name: plugins
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (rust-toolchain.toml) (with clippy, wasm32-wasip2)
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+        with:
+          components: clippy
+          targets: wasm32-wasip2
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - name: cargo xtask plugins-check
+        run: cargo xtask plugins-check
+
+  # ── Unit + integration tests ───────────────────────────────────────────────
+  # The integration tests start their own Postgres, versitygw and Redis with
+  # testcontainers (the runner has a Docker daemon). There is no separate
+  # `cargo build --workspace`: `cargo test` builds with the dev-dependencies'
+  # features, so it would rebuild most of it (and clippy and the docker job
+  # already prove the workspace builds).
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+
+    env:
+      SQLX_OFFLINE: "true"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The hosted runner has ~80 GB free, plenty for target/; the cleanup
+      # (about a minute) runs only on a smaller disk.
+      - name: Free disk space (if short)
+        run: |
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          fi
+          df -h /
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+        with:
+          # The format-plugin tests build plugins/ as WebAssembly components.
+          targets: wasm32-wasip2
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - name: cargo test --workspace (test binaries in parallel)
+        id: tests
+        # forge-e2e feature is intentionally excluded here — unit tests only.
+        # test-parallel.sh runs the test binaries as many at a time as the
+        # runner has CPUs (#340), each through test-timings-runner.sh, which
+        # adds every test's duration to its result line and records it for
+        # the job summary below.
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.github/scripts/test-timings-runner.sh
+          FORGE_TEST_TIMINGS: ${{ runner.temp }}/test-timings
+        run: .github/scripts/test-parallel.sh --workspace
+      - name: Test timings (job summary)
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
+        continue-on-error: true
+        run: .github/scripts/test-timings-summary.sh "$RUNNER_TEMP/test-timings" >> "$GITHUB_STEP_SUMMARY"
+
   # ── Container image (build only; releases push from release.yml) ─────────
-  # Builds the production Dockerfile on every change so a broken image is
-  # caught before a release tag, not by it.
+  # Builds the production Dockerfile so a broken image is caught before a
+  # release tag, not by it, whenever a change touches what the image is built
+  # from (the image group, #338, #353 and #361), for a release commit and on
+  # manual runs without a `base`. clippy, test and web compile the Rust code
+  # and the SPA of every other change; one that breaks only the image (a
+  # release-only cfg, a file .dockerignore leaves out) fails in the next run
+  # that builds it, the release's at the latest.
   docker:
     name: docker
     runs-on: ubuntu-latest
-    needs: [fmt]
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.image != 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The BuildKit release.yml builds with (pinned by digest; keep in step),
+      # which pulls the Dockerfile's Docker Hub images through mirror.gcr.io.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Build image (no push)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -178,7 +335,60 @@ jobs:
           build-args: |
             FORGE_GIT_SHA=${{ github.sha }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Written by pushes to the default branch only (see the note on
+          # build caches at the top).
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
+
+  # ── Kubernetes manifests (deploy/kubernetes) and Helm chart (deploy/helm) ──
+  # Checks that every image reference (Dockerfile, deploy/, the workflows) is
+  # pinned by digest; builds every overlay, and the base with each component;
+  # lints and renders the chart with each of its ci/ values files; and
+  # validates the output against the Kubernetes schemas. kustomize and
+  # kubeconform are pinned by checksum, Helm is built from its pinned Go
+  # module (verified by the Go checksum database; keep HELM_VERSION in step
+  # with release.yml). Runs when the change touches any of these (the
+  # kubernetes group, #353).
+  kubernetes:
+    name: kubernetes
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.kubernetes != 'false' }}
+    env:
+      KUSTOMIZE_VERSION: "5.7.1"
+      KUSTOMIZE_SHA256: ea375e7372f9aa029129d4b2d16c66b7750b7f1213c4f66f910d981c895818d8
+      KUBECONFORM_VERSION: "0.7.0"
+      KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+      HELM_VERSION: v4.3.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Image references are pinned by digest
+        run: .github/scripts/image-pin-check.sh
+      - name: Install kustomize + kubeconform
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o kustomize.tgz "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o kubeconform.tgz "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          printf '%s  kustomize.tgz\n%s  kubeconform.tgz\n' "$KUSTOMIZE_SHA256" "$KUBECONFORM_SHA256" | sha256sum -c -
+          tar -xzf kustomize.tgz -C bin kustomize
+          tar -xzf kubeconform.tgz -C bin kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build and validate
+        run: .github/scripts/kustomize-check.sh 1.33.0
+      - name: Cache the Helm build
+        id: helm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/helm
+          key: ${{ runner.os }}-helm-${{ env.HELM_VERSION }}
+      - name: Install Helm
+        run: |
+          if [ "${{ steps.helm-cache.outputs.cache-hit }}" != "true" ]; then
+            GOBIN="$RUNNER_TEMP/helm" GOTOOLCHAIN=auto GOFLAGS=-trimpath go install "helm.sh/helm/v4/cmd/helm@${HELM_VERSION}"
+          fi
+          echo "$RUNNER_TEMP/helm" >> "$GITHUB_PATH"
+      - name: Lint, render and validate the Helm chart
+        run: .github/scripts/helm-check.sh 1.33.0
 
   # ── Frontend (TanStack Router SPA in web/) ─────────────────────────────────
   # Typecheck + unit/component tests (Vitest + RTL) + production build. The build
@@ -187,6 +397,8 @@ jobs:
   web:
     name: web
     runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.web != 'false' }}
     defaults:
       run:
         working-directory: web
@@ -222,8 +434,138 @@ jobs:
           path: web/dist
           retention-days: 1
 
+  # ── Docker / OCI registry e2e (real clients against a live server) ─────────
+  # Boots forge-server and drives the registry with the OCI distribution-spec
+  # conformance suite, docker (buildx multi-arch), crane, a proxy of a
+  # registry:2 upstream, a group, and cosign signatures/attestations through
+  # the referrers API (.github/scripts/oci-e2e.sh). Runs on pull requests too:
+  # it is the only check that the registry still speaks to real clients.
+  oci-e2e:
+    name: oci-e2e
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        env:
+          POSTGRES_DB: forge
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: forge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SQLX_OFFLINE: "true"
+      CRANE_VERSION: v0.20.2
+      COSIGN_VERSION: v3.0.2
+      COSIGN_SHA256: 46dbdcb5467a3dfec2526923d0b3365e40c8d9dc00ec23d5aca3437449e8cbfd
+      # The upstream registry the proxy repository caches, and buildx's
+      # BuildKit, pinned like every other image.
+      FORGE_E2E_UPSTREAM_IMAGE: mirror.gcr.io/library/registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+      FORGE_E2E_BUILDKIT_IMAGE: mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # oci-e2e and web-e2e build the same debug forge-server.
+          shared-key: forge-server
+          save-if: ${{ github.event_name == 'push' }}
+      - name: Install crane and cosign
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          # crane: built by `go install`, so the Go checksum database verifies it.
+          GOBIN="$RUNNER_TEMP/bin" GOTOOLCHAIN=auto GOFLAGS=-trimpath \
+            go install "github.com/google/go-containerregistry/cmd/crane@${CRANE_VERSION}"
+          curl -sSfL -o "$RUNNER_TEMP/bin/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          echo "${COSIGN_SHA256}  $RUNNER_TEMP/bin/cosign" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/cosign"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Start the S3 gateway and pull the upstream registry image
+        run: |
+          docker run -d --name forge-e2e-s3 -p 7070:7070 \
+            mirror.gcr.io/versity/versitygw:v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f \
+            --port :7070 --access forge-e2e-key --secret forge-e2e-secret posix /tmp
+          docker pull "$FORGE_E2E_UPSTREAM_IMAGE"
+      - name: cargo build -p forge-server
+        run: cargo build -p forge-server --bin forge-server
+      - name: Registry e2e (conformance, docker, crane, proxy, group, cosign)
+        env:
+          GOTOOLCHAIN: auto
+        run: .github/scripts/oci-e2e.sh target/debug/forge-server oci-e2e-results
+      - name: Upload the conformance report and server log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oci-e2e-results
+          path: oci-e2e-results
+          retention-days: 7
+
+  # ── Raw repositories e2e (curl against a live server) ──────────────────────
+  # Boots forge-server and drives raw repositories with curl: uploads with a
+  # token, ranges and resumed downloads, checksum sidecars, the deployment
+  # policy, path traversal, a proxy of a mock upstream that redirects to a
+  # second host, a group, and the pdfium example (a proxy of a GitHub release
+  # asset and a hosted re-packaged copy) (.github/scripts/raw-e2e.sh).
+  raw-e2e:
+    name: raw-e2e
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        env:
+          POSTGRES_DB: forge
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: forge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U forge -d forge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # raw-e2e, oci-e2e and web-e2e build the same debug forge-server.
+          shared-key: forge-server
+          save-if: false
+      - name: Start the S3 gateway
+        run: |
+          docker run -d --name forge-e2e-s3 -p 7070:7070 \
+            mirror.gcr.io/versity/versitygw:v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f \
+            --port :7070 --access forge-e2e-key --secret forge-e2e-secret posix /tmp
+      - name: cargo build -p forge-server
+        run: cargo build -p forge-server --bin forge-server
+      - name: Raw e2e with curl (hosted, ranges, sidecars, traversal, proxy, group, pdfium)
+        run: .github/scripts/raw-e2e.sh target/debug/forge-server raw-e2e-results
+      - name: Upload the server and upstream logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: raw-e2e-results
+          path: raw-e2e-results
+          retention-days: 7
+
   # ── E2E / integration tests (forge-e2e crate, testcontainers) ──────────────
-  # The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis)
+  # The forge-e2e harness boots its OWN Postgres + versitygw (+ Redis, and a
+  # versitygw with its IAM/STS service for the S3 web identity scenarios)
   # containers via testcontainers — the ubuntu-latest runner ships a working
   # Docker daemon, so no `services:` are needed. Gated behind the `forge-e2e`
   # feature. The optional dotnet smoke test runs because actions/setup-dotnet
@@ -231,62 +573,87 @@ jobs:
   e2e:
     name: e2e
     runs-on: ubuntu-latest
-    # Only run on pushes to main/master; skipping on every PR keeps CI fast.
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    # Skipped on pull requests to keep them fast (a skipped job passes a
+    # required check); runs in the merge queue and on main/master when the
+    # change touches Rust, so a change that breaks it never lands. release.yml
+    # refuses a tag unless this and web-e2e passed on its commit.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && needs.changes.outputs.rust != 'false' }}
 
     env:
       SQLX_OFFLINE: "true"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free disk space
+      # The hosted runner has ~80 GB free, plenty for target/; the cleanup
+      # (about a minute) runs only on a smaller disk.
+      - name: Free disk space (if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          fi
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
       - name: Install .NET SDK (for the optional dotnet smoke test)
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: "8.0.x"
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust-toolchain.toml') }}-
+          save-if: ${{ github.event_name == 'push' }}
 
       # Pre-pull the images the testcontainers harness uses (deterministic).
+      # By tag, not digest: the harness names them by tag in its code
+      # (crates/e2e), so a digest here would not decide what it runs
+      # (.github/scripts/image-pin-check.sh leaves `docker pull` alone).
       - name: Pre-pull container images
         run: |
-          docker pull postgres:17
-          docker pull versity/versitygw:v1.4.1
-          docker pull redis:5.0
+          docker pull mirror.gcr.io/library/postgres:17
+          docker pull mirror.gcr.io/versity/versitygw:v1.4.1
+          docker pull mirror.gcr.io/versity/versitygw:v1.9.0
+          docker pull mirror.gcr.io/library/redis:5.0
+          docker pull mirror.gcr.io/sonatype/nexus3:3.70.1
 
       - name: Run e2e tests (forge-e2e feature)
-        run: cargo test --workspace --features forge-e2e
+        id: tests
+        # The forge-e2e crate alone (as `cargo xtask e2e`): the test job of
+        # the same merge group or push runs the rest of the workspace (#341).
+        # Per-test timings for the job summary, as in the test job.
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/.github/scripts/test-timings-runner.sh
+          FORGE_TEST_TIMINGS: ${{ runner.temp }}/test-timings
+        run: cargo test -p forge-e2e --features forge-e2e
+      - name: Test timings (job summary)
+        if: ${{ !cancelled() && steps.tests.outcome != 'skipped' }}
+        continue-on-error: true
+        run: .github/scripts/test-timings-summary.sh "$RUNNER_TEMP/test-timings" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Frontend e2e (Playwright drives the Rust server serving the built UI) ────
   # Boots Postgres + versitygw via docker compose, builds the SPA + server, and
-  # runs the browser specs. Default-branch only (slow; needs Docker + browsers).
+  # runs the browser specs. Like e2e, only in the merge queue and on the
+  # default branch, when the change touches Rust or web/ (slow; needs Docker +
+  # browsers).
   web-e2e:
     name: web-e2e
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && (needs.changes.outputs.rust != 'false' || needs.changes.outputs.web != 'false') }}
     env:
       SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Free disk space
+      # The hosted runner has ~80 GB free, plenty for target/; the cleanup
+      # (about a minute) runs only on a smaller disk.
+      - name: Free disk space (if short)
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+          fi
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
       - name: Setup pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
@@ -298,20 +665,17 @@ jobs:
           node-version: "22"
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
-      - name: Cache cargo registry + build artefacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Cache cargo registry + dependency builds
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-web-e2e-${{ hashFiles('rust-toolchain.toml') }}-
+          # oci-e2e and web-e2e build the same debug forge-server.
+          shared-key: forge-server
+          save-if: ${{ github.event_name == 'push' }}
+      # By tag, like the e2e job: web/e2e names them by tag.
       - name: Pre-pull container images
         run: |
-          docker pull postgres:17
-          docker pull versity/versitygw:v1.4.1
+          docker pull mirror.gcr.io/library/postgres:17
+          docker pull mirror.gcr.io/versity/versitygw:v1.4.1
       - name: Install deps (frozen lockfile)
         run: pnpm install --frozen-lockfile
         working-directory: web

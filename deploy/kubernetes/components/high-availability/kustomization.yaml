@@ -1,0 +1,19 @@
+# Two Forge instances spread over nodes, with a PodDisruptionBudget so a node
+# drain keeps one serving. Instances coordinate through PostgreSQL; give them
+# a shared Valkey too (../valkey, or FORGE_REDIS__URL in the forge-env Secret),
+# or caches and invalidations converge only by TTL.
+#
+# Every instance opens up to database.max_connections (default 20): keep
+# replicas × that below PostgreSQL's max_connections.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: forge
+
+resources:
+  - poddisruptionbudget.yaml
+
+patches:
+  - path: deployment-patch.yaml

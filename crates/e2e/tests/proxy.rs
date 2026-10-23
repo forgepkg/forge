@@ -2,7 +2,7 @@
 //! package-delay hidden→visible, genuine upstream-404 negative caching (and a
 //! planted marker not hiding a later release), verified upstream manifests and
 //! upstream registration metadata, driven through the full HTTP stack against
-//! an in-process mock upstream feed (spec §9). Gated behind `forge-e2e`.
+//! an in-process mock upstream feed. Gated behind `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 
@@ -119,7 +119,7 @@ async fn cache_on_demand_fetches_upstream_once() {
 ///
 /// The `proxy_cached_version` row lock is held only for the short state-decision
 /// and finalize transactions, never across the upstream fetch / CAS PUT
-/// (Addendum A7 — never hold a DB tx across a network/S3 call). The singleflight
+/// (no DB transaction is ever held across a network/S3 call). The singleflight
 /// is therefore *best-effort*: under contention more than one caller may fetch
 /// from upstream, but the CAS is content-addressed and the finalize tx re-checks
 /// `downloaded`, so the writers converge on identical state — a single cached
@@ -292,6 +292,7 @@ async fn upstream_metadata_is_served_before_download() {
     assert!(nuspec.contains("<id>Meta.Lib</id>"), "{nuspec}");
     assert_eq!(mock.nuspec_hits(), 1);
 
+    mock.set_published("Meta.Lib", "1.0.0", "2026-01-01T00:00:00+00:00");
     let resp = get_v3(&srv, "px-meta", "registration/meta.lib/index.json").await;
     assert_eq!(resp.status(), 200);
     let reg: Value = resp.json().await.unwrap();

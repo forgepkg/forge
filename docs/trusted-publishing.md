@@ -5,6 +5,16 @@ of a stored NuGet API key. The token is validated against the configured
 issuer's discovery document and JWKS, matched against explicit claim rules, and
 mapped to an ordinary Forge RBAC role. No user or browser session is created.
 
+A job uses its token in one of two ways:
+
+- **Token exchange (recommended).** The job sends the token once to
+  `POST /api/v2/token` and gets a short-lived workload API key back, exactly as
+  nuget.org's trusted publishing works. It publishes with
+  `dotnet nuget push --api-key <key>` and restores with the key as the Basic
+  password of the username `oidc`. Each token is redeemed once.
+- **Direct token.** The job presents the token itself on every request, as the
+  Basic password (username `oidc`), the `X-NuGet-ApiKey` or a Bearer token.
+
 The implementation supports workload-only discovery documents containing just
 `issuer` and `jwks_uri`, including GitHub Actions. Interactive OIDC login keeps
 its stricter discovery requirements and remains a separate realm kind.
@@ -48,16 +58,10 @@ Positive signature-verification results may be cached only when the token has a
 digest, and its TTL is the smaller of `positive_cache_seconds` and the remaining
 time to `exp`. Claim rules and role lookup still run for every request.
 
-This is a direct-token flow. A valid token can be reused for the multiple HTTP
+In the direct-token flow a valid token can be reused for the multiple HTTP
 requests a native NuGet operation makes until `exp`; `jti` is not a one-time
-consumption ledger. Keep provider token lifetimes short and set
+consumption ledger there. Keep provider token lifetimes short and set
 `max_token_age_seconds` accordingly.
-
-Relative to the OpenSSF Trusted Publishers guidance, Forge supports the direct
-OIDC-token authentication variant. It does **not** yet implement the recommended
-exchange for a repository-controlled short-lived publish token or consumed-`jti`
-replay prevention. Treat this as compatible direct-token support, not full
-alignment with the recommended token-exchange profile.
 
 Every successful workload publish — and every unlist, relist and delete a
 workload performs — appends a `trusted_publish_audit` row (its `action` says
@@ -78,6 +82,80 @@ tamper-evident or external transparency log: a database owner can still disable
 the trigger or truncate the table, and the row does not capture every provider
 claim, matched rule, source commit, or ref. An admin API/UI and externally
 verifiable attestations are follow-up work.
+
+### Token exchange
+
+`POST /api/v2/token` takes the job's token as `Authorization: Bearer`, with
+nuget.org's request body (optional here):
+
+```http
+POST /api/v2/token
+Authorization: Bearer <CI OIDC token>
+Content-Type: application/json
+
+{"username": "oidc", "tokenType": "ApiKey"}
+```
+
+```json
+{"apiKey": "forge_wif.…", "expires": "2026-10-21T15:04:05Z"}
+```
+
+- The token passes every check above (the realm's claim rules pick the role),
+  and it must carry a `jti`: each `(issuer, jti)` is exchanged **once**, so a
+  token captured from a job log cannot be redeemed again. A second exchange,
+  a token without `jti`, an API key in place of a token and a token of an
+  issuer no realm trusts all get 401.
+- `username` is optional and, when given, must be `oidc`; `tokenType`, when
+  given, must be `ApiKey` (400 otherwise). Identity comes only from the
+  verified token, never from the body.
+- The key lives for the realm's `api_key_ttl_seconds` (60 to 86400, default
+  3600, nuget.org's lifetime), independent of the token's own `exp`. That
+  matters for GitLab, whose token lives as long as the job's timeout.
+- The key authorizes as the token's workload: same realm, role and audit
+  identity. A publish with it records the exchanged token's subject and `jti`
+  digests and its `iat` in `trusted_publish_audit`.
+- **Revocation:** a key is honoured only while its realm is enabled with the
+  very configuration it was issued under. Editing anything in the realm
+  (rules, audiences, lifetimes, its name) or disabling or deleting it revokes
+  all of its outstanding keys on the next request, for good: enabling the
+  realm again or reverting the edit does not bring them back. A key issued
+  under the new configuration works on every instance at once, also on
+  those that have not reloaded the realm yet. Deleting the role leaves the
+  key without rights. A registry token `docker login -u oidc` got with a
+  key stops working within 10 seconds of the same changes, and expires no
+  later than the key. Forge stores only SHA-256 digests of the key, subject
+  and `jti` (table `workload_api_key`), and the auth reaper deletes a row
+  once the key has expired and the token has been expired for 15 minutes
+  (the most clock skew a realm accepts, plus a margin). Whether a token has
+  expired is decided on the database's clock, so an instance whose clock
+  runs behind it cannot redeem a token twice.
+- A key starts with `forge_wif.`, which no user API token can (user tokens
+  are URL-safe base64, without a dot). Secret scanners can match
+  `forge_wif\.[A-Za-z0-9_-]{43}`.
+- The key is accepted as `X-NuGet-ApiKey` (`--api-key`, or the `NUGET_API_KEY`
+  environment variable from .NET SDK 10.0.300), as a Bearer token, or as the
+  Basic password of the username `oidc`.
+
+This implements the exchange profile of the OpenSSF Trusted Publishers
+guidance: a short-lived, repository-controlled publish credential and
+one-time `jti` redemption. The direct-token flow stays available for clients
+that cannot run an exchange step.
+
+### The `oidc` username
+
+`oidc` is a reserved account name. HTTP Basic with the username `oidc` (in
+any case) is only ever checked as a workload credential: the password must be
+a token of an enabled `workload_identity` realm or a workload API key. Anything
+else, including a user's API token, is refused with 401, and it never reaches
+the password realms, so it is never forwarded to a credential-forwarding
+upstream. No account can be created, bootstrapped or provisioned under the name
+(it is no UPN either), and the browser login refuses it.
+
+1.0.0 reserved no names: an account named `oidc` from 1.0.0 needs renaming,
+as the 1.1.0 upgrade notes in `CHANGELOG.md` describe.
+
+Other Basic usernames still work with a direct token, as before. Prefer `oidc`:
+it is the one name that can never mean an account.
 
 ## GitHub Actions
 
@@ -119,8 +197,54 @@ triggers you did not intend.
 ```
 
 The workflow needs only read access to the checkout plus permission to request
-an OIDC token. Request the exact audience configured above and pass the returned
-token as the NuGet API key:
+an OIDC token. The official `NuGet/login` action requests it with the audience
+configured above and exchanges it at Forge's token endpoint. Push to the hosted
+repository's publish URL with `--no-service-endpoint`: the client then sends a
+single `PUT` carrying the key, without first fetching the private service
+index, so no source credentials are needed for the push.
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+steps:
+  - uses: actions/checkout@v4
+  - uses: actions/setup-dotnet@v4
+
+  - name: Exchange the OIDC token for a Forge API key
+    uses: NuGet/login@v1
+    id: forge
+    with:
+      user: oidc
+      audience: https://forge.example.com
+      token-service-url: https://forge.example.com/api/v2/token
+
+  - name: Restore and build
+    shell: bash
+    env:
+      # `forge` is the repository's nuget.config source (no credentials in it).
+      NuGetPackageSourceCredentials_forge: Username=oidc;Password=${{ steps.forge.outputs.NUGET_API_KEY }}
+    run: |
+      dotnet restore
+      dotnet pack -c Release -o artifacts --no-restore
+
+  - name: Publish
+    shell: bash
+    run: >-
+      dotnet nuget push "artifacts/*.nupkg"
+      --source https://forge.example.com/v3/releases/package
+      --no-service-endpoint
+      --api-key "${{ steps.forge.outputs.NUGET_API_KEY }}"
+```
+
+`NuGetPackageSourceCredentials_<name>` applies to the source of that name in
+`nuget.config`; the name must be a valid environment-variable name (no `-`),
+and NuGet ignores a malformed value without a message.
+
+#### Without the exchange
+
+Pass the token itself as the NuGet API key and the source password:
 
 ```yaml
 permissions:
@@ -188,7 +312,7 @@ refs or a protected environment for release jobs:
   "issuer": "https://gitlab.com",
   "allowed_audiences": ["https://forge.example.com"],
   "clock_skew_seconds": 60,
-  "max_token_age_seconds": 3600,
+  "max_token_age_seconds": 39600,
   "positive_cache_seconds": 60,
   "rules": [
     {
@@ -203,7 +327,38 @@ refs or a protected environment for release jobs:
 }
 ```
 
-Ask GitLab to mint an ID token with that exact audience:
+GitLab gives an ID token the job's timeout as its lifetime, so
+`max_token_age_seconds` must be at least the longest timeout of a job that
+publishes. The default, 39600 (11 hours), covers jobs up to 11 hours; set a
+lower value when your release jobs are shorter. The exchanged key lives for the
+realm's `api_key_ttl_seconds` instead, whatever the job's timeout.
+
+Ask GitLab to mint an ID token with that exact audience, exchange it, and push
+to the publish URL with `--no-service-endpoint` (see GitHub Actions above):
+
+```yaml
+publish:
+  id_tokens:
+    FORGE_ID_TOKEN:
+      aud: https://forge.example.com
+  script:
+    - >-
+      export NUGET_API_KEY="$(curl --fail --silent --show-error
+      -X POST https://forge.example.com/api/v2/token
+      -H "Authorization: Bearer $FORGE_ID_TOKEN"
+      -H 'Content-Type: application/json'
+      -d '{"username":"oidc","tokenType":"ApiKey"}' | jq -r .apiKey)"
+    - export NuGetPackageSourceCredentials_forge="Username=oidc;Password=$NUGET_API_KEY"
+    - dotnet restore
+    - dotnet pack -c Release -o artifacts --no-restore
+    - >-
+      dotnet nuget push "artifacts/*.nupkg"
+      --source https://forge.example.com/v3/releases/package
+      --no-service-endpoint
+      --api-key "$NUGET_API_KEY"
+```
+
+#### Without the exchange
 
 ```yaml
 publish:
@@ -237,9 +392,10 @@ publish:
 See GitLab's [ID-token authentication reference](https://docs.gitlab.com/ci/secrets/id_token_authentication/)
 for provider claim semantics.
 
-The temporary Basic source is intentional. The .NET NuGet client resolves the
-service index before it sends the push API key, and `--api-key` is not attached
-to that initial GET. Supplying the same short-lived OIDC token as the source
+In the direct-token examples the temporary Basic source is intentional. The
+.NET NuGet client resolves the service index before it sends the push API key,
+and `--api-key` is not attached to that initial GET (pushing to the publish URL
+with `--no-service-endpoint`, as the exchange examples do, skips that GET). Supplying the same short-lived OIDC token as the source
 password authenticates both phases; the cleanup step removes it even after a
 failed push. The examples use a job-unique, mode-0600 config rather than the
 runner's default/global NuGet.Config, so concurrent jobs cannot reuse it and
@@ -275,5 +431,16 @@ metadata according to the configured anonymous policy.
   so this does not force signing-key revocation to be fetched on every request.
   The positive verdict cache itself never extends past its configured TTL or
   token expiry.
-- Treat a token as a bearer credential until `exp`: mask it in CI logs and do
-  not persist it as an artifact, cache entry, or repository secret.
+- When the issuer's discovery document or JWKS cannot be fetched (a timeout,
+  a refused connection, a 5xx) and is not cached yet, a workload token
+  cannot be checked: the exchange, the feeds and `/v2/token` answer 503 with
+  `Retry-After` rather than 401, so clients that retry do. This happens on a
+  cold cache only: after a restart, on a new replica, or when the JWKS cache
+  expires (hourly by default) during the issuer's outage.
+- Treat a token as a bearer credential until `exp`, and a workload key until
+  its `expires`: mask both in CI logs and do not persist them as an artifact,
+  cache entry, or repository secret. Exchange right before restoring or
+  publishing; a key outlives the job only up to `api_key_ttl_seconds`, so
+  lower it when your jobs are short.
+- To revoke every outstanding workload key of a realm at once, edit or disable
+  the realm; the keys stay revoked when you enable it again.

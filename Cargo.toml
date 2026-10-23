@@ -6,18 +6,22 @@ members = [
     "crates/cache",
     "crates/core",
     "crates/crypto",
-    "crates/format-nuget",
+    "crates/plugin-api",
+    "crates/plugin",
+    "crates/format-oci",
     "crates/server",
     "crates/e2e",
+    "plugins/helm",
+    "plugins/nuget",
     "xtask",
 ]
 
 # One version for the whole product: every crate inherits it, so a release
 # bumps it here once (and `web/package.json` to match).
 [workspace.package]
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.99"
 # AGPL v3 or the envisia license, at the user's choice (see README → License).
 license = "AGPL-3.0-only OR LicenseRef-envisia"
 publish = false
@@ -59,15 +63,37 @@ aws-sdk-s3 = { version = "1.85", default-features = false, features = [
     "rt-tokio",
 ] }
 aws-config = { version = "1.8" }
+# Short-lived S3 credentials (`s3.credentials = "web_identity"`): STS
+# AssumeRoleWithWebIdentity against AWS or an S3-compatible STS endpoint.
+# `default-features = false` for the same reason as `aws-sdk-s3` above (the
+# SDK's `rustls` feature is the legacy connector); the call is unsigned, so
+# no `sigv4a` either.
+aws-sdk-sts = { version = "1.114", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-credential-types = { version = "1.2" }
 
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "form", "system-proxy"] }
 
+# Outgoing email (Admin → Settings → Email): SMTP submission over rustls,
+# verified against the system roots like reqwest (the platform verifier),
+# with the workspace's aws-lc-rs provider.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "builder",
+    "hostname",
+    "tokio1-rustls",
+    "rustls-platform-verifier",
+    "aws-lc-rs",
+] }
+
 # In-memory cache
 moka = { version = "0.12", features = ["future"] }
 
-# Glob matching for RBAC content selectors (slice 12.4): compile a GlobSet once
-# per selector and match lowercased package names. Audited, standard choice.
+# Glob matching for RBAC content selectors: compile a GlobSet once per
+# selector and match lowercased package names. Audited, standard choice.
 globset = { version = "0.4" }
 
 # Redis (optional)
@@ -105,19 +131,19 @@ argon2 = { version = "0.6" }
 # Constant-time comparison
 subtle = { version = "2.6" }
 
-# AEAD ciphers for secret encryption at rest (slice 12.5). AES-256-GCM is the
-# default (hardware-accelerated, KMS-friendly); XChaCha20-Poly1305 is the
-# opt-in alternative whose 192-bit extended nonce makes pure-random nonces
+# AEAD ciphers for secret encryption at rest. AES-256-GCM is the default
+# (hardware-accelerated, KMS-friendly); XChaCha20-Poly1305 is the opt-in
+# alternative whose 192-bit extended nonce makes pure-random nonces
 # collision-safe without any per-key counter state. `zeroize` scrubs the
 # expanded key schedule (AES round keys, GHASH/ChaCha state) when a cipher
-# instance is dropped; without it only our own key buffers were wiped.
+# instance is dropped; without it only our own key buffers would be wiped.
 aes-gcm = { version = "0.11", features = ["zeroize"] }
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 
-# Scrub unwrapped key bytes / transient plaintext from memory on drop (12.5).
+# Scrub unwrapped key bytes / transient plaintext from memory on drop.
 zeroize = { version = "1.8" }
 
-# Secret wrappers that redact Debug/Display and zeroize on drop (12.5): the
+# Secret wrappers that redact Debug/Display and zeroize on drop: the
 # plaintext-secret type handed to callers so it can never leak into logs.
 secrecy = { version = "0.10" }
 
@@ -139,16 +165,61 @@ async-trait = { version = "0.1" }
 # Base64 (RFC 4648 standard alphabet)
 base64 = { version = "0.23" }
 
-# JWT decode/verify (OIDC ID-token signature + claim validation, slice 12.2).
-# We use `jsonwebtoken` (not the heavier `openidconnect`) for Phase 2: it gives
-# explicit control over the signing-key (RSA n/e from JWKS), the algorithm
-# allowlist (reject `alg: none`/HMAC), and the iss/aud/exp leeway — and it slots
-# cleanly behind the existing SSRF `guarded_client` + `forge-cache` rather than
-# bringing its own HTTP-client abstraction.
+# JWT decode/verify (OIDC ID-token signature + claim validation).
+# We use `jsonwebtoken` (not the heavier `openidconnect`): it gives explicit
+# control over the signing-key (RSA n/e from JWKS), the algorithm allowlist
+# (reject `alg: none`/HMAC), and the iss/aud/exp leeway — and it slots cleanly
+# behind our own outbound metadata client (`outbound_metadata_client`) +
+# `forge-cache` rather than bringing its own HTTP-client abstraction.
 jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+
+# RSA key generation and signing for the client assertions forge issues
+# itself (forge_core::oidc::assertion): the crypto backend `jsonwebtoken`
+# already links, used directly where `jsonwebtoken` has no key generation.
+aws-lc-rs = { version = "1.18" }
 
 # Temp files
 tempfile = { version = "3" }
 
 # Date/time (shared with forge-db's model types)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# WebAssembly runtime for format plugins (forge-plugin). 49 is a regular
+# Wasmtime release: it gets security fixes for two months, an LTS release
+# (every 12th, like 48) for two years, so the next major is due within two
+# months. wasmtime-wasi of a major builds only against the wasmtime of the same
+# major: bump both together (Dependabot groups them). Only what the host uses:
+# the component model compiled by Cranelift, no WAT text parser, no GC
+# proposals, no profiling or debugging.
+wasmtime = { version = "49.0.4", default-features = false, features = [
+    "runtime",
+    "cranelift",
+    "component-model",
+    "std",
+    "parallel-compilation",
+] }
+# WASI 0.2 for plugin components (a Rust guest's std imports it); the host
+# grants no filesystem, network or environment.
+wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
+
+# Format plugins built as WebAssembly components (`cargo xtask plugins`):
+# small, self-contained `.wasm` files.
+[profile.plugin]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# Tests build unoptimized, yet the mock IdPs generate RSA keys and every test
+# server hashes its bootstrap admin password: ~30x (RSA-2048 keygen, ~3 s) and
+# ~15x (Argon2 default, ~0.3 s) slower than optimized. Optimize just those
+# dependencies; the workspace crates stay fast to build and debug.
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

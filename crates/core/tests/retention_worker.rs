@@ -1,15 +1,15 @@
 //! Integration tests for the retention **worker**
-//! (`forge_core::retention::worker::RetentionWorker`, slice 12.1 Phase 5).
+//! (`forge_core::retention::worker::RetentionWorker`).
 //!
 //! A single tick on a seeded, armed repository must prune per policy via the
-//! slice-1 outbox (decref + `blob_outbox`, never a direct S3 delete); a second
+//! blob outbox (decref + `blob_outbox`, never a direct S3 delete); a second
 //! tick is a no-op (idempotent — the deleted components are no longer
 //! candidates); the ledger's `next_run_at` advances by the per-repo interval;
 //! the lease is cleared and the run summary recorded. A `dry_run_only` policy
 //! audits but mutates nothing. A shared blob across two versions is not enqueued
 //! until its last reference is removed.
 //!
-//! Postgres only — the apply path produces outbox rows the slice-1 worker
+//! Postgres only — the apply path produces outbox rows the outbox worker
 //! drains; no S3 needed here.
 
 mod common;
@@ -20,17 +20,29 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use forge_core::repo::NoopCacheInvalidator;
-use forge_core::retention::worker::{RetentionConfig, RetentionWorker, WorkerError};
+use forge_core::retention::worker::{
+    RetentionConfig, RetentionWorker, WorkerError, MIN_RUN_INTERVAL_SECONDS,
+};
 use forge_core::{Format, FormatError, ParsedUpload, ReadSeek};
 use forge_db::asset_dao::{self, NewAsset};
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::{blob_dao, proxy_dao, retention_dao};
-use forge_nuget::NugetFormat;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{pool, unique};
+
+/// NuGet, the built-in format plugin, as the `Format` the repository code
+/// works with.
+fn nuget() -> forge_plugin::PluginFormat {
+    let plugin = forge_plugin::Plugin::builtin(
+        forge_format_nuget::PLUGIN_TOML,
+        forge_format_nuget::Nuget::default(),
+    )
+    .expect("plugins/nuget/plugin.toml is valid");
+    forge_plugin::PluginFormat::new(&plugin)
+}
 
 fn config() -> RetentionConfig {
     RetentionConfig {
@@ -44,7 +56,7 @@ fn config() -> RetentionConfig {
 fn worker(pool: &PgPool, config: RetentionConfig) -> RetentionWorker {
     RetentionWorker::new(
         pool.clone(),
-        Arc::new(NugetFormat::new()),
+        Arc::new(nuget()) as Arc<dyn Format>,
         Arc::new(NoopCacheInvalidator),
         config,
     )
@@ -272,6 +284,109 @@ async fn next_run_at_respects_per_repo_min_interval() {
         run.next_run_at >= before + Duration::seconds(86_400 - 5),
         "next_run_at should honor the larger per-repo interval"
     );
+}
+
+#[tokio::test]
+async fn zero_run_intervals_do_not_rerun_back_to_back() {
+    // Regression (#25): with `default_run_interval = 0` and a policy's
+    // `min_run_interval_seconds: 0` (both accepted), a finished run was due
+    // again at once, so the drain loop re-claimed the repository forever,
+    // a dry-run policy appending audit rows on every pass. Runs are now at
+    // least MIN_RUN_INTERVAL_SECONDS apart; a failed run is retried no sooner.
+    let pool = pool().await;
+    let n = unique();
+    let w = worker(
+        &pool,
+        RetentionConfig {
+            default_run_interval: Duration::zero(),
+            ..config()
+        },
+    );
+    let floor = Duration::seconds(MIN_RUN_INTERVAL_SECONDS - 5);
+
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw0-{n}")))
+        .await
+        .unwrap();
+    let sha = seed_blob(&pool, n * 100, 1).await;
+    seed_component(&pool, repo.id, "lib", "1.0.0", &sha, 100).await;
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "dry_run_only": true,
+            "min_run_interval_seconds": 0,
+            "rules": [{ "id": "r", "action": "hard_delete", "criteria": { "older_than_days": 30 } }]
+        }),
+    )
+    .await;
+
+    let before = Utc::now();
+    let summary = w.tick_repo(repo.id).await.unwrap().expect("first run");
+    assert_eq!(summary.deleted, 1);
+    let run = retention_dao::get_run(&pool, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(run.next_run_at >= before + floor, "{:?}", run.next_run_at);
+    // The drain loop's next tick finds the repository not due and stops.
+    assert!(
+        w.tick_repo(repo.id).await.unwrap().is_none(),
+        "the repository must not be due again right away"
+    );
+    assert_eq!(audit_total(&pool, repo.id).await, 1);
+
+    // A run that fails is rescheduled by the default interval alone.
+    let broken =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw0b-{n}")))
+            .await
+            .unwrap();
+    arm(
+        &pool,
+        broken.id,
+        &json!({ "version": 1, "min_run_interval_seconds": 0, "rules": [] }),
+    )
+    .await;
+    let before = Utc::now();
+    w.tick_repo(broken.id)
+        .await
+        .expect_err("an invalid policy fails the run");
+    let run = retention_dao::get_run(&pool, broken.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(run.next_run_at >= before + floor, "{:?}", run.next_run_at);
+    assert!(w.tick_repo(broken.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_run_survives_an_app_clock_behind_the_database() {
+    // #27: with this process's clock an hour behind the database's, the
+    // run's lease was computed from the process clock and so had already
+    // run out by the database's `now()`: every apply step failed its lease
+    // fence, and retention on the instance never removed anything.
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rwc-{n}")))
+        .await
+        .unwrap();
+    let sha = seed_blob(&pool, n * 100, 1).await;
+    seed_component(&pool, repo.id, "lib", "1.0.0", &sha, 100).await;
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{ "id": "r", "action": "hard_delete", "criteria": { "older_than_days": 30 } }]
+        }),
+    )
+    .await;
+
+    let skewed = common::pool_with_clock_ahead().await;
+    let w = worker(&skewed, config()); // a 60 s lease, an hour of skew
+    let summary = w.tick_repo(repo.id).await.unwrap().unwrap();
+    assert_eq!(summary.deleted, 1);
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
 }
 
 #[tokio::test]
@@ -596,7 +711,7 @@ async fn panicking_run_is_recorded_as_failed_and_its_heartbeat_stops() {
 
     let w = RetentionWorker::new(
         pool.clone(),
-        Arc::new(PanickingFormat),
+        Arc::new(PanickingFormat) as Arc<dyn Format>,
         Arc::new(NoopCacheInvalidator),
         short_lease_config(),
     );
@@ -704,27 +819,24 @@ async fn claim_and_evaluate(
     tx.commit().await.unwrap();
     let policy: forge_core::retention::model::RetentionPolicy =
         serde_json::from_value(claimed.policy.clone()).unwrap();
-    let candidates: Vec<_> = retention_dao::load_candidate_components(pool, repo_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(
-            |(r, _)| forge_core::retention::evaluate::CandidateComponent {
-                component_id: r.component_id,
-                package_name: r.name,
-                version: r.version,
-                listed: r.listed,
-                created_at: r.created_at,
-                last_downloaded_at: r.last_downloaded_at,
-            },
-        )
-        .collect();
-    let decisions = forge_core::retention::evaluate::evaluate(
-        &NugetFormat::default(),
-        Utc::now(),
-        &policy,
-        &candidates,
-    );
+    let candidates: Vec<_> =
+        retention_dao::load_candidate_components(pool, repo_id, forge_core::repo::NUPKG_ASSET_PATH)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(
+                |(r, _)| forge_core::retention::evaluate::CandidateComponent {
+                    component_id: r.component_id,
+                    package_name: r.name,
+                    version: r.version,
+                    listed: r.listed,
+                    created_at: r.created_at,
+                    last_downloaded_at: r.last_downloaded_at,
+                },
+            )
+            .collect();
+    let decisions =
+        forge_core::retention::evaluate::evaluate(&nuget(), Utc::now(), &policy, &candidates);
     (claimed, run_id, policy, decisions)
 }
 
@@ -735,7 +847,7 @@ async fn apply_fenced(
     policy: &forge_core::retention::model::RetentionPolicy,
     decisions: &[forge_core::retention::evaluate::Decision],
 ) -> retention_dao::RunSummary {
-    let format = NugetFormat::default();
+    let format = nuget();
     let ctx = forge_core::retention::apply::ApplyContext {
         pool,
         repository_id: claimed.repository_id,
