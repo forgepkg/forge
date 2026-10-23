@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM raw_file WHERE repository_id = $1 AND path = $2 RETURNING blob_sha256",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "blob_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "blob_sha256"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f0f94de729bed69bfa3524dbabadb247f14cebe72e14b27a477767acbc2f7967"
+}

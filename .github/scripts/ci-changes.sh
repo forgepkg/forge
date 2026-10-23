@@ -42,7 +42,7 @@ CI=.github/workflows/ci.yml
 declare -A CI_JOB_GROUP=(
     [fmt]=changelog [clippy]=rust [audit]=audit [plugins]=rust [test]=rust
     [docker]=image [kubernetes]=kubernetes [web]=web [oci-e2e]=rust
-    [e2e]=rust [web-e2e]=web
+    [raw-e2e]=rust [e2e]=rust [web-e2e]=web
 )
 
 # Rust: the workspace, what its build and tests read from outside the crates
@@ -55,6 +55,7 @@ RUST=(
     web/index.html docker/forge.docker.toml
     .github/scripts/test-parallel.sh .github/scripts/test-timings-runner.sh
     .github/scripts/test-timings-summary.sh .github/scripts/oci-e2e.sh
+    .github/scripts/raw-e2e.sh
 )
 # fmt's second check: the changelog fragments.
 CHANGELOG=(docs/changes)

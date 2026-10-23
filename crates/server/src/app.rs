@@ -122,12 +122,18 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let admin = admin_router(state.clone());
 
-    let mounts: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
-        state
-            .formats
-            .mounts()
-            .into_iter()
-            .map(str::to_string)
+    let mounts: Vec<String> = state
+        .formats
+        .mounts()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    // Raw repositories are feeds too, for the response policy.
+    let feeds: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
+        mounts
+            .iter()
+            .cloned()
+            .chain([crate::raw::MOUNT.to_string()])
             .collect(),
     );
     let mut app = Router::new()
@@ -155,7 +161,11 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // the host) itself.
         .route("/v2", any(crate::registry::registry))
         .route("/v2/", any(crate::registry::registry))
-        .route("/v2/{*rest}", any(crate::registry::registry));
+        .route("/v2/{*rest}", any(crate::registry::registry))
+        // Raw (generic file) repositories: `/raw/<repo>/<path>`.
+        .route("/raw/{repo}", any(crate::raw::handle))
+        .route("/raw/{repo}/", any(crate::raw::handle))
+        .route("/raw/{repo}/{*rest}", any(crate::raw::handle));
     // Repositories, each served by its format's plugin under the format's
     // mount (`crate::plugins`; NuGet at `/v3`). `any` covers
     // GET/HEAD/PUT/POST/DELETE; the dispatcher authorizes per method.
@@ -187,7 +197,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Caching and transport policy for every response, including the
         // ones the principal middleware answers itself.
         .layer(axum::middleware::from_fn(move |req, next| {
-            response_policy(hsts, mounts.clone(), public_base_url.clone(), req, next)
+            response_policy(hsts, feeds.clone(), public_base_url.clone(), req, next)
         }));
     // A stalled upload or a handler that never answers must not pin a task
     // and a connection forever (header reads are bounded in `serve`).

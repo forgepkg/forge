@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE raw_file\n        SET checked_at = now(),\n            upstream_etag = coalesce($2, upstream_etag),\n            upstream_last_modified = coalesce($3, upstream_last_modified)\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8e4edb618d797a846d3d93cef4c59417df8eb274e94a3bb5fe48b11f720b33d4"
+}

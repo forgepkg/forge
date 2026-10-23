@@ -1,0 +1,209 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT f.id, f.repository_id, f.path, f.blob_sha256, b.s3_key, f.size,\n               f.content_type, f.sha512_base64, f.sha1, f.md5, f.created_at,\n               f.updated_at, f.last_downloaded_at, f.upstream_etag,\n               f.upstream_last_modified, f.checked_at\n        FROM raw_file f\n        JOIN blob b ON b.sha256 = f.blob_sha256\n        WHERE f.repository_id = $1 AND f.path = $2\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "path",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "path"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "blob_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "blob_sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "s3_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob",
+            "name": "s3_key"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "content_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "sha512_base64",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "sha512_base64"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "sha1",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "sha1"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "md5",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "md5"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "last_downloaded_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "last_downloaded_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "upstream_etag",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "upstream_etag"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "upstream_last_modified",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "upstream_last_modified"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "checked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "checked_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "22abc387b0e4e8f6a15b06634ca8c4361fe031cda1a2247530cdf863d234a5c3"
+}
