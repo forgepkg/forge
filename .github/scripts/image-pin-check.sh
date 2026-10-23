@@ -5,14 +5,14 @@
 #   - deploy/: every `image:` of the Kubernetes manifests, kustomize
 #     `images:` overrides, and the Helm values' image maps (a
 #     `tag: <tag>@sha256:…`, the form Dependabot updates, or a `digest:`);
-#   - the workflows (.github/workflows, .gitlab-ci.yml): job, service and
-#     container images, `docker://` actions, BuildKit (setup-buildx-action
-#     must pass `driver-opts: image=…@sha256:…`; its default is a floating
-#     tag) and the SBOM generator (`sbom: true` runs a floating one; name it
-#     with `generator=…@sha256:…`).
+#   - the workflows (.github/workflows): service and container images,
+#     `docker://` actions, BuildKit (setup-buildx-action must pass
+#     `driver-opts: image=…@sha256:…`; its default is a floating tag) and
+#     the SBOM generator (`sbom: true` runs a floating one; name it with
+#     `generator=…@sha256:…`).
 #
 # Exempt on purpose:
-#   - Forge's own image, ghcr.io/schmitch/forge, which the release pins
+#   - Forge's own image, ghcr.io/forgepkg/forge, which the release pins
 #     itself: the published chart pulls it by the digest the release workflow
 #     signed (Chart.yaml annotation forge.envisia.de/image-digest), and the
 #     Kubernetes base names the release's tag, which the release workflow
@@ -35,7 +35,7 @@ function pinned(ref,   at) {
   return at > 0 && length(ref) - at - 7 == 64 && substr(ref, at + 8) ~ /^[0-9a-f]+$/
 }
 function own(ref) {
-  return ref ~ /^ghcr\.io\/schmitch\/forge([:@]|$)/
+  return ref ~ /^ghcr\.io\/forgepkg\/forge([:@]|$)/
 }
 function check(ref, what, file, line) {
   if (ref == "" || own(ref) || pinned(ref)) return
@@ -59,7 +59,6 @@ while IFS= read -r file; do dockerfiles+=("$file"); done < <(
 yamls=()
 while IFS= read -r file; do yamls+=("$file"); done < <(
   find deploy .github/workflows -type f \( -name '*.yaml' -o -name '*.yml' \) | sort
-  if [ -f .gitlab-ci.yml ]; then echo .gitlab-ci.yml; fi
 )
 
 failed=0
@@ -104,16 +103,13 @@ END { exit bad }
 # YAML: `image:` values and maps, kustomize `images:` entries; in the
 # workflows also `container:` values, docker:// actions, BuildKit and SBOM
 # generator options, setup-buildx-action without a pinned BuildKit and
-# `sbom: true`; in .gitlab-ci.yml also service `name:`s.
+# `sbom: true`.
 awk "$common"'
 function finish_map(   ref) {
-  if (map_line) {
-    ref = map_name
-    if (map_repo != "") {
-      ref = (map_registry != "" ? map_registry "/" : "") map_repo
-      if (map_tag != "") ref = ref ":" map_tag
-      if (map_digest != "") ref = ref "@" map_digest
-    }
+  if (map_line && map_repo != "") {
+    ref = (map_registry != "" ? map_registry "/" : "") map_repo
+    if (map_tag != "") ref = ref ":" map_tag
+    if (map_digest != "") ref = ref "@" map_digest
     check(ref, "image", file, map_line)
   }
   map_line = 0
@@ -137,7 +133,6 @@ FNR == 1 {
   images_col = -1
   file = FILENAME
   workflow = (file ~ /\.github\/workflows\//)
-  gitlab = (file ~ /(^|\/)\.gitlab-ci\.yml$/)
 }
 /^[ \t]*(#|$)/ { next }
 {
@@ -164,7 +159,6 @@ FNR == 1 {
       else if (key == "repository") map_repo = value
       else if (key == "tag") map_tag = value
       else if (key == "digest") map_digest = value
-      else if (key == "name") map_name = value
     }
   }
   if (images_col >= 0) {
@@ -175,13 +169,13 @@ FNR == 1 {
     else if (key == "digest") entry_digest = value
   }
 
-  # A map is a Helm values image (registry, repository, tag, digest) or a
-  # GitLab one (name); in a GitHub workflow `image:` is only ever a scalar
-  # (an empty one is a job named image).
+  # A map is a Helm values image (registry, repository, tag, digest); in a
+  # GitHub workflow `image:` is only ever a scalar (an empty one is a job
+  # named image).
   if (key == "image") {
     if (value == "" && !workflow) {
       map_line = FNR; map_col = col; map_child = -1
-      map_registry = map_repo = map_tag = map_digest = map_name = ""
+      map_registry = map_repo = map_tag = map_digest = ""
     } else if (value != "" && value !~ /\{\{/) {
       check(value, "image", file, FNR)
     }
@@ -189,8 +183,6 @@ FNR == 1 {
   if (key == "images" && value == "") images_col = col
   if (workflow && key == "container" && value != "" && value !~ /\$\{\{/)
     check(value, "container image", file, FNR)
-  if (gitlab && key == "name" && value ~ /^[a-z0-9][a-z0-9._\/-]*(:[A-Za-z0-9._-]+)?(@sha256:[0-9a-f]+)?$/ && value ~ /[:@]/)
-    check(value, "service image", file, FNR)
 
   if (workflow) {
     if (key == "uses" && value ~ /^docker\/setup-buildx-action@/) {

@@ -247,7 +247,7 @@ async fn stale_lease_is_reclaimed() {
     let repo_id = armed_hosted_repo(&pool, common::unique()).await;
     let now = Utc::now();
 
-    // Claim with a lease that's already expired relative to `later`.
+    // Claim with a lease that's already expired relative to the sweep below.
     let mut tx = pool.begin().await.unwrap();
     retention_dao::claim_next_due_repo(&mut tx, now, Duration::seconds(1), Some(repo_id))
         .await
@@ -255,8 +255,10 @@ async fn stale_lease_is_reclaimed() {
         .unwrap();
     tx.commit().await.unwrap();
 
-    let later = now + Duration::seconds(120);
-    let reclaimed = retention_dao::release_stale_leases(&pool, later)
+    // The sweep is not limited to this repository, and the other tests of
+    // this binary hold 60 s leases on the same database meanwhile: a cutoff
+    // just past this 1 s lease releases none of theirs (#345).
+    let reclaimed = retention_dao::release_stale_leases(&pool, now + Duration::seconds(2))
         .await
         .expect("reclaim");
     assert!(reclaimed >= 1);
@@ -269,6 +271,7 @@ async fn stale_lease_is_reclaimed() {
     assert!(run.locked_until.is_none());
 
     // After reclaim, a fresh claim can take it again.
+    let later = now + Duration::seconds(120);
     let mut tx = pool.begin().await.unwrap();
     let again =
         retention_dao::claim_next_due_repo(&mut tx, later, Duration::seconds(60), Some(repo_id))

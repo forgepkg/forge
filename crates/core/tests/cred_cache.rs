@@ -248,8 +248,8 @@ async fn a_rejection_lives_only_for_the_negative_ttl() {
 
 #[tokio::test]
 async fn a_peers_verdict_is_cached_only_for_what_its_row_has_left() {
-    // #17: instance B reads instance A's verdict shortly before its row
-    // expires. B must not then keep accepting the credential in memory for a
+    // #17: instance B reads instance A's verdict while its row is still
+    // valid. B must not then keep accepting the credential in memory for a
     // whole positive TTL of its own: past the row's expiry it re-validates.
     let pool = pool().await;
     let instance = |positive_ttl| {
@@ -261,7 +261,9 @@ async fn a_peers_verdict_is_cached_only_for_what_its_row_has_left() {
             Duration::from_secs(30),
         )
     };
-    let a = instance(Duration::from_millis(600));
+    // A's row lives 2 s: B reads it 400 ms in, with room to spare on a
+    // loaded machine (#347), and again 2.2 s in, past its expiry.
+    let a = instance(Duration::from_secs(2));
     let b = instance(Duration::from_secs(300));
     let user = format!("peer-ttl-{}", unique());
     let forwards = Arc::new(AtomicU32::new(0));
@@ -272,7 +274,7 @@ async fn a_peers_verdict_is_cached_only_for_what_its_row_has_left() {
     assert_eq!(b.check(PROVIDER, &user, "pw", forward()).await, Ok(true));
     assert_eq!(forwards.load(Ordering::SeqCst), 1, "B read A's verdict");
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(1800)).await;
     assert_eq!(b.check(PROVIDER, &user, "pw", forward()).await, Ok(true));
     assert_eq!(
         forwards.load(Ordering::SeqCst),

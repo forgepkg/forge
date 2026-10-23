@@ -102,6 +102,20 @@ ENV SQLX_OFFLINE=true
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo chef cook --release --locked --recipe-path recipe.json -p forge-server
+# Third-party notices for the crates compiled into forge-server
+# (docker/licenses/about.toml). They depend on the dependencies alone, so they
+# are rendered from the skeleton the cook leaves (every manifest and
+# Cargo.lock), before the sources come in: cached as long as the cook is, and
+# the same file as from the full tree. cargo-about reads the metadata of every
+# locked crate, so fetch those of the other platforms too; then it needs no
+# network (--frozen) and takes the license texts from the crates' sources.
+COPY docker/licenses/ docker/licenses/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo fetch --locked \
+    && mkdir /licenses \
+    && cargo about generate --frozen --fail -c docker/licenses/about.toml \
+       -m crates/server/Cargo.toml -o /licenses/THIRD-PARTY-RUST.txt \
+       docker/licenses/about.hbs
 # Now build the actual server binary. .sqlx/ and migrations/ come in with the
 # source copy (migrations/ is embedded into the binary via sqlx::migrate!).
 # `--locked`: the committed Cargo.lock is the release's dependency set.
@@ -115,30 +129,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo auditable build --release --locked -p forge-server \
     && cp target/release/forge-server /usr/local/bin/forge-server \
     && rm -rf target
-# Third-party notices for the crates compiled into forge-server
-# (docker/licenses/about.toml). cargo-about reads the metadata of every locked
-# crate, so fetch those of the other platforms too; then it needs no network
-# (--frozen) and takes the license texts from the crates' sources.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo fetch --locked \
-    && mkdir /licenses \
-    && cargo about generate --frozen --fail -c docker/licenses/about.toml \
-       -m crates/server/Cargo.toml -o /licenses/THIRD-PARTY-RUST.txt \
-       docker/licenses/about.hbs
 
 
 # ── Stage 3: slim runtime ─────────────────────────────────────────────────────
 # debian:bookworm-slim (glibc + libgcc that aws-lc-rs needs) plus ca-certificates
 # for outbound HTTPS (S3, OIDC discovery, credential-forwarding upstreams).
 FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
-# The image's version label. The release workflow passes the released version;
-# a local or CI build is not a release, so it says so instead of naming one.
-ARG FORGE_VERSION=0.0.0-dev
-ARG FORGE_GIT_SHA=unknown
-LABEL org.opencontainers.image.title="envisia-forge" \
-      org.opencontainers.image.description="Self-hosted NuGet, Docker / OCI and Helm registry (hosted, proxy and group repositories)" \
-      org.opencontainers.image.version="${FORGE_VERSION}" \
-      org.opencontainers.image.revision="${FORGE_GIT_SHA}"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -146,6 +142,17 @@ RUN apt-get update \
 # Run as an unprivileged user.
 RUN useradd --system --uid 10001 --user-group --no-create-home forge
 WORKDIR /app
+
+# The image's version label. The release workflow passes the released version;
+# a local or CI build is not a release, so it says so instead of naming one.
+# Declared after the RUN steps: BuildKit hands every build argument to each
+# RUN that follows it, so a new commit SHA would rebuild them.
+ARG FORGE_VERSION=0.0.0-dev
+ARG FORGE_GIT_SHA=unknown
+LABEL org.opencontainers.image.title="envisia-forge" \
+      org.opencontainers.image.description="Self-hosted NuGet, Docker / OCI and Helm registry (hosted, proxy and group repositories)" \
+      org.opencontainers.image.version="${FORGE_VERSION}" \
+      org.opencontainers.image.revision="${FORGE_GIT_SHA}"
 
 # The license (AGPL-3.0-only; see README.md for the alternative envisia
 # license) and the third-party notices of what the image redistributes.

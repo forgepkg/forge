@@ -34,5 +34,5 @@ configMapGenerator:
 # whose manifest names another version, so this base at ref vX.Y.Z always
 # deploys the X.Y.Z image.
 images:
-  - name: ghcr.io/schmitch/forge
+  - name: ghcr.io/forgepkg/forge
     newTag: 1.1.0
