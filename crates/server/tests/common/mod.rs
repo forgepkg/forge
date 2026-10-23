@@ -119,10 +119,30 @@ pub async fn pool() -> PgPool {
         let _guard = INIT_LOCK.lock().await;
         if MIGRATED.get().is_none() {
             forge_db::migrate(&pool).await.expect("migrate");
+            seed_auth_settings(&pool).await;
             MIGRATED.set(()).ok();
         }
     }
     pool
+}
+
+/// The auth settings every test database starts with: password Basic on
+/// (tests sign in over Basic), everything else at its default (anonymous
+/// access off). A test that needs others changes them on a database of its
+/// own ([`fresh_pool`], [`TestServer::set_auth_settings`]): the shared one
+/// serves every test of the binary at once.
+async fn seed_auth_settings(pool: &PgPool) {
+    let settings = forge_server::auth::AuthSettings {
+        allow_password_basic: true,
+        ..Default::default()
+    };
+    forge_db::authz_dao::set_setting(
+        pool,
+        forge_server::auth::AUTH_SETTINGS_KEY,
+        &serde_json::to_string(&settings).expect("settings serialize"),
+    )
+    .await
+    .expect("seed auth settings");
 }
 
 /// A migrated pool over a fresh, uniquely named database on the same Postgres
@@ -147,6 +167,7 @@ pub async fn fresh_pool() -> PgPool {
         .await
         .expect("connect fresh database");
     forge_db::migrate(&pool).await.expect("migrate");
+    seed_auth_settings(&pool).await;
     pool
 }
 
@@ -175,13 +196,12 @@ async fn blob_store() -> BlobStore {
 }
 
 /// A built TOML config string for the harness, parameterized by the bootstrap
-/// admin credentials and anonymous mode.
+/// admin credentials.
 fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
     let admin = opts
         .bootstrap_admin
         .as_ref()
         .map(|(u, p)| (u.as_str(), p.as_str()));
-    let anon = &opts.anonymous_mode;
     let web_assets_dir = opts.web_assets_dir.as_deref();
     let oidc_block = opts.oidc_block.as_deref();
     let crypto_block = opts.crypto_block.as_deref();
@@ -195,6 +215,7 @@ fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
         .as_deref()
         .unwrap_or("http://test.local");
     let server_extra = opts.server_extra.as_deref().unwrap_or("");
+    let auth_extra = opts.auth_extra.as_deref().unwrap_or("");
     let bootstrap = match admin {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
         None => String::new(),
@@ -223,8 +244,7 @@ force_path_style = true
 {s3_credentials}
 
 [auth]
-anonymous_mode = "{anon}"
-allow_password_basic = true
+{auth_extra}
 {bootstrap}
 
 [cache]
@@ -275,7 +295,6 @@ impl Drop for TestServer {
 /// Options for spinning up a test server.
 pub struct ServerOpts {
     pub bootstrap_admin: Option<(String, String)>,
-    pub anonymous_mode: String,
     pub spawn_workers: bool,
     /// When set, the static SPA is served from this directory; otherwise the
     /// web UI is disabled for the test.
@@ -292,6 +311,9 @@ pub struct ServerOpts {
     pub public_base_url: Option<String>,
     /// Extra raw TOML lines for the `[server]` section (e.g. timeouts).
     pub server_extra: Option<String>,
+    /// Extra raw TOML lines for the `[auth]` section (e.g.
+    /// `realm_cache_ttl_seconds`).
+    pub auth_extra: Option<String>,
     /// When set, this raw TOML is appended last (the `[plugins]` section, or
     /// any other), and the format plugins it lists are loaded.
     pub plugins_block: Option<String>,
@@ -308,13 +330,13 @@ impl Default for ServerOpts {
     fn default() -> Self {
         ServerOpts {
             bootstrap_admin: Some(("admin@example.com".into(), "adminpw".into())),
-            anonymous_mode: "off".into(),
             spawn_workers: false,
             web_assets_dir: None,
             oidc_block: None,
             crypto_block: None,
             public_base_url: None,
             server_extra: None,
+            auth_extra: None,
             plugins_block: None,
             extra_plugins: Vec::new(),
             s3_credentials: None,
@@ -484,6 +506,30 @@ impl BrowserSession {
 }
 
 impl TestServer {
+    /// Change the auth settings ([`forge_server::auth::AuthSettings`]) the
+    /// way `PUT /admin/settings/auth` does: the fields `update` names, for
+    /// this server at once. They are stored in the server's database, so
+    /// only a server with a database of its own ([`fresh_pool`]) may change
+    /// them: the shared one serves every test of the binary at once.
+    pub async fn set_auth_settings(
+        &self,
+        update: serde_json::Value,
+    ) -> forge_server::auth::AuthSettings {
+        let update: forge_server::auth::AuthSettingsUpdate =
+            serde_json::from_value(update).expect("an auth settings update");
+        let current = forge_server::auth::load_auth_settings(&self.pool)
+            .await
+            .expect("stored auth settings");
+        let next = update.apply_to(&current).expect("valid auth settings");
+        self.state
+            .auth_settings
+            .save(next)
+            .await
+            .expect("save auth settings")
+            .settings
+            .clone()
+    }
+
     /// Sign `username` in through `/auth/login` (password realms).
     pub async fn login(&self, username: &str, password: &str) -> BrowserSession {
         let resp = self

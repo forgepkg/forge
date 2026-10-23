@@ -270,7 +270,7 @@ async fn usernames_with_a_colon_are_refused() {
 }
 
 /// #317: every account is named by a UPN (`POST /admin/users` answers 400
-/// otherwise). An account from before 1.2 is renamed `<name>@example.com` at
+/// otherwise). An account from before 2.0 is renamed `<name>@example.com` at
 /// startup and signs in under that name, with its password and its tokens.
 #[tokio::test]
 async fn new_accounts_need_a_upn_and_old_ones_are_renamed() {
@@ -305,7 +305,7 @@ async fn new_accounts_need_a_upn_and_old_ones_are_renamed() {
             .is_none());
     }
 
-    // An account from before 1.2, in a database of its own (the rename
+    // An account from before 2.0, in a database of its own (the rename
     // touches every account), written around the DAO, which no longer
     // creates one.
     let pool = common::fresh_pool().await;
@@ -2821,17 +2821,18 @@ async fn repository_and_realm_bodies_reject_unknown_fields() {
 #[tokio::test]
 async fn anonymous_read_off_deletes_the_synthesized_grant() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
             )),
-            anonymous_mode: "all".into(),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
     let anon_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")

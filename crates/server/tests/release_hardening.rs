@@ -624,7 +624,7 @@ async fn the_bootstrap_admin_is_named_by_a_upn() {
     assert_eq!(user.username, upn.to_lowercase());
 }
 
-/// #317: the bootstrap admin of an install from before 1.2 is renamed with
+/// #317: the bootstrap admin of an install from before 2.0 is renamed with
 /// its "created once" marker (`admin` becomes `admin@example.com`, the new
 /// default), so it is found under its new name, and one deleted since is
 /// not created again under it.
@@ -632,7 +632,7 @@ async fn the_bootstrap_admin_is_named_by_a_upn() {
 async fn a_pre_upn_bootstrap_admin_is_renamed_with_its_marker() {
     let pool = common::fresh_pool().await;
     let marker = |name: &str| format!("{}:{name}", forge_server::app::BOOTSTRAP_ADMIN_CREATED_KEY);
-    // As a release before 1.2 left them: the default `admin`, and a `root`
+    // As a release before 2.0 left them: the default `admin`, and a `root`
     // an earlier config named, created and deleted since.
     let admin_id: i64 = sqlx::query_scalar(
         "INSERT INTO app_user (username, password_hash, active, auth_source) \

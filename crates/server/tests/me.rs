@@ -164,9 +164,8 @@ async fn me_unauthenticated_is_401() {
 #[tokio::test]
 async fn me_anonymous_is_401() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
-            anonymous_mode: "all".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -175,6 +174,8 @@ async fn me_anonymous_is_401() {
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let resp = srv
         .client()
         .get(format!("{}/admin/me", srv.base_url))

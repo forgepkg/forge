@@ -50,6 +50,7 @@ use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
 use super::issuer::{AssertionIssuer, RealmAssertion};
+use super::settings::AuthSettingsCache;
 use super::OidcRuntime;
 use crate::config::{ClientAuthentication, Config, OidcConfig};
 
@@ -120,7 +121,7 @@ pub struct CredForwardRealmConfig {
     /// sends a password there, so it must be https.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_http: bool,
-    /// Gone in 1.2: a credential-forwarding realm creates no accounts (an
+    /// Gone in 2.0: a credential-forwarding realm creates no accounts (an
     /// administrator creates each one, `POST /admin/users` with the realm).
     /// Accepted only as `false`, and never stored (migration 0041 removed it
     /// from stored rows).
@@ -163,8 +164,8 @@ impl std::fmt::Debug for CredForwardRealmConfig {
 
 /// `config` shape for an `oidc` realm. Mirrors the `[oidc]` block, minus what
 /// is derived: the redirect URL is always
-/// `{public_base_url}/auth/oidc/callback`, and session TTLs are global
-/// (`auth.session_*`).
+/// `{public_base_url}/auth/oidc/callback`, and the session lifetimes are auth
+/// settings ([`super::AuthSettings`]).
 ///
 /// `client_secret` is a **secret** (write-only / redacted), like `key_pepper`
 /// above. With `client_authentication = "federated_credential"` there is none:
@@ -578,9 +579,10 @@ pub struct RealmSnapshot {
     /// The password chain over the enabled password-capable realms (`local`,
     /// `credential_forwarding`), or `None` when none are enabled.
     pub chain: Option<Arc<Chain>>,
-    /// Whether the **wire** Basic password path is enabled: the config flag
-    /// `auth.allow_password_basic`, or any enabled credential-forwarding realm.
-    pub wire_password_enabled: bool,
+    /// Whether an enabled credential-forwarding realm was built. It turns the
+    /// **wire** Basic password path on by itself; otherwise the
+    /// `allow_password_basic` setting decides ([`super::AuthSettings`]).
+    pub forwards_credentials: bool,
     /// The (at most one — admin API invariant) enabled OIDC realm's runtime.
     pub oidc: Option<OidcRealmRuntime>,
     /// Enabled `workload_identity` (WIF) realms, each with its issuer-scoped
@@ -626,6 +628,9 @@ pub struct RealmAuth {
     pool: PgPool,
     cache: Cache,
     config: Arc<Config>,
+    /// The auth settings: whether passwords are accepted over HTTP Basic,
+    /// and the session service an OIDC login signs in with.
+    settings: Arc<AuthSettingsCache>,
     ttl: Duration,
     snapshot: tokio::sync::RwLock<Option<Arc<RealmSnapshot>>>,
     /// When [`RealmAuth::refreshed`] last rebuilt the snapshot.
@@ -649,12 +654,14 @@ pub struct RealmAuth {
 impl RealmAuth {
     /// Build the (empty) cache; the first `snapshot()` call populates it.
     /// A `federated_credential` OIDC realm signs its client assertions with
-    /// `assertion_issuer`.
+    /// `assertion_issuer`; `settings` say whether passwords are accepted over
+    /// HTTP Basic and own the session service OIDC logins use.
     pub fn new(
         pool: PgPool,
         cache: Cache,
         config: Arc<Config>,
         assertion_issuer: AssertionIssuer,
+        settings: Arc<AuthSettingsCache>,
     ) -> Self {
         let ttl = Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1));
         let forward_limits = Arc::new(ForwardLimits::new(
@@ -668,6 +675,7 @@ impl RealmAuth {
             pool,
             cache,
             config,
+            settings,
             ttl,
             snapshot: tokio::sync::RwLock::new(None),
             last_refresh: std::sync::Mutex::new(None),
@@ -852,7 +860,6 @@ impl RealmAuth {
         } else {
             Some(Arc::new(Chain::new(providers)))
         };
-        let wire_password_enabled = self.config.auth.allow_password_basic || has_cred_forward;
         workload_configured_issuers.sort();
         let workload_ambiguous_issuers = workload_configured_issuers
             .windows(2)
@@ -867,7 +874,7 @@ impl RealmAuth {
             built_at: Instant::now(),
             realms,
             chain,
-            wire_password_enabled,
+            forwards_credentials: has_cred_forward,
             oidc,
             workload,
             workload_configured_issuers,
@@ -956,7 +963,6 @@ impl RealmAuth {
         let cfg: OidcRealmConfig =
             serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
         let base = self.config.public_base_url();
-        let (idle, absolute) = self.config.session_ttls();
         let federated = cfg.federated_credential(self.assertion_issuer.issuer());
         let auth = match &federated {
             None => ClientAuth::Secret(cfg.client_secret.clone()),
@@ -1001,13 +1007,13 @@ impl RealmAuth {
             admin_claim: cfg.admin_claim.clone(),
             required_claims: cfg.required_claims.clone(),
             endpoint_hosts: cfg.endpoint_hosts.clone(),
-            session_idle_ttl_seconds: Some(idle),
-            session_absolute_ttl_seconds: Some(absolute),
+            removed_session_idle_ttl_seconds: None,
+            removed_session_absolute_ttl_seconds: None,
         };
         let runtime = OidcRuntime::build(
             &oidc_config,
             auth,
-            self.pool.clone(),
+            self.settings.sessions().clone(),
             &base,
             self.cache.clone(),
         )?;
@@ -1038,7 +1044,10 @@ impl RealmAuth {
 impl ChainSource for RealmAuth {
     async fn password_chain(&self) -> Result<Option<Arc<Chain>>, ChainUnavailable> {
         match self.snapshot().await {
-            Ok(s) if s.wire_password_enabled => Ok(s.chain.clone()),
+            Ok(s) if s.forwards_credentials => Ok(s.chain.clone()),
+            Ok(s) if self.settings.current().await.settings.allow_password_basic => {
+                Ok(s.chain.clone())
+            }
             Ok(_) => Ok(None),
             Err(e) => {
                 tracing::error!(error = %e, "realm snapshot failed; password path denied");

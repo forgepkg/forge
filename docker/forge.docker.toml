@@ -51,19 +51,11 @@ bucket = "forge"
 force_path_style = true
 
 [auth]
-# Secure default: no anonymous principal — every request must authenticate.
-# For public/anonymous reads set FORGE_AUTH__ANONYMOUS_MODE=all (or allowlist)
-# AND create the repo with anonymous_read=true.
-anonymous_mode = "off"
-# HTTP Basic with a USER PASSWORD on the API/feed (tokens in Basic are always
-# accepted). Off: the web UI signs in through /auth/login (not affected by this
-# flag), NuGet clients and scripts use API tokens, and an enabled
-# credential-forwarding realm turns the wire password path on by itself (for
-# the whole chain, so local users' passwords then work over Basic as well).
-# Set FORGE_AUTH__ALLOW_PASSWORD_BASIC=true only if a NuGet client must send a
-# local user's password over Basic. The admin API never accepts a password
-# over Basic: scripts sign in through /auth/login or use an admin-scoped token.
-allow_password_basic = false
+# Anonymous access and password Basic authentication are not set here: an
+# administrator sets them in the web UI (Admin → Settings), for every instance
+# at once. A new install starts with both off: every request authenticates,
+# NuGet clients and scripts use API tokens, and the web UI signs in through
+# /auth/login.
 
 # No [auth.bootstrap_admin] block: see the header (env only).
 

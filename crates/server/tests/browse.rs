@@ -255,9 +255,8 @@ async fn browse_detail_unknown_repo_404() {
 #[tokio::test]
 async fn browse_requires_login() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         ServerOpts {
-            anonymous_mode: "all".into(),
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
@@ -266,6 +265,8 @@ async fn browse_requires_login() {
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (u, p) = srv.admin_basic();
     let suffix = common::unique();
     let pub_repo = format!("pub{suffix}");

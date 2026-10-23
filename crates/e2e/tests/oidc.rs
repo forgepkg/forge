@@ -50,19 +50,6 @@ async fn start_oidc_stack(idp: &MockOidc) -> TestServer {
 /// The `[oidc]` block (standalone copy of `MockOidc::oidc_block`, so the same
 /// closure can be cloned for a peer with its own base URL).
 fn oidc_block(issuer: &str, client_id: &str, public_base_url: &str) -> String {
-    oidc_block_with_ttls(issuer, client_id, public_base_url, 28800, 604800)
-}
-
-/// Like [`oidc_block`] but with caller-chosen session TTLs, so a test can inject
-/// a deliberately tiny idle/absolute lifetime (a short-TTL session is rejected
-/// on the next request once it lapses).
-fn oidc_block_with_ttls(
-    issuer: &str,
-    client_id: &str,
-    public_base_url: &str,
-    idle_ttl_seconds: u64,
-    absolute_ttl_seconds: u64,
-) -> String {
     format!(
         r#"
 [oidc]
@@ -73,8 +60,6 @@ redirect_url = "{public_base_url}/auth/oidc/callback"
 allow_private_issuer = true
 admin_groups = ["forge-admins"]
 admin_claim = "roles"
-session_idle_ttl_seconds = {idle_ttl_seconds}
-session_absolute_ttl_seconds = {absolute_ttl_seconds}
 "#,
     )
 }
@@ -503,7 +488,8 @@ async fn short_ttl_session_is_rejected_after_it_lapses() {
     // second. (Absolute TTL is comfortably long so we isolate the idle path.)
     let srv = StackBuilder::default()
         .bootstrap_admin("root@example.com", "rootpw")
-        .with_oidc(move |base| oidc_block_with_ttls(&issuer, &client_id, base, 1, 604800))
+        .with_oidc(move |base| oidc_block(&issuer, &client_id, base))
+        .auth_settings(json!({"session_idle_ttl_seconds": 1}))
         .start()
         .await;
 

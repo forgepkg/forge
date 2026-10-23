@@ -125,8 +125,9 @@ Infrastructure (docker compose):
 
 Server:
   run           Run forge-server (expects `up` first; loads ./forge.toml).
-  seed          Demo data: anonymous-readable repo + token, push the sample fixture
-                (server must already be running). Honors FORGE_URL / ADMIN env vars.
+  seed          Demo data: anonymous reads + password Basic on, anonymous-readable repo
+                + token, push the sample fixture (server must already be running).
+                Honors FORGE_URL / ADMIN env vars.
 
 Web UI (TanStack Router SPA in web/):
   web           Build the SPA into web/dist/ (run before `run` for single-origin prod-like).
@@ -534,6 +535,18 @@ fn seed() -> Result<(), String> {
             body.to_string(),
         ])
     };
+
+    // A dev stack reads anonymously and takes passwords over Basic (so
+    // `curl -u admin@example.com:changeme` works on the feeds). These are
+    // auth settings now, set in the web UI (Admin → Settings) rather than in
+    // forge.toml.
+    println!("Opening anonymous reads and password Basic (Admin → Settings)…");
+    session(
+        "PUT",
+        "/admin/settings/auth",
+        r#"{"anonymous_mode":"all","allow_password_basic":true}"#,
+    )
+    .output_string()?;
 
     println!("Creating hosted repo 'nuget' (anonymous_read=true)…");
     // Repo creation: ignore failure (likely already exists).

@@ -1221,17 +1221,18 @@ async fn content_selector_patch_keeps_omitted_fields() {
 #[tokio::test]
 async fn signed_in_user_reads_anonymous_read_repo() {
     let srv = common::start_with(
-        common::pool().await,
+        common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
             )),
-            anonymous_mode: "all".into(),
             ..Default::default()
         },
     )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let (user_id, username, password) = make_user(&srv).await;

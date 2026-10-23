@@ -354,8 +354,8 @@ async fn login_lockout_is_429_with_retry_after() {
     let login = format!("{}/auth/login", srv.base_url);
     let username = format!("ghost{}@example.com", common::unique());
 
-    let max = srv.state.config.auth.login_max_failures;
-    for _ in 0..max {
+    let settings = srv.state.auth_settings.current().await.settings.clone();
+    for _ in 0..settings.login_max_failures {
         let resp = client
             .post(&login)
             .json(&json!({ "username": username, "password": "pw" }))
@@ -380,11 +380,7 @@ async fn login_lockout_is_429_with_retry_after() {
         .to_string();
     assert_eq!(
         retry_after,
-        srv.state
-            .config
-            .auth
-            .login_failure_window_seconds
-            .to_string()
+        settings.login_failure_window_seconds.to_string()
     );
 }
 
@@ -902,11 +898,16 @@ async fn unknown_names_pay_the_dummy_hash_while_the_forwarding_realm_is_broken()
     ));
     let issuer =
         forge_server::auth::AssertionIssuer::new(pool.clone(), None, config.public_base_url());
+    let settings = Arc::new(forge_server::auth::AuthSettingsCache::new(
+        pool.clone(),
+        std::time::Duration::from_secs(10),
+    ));
     let realms = forge_server::auth::RealmAuth::new(
         pool.clone(),
         forge_cache::Cache::l1_only(100),
         Arc::new(config),
         issuer,
+        settings,
     )
     .with_password_limiter(no_slot);
     let snapshot = realms.snapshot().await.expect("snapshot");
