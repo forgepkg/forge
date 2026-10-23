@@ -13,8 +13,8 @@
 # runs the jobs of what it changed (#361): with the merge queue, the same
 # commit already passed as a merge group. A push that sets a new workspace
 # version (a release commit) needs every group, since the release gate wants
-# every job of its run. A manual run given a base branch (DISPATCH_BASE;
-# stack.yml names the default branch for a pull request retargeted to it) is
+# every job of its run. A manual run given a base branch (DISPATCH_BASE, such
+# as the default branch for a stacked pull request's branch) is
 # compared with the commit it forked off that branch, as GitHub's compare API
 # finds it. Any other event (a manual run without a base), a commit that
 # cannot be fetched, or a diff that fails, needs every group.

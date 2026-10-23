@@ -96,8 +96,10 @@ the others, such as an urgent fix, gets a pull request of its own off `main`.
   targets `main`; a ruleset requires it on every branch but `main`, so the
   pull request cannot be merged into the branch below it. That pending
   status is not a CI failure to fix: it clears itself once the pull request
-  below has merged, and CI starts then. Never retarget a pull request to
-  `main` early to clear it.
+  below has merged, and CI starts then, on the merge of `main` that the
+  `Stack` workflow pushes to the branch (if none comes, merge `main` into
+  the branch yourself and push). Never retarget a pull request to `main`
+  early to clear it.
 
 ## Pull requests: ready for review, never drafts
 
