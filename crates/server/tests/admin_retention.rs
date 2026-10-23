@@ -667,3 +667,98 @@ async fn audit_lists_persisted_rows() {
     assert_eq!(items.len(), 1, "run_id filter narrows to one row");
     assert_eq!(items[0]["version"], json!("1.0.0"));
 }
+
+/// A draft `policy` in the preview body is evaluated in place of the stored
+/// one: validated like a `PUT` of it (422 for an unknown field, 400 for an
+/// invalid rule), evaluated even while disabled, and never stored. A
+/// misspelled `policy` is refused instead of previewing the stored policy.
+#[tokio::test]
+async fn preview_evaluates_a_draft_without_storing_it() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("retd{s}");
+    seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0", "1.1.0", "2.0.0"]).await;
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let preview = |body: Value| {
+        client
+            .post(format!("{url}/preview"))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+    let stored = || async {
+        let resp = client
+            .get(&url)
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        resp.json::<Value>().await.unwrap()
+    };
+
+    // A disabled draft, with nothing stored: evaluated all the same.
+    let mut draft = keep_one_policy();
+    draft["enabled"] = json!(false);
+    let resp = preview(json!({ "policy": draft })).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["counts"]["evaluated"], json!(3));
+    assert_eq!(body["counts"]["deleted"], json!(2), "{body}");
+    let view = stored().await;
+    assert!(view["policy"].is_null(), "a draft is not stored: {view}");
+    assert!(view["last_run"].is_null(), "a draft arms nothing: {view}");
+
+    // With a policy stored, the draft is evaluated in its place.
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": keep_one_policy() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut keep_two = keep_one_policy();
+    keep_two["rules"][0]["criteria"]["keep_last_n"] = json!(2);
+    let body: Value = preview(json!({ "policy": keep_two }))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["counts"]["deleted"], json!(1), "{body}");
+    assert_eq!(body["decisions"][0]["version"], json!("1.0.0"));
+    let body: Value = preview(json!({})).await.unwrap().json().await.unwrap();
+    assert_eq!(
+        body["counts"]["deleted"],
+        json!(2),
+        "the stored policy: {body}"
+    );
+    let view = stored().await;
+    assert_eq!(
+        view["policy"]["rules"][0]["criteria"]["keep_last_n"],
+        json!(1),
+        "the stored policy is unchanged: {view}"
+    );
+
+    // Refused like a PUT of it.
+    let mut misspelled = keep_one_policy();
+    misspelled["dry_run"] = json!(true);
+    let resp = preview(json!({ "policy": misspelled })).await.unwrap();
+    assert_eq!(resp.status(), 422);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("unknown field `dry_run`"), "{msg}");
+    let mut empty = keep_one_policy();
+    empty["rules"] = json!([]);
+    let resp = preview(json!({ "policy": empty })).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.starts_with("invalid retention policy"), "{msg}");
+
+    // A misspelled `policy` is not silently read as "the stored policy".
+    let resp = preview(json!({ "polciy": keep_one_policy() }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422, "{}", resp.text().await.unwrap());
+}

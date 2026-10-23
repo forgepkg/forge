@@ -270,7 +270,10 @@ A docker repository's retention policy (`PUT
 - `dry_run_only`, `enabled`, `min_run_interval_seconds`, preview, run and
   audit work as for NuGet repositories; audit rows carry the image as
   `package_name` and the tag or digest as `version`. Group repositories have
-  no policy of their own.
+  no policy of their own. The repository's **Retention** screen in the web UI
+  (Repositories → the repository → Retention) edits the rules, previews a
+  draft before it is saved (`POST …/retention/preview` with
+  `{"policy": {…}}`), runs the policy and lists the audit log.
 - A run applies its decisions image by image, in batches of up to 100. As
   for NuGet repositories, a batch first checks that the policy is still the
   one the run evaluated and that the run still holds its lease; otherwise
