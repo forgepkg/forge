@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, name, version, first_seen_at, last_downloaded_at\n        FROM proxy_cached_version\n        WHERE repository_id = $1 AND downloaded AND not_found = false\n        ORDER BY name, version\n        ",
+  "query": "\n        SELECT id, name, version, listed, first_seen_at, last_downloaded_at\n        FROM proxy_cached_version\n        WHERE repository_id = $1 AND downloaded AND not_found = false\n        ORDER BY name, version\n        ",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,17 @@
       },
       {
         "ordinal": 3,
+        "name": "listed",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "listed"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "first_seen_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -48,7 +59,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "last_downloaded_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -69,8 +80,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "85f2b3b4df860e356ed2be97519bca10e16011ca3ffb89f0e7e207fe1d81a62d"
+  "hash": "4f190f83e62fecccb98116a5673483a75eb4fafcbd283dffe9b24123c5959fee"
 }

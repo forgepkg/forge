@@ -1032,3 +1032,59 @@ async fn a_package_with_many_versions_is_applied_in_batches() {
     .unwrap();
     assert_eq!(audited, 229);
 }
+
+#[tokio::test]
+async fn proxy_eviction_keeps_the_newest_and_the_recently_pulled_versions() {
+    // #59: a proxy rule's protections keep a working set per package, so a
+    // quiet month no longer evicts every cached version of it.
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::proxy(format!("rwk-{n}")))
+        .await
+        .unwrap();
+    // Four cold cached versions; 1.0.0 was pulled last, 4.0.0 is the newest.
+    for (i, (version, pulled)) in [("1.0.0", 40), ("2.0.0", 60), ("3.0.0", 70), ("4.0.0", 80)]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, "lib", version, &sha, 100).await;
+        seed_cached_version(&pool, repo.id, version, true, Some(pulled)).await;
+    }
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{ "id": "evict", "action": "hard_delete", "scope": "proxy_cached",
+                        "criteria": { "not_pulled_for_days": 30,
+                                      "keep_last_n": 1, "keep_n_most_downloaded": 1 } }]
+        }),
+    )
+    .await;
+
+    let w = worker(&pool, config());
+    let summary = w.tick_repo(repo.id).await.unwrap().unwrap();
+    assert_eq!(summary.deleted, 2);
+    // The newest (4.0.0) and the one pulled last (1.0.0) stay cached.
+    for (version, kept) in [
+        ("1.0.0", true),
+        ("2.0.0", false),
+        ("3.0.0", false),
+        ("4.0.0", true),
+    ] {
+        assert_eq!(
+            component_exists(&pool, repo.id, "lib", version).await,
+            kept,
+            "{version}"
+        );
+        assert_eq!(
+            cached_row(&pool, repo.id, version)
+                .await
+                .unwrap()
+                .downloaded,
+            kept,
+            "{version}"
+        );
+    }
+}

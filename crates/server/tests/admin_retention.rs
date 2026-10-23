@@ -762,3 +762,92 @@ async fn preview_evaluates_a_draft_without_storing_it() {
         .unwrap();
     assert_eq!(resp.status(), 422, "{}", resp.text().await.unwrap());
 }
+
+/// #59: a proxy rule takes `keep_last_n` and `keep_n_most_downloaded`, and the
+/// preview evicts none of the cached versions they keep.
+#[tokio::test]
+async fn proxy_rules_keep_the_newest_and_recently_pulled_cached_versions() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("retk{s}");
+    let repo = repository_dao::insert_repository(&srv.pool, NewRepository::proxy(name.clone()))
+        .await
+        .unwrap();
+    // Four cold cached versions: 1.0.0 was pulled last, 4.0.0 is the newest.
+    for (version, pulled) in [("1.0.0", 40), ("2.0.0", 60), ("3.0.0", 70), ("4.0.0", 80)] {
+        forge_db::proxy_dao::upsert_cached_version(
+            &srv.pool,
+            forge_db::proxy_dao::NewProxyCachedVersion {
+                repository_id: repo.id,
+                name: "lib".into(),
+                version: version.into(),
+                listed: true,
+                downloaded: true,
+                not_found: false,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE proxy_cached_version \
+             SET first_seen_at = now() - interval '90 days', \
+                 last_downloaded_at = now() - make_interval(days => $3) \
+             WHERE repository_id = $1 AND version = $2",
+        )
+        .bind(repo.id)
+        .bind(version)
+        .bind(pulled)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    }
+    let policy = json!({
+        "version": 1,
+        "rules": [{ "id": "evict", "action": "hard_delete", "scope": "proxy_cached",
+                    "criteria": { "not_pulled_for_days": 30,
+                                  "keep_last_n": 1, "keep_n_most_downloaded": 1 } }]
+    });
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": policy }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    let body: Value = client
+        .post(format!("{url}/preview"))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["counts"]["evaluated"], json!(4), "{body}");
+    let mut evicted: Vec<&str> = body["proxy_decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["version"].as_str().unwrap())
+        .collect();
+    evicted.sort_unstable();
+    assert_eq!(evicted, ["2.0.0", "3.0.0"], "{body}");
+
+    // Zero protects nothing and is refused, as on hosted rules.
+    let mut zero = policy.clone();
+    zero["rules"][0]["criteria"]["keep_last_n"] = json!(0);
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": zero }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
