@@ -1076,48 +1076,45 @@ impl OutboxConfig {
 ///
 /// The worker runs on every instance, claims one due repository per tick via
 /// `FOR UPDATE SKIP LOCKED` + a lease, evaluates its policy, and applies
-/// decisions through the blob outbox. `default_run_interval` is the
-/// floor between automatic runs (a larger per-repo `min_run_interval_seconds`
-/// in the policy wins); `lease_seconds` is the crash-safe lease; `delete_grace`
-/// defaults to the outbox grace when unset and is the deferral before a
-/// dereferenced blob is S3-deleted.
+/// decisions through the blob outbox. What retention does is set in the web
+/// UI and kept in the database: each repository's policy, and whether runs
+/// happen and how long the audit log is kept
+/// ([`forge_db::retention_dao::RetentionSettings`], Admin → Retention). The
+/// keys that used to set those are refused ([`REMOVED_RETENTION_KEYS`]).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetentionConfig {
-    /// Run the background retention worker on this instance. When `false`, the
-    /// worker loop is not spawned (the admin REST surface — including manual
-    /// "run now" scheduling and dry-run preview — still works; scheduled rows
-    /// simply accumulate until an instance with the worker enabled drains them).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// How often each instance polls for a due repository (seconds).
     #[serde(default = "default_retention_poll")]
     pub poll_interval_seconds: u64,
-    /// Default floor between automatic runs per repo (seconds). The worker
-    /// never schedules runs less than 60 s apart, so `0` leaves the interval
-    /// to each policy's `min_run_interval_seconds`.
-    #[serde(default = "default_retention_run_interval")]
-    pub default_run_interval_seconds: i64,
     /// Crash-safe lease held while a repo is evaluated (seconds).
     #[serde(default = "default_retention_lease")]
     pub lease_seconds: i64,
-    /// How long `retention_audit` rows are kept before the reconciler loop
-    /// deletes them (default 90 days). Dry-run policies add a row per
-    /// matched version on every run, so the table grows without this. `0`
-    /// keeps every row. Pruning runs on every instance, also where the
-    /// worker is disabled.
-    #[serde(default = "default_retention_audit_retention")]
-    pub audit_retention_seconds: u64,
+    /// The keys [`REMOVED_RETENTION_KEYS`] names, kept only to refuse them:
+    /// `RetentionConfig` accepts unknown keys, so a leftover setting would
+    /// otherwise be ignored without a word.
+    #[serde(default, rename = "enabled")]
+    removed_enabled: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "audit_retention_seconds")]
+    removed_audit_retention_seconds: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "default_run_interval_seconds")]
+    removed_default_run_interval_seconds: Option<serde::de::IgnoredAny>,
 }
 
+/// The `[retention]` keys whose settings moved to the database (#429): whether
+/// retention runs and how long its audit log is kept are set in the web UI
+/// (Admin → Retention) and `/admin/settings/retention` for every instance,
+/// and each policy's own `min_run_interval_seconds` decides how often it runs.
+/// A configuration that still sets one is refused at startup.
+pub const REMOVED_RETENTION_KEYS: [&str; 3] = [
+    "enabled",
+    "audit_retention_seconds",
+    "default_run_interval_seconds",
+];
+
 impl Default for RetentionConfig {
+    /// Every key at its serde default, as for an empty `[retention]` table.
     fn default() -> Self {
-        RetentionConfig {
-            enabled: default_true(),
-            poll_interval_seconds: default_retention_poll(),
-            default_run_interval_seconds: default_retention_run_interval(),
-            lease_seconds: default_retention_lease(),
-            audit_retention_seconds: default_retention_audit_retention(),
-        }
+        serde_json::from_value(serde_json::json!({})).expect("every retention key has a default")
     }
 }
 
@@ -1126,23 +1123,21 @@ impl RetentionConfig {
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_interval_seconds)
     }
-    /// Default run interval as a chrono [`chrono::Duration`].
-    pub fn default_run_interval(&self) -> chrono::Duration {
-        chrono::Duration::seconds(self.default_run_interval_seconds)
-    }
     /// Lease as a chrono [`chrono::Duration`].
     pub fn lease(&self) -> chrono::Duration {
         chrono::Duration::seconds(self.lease_seconds)
     }
-    /// How long audit rows are kept, or `None` when pruning is disabled
-    /// (`audit_retention_seconds = 0`). Clamped to 100 years so the cutoff
-    /// arithmetic can never overflow.
-    pub fn audit_retention(&self) -> Option<chrono::Duration> {
-        const MAX_SECS: u64 = 100 * 365 * 24 * 3600;
-        match self.audit_retention_seconds {
-            0 => None,
-            secs => Some(chrono::Duration::seconds(secs.min(MAX_SECS) as i64)),
-        }
+    /// The keys of [`REMOVED_RETENTION_KEYS`] this configuration sets.
+    fn removed_keys(&self) -> Vec<&'static str> {
+        [
+            self.removed_enabled.is_some(),
+            self.removed_audit_retention_seconds.is_some(),
+            self.removed_default_run_interval_seconds.is_some(),
+        ]
+        .into_iter()
+        .zip(REMOVED_RETENTION_KEYS)
+        .filter_map(|(set, key)| set.then_some(key))
+        .collect()
     }
 }
 
@@ -1977,14 +1972,8 @@ fn default_outbox_processed_retention() -> u64 {
 fn default_retention_poll() -> u64 {
     30
 }
-fn default_retention_run_interval() -> i64 {
-    3600
-}
 fn default_retention_lease() -> i64 {
     300
-}
-fn default_retention_audit_retention() -> u64 {
-    90 * 24 * 3600
 }
 
 /// Dotted config keys holding **secret strings**. Their `FORGE_*` environment
@@ -2237,6 +2226,7 @@ impl Config {
         )
         .map_err(|e| ConfigError::Invalid(format!("server.allowed_hosts: {e}")))?;
         self.validate_removed_auth_keys()?;
+        self.validate_removed_retention_keys()?;
         // Eagerly validate the trusted CIDRs so a bad value fails at startup
         // rather than mid-request.
         self.trusted_proxy_cidrs()?;
@@ -2383,6 +2373,31 @@ impl Config {
             .map(|budget| budget.saturating_sub(self.nuget.max_nuspec_bytes))
     }
 
+    /// Refuse the `[retention]` keys whose settings moved to the database
+    /// ([`REMOVED_RETENTION_KEYS`]), naming where they are set now.
+    fn validate_removed_retention_keys(&self) -> Result<(), ConfigError> {
+        let keys: Vec<String> = self
+            .retention
+            .removed_keys()
+            .into_iter()
+            .map(|key| format!("retention.{key}"))
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "{} {} removed: whether retention runs and how long its audit log is kept are \
+             set in the web UI (Admin → Retention) or through /admin/settings/retention, \
+             for every instance at once, and each repository's policy sets how often it \
+             runs (min_run_interval_seconds). Remove {} from the configuration \
+             (FORGE_RETENTION__* variables included); an install starts with runs on and \
+             audit rows kept 90 days",
+            keys.join(", "),
+            if keys.len() == 1 { "was" } else { "were" },
+            if keys.len() == 1 { "it" } else { "them" },
+        )))
+    }
+
     /// Refuse the access and sign-in policy keys that moved to the database
     /// ([`REMOVED_AUTH_KEYS`], and the session lifetimes `[oidc]` once set),
     /// naming where they are set now.
@@ -2500,17 +2515,8 @@ impl Config {
             self.retention.poll_interval_seconds > 0,
         )?;
         positive("retention.lease_seconds", self.retention.lease_seconds > 0)?;
-        if self.retention.default_run_interval_seconds < 0 {
-            return Err(ConfigError::Invalid(
-                "retention.default_run_interval_seconds must not be negative".into(),
-            ));
-        }
         for (key, seconds) in [
             ("outbox.grace_seconds", self.outbox.grace_seconds),
-            (
-                "retention.default_run_interval_seconds",
-                self.retention.default_run_interval_seconds,
-            ),
             ("retention.lease_seconds", self.retention.lease_seconds),
         ] {
             at_most_100_years(key, i128::from(seconds))?;
@@ -3101,9 +3107,7 @@ mod tests {
         assert_eq!(cfg.cache.l1_max_capacity, 10_000);
         assert_eq!(cfg.outbox.batch_size, 100);
         assert_eq!(cfg.outbox.processed_retention_seconds, 7 * 24 * 3600);
-        assert!(cfg.retention.enabled);
         assert_eq!(cfg.retention.poll_interval_seconds, 30);
-        assert_eq!(cfg.retention.default_run_interval_seconds, 3600);
         assert_eq!(cfg.retention.lease_seconds, 300);
         // Web UI: enabled by default, served from `web/dist`.
         assert!(cfg.web.enabled);
@@ -3168,9 +3172,7 @@ mod tests {
             jail.set_env("FORGE_OUTBOX__BATCH_SIZE", "7");
             jail.set_env("FORGE_OUTBOX__GRACE_SECONDS", "60");
             jail.set_env("FORGE_OUTBOX__POLL_INTERVAL_SECONDS", "3");
-            jail.set_env("FORGE_RETENTION__ENABLED", "false");
             jail.set_env("FORGE_RETENTION__POLL_INTERVAL_SECONDS", "11");
-            jail.set_env("FORGE_RETENTION__DEFAULT_RUN_INTERVAL_SECONDS", "7200");
             jail.set_env("FORGE_RETENTION__LEASE_SECONDS", "120");
             jail.set_env("FORGE_WEB__ENABLED", "false");
             jail.set_env("FORGE_WEB__ASSETS_DIR", "/srv/ui");
@@ -3219,9 +3221,7 @@ mod tests {
             assert_eq!(cfg.outbox.batch_size, 7);
             assert_eq!(cfg.outbox.grace_seconds, 60);
             assert_eq!(cfg.outbox.poll_interval_seconds, 3);
-            assert!(!cfg.retention.enabled);
             assert_eq!(cfg.retention.poll_interval_seconds, 11);
-            assert_eq!(cfg.retention.default_run_interval_seconds, 7200);
             assert_eq!(cfg.retention.lease_seconds, 120);
             assert!(!cfg.web.enabled);
             assert_eq!(cfg.web.assets_dir, "/srv/ui");
@@ -3302,6 +3302,53 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// Whether retention runs and how long its audit log is kept are set in
+    /// the web UI: the old `[retention]` keys are refused, naming where they
+    /// went, whatever their value.
+    #[test]
+    fn removed_retention_keys_are_refused() {
+        for key in REMOVED_RETENTION_KEYS {
+            let toml = format!("{MINIMAL}\n[retention]\n{key} = 1\n");
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("retention.{key} was removed"))
+                    && msg.contains("Admin → Retention")
+                    && msg.contains("/admin/settings/retention"),
+                "{msg}"
+            );
+        }
+        let toml = format!("{MINIMAL}\n[retention]\nenabled = false\npoll_interval_seconds = 5\n");
+        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+        assert!(
+            err.to_string().contains("retention.enabled was removed"),
+            "{err}"
+        );
+        // The worker tuning stays.
+        let toml =
+            format!("{MINIMAL}\n[retention]\npoll_interval_seconds = 5\nlease_seconds = 60\n");
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(cfg.retention.poll_interval_seconds, 5);
+        assert_eq!(cfg.retention.lease_seconds, 60);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn removed_retention_variables_are_refused() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_RETENTION__ENABLED", "false");
+            jail.set_env("FORGE_RETENTION__AUDIT_RETENTION_SECONDS", "0");
+            let err = Config::load(Some(std::path::Path::new("forge.toml"))).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("retention.enabled, retention.audit_retention_seconds were removed"),
+                "{err}"
+            );
+            Ok(())
+        });
     }
 
     #[test]
@@ -4696,11 +4743,7 @@ mod tests {
     #[test]
     fn oversized_durations_fail_validation_naming_the_key() {
         let max = i64::MAX;
-        for (section, key) in [
-            ("outbox", "grace_seconds"),
-            ("retention", "default_run_interval_seconds"),
-            ("retention", "lease_seconds"),
-        ] {
+        for (section, key) in [("outbox", "grace_seconds"), ("retention", "lease_seconds")] {
             let toml = format!("{MINIMAL}\n[{section}]\n{key} = {max}\n");
             let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
             assert!(

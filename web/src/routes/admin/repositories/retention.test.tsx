@@ -163,7 +163,7 @@ interface Handlers {
 }
 
 function mockApi(h: Handlers) {
-  let view: RetentionView = h.view ?? { policy: null, last_run: null }
+  let view: RetentionView = h.view ?? { policy: null, last_run: null, runs_enabled: true }
   fetchMock.mockImplementation(
     (input: RequestInfo | URL, init?: RequestInit) => {
       const raw = typeof input === 'string' ? input : input.toString()
@@ -189,7 +189,7 @@ function mockApi(h: Handlers) {
             const resp = h.onPut(body)
             if (!resp.ok) return Promise.resolve(resp)
           }
-          view = { policy: body.policy, last_run: view.last_run ?? ledger }
+          view = { ...view, policy: body.policy, last_run: view.last_run ?? ledger }
           return Promise.resolve(json(view))
         }
         if (method === 'DELETE') {
@@ -266,7 +266,8 @@ describe('retention screen', () => {
       ],
     })
     const router = await renderAt('/manage/repositories/nuget-internal')
-    await userEvent.click(await screen.findByRole('link', { name: 'Retention' }))
+    const main = within(screen.getByRole('main'))
+    await userEvent.click(await main.findByRole('link', { name: 'Retention' }))
     await waitFor(() =>
       expect(router.state.location.pathname).toBe(
         '/manage/repositories/nuget-internal/retention',
@@ -281,7 +282,9 @@ describe('retention screen', () => {
       params: { repo: 'nuget-all' },
     })
     await screen.findByRole('heading', { level: 1, name: 'Edit nuget-all' })
-    expect(screen.queryByRole('link', { name: 'Retention' })).not.toBeInTheDocument()
+    expect(
+      within(screen.getByRole('main')).queryByRole('link', { name: 'Retention' }),
+    ).not.toBeInTheDocument()
 
     await router.navigate({
       to: '/manage/repositories/$repo/retention',
@@ -417,7 +420,7 @@ describe('retention screen', () => {
   it('edits a stored policy, removes it after asking, and shows its runs', async () => {
     mockApi({
       repositories: [repo({})],
-      view: { policy: storedPolicy, last_run: ledger },
+      view: { policy: storedPolicy, last_run: ledger, runs_enabled: true },
     })
     await renderAt('/manage/repositories/nuget-internal/retention')
     expect(await screen.findByRole('switch', { name: 'Dry run only' })).not.toBeChecked()
@@ -455,7 +458,7 @@ describe('retention screen', () => {
     )
     mockApi({
       repositories: [repo({})],
-      view: { policy: storedPolicy, last_run: ledger },
+      view: { policy: storedPolicy, last_run: ledger, runs_enabled: true },
       audit: (q) => {
         if (q.get('run_id')) return [auditRow({ id: 7, run_id: q.get('run_id')! })]
         if (q.get('before') === '151') {
@@ -493,6 +496,22 @@ describe('retention screen', () => {
         ),
       ).toBe(true),
     )
+  })
+
+  it('says when retention runs are switched off, and offers no Run now', async () => {
+    mockApi({
+      repositories: [repo({})],
+      view: { policy: storedPolicy, last_run: ledger, runs_enabled: false },
+    })
+    await renderAt('/manage/repositories/nuget-internal/retention')
+    const runs = within(await screen.findByRole('complementary', { name: 'Runs' }))
+    expect(runs.getByText('Retention runs are switched off')).toBeInTheDocument()
+    expect(runs.getByRole('link', { name: 'Admin → Retention' })).toHaveAttribute(
+      'href',
+      '/manage/settings/retention',
+    )
+    expect(runs.getByText('waiting: retention runs are off')).toBeInTheDocument()
+    expect(runs.getByRole('button', { name: 'Run now' })).toBeDisabled()
   })
 
   it('edits image rules on a docker repository', async () => {

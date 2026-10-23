@@ -11,7 +11,8 @@ import { httpClient } from '~/lib/httpClient'
  *    the body: checked like a `PUT` of it, evaluated even when disabled, and
  *    never stored.
  *  - `POST …/run` makes the policy due now; the worker starts the run on its
- *    next poll. 409 without a policy.
+ *    next poll. 409 without a policy, or while retention runs are switched
+ *    off for every repository (`/admin/settings/retention`).
  *  - `GET …/audit` returns audit rows, newest first, filtered by `run_id` and
  *    paged with `before` (an audit row id) and `limit`.
  *
@@ -106,6 +107,11 @@ export interface RunState {
 export interface RetentionView {
   policy: RetentionPolicy | null
   last_run: RunState | null
+  /**
+   * Whether retention runs at all (`/admin/settings/retention`): while it is
+   * off, no policy runs and Run now is refused.
+   */
+  runs_enabled: boolean
 }
 
 /** Why a version was selected: the triggers that held, with their days. */

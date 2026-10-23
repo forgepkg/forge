@@ -43,6 +43,10 @@ use crate::retention::model::{validate_policy, RetentionPolicy};
 /// of a repository, whatever the config and the policy say (both accept 0).
 pub const MIN_RUN_INTERVAL_SECONDS: i64 = 60;
 
+/// A policy's `min_run_interval_seconds` when it names none (the default of
+/// every policy shape).
+const DEFAULT_POLICY_INTERVAL_SECONDS: u64 = 3600;
+
 /// Tuning for the retention worker, mirrored from the server config.
 #[derive(Debug, Clone)]
 pub struct RetentionConfig {
@@ -50,7 +54,8 @@ pub struct RetentionConfig {
     pub poll_interval: StdDuration,
     /// Floor on the next-run interval (a per-repo `min_run_interval_seconds`
     /// larger than this wins). Bounds how often a repo is re-evaluated; values
-    /// below [`MIN_RUN_INTERVAL_SECONDS`] are raised to it.
+    /// below [`MIN_RUN_INTERVAL_SECONDS`] are raised to it. The server leaves
+    /// it at that minimum, so each policy's own interval decides.
     pub default_run_interval: Duration,
     /// Crash-safe lease held while a repo is being evaluated.
     pub lease: Duration,
@@ -103,8 +108,8 @@ impl RetentionWorker {
         // The config and a policy's `min_run_interval_seconds` both accept 0.
         // With both at 0 a finished run would be due again at once, and the
         // drain loop in `spawn_loop` would re-claim the same repository
-        // back-to-back forever. Raising the default also spaces out the
-        // retries of a failing run, which are rescheduled by it alone.
+        // back-to-back forever. A failing run is retried no sooner either
+        // ([`Self::retry_interval`]).
         config.default_run_interval = config
             .default_run_interval
             .max(Duration::seconds(MIN_RUN_INTERVAL_SECONDS));
@@ -197,7 +202,7 @@ impl RetentionWorker {
                 let now = forge_db::db_now(&self.pool)
                     .await
                     .unwrap_or_else(|_| Utc::now());
-                let next = now + self.config.default_run_interval;
+                let next = now + self.retry_interval(&repo.policy);
                 if let Err(e2) = retention_dao::fail_run(
                     &self.pool,
                     repo.repository_id,
@@ -509,6 +514,20 @@ impl RetentionWorker {
             .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
         let per_repo = Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX));
         per_repo.max(self.config.default_run_interval)
+    }
+
+    /// When a failed run is tried again: after its policy's
+    /// `min_run_interval_seconds`, read from the raw document (which may be
+    /// what failed to parse) or the default when it names none, and no sooner
+    /// than the floor, so a broken policy is not retried every minute.
+    fn retry_interval(&self, policy: &serde_json::Value) -> Duration {
+        let secs = policy
+            .get("min_run_interval_seconds")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(DEFAULT_POLICY_INTERVAL_SECONDS)
+            .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
+        Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+            .max(self.config.default_run_interval)
     }
 
     /// Run the worker loop forever: a startup stale-lease sweep, then a tick on
