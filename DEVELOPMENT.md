@@ -840,7 +840,7 @@ It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
-| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
+| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `raw-e2e`, `e2e`, `web-e2e` |
 | Changelog | `docs/changes/` | `fmt` |
 | Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
@@ -850,8 +850,8 @@ It sorts the change into groups of paths:
 
 A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
 counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
-`clippy`, `plugins`, `test`, `oci-e2e` and `e2e` in Rust; `audit` in Audit;
-`web` and `web-e2e` in Web; `docker` in Image and `kubernetes` in
+`clippy`, `plugins`, `test`, `oci-e2e`, `raw-e2e` and `e2e` in Rust; `audit`
+in Audit; `web` and `web-e2e` in Web; `docker` in Image and `kubernetes` in
 Kubernetes. A change outside the jobs (the triggers, the settings, the
 `changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
 counts for every group; blank and comment lines count for none. The
@@ -893,11 +893,15 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
 1. Enable **Require merge queue**. Keep its **status check timeout** above
    the run time of `e2e` and `web-e2e` (60 minutes by default).
 2. Under **Require status checks to pass**, require `fmt`, `clippy`, `audit`,
-   `test`, `docker`, `kubernetes`, `web`, `e2e` and `web-e2e` from GitHub
-   Actions. On a pull request, `e2e` and `web-e2e` are skipped, which counts
-   as passed, so the pull request can join the queue; the queue runs them and
-   merges only once they passed. Leave them out and the queue merges without
-   waiting for them.
+   `plugins`, `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`,
+   `e2e` and `web-e2e` from GitHub Actions: every job of `ci.yml` but
+   `changes`, the jobs the release workflow requires of the tagged commit
+   (`REQUIRED_JOBS` in `.github/workflows/release.yml`). A job left out here
+   can fail on a pull request that merges anyway, and the release then
+   refuses to tag until `main` is fixed. On a pull request, `e2e` and
+   `web-e2e` are skipped, which counts as passed, so the pull request can
+   join the queue; the queue runs them and merges only once they passed.
+   Leave them out and the queue merges without waiting for them.
 3. Keep **Only merge non-failing pull requests** enabled (the default). A
    merge group runs only the jobs its own pull request needs, so a pull
    request must not land on the strength of a later group that skipped the
