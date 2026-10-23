@@ -206,6 +206,17 @@ curl -u ci:$TOKEN -X DELETE \
   https://forge.example.com/repository/charts/api/charts/mychart/1.2.0
 ```
 
+Forge takes a chart's name and version from the `Chart.yaml` Helm loads
+when it installs the chart. Helm reads the whole archive and the last
+`<chart>/Chart.yaml` wins, so Forge reads the whole archive as Helm does, up
+to 256 MiB unpacked, and refuses one whose files are not all in one
+top-level directory, that holds more than one `<chart>/Chart.yaml`, or whose
+`requirements.yaml` declares more than `dependencies` (Helm reads it into
+the chart's metadata too). It also refuses names Helm refuses (absolute, or
+out of the chart's directory) and tar features charts do not use, such as
+sparse files. Archives from `helm package` or `tar` pass; a Helm proxy
+checks the charts it downloads the same way.
+
 A Helm **proxy** mirrors another chart repository: its index lists the
 upstream's charts, and each chart is downloaded from the upstream on first
 use and served from Forge after.
@@ -564,5 +575,6 @@ contract:
 | Instances | A new store and instance per call | Instances reused per plugin, a fresh budget per call, recycled after a trap or 10,000 calls |
 
 The Helm plugin shows the difference in practice: a 64 MiB component serves
-a repository index of any size the query bounds allow, and a 500 MB chart is
-never copied into the sandbox, which reads it only up to its `Chart.yaml`.
+a repository index of any size the query bounds allow, and a chart is never
+copied into the sandbox, which streams it through the lent reader and keeps
+only its `Chart.yaml`.

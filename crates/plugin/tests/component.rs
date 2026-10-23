@@ -27,16 +27,24 @@ fn builtin() -> Arc<Plugin> {
     Plugin::builtin(forge_format_helm::PLUGIN_TOML, forge_format_helm::Helm).unwrap()
 }
 
+/// A ustar header of a regular file, with its checksum.
+fn tar_header(path: &str, size: u64) -> [u8; 512] {
+    let mut header = [0u8; 512];
+    header[..path.len()].copy_from_slice(path.as_bytes());
+    header[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[148..156].fill(b' ');
+    let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    header
+}
+
 /// A gzipped ustar archive of `(path, contents)` entries.
 fn tgz(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut tar = Vec::new();
     for (path, data) in entries {
-        let mut header = [0u8; 512];
-        header[..path.len()].copy_from_slice(path.as_bytes());
-        header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
-        header[156] = b'0';
-        header[257..263].copy_from_slice(b"ustar\0");
-        tar.extend_from_slice(&header);
+        tar.extend_from_slice(&tar_header(path, data.len() as u64));
         tar.extend_from_slice(data);
         tar.resize(tar.len().div_ceil(512) * 512, 0);
     }
@@ -336,11 +344,7 @@ fn runs_inside_its_limits() {
     let bomb = {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         // A tar entry claiming 32 MiB of zeros before any Chart.yaml.
-        let mut header = [0u8; 512];
-        header[..10].copy_from_slice(b"bomb/zeros");
-        header[124..136].copy_from_slice(format!("{:011o}\0", 32u64 << 20).as_bytes());
-        header[156] = b'0';
-        gz.write_all(&header).unwrap();
+        gz.write_all(&tar_header("bomb/zeros", 32 << 20)).unwrap();
         let zeros = vec![0u8; 1 << 20];
         for _ in 0..32 {
             gz.write_all(&zeros).unwrap();
