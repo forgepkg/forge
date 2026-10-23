@@ -19,11 +19,12 @@ import { routeTree } from '~/routeTree.gen'
  * Admin authentication-realms screens, driven against the real route tree +
  * query hooks so the admin guard, routing, and mutations are exercised:
  *  - the list renders realms in priority order with kind badges and hides the
- *    delete affordance for the built-in local realm;
+ *    delete affordance for the built-in local realm; a delete is confirmed in
+ *    a dialog;
  *  - reordering PUTs the **full** new id order to /admin/realms/order;
- *  - the enabled toggle PATCHes the realm; disabling a realm people sign in
- *    with (local, OIDC, credential forwarding) asks first, and a server
- *    refusal (409) is shown with its reason;
+ *  - the enabled switch PATCHes the realm; disabling a realm people sign in
+ *    with (local, OIDC, credential forwarding) asks first in a dialog, and a
+ *    server refusal (409) is shown with its reason;
  *  - the create form validates required fields per kind (no POST when
  *    invalid) and POSTs the parsed config when valid;
  *  - the edit form sends list values containing commas back unchanged,
@@ -261,7 +262,7 @@ describe('admin realms list', () => {
     await renderAt('/manage/realms')
 
     await u.click(
-      await screen.findByRole('checkbox', { name: 'legacy-auth enabled' }),
+      await screen.findByRole('switch', { name: 'legacy-auth enabled' }),
     )
 
     await waitFor(() =>
@@ -282,19 +283,20 @@ describe('admin realms list', () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms')
 
-    const toggle = await screen.findByRole('checkbox', { name: 'local enabled' })
+    const toggle = await screen.findByRole('switch', { name: 'local enabled' })
     await u.click(toggle)
 
-    const row = toggle.closest('tr')!
+    const dialog = screen.getByRole('dialog', { name: 'Disable local?' })
     expect(
-      within(row).getByText(/stops every password login/),
+      within(dialog).getByText(/stops every password login/),
     ).toHaveTextContent(
       'browser sign-in and NuGet clients sending a password over Basic',
     )
     expect(toggle).toBeChecked()
 
-    await u.click(within(row).getByRole('button', { name: 'Cancel' }))
-    expect(within(row).queryByText(/stops every password login/)).toBeNull()
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText(/stops every password login/)).toBeNull()
     expect(toggle).toBeChecked()
     expect(patches).toEqual([])
     expect(
@@ -317,22 +319,24 @@ describe('admin realms list', () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms')
 
-    const toggle = await screen.findByRole('checkbox', { name: 'corp-sso enabled' })
+    const toggle = await screen.findByRole('switch', { name: 'corp-sso enabled' })
     await u.click(toggle)
 
-    const row = toggle.closest('tr')!
+    const dialog = screen.getByRole('dialog', { name: 'Disable corp-sso?' })
     expect(
-      within(row).getByText(/stops sign-in through its identity provider/),
+      within(dialog).getByText(/stops sign-in through its identity provider/),
     ).toHaveTextContent('people who use it can no longer sign in to Forge')
     expect(toggle).toBeChecked()
 
-    await u.click(within(row).getByRole('button', { name: 'Cancel' }))
-    expect(within(row).queryByText(/stops sign-in/)).toBeNull()
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByText(/stops sign-in/)).toBeNull()
     expect(patches).toEqual([])
 
     await u.click(toggle)
     expect(patches).toEqual([])
-    await u.click(within(row).getByRole('button', { name: 'Disable' }))
+    await u.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Disable corp-sso' }),
+    )
 
     await waitFor(() =>
       expect(patches).toEqual([{ id: 5, body: { enabled: false } }]),
@@ -356,12 +360,12 @@ describe('admin realms list', () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms')
 
-    const toggle = await screen.findByRole('checkbox', { name: 'legacy-auth enabled' })
+    const toggle = await screen.findByRole('switch', { name: 'legacy-auth enabled' })
     await u.click(toggle)
 
-    const row = toggle.closest('tr')!
+    const dialog = screen.getByRole('dialog', { name: 'Disable legacy-auth?' })
     expect(
-      within(row).getByText(/stops the logins it checks against its upstream/),
+      within(dialog).getByText(/stops the logins it checks against its upstream/),
     ).toHaveTextContent('NuGet clients sending those passwords over Basic')
     expect(
       fetchMock.mock.calls.some(
@@ -386,10 +390,12 @@ describe('admin realms list', () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms')
 
-    const toggle = await screen.findByRole('checkbox', { name: 'local enabled' })
+    const toggle = await screen.findByRole('switch', { name: 'local enabled' })
     await u.click(toggle)
     const row = toggle.closest('tr')!
-    await u.click(within(row).getByRole('button', { name: 'Disable' }))
+    await u.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Disable local' }),
+    )
 
     await waitFor(() =>
       expect(patched).toEqual({ id: 1, body: { enabled: false } }),
@@ -397,9 +403,10 @@ describe('admin realms list', () => {
     expect(await within(row).findByRole('alert')).toHaveTextContent(
       'Could not disable local: no enabled realm to sign in with would remain (local or OIDC); enable another one first',
     )
-    // The checkbox still shows the stored state, and the question is gone.
+    // The switch still shows the stored state, and the question is gone.
     expect(toggle).toBeChecked()
-    expect(within(row).queryByText(/stops every password login/)).toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText(/stops every password login/)).toBeNull()
   })
 
   it('shows the server refusal when a delete would leave no sign-in realm', async () => {
@@ -417,7 +424,11 @@ describe('admin realms list', () => {
 
     const row = (await screen.findByText('corp-sso')).closest('tr')!
     await u.click(within(row).getByRole('button', { name: 'Delete' }))
-    await u.click(within(row).getByRole('button', { name: 'Confirm' }))
+    await u.click(
+      within(screen.getByRole('dialog', { name: 'Delete corp-sso?' })).getByRole('button', {
+        name: 'Delete corp-sso',
+      }),
+    )
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'no enabled realm to sign in with would remain (local or OIDC); enable another one first',
@@ -440,7 +451,12 @@ describe('admin realms list', () => {
 
     const row = (await screen.findByText('legacy-auth')).closest('tr')!
     await u.click(within(row).getByRole('button', { name: 'Delete' }))
-    await u.click(within(row).getByRole('button', { name: 'Confirm' }))
+    expect(deleted).toBeNull()
+    await u.click(
+      within(screen.getByRole('dialog', { name: 'Delete legacy-auth?' })).getByRole('button', {
+        name: 'Delete legacy-auth',
+      }),
+    )
 
     await waitFor(() => expect(deleted).toBe(3))
   })
@@ -537,7 +553,7 @@ describe('admin realms create', { timeout: 20_000 }, () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms/new')
 
-    await u.selectOptions(await screen.findByLabelText('Kind'), 'credential_forwarding')
+    await u.click(await screen.findByRole('radio', { name: /^Credential forwarding/ }))
     expect(screen.queryByLabelText('Issuer URL')).not.toBeInTheDocument()
 
     await u.type(screen.getByLabelText('Name'), 'legacy')
@@ -582,10 +598,7 @@ describe('admin realms create', { timeout: 20_000 }, () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms/new')
 
-    await u.selectOptions(
-      await screen.findByLabelText('Kind'),
-      'workload_identity',
-    )
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
     expect(screen.queryByLabelText('Client ID')).not.toBeInTheDocument()
 
     await u.type(screen.getByLabelText('Name'), 'wif')
@@ -650,10 +663,7 @@ describe('admin realms create', { timeout: 20_000 }, () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms/new')
 
-    await u.selectOptions(
-      await screen.findByLabelText('Kind'),
-      'workload_identity',
-    )
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
     await u.click(screen.getByRole('button', { name: 'Create realm' }))
 
     expect(
@@ -677,10 +687,7 @@ describe('admin realms create', { timeout: 20_000 }, () => {
 
     const u = userEvent.setup()
     await renderAt('/manage/realms/new')
-    await u.selectOptions(
-      await screen.findByLabelText('Kind'),
-      'workload_identity',
-    )
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
     await u.type(screen.getByLabelText('Name'), 'github-actions')
     await u.type(
       screen.getByLabelText('Issuer URL'),
@@ -839,7 +846,7 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
     // Without kept hashes there is nothing to sign in with.
     await u.click(keep)
     expect(only).not.toBeChecked()
-    expect(only).toHaveAttribute('aria-disabled', 'true')
+    expect(only).toBeDisabled()
   })
 
   it('switches the accounts with a kept password to local ones after confirming', async () => {
@@ -941,16 +948,17 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms/1')
 
-    await u.click(await screen.findByRole('checkbox', { name: /Enabled/ }))
+    await u.click(await screen.findByRole('switch', { name: /Enabled/ }))
     await u.click(screen.getByRole('button', { name: 'Save changes' }))
 
-    expect(screen.getByText(/stops every password login/)).toBeInTheDocument()
+    const dialog = screen.getByRole('dialog', { name: 'Disable local?' })
+    expect(within(dialog).getByText(/stops every password login/)).toBeInTheDocument()
     expect(patches).toEqual([])
 
     // Cancel keeps the form as it is and sends nothing.
-    await u.click(screen.getByRole('button', { name: 'Cancel' }))
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     expect(screen.queryByText(/stops every password login/)).toBeNull()
-    expect(screen.getByRole('checkbox', { name: /Enabled/ })).not.toBeChecked()
+    expect(screen.getByRole('switch', { name: /Enabled/ })).not.toBeChecked()
     expect(patches).toEqual([])
 
     await u.click(screen.getByRole('button', { name: 'Save changes' }))
@@ -974,11 +982,13 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
     const u = userEvent.setup()
     await renderAt('/manage/realms/5')
 
-    await u.click(await screen.findByRole('checkbox', { name: /Enabled/ }))
+    await u.click(await screen.findByRole('switch', { name: /Enabled/ }))
     await u.click(screen.getByRole('button', { name: 'Save changes' }))
 
     expect(
-      screen.getByText(/stops sign-in through its identity provider/),
+      within(screen.getByRole('dialog', { name: 'Disable corp-sso?' })).getByText(
+        /stops sign-in through its identity provider/,
+      ),
     ).toBeInTheDocument()
     expect(patched).toBeNull()
 
