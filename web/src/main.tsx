@@ -8,10 +8,12 @@ import { installChunkReloadHandler } from '~/lib/chunkReload'
 import { initTheme } from '~/lib/theme'
 import { RouteError } from '~/components/RouteError'
 import { routeTree } from './routeTree.gen'
+import '@fontsource-variable/ibm-plex-sans/wght.css'
+import '@fontsource-variable/jetbrains-mono/wght.css'
 import './styles.css'
 
-// Re-apply the stored light/dark preference and follow OS changes while in
-// "system" (the index.html bootstrap already painted the right theme).
+// Re-apply the stored theme and follow OS changes while in "system" (the
+// index.html bootstrap already painted the right theme).
 initTheme()
 
 // A lazy chunk from a previous deploy that no longer exists: reload once to

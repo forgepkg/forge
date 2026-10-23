@@ -1,7 +1,8 @@
+import type { ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 
 import type { Action, GrantView, RoleView, SelectorView } from '~/api/rbac'
-import { Badge } from '~/components/catalyst/badge'
+import { Notice, StatusBadge, type Tone } from '~/components/ui'
 
 /**
  * Display pieces shared by the RBAC screens. The API names repositories,
@@ -24,15 +25,21 @@ export function byId<T extends { id: number }>(
   return new Map((items ?? []).map((i) => [i.id, i]))
 }
 
-const ACTION_COLORS: Record<Action, 'red' | 'amber' | 'sky' | 'zinc'> = {
-  admin: 'red',
-  delete: 'amber',
-  write: 'sky',
-  read: 'zinc',
+/** `admin` in heat (as everywhere admin shows), `delete` as a warning. */
+const ACTION_TONES: Record<Action, Tone> = {
+  admin: 'heat',
+  delete: 'warn',
+  write: 'neutral',
+  read: 'neutral',
 }
 
+/** A grant's action as a badge. */
 export function ActionBadge({ action }: { action: Action }) {
-  return <Badge color={ACTION_COLORS[action] ?? 'zinc'}>{action}</Badge>
+  return (
+    <StatusBadge tone={ACTION_TONES[action] ?? 'neutral'} dot={false}>
+      {action}
+    </StatusBadge>
+  )
 }
 
 /** The repository a grant covers: every repository, a linked name, or an id. */
@@ -44,20 +51,14 @@ export function RepositoryLabel({
   names: RepoNames
 }) {
   if (id == null) {
-    return <span className="font-medium">All repositories</span>
+    return <span className="font-medium text-ink">All repositories</span>
   }
   const name = names.get(id)
   if (name == null) {
-    return (
-      <span className="text-zinc-500 dark:text-zinc-400">repository #{id}</span>
-    )
+    return <span className="fg-muted">repository #{id}</span>
   }
   return (
-    <Link
-      to="/manage/repositories/$repo"
-      params={{ repo: name }}
-      className="font-mono text-sky-600 hover:underline dark:text-sky-400"
-    >
+    <Link to="/manage/repositories/$repo" params={{ repo: name }} className="fg-link">
       {name}
     </Link>
   )
@@ -79,7 +80,7 @@ export function SelectorLabel({
   excludes?: string[] | null
 }) {
   if (id == null) {
-    return <span className="text-zinc-500 dark:text-zinc-400">All packages</span>
+    return <span className="fg-muted">All packages</span>
   }
   const selector = selectors.get(id)
   if (selector == null) {
@@ -88,7 +89,7 @@ export function SelectorLabel({
       excludes && excludes.length > 0 ? `not ${excludes.join(', ')}` : null,
     ].filter(Boolean)
     return (
-      <span className="text-zinc-500 dark:text-zinc-400">
+      <span className="fg-muted">
         selector #{id}
         {parts.length > 0 && ` (${parts.join('; ')})`}
       </span>
@@ -98,7 +99,7 @@ export function SelectorLabel({
     <Link
       to="/manage/content-selectors/$selectorId"
       params={{ selectorId: String(id) }}
-      className="text-sky-600 hover:underline dark:text-sky-400"
+      className="fg-link"
     >
       {selector.name}
     </Link>
@@ -115,11 +116,7 @@ export function RoleLabel({
 }) {
   const role = roles.get(id)
   return (
-    <Link
-      to="/manage/roles/$roleId"
-      params={{ roleId: String(id) }}
-      className="font-medium text-sky-600 hover:underline dark:text-sky-400"
-    >
+    <Link to="/manage/roles/$roleId" params={{ roleId: String(id) }} className="fg-link">
       {role?.name ?? `role #${id}`}
     </Link>
   )
@@ -145,13 +142,7 @@ export function grantText(
   return `${grant.action} on ${repo}${packages}`
 }
 
-export function InlineError({ children }: { children: React.ReactNode }) {
-  return (
-    <p
-      role="alert"
-      className="rounded-lg border border-red-500/25 bg-red-500/5 px-3 py-2 text-sm/6 text-red-700 dark:bg-red-500/10 dark:text-red-400"
-    >
-      {children}
-    </p>
-  )
+/** A refused write or a failed load, where it happened (`role="alert"`). */
+export function InlineError({ children }: { children: ReactNode }) {
+  return <Notice tone="danger">{children}</Notice>
 }

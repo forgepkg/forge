@@ -1,8 +1,8 @@
-import { Button } from '~/components/catalyst/button'
+import { Button, Notice } from '~/components/ui'
 
 /**
- * Generic error panel with an optional retry. Used by every data screen so the
- * failure UX is consistent. `message` is the human-readable summary;
+ * Generic error notice with an optional retry. Used by every data screen so
+ * the failure UX is consistent. `message` is the human-readable summary;
  * pass the API error's message when available.
  */
 export function ErrorState({
@@ -15,22 +15,19 @@ export function ErrorState({
   onRetry?: () => void
 }) {
   return (
-    <div
-      role="alert"
-      className="rounded-xl border border-red-500/25 bg-red-500/5 p-5 dark:bg-red-500/10"
+    <Notice
+      tone="danger"
+      title={title}
+      action={
+        onRetry && (
+          <Button size="sm" icon="Refresh" onClick={onRetry}>
+            Retry
+          </Button>
+        )
+      }
     >
-      <p className="font-medium text-red-700 dark:text-red-400">{title}</p>
-      {message && (
-        <p className="mt-1 text-sm/6 text-red-600/90 dark:text-red-400/80">
-          {message}
-        </p>
-      )}
-      {onRetry && (
-        <Button outline className="mt-3" onClick={onRetry}>
-          Retry
-        </Button>
-      )}
-    </div>
+      {message}
+    </Notice>
   )
 }
 

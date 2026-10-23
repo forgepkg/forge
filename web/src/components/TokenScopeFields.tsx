@@ -1,10 +1,7 @@
 import type { TokenScope } from '~/api/tokens'
 import { ACTIONS, type Action } from '~/api/rbac'
-import { Checkbox, CheckboxField, CheckboxGroup } from '~/components/catalyst/checkbox'
-import { Description, Fieldset, Label, Legend } from '~/components/catalyst/fieldset'
-import { Radio, RadioField, RadioGroup } from '~/components/catalyst/radio'
-import { Text } from '~/components/catalyst/text'
 import { parseTokenScope } from '~/components/TokenBadges'
+import { Checkbox, RadioGroup } from '~/components/ui'
 
 /**
  * The scope of a token being created or changed, as a form edits it. A scope
@@ -78,9 +75,10 @@ const ACTION_HELP: Record<Action, string> = {
 }
 
 /**
- * The scope fields of a token form: which actions and which repositories.
- * `repositories` are those the picker offers (an admin sees all of them; a
- * user the ones they can read).
+ * The scope fields of a token form: which actions and which repositories,
+ * side by side (stacked on narrow screens). Choosing "Only these …" opens
+ * the checkboxes under it. `repositories` are those the picker offers (an
+ * admin sees all of them; a user the ones they can read).
  */
 export function TokenScopeFields({
   value,
@@ -111,91 +109,85 @@ export function TokenScopeFields({
   )
 
   return (
-    <div className="grid gap-6 sm:grid-cols-2">
-      <Fieldset>
-        <Legend>Actions</Legend>
+    <div className="fg-fieldrow">
+      <div className="grid content-start gap-3">
         <RadioGroup
+          legend="Actions"
           value={value.limitActions ? 'only' : 'owner'}
           onChange={(v) => onChange({ ...value, limitActions: v === 'only' })}
-        >
-          <RadioField>
-            <Radio value="owner" />
-            <Label>The owner&apos;s read, write and delete</Label>
-            <Description>Never admin.</Description>
-          </RadioField>
-          <RadioField>
-            <Radio value="only" />
-            <Label>Only these actions</Label>
-          </RadioField>
-        </RadioGroup>
+          options={[
+            {
+              value: 'owner',
+              label: "The owner's read, write and delete",
+              description: 'Never admin.',
+            },
+            { value: 'only', label: 'Only these actions' },
+          ]}
+        />
         {value.limitActions && (
-          <CheckboxGroup className="mt-3 pl-6">
+          <div role="group" aria-label="Actions of the token" className="fg-choice-list pl-6">
             {ACTIONS.map((action) => {
               const disabled = action === 'admin' && value.limitRepositories
               return (
-                <CheckboxField key={action} disabled={disabled}>
-                  <Checkbox
-                    checked={value.actions.includes(action) && !disabled}
-                    onChange={(c) => toggleAction(action, c)}
-                  />
-                  <Label>{action}</Label>
-                  <Description>{ACTION_HELP[action]}</Description>
-                </CheckboxField>
+                <Checkbox
+                  key={action}
+                  label={action}
+                  description={ACTION_HELP[action]}
+                  checked={value.actions.includes(action) && !disabled}
+                  disabled={disabled}
+                  onChange={(c) => toggleAction(action, c)}
+                />
               )
             })}
-          </CheckboxGroup>
+          </div>
         )}
-      </Fieldset>
+      </div>
 
-      <Fieldset>
-        <Legend>Repositories</Legend>
+      <div className="grid content-start gap-3">
         <RadioGroup
+          legend="Repositories"
           value={value.limitRepositories ? 'only' : 'all'}
-          onChange={(v) =>
-            onChange({ ...value, limitRepositories: v === 'only' })
-          }
-        >
-          <RadioField>
-            <Radio value="all" />
-            <Label>Every repository the owner can reach</Label>
-          </RadioField>
-          <RadioField>
-            <Radio value="only" />
-            <Label>Only these repositories</Label>
-            <Description>
-              A group reaches only the members also chosen here.
-            </Description>
-          </RadioField>
-        </RadioGroup>
+          onChange={(v) => onChange({ ...value, limitRepositories: v === 'only' })}
+          options={[
+            { value: 'all', label: 'Every repository the owner can reach' },
+            {
+              value: 'only',
+              label: 'Only these repositories',
+              description: 'A group reaches only the members also chosen here.',
+            },
+          ]}
+        />
         {value.limitRepositories && (
-          <div className="mt-3 max-h-60 overflow-y-auto pl-6">
+          <div
+            role="group"
+            aria-label="Repositories of the token"
+            className="fg-choice-list max-h-60 overflow-y-auto pl-6"
+          >
             {offered.length === 0 && unknown.length === 0 ? (
-              <Text>No repositories to choose from.</Text>
+              <p className="fg-text">No repositories to choose from.</p>
             ) : (
-              <CheckboxGroup>
+              <>
                 {offered.map((r) => (
-                  <CheckboxField key={r.id}>
-                    <Checkbox
-                      checked={value.repositories.includes(r.id)}
-                      onChange={(c) => toggleRepository(r.id, c)}
-                    />
-                    <Label className="font-mono">{r.name}</Label>
-                  </CheckboxField>
+                  <Checkbox
+                    key={r.id}
+                    label={r.name}
+                    checked={value.repositories.includes(r.id)}
+                    onChange={(c) => toggleRepository(r.id, c)}
+                  />
                 ))}
                 {unknown.map((id) => (
-                  <CheckboxField key={id}>
-                    <Checkbox
-                      checked
-                      onChange={(c) => toggleRepository(id, c)}
-                    />
-                    <Label>repository #{id}</Label>
-                  </CheckboxField>
+                  <Checkbox
+                    key={id}
+                    label={`repository #${id}`}
+                    checked
+                    onChange={(c) => toggleRepository(id, c)}
+                  />
                 ))}
-              </CheckboxGroup>
+              </>
             )}
           </div>
         )}
-      </Fieldset>
+      </div>
     </div>
   )
 }

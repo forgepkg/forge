@@ -1,4 +1,4 @@
-import { Badge } from '~/components/catalyst/badge'
+import { StatusBadge } from '~/components/ui'
 import type { DelayStatus } from '~/api/packages'
 
 /**
@@ -20,20 +20,22 @@ export function DelayBadge({
   if (!status) return null
 
   if (status === 'available') {
-    return <Badge color="emerald">available</Badge>
+    return <StatusBadge tone="ok">available</StatusBadge>
   }
 
   const eta = delayedUntil ? formatEta(delayedUntil) : null
   return (
-    <span
+    <StatusBadge
+      tone="warn"
+      icon="Clock"
       title={
         delayedUntil
           ? `available ${new Date(delayedUntil).toLocaleString()}`
           : undefined
       }
     >
-      <Badge color="amber">delayed{eta ? ` · ${eta}` : ''}</Badge>
-    </span>
+      delayed{eta ? ` · ${eta}` : ''}
+    </StatusBadge>
   )
 }
 
