@@ -3,6 +3,7 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import type { ImageDetail } from '~/api/images'
 import { isRepositoryOffline } from '~/api/packages'
 import { ApiError } from '~/lib/httpClient'
+import { defaultPullTag } from '~/lib/oci'
 import { useImageDetail } from '~/queries/useImageDetail'
 import { Heading, Subheading } from '~/components/catalyst/heading'
 import { Code, Text } from '~/components/catalyst/text'
@@ -136,9 +137,10 @@ function ImageDetailPage() {
 }
 
 /**
- * `docker pull` by tag (the selected one, else the first) and by digest.
- * An image with no tag at all is pulled by the digest of a top-level
- * manifest (not an index's child, not a referrer).
+ * `docker pull` by tag (the selected one, else {@link defaultPullTag}:
+ * `latest` or the newest image tag) and by digest. An image with no tag at
+ * all is pulled by the digest of a top-level manifest (not an index's child,
+ * not a referrer).
  */
 function PullPanel({
   detail,
@@ -150,7 +152,8 @@ function PullPanel({
   onSelectTag: (tag: string) => void
 }) {
   const current =
-    detail.tags.find((t) => t.tag === selectedTag) ?? detail.tags[0]
+    detail.tags.find((t) => t.tag === selectedTag) ??
+    defaultPullTag(detail.tags, detail.manifests)
   const children = new Set(detail.manifests.flatMap((m) => m.children))
   const digest =
     current?.digest ??

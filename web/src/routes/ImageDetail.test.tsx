@@ -15,7 +15,7 @@ import { routeTree } from '~/routeTree.gen'
 
 /**
  * Image-detail screen of a docker repository: the pull commands (selected /
- * first tag and by digest), the tags table (short digest + copy, size,
+ * default tag and by digest), the tags table (short digest + copy, size,
  * platforms), the manifests table (kind, referrer hint, source in groups),
  * and the not-found / error states. Drives the real route tree (the image
  * name is the `/images/$repo/$` splat, slashes included) + `useImageDetail`.
@@ -190,18 +190,19 @@ describe('ImageDetail', () => {
     expect(within(crumbs).getByText('team/app')).toBeInTheDocument()
   })
 
-  it('shows pull commands for the first tag and by digest; the tag select switches them', async () => {
+  it('shows pull commands for `latest` and by digest; the tag select switches them', async () => {
     mockApi(() => jsonResponse(hostedDetail))
 
     const user = userEvent.setup()
     const router = await renderDetail('/images/docker-hosted/team/app')
 
     const pull = await screen.findByRole('region', { name: 'Pull' })
+    // `latest`, though `1.36` sorts first.
     expect(
-      within(pull).getByText('docker pull forge.example.com/docker-hosted/team/app:1.36'),
+      within(pull).getByText('docker pull forge.example.com/docker-hosted/team/app:latest'),
     ).toBeInTheDocument()
     expect(
-      within(pull).getByText(`docker pull forge.example.com/docker-hosted/team/app@${INDEX}`),
+      within(pull).getByText(`docker pull forge.example.com/docker-hosted/team/app@${AMD64}`),
     ).toBeInTheDocument()
     // The login hint names the registry and links to the Tokens page.
     expect(within(pull).getByText('docker login forge.example.com')).toBeInTheDocument()
@@ -210,27 +211,68 @@ describe('ImageDetail', () => {
       '/tokens',
     )
 
-    await user.selectOptions(within(pull).getByLabelText('Tag'), 'latest')
+    await user.selectOptions(within(pull).getByLabelText('Tag'), '1.36')
 
     expect(
       await within(pull).findByText(
-        'docker pull forge.example.com/docker-hosted/team/app:latest',
+        'docker pull forge.example.com/docker-hosted/team/app:1.36',
       ),
     ).toBeInTheDocument()
     expect(
-      within(pull).getByText(`docker pull forge.example.com/docker-hosted/team/app@${AMD64}`),
+      within(pull).getByText(`docker pull forge.example.com/docker-hosted/team/app@${INDEX}`),
     ).toBeInTheDocument()
-    expect(router.state.location.search).toMatchObject({ tag: 'latest' })
+    expect(router.state.location.search).toMatchObject({ tag: '1.36' })
   })
 
-  it('a ?tag= deep link selects that tag', async () => {
-    mockApi(() => jsonResponse(hostedDetail))
+  it('without `latest`, starts with the newest image tag, not a signature tag', async () => {
+    const sigTag = `sha256-${INDEX.slice('sha256:'.length)}.sig`
+    const image = (digest: string, created_at: string) => ({
+      ...hostedDetail.manifests[1],
+      digest,
+      created_at,
+    })
+    const OLD = 'sha256:5555555555ee' + '0'.repeat(52)
+    mockApi(() =>
+      jsonResponse({
+        ...hostedDetail,
+        // As the server sends them: sorted by name.
+        tags: [
+          { ...hostedDetail.tags[1], tag: '1.10', digest: OLD },
+          { ...hostedDetail.tags[0], tag: '1.9' },
+          { ...hostedDetail.tags[1], tag: sigTag, digest: SIG },
+        ],
+        manifests: [
+          { ...hostedDetail.manifests[0], created_at: '2026-10-21T10:58:44Z' },
+          image(OLD, '2026-09-01T08:00:00Z'),
+          { ...hostedDetail.manifests[3], tags: [sigTag], created_at: '2026-10-22T09:00:00Z' },
+        ],
+      }),
+    )
 
-    await renderDetail('/images/docker-hosted/team/app?tag=latest')
+    await renderDetail('/images/docker-hosted/team/app')
 
     const pull = await screen.findByRole('region', { name: 'Pull' })
     expect(
-      within(pull).getByText('docker pull forge.example.com/docker-hosted/team/app:latest'),
+      within(pull).getByText('docker pull forge.example.com/docker-hosted/team/app:1.9'),
+    ).toBeInTheDocument()
+    expect(
+      within(pull).getByText(`docker pull forge.example.com/docker-hosted/team/app@${INDEX}`),
+    ).toBeInTheDocument()
+  })
+
+  it('a ?tag= deep link selects that tag', async () => {
+    mockApi(() =>
+      jsonResponse({
+        ...hostedDetail,
+        tags: [...hostedDetail.tags, { ...hostedDetail.tags[0], tag: 'stable' }],
+      }),
+    )
+
+    await renderDetail('/images/docker-hosted/team/app?tag=stable')
+
+    const pull = await screen.findByRole('region', { name: 'Pull' })
+    expect(
+      within(pull).getByText('docker pull forge.example.com/docker-hosted/team/app:stable'),
     ).toBeInTheDocument()
   })
 
