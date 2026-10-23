@@ -250,8 +250,14 @@ groups. See [docs/raw.md](docs/raw.md).
 
 ### Repositories of other formats (format plugins)
 
-Formats other than NuGet come from format plugins, crates in
-[`plugins/`](./plugins) (see [docs/format-plugins.md](./docs/format-plugins.md)).
+Every package format is a format plugin, a crate in
+[`plugins/`](./plugins) (see [docs/format-plugins.md](./docs/format-plugins.md)),
+whether it runs built in only, as a WebAssembly component, or both: NuGet runs
+built in only, Helm either way. A new format goes there too, never in a
+`crates/format-<id>` crate or the server. Docker / OCI (`crates/format-oci`)
+and raw (`crates/server/src/raw/`) are not there yet and are to move to
+`plugins/docker` and `plugins/raw`.
+
 Helm is built in: create a repository with `"format": "helm"` (hosted, proxy or
 group; a plugin format has proxies when it implements the upstream side). It is
 served under `/repository/<name>/`, e.g.

@@ -59,6 +59,12 @@ A Cargo workspace of small crates plus the web SPA:
 | `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `nuget` (built in only), `helm`. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
+**Every format is a plugin in `plugins/`.** A package format is a crate in
+`plugins/<id>/` implementing `FormatPlugin`, whether it runs built in only, as
+a WebAssembly component, or both. Docker / OCI (`crates/format-oci`) and raw
+(in `forge-server`) are not there yet and are to move to `plugins/docker` and
+`plugins/raw`.
+
 **Single-origin serving.** `forge-server` mounts each format plugin's feed
 (NuGet at `/v3`, Helm at `/repository`), the Docker / OCI registry (`/v2`),
 raw file repositories (`/raw`),
