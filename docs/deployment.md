@@ -281,10 +281,10 @@ the name defaulted to `admin`; the upgrade renames that account
 `admin@example.com` ([below](#accounts-from-before-20)), so a configuration
 that sets no name keeps finding it, and one that names a non-UPN must name the
 account's new name instead. Sign in to the web UI,
-create personal admin accounts (or connect OIDC), then delete the bootstrap
-account. It is not re-created on later restarts. Then remove the password from
-the environment: with no bootstrap password configured, Forge simply starts
-without a bootstrap admin.
+invite personal admin accounts ([below](#inviting-users)) or connect OIDC,
+then delete the bootstrap account. It is not re-created on later restarts.
+Then remove the password from the environment: with no bootstrap password
+configured, Forge simply starts without a bootstrap admin.
 
 Forge never lets the last active administrator go: deleting or deactivating
 that account, or removing its `admin` role, is refused with `409 Conflict`.
