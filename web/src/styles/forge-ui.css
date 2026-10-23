@@ -409,7 +409,7 @@
   .fg-cols-side { display: flex; flex: 1 1 340px; flex-direction: column; gap: var(--space-6); min-width: 0; }
   .fg-stats { display: flex; flex-wrap: wrap; gap: var(--space-4); }
   .fg-stats > * { flex: 1 1 200px; min-width: 0; }
-  .fg-fieldrow { display: flex; flex-wrap: wrap; gap: var(--space-4); }
+  .fg-fieldrow { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-4); }
   .fg-fieldrow > * { flex: 1 1 240px; min-width: 0; }
   .fg-form { display: grid; gap: var(--space-4); max-width: 560px; }
   .fg-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
@@ -440,6 +440,7 @@
   .fg-fieldset > legend { float: left; width: 100%; margin-bottom: var(--space-1); padding: 0; color: var(--ink); font-size: 13px; line-height: 20px; font-weight: 500; }
   .fg-fieldset > legend + * { clear: both; }
   .fg-choice-list { display: grid; gap: var(--space-3); }
+  .fg-check-label { cursor: inherit; }
   .fg-input[type='date'], .fg-input[type='datetime-local'] { font-family: var(--font-sans); }
 
   /* ---------- App additions: toasts ---------- */

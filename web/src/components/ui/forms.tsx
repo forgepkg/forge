@@ -232,9 +232,11 @@ interface ChoiceProps {
 function Choice({ kind, ...p }: ChoiceProps & { kind: 'checkbox' | 'switch' }) {
   const auto = useId()
   const id = p.id ?? auto
+  // The label element holds the label alone, so the description is the
+  // control's description (`aria-describedby`), not part of its name. The
+  // invisible native input lies over the visual box, which takes the clicks.
   return (
-    <label
-      htmlFor={id}
+    <div
       className={clsx(
         'fg-check',
         kind === 'switch' && 'fg-check--switch',
@@ -267,14 +269,16 @@ function Choice({ kind, ...p }: ChoiceProps & { kind: 'checkbox' | 'switch' }) {
         </span>
       )}
       <span className={clsx('fg-check-text', p.hideLabel && 'fg-sr')}>
-        <span className="fg-check-label">{p.label}</span>
+        <label htmlFor={id} className="fg-check-label">
+          {p.label}
+        </label>
         {p.description && (
           <span id={`${id}-desc`} className="fg-field-desc">
             {p.description}
           </span>
         )}
       </span>
-    </label>
+    </div>
   )
 }
 
@@ -331,9 +335,8 @@ export function RadioGroup<T extends string>({
         {options.map((o) => {
           const id = `${group}-${o.value}`
           return (
-            <label
+            <div
               key={o.value}
-              htmlFor={id}
               className={clsx('fg-check fg-check--radio', o.disabled && 'is-disabled')}
             >
               <input
@@ -351,14 +354,16 @@ export function RadioGroup<T extends string>({
                 <span className="fg-radio-dot" />
               </span>
               <span className="fg-check-text">
-                <span className="fg-check-label">{o.label}</span>
+                <label htmlFor={id} className="fg-check-label">
+                  {o.label}
+                </label>
                 {o.description && (
                   <span id={`${id}-desc`} className="fg-field-desc">
                     {o.description}
                   </span>
                 )}
               </span>
-            </label>
+            </div>
           )
         })}
       </div>
