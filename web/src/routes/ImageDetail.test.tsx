@@ -12,6 +12,7 @@ import { clearSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { ImageDetail } from '~/api/images'
 import { routeTree } from '~/routeTree.gen'
+import { searchOptions } from '~/lib/search'
 
 /**
  * Image-detail screen of a docker repository: the pull commands (selected /
@@ -144,6 +145,7 @@ async function renderDetail(path: string) {
   const queryClient = testQueryClient()
   const router = createRouter({
     routeTree,
+    ...searchOptions,
     context: { queryClient },
     history: createMemoryHistory({ initialEntries: [path] }),
   })
@@ -222,6 +224,8 @@ describe('ImageDetail', () => {
       within(pull).getByText(`docker pull forge.example.com/docker-hosted/team/app@${INDEX}`),
     ).toBeInTheDocument()
     expect(router.state.location.search).toMatchObject({ tag: '1.36' })
+    // Written as typed, as a link to the page would be (#403).
+    expect(router.state.location.searchStr).toBe('?tag=1.36')
   })
 
   it('without `latest`, starts with the newest image tag, not a signature tag', async () => {
@@ -274,6 +278,34 @@ describe('ImageDetail', () => {
     expect(
       within(pull).getByText('docker pull forge.example.com/docker-hosted/team/app:stable'),
     ).toBeInTheDocument()
+  })
+
+  it.each([
+    // A number to JSON: 1.1 (#403).
+    ['?tag=1.10', '1.10'],
+    ['?tag=1.36', '1.36'],
+    ['?tag=2', '2'],
+    // As the router wrote a numeric-looking tag before.
+    ['?tag=%221.36%22', '1.36'],
+  ])('a %s deep link selects the tag %s', async (search, tag) => {
+    mockApi(() =>
+      jsonResponse({
+        ...hostedDetail,
+        tags: [
+          ...hostedDetail.tags,
+          { ...hostedDetail.tags[0], tag: '1.10' },
+          { ...hostedDetail.tags[0], tag: '2' },
+        ],
+      }),
+    )
+
+    await renderDetail(`/images/docker-hosted/team/app${search}`)
+
+    const pull = await screen.findByRole('region', { name: 'Pull' })
+    expect(
+      within(pull).getByText(`docker pull forge.example.com/docker-hosted/team/app:${tag}`),
+    ).toBeInTheDocument()
+    expect(within(pull).getByLabelText('Tag')).toHaveValue(tag)
   })
 
   it('renders the tags table with short digests, sizes and platforms', async () => {

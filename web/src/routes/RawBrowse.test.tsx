@@ -212,6 +212,20 @@ describe('RawBrowse', () => {
     expect(del?.url.searchParams.get('path')).toBe('pdfium/')
   })
 
+  it('opens a directory whose name looks like a number', async () => {
+    const year: RawListing = {
+      repository: 'binaries',
+      path: '2026/',
+      entries: [{ name: 'tool.tgz', path: '2026/tool.tgz', type: 'file', size: 3 }],
+      next: null,
+    }
+    mockApi(reader, 'hosted', { '': root, '2026/': year })
+    // `?path=2026` was the number 2026 to the router, and opened the root (#403).
+    await renderApp('/repos/binaries?path=2026')
+    const dir = await screen.findByRole('table', { name: 'Contents of binaries/2026/' })
+    expect(within(dir).getByText('tool.tgz')).toBeInTheDocument()
+  })
+
   it('says so when the directory does not exist', async () => {
     mockApi(reader, 'hosted', {})
     await renderApp('/repos/binaries?path=gone/')

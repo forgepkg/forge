@@ -14,6 +14,7 @@ import type { Me } from '~/api/me'
 import type { RepoView } from '~/api/repositories'
 import type { ImportItem, ImportView } from '~/api/imports'
 import { routeTree } from '~/routeTree.gen'
+import { searchOptions } from '~/lib/search'
 
 /**
  * The import-from-Nexus screen (`/manage/repositories/$repo/import`), driven
@@ -183,6 +184,7 @@ async function renderAt(initialPath: string) {
   const queryClient = makeQueryClient()
   const router = createRouter({
     routeTree,
+    ...searchOptions,
     context: { queryClient },
     history: createMemoryHistory({ initialEntries: [initialPath] }),
   })
