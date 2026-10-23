@@ -312,7 +312,11 @@ pub async fn apply_files(
                         .collect(),
                 );
             }
-            for d in batch {
+            // Blob rows are locked in hash order, as every other writer
+            // takes them.
+            let mut batch = batch.to_vec();
+            batch.sort_by(|a, b| a.blob_sha256.cmp(&b.blob_sha256));
+            for &d in &batch {
                 let still = decided_now
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&d.file_id));

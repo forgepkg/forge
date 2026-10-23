@@ -216,7 +216,10 @@ pub struct Stored {
     pub status: &'static str,
 }
 
-/// Record `files` in one transaction: all of them or none.
+/// Record `files` in one transaction: all of them or none. The files are
+/// stored in the order of their content's hash, so the blob rows they lock
+/// are locked in the order every other writer takes them in; the answer
+/// lists them in the order given.
 async fn record_all(
     raw: &Raw<'_>,
     repo: &Repository,
@@ -231,8 +234,17 @@ async fn record_all(
     let may_delete = raw.state.authz.can_delete(&raw.principal, repo).await;
     let grace = raw.state.config.outbox.grace();
     let mut tx = raw.state.pool.begin().await?;
-    let mut out = Vec::with_capacity(files.len());
-    for file in &files {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|&a, &b| {
+        files[a]
+            .ingested
+            .stored
+            .sha256
+            .cmp(&files[b].ingested.stored.sha256)
+    });
+    let mut out: Vec<Option<Stored>> = (0..files.len()).map(|_| None).collect();
+    for index in order {
+        let file = &files[index];
         let stored = &file.ingested.stored;
         let replaceable =
             policy == DeploymentPolicy::AllowRedeploy && may_delete && replace.allows(&file.path);
@@ -284,7 +296,7 @@ async fn record_all(
             )
             .await?;
         }
-        out.push(Stored {
+        out[index] = Some(Stored {
             path: file.path.clone(),
             size: stored.size,
             sha256: stored.sha256.clone(),
@@ -292,7 +304,7 @@ async fn record_all(
         });
     }
     tx.commit().await?;
-    Ok(out)
+    Ok(out.into_iter().flatten().collect())
 }
 
 /// `PUT /raw/<repo>/<path>`: store the request body as the file.

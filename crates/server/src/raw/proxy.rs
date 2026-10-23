@@ -34,10 +34,12 @@ use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST
 use super::upload::{content_type, ingest};
 use super::{Raw, RawError};
 
+/// The gate of one file's upstream requests, by `(repository id, path)`.
+type Gates = HashMap<(i64, String), Weak<tokio::sync::Mutex<()>>>;
+
 /// In-flight upstream requests, so concurrent requests for one file share
 /// a single upstream fetch per process.
-static GATES: LazyLock<Mutex<HashMap<(i64, String), Weak<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(Default::default);
+static GATES: LazyLock<Mutex<Gates>> = LazyLock::new(Default::default);
 
 fn gate(repository_id: i64, path: &str) -> Arc<tokio::sync::Mutex<()>> {
     let mut gates = GATES.lock().unwrap_or_else(PoisonError::into_inner);

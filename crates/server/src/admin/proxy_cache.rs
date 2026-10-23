@@ -61,8 +61,9 @@ pub struct Invalidated {
     pub not_found_cleared: u64,
     /// Tags due for re-validation (docker proxies).
     pub tags_expired: u64,
-    /// Cached files due for re-validation (raw proxies).
-    pub files_expired: u64,
+    /// Cached files due for re-validation (raw proxies only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_expired: Option<u64>,
 }
 
 /// `POST /admin/repositories/{name}/proxy-cache/invalidate`
@@ -122,7 +123,7 @@ pub async fn invalidate(
                 package = package.as_deref().unwrap_or("*"),
                 not_found_cleared = invalidated.not_found_cleared,
                 tags_expired = invalidated.tags_expired,
-                files_expired = invalidated.files_expired,
+                files_expired = invalidated.files_expired.unwrap_or(0),
                 "proxy cache invalidated"
             );
             Json(invalidated).into_response()
@@ -145,16 +146,16 @@ async fn forget(
     let mut invalidated = Invalidated {
         not_found_cleared: 0,
         tags_expired: 0,
-        files_expired: 0,
+        files_expired: None,
     };
     if repo.is_raw() {
         // A file is the range of its own path; a directory, of its files.
         let prefix = package.unwrap_or("");
-        invalidated.files_expired = if prefix.is_empty() || prefix.ends_with('/') {
+        invalidated.files_expired = Some(if prefix.is_empty() || prefix.ends_with('/') {
             raw_dao::expire_checks(&mut *tx, repo.id, prefix).await?
         } else {
             raw_dao::expire_file_check(&mut *tx, repo.id, prefix).await?
-        };
+        });
     } else if docker {
         invalidated.tags_expired = oci_dao::expire_tags(&mut tx, repo.id, package).await?;
     } else {

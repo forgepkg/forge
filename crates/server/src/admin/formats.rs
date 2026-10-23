@@ -41,8 +41,8 @@ pub struct FormatView {
     pub max_upload_bytes_limit: Option<u64>,
 }
 
-/// `GET /admin/formats`: NuGet first, then Docker and raw, then the other
-/// formats by id.
+/// `GET /admin/formats`: NuGet first, then Docker, then the other formats
+/// (the other plugins and raw files) by id.
 pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
     let ceiling = state.config.max_repository_upload_bytes();
@@ -77,7 +77,8 @@ pub async fn list(State(state): State<AppState>) -> Response {
         default_max_upload_bytes: state.config.default_upload_limit(DOCKER_FORMAT),
         max_upload_bytes_limit: ceiling,
     });
-    formats.push(FormatView {
+    let mut others: Vec<FormatView> = others.into_iter().map(|p| view(p)).collect();
+    others.push(FormatView {
         id: RAW_FORMAT.to_string(),
         name: "Raw files".into(),
         builtin: true,
@@ -89,6 +90,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
         default_max_upload_bytes: state.config.default_upload_limit(RAW_FORMAT),
         max_upload_bytes_limit: ceiling,
     });
-    formats.extend(others.into_iter().map(|p| view(p)));
+    others.sort_by(|a, b| a.id.cmp(&b.id));
+    formats.extend(others);
     Json(formats).into_response()
 }
