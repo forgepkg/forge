@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { screen, waitFor } from '@testing-library/react'
+import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { clearSession, setSession } from '~/lib/auth'
@@ -18,7 +18,7 @@ vi.mock('~/lib/navigation', () => ({ assignLocation: vi.fn() }))
  *    is left out of the PUT (the server keeps the stored one), and the page
  *    shows the last failed send;
  *  - a test send shows the recipient, and a failed one the server's error;
- *  - removing the settings asks first, then DELETEs them;
+ *  - removing the settings asks first (a dialog), then DELETEs them;
  *  - a Microsoft Graph app: its fields, the federated credential's values to
  *    register, and no secret sent for a federated app;
  *  - SMTP with OAuth: its fields, registering Forge, the authorization in
@@ -291,9 +291,10 @@ describe('admin email settings screen', () => {
     mockApi({ settings: stored })
     await renderApp('/manage/settings/email')
 
-    await user.click(await screen.findByRole('button', { name: 'Remove…' }))
+    await user.click(await screen.findByRole('button', { name: 'Remove email settings' }))
     expect(calls('DELETE', '/admin/settings/email')).toHaveLength(0)
-    await user.click(screen.getByRole('button', { name: 'Remove the email settings' }))
+    const dialog = screen.getByRole('dialog', { name: 'Remove the email settings?' })
+    await user.click(within(dialog).getByRole('button', { name: 'Remove the email settings' }))
     await waitFor(() => expect(calls('DELETE', '/admin/settings/email')).toHaveLength(1))
   })
 
@@ -325,12 +326,12 @@ describe('admin email settings screen', () => {
       client_secret: 's3cret',
     })
 
-    // The stored federated app: the values to register on it.
-    expect(await screen.findByText('https://forge.example.com')).toBeInTheDocument()
-    expect(
-      screen.getByText('app-id@https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0'),
-    ).toBeInTheDocument()
-    expect(screen.getByText('api://AzureADTokenExchange')).toBeInTheDocument()
+    // The stored federated app: the values to register on it, to copy.
+    expect(await screen.findByLabelText('Issuer')).toHaveValue('https://forge.example.com')
+    expect(screen.getByLabelText('Subject identifier')).toHaveValue(
+      'app-id@https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0',
+    )
+    expect(screen.getByLabelText('Audience')).toHaveValue('api://AzureADTokenExchange')
     expect(screen.queryByLabelText(/^Client secret/)).toBeNull()
   })
 
@@ -376,9 +377,9 @@ describe('admin email settings screen', () => {
     // No client yet: register Forge, as an account of the mail server
     // (Stalwart's way).
     expect(await screen.findByText(/Forge has no client/)).toBeInTheDocument()
-    expect(
-      screen.getByText('https://forge.example.com/admin/settings/email/oauth/callback'),
-    ).toBeInTheDocument()
+    expect(screen.getByLabelText('Redirect URI')).toHaveValue(
+      'https://forge.example.com/admin/settings/email/oauth/callback',
+    )
     await user.selectOptions(screen.getByLabelText('Register as'), 'account')
     await user.type(screen.getByLabelText('Account'), 'admin')
     await user.type(screen.getByLabelText('Account password'), 'adm1n-pw')
@@ -386,7 +387,7 @@ describe('admin email settings screen', () => {
     await waitFor(() =>
       expect(registrations).toEqual([{ username: 'admin', password: 'adm1n-pw' }]),
     )
-    expect(await screen.findByText('Not authorized')).toBeInTheDocument()
+    expect(await screen.findByText('not authorized')).toBeInTheDocument()
     expect(screen.getByText(/registered by Forge/)).toBeInTheDocument()
     // The registered client is kept by the form without naming it.
     expect(screen.queryByLabelText('Client id')).toBeNull()
@@ -438,7 +439,7 @@ describe('admin email settings screen', () => {
       }),
     ).toBeInTheDocument()
     expect(polls).toBe(2)
-    expect(screen.getByText('Authorized')).toBeInTheDocument()
+    expect(screen.getByText('authorized')).toBeInTheDocument()
     expect(screen.queryByText('WDJB-MJHT')).toBeNull()
   }, 20_000)
 
@@ -473,7 +474,7 @@ describe('admin email settings screen', () => {
     expect(await screen.findByText(/must authorize Forge again/)).toHaveTextContent(
       'invalid_grant',
     )
-    expect(screen.queryByText('Authorized')).toBeNull()
+    expect(screen.queryByText('authorized')).toBeNull()
   })
 })
 
