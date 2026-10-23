@@ -406,6 +406,7 @@ pub async fn preview(
                     cached_version_id: r.cached_version_id,
                     package_name: r.name,
                     version: r.version,
+                    listed: r.listed,
                     first_seen_at: r.first_seen_at,
                     last_downloaded_at: r.last_downloaded_at,
                 })
@@ -422,7 +423,7 @@ pub async fn preview(
     let evaluation = tokio::task::spawn_blocking(move || {
         (
             evaluate(format.as_ref(), now, &policy, &hosted),
-            evaluate_proxy(now, &policy, &proxy),
+            evaluate_proxy(format.as_ref(), now, &policy, &proxy),
         )
     })
     .await;

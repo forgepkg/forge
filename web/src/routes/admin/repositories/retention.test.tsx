@@ -588,7 +588,9 @@ describe('retention screen', () => {
     await renderAt('/manage/repositories/nuget-proxy/retention')
     expect(await screen.findByText(/An evicted version stays listed/)).toBeInTheDocument()
     expect(rule(1).queryByLabelText(/^Action/)).not.toBeInTheDocument()
-    expect(rule(1).queryByLabelText(/^Newest versions/)).not.toBeInTheDocument()
+    // The example keeps the newest three cached versions of each package.
+    expect(rule(1).getByLabelText(/^Newest versions/)).toHaveValue('3')
+    await userEvent.type(rule(1).getByLabelText(/^Most recently pulled/), '5')
     await userEvent.clear(rule(1).getByLabelText(/^Not pulled for/))
     await userEvent.type(rule(1).getByLabelText(/^Not pulled for/), '30')
     await userEvent.click(screen.getByRole('button', { name: 'Save policy' }))
@@ -605,7 +607,11 @@ describe('retention screen', () => {
               action: 'hard_delete',
               scope: 'proxy_cached',
               release_type: 'any',
-              criteria: { not_pulled_for_days: 30 },
+              criteria: {
+                keep_last_n: 3,
+                keep_n_most_downloaded: 5,
+                not_pulled_for_days: 30,
+              },
             },
           ],
         },

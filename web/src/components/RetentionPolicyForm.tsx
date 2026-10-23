@@ -166,10 +166,30 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
     },
   },
   proxy: {
-    rulesNote: 'A cached version is evicted when any rule selects it.',
+    rulesNote:
+      'A cached version is evicted when any rule selects it. What any rule keeps is never evicted, so each package can keep a working set however long nobody pulls it.',
     head: [],
     groups: [
       { legend: 'Versions it looks at', fields: [RELEASE_TYPE, PACKAGE_PREFIX] },
+      {
+        legend: 'Always keep',
+        description:
+          'Per package, among its cached versions the filters above admit. A version any rule keeps stays cached.',
+        fields: [
+          {
+            path: ['criteria', 'keep_last_n'],
+            label: 'Newest versions',
+            kind: 'count',
+            description: 'The newest N cached versions the upstream lists.',
+          },
+          {
+            path: ['criteria', 'keep_n_most_downloaded'],
+            label: 'Most recently pulled',
+            kind: 'count',
+            description: 'The N cached versions pulled last, listed or not.',
+          },
+        ],
+      },
       {
         legend: 'Evict a cached version when',
         description:
@@ -193,6 +213,7 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
     example: {
       id: 'evict-cold',
       release_type: 'any',
+      'criteria.keep_last_n': '3',
       'criteria.not_pulled_for_days': '90',
     },
   },

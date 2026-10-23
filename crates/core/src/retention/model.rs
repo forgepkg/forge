@@ -11,7 +11,8 @@
 //!   * protections: `keep_last_n`, `keep_n_most_downloaded`
 //!   * triggers (ANDed within a rule): `older_than_days`, `not_downloaded_for_days`
 //!   * filters: `release_type` (release vs prerelease), `package_name_prefix`
-//!   * proxy rules: `scope: proxy_cached` with `not_pulled_for_days`
+//!   * proxy rules: `scope: proxy_cached` with `not_pulled_for_days`, and the
+//!     same protections over each package's cached versions
 //!
 //! These types are **pure data** + a `validate_policy` function; no I/O. They are
 //! (de)serialized straight to/from the jsonb column with serde.
@@ -116,7 +117,8 @@ pub enum Scope {
     /// Proxy cached versions (`proxy_cached_version` rows); only valid on proxy
     /// repos. Eviction deletes the locally cached bytes and leaves the version
     /// listed (re-fetched from upstream on the next pull); proxy entries are
-    /// never "unlisted".
+    /// never "unlisted". Its rules trigger on `not_pulled_for_days` and may
+    /// keep versions with the protections of [`Criteria`].
     ProxyCached,
 }
 
@@ -142,7 +144,9 @@ pub enum ReleaseType {
 /// A `releases`-only rule with `keep_last_n: 3` therefore protects the three
 /// newest stable releases, never prereleases. The protected sets of all rules
 /// are then **unioned**: a version protected by any rule is never unlisted or
-/// deleted by any rule.
+/// deleted by any rule. On `scope: proxy_cached` rules the pool is the
+/// package's *cached* versions, `listed` is whether the upstream lists them,
+/// downloads are pulls, and a protected cached version is never evicted.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Criteria {
@@ -318,8 +322,9 @@ fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), Policy
             return Err(PolicyError::ProxyScopeOnNonProxy(rule.id.clone()));
         }
         Scope::ProxyCached => {
-            // Proxy rules act only on `not_pulled_for_days`; hosted-only fields
-            // are nonsensical here and almost certainly a copy-paste mistake.
+            // Proxy rules trigger only on `not_pulled_for_days` (and keep what
+            // their protections name); the hosted triggers are nonsensical
+            // here and almost certainly a copy-paste mistake.
             if c.older_than_days.is_some() {
                 return Err(PolicyError::HostedFieldOnProxyScope {
                     rule: rule.id.clone(),
@@ -330,12 +335,6 @@ fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), Policy
                 return Err(PolicyError::HostedFieldOnProxyScope {
                     rule: rule.id.clone(),
                     field: "not_downloaded_for_days",
-                });
-            }
-            if c.has_protection() {
-                return Err(PolicyError::HostedFieldOnProxyScope {
-                    rule: rule.id.clone(),
-                    field: "keep_last_n/keep_n_most_downloaded",
                 });
             }
         }
@@ -640,16 +639,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_protection_on_proxy_scope() {
+    fn accepts_protections_on_proxy_scope() {
         let mut rule = example_proxy_rule();
         rule.criteria.keep_last_n = Some(3);
+        rule.criteria.keep_n_most_downloaded = Some(5);
+        let p = RetentionPolicy {
+            rules: vec![rule.clone()],
+            ..minimal_valid()
+        };
+        validate_policy(&p, RepoKind::Proxy).unwrap();
+        // Zero still protects nothing and is refused, as on hosted rules.
+        rule.criteria.keep_last_n = Some(0);
+        let p = RetentionPolicy {
+            rules: vec![rule.clone()],
+            ..minimal_valid()
+        };
+        assert!(matches!(
+            validate_policy(&p, RepoKind::Proxy),
+            Err(PolicyError::ZeroCount {
+                field: "keep_last_n",
+                ..
+            })
+        ));
+        // A proxy rule still needs its trigger.
+        rule.criteria.keep_last_n = Some(3);
+        rule.criteria.not_pulled_for_days = None;
         let p = RetentionPolicy {
             rules: vec![rule],
             ..minimal_valid()
         };
         assert!(matches!(
             validate_policy(&p, RepoKind::Proxy),
-            Err(PolicyError::HostedFieldOnProxyScope { .. })
+            Err(PolicyError::RuleHasNoTrigger(_))
         ));
     }
 

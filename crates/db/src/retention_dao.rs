@@ -64,6 +64,8 @@ pub struct ProxyCandidateRow {
     pub name: String,
     /// Normalized version.
     pub version: String,
+    /// Whether the upstream lists the version.
+    pub listed: bool,
     /// When the version was first seen upstream (the package-delay anchor).
     pub first_seen_at: DateTime<Utc>,
     /// Last pull timestamp, or `None` if never pulled.
@@ -517,7 +519,7 @@ where
 {
     let rows = sqlx::query!(
         r#"
-        SELECT id, name, version, first_seen_at, last_downloaded_at
+        SELECT id, name, version, listed, first_seen_at, last_downloaded_at
         FROM proxy_cached_version
         WHERE repository_id = $1 AND downloaded AND not_found = false
         ORDER BY name, version
@@ -533,6 +535,7 @@ where
             cached_version_id: r.id,
             name: r.name,
             version: r.version,
+            listed: r.listed,
             first_seen_at: r.first_seen_at,
             last_downloaded_at: r.last_downloaded_at,
         })
