@@ -92,8 +92,8 @@ sys.exit(1 if failed else 0)
 EOF
 echo "forge.toml: every rendering parses" >&2
 
-# A secretEnv or Redis password change rolls the pods through a pod
-# annotation (checksum/secret-env, Redis's checksum/auth) that anyone who can
+# A secretEnv or Valkey password change rolls the pods through a pod
+# annotation (checksum/secret-env, Valkey's checksum/auth) that anyone who can
 # read the pods sees, so it must not be the plain SHA-256 of the secrets,
 # which can be tested against guesses. Render known secrets, once with a
 # generated salt and once with one set in the values, next to the plain JSON
@@ -101,13 +101,13 @@ echo "forge.toml: every rendering parses" >&2
 # from the plain hash and be the hash salted with the salt the chart keeps in
 # its Secret (the same value in one render).
 plain='[{"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "plain-secrets"},
-  "data": {"secret-env": "{{ toJson .Values.secretEnv }}", "redis-auth": "{{ toJson .Values.redis.auth }}"}}]'
+  "data": {"secret-env": "{{ toJson .Values.secretEnv }}", "valkey-auth": "{{ toJson .Values.valkey.auth }}"}}]'
 for salt in "" check-salt; do
   helm template forge "$chart" --namespace forge --kube-version "$k8s_version" \
-    --set redis.enabled=true \
+    --set valkey.enabled=true \
     --set-string secretEnv.FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD=check-only \
-    --set-string redis.auth.password=check-only \
-    --set-string secretEnvChecksumSalt="$salt" --set-string redis.auth.checksumSalt="$salt" \
+    --set-string valkey.auth.password=check-only \
+    --set-string secretEnvChecksumSalt="$salt" --set-string valkey.auth.checksumSalt="$salt" \
     --set-json extraObjects="$plain" > "$work/salted-${salt:-generated}.yaml"
 done
 python3 - "$work/salted-generated.yaml" "$work/salted-check-salt.yaml" <<'EOF'
@@ -142,16 +142,16 @@ for path, set_salt in zip(sys.argv[1:], ["", "check-salt"]):
     documents = open(path, encoding="utf-8").read().split("\n---\n")
     plain = find(documents, "ConfigMap", "plain-secrets")
     env_json = field(plain, "secret-env")
-    auth_json = field(plain, "redis-auth")
+    auth_json = field(plain, "valkey-auth")
     salts = {
         "checksum/secret-env": base64.b64decode(field(find(documents, "Secret", "forge-checksum-salt"), "salt")).decode(),
-        "checksum/auth": base64.b64decode(field(find(documents, "Secret", "forge-redis"), "checksum-salt")).decode(),
+        "checksum/auth": base64.b64decode(field(find(documents, "Secret", "forge-valkey"), "checksum-salt")).decode(),
     }
     auth = {k: v for k, v in json.loads(auth_json).items() if k not in ("password", "checksumSalt")}
     auth["password"] = sha256(salts["checksum/auth"] + "\n" + json.loads(auth_json)["password"])
     cases = [
         ("checksum/secret-env", "forge", env_json, sha256(salts["checksum/secret-env"] + "\n" + env_json)),
-        ("checksum/auth", "forge-redis", auth_json, sha256(json.dumps(auth, separators=(",", ":"), sort_keys=True))),
+        ("checksum/auth", "forge-valkey", auth_json, sha256(json.dumps(auth, separators=(",", ":"), sort_keys=True))),
     ]
     for annotation, deployment, plain_json, salted in cases:
         value = field(find(documents, "Deployment", deployment), annotation)

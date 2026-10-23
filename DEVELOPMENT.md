@@ -706,10 +706,15 @@ SBOM attestation covers the npm packages and crates, not just Debian's.
 
 Every image the build and the deployment use is pinned by digest
 (`tag@sha256:…`): the base images, the Dockerfile frontend (`# syntax=`),
-BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Redis
+BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Valkey
 and versitygw images in `deploy/`. `.github/scripts/image-pin-check.sh` (CI)
 fails on a reference without one; Forge's own image is exempt, since the
-release pins it. Dependabot bumps the base images and the `deploy/` images;
+release pins it. `deploy/` pulls PostgreSQL, Valkey and versitygw from
+byte-for-byte copies of their Docker Hub images on ghcr.io
+(`ghcr.io/forgepkg/forge/<name>`, the same digests), which
+`.github/workflows/mirror-images.yml` keeps in line with Docker Hub daily and
+fills with every newly pinned digest once it lands on `main`. Dependabot
+bumps the base images and the `deploy/` images (watching those ghcr.io tags);
 the frontend, BuildKit, the SBOM generator and ci.yml's `postgres` service
 are bumped by hand (tag and digest, from the registry's index of the tag).
 
@@ -880,9 +885,11 @@ next milestone.
 ## Releasing
 
 A `v<version>` tag on the default branch publishes the release: the release
-workflow (`.github/workflows/release.yml`) builds, signs and pushes
-`ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned to that
-image's digest, pushes and signs it as `oci://ghcr.io/forgepkg/charts/forge`
+workflow (`.github/workflows/release.yml`) makes sure the dependency images
+`deploy/` pins are on ghcr.io and public (`mirror-images.yml`), builds, signs
+and pushes `ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned
+to that image's digest, pushes and signs it as
+`oci://ghcr.io/forgepkg/charts/forge`
 (version `<version>`), and creates the GitHub release from the matching
 `CHANGELOG.md` section with the chart attached. It refuses a tag unless the
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
@@ -991,6 +998,15 @@ organization's **Packages** tab → the package → **Package settings**):
 2. On the chart, under **Manage Actions access**, give the `forgepkg/forge`
    repository the **Write** role if it is not listed. Without it the next
    release's `helm push` fails after the image tags have already moved.
+
+The same goes for the dependency images' copies, which the first run of
+`mirror-images.yml` on `main` creates: `ghcr.io/forgepkg/forge/postgres`,
+`ghcr.io/forgepkg/forge/valkey` and `ghcr.io/forgepkg/forge/versitygw`. Make
+them **Public** and check that `forgepkg/forge` has the **Write** role under
+**Manage Actions access**; until then the mirror run warns, and the release
+refuses to publish a chart that pulls them. They keep Docker Hub's
+`org.opencontainers.image.source` (a byte-for-byte copy cannot change it),
+so GHCR does not link them to the repository on its own.
 
 Both packages name the repository in `org.opencontainers.image.source`: the
 image through `docker/metadata-action`, the chart because `helm push` copies

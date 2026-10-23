@@ -60,7 +60,7 @@ it up and would roll the pods on every render: set `secretEnvChecksumSalt`
 there (`openssl rand -hex 16`). A change inside `existingSecret` rolls
 nothing; restart the pods yourself.
 
-A production setup with an external PostgreSQL and S3 and a Redis in the
+A production setup with an external PostgreSQL and S3 and a Valkey in the
 cluster:
 
 ```yaml
@@ -90,7 +90,7 @@ config:
 existingSecret: forge-credentials       # FORGE_DATABASE__URL, FORGE_S3__ACCESS_KEY,
                                         # FORGE_S3__SECRET_KEY, FORGE_ROOT_KEY,
                                         # FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
-redis:
+valkey:
   enabled: true
 
 podDisruptionBudget:
@@ -249,20 +249,28 @@ and wired into Forge when enabled:
 | Dependency | Enable with | Sets |
 | --- | --- | --- |
 | PostgreSQL 17 (StatefulSet) | `postgresql.enabled` | `FORGE_DATABASE__URL` |
-| Redis, cache only (Deployment) | `redis.enabled` | `FORGE_REDIS__URL` |
+| Valkey, cache only (Deployment) | `valkey.enabled` | `FORGE_REDIS__URL` |
 | versitygw S3 gateway (StatefulSet) | `versitygw.enabled` | `s3.endpoint`, `s3.bucket`, `FORGE_S3__ACCESS_KEY` / `_SECRET_KEY` (static root credentials only: not with short-lived `s3.credentials`) |
 
 None has backups, replication or failover. For production use a managed
 PostgreSQL (or an operator such as CloudNativePG; point
 `FORGE_DATABASE__URL` at its app Secret with `env`) and a real object store.
+Leaving `valkey.enabled` off and setting `FORGE_REDIS__URL` (in `secretEnv` or
+`existingSecret`) uses your own Valkey or Redis instead; Forge speaks the
+Redis protocol to either.
 Each one only accepts connections from this release's Forge pods (a
 NetworkPolicy), and every value is listed in
 `charts/<name>/values.yaml`; set them under the dependency's key.
 
-Their images are pinned by digest: `image.tag` is `<tag>@sha256:…` (the
-multi-arch index), which Dependabot bumps together with the tag. A digest in
-`image.digest` replaces the pinned one; a plain `image.tag` such as `"16"`
-pulls by tag.
+Their images come from ghcr.io, like Forge's: `ghcr.io/forgepkg/forge/<name>`
+holds byte-for-byte copies of the Docker Hub images (`library/postgres`,
+`valkey/valkey`, `versity/versitygw`) under the same digests, so a cluster
+needs no access to Docker Hub. To pull the originals instead, set
+`image.registry: docker.io` and `image.repository` to the Docker Hub name;
+the pinned digest stays valid. They are pinned by digest: `image.tag` is
+`<tag>@sha256:…` (the multi-arch index), which Dependabot bumps together with
+the tag. A digest in `image.digest` replaces the pinned one; a plain
+`image.tag` such as `"16"` pulls by tag.
 
 Passwords are generated on install and kept across upgrades by looking up the
 existing Secret; the PostgreSQL and S3 Secrets also survive `helm uninstall`
@@ -270,10 +278,10 @@ together with their volumes. Tools that render without a cluster (Argo CD,
 `helm template`) cannot look them up and would generate new ones on every
 render: set `auth.password` (or `auth.existingSecret`) there. Passwords are
 pasted into Forge's connection URLs unescaped, so use URL-safe values
-(`openssl rand -hex 24`). Redis restarts when `redis.auth.password` changes,
-through a pod annotation salted like Forge's (the salt is kept in the Redis
-Secret): with `redis.auth.password` in Argo CD, set
-`redis.auth.checksumSalt` too.
+(`openssl rand -hex 24`). Valkey restarts when `valkey.auth.password`
+changes, through a pod annotation salted like Forge's (the salt is kept in
+the Valkey Secret): with `valkey.auth.password` in Argo CD, set
+`valkey.auth.checksumSalt` too.
 
 Evaluation install, everything in the cluster:
 

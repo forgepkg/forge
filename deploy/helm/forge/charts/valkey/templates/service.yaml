@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "forge-redis.fullname" . }}
+  name: {{ include "forge-valkey.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "forge-redis.labels" . | nindent 4 }}
+    {{- include "forge-valkey.labels" . | nindent 4 }}
     {{- with .Values.service.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -15,9 +15,9 @@ metadata:
 spec:
   type: {{ .Values.service.type }}
   selector:
-    {{- include "forge-redis.selectorLabels" . | nindent 4 }}
+    {{- include "forge-valkey.selectorLabels" . | nindent 4 }}
   ports:
-    - name: redis
+    - name: valkey
       port: {{ .Values.service.port }}
-      targetPort: redis
+      targetPort: valkey
       protocol: TCP

@@ -13,7 +13,7 @@ deploy/kubernetes/
 │   ├── ingress/             Ingress with TLS (ingress-nginx annotations for large, slow pushes)
 │   ├── httproute/           Gateway API HTTPRoute instead of an Ingress
 │   ├── network-policy/      only the ingress controller / gateway reaches Forge
-│   ├── redis/               in-cluster Redis (shared cache), password-protected
+│   ├── valkey/              in-cluster Valkey (shared cache), password-protected
 │   ├── high-availability/   two replicas, spread over nodes, PodDisruptionBudget
 │   ├── local-cache/         local blob cache on an emptyDir (faster downloads, serves through an S3 outage)
 │   ├── local-cache-persistent/  the same on a PersistentVolume (one replica, survives restarts)
@@ -22,7 +22,7 @@ deploy/kubernetes/
 │   ├── s3-workload-identity/  short-lived S3 credentials from a projected service-account token (no S3 keys)
 │   └── image-latest/        run :latest instead of the pinned release
 └── overlays/
-    ├── production/          external PostgreSQL + S3, Redis, two replicas, Ingress, NetworkPolicy
+    ├── production/          external PostgreSQL + S3, Valkey, two replicas, Ingress, NetworkPolicy
     └── evaluation/          everything in-cluster, no Ingress
 ```
 
@@ -46,7 +46,7 @@ of one `ref`:
 resources:
   - https://github.com/schmitch/forge//deploy/kubernetes/base?ref=v1.0.0
 components:
-  - https://github.com/schmitch/forge//deploy/kubernetes/components/redis?ref=v1.0.0
+  - https://github.com/schmitch/forge//deploy/kubernetes/components/valkey?ref=v1.0.0
 ```
 
 To follow `:latest` instead, add `components/image-latest`. Nothing restarts
@@ -56,9 +56,13 @@ only go forward, read the changelog before that happens.
 
 Release images are signed; the cosign command is in each GitHub release. If
 the GHCR package is not public, give the `forge` ServiceAccount an
-`imagePullSecrets` entry. The images of the postgres, redis and s3-versitygw
-components are pinned by digest (`tag@sha256:…`); Dependabot proposes
-updates.
+`imagePullSecrets` entry. The postgres, valkey and s3-versitygw components
+pull from ghcr.io too: `ghcr.io/forgepkg/forge/<name>` holds byte-for-byte
+copies of the Docker Hub images under the same digests, pinned by digest
+(`tag@sha256:…`); Dependabot proposes updates. To pull the originals
+instead, add an `images:` entry to your overlay (`name:
+ghcr.io/forgepkg/forge/valkey`, `newName: valkey/valkey`); the digest stays
+valid.
 
 ## Configuration and secrets
 
@@ -75,9 +79,9 @@ Forge reads its configuration from `FORGE_*` environment variables
   `forge-env` and drop the `secretGenerator`.
 
 The components that run a backing service read their password from the same
-Secret: `POSTGRES_PASSWORD` (postgres), `REDIS_PASSWORD` (redis), and the
+Secret: `POSTGRES_PASSWORD` (postgres), `VALKEY_PASSWORD` (valkey), and the
 gateway uses Forge's own `FORGE_S3__ACCESS_KEY`/`FORGE_S3__SECRET_KEY`
-(s3-versitygw). The Postgres and Redis passwords are pasted into a URL, so
+(s3-versitygw). The Postgres and Valkey passwords are pasted into a URL, so
 generate URL-safe values: `openssl rand -hex 24`.
 
 Turn on secret encryption at rest before you configure proxy repositories or
@@ -125,8 +129,8 @@ Points that matter on Kubernetes:
   Pushes and first-time proxy downloads are staged there, up to
   `server.max_staging_bytes` (4 GiB by default); the volume's `sizeLimit` is
   6 GiB. Raise both together.
-- **Two or more replicas** need Redis (`components/redis` or your own
-  `FORGE_REDIS__URL`), and replicas × `database.max_connections` (20) must fit
+- **Two or more replicas** need Valkey or Redis (`components/valkey` or your
+  own `FORGE_REDIS__URL`), and replicas × `database.max_connections` (20) must fit
   PostgreSQL's `max_connections`.
 - **Reverse proxy.** Allow 1 GiB request bodies without buffering (image
   layers are up to 1 GiB and package pushes up to 512 MiB unless a
