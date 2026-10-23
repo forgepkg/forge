@@ -798,6 +798,20 @@ tests read from outside the crates belongs in the Rust group, one only
 xtask's tests read in the Release group: add a new one to `ci-changes.sh`.
 A new job of `ci.yml` goes in `CI_JOB_GROUP` too.
 
+The `audit` job runs `cargo audit` only for a change to `Cargo.lock` or
+`.cargo/audit.toml`: every change to a `Cargo.toml` that adds or updates a
+dependency changes the lockfile, and the lockfile is all the job reads. A
+RustSec advisory published for a dependency no change touches is caught by
+the `Audit` workflow (`.github/workflows/audit.yml`) instead, so it does not
+fail an unrelated pull request: it audits `main` every day at 9:00 Berlin
+time, and on demand (**Actions → Audit → Run workflow**). GitHub notifies the
+user who created the workflow, or who last changed its `cron` line, of a
+failed scheduled run, on github.com and by email as their notification
+settings for Actions say; to receive them yourself, disable and re-enable the
+workflow (**Actions → Audit → ⋯**). Fix a failure as in CI: update the crate
+(`cargo update -p <crate>`), or accept the advisory in `.cargo/audit.toml`
+with a one-line rationale.
+
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
 only the image build, such as an `include_str!` of a file `.dockerignore`

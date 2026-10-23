@@ -214,7 +214,9 @@ jobs:
   # ── Dependency advisories (RustSec) ────────────────────────────────────────
   # Fails on any known vulnerability in Cargo.lock. Accepted advisories, each
   # with a one-line rationale, live in .cargo/audit.toml. Reads only the
-  # lockfile (no build), so it is quick and needs no toolchain cache.
+  # lockfile (no build), so it is quick and needs no toolchain cache. Runs
+  # only for a change to either file; an advisory published for a dependency
+  # no change touches fails the daily run of audit.yml instead.
   audit:
     name: audit
     runs-on: ubuntu-latest
