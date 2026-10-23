@@ -9,8 +9,9 @@
 //! it then calls `Chart.yaml`, then every `requirements.yaml`, into the
 //! chart's metadata: the last one wins. So Forge reads the whole archive
 //! too ([`tar`] reads it as Go does), and refuses one with more than one
-//! top-level directory, more than one Chart.yaml or requirements.yaml, or a
-//! requirements.yaml that declares more than dependencies.
+//! top-level directory, more than one Chart.yaml or requirements.yaml, a
+//! requirements.yaml that declares more than dependencies, or a Chart.yaml
+//! key that Helm reads as another field ([`folded_field`]).
 
 use std::io::{self, Read};
 
@@ -239,6 +240,14 @@ pub fn parse_chart_yaml(chart_yaml: Vec<u8>) -> Result<Chart, String> {
     let Some(Value::Object(metadata)) = docs.first().map(to_json) else {
         return Err("Chart.yaml is not a mapping".into());
     };
+    if let Some((key, field)) = metadata
+        .keys()
+        .find_map(|key| Some((key, folded_field(key)?)))
+    {
+        return Err(format!(
+            "Chart.yaml has the key {key:?}, which Helm reads as {field:?}"
+        ));
+    }
     let field = |key: &str| -> Result<String, String> {
         match metadata.get(key) {
             Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
@@ -260,6 +269,36 @@ pub fn parse_chart_yaml(chart_yaml: Vec<u8>) -> Result<Chart, String> {
         chart_yaml,
         metadata,
     })
+}
+
+/// The field of Helm's chart metadata that `key` sets without being its
+/// name: one that equals it only under Go's case folding.
+///
+/// Helm reads Chart.yaml with `sigs.k8s.io/yaml`, which turns it into JSON,
+/// keys sorted, and decodes that with Go's `encoding/json`. The decoder
+/// matches a key to a field case-insensitively, by Unicode simple case
+/// folding, and a later key overwrites an earlier one. So `verſion` (`ſ`
+/// folds to `s`), which sorts after `version`, is the version Helm installs
+/// whatever `version` says, and `apiversion` sorts after `apiVersion` (#422).
+/// Only ASCII letters, U+017F (`ſ`, the long s, to `s`) and U+212A (the
+/// Kelvin sign, to `k`) fold to ASCII letters, and every field name is ASCII.
+fn folded_field(key: &str) -> Option<&'static str> {
+    if crate::METADATA_KEYS.contains(&key) {
+        return None;
+    }
+    let folded: String = key
+        .chars()
+        .map(|c| match c {
+            '\u{17f}' => Some('s'),
+            '\u{212a}' => Some('k'),
+            c if c.is_ascii() => Some(c.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    crate::METADATA_KEYS
+        .iter()
+        .copied()
+        .find(|field| field.eq_ignore_ascii_case(&folded))
 }
 
 /// A YAML value as JSON. Scalars YAML would read as numbers keep their text
@@ -587,6 +626,82 @@ mod tests {
             ("demo/charts/sub/requirements.yaml", b"name: evil\n"),
         ]);
         assert_eq!(identity(&tar).unwrap(), "good 1.0.0");
+    }
+
+    #[test]
+    fn folds_keys_like_go() {
+        for (key, field) in [
+            ("verſion", Some("version")),
+            ("VERSION", Some("version")),
+            ("Version", Some("version")),
+            ("apiversion", Some("apiVersion")),
+            ("APIVERSION", Some("apiVersion")),
+            ("\u{212a}ubeVersion", Some("kubeVersion")),
+            ("\u{212a}EYWORDſ", Some("keywords")),
+            ("Name", Some("name")),
+            // Exact names, and keys that are no field.
+            ("version", None),
+            ("apiVersion", None),
+            ("versions", None),
+            ("\u{212a}ind", None),
+            ("versión", None),
+            ("ver\u{0131}sion", None),
+            ("", None),
+        ] {
+            assert_eq!(folded_field(key), field, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn refuses_keys_helm_reads_as_another_field() {
+        // What Helm 3.17 (sigs.k8s.io/yaml v1.4.0) reads, after `apiVersion: v2`:
+        // `good 6.6.6` for the first two, `evil 1.0.0` for the fourth, a v1
+        // chart for `apiversion` and appVersion 9 for `appversion`.
+        for keys in [
+            "name: good\nversion: 1.0.0\nverſion: 6.6.6\n",
+            "name: good\nverſion: 6.6.6\nversion: 1.0.0\n",
+            "name: good\nversion: 1.0.0\nVERSION: 6.6.6\n",
+            "NAME: evil\nversion: 1.0.0\n",
+            "name: good\nNAME: evil\nversion: 1.0.0\n",
+            "name: good\nversion: 1.0.0\napiversion: v1\n",
+            "name: good\nversion: 1.0.0\nappVersion: \"1\"\nappversion: \"9\"\n",
+            "name: good\nversion: 1.0.0\n\u{212a}ubeVersion: \">=1.0\"\n",
+        ] {
+            let chart_yaml = format!("apiVersion: v2\n{keys}");
+            let err = parse_chart_yaml(chart_yaml.clone().into_bytes()).err();
+            assert!(
+                err.as_deref()
+                    .is_some_and(|e| e.contains("which Helm reads as")),
+                "{chart_yaml:?}: {err:?}"
+            );
+        }
+        let err = parse_chart_yaml(
+            "apiVersion: v2\nname: good\nversion: 1.0.0\nverſion: 6.6.6\n"
+                .as_bytes()
+                .to_vec(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            err,
+            r#"Chart.yaml has the key "verſion", which Helm reads as "version""#
+        );
+        // In an archive, as a push or a proxy download reads it.
+        let tar = archive(&[(
+            "demo/Chart.yaml",
+            "apiVersion: v2\nname: good\nversion: 1.0.0\nverſion: 6.6.6\n".as_bytes(),
+        )]);
+        assert!(refusal(&tar).contains("which Helm reads as \"version\""));
+        // Keys that are no field of Helm's stay accepted, as Helm ignores them.
+        let chart = parse_chart_yaml(
+            b"apiVersion: v2\nname: good\nversion: 1.0.0\nappVersion: \"1\"\nversions: 2\nKind: x\n"
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            (chart.name.as_str(), chart.version.as_str()),
+            ("good", "1.0.0")
+        );
     }
 
     #[test]

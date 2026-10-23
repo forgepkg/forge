@@ -210,8 +210,11 @@ poll_interval_seconds = 10      # (default: 10)
 processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processed outbox rows this long; 0 = never prune
 
 [retention]
-# enabled = true                         # (default: true) run the retention worker on this instance
-# audit_retention_seconds = 7776000      # (default: 7776000 = 90 days) keep retention_audit rows this long; 0 = never prune
+# Retention is set in the web UI, for every instance: each repository's policy
+# (Repositories → <name> → Retention), and whether runs happen and how long
+# the audit log is kept (Admin → Retention). These keys only tune the worker.
+# poll_interval_seconds = 30             # (default: 30) how often this instance looks for a due repository
+# lease_seconds = 300                    # (default: 300) lease a run holds, renewed while it works
 
 # Optional: OpenID Connect / Microsoft Entra interactive login.
 # This block is a one-shot SEED — on first boot it is imported into an

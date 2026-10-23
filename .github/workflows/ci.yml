@@ -304,14 +304,17 @@ jobs:
         continue-on-error: true
         run: .github/scripts/test-timings-summary.sh "$RUNNER_TEMP/test-timings" >> "$GITHUB_STEP_SUMMARY"
 
-  # ── Container image (build only; releases push from release.yml) ─────────
+  # ── Container image (build and smoke test; releases push from release.yml) ─
   # Builds the production Dockerfile so a broken image is caught before a
   # release tag, not by it, whenever a change touches what the image is built
   # from (the image group, #338, #353 and #361), for a release commit and on
   # manual runs without a `base`. clippy, test and web compile the Rust code
   # and the SPA of every other change; one that breaks only the image (a
   # release-only cfg, a file .dockerignore leaves out) fails in the next run
-  # that builds it, the release's at the latest.
+  # that builds it, the release's at the latest. The built image is then
+  # started the way the Kubernetes manifests run it (#239): read-only root,
+  # /tmp a tmpfs, user 10001, the baked forge.toml, a blob cache volume, and a
+  # restart (.github/scripts/image-smoke.sh).
   docker:
     name: docker
     runs-on: ubuntu-latest
@@ -332,12 +335,20 @@ jobs:
         with:
           context: .
           push: false
+          # Into the runner's docker, for the smoke test.
+          load: true
+          tags: forge:ci
           build-args: |
             FORGE_GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           # Written by pushes to the default branch only (see the note on
           # build caches at the top).
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
+      - name: Smoke test the image (as the manifests run it)
+        env:
+          FORGE_SMOKE_POSTGRES_IMAGE: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+          FORGE_SMOKE_S3_IMAGE: mirror.gcr.io/versity/versitygw:v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f
+        run: .github/scripts/image-smoke.sh forge:ci "${{ github.sha }}"
 
   # ── Kubernetes manifests (deploy/kubernetes) and Helm chart (deploy/helm) ──
   # Checks that every image reference (Dockerfile, deploy/, the workflows) is

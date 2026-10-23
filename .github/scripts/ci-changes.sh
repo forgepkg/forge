@@ -68,11 +68,13 @@ RELEASE=(
 )
 AUDIT=(Cargo.lock .cargo/audit.toml)
 WEB=(web)
-# What the image is built from beyond the sources clippy, test and web check.
+# What the image is built from beyond the sources clippy, test and web check,
+# and what its smoke test reads.
 IMAGE=(
     Dockerfile .dockerignore docker LICENSE
     ':(glob)**/Cargo.toml' Cargo.lock rust-toolchain.toml .cargo ':(exclude).cargo/audit.toml'
     web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml web/.npmrc
+    .github/scripts/image-smoke.sh fixtures/nuget/sample.lib.1.0.0.nupkg
 )
 # The kubernetes job: the manifests and the chart, and what its digest-pin
 # check reads besides them (Dockerfiles, the workflows).

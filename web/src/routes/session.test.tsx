@@ -12,6 +12,7 @@ import { makeQueryClient } from '~/lib/queryClient'
 import { clearSession, getCsrfToken, setSession } from '~/lib/auth'
 import { meKeys, type Me } from '~/api/me'
 import { routeTree } from '~/routeTree.gen'
+import { searchOptions } from '~/lib/search'
 
 /**
  * Session expiry + sign-out against the real route tree, query client and
@@ -92,6 +93,7 @@ async function renderApp(initialPath: string) {
   const queryClient = makeQueryClient()
   const router = createRouter({
     routeTree,
+    ...searchOptions,
     context: { queryClient },
     history: createMemoryHistory({ initialEntries: [initialPath] }),
   })
@@ -142,7 +144,7 @@ describe('session expiry', () => {
     expect(router.state.location.pathname).toBe('/login')
     expect(router.state.location.search).toMatchObject({
       redirect: '/',
-      expired: true,
+      expired: 'true',
     })
     expect(
       await screen.findByText(/your session expired/i),
@@ -173,7 +175,7 @@ describe('session expiry', () => {
     await waitFor(() => expect(router.state.location.pathname).toBe('/login'))
     expect(router.state.location.search).toMatchObject({
       redirect: '/manage/repositories',
-      expired: true,
+      expired: 'true',
     })
     expect(queryClient.getQueryData(meKeys.self())).toBeUndefined()
     await sleep(300)

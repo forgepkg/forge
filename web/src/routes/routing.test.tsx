@@ -12,6 +12,7 @@ import { makeQueryClient } from '~/lib/queryClient'
 import { clearSession, getCsrfToken, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import { routeTree } from '~/routeTree.gen'
+import { searchOptions } from '~/lib/search'
 
 /**
  * Router-integration tests against the **real** route tree:
@@ -69,6 +70,7 @@ async function renderApp(initialPath: string) {
   const queryClient = makeQueryClient()
   const router = createRouter({
     routeTree,
+    ...searchOptions,
     context: { queryClient },
     history: createMemoryHistory({ initialEntries: [initialPath] }),
   })
@@ -162,7 +164,7 @@ describe('app routing + admin gating', () => {
     // is no longer part of that rest.
     expect(main.queryByText(/admin flags|with retention/)).toBeNull()
     expect(
-      main.getByText(/Retention and user deactivation have no screen/),
+      main.getByText(/User deactivation has no screen/),
     ).toBeInTheDocument()
     expect(main.queryByText(/RBAC/)).toBeNull()
     expect(main.getByRole('link', { name: /^Roles/ })).toHaveAttribute(

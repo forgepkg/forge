@@ -65,11 +65,53 @@ pub enum RepoError {
     /// the client should retry later → 503.
     #[error("temporarily unavailable: {0}")]
     Busy(String),
+    /// A proxy's upstream is unavailable (it did not answer, timed out, or
+    /// answered a 5xx or a 429) and nothing cached answers in its place: an
+    /// outage of a dependency, not a fault of Forge, so the client should
+    /// retry later → 503.
+    #[error("upstream unavailable: {0}")]
+    Upstream(String),
     /// The repository's format is not installed on this server (a format
     /// plugin missing from the configuration) → 503: nothing of it is served
     /// until the format is back, and it is never read as another format.
     #[error("format {0:?} is not installed")]
     FormatUnavailable(String),
+}
+
+/// A [`RepoError`] that a cache shares between the requests it coalesces,
+/// which takes `Clone` ([`RepoError::Db`] is not). Turned back into a
+/// [`RepoError`], a database error is its text ([`RepoError::Storage`]); every
+/// other error keeps its kind, so an unavailable upstream stays one.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedRepoError(Arc<RepoError>);
+
+impl From<RepoError> for SharedRepoError {
+    fn from(e: RepoError) -> Self {
+        Self(Arc::new(e))
+    }
+}
+
+impl From<SharedRepoError> for RepoError {
+    fn from(shared: SharedRepoError) -> Self {
+        Arc::try_unwrap(shared.0).unwrap_or_else(|e| match &*e {
+            RepoError::RepoNotFound(name) => RepoError::RepoNotFound(name.clone()),
+            RepoError::WrongKind { name, kind } => RepoError::WrongKind {
+                name: name.clone(),
+                kind: kind.clone(),
+            },
+            RepoError::Db(db) => RepoError::Storage(format!("database error: {db}")),
+            RepoError::Storage(reason) => RepoError::Storage(reason.clone()),
+            RepoError::Busy(reason) => RepoError::Busy(reason.clone()),
+            RepoError::Upstream(reason) => RepoError::Upstream(reason.clone()),
+            RepoError::FormatUnavailable(format) => RepoError::FormatUnavailable(format.clone()),
+        })
+    }
+}
+
+impl std::fmt::Display for SharedRepoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 /// Errors surfaced by the hosted **write** path (publish / delete / relist).

@@ -1220,3 +1220,76 @@ async fn a_helm_proxy_downloads_a_chart_its_upstreams_index_lists_on_another_hos
     assert_eq!(resp.bytes().await.unwrap().as_ref(), demo.as_slice());
     assert_eq!((upstream.downloads(), releases.downloads()), (0, 1));
 }
+
+/// #283: a proxy whose upstream cannot be reached, with nothing cached for
+/// the request, answers 503 with `Retry-After` (an upstream outage), not 500
+/// (a fault of Forge); so does a group whose member it is. What is answered
+/// locally (NuGet's service index) is still served.
+#[tokio::test]
+async fn a_proxy_of_an_unreachable_upstream_answers_503() {
+    // Nothing listens on the port: connection refused.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let srv = start_helm(ServerOpts::default()).await;
+    let creds = credentials(&srv).await;
+    let s = unique();
+    let (helm, nuget, group) = (
+        format!("hdown{s}"),
+        format!("ndown{s}"),
+        format!("gdown{s}"),
+    );
+    for body in [
+        json!({ "name": helm, "kind": "proxy", "format": "helm", "remote_url": format!("http://{closed}") }),
+        json!({ "name": nuget, "kind": "proxy", "remote_url": format!("http://{closed}/v3/index.json") }),
+        json!({ "name": group, "kind": "group" }),
+    ] {
+        let resp = create_repo(&srv, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "{}",
+            resp.text().await.unwrap()
+        );
+    }
+    let (u, p) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .post(format!(
+            "{}/admin/repositories/{group}/members",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "member": nuget, "priority": 10 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "{}",
+        resp.text().await.unwrap()
+    );
+
+    let get = |path: String| {
+        srv.client()
+            .get(format!("{}{path}", srv.base_url))
+            .basic_auth(&creds.0, Some(&creds.1))
+            .send()
+    };
+    for path in [
+        format!("/repository/{helm}/charts/demo/1.0.0/demo-1.0.0.tgz"),
+        format!("/v3/{nuget}/flat/sample.lib/index.json"),
+        format!("/v3/{nuget}/registration/sample.lib/index.json"),
+        format!("/v3/{nuget}/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg"),
+        format!("/v3/{group}/flat/sample.lib/index.json"),
+        format!("/v3/{group}/registration/sample.lib/index.json"),
+    ] {
+        let resp = get(path.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(resp.headers()["retry-after"], "30", "{path}");
+    }
+    let resp = get(format!("/v3/{nuget}/index.json")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

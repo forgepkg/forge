@@ -14,6 +14,7 @@ import type { Me } from '~/api/me'
 import type { RealmView } from '~/api/realms'
 import type { RoleView } from '~/api/rbac'
 import { routeTree } from '~/routeTree.gen'
+import { searchOptions } from '~/lib/search'
 
 /**
  * Admin authentication-realms screens, driven against the real route tree +
@@ -206,6 +207,7 @@ async function renderAt(initialPath: string) {
   const queryClient = makeQueryClient()
   const router = createRouter({
     routeTree,
+    ...searchOptions,
     context: { queryClient },
     history: createMemoryHistory({ initialEntries: [initialPath] }),
   })

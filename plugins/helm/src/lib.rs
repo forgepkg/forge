@@ -52,7 +52,8 @@ pub const PLUGIN_TOML: &str = forge_plugin_api::plugin_toml!();
 /// Searches page through the repository this many charts at a time.
 const PAGE: u32 = 1000;
 
-/// The Chart.yaml keys an index entry carries (Helm's chart metadata).
+/// The Chart.yaml keys an index entry carries: the JSON names of the fields
+/// of Helm's chart metadata (`chart.Metadata`), every one of them.
 const METADATA_KEYS: &[&str] = &[
     "apiVersion",
     "name",
