@@ -3,8 +3,7 @@
 //!   cleared on the response;
 //! * a cross-site browser mutation is refused even with cached Basic
 //!   credentials (which the CSRF token does not cover);
-//! * removing the built-in `admin` role actually revokes admin, including for
-//!   users that also carry the legacy `is_admin` flag;
+//! * removing the built-in `admin` role actually revokes admin;
 //! * a deleted bootstrap admin is not re-created on restart — including one
 //!   whose account existed before the "created once" marker was recorded;
 //! * an existing bootstrap account still using the placeholder password is
@@ -382,7 +381,7 @@ async fn removing_the_admin_role_revokes_admin() {
     let (admin, password) = srv.admin_basic();
     let client = srv.client();
 
-    // A user created as admin holds the role and the legacy flag.
+    // A user created as admin holds the role.
     let username = format!("second-admin{}", common::unique());
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
@@ -434,14 +433,8 @@ async fn removing_the_admin_role_revokes_admin() {
         403,
         "admin rights are gone once the admin role is removed"
     );
-    let flag = forge_db::user_dao::find_user_by_id(&srv.pool, user_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .is_admin;
-    assert!(!flag, "legacy is_admin flag cleared with the role");
 
-    // Re-assigning the role restores admin (and the flag stays in step).
+    // Re-assigning the role restores admin.
     let resp = client
         .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
         .basic_auth(&admin, Some(&password))
@@ -492,7 +485,7 @@ async fn bootstrap_marker_is_recorded_for_a_preexisting_account() {
     // The account exists, but no marker was ever written for it.
     let user = forge_db::user_dao::insert_user(
         &pool,
-        forge_db::user_dao::NewUser::local(name.clone(), "$argon2id$unused".into(), true, true),
+        forge_db::user_dao::NewUser::local(name.clone(), "$argon2id$unused".into(), true),
     )
     .await
     .unwrap();
@@ -545,7 +538,6 @@ async fn placeholder_bootstrap_password_is_detected() {
         id: 1,
         username: "admin".into(),
         password_hash,
-        is_admin: true,
         active: true,
         auth_source: "local".into(),
         external_subject: None,
@@ -562,7 +554,7 @@ async fn placeholder_bootstrap_password_is_detected() {
     let pool = common::pool().await;
     forge_db::user_dao::insert_user(
         &pool,
-        forge_db::user_dao::NewUser::local(name.clone(), hash("changeme"), true, true),
+        forge_db::user_dao::NewUser::local(name.clone(), hash("changeme"), true),
     )
     .await
     .unwrap();

@@ -14,7 +14,7 @@
 //! `Cookie` header, validate it against the shared Postgres via
 //! [`SessionService::validate`] (the session row is the authority — an unknown
 //! or tampered cookie simply hashes to a missing row), and on a hit yield a
-//! [`Principal::User`] reflecting the session's user + *current* `is_admin`.
+//! [`Principal::User`] for the session's user.
 //!
 //! ## Security semantics
 //!
@@ -28,9 +28,11 @@
 //! * A database error while checking the cookie ⇒ [`SourceOutcome::Unavailable`]
 //!   — fail closed with 503 (mirrors the token path), never a 401 for a session
 //!   that may well be live.
-//! * The `is_admin` flag comes from the **live `app_user` row** looked up by the
-//!   session's `user_id`, not a value cached on the session, so an admin
-//!   grant/revoke takes effect without re-login (a deactivated user is rejected).
+//! * The user's `active` flag comes from the **live `app_user` row** looked up
+//!   by the session's `user_id`, so a deactivated user is rejected without
+//!   waiting for the session to end. What the user may do is never cached on
+//!   the session either: the authz seam reads its roles, so an admin
+//!   grant/revoke takes effect without re-login.
 
 use std::net::IpAddr;
 
@@ -70,7 +72,7 @@ pub struct SessionCookieSource {
 
 impl SessionCookieSource {
     /// Build a source over the session service + pool (the pool is used to read
-    /// the live `app_user` row for the current `is_admin`/`active` flags).
+    /// the live `app_user` row for the current `active` flag).
     /// `secure` selects the cookie name ([`session_cookie_name`]).
     pub fn new(sessions: SessionService, pool: PgPool, secure: bool) -> Self {
         Self {
@@ -131,7 +133,6 @@ impl PrincipalSource for SessionCookieSource {
             Ok(Some(user)) if user.active => SourceOutcome::Authenticated(Principal::User {
                 user_id: user.id,
                 token_id: None,
-                is_admin: user.is_admin,
                 method: crate::auth::AuthMethod::Session,
             }),
             // The session points at a vanished or deactivated user: it grants

@@ -85,10 +85,7 @@ pub async fn assign(
         Err(resp) => return resp,
     };
 
-    if let Err(e) = authz_dao::assign_role(&state.pool, user_id, role_id).await {
-        return db_error(e);
-    }
-    let result = sync_legacy_admin_flag(&state, user_id, role_id, true).await;
+    let result = authz_dao::assign_role(&state.pool, user_id, role_id).await;
     invalidate_user(&state.cache, user_id).await;
     match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -116,45 +113,17 @@ async fn unassign_guarded(state: &AppState, user_id: i64, role_id: i64) -> Resul
     let admin_role = authz_dao::role_id_by_name(&mut *tx, authz_dao::ADMIN_ROLE)
         .await
         .map_err(db_error)?;
-    if admin_role == Some(role_id) {
-        if authz_dao::would_leave_no_admin(&mut tx, user_id)
+    if admin_role == Some(role_id)
+        && authz_dao::would_leave_no_admin(&mut tx, user_id)
             .await
             .map_err(db_error)?
-        {
-            return Err(last_admin_conflict());
-        }
-        // Clear the legacy flag too: while `app_user.is_admin` is set the user
-        // stays a global admin through the dual-read fallback, so removing only
-        // the role would silently leave the admin rights in place.
-        match user_dao::update_is_admin(&mut *tx, user_id, false).await {
-            Ok(_) | Err(sqlx::Error::RowNotFound) => {}
-            Err(e) => return Err(db_error(e)),
-        }
+    {
+        return Err(last_admin_conflict());
     }
     authz_dao::unassign_role(&mut *tx, user_id, role_id)
         .await
         .map_err(db_error)?;
     tx.commit().await.map_err(db_error)
-}
-
-/// Keep the slice-1 `app_user.is_admin` column in step with membership of the
-/// built-in `admin` role. The authz seam still honors the column as a
-/// dual-read fallback, so the role alone cannot revoke admin: an unassign that
-/// left the flag set would be a no-op. A no-op for any other role, or for a
-/// user that no longer exists.
-async fn sync_legacy_admin_flag(
-    state: &AppState,
-    user_id: i64,
-    role_id: i64,
-    is_admin: bool,
-) -> sqlx::Result<()> {
-    if authz_dao::role_id_by_name(&state.pool, authz_dao::ADMIN_ROLE).await? != Some(role_id) {
-        return Ok(());
-    }
-    match user_dao::update_is_admin(&state.pool, user_id, is_admin).await {
-        Ok(_) | Err(sqlx::Error::RowNotFound) => Ok(()),
-        Err(e) => Err(e),
-    }
 }
 
 /// Resolve `(role, role_id)` to a concrete role id, returning a 400/404 response

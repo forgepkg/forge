@@ -1138,7 +1138,7 @@ async fn user_and_token_round_trip() {
 
     let user = user_dao::insert_user(
         pool,
-        NewUser::local(username.clone(), "argon2-hash".to_string(), true, true),
+        NewUser::local(username.clone(), "argon2-hash".to_string(), true),
     )
     .await
     .expect("user");
@@ -1225,7 +1225,6 @@ async fn upstream_basic_user_has_no_local_password() {
         NewUser {
             username: username.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".to_string(),
             external_subject: Some(username.clone()),
@@ -1249,45 +1248,28 @@ async fn upstream_basic_user_has_no_local_password() {
 }
 
 #[tokio::test]
-async fn provision_upstream_user_inserts_then_tracks_authoritative_admin() {
+async fn provision_upstream_user_inserts_then_refreshes() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
     let username = format!("up-prov-{n}");
 
-    // First call inserts a passwordless upstream-basic user (non-admin).
-    let u1 = user_dao::provision_upstream_user(pool, &username, false, true, None)
+    // First call inserts a passwordless upstream-basic user.
+    let u1 = user_dao::provision_upstream_user(pool, &username, None)
         .await
         .expect("provision")
         .expect("row");
     assert_eq!(u1.auth_source, "upstream-basic");
     assert!(u1.password_hash.is_none());
     assert!(u1.active);
-    assert!(!u1.is_admin);
     assert_eq!(u1.external_subject.as_deref(), Some(username.as_str()));
 
-    // Authoritative admin suggestion reuses the row AND grants admin.
-    let u2 = user_dao::provision_upstream_user(pool, &username, true, true, None)
+    // A later login reuses the row.
+    let u2 = user_dao::provision_upstream_user(pool, &username, None)
         .await
-        .expect("re-provision grants admin")
+        .expect("re-provision")
         .expect("row");
     assert_eq!(u2.id, u1.id, "same row");
-    assert!(u2.is_admin, "admin granted on refresh");
-
-    // A non-authoritative reading never changes the stored admin flag.
-    let u3 = user_dao::provision_upstream_user(pool, &username, false, false, None)
-        .await
-        .expect("re-provision")
-        .expect("row");
-    assert_eq!(u3.id, u1.id);
-    assert!(u3.is_admin, "non-authoritative: admin untouched");
-
-    // An authoritative non-admin reading revokes it.
-    let u4 = user_dao::provision_upstream_user(pool, &username, false, true, None)
-        .await
-        .expect("re-provision")
-        .expect("row");
-    assert!(!u4.is_admin, "authoritative: admin revoked");
 }
 
 #[tokio::test]
@@ -1300,14 +1282,14 @@ async fn provision_upstream_user_does_not_clobber_local_user() {
     // Pre-existing LOCAL user with a password.
     user_dao::insert_user(
         pool,
-        NewUser::local(username.clone(), "$argon2id$dummy".to_string(), false, true),
+        NewUser::local(username.clone(), "$argon2id$dummy".to_string(), true),
     )
     .await
     .expect("insert local");
 
     // An upstream provision for the same username returns no row (deny) and
-    // must NOT null the password, flip auth_source or grant admin.
-    let u = user_dao::provision_upstream_user(pool, &username, true, true, None)
+    // must NOT null the password or flip auth_source.
+    let u = user_dao::provision_upstream_user(pool, &username, None)
         .await
         .expect("provision over local");
     assert!(u.is_none(), "local user is never taken over");
@@ -1321,7 +1303,6 @@ async fn provision_upstream_user_does_not_clobber_local_user() {
         .unwrap();
     assert_eq!(local.auth_source, "local", "local provenance preserved");
     assert!(local.password_hash.is_some(), "local password preserved");
-    assert!(!local.is_admin, "no admin grant through upstream");
 }
 
 // ── proxy_dao ─────────────────────────────────────────────────────────────────
@@ -1630,7 +1611,7 @@ async fn usernames_are_unique_in_canonical_form() {
     let n = common::unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("  Dora{n} "), "x".into(), false, true),
+        NewUser::local(format!("  Dora{n} "), "x".into(), true),
     )
     .await
     .unwrap();
@@ -1642,8 +1623,8 @@ async fn usernames_are_unique_in_canonical_form() {
     assert_eq!(found.id, user.id);
 
     let raw = sqlx::query(
-        "INSERT INTO app_user (username, password_hash, is_admin, active, auth_source) \
-         VALUES ($1, 'x', false, true, 'local')",
+        "INSERT INTO app_user (username, password_hash, active, auth_source) \
+         VALUES ($1, 'x', true, 'local')",
     )
     .bind(format!("DORA{n}"))
     .execute(&pool)
@@ -1654,11 +1635,8 @@ async fn usernames_are_unique_in_canonical_form() {
         "{err}"
     );
 
-    let invalid = user_dao::insert_user(
-        &pool,
-        NewUser::local("bad\nname".into(), "x".into(), false, true),
-    )
-    .await;
+    let invalid =
+        user_dao::insert_user(&pool, NewUser::local("bad\nname".into(), "x".into(), true)).await;
     assert!(matches!(invalid, Err(sqlx::Error::InvalidArgument(_))));
 }
 
@@ -1672,8 +1650,8 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     let n = common::unique();
     let raw = |name: String| {
         sqlx::query_scalar::<_, i64>(
-            "INSERT INTO app_user (username, password_hash, is_admin, active, auth_source) \
-             VALUES ($1, 'x', false, true, 'local') RETURNING id",
+            "INSERT INTO app_user (username, password_hash, active, auth_source) \
+             VALUES ($1, 'x', true, 'local') RETURNING id",
         )
         .bind(name)
         .fetch_one(&pool)
@@ -1682,12 +1660,10 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     let spaced = raw(format!("erin{n}\u{a0}")).await.unwrap();
     let upper = raw(format!("Ünal{n}")).await.unwrap();
     // A twin of an account that already holds the canonical name.
-    let holder = user_dao::insert_user(
-        &pool,
-        NewUser::local(format!("fritz{n}"), "x".into(), false, true),
-    )
-    .await
-    .unwrap();
+    let holder =
+        user_dao::insert_user(&pool, NewUser::local(format!("fritz{n}"), "x".into(), true))
+            .await
+            .unwrap();
     let twin = raw(format!("fritz{n}\u{2003}")).await.unwrap();
 
     let repairs = user_dao::canonicalize_stored_usernames(&pool)

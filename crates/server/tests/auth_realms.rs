@@ -767,7 +767,6 @@ async fn an_unusable_token_sent_as_the_basic_password_is_never_forwarded() {
         forge_db::user_dao::NewUser {
             username: username.clone(),
             password_hash: None,
-            is_admin: false,
             active: true,
             auth_source: "upstream-basic".into(),
             external_subject: Some(username.clone()),

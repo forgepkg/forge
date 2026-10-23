@@ -371,7 +371,7 @@ mod tests {
         async fn echo(req: Request<Body>) -> Response {
             let p = principal_of(&req);
             let label = match p {
-                Principal::User { is_admin, .. } => format!("user:{is_admin}"),
+                Principal::User { user_id, .. } => format!("user:{user_id}"),
                 Principal::Workload { role_id, .. } => format!("workload:{role_id}"),
                 Principal::Anonymous { .. } => "anonymous".to_string(),
                 Principal::Unauthenticated => "unauthenticated".to_string(),
@@ -412,7 +412,6 @@ mod tests {
                 SourceOutcome::Authenticated(Principal::User {
                     user_id: 1,
                     token_id: None,
-                    is_admin: true,
                     method: forge_core::auth::AuthMethod::Password,
                 })
             } else {
@@ -499,7 +498,6 @@ mod tests {
                 outcome: SourceOutcome::Authenticated(Principal::User {
                     user_id: 2,
                     token_id: Some(9),
-                    is_admin: false,
                     method: forge_core::auth::AuthMethod::Token,
                 }),
                 require_header: true,
@@ -602,7 +600,6 @@ mod tests {
             outcome: SourceOutcome::Authenticated(Principal::User {
                 user_id: 1,
                 token_id: None,
-                is_admin: true,
                 method: forge_core::auth::AuthMethod::Password,
             }),
             require_header: true,
@@ -738,7 +735,6 @@ mod tests {
                 outcome: SourceOutcome::Authenticated(Principal::User {
                     user_id: 1,
                     token_id: Some(2),
-                    is_admin: false,
                     method: forge_core::auth::AuthMethod::Token,
                 }),
                 require_header: true,
@@ -756,7 +752,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(body_string(resp).await, "user:false");
+        assert_eq!(body_string(resp).await, "user:1");
     }
 
     /// Echoes the resolved principal's IP (anonymous) for the XFF tests.
@@ -826,7 +822,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: Some(2),
-            is_admin: true,
             method: forge_core::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StubSource {
@@ -845,7 +840,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_string(resp).await, "user:true");
+        assert_eq!(body_string(resp).await, "user:1");
     }
 
     #[tokio::test]

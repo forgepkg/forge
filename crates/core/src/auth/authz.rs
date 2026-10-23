@@ -24,10 +24,8 @@
 //! of its roles' grants) and asks the pure evaluator:
 //!
 //! * **User** — its `user_role`-derived grants, loaded once per user and cached
-//!   ([`crate::authz::cache`]). The slice-1 `app_user.is_admin` flag is folded in
-//!   as a **dual-read** admin fallback (`in_admin_role OR is_admin`) so existing
-//!   admins keep working during the migration window — it can only ever *grant*
-//!   admin, never remove it.
+//!   ([`crate::authz::cache`]). Membership in the built-in `admin` role makes it
+//!   an admin.
 //! * **Anonymous** — exactly the built-in `anonymous` role's grants (cached under
 //!   one shared key). On an un-migrated install that role has no grants ⇒ deny.
 //! * **Public read** — for `read` (the [`Authz::can_read`] gate and the read
@@ -142,14 +140,14 @@ impl Authz {
 
     /// May `principal` perform admin operations on `repo`?
     ///
-    /// Admin is the `admin`-role short-circuit (or the `is_admin` dual-read
-    /// fallback); a per-repo `admin` grant also satisfies it. Fail-closed.
+    /// Admin is the `admin`-role short-circuit; a per-repo `admin` grant also
+    /// satisfies it. Fail-closed.
     pub async fn can_admin(&self, principal: &Principal, repo: &Repository) -> bool {
         self.allows(principal, Action::Admin, repo.id).await
     }
 
     /// Is `principal` a **global admin** — i.e. a member of the built-in `admin`
-    /// role (or the slice-1 `is_admin` dual-read fallback)?
+    /// role?
     ///
     /// This is the repo-less admin gate used by the privilege-management admin
     /// API (`/admin/roles`, `/admin/users/{id}/roles`, …), which has no single
@@ -269,19 +267,11 @@ impl Authz {
                 })
             }
             Principal::User {
-                user_id,
-                token_id,
-                is_admin,
-                ..
+                user_id, token_id, ..
             } => {
-                let mut owner = authz_cache::load_user_effective(
-                    &self.pool,
-                    &self.cache,
-                    *user_id,
-                    *is_admin, // dual-read admin fallback (grant-only)
-                )
-                .await
-                .map_err(|e| tracing::error!(error = %e, user_id, "authz user load failed"))?;
+                let mut owner = authz_cache::load_user_effective(&self.pool, &self.cache, *user_id)
+                    .await
+                    .map_err(|e| tracing::error!(error = %e, user_id, "authz user load failed"))?;
                 if let Some(flag) = public_read.filter(|_| self.public_read_for_signed_in) {
                     owner = self.add_public_read(owner, flag).await;
                 }
@@ -294,8 +284,7 @@ impl Authz {
             // WIF: a workload is authorized purely by the single
             // forge role its realm's claim-rules mapped it to (plus, for reads,
             // the public reach every principal holds). No `app_user`, no token
-            // scope, no dual-read admin fallback — a deleted role resolves to
-            // deny-all.
+            // scope — a deleted role resolves to deny-all.
             Principal::Workload { role_id, .. } => {
                 let role = authz_cache::load_role_effective(&self.pool, &self.cache, *role_id)
                     .await
@@ -356,11 +345,10 @@ fn deny_all_scope() -> TokenScope {
 mod tests {
     use super::*;
 
-    fn user(is_admin: bool) -> Principal {
+    fn user() -> Principal {
         Principal::User {
             user_id: 42,
             token_id: None,
-            is_admin,
             method: crate::auth::AuthMethod::Password,
         }
     }
@@ -401,7 +389,7 @@ mod tests {
 
     #[test]
     fn principals_distinguish_user_anon() {
-        assert!(user(true).is_user());
+        assert!(user().is_user());
         assert!(!anon().is_user());
     }
 }

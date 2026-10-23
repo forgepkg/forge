@@ -140,7 +140,6 @@ pub async fn check_token(pool: &PgPool, secret: &str) -> sqlx::Result<TokenCheck
     Ok(TokenCheck::Live(UserPrincipal {
         user_id: user.id,
         token_id: Some(token.id),
-        is_admin: user.is_admin,
     }))
 }
 
@@ -178,7 +177,6 @@ pub async fn verify_password(
     Some(UserPrincipal {
         user_id: user.id,
         token_id: None,
-        is_admin: user.is_admin,
     })
 }
 
@@ -732,7 +730,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: Some(2),
-            is_admin: false,
             method: crate::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
@@ -752,7 +749,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: true,
             method: crate::auth::AuthMethod::Password,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
@@ -772,7 +768,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: false,
             method: crate::auth::AuthMethod::Password,
         };
         for sources in [
@@ -818,7 +813,6 @@ mod tests {
         let authed = Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: false,
             method: crate::auth::AuthMethod::Password,
         };
         // An explicit credential wins before the cookie source: not ambient.

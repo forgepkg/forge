@@ -68,11 +68,8 @@ use crate::state::AppState;
 /// Middleware: allow only **global admins** past. Non-admins → 403,
 /// unauthenticated/anonymous → 401.
 ///
-/// §12.4: admin is now decided by RBAC via [`Authz::is_global_admin`] — a member
-/// of the built-in `admin` role (with the slice-1 `app_user.is_admin` column as a
-/// dual-read fallback, folded into the effective set). This means a user made
-/// admin **only** via the `admin` role (no `is_admin` column) is correctly
-/// allowed, and an admin demoted by removing the role is correctly rejected
+/// Admin is decided by RBAC via [`Authz::is_global_admin`] — a member of the
+/// built-in `admin` role. An admin demoted by removing the role is rejected
 /// (within the cache TTL / on invalidation). Fail-closed: an evaluation error
 /// denies. A 401 (vs 403) distinction is kept for anonymous/unauthenticated so a
 /// client knows to authenticate.

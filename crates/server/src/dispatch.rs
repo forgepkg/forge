@@ -343,7 +343,6 @@ mod tests {
         assert!(principal_allows_protocol_mutations(&Principal::User {
             user_id: 1,
             token_id: Some(7),
-            is_admin: false,
             method: forge_core::auth::AuthMethod::Token
         }));
         assert!(principal_allows_protocol_mutations(&Principal::Workload {
@@ -360,7 +359,6 @@ mod tests {
         assert!(!principal_allows_protocol_mutations(&Principal::User {
             user_id: 1,
             token_id: None,
-            is_admin: true,
             method: forge_core::auth::AuthMethod::Password
         }));
         assert!(!principal_allows_protocol_mutations(

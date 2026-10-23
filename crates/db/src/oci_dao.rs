@@ -1524,31 +1524,31 @@ pub async fn expire_upload(
 
 // ── Registry tokens ─────────────────────────────────────────────────────────
 
-/// Whether the user a registry token names is still active — and the API
-/// token it was minted from (if any) still live — with the user's current
-/// admin flag. `None`: the token must no longer be honored.
+/// Whether the user a registry token names is still active, and the API
+/// token it was minted from (if any) still live. `false`: the token must no
+/// longer be honored. What the user may do is the authz seam's to decide.
 pub async fn live_principal(
     pool: &PgPool,
     user_id: i64,
     token_id: Option<i64>,
-) -> sqlx::Result<Option<bool>> {
-    let row = sqlx::query!(
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
         r#"
-        SELECT u.is_admin,
-               ($2::bigint IS NULL OR EXISTS (
-                   SELECT 1 FROM token t
-                   WHERE t.id = $2 AND t.user_id = u.id AND t.revoked_at IS NULL
-                     AND (t.expires_at IS NULL OR t.expires_at > now())
-               )) AS "token_live!"
-        FROM app_user u
-        WHERE u.id = $1 AND u.active
+        SELECT EXISTS (
+            SELECT 1 FROM app_user u
+            WHERE u.id = $1 AND u.active
+              AND ($2::bigint IS NULL OR EXISTS (
+                  SELECT 1 FROM token t
+                  WHERE t.id = $2 AND t.user_id = u.id AND t.revoked_at IS NULL
+                    AND (t.expires_at IS NULL OR t.expires_at > now())
+              ))
+        ) AS "live!"
         "#,
         user_id,
         token_id,
     )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.filter(|r| r.token_live).map(|r| r.is_admin))
+    .fetch_one(pool)
+    .await
 }
 
 // ── Retention ───────────────────────────────────────────────────────────────

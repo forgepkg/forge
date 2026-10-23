@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, password_hash, is_admin, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        ORDER BY username\n        ",
+  "query": "\n        INSERT INTO app_user\n            (username, password_hash, active, auth_source,\n             external_subject, last_auth_source_at, realm_id)\n        VALUES ($1, NULL, true, 'upstream-basic', $1, now(), $2)\n        ON CONFLICT (username) DO UPDATE SET\n            last_auth_source_at = now()\n        WHERE app_user.auth_source = 'upstream-basic'\n          AND NOT app_user.realm_orphaned\n          AND app_user.realm_id IS NOT DISTINCT FROM EXCLUDED.realm_id\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -38,17 +38,6 @@
       },
       {
         "ordinal": 3,
-        "name": "is_admin",
-        "type_info": "Bool",
-        "origin": {
-          "Table": {
-            "table": "app_user",
-            "name": "is_admin"
-          }
-        }
-      },
-      {
-        "ordinal": 4,
         "name": "active",
         "type_info": "Bool",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "auth_source",
         "type_info": "Text",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "external_subject",
         "type_info": "Text",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -92,7 +81,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -104,7 +93,10 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Text",
+        "Int8"
+      ]
     },
     "nullable": [
       false,
@@ -112,11 +104,10 @@
       true,
       false,
       false,
-      false,
       true,
       false,
       false
     ]
   },
-  "hash": "ea42b48db021c224455f7e127b0348edf286176d90124f053db45c18cf9fde3b"
+  "hash": "8080cafd012ed0ab7c453893a6bd17a2992a08c67e14a835bffca88ec9382034"
 }

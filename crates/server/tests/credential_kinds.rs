@@ -103,11 +103,10 @@ async fn reauth_revokes_tokens_minted_via_credential_forwarding() {
     let client = srv.client();
     let (au, ap) = srv.admin_basic();
     let username = format!("fwd{}", common::unique());
-    let user =
-        forge_db::user_dao::provision_upstream_user(&srv.pool, &username, false, false, None)
-            .await
-            .unwrap()
-            .expect("provisioned upstream user");
+    let user = forge_db::user_dao::provision_upstream_user(&srv.pool, &username, None)
+        .await
+        .unwrap()
+        .expect("provisioned upstream user");
 
     // The user mints a token from a (forwarded-credential) session...
     let session = srv.session_for(user.id).await;

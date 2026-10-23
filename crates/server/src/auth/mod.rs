@@ -627,8 +627,7 @@ struct AuthMe {
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let rt = SessionAuthCtx::of(&state);
     // `require_session` reflects the live user row (deactivation); report the
-    // effective RBAC admin verdict (admin role or legacy flag), not the raw
-    // column.
+    // effective RBAC admin verdict (the `admin` role).
     let ActiveSession { session, user: u } = match require_session(&rt, &headers).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -638,7 +637,6 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .is_global_admin(&forge_core::auth::Principal::User {
             user_id: u.id,
             token_id: None,
-            is_admin: u.is_admin,
             method: forge_core::auth::AuthMethod::Session,
         })
         .await;

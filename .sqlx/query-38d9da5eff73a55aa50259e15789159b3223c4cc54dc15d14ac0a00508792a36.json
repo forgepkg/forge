@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1 FROM app_user u\n            WHERE u.id = $1 AND u.active\n              AND ($2::bigint IS NULL OR EXISTS (\n                  SELECT 1 FROM token t\n                  WHERE t.id = $2 AND t.user_id = u.id AND t.revoked_at IS NULL\n                    AND (t.expires_at IS NULL OR t.expires_at > now())\n              ))\n        ) AS \"live!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "38d9da5eff73a55aa50259e15789159b3223c4cc54dc15d14ac0a00508792a36"
+}
