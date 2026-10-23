@@ -1,11 +1,10 @@
-//! The pluggable, ordered authentication-provider abstraction (slice 12.3).
+//! The pluggable, ordered authentication-provider abstraction.
 //!
-//! Slice 1 baked exactly one password check (local argon2id) into the
-//! principal middleware. This module introduces a **pluggable, ordered
-//! [`AuthProvider`] chain** so that a username/password pair can be validated
-//! by the local store, by forwarding to a configured upstream over HTTP Basic
+//! The password-style auth path is a **pluggable, ordered [`AuthProvider`]
+//! chain**, so that a username/password pair can be validated by the local
+//! store, by forwarding to a configured upstream over HTTP Basic
 //! (`upstream-basic`), or — conceptually — by any future backend, without the
-//! middleware knowing *how*.
+//! principal middleware knowing *how*.
 //!
 //! Token auth (`X-NuGet-ApiKey` / Basic-as-token) is handled *before* the chain
 //! (see [`super::token`]) and is **not** a provider: the chain is only the
@@ -36,11 +35,11 @@ use std::net::IpAddr;
 /// spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthSource {
-    /// Slice-1 local argon2id password (the `local-password` provider).
+    /// Local argon2id password (the `local-password` provider).
     Local,
     /// Credential forwarded to a configured upstream over HTTP Basic.
     UpstreamBasic,
-    /// OpenID Connect (§12.2). Not driven through this chain — OIDC is its own
+    /// OpenID Connect. Not driven through this chain — OIDC is its own
     /// interactive login path — but listed for `app_user.auth_source` symmetry.
     Oidc,
 }
@@ -60,8 +59,8 @@ impl AuthSource {
 ///
 /// Token auth is resolved before the chain and is not represented here. The
 /// `password` is plaintext only for the lifetime of the request; it is never
-/// stored or logged (see the slice 12.3 cache design, which stores only an
-/// HMAC of it).
+/// stored or logged (the validated-credential cache, [`super::cred_cache`],
+/// stores only an HMAC of it).
 ///
 /// `Debug` is implemented **manually** so the plaintext `password` field is
 /// always redacted: any future caller that logs a `PasswordCredential` with
@@ -92,8 +91,8 @@ impl fmt::Debug for PasswordCredential<'_> {
 ///
 /// `core` maps this to an `app_user` (lookup by `username`, auto-provision when
 /// the provider allows). The `groups` are the *raw, coarse* upstream
-/// groups/roles — stashed for §12.4, used here at most as an allow/deny gate;
-/// they are not authoritative forge authz.
+/// groups/roles, used at most as an allow/deny gate; they are not
+/// authoritative forge authz.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvenIdentity {
     /// The authenticated username (the forge `app_user.username`).
@@ -115,12 +114,12 @@ pub struct ProvenIdentity {
     /// [`super::chain::provision_and_map`]). Always `false` for local.
     pub admin_authoritative: bool,
     /// Whether the vouching provider is configured to auto-provision an
-    /// `app_user` for this identity on first success (12.7: per-realm — each
-    /// credential-forwarding realm carries its own flag, so the chain caller no
-    /// longer needs a chain-global setting). Always `false` for local.
+    /// `app_user` for this identity on first success (per realm: each
+    /// credential-forwarding realm carries its own flag). Always `false` for
+    /// local.
     pub auto_provision: bool,
     /// The `auth_realm.id` of the vouching realm, when the provider was built
-    /// from a realm row (12.7). Recorded as `app_user.realm_id` provenance on
+    /// from a realm row. Recorded as `app_user.realm_id` provenance on
     /// provision; `None` for the built-in/static wiring.
     pub realm_id: Option<i64>,
     /// An argon2id hash of the presented password, set only when the vouching
@@ -209,7 +208,7 @@ pub enum AuthOutcome {
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
     /// Stable provider id, e.g. `"local-password"` / `"upstream-basic"`, or a
-    /// realm-scoped id like `"realm:corp-nexus"` (12.7). Keys the
+    /// realm-scoped id like `"realm:corp-nexus"`. Keys the
     /// validated-credential cache, so it must be stable for a given realm.
     fn id(&self) -> &str;
 

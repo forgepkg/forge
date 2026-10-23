@@ -1,8 +1,7 @@
-//! The `local-password` [`AuthProvider`] (slice 12.3, phase 2).
+//! The `local-password` [`AuthProvider`].
 //!
-//! This is the refactor of slice 1's password-basic path
-//! ([`super::token::verify_password`]) into the pluggable [`AuthProvider`]
-//! chain. Its behaviour is **byte-for-byte** the slice-1 logic:
+//! Local argon2id password authentication against `app_user.password_hash`,
+//! as one provider of the pluggable [`AuthProvider`] chain:
 //!
 //! * Look up the user by username.
 //! * An unknown user, or a user without a local `password_hash` (i.e. an
@@ -31,11 +30,12 @@
 //! The provider only *vouches for* the username; mapping that identity back to
 //! a concrete [`UserPrincipal`] (user id, admin flag) is the chain caller's job
 //! (see [`super::chain`] mapping helpers). This keeps providers free of the
-//! `UserPrincipal` shape and lets §12.4 reshape authz without touching them.
+//! `UserPrincipal` shape, so authorization can change without touching them.
 //!
 //! ## Skip vs Rejected — why it matters for the chain
-//! Slice 1's [`super::token::verify_password`] returned `None` for *both*
-//! "unknown user" and "wrong password". In the chain those must differ:
+//! A plain yes/no check such as [`super::token::verify_password`] returns
+//! `None` for *both* "unknown user" and "wrong password". In the chain those
+//! must differ:
 //! * unknown / no-local-hash → **Skip** (a later provider, e.g.
 //!   `upstream-basic`, may own this username);
 //! * known local user, wrong password, or an inactive local account with any
@@ -44,11 +44,10 @@
 //!   an upstream realm).
 //!
 //! When the chain is just `["local-password"]` this distinction is invisible on
-//! the wire: both `Skip` (→ `NoCredentials` → anon policy) and `Rejected`
-//! (→ 401) reproduce slice-1 behaviour, because slice 1's `BasicAuthSource`
-//! turned a `None` password verify into `SourceOutcome::Invalid` only when the
-//! basic header was present (creds were attempted), which is exactly what the
-//! refactored `BasicAuthSource` still does. See the phase-2 tests.
+//! the wire: Basic credentials were presented either way, so `BasicAuthSource`
+//! answers both `Skip` (→ `NoCredentials`) and `Rejected` with
+//! `SourceOutcome::Invalid` (→ 401), never anonymous. See the `basic_*` tests
+//! in `crates/core/tests/local_password.rs`.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -193,7 +192,7 @@ impl PasswordHashLimiter {
     }
 }
 
-/// Slice-1 local argon2id password authentication, as an [`AuthProvider`].
+/// Local argon2id password authentication, as an [`AuthProvider`].
 pub struct LocalPasswordProvider {
     pool: PgPool,
     limiter: Arc<PasswordHashLimiter>,

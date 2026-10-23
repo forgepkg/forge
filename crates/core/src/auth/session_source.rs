@@ -1,6 +1,6 @@
-//! Session-cookie principal source (slice 12.2, §3.7 / Phase 5).
+//! Session-cookie principal source.
 //!
-//! This is the integration point that lets the slice-1 ordered
+//! This is the integration point that lets the ordered
 //! [`PrincipalSource`] chain authenticate **browser** callers carrying a
 //! `forge_session` cookie, *in addition to* the existing token-header / HTTP
 //! Basic sources. It is appended to the chain in

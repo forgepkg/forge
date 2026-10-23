@@ -1,5 +1,5 @@
-//! E2E: admin retention REST surface (slice 12.1, plan Phase 7). Requires Docker
-//! (Postgres + versitygw via the shared harness).
+//! E2E: admin retention REST surface. Requires Docker (Postgres + versitygw
+//! via the shared harness).
 //!
 //! Covers the six endpoints under `/admin/repositories/{name}/retention`:
 //! admin gating (401/403), PUT validation (400) + GET round-trip, DELETE

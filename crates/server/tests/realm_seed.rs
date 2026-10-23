@@ -1,6 +1,6 @@
 //! Importing a legacy `[auth.upstream_basic]` block into its `auth_realm` row
-//! (12.7 "config as seed"): drift detection whose marker holds nothing derived
-//! from the realm's secrets.
+//! ("config as seed"): drift detection whose marker holds nothing derived from
+//! the realm's secrets.
 //!
 //! Every test seeds into its own database: a seeded, enabled
 //! credential-forwarding realm in the shared one would change how every other

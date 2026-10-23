@@ -20,7 +20,7 @@ import { routeTree } from '~/routeTree.gen'
 vi.mock('~/lib/navigation', () => ({ assignLocation: vi.fn() }))
 
 /**
- * Login behavior (§12.7 realms):
+ * Login behavior:
  *  - identifier-first renders two steps (username -> /auth/identify ->
  *    password -> /auth/login) and enters session mode on success;
  *  - an oidc_redirect decision leaves the SPA for the IdP, carrying the

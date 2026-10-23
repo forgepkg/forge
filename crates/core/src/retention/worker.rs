@@ -1,4 +1,4 @@
-//! The retention background worker (design §3.5, §3.6 steps 1–10; plan Phase 5).
+//! The retention background worker.
 //!
 //! The worker runs on **every** instance of a horizontally-scaled deployment
 //! with **no Postgres advisory locks**. Each [`tick`](RetentionWorker::tick)
@@ -17,9 +17,9 @@
 //! 5. records the run summary + schedules the next run on the ledger;
 //! 6. invalidates the read cache for every affected package.
 //!
-//! All S3 deletion still flows through the slice-1 outbox; this worker never
-//! touches S3. A `dry_run_only` policy (or a disabled one) audits/no-ops but
-//! never mutates.
+//! All S3 deletion flows through the transactional blob outbox; this worker
+//! never touches S3. A `dry_run_only` policy (or a disabled one) audits/no-ops
+//! but never mutates.
 
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
@@ -149,7 +149,8 @@ impl RetentionWorker {
     /// Shared claim-then-process body for [`Self::tick`] / [`Self::tick_repo`].
     async fn tick_inner(&self, only_repo: Option<i64>) -> Result<Option<RunSummary>, WorkerError> {
         // Claim inside a short tx; the row is leased on commit so the network/CPU
-        // work below happens with NO transaction held (mirrors the proxy A7 rule).
+        // work below happens with NO transaction held (the same rule as the
+        // proxy fetch).
         let claimed = {
             let mut tx = self.pool.begin().await?;
             // Due-ness and the lease (checked by the run fence against

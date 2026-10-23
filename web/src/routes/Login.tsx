@@ -102,8 +102,8 @@ export const Route = createFileRoute('/login')({
 })
 
 /**
- * Sign-in screen (§12.7 realms). On load it fetches `GET /auth/login-options`
- * and renders one of two layouts:
+ * Sign-in screen. On load it fetches `GET /auth/login-options` and renders one
+ * of two layouts:
  *
  *  - **identifier-first** (default): step 1 asks only for the username and
  *    calls `POST /auth/identify`; depending on the realm decision step 2 shows

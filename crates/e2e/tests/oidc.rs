@@ -1,9 +1,9 @@
-//! E2E: OIDC / Microsoft Entra interactive login (slice 12.2 Phase 6).
+//! E2E: OIDC / Microsoft Entra interactive login.
 //!
 //! Drives the **real** forge server(s) over HTTP against a real Postgres
 //! testcontainer + an in-process mock OIDC IdP (`MockOidc`: discovery + JWKS +
 //! an authorize endpoint that 302s straight back to the forge callback + a token
-//! endpoint signing a test ID token). Covers the plan §5 scenarios:
+//! endpoint signing a test ID token). Covers these scenarios:
 //!
 //! 1. `login → callback` success creates a session; `/auth/me` shows the user.
 //! 2. unknown `state` rejected; `nonce` mismatch rejected.
@@ -12,13 +12,12 @@
 //! 4. session **logout** revokes the cookie cluster-wide.
 //! 5. a session-authenticated user **mints a repository token** and uses it as
 //!    `X-NuGet-ApiKey` against a real NuGet repo endpoint.
-//! 6. **session expiry** (plan §5 scenario 6): a session created with a tiny
-//!    idle TTL is accepted while fresh and `401`s on the next request once it
-//!    lapses (the validity predicate is evaluated on read, in SQL).
-//! 7. **auth reaper** (plan §5 Phase-6 requirement): against a running stack
-//!    with the wired reaper worker, expired `oidc_flow` rows and dead
-//!    (expired/revoked) `session` rows are deleted while the live ones survive
-//!    and stay usable.
+//! 6. **session expiry**: a session created with a tiny idle TTL is accepted
+//!    while fresh and `401`s on the next request once it lapses (the validity
+//!    predicate is evaluated on read, in SQL).
+//! 7. **auth reaper**: against a running stack with the wired reaper worker,
+//!    expired `oidc_flow` rows and dead (expired/revoked) `session` rows are
+//!    deleted while the live ones survive and stay usable.
 //!
 //! Requires Docker.
 
@@ -55,8 +54,8 @@ fn oidc_block(issuer: &str, client_id: &str, public_base_url: &str) -> String {
 }
 
 /// Like [`oidc_block`] but with caller-chosen session TTLs, so a test can inject
-/// a deliberately tiny idle/absolute lifetime (plan §5 scenario 6: a short-TTL
-/// session is rejected on the next request once it lapses).
+/// a deliberately tiny idle/absolute lifetime (a short-TTL session is rejected
+/// on the next request once it lapses).
 fn oidc_block_with_ttls(
     issuer: &str,
     client_id: &str,
@@ -455,7 +454,7 @@ async fn session_minted_token_authenticates_nuget_endpoint() {
         .to_string();
 
     // Create a hosted repo (as the bootstrap admin) and publish to it with the
-    // session-minted key, proving it is a real slice-1 token.
+    // session-minted key, proving it is an ordinary repository token.
     let repo = "oidc-minted";
     let resp = srv
         .create_repo(json!({"name": repo, "kind": "hosted", "anonymous_read": false}))

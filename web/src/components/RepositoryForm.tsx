@@ -26,7 +26,7 @@ import { Input } from '~/components/catalyst/input'
 import { Select } from '~/components/catalyst/select'
 
 /**
- * Shared repository create/edit form (plan §Phase 4). Kind-conditional fields:
+ * Shared repository create/edit form. Kind-conditional fields:
  *
  *  - **hosted** → `allow_redeploy` (NuGet) / `immutable_tags` +
  *                 `latest_mutable` (docker), and the upload limit
@@ -34,9 +34,9 @@ import { Select } from '~/components/catalyst/select'
  *                 default)
  *  - **proxy**  → `remote_url`, `package_delay_seconds` (not docker),
  *                 metadata/not-found TTLs, and **write-only** upstream creds
- *                 (the password is never populated from a GET — slice-1
- *                 redaction; the form offers a "set new password" affordance and
- *                 only sends it when the admin types one)
+ *                 (the password is never populated from a GET; the form
+ *                 offers a "set new password" affordance and only sends it
+ *                 when the admin types one)
  *  - **group**  → `prefer_hosted`, `reserved_prefixes`, and for docker the
  *                 optional `writable_member`; members are managed on a
  *                 separate screen (`GroupMembers`)

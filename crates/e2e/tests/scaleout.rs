@@ -1,8 +1,7 @@
 //! E2E: scale-out — two server instances sharing one Postgres + versitygw.
 //! A push on instance A is visible on instance B; concurrent proxy misses across
 //! both instances fetch upstream exactly once (row `FOR UPDATE`); the outbox is
-//! drained exactly once cluster-wide (`SKIP LOCKED`) (spec §9). Gated behind
-//! `forge-e2e`.
+//! drained exactly once cluster-wide (`SKIP LOCKED`). Gated behind `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 
@@ -87,7 +86,7 @@ async fn push_on_a_visible_and_downloadable_on_b() {
 /// advisory locks).
 ///
 /// The row lock is held only for the short state-decision and finalize
-/// transactions, never across the upstream fetch / CAS PUT (Addendum A7). The
+/// transactions, never across the upstream fetch / CAS PUT. The
 /// singleflight is thus *best-effort*: under contention both instances may fetch
 /// from upstream, but the content-addressed CAS plus the `downloaded` re-check
 /// in the finalize tx make the writers converge on identical state, after which

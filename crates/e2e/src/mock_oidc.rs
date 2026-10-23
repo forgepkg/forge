@@ -1,4 +1,4 @@
-//! In-process mock OpenID Connect provider for the slice-12.2 e2e scenarios.
+//! In-process mock OpenID Connect provider for the OIDC e2e scenarios.
 //!
 //! A tiny axum app served on an ephemeral loopback port that plays the IdP:
 //!
@@ -258,8 +258,8 @@ session_absolute_ttl_seconds = 604800
     }
 
     /// Sign an arbitrary claim set with the active key and return the compact
-    /// JWT. Used by WIF (slice 12.8) e2e scenarios where a workload presents its
-    /// `id_token` directly (there is no `/token` exchange).
+    /// JWT. Used by WIF e2e scenarios where a workload presents its `id_token`
+    /// directly (there is no `/token` exchange).
     pub async fn sign_token(&self, claims: Value) -> String {
         self.inner.lock().await.signer.sign(&claims)
     }

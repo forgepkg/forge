@@ -1,10 +1,10 @@
 /**
- * E2E harness: bring up the slice-1 infra (Postgres + versitygw) and a real
+ * E2E harness: bring up the infra (Postgres + versitygw) and a real
  * `forge-server` process serving the built SPA, then expose its base URL +
  * bootstrap-admin credentials to the Playwright specs.
  *
  * This deliberately drives the **actual Rust server binary** against the same
- * container images the slice-1 testcontainers harness uses (Postgres 17 +
+ * container images the Rust testcontainers harness uses (Postgres 17 +
  * versity/versitygw:v1.4.1), proving the single-origin serving model end to end:
  * the browser hits `/`, `/admin/*`, `/browse/*`, `/v3/*` on one origin with no
  * Node proxy.

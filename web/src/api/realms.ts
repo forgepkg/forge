@@ -1,7 +1,7 @@
 import { httpClient } from '~/lib/httpClient'
 
 /**
- * Admin auth-realm CRUD API (§12.7).
+ * Admin auth-realm CRUD API.
  *
  * Types mirror the Rust DTOs:
  *

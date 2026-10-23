@@ -1,14 +1,13 @@
-//! Outbound-URL scheme guard (12.7 design §3.6 — SSRF restriction dropped).
+//! Outbound-URL scheme guard.
 //!
-//! Slice 1 shipped a full SSRF guard here: a custom DNS resolver that blocked
-//! private/loopback/link-local ranges on every redirect hop, plus a per-proxy
-//! `allow_private_upstream` opt-out. The 12.7 auth-realms design **removes that
-//! restriction deliberately**: upstream URLs (proxy `remote_url`, the
-//! credential-forwarding IdP, OIDC issuers) are configurable only by admins
-//! (RBAC `can_admin`), so the threat model is a trusted/compromised admin — and
-//! for that actor the IP-range block was a speed bump, not a boundary, while it
-//! made every legitimate internal deployment (Nexus on RFC1918, self-hosted
-//! IdPs) need a confusing opt-out flag.
+//! Admin-configured upstream URLs are **deliberately not restricted by IP
+//! range** (no private/loopback/link-local block): upstream URLs (proxy
+//! `remote_url`, the credential-forwarding IdP, OIDC issuers) are configurable
+//! only by admins (RBAC `can_admin`), so the threat model is a
+//! trusted/compromised admin — and for that actor an IP-range block is a speed
+//! bump, not a boundary, while it would make every legitimate internal
+//! deployment (Nexus on RFC1918, self-hosted IdPs) need a confusing opt-out
+//! flag.
 //!
 //! What remains, and MUST stay:
 //! * [`validate_url`] — the **scheme check**: outbound URLs are `http`/`https`
@@ -46,8 +45,8 @@ pub enum SsrfError {
 }
 
 /// Validate an outbound URL: it must parse, carry a host, and use `http` or
-/// `https`. This is the **only** restriction on admin-configured upstream URLs
-/// (12.7 §3.6); private/loopback addresses are permitted.
+/// `https`. This is the **only** restriction on admin-configured upstream URLs;
+/// private/loopback addresses are permitted.
 ///
 /// Synchronous — no DNS is consulted anymore. Used by the admin API to reject a
 /// bad `remote_url` / upstream URL at config time, and by config validation at
@@ -185,8 +184,8 @@ mod tests {
     fn accepts_public_and_private_http_urls() {
         // Public hosts are obviously fine…
         assert!(validate_url("https://api.nuget.org/v3/index.json").is_ok());
-        // …and per the 12.7 decision, private/loopback hosts are now equally
-        // fine: the IP-range restriction is gone, only the scheme is checked.
+        // …and private/loopback hosts are equally fine: there is no IP-range
+        // restriction, only the scheme is checked.
         assert!(validate_url("http://127.0.0.1:8081/status").is_ok());
         assert!(validate_url("https://nexus.internal/service/rest/v1/status").is_ok());
         assert!(validate_url("http://169.254.169.254/latest/meta-data").is_ok());

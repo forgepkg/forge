@@ -1,4 +1,4 @@
-//! Admin retention-policy REST API (slice 12.1, design §3.3). **Admin-only.**
+//! Admin retention-policy REST API. **Admin-only.**
 //!
 //! Mounted under `/admin/repositories/{name}/retention`. Every route resolves
 //! the repository by name first (404 if absent), then operates on its
@@ -17,8 +17,8 @@
 //!   filtered by `run_id` and paged with `before`/`limit`.
 //!
 //! Nothing here deletes S3 objects: applied runs go through the worker + the
-//! slice-1 blob outbox. Preview never mutates at all. Policies carry no secrets,
-//! so nothing is redacted.
+//! blob outbox. Preview never mutates at all. Policies carry no secrets, so
+//! nothing is redacted.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

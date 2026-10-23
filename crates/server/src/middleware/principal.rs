@@ -1,4 +1,4 @@
-//! Principal-resolution middleware (spec §5, plan 10.2).
+//! Principal-resolution middleware.
 //!
 //! Runs an **ordered** list of [`PrincipalSource`]s (token header, then HTTP
 //! Basic) against each request, resolves the client IP behind trusted proxies,

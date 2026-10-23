@@ -1,4 +1,4 @@
-//! Application state shared across all requests (spec §8, plan 10.1/10.3).
+//! Application state shared across all requests.
 //!
 //! [`AppState`] holds the database pool, the S3 blob store + content-addressed
 //! store, the hybrid cache, the package-format registry, and the parsed
@@ -51,16 +51,16 @@ pub struct AppState {
     pub cas: Cas,
     /// Two-tier read cache (L1 always; L2 Redis when configured).
     pub cache: Cache,
-    /// Authorization decision service (§12.4 seam): every read/write/admin gate
-    /// routes through this.
+    /// Authorization decision service: every read/write/admin gate routes
+    /// through this.
     pub authz: Authz,
     /// Package-format registry, keyed by `Format::id()`: the built-in format
     /// plugins (NuGet, Helm) and any loaded WebAssembly plugins.
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
-    /// DB-backed auth realms (12.7): the snapshot cache the password chain,
-    /// the OIDC login runtime and the login UX endpoints are built from.
+    /// DB-backed auth realms: the snapshot cache the password chain, the OIDC
+    /// login runtime and the login UX endpoints are built from.
     pub realms: Arc<RealmAuth>,
     /// Browser-session lifecycle, shared by local-password login and OIDC.
     pub sessions: SessionService,
@@ -72,8 +72,8 @@ pub struct AppState {
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
     pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
-    /// Secret encryption at rest (slice 12.5). `None` ⇒ disabled: secrets use
-    /// the legacy plaintext columns and `/admin/crypto/*` reports disabled.
+    /// Secret encryption at rest. `None` ⇒ disabled: secrets use the legacy
+    /// plaintext columns and `/admin/crypto/*` reports disabled.
     /// Built fallibly by [`crate::crypto::build_envelope`] **before**
     /// [`AppState::new`] (a configured-but-broken root key must abort startup)
     /// and attached via [`AppState::with_envelope`].
@@ -271,8 +271,8 @@ impl AppState {
     ///
     /// Authentication runtimes (the password chain, the OIDC login flow) are
     /// **not** built here: they live behind [`RealmAuth`], which rebuilds them
-    /// from the `auth_realm` table on demand (12.7). The session service and
-    /// cookie security bit are config-derived and shared by every login path.
+    /// from the `auth_realm` table on demand. The session service and cookie
+    /// security bit are config-derived and shared by every login path.
     pub fn new(pool: PgPool, blob_store: BlobStore, cache: Cache, config: Config) -> Self {
         let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
             .unwrap_or_else(|e| {
@@ -384,7 +384,7 @@ impl AppState {
         })
     }
 
-    /// Attach the secret-encryption envelope service (slice 12.5). Kept out of
+    /// Attach the secret-encryption envelope service. Kept out of
     /// [`AppState::new`] because building it reads the root key and must be
     /// able to fail startup; `None` keeps encryption disabled.
     pub fn with_envelope(
@@ -480,8 +480,7 @@ impl AppState {
     }
 
     /// A fully wired proxy read facade: shared upstream client, local blob
-    /// access, and (§12.5) the envelope service for encrypted upstream
-    /// passwords.
+    /// access, and the envelope service for encrypted upstream passwords.
     pub fn proxy_repo(&self, format: Arc<dyn Format>) -> ProxyRepo {
         ProxyRepo::new(
             self.pool.clone(),
@@ -579,7 +578,7 @@ pub struct MemberFactory {
     cas: Cas,
     cache: Cache,
     formats: Arc<FormatRegistry>,
-    /// §12.5: proxy members decrypt their upstream password through this.
+    /// Proxy members decrypt their upstream password through this.
     envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
     /// Shared proxy upstream client.
     upstream: UpstreamHttp,

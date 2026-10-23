@@ -1,4 +1,4 @@
-//! Admin content-selector management (§12.4 Phase 6).
+//! Admin content-selector management.
 //!
 //! A content selector is a reusable named include/exclude glob set on the
 //! (lowercased) package name. It scopes a grant down to matching packages.

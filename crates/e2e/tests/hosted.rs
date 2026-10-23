@@ -1,5 +1,5 @@
 //! E2E: hosted repository — push → restore, registration + search, SHA512
-//! `packageHash`, and unlist/relist (spec §9). Gated behind `forge-e2e`.
+//! `packageHash`, and unlist/relist. Gated behind `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 

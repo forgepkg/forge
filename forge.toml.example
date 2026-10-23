@@ -108,7 +108,7 @@ login_failure_window_seconds = 300  # (default: 300)
 # more queue for a few seconds, then fail as unavailable (not counted as a
 # failed password). 0 = the number of available CPUs.
 password_verify_concurrency = 0     # (default: 0)
-# 12.7 login UX: "identifier_first" (ask username, then route to a password
+# Login screen: "identifier_first" (ask username, then route to a password
 # prompt or an OIDC redirect) or "combined" (always show username+password +
 # a button per enabled OIDC realm).
 login_mode = "identifier_first" # (default: "identifier_first")
@@ -220,8 +220,8 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # enabled = true                         # (default: true) run the retention worker on this instance
 # audit_retention_seconds = 7776000      # (default: 7776000 = 90 days) keep retention_audit rows this long; 0 = never prune
 
-# Optional: OpenID Connect / Microsoft Entra interactive login (slice 12.2).
-# 12.7: this block is a one-shot SEED — on first boot it is imported into an
+# Optional: OpenID Connect / Microsoft Entra interactive login.
+# This block is a one-shot SEED — on first boot it is imported into an
 # `auth_realm` row and authentication is managed in the admin UI from then on
 # (the block is ignored afterwards; the same applies to [auth.upstream_basic]).
 # All flow state and sessions live in Postgres, so any instance can complete a

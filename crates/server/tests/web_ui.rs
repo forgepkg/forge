@@ -1,4 +1,4 @@
-//! Integration tests for the static SPA serving layer (plan §12.6 Phase 1).
+//! Integration tests for the static SPA serving layer.
 //!
 //! Verifies the correctness properties the serving model depends on:
 //! * the API routers (`/admin/*`, `/browse/*`, `/v3/*`) are **not** shadowed by

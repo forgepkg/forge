@@ -1,4 +1,4 @@
-//! Admin token management (plan 10.4).
+//! Admin token management.
 //!
 //! On issue, a fresh 256-bit secret is generated; the **plaintext is returned
 //! once** in the create response and only its SHA-256 hash is persisted. Listing
@@ -63,7 +63,7 @@ pub struct CreateToken {
     pub name: String,
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
-    /// Optional per-token privilege scope (§12.4): a subset that **narrows** the
+    /// Optional per-token privilege scope: a subset that **narrows** the
     /// owner's effective set (it can never widen it). Omit / `null` ⇒ the token
     /// inherits the owner's set **except `admin`**, which must be listed in
     /// `actions` explicitly. Unknown keys are rejected (400/422).
@@ -146,7 +146,7 @@ pub async fn create(
         Err(e) => return db_error(e),
     };
 
-    // Persist the optional per-token scope (§12.4).
+    // Persist the optional per-token scope.
     let scope = match store_scope(&state, t.id, body.scope.as_ref()).await {
         Ok(scope) => scope,
         Err(resp) => return resp,

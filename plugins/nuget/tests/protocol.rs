@@ -1,4 +1,4 @@
-//! The NuGet V3 protocol as the plugin speaks it (spec §6, Appendix A),
+//! The NuGet V3 protocol as the plugin speaks it,
 //! driven through `forge_plugin_api::testing::serve` against an in-memory
 //! repository: the exact JSON shapes, absolute `@id`s, hosted-only
 //! `PackagePublish`, `GET` + `HEAD`, content types, lowercasing, 404s before

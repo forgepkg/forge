@@ -50,14 +50,14 @@ export const Route = createFileRoute('/_app/manage/users')({
 })
 
 /**
- * Admin users screen (plan §Phase 5). Lists every user with how they sign in
- * (password, identity provider, credential forwarding: look-alike usernames
- * from different sources are different accounts), the roles they hold and
- * their active flag, offers an inline create form (`CreateUser`, then the
- * chosen roles), links each user to its roles-and-tokens screen, and deletes
- * with a confirm step. There is no edit-in-place beyond create/delete + the
- * per-user screen. A new account is named by a UPN; one created before that
- * rule (`alice`) is marked "legacy name".
+ * Admin users screen. Lists every user with how they sign in (password,
+ * identity provider, credential forwarding: look-alike usernames from
+ * different sources are different accounts), the roles they hold and their
+ * active flag, offers an inline create form (`CreateUser`, then the chosen
+ * roles), links each user to its roles-and-tokens screen, and deletes with a
+ * confirm step. There is no edit-in-place beyond create/delete + the per-user
+ * screen. A new account is named by a UPN; one created before that rule
+ * (`alice`) is marked "legacy name".
  */
 function UsersList() {
   const users = useUsers()

@@ -1,4 +1,4 @@
-//! Admin user-role assignment (§12.4 Phase 6).
+//! Admin user-role assignment.
 //!
 //! * `GET    /admin/users/{id}/roles` — list the roles a user holds.
 //! * `PUT    /admin/users/{id}/roles` — assign a role (idempotent).

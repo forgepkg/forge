@@ -14,12 +14,11 @@ import type { PackageDetail } from '~/api/packages'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Package-detail screen (plan §Phase 3 testing): renders versions + dependency
- * groups; a delayed proxy version shows the delay badge; a proxy labels the
- * time column "Cached" (when Forge downloaded it), a hosted repository
- * "Published"; a 404 renders the not-found empty state; an offline
- * repository's 503 says so (without retrying). Drives the real route tree +
- * `usePackageDetail`.
+ * Package-detail screen: renders versions + dependency groups; a delayed proxy
+ * version shows the delay badge; a proxy labels the time column "Cached" (when
+ * Forge downloaded it), a hosted repository "Published"; a 404 renders the
+ * not-found empty state; an offline repository's 503 says so (without
+ * retrying). Drives the real route tree + `usePackageDetail`.
  */
 
 const anonMe: Me = {
