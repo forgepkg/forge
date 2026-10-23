@@ -22,6 +22,9 @@ accepted = [
     "Zlib",
     "BSL-1.0",
     "Unicode-3.0",
+    # Zero-clause BSD, public-domain-like with no attribution required:
+    # quoted_printable, lettre's encoder for email bodies.
+    "0BSD",
 ]
 
 # What the image ships: forge-server's normal dependencies on Linux.
