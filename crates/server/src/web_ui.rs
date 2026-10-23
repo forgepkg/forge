@@ -43,14 +43,12 @@
 //!
 //! The admin **UI** therefore lives under [`UI_ADMIN_PREFIX`] (`/manage/*`),
 //! not `/admin/*`: a UI route sharing the API's paths would answer a refresh,
-//! bookmark or deep link with raw JSON (or a 404/405). Links saved before the
-//! move keep working through [`legacy_admin_ui_redirect`].
+//! bookmark or deep link with raw JSON (or a 404/405).
 
 use std::path::PathBuf;
 
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
-use axum::middleware::Next;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use base64::Engine as _;
@@ -219,126 +217,6 @@ fn inline_scripts(html: &str) -> Vec<&str> {
     scripts
 }
 
-/// Middleware: 302-redirect a **browser navigation** to a former admin-UI path
-/// (`/admin`, `/admin/repositories/foo`, ...) to its [`UI_ADMIN_PREFIX`]
-/// equivalent (`/manage`, `/manage/repositories/foo`), keeping the query
-/// string, so bookmarks and links from before the UI moved keep working.
-///
-/// Only top-level document loads are redirected (see
-/// [`is_document_navigation`]): API clients — including the SPA's own
-/// `fetch` calls (`Accept: application/json`, `Sec-Fetch-Dest: empty`) — and
-/// every path the UI never used (`/admin/me`, `/admin/realms/order`,
-/// `/admin/users/{id}/tokens`, ...) reach the admin API unchanged. Installed
-/// only when the SPA is served.
-pub async fn legacy_admin_ui_redirect(req: Request, next: Next) -> Response {
-    match legacy_redirect_location(&req) {
-        Some(location) => (
-            StatusCode::FOUND,
-            [
-                (header::LOCATION, location),
-                (
-                    header::VARY,
-                    HeaderValue::from_static("Accept, Sec-Fetch-Dest"),
-                ),
-            ],
-        )
-            .into_response(),
-        None => next.run(req).await,
-    }
-}
-
-/// The `Location` for a legacy admin-UI navigation, or `None` to pass the
-/// request on.
-fn legacy_redirect_location(req: &Request) -> Option<HeaderValue> {
-    if !matches!(*req.method(), Method::GET | Method::HEAD) {
-        return None;
-    }
-    let target = legacy_ui_path(req.uri().path())?;
-    if !is_document_navigation(req.headers()) {
-        return None;
-    }
-    let location = match req.uri().query() {
-        Some(query) => format!("{target}?{query}"),
-        None => target,
-    };
-    HeaderValue::from_str(&location).ok()
-}
-
-/// Map a path the admin UI used before it moved to [`UI_ADMIN_PREFIX`] to its
-/// new equivalent; `None` for any other path (including every API-only path
-/// under `/admin`).
-///
-/// The former UI routes were `/admin`, `/admin/repositories[/new|/{name}
-/// [/members]]`, `/admin/users[/{id}]` and `/admin/realms[/new|/{id}]`. The
-/// remaining path is reused verbatim (still percent-encoded), so the target is
-/// always a same-origin path under `/manage`.
-pub fn legacy_ui_path(path: &str) -> Option<String> {
-    let rest = path.strip_prefix("/admin")?;
-    if rest.is_empty() || rest == "/" {
-        return Some(UI_ADMIN_PREFIX.to_string());
-    }
-    // `/administrator` is not under `/admin`.
-    let rest = rest.strip_prefix('/')?;
-    let rest = rest.strip_suffix('/').unwrap_or(rest);
-    let segments: Vec<&str> = rest.split('/').collect();
-    if segments.iter().any(|s| s.is_empty() || s.contains('\\')) {
-        return None;
-    }
-    let was_ui = match segments.as_slice() {
-        ["repositories"] | ["repositories", _] | ["repositories", _, "members"] => true,
-        ["users"] | ["users", _] => true,
-        ["realms"] => true,
-        // `PUT /admin/realms/order` is API-only.
-        ["realms", id] => *id != "order",
-        _ => false,
-    };
-    was_ui.then(|| format!("{UI_ADMIN_PREFIX}/{rest}"))
-}
-
-/// Whether a request is a browser's top-level document navigation (address
-/// bar, bookmark, link, refresh) rather than an API call.
-///
-/// `Sec-Fetch-Dest` is authoritative when present (every current browser
-/// sends it): only `document` counts. Without it, an `Accept` header that
-/// ranks `text/html` above JSON and wildcards counts (a browser's
-/// `text/html,…,*/*;q=0.8`; not curl's `*/*` or an API client's
-/// `application/json`).
-fn is_document_navigation(headers: &HeaderMap) -> bool {
-    if let Some(dest) = headers.get("sec-fetch-dest") {
-        return dest.as_bytes().eq_ignore_ascii_case(b"document");
-    }
-    accept_prefers_html(headers)
-}
-
-/// Whether the `Accept` header gives `text/html` a higher quality than
-/// `application/json` (or a wildcard that would match it).
-fn accept_prefers_html(headers: &HeaderMap) -> bool {
-    let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    let mut html = 0.0_f32;
-    let mut other = 0.0_f32;
-    for item in accept.split(',') {
-        let mut parts = item.split(';');
-        let media = parts.next().unwrap_or("").trim().to_ascii_lowercase();
-        let q = parts
-            .find_map(|param| {
-                let (key, value) = param.split_once('=')?;
-                key.trim()
-                    .eq_ignore_ascii_case("q")
-                    .then(|| value.trim().parse::<f32>().ok())
-                    .flatten()
-            })
-            .unwrap_or(1.0);
-        match media.as_str() {
-            "text/html" | "application/xhtml+xml" => html = html.max(q),
-            "application/json" | "application/*" | "*/*" => other = other.max(q),
-            _ => {}
-        }
-    }
-    html > 0.0 && html > other
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,99 +346,5 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_ne!(body, b"INDEX");
         assert_eq!(cache.as_deref(), Some("no-cache"), "a miss is never pinned");
-    }
-
-    #[test]
-    fn legacy_ui_paths_map_to_manage() {
-        let cases = [
-            ("/admin", "/manage"),
-            ("/admin/", "/manage"),
-            ("/admin/repositories", "/manage/repositories"),
-            ("/admin/repositories/", "/manage/repositories"),
-            ("/admin/repositories/new", "/manage/repositories/new"),
-            ("/admin/repositories/nuget", "/manage/repositories/nuget"),
-            (
-                "/admin/repositories/all/members",
-                "/manage/repositories/all/members",
-            ),
-            ("/admin/users", "/manage/users"),
-            ("/admin/users/5", "/manage/users/5"),
-            ("/admin/realms", "/manage/realms"),
-            ("/admin/realms/new", "/manage/realms/new"),
-            ("/admin/realms/3", "/manage/realms/3"),
-        ];
-        for (from, to) in cases {
-            assert_eq!(legacy_ui_path(from).as_deref(), Some(to), "{from}");
-        }
-    }
-
-    #[test]
-    fn api_only_paths_are_not_mapped() {
-        for path in [
-            "/admin/me",
-            "/admin/me/tokens",
-            "/admin/realms/order",
-            "/admin/users/5/tokens",
-            "/admin/users/5/roles",
-            "/admin/repositories/nuget/retention",
-            "/admin/repositories/nuget/packages/a/1.0.0",
-            "/admin/roles",
-            "/admin/tokens/3",
-            "/admin/crypto/keys",
-            "/admin//repositories",
-            "/administrator",
-            "/manage/repositories",
-            "/v3/nuget/index.json",
-        ] {
-            assert_eq!(legacy_ui_path(path), None, "{path}");
-        }
-    }
-
-    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(*k, HeaderValue::from_static(v));
-        }
-        h
-    }
-
-    #[test]
-    fn document_navigation_detection() {
-        // A browser navigation (Chrome/Firefox send both headers).
-        assert!(is_document_navigation(&headers(&[
-            ("sec-fetch-dest", "document"),
-            (
-                "accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            ),
-        ])));
-        // Sec-Fetch-Dest is authoritative: a fetch() is never a navigation.
-        assert!(!is_document_navigation(&headers(&[
-            ("sec-fetch-dest", "empty"),
-            ("accept", "text/html"),
-        ])));
-        // Without Sec-Fetch-Dest, Accept must rank HTML first.
-        assert!(is_document_navigation(&headers(&[(
-            "accept",
-            "text/html,*/*;q=0.8"
-        )])));
-        assert!(is_document_navigation(&headers(&[(
-            "accept",
-            "text/html;q=0.9, application/json;q=0.5"
-        )])));
-        assert!(!is_document_navigation(&headers(&[(
-            "accept",
-            "application/json"
-        )])));
-        assert!(!is_document_navigation(&headers(&[("accept", "*/*")])));
-        assert!(!is_document_navigation(&headers(&[(
-            "accept",
-            "text/html, application/json"
-        )])));
-        assert!(!is_document_navigation(&headers(&[(
-            "accept",
-            "text/html;q=0"
-        )])));
-        assert!(!is_document_navigation(&HeaderMap::new()));
     }
 }
