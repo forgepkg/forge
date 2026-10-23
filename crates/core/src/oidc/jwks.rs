@@ -134,9 +134,9 @@ pub struct WorkloadDiscoveryDocument {
     pub jwks_uri: String,
 }
 
-/// The ID-token claims we extract after a successful verification. Format-
-/// specific claim → user mapping happens in a later phase (`claims.rs`); here we
-/// keep the raw values plus the full claim set for that step.
+/// The ID-token claims we extract after a successful verification. The claim →
+/// user mapping happens afterwards ([`super::claims`]); here we keep the raw
+/// values plus the full claim set for that step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verified {
     /// `sub` — the stable, issuer-scoped subject identifier.
@@ -150,7 +150,7 @@ pub struct Verified {
 
 /// Decoded ID-token claims. Registered claims are typed; everything else (the
 /// IdP-specific claims used for username/email/groups/roles mapping) is kept in
-/// `additional` for the claim-mapping phase.
+/// `additional` for the claim mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdTokenClaims {
     /// Subject.
@@ -212,7 +212,7 @@ pub struct OidcMetadataClient {
     /// Outbound HTTP client (no redirects, https only; built by the caller via
     /// [`crate::net::ssrf::outbound_metadata_client`]).
     http: reqwest::Client,
-    /// Slice-1 hybrid cache for discovery + JWKS.
+    /// Hybrid cache for discovery + JWKS.
     cache: Cache,
     /// Discovery TTL.
     discovery_ttl: Duration,
@@ -401,8 +401,8 @@ impl OidcMetadataClient {
     /// Verify an ID token: signature (against the cached JWKS, with a single
     /// kid-miss refetch), then `iss`/`aud`/`exp`/`nbf` (with leeway) and `nonce`.
     ///
-    /// Returns the validated subject + full claim set for the claim-mapping
-    /// phase. Rejects `alg: none`, HMAC, and any non-RSA key family.
+    /// Returns the validated subject + full claim set for the claim mapping.
+    /// Rejects `alg: none`, HMAC, and any non-RSA key family.
     pub async fn verify_id_token(
         &self,
         token: &str,
@@ -420,7 +420,7 @@ impl OidcMetadataClient {
     }
 
     /// Verify a JWT against this issuer, accepting **any** of `audiences`
-    /// (slice 12.8, WIF: a workload realm trusts a set of allowed audiences and
+    /// (WIF: a workload realm trusts a set of allowed audiences and
     /// presents no nonce). This is the shared core of [`verify_id_token`]:
     /// signature against the cached JWKS (one kid-miss refetch), the RSA-only
     /// algorithm allowlist, `iss` = configured issuer, `aud` ∈ `audiences`,
@@ -1288,7 +1288,7 @@ mod tests {
                 .unwrap(),
             "alice@example.com"
         );
-        // `roles` flows through for the later admin-mapping phase.
+        // `roles` flows through for the admin mapping (`claims.rs`).
         assert!(verified.claims.additional.contains_key("roles"));
     }
 

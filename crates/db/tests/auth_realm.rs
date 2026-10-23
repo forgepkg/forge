@@ -1,4 +1,4 @@
-//! Integration tests for the 12.7 `auth_realm` DAO against a real Postgres
+//! Integration tests for the `auth_realm` DAO against a real Postgres
 //! testcontainer.
 //!
 //! Covers what the realm runtime hinges on:

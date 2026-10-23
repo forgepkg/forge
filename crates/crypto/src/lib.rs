@@ -1,4 +1,4 @@
-//! Secret encryption at rest — double envelope encryption (spec §12.5).
+//! Secret encryption at rest — double envelope encryption.
 //!
 //! Implements the three-layer key hierarchy and the AEAD envelope used to
 //! encrypt small secret values (the proxy `upstream_password` first; future
@@ -26,8 +26,9 @@
 //!
 //! No unwrapped key material is ever persisted: the authoritative state is the
 //! wrapped rows in Postgres plus the root held outside the database, so every
-//! instance can reconstruct every key (§2.1-compliant; the unwrapped-key cache
-//! holds only derivable material for a short TTL and zeroizes on drop).
+//! instance can reconstruct every key and instances stay stateless (the
+//! unwrapped-key cache holds only derivable material for a short TTL and
+//! zeroizes on drop).
 
 pub mod envelope;
 pub mod error;

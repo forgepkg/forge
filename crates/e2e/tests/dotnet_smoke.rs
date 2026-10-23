@@ -1,7 +1,7 @@
 //! E2E (optional): real `dotnet` NuGet client smoke test — `dotnet nuget push`
 //! a package built with `dotnet pack`, then `dotnet restore` it back from a
-//! consuming project (spec §9). Skipped (passes trivially) when the dotnet SDK
-//! is not on PATH. Gated behind `forge-e2e`.
+//! consuming project. Skipped (passes trivially) when the dotnet SDK is not on
+//! PATH. Gated behind `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 
@@ -60,8 +60,8 @@ async fn dotnet_push_and_restore_smoke() {
         .status(),
         201
     );
-    // §12.4 RBAC: anonymous read flows through an anonymous-role grant (what the
-    // data migration converts the slice-1 anonymous_read flag into).
+    // RBAC: anonymous read flows through an anonymous-role grant (what the RBAC
+    // data migration converted the anonymous_read flag into).
     srv.grant_anonymous_read("dn-repo").await;
     let source = format!("{}/v3/dn-repo/index.json", srv.base_url);
     let api_key = srv.admin_token.clone();

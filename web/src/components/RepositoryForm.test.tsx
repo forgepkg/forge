@@ -18,7 +18,7 @@ import {
 } from './RepositoryForm'
 
 /**
- * RepositoryForm (plan §Phase 4 testing):
+ * RepositoryForm:
  *  - a create-hosted submission produces the right `CreateRepo` body (kind +
  *    hosted-only `allow_redeploy`, no proxy fields);
  *  - the proxy upstream password is **write-only**: never seeded from an

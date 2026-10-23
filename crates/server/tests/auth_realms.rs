@@ -1,4 +1,4 @@
-//! E2E: the 12.7 auth-realm surface — login options, identifier-first
+//! E2E: the auth-realm surface — login options, identifier-first
 //! `/auth/identify`, the password `/auth/login` (session mint + cookie),
 //! logout, and the `/admin/realms` CRUD with write-only secrets.
 //!
@@ -109,7 +109,7 @@ async fn password_login_session_round_trip() {
     assert_eq!(me["username"], json!(admin));
 
     // … and the admin API too (the principal middleware mounts the session
-    // source independent of OIDC since 12.7).
+    // source independent of OIDC).
     let resp = client
         .get(format!("{}/admin/users", srv.base_url))
         .header("cookie", &cookie)

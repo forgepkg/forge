@@ -41,8 +41,8 @@ use crate::web_ui::spa_service;
 /// as no credentials and cleared on the response (a 401 there would lock the
 /// browser out of the login page itself).
 ///
-/// 12.7: the Basic source's password path asks [`crate::auth::RealmAuth`] for
-/// the chain on every attempt, so admin realm edits apply without a restart
+/// The Basic source's password path asks [`crate::auth::RealmAuth`] for the
+/// chain on every attempt, so admin realm edits apply without a restart
 /// (and the wire path stays disabled unless `auth.allow_password_basic` or an
 /// enabled credential-forwarding realm allows it). The session source is
 /// always mounted — local password logins mint sessions too — and every
@@ -51,7 +51,7 @@ use crate::web_ui::spa_service;
 pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
     let pool = &state.pool;
     let sources: Vec<Box<dyn PrincipalSource>> = vec![
-        // WIF first (slice 12.8): a presented JWT whose `iss` names a configured
+        // WIF first: a presented JWT whose `iss` names a configured
         // workload_identity realm is claimed here — including one passed as the
         // `X-NuGet-ApiKey` or the Basic password — so it is never treated as an
         // opaque token or forwarded upstream as a password. A non-WIF secret
@@ -145,7 +145,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         .merge(me_tokens_router())
         .nest("/admin", admin)
         .merge(browse_router())
-        // Login / session surface (12.7): always mounted — local-password
+        // Login / session surface: always mounted — local-password
         // login and sessions exist independent of OIDC; the `/auth/oidc/*`
         // endpoints answer 404 themselves when no enabled oidc realm exists.
         .merge(auth_router())
@@ -523,12 +523,13 @@ fn warn_placeholder(username: &str) {
     );
 }
 
-/// One-shot import of the legacy `[oidc]` / `[auth.upstream_basic]` config
-/// blocks into `auth_realm` rows (12.7). Delegates to
-/// [`crate::auth::seed_auth_realms`]; call on every boot — a `forge_setting`
-/// marker makes it a no-op after the first import. Pass the (bootstrapped)
-/// envelope service when secret encryption is enabled so seeded realm secrets
-/// are encrypted at rest.
+/// Import the legacy `[oidc]` / `[auth.upstream_basic]` config blocks into
+/// `auth_realm` rows. Delegates to [`crate::auth::seed_auth_realms`]; call on
+/// every boot — the first boot inserts the realms, later boots re-apply a
+/// changed block only while its seeded row is untouched by the admin API (see
+/// there for the drift detection). Pass the (bootstrapped) envelope service
+/// when secret encryption is enabled so seeded realm secrets are encrypted at
+/// rest.
 pub async fn ensure_auth_realms(
     config: &Config,
     pool: &PgPool,

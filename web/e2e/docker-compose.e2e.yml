@@ -5,7 +5,7 @@
 # (Postgres 25432, versitygw 27070; below the ephemeral port range, see
 # harness.ts) so running e2e never disturbs a dev stack.
 #
-# Mirrors the slice-1 testcontainers harness (crates/e2e/src/stack.rs): the same
+# Mirrors the Rust testcontainers harness (crates/e2e/src/stack.rs): the same
 # Postgres 17 and versity/versitygw:v1.4.1 images (through mirror.gcr.io), the
 # same credentials shape.
 services:
@@ -26,7 +26,7 @@ services:
   s3:
     image: mirror.gcr.io/versity/versitygw:v1.4.1
     # posix backend over /tmp (always present in the image), matching the
-    # slice-1 testcontainers harness. The server's ensure_bucket() creates the
+    # Rust testcontainers harness. The server's ensure_bucket() creates the
     # bucket subdirectory on boot.
     command:
       ["--port", ":7070", "--access", "test", "--secret", "test", "posix", "/tmp"]

@@ -79,7 +79,7 @@ fn main() -> ExitCode {
         // Format plugins (WebAssembly components in plugins/)
         "plugins" => plugins(),
         "plugins-check" => plugins_check(),
-        // Docker image (Dockerfile lands in phase 2; thin wrappers now)
+        // Docker image (build it; run it against the dev infra)
         "docker-build" => docker_build(),
         "docker-run" => docker_run(),
         // Release
@@ -588,9 +588,8 @@ fn json_escape(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Minimal extractor for `"<key>":"<value>"` from a JSON blob (matches the old
-/// Makefile's `sed`). Good enough for the single-field token response; avoids a
-/// JSON dependency in the runner.
+/// Minimal extractor for `"<key>":"<value>"` from a JSON blob. Good enough for
+/// the single-field token response; avoids a JSON dependency in the runner.
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
     let start = json.find(&needle)? + needle.len();
@@ -693,8 +692,8 @@ fn migrate() -> Result<(), String> {
 }
 
 /// Regenerate the committed .sqlx/ offline cache from a live DB. Applies
-/// migrations first (mirrors the old `just prepare`), then runs `cargo sqlx
-/// prepare`. Needs `up` (or a reachable DATABASE_URL) + sqlx-cli.
+/// migrations first, then runs `cargo sqlx prepare`. Needs `up` (or a reachable
+/// DATABASE_URL) + sqlx-cli.
 fn prepare() -> Result<(), String> {
     migrate()?;
     sqlx_prepare(&[])

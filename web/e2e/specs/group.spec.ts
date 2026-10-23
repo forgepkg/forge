@@ -10,14 +10,13 @@ import {
 } from '../helpers'
 
 /**
- * Group + priority (plan §Testing #6).
+ * Group + priority.
  *
  * An admin creates a group of two members and sets their priorities through the
  * `PriorityList` editor (the Members screen). Both members publish the SAME
  * package id + version, but with a DISTINCT dependency, so the group's resolved
- * package detail reveals which member won: per slice-1 §7 the highest-priority
- * member wins ties, and the group's registration surfaces that member's
- * dependency group.
+ * package detail reveals which member won: the highest-priority member wins
+ * ties, and the group's registration surfaces that member's dependency group.
  *
  * Member fixtures:
  *   - winner  → `sample.lib.winner.1.0.0.nupkg`  (dep `WinnerMarker.Dependency`)

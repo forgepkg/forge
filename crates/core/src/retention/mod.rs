@@ -1,4 +1,4 @@
-//! Retention / cleanup policy model and the pure decision evaluator (slice 12.1).
+//! Retention / cleanup policy model and the pure decision evaluator.
 //!
 //! This module is the **format-agnostic** core of retention: it defines the
 //! serde [`RetentionPolicy`] stored in `repository.retention_policy` (with
@@ -7,9 +7,10 @@
 //! versions to delete or unlist. Versions are ordered through the
 //! [`crate::format::Format`] seam, never by importing a concrete format.
 //!
-//! The DB-touching pieces (claim/apply/worker) live in later phases and reuse
-//! the slice-1 transactional blob outbox for all blob GC — this module performs
-//! **no I/O** and is fully unit-testable.
+//! The DB-touching pieces live in [`apply`](mod@apply) and [`worker`] (the
+//! claim ledger in `forge_db::retention_dao`) and route all blob GC through
+//! the transactional blob outbox; the model and the evaluator perform **no
+//! I/O** and are fully unit-testable.
 
 pub mod apply;
 pub mod evaluate;

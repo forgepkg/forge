@@ -1,13 +1,14 @@
-//! Read-side browse / search API (plan §12.6 Phase 0, §8).
+//! Read-side browse / search API.
 //!
 //! These endpoints back the SPA's browse + package-detail screens with plain
-//! JSON DTOs (not the NuGet V3 protocol shapes). They are **additive** and reuse
-//! the existing slice-1 read path:
+//! JSON DTOs (not the NuGet V3 protocol shapes). They reuse the feed's read
+//! path:
 //!
 //! * browsing requires a **signed-in user**: every `/browse/*` endpoint rejects
 //!   anonymous / unauthenticated callers with 401, regardless of any repo's
 //!   `anonymous_read` flag (which continues to apply to the `/v3` feed only);
-//! * authorization on top of that is the slice-1 [`can_read`] predicate,
+//! * authorization on top of that is the
+//!   [`Authz::can_read`](forge_core::auth::Authz::can_read) predicate,
 //!   evaluated against the request's [`Principal`];
 //! * version visibility, group member resolution, listed/prerelease filtering,
 //!   and proxy **package-delay** gating all come for free from
@@ -32,12 +33,11 @@
 //! cached.
 //!
 //! ## Download stats
-//! Slice 1 has **no** download counters in its schema (`component` has no
-//! `downloads` column and there is no counter table). The plan's
-//! `total_downloads` / `downloads` fields are therefore **omitted** rather than
-//! emitted as misleading zeros, and the `/stats` split is not implemented. The
-//! DTOs keep room for them to be added without breaking the SPA. `published_at`
-//! maps to `component.created_at` (plan assumption (b)).
+//! Downloads are tracked ([`forge_db::download_dao`]; retention rules and the
+//! feed search's download totals read them), but this API does not expose
+//! them: the DTOs carry no `total_downloads` / `downloads` fields and there is
+//! no `/stats` endpoint. The DTOs keep room for them to be added without
+//! breaking the SPA. `published_at` maps to `component.created_at`.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -220,11 +220,10 @@ pub struct BrowseResult {
 /// `GET /browse/packages` — cross-repository search.
 ///
 /// Iterates every repository the principal may read (honoring
-/// `anonymous_read`), runs the slice-1 [`RepoReadOps::search`] on each, merges
-/// the hits, then sorts + paginates the merged set. A `repo` filter restricts to
-/// a single repository, which then pages in its backend. `total` is the sum of
-/// the backends' `total_hits` (already filtered by the caller's package
-/// selector).
+/// `anonymous_read`), runs [`RepoReadOps::search`] on each, merges the hits,
+/// then sorts + paginates the merged set. A `repo` filter restricts to a single
+/// repository, which then pages in its backend. `total` is the sum of the
+/// backends' `total_hits` (already filtered by the caller's package selector).
 ///
 /// A merged page needs every repository's first `skip + take` hits, so the
 /// merge is exact while that window stays within
@@ -371,7 +370,7 @@ pub struct DetailVersion {
     /// When a delayed proxy version becomes available (`first_seen_at + delay`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delayed_until: Option<DateTime<Utc>>,
-    /// Retention status — reserved for §12.1; always `null` in slice 1.
+    /// Retention status — reserved; always `null`.
     pub retention_status: Option<String>,
 }
 

@@ -23,7 +23,7 @@ export const Route = createFileRoute('/_app/manage/realms/$realmId')({
 })
 
 /**
- * Edit-realm screen (§12.7). Loads the (redacted) realm, seeds the shared
+ * Edit-realm screen. Loads the (redacted) realm, seeds the shared
  * form, and PATCHes an `UpdateRealm`. Secrets are **write-only**: never seeded
  * from the GET and only included when the admin typed a new one (a blank field
  * keeps the stored secret). The built-in local realm has no config — only

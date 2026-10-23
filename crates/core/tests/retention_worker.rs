@@ -1,15 +1,15 @@
 //! Integration tests for the retention **worker**
-//! (`forge_core::retention::worker::RetentionWorker`, slice 12.1 Phase 5).
+//! (`forge_core::retention::worker::RetentionWorker`).
 //!
 //! A single tick on a seeded, armed repository must prune per policy via the
-//! slice-1 outbox (decref + `blob_outbox`, never a direct S3 delete); a second
+//! blob outbox (decref + `blob_outbox`, never a direct S3 delete); a second
 //! tick is a no-op (idempotent — the deleted components are no longer
 //! candidates); the ledger's `next_run_at` advances by the per-repo interval;
 //! the lease is cleared and the run summary recorded. A `dry_run_only` policy
 //! audits but mutates nothing. A shared blob across two versions is not enqueued
 //! until its last reference is removed.
 //!
-//! Postgres only — the apply path produces outbox rows the slice-1 worker
+//! Postgres only — the apply path produces outbox rows the outbox worker
 //! drains; no S3 needed here.
 
 mod common;

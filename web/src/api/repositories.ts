@@ -3,15 +3,14 @@ import { httpClient } from '~/lib/httpClient'
 /**
  * Admin repository CRUD + group-membership API.
  *
- * Types mirror the **real** Rust DTOs (reconciled against slice 1, not the
- * forward-looking plan):
+ * Types mirror the **real** Rust DTOs:
  *
  *  - `RepoView` (`crates/server/src/admin/repositories.rs`) is the password-free
  *    response shape. `upstream_password` is **never** returned; the boolean
  *    `has_upstream_password` reports whether one is stored, so the edit form can
  *    show a "set new password" affordance without ever populating the value.
  *  - `GET /admin/repositories` returns a **bare array** of `RepoView` (no
- *    `{ total, items }` envelope — slice-1 admin list is unpaginated).
+ *    `{ total, items }` envelope — the admin list is unpaginated).
  *  - `CreateRepo` / `UpdateRepo` are the request bodies. On update an absent
  *    field keeps the stored value; the nullable proxy fields (credentials,
  *    TTLs) are cleared by an explicit `null`. `kind` / `format` are not

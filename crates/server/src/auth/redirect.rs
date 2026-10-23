@@ -1,4 +1,4 @@
-//! Open-redirect guard for the post-login `redirect_to` target (slice 12.2, §6).
+//! Open-redirect guard for the post-login `redirect_to` target.
 //!
 //! After login we 302 the browser to a caller-supplied path. To prevent an
 //! **open redirect** (`?redirect_to=https://evil.example`), we only ever honor a

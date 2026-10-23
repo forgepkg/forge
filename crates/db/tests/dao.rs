@@ -83,7 +83,7 @@ async fn group_members_ordered_by_priority_desc() {
         .await
         .expect("members");
 
-    // Highest priority first (wins ties per spec §7).
+    // Highest priority first (the highest-priority member wins ties).
     let priorities: Vec<i32> = members.iter().map(|(_, p)| *p).collect();
     assert_eq!(priorities, vec![100, 50, 1], "must be priority DESC");
     assert_eq!(members[0].0.id, high.id);
@@ -101,7 +101,7 @@ async fn group_members_ordered_by_priority_desc() {
     assert_eq!(after.len(), 2);
 }
 
-// ── nested groups: cycle + depth guard (§12.4 Phase 4) ──────────────────────
+// ── nested groups: cycle + depth guard ──────────────────────────────────────
 
 #[tokio::test]
 async fn add_group_member_checked_allows_valid_nesting() {

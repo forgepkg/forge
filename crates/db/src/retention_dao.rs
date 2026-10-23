@@ -1,4 +1,4 @@
-//! Data access for the slice-12.1 retention coordination ledger
+//! Data access for the retention coordination ledger
 //! (`retention_run`), the audit log (`retention_audit`), the policy column on
 //! `repository`, and the candidate snapshots the evaluator consumes.
 //!

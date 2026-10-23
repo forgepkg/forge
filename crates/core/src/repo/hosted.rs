@@ -1,4 +1,4 @@
-//! Hosted-repository read operations (spec §6, §7 "Hosted").
+//! Hosted-repository read and write operations.
 //!
 //! Reads are served entirely from local data: `repository` → `component` →
 //! `asset` → `blob`. The package (the `.nupkg` for NuGet) is located via the
@@ -330,7 +330,7 @@ impl HostedRepo {
             return Ok(None);
         };
 
-        // Download tracking (slice 12.1 §3.7): best-effort, off the hot path.
+        // Download tracking: best-effort, off the hot path.
         // A resolved `.nupkg` is a download (a `HEAD` is not); it is counted
         // in memory and written in a batch, so a tracking write never blocks
         // (or fails) the response, and a burst on one version never queues
@@ -604,7 +604,7 @@ impl HostedWrite {
 
     /// Publish (or redeploy) a package read from `reader`.
     ///
-    /// Pipeline (spec §6/§7, plan 7.1):
+    /// Pipeline:
     /// 1. Stage and hash the bytes locally, enforcing `max_upload_bytes`.
     /// 2. Parse the temp `.nupkg` into a [`ParsedUpload`](crate::ParsedUpload),
     ///    authorize its canonical id, then promote it into CAS. A parse failure
@@ -1216,7 +1216,7 @@ impl HostedWrite {
         Ok(())
     }
 
-    /// Soft- or hard-delete a specific package version (plan 7.2 / A12).
+    /// Soft- or hard-delete a specific package version.
     ///
     /// * `hard == false` (unlist): flips `component.listed = false`. The version
     ///   stays downloadable by exact version and present in flat-container

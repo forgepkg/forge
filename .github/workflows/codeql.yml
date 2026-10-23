@@ -130,7 +130,7 @@ jobs:
       # sources (rust-src), which the pinned toolchain lacks by default.
       - name: Install Rust toolchain (rust-toolchain.toml) (with rust-src)
         if: matrix.language == 'rust'
-        uses: dtolnay/rust-toolchain@eb0a44f258ec94ab9ee0f14f998f4cf332c25d3a # 1.95.0
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.95.0
         with:
           components: rust-src
       - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1

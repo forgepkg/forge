@@ -3,7 +3,7 @@ import { expect, test } from '@playwright/test'
 import { adminBasic, facts, fetchPackageDetail, signInSession } from '../helpers'
 
 /**
- * Proxy delay status (plan §Testing #7).
+ * Proxy delay status.
  *
  * An admin configures a proxy with a long package delay through the repository
  * form. A version freshly discovered upstream is inside the delay window, so:
@@ -15,8 +15,7 @@ import { adminBasic, facts, fetchPackageDetail, signInSession } from '../helpers
  *     list until the window elapses.
  *
  * The upstream is the loopback mock feed booted by the harness
- * (`facts().upstreamIndexUrl`); a loopback remote requires `allow_private_upstream`
- * to clear the SSRF guard, which the form exposes as a checkbox.
+ * (`facts().upstreamIndexUrl`).
  *
  * The proxy is created via in-app navigation (Browse -> Admin nav).
  */
@@ -39,8 +38,8 @@ test('a delayed proxy version shows the delay badge and is absent from browse', 
   await expect(page).toHaveURL(/\/manage\/repositories$/)
   await page.getByRole('link', { name: /new repository/i }).click()
 
-  // (The 12.7 SSRF guard is scheme-only, so the loopback upstream needs no
-  // allow-private flag any more.)
+  // (The SSRF guard checks only the scheme, so the loopback upstream needs no
+  // allow-private flag.)
   await page.getByLabel(/^name$/i).fill(proxy)
   await page.getByLabel(/^kind$/i).selectOption('proxy')
   await page.getByLabel(/allow anonymous read/i).check()

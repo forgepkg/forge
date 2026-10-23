@@ -5,14 +5,13 @@ import { Checkbox } from '~/components/catalyst/checkbox'
 import { RepoKindBadge } from '~/components/RepoKindBadge'
 
 /**
- * Ordered group-member list (plan §6, §Phase 4). Members are shown sorted by
- * descending priority — the highest-priority member wins ties per slice-1 §7.
- * Each row offers an owner toggle and a remove action. Removing asks first,
- * and so does unflagging the last owner: a group without owners trusts every
- * hosted member equally. `onRemove` / `onToggleOwner` fire only once
- * confirmed.
+ * Ordered group-member list. Members are shown sorted by descending priority —
+ * the highest-priority member wins ties. Each row offers an owner toggle and a
+ * remove action. Removing asks first, and so does unflagging the last owner: a
+ * group without owners trusts every hosted member equally. `onRemove` /
+ * `onToggleOwner` fire only once confirmed.
  *
- * **Reconciliation note:** the group API has *add* (`POST .../members` with a
+ * **No in-place reorder:** the group API has *add* (`POST .../members` with a
  * unique `priority`), *remove* (`DELETE .../members/{member}`) and an
  * owner-only update (`PATCH .../members/{member}` `{"owner": bool}`) — there
  * is **no** priority-update / reorder endpoint. So this list does not offer

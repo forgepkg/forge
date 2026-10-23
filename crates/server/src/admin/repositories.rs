@@ -1,4 +1,4 @@
-//! Admin repository CRUD + package hard-delete (plan 10.4, A12).
+//! Admin repository CRUD + package hard-delete.
 //!
 //! `upstream_password` is **write-only**: accepted on create/update, never
 //! returned (responses carry a [`RepoView`] with no password field). The update
@@ -6,7 +6,7 @@
 //! credential drop on an origin change are documented on [`UpdateRepo`].
 //!
 //! `remote_url` on a proxy is **scheme-validated** at create/update time
-//! (http/https only — 12.7 §3.6 dropped the private-range restriction) so a bad
+//! (http/https only; private and loopback addresses are allowed) so a bad
 //! upstream is rejected before any fetch. The configured host is logged on save
 //! for operator visibility (the URL may point at internal addresses).
 //!
@@ -93,7 +93,7 @@ impl RepoView {
             remote_url: r.remote_url.clone(),
             package_delay_seconds: r.package_delay_seconds,
             upstream_username: r.upstream_username.clone(),
-            // §12.5: true for an encrypted blob OR a (pre-backfill) plaintext.
+            // True for an encrypted blob OR a (pre-backfill) plaintext.
             has_upstream_password: r.has_upstream_password(),
             metadata_ttl_seconds: r.metadata_ttl_seconds,
             not_found_ttl_seconds: r.not_found_ttl_seconds,
@@ -346,8 +346,8 @@ fn bad_request(msg: impl Into<String>) -> Response {
 
 /// Scheme-validate a proxy `remote_url` (http/https only). `None` is OK at this
 /// layer (proxy-without-url is rejected separately). Logs the configured host
-/// (12.7 §3.6: the URL may legitimately point at internal addresses; the log
-/// line gives operators an audit trail of where forge was pointed).
+/// (the URL may legitimately point at internal addresses; the log line gives
+/// operators an audit trail of where forge was pointed).
 #[allow(clippy::result_large_err)] // the Err is a ready-made axum Response
 fn validate_remote_url(url: &str) -> Result<(), Response> {
     validate_url(url).map_err(|e| bad_request(format!("invalid remote_url: {e}")))?;
@@ -672,9 +672,9 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         }
     }
 
-    // §12.5: with encryption enabled the password is NOT inserted as plaintext;
-    // the row is created first (the AAD binds the ciphertext to the row id,
-    // which does not exist before the INSERT) and the secret is sealed below.
+    // With encryption enabled the password is NOT inserted as plaintext; the
+    // row is created first (the AAD binds the ciphertext to the row id, which
+    // does not exist before the INSERT) and the secret is sealed below.
     let encrypting = state.envelope.is_some();
     let new = NewRepository {
         name: body.name.clone(),
@@ -1138,7 +1138,7 @@ pub async fn update(
         None => PasswordChange::Keep,
     };
     // The plaintext column value, and whether the sealed blob is cleared too.
-    // §12.5: with encryption enabled the plaintext column is always NULL after
+    // With encryption enabled the plaintext column is always NULL after
     // an update — a new password is sealed below, and a kept legacy plaintext
     // value is sealed as well (it is not carried forward).
     let (upstream_password, clear_upstream_password_enc) = match (&state.envelope, &password) {
@@ -1251,8 +1251,8 @@ pub async fn update(
         false
     };
 
-    // §12.5: seal a new password through the envelope, or re-seal a kept
-    // legacy plaintext one (the update above nulled its column).
+    // Seal a new password through the envelope, or re-seal a kept legacy
+    // plaintext one (the update above nulled its column).
     let to_seal = match (&state.envelope, password) {
         (Some(envelope), PasswordChange::Set(pw)) => Some((envelope, pw)),
         (Some(envelope), PasswordChange::Keep) if existing.upstream_password_enc.is_none() => {
@@ -1459,8 +1459,8 @@ async fn delete_repository_once(
     })
 }
 
-/// `DELETE /admin/repositories/{name}/packages/{id}/{version}` — **hard delete**
-/// (A12): remove the component + its assets and decrement the referenced blobs'
+/// `DELETE /admin/repositories/{name}/packages/{id}/{version}` — **hard delete**:
+/// remove the component + its assets and decrement the referenced blobs'
 /// ref-counts (enqueuing outbox deletes at zero) in one transaction.
 pub async fn hard_delete_package(
     State(state): State<AppState>,

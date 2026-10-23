@@ -10,7 +10,7 @@ publish.workspace = true
 forge-db = { path = "../db" }
 forge-storage = { path = "../storage" }
 forge-cache = { path = "../cache" }
-# Secret encryption at rest (slice 12.5): the proxy upstream fetch decrypts the
+# Secret encryption at rest: the proxy upstream fetch decrypts the
 # upstream password through the envelope service (the single sanctioned site).
 forge-crypto = { path = "../crypto" }
 # The format-plugin contract: the upstream conversation of proxy repositories
@@ -26,8 +26,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
-# RBAC content-selector glob matching (slice 12.4 Phase 2): compile include/exclude
-# globs once into a GlobSet held behind Arc in the cached effective set.
+# RBAC content-selector glob matching: compile include/exclude globs once
+# into a GlobSet held behind Arc in the cached effective set.
 globset = { workspace = true }
 
 # Auth
@@ -42,7 +42,7 @@ http = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 
-# OIDC ID-token verification (slice 12.2 Phase 2): explicit JWT decode + RSA
+# OIDC ID-token verification: explicit JWT decode + RSA
 # JWKS key construction + iss/aud/exp/nonce validation with an alg allowlist.
 jsonwebtoken = { workspace = true }
 # Forge's own client assertions (oidc::assertion): RSA key generation, PKCS#8

@@ -2,7 +2,7 @@ import { Button } from '~/components/catalyst/button'
 
 /**
  * Generic error panel with an optional retry. Used by every data screen so the
- * failure UX is consistent (plan §UX). `message` is the human-readable summary;
+ * failure UX is consistent. `message` is the human-readable summary;
  * pass the API error's message when available.
  */
 export function ErrorState({

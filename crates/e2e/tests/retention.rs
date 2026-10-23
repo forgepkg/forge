@@ -1,11 +1,11 @@
-//! E2E: retention / cleanup + policy-driven blob GC (slice 12.1, plan Phase 8).
+//! E2E: retention / cleanup + policy-driven blob GC.
 //!
-//! Full-stack scenarios on the slice-1 testcontainers harness (Postgres +
+//! Full-stack scenarios on the shared testcontainers harness (Postgres +
 //! versitygw, in-process server[s] with workers). Each scenario arms a
 //! `retention_policy` via the admin REST surface, lets the background
 //! `RetentionWorker` claim + evaluate + apply the repo, and asserts the end
 //! state: components unlisted/hard-deleted, blobs dereferenced + S3 objects
-//! removed **through the slice-1 outbox worker**, audit rows written.
+//! removed **through the outbox worker**, audit rows written.
 //!
 //! Hard rules exercised here:
 //!   * blob deletion only ever flows through `decref → blob_outbox → outbox
@@ -154,7 +154,7 @@ where
 /// Push 15 distinct versions, arm `keep_last_n = 10` + `older_than_days = 0`,
 /// run the worker, and assert the 5 oldest are hard-deleted: gone from the
 /// flat-container list, their blobs dereferenced and removed from S3 by the
-/// slice-1 outbox worker, and 5 audit rows recorded.
+/// outbox worker, and 5 audit rows recorded.
 #[tokio::test]
 async fn keep_last_n_hard_deletes_oldest_and_gcs_blobs() {
     let srv = worker_stack().await;

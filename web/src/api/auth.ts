@@ -4,7 +4,7 @@ import { getCsrfToken, setSession } from '~/lib/auth'
 import { httpClient } from '~/lib/httpClient'
 
 /**
- * Public + session auth API (§12.7 realms).
+ * Public + session auth API.
  *
  * Types mirror the Rust DTOs:
  *

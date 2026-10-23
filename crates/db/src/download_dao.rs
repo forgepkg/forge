@@ -1,4 +1,4 @@
-//! Best-effort download-tracking writes (slice 12.1, design §3.7).
+//! Best-effort download-tracking writes.
 //!
 //! These feed the download-sensitive retention criteria
 //! (`keep_n_most_downloaded`, `not_downloaded_for_days`,
@@ -21,7 +21,7 @@
 //!   `component`/`asset` exists, bump those too so a proxy repo can also use the
 //!   hosted-style download criteria.
 //!
-//! All timestamps come from Postgres `now()` (single clock, §6 "time source").
+//! All timestamps come from Postgres `now()` (single clock).
 
 use sqlx::PgExecutor;
 

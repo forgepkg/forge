@@ -44,7 +44,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 http = { workspace = true }
 async-trait = { workspace = true }
-# WIF (slice 12.8): decode the unverified JWT header/payload for issuer routing
+# WIF: decode the unverified JWT header/payload for issuer routing
 # (cryptographic verification stays in forge-core's JWKS verifier) and the HTTP
 # Basic credential when a workload presents its id_token as the password.
 base64 = { workspace = true }
@@ -96,9 +96,9 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-# Mock OIDC IdP for the /auth route integration tests (slice 12.2 Phase 5):
-# serve discovery/JWKS/token, sign a self-issued ID token with a throwaway RSA
-# key. Mirrors the forge-core OIDC test harness.
+# Mock OIDC IdP for the /auth route integration tests: serve
+# discovery/JWKS/token, sign a self-issued ID token with a throwaway RSA key.
+# Mirrors the forge-core OIDC test harness.
 wiremock = "0.6"
 rsa = { version = "0.9", features = ["sha2", "getrandom"] }
 jsonwebtoken = { workspace = true }

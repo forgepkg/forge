@@ -1,16 +1,16 @@
-//! Workload-identity-federation (WIF) auth realm (slice 12.8, design doc
-//! 2026-06-03 §4).
+//! Workload-identity-federation (WIF) auth realm.
 //!
 //! A **non-interactive** realm for CI/automation: a workload (a GitLab CI job, a
 //! GitHub Actions run, …) presents its OIDC `id_token` (a JWT) and forge
 //! authenticates it by validating the JWT against a configured **trusted
-//! issuer** (`.well-known/openid-configuration` → JWKS, reusing the 12.2
-//! verifier), then maps its claims to a forge **role** via ordered claim-match
-//! rules. No password ever exists; no interactive session is created — the
-//! result is a stateless per-request [`Principal::Workload`] carrying the
-//! resolved `role_id` (the §12.4 authz seam loads that role's effective set).
+//! issuer** (`.well-known/openid-configuration` → JWKS, reusing the OIDC
+//! login's verifier), then maps its claims to a forge **role** via ordered
+//! claim-match rules. No password ever exists; no interactive session is
+//! created — the result is a stateless per-request [`Principal::Workload`]
+//! carrying the resolved `role_id` (the authz seam loads that role's effective
+//! set).
 //!
-//! ## Token routing (design §8 — no misrouting, no fall-through)
+//! ## Token routing (no misrouting, no fall-through)
 //!
 //! NuGet's wire auth is Basic, so the workload can pass its `id_token` as the
 //! Basic **password**, `X-NuGet-ApiKey`, or `Authorization: Bearer`. The
@@ -607,7 +607,7 @@ impl WorkloadIdentitySource {
     /// failure is [`SourceOutcome::Reject`] (or [`SourceOutcome::Unavailable`])
     /// — the chain stops and the token is *never* handed to a downstream
     /// source (so it cannot be reinterpreted as an opaque API token or
-    /// forwarded upstream as a password — design §8).
+    /// forwarded upstream as a password).
     async fn verify(
         &self,
         realm: &WorkloadIdentityRealm,

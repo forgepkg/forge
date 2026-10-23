@@ -18,10 +18,9 @@ export const Route = createFileRoute('/_app/packages/$repo/$id')({
 })
 
 /**
- * Package-detail view (plan §4, §Phase 3): versions with per-version metadata +
- * delay/retention badges, and dependency groups per version. Loading / empty /
- * not-found / repository-offline / error states are all handled. Reachable by
- * any reader.
+ * Package-detail view: versions with per-version metadata + delay/retention
+ * badges, and dependency groups per version. Loading / empty / not-found /
+ * repository-offline / error states are all handled. Reachable by any reader.
  */
 function PackageDetailPage() {
   const { repo, id } = Route.useParams()

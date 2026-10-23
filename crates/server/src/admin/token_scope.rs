@@ -1,4 +1,4 @@
-//! Admin per-token privilege scoping (§12.4 Phase 6).
+//! Admin per-token privilege scoping.
 //!
 //! `PATCH /admin/tokens/{id}/scope` sets (or, on an explicit `null`, clears) a
 //! token's `scope` jsonb. A scope can only ever **narrow** its owner's

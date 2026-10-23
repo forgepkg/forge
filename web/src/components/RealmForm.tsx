@@ -32,7 +32,7 @@ import { ADMIN_ROLE } from '~/api/rbac'
 import { useRoles } from '~/queries/useRbac'
 
 /**
- * Shared auth-realm create/edit form (§12.7). Kind-conditional fields:
+ * Shared auth-realm create/edit form. Kind-conditional fields:
  *
  *  - **oidc** → issuer / client / write-only secret or a federated credential
  *    (Forge's own client assertions: no secret; shows the issuer, subject and

@@ -1,4 +1,4 @@
-//! The root-layer abstraction (plan §2.5).
+//! The root-layer abstraction.
 //!
 //! The root key wraps **KEK material only** — nothing else ever touches the
 //! root. [`KmsProvider`] abstracts where the root lives so the rest of the
@@ -8,13 +8,13 @@
 //!   key loaded from an **env var** or a **file** (base64). Wrap/unwrap are
 //!   local AEAD operations under the AAD [`crate::envelope::ROOT_WRAP_AAD`].
 //! * `AwsKmsProvider` — a later, additive impl of the same trait (`kms:Encrypt`
-//!   / `kms:Decrypt`; the root never leaves the HSM). Not shipped in §12.5's
-//!   first cut; the trait is the seam.
+//!   / `kms:Decrypt`; the root never leaves the HSM). Not shipped yet; the
+//!   trait is the seam.
 //!
 //! Every instance is configured with the **same** provider, so every instance
 //! reaches the same root, can unwrap the same KEKs, and can decrypt every
 //! secret — key material is always reachable from shared config + Postgres,
-//! never generated per-instance (§2.1).
+//! never generated per-instance, so instances stay stateless.
 //!
 //! ## Root rotation (static provider)
 //!
@@ -68,7 +68,7 @@ pub fn root_version_label(key: &KeyBytes) -> String {
 
 /// Dev / test / lower-environment root provider: a static 32-byte root key from
 /// an env var or a file (base64-encoded), with optional **previous** roots kept
-/// reachable during a root-rotation window (plan §6 open question 5).
+/// reachable during a root-rotation window.
 ///
 /// Wrap = local AEAD (`seal_with_key`) under [`ROOT_WRAP_AAD`]; unwrap selects
 /// the root whose derived version label matches the recorded

@@ -1,8 +1,8 @@
-//! Admin group-membership management (plan 10.4, nested groups in §12.4 Phase 4).
+//! Admin group-membership management, including nested groups.
 //!
-//! Validation (spec §7 + §12.4):
+//! Validation:
 //! * The `{name}` repository must be a **group**.
-//! * A member must exist. It **may** itself be a group (nested groups, §12.4) —
+//! * A member must exist. It **may** itself be a group (nested groups) —
 //!   but the resulting group graph must stay an acyclic DAG of bounded depth.
 //! * A member cannot be the group itself.
 //! * Adding an edge that would create a **cycle** or exceed
@@ -165,8 +165,8 @@ pub async fn add(
             return resp;
         }
     }
-    // Nested groups are allowed (§12.4); the checked insert runs the cycle +
-    // depth guard in the same transaction.
+    // Nested groups are allowed; the checked insert runs the cycle + depth
+    // guard in the same transaction.
     let max_depth = state.config.groups.max_nesting_depth;
 
     match repository_dao::add_group_member_checked(

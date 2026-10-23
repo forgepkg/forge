@@ -1,4 +1,4 @@
-//! Admin role management (§12.4 Phase 6).
+//! Admin role management.
 //!
 //! Roles are named, assignable bundles of grants. This module CRUDs the `role`
 //! table and lists a role's members (`GET /admin/roles/{id}/users`); grants
@@ -6,7 +6,7 @@
 //! A role view counts the role's grants and users, so the role list and a
 //! delete confirmation can say what a role carries.
 //!
-//! Built-in protections (plan §3, §6 "Builtin-role tampering"):
+//! Built-in protections:
 //! * **DELETE** of a built-in role (`admin`/`authenticated`/`anonymous`) is
 //!   forbidden (**403**).
 //! * **PATCH** may edit a built-in role's `description` but never its identity
