@@ -147,6 +147,13 @@ until the release folds them in.
   previous upstream's tag was served for `metadata_ttl_seconds`. Such a
   fetch caches nothing; its client is asked to retry (503).
   ([#217](https://github.com/schmitch/forge/issues/217))
+- Docker registry: the sweeper could release a layer a client had just
+  confirmed, so the manifest push answered `MANIFEST_BLOB_UNKNOWN`: a pull
+  or `HEAD` of a blob recorded its use at most hourly, which with
+  `docker.unreferenced_blob_ttl_seconds = 3600` left no time, and pushing
+  or mounting a blob the image already had recorded none. Pushes and
+  mounts record the use, and pulls record it every tenth of the TTL.
+  ([#218](https://github.com/schmitch/forge/issues/218))
 
 ## [1.1.0]
 

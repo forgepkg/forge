@@ -231,7 +231,9 @@ manifest, and the registry sweeper (every `docker.sweep_interval_seconds`)
 releases the blobs no manifest of the image references any more once they
 have been unused for `docker.unreferenced_blob_ttl_seconds` (24 h by
 default: the time a client has between pushing layers and pushing their
-manifest). The blob outbox deletes a blob after its grace period once no
+manifest). Pushing or mounting a blob the image already has counts as a
+use, and so does a pull or `HEAD` of it, recorded at most every tenth of
+that TTL (at most hourly). The blob outbox deletes a blob after its grace period once no
 image of any repository links it, so deleting an image never removes a layer
 another image uses.
 

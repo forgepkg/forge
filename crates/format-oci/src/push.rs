@@ -248,6 +248,16 @@ impl Registry {
             .await?
             .is_some()
         {
+            // The client is about to name it in a manifest: record the use
+            // now, or the sweeper may release it first.
+            oci_dao::touch_link(
+                pool,
+                t.repo.id,
+                &t.image,
+                digest.as_str(),
+                chrono::Duration::zero(),
+            )
+            .await?;
             return Ok(true);
         }
         let Some(from) = from.filter(|f| reference::valid_name(f)) else {

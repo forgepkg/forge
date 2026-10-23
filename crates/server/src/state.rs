@@ -370,6 +370,10 @@ impl AppState {
                 token_ttl_seconds: self.config.docker.token_ttl_seconds,
                 delete_grace: self.config.outbox.grace(),
                 max_group_depth: self.config.groups.max_nesting_depth.max(0) as u32,
+                // Validated to at most 100 years.
+                unreferenced_blob_ttl: chrono::Duration::seconds(
+                    self.config.docker.unreferenced_blob_ttl_seconds as i64,
+                ),
             },
             keys: self.registry_keys.clone(),
             recorder: Some(Arc::new(crate::registry::LedgerRecorder)),
