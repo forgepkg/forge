@@ -856,18 +856,43 @@ and Dependabot's:
   pull request's branch go through as before, and they can still merge a
   stacked pull request, but only by ticking **Merge without waiting for
   requirements to be met (bypass rules)**. A GitHub App pushing with its own
-  token has to be added to the bypass list.
+  token, such as the stack App below, has to be added to the bypass list.
 
 CI runs only on pull requests that target `main`, so a stacked pull request
 runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
 on every pull request above it. When a pull request is retargeted to `main`,
-the `Stack` workflow starts CI on its branch, with `main` as its `base`, so
-it runs the jobs the pull request's change needs, as a pull request run
-does. That run checks the branch as it is, not its merge with `main`; the
-next push, and the merge queue, check the merge. To check a stacked branch
-earlier, run CI on it by hand: **Actions → CI → Run workflow**, or
-`gh workflow run ci.yml --ref <branch> -f base=main`.
-A pull request from a fork gets no such run: a push to it starts CI.
+the `Stack` workflow merges `main` into its branch, as the pull request's
+**Update branch** button does, and that push runs CI on the pull request.
+A retarget alone starts no CI run, and a manual run's checks would not
+count: GitHub shows a pull request only the checks of `pull_request`,
+`push` and a few other runs, and only those satisfy its required checks.
+The workflow pushes the merge with a GitHub App's token, since a push with
+a workflow's own `GITHUB_TOKEN` starts no workflow. Without the App, the
+workflow warns, and the **Update branch** button starts CI instead. When
+`main` does not merge cleanly, the `stack-status` check fails: merge `main`
+by hand and push.
+
+To set up the stack App:
+
+1. Create a GitHub App (**Settings → Developer settings → GitHub Apps → New
+   GitHub App**), without a webhook, with the repository permissions
+   **Contents**, **Pull requests** and **Workflows**, each **Read and
+   write**. Install it on this repository only.
+2. Generate a private key for it. Save the App's client ID as the repository
+   variable `STACK_APP_CLIENT_ID`, and the key as the repository secret
+   `STACK_APP_PRIVATE_KEY` (**Settings → Secrets and variables → Actions**).
+3. If the stacked pull requests ruleset is active, add the App to its bypass
+   list, or it refuses the merge on the pull request's branch.
+
+The App's merge, like the button's, dismisses the pull request's approvals
+under a rule that dismisses stale ones.
+
+To check a stacked branch before its retarget, run CI on it by hand:
+**Actions → CI → Run workflow**, or
+`gh workflow run ci.yml --ref <branch> -f base=main`. The run compares the
+branch with the commit it forked off `main`, so it runs the jobs the pull
+request's change needs; its results show under **Actions**, not on the pull
+request. A pull request from a fork gets no merge: a push to it starts CI.
 
 ## Changelog entries
 
