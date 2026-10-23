@@ -1797,3 +1797,105 @@ async fn the_graph_client_secret_is_sealed_and_bound_to_the_app() {
         .await
         .unwrap();
 }
+
+/// The `smtp_oauth` transport's secrets (#321), the client secret, the
+/// registration access token and the refresh token, are sealed, and bound to
+/// the issuer, the client and the mailbox; a compare-and-set update reseals
+/// them and refuses a row that changed meanwhile.
+#[tokio::test]
+async fn the_smtp_oauth_secrets_are_sealed_and_bound_to_the_authorization() {
+    use forge_db::email_settings_dao;
+    use serde_json::json;
+
+    let _serial = TABLE_WIDE.lock().await;
+    let pool = pool().await;
+    let envelope = envelope_with_scope(&pool, &format!("oauth-{}", uuid::Uuid::new_v4()));
+    envelope.ensure_active_keys().await.unwrap();
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let secrets = ["client-s3cret", "reg-token-1", "refresh-1"];
+    let logical = json!({
+        "from_address": "forge@example.com",
+        "invitation_ttl_hours": 72,
+        "transport": {
+            "kind": "smtp_oauth",
+            "host": "mail.example.com",
+            "tls": "starttls",
+            "issuer": "https://mail.example.com",
+            "username": "forge@example.com",
+            "client_id": "forge-client",
+            "client_secret": secrets[0],
+            "registration_access_token": secrets[1],
+            "grant": "refresh_token",
+            "refresh_token": secrets[2],
+        },
+    });
+
+    let row = secret_dao::store_email_settings(&pool, Some(&envelope), true, &logical)
+        .await
+        .unwrap();
+    let blob = row.secrets_enc.clone().expect("sealed");
+    for secret in secrets {
+        assert!(!row.config.to_string().contains(secret), "{secret}");
+        assert!(!String::from_utf8_lossy(&blob).contains(secret), "{secret}");
+    }
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &row)
+            .await
+            .unwrap(),
+        logical
+    );
+
+    for (field, value) in [
+        ("issuer", "https://evil.example"),
+        ("client_id", "other-client"),
+        ("username", "other@example.com"),
+    ] {
+        sqlx::query("UPDATE email_settings SET config = jsonb_set(config, $1, $2)")
+            .bind(vec!["transport", field])
+            .bind(json!(value))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let moved = email_settings_dao::get(&pool).await.unwrap().unwrap();
+        assert!(
+            secret_dao::email_config(Some(&envelope), &moved)
+                .await
+                .is_err(),
+            "{field}"
+        );
+        sqlx::query("UPDATE email_settings SET config = $1")
+            .bind(&row.config)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // A rotated refresh token, stored over the row as read.
+    let row = email_settings_dao::get(&pool).await.unwrap().unwrap();
+    let mut rotated = logical.clone();
+    rotated["transport"]["refresh_token"] = json!("refresh-2");
+    let updated = secret_dao::update_email_settings(&pool, Some(&envelope), &row, &rotated)
+        .await
+        .unwrap()
+        .expect("unchanged row");
+    assert_eq!(
+        secret_dao::email_config(Some(&envelope), &updated)
+            .await
+            .unwrap(),
+        rotated
+    );
+    // The row as read before is stale now.
+    assert!(
+        secret_dao::update_email_settings(&pool, Some(&envelope), &row, &logical)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("DELETE FROM email_settings")
+        .execute(&pool)
+        .await
+        .unwrap();
+}

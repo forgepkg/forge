@@ -55,6 +55,10 @@ pub enum TransportConfig {
     Smtp(SmtpConfig),
     /// Microsoft Graph `sendMail`, as an Entra app registration (#320).
     MicrosoftGraph(GraphConfig),
+    /// SMTP submission authenticated with an OAuth access token (SASL
+    /// OAUTHBEARER or XOAUTH2) from the mail server's own authorization
+    /// server (#321).
+    SmtpOauth(SmtpOauthConfig),
 }
 
 impl TransportConfig {
@@ -63,6 +67,7 @@ impl TransportConfig {
         match self {
             TransportConfig::Smtp(_) => "smtp",
             TransportConfig::MicrosoftGraph(_) => "microsoft_graph",
+            TransportConfig::SmtpOauth(_) => "smtp_oauth",
         }
     }
 }
@@ -105,6 +110,179 @@ pub enum GraphClientAuth {
 
 /// Entra's sign-in host.
 pub const MICROSOFT_LOGIN_HOST: &str = "https://login.microsoftonline.com";
+
+/// SMTP submission with an OAuth access token (#321): Forge holds a token an
+/// administrator authorized once (or gets one with the client credentials
+/// grant), never a mailbox password.
+///
+/// The administrator enters the server, the authorization server's issuer
+/// and the mailbox. The rest is Forge's: the client it registered (RFC 7591)
+/// or that was entered by hand, and the refresh token the authorization gave
+/// ([`merge_secrets`] keeps them across saves of the same issuer and
+/// mailbox).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmtpOauthConfig {
+    /// The SMTP server's host name or IP address.
+    pub host: String,
+    /// The port; the TLS mode's usual port when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// How the SMTP connection is protected.
+    pub tls: SmtpTls,
+    /// The authorization server's issuer URL (`https`, or `http` to a
+    /// loopback host).
+    pub issuer: String,
+    /// The mailbox Forge sends as: the SASL user, and the account that
+    /// authorizes Forge.
+    pub username: String,
+    /// The scope to ask for; none when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// The OAuth client id: registered by Forge, or entered by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// The client's secret. Write-only: never returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// Whether Forge registered the client (RFC 7591) rather than an
+    /// administrator entering it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub registered: bool,
+    /// Where the registration is managed (RFC 7592), when Forge registered
+    /// the client and the server said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_client_uri: Option<String>,
+    /// The registration's access token (RFC 7592). Write-only: never
+    /// returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_access_token: Option<String>,
+    /// How Forge gets its access tokens, once it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<OauthGrant>,
+    /// The refresh token of the mailbox's authorization. Write-only: never
+    /// returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Why the mailbox must authorize Forge again (a refresh that failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_error: Option<String>,
+}
+
+/// How an [`SmtpOauthConfig`] gets its access tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OauthGrant {
+    /// The mailbox authorized Forge (authorization code or device flow):
+    /// access tokens come from the refresh token.
+    RefreshToken,
+    /// The authorization server issues tokens to the client itself.
+    ClientCredentials,
+}
+
+impl SmtpOauthConfig {
+    /// The port to connect to.
+    pub fn port(&self) -> u16 {
+        self.port.unwrap_or_else(|| self.tls.default_port())
+    }
+
+    /// Whether Forge can get an access token without the mailbox's help.
+    pub fn authorized(&self) -> bool {
+        match self.grant {
+            Some(OauthGrant::ClientCredentials) => self.client_id.is_some(),
+            Some(OauthGrant::RefreshToken) => {
+                self.refresh_token.is_some() && self.authorization_error.is_none()
+            }
+            None => false,
+        }
+    }
+
+    fn validate(&mut self) -> Result<(), InvalidSettings> {
+        self.host = self.host.trim().to_string();
+        if !is_host(&self.host) {
+            return Err(invalid(
+                "transport.host must be a host name or an IP address (no scheme or port)",
+            ));
+        }
+        if self.port == Some(0) {
+            return Err(invalid("transport.port must be between 1 and 65535"));
+        }
+        if self.tls == SmtpTls::None && !is_loopback_host(&self.host) {
+            return Err(invalid(
+                "transport.tls \"none\" sends the token unencrypted: Forge connects without \
+                 TLS only to a loopback host; use \"starttls\" or \"implicit\"",
+            ));
+        }
+        self.issuer = self.issuer.trim().trim_end_matches('/').to_string();
+        check_oauth_url("transport.issuer", &self.issuer)?;
+        self.username = self.username.trim().to_string();
+        if self.username.is_empty()
+            || self.username.len() > 256
+            || self.username.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "transport.username must be the mailbox Forge sends as (at most 256 bytes)",
+            ));
+        }
+        self.scope = blank_to_none(self.scope.take());
+        if let Some(scope) = &self.scope {
+            if scope.len() > 1024 || scope.chars().any(char::is_control) {
+                return Err(invalid(
+                    "transport.scope must be space-separated scope names (at most 1024 bytes)",
+                ));
+            }
+        }
+        self.client_id = blank_to_none(self.client_id.take());
+        if let Some(client_id) = &self.client_id {
+            if client_id.len() > 256 || client_id.chars().any(char::is_control) {
+                return Err(invalid("transport.client_id must be at most 256 bytes"));
+            }
+        }
+        if self.client_secret.as_deref() == Some("") {
+            self.client_secret = None;
+        }
+        if let Some(secret) = &self.client_secret {
+            if secret.len() > MAX_SECRET_BYTES {
+                return Err(invalid(format!(
+                    "transport.client_secret must be at most {MAX_SECRET_BYTES} bytes"
+                )));
+            }
+            if self.client_id.is_none() {
+                return Err(invalid(
+                    "transport.client_secret needs a transport.client_id",
+                ));
+            }
+        }
+        if let Some(uri) = &self.registration_client_uri {
+            check_oauth_url("transport.registration_client_uri", uri)?;
+        }
+        Ok(())
+    }
+}
+
+/// An OAuth endpoint or issuer URL: `https`, or `http` to a loopback host (a
+/// test server, an authorization server on the same machine).
+pub fn check_oauth_url(field: &str, raw: &str) -> Result<url::Url, InvalidSettings> {
+    let url = url::Url::parse(raw)
+        .map_err(|_| invalid(format!("{field} must be an absolute https URL")))?;
+    let loopback = url
+        .host_str()
+        .is_some_and(|h| is_loopback_host(h.trim_start_matches('[').trim_end_matches(']')));
+    let ok = match url.scheme() {
+        "https" => true,
+        "http" => loopback,
+        _ => false,
+    };
+    if !ok || url.cannot_be_a_base() || url.host_str().is_none() {
+        return Err(invalid(format!("{field} must be an https URL")));
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return Err(invalid(format!(
+            "{field} must not carry credentials or a fragment"
+        )));
+    }
+    Ok(url)
+}
 
 /// What the app registration's federated identity credential must name for
 /// Forge's client assertions.
@@ -289,6 +467,9 @@ impl EmailConfig {
         match &mut self.transport {
             TransportConfig::Smtp(smtp) => smtp.validate(require_secrets)?,
             TransportConfig::MicrosoftGraph(graph) => graph.validate(require_secrets)?,
+            // Nothing is required up front: registration and authorization
+            // follow the save.
+            TransportConfig::SmtpOauth(oauth) => oauth.validate()?,
         }
         Ok(self)
     }
@@ -386,19 +567,20 @@ impl SmtpConfig {
 /// host and username, the Graph tenant and client id) are unchanged.
 /// Otherwise the secret must be entered again, which validation then
 /// reports.
+///
+/// An `smtp_oauth` transport takes Forge's OAuth state (the registration and
+/// the authorization) from the stored settings only, never from `incoming`
+/// ([`merge_oauth_state`]).
 pub fn merge_secrets(stored: Option<&EmailConfig>, mut incoming: EmailConfig) -> EmailConfig {
-    let Some(stored) = stored else {
-        return incoming;
-    };
-    match (&stored.transport, &mut incoming.transport) {
-        (TransportConfig::Smtp(old), TransportConfig::Smtp(new)) => {
+    match (stored.map(|s| &s.transport), &mut incoming.transport) {
+        (Some(TransportConfig::Smtp(old)), TransportConfig::Smtp(new)) => {
             let same_party = old.host.trim().eq_ignore_ascii_case(new.host.trim())
                 && old.username.as_deref().map(str::trim) == new.username.as_deref().map(str::trim);
             if new.password.as_deref().is_none_or(str::is_empty) && same_party {
                 new.password = old.password.clone();
             }
         }
-        (TransportConfig::MicrosoftGraph(old), TransportConfig::MicrosoftGraph(new)) => {
+        (Some(TransportConfig::MicrosoftGraph(old)), TransportConfig::MicrosoftGraph(new)) => {
             let same_app = old
                 .tenant_id
                 .trim()
@@ -411,9 +593,66 @@ pub fn merge_secrets(stored: Option<&EmailConfig>, mut incoming: EmailConfig) ->
                 new.client_secret = old.client_secret.clone();
             }
         }
+        (Some(TransportConfig::SmtpOauth(old)), TransportConfig::SmtpOauth(new)) => {
+            merge_oauth_state(old, new);
+        }
+        // The OAuth state is Forge's: an update never sets it.
+        (_, TransportConfig::SmtpOauth(new)) => {
+            new.registered = false;
+            new.registration_client_uri = None;
+            new.registration_access_token = None;
+            new.grant = None;
+            new.refresh_token = None;
+            new.authorization_error = None;
+        }
         _ => {}
     }
     incoming
+}
+
+/// Carry Forge's OAuth state over a save: the registered client while the
+/// issuer is the same (and the update names no other client), and the
+/// authorization while the client and the mailbox are the same too. What an
+/// update cannot set (the registration, the grant, the refresh token) is
+/// never taken from it.
+fn merge_oauth_state(old: &SmtpOauthConfig, new: &mut SmtpOauthConfig) {
+    let same_issuer =
+        old.issuer.trim().trim_end_matches('/') == new.issuer.trim().trim_end_matches('/');
+    let named_client = new
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let same_client = same_issuer
+        && match named_client {
+            None => true,
+            Some(client) => old.client_id.as_deref() == Some(client),
+        };
+    new.registered = false;
+    new.registration_client_uri = None;
+    new.registration_access_token = None;
+    new.grant = None;
+    new.refresh_token = None;
+    new.authorization_error = None;
+    if !same_client {
+        return;
+    }
+    new.client_id = old.client_id.clone();
+    new.registered = old.registered;
+    if new.client_secret.as_deref().is_none_or(str::is_empty) {
+        new.client_secret = old.client_secret.clone();
+    }
+    new.registration_client_uri = old.registration_client_uri.clone();
+    new.registration_access_token = old.registration_access_token.clone();
+    let same_mailbox = old.username.trim() == new.username.trim()
+        && old.scope.as_deref().map(str::trim) == new.scope.as_deref().map(str::trim);
+    if same_mailbox {
+        new.grant = old.grant;
+        new.refresh_token = old.refresh_token.clone();
+        new.authorization_error = old.authorization_error.clone();
+    } else if old.grant == Some(OauthGrant::ClientCredentials) {
+        new.grant = old.grant;
+    }
 }
 
 /// Parse an email address for the setting `field`.
@@ -718,5 +957,171 @@ mod tests {
             assert_eq!(s.password, None, "{changed}");
             assert!(merged.validated(true).is_err(), "{changed}");
         }
+    }
+
+    fn oauth(extra: JsonValue) -> EmailConfig {
+        let mut transport = json!({
+            "kind": "smtp_oauth",
+            "host": "mail.example.com",
+            "tls": "starttls",
+            "issuer": "https://mail.example.com",
+            "username": "forge@example.com",
+        });
+        transport
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(json!({"from_address": "forge@example.com", "transport": transport}))
+            .unwrap()
+    }
+
+    fn oauth_of(config: &EmailConfig) -> &SmtpOauthConfig {
+        match &config.transport {
+            TransportConfig::SmtpOauth(o) => o,
+            other => panic!("not smtp_oauth: {other:?}"),
+        }
+    }
+
+    /// What Forge stored after registering and an authorization.
+    fn authorized() -> EmailConfig {
+        oauth(json!({
+            "scope": "smtp",
+            "client_id": "forge-client",
+            "client_secret": "client-s3cret",
+            "registered": true,
+            "registration_client_uri": "https://mail.example.com/register/forge-client",
+            "registration_access_token": "reg-token",
+            "grant": "refresh_token",
+            "refresh_token": "refresh-1",
+        }))
+    }
+
+    #[test]
+    fn oauth_settings_need_no_secret_but_a_safe_issuer_and_connection() {
+        let config = oauth(json!({"issuer": " https://mail.example.com/ "}))
+            .validated(true)
+            .unwrap();
+        assert_eq!(oauth_of(&config).issuer, "https://mail.example.com");
+        assert_eq!(oauth_of(&config).port(), 587);
+        assert!(!oauth_of(&config).authorized());
+        assert!(oauth(json!({"issuer": "http://127.0.0.1:8080"}))
+            .validated(true)
+            .is_ok());
+        assert!(oauth(json!({"host": "127.0.0.1", "tls": "none"}))
+            .validated(true)
+            .is_ok());
+        for bad in [
+            json!({"issuer": "http://mail.example.com"}),
+            json!({"issuer": "mail.example.com"}),
+            json!({"issuer": "https://mail.example.com/#x"}),
+            json!({"tls": "none"}),
+            json!({"username": ""}),
+            json!({"client_secret": "s"}),
+            json!({"scope": "smtp\nx"}),
+        ] {
+            assert!(oauth(bad.clone()).validated(true).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn oauth_secrets_are_redacted() {
+        let view = authorized().redacted();
+        let transport = &view["transport"];
+        for key in [
+            "client_secret",
+            "registration_access_token",
+            "refresh_token",
+        ] {
+            assert!(transport.get(key).is_none(), "{key}");
+            assert_eq!(transport[format!("{key}_set")], json!(true), "{key}");
+        }
+        assert_eq!(transport["client_id"], "forge-client");
+        assert_eq!(transport["grant"], "refresh_token");
+    }
+
+    #[test]
+    fn a_save_never_sets_forges_oauth_state() {
+        let planted = json!({
+            "registered": true,
+            "registration_client_uri": "https://evil.example/r",
+            "registration_access_token": "x",
+            "grant": "client_credentials",
+            "refresh_token": "x",
+            "authorization_error": "x",
+        });
+        for stored in [None, Some(smtp(json!({})))] {
+            let merged = merge_secrets(stored.as_ref(), oauth(planted.clone()));
+            let o = oauth_of(&merged);
+            assert!(!o.registered);
+            assert_eq!(o.registration_client_uri, None);
+            assert_eq!(o.registration_access_token, None);
+            assert_eq!(o.grant, None);
+            assert_eq!(o.refresh_token, None);
+            assert_eq!(o.authorization_error, None);
+        }
+        // Over stored state, the stored state wins.
+        let merged = merge_secrets(Some(&authorized()), oauth(planted));
+        assert_eq!(oauth_of(&merged).refresh_token, None, "another scope");
+        let merged = merge_secrets(Some(&authorized()), oauth(planted_with_scope()));
+        let o = oauth_of(&merged);
+        assert_eq!(o.refresh_token.as_deref(), Some("refresh-1"));
+        assert_eq!(o.grant, Some(OauthGrant::RefreshToken));
+        assert_eq!(o.authorization_error, None);
+        assert_eq!(
+            o.registration_client_uri.as_deref(),
+            Some("https://mail.example.com/register/forge-client")
+        );
+    }
+
+    fn planted_with_scope() -> JsonValue {
+        json!({"scope": "smtp", "grant": "client_credentials", "refresh_token": "x"})
+    }
+
+    #[test]
+    fn the_oauth_state_is_kept_for_the_same_issuer_client_and_mailbox() {
+        let stored = authorized();
+        // The same: everything kept, the client and its secret too.
+        let merged = merge_secrets(Some(&stored), oauth(json!({"scope": "smtp", "port": 2525})));
+        let o = oauth_of(&merged);
+        assert_eq!(o.client_id.as_deref(), Some("forge-client"));
+        assert_eq!(o.client_secret.as_deref(), Some("client-s3cret"));
+        assert_eq!(o.registration_access_token.as_deref(), Some("reg-token"));
+        assert!(o.registered);
+        assert!(o.authorized());
+
+        // Another mailbox or scope: the client stays, the authorization goes.
+        for changed in [
+            json!({"scope": "smtp", "username": "other@example.com"}),
+            json!({"scope": "smtp submission"}),
+        ] {
+            let merged = merge_secrets(Some(&stored), oauth(changed.clone()));
+            let o = oauth_of(&merged);
+            assert_eq!(o.client_id.as_deref(), Some("forge-client"), "{changed}");
+            assert_eq!(o.refresh_token, None, "{changed}");
+            assert_eq!(o.grant, None, "{changed}");
+        }
+
+        // Another issuer, or another client named: nothing is kept.
+        for changed in [
+            json!({"scope": "smtp", "issuer": "https://idp.example.com"}),
+            json!({"scope": "smtp", "client_id": "manual", "client_secret": "m"}),
+        ] {
+            let merged = merge_secrets(Some(&stored), oauth(changed.clone()));
+            let o = oauth_of(&merged);
+            assert_ne!(o.client_id.as_deref(), Some("forge-client"), "{changed}");
+            assert!(!o.registered, "{changed}");
+            assert_eq!(o.registration_client_uri, None, "{changed}");
+            assert_eq!(o.registration_access_token, None, "{changed}");
+            assert_eq!(o.refresh_token, None, "{changed}");
+        }
+
+        // The client credentials grant needs no mailbox: kept across one.
+        let cc = oauth(json!({
+            "client_id": "forge-client",
+            "client_secret": "client-s3cret",
+            "grant": "client_credentials",
+        }));
+        let merged = merge_secrets(Some(&cc), oauth(json!({"username": "other@example.com"})));
+        assert_eq!(oauth_of(&merged).grant, Some(OauthGrant::ClientCredentials));
     }
 }

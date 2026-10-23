@@ -638,6 +638,27 @@ cargo build -p forge-server
 .github/scripts/raw-e2e.sh target/debug/forge-server target/raw-e2e
 ```
 
+**SMTP with OAuth against Stalwart** (#321) is a manual check: Stalwart 0.16
+is set up through its web UI's first-run wizard, which no test can drive.
+`crates/server/tests/email_oauth.rs` covers the protocol with a mock
+authorization server and an SMTP server that checks the SASL token. To check
+it against the real thing:
+
+1. `docker run -d --name stalwart -p 8080:8080 -p 443:443 -p 587:587
+   mirror.gcr.io/stalwartlabs/stalwart:v0.16.27`, and sign in at
+   `http://localhost:8080/admin` with the temporary administrator that
+   `docker logs stalwart` prints. Finish the setup with a host name and a
+   certificate Forge trusts (the system roots, or `SSL_CERT_FILE` for a test
+   CA), and create the account Forge sends as, allowed to send email.
+2. In Forge, **Admin → Email**: *SMTP server with OAuth*, the host, port 587
+   with STARTTLS, the mailbox, and Stalwart's https URL as the authorization
+   server. Save.
+3. **Register Forge** as *An account of the mail server* (Stalwart's
+   administrator), then **Authorize on another device** and enter the code
+   at Stalwart's `/device` page as the mailbox (or **Authorize in this
+   browser**, when the browser reaches Forge's callback).
+4. **Send test email**: it goes out with `OAUTHBEARER`.
+
 **Without Docker**, point the db / storage / core / server suites at running
 services instead (use a fresh database per crate run — suites share it):
 

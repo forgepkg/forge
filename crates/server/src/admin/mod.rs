@@ -23,6 +23,8 @@
 //! * [`imports`] — importing a Nexus hosted repository into a hosted
 //!   repository (start with a preflight, progress, cancel, resume, retry).
 //! * [`email`] — the email service's settings and a test send.
+//! * [`email_oauth`] — registering and authorizing Forge for the email
+//!   service's SMTP with OAuth.
 //! * [`settings`] — the sign-in and anonymous-access policy (anonymous mode,
 //!   login mode, password Basic, session lifetimes, lockout).
 //!
@@ -44,6 +46,7 @@ pub mod content_selectors;
 pub mod crypto;
 pub mod effective;
 pub mod email;
+pub mod email_oauth;
 pub mod formats;
 pub mod grants;
 pub mod imports;
@@ -309,6 +312,23 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             get(email::get).put(email::put).delete(email::delete),
         )
         .route("/settings/email/test", axum::routing::post(email::test))
+        .route(
+            "/settings/email/oauth/register",
+            axum::routing::post(email_oauth::register),
+        )
+        .route(
+            "/settings/email/oauth/client",
+            axum::routing::delete(email_oauth::forget_client),
+        )
+        .route(
+            "/settings/email/oauth/authorize",
+            axum::routing::post(email_oauth::authorize),
+        )
+        .route("/settings/email/oauth/callback", get(email_oauth::callback))
+        .route(
+            "/settings/email/oauth/device/{id}",
+            axum::routing::post(email_oauth::poll_device),
+        )
         .route(
             "/crypto/rotate/{layer}",
             axum::routing::post(crypto::rotate),

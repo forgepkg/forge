@@ -16,6 +16,10 @@
 //! app (`federated_credential`), and saving it creates Forge's issuer keys
 //! first: the credential can be set up before the first send.
 //!
+//! An `smtp_oauth` transport (#321) is shown with the redirect URI to
+//! register a client with by hand (`oauth_redirect_uri`); registering Forge
+//! and authorizing it are [`super::email_oauth`]'s.
+//!
 //! The settings exist here only: there is no `forge.toml` section and no
 //! `FORGE_*` variable for them.
 
@@ -31,7 +35,8 @@ use serde_json::{json, Value as JsonValue};
 
 use super::db_error;
 use crate::email::{
-    self, settings, EmailConfig, GraphClientAuth, SendError, StoredEmail, TransportConfig,
+    self, oauth, settings, EmailConfig, GraphClientAuth, Mailer, SendError, StoredEmail,
+    TransportConfig,
 };
 use crate::state::AppState;
 
@@ -69,17 +74,26 @@ pub struct TestEmail {
     pub to: Option<String>,
 }
 
-/// The API view of the stored settings: secrets as `<key>_set` markers, and
-/// a federated Graph app's credential as forge (the issuer `forge_issuer`)
-/// presents it.
-fn view(stored: &StoredEmail, forge_issuer: &str) -> JsonValue {
+/// The API view of the stored settings: secrets as `<key>_set` markers, a
+/// federated Graph app's credential as forge presents it, and the redirect
+/// URI an `smtp_oauth` client is registered with.
+pub(super) fn view(stored: &StoredEmail, mailer: &Mailer) -> JsonValue {
     let mut doc = stored.config.redacted();
     if let JsonValue::Object(map) = &mut doc {
         map.insert("configured".into(), json!(true));
-        if let TransportConfig::MicrosoftGraph(graph) = &stored.config.transport {
-            if let Some(credential) = graph.federated_credential(forge_issuer) {
-                map.insert("federated_credential".into(), json!(credential));
+        match &stored.config.transport {
+            TransportConfig::MicrosoftGraph(graph) => {
+                if let Some(credential) = graph.federated_credential(mailer.forge_issuer()) {
+                    map.insert("federated_credential".into(), json!(credential));
+                }
             }
+            TransportConfig::SmtpOauth(_) => {
+                map.insert(
+                    "oauth_redirect_uri".into(),
+                    json!(mailer.oauth_redirect_uri()),
+                );
+            }
+            TransportConfig::Smtp(_) => {}
         }
         map.insert("enabled".into(), json!(stored.row.enabled));
         map.insert(
@@ -111,7 +125,7 @@ async fn load(state: &AppState) -> Result<Option<StoredEmail>, Response> {
 /// `GET /admin/settings/email`
 pub async fn get(State(state): State<AppState>) -> Response {
     match load(&state).await {
-        Ok(Some(stored)) => Json(view(&stored, state.mailer.forge_issuer())).into_response(),
+        Ok(Some(stored)) => Json(view(&stored, &state.mailer)).into_response(),
         Ok(None) => Json(json!({"configured": false})).into_response(),
         Err(resp) => resp,
     }
@@ -182,26 +196,58 @@ pub async fn put(State(state): State<AppState>, Json(body): Json<PutEmailSetting
         }
     };
     state.mailer.invalidate().await;
+    // The OAuth client and authorization of the settings before, when these
+    // no longer use them.
+    let mut warning = None;
+    if let Some(TransportConfig::SmtpOauth(old)) = stored.as_ref().map(|s| &s.config.transport) {
+        let kept = match &config.transport {
+            TransportConfig::SmtpOauth(new) => Some(new),
+            _ => None,
+        };
+        if old.registered && kept.is_none_or(|new| new.client_id != old.client_id) {
+            warning = super::email_oauth::release_registration(&state, old).await;
+        }
+        if kept.is_none_or(|new| !oauth::same_authorization(old, new)) {
+            super::email_oauth::drop_flows(&state).await;
+        }
+    }
     tracing::info!(
         transport = config.transport.kind(),
         enabled = row.enabled,
         "email settings changed"
     );
-    Json(view(
+    let mut doc = view(
         &StoredEmail {
             row,
             config,
             secrets_unreadable: false,
         },
-        state.mailer.forge_issuer(),
-    ))
-    .into_response()
+        &state.mailer,
+    );
+    if let Some(warning) = warning {
+        doc["warning"] = json!(warning);
+    }
+    Json(doc).into_response()
 }
 
-/// `DELETE /admin/settings/email`
+/// `DELETE /admin/settings/email`: also deletes the OAuth client Forge
+/// registered for them.
 pub async fn delete(State(state): State<AppState>) -> Response {
+    let before = match load(&state).await {
+        Ok(stored) => stored,
+        Err(resp) => return resp,
+    };
     let result = email_settings_dao::delete(&state.pool).await;
     state.mailer.invalidate().await;
+    if result.is_ok() {
+        if let Some(TransportConfig::SmtpOauth(old)) = before.as_ref().map(|s| &s.config.transport)
+        {
+            if let Some(warning) = super::email_oauth::release_registration(&state, old).await {
+                tracing::warn!(%warning, "email settings removed with Forge's OAuth client");
+            }
+        }
+        super::email_oauth::drop_flows(&state).await;
+    }
     match result {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => db_error(e),

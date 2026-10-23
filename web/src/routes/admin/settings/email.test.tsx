@@ -3,10 +3,13 @@ import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { clearSession, setSession } from '~/lib/auth'
+import { assignLocation } from '~/lib/navigation'
 import type { Me } from '~/api/me'
-import type { EmailSettings, EmailSettingsView } from '~/api/email'
+import type { EmailSettings, EmailSettingsView, SmtpOauthTransportView } from '~/api/email'
 import { renderApp } from '~/test/renderApp'
 import { graphFederatedSubject, seedEmailFormValues, toEmailSettingsInput } from './Email'
+
+vi.mock('~/lib/navigation', () => ({ assignLocation: vi.fn() }))
 
 /**
  * **Admin → Email** (`/manage/settings/email`), against the real route tree:
@@ -17,7 +20,11 @@ import { graphFederatedSubject, seedEmailFormValues, toEmailSettingsInput } from
  *  - a test send shows the recipient, and a failed one the server's error;
  *  - removing the settings asks first, then DELETEs them;
  *  - a Microsoft Graph app: its fields, the federated credential's values to
- *    register, and no secret sent for a federated app.
+ *    register, and no secret sent for a federated app;
+ *  - SMTP with OAuth: its fields, registering Forge, the authorization in
+ *    this browser (to the authorization URL) and on another device (polled
+ *    until authorized), the outcome the callback returns with, and a refused
+ *    refresh.
  */
 
 const adminMe: Me = {
@@ -59,6 +66,8 @@ interface Handlers {
   onPut?: (body: unknown) => Response
   onTest?: (body: unknown) => Response
   onDelete?: () => Response
+  /** `/admin/settings/email/oauth/<rest>`. */
+  onOauth?: (rest: string, method: string, body: unknown) => Response
 }
 
 function mockApi(h: Handlers) {
@@ -68,6 +77,8 @@ function mockApi(h: Handlers) {
     const method = (init?.method ?? 'GET').toUpperCase()
     const body = () => (init?.body ? JSON.parse(init.body as string) : {})
     if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
+    const oauth = path.match(/\/admin\/settings\/email\/oauth\/(.+)$/)
+    if (oauth && h.onOauth) return Promise.resolve(h.onOauth(oauth[1], method, body()))
     if (path.endsWith('/admin/settings/email/test') && method === 'POST') {
       return Promise.resolve(
         h.onTest ? h.onTest(body()) : json({ sent: true, to: 'root@example.com' }),
@@ -321,5 +332,215 @@ describe('admin email settings screen', () => {
     ).toBeInTheDocument()
     expect(screen.getByText('api://AzureADTokenExchange')).toBeInTheDocument()
     expect(screen.queryByLabelText(/^Client secret/)).toBeNull()
+  })
+
+  it('configures SMTP with OAuth and registers Forge', async () => {
+    const user = userEvent.setup()
+    const puts: Record<string, unknown>[] = []
+    const registrations: unknown[] = []
+    mockApi({
+      settings: { configured: false },
+      onPut: (body) => {
+        puts.push(body as Record<string, unknown>)
+        return json(oauthStored)
+      },
+      onOauth: (rest, method, body) => {
+        if (rest === 'register' && method === 'POST') {
+          registrations.push(body)
+          return json(registeredStored)
+        }
+        if (rest === 'authorize' && method === 'POST') {
+          return json({ authorization_url: 'https://mail.example.com/authorize?state=s' })
+        }
+        return new Response('unexpected', { status: 500 })
+      },
+    })
+    await renderApp('/manage/settings/email')
+
+    await user.type(await screen.findByLabelText('From address'), 'forge@example.com')
+    await user.selectOptions(screen.getByLabelText('Send through'), 'smtp_oauth')
+    await user.type(screen.getByLabelText('Host'), 'mail.example.com')
+    await user.type(screen.getByLabelText('Mailbox'), 'forge@example.com')
+    await user.type(screen.getByLabelText('Authorization server'), 'https://mail.example.com')
+    expect(screen.queryByLabelText(/^Client secret/)).toBeNull()
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0].transport).toEqual({
+      kind: 'smtp_oauth',
+      host: 'mail.example.com',
+      tls: 'starttls',
+      issuer: 'https://mail.example.com',
+      username: 'forge@example.com',
+    })
+
+    // No client yet: register Forge, as an account of the mail server
+    // (Stalwart's way).
+    expect(await screen.findByText(/Forge has no client/)).toBeInTheDocument()
+    expect(
+      screen.getByText('https://forge.example.com/admin/settings/email/oauth/callback'),
+    ).toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('Register as'), 'account')
+    await user.type(screen.getByLabelText('Account'), 'admin')
+    await user.type(screen.getByLabelText('Account password'), 'adm1n-pw')
+    await user.click(screen.getByRole('button', { name: 'Register Forge' }))
+    await waitFor(() =>
+      expect(registrations).toEqual([{ username: 'admin', password: 'adm1n-pw' }]),
+    )
+    expect(await screen.findByText('Not authorized')).toBeInTheDocument()
+    expect(screen.getByText(/registered by Forge/)).toBeInTheDocument()
+    // The registered client is kept by the form without naming it.
+    expect(screen.queryByLabelText('Client id')).toBeNull()
+
+    // In this browser: off to the authorization server.
+    await user.click(screen.getByRole('button', { name: 'Authorize in this browser' }))
+    await waitFor(() =>
+      expect(assignLocation).toHaveBeenCalledWith('https://mail.example.com/authorize?state=s'),
+    )
+  })
+
+  it('authorizes on another device', async () => {
+    const user = userEvent.setup()
+    let polls = 0
+    mockApi({
+      settings: registeredStored,
+      onOauth: (rest, method) => {
+        if (rest === 'authorize' && method === 'POST') {
+          return json({
+            flow_id: 'flow-1',
+            user_code: 'WDJB-MJHT',
+            verification_uri: 'https://mail.example.com/device',
+            verification_uri_complete: null,
+            expires_in: 600,
+            interval: 1,
+          })
+        }
+        if (rest === 'device/flow-1' && method === 'POST') {
+          polls += 1
+          return polls < 2
+            ? json({ status: 'pending' })
+            : json({ status: 'authorized', settings: authorizedStored })
+        }
+        return new Response('unexpected', { status: 500 })
+      },
+    })
+    await renderApp('/manage/settings/email')
+
+    await user.click(await screen.findByRole('button', { name: 'Authorize on another device' }))
+    expect(await screen.findByText('WDJB-MJHT')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'https://mail.example.com/device' })).toHaveAttribute(
+      'href',
+      'https://mail.example.com/device',
+    )
+    // Two polls a second apart, in real time.
+    expect(
+      await screen.findByText('The mailbox authorized Forge: it can send now.', undefined, {
+        timeout: 10_000,
+      }),
+    ).toBeInTheDocument()
+    expect(polls).toBe(2)
+    expect(screen.getByText('Authorized')).toBeInTheDocument()
+    expect(screen.queryByText('WDJB-MJHT')).toBeNull()
+  }, 20_000)
+
+  it('shows how the authorization in the browser ended', async () => {
+    mockApi({ settings: registeredStored })
+    const router = await renderApp('/manage/settings/email?oauth=refused&error=access_denied')
+    expect(await screen.findByText(/refused the authorization/)).toHaveTextContent(
+      'access_denied',
+    )
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(router.state.location.search).toEqual({}))
+  })
+
+  it('ignores free text in the outcome', async () => {
+    mockApi({ settings: registeredStored })
+    await renderApp('/manage/settings/email?oauth=evil&error=Call+us')
+    expect(await screen.findByText(/Forge has registered|registered by Forge/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull()
+  })
+
+  it('asks for a new authorization after a refused refresh', async () => {
+    mockApi({
+      settings: {
+        ...authorizedStored,
+        transport: {
+          ...(authorizedStored.transport as SmtpOauthTransportView),
+          authorization_error: 'the token request was refused (400 invalid_grant)',
+        },
+      },
+    })
+    await renderApp('/manage/settings/email')
+    expect(await screen.findByText(/must authorize Forge again/)).toHaveTextContent(
+      'invalid_grant',
+    )
+    expect(screen.queryByText('Authorized')).toBeNull()
+  })
+})
+
+const oauthStored: EmailSettingsView = {
+  ...stored,
+  last_failure: null,
+  transport: {
+    kind: 'smtp_oauth',
+    host: 'mail.example.com',
+    tls: 'starttls',
+    issuer: 'https://mail.example.com',
+    username: 'forge@example.com',
+    client_secret_set: false,
+    registration_access_token_set: false,
+    refresh_token_set: false,
+  },
+  oauth_redirect_uri: 'https://forge.example.com/admin/settings/email/oauth/callback',
+}
+
+const registeredStored: EmailSettingsView = {
+  ...oauthStored,
+  transport: {
+    ...(oauthStored.transport as SmtpOauthTransportView),
+    client_id: 'forge-client',
+    client_secret_set: true,
+    registered: true,
+    registration_client_uri: 'https://mail.example.com/register/forge-client',
+    registration_access_token_set: true,
+  },
+}
+
+const authorizedStored: EmailSettingsView = {
+  ...registeredStored,
+  transport: {
+    ...(registeredStored.transport as SmtpOauthTransportView),
+    grant: 'refresh_token',
+    refresh_token_set: true,
+  },
+}
+
+describe('smtp oauth form values', () => {
+  it('keeps a registered client without naming it, and names one entered by hand', () => {
+    expect(toEmailSettingsInput(seedEmailFormValues(registeredStored)).transport).toEqual({
+      kind: 'smtp_oauth',
+      host: 'mail.example.com',
+      port: undefined,
+      tls: 'starttls',
+      issuer: 'https://mail.example.com',
+      username: 'forge@example.com',
+      scope: undefined,
+      client_id: undefined,
+      client_secret: undefined,
+    })
+    const manual: EmailSettingsView = {
+      ...registeredStored,
+      transport: {
+        ...(registeredStored.transport as SmtpOauthTransportView),
+        registered: undefined,
+        registration_client_uri: undefined,
+        client_id: 'manual',
+      },
+    }
+    const values = { ...seedEmailFormValues(manual), oauth_client_secret: 'new', scope: ' smtp ' }
+    expect(toEmailSettingsInput(values).transport).toMatchObject({
+      client_id: 'manual',
+      client_secret: 'new',
+      scope: 'smtp',
+    })
   })
 })

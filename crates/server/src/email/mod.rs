@@ -16,6 +16,7 @@
 //! is also kept on the settings row for the settings page.
 
 mod graph;
+pub(crate) mod oauth;
 pub mod settings;
 mod smtp;
 pub mod templates;
@@ -32,8 +33,8 @@ use sqlx::PgPool;
 
 pub use graph::MicrosoftEndpoints;
 pub use settings::{
-    EmailConfig, FederatedCredential, GraphClientAuth, GraphConfig, InvalidSettings, SmtpConfig,
-    SmtpTls, TransportConfig,
+    EmailConfig, FederatedCredential, GraphClientAuth, GraphConfig, InvalidSettings, OauthGrant,
+    SmtpConfig, SmtpOauthConfig, SmtpTls, TransportConfig,
 };
 pub use templates::Content;
 
@@ -118,6 +119,7 @@ pub struct Mailer {
     ttl: Duration,
     snapshot: tokio::sync::RwLock<Option<Snapshot>>,
     graph: graph::GraphTransport,
+    oauth: oauth::OauthTokens,
 }
 
 impl Mailer {
@@ -131,18 +133,24 @@ impl Mailer {
         config: &Config,
     ) -> Self {
         Mailer {
-            pool,
-            envelope,
             public_base_url: config.public_base_url(),
             ttl: Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1)),
             snapshot: tokio::sync::RwLock::new(None),
             graph: graph::GraphTransport::new(issuer),
+            oauth: oauth::OauthTokens::new(pool.clone(), envelope.clone()),
+            pool,
+            envelope,
         }
     }
 
     /// `server.public_base_url`, which links in messages start with.
     pub fn public_base_url(&self) -> &str {
         &self.public_base_url
+    }
+
+    /// The redirect URI of the `smtp_oauth` authorization code flow.
+    pub fn oauth_redirect_uri(&self) -> String {
+        format!("{}{}", self.public_base_url, oauth::CALLBACK_PATH)
     }
 
     /// Forge's issuer URL, which a federated Graph app's credential names.
@@ -157,10 +165,16 @@ impl Mailer {
         self.graph.set_endpoints(endpoints);
     }
 
+    /// The OAuth client side of the `smtp_oauth` transport.
+    pub(crate) fn oauth(&self) -> &oauth::OauthTokens {
+        &self.oauth
+    }
+
     /// Drop the snapshot (after an admin write), so the next send reads the
-    /// settings again.
+    /// settings again, and the OAuth tokens of the settings before.
     pub async fn invalidate(&self) {
         *self.snapshot.write().await = None;
+        self.oauth.clear().await;
     }
 
     /// The settings in use, `None` when email is not configured or turned
@@ -293,6 +307,23 @@ impl Mailer {
             }
             TransportConfig::MicrosoftGraph(graph_config) => {
                 self.graph.send(config, graph_config, &to, content).await
+            }
+            TransportConfig::SmtpOauth(oauth_config) => {
+                let message = build_message(config, Mailbox::new(None, to), content)?;
+                let token = self
+                    .oauth
+                    .access_token(oauth_config)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match smtp::send_oauth(oauth_config, &token, message).await {
+                    Ok(()) => Ok(()),
+                    // The next send gets a fresh token.
+                    Err(smtp::OauthSendError::TokenRefused(why)) => {
+                        self.oauth.forget(oauth_config).await;
+                        Err(why)
+                    }
+                    Err(smtp::OauthSendError::Failed(why)) => Err(why),
+                }
             }
         }
     }
