@@ -145,9 +145,10 @@ the contract, `upstream`. The host keeps everything a proxy is, whatever the
 format: the `proxy_cached_version` rows, the package delay, the not-found
 markers and their TTL, the download singleflight, the content-addressed
 store, credentials (decrypted per request, sent only to the origin of the
-repository's `remote_url`), the SSRF and cloud-metadata guards, the size and
-time bounds of every request, and the offline mode. What the plugin knows is
-which documents an operation needs and what they say:
+repository's `remote_url`), where requests may go (below), the SSRF and
+cloud-metadata guards, the size and time bounds of every request, and the
+offline mode. What the plugin knows is which documents an operation needs and
+what they say:
 
 | Operation | The plugin answers |
 | --- | --- |
@@ -164,6 +165,21 @@ GETs (`fetch`), and is called again with every fetch so far and how it went
 fetch says how long its document may be reused: for the repository's
 metadata TTL, or for a day when it never changes once published. One
 conversation gets at most 4 rounds and 256 fetches, 4 at a time.
+
+The host sends a fetch only where the upstream points: to the origin (scheme,
+host and port) of `remote_url`, or to an origin that an absolute `http` or
+`https` URL names in a document the host fetched for the same operation (in an
+earlier round), or while resolving `index`. The URL `package` answers is held
+to the same rule. Anything else is not sent: the fetch comes back as a
+failure, a package URL fails the download like an upstream error, and the host
+logs a warning naming the format and the repository. What the plugin answers
+names no origin: its index is its own making (and the host keeps fields of its
+own beside it, so an index may not use the keys `remote_url` and
+`named_origins`). So a NuGet service index can put its resources on other
+hosts (nuget.org's search service is on `azuresearch-*.nuget.org`), and a Helm
+index its charts (on a project's GitHub releases), but a plugin cannot make
+Forge request a host its upstream does not point at. Redirects are the
+upstream's to choose, and are followed under the cloud-metadata guard.
 
 An administrator makes a proxy of any format ask its upstream again before
 those TTLs run out with *Invalidate cache* on the repository's page, or
@@ -314,6 +330,14 @@ The host enforces these for every plugin, built in or not:
   action against the method the caller was authorized for, the repository
   kind and the credential type, before the hosted write path applies its
   own selector and redeploy checks.
+- **Upstream requests go where the upstream points.** A proxy's plugin
+  reaches the network only through the GETs the host sends for it, and the
+  host sends them, and downloads packages, only from the origin of the
+  repository's `remote_url` and from origins that the documents it fetched
+  from that upstream name ([Proxy repositories](#proxy-repositories)). A
+  plugin cannot have Forge read `http://localhost:8421/admin/…` or an internal
+  search cluster that its upstream does not point at, and pass the answers on
+  through the proxy's metadata.
 - **Responses cannot attack the origin.** Only `cache-control`,
   `content-disposition`, `content-language`, `content-type`, `etag`,
   `last-modified` and `location` survive; `location` survives only when it
@@ -333,7 +357,8 @@ plugin is code from elsewhere, so it is also sandboxed:
 - **No ambient authority.** The component gets an empty WASI context: no
   files, no sockets, no environment, no arguments; only clocks and
   randomness. Its stdout and stderr go nowhere. It imports exactly one
-  host interface, the reader for the package being parsed.
+  host interface, the reader for the package being parsed. What it can make
+  the host request for a proxy is bounded by the rule above.
 - **Resource limits.** Each call runs with a fresh fuel budget and an epoch
   deadline (10 ms ticks), in an instance with a memory ceiling. A trap (out
   of fuel, past the deadline, out of memory, a guest panic) fails that call
@@ -348,6 +373,15 @@ plugin is code from elsewhere, so it is also sandboxed:
 Plugins are still code you run: a plugin with a bug can serve wrong
 metadata for its own repositories. Review a plugin like any other
 dependency before you pin it.
+
+The documents an upstream serves decide which hosts a proxy's plugin can
+reach. A public feed whose package metadata names an internal URL (a
+project URL or a chart's home page pointing at `http://10.0.0.5:9200/`) makes
+that host reachable for a proxy of that feed, and a plugin can read what it
+answers back into what the proxy serves. The rule bounds a plugin to the
+hosts its upstream points at, public or internal; where internal services
+must stay out of Forge's reach altogether, confine its egress with network
+policy (an outbound proxy, a Kubernetes `NetworkPolicy`).
 
 ## Writing a plugin
 

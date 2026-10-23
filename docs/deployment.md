@@ -883,7 +883,12 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   resolves the host name, so Forge resolves it first and refuses it when any
   of its addresses is such a target. A name that resolves differently for
   the proxy than for Forge, or that only the proxy can resolve, still gets
-  through: block those addresses on the proxy too.
+  through: block those addresses on the proxy too. A proxy's format chooses
+  which upstream URLs to request, but Forge sends them only to the origin of
+  the repository's `remote_url` and to origins the upstream's own documents
+  name ([format-plugins.md](./format-plugins.md#security-model)); to keep
+  internal services out of reach even of an upstream that names them, block
+  them on the outbound proxy or with network policy.
 - **Format plugins.** Every instance must load the same WebAssembly plugins
   (the same `[plugins]` section and component files): a repository whose
   format is missing on an instance answers 503 there. Built-in plugins

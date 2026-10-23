@@ -10,7 +10,10 @@
 //! `executor`). A trap — out of fuel, past the deadline, out of memory, a
 //! guest panic — fails that call and discards the instance. The WASI context
 //! is empty: no files, no sockets, no environment, no arguments; stdout and
-//! stderr go nowhere.
+//! stderr go nowhere. A component reaches the network only through the GETs
+//! the host sends for a proxy's upstream conversation, and the host sends
+//! them only to the origins that upstream points at
+//! (`forge_core::net::origins`).
 //!
 //! A failed call cannot fail the infallible trait methods: they log it and
 //! answer as for an unknown input — [`FormatPlugin::canonical_id`] the id

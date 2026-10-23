@@ -425,12 +425,15 @@ pub struct Remote {
 pub enum UpstreamOp {
     /// Resolve the upstream into the index every other operation gets as
     /// [`Remote::index`]. The host keeps it, refreshes it once per metadata
-    /// TTL and falls back to the last good one when a refresh fails.
+    /// TTL and falls back to the last good one when a refresh fails. It
+    /// also keeps the origins the documents fetched to resolve it name:
+    /// every other operation may fetch from them (see [`Fetch`]).
     Index,
     /// The versions the upstream lists of a package (canonical id).
     Versions(String),
-    /// The URL of a version's package. The host downloads it, checks it
-    /// with `parse_package` against the version asked for, and stores it.
+    /// The URL of a version's package. The host downloads it (from an
+    /// origin a [`Fetch`] may reach, and from no other), checks it with
+    /// `parse_package` against the version asked for, and stores it.
     Package(PackageRef),
     /// A version's manifest without its package, verified to be that
     /// version's; `None` sends the host to the package instead.
@@ -458,6 +461,17 @@ pub enum Freshness {
 
 /// A GET the plugin asks the host to send to the upstream.
 ///
+/// The host sends it only where the upstream points: to the origin (scheme,
+/// host and port) of [`Remote::url`], or to an origin that an absolute
+/// `http`/`https` URL names in a document the host fetched for the same
+/// operation (in an earlier round), or while resolving [`UpstreamOp::Index`].
+/// What the plugin answers names no origin, its index included. A fetch
+/// anywhere else is not sent, and comes back [`Fetched::Failed`]. So a
+/// NuGet service index may put its resources on other hosts, and a Helm
+/// index its charts, but a plugin reaches no host its upstream does not
+/// point at. A host the upstream's documents name is reachable, though,
+/// whatever names it (a project URL in a package's metadata included).
+///
 /// The host sends the repository's credentials only to the origin of
 /// [`Remote::url`], bounds the response's size and time, inflates a
 /// gzip-encoded body, and refuses link-local and cloud-metadata targets.
@@ -475,7 +489,7 @@ pub enum Fetched {
     /// A 404.
     NotFound,
     /// Anything else: a transport error, another status, a body over the
-    /// size limit.
+    /// size limit, a URL the host does not send to (see [`Fetch`]).
     Failed(String),
 }
 
@@ -539,11 +553,16 @@ pub struct UpstreamSearch {
 /// What an [`UpstreamOp`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamAnswer {
-    /// The answer to [`UpstreamOp::Index`]: a JSON object.
+    /// The answer to [`UpstreamOp::Index`]: a JSON object. The host keeps
+    /// its own fields beside it, so the keys `remote_url` and
+    /// `named_origins` are not the plugin's: an index using them is refused
+    /// like one that is not an object.
     Index(String),
     /// `None`: the upstream does not know the package.
     Versions(Option<Vec<String>>),
-    /// The package's URL.
+    /// The package's URL, on an origin a [`Fetch`] may reach: a package
+    /// anywhere else is not downloaded, and the host takes it for an
+    /// upstream failure.
     Package(String),
     Manifest(Option<Vec<u8>>),
     /// The answer to [`UpstreamOp::Metadata`] and [`UpstreamOp::Dating`].
