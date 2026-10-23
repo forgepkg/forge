@@ -83,11 +83,14 @@ jobs:
   # `base` branch with the commit it forked off that branch) and sets one
   # output per group of paths (rust, changelog, release, audit, web, image,
   # kubernetes), and a job whose groups are all `false` is skipped, which
-  # passes a required check. A push to main repeats its merge group's run on
-  # the same commit, so it runs only what that push changed; a push that sets
-  # a new workspace version (a release commit) and a manual run without a
-  # `base` set every group, which the release gate needs. The conditions run
-  # a job unless its output is `false`, so if this job fails, every job runs.
+  # passes a required check. A change to this file counts for the groups of
+  # the jobs it changes (#365), or for every group when it changes anything
+  # outside them (the triggers, the settings, this job). A push to main
+  # repeats its merge group's run on the same commit, so it runs only what
+  # that push changed; a push that sets a new workspace version (a release
+  # commit) and a manual run without a `base` set every group, which the
+  # release gate needs. The conditions run a job unless its output is
+  # `false`, so if this job fails, every job runs.
   # Every job waits for this one, a second turn in the runner queue for a few
   # seconds of work (see fmt); in exchange most changes leave most jobs out.
   changes:
