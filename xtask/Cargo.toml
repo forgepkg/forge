@@ -1,4 +1,4 @@
-# xtask — the single task runner for envisia-forge.
+# xtask — the single task runner for Forge.
 #
 # `cargo xtask <cmd>` (alias in .cargo/config.toml) replaces the old Makefile +
 # Justfile. It is a plain Rust binary that shells out to docker/cargo/pnpm/sqlx

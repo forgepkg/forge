@@ -1,4 +1,4 @@
-# envisia-forge
+# Forge
 
 A self-hosted **NuGet package registry and Docker / OCI registry** written in
 Rust. It speaks the NuGet **V3** protocol and the **OCI Distribution Spec**
@@ -111,7 +111,7 @@ checkout instead, the root `Dockerfile` packages the SPA **and** the Rust
 server into one image (no Node in prod):
 
 ```bash
-cargo xtask docker-build     # docker build -t envisia-forge:latest .
+cargo xtask docker-build     # docker build -t forge:latest .
 cargo xtask docker-run       # run the image against the compose db + s3 on :8421
 ```
 
@@ -124,7 +124,7 @@ docker run --rm -p 8421:8421 \
   -e FORGE_S3__ENDPOINT=http://s3:8422 -e FORGE_S3__BUCKET=forge \
   -e FORGE_S3__ACCESS_KEY=… -e FORGE_S3__SECRET_KEY=… \
   -e FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD=… \
-  envisia-forge:latest
+  forge:latest
 ```
 
 The image refuses to start without S3 credentials and with placeholder
@@ -193,7 +193,7 @@ Run `cargo xtask help` for the complete command list.
 
 ## License
 
-envisia-forge is dual-licensed. You may use, modify and distribute it under
+Forge is dual-licensed. You may use, modify and distribute it under
 either of:
 
 - the **GNU Affero General Public License, version 3** — see

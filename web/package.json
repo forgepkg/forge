@@ -5,7 +5,7 @@
   "version": "1.1.0",
   "license": "(AGPL-3.0-only OR LicenseRef-envisia)",
   "packageManager": "pnpm@11.5.0",
-  "description": "envisia-forge admin + browse SPA (TanStack Router, SPA mode, served by the Rust server).",
+  "description": "Forge admin + browse SPA (TanStack Router, SPA mode, served by the Rust server).",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

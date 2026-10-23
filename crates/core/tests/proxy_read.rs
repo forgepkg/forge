@@ -30,7 +30,7 @@ mod common;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
@@ -100,6 +100,8 @@ struct MockState {
     search: Mutex<Option<(StatusCode, serde_json::Value)>>,
     /// The query strings the search service received.
     search_queries: Mutex<Vec<String>>,
+    /// When set, every flat-container listing answers 503 (an outage).
+    listings_fail: AtomicBool,
 }
 
 impl MockState {
@@ -278,6 +280,9 @@ async fn serve_flat_index(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     st.flat_index_hits.fetch_add(1, Ordering::SeqCst);
+    if st.listings_fail.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     if let Some(doc) = st.flat_index_override.lock().unwrap().get(&id) {
         return (StatusCode::OK, axum::Json(doc.clone())).into_response();
     }
@@ -432,6 +437,7 @@ async fn start_mock_with_auth(packages: Corpus, required_auth: Option<String>) -
         hold_nupkg: Mutex::default(),
         search: Mutex::default(),
         search_queries: Mutex::default(),
+        listings_fail: AtomicBool::new(false),
     });
 
     let app = Router::new()
@@ -992,6 +998,103 @@ async fn proxy_delay_and_not_found_ttl_run_on_the_database_clock() {
         ["2.0.0"],
         "the marker expired on the database's clock"
     );
+}
+
+/// #222: the answer "the upstream does not know this id" is cached for the
+/// metadata TTL, but stands only while the id's not-found marker does. With
+/// a `not_found_ttl_seconds` shorter than the metadata TTL (0 included), a
+/// package published upstream meanwhile is listed through the same cache
+/// once its marker expired, and not before.
+#[tokio::test]
+async fn an_expired_not_found_marker_hides_nothing_through_the_cache() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(Corpus::new()).await;
+    for not_found_ttl in [30, 0] {
+        let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+        sqlx::query(
+            "UPDATE repository SET metadata_ttl_seconds = 3600, not_found_ttl_seconds = $2 \
+             WHERE name = $1",
+        )
+        .bind(&repo)
+        .bind(not_found_ttl)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+        let id = format!("Acme.Lib{not_found_ttl}");
+        assert!(px.list_versions(&repo, &id).await.unwrap().is_empty());
+        mock.state
+            .packages
+            .lock()
+            .unwrap()
+            .extend(corpus_of(&id, &["1.0.0"]));
+        if not_found_ttl > 0 {
+            assert!(
+                px.list_versions(&repo, &id).await.unwrap().is_empty(),
+                "the marker still stands"
+            );
+            sqlx::query(
+                "UPDATE proxy_cached_version SET not_found_at = now() - interval '31 seconds' \
+                 WHERE repository_id = (SELECT id FROM repository WHERE name = $1)",
+            )
+            .bind(&repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            versions_of(&px.list_versions(&repo, &id).await.unwrap()),
+            ["1.0.0"],
+            "not_found_ttl_seconds = {not_found_ttl}"
+        );
+    }
+}
+
+/// #223: after an upstream version listing fails, the proxy answers the
+/// listings of ids it has cached versions of from its cache, without asking
+/// the upstream again, for a while: during an outage, a restore of cached
+/// packages does not wait for the upstream on every listing. An id with
+/// nothing cached still asks it.
+#[tokio::test]
+async fn a_failed_listing_serves_cached_ids_without_asking_again() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mut corpus = corpus_of("Contoso.A", &["1.0.0"]);
+    corpus.extend(corpus_of("Contoso.B", &["2.0.0"]));
+    let mock = start_mock(corpus).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    // Every listing asks the upstream (no metadata TTL).
+    sqlx::query("UPDATE repository SET metadata_ttl_seconds = 0 WHERE name = $1")
+        .bind(&repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    let listed = |id: &'static str| {
+        let px = &px;
+        let repo = repo.clone();
+        async move { versions_of(&px.list_versions(&repo, id).await.unwrap()) }
+    };
+    assert_eq!(listed("Contoso.A").await, ["1.0.0"]);
+    assert_eq!(listed("Contoso.B").await, ["2.0.0"]);
+    assert_eq!(listed("Contoso.A").await, ["1.0.0"]);
+    let asked = mock.flat_index_hits();
+    assert_eq!(asked, 3, "no metadata TTL: every listing asks");
+
+    mock.state.listings_fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        listed("Contoso.A").await,
+        ["1.0.0"],
+        "served from the cache"
+    );
+    assert_eq!(mock.flat_index_hits(), asked + 1);
+    assert_eq!(listed("Contoso.B").await, ["2.0.0"]);
+    assert_eq!(listed("Contoso.A").await, ["1.0.0"]);
+    assert_eq!(mock.flat_index_hits(), asked + 1, "not asked again");
+
+    assert!(px.list_versions(&repo, "Contoso.C").await.is_err());
+    assert_eq!(mock.flat_index_hits(), asked + 2, "nothing cached: asked");
 }
 
 /// #76: a service index without `PackageBaseAddress` (a captive portal, a

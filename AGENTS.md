@@ -39,6 +39,17 @@ the dependencies' byte-for-byte copies on ghcr.io
 dependency image goes there too: add it to `.github/scripts/mirror-images.sh`
 and name its ghcr.io copy.
 
+## Admin APIs: give the feature a screen in the web UI
+
+A feature that adds to or changes the admin API (`/admin/*`,
+`crates/server/src/admin/`) should preferably come with its screen in the web
+UI's admin pages (`/manage/*`, `web/src/routes/admin/`), in the same pull
+request: administrators run Forge from the browser, and a setting that only
+`curl` reaches is one they do not find. Authentication realms are the model:
+`/admin/realms` has the CRUD, and **Admin → Authentication**
+(`/manage/realms`) offers the same. When a feature ships without its screen,
+its pull request's description says why.
+
 ## Changelog: a fragment per change, never CHANGELOG.md
 
 A change never edits `CHANGELOG.md`. Its entry goes in a new file,

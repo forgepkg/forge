@@ -1,4 +1,4 @@
-# envisia-forge configuration (TOML form).
+# Forge configuration (TOML form).
 #
 # Copy this to `forge.toml` (loaded automatically if present in the working
 # directory) or point $FORGE_CONFIG at it (the file must then exist: a missing
@@ -37,7 +37,9 @@ allowed_hosts = []              # (default: [])
 # Connection and request time limits. A client that takes longer to send its
 # request headers, or whose request body stalls longer, is cut off; a handler
 # that has not answered within request_timeout_seconds gets 408 (an already
-# streaming download is not cut off). Keep request_timeout_seconds above the
+# streaming download is not cut off; a proxy's download from its upstream may
+# take [proxy] download_timeout_seconds, and the handler has
+# request_timeout_seconds again after it). Keep request_timeout_seconds above the
 # slowest push of the largest repository upload limit you expect. header_read_timeout_seconds also
 # closes an idle keep-alive connection: keep it above your reverse proxy's
 # upstream keep-alive idle timeout, or the proxy may reuse a connection Forge is
@@ -144,7 +146,7 @@ password = "changeme"
 connect_timeout_seconds  = 15          # (default: 15)
 read_timeout_seconds     = 60          # (default: 60) max silence between two reads
 metadata_timeout_seconds = 60          # (default: 60) total, per metadata request
-download_timeout_seconds = 1800        # (default: 1800) total, per .nupkg download
+download_timeout_seconds = 1800        # (default: 1800) total, per .nupkg or layer download
 max_metadata_bytes       = 33554432    # (default: 32 MiB)
 max_package_bytes        = 1073741824  # (default: 1 GiB)
 # Metadata bodies up to this size stay in memory; larger ones spill to a

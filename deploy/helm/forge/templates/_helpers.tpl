@@ -34,7 +34,7 @@ helm.sh/chart: {{ include "forge.chart" . }}
 {{ include "forge.selectorLabels" . }}
 app.kubernetes.io/version: {{ include "forge.imageTag" . | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app.kubernetes.io/part-of: envisia-forge
+app.kubernetes.io/part-of: forge
 {{- with .Values.commonLabels }}
 {{ toYaml . }}
 {{- end }}
@@ -124,7 +124,7 @@ digest the release workflow recorded for appVersion (Chart.yaml annotation). */}
 {{- end }}
 {{- $digest := .Values.image.digest }}
 {{- if and (not $digest) (not .Values.image.tag) }}
-{{- $digest = index (default dict .Chart.Annotations) "forge.envisia.de/image-digest" | default "" }}
+{{- $digest = index (default dict .Chart.Annotations) "forge/image-digest" | default "" }}
 {{- end }}
 {{- printf "%s:%s" $repository (include "forge.imageTag" .) }}
 {{- with $digest }}@{{ . }}{{ end }}

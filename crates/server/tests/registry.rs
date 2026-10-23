@@ -1396,6 +1396,8 @@ struct MockRegistry {
     tag_queries: Mutex<Vec<String>>,
     /// Hold every manifest `GET` this long before answering.
     manifest_delay: Mutex<std::time::Duration>,
+    /// Hold every blob `GET` this long before answering.
+    blob_delay: Mutex<std::time::Duration>,
 }
 
 impl MockRegistry {
@@ -1516,6 +1518,8 @@ impl MockRegistry {
                     return resp;
                 }
                 self.blob_gets.fetch_add(1, Ordering::SeqCst);
+                let delay = *self.blob_delay.lock().unwrap();
+                tokio::time::sleep(delay).await;
                 if self.corrupt.load(Ordering::SeqCst) {
                     body.push(0);
                 }
@@ -1766,6 +1770,56 @@ async fn a_fetch_from_the_previous_upstream_is_not_cached_after_a_repoint() {
     .await
     .unwrap();
     assert_eq!(rows, (0, 0), "no tag or manifest of the previous upstream");
+}
+
+/// A proxy's first download of a layer may take longer than
+/// `server.request_timeout_seconds`: the download, bounded by
+/// `proxy.download_timeout_seconds`, extends its request's deadline, so a
+/// large layer from a slow upstream gets cached (#220). A slow metadata
+/// request still ends at the request timeout.
+#[tokio::test]
+async fn a_slow_layer_download_outlasts_the_request_timeout() {
+    let srv = common::start_with(
+        common::pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            server_extra: Some("request_timeout_seconds = 1\n".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mock = MockRegistry::start().await;
+    let cfg = config("amd64");
+    let layer = format!("a slow layer {}", unique()).into_bytes();
+    let manifest = image(&cfg, &[&layer]);
+    mock.put("library/slow", "1.0", OCI_MANIFEST, &manifest);
+    mock.put_blob(&layer);
+    *mock.blob_delay.lock().unwrap() = std::time::Duration::from_secs(2);
+    *mock.manifest_delay.lock().unwrap() = std::time::Duration::from_secs(2);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{proxy}/library/slow");
+
+    let resp = oci.get(&name, &format!("blobs/{}", sha(&layer))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), layer.as_slice());
+    assert_eq!(
+        oci.get(&name, &format!("blobs/{}", sha(&layer)))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(mock.blob_gets.load(Ordering::SeqCst), 1, "cached");
+
+    assert_eq!(oci.get(&name, "manifests/1.0").await.status(), 408);
 }
 
 #[tokio::test]
@@ -2108,7 +2162,7 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     let mock = MockRegistry::start().await;
     let cfg = config("amd64");
     let manifest = image(&cfg, &[b"public"]);
-    for name in ["envisia/app", "public/app"] {
+    for name in ["acme/app", "public/app"] {
         mock.put(name, "1", OCI_MANIFEST, &manifest);
     }
     mock.put_blob(&cfg);
@@ -2130,7 +2184,7 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     .await;
     create_repo(
         &srv,
-        json!({"name": group, "kind": "group", "format": "docker", "reserved_prefixes": ["envisia/"]}),
+        json!({"name": group, "kind": "group", "format": "docker", "reserved_prefixes": ["acme/"]}),
     )
     .await;
     for (member, priority) in [(&hosted, 10), (&proxy, 5)] {
@@ -2144,7 +2198,7 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     let oci = admin_oci(&srv).await;
     // A reserved namespace is never served by the proxy member.
     assert_eq!(
-        oci.get(&format!("{group}/envisia/app"), "manifests/1")
+        oci.get(&format!("{group}/acme/app"), "manifests/1")
             .await
             .status(),
         404

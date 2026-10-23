@@ -6,7 +6,7 @@ import tailwindcss from '@tailwindcss/vite'
 import { tanstackRouter } from '@tanstack/router-plugin/vite'
 
 /**
- * Vite config for the envisia-forge SPA.
+ * Vite config for the Forge SPA.
  *
  * Production: `vite build` emits a static SPA into `dist/` (`index.html` +
  * `assets/*`). The Rust `server` serves that directory directly (single

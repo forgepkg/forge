@@ -52,8 +52,9 @@
 //!   at its first sighting.
 //! * **Negative cache** — a genuine upstream 404 sets `not_found = true` +
 //!   `not_found_at = now()`, honored for `not_found_ttl_seconds` — by direct
-//!   downloads *and* listings; an expired marker hides nothing. An upstream
-//!   version listing that contains the version clears its marker.
+//!   downloads *and* listings; an expired marker hides nothing, not even
+//!   through the listing cached for the metadata TTL. An upstream version
+//!   listing that contains the version clears its marker.
 //! * **Upstream confirmation** — the download singleflight creates its row for
 //!   whatever version a client asks for, so such a row starts *unconfirmed*
 //!   and is never enumerated (flat index, registration, search) until an
@@ -149,6 +150,9 @@ pub const NS_UPSTREAM_SEARCH_FAILED: &str = "proxy_search_failed";
 /// Cache namespace remembering why an upstream package was rejected for its
 /// content, keyed by `"{scope}/{lower_id}/{version}"`.
 pub const NS_UPSTREAM_REJECTED: &str = "proxy_rejected";
+/// Cache namespace marking a proxy whose upstream version listing failed,
+/// keyed by `"{scope}"`; see [`UPSTREAM_LISTING_BACKOFF`].
+pub const NS_UPSTREAM_LISTING_FAILED: &str = "proxy_listing_failed";
 
 /// The earliest upstream creation time the package delay trusts
 /// (2010-01-01, before any NuGet feed): nuget.org reports unlisted versions as
@@ -161,6 +165,12 @@ fn min_trusted_publish_time() -> DateTime<Utc> {
 /// long, so an upstream that times out does not hold every search for the
 /// whole metadata timeout.
 const UPSTREAM_SEARCH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+/// After an upstream version listing fails, the proxy answers listings of
+/// the ids it has cached versions of from its cache, without asking the
+/// upstream, for this long: an upstream that times out does not hold every
+/// listing for the whole connect or metadata timeout before the cache
+/// answers. Ids without cached versions still ask it.
+const UPSTREAM_LISTING_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 /// Default metadata TTL when a proxy leaves `metadata_ttl_seconds` unset.
 const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
 /// Default negative-cache TTL when a proxy leaves `not_found_ttl_seconds` unset.
@@ -785,31 +795,86 @@ impl ProxyRepo {
         if !repo.online {
             return self.cached_rows(repo.id, lower_id).await;
         }
+        // The upstream failed a listing moments ago: what is cached is
+        // served without waiting for it again.
+        if self.upstream_listing_failed(repo).await {
+            let rows = self.cached_rows(repo.id, lower_id).await?;
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
 
-        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
-        let key = Self::versions_key(repo, lower_id);
-        let refreshed = self
-            .cache
-            .get_or_try_insert_with(NS_UPSTREAM_VERSIONS, &key, ttl, || async {
-                Box::pin(self.refresh_versions(repo, lower_id))
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-            .await;
+        let mut refreshed = self.listing_refreshed(repo, lower_id).await;
+        // "The upstream does not know the id" is cached for the metadata
+        // TTL, but stands only while the id's not-found marker does
+        // (`not_found_ttl_seconds`, which may be shorter, or 0): past it,
+        // the upstream is asked again.
+        if refreshed == Ok(false) && !self.negative_cached(repo, lower_id, "*").await? {
+            self.cache
+                .invalidate(NS_UPSTREAM_VERSIONS, &Self::versions_key(repo, lower_id))
+                .await;
+            refreshed = self.listing_refreshed(repo, lower_id).await;
+        }
         match refreshed {
             Ok(true) => self.cached_rows(repo.id, lower_id).await,
             Ok(false) => Ok(Vec::new()),
             Err(e) => {
                 // Upstream unreachable: degrade to what is already cached
-                // locally rather than failing a restore that could be served.
+                // locally rather than failing a restore that could be served,
+                // and keep doing so for a while without asking it.
+                let _ = self
+                    .cache
+                    .get_or_try_insert_local(
+                        NS_UPSTREAM_LISTING_FAILED,
+                        &Self::upstream_scope(repo),
+                        UPSTREAM_LISTING_BACKOFF,
+                        || async { Ok::<_, ()>(true) },
+                    )
+                    .await;
                 let rows = self.cached_rows(repo.id, lower_id).await?;
                 if rows.is_empty() {
                     return Err(RepoError::Storage(e));
                 }
-                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream version listing failed; serving cached versions");
+                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream version listing failed; serving cached versions for a minute");
                 Ok(rows)
             }
         }
+    }
+
+    /// Whether a version listing of `repo`'s upstream failed within the last
+    /// [`UPSTREAM_LISTING_BACKOFF`].
+    async fn upstream_listing_failed(&self, repo: &Repository) -> bool {
+        // Lookup only: the factory never yields a value, so a miss caches
+        // nothing.
+        self.cache
+            .get_or_try_insert_local(
+                NS_UPSTREAM_LISTING_FAILED,
+                &Self::upstream_scope(repo),
+                UPSTREAM_LISTING_BACKOFF,
+                || async { Err::<bool, ()>(()) },
+            )
+            .await
+            .is_ok()
+    }
+
+    /// Refresh `lower_id`'s listing ([`Self::refresh_versions`]) unless it
+    /// was refreshed within the metadata TTL (the cache coalesces concurrent
+    /// refreshes, across instances too). `Ok(false)`: the upstream does not
+    /// know the id.
+    async fn listing_refreshed(&self, repo: &Repository, lower_id: &str) -> Result<bool, String> {
+        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
+        self.cache
+            .get_or_try_insert_with(
+                NS_UPSTREAM_VERSIONS,
+                &Self::versions_key(repo, lower_id),
+                ttl,
+                || async {
+                    Box::pin(self.refresh_versions(repo, lower_id))
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .await
     }
 
     /// Fetch the upstream's version listing of `lower_id`

@@ -1,4 +1,4 @@
-# envisia-forge — ready-to-use LOCAL DEV configuration.
+# Forge — ready-to-use LOCAL DEV configuration.
 #
 # The server loads ./forge.toml automatically (override the path with
 # $FORGE_CONFIG). Values match docker-compose.yml (Postgres on :5432,

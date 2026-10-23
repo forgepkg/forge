@@ -1,4 +1,4 @@
-name: envisia-forge-dev
+name: forge-dev
 
 services:
   # PostgreSQL 17 — metadata store

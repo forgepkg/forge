@@ -1,4 +1,4 @@
-# envisia-forge Helm chart.
+# Forge Helm chart.
 #
 # `version` and `appVersion` are the release version: `cargo xtask release
 # <version>` sets both, the release workflow refuses a tag whose chart names
@@ -26,7 +26,7 @@ annotations:
   # it to the digest it signed before it publishes the chart
   # (oci://ghcr.io/forgepkg/charts/forge), so the published chart always pulls
   # exactly that image (unless image.tag or image.digest is set).
-  forge.envisia.de/image-digest: ""
+  forge/image-digest: ""
 
 # Optional in-cluster backing services for evaluation and small installs,
 # shipped inside this chart (charts/). Each one is off by default; production

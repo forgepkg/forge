@@ -10,8 +10,10 @@ name: CI
 # Only a pull request that targets the default branch runs CI. A stacked pull
 # request, which targets the branch of the one below it, runs the Stack
 # workflow alone; once GitHub retargets it to the default branch, stack.yml
-# starts this workflow on its branch via `workflow_dispatch`, with the
-# default branch as `base`, so that run too runs the jobs the change needs.
+# merges the default branch into it, and that push runs this workflow. A
+# `workflow_dispatch` run of a pull request's branch would not do: GitHub
+# neither shows its checks on the pull request nor counts them as its
+# required checks.
 on:
   push:
     branches: [main, master]
@@ -83,11 +85,14 @@ jobs:
   # `base` branch with the commit it forked off that branch) and sets one
   # output per group of paths (rust, changelog, release, audit, web, image,
   # kubernetes), and a job whose groups are all `false` is skipped, which
-  # passes a required check. A push to main repeats its merge group's run on
-  # the same commit, so it runs only what that push changed; a push that sets
-  # a new workspace version (a release commit) and a manual run without a
-  # `base` set every group, which the release gate needs. The conditions run
-  # a job unless its output is `false`, so if this job fails, every job runs.
+  # passes a required check. A change to this file counts for the groups of
+  # the jobs it changes (#365), or for every group when it changes anything
+  # outside them (the triggers, the settings, this job). A push to main
+  # repeats its merge group's run on the same commit, so it runs only what
+  # that push changed; a push that sets a new workspace version (a release
+  # commit) and a manual run without a `base` set every group, which the
+  # release gate needs. The conditions run a job unless its output is
+  # `false`, so if this job fails, every job runs.
   # Every job waits for this one, a second turn in the runner queue for a few
   # seconds of work (see fmt); in exchange most changes leave most jobs out.
   changes:

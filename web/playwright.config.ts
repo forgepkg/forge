@@ -3,7 +3,7 @@ import { defineConfig, devices } from '@playwright/test'
 import { BASE_URL } from './e2e/harness'
 
 /**
- * Playwright config for the envisia-forge SPA e2e suite.
+ * Playwright config for the Forge SPA e2e suite.
  *
  * The suite drives a **real `forge-server`** serving the **built** SPA against
  * the slice-1 infra (Postgres + versitygw), brought up in globalSetup. The

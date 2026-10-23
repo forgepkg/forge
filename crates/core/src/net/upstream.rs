@@ -355,7 +355,7 @@ impl UpstreamHttp {
             })
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.read_timeout)
-            .user_agent(concat!("envisia-forge/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("forge/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(UpstreamHttp {
             client,
@@ -433,6 +433,11 @@ impl UpstreamHttp {
             RequestClass::Download => self.config.download_timeout,
         };
         let deadline = tokio::time::Instant::now() + timeout;
+        // A download may take longer than the request it serves is allowed
+        // (`server.request_timeout_seconds`): the request waits for it.
+        if class == RequestClass::Download {
+            super::deadline::extend(deadline);
+        }
         let origin = Origin::of(url);
         let mut hop = url.to_string();
         let mut hops = 0;
