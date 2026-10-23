@@ -37,7 +37,7 @@ use forge_db::model::{RepoKind, Repository, DOCKER_FORMAT, RAW_FORMAT};
 use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
-use crate::auth::{AssertionIssuer, RealmAuth};
+use crate::auth::{AssertionIssuer, AuthSettingsCache, RealmAuth};
 use crate::config::Config;
 
 /// Shared, cheaply-cloneable application state.
@@ -62,12 +62,18 @@ pub struct AppState {
     /// DB-backed auth realms: the snapshot cache the password chain, the OIDC
     /// login runtime and the login UX endpoints are built from.
     pub realms: Arc<RealmAuth>,
-    /// Browser-session lifecycle, shared by local-password login and OIDC.
+    /// Browser-session lifecycle, shared by local-password login and OIDC;
+    /// its lifetimes follow [`Self::auth_settings`].
     pub sessions: SessionService,
+    /// The sign-in and anonymous-access policy administrators set at runtime
+    /// (the anonymous mode, the login mode, password Basic, session lifetimes
+    /// and the lockout), as this instance last read it.
+    pub auth_settings: Arc<AuthSettingsCache>,
     /// Whether session cookies carry `Secure` (https `public_base_url`).
     pub cookie_secure: bool,
     /// Password-failure lockout per `(client IP, username)`, shared by
-    /// `POST /auth/login` and the wire Basic password path.
+    /// `POST /auth/login` and the wire Basic password path; its limits follow
+    /// [`Self::auth_settings`].
     pub login_throttle: Arc<forge_core::auth::LoginThrottle>,
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
@@ -284,8 +290,10 @@ impl AppState {
     ///
     /// Authentication runtimes (the password chain, the OIDC login flow) are
     /// **not** built here: they live behind [`RealmAuth`], which rebuilds them
-    /// from the `auth_realm` table on demand. The session service and cookie
-    /// security bit are config-derived and shared by every login path.
+    /// from the `auth_realm` table on demand. The session service is
+    /// shared by every login path; it, the lockout and authorization's public
+    /// read follow the auth settings ([`AuthSettingsCache`]), read from the
+    /// database on demand too.
     pub fn new(pool: PgPool, blob_store: BlobStore, cache: Cache, config: Config) -> Self {
         let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
             .unwrap_or_else(|e| {
@@ -296,17 +304,25 @@ impl AppState {
             });
         let cas = Cas::new(blob_store.clone(), pool.clone()).with_staging(staging);
         // Signed-in callers share the public read reach only where everyone
-        // may read anonymously (see `Authz::with_public_read_for_signed_in`).
-        let authz = Authz::new(pool.clone(), cache.clone())
-            .with_public_read_for_signed_in(config.auth.anonymous_mode.eq_ignore_ascii_case("all"));
+        // may read anonymously (see `Authz::with_public_read_for_signed_in`):
+        // the auth settings turn it on and off.
+        let authz = Authz::new(pool.clone(), cache.clone());
         let config = Arc::new(config);
 
-        let (idle, absolute) = config.session_ttls();
-        let sessions = SessionService::new(
-            pool.clone(),
-            chrono::Duration::seconds(idle as i64),
-            chrono::Duration::seconds(absolute as i64),
+        let login_throttle = Arc::new(
+            forge_core::auth::LoginThrottle::default().with_known_network_store(Arc::new(
+                forge_core::auth::PgKnownNetworks::new(pool.clone()),
+            )),
         );
+        let auth_settings = Arc::new(
+            AuthSettingsCache::new(
+                pool.clone(),
+                std::time::Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1)),
+            )
+            .with_authz(authz.clone())
+            .with_login_throttle(login_throttle.clone()),
+        );
+        let sessions = auth_settings.sessions().clone();
         let cookie_secure = config.public_base_url().starts_with("https://");
         let assertion_issuer = AssertionIssuer::new(pool.clone(), None, config.public_base_url());
         let realms = Arc::new(RealmAuth::new(
@@ -314,20 +330,12 @@ impl AppState {
             cache.clone(),
             config.clone(),
             assertion_issuer.clone(),
+            auth_settings.clone(),
         ));
         let upstream = UpstreamHttp::new(config.proxy.upstream_http()).unwrap_or_else(|e| {
             tracing::error!(error = %e, "failed to build the configured proxy upstream client; using defaults");
             UpstreamHttp::shared_default()
         });
-        let login_throttle = Arc::new(
-            forge_core::auth::LoginThrottle::new(
-                config.auth.login_max_failures,
-                std::time::Duration::from_secs(config.auth.login_failure_window_seconds),
-            )
-            .with_known_network_store(Arc::new(
-                forge_core::auth::PgKnownNetworks::new(pool.clone()),
-            )),
-        );
         let oidc_login_starts = Arc::new(forge_core::auth::WindowLimiter::new(
             config.auth.oidc_login_starts_per_minute,
             std::time::Duration::from_secs(60),
@@ -345,6 +353,7 @@ impl AppState {
             config,
             realms,
             sessions,
+            auth_settings,
             cookie_secure,
             login_throttle,
             oidc_login_starts,
@@ -425,6 +434,7 @@ impl AppState {
                 self.cache.clone(),
                 self.config.clone(),
                 self.assertion_issuer.clone(),
+                self.auth_settings.clone(),
             )
             .with_envelope(envelope.clone()),
         );

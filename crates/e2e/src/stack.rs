@@ -181,32 +181,27 @@ async fn blob_store() -> BlobStore {
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
-/// Anonymous-access mode for a stack.
+/// Anonymous-access mode for a stack (the `anonymous_mode` auth setting).
 #[derive(Debug, Clone)]
 pub enum AnonMode {
-    /// `anonymous_mode = "off"` — every read requires authentication.
+    /// `off` — every read requires authentication.
     Off,
-    /// `anonymous_mode = "allowlist"` with the given allowlist tokens.
+    /// `allowlist` with the given allowlist tokens.
     Allowlist(Vec<String>),
-    /// `anonymous_mode = "all"` — anonymous reads of `anonymous_read` repos.
+    /// `all` — anonymous reads of `anonymous_read` repos.
     All,
 }
 
 impl AnonMode {
-    fn mode(&self) -> &'static str {
+    /// The auth settings update that selects this mode.
+    fn settings(&self) -> serde_json::Value {
         match self {
-            AnonMode::Off => "off",
-            AnonMode::Allowlist(_) => "allowlist",
-            AnonMode::All => "all",
-        }
-    }
-    fn allowlist_toml(&self) -> String {
-        match self {
-            AnonMode::Allowlist(tokens) => {
-                let quoted: Vec<String> = tokens.iter().map(|t| format!("{t:?}")).collect();
-                format!("anonymous_ip_allowlist = [{}]\n", quoted.join(", "))
-            }
-            _ => String::new(),
+            AnonMode::Off => serde_json::json!({"anonymous_mode": "off"}),
+            AnonMode::Allowlist(tokens) => serde_json::json!({
+                "anonymous_mode": "allowlist",
+                "anonymous_ip_allowlist": tokens,
+            }),
+            AnonMode::All => serde_json::json!({"anonymous_mode": "all"}),
         }
     }
 }
@@ -216,7 +211,6 @@ fn config_toml(
     db_url: &str,
     s3_endpoint: &str,
     admin: Option<(&str, &str)>,
-    anon: &AnonMode,
     redis: Option<&str>,
     trusted_proxies: &[String],
     cache_ttl_seconds: u64,
@@ -270,9 +264,7 @@ force_path_style = true
 {s3_credentials}
 
 [auth]
-anonymous_mode = "{anon_mode}"
-allow_password_basic = true
-{allowlist}{trusted}{auth_block}{bootstrap}
+{trusted}{auth_block}{bootstrap}
 {redis_block}
 [cache]
 l1_max_capacity = 1000
@@ -292,8 +284,6 @@ lease_seconds = 30
 {blob_cache_block}
 "#,
         bucket = S3_BUCKET,
-        anon_mode = anon.mode(),
-        allowlist = anon.allowlist_toml(),
     )
 }
 
@@ -314,6 +304,8 @@ type OidcBlockFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 /// Builder for a stack ([`start_stack`] is the common case with defaults).
 pub struct StackBuilder {
     anon: AnonMode,
+    /// Further auth settings to store (an `/admin/settings/auth` update).
+    auth_settings: Option<serde_json::Value>,
     bootstrap_admin: Option<(String, String)>,
     spawn_workers: bool,
     use_redis: bool,
@@ -337,6 +329,7 @@ impl Default for StackBuilder {
     fn default() -> Self {
         StackBuilder {
             anon: AnonMode::Off,
+            auth_settings: None,
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             spawn_workers: false,
             use_redis: false,
@@ -357,6 +350,13 @@ impl StackBuilder {
     /// Set the anonymous-access mode (default [`AnonMode::Off`]).
     pub fn anon(mut self, anon: AnonMode) -> Self {
         self.anon = anon;
+        self
+    }
+    /// Store these auth settings too (fields of a `PUT
+    /// /admin/settings/auth` body, e.g. `{"session_idle_ttl_seconds": 1}`).
+    /// Every stack has password Basic on and its [`Self::anon`] mode.
+    pub fn auth_settings(mut self, update: serde_json::Value) -> Self {
+        self.auth_settings = Some(update);
         self
     }
     /// Override the bootstrap admin (default a unique `adminN`/`adminpw`).
@@ -489,7 +489,6 @@ impl StackBuilder {
             &db_url,
             s3,
             admin_ref,
-            &self.anon,
             redis.as_deref(),
             &self.trusted_proxies,
             self.cache_ttl_seconds,
@@ -541,6 +540,30 @@ impl StackBuilder {
             .expect("registry token key");
         let state =
             AppState::new(pool.clone(), store, cache, config).with_registry_keys(registry_keys);
+        // The access policy is stored in the database: password Basic on
+        // (tests sign in over Basic), the stack's anonymous mode, and any
+        // further settings. A peer on the same database stores the same.
+        let mut update = serde_json::json!({"allow_password_basic": true});
+        for extra in [Some(self.anon.settings()), self.auth_settings.clone()]
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(update), serde_json::Value::Object(extra)) =
+                (update.as_object_mut(), extra)
+            {
+                update.extend(extra);
+            }
+        }
+        let update: forge_server::auth::AuthSettingsUpdate =
+            serde_json::from_value(update).expect("an auth settings update");
+        let current = forge_server::auth::load_auth_settings(&pool)
+            .await
+            .expect("stored auth settings");
+        state
+            .auth_settings
+            .save(update.apply_to(&current).expect("valid auth settings"))
+            .await
+            .expect("store auth settings");
         let layer = principal_layer(&state).expect("principal layer");
 
         let worker_handles = if self.spawn_workers {

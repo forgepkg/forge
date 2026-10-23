@@ -3,7 +3,7 @@
 //! Configuration is layered: a TOML file (optional) is the base, and `FORGE_*`
 //! environment variables override individual keys. Nested keys use `__` as the
 //! separator, e.g. `FORGE_SERVER__BIND`, `FORGE_S3__ACCESS_KEY`,
-//! `FORGE_AUTH__ANONYMOUS_MODE`.
+//! `FORGE_AUTH__TRUSTED_PROXY_CIDRS`.
 //!
 //! Secret string keys ([`SECRET_KEYS`]: database/Redis URLs, S3 keys, the
 //! bootstrap-admin password, the OIDC client secret, the credential-forwarding
@@ -12,8 +12,11 @@
 //! never echo their values.
 //!
 //! The raw deserialized shape ([`Config`]) is validated into typed runtime
-//! values where useful (e.g. the anonymous policy + trusted-proxy CIDRs are
-//! parsed once via [`Config::anon_policy`] / [`Config::trusted_proxy_cidrs`]).
+//! values where useful (e.g. the trusted-proxy CIDRs are parsed once via
+//! [`Config::trusted_proxy_cidrs`]).
+//!
+//! Sign-in and anonymous-access policy is not configured here: it is set at
+//! runtime and kept in the database ([`crate::auth::AuthSettings`]).
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -21,7 +24,6 @@ use std::time::Duration;
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
-use forge_core::auth::client_ip::AnonPolicy;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
@@ -34,9 +36,9 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// S3 / versitygw object store.
     pub s3: S3Config,
-    /// Authentication / anonymous-access policy. Every key has a default, so
-    /// the section may be left out (e.g. an install configured through
-    /// `FORGE_*` variables without any `FORGE_AUTH__*`).
+    /// Authentication bootstrap and per-instance sizing. Every key has a
+    /// default, so the section may be left out (e.g. an install configured
+    /// through `FORGE_*` variables without any `FORGE_AUTH__*`).
     #[serde(default)]
     pub auth: AuthConfig,
     /// Optional Redis L2 cache.
@@ -132,8 +134,8 @@ pub struct ServerConfig {
     pub allow_insecure_defaults: bool,
     /// Extra `Host` names (an optional `:port` is ignored) under which the
     /// server is legitimately reached, besides the host of
-    /// [`Self::public_base_url`]. Only consulted for the
-    /// `auth.anonymous_mode = "allowlist"` grant: an unauthenticated request
+    /// [`Self::public_base_url`]. Only consulted for the anonymous mode
+    /// `allowlist` ([`crate::auth::AuthSettings`]): an unauthenticated request
     /// whose `Host` matches neither is not served anonymously by IP (a
     /// DNS-rebinding page in an internal user's browser presents its own host
     /// name). Add the names a reverse proxy rewrites `Host` to, or that
@@ -531,22 +533,16 @@ impl S3WebIdentityConfig {
 }
 
 /// `auth.*`
+///
+/// The access and sign-in policy that used to live here (the anonymous mode
+/// and its allowlist, the login mode, password Basic, the session lifetimes
+/// and the lockout) is set in the web UI and kept in the database
+/// ([`crate::auth::AuthSettings`]); its keys are refused ([`REMOVED_AUTH_KEYS`]).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
-    /// Global anonymous mode: `off` | `allowlist` | `all`.
-    #[serde(default = "default_anonymous_mode")]
-    pub anonymous_mode: String,
-    /// Allowlist tokens for `anonymous_mode = allowlist`
-    /// (`loopback` / `private` / `local` / explicit CIDRs / hosts).
-    #[serde(default)]
-    pub anonymous_ip_allowlist: Vec<String>,
     /// CIDRs of proxies whose `X-Forwarded-For` we trust.
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
-    /// Allow HTTP Basic password auth (token-in-basic always allowed). Defaults
-    /// off; intended for the admin API.
-    #[serde(default)]
-    pub allow_password_basic: bool,
     /// First-run bootstrap admin credentials.
     #[serde(default)]
     pub bootstrap_admin: Option<BootstrapAdmin>,
@@ -568,37 +564,13 @@ pub struct AuthConfig {
     /// the authority and the block is ignored.
     #[serde(default)]
     pub upstream_basic: Option<UpstreamBasicAuthConfig>,
-    /// Login-screen behavior: `identifier_first` (default — ask for the
-    /// username, then route to a password prompt or an OIDC redirect) or
-    /// `combined` (always show username+password plus a button per enabled
-    /// OIDC realm).
-    #[serde(default = "default_login_mode")]
-    pub login_mode: String,
-    /// Idle timeout (seconds) for browser sessions: a session expires this long
-    /// after its last use. Applies to ALL sessions (local-password logins and
-    /// OIDC). When unset, falls back to the deprecated
-    /// `oidc.session_idle_ttl_seconds` if set, else 8h.
-    #[serde(default)]
-    pub session_idle_ttl_seconds: Option<u64>,
-    /// Absolute lifetime (seconds) for browser sessions, regardless of
-    /// activity. Fallback mirrors [`Self::session_idle_ttl_seconds`]; default 7d.
-    #[serde(default)]
-    pub session_absolute_ttl_seconds: Option<u64>,
     /// How long (seconds) an instance trusts its in-process snapshot of the
-    /// `auth_realm` table before re-reading it. Admin realm edits invalidate
-    /// the local snapshot immediately; OTHER instances converge within this
-    /// window. Keep small — the rebuild is two cheap queries.
+    /// `auth_realm` table and of the auth settings before re-reading them.
+    /// Admin edits replace the local copy immediately; OTHER instances
+    /// converge within this window. Keep small — the rebuild is a few cheap
+    /// queries.
     #[serde(default = "default_realm_cache_ttl")]
     pub realm_cache_ttl_seconds: u64,
-    /// Failed password attempts allowed per `(client IP, username)` within
-    /// [`Self::login_failure_window_seconds`] before further attempts are
-    /// refused until the window lapses (browser login and Basic password auth;
-    /// per instance, in memory). `0` disables the lockout.
-    #[serde(default = "default_login_max_failures")]
-    pub login_max_failures: u32,
-    /// Length (seconds) of the password-failure window / lockout.
-    #[serde(default = "default_login_failure_window")]
-    pub login_failure_window_seconds: u64,
     /// OIDC login starts (`GET /auth/oidc/login`) allowed per client network
     /// (IPv6: per /64) and minute, per instance. Each start stores a flow
     /// row. `0` disables the limit.
@@ -619,6 +591,59 @@ pub struct AuthConfig {
     /// (default) means the number of available CPUs.
     #[serde(default)]
     pub password_verify_concurrency: usize,
+    /// The keys [`REMOVED_AUTH_KEYS`] names, kept only to refuse them:
+    /// `AuthConfig` accepts unknown keys, so a leftover setting would
+    /// otherwise be ignored without a word.
+    #[serde(default, rename = "anonymous_mode")]
+    removed_anonymous_mode: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "anonymous_ip_allowlist")]
+    removed_anonymous_ip_allowlist: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "login_mode")]
+    removed_login_mode: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "allow_password_basic")]
+    removed_allow_password_basic: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "session_idle_ttl_seconds")]
+    removed_session_idle_ttl_seconds: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "session_absolute_ttl_seconds")]
+    removed_session_absolute_ttl_seconds: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "login_max_failures")]
+    removed_login_max_failures: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "login_failure_window_seconds")]
+    removed_login_failure_window_seconds: Option<serde::de::IgnoredAny>,
+}
+
+/// The `[auth]` keys whose settings moved to the database (#294): the web UI's
+/// **Admin → Settings** and `/admin/settings/auth` set them for every
+/// instance. A configuration that still sets one is refused at startup.
+pub const REMOVED_AUTH_KEYS: [&str; 8] = [
+    "anonymous_mode",
+    "anonymous_ip_allowlist",
+    "login_mode",
+    "allow_password_basic",
+    "session_idle_ttl_seconds",
+    "session_absolute_ttl_seconds",
+    "login_max_failures",
+    "login_failure_window_seconds",
+];
+
+impl AuthConfig {
+    /// The keys of [`REMOVED_AUTH_KEYS`] this configuration sets.
+    fn removed_keys(&self) -> Vec<&'static str> {
+        [
+            self.removed_anonymous_mode.is_some(),
+            self.removed_anonymous_ip_allowlist.is_some(),
+            self.removed_login_mode.is_some(),
+            self.removed_allow_password_basic.is_some(),
+            self.removed_session_idle_ttl_seconds.is_some(),
+            self.removed_session_absolute_ttl_seconds.is_some(),
+            self.removed_login_max_failures.is_some(),
+            self.removed_login_failure_window_seconds.is_some(),
+        ]
+        .into_iter()
+        .zip(REMOVED_AUTH_KEYS)
+        .filter_map(|(set, key)| set.then_some(key))
+        .collect()
+    }
 }
 
 impl Default for AuthConfig {
@@ -627,10 +652,6 @@ impl Default for AuthConfig {
         serde_json::from_value(serde_json::json!({})).expect("every auth key has a default")
     }
 }
-
-/// Longest accepted session lifetime (10 years): longer ones overflow the
-/// duration arithmetic and are a configuration mistake anyway.
-const MAX_SESSION_TTL_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 
 /// Longest accepted worker and key-cache duration (100 years). Larger values
 /// panic in the duration arithmetic (chrono above about 9.2e15 seconds, moka
@@ -642,20 +663,8 @@ fn default_credential_forward_max_concurrent() -> usize {
     forge_core::auth::DEFAULT_MAX_CONCURRENT_FORWARDS
 }
 
-fn default_login_max_failures() -> u32 {
-    10
-}
-
-fn default_login_failure_window() -> u64 {
-    300
-}
-
 fn default_oidc_login_starts_per_minute() -> u32 {
     30
-}
-
-fn default_login_mode() -> String {
-    "identifier_first".into()
 }
 
 fn default_realm_cache_ttl() -> u64 {
@@ -727,7 +736,7 @@ pub struct UpstreamBasicAuthConfig {
     /// fetches the groups re-applies it (grants and demotes).
     #[serde(default)]
     pub admin_group: String,
-    /// Ignored since 1.2: credential forwarding creates no accounts (an
+    /// Ignored since 2.0: credential forwarding creates no accounts (an
     /// administrator creates each one). Still accepted so an existing block
     /// keeps loading.
     #[serde(default)]
@@ -854,7 +863,7 @@ fn default_negative_ttl() -> u64 {
 pub struct BootstrapAdmin {
     /// Admin username to create on first run if absent: a UPN, like every
     /// account's. Default `admin@example.com`, which the `admin` of an install
-    /// from before 1.2 is renamed to.
+    /// from before 2.0 is renamed to.
     #[serde(default = "default_bootstrap_username")]
     pub username: String,
     /// Plaintext password (hashed with argon2id on creation). Required for the
@@ -1696,19 +1705,14 @@ pub struct OidcConfig {
     #[serde(default)]
     pub endpoint_hosts: Vec<String>,
 
-    // ---- session lifecycle ----
-    /// **Deprecated** in favour of `auth.session_idle_ttl_seconds`, which it
-    /// stands in for while that is unset ([`Config::session_ttls`]; startup
-    /// warns, [`Config::deprecations`]). Idle timeout (seconds): a session
-    /// expires this long after its last use. Default 8h.
-    #[serde(default)]
-    pub session_idle_ttl_seconds: Option<u64>,
-    /// **Deprecated** in favour of `auth.session_absolute_ttl_seconds`, like
-    /// [`Self::session_idle_ttl_seconds`]. Absolute lifetime (seconds): a
-    /// session expires this long after creation regardless of activity.
-    /// Default 7d.
-    #[serde(default)]
-    pub session_absolute_ttl_seconds: Option<u64>,
+    /// The session lifetimes this block once set, kept only to refuse them
+    /// with a message naming their new place (they are auth settings now,
+    /// [`crate::auth::AuthSettings`]); as unknown keys they would be refused
+    /// without one.
+    #[serde(default, rename = "session_idle_ttl_seconds")]
+    pub(crate) removed_session_idle_ttl_seconds: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "session_absolute_ttl_seconds")]
+    pub(crate) removed_session_absolute_ttl_seconds: Option<serde::de::IgnoredAny>,
 }
 
 /// How an OIDC client authenticates at the IdP's token endpoint (an `oidc`
@@ -1754,30 +1758,11 @@ impl std::fmt::Debug for OidcConfig {
             .field("admin_groups", &self.admin_groups)
             .field("admin_claim", &self.admin_claim)
             .field("endpoint_hosts", &self.endpoint_hosts)
-            .field("session_idle_ttl_seconds", &self.session_idle_ttl_seconds)
-            .field(
-                "session_absolute_ttl_seconds",
-                &self.session_absolute_ttl_seconds,
-            )
             .finish()
     }
 }
 
 impl OidcConfig {
-    /// Idle timeout as a [`Duration`].
-    pub fn session_idle_ttl(&self) -> Duration {
-        Duration::from_secs(
-            self.session_idle_ttl_seconds
-                .unwrap_or_else(default_session_idle_ttl),
-        )
-    }
-    /// Absolute lifetime as a [`Duration`].
-    pub fn session_absolute_ttl(&self) -> Duration {
-        Duration::from_secs(
-            self.session_absolute_ttl_seconds
-                .unwrap_or_else(default_session_absolute_ttl),
-        )
-    }
     /// Clock-skew leeway as a [`Duration`].
     pub fn clock_skew(&self) -> Duration {
         Duration::from_secs(self.clock_skew_seconds)
@@ -1810,12 +1795,6 @@ fn default_display_name_claim() -> String {
 }
 fn default_admin_claim() -> String {
     "roles".into()
-}
-fn default_session_idle_ttl() -> u64 {
-    8 * 60 * 60 // 8h
-}
-fn default_session_absolute_ttl() -> u64 {
-    7 * 24 * 60 * 60 // 7d
 }
 
 /// `crypto.*` — secret encryption at rest.
@@ -1977,9 +1956,6 @@ fn default_true() -> bool {
 }
 fn default_multipart_threshold() -> u64 {
     8 * 1024 * 1024
-}
-fn default_anonymous_mode() -> String {
-    "off".into()
 }
 fn default_l1_capacity() -> u64 {
     10_000
@@ -2261,20 +2237,9 @@ impl Config {
             &self.server.allowed_hosts,
         )
         .map_err(|e| ConfigError::Invalid(format!("server.allowed_hosts: {e}")))?;
-        let (idle, absolute) = self.session_ttls();
-        for (name, ttl) in [
-            ("session_idle_ttl_seconds", idle),
-            ("session_absolute_ttl_seconds", absolute),
-        ] {
-            if !(1..=MAX_SESSION_TTL_SECONDS).contains(&ttl) {
-                return Err(ConfigError::Invalid(format!(
-                    "auth.{name} must be between 1 and {MAX_SESSION_TTL_SECONDS} (10 years), got {ttl}"
-                )));
-            }
-        }
-        // Eagerly validate the anon policy + trusted CIDRs so a bad value fails
-        // at startup rather than mid-request.
-        self.anon_policy()?;
+        self.validate_removed_auth_keys()?;
+        // Eagerly validate the trusted CIDRs so a bad value fails at startup
+        // rather than mid-request.
         self.trusted_proxy_cidrs()?;
         self.validate_oidc()?;
         self.validate_auth_providers()?;
@@ -2289,7 +2254,7 @@ impl Config {
                         ba.username.trim()
                     ),
                     forge_core::auth::InvalidUsername::NotUpn => format!(
-                        "auth.bootstrap_admin.username: {:?} is not a UPN: since 1.2 every \
+                        "auth.bootstrap_admin.username: {:?} is not a UPN: since 2.0 every \
                          account is named by one, such as admin@example.com (an account named \
                          {:?} before was renamed {:?})",
                         ba.username.trim(),
@@ -2299,14 +2264,6 @@ impl Config {
                     e => format!("auth.bootstrap_admin.username: {e}"),
                 })
             })?;
-        }
-        match self.auth.login_mode.as_str() {
-            "identifier_first" | "combined" => {}
-            other => {
-                return Err(ConfigError::Invalid(format!(
-                    "unknown auth.login_mode {other:?} (expected identifier_first|combined)"
-                )))
-            }
         }
         self.s3.validate()?;
         self.validate_crypto()?;
@@ -2430,38 +2387,46 @@ impl Config {
             .map(|budget| budget.saturating_sub(self.nuget.max_nuspec_bytes))
     }
 
-    /// Settings this configuration still uses but that are on their way
-    /// out, each with what replaces it: logged as warnings at startup.
-    pub fn deprecations(&self) -> Vec<String> {
-        let mut out = Vec::new();
+    /// Refuse the access and sign-in policy keys that moved to the database
+    /// ([`REMOVED_AUTH_KEYS`], and the session lifetimes `[oidc]` once set),
+    /// naming where they are set now.
+    fn validate_removed_auth_keys(&self) -> Result<(), ConfigError> {
+        let mut keys: Vec<String> = self
+            .auth
+            .removed_keys()
+            .into_iter()
+            .map(|key| format!("auth.{key}"))
+            .collect();
         if let Some(oidc) = &self.oidc {
-            for (key, legacy, current) in [
+            for (set, key) in [
                 (
+                    oidc.removed_session_idle_ttl_seconds.is_some(),
                     "session_idle_ttl_seconds",
-                    oidc.session_idle_ttl_seconds,
-                    self.auth.session_idle_ttl_seconds,
                 ),
                 (
+                    oidc.removed_session_absolute_ttl_seconds.is_some(),
                     "session_absolute_ttl_seconds",
-                    oidc.session_absolute_ttl_seconds,
-                    self.auth.session_absolute_ttl_seconds,
                 ),
             ] {
-                match (legacy, current) {
-                    (Some(_), None) => out.push(format!(
-                        "oidc.{key} is deprecated: it sets the lifetime of every browser \
-                         session while auth.{key} is unset. Move the value to auth.{key} \
-                         and remove oidc.{key}."
-                    )),
-                    (Some(_), Some(_)) => out.push(format!(
-                        "oidc.{key} is deprecated, and ignored since auth.{key} is set: \
-                         remove it."
-                    )),
-                    (None, _) => {}
+                if set {
+                    keys.push(format!("oidc.{key}"));
                 }
             }
         }
-        out
+        if keys.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid(format!(
+            "{} {} removed: anonymous access, the login mode, password Basic \
+             authentication, the session lifetimes and the login lockout are set in the \
+             web UI (Admin → Settings) or through /admin/settings/auth, for every \
+             instance at once. Remove {} from the configuration (FORGE_AUTH__* and \
+             FORGE_OIDC__* variables included); an install starts with anonymous access \
+             off and password Basic authentication off",
+            keys.join(", "),
+            if keys.len() == 1 { "was" } else { "were" },
+            if keys.len() == 1 { "it" } else { "them" },
+        )))
     }
 
     /// What one push or download stages at once at most: the package, and
@@ -2967,19 +2932,6 @@ impl Config {
         Ok(())
     }
 
-    /// Build the [`AnonPolicy`] from `auth.anonymous_mode` + allowlist tokens.
-    pub fn anon_policy(&self) -> Result<AnonPolicy, ConfigError> {
-        match self.auth.anonymous_mode.to_ascii_lowercase().as_str() {
-            "off" => Ok(AnonPolicy::Off),
-            "all" => Ok(AnonPolicy::All),
-            "allowlist" => AnonPolicy::allowlist_from_tokens(&self.auth.anonymous_ip_allowlist)
-                .map_err(|e| ConfigError::Invalid(e.to_string())),
-            other => Err(ConfigError::Invalid(format!(
-                "unknown auth.anonymous_mode {other:?} (expected off|allowlist|all)"
-            ))),
-        }
-    }
-
     /// Parse `auth.trusted_proxy_cidrs` into [`IpNet`]s. A bare IP is accepted
     /// as a single-host CIDR.
     pub fn trusted_proxy_cidrs(&self) -> Result<Vec<IpNet>, ConfigError> {
@@ -3009,24 +2961,6 @@ impl Config {
             }
         }
         Ok(out)
-    }
-
-    /// Resolve the browser-session TTLs `(idle, absolute)` in seconds.
-    ///
-    /// Precedence: explicit `auth.session_*` → the deprecated `oidc.session_*`
-    /// (see [`Self::deprecations`]) → defaults (8h idle / 7d absolute).
-    pub fn session_ttls(&self) -> (u64, u64) {
-        let idle = self
-            .auth
-            .session_idle_ttl_seconds
-            .or_else(|| self.oidc.as_ref()?.session_idle_ttl_seconds)
-            .unwrap_or_else(default_session_idle_ttl);
-        let absolute = self
-            .auth
-            .session_absolute_ttl_seconds
-            .or_else(|| self.oidc.as_ref()?.session_absolute_ttl_seconds)
-            .unwrap_or_else(default_session_absolute_ttl);
-        (idle, absolute)
     }
 
     /// `server.public_base_url` must be an absolute http(s) URL with a host
@@ -3167,8 +3101,6 @@ mod tests {
         // Defaults applied.
         assert_eq!(cfg.s3.region, "us-east-1");
         assert!(cfg.s3.force_path_style);
-        assert_eq!(cfg.auth.anonymous_mode, "off");
-        assert!(!cfg.auth.allow_password_basic);
         assert!(cfg.redis.url.is_none());
         assert_eq!(cfg.cache.l1_max_capacity, 10_000);
         assert_eq!(cfg.outbox.batch_size, 100);
@@ -3177,7 +3109,6 @@ mod tests {
         assert_eq!(cfg.retention.poll_interval_seconds, 30);
         assert_eq!(cfg.retention.default_run_interval_seconds, 3600);
         assert_eq!(cfg.retention.lease_seconds, 300);
-        assert!(matches!(cfg.anon_policy().unwrap(), AnonPolicy::Off));
         // Web UI: enabled by default, served from `web/dist`.
         assert!(cfg.web.enabled);
         assert_eq!(cfg.web.assets_dir, "web/dist");
@@ -3202,11 +3133,11 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.create_file("forge.toml", MINIMAL)?;
             jail.set_env("FORGE_SERVER__BIND", "127.0.0.1:9999");
-            jail.set_env("FORGE_AUTH__ALLOW_PASSWORD_BASIC", "true");
+            jail.set_env("FORGE_AUTH__REALM_CACHE_TTL_SECONDS", "3");
             jail.set_env("FORGE_REDIS__URL", "redis://localhost:6379");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
             assert_eq!(cfg.server.bind, "127.0.0.1:9999");
-            assert!(cfg.auth.allow_password_basic);
+            assert_eq!(cfg.auth.realm_cache_ttl_seconds, 3);
             assert_eq!(cfg.redis.url.as_deref(), Some("redis://localhost:6379"));
             Ok(())
         });
@@ -3229,9 +3160,10 @@ mod tests {
             jail.set_env("FORGE_S3__SECRET_KEY", "sk");
             jail.set_env("FORGE_S3__FORCE_PATH_STYLE", "false");
             jail.set_env("FORGE_S3__MULTIPART_THRESHOLD", "1048576");
-            jail.set_env("FORGE_AUTH__ANONYMOUS_MODE", "allowlist");
-            jail.set_env("FORGE_AUTH__ANONYMOUS_IP_ALLOWLIST", "[loopback,private]");
-            jail.set_env("FORGE_AUTH__ALLOW_PASSWORD_BASIC", "true");
+            jail.set_env(
+                "FORGE_AUTH__TRUSTED_PROXY_CIDRS",
+                "[10.0.0.0/8,192.168.1.1]",
+            );
             jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", "root@corp.example");
             jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "s3cret");
             jail.set_env("FORGE_REDIS__URL", "redis://localhost:6379");
@@ -3263,8 +3195,6 @@ mod tests {
             jail.set_env("FORGE_OIDC__LINK_EXISTING_BY_USERNAME", "false");
             jail.set_env("FORGE_OIDC__ADMIN_GROUPS", "[forge-admins]");
             jail.set_env("FORGE_OIDC__ADMIN_CLAIM", "groups");
-            jail.set_env("FORGE_OIDC__SESSION_IDLE_TTL_SECONDS", "3600");
-            jail.set_env("FORGE_OIDC__SESSION_ABSOLUTE_TTL_SECONDS", "86400");
 
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
 
@@ -3276,12 +3206,10 @@ mod tests {
             assert_eq!(cfg.s3.secret_key.as_deref(), Some("sk"));
             assert!(!cfg.s3.force_path_style);
             assert_eq!(cfg.s3.multipart_threshold, 1_048_576);
-            assert_eq!(cfg.auth.anonymous_mode, "allowlist");
             assert_eq!(
-                cfg.auth.anonymous_ip_allowlist,
-                vec!["loopback".to_string(), "private".to_string()]
+                cfg.auth.trusted_proxy_cidrs,
+                vec!["10.0.0.0/8".to_string(), "192.168.1.1".to_string()]
             );
-            assert!(cfg.auth.allow_password_basic);
             let ba = cfg
                 .auth
                 .bootstrap_admin
@@ -3315,8 +3243,6 @@ mod tests {
             assert!(!oidc.link_existing_by_username);
             assert_eq!(oidc.admin_groups, vec!["forge-admins".to_string()]);
             assert_eq!(oidc.admin_claim, "groups");
-            assert_eq!(oidc.session_idle_ttl_seconds, Some(3600));
-            assert_eq!(oidc.session_absolute_ttl_seconds, Some(86400));
             Ok(())
         });
     }
@@ -3347,35 +3273,54 @@ mod tests {
         assert!(err.to_string().contains("server.bind"), "{err}");
     }
 
+    /// The access and sign-in policy is set in the web UI: its old keys are
+    /// refused, naming where they went, whatever their value.
     #[test]
-    fn anonymous_mode_allowlist_parses_tokens() {
-        let toml = r#"
-            [server]
-            bind = "0.0.0.0:8080"
-            public_base_url = "https://x"
-            [database]
-            url = "postgres://x"
-            [s3]
-            endpoint = "http://localhost:7070"
-            bucket = "forge"
-            access_key = "a"
-            secret_key = "b"
-            [auth]
-            anonymous_mode = "allowlist"
-            anonymous_ip_allowlist = ["loopback", "10.0.0.0/8"]
-        "#;
-        let cfg = Config::from_figment(fig_from_toml(toml)).expect("valid");
-        let policy = cfg.anon_policy().unwrap();
-        assert!(policy.allows("127.0.0.1".parse().unwrap()));
-        assert!(policy.allows("10.1.2.3".parse().unwrap()));
-        assert!(!policy.allows("8.8.8.8".parse().unwrap()));
+    fn removed_auth_policy_keys_are_refused() {
+        for key in REMOVED_AUTH_KEYS {
+            let toml = MINIMAL.replace("[auth]", &format!("[auth]\n{key} = 1"));
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("auth.{key} was removed"))
+                    && msg.contains("Admin → Settings")
+                    && msg.contains("/admin/settings/auth"),
+                "{msg}"
+            );
+        }
+        let both = MINIMAL.replace(
+            "[auth]",
+            "[auth]\nanonymous_mode = \"all\"\nallow_password_basic = true",
+        );
+        let err = Config::from_figment(fig_from_toml(&both)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("auth.anonymous_mode, auth.allow_password_basic were removed"),
+            "{err}"
+        );
+        for key in ["session_idle_ttl_seconds", "session_absolute_ttl_seconds"] {
+            let toml = minimal_with_oidc(&format!("{key} = 600\n"));
+            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("oidc.{key} was removed")),
+                "{err}"
+            );
+        }
     }
 
     #[test]
-    fn unknown_anonymous_mode_rejected() {
-        let toml = MINIMAL.replace("[auth]", "[auth]\nanonymous_mode = \"sometimes\"");
-        let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
-        assert!(err.to_string().contains("anonymous_mode"), "{err}");
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn removed_auth_policy_variables_are_refused() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_AUTH__ANONYMOUS_MODE", "off");
+            let err = Config::load(Some(std::path::Path::new("forge.toml"))).unwrap_err();
+            assert!(
+                err.to_string().contains("auth.anonymous_mode was removed"),
+                "{err}"
+            );
+            Ok(())
+        });
     }
 
     #[test]
@@ -3761,35 +3706,6 @@ mod tests {
         assert!(cfg.oidc.is_none());
     }
 
-    /// `oidc.session_*` are deprecated in favour of `auth.session_*`: while
-    /// those are unset they still decide the session lifetimes, and either way
-    /// startup warns. An `[oidc]` block without them warns about nothing.
-    #[test]
-    fn oidc_session_ttls_are_deprecated() {
-        let cfg = Config::from_figment(fig_from_toml(&minimal_with_oidc(""))).expect("valid");
-        assert!(cfg.deprecations().is_empty());
-        assert_eq!(cfg.session_ttls(), (8 * 60 * 60, 7 * 24 * 60 * 60));
-
-        let legacy = minimal_with_oidc("session_idle_ttl_seconds = 600\n");
-        let cfg = Config::from_figment(fig_from_toml(&legacy)).expect("valid");
-        assert_eq!(cfg.session_ttls(), (600, 7 * 24 * 60 * 60));
-        let deprecations = cfg.deprecations();
-        assert_eq!(deprecations.len(), 1, "{deprecations:?}");
-        assert!(
-            deprecations[0].contains("oidc.session_idle_ttl_seconds is deprecated")
-                && deprecations[0].contains("auth.session_idle_ttl_seconds"),
-            "{deprecations:?}"
-        );
-
-        let both = minimal_with_oidc("session_idle_ttl_seconds = 600\n")
-            .replace("[auth]", "[auth]\nsession_idle_ttl_seconds = 900");
-        let cfg = Config::from_figment(fig_from_toml(&both)).expect("valid");
-        assert_eq!(cfg.session_ttls(), (900, 7 * 24 * 60 * 60));
-        let deprecations = cfg.deprecations();
-        assert_eq!(deprecations.len(), 1, "{deprecations:?}");
-        assert!(deprecations[0].contains("ignored"), "{deprecations:?}");
-    }
-
     #[test]
     fn oidc_valid_block_parses_with_defaults() {
         let cfg = Config::from_figment(fig_from_toml(&minimal_with_oidc(""))).expect("valid");
@@ -3810,11 +3726,6 @@ mod tests {
         );
         assert!(oidc.admin_groups.is_empty());
         assert_eq!(oidc.admin_claim, "roles");
-        assert_eq!(oidc.session_idle_ttl(), Duration::from_secs(8 * 60 * 60));
-        assert_eq!(
-            oidc.session_absolute_ttl(),
-            Duration::from_secs(7 * 24 * 60 * 60)
-        );
         // effective_scopes keeps openid; idempotent when already present.
         assert_eq!(oidc.effective_scopes(), vec!["openid", "profile", "email"]);
     }
@@ -3903,23 +3814,10 @@ mod tests {
     }
 
     #[test]
-    fn session_ttls_must_be_positive_and_bounded() {
-        for (key, value) in [
-            ("session_idle_ttl_seconds", "0"),
-            ("session_absolute_ttl_seconds", "0"),
-            ("session_idle_ttl_seconds", "18446744073709551615"),
-        ] {
-            let toml = MINIMAL.replace("[auth]", &format!("[auth]\n{key} = {value}"));
-            let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
-            assert!(err.to_string().contains(key), "{key} = {value}: {err}");
-        }
-    }
-
-    #[test]
     fn auth_section_may_be_left_out_and_allowed_hosts_are_checked_early() {
         let toml = MINIMAL.replace("[auth]", "");
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("no [auth] table");
-        assert_eq!(cfg.auth.anonymous_mode, "off");
+        assert!(cfg.auth.bootstrap_admin.is_none());
         let toml = MINIMAL.replace(
             "public_base_url = \"https://forge.example.com/\"",
             "public_base_url = \"https://forge.example.com/\"\nallowed_hosts = [\"https://bad/\"]",
@@ -4246,7 +4144,6 @@ mod tests {
             cfg.default_upload_limit("docker"),
             DEFAULT_DOCKER_MAX_UPLOAD_BYTES
         );
-        assert!(cfg.deprecations().is_empty());
         // A repository may hold up to what a push can stage.
         assert_eq!(
             cfg.max_repository_upload_bytes(),
@@ -4287,7 +4184,7 @@ mod tests {
         assert_eq!(ub.reject_status, vec![401, 403]);
         assert_eq!(ub.connect_timeout_ms, 2000);
         assert_eq!(ub.request_timeout_ms, 5000);
-        assert_eq!(ub.auto_provision, None, "ignored since 1.2");
+        assert_eq!(ub.auto_provision, None, "ignored since 2.0");
         assert_eq!(ub.cache.positive_ttl_secs, 300);
         assert_eq!(ub.cache.negative_ttl_secs, 30);
         // to_core mirrors the block.
@@ -4537,8 +4434,8 @@ mod tests {
         });
     }
 
-    /// The image's baked config carries no bootstrap admin and no
-    /// `allow_password_basic`, and loads with only the required env set.
+    /// The image's baked config carries no bootstrap admin and loads with
+    /// only the required env set.
     #[test]
     #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
     fn docker_image_config_starts_without_a_bootstrap_password() {
@@ -4551,7 +4448,6 @@ mod tests {
             let cfg = Config::load(Some(std::path::Path::new("forge.toml")))
                 .expect("the image starts without any bootstrap password");
             assert!(cfg.auth.bootstrap_admin.is_none());
-            assert!(!cfg.auth.allow_password_basic);
             assert!(!cfg.server.allow_insecure_defaults);
 
             jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "First-Run-Pw");

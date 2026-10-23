@@ -139,10 +139,8 @@ function startServer() {
     FORGE_SERVER__PUBLIC_BASE_URL: BASE_URL,
     // The e2e bootstrap admin uses the placeholder password (dev stack only).
     FORGE_SERVER__ALLOW_INSECURE_DEFAULTS: 'true',
-    // auth: anonymous reads on so the Browse screen works without a token, and
-    // password basic on so the bootstrap admin can mint a token.
-    FORGE_AUTH__ANONYMOUS_MODE: 'all',
-    FORGE_AUTH__ALLOW_PASSWORD_BASIC: 'true',
+    // auth: anonymous reads and password Basic are auth settings, stored in
+    // the database (`openAccess` sets them once the server is up).
     FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME: ADMIN_USER,
     FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: ADMIN_PASS,
     // web UI: serve the freshly built dist (single origin).
@@ -165,12 +163,18 @@ function startServer() {
   })
 }
 
+/** A signed-in admin session: the cookie pair and its CSRF token. */
+interface AdminSession {
+  cookie: string
+  csrf: string
+}
+
 /**
- * Mint an admin-scoped API token for the bootstrap admin. The admin API
- * refuses a password sent over HTTP Basic, so sign in through `/auth/login`
- * (session cookie + CSRF token) and mint the token from that session.
+ * Sign the bootstrap admin in. The admin API refuses a password sent over
+ * HTTP Basic, so this goes through `/auth/login` (session cookie + CSRF
+ * token).
  */
-async function mintAdminToken(): Promise<string> {
+async function signInAdmin(): Promise<AdminSession> {
   const login = await fetch(`${BASE_URL}/auth/login`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -180,6 +184,25 @@ async function mintAdminToken(): Promise<string> {
   const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]
   const { csrf_token: csrf }: { csrf_token: string } = await login.json()
   if (!cookie || !csrf) throw new Error('login returned no session')
+  return { cookie, csrf }
+}
+
+/**
+ * Open anonymous reads (so the Browse screen works without a token) and
+ * password Basic (so specs can use the bootstrap admin's password on the
+ * feeds): auth settings, changed through the admin API.
+ */
+async function openAccess({ cookie, csrf }: AdminSession): Promise<void> {
+  const res = await fetch(`${BASE_URL}/admin/settings/auth`, {
+    method: 'PUT',
+    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
+    body: JSON.stringify({ anonymous_mode: 'all', allow_password_basic: true }),
+  })
+  if (!res.ok) throw new Error(`PUT /admin/settings/auth -> ${res.status}`)
+}
+
+/** Mint an admin-scoped API token for the bootstrap admin from its session. */
+async function mintAdminToken({ cookie, csrf }: AdminSession): Promise<string> {
   const tokRes = await fetch(`${BASE_URL}/admin/me/tokens`, {
     method: 'POST',
     headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
@@ -242,8 +265,11 @@ export async function setup(): Promise<HarnessFacts> {
     return res.ok
   })
 
-  // 6. Mint an admin token for the token-sign-in spec.
-  const adminToken = await mintAdminToken()
+  // 6. Open anonymous reads and password Basic, and mint an admin token for
+  //    the token-sign-in spec.
+  const session = await signInAdmin()
+  await openAccess(session)
+  const adminToken = await mintAdminToken(session)
 
   // 7. Boot the mock upstream feed (loopback) for the proxy-delay spec. It
   //    serves the `Sample.Lib` fixture at the upstream's original version casing

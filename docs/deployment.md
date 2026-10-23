@@ -276,9 +276,9 @@ The image bakes no bootstrap admin; it comes only from the environment, and
 only while a password is set. Set `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` for
 the first start, and `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` to a
 [UPN](#usernames) of your organization if `admin@example.com` will not do: the
-account is created **once**. Startup refuses a name that is no UPN. Before 1.2
+account is created **once**. Startup refuses a name that is no UPN. Before 2.0
 the name defaulted to `admin`; the upgrade renames that account
-`admin@example.com` ([below](#accounts-from-before-12)), so a configuration
+`admin@example.com` ([below](#accounts-from-before-20)), so a configuration
 that sets no name keeps finding it, and one that names a non-UPN must name the
 account's new name instead. Sign in to the web UI,
 create personal admin accounts (or connect OIDC), then delete the bootstrap
@@ -352,9 +352,9 @@ The rule applies wherever an account is created:
   `alice@example.com` signs in as the upstream's `alice`. A login the
   upstream accepts but that names no account of the realm is refused.
 
-#### Accounts from before 1.2
+#### Accounts from before 2.0
 
-The first start of 1.2 renames every account whose name is no UPN, and logs
+The first start of 2.0 renames every account whose name is no UPN, and logs
 each rename as a warning:
 
 - `alice` becomes `alice@example.com`, the bootstrap admin `admin` becomes
@@ -381,19 +381,45 @@ the accounts of new users under **Admin → Users**. A realm config that still
 sets `auto_provision: true` is refused by the admin API; the legacy
 `[auth.upstream_basic]` block's `auto_provision` is ignored.
 
-The rename goes away in 1.3.0; upgrade to 1.3 from a 1.2 release.
+The rename goes away in 2.1.0; upgrade to 2.1 from a 2.0 release.
 
-### Password Basic auth
+### Access and sign-in settings
 
-The image defaults to `allow_password_basic = false`: the web UI signs in
-through its login form (not affected by this setting), and NuGet clients and
-scripts authenticate with API tokens (a token in the Basic password field is
-always accepted). An enabled credential-forwarding realm turns the Basic
-password path on by itself, because its users have no tokens until they first
-sign in — and that path runs the whole password chain, so **local** users'
-passwords are then accepted over Basic too, whatever this setting says. Set
-`FORGE_AUTH__ALLOW_PASSWORD_BASIC=true` only if a client must send a local
-user's password over Basic without such a realm.
+Who may read without signing in, and how people sign in, is not deployment
+configuration: an administrator sets it in the web UI (**Admin → Settings**,
+`/manage/settings`) or through `GET`/`PUT /admin/settings/auth`. The values
+are kept in the database, so every instance applies the same ones: the
+instance that takes a change at once, the others within
+`auth.realm_cache_ttl_seconds` (10 s), without a restart. A `PUT` changes the
+fields its body names; a value out of range is refused with `400` and what is
+wrong.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `anonymous_mode` | `off` | `off`, `allowlist` or `all`: who is served without credentials. A repository is read anonymously only when it also allows it (**Allow anonymous read**, or a grant of the `anonymous` role). Under `all`, signed-in users also read what anonymous callers may. |
+| `anonymous_ip_allowlist` | `[]` | Under `allowlist`: `loopback`, `private`, `local`, networks and addresses. It depends on `auth.trusted_proxy_cidrs` and `server.allowed_hosts`, which stay in the configuration file. |
+| `login_mode` | `identifier_first` | The login screen: the username first (then a password prompt or the identity provider whose login domains match), or `combined` (username and password, plus the OIDC button). |
+| `allow_password_basic` | `false` | Accept a user's password over HTTP Basic on the feeds (see below). |
+| `session_idle_ttl_seconds` | `28800` (8 h) | A browser session ends this long after its last use. |
+| `session_absolute_ttl_seconds` | `604800` (7 d) | A browser session ends this long after sign-in. New lifetimes apply to sessions signed in afterwards; an open session's idle window moves to the new idle timeout on its next use. |
+| `login_max_failures` | `10` | Failed passwords per client network and username before the lockout; `0` turns it off. Each instance counts its own. |
+| `login_failure_window_seconds` | `300` | The failure window, and how long a lockout lasts (at most a day). |
+
+A configuration that still sets one of these (`auth.anonymous_mode`,
+`FORGE_AUTH__ALLOW_PASSWORD_BASIC`, …, or the `oidc.session_*` lifetimes)
+is refused at startup, with a message naming the keys to remove.
+
+#### Password Basic auth
+
+`allow_password_basic` is off by default: the web UI signs in through its
+login form (not affected by this setting), and NuGet clients and scripts
+authenticate with API tokens (a token in the Basic password field is always
+accepted). An enabled credential-forwarding realm turns the Basic password
+path on by itself, because its users have no tokens until they first sign in
+— and that path runs the whole password chain, so **local** users' passwords
+are then accepted over Basic too, whatever this setting says. Turn it on only
+if a client must send a local user's password over Basic without such a
+realm.
 
 A password sent over Basic is a **feed** credential only: the admin API
 (`/admin/*`) and token minting refuse it with 403, even for an administrator,
@@ -619,7 +645,7 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   `Vary: Authorization, Cookie, X-NuGet-ApiKey` and registry responses
   `Vary: Authorization, Cookie, Accept`: keep a caching proxy from
   overriding either.
-- With `anonymous_mode = "allowlist"`, do not let a shared cache store `/v3`
+- With the anonymous mode `allowlist`, do not let a shared cache store `/v3`
   (or `/raw`) responses at all. Anonymous feed responses carry no `Cache-Control`, and
   whether Forge serves one depends on the client's address, which the cache
   does not key on: a cache that stores responses without caching headers
@@ -708,9 +734,11 @@ largest package download.
 Instances coordinate through PostgreSQL (row locks and leases), so any number
 can run behind the load balancer. Configure `FORGE_REDIS__URL` so that caches
 and invalidations converge immediately, not only after a TTL expires. The
-password-failure lockout is kept in memory on each instance; the networks a
-username signed in from, which that username's backoff exempts, are shared
-through the database.
+[access and sign-in settings](#access-and-sign-in-settings) are read from the
+database: the other instances follow a change within
+`auth.realm_cache_ttl_seconds`. The password-failure lockout is kept in memory
+on each instance; the networks a username signed in from, which that
+username's backoff exempts, are shared through the database.
 
 Redis is optional at runtime: an instance starts while Redis is unreachable
 (after waiting a few seconds for it) and works from its own memory until
