@@ -360,7 +360,67 @@ pub async fn evaluate_repository(
     Ok((decisions, evaluated))
 }
 
-/// Apply decisions (or, `dry_run`, only audit them), one transaction each.
+/// What an image retention run's decisions were made under, re-checked
+/// before each batch of them is applied (see [`apply_images`]).
+pub struct ImageRunFence<'a> {
+    /// The policy as stored in `repository.retention_policy` when the run
+    /// claimed the repository.
+    pub stored_policy: &'a serde_json::Value,
+    /// The same policy, parsed: re-evaluates an image's tags and manifests.
+    pub policy: &'a ImageRetentionPolicy,
+    /// When the decisions were evaluated. The re-evaluation judges ages as
+    /// of then, so a tag pulled or pushed since is no longer old or unpulled.
+    pub evaluated_at: DateTime<Utc>,
+}
+
+/// The most decisions of one image applied in one transaction: the image's
+/// manifests and tags are locked and re-evaluated once per batch.
+const IMAGE_BATCH: usize = 100;
+
+/// A decision of either kind.
+#[derive(Clone, Copy)]
+enum ImageDecision<'a> {
+    Tag(&'a TagDecision),
+    Manifest(&'a ManifestDecision),
+}
+
+impl<'a> ImageDecision<'a> {
+    fn image(self) -> &'a str {
+        match self {
+            ImageDecision::Tag(d) => &d.image,
+            ImageDecision::Manifest(d) => &d.image,
+        }
+    }
+}
+
+/// What the policy decides for an image now: its doomed tags (with the
+/// manifest each points at) and manifests.
+struct DecidedNow {
+    tags: HashSet<(String, i64)>,
+    manifests: HashSet<i64>,
+}
+
+impl DecidedNow {
+    fn contains(&self, d: ImageDecision<'_>) -> bool {
+        match d {
+            ImageDecision::Tag(d) => self.tags.contains(&(d.tag.clone(), d.manifest_id)),
+            ImageDecision::Manifest(d) => self.manifests.contains(&d.manifest_id),
+        }
+    }
+}
+
+/// Apply decisions (or, `dry_run`, only audit them).
+///
+/// Decisions are applied per image, in batches of up to [`IMAGE_BATCH`]
+/// (its tags first, then its manifests, indexes before their children),
+/// one transaction each. With a `fence`, each batch first checks that the
+/// run still owns its lease and that the stored policy is still the one it
+/// evaluated, or the run stops: the rest is left to the next run, under the
+/// policy as it is then. The batch then locks the image's manifests and
+/// tags and evaluates the policy on them again; a decision their current
+/// state no longer produces (a tag pulled or pushed since, newer tags
+/// deleted meanwhile, a referrer whose subject was tagged again) is
+/// skipped.
 pub async fn apply_images(
     pool: &PgPool,
     repository_id: i64,
@@ -368,20 +428,117 @@ pub async fn apply_images(
     decisions: &ImageDecisions,
     grace: Duration,
     dry_run: bool,
+    fence: Option<&ImageRunFence<'_>>,
 ) -> sqlx::Result<RunSummary> {
     let mut summary = RunSummary::default();
-    for d in &decisions.tags {
+    let batches = image_batches(decisions);
+    let mut remaining = decisions.tags.len() + decisions.manifests.len();
+    for (image, batch) in &batches {
         let mut tx = pool.begin().await?;
-        let applied = dry_run
-            || oci_dao::delete_tag_if(&mut tx, repository_id, &d.image, &d.tag, d.manifest_id)
-                .await?;
-        retention_dao::insert_audit(
-            &mut *tx,
-            &AuditRow {
+        let mut decided = None;
+        if let Some(fence) = fence.filter(|_| !dry_run) {
+            if !retention_dao::lock_run_fence(&mut tx, repository_id, run_id, fence.stored_policy)
+                .await?
+            {
+                tracing::info!(
+                    repository_id,
+                    %run_id,
+                    remaining,
+                    "image retention run stopped: it lost its lease or its policy changed; \
+                     the next run re-evaluates the rest"
+                );
+                summary.skipped += remaining as u64;
+                return Ok(summary);
+            }
+            decided = Some(decided_now(&mut tx, repository_id, image, fence).await?);
+        }
+        for &d in batch {
+            let still = decided.as_ref().is_none_or(|now| now.contains(d));
+            let applied =
+                apply_one(&mut tx, repository_id, run_id, d, grace, dry_run, still).await?;
+            if applied {
+                summary.deleted += 1;
+            } else {
+                summary.skipped += 1;
+            }
+        }
+        tx.commit().await?;
+        remaining -= batch.len();
+    }
+    Ok(summary)
+}
+
+/// `decisions` grouped by image, in the order the images first appear (an
+/// image's tags before its manifests, each in decision order), and split
+/// into batches of at most [`IMAGE_BATCH`].
+fn image_batches(decisions: &ImageDecisions) -> Vec<(&str, Vec<ImageDecision<'_>>)> {
+    let mut images: Vec<(&str, Vec<ImageDecision<'_>>)> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let all = decisions
+        .tags
+        .iter()
+        .map(ImageDecision::Tag)
+        .chain(decisions.manifests.iter().map(ImageDecision::Manifest));
+    for d in all {
+        let i = *index.entry(d.image()).or_insert_with(|| {
+            images.push((d.image(), Vec::new()));
+            images.len() - 1
+        });
+        images[i].1.push(d);
+    }
+    images
+        .into_iter()
+        .flat_map(|(image, decisions)| {
+            decisions
+                .chunks(IMAGE_BATCH)
+                .map(|batch| (image, batch.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// What evaluating `image`'s current manifests and tags (locked by this
+/// call) under the run's policy decides now.
+async fn decided_now(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repository_id: i64,
+    image: &str,
+    fence: &ImageRunFence<'_>,
+) -> sqlx::Result<DecidedNow> {
+    let (tags, manifests) = oci_dao::lock_image_for_retention(tx, repository_id, image).await?;
+    let now = evaluate_images(fence.evaluated_at, fence.policy, &tags, &manifests);
+    Ok(DecidedNow {
+        tags: now
+            .tags
+            .into_iter()
+            .map(|t| (t.tag, t.manifest_id))
+            .collect(),
+        manifests: now.manifests.into_iter().map(|m| m.manifest_id).collect(),
+    })
+}
+
+/// Apply one decision inside its batch's transaction (unless `dry_run`, or
+/// it no longer `still` holds) and audit it. Returns whether it was applied.
+async fn apply_one(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repository_id: i64,
+    run_id: uuid::Uuid,
+    d: ImageDecision<'_>,
+    grace: Duration,
+    dry_run: bool,
+    still: bool,
+) -> sqlx::Result<bool> {
+    let (applied, done, row) = match d {
+        ImageDecision::Tag(d) => {
+            let applied = still
+                && (dry_run
+                    || oci_dao::delete_tag_if(tx, repository_id, &d.image, &d.tag, d.manifest_id)
+                        .await?);
+            let row = AuditRow {
                 repository_id,
                 run_id,
                 rule_id: d.rule_id.clone(),
-                action: if applied { "delete_tag" } else { "skipped" }.into(),
+                action: String::new(),
                 target_kind: "oci_tag".into(),
                 package_name: d.image.clone(),
                 version: d.tag.clone(),
@@ -391,33 +548,19 @@ pub async fn apply_images(
                 blob_delete_enqueued: false,
                 dry_run,
                 reason: d.reason.clone(),
-            },
-        )
-        .await?;
-        tx.commit().await?;
-        if applied {
-            summary.deleted += 1;
-        } else {
-            summary.skipped += 1;
+            };
+            (applied, "delete_tag", row)
         }
-    }
-    for d in &decisions.manifests {
-        let mut tx = pool.begin().await?;
-        let applied = dry_run
-            || oci_dao::delete_untagged_manifest(&mut tx, repository_id, d.manifest_id, grace)
-                .await?;
-        retention_dao::insert_audit(
-            &mut *tx,
-            &AuditRow {
+        ImageDecision::Manifest(d) => {
+            let applied = still
+                && (dry_run
+                    || oci_dao::delete_untagged_manifest(tx, repository_id, d.manifest_id, grace)
+                        .await?);
+            let row = AuditRow {
                 repository_id,
                 run_id,
                 rule_id: d.rule_id.clone(),
-                action: if applied {
-                    "delete_manifest"
-                } else {
-                    "skipped"
-                }
-                .into(),
+                action: String::new(),
                 target_kind: "oci_manifest".into(),
                 package_name: d.image.clone(),
                 version: d.digest.clone(),
@@ -427,17 +570,20 @@ pub async fn apply_images(
                 blob_delete_enqueued: false,
                 dry_run,
                 reason: d.reason.clone(),
-            },
-        )
-        .await?;
-        tx.commit().await?;
-        if applied {
-            summary.deleted += 1;
-        } else {
-            summary.skipped += 1;
+            };
+            (applied, "delete_manifest", row)
         }
-    }
-    Ok(summary)
+    };
+    let action = if applied { done } else { "skipped" };
+    retention_dao::insert_audit(
+        &mut **tx,
+        &AuditRow {
+            action: action.into(),
+            ..row
+        },
+    )
+    .await?;
+    Ok(applied)
 }
 
 #[cfg(test)]
