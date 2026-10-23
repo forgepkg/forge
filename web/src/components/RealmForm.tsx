@@ -707,11 +707,11 @@ export function RealmForm({
                   />
                 )}
                 {secretWillDrop && values.client_secret === '' && (
-                  <TypingWarning>
+                  <Notice tone="warn" role="status">
                     The issuer or client ID differs from the stored one. The stored
                     client secret will be dropped when you save, so enter the
                     client secret for the new issuer or client ID.
-                  </TypingWarning>
+                  </Notice>
                 )}
                 <TextareaField
                   label="Scopes"
@@ -1429,23 +1429,6 @@ function SecretField({
       }
       error={error}
     />
-  )
-}
-
-/**
- * A warning that appears as the admin types (the stored client secret is
- * about to be dropped): the look of a warn `Notice`, announced politely as a
- * status instead of interrupting as the alert the ui `Notice` makes of every
- * warning.
- */
-function TypingWarning({ children }: { children: ReactNode }) {
-  return (
-    <div className="fg-notice fg-notice--warn" role="status">
-      <Icon name="Alert" size={16} />
-      <div className="fg-notice-text">
-        <div className="fg-notice-body">{children}</div>
-      </div>
-    </div>
   )
 }
 
