@@ -24,18 +24,23 @@ import { RepoKindBadge } from '~/components/RepoKindBadge'
 import { RepoFormatBadge } from '~/components/RepoFormatBadge'
 import { DockerConnect } from '~/components/DockerConnect'
 import { PackageConnect } from '~/components/PackageConnect'
+import { RawBrowser } from '~/components/RawBrowser'
+import { useMe } from '~/queries/useMe'
 import { ChevronIcon, FolderIcon } from './Browse'
 
 /**
  * Validated per-repo search params (shareable / deep-linkable URL state). All
  * keys are optional so links *to* the repo screen need not restate them; the
  * route component reads them with concrete defaults applied below.
- * (`prerelease` only applies to NuGet repositories.)
+ * (`prerelease` only applies to NuGet repositories; `path` and `after` — the
+ * directory and the page — to raw ones.)
  */
 interface RepoBrowseSearch {
   q?: string
   prerelease?: boolean
   skip?: number
+  path?: string
+  after?: string
 }
 
 const PAGE_SIZE = 20
@@ -49,6 +54,14 @@ export const Route = createFileRoute('/_app/repos/$repo')({
     }
     if (typeof search.skip === 'number' && search.skip > 0) {
       out.skip = Math.floor(search.skip)
+    }
+    // A directory: no leading `/`, ending in `/`.
+    if (typeof search.path === 'string' && search.path.length > 0) {
+      const path = search.path.replace(/^\/+/, '')
+      if (path !== '') out.path = path.endsWith('/') ? path : `${path}/`
+    }
+    if (typeof search.after === 'string' && search.after.length > 0) {
+      out.after = search.after
     }
     return out
   },
@@ -91,6 +104,8 @@ function RepoBrowse() {
   // answers with the server's verdict.
   const info = repos.data?.find((r) => r.name === repo)
   const isDocker = info?.format === 'docker'
+  const isRaw = info?.format === 'raw'
+  const me = useMe()
 
   // Local input mirrors the URL `q` but updates on every keystroke; a debounce
   // pushes it into the URL (and thus the query key) so we don't fetch per char.
@@ -151,7 +166,9 @@ function RepoBrowse() {
         <Text>
           {isDocker
             ? 'Search and browse the images in this repository.'
-            : 'Search and browse the packages in this repository.'}
+            : isRaw
+              ? 'Browse the files in this repository.'
+              : 'Search and browse the packages in this repository.'}
         </Text>
       </div>
 
@@ -163,6 +180,23 @@ function RepoBrowse() {
         />
       ) : repos.isLoading ? (
         <Text>Loading repository…</Text>
+      ) : isRaw && info ? (
+        <RawBrowser
+          repo={repo}
+          kind={info.kind}
+          url={info.url}
+          path={raw.path ?? ''}
+          after={raw.after}
+          isAdmin={me.data?.is_admin ?? false}
+          onNavigate={(path, after) =>
+            void navigate({
+              search: {
+                ...(path !== '' ? { path } : {}),
+                ...(after ? { after } : {}),
+              },
+            })
+          }
+        />
       ) : isDocker ? (
         <>
           <SearchBox

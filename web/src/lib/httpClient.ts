@@ -30,6 +30,11 @@ interface RequestOptions {
   method?: string
   /** JSON body; serialized and sent with `Content-Type: application/json`. */
   json?: unknown
+  /**
+   * A `multipart/form-data` body (file uploads); the browser sets the
+   * content type with its boundary.
+   */
+  form?: FormData
   /** Extra query parameters (undefined values are dropped). */
   query?: Record<string, string | number | boolean | undefined>
   signal?: AbortSignal
@@ -120,10 +125,12 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     Accept: 'application/json',
     ...authHeaders(),
   }
-  let body: string | undefined
+  let body: string | FormData | undefined
   if (opts.json !== undefined) {
     headers['Content-Type'] = 'application/json'
     body = JSON.stringify(opts.json)
+  } else if (opts.form !== undefined) {
+    body = opts.form
   }
 
   const method = opts.method ?? 'GET'
@@ -183,6 +190,12 @@ export const httpClient = {
     request<T>(path, { ...opts, method: 'PUT', json }),
   patch: <T>(path: string, json?: unknown, opts?: Omit<RequestOptions, 'method'>) =>
     request<T>(path, { ...opts, method: 'PATCH', json }),
+  /** `POST` a `multipart/form-data` body. */
+  postForm: <T>(
+    path: string,
+    form: FormData,
+    opts?: Omit<RequestOptions, 'method' | 'json' | 'form'>,
+  ) => request<T>(path, { ...opts, method: 'POST', form }),
   delete: <T>(path: string, opts?: Omit<RequestOptions, 'method' | 'json'>) =>
     request<T>(path, { ...opts, method: 'DELETE' }),
 }

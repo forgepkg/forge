@@ -2,6 +2,7 @@ import { useState } from 'react'
 
 import type {
   CreateRepo,
+  DeploymentPolicy,
   FormatView,
   RepoKind,
   RepoView,
@@ -42,6 +43,10 @@ import { Select } from '~/components/catalyst/select'
  *                 separate screen (`GroupMembers`)
  *  - **docker** (any kind) → the optional `host` the repository also answers
  *                 on at the root
+ *  - **raw** → instead of the NuGet options: the deployment policy (hosted),
+ *                 whether files display in the browser (any kind), and the
+ *                 maximum age of a proxy's cached files; a raw group has no
+ *                 dependency-confusion options
  *
  * On **create** `format` and `kind` are selectable (the kinds the format
  * supports: format plugins have no proxies); on **edit** both are fixed
@@ -151,6 +156,22 @@ export const DOCKER_FORMAT: FormatView = {
   mount: '/v2',
 }
 
+/**
+ * Raw (generic file) repositories, built in: files under arbitrary paths,
+ * served under `/raw`. They carry their own options (deployment policy,
+ * content disposition, a proxy's maximum age).
+ */
+export const RAW_FORMAT: FormatView = {
+  id: 'raw',
+  name: 'Raw files',
+  builtin: true,
+  kinds: ['hosted', 'proxy', 'group'],
+  mount: '/raw',
+}
+
+/** Default maximum age of a raw proxy's cached files: a day. */
+export const DEFAULT_RAW_MAX_AGE_SECONDS = 86400
+
 /** Where a repository of `format` named `name` is served. */
 export function feedPath(format: FormatView, name: string): string {
   return format.id === NUGET_FORMAT.id
@@ -189,6 +210,12 @@ export interface RepoFormValues {
   writable_member: string
   /** Hosted: the upload limit in MiB; blank = the format's default. */
   max_upload_mib: string
+  /** Hosted raw: what an upload to an existing path does. */
+  deployment_policy: DeploymentPolicy
+  /** Raw: files display in the browser instead of downloading. */
+  inline_content: boolean
+  /** Raw proxy: seconds before a cached file is re-validated; blank = a day. */
+  max_age_seconds: string
 }
 
 export interface RepositoryFormProps {
@@ -241,6 +268,13 @@ function seed(existing?: RepoView): RepoFormValues {
     writable_member: existing?.writable_member ?? '',
     max_upload_mib:
       existing?.max_upload_bytes != null ? bytesToMib(existing.max_upload_bytes) : '',
+    deployment_policy: existing?.deployment_policy ?? 'disable_redeploy',
+    inline_content: existing?.content_disposition === 'inline',
+    max_age_seconds:
+      existing?.max_age_seconds != null &&
+      existing.max_age_seconds !== DEFAULT_RAW_MAX_AGE_SECONDS
+        ? String(existing.max_age_seconds)
+        : '',
   }
 }
 
@@ -298,7 +332,17 @@ export function RepositoryForm({
     if (values.kind === 'proxy' && values.remote_url.trim() === '') {
       next.remote_url = 'A proxy repository requires a remote URL.'
     }
-    if (values.kind === 'proxy' && values.format !== DOCKER_FORMAT.id) {
+    if (values.kind === 'proxy' && values.format === RAW_FORMAT.id) {
+      const maxAge = values.max_age_seconds.trim()
+      if (maxAge !== '' && !(Number.isInteger(Number(maxAge)) && Number(maxAge) >= 0)) {
+        next.max_age_seconds = 'The maximum age must be a whole number of seconds (0: never).'
+      }
+    }
+    if (
+      values.kind === 'proxy' &&
+      values.format !== DOCKER_FORMAT.id &&
+      values.format !== RAW_FORMAT.id
+    ) {
       const delay = Number(values.package_delay_seconds)
       if (!Number.isFinite(delay) || delay < 0) {
         next.package_delay_seconds = 'Delay must be a non-negative number.'
@@ -332,7 +376,7 @@ export function RepositoryForm({
   // load, or a plugin is not installed any more): the built-in formats are
   // known; any other one must have been a plugin format.
   const format: FormatView = available.find((f) => f.id === values.format) ??
-    [NUGET_FORMAT, DOCKER_FORMAT].find((f) => f.id === values.format) ?? {
+    [NUGET_FORMAT, DOCKER_FORMAT, RAW_FORMAT].find((f) => f.id === values.format) ?? {
     id: values.format,
     name: values.format,
     builtin: false,
@@ -353,6 +397,9 @@ export function RepositoryForm({
   const isHosted = values.kind === 'hosted'
   const isGroup = values.kind === 'group'
   const isDocker = values.format === DOCKER_FORMAT.id
+  const isRaw = values.format === RAW_FORMAT.id
+  // What the repository holds, for the help texts.
+  const things = isDocker ? 'images' : isRaw ? 'files' : 'packages'
 
   // Edit only: what is stored server-side for the upstream credentials.
   const hasStoredCredentials =
@@ -423,7 +470,9 @@ export function RepositoryForm({
                 ? 'NuGet packages, served as a NuGet V3 feed.'
                 : format.id === DOCKER_FORMAT.id
                   ? 'Container images and other OCI artifacts, served by the registry under /v2.'
-                  : 'A format plugin.')}
+                  : format.id === RAW_FORMAT.id
+                    ? 'Files under arbitrary paths (binaries, installers, fixtures), served under /raw.'
+                    : 'A format plugin.')}
         </Description>
       </Field>
 
@@ -464,7 +513,7 @@ export function RepositoryForm({
           <Label>Online</Label>
           <Description>
             {isProxy
-              ? `Offline, the proxy serves only ${isDocker ? 'images' : 'packages'} it has already cached and never contacts the upstream.`
+              ? `Offline, the proxy serves only ${things} it has already cached and never contacts the upstream.`
               : `Offline, the repository answers every ${isDocker ? 'registry' : 'feed'} request with 503 (a maintenance window); in a group it counts as a failing member.`}
           </Description>
         </CheckboxField>
@@ -475,6 +524,20 @@ export function RepositoryForm({
           />
           <Label>Allow anonymous read</Label>
         </CheckboxField>
+        {isRaw && (
+          <CheckboxField>
+            <Checkbox
+              checked={values.inline_content}
+              onChange={(c) => set('inline_content', c)}
+            />
+            <Label>Display files in the browser</Label>
+            <Description>
+              Files are served for display (<span className="font-mono">Content-Disposition: inline</span>)
+              rather than as downloads. They stay sandboxed: an HTML or SVG file
+              cannot run script on this server&apos;s origin.
+            </Description>
+          </CheckboxField>
+        )}
       </CheckboxGroup>
 
       {isDocker && (
@@ -534,6 +597,26 @@ export function RepositoryForm({
                 </Description>
               </CheckboxField>
             </CheckboxGroup>
+          ) : isRaw ? (
+            <Field>
+              <Label>Deployment policy</Label>
+              <Select
+                value={values.deployment_policy}
+                onChange={(e) =>
+                  set('deployment_policy', e.target.value as DeploymentPolicy)
+                }
+              >
+                <option value="disable_redeploy">Disable redeploy</option>
+                <option value="allow_redeploy">Allow redeploy</option>
+                <option value="read_only">Read-only</option>
+              </Select>
+              <Description>
+                What an upload to a path that holds a file does: refused
+                (uploading the same content again is accepted), replaces it
+                (which needs the delete permission too), or every upload and
+                delete is refused.
+              </Description>
+            </Field>
           ) : (
             <CheckboxGroup>
               <CheckboxField>
@@ -563,7 +646,9 @@ export function RepositoryForm({
             <Description>
               {isDocker
                 ? 'The largest layer (blob) a push to this repository may carry.'
-                : 'The largest package a push to this repository may carry.'}{' '}
+                : isRaw
+                  ? 'The largest file an upload to this repository may carry.'
+                  : 'The largest package a push to this repository may carry.'}{' '}
               Empty: the server default
               {format.default_max_upload_bytes != null
                 ? ` (${bytesToMib(format.default_max_upload_bytes)} MiB)`
@@ -594,9 +679,11 @@ export function RepositoryForm({
                 placeholder={
                   isDocker
                     ? 'https://registry-1.docker.io'
-                    : values.format === NUGET_FORMAT.id
-                      ? 'https://api.nuget.org/v3/index.json'
-                      : 'https://charts.example.com/stable'
+                    : isRaw
+                      ? 'https://github.com/bblanchon/pdfium-binaries/releases/download/'
+                      : values.format === NUGET_FORMAT.id
+                        ? 'https://api.nuget.org/v3/index.json'
+                        : 'https://charts.example.com/stable'
                 }
                 invalid={!!errors.remote_url}
               />
@@ -608,12 +695,43 @@ export function RepositoryForm({
                   <span className="font-mono">https://ghcr.io</span>.
                 </Description>
               )}
+              {isRaw && (
+                <Description>
+                  The base URL files are under: a request for{' '}
+                  <span className="font-mono">&lt;path&gt;</span> fetches{' '}
+                  <span className="font-mono">&lt;remote URL&gt;/&lt;path&gt;</span>,
+                  following redirects. Credentials below are sent to this
+                  URL&apos;s host only.
+                </Description>
+              )}
               {errors.remote_url && (
                 <ErrorMessage role="alert">{errors.remote_url}</ErrorMessage>
               )}
             </Field>
 
-            {!isDocker && (
+            {isRaw && (
+              <Field>
+                <Label>Maximum age (seconds)</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={values.max_age_seconds}
+                  onChange={(e) => set('max_age_seconds', e.target.value)}
+                  placeholder={`Default: ${DEFAULT_RAW_MAX_AGE_SECONDS} (a day)`}
+                  invalid={!!errors.max_age_seconds}
+                />
+                <Description>
+                  How long a cached file is served before the upstream is asked
+                  whether it changed. 0: never (the upstream&apos;s files do not
+                  change, as release assets).
+                </Description>
+                {errors.max_age_seconds && (
+                  <ErrorMessage role="alert">{errors.max_age_seconds}</ErrorMessage>
+                )}
+              </Field>
+            )}
+
+            {!isDocker && !isRaw && (
               <Field>
                 <Label>Package delay (seconds)</Label>
                 <Input
@@ -638,16 +756,18 @@ export function RepositoryForm({
             )}
 
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <Label>Metadata TTL (seconds)</Label>
-                <Input
-                  type="number"
-                  min={0}
-                  value={values.metadata_ttl_seconds}
-                  onChange={(e) => set('metadata_ttl_seconds', e.target.value)}
-                  placeholder="server default"
-                />
-              </Field>
+              {!isRaw && (
+                <Field>
+                  <Label>Metadata TTL (seconds)</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    value={values.metadata_ttl_seconds}
+                    onChange={(e) => set('metadata_ttl_seconds', e.target.value)}
+                    placeholder="server default"
+                  />
+                </Field>
+              )}
               <Field>
                 <Label>Not-found TTL (seconds)</Label>
                 <Input
@@ -744,7 +864,13 @@ export function RepositoryForm({
         </Fieldset>
       )}
 
-      {isGroup && (
+      {isGroup && isRaw && (
+        <p className="rounded-lg bg-zinc-950/[2.5%] px-3 py-2 text-sm/6 text-zinc-600 ring-1 ring-zinc-950/5 dark:bg-white/[2.5%] dark:text-zinc-400 dark:ring-white/10">
+          A path is served by the first member, by priority, that has it.
+        </p>
+      )}
+
+      {isGroup && !isRaw && (
         <Fieldset className="border-t border-zinc-950/5 pt-4 dark:border-white/10">
           <Legend>Group options</Legend>
           <CheckboxGroup>
@@ -858,6 +984,7 @@ export function RepositoryForm({
  */
 export function toCreateBody(values: RepoFormValues): CreateRepo {
   const docker = values.format === DOCKER_FORMAT.id
+  const raw = values.format === RAW_FORMAT.id
   const body: CreateRepo = {
     name: values.name.trim(),
     kind: values.kind,
@@ -869,17 +996,20 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
   if (docker && values.host.trim() !== '') {
     body.host = values.host.trim()
   }
+  if (raw && values.inline_content) body.content_disposition = 'inline'
   if (values.kind === 'hosted') {
     if (docker) {
       body.immutable_tags = values.immutable_tags
       body.latest_mutable = values.immutable_tags && values.latest_mutable
+    } else if (raw) {
+      body.deployment_policy = values.deployment_policy
     } else {
       body.allow_redeploy = values.allow_redeploy
     }
     const maxUpload = mibToBytes(values.max_upload_mib)
     if (maxUpload != null) body.max_upload_bytes = maxUpload
   }
-  if (values.kind === 'group') {
+  if (values.kind === 'group' && !raw) {
     body.prefer_hosted = values.prefer_hosted
     const prefixes = parsePrefixes(values.reserved_prefixes)
     if (prefixes.length > 0) body.reserved_prefixes = prefixes
@@ -889,10 +1019,15 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
   }
   if (values.kind === 'proxy') {
     body.remote_url = values.remote_url.trim()
-    if (!docker) {
+    if (!docker && !raw) {
       body.package_delay_seconds = Number(values.package_delay_seconds) || 0
     }
-    body.metadata_ttl_seconds = parseTtl(values.metadata_ttl_seconds)
+    if (raw) {
+      const maxAge = parseTtl(values.max_age_seconds)
+      if (maxAge != null) body.max_age_seconds = maxAge
+    } else {
+      body.metadata_ttl_seconds = parseTtl(values.metadata_ttl_seconds)
+    }
     body.not_found_ttl_seconds = parseTtl(values.not_found_ttl_seconds)
     if (values.upstream_username.trim() !== '') {
       body.upstream_username = values.upstream_username.trim()
@@ -937,6 +1072,7 @@ export function toUpdateBody(
 ): UpdateRepo {
   const before = seed(existing)
   const docker = before.format === DOCKER_FORMAT.id
+  const raw = before.format === RAW_FORMAT.id
   const body: UpdateRepo = {}
   const name = values.name.trim()
   if (name !== existing.name) body.name = name
@@ -946,10 +1082,28 @@ export function toUpdateBody(
   if (values.online !== before.online) body.online = values.online
   if (
     !docker &&
+    !raw &&
     values.kind === 'hosted' &&
     values.allow_redeploy !== before.allow_redeploy
   ) {
     body.allow_redeploy = values.allow_redeploy
+  }
+  if (raw) {
+    if (values.inline_content !== before.inline_content) {
+      body.content_disposition = values.inline_content ? 'inline' : 'attachment'
+    }
+    if (
+      values.kind === 'hosted' &&
+      values.deployment_policy !== before.deployment_policy
+    ) {
+      body.deployment_policy = values.deployment_policy
+    }
+    if (
+      values.kind === 'proxy' &&
+      values.max_age_seconds.trim() !== before.max_age_seconds.trim()
+    ) {
+      body.max_age_seconds = parseTtl(values.max_age_seconds)
+    }
   }
   if (docker) {
     const host = values.host.trim()
@@ -976,10 +1130,14 @@ export function toUpdateBody(
       body.writable_member = member === '' ? null : member
     }
   }
-  if (values.kind === 'group' && values.prefer_hosted !== before.prefer_hosted) {
+  if (
+    !raw &&
+    values.kind === 'group' &&
+    values.prefer_hosted !== before.prefer_hosted
+  ) {
     body.prefer_hosted = values.prefer_hosted
   }
-  if (values.kind === 'group') {
+  if (values.kind === 'group' && !raw) {
     const prefixes = parsePrefixes(values.reserved_prefixes)
     if (prefixes.join(',') !== parsePrefixes(before.reserved_prefixes).join(',')) {
       body.reserved_prefixes = prefixes
@@ -989,10 +1147,13 @@ export function toUpdateBody(
     const remoteUrl = values.remote_url.trim()
     if (remoteUrl !== before.remote_url) body.remote_url = remoteUrl
     const delay = Number(values.package_delay_seconds) || 0
-    if (!docker && delay !== existing.package_delay_seconds) {
+    if (!docker && !raw && delay !== existing.package_delay_seconds) {
       body.package_delay_seconds = delay
     }
-    for (const key of ['metadata_ttl_seconds', 'not_found_ttl_seconds'] as const) {
+    const ttls = raw
+      ? (['not_found_ttl_seconds'] as const)
+      : (['metadata_ttl_seconds', 'not_found_ttl_seconds'] as const)
+    for (const key of ttls) {
       if (values[key].trim() !== before[key].trim()) {
         body[key] = parseTtl(values[key])
       }

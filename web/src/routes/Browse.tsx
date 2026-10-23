@@ -46,7 +46,7 @@ function Browse() {
         <div>
           <Heading>Browse</Heading>
           <Text className="mt-1">
-            Open a repository to browse and search its packages or images.
+            Open a repository to browse and search its packages, images or files.
           </Text>
         </div>
         {(formats.length > 1 || format) && (
