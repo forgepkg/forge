@@ -338,12 +338,17 @@ const PLACEHOLDER_BOOTSTRAP_PASSWORD: &str = "changeme";
 /// restart. A concurrent instance creating the account at the same moment is
 /// handled the same way.
 ///
+/// The name is a UPN (config validation): `admin@example.com` by default,
+/// which an install's `admin` from before 1.2 was renamed to, together with
+/// its marker ([`forge_db::user_dao::rename_legacy_usernames`]).
+///
 /// Logs a warning while the bootstrap password remains in use (the admin should
 /// rotate it), and a loud one when the existing account still has the
 /// placeholder password [`PLACEHOLDER_BOOTSTRAP_PASSWORD`]. When
 /// `auth.bootstrap_admin` is unset (the documented production state once the
 /// account exists) nothing is created, but the placeholder check still runs
-/// for the default `admin` account and every account a marker names.
+/// for the default `admin@example.com` account and every account a marker
+/// names.
 pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::Result<()> {
     let Some(ba) = &config.auth.bootstrap_admin else {
         warn_on_placeholder_accounts(pool).await;
@@ -471,7 +476,8 @@ pub async fn has_placeholder_password(user: &AppUser) -> bool {
 }
 
 /// Boot-time placeholder check when no bootstrap admin is configured: the
-/// default `admin` account and every account a "created once" marker names.
+/// default `admin@example.com` account and every account a "created once"
+/// marker names.
 /// Best effort — a lookup failure is logged, never fatal.
 async fn warn_on_placeholder_accounts(pool: &PgPool) {
     let pattern = format!("{BOOTSTRAP_ADMIN_CREATED_KEY}:%");
@@ -493,7 +499,7 @@ async fn warn_on_placeholder_accounts(pool: &PgPool) {
         .iter()
         .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
         .collect();
-    usernames.push("admin".to_string());
+    usernames.push(crate::config::DEFAULT_BOOTSTRAP_USERNAME.to_string());
     usernames.sort();
     usernames.dedup();
     for username in usernames {

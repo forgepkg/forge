@@ -307,7 +307,7 @@ pub struct ServerOpts {
 impl Default for ServerOpts {
     fn default() -> Self {
         ServerOpts {
-            bootstrap_admin: Some(("admin".into(), "adminpw".into())),
+            bootstrap_admin: Some(("admin@example.com".into(), "adminpw".into())),
             anonymous_mode: "off".into(),
             spawn_workers: false,
             web_assets_dir: None,
@@ -455,7 +455,7 @@ pub async fn mint_admin_scoped_token(pool: &PgPool, username: &str) -> Option<St
 /// the one Postgres container don't collide on the `admin` username), anonymous
 /// off, no workers.
 pub async fn start() -> TestServer {
-    let admin = format!("admin{}", unique());
+    let admin = format!("admin{}@example.com", unique());
     start_with(
         pool().await,
         ServerOpts {

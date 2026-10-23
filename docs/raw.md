@@ -35,7 +35,7 @@ several paths, or in several repositories, is stored once.
 ## Hosted repositories
 
 ```bash
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories \
   -d '{"name": "binaries", "kind": "hosted", "format": "raw"}'
 ```
@@ -77,7 +77,7 @@ staged on disk like every push (see `server.max_staging_bytes`).
 every file below it, is deleted through the admin API (or the web UI):
 
 ```bash
-curl -u admin:<admin-token> -X DELETE \
+curl -u admin@example.com:<admin-token> -X DELETE \
   'https://forge.example.com/admin/repositories/binaries/files?path=pdfium/7350/'
 # {"deleted": 2}
 ```
@@ -98,7 +98,7 @@ a file does:
 | `read_only` | Every upload and delete is refused with `405`. |
 
 ```bash
-curl -u admin:<admin-token> -X PUT -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -X PUT -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories/binaries \
   -d '{"deployment_policy": "allow_redeploy"}'
 ```
@@ -194,7 +194,7 @@ has exactly one spelling. Percent-encoded characters are decoded once
 ## Proxy repositories
 
 ```bash
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories -d '{
     "name": "pdfium-releases", "kind": "proxy", "format": "raw",
     "remote_url": "https://github.com/bblanchon/pdfium-binaries/releases/download/",
@@ -237,11 +237,11 @@ served from the cache.
 ## Group repositories
 
 ```bash
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories -d '{"name": "files", "kind": "group", "format": "raw"}'
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories/files/members -d '{"member": "binaries", "priority": 100}'
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories/files/members -d '{"member": "pdfium-releases", "priority": 10}'
 ```
 
@@ -265,7 +265,7 @@ A group takes no uploads; upload to a hosted member.
 can be limited to part of a repository:
 
 ```bash
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/content-selectors \
   -d '{"name": "pdfium-only", "includes": ["pdfium/**"]}'
 ```
@@ -296,7 +296,7 @@ must hold. On a proxy the same rules evict cached files, which the upstream
 serves again on their next download.
 
 ```bash
-curl -u admin:<admin-token> -X PUT -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -X PUT -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories/binaries/retention -d '{"policy": {
     "version": 1,
     "rules": [
@@ -317,7 +317,7 @@ copies; a group serves both under one URL:
 
 ```bash
 # The proxy of the release downloads (assets of a release never change).
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories -d '{
     "name": "pdfium-releases", "kind": "proxy", "format": "raw",
     "remote_url": "https://github.com/bblanchon/pdfium-binaries/releases/download/",

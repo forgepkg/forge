@@ -16,7 +16,8 @@
 #
 # The first-run bootstrap admin is configured ONLY through env and exists only
 # while a password is set:
-#   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD   (FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME, default "admin")
+#   FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME   a UPN (default admin@example.com)
+#   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD
 # No password configured = no bootstrap admin, so removing the variable after
 # the first start (docs/deployment.md) is safe and the image keeps starting.
 #

@@ -49,7 +49,7 @@ fn hash(password: &str) -> String {
 
 /// Insert a local (argon2 password) user with a unique username.
 async fn insert_local(pool: &PgPool, password: &str, active: bool) -> String {
-    let username = format!("alice-{}", common::unique());
+    let username = format!("alice-{}@example.com", common::unique());
     user_dao::insert_user(
         pool,
         NewUser::local(username.clone(), hash(password), active),
@@ -174,7 +174,7 @@ async fn local_provider_skips_user_without_local_password() {
     // An upstream-basic / oidc provisioned user has no local password_hash and
     // must never be acceptable by the local provider — it's not ours.
     let pool = common::pool().await;
-    let username = format!("upstream-{}", common::unique());
+    let username = format!("upstream-{}@example.com", common::unique());
     user_dao::insert_user(
         &pool,
         NewUser {
@@ -457,7 +457,7 @@ async fn foreign_names_cost_the_same_as_each_other() {
     // chain both pay the dummy verification (they need a slot, so here they
     // come back Unavailable). Inactive local accounts always pay it.
     let pool = common::pool().await;
-    let federated = format!("federated-{}", common::unique());
+    let federated = format!("federated-{}@example.com", common::unique());
     user_dao::insert_user(
         &pool,
         NewUser {
@@ -471,7 +471,7 @@ async fn foreign_names_cost_the_same_as_each_other() {
     .await
     .expect("insert federated user");
     let inactive = insert_local(&pool, "pw", false).await;
-    let ghost = format!("ghost-{}", common::unique());
+    let ghost = format!("ghost-{}@example.com", common::unique());
 
     let forwarding = LocalPasswordProvider::with_limiter(pool.clone(), saturated_limiter())
         .forwarding_follows(true);
@@ -510,7 +510,6 @@ async fn inactive_local_account_is_never_forwarded() {
         AuthOutcome::Authenticated(forge_core::auth::ProvenIdentity {
             source: AuthSource::UpstreamBasic,
             external_subject: Some(username.clone()),
-            auto_provision: true,
             ..forge_core::auth::ProvenIdentity::local(username.clone())
         }),
         Duration::ZERO,

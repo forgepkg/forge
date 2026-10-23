@@ -4,5 +4,9 @@ postgresql:
   enabled: true
 versitygw:
   enabled: true
+config:
+  auth:
+    bootstrap_admin:
+      username: admin@example.com
 secretEnv:
   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: check-only

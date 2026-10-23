@@ -14,7 +14,7 @@ bind = "0.0.0.0:8421"
 # Public base URL for absolute NuGet V3 service-index @id values. No trailing slash.
 public_base_url = "http://localhost:8421"
 # The placeholder credentials in this example (minioadmin S3 keys, bootstrap
-# admin/changeme) are refused at startup unless this is true. Keep it for a
+# admin@example.com/changeme) are refused at startup unless this is true. Keep it for a
 # local dev copy only; in production replace the placeholders and drop it.
 allow_insecure_defaults = true  # (default: false)
 # Upload limits are set per hosted repository in the web UI (Repositories →
@@ -125,9 +125,11 @@ credential_forward_max_concurrent = 32  # (default: 32)
 # Optional: bootstrap admin, created once on the first start with a password.
 # Omit the section, or leave the password empty/unset, for no bootstrap admin
 # (remove the password once real admins exist). "changeme" is refused unless
-# server.allow_insecure_defaults = true.
+# server.allow_insecure_defaults = true. The username is a UPN
+# (local-part@domain), as every account is named; default admin@example.com,
+# which the `admin` of an install from before 1.2 is renamed to.
 [auth.bootstrap_admin]
-username = "admin"              # (default: "admin")
+username = "admin@example.com"
 password = "changeme"
 
 [redis]

@@ -429,13 +429,14 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
         .encode(json!({"iss": issuer, "sub": "workload-1"}).to_string());
     let token = format!("{header}.{payload}.signature");
 
-    // If WIF declined this token, the forwarding realm would accept the exact
-    // same username/password pair. The request must instead terminate at WIF.
+    // If WIF declined this token, the forwarding realm would forward the
+    // same password for `ci@example.com` as `ci`, which the upstream accepts.
+    // The request must instead terminate at WIF.
     let upstream = MockBasicUpstream::start(vec![("ci", token.as_str(), vec![])]).await;
     let block =
         upstream.upstream_basic_block(&["local-password", "upstream-basic"], 300, 30, &[], "");
     let srv = StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_upstream_basic(block)
         .start()
         .await;
@@ -458,7 +459,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let malformed_patch = srv
         .client()
         .patch(format!("{}/admin/realms/{broken_id}", srv.base_url))
-        .basic_auth("root", srv.admin_scoped_token.as_deref())
+        .basic_auth("root@example.com", srv.admin_scoped_token.as_deref())
         .json(&json!({"name": "still-broken-wif"}))
         .send()
         .await
@@ -479,7 +480,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let invalidate = srv
         .client()
         .patch(format!("{}/admin/realms/{local_id}", srv.base_url))
-        .basic_auth("root", srv.admin_scoped_token.as_deref())
+        .basic_auth("root@example.com", srv.admin_scoped_token.as_deref())
         .json(&json!({"enabled": true}))
         .send()
         .await
@@ -489,7 +490,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let response = srv
         .client()
         .get(format!("{}/admin/me", srv.base_url))
-        .basic_auth("ci", Some(&token))
+        .basic_auth("ci@example.com", Some(&token))
         .send()
         .await
         .unwrap();

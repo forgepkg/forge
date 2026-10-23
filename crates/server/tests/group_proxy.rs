@@ -91,7 +91,10 @@ async fn downstream_proxy_does_not_cache_a_miss_while_a_group_member_is_failing(
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             anonymous_mode: "all".into(),
             ..Default::default()
         },

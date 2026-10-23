@@ -74,7 +74,7 @@ force_path_style = true
 [auth]
 anonymous_mode = "off"
 [auth.bootstrap_admin]
-username = "admin"
+username = "admin@example.com"
 password = "$admin_password"
 [outbox]
 grace_seconds = 0
@@ -92,7 +92,7 @@ curl -fsS "$base/readyz" >/dev/null || { cat "$work/server.log"; fail "server no
 
 step "create repositories and an API token"
 login=$(curl -fsS -c "$work/jar" -H 'content-type: application/json' \
-  -d "{\"username\":\"admin\",\"password\":\"$admin_password\"}" "$base/auth/login")
+  -d "{\"username\":\"admin@example.com\",\"password\":\"$admin_password\"}" "$base/auth/login")
 csrf=$(jq -r .csrf_token <<<"$login")
 admin() { # <method> <path> [json body]
   curl -fsS -b "$work/jar" -H "x-csrf-token: $csrf" -H 'content-type: application/json' \

@@ -72,7 +72,7 @@ describe('admin user roles', () => {
     const u = userEvent.setup()
     await renderApp('/manage/users')
 
-    await u.type(await screen.findByLabelText('Username'), 'carol')
+    await u.type(await screen.findByLabelText('Username'), 'carol@example.com')
     await u.type(screen.getByLabelText('Password'), 'hunter2')
     await u.click(await screen.findByRole('checkbox', { name: /^admin/ }))
     await u.click(screen.getByRole('checkbox', { name: /^ci-pushers/ }))
@@ -80,16 +80,18 @@ describe('admin user roles', () => {
 
     await waitFor(() => expect(api.sent('PUT', /\/roles$/)).toHaveLength(1))
     expect(api.sent('POST', /^\/admin\/users$/)[0].body).toEqual({
-      username: 'carol',
+      username: 'carol@example.com',
       password: 'hunter2',
       active: true,
       is_admin: true,
     })
-    const carol = api.state.users.find((x) => x.username === 'carol')!
+    const carol = api.state.users.find((x) => x.username === 'carol@example.com')!
     expect(api.sent('PUT', /\/roles$/)[0].path).toBe(`/admin/users/${carol.id}/roles`)
     expect(api.sent('PUT', /\/roles$/)[0].body).toEqual({ role_id: 7 })
 
-    const row = (await screen.findByRole('button', { name: 'carol' })).closest('tr')!
+    const row = (
+      await screen.findByRole('button', { name: 'carol@example.com' })
+    ).closest('tr')!
     await waitFor(() =>
       expect(within(row).getByText('ci-pushers')).toBeInTheDocument(),
     )
@@ -102,7 +104,7 @@ describe('admin user roles', () => {
     const u = userEvent.setup()
     await renderApp('/manage/users')
 
-    await u.type(await screen.findByLabelText('Username'), 'dave')
+    await u.type(await screen.findByLabelText('Username'), 'dave@example.com')
     await u.type(screen.getByLabelText('Password'), 'hunter2')
     await u.click(await screen.findByRole('checkbox', { name: /^ci-pushers/ }))
     // Deleted by someone else after the form loaded.
@@ -110,9 +112,11 @@ describe('admin user roles', () => {
     await u.click(screen.getByRole('button', { name: 'Create user' }))
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Created dave, but could not give it the role ci-pushers: role not found',
+      'Created dave@example.com, but could not give it the role ci-pushers: role not found',
     )
-    expect(await screen.findByRole('button', { name: 'dave' })).toBeInTheDocument()
+    expect(
+      await screen.findByRole('button', { name: 'dave@example.com' }),
+    ).toBeInTheDocument()
     expect(screen.getByLabelText('Username')).toHaveValue('')
   })
 

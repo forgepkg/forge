@@ -396,7 +396,10 @@ async fn forge(crypto_block: Option<String>) -> TestServer {
     common::start_with(
         common::fresh_pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             crypto_block,
             ..Default::default()
         },

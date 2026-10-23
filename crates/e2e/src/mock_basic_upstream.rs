@@ -203,7 +203,6 @@ url = "{url}"
 method = "GET"
 success_status = [200]
 reject_status = [401, 403]
-auto_provision = true
 required_groups = [{required}]
 {groups_path}admin_group = "{admin_group}"
 

@@ -131,7 +131,11 @@ fn group_repo_depth(
 async fn user(pool: &PgPool) -> Principal {
     let u = user_dao::insert_user(
         pool,
-        NewUser::local(format!("groupuser-{}", common::unique()), "x".into(), true),
+        NewUser::local(
+            format!("groupuser-{}@example.com", common::unique()),
+            "x".into(),
+            true,
+        ),
     )
     .await
     .expect("insert user");
@@ -662,7 +666,11 @@ async fn diamond_paths_preserve_each_paths_package_filter() {
     let suffix = common::unique();
     let account = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("diamond-user-{suffix}"), "x".into(), true),
+        NewUser::local(
+            format!("diamond-user-{suffix}@example.com"),
+            "x".into(),
+            true,
+        ),
     )
     .await
     .expect("insert user");
@@ -1559,7 +1567,11 @@ async fn prefer_hosted_shields_internal_ids_from_selector_scoped_callers() {
     let suffix = common::unique();
     let account = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("scoped-user-{suffix}"), "x".into(), true),
+        NewUser::local(
+            format!("scoped-user-{suffix}@example.com"),
+            "x".into(),
+            true,
+        ),
     )
     .await
     .expect("insert user");

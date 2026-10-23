@@ -105,24 +105,27 @@ pub struct CredForwardRealmConfig {
     #[serde(default)]
     pub groups_path: String,
     /// Optional upstream group that maps to forge admin. Every login that
-    /// fetches the groups re-applies it (grants and demotes), with or without
-    /// `auto_provision`.
+    /// fetches the groups re-applies it (grants and demotes).
     #[serde(default)]
     pub admin_group: String,
     /// `.`-separated path into the JSON success body naming the account the
     /// upstream authenticated (e.g. `login`). When set it must equal the
-    /// canonical username, or the credential is rejected — required for an
-    /// upstream that accepts a secret with any username (personal access
-    /// tokens). Empty ⇒ the upstream must itself bind username to secret.
+    /// forwarded name (the local part of the username), or the credential is
+    /// rejected — required for an upstream that accepts a secret with any
+    /// username (personal access tokens). Empty ⇒ the upstream must itself
+    /// bind username to secret.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub identity_path: String,
     /// Accept a plain-`http` `url` that is not loopback. Off: every login
     /// sends a password there, so it must be https.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_http: bool,
-    /// Auto-provision an `app_user` on first successful upstream login.
-    #[serde(default = "default_true")]
-    pub auto_provision: bool,
+    /// Gone in 1.2: a credential-forwarding realm creates no accounts (an
+    /// administrator creates each one, `POST /admin/users` with the realm).
+    /// Accepted only as `false`, and never stored (migration 0041 removed it
+    /// from stored rows).
+    #[serde(default, skip_serializing)]
+    pub auto_provision: Option<bool>,
     /// Keep an argon2id hash of every password the upstream accepts on the
     /// account (migration 0035), so an administrator can later switch the
     /// realm's accounts to local ones and retire the upstream. Off by default;
@@ -387,6 +390,13 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
                 return Err(
                     "captured_password_only needs capture_password_hash (the kept hashes \
                      are what the accounts then sign in with)"
+                        .into(),
+                );
+            }
+            if cfg.auto_provision == Some(true) {
+                return Err(
+                    "auto_provision is gone: a credential-forwarding realm creates no accounts; \
+                     create them under Admin → Users (POST /admin/users with \"realm\")"
                         .into(),
                 );
             }
@@ -877,16 +887,6 @@ impl RealmAuth {
         // in the clear to a non-loopback host unless the realm says so.
         ssrf::validate_credential_forward_url(&cfg.url, cfg.allow_http)
             .map_err(|e| anyhow::anyhow!("url: {e}"))?;
-        if cfg.auto_provision && !cfg.captured_password_only && cfg.identity_path.trim().is_empty()
-        {
-            tracing::warn!(
-                realm = %realm.name,
-                "credential-forwarding realm provisions accounts without identity_path: \
-                 an upstream that also accepts another spelling of a username \
-                 (DOMAIN\\user, user@domain) signs that spelling in as a new account, \
-                 which a deactivation of the usual name does not stop"
-            );
-        }
         let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms);
         let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
         // Never follows redirects: a 3xx is judged (as unavailable) by the
@@ -938,7 +938,6 @@ impl RealmAuth {
             identity_path: cfg.identity_path,
             admin_group: cfg.admin_group,
             provider_id,
-            auto_provision: cfg.auto_provision,
             realm_id: Some(realm.id),
             capture_password_hash: cfg.capture_password_hash,
         };
@@ -1171,7 +1170,7 @@ pub async fn seed_auth_realms(
             identity_path: ub.identity_path.clone(),
             allow_http: ub.allow_http,
             admin_group: ub.admin_group.clone(),
-            auto_provision: ub.auto_provision,
+            auto_provision: None,
             capture_password_hash: false,
             captured_password_only: false,
             positive_ttl_secs: ub.cache.positive_ttl_secs,

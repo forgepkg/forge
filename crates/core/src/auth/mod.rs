@@ -76,5 +76,6 @@ pub use workload_key::{
 // Canonical usernames live with the DAOs that enforce them.
 pub use forge_db::username::{
     canonical_account_username, canonical_password_username, canonical_username,
-    is_reserved_username, InvalidUsername, RESERVED_USERNAMES, WORKLOAD_USERNAME,
+    is_reserved_username, is_upn, upn_local_part, InvalidUsername, RESERVED_USERNAMES,
+    WORKLOAD_USERNAME,
 };

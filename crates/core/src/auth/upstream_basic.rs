@@ -18,16 +18,22 @@
 //!
 //! ## Identity binding
 //!
-//! Forge maps the login to the account named by the **canonical** username
-//! (trimmed, NFC, lowercased — the chain canonicalizes it before this provider
-//! runs) and forwards exactly that name, so the upstream verifies the very
-//! name Forge will act on. That is only sound when the upstream **binds the
-//! username to the secret**. Many do not: a GitHub, Azure DevOps or GitLab
-//! personal access token is accepted with *any* username. For such an
-//! upstream, set `identity_path`: the name the upstream reports in its JSON
-//! response (e.g. `login`) must equal the canonical username, or the
+//! Every account is named by a UPN. Forge maps the login to the account named
+//! by the **canonical** username (trimmed, NFC, lowercased — the chain
+//! canonicalizes it before this provider runs) and forwards its **local
+//! part**: `alice@example.com` signs in as the upstream's `alice`. A name that
+//! is not a UPN is rejected without forwarding. That is only sound when the
+//! upstream **binds the username to the secret**. Many do not: a GitHub, Azure
+//! DevOps or GitLab personal access token is accepted with *any* username. For
+//! such an upstream, set `identity_path`: the name the upstream reports in its
+//! JSON response (e.g. `login`) must equal the forwarded name, or the
 //! credential is rejected. A success without that field is treated as an
 //! outage (fail closed).
+//!
+//! Only the account's own UPN signs it in: the realm creates no accounts
+//! ([`super::chain::provision_and_map`]), so `alice@other.example`, which
+//! forwards the same `alice`, is denied unless an administrator created an
+//! account of that name for the realm.
 //!
 //! A username containing `:` is rejected without forwarding: HTTP Basic
 //! splits at the first colon, so the upstream would verify a different name
@@ -53,19 +59,18 @@
 //! loopback upstreams are permitted — the upstream URL is admin-only config,
 //! and an internal Nexus on RFC1918 is the common case.
 //!
-//! ## Auto-provision
+//! ## Accounts
 //!
 //! This provider only *vouches for* a [`ProvenIdentity`] (the username + coarse
-//! groups + an admin suggestion). Mapping that to an `app_user` — creating one on
-//! first success with `auth_source = 'upstream-basic'` and **no** local password
-//! — is the chain caller's job ([`super::chain::provision_and_map`]), so this
-//! file stays free of the DB-provision policy.
+//! groups + an admin suggestion). Mapping that to the realm's existing
+//! `app_user` is the chain caller's job ([`super::chain::provision_and_map`]);
+//! no account is created on a login.
 //!
 //! ## Keeping a password hash (opt-in)
 //!
 //! With `capture_password_hash` set, a login that asked the upstream and was
 //! accepted also carries an argon2id hash of the password on its
-//! [`ProvenIdentity`], which provisioning keeps on the account (migration
+//! [`ProvenIdentity`], which the account keeps (migration
 //! 0035) so an administrator can later switch the account to a local one and
 //! retire the upstream. A cache hit carries none: the hash is refreshed once
 //! per positive-TTL window, like the verdict. Hashing never queues for an
@@ -166,26 +171,23 @@ pub struct UpstreamBasicConfig {
     pub groups_path: String,
     /// `.`-separated path into the JSON success body naming the account the
     /// upstream authenticated (e.g. `login`). When set, that name
-    /// (canonicalized) must equal the canonical username presented, or the
-    /// credential is rejected. Empty ⇒ the upstream is trusted to bind the
-    /// username to the secret (see the [module docs](self)).
+    /// (canonicalized) must equal the forwarded name (the local part of the
+    /// canonical username), or the credential is rejected. Empty ⇒ the
+    /// upstream is trusted to bind the username to the secret (see the
+    /// [module docs](self)).
     pub identity_path: String,
     /// Optional upstream group that maps to forge admin. When set (with a
     /// `groups_path`), every login that freshly fetched the groups is
     /// authoritative: membership grants admin and its absence revokes it for
-    /// `upstream-basic` users (see chain provisioning). Empty ⇒ never suggests
-    /// admin and never touches an existing user's admin state.
+    /// `upstream-basic` users (see [`super::chain::provision_and_map`]).
+    /// Empty ⇒ never suggests admin and never touches a user's admin state.
     pub admin_group: String,
     /// Stable provider id keying the validated-credential cache and logged as
     /// the chain winner. The static-config wiring uses [`UPSTREAM_BASIC_ID`];
     /// realm-driven wiring uses a realm-scoped id (`"realm:<name>"`).
     pub provider_id: String,
-    /// Auto-provision an `app_user` on first successful upstream login.
-    /// Stamped onto every [`ProvenIdentity`] this provider vouches for (the
-    /// chain caller acts on it, per realm).
-    pub auto_provision: bool,
-    /// The `auth_realm.id` this provider was built from, recorded as
-    /// provenance on provisioned users. `None` for static-config wiring.
+    /// The `auth_realm.id` this provider was built from: only that realm's
+    /// accounts sign in through it. `None` for static-config wiring.
     pub realm_id: Option<i64>,
     /// Hash every password the upstream accepts, for the account to keep
     /// (see the [module docs](self)). Needs a `realm_id`: the hash is kept
@@ -255,8 +257,8 @@ impl UpstreamBasicProvider {
     /// once per credential per TTL window per cluster.
     ///
     /// Returns the verdict plus, on success, the coarse groups parsed from the
-    /// body (so the cache can stash them for the provisioning step). A network
-    /// error / timeout / unexpected status is `Unavailable` (fail-closed).
+    /// body (for the vouched identity). A network error / timeout /
+    /// unexpected status is `Unavailable` (fail-closed).
     async fn forward(&self, username: &str, password: &str) -> ForwardResult {
         let method = match reqwest::Method::from_bytes(self.config.method.as_bytes()) {
             Ok(m) => m,
@@ -456,20 +458,27 @@ impl AuthProvider for UpstreamBasicProvider {
         //
         // Likewise a name a folding directory could map onto another account
         // (full-width letters, a soft hyphen, ...): the upstream would vouch
-        // for that account while Forge provisions and signs in a new one,
+        // for that account while Forge signs in the one of this spelling,
         // which gets around a deactivation of the plain name (#69).
         if cred.username.contains(':') || forge_db::username::may_alias_upstream(cred.username) {
             return AuthOutcome::Rejected;
         }
+        // Every account is named by a UPN, and the upstream gets its local
+        // part (`alice` of `alice@example.com`); a name that is no UPN names
+        // no account of the realm. The cache keys on the account's name (the
+        // UPN), which revocation purges by.
+        let Some(forwarded) = forge_db::username::upn_local_part(cred.username) else {
+            return AuthOutcome::Rejected;
+        };
 
         // The cache stashes only a boolean verdict (never the groups — they are
         // not security-critical and re-deriving them on a cold cache is cheap and
         // correct). On a cache miss the factory runs `forward`, whose `groups`
-        // we capture here for the provisioning identity. Because the factory may
+        // we capture here for the vouched identity. Because the factory may
         // be coalesced away (a peer wins the singleflight), `captured_groups`
-        // stays empty for the loser; that only means a refreshed login provisions
+        // stays empty for the loser; that only means a refreshed login carries
         // groups, which matches the "coarse, best-effort" contract.
-        let username = cred.username.to_string();
+        let username = forwarded.to_string();
         let password = cred.password.to_string();
         // The factory future must be `Send` (moka coalesces it across tasks), so
         // we hand the captured groups out through an `Arc<Mutex<_>>` rather than a
@@ -516,11 +525,10 @@ impl AuthProvider for UpstreamBasicProvider {
                 AuthOutcome::Authenticated(ProvenIdentity {
                     username: cred.username.to_string(),
                     source: AuthSource::UpstreamBasic,
-                    external_subject: Some(cred.username.to_string()),
+                    external_subject: Some(forwarded.to_string()),
                     groups,
                     suggested_is_admin,
                     admin_authoritative,
-                    auto_provision: self.config.auto_provision,
                     realm_id: self.config.realm_id,
                     captured_password_hash,
                 })

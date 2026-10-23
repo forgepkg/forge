@@ -24,7 +24,7 @@ In the web UI, open the hosted repository under **Admin → Repositories** and
 choose **Import from Nexus**. Or with the admin API:
 
 ```bash
-curl -u admin:<admin-scoped token> -X POST \
+curl -u admin@example.com:<admin-scoped token> -X POST \
   https://forge.example.com/admin/repositories/nuget-internal/imports \
   -H 'content-type: application/json' \
   -d '{

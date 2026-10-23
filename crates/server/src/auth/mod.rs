@@ -47,7 +47,7 @@ use forge_core::auth::PasswordCredential;
 use forge_core::net::ssrf::outbound_metadata_client;
 use forge_core::oidc::{
     begin_login, browser_binding, complete_login, map_claims, resolve_user, CallbackParams,
-    ClaimMapping, ClientAuth, ClientParams, OidcMetadataClient, ResolvePolicy,
+    ClaimMapping, ClientAuth, ClientParams, OidcMetadataClient, ResolveError, ResolvePolicy,
 };
 use forge_core::session::{csrf_token_matches, IssuedSession, SessionService};
 use forge_db::model::{AppUser, Session};
@@ -138,8 +138,6 @@ impl OidcRuntime {
         let policy = ResolvePolicy {
             auto_provision: oidc.auto_provision,
             link_existing_by_username: oidc.link_existing_by_username,
-            // Set per login from the realms enabled then (oidc_callback).
-            provision_namespace: None,
         };
         let cookie_secure = public_base_url.trim().starts_with("https://");
         let sessions = SessionService::new(
@@ -298,7 +296,7 @@ async fn oidc_callback(
 }
 
 /// Why an OIDC sign-in was refused, as the SPA's login page names it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum LoginFailure {
     /// The callback did not validate (state, binding, code exchange, token),
     /// or the IdP answered with an error such as a cancelled sign-in.
@@ -307,13 +305,19 @@ enum LoginFailure {
     /// claims are missing, auto-provisioning is off, or the account is
     /// inactive.
     NotPermitted,
+    /// A new account would be provisioned, but the username the realm's claim
+    /// chain resolved is not a UPN. The claim it came from is passed on
+    /// (`&claim=`): it names realm configuration, not anything the user or the
+    /// IdP's token chose.
+    UsernameNotUpn { claim: String },
 }
 
 impl LoginFailure {
-    fn code(self) -> &'static str {
+    fn code(&self) -> &'static str {
         match self {
             LoginFailure::OidcFailed => "oidc_failed",
             LoginFailure::NotPermitted => "not_permitted",
+            LoginFailure::UsernameNotUpn { .. } => "username_not_upn",
         }
     }
 }
@@ -324,9 +328,14 @@ impl LoginFailure {
 /// body left the user on a dead end. The code is generic: the IdP's
 /// `error_description` is never passed on (it is only logged, bounded).
 fn login_failed(failure: LoginFailure) -> Response {
+    let mut location = url::form_urlencoded::Serializer::new(String::new());
+    location.append_pair("error", failure.code());
+    if let LoginFailure::UsernameNotUpn { claim } = &failure {
+        location.append_pair("claim", claim);
+    }
     (
         StatusCode::FOUND,
-        [(header::LOCATION, format!("/login?error={}", failure.code()))],
+        [(header::LOCATION, format!("/login?{}", location.finish()))],
     )
         .into_response()
 }
@@ -376,20 +385,15 @@ async fn oidc_callback_inner(
     }
 
     let mapped = map_claims(&validated.claims, &rt.mapping);
-    // While a credential-forwarding realm is enabled, its users' accounts
-    // appear on their first password login, so a new OIDC account must not
-    // take a bare name one of them may still claim: it is namespaced by the
-    // OIDC realm (`bob@entra`).
-    let mut policy = rt.policy.clone();
-    if snap
-        .realms
-        .iter()
-        .any(|r| r.enabled && r.kind == realms::KIND_CRED_FORWARD)
-    {
-        policy.provision_namespace = Some(orr.realm_name.clone());
-    }
-    let user = match resolve_user(&state.pool, &validated, &mapped, &policy).await {
+    let user = match resolve_user(&state.pool, &validated, &mapped, &rt.policy).await {
         Ok(u) => u,
+        Err(ResolveError::NotUpn { claim }) => {
+            tracing::warn!(
+                %claim,
+                "oidc login refused: a new account needs a UPN, and the claim does not hold one"
+            );
+            return login_failed(LoginFailure::UsernameNotUpn { claim });
+        }
         Err(e) => {
             tracing::warn!(error = %e, "oidc user resolution failed");
             return login_failed(LoginFailure::NotPermitted);

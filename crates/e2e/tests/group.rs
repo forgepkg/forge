@@ -454,7 +454,7 @@ async fn prefer_hosted_shields_internal_id_from_selector_scoped_tokens() {
     let selector = srv
         .create_content_selector("dc-public-only", &["public.*"], &[])
         .await;
-    let user = srv.create_user("dc-scoped", "pw").await;
+    let user = srv.create_user("dc-scoped@example.com", "pw").await;
     let role = srv.create_role("dc-scoped-reader").await;
     for (repo, selector) in [
         ("dc-grp", None),

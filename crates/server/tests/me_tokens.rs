@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 /// Create a non-admin user via the admin API; returns its (username, password).
 async fn make_user(srv: &common::TestServer) -> (String, String) {
     let (au, ap) = srv.admin_basic();
-    let username = format!("self{}", common::unique());
+    let username = format!("self{}@example.com", common::unique());
     let resp = srv
         .client()
         .post(format!("{}/admin/users", srv.base_url))

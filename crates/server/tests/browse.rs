@@ -258,7 +258,10 @@ async fn browse_requires_login() {
         common::pool().await,
         ServerOpts {
             anonymous_mode: "all".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )

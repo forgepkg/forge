@@ -61,7 +61,7 @@ async fn make_role(pool: &sqlx::PgPool, n: u64) -> i64 {
 async fn make_user(pool: &sqlx::PgPool, n: u64) -> i64 {
     user_dao::insert_user(
         pool,
-        NewUser::local(format!("seamuser-{n}"), "x".into(), true),
+        NewUser::local(format!("seamuser-{n}@example.com"), "x".into(), true),
     )
     .await
     .expect("insert user")

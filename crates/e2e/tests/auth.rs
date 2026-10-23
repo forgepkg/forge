@@ -197,18 +197,18 @@ async fn admin_api_requires_admin_and_bootstrap_works() {
     let body: Value = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&u, Some(&p))
-        .json(&serde_json::json!({"username": "alice", "password": "alicepw", "is_admin": false}))
+        .json(&serde_json::json!({"username": "alice@example.com", "password": "alicepw", "is_admin": false}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(body["username"], serde_json::json!("alice"));
+    assert_eq!(body["username"], serde_json::json!("alice@example.com"));
 
     let resp = client
         .get(format!("{}/admin/users", srv.base_url))
-        .basic_auth("alice", Some("alicepw"))
+        .basic_auth("alice@example.com", Some("alicepw"))
         .send()
         .await
         .unwrap();

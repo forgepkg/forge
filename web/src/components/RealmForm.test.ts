@@ -87,7 +87,6 @@ describe('list fields', () => {
       'credential_forwarding',
       {
         url: 'https://auth.example.com/check',
-        auto_provision: true,
         success_status: [200, 204],
         required_groups: [dn, 'developers'],
       },
@@ -187,7 +186,7 @@ describe('kept password options', () => {
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
   })
-  const base = { url: 'https://nexus.example.com/status', auto_provision: true }
+  const base = { url: 'https://nexus.example.com/status' }
 
   it('round-trips both options and omits them when off', () => {
     for (const config of [

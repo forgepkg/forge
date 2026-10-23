@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 /// Create a non-admin user, returning `(id, username, password)`.
 async fn make_user(srv: &common::TestServer) -> (i64, String, String) {
     let (au, ap) = srv.admin_basic();
-    let username = format!("rbac{}", common::unique());
+    let username = format!("rbac{}@example.com", common::unique());
     let password = "pw12345678".to_string();
     let created: Value = srv
         .client()
@@ -1123,7 +1123,10 @@ async fn signed_in_user_reads_anonymous_read_repo() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             anonymous_mode: "all".into(),
             ..Default::default()
         },
@@ -1231,7 +1234,7 @@ async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role(
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
-    let username = format!("anonuser{s}");
+    let username = format!("anonuser{s}@example.com");
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))

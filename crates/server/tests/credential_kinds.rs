@@ -68,7 +68,7 @@ async fn tokens_are_minted_only_from_a_session() {
     let srv = common::start().await;
     let client = srv.client();
     let (au, ap) = srv.admin_basic();
-    let username = format!("minter{}", common::unique());
+    let username = format!("minter{}@example.com", common::unique());
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -102,11 +102,22 @@ async fn reauth_revokes_tokens_minted_via_credential_forwarding() {
     let srv = common::start().await;
     let client = srv.client();
     let (au, ap) = srv.admin_basic();
-    let username = format!("fwd{}", common::unique());
-    let user = forge_db::user_dao::provision_upstream_user(&srv.pool, &username, None)
+    let realm = forge_db::auth_realm_dao::insert_realm(
+        &srv.pool,
+        forge_db::auth_realm_dao::NewAuthRealm {
+            kind: "credential_forwarding".into(),
+            name: format!("fwd-{}", common::unique()),
+            enabled: false,
+            priority: 9_000_000 + (common::unique() % 1_000_000) as i32,
+            config: json!({}),
+        },
+    )
+    .await
+    .unwrap();
+    let username = format!("fwd{}@example.com", common::unique());
+    let user = forge_db::user_dao::insert_forwarded_user(&srv.pool, &username, realm.id, true)
         .await
-        .unwrap()
-        .expect("provisioned upstream user");
+        .unwrap();
 
     // The user mints a token from a (forwarded-credential) session...
     let session = srv.session_for(user.id).await;

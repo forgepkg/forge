@@ -817,7 +817,7 @@ async fn basic_oidc_only_ever_carries_a_workload_credential() {
     let block =
         upstream.upstream_basic_block(&["local-password", "upstream-basic"], 300, 30, &[], "");
     let srv = StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_upstream_basic(block)
         .start()
         .await;
@@ -830,12 +830,12 @@ async fn basic_oidc_only_ever_carries_a_workload_credential() {
             .status(),
         StatusCode::CREATED
     );
-    let alice = srv.create_user("alice", "alice-password").await;
+    let alice = srv.create_user("alice@example.com", "alice-password").await;
     assert!(srv.assign_role(alice, reader).await.status().is_success());
     let user_token = srv.issue_token(alice, None).await;
     assert_eq!(
         read_index(&srv, "ci-hosted", |r| r
-            .basic_auth("alice", Some(&user_token)))
+            .basic_auth("alice@example.com", Some(&user_token)))
         .await,
         StatusCode::OK,
         "the user token itself works under its owner's name"

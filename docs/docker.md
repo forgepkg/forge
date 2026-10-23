@@ -100,7 +100,7 @@ tokens of the previous one.
 ## Hosted repositories
 
 ```bash
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories \
   -d '{"name":"docker-hosted","kind":"hosted","format":"docker"}'
 ```
@@ -143,7 +143,7 @@ as well.
 ## Proxy repositories
 
 ```bash
-curl -u admin:<admin-token> -H 'content-type: application/json' \
+curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
   https://forge.example.com/admin/repositories -d '{
     "name": "docker-hub", "kind": "proxy", "format": "docker",
     "remote_url": "https://registry-1.docker.io",

@@ -55,7 +55,7 @@ async fn matrix_read_write_any_and_fail_closed() {
     }
 
     // A non-admin user with NO roles — fail-closed deny everywhere.
-    let uid = srv.create_user("matrix-user", "pw").await;
+    let uid = srv.create_user("matrix-user@example.com", "pw").await;
     let token = srv.issue_token(uid, None).await;
 
     assert_eq!(
@@ -154,7 +154,7 @@ async fn token_scope_narrows_below_owner() {
     }
 
     // Owner holds read+write on ANY repo.
-    let uid = srv.create_user("scoped-user", "pw").await;
+    let uid = srv.create_user("scoped-user@example.com", "pw").await;
     let role = srv.create_role("rw-any").await;
     assert_eq!(srv.add_grant(role, None, "read", None).await.status(), 201);
     assert_eq!(srv.add_grant(role, None, "write", None).await.status(), 201);
@@ -218,7 +218,7 @@ async fn token_scope_cannot_widen_owner() {
     );
 
     // Owner holds ONLY read on `narrow` (no write anywhere).
-    let uid = srv.create_user("narrow-user", "pw").await;
+    let uid = srv.create_user("narrow-user@example.com", "pw").await;
     let role = srv.create_role("read-only-narrow").await;
     assert_eq!(
         srv.add_grant(role, Some("narrow"), "read", None)
@@ -351,7 +351,7 @@ async fn content_selector_filters_reads_and_package_mutations() {
     let selector = srv
         .create_content_selector("company-only", &["company.*"], &[])
         .await;
-    let user = srv.create_user("selector-user", "pw").await;
+    let user = srv.create_user("selector-user@example.com", "pw").await;
     let role = srv.create_role("selector-role").await;
     for action in ["read", "write", "delete"] {
         assert_eq!(
@@ -544,7 +544,7 @@ async fn nested_group_visibility_honors_privileges() {
     );
 
     // A user who can read g-outer, g-inner and leaf-ok — but NOT leaf-no.
-    let uid = srv.create_user("nest-user", "pw").await;
+    let uid = srv.create_user("nest-user@example.com", "pw").await;
     let role = srv.create_role("nest-reader").await;
     for repo in ["g-outer", "g-inner"] {
         assert_eq!(
@@ -741,7 +741,7 @@ async fn cross_instance_cache_invalidation_on_grant_change() {
     );
 
     // A user granted read on xinst via a role.
-    let uid = a.create_user("xinst-user", "pw").await;
+    let uid = a.create_user("xinst-user@example.com", "pw").await;
     let role = a.create_role("xinst-readers").await;
     assert_eq!(
         a.add_grant(role, Some("xinst"), "read", None)
@@ -839,7 +839,7 @@ async fn fresh_install_defaults_closed_over_http() {
     );
 
     // A user created on a fresh install holds no roles ⇒ denied (fail-closed).
-    let uid = srv.create_user("fresh-user", "pw").await;
+    let uid = srv.create_user("fresh-user@example.com", "pw").await;
     let token = srv.issue_token(uid, None).await;
     assert_eq!(
         srv.read_index_with_token("fresh-repo", &token).await,
@@ -910,7 +910,7 @@ async fn admin_api_requires_admin_scoped_token() {
 
     let unscoped = srv.admin_token.clone();
     assert_eq!(
-        create_user(unscoped.clone(), "token-made-admin").await,
+        create_user(unscoped.clone(), "token-made-admin@example.com").await,
         StatusCode::FORBIDDEN,
         "an unscoped admin token must not create (admin) users"
     );
@@ -944,7 +944,7 @@ async fn admin_api_requires_admin_scoped_token() {
         "an admin-scoped token may mint tokens"
     );
     assert_eq!(
-        create_user(automation, "automation-made").await,
+        create_user(automation, "automation-made@example.com").await,
         StatusCode::CREATED,
         "an admin-scoped token may create users"
     );
@@ -976,7 +976,7 @@ async fn signed_in_user_reads_anonymous_readable_repos() {
         201
     );
 
-    let uid = srv.create_user("l6-user", "pw").await;
+    let uid = srv.create_user("l6-user@example.com", "pw").await;
     let token = srv.issue_token(uid, None).await;
     for repo in ["l6-flag", "l6-grant"] {
         assert_eq!(
@@ -1026,7 +1026,7 @@ async fn signed_in_user_gets_no_public_reach_when_anonymous_access_is_off() {
         .status(),
         201
     );
-    let uid = srv.create_user("l6-off-user", "pw").await;
+    let uid = srv.create_user("l6-off-user@example.com", "pw").await;
     let token = srv.issue_token(uid, None).await;
     assert_eq!(
         srv.read_index_with_token("l6-off", &token).await,

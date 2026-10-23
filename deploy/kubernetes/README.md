@@ -99,7 +99,7 @@ kubectl -n forge-eval rollout status deployment/forge
 kubectl -n forge-eval port-forward svc/forge 8421
 ```
 
-Open http://localhost:8421 and sign in as `admin` with the bootstrap password.
+Open http://localhost:8421 and sign in as the bootstrap admin (`FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME`) with its password.
 The evaluation overlay has no backups and single instances of everything.
 
 ## Production

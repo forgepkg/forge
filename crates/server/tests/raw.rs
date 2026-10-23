@@ -815,7 +815,7 @@ async fn selectors_scope_paths() {
     files.put("mixed/hidden.bin", b"d").await;
 
     // A user who may read `pdfium/**` and `**/*.tgz` outside `secret/`.
-    let username = format!("reader{}", unique());
+    let username = format!("reader{}@example.com", unique());
     let user: Value = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))

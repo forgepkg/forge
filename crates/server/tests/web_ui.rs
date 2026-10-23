@@ -40,7 +40,7 @@ fn build_fake_spa() -> String {
 #[tokio::test]
 async fn spa_serving_and_api_precedence() {
     let assets_dir = build_fake_spa();
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let server = start_with(
         common::pool().await,
         ServerOpts {
@@ -164,7 +164,7 @@ const NAV_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,
 #[tokio::test]
 async fn spa_cache_headers_missing_assets_and_admin_ui_paths() {
     let assets_dir = build_fake_spa();
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let server = start_with(
         common::pool().await,
         ServerOpts {

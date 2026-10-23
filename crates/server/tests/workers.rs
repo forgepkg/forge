@@ -18,7 +18,10 @@ async fn outbox_drained_once_across_two_instances() {
     let a = common::start_with(
         pool.clone(),
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             spawn_workers: true,
             ..Default::default()
         },

@@ -131,8 +131,6 @@ impl AuthProvider for CapturedPasswordProvider {
                 // admin state is left alone.
                 suggested_is_admin: false,
                 admin_authoritative: false,
-                // Only an existing account keeps a password.
-                auto_provision: false,
                 realm_id: Some(self.realm_id),
                 captured_password_hash: None,
             }),

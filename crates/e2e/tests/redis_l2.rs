@@ -86,7 +86,11 @@ async fn a_planted_redis_authz_entry_is_never_trusted() {
     let b = a.spawn_peer().await;
     let user = user_dao::insert_user(
         &a.pool,
-        NewUser::local(format!("plain{}", forge_e2e_unique()), "x".into(), true),
+        NewUser::local(
+            format!("plain{}@example.com", forge_e2e_unique()),
+            "x".into(),
+            true,
+        ),
     )
     .await
     .unwrap();

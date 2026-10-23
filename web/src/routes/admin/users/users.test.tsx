@@ -71,6 +71,7 @@ const fetchMock = vi.fn()
 
 interface ApiHandlers {
   users?: UserView[]
+  realms?: unknown[]
   tokens?: TokenView[]
   onCreateUser?: (body: unknown) => Response
   onDeleteUser?: (id: number) => Response
@@ -89,6 +90,9 @@ function mockApi(h: ApiHandlers) {
       const path = url.pathname
 
       if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
+      if (path.endsWith('/admin/realms') && method === 'GET') {
+        return Promise.resolve(json(h.realms ?? []))
+      }
 
       // Per-user token list / create.
       const tokensMatch = path.match(/\/admin\/users\/(\d+)\/tokens$/)
@@ -217,9 +221,81 @@ describe('admin users', () => {
     expect(signIn('svc')).toHaveTextContent('scim')
   })
 
+  it('creates an account of a credential-forwarding realm, without a password', async () => {
+    let posted: unknown = null
+    mockApi({
+      users: [],
+      realms: [
+        { id: 3, kind: 'credential_forwarding', name: 'nexus', enabled: true, priority: 20, config: {} },
+        { id: 4, kind: 'oidc', name: 'entra', enabled: true, priority: 30, config: {} },
+      ],
+      onCreateUser: (body) => {
+        posted = body
+        return json(user({ id: 2, username: 'dora@example.com', auth_source: 'upstream-basic' }), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users')
+
+    await u.type(await screen.findByLabelText('Username'), 'dora@example.com')
+    const signIn = await screen.findByLabelText('Sign-in')
+    // Only credential-forwarding realms are offered.
+    expect(
+      within(signIn).queryByRole('option', { name: /entra/ }),
+    ).toBeNull()
+    await u.selectOptions(signIn, 'nexus')
+    expect(screen.queryByLabelText('Password')).toBeNull()
+    expect(
+      screen.getByText(/gets the part of the username before the @/),
+    ).toBeInTheDocument()
+    await u.click(screen.getByRole('button', { name: 'Create user' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toEqual({
+      username: 'dora@example.com',
+      realm: 'nexus',
+      is_admin: false,
+      active: true,
+    })
+  })
+
+  it('create-user asks for a UPN before it POSTs', async () => {
+    let posted = false
+    mockApi({
+      users: [],
+      onCreateUser: () => {
+        posted = true
+        return json(user({ id: 2, username: 'carol' }), 201)
+      },
+    })
+
+    const user_ = userEvent.setup()
+    await renderAt('/manage/users')
+
+    const username = await screen.findByLabelText('Username')
+    expect(username).toHaveAttribute('placeholder', 'alice@example.com')
+    await user_.type(username, 'carol')
+    await user_.type(screen.getByLabelText('Password'), 'hunter2')
+
+    expect(
+      screen.getByText('The username must be a UPN such as alice@example.com.'),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Create user' })).toBeDisabled()
+
+    await user_.type(username, '@example')
+    expect(screen.getByRole('button', { name: 'Create user' })).toBeDisabled()
+    await user_.type(username, '.com')
+    expect(
+      screen.queryByText('The username must be a UPN such as alice@example.com.'),
+    ).toBeNull()
+    expect(screen.getByRole('button', { name: 'Create user' })).toBeEnabled()
+    expect(posted).toBe(false)
+  })
+
   it('create-user POSTs the right body and re-fetches the list', async () => {
     let posted: unknown = null
-    const usersAfter = [user({ id: 2, username: 'carol' })]
+    const usersAfter = [user({ id: 2, username: 'carol@example.com' })]
     mockApi({
       users: [],
       onCreateUser: (body) => {
@@ -233,7 +309,7 @@ describe('admin users', () => {
     const user_ = userEvent.setup()
     await renderAt('/manage/users')
 
-    await user_.type(await screen.findByLabelText('Username'), 'carol')
+    await user_.type(await screen.findByLabelText('Username'), 'carol@example.com')
     // A password manager must not offer the admin's own password here.
     expect(screen.getByLabelText('Password')).toHaveAttribute(
       'autocomplete',
@@ -244,13 +320,13 @@ describe('admin users', () => {
 
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toEqual({
-      username: 'carol',
+      username: 'carol@example.com',
       password: 'hunter2',
       is_admin: false,
       active: true,
     })
     // List invalidation re-fetched and shows the new user.
-    expect(await screen.findByText('carol')).toBeInTheDocument()
+    expect(await screen.findByText('carol@example.com')).toBeInTheDocument()
   })
 
   it('delete-user confirms then DELETEs and re-fetches', async () => {

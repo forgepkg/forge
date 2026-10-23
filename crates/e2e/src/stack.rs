@@ -337,7 +337,7 @@ impl Default for StackBuilder {
     fn default() -> Self {
         StackBuilder {
             anon: AnonMode::Off,
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             spawn_workers: false,
             use_redis: false,
             // Trust loopback so XFF-driven anon-allowlist tests can spoof the
