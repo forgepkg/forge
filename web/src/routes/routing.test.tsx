@@ -162,7 +162,7 @@ describe('app routing + admin gating', () => {
     // is no longer part of that rest.
     expect(main.queryByText(/admin flags|with retention/)).toBeNull()
     expect(
-      main.getByText(/Retention and user deactivation have no screen/),
+      main.getByText(/User deactivation has no screen/),
     ).toBeInTheDocument()
     expect(main.queryByText(/RBAC/)).toBeNull()
     expect(main.getByRole('link', { name: /^Roles/ })).toHaveAttribute(

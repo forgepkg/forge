@@ -10,7 +10,8 @@
 //! * `DELETE …/retention`         — clear the policy (disarm; ledger row left).
 //! * `POST   …/retention/preview` — **dry run**: snapshot + the pure evaluator,
 //!   returning what *would* be deleted/unlisted with **zero** mutation and
-//!   **zero** outbox rows.
+//!   **zero** outbox rows. Evaluates the stored policy, or a draft `policy`
+//!   from the body (checked like `PUT`, never stored).
 //! * `POST   …/retention/run`     — schedule a run promptly (`next_run_at=now()`);
 //!   the background worker claims it on its next poll (does **not** run inline).
 //! * `GET    …/retention/audit`   — recent audit rows (newest first), optionally
@@ -195,12 +196,59 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
     }
 }
 
-/// `POST …/retention/preview` request body (all optional).
+/// `POST …/retention/preview` request body (all optional). Unknown fields are
+/// rejected: a misspelled `policy` would otherwise preview the stored policy
+/// instead of the draft.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreviewBody {
     /// Evaluate as-of this instant instead of `now()` (for staging/testing).
     #[serde(default)]
     pub at: Option<chrono::DateTime<Utc>>,
+    /// A draft policy to evaluate in place of the stored one: parsed and
+    /// validated like a `PUT` body's, evaluated whatever its `enabled` says,
+    /// and never stored.
+    #[serde(default)]
+    pub policy: Option<JsonValue>,
+}
+
+/// Where a previewed policy comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicySource {
+    /// The repository's stored policy; a disabled one previews nothing.
+    Stored,
+    /// A draft from the request body; refused like a `PUT` of it would be,
+    /// and evaluated even when disabled, to show what enabling it would do.
+    Draft,
+}
+
+impl PolicySource {
+    /// Parse the policy as `T`: a draft that does not parse is a 422, as on
+    /// `PUT`; a stored one is a 400.
+    fn parse<T: serde::de::DeserializeOwned>(self, policy: JsonValue) -> Result<T, Response> {
+        serde_json::from_value(policy).map_err(|e| match self {
+            PolicySource::Draft => unprocessable(e),
+            PolicySource::Stored => bad_request(format!("stored policy is unparseable: {e}")),
+        })
+    }
+
+    /// The 400 for a policy its repository's validation refused.
+    fn invalid(self, e: impl std::fmt::Display) -> Response {
+        match self {
+            PolicySource::Draft => bad_request(format!("invalid retention policy: {e}")),
+            PolicySource::Stored => bad_request(format!("stored policy is invalid: {e}")),
+        }
+    }
+
+    /// Whether to evaluate a policy with this `enabled` flag. The evaluators
+    /// decide nothing for a disabled policy, so a draft is marked enabled:
+    /// its preview shows what it would do once enabled.
+    fn enable(self, enabled: &mut bool) -> bool {
+        if self == PolicySource::Draft {
+            *enabled = true;
+        }
+        *enabled
+    }
 }
 
 /// Counts for a preview pass.
@@ -235,8 +283,10 @@ pub struct PreviewView {
 ///
 /// Snapshots the repo's candidates and runs the *pure* evaluator, returning the
 /// decision set without applying anything (no row changes, no `blob_outbox`
-/// rows). A missing/disabled policy yields an empty decision set. This mirrors
-/// exactly what the worker's evaluation step would produce.
+/// rows). This mirrors exactly what the worker's evaluation step would
+/// produce. Without a draft `policy` in the body it evaluates the stored
+/// policy, and a missing/disabled one yields an empty decision set; a draft is
+/// evaluated in its place, even when disabled, and stored nowhere.
 pub async fn preview(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -246,36 +296,40 @@ pub async fn preview(
         Ok(r) => r,
         Err(resp) => return resp,
     };
+    let PreviewBody { at, policy: draft } = body.map(|b| b.0).unwrap_or_default();
 
-    // Load + validate the policy. No policy / disabled ⇒ empty preview.
-    let policy_json = match retention_dao::read_policy(&state.pool, repo.id).await {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Json(PreviewView {
-                decisions: Vec::new(),
-                proxy_decisions: Vec::new(),
-                image_decisions: repo.is_docker().then(ImageDecisions::default),
-                file_decisions: repo.is_raw().then(Vec::new),
-                counts: PreviewCounts::default(),
-            })
-            .into_response()
-        }
-        Err(e) => return db_error(e),
+    // The draft, else the stored policy. No policy ⇒ empty preview.
+    let (policy_json, source) = match draft {
+        Some(p) => (p, PolicySource::Draft),
+        None => match retention_dao::read_policy(&state.pool, repo.id).await {
+            Ok(Some(p)) => (p, PolicySource::Stored),
+            Ok(None) => {
+                return Json(PreviewView {
+                    decisions: Vec::new(),
+                    proxy_decisions: Vec::new(),
+                    image_decisions: repo.is_docker().then(ImageDecisions::default),
+                    file_decisions: repo.is_raw().then(Vec::new),
+                    counts: PreviewCounts::default(),
+                })
+                .into_response()
+            }
+            Err(e) => return db_error(e),
+        },
     };
     if repo.is_docker() {
-        return preview_images(&state, &repo, policy_json, body.and_then(|b| b.0.at)).await;
+        return preview_images(&state, &repo, policy_json, source, at).await;
     }
     if repo.is_raw() {
-        return preview_files(&state, &repo, policy_json, body.and_then(|b| b.0.at)).await;
+        return preview_files(&state, &repo, policy_json, source, at).await;
     }
-    let policy: RetentionPolicy = match serde_json::from_value(policy_json) {
+    let mut policy: RetentionPolicy = match source.parse(policy_json) {
         Ok(p) => p,
-        Err(e) => return bad_request(format!("stored policy is unparseable: {e}")),
+        Err(resp) => return resp,
     };
     if let Err(e) = validate_policy(&policy, repo.kind()) {
-        return bad_request(format!("stored policy is invalid: {e}"));
+        return source.invalid(e);
     }
-    if !policy.enabled {
+    if !source.enable(&mut policy.enabled) {
         return Json(PreviewView {
             decisions: Vec::new(),
             proxy_decisions: Vec::new(),
@@ -286,7 +340,7 @@ pub async fn preview(
         .into_response();
     }
 
-    let now = body.and_then(|b| b.0.at).unwrap_or_else(Utc::now);
+    let now = at.unwrap_or_else(Utc::now);
     let kind = repo.kind();
     let format = match state.formats.for_repository(&repo) {
         Ok(format) => format,
@@ -387,14 +441,15 @@ async fn preview_images(
     state: &AppState,
     repo: &forge_db::model::Repository,
     policy_json: JsonValue,
+    source: PolicySource,
     at: Option<chrono::DateTime<Utc>>,
 ) -> Response {
-    let policy: ImageRetentionPolicy = match serde_json::from_value(policy_json) {
+    let mut policy: ImageRetentionPolicy = match source.parse(policy_json) {
         Ok(p) => p,
-        Err(e) => return bad_request(format!("stored policy is unparseable: {e}")),
+        Err(resp) => return resp,
     };
     if let Err(e) = validate_image_policy(&policy, repo.kind()) {
-        return bad_request(format!("stored policy is invalid: {e}"));
+        return source.invalid(e);
     }
     let empty = |evaluated| PreviewView {
         decisions: Vec::new(),
@@ -406,7 +461,7 @@ async fn preview_images(
             ..PreviewCounts::default()
         },
     };
-    if !policy.enabled {
+    if !source.enable(&mut policy.enabled) {
         return Json(empty(0)).into_response();
     }
     let now = match at {
@@ -442,14 +497,15 @@ async fn preview_files(
     state: &AppState,
     repo: &forge_db::model::Repository,
     policy_json: JsonValue,
+    source: PolicySource,
     at: Option<chrono::DateTime<Utc>>,
 ) -> Response {
-    let policy: FileRetentionPolicy = match serde_json::from_value(policy_json) {
+    let mut policy: FileRetentionPolicy = match source.parse(policy_json) {
         Ok(p) => p,
-        Err(e) => return bad_request(format!("stored policy is unparseable: {e}")),
+        Err(resp) => return resp,
     };
     if let Err(e) = validate_file_policy(&policy, repo.kind()) {
-        return bad_request(format!("stored policy is invalid: {e}"));
+        return source.invalid(e);
     }
     let view = |decisions: Vec<FileDecision>, evaluated: usize| PreviewView {
         decisions: Vec::new(),
@@ -462,7 +518,7 @@ async fn preview_files(
         },
         file_decisions: Some(decisions),
     };
-    if !policy.enabled {
+    if !source.enable(&mut policy.enabled) {
         return Json(view(Vec::new(), 0)).into_response();
     }
     let now = match at {
