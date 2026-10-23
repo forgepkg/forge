@@ -50,6 +50,19 @@ request: administrators run Forge from the browser, and a setting that only
 (`/manage/realms`) offers the same. When a feature ships without its screen,
 its pull request's description says why.
 
+## Formats: every format plugin lives under plugins/
+
+A package format is a crate in `plugins/<id>/`, the directory named after its
+format id, whether it runs built in only, as a WebAssembly component, or
+both. Built in only is no reason to put it elsewhere: NuGet runs built in
+only and lives in `plugins/nuget`, like Helm. Never add a format as a crate
+under `crates/` (no `crates/format-<id>`) or as a module of the server: it
+implements `FormatPlugin` with the layout
+[plugins/README.md](plugins/README.md) describes, and has a `component`
+feature unless it is built in only. Docker / OCI (`crates/format-oci`) and
+raw (`crates/server/src/raw/`) are served natively, outside the plugin
+contract; they are not the model for a new format.
+
 ## Changelog: a fragment per change, never CHANGELOG.md
 
 A change never edits `CHANGELOG.md`. Its entry goes in a new file,
