@@ -1,4 +1,4 @@
-//! E2E: credential-forwarding authentication (slice 12.3 Phase 6).
+//! E2E: credential-forwarding authentication.
 //!
 //! Drives the **real** forge server(s) over HTTP against a real Postgres
 //! testcontainer + an in-process mock HTTP Basic upstream (`MockBasicUpstream`:
@@ -6,7 +6,7 @@
 //! the user's roles, counts the requests it receives, and can be flipped
 //! `down`). The forge server's `upstream-basic` provider forwards the user's
 //! `username:password` to this mock; a validated-credential cache absorbs the
-//! per-request fan-out. Covers the plan §4 scenarios:
+//! per-request fan-out. Covers these scenarios:
 //!
 //! 1. successful forward auto-provisions a non-local `app_user` who can then use
 //!    the API; the stored `app_user` has `auth_source='upstream-basic'` and a

@@ -1,4 +1,4 @@
-//! Integration tests for secret encryption at rest (slice 12.5): the Postgres
+//! Integration tests for secret encryption at rest: the Postgres
 //! [`PgKeyStore`], the encrypted `repository.upstream_password_enc` column,
 //! the plaintext backfill, and the DEK-rotation re-encrypt sweep.
 //!
@@ -629,10 +629,10 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
         .unwrap();
 }
 
-/// The full §12.5 data path against real Postgres: encrypted set/get, envelope
-/// (not plaintext) at rest, tamper + AAD-swap rejection at the DB layer, the
-/// plaintext backfill, and the DEK-rotation sweep. One serial test because the
-/// backfill/sweep helpers operate on the whole `repository` table.
+/// The full encryption data path against real Postgres: encrypted set/get,
+/// envelope (not plaintext) at rest, tamper + AAD-swap rejection at the DB
+/// layer, the plaintext backfill, and the DEK-rotation sweep. One serial test
+/// because the backfill/sweep helpers operate on the whole `repository` table.
 #[tokio::test]
 async fn upstream_password_end_to_end() {
     let _serial = TABLE_WIDE.lock().await;
@@ -754,7 +754,7 @@ async fn upstream_password_end_to_end() {
     .await
     .unwrap();
 
-    // ── plaintext backfill (slice-1 rows) ────────────────────────────────────
+    // ── plaintext backfill ───────────────────────────────────────────────────
     let mut legacy = NewRepository::proxy("crypt-legacy");
     legacy.upstream_password = Some("legacy-pw".to_string());
     let legacy = repository_dao::insert_repository(&pool, legacy)

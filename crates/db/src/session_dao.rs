@@ -2,7 +2,7 @@
 //!
 //! The session row is the **authority**; the `forge_session` cookie is just an
 //! opaque pointer. Only `sha256(cookie_secret)` is stored (`token_hash`),
-//! mirroring the slice-1 `token.token_hash` model, so a DB read yields no usable
+//! mirroring the `token.token_hash` model, so a DB read yields no usable
 //! credential. A session is valid iff
 //! `revoked_at IS NULL AND now() < idle_expiry AND now() < absolute_expiry`.
 
@@ -81,7 +81,7 @@ pub async fn find_valid_by_hash(pool: &PgPool, token_hash: &str) -> sqlx::Result
 
 /// Refresh `last_seen_at`/`idle_expiry` for a session, but only if the existing
 /// `last_seen_at` is older than `min_age_secs` (throttle to avoid a write per
-/// request, like slice-1 `token.last_used_at`). The new `idle_expiry` is
+/// request, like `token.last_used_at`). The new `idle_expiry` is
 /// `now() + idle_ttl_secs`. Returns whether a row was touched.
 pub async fn touch_last_seen(
     pool: &PgPool,

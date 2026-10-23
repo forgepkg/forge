@@ -1,4 +1,4 @@
-//! Admin surface for secret encryption at rest (slice 12.5). **Admin-only**
+//! Admin surface for secret encryption at rest. **Admin-only**
 //! (mounted under the [`super::require_admin`] gate).
 //!
 //! * `GET /admin/crypto/keys` — key **metadata only** (layer, version,

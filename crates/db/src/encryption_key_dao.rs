@@ -1,6 +1,7 @@
 //! Postgres implementation of the `forge-crypto` [`KeyStore`] over the
-//! `encryption_key` table (slice 12.5, plan §2.2), plus the secret-column
-//! helpers for `repository.upstream_password_enc` (plan §2.4/§2.8).
+//! `encryption_key` table. The secret-column helpers (for
+//! `repository.upstream_password_enc` and the realm secrets) live in
+//! [`crate::secret_dao`].
 //!
 //! Only **wrapped** key bytes are stored; the partial unique index
 //! `encryption_key_one_active` guarantees at most one `active` key per

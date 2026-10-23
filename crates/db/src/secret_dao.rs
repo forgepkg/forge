@@ -1,7 +1,6 @@
 //! Encrypted secret columns: transparent encrypt-on-write / decrypt-on-read for
-//! `repository.upstream_password_enc` (slice 12.5, plan §2.4), plus the
-//! plaintext **backfill** job and the DEK-rotation **re-encrypt sweep**
-//! (plan §2.7/§2.8).
+//! `repository.upstream_password_enc`, plus the plaintext **backfill** job and
+//! the DEK-rotation **re-encrypt sweep**.
 //!
 //! Callers see [`PlaintextSecret`] only; the envelope blob never leaves this
 //! module's helpers undecrypted except as the opaque `bytea` column value. The
@@ -300,7 +299,7 @@ pub async fn get_upstream_credential(
     }))
 }
 
-/// One batch of the plaintext → encrypted **backfill** (plan §2.8 step 3).
+/// One batch of the plaintext → encrypted **backfill**.
 ///
 /// Up to `batch` rows whose plaintext column is set and whose `_enc` column is
 /// still NULL are sealed; the plaintext is NULLed **in the same guarded
@@ -429,10 +428,10 @@ pub struct SweepBatch {
     pub resealed: usize,
 }
 
-/// One keyset-paginated batch of the **DEK-rotation re-encrypt sweep** (plan
-/// §2.7): re-seal every `upstream_password_enc` blob that references a
-/// non-active DEK. Each row is one guarded UPDATE (last-writer-wins
-/// with a concurrent admin password change — both old and new DEKs decrypt
+/// One keyset-paginated batch of the **DEK-rotation re-encrypt sweep**:
+/// re-seal every `upstream_password_enc` blob that references a non-active
+/// DEK. Each row is one guarded UPDATE (last-writer-wins with a concurrent
+/// admin password change — both old and new DEKs decrypt
 /// during the window, so any interleaving stays readable). A blob that does
 /// not decrypt (its row was repointed outside the API) is logged and left
 /// alone, so it cannot stall the sweep for every other row.

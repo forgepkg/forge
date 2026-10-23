@@ -3,15 +3,14 @@ import { httpClient } from '~/lib/httpClient'
 /**
  * Admin token management API (per-user).
  *
- * Types mirror the **real** Rust DTOs (reconciled against slice 1, not the
- * forward-looking plan):
+ * Types mirror the **real** Rust DTOs:
  *
  *  - `TokenView` (`crates/server/src/admin/tokens.rs`) is the metadata view —
  *    it carries **no secret and no hash**. Listing never returns the plaintext.
  *  - `CreatedToken` is the `POST` response and the **only** time the plaintext
  *    `token` is ever returned (flattened onto a `TokenView`). It is shown once
  *    via `ShowOnceSecret` and never re-fetched or cached.
- *  - Tokens are scoped to a user in slice 1: `GET`/`POST` are under
+ *  - Tokens belong to a user: `GET`/`POST` are under
  *    `/admin/users/{id}/tokens`; revoke is `DELETE /admin/tokens/{id}`, and
  *    an admin changes a token's scope with `PATCH /admin/tokens/{id}/scope`.
  *  - `GET /admin/users/{id}/tokens` returns a **bare array** of `TokenView`.

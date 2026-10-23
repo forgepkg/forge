@@ -1,4 +1,4 @@
-//! The retention **apply** path (design §3.6 step 9, §3.4 outbox integration).
+//! The retention **apply** path (blob GC through the transactional outbox).
 //!
 //! Turns the pure evaluator's [`Decision`] / [`ProxyDecision`] sets into durable
 //! mutations in small transactions: one per proxy eviction, and one per batch

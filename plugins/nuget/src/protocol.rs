@@ -1,13 +1,13 @@
-//! The NuGet V3 protocol (spec §6, Appendix A): which URL answers what, and
-//! the documents it answers with.
+//! The NuGet V3 protocol: which URL answers what, and the documents it answers
+//! with.
 //!
 //! Every `@id` is absolute, built from the repository's base URL
 //! (`{public_base_url}/v3/{repo}`). The host has authorized the request
 //! before [`handle`] sees it; publishing, unlisting and relisting are host
-//! actions, offered for hosted repositories only. Paths match as the old
-//! axum router did: literal segments as sent, parameters percent-decoded, an
-//! unknown path `404` with an empty body, a known path with another method
-//! `405` with `Allow`.
+//! actions, offered for hosted repositories only. Paths match literal
+//! segments as sent and percent-decode parameters; an unknown path answers
+//! `404` with an empty body, a known path with another method `405` with
+//! `Allow`.
 
 use std::collections::HashMap;
 

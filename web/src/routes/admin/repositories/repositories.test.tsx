@@ -15,9 +15,8 @@ import type { MemberView, RepoView } from '~/api/repositories'
 import { routeTree } from '~/routeTree.gen'
 
 /**
- * Admin repositories screens (plan §Phase 4 testing), driven against the **real**
- * route tree + query hooks so the admin guard, routing, and mutations are all
- * exercised:
+ * Admin repositories screens, driven against the **real** route tree + query
+ * hooks so the admin guard, routing, and mutations are all exercised:
  *  - the list renders repositories with their format;
  *  - create-hosted POSTs the right body to `/admin/repositories`, and a docker
  *    create sends the format and docker options (no NuGet-only fields);

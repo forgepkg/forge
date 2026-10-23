@@ -1,5 +1,5 @@
 //! Integration tests for the best-effort download-tracking DAO
-//! (`forge_db::download_dao`, slice 12.1 §3.7).
+//! (`forge_db::download_dao`).
 //!
 //! Postgres only. Verifies the hosted bump increments the asset count + stamps
 //! both asset and component timestamps, and that the proxy bump stamps the

@@ -1,10 +1,10 @@
 //! Repository read/write operations, organized by repository kind.
 //!
-//! Slice 1 implements the **hosted** read path here (Phase 6); proxy and group
-//! read paths arrive in later phases. The neutral DTOs in this module are the
-//! contract between the storage-backed implementations and the format plugins
-//! (served by the server's plugin dispatcher): they are format-agnostic and
-//! carry exactly what a feed needs to render Appendix A JSON, **plus** the raw
+//! The [`hosted`], [`proxy`] and [`group`] read paths live in their submodules.
+//! The neutral DTOs in this module are the contract between the storage-backed
+//! implementations and the format plugins (served by the server's plugin
+//! dispatcher): they are format-agnostic and carry exactly what a feed needs
+//! to render its JSON responses, **plus** the raw
 //! manifest bytes so the format layer can extract dependency groups itself
 //! (keeping `forge-core` free of NuGet-specific manifest parsing).
 
@@ -55,7 +55,7 @@ pub enum RepoError {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
     /// A storage/I-O error while fetching blob bytes (e.g. an S3 failure).
-    /// The concrete blob fetcher (Phase 10) surfaces transport errors here
+    /// The concrete blob fetcher surfaces transport errors here
     /// rather than overloading [`RepoError::RepoNotFound`].
     #[error("storage error: {0}")]
     Storage(String),

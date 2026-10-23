@@ -13,7 +13,7 @@ export const Route = createFileRoute('/_app/manage/repositories/new')({
 })
 
 /**
- * Create-repository screen (plan §Phase 4). Renders the shared kind-conditional
+ * Create-repository screen. Renders the shared kind-conditional
  * `RepositoryForm`, posts a `CreateRepo` body, and on success navigates to the
  * new repository's edit page. Server errors (e.g. 409 name conflict, 400 invalid
  * remote URL) are surfaced inline by the form.

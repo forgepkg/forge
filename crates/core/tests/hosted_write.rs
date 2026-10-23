@@ -1,4 +1,4 @@
-//! Integration tests for hosted-repository write ops (Phase 7, Task 7.1 / 7.2).
+//! Integration tests for hosted-repository write ops.
 //!
 //! Drives [`forge_core::repo::hosted::HostedWrite`] against real Postgres +
 //! versitygw containers: publishing the `sample.lib.1.0.0.nupkg` fixture,

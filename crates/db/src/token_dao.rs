@@ -113,7 +113,7 @@ pub async fn revoke_token(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
-/// Set (or clear) a token's per-token privilege `scope` jsonb (§12.4 Phase 6).
+/// Set (or clear) a token's per-token privilege `scope` jsonb.
 ///
 /// `scope = None` clears the column (the token then inherits its owner's full
 /// effective set); `Some(value)` stores the raw jsonb (the caller validates its

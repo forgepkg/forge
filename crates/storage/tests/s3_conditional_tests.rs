@@ -1,7 +1,6 @@
 //! Conditional-write (`If-None-Match: *`) behavior of `BlobStore::put_if_absent`
-//! against a scripted fake S3 — covers both code paths from the design spec
-//! (§3.7: "a fake S3 returning 412 vs. not") without Docker, unlike
-//! `s3_tests.rs` which needs a live versitygw.
+//! against a scripted fake S3 — covers both code paths (a fake S3 returning 412
+//! vs. not) without Docker, unlike `s3_tests.rs` which needs a live versitygw.
 //!
 //! The fake is a minimal HTTP/1.1 responder: it records every request (method +
 //! whether `If-None-Match` was sent), answers from a per-test script keyed on

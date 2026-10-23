@@ -1,7 +1,7 @@
-//! Integration tests for the slice-12.3 validated-credential cache against a
-//! real Postgres testcontainer.
+//! Integration tests for the validated-credential cache against a real
+//! Postgres testcontainer.
 //!
-//! These exercise the security-critical behaviors from the plan (§2.5, Phase 3):
+//! These exercise the cache's security-critical behaviors:
 //!   * a positive verdict is cached so a second identical check does **not**
 //!     re-run the upstream forward (the whole point — NuGet's per-request Basic);
 //!   * a negative verdict is cached too (bounded brute-force amplification);

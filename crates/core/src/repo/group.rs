@@ -1,4 +1,4 @@
-//! Group-repository read resolution (spec §7 "Group", plan Phase 9).
+//! Group-repository read resolution.
 //!
 //! A **group** repository has no storage of its own: it federates reads across
 //! an ordered list of **member** repositories (hosted or proxy). Members carry a
@@ -8,7 +8,7 @@
 //! mixed-anonymity group serves an anonymous caller only its `anonymous_read`
 //! members, while an authenticated caller sees them all.
 //!
-//! Semantics (spec §7):
+//! Semantics:
 //! * **Enumeration** ([`list_versions`](RepoReadOps::list_versions)) = the
 //!   **union** of the visible members' versions, deduped by normalized version.
 //! * **Specific download** ([`resolve_nupkg`](RepoReadOps::resolve_nupkg) /
@@ -68,8 +68,8 @@
 //!   group serves nothing through them (an offline nested group is not
 //!   descended into), while an offline proxy still serves what it cached.
 //!
-//! Groups are **read-only**. Since §12.4 Phase 4 a group member **may itself be
-//! a group** (nested groups). Resolution first loads each readable group node
+//! Groups are **read-only**. A group member **may itself be a group** (nested
+//! groups). Resolution first loads each readable group node
 //! and edge once, then evaluates package-specific reachability over that compact
 //! graph: the [`MemberOpsFactory`] is only ever asked for each selected leaf.
 //! Two guards keep this safe even against a cycle injected by a raw DB write:
@@ -85,7 +85,7 @@
 //! deliberate exception: it only ever *removes* proxy candidates, so it
 //! consults every hosted leaf. Being able to read an outer group grants **no**
 //! transitive read on an inner member — only a `read` grant on the actual leaf
-//! repo does. Priority ordering (slice §7: higher wins ties) is preserved as a
+//! repo does. Priority ordering (higher wins ties) is preserved as a
 //! stable pre-order walk. For a concrete package id, selectors are evaluated
 //! while walking and a repeated group is expanded only when reached at a
 //! strictly shallower depth or under other active guards. A repeated leaf is queried once at its first
@@ -130,9 +130,9 @@ use crate::repo::{
 /// whose backing wiring is unavailable surfaces as a [`RepoError`] rather than a
 /// panic.
 pub trait MemberOpsFactory: Send + Sync {
-    /// Construct the read ops for `member`. Implementations should reject a
-    /// nested group member (kind == "group") — though Phase 10 config validation
-    /// already prevents one from being persisted.
+    /// Construct the read ops for a leaf `member` (hosted or proxy). Nested
+    /// groups are walked by the resolver itself and never reach the factory, so
+    /// implementations should reject a group member (kind == "group").
     fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError>;
 }
 

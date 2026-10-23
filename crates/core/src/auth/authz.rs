@@ -1,4 +1,4 @@
-//! Authorization seam (§12.4: the single fine-grained-RBAC decision point).
+//! Authorization seam: the single fine-grained-RBAC decision point.
 //!
 //! ## The seam
 //! Authorization is decided by the [`Authz`] service. It owns the data handles a
@@ -16,10 +16,10 @@
 //! Every gate (request dispatch in `server::dispatch`, the browse read
 //! endpoints, the admin `require_admin` middleware, and identity-aware group
 //! resolution in `core::repo::group`) calls these methods. Keeping them on one
-//! service is what lets §12.4 answer them from the cached RBAC evaluator
-//! **without touching any call site**.
+//! service lets the cached RBAC evaluator answer them all, so **no call site
+//! evaluates policy itself**.
 //!
-//! ## Behavior (fine-grained RBAC, §12.4 Phase 3)
+//! ## Behavior (fine-grained RBAC)
 //! Each predicate resolves the principal's **effective set** (the additive union
 //! of its roles' grants) and asks the pure evaluator:
 //!
@@ -44,9 +44,9 @@
 //! * **Unauthenticated** — always denied.
 //!
 //! ## Fail-closed
-//! The methods return `bool` (preserving the slice-1 call sites). Any evaluation
-//! error — a DB load failure, a selector that won't compile, a malformed token
-//! scope — is **logged and denied**: an error never grants. The repo-level gate
+//! The methods return a plain `bool`, never an error. Any evaluation error — a
+//! DB load failure, a selector that won't compile, a malformed token scope — is
+//! **logged and denied**: an error never grants. The repo-level gate
 //! is a fast in-memory set test over the (warm-cache) effective set; selector
 //! filtering happens separately via [`Authz::package_filter`].
 
@@ -59,7 +59,7 @@ use super::principal::Principal;
 use crate::authz::cache as authz_cache;
 use crate::authz::{parse_token_scope, Action, EffectiveSet, PackageFilter, TokenScope};
 
-/// The authorization decision service (§12.4 seam).
+/// The authorization decision service (the single RBAC decision point).
 ///
 /// Cheaply cloneable: the [`PgPool`] and [`Cache`] inside are both `Arc`-backed.
 /// Constructed once during server wiring and held in app state / threaded into
@@ -102,8 +102,8 @@ impl Authz {
     ///
     /// `repo.anonymous_read` is a first-class toggle (exposed by the admin
     /// API/UI and honored independently of RBAC grants): when set, the anonymous
-    /// principal may read the repo. This preserves slice-1 semantics for repos
-    /// created with `anonymous_read = true` even on a fresh, default-deny RBAC
+    /// principal may read the repo. A repo created with `anonymous_read = true`
+    /// is therefore anonymously readable even on a fresh, default-deny RBAC
     /// install. RBAC grants are still consulted for everything else.
     ///
     /// With [`Self::with_public_read_for_signed_in`] (`anonymous_mode = "all"`),
@@ -281,7 +281,7 @@ impl Authz {
                     Some(tid) => self.apply_token_scope(owner, *tid).await,
                 }
             }
-            // WIF (slice 12.8): a workload is authorized purely by the single
+            // WIF: a workload is authorized purely by the single
             // forge role its realm's claim-rules mapped it to (plus, for reads,
             // the public reach every principal holds). No `app_user`, no token
             // scope — a deleted role resolves to deny-all.

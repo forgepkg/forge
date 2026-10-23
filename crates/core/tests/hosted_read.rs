@@ -1,4 +1,4 @@
-//! Integration tests for hosted-repository read ops (Phase 6, Task 6.1).
+//! Integration tests for hosted-repository read ops.
 //!
 //! Seeds `repository` + `blob` + `component` + `asset` rows via the DAOs, then
 //! drives [`forge_core::repo::hosted::HostedRepo`] through the [`RepoReadOps`]

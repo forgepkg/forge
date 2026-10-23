@@ -1,5 +1,5 @@
 //! E2E: repository dispatch + authorization + hosted publish/read round-trip
-//! through the full HTTP stack (plan 10.3). Requires Docker.
+//! through the full HTTP stack. Requires Docker.
 
 mod common;
 
@@ -450,8 +450,8 @@ async fn anonymous_read_when_allowed() {
         .await
         .unwrap();
 
-    // Under §12.4 RBAC, anonymous read flows through a grant on the built-in
-    // `anonymous` role (what the data migration converts the slice-1
+    // Under RBAC, anonymous read flows through a grant on the built-in
+    // `anonymous` role (what the RBAC data migration converted the
     // `anonymous_read` flag into), not the column. Seed that grant directly,
     // mirroring the migration, so the seam permits the anonymous read.
     let repo_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, &repo)

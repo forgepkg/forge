@@ -9,8 +9,8 @@ repo; re-run this script only when the fixtures need to change:
     python3 fixtures/nuget/make_fixtures.py
 
 The fixtures intentionally cover:
-  * two different nuspec `xmlns` schema versions (Addendum A3 — the parser must
-    be namespace-insensitive);
+  * two different nuspec `xmlns` schema versions (the parser must be
+    namespace-insensitive);
   * grouped and flat dependency declarations;
   * a "zip bomb" archive with a hugely compressible payload entry next to a
     valid manifest. Only the .nuspec is ever decompressed, so the parser must

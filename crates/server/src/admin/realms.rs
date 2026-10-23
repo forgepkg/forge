@@ -1,4 +1,4 @@
-//! Admin auth-realm CRUD (12.7 §3.5). **Admin-only** (mounted behind
+//! Admin auth-realm CRUD. **Admin-only** (mounted behind
 //! [`super::require_admin`]).
 //!
 //! Secrets inside a realm `config` (OIDC `client_secret`, credential-forwarding
@@ -202,7 +202,8 @@ async fn assert_unique_enabled_wif_issuer(
 }
 
 /// Refuse a write that would leave more than one **enabled** `oidc` realm
-/// (12.7 ships single-IdP; multi-IdP selection/routing is a later slice).
+/// (one OIDC identity provider at a time; there is no selection or routing
+/// among several).
 async fn assert_single_enabled_oidc(
     state: &AppState,
     exclude_id: Option<i64>,

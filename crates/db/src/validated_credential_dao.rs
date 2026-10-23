@@ -1,9 +1,9 @@
-//! Data access for `validated_credential` (slice 12.3): the durable,
-//! authoritative backing store of the validated-credential cache.
+//! Data access for `validated_credential`: the durable, authoritative backing
+//! store of the validated-credential cache.
 //!
 //! NuGet clients send Basic credentials on *every* request, so forwarding each
 //! one to the configured upstream is unacceptable. The
-//! [`forge_cache::Cache`](../../cache) L1(+optional L2) layer absorbs the hot
+//! [`forge_cache::Cache`](../../cache) in-process L1 layer absorbs the hot
 //! path, but the **authoritative** validation verdict lives here in Postgres so
 //! a cold instance with no Redis still avoids re-forwarding (the no
 //! in-memory-only-authoritative-state rule).

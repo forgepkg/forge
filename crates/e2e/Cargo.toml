@@ -39,7 +39,7 @@ figment = { version = "0.10", features = ["toml"] }
 testcontainers = { version = "0.27", optional = true }
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis"], optional = true }
 
-# In-process mock OIDC IdP for the slice-12.2 e2e scenarios: an axum app
+# In-process mock OIDC IdP for the OIDC e2e scenarios: an axum app
 # serving discovery/JWKS + an authorize endpoint that 302s straight back to the
 # forge callback and a token endpoint that signs a test ID token with a
 # throwaway RSA key. Mirrors the forge-server route-test harness, but in-process

@@ -1,4 +1,4 @@
-//! Integration tests for identity-aware group resolution (Phase 9, Task 9.1).
+//! Integration tests for identity-aware group resolution.
 //!
 //! Seeds two hosted **member** repositories plus a **group** that federates
 //! them, then drives [`forge_core::repo::group::GroupRepo`] through the
@@ -6,7 +6,7 @@
 //! (over the shared Postgres) via an in-memory [`MemberOpsFactory`], with a stub
 //! [`BlobFetch`] so no S3 is needed.
 //!
-//! Coverage (per plan Phase 9):
+//! Coverage:
 //! * two members share an overlapping version → the **highest-priority** member
 //!   serves the `.nupkg`;
 //! * `list_versions` returns the **union** of both members' versions;
@@ -66,9 +66,11 @@ impl BlobFetch for StubBlobs {
 }
 
 /// A [`MemberOpsFactory`] that builds a [`HostedRepo`] for every member, sharing
-/// the pool and the stub blob bytes. Slice-1 group members are hosted/proxy; the
-/// tests only exercise hosted members, which is sufficient for the resolution
-/// semantics (the factory seam is what the server swaps for proxy support).
+/// the pool and the stub blob bytes. The leaf members the factory is asked for
+/// are hosted or proxy repositories (nested groups are flattened by the
+/// resolver); the tests only exercise hosted members, which is sufficient for
+/// the resolution semantics (the factory seam is what the server swaps for
+/// proxy support).
 struct HostedFactory {
     pool: PgPool,
     blobs: StubBlobs,
@@ -123,10 +125,9 @@ fn group_repo_depth(
 }
 
 /// A real (non-admin) authenticated user holding the seeded `authenticated`
-/// role — the role the §12.4 data migration assigns to preserve slice-1
-/// "any authenticated user reads/writes everywhere". This is what makes the
+/// role, which carries read/write on every repository. This is what makes the
 /// authenticated-sees-all assertions hold under fine-grained RBAC: visibility
-/// now flows through `can_read`, so the user must actually be granted read.
+/// flows through `can_read`, so the user must actually be granted read.
 async fn user(pool: &PgPool) -> Principal {
     let u = user_dao::insert_user(
         pool,
@@ -167,10 +168,10 @@ async fn seed_blob(pool: &PgPool, sha: &str, s3_key: &str, size: i64) {
 }
 
 /// Seed a hosted member repository. When `anonymous_read` is set, also grant the
-/// built-in `anonymous` role `read` on it — under §12.4 RBAC anonymous
-/// visibility flows through that grant (what the data migration converts the
-/// slice-1 `anonymous_read` flag into), not the column. The column is still set
-/// for parity but is no longer consulted by the seam.
+/// built-in `anonymous` role `read` on it — under RBAC anonymous visibility
+/// flows through that grant (what the RBAC data migration converted the
+/// `anonymous_read` flag into), not the column. The column is still set for
+/// parity but is not consulted by the seam.
 async fn seed_member(pool: &PgPool, anonymous_read: bool) -> Repository {
     let name = format!("member-{}", common::unique());
     let new = NewRepository {
@@ -457,7 +458,7 @@ async fn search_merges_and_dedups_highest_priority_wins() {
         .any(|h| h.original_id.eq_ignore_ascii_case("onlylow")));
 }
 
-// ── nested groups (§12.4 Phase 4) ───────────────────────────────────────────
+// ── nested groups ───────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn nested_group_flattens_leaves_through_inner_group() {

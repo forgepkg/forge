@@ -13,11 +13,12 @@ export const Route = createFileRoute('/_app/manage/realms/new')({
 })
 
 /**
- * Create-realm screen (§12.7). Renders the shared kind-conditional `RealmForm`
- * (oidc | credential_forwarding — local is built in), posts a `CreateRealm`
- * body (the new realm is appended at the end of the order), and on success
- * navigates back to the list. Server errors (400 invalid config such as a
- * missing secret, 409 duplicate name) are surfaced inline by the form.
+ * Create-realm screen. Renders the shared kind-conditional `RealmForm` (oidc |
+ * credential_forwarding | workload_identity — local is built in), posts a
+ * `CreateRealm` body (the new realm is appended at the end of the order), and
+ * on success navigates back to the list. Server errors (400 invalid config
+ * such as a missing secret, 409 duplicate name) are surfaced inline by the
+ * form.
  */
 function CreateRealmScreen() {
   const navigate = useNavigate()

@@ -281,11 +281,11 @@ pub struct ServerOpts {
     /// web UI is disabled for the test.
     pub web_assets_dir: Option<String>,
     /// When set, this raw TOML is appended as the `[oidc]` section so the server
-    /// builds an `OidcRuntime` + mounts the `/auth/oidc/*` routes (slice 12.2).
+    /// builds an `OidcRuntime` + mounts the `/auth/oidc/*` routes.
     pub oidc_block: Option<String>,
     /// When set, this raw TOML is appended as the `[crypto]` section so the
-    /// server builds the secret-encryption envelope service (slice 12.5). The
-    /// caller is responsible for exporting the root-key env var it references.
+    /// server builds the secret-encryption envelope service. The caller is
+    /// responsible for exporting the root-key env var it references.
     pub crypto_block: Option<String>,
     /// `server.public_base_url` (default `http://test.local`); an `https://`
     /// URL makes the server issue `Secure` (`__Host-`) cookies.
@@ -359,7 +359,7 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .await
         .expect("bootstrap admin");
 
-    // §12.5: build + bootstrap the envelope service when the test enabled the
+    // Build + bootstrap the envelope service when the test enabled the
     // [crypto] block (no-op otherwise).
     let envelope =
         forge_server::crypto::build_envelope(&config, &pool).expect("build envelope service");
@@ -369,7 +369,7 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
             .expect("bootstrap secret encryption");
     }
 
-    // 12.7: import any [oidc]/[auth.upstream_basic] block into auth_realm rows
+    // Import any [oidc]/[auth.upstream_basic] block into auth_realm rows
     // (drift-detected) so the realm-driven runtime sees them.
     forge_server::app::ensure_auth_realms(&config, &pool, envelope.as_deref())
         .await

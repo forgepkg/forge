@@ -22,8 +22,9 @@ pub const KEY_LEN: usize = 32;
 ///
 /// Used for unwrapped DEKs/KEKs and the dev root key. The bytes live in RAM
 /// only while needed (bounded by the unwrapped-key cache TTL) — this is the
-/// documented, §2.1-compliant exception: the material is *derivable* (it can
-/// always be re-unwrapped from Postgres + the root), never authoritative.
+/// documented exception to keeping instances stateless: the material is
+/// *derivable* (it can always be re-unwrapped from Postgres + the root), never
+/// authoritative.
 pub struct KeyBytes(Zeroizing<[u8; KEY_LEN]>);
 
 impl KeyBytes {
