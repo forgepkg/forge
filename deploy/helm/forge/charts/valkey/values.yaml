@@ -13,7 +13,7 @@ image:
   repository: forgepkg/forge/valkey
   # Pinned by digest (`<tag>@sha256:…`, the multi-arch index), which
   # Dependabot bumps together with the tag; `digest`, when set, replaces it.
-  tag: 9.1-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11
+  tag: 9.2-alpine@sha256:cdcb7b1c7b6f1c9cb9442c71ac6275e78184657448407b2c1fdde7ee8024f4fb
   digest: ""
   pullPolicy: IfNotPresent
 
