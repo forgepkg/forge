@@ -60,8 +60,9 @@ under `crates/` (no `crates/format-<id>`) or as a module of the server: it
 implements `FormatPlugin` with the layout
 [plugins/README.md](plugins/README.md) describes, and has a `component`
 feature unless it is built in only. Docker / OCI (`crates/format-oci`) and
-raw (`crates/server/src/raw/`) are served natively, outside the plugin
-contract; they are not the model for a new format.
+raw (`crates/server/src/raw/`) are not there yet and are to move, to
+`plugins/docker` and `plugins/raw`, each in a pull request of its own; until
+then they are not the model for a new format.
 
 ## Changelog: a fragment per change, never CHANGELOG.md
 
