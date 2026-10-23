@@ -176,7 +176,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # release (security fixes for two years) and the newest that builds with the
 # pinned toolchain. Only what the host uses: the component model compiled by
 # Cranelift, no WAT text parser, no GC proposals, no profiling or debugging.
-wasmtime = { version = "48.0.7", default-features = false, features = [
+wasmtime = { version = "49.0.4", default-features = false, features = [
     "runtime",
     "cranelift",
     "component-model",
