@@ -7,16 +7,18 @@ use std::time::Duration;
 use crate::auth::WorkloadIdentitySource;
 use anyhow::Context;
 use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::any;
 use axum::Router;
 use forge_core::auth::session_source::SessionCookieSource;
 use forge_core::auth::token::{BasicAuthSource, PrincipalSource, TokenHeaderSource};
+use forge_core::net::deadline::HandlerDeadline;
 use forge_db::authz_dao;
 use forge_db::model::AppUser;
 use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
 use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::timeout::{RequestBodyTimeoutLayer, TimeoutLayer};
+use tower_http::timeout::RequestBodyTimeoutLayer;
 
 use crate::admin::admin_router;
 use crate::auth::auth_router;
@@ -199,10 +201,18 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     } else {
         app
     };
+    // A proxy's first download of a package or layer may take longer
+    // (`proxy.download_timeout_seconds`): it extends its request's deadline
+    // (`forge_core::net::deadline`).
     let app = if server.request_timeout_seconds > 0 {
-        app.layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(server.request_timeout_seconds),
+        let timeout = Duration::from_secs(server.request_timeout_seconds);
+        app.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                HandlerDeadline::new(timeout)
+                    .run(next.run(req))
+                    .await
+                    .unwrap_or_else(|| StatusCode::REQUEST_TIMEOUT.into_response())
+            },
         ))
     } else {
         app
@@ -519,24 +529,4 @@ pub async fn ensure_auth_realms(
     crate::auth::seed_auth_realms(config, pool, envelope)
         .await
         .context("seed auth realms")
-}
-
-/// Apply the behavior-preserving RBAC legacy mapping **once** per install
-/// (§12.4 Phase 5).
-///
-/// Migration `0007` ran it and recorded the install-wide `legacy_open_access`
-/// default (open on upgrade, closed on a fresh install). This boot hook runs it
-/// one more time for installs that upgraded before the one-shot marker existed,
-/// then records the `legacy_rbac_synced` marker: re-running it on every boot
-/// would re-grant admin roles / anonymous grants an operator has since revoked
-/// through RBAC (the routine only ever adds). It never *opens* a fresh install:
-/// the `authenticated` auto-assignment is gated on `legacy_open_access`.
-pub async fn ensure_legacy_rbac(pool: &PgPool) -> anyhow::Result<()> {
-    if authz_dao::apply_legacy_migration_once(pool)
-        .await
-        .context("apply legacy RBAC migration")?
-    {
-        tracing::info!("applied the one-shot legacy RBAC mapping");
-    }
-    Ok(())
 }

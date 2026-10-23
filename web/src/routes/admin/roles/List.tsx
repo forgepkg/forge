@@ -46,8 +46,9 @@ function RolesList() {
           built-in roles cannot be deleted: <strong>admin</strong> may do
           everything, <strong>anonymous</strong> applies to callers who do not
           sign in (and its reads to everyone), and{' '}
-          <strong>authenticated</strong> is the open access of installs
-          upgraded from before roles existed.
+          <strong>authenticated</strong> reads and writes every repository,
+          the open access from before roles existed; no user gets it
+          automatically.
         </Text>
       </div>
 

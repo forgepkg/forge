@@ -7,6 +7,11 @@
 // since Rust 1.98. Boxing every handler error would fight the framework on a
 // path that is not hot, so the lint is opted out crate-wide.
 #![allow(clippy::result_large_err)]
+// The background tasks that run the proxy's reads (a listing refresh, its
+// not-found check, a cache invalidation) nest deeper than the default depth
+// the trait solver walks to prove a spawned future `Send`; `forge-core`
+// raises it for the same reason.
+#![recursion_limit = "256"]
 
 pub mod admin;
 pub mod app;

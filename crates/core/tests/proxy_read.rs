@@ -994,6 +994,57 @@ async fn proxy_delay_and_not_found_ttl_run_on_the_database_clock() {
     );
 }
 
+/// #222: the answer "the upstream does not know this id" is cached for the
+/// metadata TTL, but stands only while the id's not-found marker does. With
+/// a `not_found_ttl_seconds` shorter than the metadata TTL (0 included), a
+/// package published upstream meanwhile is listed through the same cache
+/// once its marker expired, and not before.
+#[tokio::test]
+async fn an_expired_not_found_marker_hides_nothing_through_the_cache() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(Corpus::new()).await;
+    for not_found_ttl in [30, 0] {
+        let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+        sqlx::query(
+            "UPDATE repository SET metadata_ttl_seconds = 3600, not_found_ttl_seconds = $2 \
+             WHERE name = $1",
+        )
+        .bind(&repo)
+        .bind(not_found_ttl)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
+        let id = format!("Acme.Lib{not_found_ttl}");
+        assert!(px.list_versions(&repo, &id).await.unwrap().is_empty());
+        mock.state
+            .packages
+            .lock()
+            .unwrap()
+            .extend(corpus_of(&id, &["1.0.0"]));
+        if not_found_ttl > 0 {
+            assert!(
+                px.list_versions(&repo, &id).await.unwrap().is_empty(),
+                "the marker still stands"
+            );
+            sqlx::query(
+                "UPDATE proxy_cached_version SET not_found_at = now() - interval '31 seconds' \
+                 WHERE repository_id = (SELECT id FROM repository WHERE name = $1)",
+            )
+            .bind(&repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            versions_of(&px.list_versions(&repo, &id).await.unwrap()),
+            ["1.0.0"],
+            "not_found_ttl_seconds = {not_found_ttl}"
+        );
+    }
+}
+
 /// #76: a service index without `PackageBaseAddress` (a captive portal, a
 /// gateway's error page) is an upstream failure. It never replaces the last
 /// good index, and without one the proxy errors instead of answering every id

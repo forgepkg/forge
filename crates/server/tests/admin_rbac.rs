@@ -11,10 +11,8 @@
 //! * user-role assign/unassign with targeted invalidation;
 //! * per-token scoping narrows (read-only scoped token cannot write).
 //!
-//! The test harness defaults to a **fresh (closed)** install (`legacy_open_access`
-//! unset ⇒ false), so a brand-new non-admin user holds no roles and is denied by
-//! default — exactly the deny-by-default baseline against which a grant's effect
-//! is observable.
+//! A brand-new non-admin user holds no roles and is denied by default — exactly
+//! the deny-by-default baseline against which a grant's effect is observable.
 
 mod common;
 

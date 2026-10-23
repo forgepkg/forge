@@ -58,7 +58,7 @@ const BUILTIN_NOTES: Record<string, string> = {
   anonymous:
     'Its grants apply to callers who do not sign in. Its read grants apply to every signed-in user too.',
   authenticated:
-    'Installs upgraded from before roles existed give it to every user, for the open access they had.',
+    'It reads and writes every repository: the open access from before roles existed. No user gets it automatically; assign it like any other role.',
 }
 
 /**

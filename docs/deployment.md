@@ -425,7 +425,12 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   a client outside the allowlist.
 - Forge bounds slow clients itself (`server.header_read_timeout_seconds`,
   `body_idle_timeout_seconds`, `request_timeout_seconds`); keep the proxy's
-  own timeouts at least as long for package pushes.
+  own timeouts at least as long for package pushes. A proxy repository's
+  first download of a package or layer may take up to
+  `proxy.download_timeout_seconds` (30 min) before Forge answers, plus
+  `request_timeout_seconds` to store it: allow that long a wait for the
+  response on the feed and registry paths too, or the client is cut off
+  first.
 - Forge speaks HTTP/1.1 to the proxy (no h2c). `header_read_timeout_seconds`
   (default 150) also closes keep-alive connections that stay idle that long.
   If the proxy keeps upstream connections open longer than that (Envoy and

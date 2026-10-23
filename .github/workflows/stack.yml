@@ -1,7 +1,7 @@
 name: Stack
 
 # A stacked pull request targets the branch of the pull request below it
-# (AGENTS.md, "Pull requests: one per issue, stacked"). Merged there, its fix
+# (DEVELOPMENT.md, "Stacked pull requests"). Merged there, its fix
 # would land in that other pull request; it has to wait until the one below
 # has merged and GitHub has retargeted it to the default branch.
 #
@@ -14,12 +14,15 @@ name: Stack
 #
 # CI (ci.yml) runs on pull requests that target the default branch only, so
 # a stacked pull request runs this workflow alone. Once it is retargeted to
-# the default branch, this workflow starts CI on its branch: as a
-# `workflow_dispatch` run, the one event a GITHUB_TOKEN may start a workflow
-# with, whose check runs land on the head commit the default branch's rules
-# check. Its `base` input makes it run only the jobs the pull request's
-# change needs, as a pull request run does. Every later push runs CI on the
-# pull request as usual.
+# the default branch, this workflow merges the default branch into it, as
+# the pull request's Update branch button does, and that push runs CI as a
+# pull request run. Nothing else would: a retarget is no event ci.yml takes,
+# a push with the GITHUB_TOKEN starts no workflow, and GitHub evaluates a
+# pull request's checks only from runs of `pull_request`, `push` and a few
+# other events, so a `workflow_dispatch` run's checks neither show on the
+# pull request nor satisfy its required checks. The merge is pushed with a
+# token of the stack App (DEVELOPMENT.md, "Stacked pull requests"); without
+# the App, the job asks for the Update branch button instead.
 #
 # A pull request opened against the default branch gets no status: the
 # ruleset does not apply there, and Dependabot's and forks' read-only tokens
@@ -30,7 +33,6 @@ on:
 
 permissions:
   statuses: write # the `stack` status
-  actions: write # start CI on a retargeted pull request
 
 # One run at a time per pull request, the newest event last, so a pull
 # request retargeted twice in a row ends with the status of its final base.
@@ -67,12 +69,38 @@ jobs:
           gh api "repos/$REPO/statuses/$SHA" \
             -f state="$state" -f context=stack \
             -f description="${description:0:140}" -f target_url="$DOCS" > /dev/null
-      # A fork's branch cannot be dispatched to; a push to it starts CI.
-      - name: Start CI on a pull request retargeted to the default branch
+      # A fork's branch is not ours to push to; a push to it starts CI.
+      - name: Mint a token of the stack App
+        id: app
+        if: github.base_ref == github.event.repository.default_branch && github.event.pull_request.head.repo.full_name == github.repository && vars.STACK_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.STACK_APP_CLIENT_ID }}
+          private-key: ${{ secrets.STACK_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          # The merge brings in the default branch's changes to the workflows.
+          permission-workflows: write
+      - name: Merge the default branch into a pull request retargeted to it
         if: github.base_ref == github.event.repository.default_branch && github.event.pull_request.head.repo.full_name == github.repository
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
-          HEAD_REF: ${{ github.head_ref }}
+          NUMBER: ${{ github.event.pull_request.number }}
           BASE: ${{ github.base_ref }}
-        run: gh workflow run ci.yml --repo "$REPO" --ref "$HEAD_REF" -f base="$BASE"
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::No stack App is set up (DEVELOPMENT.md, \"Stacked pull requests\"), so CI did not start: press Update branch on the pull request."
+            exit 0
+          fi
+          # The branch now, not as the event saw it: a push since has run CI.
+          head=$(gh api "repos/$REPO/pulls/$NUMBER" --jq .head.sha)
+          if [ "$(gh api "repos/$REPO/compare/$BASE...$head" --jq .behind_by)" = 0 ]; then
+            echo "::warning::The branch already holds $BASE, so there is nothing to merge and CI did not start: push to the branch."
+            exit 0
+          fi
+          if ! out=$(gh api -X PUT "repos/$REPO/pulls/$NUMBER/update-branch" -f expected_head_sha="$head" 2>&1); then
+            echo "::error::Could not merge $BASE into the branch, so CI did not start: $out"
+            exit 1
+          fi
+          echo "Merged $BASE into the branch; that push runs CI."

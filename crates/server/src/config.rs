@@ -156,8 +156,10 @@ pub struct ServerConfig {
     /// Seconds a handler has to produce its response (`408` after that); a
     /// response body already streaming, such as a package download, is not cut
     /// off. Covers reading an upload, so keep it above the slowest expected
-    /// push of the largest repository upload limit. `0` disables. Default
-    /// 900.
+    /// push of the largest repository upload limit. A proxy's download from
+    /// its upstream, bounded by `proxy.download_timeout_seconds`, extends it:
+    /// the handler has this long again after that download's deadline. `0`
+    /// disables. Default 900.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
 }
@@ -1180,7 +1182,9 @@ pub struct ProxyConfig {
     /// `.nuspec`). Default 60 s.
     #[serde(default = "default_proxy_metadata_timeout")]
     pub metadata_timeout_seconds: u64,
-    /// Total deadline for a `.nupkg` download. Default 30 min.
+    /// Total deadline for a download (a `.nupkg`, a docker layer). It
+    /// extends the deadline of the request it serves
+    /// (`server.request_timeout_seconds`). Default 30 min.
     #[serde(default = "default_proxy_download_timeout")]
     pub download_timeout_seconds: u64,
     /// Largest accepted upstream metadata document. Default 32 MiB.

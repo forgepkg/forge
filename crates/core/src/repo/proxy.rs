@@ -52,8 +52,9 @@
 //!   at its first sighting.
 //! * **Negative cache** — a genuine upstream 404 sets `not_found = true` +
 //!   `not_found_at = now()`, honored for `not_found_ttl_seconds` — by direct
-//!   downloads *and* listings; an expired marker hides nothing. An upstream
-//!   version listing that contains the version clears its marker.
+//!   downloads *and* listings; an expired marker hides nothing, not even
+//!   through the listing cached for the metadata TTL. An upstream version
+//!   listing that contains the version clears its marker.
 //! * **Upstream confirmation** — the download singleflight creates its row for
 //!   whatever version a client asks for, so such a row starts *unconfirmed*
 //!   and is never enumerated (flat index, registration, search) until an
@@ -786,16 +787,17 @@ impl ProxyRepo {
             return self.cached_rows(repo.id, lower_id).await;
         }
 
-        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
-        let key = Self::versions_key(repo, lower_id);
-        let refreshed = self
-            .cache
-            .get_or_try_insert_with(NS_UPSTREAM_VERSIONS, &key, ttl, || async {
-                Box::pin(self.refresh_versions(repo, lower_id))
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-            .await;
+        let mut refreshed = self.listing_refreshed(repo, lower_id).await;
+        // "The upstream does not know the id" is cached for the metadata
+        // TTL, but stands only while the id's not-found marker does
+        // (`not_found_ttl_seconds`, which may be shorter, or 0): past it,
+        // the upstream is asked again.
+        if refreshed == Ok(false) && !self.negative_cached(repo, lower_id, "*").await? {
+            self.cache
+                .invalidate(NS_UPSTREAM_VERSIONS, &Self::versions_key(repo, lower_id))
+                .await;
+            refreshed = self.listing_refreshed(repo, lower_id).await;
+        }
         match refreshed {
             Ok(true) => self.cached_rows(repo.id, lower_id).await,
             Ok(false) => Ok(Vec::new()),
@@ -810,6 +812,26 @@ impl ProxyRepo {
                 Ok(rows)
             }
         }
+    }
+
+    /// Refresh `lower_id`'s listing ([`Self::refresh_versions`]) unless it
+    /// was refreshed within the metadata TTL (the cache coalesces concurrent
+    /// refreshes, across instances too). `Ok(false)`: the upstream does not
+    /// know the id.
+    async fn listing_refreshed(&self, repo: &Repository, lower_id: &str) -> Result<bool, String> {
+        let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
+        self.cache
+            .get_or_try_insert_with(
+                NS_UPSTREAM_VERSIONS,
+                &Self::versions_key(repo, lower_id),
+                ttl,
+                || async {
+                    Box::pin(self.refresh_versions(repo, lower_id))
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .await
     }
 
     /// Fetch the upstream's version listing of `lower_id`

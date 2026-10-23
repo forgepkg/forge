@@ -684,7 +684,7 @@ and the static SPA on a single port (no Node in prod):
 
 1. **web** — Node 22 + pnpm (corepack): `pnpm install --frozen-lockfile` +
    `pnpm run build` → `web/dist`.
-2. **builder** — `rust:1.95` with cargo-chef for dependency-layer caching;
+2. **builder** — `rust:1.99` with cargo-chef for dependency-layer caching;
    `cargo build --release -p forge-server` with `SQLX_OFFLINE=true` against the
    committed `.sqlx/` cache (no DB needed at build time).
 3. **runtime** — `debian:bookworm-slim` (+ `ca-certificates`) running as an
@@ -759,7 +759,7 @@ queue and on every push to `main`. It runs on pull requests that target
 `main` only; a stacked one waits (see [Stacked pull
 requests](#stacked-pull-requests)).
 
-A job runs only when the change touches what it checks (#353, #361). The
+A job runs only when the change touches what it checks (#353, #361, #363). The
 `changes` job (`.github/scripts/ci-changes.sh`) compares:
 
 - a pull request with its base branch;
@@ -777,20 +777,30 @@ It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
-| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `migrations/`, `.sqlx/`, `fixtures/`, `.github/scripts/`; and the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`, `web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
+| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `e2e`, `web-e2e` |
 | Changelog | `docs/changes/` | `fmt` |
+| Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
 | Web | `web/` | `web`, `web-e2e` |
-| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
+| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc` | `docker` |
 | Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
-A change to the CI configuration counts for every group. A job left out is
-skipped, which passes a required check. If the `changes` job fails, every job
-runs. A manual run without a `base` (`gh workflow run ci.yml --ref main`)
-and the push of a release commit, which sets a new workspace version, run
-every job, which the release gate requires (see [Releasing](#releasing)). A
-file that Rust code or its tests read from outside the crates belongs in the
-Rust group: add a new one to `ci-changes.sh`.
+A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
+counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
+`clippy`, `plugins`, `test`, `oci-e2e` and `e2e` in Rust; `audit` in Audit;
+`web` and `web-e2e` in Web; `docker` in Image and `kubernetes` in
+Kubernetes. A change outside the jobs (the triggers, the settings, the
+`changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
+counts for every group; blank and comment lines count for none. The
+Kubernetes group's digest-pin check reads every workflow, so any change to
+one runs `kubernetes`. A job left out is skipped, which passes a required
+check. If the `changes` job fails, every job runs. A manual run without a
+`base` (`gh workflow run ci.yml --ref main`) and the push of a release
+commit, which sets a new workspace version, run every job, which the release
+gate requires (see [Releasing](#releasing)). A file that Rust code or its
+tests read from outside the crates belongs in the Rust group, one only
+xtask's tests read in the Release group: add a new one to `ci-changes.sh`.
+A new job of `ci.yml` goes in `CI_JOB_GROUP` too.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
@@ -846,18 +856,83 @@ and Dependabot's:
   pull request's branch go through as before, and they can still merge a
   stacked pull request, but only by ticking **Merge without waiting for
   requirements to be met (bypass rules)**. A GitHub App pushing with its own
-  token has to be added to the bypass list.
+  token, such as the stack App below, has to be added to the bypass list.
 
 CI runs only on pull requests that target `main`, so a stacked pull request
 runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
 on every pull request above it. When a pull request is retargeted to `main`,
-the `Stack` workflow starts CI on its branch, with `main` as its `base`, so
-it runs the jobs the pull request's change needs, as a pull request run
-does. That run checks the branch as it is, not its merge with `main`; the
-next push, and the merge queue, check the merge. To check a stacked branch
-earlier, run CI on it by hand: **Actions → CI → Run workflow**, or
-`gh workflow run ci.yml --ref <branch> -f base=main`.
-A pull request from a fork gets no such run: a push to it starts CI.
+the `Stack` workflow merges `main` into its branch, as the pull request's
+**Update branch** button does, and that push runs CI on the pull request.
+A retarget alone starts no CI run, and a manual run's checks would not
+count: GitHub shows a pull request only the checks of `pull_request`,
+`push` and a few other runs, and only those satisfy its required checks.
+The workflow pushes the merge with a GitHub App's token, since a push with
+a workflow's own `GITHUB_TOKEN` starts no workflow. Without the App, the
+workflow warns, and the **Update branch** button starts CI instead. When
+`main` does not merge cleanly, the `stack-status` check fails: merge `main`
+by hand and push.
+
+To set up the stack App:
+
+1. Create a GitHub App (**Settings → Developer settings → GitHub Apps → New
+   GitHub App**), without a webhook, with the repository permissions
+   **Contents**, **Pull requests** and **Workflows**, each **Read and
+   write**. Install it on this repository only.
+2. Generate a private key for it. Save the App's client ID as the repository
+   variable `STACK_APP_CLIENT_ID`, and the key as the repository secret
+   `STACK_APP_PRIVATE_KEY` (**Settings → Secrets and variables → Actions**).
+3. If the stacked pull requests ruleset is active, add the App to its bypass
+   list, or it refuses the merge on the pull request's branch.
+
+The App's merge, like the button's, dismisses the pull request's approvals
+under a rule that dismisses stale ones.
+
+To check a stacked branch before its retarget, run CI on it by hand:
+**Actions → CI → Run workflow**, or
+`gh workflow run ci.yml --ref <branch> -f base=main`. The run compares the
+branch with the commit it forked off `main`, so it runs the jobs the pull
+request's change needs; its results show under **Actions**, not on the pull
+request. A pull request from a fork gets no merge: a push to it starts CI.
+
+## Code scanning (CodeQL)
+
+CodeQL code scanning runs as an advanced setup, the `CodeQL` workflow
+(`.github/workflows/codeql.yml`) with its configuration
+`.github/codeql/codeql-config.yml`. GitHub's default setup has to stay off
+(**CodeQL analysis** under code scanning in the repository's security
+settings): while it is on, GitHub refuses the workflow's uploads.
+
+The workflow analyzes three languages, each without a build, and a language
+only when a change touches its code:
+
+| Language | Paths |
+|---|---|
+| `rust` | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `.sqlx/` |
+| `javascript-typescript` | `web/`, and every `.js`, `.cjs`, `.mjs`, `.ts` and `.tsx` file |
+| `actions` | `.github/workflows/`, and every `action.yml` and `action.yaml` |
+
+A pull request that targets `main` is compared with its base branch, and a
+push to `main` with `main`'s previous commit. A change to the workflow or to
+`.github/codeql/` analyzes every language, and so do the weekly run and a
+manual run (**Actions → CodeQL → Run workflow**), so that a newer CodeQL's
+queries also look at code no change touched. A language a push to `main`
+leaves out keeps the alerts of its last analysis there, which the Security
+tab shows. The Rust analysis is by far the slowest, so a change to the web UI
+or the docs no longer waits for it. CodeQL is not among `main`'s required
+checks (see above), and the merge queue does not run it.
+
+Tests are not analyzed. Their fixed passwords and keys and their plain-http
+URLs to local test servers are on purpose, and an alert for each would only
+be dismissed by hand. The configuration's `paths-ignore` leaves out the test
+directories (`**/tests`, `crates/e2e`, `web/e2e`), the web UI's
+`*.test.ts(x)` and test runner configuration, the `testing` helpers of
+`crates/plugin` and `crates/plugin-api`, and `fixtures/`. The unit tests
+inside the Rust source files (`#[cfg(test)] mod tests`) cannot be left out by
+path; the Rust extractor compiles the code with `cfg(test)` off instead
+(`CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES=-test`), as a release build
+does. Add a new test directory or test helper outside these to `paths-ignore`.
+The repository's one Python file, `fixtures/nuget/make_fixtures.py`, makes
+test packages, so Python is not analyzed at all.
 
 ## Changelog entries
 
