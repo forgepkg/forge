@@ -213,8 +213,6 @@ redirect_url = "{public_base_url}/auth/oidc/callback"
 allow_private_issuer = true
 admin_groups = ["forge-admins"]
 admin_claim = "roles"
-session_idle_ttl_seconds = 28800
-session_absolute_ttl_seconds = 604800
 "#,
             issuer = self.base_url,
             client_id = self.client_id,

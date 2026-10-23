@@ -13,6 +13,8 @@
 //! session created on instance A is immediately visible (and revocable) on
 //! instance B.
 
+use std::sync::{Arc, RwLock};
+
 use base64::Engine;
 use chrono::Duration as ChronoDuration;
 use forge_db::model::Session;
@@ -47,15 +49,23 @@ pub struct IssuedSession {
     pub cookie_secret: String,
 }
 
+/// A session's idle timeout and absolute lifetime.
+#[derive(Debug, Clone, Copy)]
+struct Lifetimes {
+    idle: ChronoDuration,
+    absolute: ChronoDuration,
+}
+
 /// Create/validate/rotate/revoke sessions over a shared Postgres.
 ///
-/// Cheaply [`Clone`]able (just a pool + a couple of durations). TTLs come from
-/// the OIDC config; the server builds one of these at startup.
+/// Cheaply [`Clone`]able (a pool and the shared lifetimes). The server builds
+/// one at startup and follows the lifetimes an administrator sets
+/// ([`Self::set_ttls`]).
 #[derive(Clone)]
 pub struct SessionService {
     pool: PgPool,
-    idle_ttl: ChronoDuration,
-    absolute_ttl: ChronoDuration,
+    /// Shared by every clone, so [`Self::set_ttls`] reaches them all.
+    lifetimes: Arc<RwLock<Lifetimes>>,
     touch_throttle_secs: i64,
 }
 
@@ -64,10 +74,35 @@ impl SessionService {
     pub fn new(pool: PgPool, idle_ttl: ChronoDuration, absolute_ttl: ChronoDuration) -> Self {
         Self {
             pool,
-            idle_ttl,
-            absolute_ttl,
+            lifetimes: Arc::new(RwLock::new(Lifetimes {
+                idle: idle_ttl,
+                absolute: absolute_ttl,
+            })),
             touch_throttle_secs: DEFAULT_TOUCH_THROTTLE_SECS,
         }
+    }
+
+    /// Change the idle / absolute TTLs, for this service and every clone of
+    /// it. A session created afterwards gets them; an existing one keeps its
+    /// absolute expiry, and its idle window slides by the new idle TTL on
+    /// its next use.
+    pub fn set_ttls(&self, idle_ttl: ChronoDuration, absolute_ttl: ChronoDuration) {
+        *self
+            .lifetimes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Lifetimes {
+            idle: idle_ttl,
+            absolute: absolute_ttl,
+        };
+    }
+
+    /// The current idle / absolute TTLs.
+    pub fn ttls(&self) -> (ChronoDuration, ChronoDuration) {
+        let lifetimes = *self
+            .lifetimes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (lifetimes.idle, lifetimes.absolute)
     }
 
     /// Override the `last_seen_at` touch throttle (mainly for tests).
@@ -93,6 +128,7 @@ impl SessionService {
         let now = forge_db::db_now(&self.pool)
             .await
             .map_err(|e| SessionError::Db(e.to_string()))?;
+        let (idle_ttl, absolute_ttl) = self.ttls();
 
         let session = session_dao::create(
             &self.pool,
@@ -102,8 +138,8 @@ impl SessionService {
                 token_hash,
                 csrf_secret,
                 user_agent_hash,
-                idle_expiry: now + self.idle_ttl,
-                absolute_expiry: now + self.absolute_ttl,
+                idle_expiry: now + idle_ttl,
+                absolute_expiry: now + absolute_ttl,
             },
         )
         .await
@@ -150,7 +186,7 @@ impl SessionService {
             &self.pool,
             session.id,
             self.touch_throttle_secs,
-            self.idle_ttl.num_seconds(),
+            self.ttls().0.num_seconds(),
         )
         .await
         {

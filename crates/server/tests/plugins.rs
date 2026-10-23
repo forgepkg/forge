@@ -401,11 +401,16 @@ async fn a_writer_uploads_charts_but_deletes_none() {
 
 #[tokio::test]
 async fn plugin_repositories_are_authorized_like_feeds() {
-    let srv = start_helm(ServerOpts {
-        anonymous_mode: "all".into(),
-        ..Default::default()
-    })
+    let srv = start_with(
+        common::fresh_pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
+            ..Default::default()
+        },
+    )
     .await;
+    srv.set_auth_settings(serde_json::json!({"anonymous_mode": "all"}))
+        .await;
     let private = helm_repo(&srv, false).await;
     let public = helm_repo(&srv, true).await;
     let creds = credentials(&srv).await;

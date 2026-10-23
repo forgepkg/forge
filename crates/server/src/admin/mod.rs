@@ -22,6 +22,8 @@
 //!   upstream (its "not found" answers, listings and documents).
 //! * [`imports`] — importing a Nexus hosted repository into a hosted
 //!   repository (start with a preflight, progress, cancel, resume, retry).
+//! * [`settings`] — the sign-in and anonymous-access policy (anonymous mode,
+//!   login mode, password Basic, session lifetimes, lockout).
 //!
 //! **API tokens and `/admin/*`.** A token is a feed credential, not an admin
 //! login: a token-authenticated caller passes [`require_admin`] only when the
@@ -49,6 +51,7 @@ pub mod realms;
 pub mod repositories;
 pub mod retention;
 pub mod roles;
+pub mod settings;
 pub mod token_scope;
 pub mod tokens;
 pub mod user_roles;
@@ -285,6 +288,11 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/realms/{id}/convert-to-local",
             axum::routing::post(realms::convert_to_local),
+        )
+        // --- sign-in and anonymous-access policy (#294) -----------------------
+        .route(
+            "/settings/auth",
+            get(settings::get_auth).put(settings::put_auth),
         )
         .route("/tokens/{id}/scope", axum::routing::patch(token_scope::set))
         .route("/users/{id}/effective", get(effective::for_user))

@@ -1,4 +1,4 @@
-//! #317: the startup rename of every pre-1.2 account name to a UPN
+//! #317: the startup rename of every pre-2.0 account name to a UPN
 //! ([`forge_db::user_dao::rename_legacy_usernames`], run by
 //! [`forge_db::migrate`]). Each test has a database of its own: the rename
 //! touches every account of a database.
@@ -30,7 +30,7 @@ async fn fresh_pool() -> PgPool {
     pool
 }
 
-/// An account as a release before 1.2 stored it (around the DAO, which no
+/// An account as a release before 2.0 stored it (around the DAO, which no
 /// longer creates one).
 async fn pre_upn_account(
     pool: &PgPool,

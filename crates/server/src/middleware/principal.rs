@@ -19,7 +19,10 @@
 //! * With no credentials, the anonymous policy decides between
 //!   [`Principal::Anonymous`] and [`Principal::Unauthenticated`]; the latter is
 //!   still passed downstream (authorization, not authentication, returns 401/403
-//!   for protected resources).
+//!   for protected resources). The policy is the one administrators set
+//!   ([`crate::auth::AuthSettings`]): every request asks for it, which also
+//!   keeps this instance's copy of the auth settings current
+//!   ([`AnonSource::Settings`]).
 //!
 //! ## CSRF (cookie-authenticated mutations)
 //! A request authenticated by an **ambient** credential (the `forge_session`
@@ -42,7 +45,7 @@
 //! `X-Forwarded-For` line behind the trusted proxies, with IPv4-mapped IPv6
 //! addresses canonicalized ([`forge_core::auth::client_ip`]). A client whose
 //! forwarded address is malformed is unknown and never allowlisted. The IP-allowlist
-//! anonymous grant (`anonymous_mode = "allowlist"`) additionally requires the
+//! anonymous grant (anonymous mode `allowlist`) additionally requires the
 //! request's `Host` to name this server (the host of `server.public_base_url`
 //! or an entry of `server.allowed_hosts`): a DNS-rebinding page in an internal
 //! user's browser reaches the server from an allowlisted IP but under its own
@@ -69,6 +72,8 @@ use forge_core::auth::token::{resolve_principal_with_origin, AuthError, Principa
 use forge_core::session::{csrf_token_matches, SessionService};
 use ipnet::IpNet;
 
+use crate::auth::AuthSettingsCache;
+
 /// The header carrying the per-session double-submit CSRF token.
 pub const CSRF_HEADER: &str = "x-csrf-token";
 
@@ -88,7 +93,7 @@ pub struct PrincipalLayer {
     /// Trusted proxy CIDRs for `X-Forwarded-For` resolution.
     pub trusted_proxies: Arc<Vec<IpNet>>,
     /// Anonymous-access policy.
-    pub anon: Arc<AnonPolicy>,
+    pub anon: AnonSource,
     /// Session service used to check the CSRF token of cookie-authenticated
     /// mutations. `None` ⇒ such requests are refused (fail closed).
     pub sessions: Option<SessionService>,
@@ -101,6 +106,22 @@ pub struct PrincipalLayer {
     /// Normalized host names ([`allowed_hosts`]) a request's `Host` must name
     /// for the IP-allowlist anonymous grant to apply (DNS-rebinding guard).
     pub allowed_hosts: Arc<Vec<String>>,
+}
+
+/// Where [`attach_principal`] gets the anonymous-access policy.
+#[derive(Clone)]
+pub enum AnonSource {
+    /// This policy, always.
+    Fixed(Arc<AnonPolicy>),
+    /// The auth settings' anonymous mode and allowlist, as this instance has
+    /// them; asking re-reads them once they are due.
+    Settings(Arc<AuthSettingsCache>),
+}
+
+impl From<AnonPolicy> for AnonSource {
+    fn from(policy: AnonPolicy) -> Self {
+        AnonSource::Fixed(Arc::new(policy))
+    }
 }
 
 /// The lowercase host of an authority (`host[:port]`, IPv6 in brackets),
@@ -240,11 +261,19 @@ pub async fn attach_principal(
     let client = resolve_client(peer, xff.as_deref(), &layer.trusted_proxies);
     let client_ip = client.ip;
 
+    let settings;
+    let policy = match &layer.anon {
+        AnonSource::Fixed(policy) => policy.as_ref(),
+        AnonSource::Settings(cache) => {
+            settings = cache.current().await;
+            &settings.anon
+        }
+    };
     // DNS-rebinding guard: the IP-allowlist grant applies only to requests
     // addressing this server by one of its own host names. It never applies to
     // a client whose address a malformed `X-Forwarded-For` hid: its `ip` is
     // the proxy's own.
-    let anon = match layer.anon.for_client(client) {
+    let anon = match policy.for_client(client) {
         AnonPolicy::Allowlist(_) if !host_is_allowed(&req, &layer.allowed_hosts) => {
             &AnonPolicy::Off
         }
@@ -391,7 +420,7 @@ mod tests {
         PrincipalLayer {
             sources: Arc::new(sources),
             trusted_proxies: Arc::new(vec![]),
-            anon: Arc::new(anon),
+            anon: anon.into(),
             sessions: None,
             cookie_secure: false,
             public_origin: Some("https://forge.example".into()),

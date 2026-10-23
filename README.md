@@ -110,7 +110,7 @@ cargo xtask dev --db none    # assume the DB is already up; don't start one
 
 Every release publishes the signed image to GitHub Packages as
 [`ghcr.io/forgepkg/forge`](https://github.com/forgepkg/forge/pkgs/container/forge)
-(from 1.2.0 on; up to 1.1.0 `ghcr.io/schmitch/forge`; see
+(from 2.0.0 on; up to 1.1.0 `ghcr.io/schmitch/forge`; see
 [docs/deployment.md](docs/deployment.md#image)). To build it from a
 checkout instead, the root `Dockerfile` packages the SPA **and** the Rust
 server into one image (no Node in prod):
@@ -140,10 +140,11 @@ identity (IRSA, EKS Pod Identity, STS web identity; see
 [docs/deployment.md](docs/deployment.md#short-lived-s3-credentials)). It
 bakes no bootstrap admin: `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start,
 named by `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` (a UPN, default `admin@example.com`), and
-once it is removed the image simply starts without one. It defaults to
-`anonymous_mode = "off"` (set `FORGE_AUTH__ANONYMOUS_MODE=all` for public reads)
-and `allow_password_basic = false` (clients use API tokens; see
-[docs/deployment.md](docs/deployment.md)).
+once it is removed the image simply starts without one. A new install has
+no anonymous access and accepts no passwords over HTTP Basic (clients use API
+tokens); an administrator changes both in the web UI under **Admin →
+Settings** (see
+[docs/deployment.md](docs/deployment.md#access-and-sign-in-settings)).
 
 ### Point a `dotnet` client at it
 

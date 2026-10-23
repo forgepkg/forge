@@ -8,11 +8,11 @@ means.
 
 Each release publishes the chart to GitHub Packages as an OCI artifact,
 [`oci://ghcr.io/forgepkg/charts/forge`](https://github.com/forgepkg/forge/pkgs/container/charts%2Fforge),
-with the same version as the image (from 1.2.0 on; the releases up to 1.1.0
+with the same version as the image (from 2.0.0 on; the releases up to 1.1.0
 are at `oci://ghcr.io/schmitch/charts/forge` and `ghcr.io/schmitch/forge`):
 
 ```bash
-helm install forge oci://ghcr.io/forgepkg/charts/forge --version 1.2.0 \
+helm install forge oci://ghcr.io/forgepkg/charts/forge --version 2.0.0 \
   --namespace forge --create-namespace --values my-values.yaml
 ```
 
@@ -25,7 +25,7 @@ annotation in `Chart.yaml`), so a published chart deploys exactly that image
 ([`ghcr.io/forgepkg/forge`](https://github.com/forgepkg/forge/pkgs/container/forge)):
 
 ```
-ghcr.io/forgepkg/forge:1.2.0@sha256:…
+ghcr.io/forgepkg/forge:2.0.0@sha256:…
 ```
 
 Setting `image.tag` or `image.digest` replaces that pin. Upgrading Forge is
@@ -289,7 +289,7 @@ Evaluation install, everything in the cluster:
 
 ```bash
 password=$(openssl rand -hex 12); echo "admin password: $password"
-helm install forge oci://ghcr.io/forgepkg/charts/forge --version 1.2.0 \
+helm install forge oci://ghcr.io/forgepkg/charts/forge --version 2.0.0 \
   --namespace forge-eval --create-namespace \
   --set postgresql.enabled=true --set versitygw.enabled=true \
   --set config.auth.bootstrap_admin.username=admin@example.com \
