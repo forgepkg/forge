@@ -12,7 +12,8 @@ import { renderApp } from '~/test/renderApp'
  *  - the list shows each role's description, built-in badge and grant and
  *    user counts, and offers no delete for a built-in role;
  *  - creating a role opens its page;
- *  - deleting a role first names the users and grants it takes along;
+ *  - deleting a role first names the users and grants it takes along, in
+ *    a confirmation dialog;
  *  - the role page adds grants (offering `admin` only on all repositories)
  *    and removes them, adds and removes members, and shows why the last
  *    administrator keeps `admin`;
@@ -99,7 +100,7 @@ describe('admin roles', () => {
     await renderApp('/manage/roles')
 
     await u.click(await screen.findByRole('button', { name: 'Delete ci-pushers' }))
-    const confirm = await screen.findByRole('region', { name: 'Delete role ci-pushers' })
+    const confirm = await screen.findByRole('dialog', { name: 'Delete ci-pushers?' })
     expect(await within(confirm).findByText('alice')).toBeInTheDocument()
     expect(within(confirm).getByText('bob')).toBeInTheDocument()
     expect(within(confirm).getByText('write on internal')).toBeInTheDocument()
@@ -222,7 +223,7 @@ describe('admin roles', () => {
     )
 
     await u.click(screen.getByRole('button', { name: 'Delete role…' }))
-    const confirm = await screen.findByRole('region', { name: 'Delete role ci-pushers' })
+    const confirm = await screen.findByRole('dialog', { name: 'Delete ci-pushers?' })
     await within(confirm).findByText('alice')
     await u.click(within(confirm).getByRole('button', { name: 'Delete role' }))
     await waitFor(() => expect(router.state.location.pathname).toBe('/manage/roles'))

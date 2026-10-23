@@ -5,9 +5,7 @@ import type { RepoView } from '~/api/repositories'
 import type { AnonymousMode } from '~/api/settings'
 import { useRoleGrants, useRoles, useSelectors } from '~/queries/useRbac'
 import { useAuthSettings } from '~/queries/useSettings'
-import { Badge } from '~/components/catalyst/badge'
-import { Subheading } from '~/components/catalyst/heading'
-import { Text } from '~/components/catalyst/text'
+import { FactList, Panel, Skeleton, StatusBadge } from '~/components/ui'
 import { ActionBadge, byId, SelectorLabel } from '~/components/RbacLabels'
 
 const MODE_LABELS: Record<AnonymousMode, string> = {
@@ -22,7 +20,8 @@ const MODE_LABELS: Record<AnonymousMode, string> = {
  * cover it, on this repository or on every repository. Either opens the
  * repository to callers who do not sign in, as far as the server's anonymous
  * mode (Settings, which this links to) lets them in at all; the grants are
- * changed on the role's page, which this links to too.
+ * changed on the role's page, which this links to too. A panel of the edit
+ * screen's side column (a region named "Anonymous access").
  */
 export function AnonymousAccessPanel({ repo }: { repo: RepoView }) {
   const settings = useAuthSettings()
@@ -37,56 +36,63 @@ export function AnonymousAccessPanel({ repo }: { repo: RepoView }) {
   )
 
   return (
-    <div
-      role="region"
-      aria-label="Anonymous access"
-      className="space-y-3 rounded-xl p-4 ring-1 ring-zinc-950/5 dark:ring-white/10"
+    <Panel
+      title="Anonymous access"
+      description="Who may read this repository without signing in."
     >
-      <Subheading>Anonymous access</Subheading>
-      <Text>
-        Server-wide anonymous access:{' '}
-        {settings.data == null ? (
-          '…'
-        ) : settings.data.anonymous_mode === 'off' ? (
-          <Badge color="zinc">off</Badge>
-        ) : (
-          <Badge color="amber">{MODE_LABELS[settings.data.anonymous_mode]}</Badge>
-        )}{' '}
-        <Link
-          to="/manage/settings"
-          className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
-        >
-          Settings →
-        </Link>
-      </Text>
+      <FactList
+        items={[
+          {
+            term: 'Server-wide',
+            value: (
+              <span className="inline-flex flex-wrap items-center gap-2">
+                {settings.data == null ? (
+                  '…'
+                ) : settings.data.anonymous_mode === 'off' ? (
+                  <StatusBadge>off</StatusBadge>
+                ) : (
+                  <StatusBadge tone="warn">
+                    {MODE_LABELS[settings.data.anonymous_mode]}
+                  </StatusBadge>
+                )}
+                <Link to="/manage/settings" className="fg-link">
+                  Settings →
+                </Link>
+              </span>
+            ),
+          },
+          {
+            term: 'Allow anonymous read',
+            value: repo.anonymous_read ? (
+              <StatusBadge tone="warn">on</StatusBadge>
+            ) : (
+              <StatusBadge>off</StatusBadge>
+            ),
+          },
+        ]}
+      />
       {settings.data?.anonymous_mode === 'off' && (
-        <Text>
+        <p className="fg-text">
           Nobody reads without signing in while it is off, whatever this
           repository allows.
-        </Text>
+        </p>
       )}
-      <Text>
-        Allow anonymous read:{' '}
-        {repo.anonymous_read ? (
-          <Badge color="amber">on</Badge>
-        ) : (
-          <Badge color="zinc">off</Badge>
-        )}
-      </Text>
       {roles.isError || grants.isError ? (
-        <Text>Could not load the anonymous role&apos;s grants.</Text>
+        <p className="fg-text">Could not load the anonymous role&apos;s grants.</p>
       ) : roles.isLoading || (role != null && grants.isLoading) ? (
-        <Text>Loading the anonymous role&apos;s grants…</Text>
+        <Skeleton lines={2} label="Loading the anonymous role's grants…" />
       ) : role == null ? (
-        <Text>There is no anonymous role.</Text>
+        <p className="fg-text">There is no anonymous role.</p>
       ) : (
         <>
           {covering.length === 0 ? (
-            <Text>The anonymous role grants nothing on this repository.</Text>
+            <p className="fg-text">
+              The anonymous role grants nothing on this repository.
+            </p>
           ) : (
-            <div>
-              <Text>The anonymous role grants on this repository:</Text>
-              <ul className="mt-1 space-y-1 text-sm/6 text-zinc-950 dark:text-white">
+            <div className="grid gap-2">
+              <p className="fg-text">The anonymous role grants on this repository:</p>
+              <ul className="m-0 grid list-none gap-2 p-0 text-ink">
                 {covering.map((g) => (
                   <li key={g.id} className="flex flex-wrap items-center gap-2">
                     <ActionBadge action={g.action} />
@@ -102,15 +108,17 @@ export function AnonymousAccessPanel({ repo }: { repo: RepoView }) {
               </ul>
             </div>
           )}
-          <Link
-            to="/manage/roles/$roleId"
-            params={{ roleId: String(role.id) }}
-            className="inline-block text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
-          >
-            Change the anonymous role&apos;s grants →
-          </Link>
+          <p className="m-0">
+            <Link
+              to="/manage/roles/$roleId"
+              params={{ roleId: String(role.id) }}
+              className="fg-link"
+            >
+              Change the anonymous role&apos;s grants →
+            </Link>
+          </p>
         </>
       )}
-    </div>
+    </Panel>
   )
 }

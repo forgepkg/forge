@@ -1,6 +1,5 @@
 import type { AccessLevel } from '~/api/rbac'
-import { Description, Fieldset, Label, Legend } from '~/components/catalyst/fieldset'
-import { Radio, RadioField, RadioGroup } from '~/components/catalyst/radio'
+import { RadioGroup } from '~/components/ui'
 
 /** The access levels an admin chooses between, most limited first. */
 export const ACCESS_LEVEL_OPTIONS: ReadonlyArray<{
@@ -30,7 +29,7 @@ export const ACCESS_LEVEL_OPTIONS: ReadonlyArray<{
 
 /**
  * A radio group of the built-in access levels (`ACCESS_LEVEL_OPTIONS`): the
- * create-user page and the user page pick one with it.
+ * user page picks one with it.
  */
 export function AccessLevelFields({
   value,
@@ -42,21 +41,16 @@ export function AccessLevelFields({
   disabled?: boolean
 }) {
   return (
-    <Fieldset disabled={disabled}>
-      <Legend>Access</Legend>
-      <RadioGroup
-        value={value}
-        onChange={(v) => onChange(v as AccessLevel)}
-        aria-label="Access"
-      >
-        {ACCESS_LEVEL_OPTIONS.map((option) => (
-          <RadioField key={option.level}>
-            <Radio value={option.level} />
-            <Label>{option.label}</Label>
-            <Description>{option.description}</Description>
-          </RadioField>
-        ))}
-      </RadioGroup>
-    </Fieldset>
+    <RadioGroup<AccessLevel>
+      legend="Access level"
+      value={value}
+      onChange={onChange}
+      disabled={disabled}
+      options={ACCESS_LEVEL_OPTIONS.map((option) => ({
+        value: option.level,
+        label: option.label,
+        description: option.description,
+      }))}
+    />
   )
 }

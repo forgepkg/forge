@@ -1,10 +1,8 @@
 import { useState } from 'react'
-import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
 import { useSelectors, useUpdateSelector } from '~/queries/useRbac'
-import { Button } from '~/components/catalyst/button'
-import { Heading } from '~/components/catalyst/heading'
-import { Text } from '~/components/catalyst/text'
+import { Button, Notice, Page, PageHeader, Skeleton } from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { SelectorDeleteConfirm } from '~/components/SelectorDeleteConfirm'
 import { SelectorForm } from '~/components/SelectorForm'
@@ -19,7 +17,7 @@ export const Route = createFileRoute(
  * Edit a content selector's description and patterns (its name is fixed).
  * The save sends both lists, so an emptied include list is saved as the
  * match-every-package selector the form warns about. Deleting asks first,
- * naming the grants that go with it.
+ * in a dialog naming the grants that go with it.
  */
 function EditSelector() {
   const { selectorId } = Route.useParams()
@@ -29,48 +27,51 @@ function EditSelector() {
   const update = useUpdateSelector(id)
   const [confirmDelete, setConfirmDelete] = useState(false)
 
+  const crumbs = [{ label: 'Content selectors', to: '/manage/content-selectors' }]
+
   if (selectors.isError) {
     return (
-      <ErrorState
-        title="Could not load content selector"
-        message={selectors.error?.message}
-        onRetry={() => void selectors.refetch()}
-      />
+      <Page>
+        <PageHeader title="Content selector" crumbs={crumbs} />
+        <ErrorState
+          title="Could not load content selector"
+          message={selectors.error?.message}
+          onRetry={() => void selectors.refetch()}
+        />
+      </Page>
     )
   }
   if (selectors.isLoading || !selectors.data) {
-    return <Text>Loading content selector…</Text>
+    return <Skeleton lines={4} label="Loading content selector…" />
   }
   const selector = selectors.data.find((s) => s.id === id)
   if (!selector) {
     return (
-      <ErrorState
-        title="Content selector not found"
-        message="It may have been deleted."
-      />
+      <Page>
+        <PageHeader title="Content selector" crumbs={crumbs} />
+        <ErrorState
+          title="Content selector not found"
+          message="It may have been deleted."
+        />
+      </Page>
     )
   }
 
   return (
-    <section className="space-y-6">
-      <div>
-        <Link
-          to="/manage/content-selectors"
-          className="text-sm/6 text-sky-600 hover:underline dark:text-sky-400"
-        >
-          ← Content selectors
-        </Link>
-        <div className="mt-1 flex items-center justify-between gap-4">
-          <Heading>
+    <Page>
+      <PageHeader
+        title={
+          <>
             Edit <span className="font-mono">{selector.name}</span>
-          </Heading>
-          {!confirmDelete && (
-            <Button outline onClick={() => setConfirmDelete(true)}>
-              Delete selector…
-            </Button>
-          )}
-        </div>
-      </div>
+          </>
+        }
+        crumbs={[...crumbs, { label: selector.name }]}
+        actions={
+          <Button variant="danger" icon="Trash" onClick={() => setConfirmDelete(true)}>
+            Delete selector…
+          </Button>
+        }
+      />
 
       {confirmDelete && (
         <SelectorDeleteConfirm
@@ -80,14 +81,7 @@ function EditSelector() {
         />
       )}
 
-      {update.isSuccess && (
-        <p
-          role="status"
-          className="rounded-lg border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-sm/6 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400"
-        >
-          Saved.
-        </p>
-      )}
+      {update.isSuccess && <Notice tone="ok">Saved.</Notice>}
 
       <SelectorForm
         key={selector.id}
@@ -102,6 +96,6 @@ function EditSelector() {
         }
         onCancel={() => void navigate({ to: '/manage/content-selectors' })}
       />
-    </section>
+    </Page>
   )
 }

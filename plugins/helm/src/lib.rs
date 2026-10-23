@@ -14,7 +14,8 @@
 //!   — the ChartMuseum JSON listing.
 //!
 //! Chart names are matched case-insensitively (the canonical id is the
-//! lowercased name); versions are SemVer, normalized (`v1.2` → `1.2.0`).
+//! lowercased name); versions are SemVer, normalized (`v1.2` → `1.2.0`), and
+//! at most 128 characters ([`semver::MAX_VERSION_LENGTH`]).
 //!
 //! A proxy repository mirrors another chart repository ([`upstream`]): its
 //! index lists the upstream's charts, each downloaded and cached on first
@@ -620,6 +621,51 @@ mod tests {
                 "keywords": ["k", "3"],
             })
         );
+    }
+
+    #[test]
+    fn versions_longer_than_an_oci_tag_are_refused() {
+        let longest = format!("1.0.0-{}", "a".repeat(semver::MAX_VERSION_LENGTH - 6));
+        let longer = format!("{longest}a");
+        assert_eq!(Helm.normalize_version(&longest).unwrap(), longest);
+        assert!(matches!(
+            Helm.normalize_version(&longer),
+            Err(FormatError::InvalidVersion(_))
+        ));
+        assert_eq!(
+            package_ref("Demo", &longest),
+            Some(PackageRef {
+                id: "demo".into(),
+                version: longest.clone(),
+            })
+        );
+        assert_eq!(package_ref("demo", &longer), None);
+
+        // A URL naming a longer version is not found: nothing is loaded,
+        // downloaded or deleted.
+        let repo = Repository {
+            name: "charts".into(),
+            kind: RepositoryKind::Proxy,
+            base_url: "https://forge.example.com/repository/charts".into(),
+        };
+        let download = Helm.handle(
+            &repo,
+            &Request::new("GET", &format!("/charts/demo/{longest}/demo.tgz")),
+        );
+        assert!(matches!(download, Action::Download(_)), "{download:?}");
+        let huge = format!("1.0.0-{}", "x".repeat(4096));
+        for (method, path) in [
+            ("GET", format!("/charts/demo/{longer}/demo.tgz")),
+            ("GET", format!("/charts/demo/{huge}/demo.tgz")),
+            ("GET", format!("/api/charts/demo/{huge}")),
+            ("DELETE", format!("/api/charts/demo/{huge}")),
+        ] {
+            let action = Helm.handle(&repo, &Request::new(method, &path));
+            assert!(
+                matches!(&action, Action::Respond(r) if r.status == 404),
+                "{method} {path}: {action:?}"
+            );
+        }
     }
 
     #[test]
