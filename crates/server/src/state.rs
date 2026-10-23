@@ -102,6 +102,9 @@ pub struct AppState {
     /// Forge's own OIDC issuer: the keys a `federated_credential` OIDC realm
     /// signs its client assertions with, published under `/.well-known/`.
     pub assertion_issuer: AssertionIssuer,
+    /// The email service (`/admin/settings/email`): sends invitations and
+    /// test messages with the settings stored in the database.
+    pub mailer: Arc<crate::email::Mailer>,
 }
 
 /// One instance of Forge: each replica of an install has state of its own
@@ -338,6 +341,7 @@ impl AppState {
             std::time::Duration::from_secs(60),
         ));
 
+        let (pool_for_mailer, config_for_mailer) = (pool.clone(), config.clone());
         AppState {
             downloads: DownloadTally::new(pool.clone()),
             pool,
@@ -363,6 +367,11 @@ impl AppState {
             }]),
             instance: Arc::new(Instance::current()),
             assertion_issuer,
+            mailer: Arc::new(crate::email::Mailer::new(
+                pool_for_mailer,
+                None,
+                &config_for_mailer,
+            )),
         }
     }
 
@@ -428,6 +437,12 @@ impl AppState {
             )
             .with_envelope(envelope.clone()),
         );
+        // The email settings' secrets are sealed with it too.
+        self.mailer = Arc::new(crate::email::Mailer::new(
+            self.pool.clone(),
+            envelope.clone(),
+            &self.config,
+        ));
         self.envelope = envelope;
         self
     }

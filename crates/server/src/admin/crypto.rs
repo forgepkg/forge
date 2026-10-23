@@ -130,12 +130,18 @@ pub async fn list_keys(State(state): State<AppState>) -> Response {
         Ok(p) => p,
         Err(e) => return crypto_error(e),
     };
+    let email_backfill_pending =
+        match secret_dao::plaintext_email_secrets_pending(&state.pool).await {
+            Ok(p) => p,
+            Err(e) => return crypto_error(e),
+        };
     Json(json!({
         "enabled": true,
         "root_key_version": root_version,
         "plaintext_backfill_pending": backfill_pending
             || realm_backfill_pending
-            || settings_backfill_pending,
+            || settings_backfill_pending
+            || email_backfill_pending,
         "keys": keys,
     }))
     .into_response()

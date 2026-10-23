@@ -56,6 +56,7 @@ export const routes = rootRoute('root.tsx', [
       route('/realms/new', 'admin/realms/Create.tsx'),
       route('/realms/$realmId', 'admin/realms/Edit.tsx'),
       route('/settings', 'admin/settings/Settings.tsx'),
+      route('/settings/email', 'admin/settings/Email.tsx'),
     ]),
   ]),
 ])

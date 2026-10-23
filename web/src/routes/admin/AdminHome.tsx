@@ -40,12 +40,18 @@ const SECTIONS = [
     description:
       'Anonymous access, the login screen, password Basic, session lifetimes and the lockout.',
   },
+  {
+    to: '/manage/settings/email',
+    title: 'Email',
+    description: 'The service Forge sends invitations and notifications through.',
+  },
 ] as const
 
 /**
  * Admin landing. Only reachable once the `AdminLayout` guard has confirmed
  * `is_admin`. Links to the repositories, users (incl. per-user tokens and
- * roles), roles, content selectors, authentication-realm and settings
+ * roles), roles, content selectors, authentication-realm, settings and
+ * email-service
  * screens, and names what only the `/admin` API manages (CHANGELOG "Known
  * limitations").
  */
@@ -56,8 +62,8 @@ function AdminHome() {
         <Heading>Administration</Heading>
         <Text className="mt-1">
           Manage repositories, users and their API tokens, roles and their
-          grants, content selectors, authentication realms, and the sign-in
-          and anonymous-access settings. Retention,
+          grants, content selectors, authentication realms, the sign-in
+          and anonymous-access settings, and the email service. Retention,
           user deactivation and key rotation have no screen yet; use the{' '}
           <Code>/admin</Code> API.
         </Text>

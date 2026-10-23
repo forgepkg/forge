@@ -396,10 +396,49 @@ Administer through a browser session (the web UI, or `POST /auth/login` plus
 the returned CSRF token), or mint an admin-scoped token
 (`{"scope": {"actions": ["admin"]}}`) for automation.
 
+## Email
+
+Forge sends email for invitations and notifications through one email
+service, set up under **Admin → Email** (`/manage/settings/email`). The
+settings are stored in the database only: there is no `forge.toml` section
+and no `FORGE_*` variable for them, so they can change while Forge runs and
+hold the same value on every instance (another instance picks a change up
+within `auth.realm_cache_ttl_seconds`). Until they are saved, Forge sends no
+email.
+
+- **Sender.** The `From` address, an optional display name and `Reply-To`,
+  and how long an invitation link stays valid (default 72 hours, at most
+  720).
+- **SMTP server.** Host, port and encryption: STARTTLS (port 587, refused
+  when the server does not offer it) or TLS from the first byte (SMTPS,
+  port 465). The server's certificate is always verified against the
+  system's trusted roots; a private CA is not supported. Without TLS Forge
+  connects only to a loopback host, a relay on the same machine (port 25).
+  A username and password sign in with AUTH PLAIN or LOGIN, whichever the
+  server offers; without a username Forge sends without signing in. IMAP is
+  not used: a mail server whose IMAP takes an app password (Stalwart, for
+  example) takes it on SMTP submission too.
+- **The password** is write-only: the page and `GET /admin/settings/email`
+  say only whether one is set. Saving without it keeps the stored one,
+  unless the host or the username changed. With [secret
+  encryption](#secret-encryption-at-rest) on it is sealed at rest.
+- **Send test email** sends a message with the stored settings, to the
+  address you enter or to your own (your UPN), even while sending is turned
+  off, and shows the server's error when it fails. The page also shows the
+  last send that failed.
+- **Turning it off** (uncheck *Send email*) keeps the settings; **Remove**
+  deletes them.
+
+Each send is logged with its purpose, the recipient's domain and the
+outcome; message bodies, links and secrets never are. The admin API is
+`GET`, `PUT` and `DELETE /admin/settings/email` and
+`POST /admin/settings/email/test` (`{"to": "..."}`, optional).
+
 ## Secret encryption at rest
 
 Upstream proxy passwords, authentication-realm secrets (OIDC client
-secrets, credential-forwarding peppers), the generated registry-token key
+secrets, credential-forwarding peppers), the email service's password
+([Email](#email)), the generated registry-token key
 (without `docker.token_secret`) and the keys Forge signs its OIDC client
 assertions with (a realm with a federated credential) are stored with
 double-envelope encryption:
@@ -432,7 +471,8 @@ refuses to start while the database holds encrypted secrets.
 
 Each encrypted secret is bound to its row and to where it is sent: a proxy
 password to the origin (scheme, host and port) of the repository's
-`remote_url`, an OIDC client secret to the realm's `issuer` and `client_id`.
+`remote_url`, an OIDC client secret to the realm's `issuer` and `client_id`,
+the email password to the SMTP host and username.
 Changing those through the admin API asks for the secret again. Changing
 them directly in the database makes the secret undecryptable (the proxy
 then fails instead of sending the password to the new host), and it has to

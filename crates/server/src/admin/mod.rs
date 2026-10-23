@@ -22,6 +22,7 @@
 //!   upstream (its "not found" answers, listings and documents).
 //! * [`imports`] — importing a Nexus hosted repository into a hosted
 //!   repository (start with a preflight, progress, cancel, resume, retry).
+//! * [`email`] — the email service's settings and a test send.
 //! * [`settings`] — the sign-in and anonymous-access policy (anonymous mode,
 //!   login mode, password Basic, session lifetimes, lockout).
 //!
@@ -42,6 +43,7 @@ pub mod blob_cache;
 pub mod content_selectors;
 pub mod crypto;
 pub mod effective;
+pub mod email;
 pub mod formats;
 pub mod grants;
 pub mod imports;
@@ -301,6 +303,12 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route("/crypto/keys", get(crypto::list_keys))
         // --- local blob cache ----------------------------------------------
         .route("/blob-cache", get(blob_cache::stats))
+        // --- the email service ---------------------------------------------
+        .route(
+            "/settings/email",
+            get(email::get).put(email::put).delete(email::delete),
+        )
+        .route("/settings/email/test", axum::routing::post(email::test))
         .route(
             "/crypto/rotate/{layer}",
             axum::routing::post(crypto::rotate),
