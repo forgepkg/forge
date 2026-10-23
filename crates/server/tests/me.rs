@@ -1,4 +1,4 @@
-//! E2E: `GET /admin/me` identity + capabilities (plan §12.6 Phase 0).
+//! E2E: `GET /admin/me` identity + capabilities.
 //!
 //! Verifies the endpoint is reachable by *any* authenticated user (not only
 //! admins — it lives outside the admin `require_admin` gate), returns the right

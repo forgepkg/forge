@@ -68,12 +68,12 @@ export const Route = createFileRoute('/_app/manage/users/$userId')({
 })
 
 /**
- * One user (plan §Phase 5): their built-in access level (reader, writer or
- * admin), which admins switch here; the roles they hold, which admins assign
- * and remove here (taking `admin` from the last active administrator is refused
- * with the server's reason); their effective access, the union of those
- * roles' grants with repository and selector names; and their tokens. Tokens
- * are listed as metadata only (the secret is never returned), issued with an
+ * One user: their built-in access level (reader, writer or admin), which
+ * admins switch here; the roles they hold, which admins assign and remove
+ * here (taking `admin` from the last active administrator is refused with
+ * the server's reason); their effective access, the union of those roles'
+ * grants with repository and selector names; and their tokens. Tokens are
+ * listed as metadata only (the secret is never returned), issued with an
  * optional scope (the plaintext is shown **once** via `ShowOnceSecret`, held
  * in transient component state and never written into a query cache),
  * re-scoped and revoked. The header says how the user signs in, so a role or
@@ -85,7 +85,7 @@ function UserPage() {
   const { userId } = Route.useParams()
   const id = Number(userId)
 
-  // The username comes from the cached users list (no per-user GET in slice 1).
+  // The username comes from the cached users list (there is no per-user GET).
   const users = useUsers()
   const user = users.data?.find((u) => u.id === id)
 

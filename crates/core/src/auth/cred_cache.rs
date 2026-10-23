@@ -1,4 +1,4 @@
-//! The validated-credential cache (slice 12.3, Phase 3) — security-critical.
+//! The validated-credential cache — security-critical.
 //!
 //! NuGet clients send HTTP Basic credentials on **every** request, so a
 //! credential-forwarding provider that hit the upstream once per request would
@@ -30,7 +30,8 @@
 //!
 //! `cred_key = hex(HMAC-SHA256(pepper, len(provider) ‖ provider ‖ len(user) ‖
 //! user ‖ password))`, where `pepper` is a server-held secret
-//! ([`CredKeyPepper`], redacted in `Debug`, §12.5-encryptable).
+//! ([`CredKeyPepper`], redacted in `Debug`; kept with the realm's secrets,
+//! which are encrypted at rest when that is enabled).
 //!
 //! * **No plaintext at rest.** Only the HMAC is ever stored / cached.
 //! * **Pepper, not a bare hash.** A bare hash of the password would be offline-
@@ -134,10 +135,11 @@ fn user_cache_tag(username: &str) -> String {
 
 /// A server-held secret keying the credential-cache HMAC.
 ///
-/// Treated like Slice 1's `upstream_password`: **redacted** in `Debug` so it can
-/// never leak through a log line or error body, and stored in a dedicated secret
-/// slot ready for §12.5 encryption. Rotating it invalidates the whole cache
-/// (every key changes), which merely causes re-forwards — acceptable.
+/// Treated like a repository's `upstream_password`: **redacted** in `Debug` so
+/// it can never leak through a log line or error body, and kept with the
+/// realm's secrets, which are encrypted at rest when that is enabled. Rotating
+/// it invalidates the whole cache (every key changes), which merely causes
+/// re-forwards — acceptable.
 #[derive(Clone)]
 pub struct CredKeyPepper(Vec<u8>);
 
@@ -360,7 +362,7 @@ impl ValidatedCredentialCache {
     /// the credential is valid; `Ok(false)` means definitively rejected;
     /// [`CredCacheError::Unavailable`] means fail-closed (deny; do not grant).
     ///
-    /// `forward` is the actual upstream HTTP Basic call (Phase 4). It is invoked
+    /// `forward` is the actual upstream HTTP Basic call. It is invoked
     /// **at most once** per credential per TTL window per cluster (singleflight),
     /// and only on a genuine miss. No database connection is held while it runs.
     /// It receives nothing but its own captured state — the plaintext password

@@ -36,8 +36,8 @@ processes; `cargo xtask down` stops the containers.
 > `xtask` is intentionally dependency-free and `std` offers no signal-handler
 > API, so it does not trap the interrupt to suppress that message.
 
-`xtask` is a plain Rust binary (in [`xtask/`](./xtask)) that replaces the old
-Makefile + Justfile — there is nothing extra to install (no `make`, no `just`).
+`xtask` is a plain Rust binary (in [`xtask/`](./xtask)), so there is nothing
+extra to install (no `make`, no `just`).
 The `cargo xtask` alias is wired up in [`.cargo/config.toml`](./.cargo/config.toml).
 
 ### Picking where Postgres comes from (`--db`)
@@ -295,7 +295,7 @@ connections, drains in-flight requests, then stops the background workers.
 > local browsing, keep `anonymous_mode = "all"` and create repos with
 > `"anonymous_read": true`.
 
-## Authentication realms (12.7)
+## Authentication realms
 
 Authentication is driven by ordered, web-managed **auth realms** stored in the
 `auth_realm` table: the built-in `local` password realm, optional `oidc`
@@ -427,12 +427,12 @@ State-changing cookie endpoints (`logout`, token mint/revoke) require a
 **double-submit CSRF token**: read `csrf_token` from `/auth/me` (or the
 `/auth/login` response) and echo it in the `X-CSRF-Token` header.
 
-> **Security note (12.7 §3.6).** The slice-1 SSRF private-range guard is gone:
-> upstream URLs (proxy `remote_url`, credential-forwarding upstreams, OIDC
-> issuers) are restricted to `http`/`https` only and **may point at internal
-> addresses**. Realm/repository configuration is admin-only by design;
-> credential-forwarding sends the user's password to its configured upstream,
-> so treat realm admin rights accordingly. Configured hosts are logged on save.
+> **Security note.** There is no SSRF private-range guard: upstream URLs
+> (proxy `remote_url`, credential-forwarding upstreams, OIDC issuers) are
+> restricted to `http`/`https` only and **may point at internal addresses**.
+> Realm/repository configuration is admin-only by design; credential-forwarding
+> sends the user's password to its configured upstream, so treat realm admin
+> rights accordingly. Configured hosts are logged on save.
 
 ## OIDC / Microsoft Entra login (optional)
 
@@ -562,9 +562,9 @@ The e2e suite (`cargo xtask e2e`) stands up an in-process mock OIDC provider
 (discovery + JWKS + a token endpoint signing a test ID token) so OIDC login can
 be exercised end-to-end without a real Entra tenant. For a real self-hosted IdP
 on a private/dev network (e.g. Keycloak over plain `http`), set
-`oidc.allow_private_issuer = true` to relax the https-issuer check. (Since the
-12.7 auth-realms slice the old SSRF private-range guard is gone entirely —
-outbound upstream/issuer URLs are only restricted to http/https.)
+`oidc.allow_private_issuer = true` to relax the https-issuer check. (There is
+no SSRF private-range guard: outbound upstream/issuer URLs are only restricted
+to http/https.)
 
 ## Tests
 

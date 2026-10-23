@@ -3,7 +3,7 @@ import { expect, test } from '@playwright/test'
 import { adminBasic, facts, signInSession } from '../helpers'
 
 /**
- * Password sign-in + admin gating (plan §Testing #2, #3).
+ * Password sign-in + admin gating.
  *
  * The UI signs in with username+password (or a realm); registry-token sign-in
  * does not exist. A wrong password stays on Login with the uniform error; an

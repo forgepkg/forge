@@ -20,7 +20,7 @@ pub struct NewRepository {
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
     /// **Plaintext** upstream password — the legacy (crypto-disabled) write
-    /// path only. With encryption at rest enabled (slice 12.5) callers insert
+    /// path only. With encryption at rest enabled callers insert
     /// with `None` here and store the secret afterwards via
     /// [`crate::secret_dao::set_upstream_password`], which seals it under the
     /// row-bound AAD (the row id does not exist before the INSERT).
@@ -228,8 +228,8 @@ pub async fn set_group_member_owner(
 }
 
 /// Return the members of a group joined to their repository rows, ordered by
-/// `priority` **descending** so the highest-priority member (which wins ties per
-/// spec §7) comes first.
+/// `priority` **descending** so the highest-priority member (which wins ties)
+/// comes first.
 pub async fn group_members(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<(Repository, i32)>> {
     let rows = sqlx::query!(
         r#"

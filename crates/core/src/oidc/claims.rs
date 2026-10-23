@@ -1,4 +1,4 @@
-//! Claim → `app_user` mapping and `is_admin` derivation (slice 12.2, §3.6).
+//! Claim → `app_user` mapping and `is_admin` derivation.
 //!
 //! Pure functions over an already-verified [`IdTokenClaims`] set and a small
 //! [`ClaimMapping`] config. No I/O — identity resolution / provisioning lives in

@@ -5,14 +5,13 @@ import { ApiError, httpClient } from '~/lib/httpClient'
 /**
  * Read-side browse / package-detail API.
  *
- * Types mirror the **real** Rust DTOs in `crates/server/src/browse.rs`
- * (reconciled against slice 1, not the forward-looking plan):
+ * Types mirror the **real** Rust DTOs in `crates/server/src/browse.rs`:
  *
- *  - The plan's `total_downloads` / per-version `downloads` fields are **absent**:
- *    slice 1 has no download counters, so the backend omits them rather than
- *    emitting misleading zeros. The UI therefore does not render download stats.
+ *  - There are **no** `total_downloads` / per-version `downloads` fields:
+ *    downloads are tracked server-side, but the browse API does not expose
+ *    them. The UI therefore does not render download stats.
  *  - `delay_status` is `"available" | "delayed_until" | null` (snake_case enum).
- *  - `retention_status` is always `null` in slice 1 (reserved for §12.1).
+ *  - `retention_status` is reserved and always `null`.
  *
  * Every `/browse/*` endpoint requires a signed-in user (401 otherwise); the
  * `_app` layout's login gate ensures these are only called with a session.
@@ -107,7 +106,7 @@ export interface DetailVersion {
   delay_status: DelayStatus | null
   /** When a delayed proxy version becomes available (`first_seen + delay`). */
   delayed_until?: string | null
-  /** Retention status — reserved for §12.1; always `null` in slice 1. */
+  /** Retention status — reserved; always `null`. */
   retention_status: string | null
 }
 

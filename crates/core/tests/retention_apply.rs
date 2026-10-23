@@ -1,12 +1,12 @@
 //! Integration tests for the retention **apply** path (`forge_core::retention::apply`).
 //!
-//! These exercise the slice-1 outbox integration directly: applying a
+//! These exercise the blob outbox integration directly: applying a
 //! `hard_delete` decision must decrement `blob.ref_count` and enqueue a
 //! `blob_outbox` delete **only** when the count hits zero; a blob still
 //! referenced by another version/repo must **not** be enqueued and its row must
 //! survive; an `unlist` decision flips `listed=false` and enqueues nothing; a
 //! `dry_run` records audit rows but mutates nothing. Postgres only — no S3 (the
-//! apply path never touches S3, it only produces outbox rows the slice-1 worker
+//! apply path never touches S3, it only produces outbox rows the outbox worker
 //! drains).
 
 mod common;

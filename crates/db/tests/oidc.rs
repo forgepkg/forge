@@ -1,5 +1,5 @@
-//! Integration tests for the slice-12.2 OIDC / session DAO layer against a real
-//! Postgres testcontainer.
+//! Integration tests for the OIDC / session DAO layer against a real Postgres
+//! testcontainer.
 //!
 //! Covers the three properties the design hinges on:
 //!   * `oidc_flow` is single-use — a second `consume` of the same `state` returns

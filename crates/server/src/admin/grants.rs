@@ -1,6 +1,5 @@
-//! Admin grant management (§12.4 Phase 6): the `repository_privilege` edges that
-//! give a role `<action>` on `<repo|ANY>`, optionally scoped by a content
-//! selector.
+//! Admin grant management: the `repository_privilege` edges that give a role
+//! `<action>` on `<repo|ANY>`, optionally scoped by a content selector.
 //!
 //! * `GET    /admin/roles/{id}/grants` — list a role's grants.
 //! * `PUT    /admin/roles/{id}/grants` — add a grant (idempotent).

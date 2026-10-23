@@ -12,9 +12,9 @@ import {
  * Cross-repository package search (`GET /browse/packages`).
  *
  * Uses `keepPreviousData` so paging / typing keeps the previous page visible
- * while the next loads (no flicker, plan §7). Auth failures are not retried
- * (the shared query-client policy); browse itself works anonymously, so a 401
- * here only happens when a stale token is attached.
+ * while the next loads (no flicker). Auth failures are not retried (the shared
+ * query-client policy); browsing requires a signed-in user, so a 401 here means
+ * the session has ended.
  */
 export function usePackageSearch(params: SearchParams) {
   return useQuery<BrowseResult, ApiError>({

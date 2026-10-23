@@ -136,8 +136,8 @@ pub async fn create(State(state): State<AppState>, req: axum::extract::Request) 
         Err(e) => return db_error(e),
     };
 
-    // Optional per-token scope (§12.4): evaluated as an intersection with the
-    // owner's effective set, so it can only narrow — safe for self-service.
+    // Optional per-token scope: evaluated as an intersection with the owner's
+    // effective set, so it can only narrow — safe for self-service.
     let scope = match store_scope(&state, t.id, body.scope.as_ref()).await {
         Ok(scope) => scope,
         Err(resp) => return resp,

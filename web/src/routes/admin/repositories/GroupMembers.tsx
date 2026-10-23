@@ -24,7 +24,7 @@ export const Route = createFileRoute(
 })
 
 /**
- * Group-members editor (plan §Phase 4). Lists the group's members ordered by
+ * Group-members editor. Lists the group's members ordered by
  * priority and lets an admin add a member (a repository name + a unique
  * priority), flag or unflag it as an owner of the group's package ids, or
  * remove one. Priority is **unique per group** (the server returns 409 on a

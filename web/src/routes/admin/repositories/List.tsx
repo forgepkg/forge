@@ -28,10 +28,10 @@ export const Route = createFileRoute('/_app/manage/repositories')({
 })
 
 /**
- * Admin repositories list (plan §Phase 4). Lists every repository with its
- * format (NuGet / Docker), kind, online / anonymous-read flags, and links to
- * edit / (for groups) members / delete. Delete surfaces the server's conflict
- * message inline (a hosted repo with packages refuses deletion).
+ * Admin repositories list. Lists every repository with its format (NuGet /
+ * Docker), kind, online / anonymous-read flags, and links to edit / (for
+ * groups) members / delete. Delete surfaces the server's conflict message
+ * inline (a hosted repo with packages refuses deletion).
  */
 function RepositoriesList() {
   const repos = useRepositories()

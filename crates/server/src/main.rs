@@ -100,11 +100,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure bootstrap admin")?;
 
-    // §12.5: secret encryption at rest. Building the envelope service reads
+    // Secret encryption at rest. Building the envelope service reads
     // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
     // operator who configured encryption never gets a silently-plaintext
     // instance. Bootstrap then idempotently creates the active KEK/DEK and
-    // backfills any pre-12.5 plaintext upstream passwords.
+    // backfills the secrets still stored in plaintext.
     let envelope = forge_server::crypto::build_envelope(&config, &pool)
         .context("build secret-encryption envelope service")?;
     if let (Some(env), Some(crypto_cfg)) = (&envelope, config.crypto.as_ref()) {
@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         forge_server::crypto::refuse_sealed_secrets_without_envelope(&pool).await?;
     }
 
-    // 12.7: import of the legacy [oidc] / [auth.upstream_basic] blocks into
+    // Import of the legacy [oidc] / [auth.upstream_basic] blocks into
     // auth_realm rows (drift-detected); the DB is the authority. After the
     // crypto bootstrap so seeded realm secrets are encrypted at rest.
     ensure_auth_realms(&config, &pool, envelope.as_deref())

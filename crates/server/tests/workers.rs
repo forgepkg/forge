@@ -1,5 +1,5 @@
 //! E2E: background workers drain the outbox exactly once cluster-wide, even
-//! with two server instances sharing one DB + S3 (plan 10.5). Requires Docker.
+//! with two server instances sharing one DB + S3. Requires Docker.
 
 mod common;
 

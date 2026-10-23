@@ -1,8 +1,7 @@
-//! Integration tests for slice-12.3 phase-5 auto-provisioning of upstream-basic
-//! users: [`forge_core::auth::provision_and_map`] over a real Postgres
-//! testcontainer.
+//! Integration tests for auto-provisioning of upstream-basic users:
+//! [`forge_core::auth::provision_and_map`] over a real Postgres testcontainer.
 //!
-//! Covers (plan §2.4 / §5 Phase 5):
+//! Covers:
 //!   * first upstream success provisions an `app_user` with
 //!     `auth_source = 'upstream-basic'`, NULL `password_hash`, active;
 //!   * a second login reuses the row (no duplicate, idempotent);
@@ -38,7 +37,7 @@ async fn is_admin(pool: &sqlx::PgPool, user_id: i64) -> bool {
 }
 
 /// An upstream-vouched identity whose provider allows auto-provisioning
-/// (`auto_provision` rides on the identity since 12.7 — per-realm).
+/// (`auto_provision` rides on the identity — it is a per-realm setting).
 fn upstream_identity(username: &str, admin: bool, auto_provision: bool) -> ProvenIdentity {
     ProvenIdentity {
         username: username.to_string(),

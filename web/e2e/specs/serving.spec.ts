@@ -3,10 +3,10 @@ import { expect, test } from '@playwright/test'
 import { createRepo, facts } from '../helpers'
 
 /**
- * Single-origin serving (plan §Testing #1, #8). The Rust server serves the SPA
- * and the API on one origin: deep links resolve to index.html (SPA fallback),
- * API routes are never shadowed by the fallback, and API responses carry no CORS
- * header (proving the browser uses the same origin — no Node proxy).
+ * Single-origin serving. The Rust server serves the SPA and the API on one
+ * origin: deep links resolve to index.html (SPA fallback), API routes are never
+ * shadowed by the fallback, and API responses carry no CORS header (proving the
+ * browser uses the same origin — no Node proxy).
  */
 test.describe('single-origin serving', () => {
   test('root boots the SPA and gates anonymous visitors at login', async ({

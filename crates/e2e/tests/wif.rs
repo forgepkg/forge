@@ -1,12 +1,11 @@
-//! E2E: workload-identity federation (WIF) auth realm (slice 12.8, design
-//! 2026-06-03 §4/§5).
+//! E2E: workload-identity federation (WIF) auth realm.
 //!
 //! Drives the **real** forge server over HTTP against a Postgres testcontainer
 //! plus an in-process mock OIDC issuer (`MockOidc`: discovery + JWKS + arbitrary
 //! token signing). A simulated CI job presents its `id_token` — as the
 //! `X-NuGet-ApiKey`, an `Authorization: Bearer`, and the HTTP Basic password —
 //! and pushes/restores against a NuGet repo it is authorized for by a mapped
-//! forge role. Covers the §5 12.8 scenarios:
+//! forge role. Covers these scenarios:
 //!
 //! 1. a valid token (right `iss`/`aud`, matching claim rule) authenticates and
 //!    its mapped role authorizes push + restore — via all three transports;

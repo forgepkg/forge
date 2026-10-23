@@ -1,6 +1,6 @@
-//! E2E: §12.4 Phase 6 — admin REST API for fine-grained RBAC.
+//! E2E: admin REST API for fine-grained RBAC.
 //!
-//! Covers (plan §4 Phase 6 test list):
+//! Covers:
 //! * role CRUD round-trip + built-in protections (can't delete `admin`);
 //! * non-admin caller is 403 on every RBAC endpoint;
 //! * editing a role's grants invalidates the cache and changes a subsequent

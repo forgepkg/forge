@@ -16,7 +16,7 @@ import { RetentionBadge } from './RetentionBadge'
 /**
  * Per-version table for the package-detail view. Columns: version, published
  * time, size, listed/unlisted, and proxy delay + retention badges. Download
- * counts are intentionally absent — slice 1 has no counters (see
+ * counts are intentionally absent — the browse API does not expose them (see
  * `src/api/packages.ts`).
  *
  * `published_at` is when the version reached Forge. On a proxy that is when

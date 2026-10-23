@@ -1,7 +1,7 @@
-//! Background workers (plan 10.5).
+//! Background workers.
 //!
-//! Three independent loops, each safe to run on **every** instance of a
-//! horizontally-scaled deployment with **no Postgres advisory locks**:
+//! The loops below are independent, each safe to run on **every** instance
+//! of a horizontally-scaled deployment with **no Postgres advisory locks**:
 //!
 //! 1. **Outbox worker** — drains `blob_outbox` to perform deferred S3 deletes.
 //!    Cross-instance exclusivity comes from `claim_due`'s
@@ -21,17 +21,17 @@
 //!    `proxy_upstream_index` row (NO advisory locks); other instances wait and
 //!    then read the freshly-populated row/cache.
 //!
-//! 4. **Auth reaper** (slice 12.2) — periodically deletes expired/used
-//!    `oidc_flow` rows, revoked/expired `session` rows and
-//!    `login_known_network` rows past the login throttle's 30-day memory. Both are pure
-//!    `DELETE`s (no advisory locks, no leases): the auth-code-flow rows are
-//!    single-use and short-lived, sessions carry their own validity predicate,
-//!    so running the reap on **every** instance is harmless (a row deleted by
-//!    one instance simply isn't there for the next). It only bounds table
-//!    growth; correctness never depends on it (callback/validate already reject
+//! 4. **Auth reaper** — periodically deletes expired/used `oidc_flow` rows,
+//!    revoked/expired `session` rows and `login_known_network` rows past the
+//!    login throttle's 30-day memory. All are pure `DELETE`s (no advisory
+//!    locks, no leases): the auth-code-flow rows are single-use and
+//!    short-lived, sessions carry their own validity predicate, so running the
+//!    reap on **every** instance is harmless (a row deleted by one instance
+//!    simply isn't there for the next). It only bounds table growth;
+//!    correctness never depends on it (callback/validate already reject
 //!    expired rows in SQL).
 //!
-//! 5. **Credential reaper** (slice 12.3) — periodically deletes expired
+//! 5. **Credential reaper** — periodically deletes expired
 //!    `validated_credential` verdicts and then the orphaned
 //!    `validated_credential_tag` fence rows left behind (rejected/sprayed
 //!    usernames, completed revocations). Pure `DELETE`s safe on every instance;
@@ -78,13 +78,13 @@ pub struct WorkerHandles {
     pub reconciler: JoinHandle<()>,
     /// Proxy metadata-refresh loop.
     pub proxy_refresh: JoinHandle<()>,
-    /// Retention-evaluation loop (slice 12.1).
+    /// Retention-evaluation loop.
     pub retention: JoinHandle<()>,
-    /// Expired-`oidc_flow` / `session` reaper loop (slice 12.2). Present only
-    /// when OIDC login is enabled (the only path that writes those tables).
+    /// Expired-`oidc_flow` / `session` reaper loop. Always present: local
+    /// password logins write `session` rows too.
     pub auth_reaper: Option<JoinHandle<()>>,
-    /// Expired-`validated_credential` / orphaned-tag reaper loop (slice 12.3).
-    /// Always present: any credential-forwarding provider writes those tables.
+    /// Expired-`validated_credential` / orphaned-tag reaper loop. Always
+    /// present: any credential-forwarding provider writes those tables.
     pub cred_reaper: JoinHandle<()>,
     /// Docker registry sweeper: abandoned upload sessions and blob links no
     /// manifest references any more.
@@ -94,11 +94,11 @@ pub struct WorkerHandles {
     pub registry_key_refresh: JoinHandle<()>,
     /// Re-reads, creates and rotates forge's OIDC issuer keys.
     pub issuer_refresh: JoinHandle<()>,
-    /// Secret-encryption rotation/backfill worker (slice 12.5). Present only
-    /// when `[crypto]` is enabled and its rotation worker is not turned off.
+    /// Secret-encryption rotation/backfill worker. Present only when
+    /// `[crypto]` is enabled and its rotation worker is not turned off.
     /// Cluster-coordinated via a Postgres advisory lock (see
-    /// [`crate::crypto::spawn_worker`]) — the documented exception to the
-    /// no-advisory-locks slice-1 style, per the §12.5 plan.
+    /// [`crate::crypto::spawn_worker`]) — the one exception to the
+    /// no-advisory-locks rule of the other loops.
     pub crypto_rotation: Option<JoinHandle<()>>,
     /// Local blob cache maintenance (re-read the disk size, evict down to the
     /// limit). Present only with `[blob_cache]`; per instance, like the cache.
@@ -168,11 +168,11 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     };
 
-    // Retention worker (slice 12.1): runs on every instance, claims one due
-    // repository per tick via FOR UPDATE SKIP LOCKED + a lease, evaluates its
-    // policy, and applies decisions through the same blob outbox the outbox
-    // worker above drains — no parallel S3-delete path. Cross-instance
-    // exclusivity is the lease, not leader election. Disabling it
+    // Retention worker: runs on every instance, claims one due repository per
+    // tick via FOR UPDATE SKIP LOCKED + a lease, evaluates its policy, and
+    // applies decisions through the same blob outbox the outbox worker above
+    // drains — no parallel S3-delete path. Cross-instance exclusivity is the
+    // lease, not leader election. Disabling it
     // (`FORGE_RETENTION__ENABLED=false`) leaves the admin REST surface intact;
     // due repositories simply wait for an instance that runs the worker.
     let retention = if state.config.retention.enabled {
@@ -198,12 +198,12 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         tokio::spawn(async {})
     };
 
-    // Auth reaper (slice 12.2): always on — local-password logins create
-    // `session` rows and DB-managed OIDC realms create `oidc_flow` rows even
-    // without the legacy `[oidc]` block. Both reaps are pure `DELETE`s safe on
-    // every instance (no advisory locks, no leases). Cadence reuses the outbox
-    // poll scaled up — flow rows live ~10min and sessions hours/days, so a
-    // per-minute sweep is plenty to bound growth.
+    // Auth reaper: always on — local-password logins create `session` rows and
+    // DB-managed OIDC realms create `oidc_flow` rows even without the legacy
+    // `[oidc]` block. Both reaps are pure `DELETE`s safe on every instance (no
+    // advisory locks, no leases). Cadence reuses the outbox poll scaled up —
+    // flow rows live ~10min and sessions hours/days, so a per-minute sweep is
+    // plenty to bound growth.
     let auth_reaper = {
         let pool = state.pool.clone();
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
@@ -212,10 +212,10 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         }))
     };
 
-    // Credential reaper (slice 12.3): bounds `validated_credential` (expired
-    // verdicts) and `validated_credential_tag` (fence rows whose usernames have
-    // no verdicts left — including every rejected/sprayed attempt). Runs
-    // unconditionally: any credential-forwarding provider writes these tables.
+    // Credential reaper: bounds `validated_credential` (expired verdicts) and
+    // `validated_credential_tag` (fence rows whose usernames have no verdicts
+    // left — including every rejected/sprayed attempt). Runs unconditionally:
+    // any credential-forwarding provider writes these tables.
     let cred_reaper = {
         let pool = state.pool.clone();
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
@@ -253,9 +253,9 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     };
 
-    // Crypto rotation/backfill worker (slice 12.5): only when secret
-    // encryption is enabled. One instance at a time performs a pass (advisory
-    // lock); every step is idempotent/resumable so crashes are harmless.
+    // Crypto rotation/backfill worker: only when secret encryption is
+    // enabled. One instance at a time performs a pass (advisory lock); every
+    // step is idempotent/resumable so crashes are harmless.
     let crypto_rotation = match (&state.envelope, state.config.crypto.as_ref()) {
         (Some(envelope), Some(crypto_cfg)) if crypto_cfg.rotation.enabled => {
             let (pool, envelope, crypto_cfg) =

@@ -1,4 +1,4 @@
-//! The **pure** retention evaluator (design §3.6).
+//! The **pure** retention evaluator.
 //!
 //! Given a policy and a snapshot of a repository's components (or a proxy repo's
 //! cached versions), [`evaluate`] / [`evaluate_proxy`] compute the set of

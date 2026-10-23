@@ -8,7 +8,7 @@
 //! 2. [`AnonPolicy`] — decide whether an unauthenticated request from a given
 //!    client IP may be served anonymously (`off` / `allowlist` / `all`).
 //!
-//! ## XFF trust model (spec §5)
+//! ## XFF trust model
 //! The client IP is the **socket peer** unless the peer is itself a trusted
 //! proxy. When the peer is trusted, we walk `X-Forwarded-For` **right-to-left**,
 //! dropping trusted hops, and take the first untrusted address. A malformed XFF
@@ -82,7 +82,7 @@ pub struct ResolvedClient {
 ///   present.
 /// * `trusted` — CIDRs of proxies we operate / trust to prepend XFF.
 ///
-/// Rules (spec §5):
+/// Rules:
 /// * If `peer` is **not** in `trusted`, return `peer` (ignore XFF entirely —
 ///   an untrusted peer's XFF is attacker-controlled).
 /// * If `peer` **is** trusted, split XFF on commas and walk **right-to-left**,

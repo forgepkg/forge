@@ -1,6 +1,6 @@
-//! E2E: fine-grained RBAC + nested groups (§12.4 Phase 7 — the full matrix).
+//! E2E: fine-grained RBAC + nested groups (the full matrix).
 //!
-//! These scenarios drive a **real server** (Postgres + versitygw, the slice-1
+//! These scenarios drive a **real server** (Postgres + versitygw, the shared
 //! testcontainers harness) over HTTP and assert the RBAC seam end-to-end:
 //!
 //!   * **principal × repo × action matrix** — a roleless user is denied (403);
@@ -20,9 +20,9 @@
 //!   * **cross-instance cache invalidation** — a grant change on instance A is
 //!     observed on instance B within the TTL/backplane bound (two instances +
 //!     Redis L2).
-//!   * **UPGRADE-PRESERVES-BEHAVIOR** — a slice-1-seeded DB upgraded through the
-//!     data migration keeps existing users reading/writing everywhere and admins
-//!     admin; **FRESH-DEFAULTS-CLOSED** — a fresh install denies a roleless user.
+//!   * **FRESH-DEFAULTS-CLOSED** — a fresh install denies a roleless user. (The
+//!     upgrade path through the RBAC data migration is covered by `forge-db`'s
+//!     `rbac_migrate.rs`.)
 //!
 //! Gated behind `forge-e2e`.
 
@@ -520,7 +520,7 @@ async fn nested_group_visibility_honors_privileges() {
     assert_eq!(
         srv.add_member("g-outer", "g-inner", 10).await.status(),
         201,
-        "a group may nest another group (§12.4)"
+        "a group may nest another group"
     );
 
     // Distinct versions per leaf (admin pushes).

@@ -1,4 +1,4 @@
-//! The `upstream-basic` [`AuthProvider`] (slice 12.3, phase 4).
+//! The `upstream-basic` [`AuthProvider`].
 //!
 //! Forwards a presented `username:password` to a configured upstream over HTTP
 //! Basic — the `github.com/schmitch/verdaccio-nexus-auth-proxy` pattern (for a
@@ -38,8 +38,8 @@
 //! NuGet clients send Basic credentials on *every* request. This provider never
 //! forwards unconditionally: it goes through the [`ValidatedCredentialCache`]
 //! ([`super::cred_cache`]), so the steady state of a repeated credential is a
-//! cache hit (L1 → L2 → Postgres) and the upstream is hit at most once per
-//! credential per TTL window per cluster (the cache's lease singleflight —
+//! cache hit (in-process L1 → Postgres) and the upstream is hit at most once
+//! per credential per TTL window per cluster (the cache's lease singleflight —
 //! **no `pg_advisory_*`**, and no database connection held while the upstream
 //! answers). The plaintext password leaves the process only here, over the
 //! outbound `Authorization: Basic` header; it is never persisted.
@@ -50,16 +50,16 @@
 //! the scheme is restricted to http/https (pre-validated at config time via
 //! [`crate::net::ssrf::validate_url`]), redirects are **not followed**, and
 //! every forward carries the configured total `request_timeout`. Private /
-//! loopback upstreams are permitted — the upstream URL is admin-only config
-//! (12.7 §3.6), and an internal Nexus on RFC1918 is the common case.
+//! loopback upstreams are permitted — the upstream URL is admin-only config,
+//! and an internal Nexus on RFC1918 is the common case.
 //!
 //! ## Auto-provision
 //!
 //! This provider only *vouches for* a [`ProvenIdentity`] (the username + coarse
 //! groups + an admin suggestion). Mapping that to an `app_user` — creating one on
 //! first success with `auth_source = 'upstream-basic'` and **no** local password
-//! — is the chain caller's job ([`super::chain::provision_and_map`], phase 5), so
-//! this file stays free of the DB-provision policy.
+//! — is the chain caller's job ([`super::chain::provision_and_map`]), so this
+//! file stays free of the DB-provision policy.
 //!
 //! ## Keeping a password hash (opt-in)
 //!
@@ -96,9 +96,9 @@ pub const MAX_SUCCESS_BODY_BYTES: usize = 1024 * 1024;
 
 /// How to read the user's groups/roles from the upstream JSON body.
 ///
-/// Kept deliberately small (plan §6 risk #4: avoid a JSONPath dependency for a
-/// status-code-first scheme). A path is a `.`-separated sequence of object keys;
-/// the value it points at is interpreted as a list of group strings:
+/// Kept deliberately small (no JSONPath dependency for a status-code-first
+/// scheme). A path is a `.`-separated sequence of object keys; the value it
+/// points at is interpreted as a list of group strings:
 ///
 /// * a JSON array of strings → those strings;
 /// * a single JSON string → a one-element list;
@@ -137,8 +137,8 @@ fn extract_identity(body: &serde_json::Value, path: &str) -> Option<String> {
 }
 
 /// Static configuration for the upstream-basic provider, assembled by the server
-/// from the `[auth.upstream_basic]` config block (phase 5). Built once at
-/// startup; cheaply cloned into the provider.
+/// from a credential-forwarding realm's config (or the `[auth.upstream_basic]`
+/// config block); cheaply cloned into the provider.
 #[derive(Debug, Clone)]
 pub struct UpstreamBasicConfig {
     /// Upstream endpoint hit with the user's Basic credentials (validated through
@@ -178,11 +178,11 @@ pub struct UpstreamBasicConfig {
     pub admin_group: String,
     /// Stable provider id keying the validated-credential cache and logged as
     /// the chain winner. The static-config wiring uses [`UPSTREAM_BASIC_ID`];
-    /// realm-driven wiring (12.7) uses a realm-scoped id (`"realm:<name>"`).
+    /// realm-driven wiring uses a realm-scoped id (`"realm:<name>"`).
     pub provider_id: String,
     /// Auto-provision an `app_user` on first successful upstream login.
     /// Stamped onto every [`ProvenIdentity`] this provider vouches for (the
-    /// chain caller acts on it — per-realm since 12.7).
+    /// chain caller acts on it, per realm).
     pub auto_provision: bool,
     /// The `auth_realm.id` this provider was built from, recorded as
     /// provenance on provisioned users. `None` for static-config wiring.

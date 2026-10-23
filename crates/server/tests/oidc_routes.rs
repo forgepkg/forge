@@ -1,4 +1,4 @@
-//! Route-level integration tests for the slice-12.2 `/auth` surface (Phase 5).
+//! Route-level integration tests for the `/auth` surface.
 //!
 //! Drives the **real** forge server over HTTP against a real Postgres
 //! testcontainer + an in-process mock OIDC IdP (wiremock serving

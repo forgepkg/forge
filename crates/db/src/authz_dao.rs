@@ -1,6 +1,5 @@
-//! Data access for fine-grained RBAC (slice 12.4): reading a principal's
-//! effective grant set and the small CRUD surface the admin API (later phase)
-//! and the evaluator need.
+//! Data access for fine-grained RBAC: reading a principal's effective grant
+//! set and the small CRUD surface the admin API and the evaluator need.
 //!
 //! The hot path is [`load_user_effective`] / [`load_anonymous_effective`]: a
 //! single indexed query joining `user_role → repository_privilege` (left-joined
@@ -16,8 +15,8 @@
 //!
 //! Multi-instance correctness: these are plain reads; no advisory locks, no
 //! in-memory-only state. Authoritative privilege data lives entirely in these
-//! tables and the `forge-cache` layer (later phase) sits in front of the
-//! resolved set with explicit cross-node invalidation.
+//! tables and the `forge-cache` layer sits in front of the resolved set with
+//! explicit cross-node invalidation.
 
 use serde_json::Value as JsonValue;
 use sqlx::{PgExecutor, PgPool};
@@ -187,8 +186,8 @@ pub async fn load_user_effective(pool: &PgPool, user_id: i64) -> sqlx::Result<Ef
 ///
 /// On a fresh / un-migrated install the `anonymous` role has no grants, so this
 /// returns an empty set (deny-all) — anonymous access is opened by granting the
-/// `anonymous` role `read` on specific repos (the data migration converts the
-/// slice-1 `anonymous_read` flag into exactly these grants).
+/// `anonymous` role `read` on specific repos (the data migration converts each
+/// repository's `anonymous_read` flag into exactly these grants).
 pub async fn load_anonymous_effective(pool: &PgPool) -> sqlx::Result<EffectiveRows> {
     let rows = sqlx::query!(
         r#"
@@ -221,7 +220,7 @@ pub async fn load_anonymous_effective(pool: &PgPool) -> sqlx::Result<EffectiveRo
 /// Load the effective set granted by a **single role** (`role.id = role_id`).
 ///
 /// Unlike [`load_user_effective`], this resolves a role directly — used by the
-/// workload-identity (WIF) auth path (slice 12.8), where a validated CI token
+/// workload-identity (WIF) auth path, where a validated CI token
 /// is mapped to exactly one forge role and authorized by that role's grants
 /// (no `app_user` row, no `user_role` membership). `is_admin` is true iff the
 /// role *is* the built-in `admin` role. A non-existent `role_id` yields an empty
@@ -282,7 +281,7 @@ fn map_grant_row(r: EffectiveQueryRow) -> EffectiveGrantRow {
 }
 
 /// Load a token's raw `scope` jsonb by token id, for per-token privilege
-/// scoping (§12.4 Phase 3).
+/// scoping.
 ///
 /// Returns `Ok(None)` when the token does not exist **or** its `scope` column is
 /// NULL — both mean "no scoping" to the caller, which then uses the owner's full
@@ -508,7 +507,7 @@ where
     .await
 }
 
-// --- admin REST CRUD surface (§12.4 Phase 6) --------------------------------
+// --- admin REST CRUD surface ------------------------------------------------
 
 /// A `role` row, as returned to the admin API.
 #[derive(Debug, Clone)]
@@ -982,7 +981,7 @@ pub async fn delete_setting(pool: &PgPool, key: &str) -> sqlx::Result<bool> {
 }
 
 /// Upsert a `forge_setting` value by key (e.g. one-shot import markers like
-/// the 12.7 `auth_realms_seeded` flag).
+/// the `auth_realms_seeded` flag).
 pub async fn set_setting(pool: &PgPool, key: &str, value: &str) -> sqlx::Result<()> {
     sqlx::query!(
         r#"

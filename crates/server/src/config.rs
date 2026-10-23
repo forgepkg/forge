@@ -1,4 +1,4 @@
-//! Server configuration (spec §8).
+//! Server configuration.
 //!
 //! Configuration is layered: a TOML file (optional) is the base, and `FORGE_*`
 //! environment variables override individual keys. Nested keys use `__` as the
@@ -51,7 +51,7 @@ pub struct Config {
     /// Background retention worker tuning.
     #[serde(default)]
     pub retention: RetentionConfig,
-    /// Group-repository nesting limits (slice 12.4).
+    /// Group-repository nesting limits.
     #[serde(default)]
     pub groups: GroupsConfig,
     /// Proxy-repository upstream HTTP tuning (timeouts, size caps, spooling).
@@ -73,16 +73,16 @@ pub struct Config {
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
-    /// Optional OpenID Connect / Microsoft Entra interactive login (slice 12.2).
-    /// Absent ⇒ OIDC disabled, no `/auth/oidc/*` routes.
+    /// Optional OpenID Connect / Microsoft Entra interactive login: a **seed**
+    /// for an `oidc` auth realm (see [`OidcConfig`]).
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
-    /// Optional secret encryption at rest (slice 12.5). Absent/disabled ⇒
-    /// slice-1 behavior (secrets stay in the legacy plaintext columns; no key
-    /// bootstrap, rotation worker, or backfill). Present + enabled ⇒ proxy
-    /// `upstream_password` writes are envelope-encrypted under the root → KEK
-    /// → DEK hierarchy, existing plaintext is backfilled at startup, and the
-    /// `/admin/crypto/*` endpoints are live.
+    /// Optional secret encryption at rest. Absent/disabled ⇒ secrets stay in
+    /// the legacy plaintext columns (no key bootstrap, rotation worker, or
+    /// backfill). Present + enabled ⇒ proxy `upstream_password` writes are
+    /// envelope-encrypted under the root → KEK → DEK hierarchy, existing
+    /// plaintext is backfilled at startup, and the `/admin/crypto/*` endpoints
+    /// are live.
     #[serde(default)]
     pub crypto: Option<CryptoConfig>,
     /// Optional local disk cache for blobs. Absent (no `path`) ⇒ every
@@ -550,25 +550,26 @@ pub struct AuthConfig {
     /// First-run bootstrap admin credentials.
     #[serde(default)]
     pub bootstrap_admin: Option<BootstrapAdmin>,
-    /// Ordered password-style auth provider chain (slice 12.3). Each entry is a
-    /// provider id; the chain is walked in order and the first to authenticate
-    /// wins. Known ids: `local-password`, `upstream-basic`. The default keeps the
-    /// local provider first so a locally-created admin survives an upstream
-    /// outage. An entry of `upstream-basic` requires `[auth.upstream_basic]` to be
+    /// Ordered password-style auth provider chain. Each entry is a provider id;
+    /// the chain is walked in order and the first to authenticate wins. Known
+    /// ids: `local-password`, `upstream-basic`. The default keeps the local
+    /// provider first so a locally-created admin survives an upstream outage.
+    /// An entry of `upstream-basic` requires `[auth.upstream_basic]` to be
     /// present and enabled (validated at startup).
     #[serde(default = "default_providers")]
     pub providers: Vec<String>,
-    /// Optional credential-forwarding upstream-basic provider (slice 12.3).
-    /// Present + enabled ⇒ the `upstream-basic` provider can appear in
+    /// Optional credential-forwarding upstream-basic provider. Present +
+    /// enabled ⇒ the `upstream-basic` provider can appear in
     /// [`Self::providers`].
     ///
-    /// Since 12.7 this block (like `[oidc]`) is a **seed**: on first boot it is
-    /// imported into an `auth_realm` row and the database becomes the
-    /// authority (edit realms in the admin UI; the block is ignored afterwards).
+    /// This block (like `[oidc]`) is a **seed**: on first boot it is imported
+    /// into an `auth_realm` row. A changed block re-applies on later boots only
+    /// until the realm is edited in the admin UI; from then on the database is
+    /// the authority and the block is ignored.
     #[serde(default)]
     pub upstream_basic: Option<UpstreamBasicAuthConfig>,
-    /// Login-screen behavior (12.7 §3.4): `identifier_first` (default — ask for
-    /// the username, then route to a password prompt or an OIDC redirect) or
+    /// Login-screen behavior: `identifier_first` (default — ask for the
+    /// username, then route to a password prompt or an OIDC redirect) or
     /// `combined` (always show username+password plus a button per enabled
     /// OIDC realm).
     #[serde(default = "default_login_mode")]
@@ -665,14 +666,15 @@ fn default_providers() -> Vec<String> {
     vec!["local-password".to_string()]
 }
 
-/// `auth.upstream_basic.*` — credential-forwarding authentication (slice 12.3).
+/// `auth.upstream_basic.*` — credential-forwarding authentication.
 ///
 /// Forwards a user's `username:password` to a configured upstream over HTTP
 /// Basic (the verdaccio-nexus-auth-proxy pattern; for a Nexus this is the
 /// status/whoami endpoint). The `key_pepper` is a **secret**: it keys the
 /// validated-credential cache HMAC and is **redacted** from `Debug` (and any
-/// config dump), mirroring the slice-1 `upstream_password` / OIDC `client_secret`
-/// treatment, and is forward-compatible with §12.5 encryption at rest.
+/// config dump), like the proxy `upstream_password` and the OIDC
+/// `client_secret`; once seeded into a realm it is encrypted at rest when
+/// `[crypto]` is enabled.
 ///
 /// Unknown keys are refused, like in a realm config set through the admin
 /// API: a misspelled `identity_path` or `required_groups` would otherwise
@@ -1058,11 +1060,11 @@ impl OutboxConfig {
     }
 }
 
-/// `retention.*` — background retention worker tuning (slice 12.1).
+/// `retention.*` — background retention worker tuning.
 ///
 /// The worker runs on every instance, claims one due repository per tick via
 /// `FOR UPDATE SKIP LOCKED` + a lease, evaluates its policy, and applies
-/// decisions through the slice-1 blob outbox. `default_run_interval` is the
+/// decisions through the blob outbox. `default_run_interval` is the
 /// floor between automatic runs (a larger per-repo `min_run_interval_seconds`
 /// in the policy wins); `lease_seconds` is the crash-safe lease; `delete_grace`
 /// defaults to the outbox grace when unset and is the deferral before a
@@ -1132,7 +1134,7 @@ impl RetentionConfig {
     }
 }
 
-/// `groups.*` — nested group-repository limits (slice 12.4 Phase 4).
+/// `groups.*` — nested group-repository limits.
 ///
 /// Nested group repositories (a group whose member is itself a group) are
 /// allowed, but the graph must stay an acyclic DAG of bounded depth. The
@@ -1581,19 +1583,20 @@ fn default_web_assets_dir() -> String {
     "web/dist".into()
 }
 
-/// `oidc.*` — OpenID Connect / Microsoft Entra interactive login (slice 12.2).
+/// `oidc.*` — OpenID Connect / Microsoft Entra interactive login.
 ///
-/// The whole `[oidc]` section is **optional**: when it is absent the feature is
-/// off and the server mounts no `/auth/oidc/*` routes. When present, it
-/// configures the authorization-code + PKCE flow against a single OIDC provider
-/// (Entra-first, but generic OIDC). All ephemeral flow state and sessions live
-/// in Postgres (`oidc_flow` / `session`), never in process memory, so any
-/// instance can complete a callback another instance started.
+/// The whole `[oidc]` section is **optional**. Like `[auth.upstream_basic]` it
+/// is a **seed** (see [`AuthConfig::upstream_basic`]): when present and
+/// enabled, it is imported into an `oidc` auth realm, which configures the
+/// authorization-code + PKCE flow against a single OIDC provider (Entra-first,
+/// but generic OIDC). All ephemeral flow state and sessions live in Postgres
+/// (`oidc_flow` / `session`), never in process memory, so any instance can
+/// complete a callback another instance started.
 ///
 /// `client_secret` is read from env/file and **redacted** from the `Debug`
-/// impl (and must be redacted from any admin API that echoes config), mirroring
-/// the slice-1 proxy `upstream_password` treatment. Encrypting it at rest is
-/// slice 12.5.
+/// impl (and must be redacted from any admin API that echoes config), like
+/// the proxy `upstream_password`; once seeded into a realm it is encrypted at
+/// rest when `[crypto]` is enabled.
 ///
 /// Unknown keys are refused, like in a realm config set through the admin
 /// API: a misspelled `required_claims` or `auto_provision` would otherwise
@@ -1637,9 +1640,9 @@ pub struct OidcConfig {
     pub clock_skew_seconds: u64,
     /// Permit a plain-`http` issuer URL. Off by default — a production issuer
     /// must be `https`. Set `true` only for a self-hosted/dev IdP without TLS
-    /// (this is what the integration tests' in-process mock IdP uses). Since
-    /// 12.7 §3.6 dropped the private-range SSRF restriction, this flag no
-    /// longer affects which *addresses* are reachable — only the scheme rule.
+    /// (this is what the integration tests' in-process mock IdP uses). The
+    /// flag governs only the scheme rule: private and loopback *addresses* are
+    /// reachable either way.
     #[serde(default)]
     pub allow_private_issuer: bool,
 
@@ -1811,7 +1814,7 @@ fn default_session_absolute_ttl() -> u64 {
     7 * 24 * 60 * 60 // 7d
 }
 
-/// `crypto.*` — secret encryption at rest (slice 12.5).
+/// `crypto.*` — secret encryption at rest.
 ///
 /// No field here is itself a secret: the **env provider** stores the *name* of
 /// the environment variable holding the base64 root key and the **file
@@ -1850,7 +1853,8 @@ pub struct CryptoRootConfig {
     pub root_key_env: String,
     /// env provider: optional env var holding the **previous** root key,
     /// reachable during a root-rotation window (until the KEK re-wrap sweep
-    /// completes; see the rotation runbook in the plan).
+    /// completes; see "Rotating the root key on a running cluster" in
+    /// `docs/deployment.md`).
     #[serde(default)]
     pub root_key_env_previous: Option<String>,
     /// file provider: path of the file holding the base64 32-byte root key
@@ -1862,7 +1866,7 @@ pub struct CryptoRootConfig {
     pub root_key_path_previous: Option<String>,
 }
 
-/// `crypto.cache.*` — the bounded, zeroizing L1 of unwrapped keys (§2.6).
+/// `crypto.cache.*` — the bounded, zeroizing L1 of unwrapped keys.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CryptoCacheConfig {
     /// TTL (seconds) of unwrapped key bytes in RAM. Bounds both root-provider
@@ -2732,12 +2736,12 @@ impl Config {
         )))
     }
 
-    /// Validate the optional `[crypto]` section when present and enabled
-    /// (slice 12.5): the algorithm name must parse and the root provider must
-    /// be a supported kind with the fields it needs. The root key **bytes**
-    /// are deliberately not read here — that happens once at startup when the
-    /// provider is built, so a missing/short key still refuses to boot, just
-    /// with the more precise root-provider error.
+    /// Validate the optional `[crypto]` section when present and enabled: the
+    /// algorithm name must parse and the root provider must be a supported
+    /// kind with the fields it needs. The root key **bytes** are deliberately
+    /// not read here — that happens once at startup when the provider is
+    /// built, so a missing/short key still refuses to boot, just with the more
+    /// precise root-provider error.
     fn validate_crypto(&self) -> Result<(), ConfigError> {
         let Some(crypto) = &self.crypto else {
             return Ok(());
@@ -2813,9 +2817,9 @@ impl Config {
         Ok(())
     }
 
-    /// Validate the slice-12.3 provider chain + `[auth.upstream_basic]` block.
+    /// Validate the provider chain + `[auth.upstream_basic]` block.
     ///
-    /// Checks (plan §2.3 startup validation):
+    /// Checks:
     /// * every `auth.providers` id is known (`local-password` / `upstream-basic`)
     ///   and not duplicated;
     /// * if `upstream-basic` is in the chain, `[auth.upstream_basic]` is present
@@ -2898,12 +2902,13 @@ impl Config {
 
     /// Validate the optional `[oidc]` section when present and enabled.
     ///
-    /// Checks (per plan §3.5/§4 Phase 0): issuer is a non-empty `https` URL,
-    /// `client_id`/`redirect_url` are non-empty, so is `client_secret` unless
-    /// the client authenticates with a federated credential, and the
-    /// `redirect_url` shares scheme+host (+port) with `server.public_base_url`
-    /// and ends in the canonical `/auth/oidc/callback` path. A disabled section
-    /// is not validated (an operator may keep an incomplete block while off).
+    /// Checks: issuer is a non-empty `https` URL (plain `http` only with
+    /// `allow_private_issuer`), `client_id`/`redirect_url` are non-empty, so is
+    /// `client_secret` unless the client authenticates with a federated
+    /// credential, and the `redirect_url` shares scheme+host (+port) with
+    /// `server.public_base_url` and ends in the canonical `/auth/oidc/callback`
+    /// path. A disabled section is not validated (an operator may keep an
+    /// incomplete block while off).
     fn validate_oidc(&self) -> Result<(), ConfigError> {
         let Some(oidc) = &self.oidc else {
             return Ok(());
@@ -2918,8 +2923,7 @@ impl Config {
         // The issuer must be https — except when `allow_private_issuer` is set,
         // which signals a trusted IdP on a private/dev network (e.g. a
         // self-hosted Keycloak or the in-process test IdP) where plain http is
-        // acceptable. This mirrors the relaxed SSRF posture that flag also
-        // enables, so the two knobs move together.
+        // acceptable.
         if issuer.scheme() != "https" && !(oidc.allow_private_issuer && issuer.scheme() == "http") {
             return Err(ConfigError::Invalid(format!(
                 "oidc.issuer must be https, got {:?}",
@@ -4024,7 +4028,7 @@ mod tests {
         });
     }
 
-    // ── slice 12.3: auth.providers + [auth.upstream_basic] ──────────────────
+    // ── auth.providers + [auth.upstream_basic] ───────────────────────────────
 
     /// A minimal valid upstream-basic block + matching provider chain appended.
     fn minimal_with_upstream(extra: &str) -> String {
@@ -4614,9 +4618,6 @@ mod tests {
         });
     }
 
-    /// Secret env values keep their pre-release normalization: surrounding
-    /// whitespace (a trailing newline from a secret file) is trimmed and one
-    /// pair of surrounding double quotes is removed.
     #[test]
     fn trusted_proxy_cidrs_accept_ipv4_mapped_entries() {
         let mut cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
@@ -4632,6 +4633,9 @@ mod tests {
         );
     }
 
+    /// Secret env values are normalized: surrounding whitespace (a trailing
+    /// newline from a secret file) is trimmed and one pair of surrounding
+    /// double quotes is removed.
     #[test]
     fn secret_env_values_are_trimmed_and_unquoted() {
         figment::Jail::expect_with(|jail| {
@@ -4732,7 +4736,7 @@ mod tests {
         });
     }
 
-    // ── slice 12.5: [crypto] secret encryption at rest ───────────────────────
+    // ── [crypto] secret encryption at rest ───────────────────────────────────
 
     #[test]
     fn crypto_absent_means_disabled() {

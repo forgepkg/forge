@@ -1,4 +1,5 @@
-//! Browser login + session surface (slice 12.2 OIDC, reworked by 12.7 realms).
+//! Browser login + session surface: local-password and OIDC logins through the
+//! DB-backed auth realms.
 //!
 //! This module wires the `core` OIDC flow + session service into the server
 //! and owns the login UX endpoints:
@@ -11,7 +12,7 @@
 //! * [`auth_router`] — the `/auth/...` browser endpoints, always mounted:
 //!   * `POST /auth/login`         — username/password through the realm chain;
 //!     mints the session cookie (uniform 401 — no user-exists oracle).
-//!   * `POST /auth/identify`      — identifier-first routing (12.7 §3.4),
+//!   * `POST /auth/identify`      — identifier-first routing,
 //!     decided ONLY by public realm config (anti-enumeration).
 //!   * `GET  /auth/login-options` — what the login screen should render.
 //!   * `GET  /auth/oidc/login`    — start the auth-code+PKCE flow (302 → IdP);
@@ -83,15 +84,15 @@ pub(crate) use wif::{realm_current_now, workload_identity_config_sha256};
 /// clone (the metadata client + session service are `Arc`/pool-backed).
 #[derive(Clone)]
 pub struct OidcRuntime {
-    /// Discovery/JWKS fetcher + ID-token verifier (Phase 2).
+    /// Discovery/JWKS fetcher + ID-token verifier.
     meta: OidcMetadataClient,
-    /// Static OAuth client params for the flow (Phase 3).
+    /// Static OAuth client params for the flow.
     client: ClientParams,
-    /// Claim → user mapping config (Phase 3).
+    /// Claim → user mapping config.
     mapping: ClaimMapping,
-    /// Provision / link policy (Phase 3).
+    /// Provision / link policy.
     policy: ResolvePolicy,
-    /// Server-side session lifecycle (Phase 4).
+    /// Server-side session lifecycle.
     sessions: SessionService,
     /// Whether the session cookie is marked `Secure` (driven by the public
     /// base URL scheme — `https` ⇒ secure).
@@ -171,7 +172,7 @@ pub struct LoginQuery {
     pub redirect_to: Option<String>,
 }
 
-/// Build the `/auth` router. Always mounted (12.7): sessions exist for local
+/// Build the `/auth` router. Always mounted: sessions exist for local
 /// password logins too, and the OIDC endpoints answer 404/503 by themselves
 /// when no enabled `oidc` realm is configured.
 pub fn auth_router() -> Router<AppState> {
@@ -453,11 +454,11 @@ struct LogoutResult {
 /// `POST /auth/logout` — revoke the current session + clear the cookie.
 ///
 /// CSRF-protected: the caller must echo the session's `csrf_secret` in the
-/// `X-CSRF-Token` header (double-submit, §3.8). A request without a session
+/// `X-CSRF-Token` header (double-submit). A request without a session
 /// cookie is a no-op `204`.
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    // Sessions are minted by BOTH the local login endpoint and OIDC (12.7),
-    // so logout works whenever sessions do — independent of any oidc realm.
+    // Sessions are minted by BOTH the local login endpoint and OIDC, so
+    // logout works whenever sessions do — independent of any oidc realm.
     let rt = SessionAuthCtx::of(&state);
 
     let Ok(Some(secret)) = unique_cookie_value(&headers, session_cookie_name(rt.cookie_secure))
@@ -549,8 +550,8 @@ impl IntoResponse for SessionAuthError {
 
 /// What the session-authenticated endpoints need: the shared session service,
 /// the pool (to read the session user's live account state) and the
-/// cookie-security bit. OIDC-independent since 12.7 (local password logins
-/// mint sessions too).
+/// cookie-security bit. OIDC-independent (local password logins mint sessions
+/// too).
 struct SessionAuthCtx {
     sessions: SessionService,
     pool: sqlx::PgPool,
@@ -610,7 +611,7 @@ async fn require_session(
 
 /// Like [`require_session`] but also enforces the double-submit CSRF token
 /// (`X-CSRF-Token` must equal the session's stored `csrf_secret`). Use on every
-/// state-changing cookie-authenticated endpoint (§3.8).
+/// state-changing cookie-authenticated endpoint.
 async fn require_session_csrf(
     rt: &SessionAuthCtx,
     headers: &HeaderMap,
@@ -627,7 +628,7 @@ async fn require_session_csrf(
 }
 
 /// `GET /auth/me` who-am-I body for the SPA. Carries the per-session
-/// `csrf_token` the UI must echo on mutating requests (§3.8).
+/// `csrf_token` the UI must echo on mutating requests.
 #[derive(Debug, Serialize)]
 struct AuthMe {
     user_id: i64,
@@ -730,10 +731,9 @@ async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> Respo
     }
 }
 
-/// `POST /auth/tokens` — mint a slice-1 repository token for the **session's**
-/// user (CSRF-protected; refused for a deactivated user). Delegates to the
-/// same hash-only token model the admin API uses; the plaintext is returned
-/// once.
+/// `POST /auth/tokens` — mint an API token for the **session's** user
+/// (CSRF-protected; refused for a deactivated user). Delegates to the same
+/// hash-only token model the admin API uses; the plaintext is returned once.
 async fn create_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -806,7 +806,7 @@ async fn revoke_token(
     }
 }
 
-// ── password login + identifier-first UX (12.7 §3.4) ────────────────────────
+// ── password login + identifier-first UX ────────────────────────────────────
 
 /// `POST /auth/login` request body.
 #[derive(Debug, Deserialize)]
@@ -1016,7 +1016,7 @@ struct IdentifyResult {
     login_url: Option<String>,
 }
 
-/// `POST /auth/identify` — identifier-first routing (12.7 §3.4).
+/// `POST /auth/identify` — identifier-first routing.
 ///
 /// **Anti-enumeration:** the decision is a pure function of *public realm
 /// configuration* (an OIDC realm's `login_domains` rule), never of whether an
@@ -1085,7 +1085,7 @@ struct LoginOptions {
     mode: String,
     /// Whether any password-capable realm is enabled (show the password form).
     password: bool,
-    /// Enabled OIDC realm buttons (at most one in 12.7).
+    /// Enabled OIDC realm buttons (at most one).
     oidc: Vec<OidcLoginOption>,
 }
 

@@ -30,7 +30,7 @@ export const Route = createFileRoute('/_app/manage/realms')({
 })
 
 /**
- * Admin authentication-realms screen (§12.7). Lists realms in priority order
+ * Admin authentication-realms screen. Lists realms in priority order
  * (lower = tried/listed first) with up/down reordering (the full new id order
  * is PUT to `/admin/realms/order`), an enable/disable toggle, edit links, and
  * delete-with-confirm. The built-in `local` realm cannot be deleted — only
