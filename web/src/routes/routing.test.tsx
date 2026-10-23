@@ -162,7 +162,7 @@ describe('app routing + admin gating', () => {
     // is no longer part of that rest.
     expect(main.queryByText(/admin flags|with retention/)).toBeNull()
     expect(
-      main.getByText(/Retention, user deactivation and key rotation have no screen/),
+      main.getByText(/Retention and user deactivation have no screen/),
     ).toBeInTheDocument()
     expect(main.queryByText(/RBAC/)).toBeNull()
     expect(main.getByRole('link', { name: /^Roles/ })).toHaveAttribute(
@@ -172,6 +172,7 @@ describe('app routing + admin gating', () => {
     expect(
       main.getByRole('link', { name: /^Content selectors/ }),
     ).toHaveAttribute('href', '/manage/content-selectors')
+    expect(main.getByRole('link', { name: /^System/ })).toHaveAttribute('href', '/manage/system')
   })
 
   it('refreshes the stored CSRF token from the live session on load', async () => {
