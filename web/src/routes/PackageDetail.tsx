@@ -158,10 +158,16 @@ function PackageDetailPage() {
   )
 }
 
-/** The newest listed version that can be downloaded, else the newest. */
+/**
+ * The version the install commands start with: the last listed one that can
+ * be downloaded, a stable one before a prerelease (as `dotnet add package`
+ * without `--version` picks), else the last one. The detail API lists the
+ * versions oldest first.
+ */
 function defaultVersion(versions: DetailVersion[]): string {
   const ready = versions.filter((v) => v.listed && v.delay_status !== 'delayed_until')
-  return (ready.at(-1) ?? versions.at(-1))?.version_original ?? ''
+  const stable = ready.filter((v) => !v.version_original.includes('-'))
+  return (stable.at(-1) ?? ready.at(-1) ?? versions.at(-1))?.version_original ?? ''
 }
 
 /**
@@ -206,7 +212,7 @@ function InstallPanel({
           <CodeBlock
             title="PackageReference"
             copyLabel="Copy PackageReference"
-            code={`<PackageReference Include="${id}" Version="${version}" />`}
+            code={`<PackageReference\n  Include="${id}"\n  Version="${version}" />`}
             placeholders={[]}
           />
         </>
