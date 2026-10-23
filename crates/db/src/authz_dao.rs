@@ -26,7 +26,8 @@ use sqlx::{PgExecutor, PgPool};
 pub const ADMIN_ROLE: &str = "admin";
 /// The fixed slug of the built-in anonymous role (applied to anonymous callers).
 pub const ANONYMOUS_ROLE: &str = "anonymous";
-/// The fixed slug of the built-in legacy-open-access role.
+/// The fixed slug of the built-in `authenticated` role (read and write on
+/// every repository), for an administrator to assign.
 pub const AUTHENTICATED_ROLE: &str = "authenticated";
 
 /// Shared shape of the effective-set query rows (user + anonymous variants).
@@ -841,17 +842,7 @@ pub async fn list_roles_for_user(pool: &PgPool, user_id: i64) -> sqlx::Result<Ve
         .collect())
 }
 
-// --- install-wide settings + legacy behavior-preserving migration (Phase 5) --
-
-/// The `forge_setting` key recording whether this install defaults to the
-/// slice-1 "open access" behavior. `true` ⇒ upgrade (existing users keep
-/// read/write everywhere and NEW users are auto-assigned the `authenticated`
-/// role); `false`/absent ⇒ fresh install, fail-closed default.
-///
-/// Stored in `forge_setting` (migration 0007 writes it once). Operators switch
-/// it off with `PUT /admin/settings/legacy-open-access {"enabled": false}`
-/// ([`set_legacy_open_access`]).
-pub const LEGACY_OPEN_ACCESS_KEY: &str = "legacy_open_access";
+// --- install-wide settings ---------------------------------------------------
 
 /// Read a `forge_setting` value by key. Returns `None` when the key is unset.
 /// Accepts any executor so it composes inside a transaction.
@@ -931,31 +922,6 @@ where
     Ok(result.rows_affected() > 0)
 }
 
-/// Whether this install opted into legacy open access (slice-1 behavior). A
-/// missing key is treated as `false` (fail-closed): a corrupted/old DB without
-/// the setting defaults to the secure, closed behavior.
-pub async fn legacy_open_access(pool: &PgPool) -> sqlx::Result<bool> {
-    Ok(get_setting(pool, LEGACY_OPEN_ACCESS_KEY).await? == Some("true".to_string()))
-}
-
-/// Switch [`LEGACY_OPEN_ACCESS_KEY`] on or off (the admin
-/// `PUT /admin/settings/legacy-open-access` endpoint).
-///
-/// The flag is read live by [`assign_authenticated_if_legacy_open`] (every
-/// user-creation path) and by step 3 of [`apply_legacy_migration`], so turning
-/// it off stops *new* users from receiving the built-in `authenticated` role
-/// (read + write on every repository) from the next creation on. It does not
-/// touch existing assignments: users that already hold `authenticated` keep it
-/// until it is unassigned (or the role's grants are removed).
-pub async fn set_legacy_open_access(pool: &PgPool, enabled: bool) -> sqlx::Result<()> {
-    set_setting(
-        pool,
-        LEGACY_OPEN_ACCESS_KEY,
-        if enabled { "true" } else { "false" },
-    )
-    .await
-}
-
 /// Delete the unscoped `(anonymous role, repository, read)` grant — the grant
 /// migration 0007 synthesized from `repository.anonymous_read` — for
 /// `repository_id`. Returns whether a row was removed.
@@ -988,93 +954,6 @@ where
     .execute(executor)
     .await?;
     Ok(res.rows_affected() > 0)
-}
-
-/// Re-apply the idempotent behavior-preserving legacy mapping (the same
-/// PL/pgSQL routine migration 0007 installs and runs once): is_admin→admin
-/// role, anonymous_read→anonymous read grants, and — only when
-/// `legacy_open_access` is set — the `authenticated` role for every user. All
-/// writes are upserts.
-///
-/// **Not for the boot path**: re-running it would re-grant anything an
-/// operator revoked through RBAC since (the routine only ever adds). Boot uses
-/// [`apply_legacy_migration_once`].
-pub async fn apply_legacy_migration(pool: &PgPool) -> sqlx::Result<()> {
-    sqlx::query!(r#"SELECT forge_rbac_apply_legacy_migration()"#)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// The `forge_setting` key marking the legacy RBAC synthesis as done.
-pub const LEGACY_RBAC_SYNCED_KEY: &str = "legacy_rbac_synced";
-
-/// Run [`apply_legacy_migration`] exactly once per install, then record
-/// [`LEGACY_RBAC_SYNCED_KEY`] so later boots never re-synthesize grants an
-/// operator has since revoked. Returns whether the mapping ran now.
-///
-/// Rows that arrive later need no re-sync: `anonymous_read` is honored
-/// directly by the authz seam, the `is_admin` column is a dual-read fallback,
-/// and new users on a legacy-open install get `authenticated` at creation
-/// ([`assign_authenticated_if_legacy_open`]). Two instances booting together
-/// may both apply it — harmless, every write is an idempotent upsert.
-pub async fn apply_legacy_migration_once(pool: &PgPool) -> sqlx::Result<bool> {
-    if get_setting(pool, LEGACY_RBAC_SYNCED_KEY).await?.as_deref() == Some("true") {
-        return Ok(false);
-    }
-    apply_legacy_migration(pool).await?;
-    set_setting(pool, LEGACY_RBAC_SYNCED_KEY, "true").await?;
-    Ok(true)
-}
-
-/// Per-creation half of the `legacy_open_access` rule: when this install opted
-/// into slice-1 open access, a freshly-created user must inherit the
-/// `authenticated` role *immediately* — not only at the next boot when
-/// [`apply_legacy_migration`] re-runs. Every user-creation path (admin
-/// `POST /admin/users`, OIDC auto-provision, upstream-basic auto-provision)
-/// calls this right after inserting the user so the new principal has the same
-/// read/write reach a slice-1 authenticated user had, with no restart gap.
-///
-/// On a fresh (fail-closed) install the flag is `false` and this is a no-op, so
-/// new users default to deny-by-default. The assignment is idempotent
-/// ([`assign_role`] upserts), so a redundant call (e.g. the user already holds
-/// the role) is harmless. Returns `true` when the role was (or already would
-/// be) assigned, `false` when the install is closed and nothing was done — the
-/// boolean lets callers decide whether to invalidate any cached effective set.
-///
-/// Fails closed on a missing built-in role: if `legacy_open_access` is set but
-/// the `authenticated` role is somehow absent, this errors rather than silently
-/// leaving the user without the legacy grant.
-pub async fn assign_authenticated_if_legacy_open(
-    pool: &PgPool,
-    user_id: i64,
-) -> sqlx::Result<bool> {
-    let mut conn = pool.acquire().await?;
-    assign_authenticated_if_legacy_open_in(&mut conn, user_id).await
-}
-
-/// [`assign_authenticated_if_legacy_open`] on a given connection, so it can
-/// run in the transaction that creates the user.
-pub async fn assign_authenticated_if_legacy_open_in(
-    conn: &mut sqlx::PgConnection,
-    user_id: i64,
-) -> sqlx::Result<bool> {
-    if get_setting(&mut *conn, LEGACY_OPEN_ACCESS_KEY)
-        .await?
-        .as_deref()
-        != Some("true")
-    {
-        return Ok(false);
-    }
-    let role_id = role_id_by_name(&mut *conn, AUTHENTICATED_ROLE)
-        .await?
-        .ok_or_else(|| {
-            sqlx::Error::Protocol(
-                "legacy_open_access is set but the built-in `authenticated` role is missing".into(),
-            )
-        })?;
-    assign_role(&mut *conn, user_id, role_id).await?;
-    Ok(true)
 }
 
 #[cfg(test)]

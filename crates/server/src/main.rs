@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use forge_cache::Cache;
 use forge_server::app::{
-    build_router, ensure_auth_realms, ensure_bootstrap_admin, ensure_legacy_rbac, principal_layer,
+    build_router, ensure_auth_realms, ensure_bootstrap_admin, principal_layer,
 };
 use forge_server::config::Config;
 use forge_server::state::AppState;
@@ -99,16 +99,6 @@ async fn main() -> anyhow::Result<()> {
     ensure_bootstrap_admin(&config, &pool)
         .await
         .context("ensure bootstrap admin")?;
-
-    // §12.4 Phase 5: apply the behavior-preserving RBAC legacy mapping
-    // (is_admin→admin role, anonymous_read→anonymous grants, and — only on
-    // legacy-open-access installs — authenticated for every user) ONCE per
-    // install (a forge_setting marker), so later RBAC revocations stick. Never
-    // opens a fresh install. Runs after bootstrap so a freshly-created
-    // legacy-open user inherits the `authenticated` role too.
-    ensure_legacy_rbac(&pool)
-        .await
-        .context("ensure legacy RBAC mapping")?;
 
     // §12.5: secret encryption at rest. Building the envelope service reads
     // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
