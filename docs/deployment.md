@@ -300,7 +300,7 @@ deleted or renamed:
 | Role | Grants | For |
 | --- | --- | --- |
 | `admin` | Everything: every repository, and administering the instance (repositories, users, roles, authentication, settings). | Administrators. |
-| `writer` | `read` and `write` on every repository, ones created later included. No `delete`, no `admin`. | People and CI that publish packages: a NuGet push, a container image push, a Helm chart upload, of a package or image the repository does not have yet too. |
+| `writer` | `read` and `write` on every repository, ones created later included. No `delete`, no `admin`. | People and CI that publish packages: a NuGet push, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
 | `authenticated` | `read` and `write` on every repository. | Legacy: what every user could do before roles existed, kept for upgraded installs. |
 | `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). | Anonymous access. |
 
@@ -308,14 +308,15 @@ A user who holds neither `admin` nor `writer` is a **reader**: they read what
 their other roles and anonymous access allow. **Admin → Users** shows each
 user's level (admin, writer or reader), and the user's page switches it.
 
-A writer cannot unlist or delete package versions or delete image tags:
+A writer cannot unlist or delete package versions, delete image tags, or
+delete or replace raw files:
 deleting stays with administrators and custom roles that grant `delete`, so a
 leaked CI token cannot remove published versions. Nor can a writer reach the
 admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
 `repo.write` capability). A writer mints their own API tokens on the
 **Tokens** page; a token never carries more than its owner's rights.
 
-Migration 0041 adds `writer`. An install that already had a custom role named
+Migration 0042 adds `writer`. An install that already had a custom role named
 `writer` keeps it as `writer#<id>`, with its grants and members, and a
 workload-identity rule that named it names `writer#<id>` too; the migration
 logs a warning for each.
@@ -492,11 +493,13 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   pod network: admit only the ingress controller or gateway with a
   NetworkPolicy (the Helm chart's `networkPolicy.from`, the kustomize
   `network-policy` component; the CNI must enforce it).
-- Allow large request bodies for `PUT /v3/{repo}/package` (package pushes)
-  and for image pushes under `/v2`, where docker sends a whole layer in one
-  request. In nginx that is `client_max_body_size`. Match it to the largest
-  upload limit a repository has (set per repository in the web UI; 512 MiB
-  for package repositories and 1 GiB per blob for docker by default).
+- Allow large request bodies for `PUT /v3/{repo}/package` (package pushes),
+  for image pushes under `/v2`, where docker sends a whole layer in one
+  request, and for file uploads under `/raw` (and the web UI's
+  `/browse/raw`). In nginx that is `client_max_body_size`. Match it to the
+  largest upload limit a repository has (set per repository in the web UI;
+  512 MiB for package and raw repositories and 1 GiB per blob for docker by
+  default).
 - Serve `/v2` at the root of the host: Docker clients always talk to
   `https://<host>/v2/`, whatever path `public_base_url` has. A docker
   repository with a `host` ([docs/docker.md](docker.md#names)) needs that
@@ -515,7 +518,7 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   `Vary: Authorization, Cookie, Accept`: keep a caching proxy from
   overriding either.
 - With `anonymous_mode = "allowlist"`, do not let a shared cache store `/v3`
-  responses at all. Anonymous feed responses carry no `Cache-Control`, and
+  (or `/raw`) responses at all. Anonymous feed responses carry no `Cache-Control`, and
   whether Forge serves one depends on the client's address, which the cache
   does not key on: a cache that stores responses without caching headers
   (Varnish's default does) would serve what an allowlisted client fetched to
