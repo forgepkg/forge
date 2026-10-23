@@ -177,7 +177,7 @@ cached.
 
 `GET /admin/formats` lists every format the server can create repositories
 of: the built-in plugins (`builtin: true`; NuGet first, then Helm), Docker,
-and the loaded WebAssembly plugins (with the `sha256` of their component),
+raw files, and the loaded WebAssembly plugins (with the `sha256` of their component),
 each with the repository kinds it supports and where its repositories are
 served. The web UI's *New repository* form offers them. Plugins serve
 **hosted** and **group** repositories, and **proxies** when they implement
@@ -278,8 +278,8 @@ FORGE_PLUGINS__FORMATS__EXAMPLE=sha256:c2053ffc…
   this server does not implement, or a component that does not instantiate
   all fail startup. A directory under `dir` that is not listed is never
   read.
-- **Built-in formats come first.** A component cannot take the id of Docker
-  or of a built-in plugin (`nuget`, `helm`); configuring one fails startup.
+- **Built-in formats come first.** A component cannot take the id of Docker,
+  raw or a built-in plugin (`nuget`, `helm`); configuring one fails startup.
 - **Every instance loads the same plugins.** A repository whose format is
   not loaded on an instance answers 503 there; it is never read as another
   format. The admin API refuses to create a repository of a format that is
@@ -529,6 +529,13 @@ repository kinds, the admin API and the web UI create its repositories the
 same way, a group holds members of its format only, and repositories, RBAC,
 package selectors (on image names), retention and the blob store are the
 same as for every other format.
+
+Raw file repositories ([raw.md](raw.md)) are native for similar reasons:
+they hold files under paths, not package versions, list directories, take
+several files in one form, always answer ranges and conditional requests,
+and their proxies follow redirects and re-validate with `If-None-Match`. They
+live in the server (`crates/server/src/raw`, served under `/raw`) and are
+registered like Docker, with selectors on paths.
 
 ## Design notes: compared with artifact-keeper
 
