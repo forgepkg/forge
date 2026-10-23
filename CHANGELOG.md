@@ -6,7 +6,9 @@ All notable changes to envisia-forge are documented here. The format follows
 major release, and each one is called out under **Upgrade notes**.
 
 The release workflow publishes the section whose heading matches the tag
-(`## [1.0.0]` for `v1.0.0`) as the GitHub release notes.
+(`## [1.0.0]` for `v1.0.0`) as the GitHub release notes. Entries for changes
+not released yet are fragments under [docs/changes/](docs/changes/README.md)
+until the release folds them in.
 
 ## [Unreleased]
 

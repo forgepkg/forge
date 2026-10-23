@@ -37,8 +37,9 @@ const S3_PORT = 27070
 const SERVER_PORT = 28421
 
 // Host where the compose-published container ports are reachable. Defaults to
-// loopback (local + GitHub runners). On GitLab dind, published ports live on the
-// `docker` service host — set FORGE_E2E_DOCKER_HOST=docker there.
+// loopback (local + GitHub runners). With a remote Docker daemon (e.g. a
+// Docker-in-Docker service named `docker`), published ports live on the
+// daemon's host — set FORGE_E2E_DOCKER_HOST to it.
 const DOCKER_HOST_NAME = process.env.FORGE_E2E_DOCKER_HOST ?? '127.0.0.1'
 
 export const ADMIN_USER = 'admin'

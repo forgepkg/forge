@@ -452,34 +452,6 @@ pub async fn has_placeholder_password(user: &AppUser) -> bool {
     .unwrap_or(false)
 }
 
-/// Warn about accounts holding a [reserved name](forge_core::auth::RESERVED_USERNAMES),
-/// which 1.0.0 allowed: `oidc` became the workload-identity Basic username in
-/// 1.1.0, so such an account no longer signs in with its password (in the
-/// browser or over Basic), and its API tokens work only as `X-NuGet-ApiKey`.
-/// Returns the names found. Best effort: a lookup failure is logged.
-pub async fn warn_on_reserved_accounts(pool: &PgPool) -> Vec<String> {
-    let mut found = Vec::new();
-    for &username in forge_core::auth::RESERVED_USERNAMES {
-        match user_dao::find_user_by_username(pool, username).await {
-            Ok(Some(user)) => {
-                tracing::warn!(
-                    user_id = user.id,
-                    %username,
-                    "account {username:?} has a name Forge reserves for workload identity: it \
-                     can no longer sign in with its password, and its API tokens work only as \
-                     X-NuGet-ApiKey. Rename it (UPDATE app_user SET username = '<new name>' \
-                     WHERE id = {}); see the 1.1.0 upgrade notes",
-                    user.id
-                );
-                found.push(username.to_string());
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, %username, "reserved account name check failed"),
-        }
-    }
-    found
-}
-
 /// Boot-time placeholder check when no bootstrap admin is configured: the
 /// default `admin` account and every account a "created once" marker names.
 /// Best effort — a lookup failure is logged, never fatal.
