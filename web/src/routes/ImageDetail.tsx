@@ -4,8 +4,9 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import type { ImageDetail } from '~/api/images'
 import { isRepositoryOffline } from '~/api/packages'
 import { ApiError } from '~/lib/httpClient'
-import { defaultPullTag, formatDateTime } from '~/lib/oci'
+import { defaultPullTag, formatDateTime, isChartImage } from '~/lib/oci'
 import { useImageDetail } from '~/queries/useImageDetail'
+import { ChartView } from '~/components/ChartView'
 import { ManifestTable, TagTable } from '~/components/ImageTables'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
@@ -40,7 +41,9 @@ export const Route = createFileRoute('/_app/images/$repo/$')({
  * Image-detail view of a docker repository: the pull commands (by tag and by
  * digest), the image's tags, and every manifest it holds — images, indexes
  * and referrers such as signatures — with sizes, platforms and timestamps.
- * Loading / not-found / error states mirror the package-detail screen.
+ * An image of Helm charts (`helm push`) shows its charts instead
+ * ({@link ChartView}). Loading / not-found / error states mirror the
+ * package-detail screen.
  */
 function ImageDetailPage() {
   const { repo, _splat } = Route.useParams()
@@ -97,34 +100,50 @@ function ImageDetailPage() {
     .filter((t): t is string => !!t)
     .sort()
     .at(-1)
+  const chart = isChartImage(img.manifests)
+  const selectTag = (next: string) =>
+    void navigate({ search: { tag: next }, replace: true })
+  const header = (
+    <PageHeader
+      title={img.image}
+      icon={chart ? 'Wheel' : 'Layers'}
+      crumbs={[
+        { label: 'Repositories', to: '/' },
+        { label: img.repo, to: '/repos/$repo', params: { repo: img.repo } },
+        { label: img.image },
+      ]}
+      kind={img.repo_kind}
+      format="docker"
+      meta={[
+        chart && 'Helm chart',
+        chart
+          ? img.tags.length === 1
+            ? '1 version'
+            : `${img.tags.length} versions`
+          : img.tags.length === 1
+            ? '1 tag'
+            : `${img.tags.length} tags`,
+        img.manifests.length === 1 ? '1 manifest' : `${img.manifests.length} manifests`,
+        // A proxy's manifests carry their cache time, not a push (#248).
+        img.repo_kind === 'hosted' && lastPushed && `Pushed ${formatDateTime(lastPushed)}`,
+      ]}
+    />
+  )
+
+  if (chart) {
+    return (
+      <Page>
+        {header}
+        <ChartView detail={img} selectedTag={tag} onSelectTag={selectTag} />
+      </Page>
+    )
+  }
 
   return (
     <Page>
-      <PageHeader
-        title={img.image}
-        icon="Layers"
-        crumbs={[
-          { label: 'Repositories', to: '/' },
-          { label: img.repo, to: '/repos/$repo', params: { repo: img.repo } },
-          { label: img.image },
-        ]}
-        kind={img.repo_kind}
-        format="docker"
-        meta={[
-          img.tags.length === 1 ? '1 tag' : `${img.tags.length} tags`,
-          img.manifests.length === 1 ? '1 manifest' : `${img.manifests.length} manifests`,
-          // A proxy's manifests carry their cache time, not a push (#248).
-          img.repo_kind === 'hosted' && lastPushed && `Pushed ${formatDateTime(lastPushed)}`,
-        ]}
-      />
+      {header}
 
-      <PullPanel
-        detail={img}
-        selectedTag={tag}
-        onSelectTag={(next) =>
-          void navigate({ search: { tag: next }, replace: true })
-        }
-      />
+      <PullPanel detail={img} selectedTag={tag} onSelectTag={selectTag} />
 
       <Panel
         title="Tags"

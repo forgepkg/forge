@@ -15,7 +15,7 @@ import { httpClient } from '~/lib/httpClient'
  */
 
 /** Formats an import copies (`crates/server/src/nexus_import/mod.rs`). */
-export const IMPORT_FORMATS = ['nuget', 'helm', 'docker']
+export const IMPORT_FORMATS = ['nuget', 'docker']
 
 /** `queued` → `running` → `completed` | `failed` | `cancelled`. */
 export type ImportState =

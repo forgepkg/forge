@@ -7,11 +7,13 @@
 #   3. crane: ls, manifest, copy;
 #   4. a proxy repository of a `registry:2` upstream (seeded with crane) and a
 #      group over the hosted and proxy repositories, pulled with docker;
-#   5. cosign: a signature and an attestation pushed as OCI 1.1 referrers,
+#   5. helm: registry login, a chart pushed, pulled, rendered and shown in
+#      the browse API, and pulled through the proxy and the group;
+#   6. cosign: a signature and an attestation pushed as OCI 1.1 referrers,
 #      found through the referrers API and verified.
 #
 # Usage: oci-e2e.sh <forge-server binary> <results dir>
-# Needs on PATH: docker (with buildx), go, crane, cosign, curl, jq, git.
+# Needs on PATH: docker (with buildx), go, crane, helm, cosign, curl, jq, git.
 # Postgres and S3 come from the environment (defaults match ci.yml):
 #   FORGE_E2E_DATABASE_URL  (postgres://forge:forge@localhost:5432/forge)
 #   FORGE_E2E_S3_ENDPOINT   (http://localhost:7070), access/secret forge-e2e-key
@@ -41,6 +43,7 @@ cleanup() {
   docker rm -f forge-e2e-upstream >/dev/null 2>&1 || true
   docker buildx rm forge-e2e >/dev/null 2>&1 || true
   docker logout "$registry" >/dev/null 2>&1 || true
+  helm registry logout "$registry" >/dev/null 2>&1 || true
   cp "$work/server.log" "$results/" 2>/dev/null || true
   rm -rf "$work"
 }
@@ -143,6 +146,50 @@ docker pull "$registry/docker-group/upstream/multi:1"
 crane copy --insecure "$image" "$registry/docker-group/e2e/via-group:1"
 crane digest --insecure "$registry/docker-hosted/e2e/via-group:1" >/dev/null || fail "group push"
 
+step "helm: login, push, pull, template; through the proxy and the group"
+# Helm keeps its registry login and cache under these, not in ~/.config.
+export HELM_CONFIG_HOME="$work/helm/config" HELM_CACHE_HOME="$work/helm/cache" \
+  HELM_DATA_HOME="$work/helm/data"
+echo "$token" | helm registry login "$registry" --username "$admin_user" --password-stdin --plain-http
+mkdir -p "$work/charts" "$work/pulled"/{hosted,range,proxy,group-charts,group-upstream-charts}
+helm create "$work/charts/e2e-chart" >/dev/null
+sed -i 's/^version: .*/version: 1.2.3/; s/^appVersion: .*/appVersion: "4.5.6"/' \
+  "$work/charts/e2e-chart/Chart.yaml"
+printf '# The e2e chart\n' > "$work/charts/e2e-chart/README.md"
+helm package "$work/charts/e2e-chart" -d "$work/charts" >/dev/null
+packaged="$work/charts/e2e-chart-1.2.3.tgz"
+helm push "$packaged" "oci://$registry/docker-hosted/charts" --plain-http
+chart="oci://$registry/docker-hosted/charts/e2e-chart"
+helm pull "$chart" --version 1.2.3 --plain-http -d "$work/pulled/hosted"
+cmp -s "$packaged" "$work/pulled/hosted/e2e-chart-1.2.3.tgz" || fail "helm pull: not the pushed chart"
+# A version range resolves against the tags.
+helm pull "$chart" --version '~1.2' --plain-http -d "$work/pulled/range"
+[ -f "$work/pulled/range/e2e-chart-1.2.3.tgz" ] || fail "helm pull --version ~1.2"
+helm show chart "$chart" --version 1.2.3 --plain-http | grep -qx 'appVersion: 4.5.6' \
+  || fail "helm show chart"
+helm template e2e "$chart" --version 1.2.3 --plain-http | grep -q '^kind: Deployment' \
+  || fail "helm template"
+# The browse API reads the chart's metadata, README and values.
+chart_digest=$(crane digest --insecure "$registry/docker-hosted/charts/e2e-chart:1.2.3")
+browsed=$(curl -fsS -b "$work/jar" \
+  "$base/browse/chart?repo=docker-hosted&image=charts/e2e-chart&digest=$chart_digest")
+jq -e '.metadata.appVersion == "4.5.6" and .readme.text == "# The e2e chart\n"
+  and (.values.text | contains("replicaCount"))' <<<"$browsed" >/dev/null \
+  || fail "browse a chart: $browsed"
+# Through the proxy of the registry:2 upstream (no login there), and the
+# group, which also takes the push to its writable member.
+helm push "$packaged" "oci://localhost:$upstream_port/upstream-charts" --plain-http
+helm pull "oci://$registry/docker-proxy/upstream-charts/e2e-chart" --version 1.2.3 \
+  --plain-http -d "$work/pulled/proxy"
+cmp -s "$packaged" "$work/pulled/proxy/e2e-chart-1.2.3.tgz" || fail "helm pull through the proxy"
+for path in charts upstream-charts; do
+  helm pull "oci://$registry/docker-group/$path/e2e-chart" --version 1.2.3 \
+    --plain-http -d "$work/pulled/group-$path"
+done
+helm push "$packaged" "oci://$registry/docker-group/via-group" --plain-http
+crane digest --insecure "$registry/docker-hosted/via-group/e2e-chart:1.2.3" >/dev/null \
+  || fail "helm push to the group"
+
 step "cosign: signature and attestation as referrers"
 # cosign 3 stores both as Sigstore bundles through the OCI 1.1 referrers
 # API. Signed with a local key and no transparency log, so verification
@@ -167,4 +214,4 @@ verify=(--key "$work/cosign.pub" --insecure-ignore-tlog --private-infrastructure
 cosign verify "${verify[@]}" "$signed" >/dev/null
 cosign verify-attestation "${verify[@]}" --type slsaprovenance "$signed" >/dev/null
 
-step "OK: conformance, docker, crane, proxy, group and cosign"
+step "OK: conformance, docker, crane, proxy, group, helm and cosign"

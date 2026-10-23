@@ -1,5 +1,5 @@
 //! Importing a Nexus hosted repository into a Forge hosted repository of the
-//! same format, one repository at a time (NuGet, Helm, Docker).
+//! same format, one repository at a time (NuGet, Docker).
 //!
 //! An administrator starts an import on a hosted repository
 //! ([`crate::admin::imports`]); this worker runs it, on one instance at a
@@ -16,7 +16,7 @@
 //!    too, so referrers (signatures, SBOMs) come along. The scan also
 //!    counts every asset of the repository and its size.
 //! 2. **Copy.** Pending items are copied, `concurrency` at a time:
-//!    * a package (NuGet, Helm) is streamed from Nexus into staging,
+//!    * a package (NuGet) is streamed from Nexus into staging,
 //!      verified against Nexus' checksums (SHA-256 and SHA-512, else SHA-1)
 //!      and size, and written through the hosted write path
 //!      ([`HostedWrite::import_staged`]): format validation, the package
@@ -75,7 +75,7 @@ use crate::state::AppState;
 use nexus::{Listing, Nexus, SourceAsset, SourceItem};
 
 /// The formats an import copies (Nexus calls them by the same names).
-pub const FORMATS: &[&str] = &["nuget", "helm", DOCKER_FORMAT];
+pub const FORMATS: &[&str] = &["nuget", DOCKER_FORMAT];
 
 /// How often an idle instance looks for an import to run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -294,7 +294,7 @@ impl Run<'_> {
             .ok_or_else(|| End::Failed("the repository was deleted".into()))?;
         if repo.kind() != RepoKind::Hosted || !FORMATS.contains(&repo.format.as_str()) {
             return Err(End::Failed(format!(
-                "imports go to a hosted NuGet, Helm or Docker repository; {} is a {} {} repository",
+                "imports go to a hosted NuGet or Docker repository; {} is a {} {} repository",
                 repo.name, repo.format, repo.kind
             )));
         }
@@ -808,15 +808,13 @@ fn published_at(format: &str, asset: &SourceAsset) -> Option<chrono::DateTime<ch
 }
 
 /// The package file among a component's assets: NuGet's `.nupkg` (Nexus
-/// keeps it under `<id>/<version>`), Helm's chart `.tgz` (not its `.prov`),
-/// any other format's only asset.
+/// keeps it under `<id>/<version>`), any other format's only asset.
 fn package_asset<'a>(format: &str, assets: &'a [SourceAsset]) -> Option<&'a SourceAsset> {
     match format {
         "nuget" => assets
             .iter()
             .find(|a| a.path.ends_with(".nupkg"))
             .or_else(|| assets.iter().find(|a| !a.path.ends_with(".nuspec"))),
-        "helm" => assets.iter().find(|a| a.path.ends_with(".tgz")),
         _ => match assets {
             [only] => Some(only),
             _ => None,
@@ -1023,9 +1021,8 @@ mod tests {
             package_asset("nuget", &nuget).unwrap().path,
             "Sample.Lib/1.0.0"
         );
-        let helm = [asset("app-1.0.0.tgz.prov"), asset("app-1.0.0.tgz")];
-        assert_eq!(package_asset("helm", &helm).unwrap().path, "app-1.0.0.tgz");
-        assert!(package_asset("raw", &helm).is_none());
+        let two = [asset("app-1.0.0.tgz.prov"), asset("app-1.0.0.tgz")];
+        assert!(package_asset("raw", &two).is_none());
     }
 
     #[test]

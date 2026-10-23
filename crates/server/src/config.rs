@@ -65,7 +65,7 @@ pub struct Config {
     pub nuget: NugetConfig,
     /// WebAssembly format plugins: further package formats loaded at startup
     /// (see `docs/format-plugins.md`). None are loaded by default; the
-    /// built-in plugins (Helm) need no configuration.
+    /// built-in plugin (NuGet) needs no configuration here.
     #[serde(default)]
     pub plugins: PluginsConfig,
     /// Docker / OCI registry (`/v2`): size limits, registry tokens, upload
@@ -1505,7 +1505,7 @@ fn default_nuget_max_nuspec_compression_ratio() -> u64 {
 
 /// `plugins.*` — WebAssembly format plugins.
 ///
-/// The format plugins built into the server (Helm) are always installed.
+/// The format plugin built into the server (NuGet) is always installed.
 /// Further ones are WebAssembly components, each listed explicitly with the
 /// SHA-256 of its component: a directory under `dir` that is not listed is
 /// never loaded, and a listed one whose component does not match its pin, or
@@ -4134,7 +4134,6 @@ mod tests {
     #[test]
     fn default_upload_limits_and_the_repository_ceiling() {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
-        assert_eq!(cfg.default_upload_limit("helm"), DEFAULT_MAX_UPLOAD_BYTES);
         assert_eq!(cfg.default_upload_limit("nuget"), DEFAULT_MAX_UPLOAD_BYTES);
         assert_eq!(
             cfg.default_upload_limit("docker"),
@@ -4165,7 +4164,7 @@ mod tests {
         }
 
         // `[plugins.max_upload_bytes]` is gone: limits are per repository.
-        let per_format = format!("{MINIMAL}\n[plugins.max_upload_bytes]\nhelm = 4096\n");
+        let per_format = format!("{MINIMAL}\n[plugins.max_upload_bytes]\nnuget = 4096\n");
         assert!(Config::from_figment(fig_from_toml(&per_format)).is_err());
     }
 

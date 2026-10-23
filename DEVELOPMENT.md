@@ -1,6 +1,7 @@
 # Developing & running Forge locally
 
-Forge is a NuGet, Docker / OCI, Helm and raw file registry written in Rust.
+Forge is a NuGet, Docker / OCI (Helm charts included) and raw file registry
+written in Rust.
 Locally it runs as a single `forge-server` process backed by **PostgreSQL**
 (metadata) and an **S3-compatible** object store (blobs) — both provided by
 `docker-compose.yml` (versitygw stands in for S3).
@@ -252,18 +253,19 @@ groups. See [docs/raw.md](docs/raw.md).
 
 Formats other than NuGet come from format plugins, crates in
 [`plugins/`](./plugins) (see [docs/format-plugins.md](./docs/format-plugins.md)).
-Helm is built in: create a repository with `"format": "helm"` (hosted, proxy or
-group; a plugin format has proxies when it implements the upstream side). It is
-served under `/repository/<name>/`, e.g.
-`helm repo add local http://localhost:8421/repository/charts`.
-
-To run a plugin as a WebAssembly component instead:
+NuGet is the one built in. `plugins/helm`, classic Helm chart repositories, is
+the example plugin the plugin tests run; it is not built in (Helm charts are
+pushed to docker repositories, see [docs/docker.md](docs/docker.md#helm-charts)).
+To run a plugin as a WebAssembly component:
 
 ```bash
 cargo xtask plugins     # builds plugins/* as components, prints the [plugins] section for forge.toml
 ```
 
-A built-in plugin's component loads only under another id (rename its
+A repository of a plugin format is created with `"format": "<id>"` (hosted,
+proxy or group; a plugin format has proxies when it implements the upstream
+side) and served under `/repository/<name>/` unless the plugin names another
+mount. A built-in plugin's component loads only under another id (rename its
 installed directory and the `id` in its `plugin.toml`).
 
 ## Configuration
@@ -610,8 +612,9 @@ cargo xtask plugins-check   # the format plugins' component builds: clippy and b
 ```
 
 The format-plugin tests (`crates/plugin/tests`, `crates/server/tests/plugins.rs`)
-build the Helm plugin as a component themselves into `target/plugins/`; they
-need the `wasm32-wasip2` target.
+run the example plugin, `plugins/helm`: built in for the test, and built as a
+component themselves into `target/plugins/`; they need the `wasm32-wasip2`
+target.
 
 The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 .NET SDK isn't installed.

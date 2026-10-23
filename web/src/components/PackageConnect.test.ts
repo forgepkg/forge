@@ -17,14 +17,8 @@ describe('connectSnippets', () => {
 
   it('leaves the push command out unless the repository takes pushes', () => {
     const labels = (canPush: boolean) =>
-      connectSnippets('helm', 'charts', 'https://f/repository/charts', canPush).map(
-        (s) => s.label,
-      )
-    expect(labels(true)).toEqual([
-      'Add the repository',
-      'Install a chart',
-      'Push a chart',
-    ])
-    expect(labels(false)).toEqual(['Add the repository', 'Install a chart'])
+      connectSnippets('nuget', 'feed', 'https://f/v3/feed', canPush).map((s) => s.label)
+    expect(labels(true)).toEqual(['Add the source', 'Push a package'])
+    expect(labels(false)).toEqual(['Add the source'])
   })
 })

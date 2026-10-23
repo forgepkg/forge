@@ -140,3 +140,116 @@ export function formatDateTime(iso: string | null | undefined): string {
     ? '—'
     : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
+
+/** The config media type of a Helm chart pushed as an artifact (`helm push`). */
+export const HELM_CHART_CONFIG = 'application/vnd.cncf.helm.config.v1+json'
+
+/** Whether a manifest is a Helm chart (and not a referrer of one). */
+export function isChart(manifest: {
+  artifact_type: string | null
+  subject_digest: string | null
+}): boolean {
+  return manifest.artifact_type === HELM_CHART_CONFIG && !manifest.subject_digest
+}
+
+/**
+ * Whether an image holds Helm charts: its top-level manifests (neither an
+ * index's children nor referrers such as signatures) are all charts, as
+ * `helm push` leaves `oci://<registry>/<repo>/<name>`.
+ */
+export function isChartImage(
+  manifests: {
+    digest: string
+    artifact_type: string | null
+    subject_digest: string | null
+    children: string[]
+  }[],
+): boolean {
+  const children = new Set(manifests.flatMap((m) => m.children))
+  const top = manifests.filter((m) => !m.subject_digest && !children.has(m.digest))
+  return top.length > 0 && top.every(isChart)
+}
+
+/**
+ * The chart version a tag names: `helm push` writes a version's build
+ * metadata (`+`, which a tag cannot hold) as `_`, and Helm reads it back.
+ */
+export function chartVersion(tag: string): string {
+  return tag.replaceAll('_', '+')
+}
+
+const SEMVER = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+
+/** A version's numbers and prerelease identifiers, or `null` if not SemVer. */
+function semver(version: string): { core: number[]; pre: string[] } | null {
+  const m = SEMVER.exec(version)
+  if (!m) return null
+  return { core: [m[1], m[2], m[3]].map(Number), pre: m[4] ? m[4].split('.') : [] }
+}
+
+/** SemVer 2 precedence of two prerelease identifier lists (empty: a release). */
+function comparePre(a: string[], b: string[]): number {
+  if (a.length === 0 || b.length === 0) return b.length - a.length
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const x = a[i]
+    const y = b[i]
+    const xn = /^\d+$/.test(x)
+    const yn = /^\d+$/.test(y)
+    if (xn && yn) {
+      const d = Number(x) - Number(y)
+      if (d !== 0) return d
+    } else if (xn !== yn) {
+      return xn ? -1 : 1
+    } else if (x !== y) {
+      return x < y ? -1 : 1
+    }
+  }
+  return a.length - b.length
+}
+
+/**
+ * The chart versions of an image: the tags of its charts, newest first.
+ * Tags that are SemVer versions (as `helm push` tags a chart) come by
+ * precedence, the others after them by name.
+ */
+export function chartVersions<T extends { tag: string; digest: string }>(
+  tags: T[],
+  manifests: { digest: string; artifact_type: string | null; subject_digest: string | null }[],
+): T[] {
+  const charts = new Set(manifests.filter(isChart).map((m) => m.digest))
+  const parsed = tags
+    .filter((t) => charts.has(t.digest))
+    .map((t) => ({ t, v: semver(chartVersion(t.tag)) }))
+  parsed.sort((a, b) => {
+    if (a.v && b.v) {
+      for (let i = 0; i < 3; i++) {
+        const d = b.v.core[i] - a.v.core[i]
+        if (d !== 0) return d
+      }
+      return comparePre(b.v.pre, a.v.pre)
+    }
+    if (a.v || b.v) return a.v ? -1 : 1
+    return a.t.tag < b.t.tag ? -1 : a.t.tag > b.t.tag ? 1 : 0
+  })
+  return parsed.map((p) => p.t)
+}
+
+/**
+ * The version the install commands start with: the newest release, as
+ * `helm install` without `--version` picks it, else the newest prerelease.
+ * `versions` are {@link chartVersions}, newest first.
+ */
+export function defaultChartVersion<T extends { tag: string }>(versions: T[]): T | undefined {
+  return versions.find((t) => semver(chartVersion(t.tag))?.pre.length === 0) ?? versions[0]
+}
+
+/** `url` as a link target when it is an http(s) URL; `null` otherwise. */
+export function httpUrl(url: string | undefined): string | null {
+  if (!url) return null
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:' ? parsed.href : null
+  } catch {
+    return null
+  }
+}

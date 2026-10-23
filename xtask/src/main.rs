@@ -772,11 +772,16 @@ fn plugin_component(dir: &std::path::Path) -> Result<String, String> {
 }
 
 /// Whether the server links the plugin in `dir` (a path dependency of
-/// forge-server): its id is then taken by the built-in plugin.
+/// forge-server, not only of its tests): its id is then taken by the
+/// built-in plugin.
 fn plugin_is_builtin(dir: &std::path::Path) -> bool {
     let server = std::fs::read_to_string("crates/server/Cargo.toml").unwrap_or_default();
+    let dependencies = server
+        .split("[dev-dependencies]")
+        .next()
+        .unwrap_or_default();
     let path = format!("\"../../{}\"", dir.display()).replace('\\', "/");
-    server.contains(&path)
+    dependencies.contains(&path)
 }
 
 /// The SHA-256 of `file` (`sha256sum`, or `shasum -a 256` on macOS).

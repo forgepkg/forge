@@ -651,6 +651,7 @@ pub fn browse_router() -> Router<AppState> {
         .route("/browse/packages", get(search_packages))
         .route("/browse/packages/{repo}/{id}", get(package_detail))
         .route("/browse/images", get(crate::browse_images::list_images))
+        .route("/browse/chart", get(crate::browse_images::chart_detail))
         .route(
             "/browse/images/{repo}/{*image}",
             get(crate::browse_images::image_detail),

@@ -10,7 +10,8 @@ import {
 
 import { clearSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
-import type { ImageDetail } from '~/api/images'
+import type { ChartDetail, ImageDetail } from '~/api/images'
+import { textContent } from '~/test/text'
 import { routeTree } from '~/routeTree.gen'
 
 /**
@@ -112,13 +113,24 @@ const hostedDetail: ImageDetail = {
 
 const fetchMock = vi.fn()
 
-/** Route the mock: `/admin/me` -> identity, `/browse/images/{repo}/{image…}`. */
-function mockApi(detail: (repo: string, image: string) => Response) {
+/**
+ * Route the mock: `/admin/me` -> identity, `/browse/images/{repo}/{image…}`,
+ * and `/browse/chart` -> `chart` (404 without one).
+ */
+function mockApi(
+  detail: (repo: string, image: string) => Response,
+  chart?: (query: URLSearchParams) => Response,
+) {
   fetchMock.mockImplementation((input: RequestInfo | URL) => {
     const raw = typeof input === 'string' ? input : input.toString()
     const url = new URL(raw, 'http://localhost')
     if (url.pathname.endsWith('/admin/me')) {
       return Promise.resolve(jsonResponse(readerMe))
+    }
+    if (url.pathname.endsWith('/browse/chart')) {
+      return Promise.resolve(
+        chart ? chart(url.searchParams) : new Response('chart not found', { status: 404 }),
+      )
     }
     const m = url.pathname.match(/\/browse\/images\/([^/]+)\/(.+)$/)
     if (m) return Promise.resolve(detail(m[1], m[2]))
@@ -411,5 +423,141 @@ describe('ImageDetail', () => {
     const alert = await screen.findByRole('alert')
     expect(within(alert).getByText('Could not load image')).toBeInTheDocument()
     expect(within(alert).getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
+  describe('a Helm chart', () => {
+    const CHART_OLD = 'sha256:5555555555ee' + '0'.repeat(52)
+    const CHART_NEW = 'sha256:6666666666ff' + '0'.repeat(52)
+    const HELM = 'application/vnd.cncf.helm.config.v1+json'
+    const chartManifest = (digest: string, tag: string, created_at: string) => ({
+      digest,
+      media_type: 'application/vnd.oci.image.manifest.v1+json',
+      artifact_type: HELM,
+      subject_digest: null,
+      manifest_size: 400,
+      size: 3_210,
+      platforms: [],
+      tags: [tag],
+      children: [],
+      created_at,
+      last_pulled_at: null,
+    })
+    const chartDetail: ImageDetail = {
+      repo: 'charts',
+      repo_kind: 'hosted',
+      image: 'stable/web',
+      registry: 'forge.example.com',
+      pull_name: 'forge.example.com/charts/stable/web',
+      tags: [
+        { tag: '1.10.0', digest: CHART_NEW, media_type: 'application/vnd.oci.image.manifest.v1+json', size: 3_210, platforms: [] },
+        { tag: '1.9.0', digest: CHART_OLD, media_type: 'application/vnd.oci.image.manifest.v1+json', size: 3_210, platforms: [] },
+      ],
+      manifests: [
+        // The older version was pushed last: the newest version still leads.
+        chartManifest(CHART_NEW, '1.10.0', '2026-10-20T10:00:00Z'),
+        chartManifest(CHART_OLD, '1.9.0', '2026-10-21T10:00:00Z'),
+      ],
+    }
+    const stored = (digest: string): ChartDetail => ({
+      digest,
+      metadata: {
+        name: 'web',
+        version: digest === CHART_NEW ? '1.10.0' : '1.9.0',
+        appVersion: '2.4.1',
+        description: 'A web server',
+        home: 'https://example.com/web',
+        sources: ['javascript:alert(1)'],
+        maintainers: [{ name: 'Ops', email: 'ops@example.com' }],
+        dependencies: [{ name: 'redis', version: '>=17', repository: 'oci://registry/charts' }],
+      },
+      readme: { name: 'README.md', text: `# web ${digest === CHART_NEW ? 'new' : 'old'}`, truncated: false },
+      values: { name: 'values.yaml', text: 'replicas: 1\n', truncated: true },
+      archive_stored: true,
+    })
+
+    it('shows the helm commands, facts, README and values of the newest version', async () => {
+      const asked: string[] = []
+      mockApi(
+        () => jsonResponse(chartDetail),
+        (q) => {
+          asked.push(`${q.get('repo')}|${q.get('image')}|${q.get('digest')}`)
+          return jsonResponse(stored(q.get('digest') ?? ''))
+        },
+      )
+
+      const user = userEvent.setup()
+      const router = await renderDetail('/images/charts/stable/web')
+
+      expect(await screen.findByText('Helm chart')).toBeInTheDocument()
+      expect(screen.queryByRole('region', { name: 'Pull' })).toBeNull()
+      const install = screen.getByRole('region', { name: 'Install' })
+      expect(
+        within(install).getByText(
+          textContent('helm install <release> oci://forge.example.com/charts/stable/web --version 1.10.0'),
+        ),
+      ).toBeInTheDocument()
+      expect(
+        within(install).getByText('helm pull oci://forge.example.com/charts/stable/web --version 1.10.0'),
+      ).toBeInTheDocument()
+      expect(
+        within(install).getByText(
+          textContent('helm registry login forge.example.com --username <username>'),
+        ),
+      ).toBeInTheDocument()
+
+      expect(await screen.findByText('# web new')).toBeInTheDocument()
+      expect(asked).toEqual([`charts|stable/web|${CHART_NEW}`])
+      const facts = screen.getByRole('region', { name: 'Chart' })
+      expect(within(facts).getByText('2.4.1')).toBeInTheDocument()
+      expect(within(facts).getByRole('link', { name: 'https://example.com/web' })).toHaveAttribute(
+        'href',
+        'https://example.com/web',
+      )
+      // Only http(s) URLs become links.
+      expect(within(facts).getByText('javascript:alert(1)').closest('a')).toBeNull()
+      expect(within(facts).getByText('ops@example.com', { exact: false })).toBeInTheDocument()
+      const values = screen.getByRole('region', { name: 'Default values' })
+      expect(within(values).getByText('values.yaml')).toBeInTheDocument()
+      expect(within(values).getByText(/Cut at 512 KiB/)).toBeInTheDocument()
+
+      await user.selectOptions(within(install).getByLabelText('Version'), '1.9.0')
+      expect(await screen.findByText('# web old')).toBeInTheDocument()
+      expect(
+        within(install).getByText('helm pull oci://forge.example.com/charts/stable/web --version 1.9.0'),
+      ).toBeInTheDocument()
+      expect(router.state.location.search).toMatchObject({ tag: '1.9.0' })
+    })
+
+    it('says when a proxy has not stored the chart yet', async () => {
+      mockApi(
+        () => jsonResponse({ ...chartDetail, repo_kind: 'proxy' }),
+        (q) =>
+          jsonResponse({
+            digest: q.get('digest'),
+            metadata: null,
+            readme: null,
+            values: null,
+            archive_stored: false,
+          }),
+      )
+
+      await renderDetail('/images/charts/stable/web')
+
+      expect(await screen.findByText('Not stored yet')).toBeInTheDocument()
+      expect(screen.queryByRole('region', { name: 'README' })).toBeNull()
+      expect(screen.queryByRole('region', { name: 'Chart' })).toBeNull()
+    })
+
+    it('renders an error state when the chart cannot be read', async () => {
+      mockApi(
+        () => jsonResponse(chartDetail),
+        () => new Response('boom', { status: 500 }),
+      )
+
+      await renderDetail('/images/charts/stable/web')
+
+      const alert = await screen.findByRole('alert')
+      expect(within(alert).getByText('Could not load the chart')).toBeInTheDocument()
+    })
   })
 })

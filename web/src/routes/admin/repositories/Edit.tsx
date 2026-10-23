@@ -39,8 +39,8 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
  * is **write-only**: it is never seeded from the GET and is only included in
  * the update when the admin typed a new one (an empty field leaves the stored
  * secret unchanged); "Remove stored credentials" clears it explicitly. The
- * header links group repos to the Members editor and hosted NuGet, Helm and
- * Docker repositories to the import from Nexus. Beside the form: for proxies,
+ * header links group repos to the Members editor and hosted NuGet and Docker
+ * repositories to the import from Nexus. Beside the form: for proxies,
  * their cache invalidation, and the repository's anonymous access (the flag
  * together with the anonymous role's grants that cover it, read-only, linking
  * to the role).

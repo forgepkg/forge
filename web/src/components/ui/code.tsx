@@ -149,7 +149,7 @@ export function CommandSnippet({
 
 /**
  * A multi-line file with a title bar (usually the file name) and a copy
- * button: a `NuGet.config`, a `PackageReference`, a Helm `values.yaml`.
+ * button: a `NuGet.config`, a `PackageReference`, a Helm chart's `values.yaml`.
  */
 export function CodeBlock({
   code,

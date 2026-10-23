@@ -6,7 +6,7 @@ import clsx from 'clsx'
  * 14px in small buttons and badges, 20px in headers and empty states.
  *
  * Formats use generic glyphs with their names, never trademark logos: NuGet
- * `Package`, Docker `Layers`, Helm `Wheel`. `Folder`, `File`, `Mail` and
+ * `Package`, Docker `Layers`, Helm charts `Wheel`. `Folder`, `File`, `Mail` and
  * `Overview` are the app's additions in the same style.
  */
 

@@ -34,7 +34,6 @@ export function KindBadge({
 const FORMATS: Record<string, { label: string; icon: IconName }> = {
   nuget: { label: 'NuGet', icon: 'Package' },
   docker: { label: 'Docker', icon: 'Layers' },
-  helm: { label: 'Helm', icon: 'Wheel' },
   raw: { label: 'Raw', icon: 'Folder' },
 }
 

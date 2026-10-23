@@ -346,8 +346,8 @@ jobs:
   # validates the output against the Kubernetes schemas. kustomize and
   # kubeconform are pinned by checksum, Helm is built from its pinned Go
   # module (verified by the Go checksum database; keep HELM_VERSION in step
-  # with release.yml). Runs when the change touches any of these (the
-  # kubernetes group, #353).
+  # with oci-e2e and release.yml). Runs when the change touches any of these
+  # (the kubernetes group, #353).
   kubernetes:
     name: kubernetes
     runs-on: ubuntu-latest
@@ -437,8 +437,9 @@ jobs:
   # ── Docker / OCI registry e2e (real clients against a live server) ─────────
   # Boots forge-server and drives the registry with the OCI distribution-spec
   # conformance suite, docker (buildx multi-arch), crane, a proxy of a
-  # registry:2 upstream, a group, and cosign signatures/attestations through
-  # the referrers API (.github/scripts/oci-e2e.sh). Runs on pull requests too:
+  # registry:2 upstream, a group, Helm charts (helm push, pull, template), and
+  # cosign signatures/attestations through the referrers API
+  # (.github/scripts/oci-e2e.sh). Runs on pull requests too:
   # it is the only check that the registry still speaks to real clients.
   oci-e2e:
     name: oci-e2e
@@ -462,6 +463,9 @@ jobs:
     env:
       SQLX_OFFLINE: "true"
       CRANE_VERSION: v0.20.2
+      # Built from its pinned Go module, as in the kubernetes job (keep it in
+      # step with that job and release.yml).
+      HELM_VERSION: v4.3.1
       COSIGN_VERSION: v3.0.2
       COSIGN_SHA256: 46dbdcb5467a3dfec2526923d0b3365e40c8d9dc00ec23d5aca3437449e8cbfd
       # The upstream registry the proxy repository caches, and buildx's
@@ -489,6 +493,18 @@ jobs:
           echo "${COSIGN_SHA256}  $RUNNER_TEMP/bin/cosign" | sha256sum -c -
           chmod +x "$RUNNER_TEMP/bin/cosign"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Cache the Helm build
+        id: helm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/helm
+          key: ${{ runner.os }}-helm-${{ env.HELM_VERSION }}
+      - name: Install Helm
+        run: |
+          if [ "${{ steps.helm-cache.outputs.cache-hit }}" != "true" ]; then
+            GOBIN="$RUNNER_TEMP/helm" GOTOOLCHAIN=auto GOFLAGS=-trimpath go install "helm.sh/helm/v4/cmd/helm@${HELM_VERSION}"
+          fi
+          echo "$RUNNER_TEMP/helm" >> "$GITHUB_PATH"
       - name: Start the S3 gateway and pull the upstream registry image
         run: |
           docker run -d --name forge-e2e-s3 -p 7070:7070 \
@@ -497,7 +513,7 @@ jobs:
           docker pull "$FORGE_E2E_UPSTREAM_IMAGE"
       - name: cargo build -p forge-server
         run: cargo build -p forge-server --bin forge-server
-      - name: Registry e2e (conformance, docker, crane, proxy, group, cosign)
+      - name: Registry e2e (conformance, docker, crane, proxy, group, helm, cosign)
         env:
           GOTOOLCHAIN: auto
         run: .github/scripts/oci-e2e.sh target/debug/forge-server oci-e2e-results

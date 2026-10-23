@@ -15,9 +15,10 @@ formats come as **format plugins**, see below):
   priority; tolerates a failing member and, by default, keeps public feeds
   from shadowing internal package ids (dependency-confusion guard).
 
-The same three types exist for container images: hosted image repositories,
-pull-through proxies of Docker Hub, GHCR, Quay or any OCI registry, and
-groups — see **[docs/docker.md](./docs/docker.md)** — and for plain files
+The same three types exist for container images and other OCI artifacts,
+Helm charts included (`helm push`, `helm install oci://…`): hosted image
+repositories, pull-through proxies of Docker Hub, GHCR, Quay or any OCI
+registry, and groups — see **[docs/docker.md](./docs/docker.md)** — and for plain files
 under arbitrary paths (binaries, installers, fixtures), like Nexus' raw
 repositories, with ranges, checksum sidecars and proxies of any HTTP(S)
 download URL such as GitHub release assets — see
@@ -35,8 +36,7 @@ token, cache, and audit limitations are documented below.
 A **retention** engine reaps cold versions and garbage-collects dereferenced
 blobs. **Format plugins** (preview) add further package formats that reuse all
 of the above, either built into the server or loaded as sandboxed WebAssembly
-components; **Helm chart repositories** are built in
-([docs/format-plugins.md](docs/format-plugins.md)). The admin + browse UI is
+components ([docs/format-plugins.md](docs/format-plugins.md)). The admin + browse UI is
 a **TanStack Router SPA** served by the same Rust process on a single origin —
 there is no Node server in production.
 
@@ -56,11 +56,11 @@ A Cargo workspace of small crates plus the web SPA:
 | `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`), the Docker registry, raw file repositories (`/raw`), `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
-| `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `nuget` (built in only), `helm`. |
+| `plugins/` | `forge-format-*` | Format plugins, built in or as WebAssembly components: `nuget` (built in only), and `helm`, the example plugin the plugin tests run (not built in). |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
 **Single-origin serving.** `forge-server` mounts each format plugin's feed
-(NuGet at `/v3`, Helm at `/repository`), the Docker / OCI registry (`/v2`),
+(NuGet at `/v3`, others at `/repository`), the Docker / OCI registry (`/v2`),
 raw file repositories (`/raw`),
 the admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
 from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
@@ -205,11 +205,11 @@ curl -u admin@example.com:<TOKEN> http://localhost:8421/raw/binaries/tools/1.0/t
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers,
   and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`).
-- **[Format plugins](./docs/format-plugins.md)** — further package formats
-  (Helm charts), built in or as sandboxed WebAssembly components: design,
-  operation, and writing one.
+- **[Format plugins](./docs/format-plugins.md)** — further package formats,
+  built in or as sandboxed WebAssembly components: design, operation, and
+  writing one.
 - **[Importing from Nexus](./docs/nexus-import.md)** — copy a Nexus hosted
-  repository (NuGet, Helm, Docker) into Forge, with its publish dates:
+  repository (NuGet, Docker) into Forge, with its publish dates:
   dry run, conflicts, resuming, and the cutover.
 
 Run `cargo xtask help` for the complete command list.

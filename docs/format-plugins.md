@@ -13,12 +13,17 @@ A plugin runs one of two ways, and the server cannot tell them apart:
 
 - **Built in.** The crate is linked into the server and called directly, like
   any other Rust code. Built-in plugins need no configuration. Forge ships
-  two: **NuGet** ([`plugins/nuget`](../plugins/nuget)) and **Helm chart
-  repositories** ([`plugins/helm`](../plugins/helm)).
+  one: **NuGet** ([`plugins/nuget`](../plugins/nuget)).
 - **As a WebAssembly component.** The same kind of crate, built for
   `wasm32-wasip2`, loaded at startup from a digest the operator pinned and
   run in a sandbox. This is how formats that are not part of Forge are added
   without rebuilding it.
+
+[`plugins/helm`](../plugins/helm), classic Helm chart repositories
+(`index.yaml`, ChartMuseum uploads), is the **example plugin**: the plugin
+tests run it both ways, and it is the crate to start a new plugin from, but
+Forge does not build it in. Helm charts are served by the registry
+([docker.md](docker.md#helm-charts)).
 
 > **Status: preview.** The plugin contract is `forge:format@0.3.0`. It may
 > change before 1.x of the contract; a plugin declares the contract version it
@@ -69,7 +74,7 @@ trait's methods, and the host turns a loaded component back into a
 `FormatPlugin`. So the dispatcher, the hosted write path, groups and
 retention run the same code for both. The test
 [`the_component_answers_like_the_builtin_plugin`](../crates/plugin/tests/component.rs)
-runs Helm both ways and checks that every answer matches.
+runs the example plugin both ways and checks that every answer matches.
 
 ## How it fits together
 
@@ -141,12 +146,9 @@ NuGet's).
 Every listing hands each version's summary to the plugin, so a summary
 should stay small. The host stores none larger than 64 KiB from a
 WebAssembly plugin, and logs a warning instead; a built-in plugin bounds its
-own. Helm's summary, which holds a version's index entry, takes at most
-16 KiB: past that, its description is cut to 1 KiB, then its largest fields
-are left out until it fits, and `apiVersion`, `name`, `version`,
-`appVersion`, `kubeVersion`, `type` and `deprecated` go last. A Helm summary
-stored before this bound is cut down the same way when the index is
-rendered.
+own. The example plugin's summary, which holds a chart version's index
+entry, takes at most 16 KiB: past that, its description is cut to 1 KiB,
+then its largest fields are left out until it fits.
 
 ## Proxy repositories
 
@@ -186,8 +188,8 @@ logs a warning naming the format and the repository. What the plugin answers
 names no origin: its index is its own making (and the host keeps fields of its
 own beside it, so an index may not use the keys `remote_url` and
 `named_origins`). So a NuGet service index can put its resources on other
-hosts (nuget.org's search service is on `azuresearch-*.nuget.org`), and a Helm
-index its charts (on a project's GitHub releases), but a plugin cannot make
+hosts (nuget.org's search service is on `azuresearch-*.nuget.org`), and a
+chart repository's index its charts (on a project's GitHub releases), but a plugin cannot make
 Forge request a host its upstream does not point at. Redirects are the
 upstream's to choose, and are followed under the cloud-metadata guard.
 
@@ -202,81 +204,32 @@ cached.
 ## Using a plugin
 
 `GET /admin/formats` lists every format the server can create repositories
-of: the built-in plugins (`builtin: true`; NuGet first, then Helm), Docker,
-raw files, and the loaded WebAssembly plugins (with the `sha256` of their component),
-each with the repository kinds it supports and where its repositories are
-served. The web UI's *New repository* form offers them. Plugins serve
-**hosted** and **group** repositories, and **proxies** when they implement
-the upstream side (NuGet and Helm do). Docker has proxies of its own.
+of: the built-in plugin (`builtin: true`; NuGet), Docker, raw files, and the
+loaded WebAssembly plugins (with the `sha256` of their component), each with
+the repository kinds it supports and where its repositories are served. The
+web UI's *New repository* form offers them. Plugins serve **hosted** and
+**group** repositories, and **proxies** when they implement the upstream
+side (NuGet does). Docker has proxies of its own.
 
-Helm is built in, so a Helm repository needs no setup beyond creating it:
-
-```bash
-# Create a hosted Helm repository (or use the web UI).
-curl -u admin@example.com:$ADMIN_TOKEN -H 'content-type: application/json' \
-  -d '{"name": "charts", "kind": "hosted", "format": "helm"}' \
-  https://forge.example.com/admin/repositories
-
-# Publish (ChartMuseum API): the body, or the `chart` multipart field.
-curl -u ci:$TOKEN --data-binary @mychart-1.2.0.tgz \
-  https://forge.example.com/repository/charts/api/charts
-helm cm-push mychart/ forge          # the helm-push plugin works too
-
-# Consume.
-helm repo add forge https://forge.example.com/repository/charts \
-  --username me --password $TOKEN
-helm install web forge/mychart --version 1.2.0
-
-# Delete a version.
-curl -u ci:$TOKEN -X DELETE \
-  https://forge.example.com/repository/charts/api/charts/mychart/1.2.0
-```
-
-Forge takes a chart's name and version from the `Chart.yaml` Helm loads
-when it installs the chart. Helm reads the whole archive and the last
-`<chart>/Chart.yaml` wins, so Forge reads the whole archive as Helm does, up
-to 256 MiB unpacked, and refuses one whose files are not all in one
-top-level directory, that holds more than one `<chart>/Chart.yaml`, or whose
-`requirements.yaml` declares more than `dependencies` (Helm reads it into
-the chart's metadata too). It also refuses names Helm refuses (absolute, or
-out of the chart's directory) and tar features charts do not use, such as
-sparse files. Archives from `helm package` or `tar` pass; a Helm proxy
-checks the charts it downloads the same way.
-
-A Helm **proxy** mirrors another chart repository: its index lists the
-upstream's charts, and each chart is downloaded from the upstream on first
-use and served from Forge after.
+A repository of a plugin's format is created like any other, with the
+plugin's format id, and served under the plugin's mount (`/repository`
+unless its `plugin.toml` names another):
 
 ```bash
+# Create a hosted repository of the plugin `example` (or use the web UI).
 curl -u admin@example.com:$ADMIN_TOKEN -H 'content-type: application/json' \
-  -d '{"name": "bitnami", "kind": "proxy", "format": "helm",
-       "remote_url": "https://charts.bitnami.com/bitnami"}' \
+  -d '{"name": "pkgs", "kind": "hosted", "format": "example"}' \
   https://forge.example.com/admin/repositories
-helm repo add bitnami-via-forge https://forge.example.com/repository/bitnami \
-  --username me --password $TOKEN
+# Its clients use https://forge.example.com/repository/pkgs/
 ```
-
-Chart versions are SemVer, as Helm reads them (`v1.2` is `1.2.0`), and at
-most 128 characters, as written and normalized: Helm pushes a chart to an OCI
-registry with its version as the tag, and an OCI tag is at most 128
-characters, so every chart Helm can push there fits. A push of a chart with a
-longer version answers 400, a URL naming one answers 404, and a proxy leaves
-such versions of its upstream's index out.
-
-Its index describes each chart's newest version fully and the older ones by
-name, version and URL: that is what one search of the upstream says, and
-reading the upstream's index once per chart would be slow for large
-repositories. A group with a Helm proxy among its members reads the
-upstream once per chart for its index; for a large upstream, add the proxy
-itself as a Helm repository.
 
 As with every format, the password is an **API token**. A password typed at
 the web login is not a publishing credential.
 
 The web UI's *Browse* screen filters repositories by format
-(`GET /browse/repos?format=helm`), and a repository's screen shows its
-client commands: `dotnet nuget` for NuGet, `helm repo add` and the push for
-Helm, the repository's URL for other plugin formats.
+(`GET /browse/repos?format=<id>`), and a repository's screen shows its
+client commands: `dotnet nuget` for NuGet, the repository's URL for other
+plugin formats.
 
 **Upload limits.** Each hosted repository has its own upload limit, the
 largest push it accepts (413 above it), whatever its format: set it under
@@ -323,7 +276,7 @@ FORGE_PLUGINS__FORMATS__EXAMPLE=sha256:c2053ffc…
   all fail startup. A directory under `dir` that is not listed is never
   read.
 - **Built-in formats come first.** A component cannot take the id of Docker,
-  raw or a built-in plugin (`nuget`, `helm`); configuring one fails startup.
+  raw or a built-in plugin (`nuget`); configuring one fails startup.
 - **Every instance loads the same plugins.** A repository whose format is
   not loaded on an instance answers 503 there; it is never read as another
   format. The admin API refuses to create a repository of a format that is
@@ -366,9 +319,9 @@ The host enforces these for every plugin, built in or not:
   answers 400, a request naming one answers like one naming an unknown
   package (404), and a proxy leaves such versions of an upstream listing
   out. Ids and versions are keys of database indexes, whose entries
-  PostgreSQL limits to about 2,700 bytes. The built-in plugins allow less:
-  NuGet 100 characters for an id and 64 for a version, Helm 250 for a chart
-  name and 128 for a version.
+  PostgreSQL limits to about 2,700 bytes. The plugins allow less: NuGet 100
+  characters for an id and 64 for a version, the example plugin 250 for a
+  chart name and 128 for a version.
 - **Upstream requests go where the upstream points.** A proxy's plugin
   reaches the network only through the GETs the host sends for it, and the
   host sends them, and downloads packages, only from the origin of the
@@ -431,9 +384,9 @@ policy (an outbound proxy, a Kubernetes `NetworkPolicy`).
 
 ## Writing a plugin
 
-Start from [`plugins/helm`](../plugins/helm): a crate in `plugins/<id>/`
-with a `plugin.toml`, a member of the workspace, depending on
-`forge-plugin-api` and implementing its trait:
+Start from the example plugin, [`plugins/helm`](../plugins/helm): a crate
+in `plugins/<id>/` with a `plugin.toml`, a member of the workspace,
+depending on `forge-plugin-api` and implementing its trait:
 
 ```rust
 use forge_plugin_api::{Action, FormatPlugin, Loaded, Rendered, Repository, Request /* … */};
@@ -517,7 +470,7 @@ A few rules hold either way:
   documents ([`plugins/nuget/tests/upstream.rs`](../plugins/nuget/tests/upstream.rs)).
 - **Test both ways.** The crate's unit tests run with the workspace.
   [`crates/plugin/tests/component.rs`](../crates/plugin/tests/component.rs)
-  loads the component and compares it with the built-in crate, and
+  loads the component and compares it with the crate built in, and
   [`crates/server/tests/plugins.rs`](../crates/server/tests/plugins.rs) runs
   a server with both; copy them for a new plugin.
 - **Check it like CI does:** `cargo xtask plugins-check` lints the component
@@ -554,27 +507,17 @@ to lift them:
 - **Prerelease is "contains a `-`".** This is right for SemVer formats; a
   format with another rule (PEP 440's `1.0a1`) needs a contract function
   for it.
-- **Listings are bounded.** A response may load at most 2,048 answers, so the
-  Helm index covers at most about 2,000 charts.
-- **A Helm upstream is read whole.** Every upstream operation of a Helm
-  proxy reads the upstream's `index.yaml` (cached for the metadata TTL, and
-  at most `proxy.max_metadata_bytes`, 32 MiB by default); the contract has
-  no ranged or streamed reads of an upstream document. The built-in plugin
-  keeps the parsed index while the upstream serves the same document and
-  parses one index at a time, so a chart listing through a proxy, or
-  through a group of several proxies, parses each upstream's index once,
-  not once per chart. The kept indexes of an instance, of all its Helm
-  proxies together, may hold 128 MiB, about twice the size of their
-  documents, so about 60 MB of `index.yaml`. A new index that does not fit
-  takes the place of kept ones nobody used for a minute; while all of them
-  are in use, it is parsed for each operation instead of being kept. So
-  past the budget, a group's listing keeps the indexes that fit and parses
-  the others once per chart. A WebAssembly build of the plugin keeps
-  nothing and parses the index for every operation.
+- **Listings are bounded.** A response may load at most 2,048 answers, so
+  a listing of every package of a repository (the example plugin's
+  `index.yaml`) covers at most about 2,000 packages.
+- **An upstream document is read whole.** A proxy reads each upstream
+  document it needs (cached for the metadata TTL, and at most
+  `proxy.max_metadata_bytes`, 32 MiB by default); the contract has no ranged
+  or streamed reads of an upstream document.
 
 ### NuGet as a plugin
 
-NuGet is a built-in plugin like Helm: [`plugins/nuget`](../plugins/nuget)
+NuGet is a built-in plugin: [`plugins/nuget`](../plugins/nuget)
 implements `FormatPlugin`, and the dispatcher serves it at `/v3/{repo}/...`
 with the same paths, status codes, messages and JSON as before. The pieces it
 needed from the contract are general ones: a mount, its own asset names,
@@ -643,7 +586,7 @@ contract:
 | Installing plugins | Admin API from git or a ZIP, Ed25519-signed when required | Operator configuration, pinned by SHA-256; no install API |
 | Instances | A new store and instance per call | Instances reused per plugin, a fresh budget per call, recycled after a trap or 10,000 calls |
 
-The Helm plugin shows the difference in practice: a 64 MiB component serves
+The example plugin shows the difference in practice: a 64 MiB component serves
 a repository index of any size the query bounds allow, and a chart is never
 copied into the sandbox, which streams it through the lent reader and keeps
 only its `Chart.yaml`.

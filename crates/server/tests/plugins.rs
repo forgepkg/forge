@@ -1,5 +1,6 @@
-//! Format plugins end to end: the built-in Helm plugin (`plugins/helm`), its
-//! repositories created through the admin API and used through
+//! Format plugins end to end, through the example plugin `plugins/helm`
+//! (Helm chart repositories; Forge does not build it in): installed as if
+//! built in, its repositories created through the admin API and used through
 //! `/repository/{repo}` the way Helm clients use a chart repository — and the
 //! same crate built as a WebAssembly component, loaded at startup.
 
@@ -12,8 +13,8 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sha2::Digest;
 
-/// The format id the Helm component is installed under (the built-in Helm
-/// plugin holds `helm`).
+/// The format id the Helm component is installed under (the Helm plugin
+/// installed as if built in holds `helm`).
 const WASM_HELM: &str = "helm-wasm";
 
 /// The `[plugins]` block loading the Helm plugin built as a component,
@@ -25,7 +26,15 @@ fn wasm_helm_plugins_block() -> String {
     format!("[plugins]\ndir = {parent:?}\n\n[plugins.formats]\n{WASM_HELM} = \"sha256:{sha}\"\n")
 }
 
-async fn start_helm(opts: ServerOpts) -> TestServer {
+/// The Helm plugin, to install as if built in.
+fn helm_plugin() -> std::sync::Arc<forge_plugin::Plugin> {
+    forge_plugin::Plugin::builtin(forge_format_helm::PLUGIN_TOML, forge_format_helm::Helm)
+        .expect("plugins/helm/plugin.toml is valid")
+}
+
+/// A server with the Helm plugin installed as if built in.
+async fn start_helm(mut opts: ServerOpts) -> TestServer {
+    opts.extra_plugins.push(helm_plugin());
     start_with(
         common::pool().await,
         ServerOpts {
@@ -422,6 +431,7 @@ async fn plugin_repositories_are_authorized_like_feeds() {
         common::fresh_pool().await,
         ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
+            extra_plugins: vec![helm_plugin()],
             ..Default::default()
         },
     )
@@ -605,8 +615,9 @@ async fn a_repository_has_an_upload_limit_of_its_own() {
 
 #[tokio::test]
 async fn a_repository_whose_plugin_is_missing_is_unavailable() {
-    // A server without the plugin, over a repository created with it.
-    let srv = common::start().await;
+    // A server without the plugin, over a repository created with it, under
+    // a mount another plugin serves.
+    let srv = start_helm(ServerOpts::default()).await;
     let name = format!("orphan{}", unique());
     let mut row = forge_db::repository_dao::NewRepository::hosted(name.clone());
     row.format = WASM_HELM.into();
@@ -697,7 +708,7 @@ async fn a_webassembly_plugin_serves_like_a_builtin_one() {
 /// A WebAssembly plugin never replaces a built-in format.
 #[test]
 fn a_component_cannot_take_a_builtin_format_id() {
-    let dir = forge_plugin::testing::example_plugin("helm");
+    let dir = forge_plugin::testing::example_plugin_as("helm", "nuget");
     let plugin = forge_plugin::Plugin::load(
         &dir,
         &forge_plugin::testing::component_sha256(&dir),
@@ -707,7 +718,7 @@ fn a_component_cannot_take_a_builtin_format_id() {
     let err = forge_server::state::FormatRegistry::new(Default::default())
         .with_plugin(plugin)
         .err()
-        .expect("helm is taken");
+        .expect("nuget is taken");
     assert!(err.contains("built into this server"), "{err}");
 }
 

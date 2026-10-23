@@ -9,7 +9,7 @@ the design, the contract and how to operate them.
 | Plugin | Format id | Runs | What it serves |
 | --- | --- | --- | --- |
 | [`nuget`](nuget) | `nuget` | built in only | NuGet V3 feeds at `/v3`: push, restore, search, unlist and relist; hosted, proxy and group repositories |
-| [`helm`](helm) | `helm` | built in | Helm chart repositories: `index.yaml`, chart downloads, ChartMuseum-compatible push, delete and listing; hosted, proxy and group repositories |
+| [`helm`](helm) | `helm` | the example plugin: not built in; the plugin tests run it built in and as a component | Classic Helm chart repositories: `index.yaml`, chart downloads, ChartMuseum-compatible push, delete and listing; hosted, proxy and group repositories |
 
 A plugin directory holds:
 

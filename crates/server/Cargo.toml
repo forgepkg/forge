@@ -21,9 +21,8 @@ forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
-# Built-in format plugins (plugins/<id>/), linked in.
-forge-format-helm = { path = "../../plugins/helm" }
 forge-oci = { path = "../format-oci" }
+# The built-in format plugin (plugins/nuget), linked in.
 forge-format-nuget = { path = "../../plugins/nuget" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
@@ -84,7 +83,9 @@ figment = { version = "0.10", features = ["toml", "env"] }
 
 [dev-dependencies]
 forge-plugin = { path = "../plugin", features = ["testing"] }
-# Builds chart archives for the format-plugin tests.
+# The example format plugin the format-plugin tests serve repositories with
+# (plugins/helm, not built in), and the chart archives they push to it.
+forge-format-helm = { path = "../../plugins/helm" }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "test-util"] }
 testcontainers = "0.27"

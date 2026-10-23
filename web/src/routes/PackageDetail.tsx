@@ -171,9 +171,9 @@ function defaultVersion(versions: DetailVersion[]): string {
 }
 
 /**
- * The install commands of one version, for the formats Forge knows a client
- * command of (NuGet, Helm). The source or repository is added once per
- * machine with the repository's Connect commands.
+ * The install commands of one version, for the format Forge knows a client
+ * command of (NuGet). The source is added once per machine with the
+ * repository's Connect commands.
  */
 function InstallPanel({
   format,
@@ -187,7 +187,7 @@ function InstallPanel({
   versions: DetailVersion[]
 }) {
   const [version, setVersion] = useState(() => defaultVersion(versions))
-  if (format !== 'nuget' && format !== 'helm') return null
+  if (format !== 'nuget') return null
   return (
     <Panel
       title="Install"
@@ -202,27 +202,17 @@ function InstallPanel({
           ))}
         </SelectField>
       )}
-      {format === 'nuget' ? (
-        <>
-          <CommandSnippet
-            label="dotnet CLI"
-            command={`dotnet add package ${id} --version ${version}`}
-            copyLabel="Copy add-package command"
-          />
-          <CodeBlock
-            title="PackageReference"
-            copyLabel="Copy PackageReference"
-            code={`<PackageReference\n  Include="${id}"\n  Version="${version}" />`}
-            placeholders={[]}
-          />
-        </>
-      ) : (
-        <CommandSnippet
-          label="Helm"
-          command={`helm install <release> ${repo}/${id} --version ${version}`}
-          copyLabel="Copy install command"
-        />
-      )}
+      <CommandSnippet
+        label="dotnet CLI"
+        command={`dotnet add package ${id} --version ${version}`}
+        copyLabel="Copy add-package command"
+      />
+      <CodeBlock
+        title="PackageReference"
+        copyLabel="Copy PackageReference"
+        code={`<PackageReference\n  Include="${id}"\n  Version="${version}" />`}
+        placeholders={[]}
+      />
     </Panel>
   )
 }

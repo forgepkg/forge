@@ -94,6 +94,65 @@ export interface ImageDetail {
   manifests: ImageManifest[]
 }
 
+/** A person named by a chart (`maintainers` of its `Chart.yaml`). */
+export interface ChartMaintainer {
+  name?: string
+  email?: string
+  url?: string
+}
+
+/** A chart a chart depends on (`dependencies` of its `Chart.yaml`). */
+export interface ChartDependency {
+  name?: string
+  version?: string
+  repository?: string
+  condition?: string
+  alias?: string
+}
+
+/**
+ * The `Chart.yaml` metadata of a Helm chart, from its config blob: the
+ * fields the server keeps, each optional (a chart declares what it likes).
+ */
+export interface ChartMetadata {
+  apiVersion?: string
+  name?: string
+  version?: string
+  appVersion?: string
+  description?: string
+  type?: string
+  kubeVersion?: string
+  home?: string
+  icon?: string
+  deprecated?: boolean
+  keywords?: string[]
+  sources?: string[]
+  maintainers?: ChartMaintainer[]
+  dependencies?: ChartDependency[]
+}
+
+/** A text file of a chart: its README or `values.yaml` (`ChartFileView`). */
+export interface ChartFile {
+  name: string
+  text: string
+  /** The file was cut at 512 KiB. */
+  truncated: boolean
+}
+
+/** `GET /browse/chart?repo=…&image=…&digest=…` response (`ChartDetail`). */
+export interface ChartDetail {
+  /** The chart's manifest digest. */
+  digest: string
+  /** `null` while the config blob is not stored here (a proxy before a pull). */
+  metadata: ChartMetadata | null
+  readme: ChartFile | null
+  values: ChartFile | null
+  /** Whether the chart archive is stored here; a proxy stores it when pulled. */
+  archive_stored: boolean
+  /** The member repository it comes from (groups only). */
+  source?: string
+}
+
 /** Search parameters for one repository's image list (`ImagesQuery`). */
 export interface ImageSearchParams {
   /** The docker repository (required by the endpoint). */
@@ -125,6 +184,8 @@ export const imageKeys = {
     ] as const,
   detail: (repo: string, image: string) =>
     ['images', 'detail', repo, image] as const,
+  chart: (repo: string, image: string, digest: string) =>
+    ['images', 'chart', repo, image, digest] as const,
 }
 
 /** Fetch a page of one docker repository's images. */
@@ -158,4 +219,21 @@ export function fetchImageDetail(
     `/browse/images/${encodeURIComponent(repo)}/${path}`,
     { signal },
   )
+}
+
+/**
+ * Fetch a Helm chart of an image (a manifest whose config is a Helm chart's):
+ * its metadata, README and default values. 404 when the manifest is not a
+ * chart, or not visible.
+ */
+export function fetchChart(
+  repo: string,
+  image: string,
+  digest: string,
+  signal?: AbortSignal,
+): Promise<ChartDetail> {
+  return httpClient.get<ChartDetail>('/browse/chart', {
+    query: { repo, image, digest },
+    signal,
+  })
 }
