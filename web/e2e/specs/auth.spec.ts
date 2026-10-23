@@ -37,7 +37,7 @@ async function createReader(
   request: import('@playwright/test').APIRequestContext,
 ): Promise<{ username: string; password: string }> {
   const f = facts()
-  const username = `reader_${Date.now()}`
+  const username = `reader_${Date.now()}@example.com`
   const password = 'reader-pw'
   const createUser = await request.post(`${f.baseUrl}/admin/users`, {
     headers: { authorization: adminBasic() },

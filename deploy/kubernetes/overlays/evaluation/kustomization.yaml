@@ -4,7 +4,7 @@
 #   cp forge.env.example forge.env      # and fill it in
 #   kubectl apply -k .
 #   kubectl -n forge-eval port-forward svc/forge 8421
-#   # http://localhost:8421, sign in as admin with the bootstrap password
+#   # http://localhost:8421, sign in as admin@example.com with the bootstrap password
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

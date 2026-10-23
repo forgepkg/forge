@@ -50,7 +50,7 @@ fn hash(password: &str) -> String {
 
 /// Insert a local (argon2 password) user with a unique username.
 async fn insert_local(pool: &PgPool, password: &str, active: bool) -> String {
-    let username = format!("alice-{}", common::unique());
+    let username = format!("alice-{}@example.com", common::unique());
     user_dao::insert_user(
         pool,
         NewUser::local(username.clone(), hash(password), active),

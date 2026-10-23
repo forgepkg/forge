@@ -276,7 +276,7 @@ fn repo_name(prefix: &str) -> String {
 
 /// A user and an API token for it.
 async fn user_with_token(srv: &TestServer) -> (String, String, i64) {
-    let username = format!("dev{}x{}", std::process::id(), unique());
+    let username = format!("dev{}x{}@example.com", std::process::id(), unique());
     let resp = admin_post(
         srv,
         "/admin/users",
@@ -769,7 +769,7 @@ async fn chunked_uploads_cache_the_blob_not_its_chunks() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             plugins_block: Some(format!(
                 "[blob_cache]\npath = {:?}\nmax_bytes = 1048576\nmin_free_bytes = 0\n",
                 dir.path().join("cache").display().to_string()
@@ -1782,7 +1782,7 @@ async fn a_slow_layer_download_outlasts_the_request_timeout() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             server_extra: Some("request_timeout_seconds = 1\n".into()),
             ..Default::default()
         },
@@ -2363,7 +2363,7 @@ async fn confirming_a_blob_records_the_use_of_its_link() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             plugins_block: Some("[docker]\nunreferenced_blob_ttl_seconds = 3600\n".into()),
             ..Default::default()
         },
@@ -2454,7 +2454,7 @@ async fn deleting_an_image_never_frees_a_layer_another_image_uses() {
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             ..Default::default()
         },
     )
@@ -3021,7 +3021,7 @@ async fn anonymous_pulls_where_the_repository_allows_them() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             anonymous_mode: "all".into(),
             ..Default::default()
         },

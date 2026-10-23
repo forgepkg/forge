@@ -29,7 +29,7 @@ async fn start_helm(opts: ServerOpts) -> TestServer {
     start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             ..opts
         },
     )

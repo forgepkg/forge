@@ -63,6 +63,63 @@ export function authSourceLabel(source: string): string {
   return AUTH_SOURCE_LABELS[source] ?? source
 }
 
+/** Longest DNS label of a UPN's domain, in characters. */
+const MAX_DOMAIN_LABEL_CHARS = 63
+
+/** A label of a UPN's domain: letters (with their marks), digits and `-`. */
+const DOMAIN_LABEL = /^[\p{L}\p{M}\p{N}-]+$/u
+
+/**
+ * The name the server stores for `raw`: trimmed, NFC, lowercased (and NFC
+ * again, as lowercasing can decompose). Mirrors `canonical_username`.
+ */
+export function canonicalUsername(raw: string): string {
+  return raw.trim().normalize('NFC').toLowerCase().normalize('NFC')
+}
+
+/**
+ * Why `raw` cannot name a new account, or `null` when it is a UPN
+ * (`local-part@domain`). Mirrors `is_upn` in `crates/db/src/username.rs`:
+ * exactly one `@`; a non-empty local part without whitespace; a domain of at
+ * least two labels, each 1 to 63 letters, digits or `-`, neither starting nor
+ * ending with `-`, no trailing dot, and a last label that is not all digits.
+ * A Unicode domain counts in its canonical form, an `xn--` A-label as
+ * written. The server's 400 stays authoritative.
+ */
+export function upnError(raw: string): string | null {
+  const name = canonicalUsername(raw)
+  const message = 'The username must be a UPN such as alice@example.com.'
+  const parts = name.split('@')
+  if (parts.length !== 2) return message
+  const [local, domain] = parts
+  if (local === '' || /\s/u.test(local)) return message
+  const labels = domain.split('.')
+  if (labels.length < 2) return message
+  for (const label of labels) {
+    const length = [...label].length
+    if (
+      length < 1 ||
+      length > MAX_DOMAIN_LABEL_CHARS ||
+      label.startsWith('-') ||
+      label.endsWith('-') ||
+      !DOMAIN_LABEL.test(label)
+    ) {
+      return message
+    }
+  }
+  if (/^[0-9]+$/.test(labels[labels.length - 1])) return message
+  return null
+}
+
+/**
+ * Whether the stored `username` is a UPN. Accounts created before Forge 1.2
+ * may be named otherwise (`alice`, `admin`): they keep signing in, and the
+ * users list marks them "legacy name".
+ */
+export function isUpn(username: string): boolean {
+  return upnError(username) === null
+}
+
 /** `POST /admin/users` request body (`CreateUser`). */
 export interface CreateUser {
   username: string

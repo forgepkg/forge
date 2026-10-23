@@ -214,7 +214,8 @@ async fn demotion_applies_without_auto_provision() {
 #[tokio::test]
 async fn existing_local_user_is_not_clobbered_or_mapped() {
     let pool = pool().await;
-    let username = unique_user("prov-local");
+    // A local account is named by a UPN; a forwarded login may use one too.
+    let username = format!("{}@example.com", unique_user("prov-local"));
 
     // A pre-existing LOCAL admin (with a password hash).
     let local = user_dao::insert_user(

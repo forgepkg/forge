@@ -118,7 +118,7 @@ async fn retention_admin_gated() {
     assert_eq!(resp.status(), 401, "anonymous retention GET must be 401");
 
     // Non-admin user → 403.
-    let username = format!("plain{s}");
+    let username = format!("plain{s}@example.com");
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))

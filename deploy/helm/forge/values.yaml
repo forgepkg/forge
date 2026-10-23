@@ -50,6 +50,10 @@ config:
   #   # real client IP (anonymous-IP allowlists, login lockout). Admit only
   #   # the gateway with networkPolicy.from.
   #   trusted_proxy_cidrs: [10.0.0.0/8]
+  #   # The first administrator, created on the first start while
+  #   # FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD is set: a UPN, no default.
+  #   bootstrap_admin:
+  #     username: admin@example.com
   # s3:
   #   endpoint: https://s3.eu-central-1.amazonaws.com
   #   region: eu-central-1
@@ -73,7 +77,8 @@ logLevel: info
 # creates (<fullname>-secret-env) and loaded with envFrom: FORGE_DATABASE__URL,
 # FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY, FORGE_REDIS__URL,
 # FORGE_ROOT_KEY, FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD,
-# FORGE_OIDC__CLIENT_SECRET, ...
+# FORGE_OIDC__CLIENT_SECRET, ... The bootstrap admin's name is not secret:
+# config.auth.bootstrap_admin.username, a UPN such as admin@example.com.
 secretEnv: {}
 #   FORGE_DATABASE__URL: postgres://forge:<password>@postgres.example.internal:5432/forge
 #   FORGE_S3__ACCESS_KEY: <access key>

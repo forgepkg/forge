@@ -37,7 +37,7 @@ const DEFAULT_FORGE_PORT: u16 = 8421;
 const VITE_DEV_PORT: u16 = 8420;
 
 /// Default bootstrap admin credentials from forge.toml (used by `seed`).
-const DEFAULT_ADMIN: &str = "admin:changeme";
+const DEFAULT_ADMIN: &str = "admin@example.com:changeme";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();

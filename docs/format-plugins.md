@@ -187,7 +187,7 @@ Helm is built in, so a Helm repository needs no setup beyond creating it:
 
 ```bash
 # Create a hosted Helm repository (or use the web UI).
-curl -u admin:$ADMIN_TOKEN -H 'content-type: application/json' \
+curl -u admin@example.com:$ADMIN_TOKEN -H 'content-type: application/json' \
   -d '{"name": "charts", "kind": "hosted", "format": "helm"}' \
   https://forge.example.com/admin/repositories
 
@@ -211,7 +211,7 @@ upstream's charts, and each chart is downloaded from the upstream on first
 use and served from Forge after.
 
 ```bash
-curl -u admin:$ADMIN_TOKEN -H 'content-type: application/json' \
+curl -u admin@example.com:$ADMIN_TOKEN -H 'content-type: application/json' \
   -d '{"name": "bitnami", "kind": "proxy", "format": "helm",
        "remote_url": "https://charts.bitnami.com/bitnami"}' \
   https://forge.example.com/admin/repositories

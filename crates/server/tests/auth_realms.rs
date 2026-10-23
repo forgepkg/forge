@@ -342,7 +342,7 @@ async fn login_lockout_is_429_with_retry_after() {
     let srv = common::start().await;
     let client = srv.client();
     let login = format!("{}/auth/login", srv.base_url);
-    let username = format!("ghost{}", common::unique());
+    let username = format!("ghost{}@example.com", common::unique());
 
     let max = srv.state.config.auth.login_max_failures;
     for _ in 0..max {

@@ -68,7 +68,7 @@ async fn tokens_are_minted_only_from_a_session() {
     let srv = common::start().await;
     let client = srv.client();
     let (au, ap) = srv.admin_basic();
-    let username = format!("minter{}", common::unique());
+    let username = format!("minter{}@example.com", common::unique());
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&au, Some(&ap))

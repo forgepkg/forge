@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use sqlx::PgPool;
 
 use crate::model::AppUser;
-use crate::username::{canonical_account_username, canonical_username};
+use crate::username::{
+    canonical_account_username, canonical_forwarded_username, canonical_username,
+};
 
 /// The canonical form of a username used as a lookup key, or `None` when it
 /// can never name an account (empty, control characters, oversized).
@@ -49,6 +51,10 @@ impl NewUser {
 /// [`sqlx::Error::InvalidArgument`] (callers validate first to answer 400).
 /// An account with a local password must also have a name a password login
 /// accepts ([`crate::username::canonical_password_username`]: no `:`).
+/// Every account but a credential-forwarding one (`upstream-basic`) must be
+/// named by a UPN ([`crate::username::canonical_account_username`]); that one
+/// keeps the name its upstream accepted
+/// ([`crate::username::canonical_forwarded_username`]).
 ///
 /// An administrator is a member of the built-in `admin` role: assign it
 /// separately ([`crate::authz_dao::assign_role`]), in the same transaction
@@ -57,8 +63,12 @@ pub async fn insert_user<'e, E>(executor: E, new: NewUser) -> sqlx::Result<AppUs
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let username = canonical_account_username(&new.username, new.password_hash.is_some())
-        .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
+    let username = if new.auth_source == "upstream-basic" {
+        canonical_forwarded_username(&new.username)
+    } else {
+        canonical_account_username(&new.username, new.password_hash.is_some())
+    }
+    .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
     sqlx::query_as!(
         AppUser,
         r#"
@@ -105,13 +115,14 @@ where
 /// [reserved](crate::username::RESERVED_USERNAMES) one, or one containing `:`
 /// (the upstream verified the part before the colon, see
 /// [`crate::username::canonical_password_username`]), provisions nothing
-/// (`None` ⇒ deny).
+/// (`None` ⇒ deny). It need not be a UPN: the account keeps the name the
+/// upstream accepted ([`crate::username::canonical_forwarded_username`]).
 pub async fn provision_upstream_user(
     pool: &PgPool,
     username: &str,
     realm_id: Option<i64>,
 ) -> sqlx::Result<Option<AppUser>> {
-    let Ok(username) = canonical_account_username(username, true) else {
+    let Ok(username) = canonical_forwarded_username(username) else {
         return Ok(None);
     };
     sqlx::query_as!(

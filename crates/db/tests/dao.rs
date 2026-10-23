@@ -1134,7 +1134,7 @@ async fn user_and_token_round_trip() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
-    let username = format!("user-{n}");
+    let username = format!("user-{n}@example.com");
 
     let user = user_dao::insert_user(
         pool,
@@ -1277,7 +1277,7 @@ async fn provision_upstream_user_does_not_clobber_local_user() {
     let pool = pool().await;
     let pool = &pool;
     let n = unique();
-    let username = format!("up-prov-local-{n}");
+    let username = format!("up-prov-local-{n}@example.com");
 
     // Pre-existing LOCAL user with a password.
     user_dao::insert_user(
@@ -1611,12 +1611,12 @@ async fn usernames_are_unique_in_canonical_form() {
     let n = common::unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("  Dora{n} "), "x".into(), true),
+        NewUser::local(format!("  Dora{n}@Example.COM "), "x".into(), true),
     )
     .await
     .unwrap();
-    assert_eq!(user.username, format!("dora{n}"));
-    let found = user_dao::find_user_by_username(&pool, &format!("DORA{n}"))
+    assert_eq!(user.username, format!("dora{n}@example.com"));
+    let found = user_dao::find_user_by_username(&pool, &format!("DORA{n}@example.com"))
         .await
         .unwrap()
         .expect("any spelling finds the account");
@@ -1626,7 +1626,7 @@ async fn usernames_are_unique_in_canonical_form() {
         "INSERT INTO app_user (username, password_hash, active, auth_source) \
          VALUES ($1, 'x', true, 'local')",
     )
-    .bind(format!("DORA{n}"))
+    .bind(format!("DORA{n}@example.com"))
     .execute(&pool)
     .await;
     let err = raw.expect_err("a case variant must violate the canonical unique index");
@@ -1638,6 +1638,14 @@ async fn usernames_are_unique_in_canonical_form() {
     let invalid =
         user_dao::insert_user(&pool, NewUser::local("bad\nname".into(), "x".into(), true)).await;
     assert!(matches!(invalid, Err(sqlx::Error::InvalidArgument(_))));
+    // A new account is named by a UPN (#317); a stored legacy name is still
+    // found.
+    let legacy =
+        user_dao::insert_user(&pool, NewUser::local(format!("dora{n}"), "x".into(), true)).await;
+    assert!(
+        matches!(&legacy, Err(sqlx::Error::InvalidArgument(m)) if m.contains("UPN")),
+        "{legacy:?}"
+    );
 }
 
 /// Names migration 0021 left non-canonical (its SQL `lower()` follows the
@@ -1645,7 +1653,7 @@ async fn usernames_are_unique_in_canonical_form() {
 /// the form every lookup uses, so their accounts can sign in again.
 #[tokio::test]
 async fn stored_usernames_are_brought_into_canonical_form() {
-    use forge_db::user_dao::{self, NewUser};
+    use forge_db::user_dao;
     let pool = common::pool().await;
     let n = common::unique();
     let raw = |name: String| {
@@ -1660,10 +1668,7 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     let spaced = raw(format!("erin{n}\u{a0}")).await.unwrap();
     let upper = raw(format!("Ünal{n}")).await.unwrap();
     // A twin of an account that already holds the canonical name.
-    let holder =
-        user_dao::insert_user(&pool, NewUser::local(format!("fritz{n}"), "x".into(), true))
-            .await
-            .unwrap();
+    let holder = raw(format!("fritz{n}")).await.unwrap();
     let twin = raw(format!("fritz{n}\u{2003}")).await.unwrap();
 
     let repairs = user_dao::canonicalize_stored_usernames(&pool)
@@ -1673,16 +1678,12 @@ async fn stored_usernames_are_brought_into_canonical_form() {
     assert_eq!(renamed(spaced), Some(format!("erin{n}")));
     assert_eq!(renamed(upper), Some(format!("ünal{n}")));
     assert_eq!(renamed(twin), Some(format!("fritz{n}#{twin}")));
-    assert_eq!(
-        renamed(holder.id),
-        None,
-        "the canonical holder keeps its name"
-    );
+    assert_eq!(renamed(holder), None, "the canonical holder keeps its name");
 
     for (spelling, id) in [
         (format!(" ERIN{n} "), spaced),
         (format!("ÜNAL{n}"), upper),
-        (format!("Fritz{n}"), holder.id),
+        (format!("Fritz{n}"), holder),
     ] {
         let found = user_dao::find_user_by_username(&pool, &spelling)
             .await

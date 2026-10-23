@@ -436,7 +436,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let block =
         upstream.upstream_basic_block(&["local-password", "upstream-basic"], 300, 30, &[], "");
     let srv = StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_upstream_basic(block)
         .start()
         .await;
@@ -459,7 +459,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let malformed_patch = srv
         .client()
         .patch(format!("{}/admin/realms/{broken_id}", srv.base_url))
-        .basic_auth("root", srv.admin_scoped_token.as_deref())
+        .basic_auth("root@example.com", srv.admin_scoped_token.as_deref())
         .json(&json!({"name": "still-broken-wif"}))
         .send()
         .await
@@ -480,7 +480,7 @@ async fn jwt_for_malformed_enabled_wif_realm_never_falls_through_to_forwarding()
     let invalidate = srv
         .client()
         .patch(format!("{}/admin/realms/{local_id}", srv.base_url))
-        .basic_auth("root", srv.admin_scoped_token.as_deref())
+        .basic_auth("root@example.com", srv.admin_scoped_token.as_deref())
         .json(&json!({"enabled": true}))
         .send()
         .await

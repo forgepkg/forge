@@ -93,7 +93,11 @@ async fn a_hash_is_stored_only_on_an_opted_in_realms_own_account() {
     // Never on a local account, even one in the realm's name space.
     let local = user_dao::insert_user(
         &pool,
-        user_dao::NewUser::local(format!("kept-local-{}", unique()), HASH.into(), true),
+        user_dao::NewUser::local(
+            format!("kept-local-{}@example.com", unique()),
+            HASH.into(),
+            true,
+        ),
     )
     .await
     .unwrap();

@@ -47,7 +47,7 @@ async fn non_admin_forbidden() {
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let suffix = common::unique();
-    let username = format!("plain{suffix}");
+    let username = format!("plain{suffix}@example.com");
 
     // Admin creates a non-admin user.
     let resp = client
@@ -185,7 +185,7 @@ async fn usernames_are_canonical() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let lower = format!("carol{}", common::unique());
+    let lower = format!("carol{}@example.com", common::unique());
     let typed = format!("  {} ", lower.to_uppercase());
 
     let resp = client
@@ -273,6 +273,93 @@ async fn usernames_with_a_colon_are_refused() {
     }
 }
 
+/// #317: a new account is named by a UPN (`POST /admin/users` answers 400
+/// otherwise), while an account created before the rule keeps signing in
+/// with its password and its tokens.
+#[tokio::test]
+async fn new_accounts_need_a_upn_and_legacy_accounts_keep_signing_in() {
+    use argon2::PasswordHasher;
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+
+    for bad in [
+        format!("dave{s}"),
+        format!("dave{s}@corp"),
+        format!("dave{s}@corp.example."),
+        format!("dave{s}@corp@example.com"),
+        format!("@corp{s}.example"),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&json!({"username": bad, "password": "pw123456"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{bad:?}");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "invalid username: username must be a UPN such as alice@example.com"
+        );
+        assert!(forge_db::user_dao::find_user_by_username(&srv.pool, &bad)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // An account from before the rule (written around the DAO, which no
+    // longer creates one).
+    let legacy = format!("erin{s}");
+    let hash = argon2::Argon2::default()
+        .hash_password(b"legacy-pw-123")
+        .unwrap()
+        .to_string();
+    let legacy_id: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash, active, auth_source) \
+         VALUES ($1, $2, true, 'local') RETURNING id",
+    )
+    .bind(&legacy)
+    .bind(&hash)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+
+    let resp = client
+        .post(format!("{}/auth/login", srv.base_url))
+        .json(&json!({"username": legacy, "password": "legacy-pw-123"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "the legacy account signs in");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["user_id"], json!(legacy_id));
+
+    let token = forge_core::auth::generate_token_secret();
+    forge_db::token_dao::insert_token(
+        &srv.pool,
+        forge_db::token_dao::NewToken {
+            user_id: legacy_id,
+            name: "legacy".into(),
+            token_hash: forge_core::auth::hash_token(&token),
+            expires_at: None,
+            minted_with_forwarded_credential: false,
+        },
+    )
+    .await
+    .unwrap();
+    let resp = client
+        .get(format!("{}/admin/me", srv.base_url))
+        .basic_auth(&legacy, Some(&token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "and its tokens keep working");
+    let me: Value = resp.json().await.unwrap();
+    assert_eq!(me["user"]["username"], json!(legacy));
+}
+
 /// `POST /admin/users/{id}/reauth` (slice 12.3): admin-only, 204 on a known
 /// user (idempotent even with no cached verdicts), 404 for an unknown id, 403
 /// for a non-admin caller.
@@ -282,7 +369,7 @@ async fn reauth_endpoint_admin_only_and_idempotent() {
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
     let suffix = common::unique();
-    let username = format!("reauth{suffix}");
+    let username = format!("reauth{suffix}@example.com");
 
     // Admin creates a non-admin user and discovers its id.
     let created: Value = client
@@ -549,7 +636,7 @@ async fn unscoped_admin_token_cannot_use_admin_api() {
             .post(format!("{}/admin/users", srv.base_url))
             .header("X-NuGet-ApiKey", &token)
             .json(&json!({
-                "username": format!("evil{}", common::unique()),
+                "username": format!("evil{}@example.com", common::unique()),
                 "password": "pw123456",
                 "is_admin": true
             }))
@@ -629,7 +716,7 @@ async fn admin_scoped_token_can_use_admin_api() {
         .post(format!("{}/admin/users", srv.base_url))
         .header("X-NuGet-ApiKey", &token)
         .json(&json!({
-            "username": format!("automated{}", common::unique()),
+            "username": format!("automated{}@example.com", common::unique()),
             "password": "pw123456",
             "is_admin": false
         }))
@@ -1216,7 +1303,7 @@ async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
         "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
          [crypto.rotation]\nenabled = false\n"
     );
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
@@ -1373,7 +1460,7 @@ async fn crypto_rotation_is_serialized_with_the_rotation_worker() {
         "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
          [crypto.rotation]\nenabled = false\n"
     );
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
@@ -1453,7 +1540,7 @@ async fn registry_token_key_survives_dek_rotation() {
         "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
          [crypto.rotation]\nenabled = false\n"
     );
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     // A database of its own: the key and the DEKs are install-wide.
     let srv = common::start_with(
         common::fresh_pool().await,
@@ -1525,7 +1612,7 @@ async fn oidc_issuer_keys_are_sealed_and_survive_dek_rotation() {
         "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
          [crypto.rotation]\nenabled = false\n"
     );
-    let admin = format!("admin{}", common::unique());
+    let admin = format!("admin{}@example.com", common::unique());
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
@@ -1651,7 +1738,7 @@ async fn deactivate_cuts_off_sessions_tokens_and_passwords() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let username = format!("deact{}", common::unique());
+    let username = format!("deact{}@example.com", common::unique());
     let password = "pw123456";
     let (user_id, cookie, csrf) = create_and_login(&srv, &username, password).await;
 
@@ -1843,7 +1930,7 @@ async fn the_last_active_admin_cannot_lose_admin() {
     };
 
     // The bootstrap admin removes itself.
-    let dormant = create_admin(&srv, "dormant", "pw-dormant").await;
+    let dormant = create_admin(&srv, "dormant@example.com", "pw-dormant").await;
     forge_db::user_dao::set_active(&srv.pool, dormant, false)
         .await
         .unwrap();
@@ -1859,7 +1946,7 @@ async fn the_last_active_admin_cannot_lose_admin() {
 
     // With a second admin, the bootstrap admin may step down, and the second
     // one is then the last.
-    let second = create_admin(&srv, "second", "pw-second").await;
+    let second = create_admin(&srv, "second@example.com", "pw-second").await;
     let resp = req(
         reqwest::Method::DELETE,
         &format!("/admin/users/{boot}/roles/{admin_role}"),
@@ -1871,7 +1958,7 @@ async fn the_last_active_admin_cannot_lose_admin() {
     .unwrap();
     assert_eq!(resp.status(), 204, "another active admin remains");
 
-    let session = srv.login("second", "pw-second").await;
+    let session = srv.login("second@example.com", "pw-second").await;
     for (method, path, body) in removals(second) {
         let resp = session
             .apply(req(method, &path, &body))
@@ -1902,7 +1989,7 @@ async fn concurrent_admin_deactivations_leave_one_admin() {
     let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
     let (u, p) = srv.admin_basic();
     let boot = admin_id(&srv).await;
-    let second = create_admin(&srv, "second", "pw-second").await;
+    let second = create_admin(&srv, "second@example.com", "pw-second").await;
 
     // Hold the role row so both requests park inside the guard.
     let mut holder = srv.pool.begin().await.unwrap();
@@ -1950,7 +2037,7 @@ async fn concurrent_admin_deactivations_leave_one_admin() {
 #[tokio::test]
 async fn auth_tokens_refuses_a_scope_it_would_drop() {
     let srv = common::start().await;
-    let username = format!("scoped{}", common::unique());
+    let username = format!("scoped{}@example.com", common::unique());
     let (_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456").await;
     let resp = srv
         .client()
@@ -1973,7 +2060,7 @@ async fn auth_tokens_refuses_a_scope_it_would_drop() {
 async fn auth_tokens_refuse_inactive_user_with_live_session() {
     let srv = common::start().await;
     let client = srv.client();
-    let username = format!("inact{}", common::unique());
+    let username = format!("inact{}@example.com", common::unique());
     let (user_id, cookie, csrf) = create_and_login(&srv, &username, "pw123456").await;
 
     let resp = client
@@ -2041,7 +2128,7 @@ async fn reauth_revokes_sessions() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let username = format!("reauthsess{}", common::unique());
+    let username = format!("reauthsess{}@example.com", common::unique());
     let (user_id, cookie, _csrf) = create_and_login(&srv, &username, "pw123456").await;
 
     let me = || {
@@ -2391,7 +2478,10 @@ async fn repo_update_with_encryption_never_keeps_plaintext() {
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             crypto_block: Some(crypto_block),
             ..Default::default()
         },
@@ -2471,7 +2561,10 @@ async fn realm_with_undecryptable_secrets_is_repaired_through_patch() {
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             crypto_block: Some(crypto_block),
             ..Default::default()
         },
@@ -2753,7 +2846,10 @@ async fn anonymous_read_off_deletes_the_synthesized_grant() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             anonymous_mode: "all".into(),
             ..Default::default()
         },
@@ -3271,7 +3367,10 @@ async fn blob_cache_statistics_name_their_instance() {
     let with_cache = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             plugins_block: Some(format!(
                 "[blob_cache]\npath = {:?}\n",
                 dir.path().join("cache").display().to_string()

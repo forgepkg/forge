@@ -266,7 +266,10 @@ async fn login_redirects_to_idp_and_writes_flow_row() {
         common::pool().await,
         ServerOpts {
             anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -323,7 +326,10 @@ async fn login_rejects_open_redirect_target() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -360,14 +366,17 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
         pool.clone(),
         ServerOpts {
             anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
     )
     .await;
     let n = common::unique();
-    let username = format!("alice-{n}");
+    let username = format!("alice-{n}@example.com");
     let sub = format!("sub-{n}");
 
     // 1. Login → authorize URL + state.
@@ -433,6 +442,77 @@ async fn callback_sets_session_cookie_and_me_recognises_it() {
     assert_eq!(body["is_admin"], json!(true), "roles claim granted admin");
 }
 
+/// #317: a first OIDC login whose username claim holds no UPN creates no
+/// account; the browser is sent to the login page with the reason and the
+/// claim it came from.
+#[tokio::test]
+async fn callback_refuses_a_new_account_without_a_upn_and_names_the_claim() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            anonymous_mode: "off".into(),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let n = common::unique();
+    let username = format!("bare-{n}");
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/login?redirect_to=/browse",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    let location = resp.headers().get("location").unwrap().to_str().unwrap();
+    let state = state_from_url(location);
+    let flow = flow_cookie_header(&resp);
+    let nonce = peek_nonce(&srv.pool, &state).await;
+    idp.mount_token_with_claims(id_claims(
+        &idp.issuer,
+        &format!("sub-{n}"),
+        &username,
+        &nonce,
+        json!([]),
+    ))
+    .await;
+
+    let resp = no_redirect_client()
+        .get(format!(
+            "{}/auth/oidc/callback?code=the-code&state={state}",
+            srv.base_url
+        ))
+        .header("cookie", &flow)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 302);
+    assert_eq!(
+        resp.headers().get("location").unwrap().to_str().unwrap(),
+        "/login?error=username_not_upn&claim=preferred_username"
+    );
+    assert!(resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .all(|c| !c.to_str().unwrap().starts_with("forge_session=")));
+    assert!(
+        forge_db::user_dao::find_user_by_username(&srv.pool, &username)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// A realm with `client_authentication = "federated_credential"` signs in
 /// without a client secret: the token request carries a client assertion
 /// that verifies against the JWKS forge publishes as its issuer, and names
@@ -446,7 +526,10 @@ async fn federated_credential_login_presents_a_forge_signed_client_assertion() {
         common::fresh_pool().await,
         ServerOpts {
             anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.federated_oidc_block()),
             ..Default::default()
         },
@@ -476,7 +559,7 @@ async fn federated_credential_login_presents_a_forge_signed_client_assertion() {
             "id_token": idp.signer.sign(&id_claims(
                 &idp.issuer,
                 &format!("sub-{n}"),
-                &format!("dora-{n}"),
+                &format!("dora-{n}@example.com"),
                 &nonce,
                 json!([]),
             )),
@@ -566,14 +649,17 @@ async fn callback_accepts_trailing_slash_issuer() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
     )
     .await;
     let n = common::unique();
-    let username = format!("slash-{n}");
+    let username = format!("slash-{n}@example.com");
     let sub = format!("sub-slash-{n}");
 
     let resp = no_redirect_client()
@@ -638,7 +724,10 @@ async fn callback_rejects_unknown_state() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -667,7 +756,10 @@ async fn callback_from_another_browser_is_rejected() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -716,7 +808,10 @@ async fn logout_revokes_session_and_clears_cookie() {
     let srv = start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -737,7 +832,7 @@ async fn logout_revokes_session_and_clears_cookie() {
     idp.mount_token_with_claims(id_claims(
         &idp.issuer,
         &format!("sub-{n}"),
-        &format!("loguser-{n}"),
+        &format!("loguser-{n}@example.com"),
         &nonce,
         json!([]),
     ))
@@ -869,14 +964,17 @@ async fn auth_me_returns_identity_and_csrf_token() {
         common::pool().await,
         ServerOpts {
             anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
     )
     .await;
     let n = common::unique();
-    let username = format!("meuser-{n}");
+    let username = format!("meuser-{n}@example.com");
 
     // Unauthenticated /auth/me → 401.
     let resp = no_redirect_client()
@@ -911,7 +1009,10 @@ async fn session_can_mint_and_revoke_repository_token() {
         common::pool().await,
         ServerOpts {
             anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
@@ -922,7 +1023,7 @@ async fn session_can_mint_and_revoke_repository_token() {
         &idp,
         &srv,
         &format!("sub-{n}"),
-        &format!("minter-{n}"),
+        &format!("minter-{n}@example.com"),
         json!([]),
     )
     .await;
@@ -1018,7 +1119,10 @@ async fn required_claims_gate_the_callback() {
         common::pool().await,
         ServerOpts {
             anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(format!(
                 "{}[oidc.required_claims]\ntid = [\"tenant-a\"]\n",
                 idp.oidc_block()
@@ -1042,7 +1146,7 @@ async fn required_claims_gate_the_callback() {
         let mut claims = id_claims(
             &idp.issuer,
             &format!("sub-{n}"),
-            &format!("guest-{n}"),
+            &format!("guest-{n}@example.com"),
             &nonce,
             json!([]),
         );
@@ -1102,14 +1206,17 @@ async fn idp_demotion_ends_sessions_opened_as_admin() {
         common::pool().await,
         ServerOpts {
             anonymous_mode: "off".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             oidc_block: Some(idp.oidc_block()),
             ..Default::default()
         },
     )
     .await;
     let n = common::unique();
-    let (sub, username) = (format!("sub-{n}"), format!("demoted-{n}"));
+    let (sub, username) = (format!("sub-{n}"), format!("demoted-{n}@example.com"));
     let me = |cookie: String| {
         let req = no_redirect_client()
             .get(format!("{}/auth/me", srv.base_url))

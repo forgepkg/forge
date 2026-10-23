@@ -68,6 +68,12 @@ pub enum ResolveError {
     /// IdP authenticated successfully (§6 account-state check).
     #[error("oidc user is inactive")]
     Inactive,
+    /// A new account would be provisioned, but the username the claim chain
+    /// resolved is not a UPN (`local-part@domain`,
+    /// [`forge_db::username::is_upn`]). `claim` names the claim it came from,
+    /// so the operator can map one that carries a UPN.
+    #[error("the oidc {claim:?} claim does not hold a UPN, which a new account needs")]
+    NotUpn { claim: String },
     /// A database error during resolution.
     #[error("oidc resolve db error: {0}")]
     Db(String),
@@ -87,12 +93,13 @@ pub struct ResolvePolicy {
     /// with a local password, admin rights, a credential-forwarding origin or
     /// an existing IdP link (see [`resolve_user`]).
     pub link_existing_by_username: bool,
-    /// When set, an auto-provisioned account is named `{claim}@{namespace}`
-    /// instead of the bare username claim. The server sets it to the OIDC
-    /// realm's name while a credential-forwarding realm is enabled: a
-    /// forwarded user's account is created on their first password login, so
-    /// a bare claim (which users may choose at some IdPs) could take that
-    /// name first and lock the directory user out.
+    /// When set, an auto-provisioned account is named
+    /// `{local-part}+{namespace}@{domain}` instead of the bare username claim
+    /// `{local-part}@{domain}`. The server sets it to the OIDC realm's name
+    /// while a credential-forwarding realm is enabled: a forwarded user's
+    /// account is created on their first password login, so a bare claim
+    /// (which users may choose at some IdPs) could take that name first and
+    /// lock the directory user out.
     pub provision_namespace: Option<String>,
 }
 
@@ -123,7 +130,8 @@ impl Default for ResolvePolicy {
 ///    Otherwise fall through (a fresh, suffixed user is provisioned
 ///    instead).
 /// 3. **No link, no linkable match** + `auto_provision` → create a no-password
-///    user, link.
+///    user, link. A new account is named by a UPN: a username that is none
+///    refuses the login ([`ResolveError::NotUpn`]).
 /// 4. **Else** → [`ResolveError::NotProvisioned`].
 ///
 /// In every path the resolved user's `active` flag is enforced
@@ -185,8 +193,14 @@ pub async fn resolve_user(
         }
     }
 
-    // 3. Auto-provision a fresh, password-less user, then link.
+    // 3. Auto-provision a fresh, password-less user, then link. A new
+    //    account is named by a UPN.
     if policy.auto_provision {
+        if !forge_db::username::is_upn(&mapped.username) {
+            return Err(ResolveError::NotUpn {
+                claim: mapped.username_claim.clone(),
+            });
+        }
         return match provision_oidc_user(pool, login, mapped, policy).await? {
             Provisioned::New(user) => {
                 finalize(pool, user, login, &identity_claims, mapped, true).await
@@ -229,7 +243,7 @@ async fn provision_oidc_user(
     policy: &ResolvePolicy,
 ) -> Result<Provisioned, ResolveError> {
     let base = match &policy.provision_namespace {
-        Some(namespace) => format!("{}@{namespace}", mapped.username),
+        Some(namespace) => with_local_suffix(&mapped.username, &format!("+{namespace}")),
         None => mapped.username.clone(),
     };
     let mut attempt = 0;
@@ -347,12 +361,13 @@ async fn finalize(
     Ok(user)
 }
 
-/// Find a free username, suffixing `-2`, `-3`, … on collision so auto-provision
-/// never fails the unique constraint. (Only reached when there is no existing
-/// `(issuer, subject)` link, so a collision means a *different* account
-/// already owns the base name and was not linked.) A
+/// Find a free username, suffixing `-2`, `-3`, … to the local part of the UPN
+/// (`bob-2@corp.example`) on collision so auto-provision never fails the
+/// unique constraint. (Only reached when there is no existing `(issuer,
+/// subject)` link, so a collision means a *different* account already owns
+/// the base name and was not linked.) A
 /// [reserved](forge_db::username::RESERVED_USERNAMES) base name is never
-/// free, so an IdP user called `oidc` becomes `oidc-2`.
+/// free.
 async fn unique_username(pool: &PgPool, base: &str) -> Result<String, ResolveError> {
     let reserved = forge_db::username::canonical_username(base)
         .is_ok_and(|canonical| forge_db::username::is_reserved_username(&canonical));
@@ -365,7 +380,7 @@ async fn unique_username(pool: &PgPool, base: &str) -> Result<String, ResolveErr
         return Ok(base.to_string());
     }
     for n in 2..1000 {
-        let candidate = format!("{base}-{n}");
+        let candidate = with_local_suffix(base, &format!("-{n}"));
         if user_dao::find_user_by_username(pool, &candidate)
             .await
             .map_err(|e| ResolveError::Db(e.to_string()))?
@@ -377,4 +392,34 @@ async fn unique_username(pool: &PgPool, base: &str) -> Result<String, ResolveErr
     Err(ResolveError::Db(
         "could not allocate a unique username".into(),
     ))
+}
+
+/// `name` with `suffix` added to the local part of the UPN
+/// (`bob@corp.example` → `bob{suffix}@corp.example`), so the result is a UPN
+/// of the same domain; appended to a name without an `@`.
+fn with_local_suffix(name: &str, suffix: &str) -> String {
+    match name.split_once('@') {
+        Some((local, domain)) => format!("{local}{suffix}@{domain}"),
+        None => format!("{name}{suffix}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_local_suffix;
+
+    #[test]
+    fn suffixes_go_into_the_local_part() {
+        assert_eq!(
+            with_local_suffix("bob@corp.example", "-2"),
+            "bob-2@corp.example"
+        );
+        assert_eq!(
+            with_local_suffix("bob@corp.example", "+entra"),
+            "bob+entra@corp.example"
+        );
+        let namespaced = with_local_suffix("bob@corp.example", "+entra.eu_1");
+        assert!(forge_db::username::is_upn(&namespaced), "{namespaced}");
+        assert_eq!(with_local_suffix("oidc", "-2"), "oidc-2");
+    }
 }

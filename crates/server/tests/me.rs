@@ -46,7 +46,7 @@ async fn me_reachable_by_non_admin() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let username = format!("plain{}", common::unique());
+    let username = format!("plain{}@example.com", common::unique());
 
     let resp = client
         .post(format!("{}/admin/users", srv.base_url))
@@ -93,7 +93,7 @@ async fn me_reflects_the_admin_role() {
     let srv = common::start().await;
     let (au, ap) = srv.admin_basic();
     let client = srv.client();
-    let username = format!("rbacadmin{}", common::unique());
+    let username = format!("rbacadmin{}@example.com", common::unique());
 
     let created: Value = client
         .post(format!("{}/admin/users", srv.base_url))
@@ -152,7 +152,10 @@ async fn me_anonymous_is_401() {
         common::pool().await,
         common::ServerOpts {
             anonymous_mode: "all".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )

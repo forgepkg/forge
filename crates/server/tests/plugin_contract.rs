@@ -196,7 +196,7 @@ async fn start_probe(extra_toml: Option<String>) -> TestServer {
     start_with(
         common::pool().await,
         ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", unique()), "adminpw".into())),
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             extra_plugins: vec![Plugin::builtin(PROBE_TOML, Probe).unwrap()],
             plugins_block: extra_toml,
             ..Default::default()
@@ -569,7 +569,7 @@ async fn mutations_outside_the_selector_are_unknown() {
             .json(&body)
             .send()
     };
-    let username = format!("deleter{}", unique());
+    let username = format!("deleter{}@example.com", unique());
     let user: Value = admin(
         reqwest::Method::POST,
         "/admin/users",

@@ -554,7 +554,7 @@ async fn resolve_user_auto_provisions_then_relinks_same_user() {
     let idp = MockIdp::start().await;
     let n = unique();
     let sub = format!("sub-{n}");
-    let username = format!("newbie-{n}");
+    let username = format!("newbie-{n}@example.com");
 
     let validated = run_login(&pool, &idp, &sub, &username, json!(["forge-admins"])).await;
     let mapped = map_claims(&validated.claims, &admin_mapping());
@@ -591,7 +591,7 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
     let n = unique();
-    let username = format!("bootstrap-admin-{n}");
+    let username = format!("bootstrap-admin-{n}@example.com");
 
     // Pre-create a local user (a bootstrap admin) with this username.
     let local = user_dao::insert_user(
@@ -637,7 +637,8 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
 /// #123: while a credential-forwarding realm is enabled, the server sets
 /// `provision_namespace`, and a first OIDC login no longer takes the bare
 /// name a forwarded directory user signs in with later: the OIDC account is
-/// `{claim}@{realm}`, and the forwarded user gets their own name.
+/// `{local-part}+{realm}@{domain}`, still a UPN (#317), and the forwarded
+/// user gets their own name.
 #[tokio::test]
 async fn namespaced_provisioning_leaves_the_bare_name_to_a_forwarded_user() {
     use forge_core::auth::chain::provision_and_map;
@@ -646,7 +647,7 @@ async fn namespaced_provisioning_leaves_the_bare_name_to_a_forwarded_user() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
     let n = unique();
-    let username = format!("bob-{n}");
+    let username = format!("bob-{n}@example.com");
 
     let validated = run_login(&pool, &idp, &format!("sub-{n}"), &username, json!([])).await;
     let mapped = map_claims(&validated.claims, &admin_mapping());
@@ -657,7 +658,7 @@ async fn namespaced_provisioning_leaves_the_bare_name_to_a_forwarded_user() {
     let oidc_user = oidc::resolve_user(&pool, &validated, &mapped, &policy)
         .await
         .expect("provisioned");
-    assert_eq!(oidc_user.username, format!("{username}@entra"));
+    assert_eq!(oidc_user.username, format!("bob-{n}+entra@example.com"));
     assert_eq!(oidc_user.auth_source, "oidc");
     // The next login resolves the same account through its identity link.
     let again = oidc::resolve_user(&pool, &validated, &mapped, &policy)
@@ -687,12 +688,80 @@ async fn namespaced_provisioning_leaves_the_bare_name_to_a_forwarded_user() {
     assert_ne!(forwarded.user_id, oidc_user.id);
 }
 
+/// #317: a new account is named by a UPN. A username claim that is none
+/// refuses the login and names the claim; an identity linked before the rule
+/// keeps signing in to its (legacy-named) account.
+#[tokio::test]
+async fn provisioning_needs_a_upn_and_names_the_claim() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let username = format!("legacy-{n}");
+
+    let validated = run_login(&pool, &idp, &format!("sub-{n}"), &username, json!([])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    assert_eq!(mapped.username, username);
+    assert_eq!(mapped.username_claim, "preferred_username");
+    let err = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default())
+        .await
+        .expect_err("no account for a non-UPN name");
+    assert!(
+        matches!(&err, oidc::ResolveError::NotUpn { claim } if claim == "preferred_username"),
+        "{err:?}"
+    );
+    assert!(user_dao::find_user_by_username(&pool, &username)
+        .await
+        .unwrap()
+        .is_none());
+
+    // The same identity, linked before the rule to an account of that name,
+    // still resolves to it.
+    let legacy_id: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash, active, auth_source, external_subject) \
+         VALUES ($1, NULL, true, 'oidc', $2) RETURNING id",
+    )
+    .bind(&username)
+    .bind(format!("sub-{n}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    forge_db::external_identity_dao::link(
+        &pool,
+        legacy_id,
+        &validated.issuer,
+        &validated.subject,
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let user = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default())
+        .await
+        .expect("the linked account signs in");
+    assert_eq!(user.id, legacy_id);
+
+    // A claim chain that falls back to `sub` names it.
+    let mapping = ClaimMapping {
+        username_claim: "upn".into(),
+        ..admin_mapping()
+    };
+    let other = run_login(&pool, &idp, &format!("sub-other-{n}"), &username, json!([])).await;
+    let mapped = map_claims(&other.claims, &mapping);
+    assert_eq!(mapped.username_claim, "sub");
+    let err = oidc::resolve_user(&pool, &other, &mapped, &ResolvePolicy::default())
+        .await
+        .expect_err("`sub` is no UPN either");
+    assert!(
+        matches!(&err, oidc::ResolveError::NotUpn { claim } if claim == "sub"),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn resolve_user_links_passwordless_non_admin_when_enabled() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
     let n = unique();
-    let username = format!("linkable-{n}");
+    let username = format!("linkable-{n}@example.com");
 
     // A passwordless, non-admin account no other credential owns (an OIDC
     // account whose identity link was removed).
@@ -752,7 +821,7 @@ async fn resolve_user_never_links_upstream_or_already_linked_accounts() {
         provision_namespace: None,
     };
 
-    let upstream_name = format!("directory-{n}");
+    let upstream_name = format!("directory-{n}@example.com");
     let upstream = user_dao::insert_user(
         &pool,
         NewUser {
@@ -784,7 +853,7 @@ async fn resolve_user_never_links_upstream_or_already_linked_accounts() {
 
     // Victim signs in once (linked to sub-victim); an attacker whose IdP
     // account claims the same preferred_username gets a separate account.
-    let victim_name = format!("victim-{n}");
+    let victim_name = format!("victim-{n}@example.com");
     let v = run_login(
         &pool,
         &idp,
@@ -819,7 +888,7 @@ async fn resolve_user_demotion_removes_admin_role() {
     let idp = MockIdp::start().await;
     let n = unique();
     let sub = format!("sub-demote-{n}");
-    let username = format!("demote-{n}");
+    let username = format!("demote-{n}@example.com");
 
     let validated = run_login(&pool, &idp, &sub, &username, json!(["forge-admins"])).await;
     let mapped = map_claims(&validated.claims, &admin_mapping());
@@ -881,7 +950,7 @@ async fn resolve_user_rejects_inactive_linked_user() {
     let idp = MockIdp::start().await;
     let n = unique();
     let sub = format!("sub-{n}");
-    let username = format!("disabled-{n}");
+    let username = format!("disabled-{n}@example.com");
 
     // Provision via a first login, then deactivate the account locally; the
     // (issuer, subject) link finds it and the active check rejects the login.
@@ -917,7 +986,7 @@ async fn concurrent_first_logins_resolve_to_the_linked_account_without_orphans()
     for round in 0..3 {
         let n = unique();
         let sub = format!("sub-race-{n}");
-        let username = format!("racer-{n}");
+        let username = format!("racer-{n}@example.com");
         let validated = run_login(&pool, &idp, &sub, &username, json!([])).await;
         let mapped = map_claims(&validated.claims, &admin_mapping());
 
@@ -971,7 +1040,7 @@ async fn session_create_validate_revoke_round_trip() {
     let n = unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("sess-user-{n}"), "x".into(), true),
+        NewUser::local(format!("sess-user-{n}@example.com"), "x".into(), true),
     )
     .await
     .expect("user");
@@ -1020,7 +1089,7 @@ async fn session_rotate_issues_new_and_revokes_old() {
     let n = unique();
     let user = user_dao::insert_user(
         &pool,
-        NewUser::local(format!("rot-user-{n}"), "x".into(), true),
+        NewUser::local(format!("rot-user-{n}@example.com"), "x".into(), true),
     )
     .await
     .expect("user");

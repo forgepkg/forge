@@ -218,9 +218,64 @@ describe('admin users', () => {
     expect(signIn('svc')).toHaveTextContent('scim')
   })
 
+  it('marks local and identity-provider accounts without a UPN as legacy names', async () => {
+    mockApi({
+      users: [
+        user({ id: 2, username: 'root', auth_source: 'local' }),
+        user({ id: 3, username: 'alice@corp.example', auth_source: 'local' }),
+        user({ id: 4, username: 'bob', auth_source: 'oidc' }),
+        // A forwarded account keeps the name its upstream accepted.
+        user({ id: 5, username: 'carol', auth_source: 'upstream-basic' }),
+      ],
+    })
+
+    await renderAt('/manage/users')
+
+    await screen.findByText('alice@corp.example')
+    const row = (name: string) =>
+      within(screen.getByRole('button', { name }).closest('tr')!)
+    expect(row('root').getByText('legacy name')).toBeInTheDocument()
+    expect(row('bob').getByText('legacy name')).toBeInTheDocument()
+    expect(row('alice@corp.example').queryByText('legacy name')).toBeNull()
+    expect(row('carol').queryByText('legacy name')).toBeNull()
+  })
+
+  it('create-user asks for a UPN before it POSTs', async () => {
+    let posted = false
+    mockApi({
+      users: [],
+      onCreateUser: () => {
+        posted = true
+        return json(user({ id: 2, username: 'carol' }), 201)
+      },
+    })
+
+    const user_ = userEvent.setup()
+    await renderAt('/manage/users')
+
+    const username = await screen.findByLabelText('Username')
+    expect(username).toHaveAttribute('placeholder', 'alice@example.com')
+    await user_.type(username, 'carol')
+    await user_.type(screen.getByLabelText('Password'), 'hunter2')
+
+    expect(
+      screen.getByText('The username must be a UPN such as alice@example.com.'),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Create user' })).toBeDisabled()
+
+    await user_.type(username, '@example')
+    expect(screen.getByRole('button', { name: 'Create user' })).toBeDisabled()
+    await user_.type(username, '.com')
+    expect(
+      screen.queryByText('The username must be a UPN such as alice@example.com.'),
+    ).toBeNull()
+    expect(screen.getByRole('button', { name: 'Create user' })).toBeEnabled()
+    expect(posted).toBe(false)
+  })
+
   it('create-user POSTs the right body and re-fetches the list', async () => {
     let posted: unknown = null
-    const usersAfter = [user({ id: 2, username: 'carol' })]
+    const usersAfter = [user({ id: 2, username: 'carol@example.com' })]
     mockApi({
       users: [],
       onCreateUser: (body) => {
@@ -234,7 +289,7 @@ describe('admin users', () => {
     const user_ = userEvent.setup()
     await renderAt('/manage/users')
 
-    await user_.type(await screen.findByLabelText('Username'), 'carol')
+    await user_.type(await screen.findByLabelText('Username'), 'carol@example.com')
     // A password manager must not offer the admin's own password here.
     expect(screen.getByLabelText('Password')).toHaveAttribute(
       'autocomplete',
@@ -245,13 +300,13 @@ describe('admin users', () => {
 
     await waitFor(() => expect(posted).not.toBeNull())
     expect(posted).toEqual({
-      username: 'carol',
+      username: 'carol@example.com',
       password: 'hunter2',
       is_admin: false,
       active: true,
     })
     // List invalidation re-fetched and shows the new user.
-    expect(await screen.findByText('carol')).toBeInTheDocument()
+    expect(await screen.findByText('carol@example.com')).toBeInTheDocument()
   })
 
   it('delete-user confirms then DELETEs and re-fetches', async () => {

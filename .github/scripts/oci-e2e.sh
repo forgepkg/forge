@@ -31,6 +31,7 @@ buildkit_image="${FORGE_E2E_BUILDKIT_IMAGE:-mirror.gcr.io/moby/buildkit:buildx-s
 conformance_rev=97274622c11112caa21efb8c52acca3c6b8fa7f1
 registry=localhost:8421
 base="http://$registry"
+admin_user="admin@example.com"
 admin_password="e2e-$(openssl rand -hex 12)"
 
 work=$(mktemp -d)
@@ -65,7 +66,7 @@ force_path_style = true
 [auth]
 anonymous_mode = "off"
 [auth.bootstrap_admin]
-username = "admin"
+username = "$admin_user"
 password = "$admin_password"
 [outbox]
 grace_seconds = 0
@@ -83,7 +84,7 @@ curl -fsS "$base/readyz" >/dev/null || { cat "$work/server.log"; fail "server no
 
 step "create repositories and an API token"
 login=$(curl -fsS -c "$work/jar" -H 'content-type: application/json' \
-  -d "{\"username\":\"admin\",\"password\":\"$admin_password\"}" "$base/auth/login")
+  -d "{\"username\":\"$admin_user\",\"password\":\"$admin_password\"}" "$base/auth/login")
 csrf=$(jq -r .csrf_token <<<"$login")
 admin() { # <method> <path> [json body]
   curl -fsS -b "$work/jar" -H "x-csrf-token: $csrf" -H 'content-type: application/json' \
@@ -104,7 +105,7 @@ git -C "$work/distribution-spec" checkout -q "$conformance_rev"
   cd "$work"
   OCI_REGISTRY=$registry OCI_TLS=disabled \
     OCI_REPO1=docker-hosted/conformance/repo1 OCI_REPO2=docker-hosted/conformance/repo2 \
-    OCI_USERNAME=admin OCI_PASSWORD="$token" \
+    OCI_USERNAME="$admin_user" OCI_PASSWORD="$token" \
     OCI_API_BLOBS_UPLOAD_CANCEL=true OCI_API_MANIFESTS_TAG_PARAM=true \
     OCI_RESULTS_DIR="$results/conformance" OCI_LOG=warn \
     ./conformance
@@ -112,7 +113,7 @@ git -C "$work/distribution-spec" checkout -q "$conformance_rev"
 grep -q '^OCI Conformance Test: Pass' "$results/conformance.txt" || fail "conformance"
 
 step "docker: login, multi-arch push, pull"
-echo "$token" | docker login "$registry" -u admin --password-stdin
+echo "$token" | docker login "$registry" -u "$admin_user" --password-stdin
 mkdir -p "$work/ctx"
 echo "built by forge e2e" > "$work/ctx/hello.txt"
 printf 'FROM scratch\nCOPY hello.txt /hello.txt\n' > "$work/ctx/Dockerfile"
@@ -123,7 +124,7 @@ docker buildx build --platform linux/amd64,linux/arm64 --provenance=false -t "$i
 docker pull "$image"
 
 step "crane: ls, manifest, copy"
-crane auth login "$registry" -u admin -p "$token" --insecure
+crane auth login "$registry" -u "$admin_user" -p "$token" --insecure
 platforms=$(crane manifest --insecure "$image" | jq -r '[.manifests[].platform | .os + "/" + .architecture] | sort | join(",")')
 [ "$platforms" = "linux/amd64,linux/arm64" ] || fail "multi-arch index platforms: $platforms"
 crane ls --insecure "$registry/docker-hosted/e2e/multi" | grep -qx 1 || fail "crane ls"
@@ -157,7 +158,7 @@ offline=(--tlog-upload=false --use-signing-config=false --allow-insecure-registr
 cosign sign --key "$work/cosign.key" "${offline[@]}" "$signed"
 cosign attest --key "$work/cosign.key" "${offline[@]}" \
   --type slsaprovenance --predicate "$work/predicate.json" "$signed"
-pull_token=$(curl -fsS -u "admin:$token" "$base/v2/token?scope=repository:docker-hosted/e2e/multi:pull" | jq -r .token)
+pull_token=$(curl -fsS -u "$admin_user:$token" "$base/v2/token?scope=repository:docker-hosted/e2e/multi:pull" | jq -r .token)
 referrers=$(curl -fsS -H "Authorization: Bearer $pull_token" "$base/v2/docker-hosted/e2e/multi/referrers/$digest")
 echo "$referrers" | jq -c '.manifests[] | {artifactType, predicate: .annotations["dev.sigstore.bundle.predicateType"]}'
 predicates=$(jq -r '[.manifests[].annotations["dev.sigstore.bundle.predicateType"]] | sort | join(",")' <<<"$referrers")

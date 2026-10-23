@@ -39,15 +39,21 @@ interface LoginSearch {
   logout_failed?: boolean
   /** Set when the server's OIDC callback sent the browser back here. */
   error?: LoginError
+  /**
+   * With `username_not_upn`: the realm claim the username came from. Shown
+   * only when it looks like a claim name (the URL is anyone's to craft).
+   */
+  claim?: string
 }
 
 /**
  * Why an OIDC sign-in ended back here (`/login?error=...`): `oidc_failed`
  * when the callback did not validate (or the IdP returned an error),
- * `not_permitted` when the account may not sign in. Any other value is
- * `other`; the raw parameter is never shown.
+ * `not_permitted` when the account may not sign in, `username_not_upn` when
+ * a new account would be named by a claim that does not hold a UPN. Any
+ * other value is `other`; the raw parameter is never shown.
  */
-type LoginError = 'oidc_failed' | 'not_permitted' | 'other'
+type LoginError = 'oidc_failed' | 'not_permitted' | 'username_not_upn' | 'other'
 
 /** Generic on purpose: IdP details stay in the server log. */
 const loginErrorMessages: Record<LoginError, string> = {
@@ -55,13 +61,26 @@ const loginErrorMessages: Record<LoginError, string> = {
     'Sign-in with your identity provider did not complete. Try again; if it keeps failing, ask your administrator.',
   not_permitted:
     'Your account is not permitted to sign in to Forge. Ask your administrator for access.',
+  username_not_upn:
+    'Forge names new accounts by a UPN such as alice@example.com, and your identity provider did not send one. Ask your administrator to map a claim that holds it.',
   other:
     'Sign-in did not complete. Try again; if it keeps failing, ask your administrator.',
 }
 
 function parseLoginError(raw: unknown): LoginError | undefined {
   if (raw === undefined || raw === null || raw === '') return undefined
-  return raw === 'oidc_failed' || raw === 'not_permitted' ? raw : 'other'
+  return raw === 'oidc_failed' ||
+    raw === 'not_permitted' ||
+    raw === 'username_not_upn'
+    ? raw
+    : 'other'
+}
+
+/** A claim name worth showing: short, and nothing but name characters. */
+function parseClaim(raw: unknown): string | undefined {
+  return typeof raw === 'string' && /^[A-Za-z0-9_.:/-]{1,64}$/.test(raw)
+    ? raw
+    : undefined
 }
 
 const passwordFallbackOptions: LoginOptions = {
@@ -78,6 +97,7 @@ export const Route = createFileRoute('/login')({
     logout_failed:
       search.logout_failed === true || search.logout_failed === 'true',
     error: parseLoginError(search.error),
+    claim: parseClaim(search.claim),
   }),
 })
 
@@ -101,7 +121,7 @@ export const Route = createFileRoute('/login')({
  * the Tokens screen for NuGet clients only.
  */
 function Login() {
-  const { redirect, expired, logout_failed, error } = useSearch({
+  const { redirect, expired, logout_failed, error, claim } = useSearch({
     from: '/login',
   })
   const options = useQuery<LoginOptions, ApiError>({
@@ -134,6 +154,11 @@ function Login() {
             className="space-y-1 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm/6 text-red-700 dark:text-red-400"
           >
             <p>{loginErrorMessages[error]}</p>
+            {error === 'username_not_upn' && claim && (
+              <p>
+                The username came from the <code>{claim}</code> claim.
+              </p>
+            )}
             <Link
               to="/login"
               search={{ redirect }}

@@ -3,7 +3,12 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
 import { ADMIN_ROLE } from '~/api/rbac'
-import { authSourceLabel, type UserView } from '~/api/users'
+import {
+  authSourceLabel,
+  isUpn,
+  upnError,
+  type UserView,
+} from '~/api/users'
 import {
   PartialCreate,
   useCreateUser,
@@ -20,6 +25,7 @@ import {
 } from '~/components/catalyst/checkbox'
 import {
   Description,
+  ErrorMessage,
   Field,
   Fieldset,
   Label,
@@ -50,7 +56,8 @@ export const Route = createFileRoute('/_app/manage/users')({
  * their active flag, offers an inline create form (`CreateUser`, then the
  * chosen roles), links each user to its roles-and-tokens screen, and deletes
  * with a confirm step. There is no edit-in-place beyond create/delete + the
- * per-user screen.
+ * per-user screen. A new account is named by a UPN; one created before that
+ * rule (`alice`) is marked "legacy name".
  */
 function UsersList() {
   const users = useUsers()
@@ -166,6 +173,15 @@ function UserRow({
         >
           {user.username}
         </button>
+        {!isUpn(user.username) && user.auth_source !== 'upstream-basic' && (
+          <Badge
+            color="amber"
+            className="ml-2"
+            title="Created before Forge named new accounts by a UPN (alice@example.com). It keeps signing in."
+          >
+            legacy name
+          </Badge>
+        )}
       </TableCell>
       <TableCell>{authSourceLabel(user.auth_source)}</TableCell>
       <TableCell>
@@ -267,15 +283,19 @@ function RoleBadges({
 /**
  * Inline create-user form. Controlled state (matching the codebase's Login /
  * RepositoryForm pattern); on success the fields reset so several users can be
- * added in a row. The username/password requirements mirror the server's 400s.
+ * added in a row. The username/password requirements mirror the server's 400s:
+ * the username is a UPN (`upnError`), checked once the field was left.
  */
 function CreateUserForm() {
   const create = useCreateUser()
   const roles = useRoles()
   const [username, setUsername] = useState('')
+  const [usernameTouched, setUsernameTouched] = useState(false)
   const [password, setPassword] = useState('')
   const [chosen, setChosen] = useState<ReadonlySet<number>>(new Set())
   const [active, setActive] = useState(true)
+  const usernameError = username.trim() ? upnError(username) : null
+  const showUsernameError = usernameTouched && usernameError !== null
 
   function toggle(id: number, on: boolean) {
     setChosen((prev) => {
@@ -289,6 +309,10 @@ function CreateUserForm() {
   function submit(e: React.FormEvent) {
     e.preventDefault()
     if (!username.trim() || !password) return
+    if (usernameError) {
+      setUsernameTouched(true)
+      return
+    }
     create.mutate(
       {
         body: { username: username.trim(), password, active },
@@ -298,6 +322,7 @@ function CreateUserForm() {
         onSettled: (created, error) => {
           if (!created && !(error instanceof PartialCreate)) return
           setUsername('')
+          setUsernameTouched(false)
           setPassword('')
           setChosen(new Set())
           setActive(true)
@@ -317,9 +342,14 @@ function CreateUserForm() {
           <Label>Username</Label>
           <Input
             type="text"
+            autoComplete="off"
+            placeholder="alice@example.com"
             value={username}
+            invalid={showUsernameError}
             onChange={(e) => setUsername(e.target.value)}
+            onBlur={() => setUsernameTouched(true)}
           />
+          {showUsernameError && <ErrorMessage>{usernameError}</ErrorMessage>}
         </Field>
         <Field>
           <Label>Password</Label>
@@ -368,7 +398,9 @@ function CreateUserForm() {
       )}
       <Button
         type="submit"
-        disabled={create.isPending || !username.trim() || !password}
+        disabled={
+          create.isPending || !username.trim() || !password || !!usernameError
+        }
       >
         {create.isPending ? 'Creating…' : 'Create user'}
       </Button>

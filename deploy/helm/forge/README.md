@@ -78,6 +78,8 @@ networkPolicy:
 config:
   auth:
     trusted_proxy_cidrs: [10.0.0.0/8]   # the gateway's pod network
+    bootstrap_admin:
+      username: admin@example.com       # a UPN of your organization
   s3:
     endpoint: https://s3.eu-central-1.amazonaws.com
     region: eu-central-1
@@ -290,12 +292,14 @@ password=$(openssl rand -hex 12); echo "admin password: $password"
 helm install forge oci://ghcr.io/forgepkg/charts/forge --version 1.2.0 \
   --namespace forge-eval --create-namespace \
   --set postgresql.enabled=true --set versitygw.enabled=true \
+  --set config.auth.bootstrap_admin.username=admin@example.com \
   --set secretEnv.FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD="$password"
 kubectl -n forge-eval rollout status deployment/forge
 kubectl -n forge-eval port-forward svc/forge 8421
 ```
 
-Open http://localhost:8421 and sign in as `admin` with that password.
+Open http://localhost:8421 and sign in as `admin@example.com` with that
+password. The bootstrap admin is named by a UPN and has no default name.
 
 ## Checking changes
 

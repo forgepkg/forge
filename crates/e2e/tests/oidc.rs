@@ -42,7 +42,7 @@ async fn start_oidc_stack(idp: &MockOidc) -> TestServer {
     let issuer = idp.issuer().to_string();
     let client_id = CLIENT_ID.to_string();
     StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_oidc(move |base| oidc_block(&issuer, &client_id, base))
         .start()
         .await
@@ -171,8 +171,13 @@ async fn login_callback_creates_session_and_me_shows_user() {
 
     let (state, nonce) = begin_login(&srv).await;
     // Mark the user an admin via the roles claim → is_admin.
-    idp.set_next_id_token(idp.id_claims("sub-alice", "alice", &nonce, json!(["forge-admins"])))
-        .await;
+    idp.set_next_id_token(idp.id_claims(
+        "sub-alice",
+        "alice@example.com",
+        &nonce,
+        json!(["forge-admins"]),
+    ))
+    .await;
 
     let resp = callback(&srv, &state).await;
     assert_eq!(resp.status(), 302);
@@ -199,7 +204,7 @@ async fn login_callback_creates_session_and_me_shows_user() {
         .json()
         .await
         .unwrap();
-    assert_eq!(me["username"], json!("alice"));
+    assert_eq!(me["username"], json!("alice@example.com"));
     assert_eq!(me["is_admin"], json!(true), "roles claim granted admin");
     assert!(me["csrf_token"].as_str().is_some_and(|s| !s.is_empty()));
 }
@@ -218,13 +223,13 @@ async fn unknown_and_replayed_state_rejected() {
 
     // A once-used state cannot be replayed (the row is consumed single-use).
     let (state, nonce) = begin_login(&srv).await;
-    idp.set_next_id_token(idp.id_claims("sub-bob", "bob", &nonce, json!([])))
+    idp.set_next_id_token(idp.id_claims("sub-bob", "bob@example.com", &nonce, json!([])))
         .await;
     let first = callback(&srv, &state).await;
     assert_eq!(first.status(), 302, "first callback succeeds");
     assert!(sets_session_cookie(&first), "first callback succeeds");
     // Replay the same state → the flow row is gone → refused.
-    idp.set_next_id_token(idp.id_claims("sub-bob", "bob", &nonce, json!([])))
+    idp.set_next_id_token(idp.id_claims("sub-bob", "bob@example.com", &nonce, json!([])))
         .await;
     let replay = callback(&srv, &state).await;
     assert!(refused_to_login_page(&replay), "replayed state rejected");
@@ -238,8 +243,13 @@ async fn nonce_mismatch_rejected() {
 
     let (state, _real_nonce) = begin_login(&srv).await;
     // The IdP issues a token with a WRONG nonce → verification fails.
-    idp.set_next_id_token(idp.id_claims("sub-carol", "carol", "not-the-nonce", json!([])))
-        .await;
+    idp.set_next_id_token(idp.id_claims(
+        "sub-carol",
+        "carol@example.com",
+        "not-the-nonce",
+        json!([]),
+    ))
+    .await;
     let resp = callback(&srv, &state).await;
     assert!(refused_to_login_page(&resp), "nonce mismatch rejected");
     assert!(!sets_session_cookie(&resp));
@@ -261,7 +271,7 @@ async fn callback_completed_by_different_instance_succeeds() {
         .await;
 
     let (state, nonce) = begin_login(&srv_a).await;
-    idp.set_next_id_token(idp.id_claims("sub-dave", "dave", &nonce, json!([])))
+    idp.set_next_id_token(idp.id_claims("sub-dave", "dave@example.com", &nonce, json!([])))
         .await;
 
     // The callback lands on B — which never saw the login leg. It consumes the
@@ -295,7 +305,7 @@ async fn callback_completed_by_different_instance_succeeds() {
             "instance {label} recognises the cross-instance session"
         );
         let me: Value = resp.json().await.unwrap();
-        assert_eq!(me["username"], json!("dave"));
+        assert_eq!(me["username"], json!("dave@example.com"));
     }
 }
 
@@ -312,7 +322,7 @@ async fn logout_revokes_session_everywhere() {
         .await;
 
     let (state, nonce) = begin_login(&srv_a).await;
-    idp.set_next_id_token(idp.id_claims("sub-erin", "erin", &nonce, json!([])))
+    idp.set_next_id_token(idp.id_claims("sub-erin", "erin@example.com", &nonce, json!([])))
         .await;
     let resp = callback(&srv_a, &state).await;
     let cookie = session_cookie_from(resp.headers().get("set-cookie").unwrap().to_str().unwrap());
@@ -362,7 +372,7 @@ async fn jwks_rotation_kid_miss_refetch_then_retired_key_rejected() {
 
     // First login warms the JWKS cache with key "k1".
     let (state, nonce) = begin_login(&srv).await;
-    idp.set_next_id_token(idp.id_claims("sub-grace", "grace", &nonce, json!([])))
+    idp.set_next_id_token(idp.id_claims("sub-grace", "grace@example.com", &nonce, json!([])))
         .await;
     assert!(
         sets_session_cookie(&callback(&srv, &state).await),
@@ -374,7 +384,7 @@ async fn jwks_rotation_kid_miss_refetch_then_retired_key_rejected() {
 
     // A token signed with the NEW key validates via the kid-miss forced refetch.
     let (state, nonce) = begin_login(&srv).await;
-    idp.set_next_id_token(idp.id_claims("sub-grace", "grace", &nonce, json!([])))
+    idp.set_next_id_token(idp.id_claims("sub-grace", "grace@example.com", &nonce, json!([])))
         .await;
     let resp = callback(&srv, &state).await;
     assert!(
@@ -384,8 +394,13 @@ async fn jwks_rotation_kid_miss_refetch_then_retired_key_rejected() {
 
     // A token signed with a key whose kid is NOT in the JWKS is rejected.
     let (state, nonce) = begin_login(&srv).await;
-    idp.set_next_id_token_with_unknown_key(idp.id_claims("sub-grace", "grace", &nonce, json!([])))
-        .await;
+    idp.set_next_id_token_with_unknown_key(idp.id_claims(
+        "sub-grace",
+        "grace@example.com",
+        &nonce,
+        json!([]),
+    ))
+    .await;
     let resp = callback(&srv, &state).await;
     assert!(
         refused_to_login_page(&resp),
@@ -402,8 +417,13 @@ async fn session_minted_token_authenticates_nuget_endpoint() {
 
     // Log in as an admin (so the minted token can publish + read).
     let (state, nonce) = begin_login(&srv).await;
-    idp.set_next_id_token(idp.id_claims("sub-frank", "frank", &nonce, json!(["forge-admins"])))
-        .await;
+    idp.set_next_id_token(idp.id_claims(
+        "sub-frank",
+        "frank@example.com",
+        &nonce,
+        json!(["forge-admins"]),
+    ))
+    .await;
     let resp = callback(&srv, &state).await;
     let cookie = session_cookie_from(resp.headers().get("set-cookie").unwrap().to_str().unwrap());
     let me: Value = no_redirect_client()
@@ -483,13 +503,13 @@ async fn short_ttl_session_is_rejected_after_it_lapses() {
     // Idle TTL of 1s: the session is valid right after login but lapses within a
     // second. (Absolute TTL is comfortably long so we isolate the idle path.)
     let srv = StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_oidc(move |base| oidc_block_with_ttls(&issuer, &client_id, base, 1, 604800))
         .start()
         .await;
 
     let (state, nonce) = begin_login(&srv).await;
-    idp.set_next_id_token(idp.id_claims("sub-heidi", "heidi", &nonce, json!([])))
+    idp.set_next_id_token(idp.id_claims("sub-heidi", "heidi@example.com", &nonce, json!([])))
         .await;
     let resp = callback(&srv, &state).await;
     assert_eq!(resp.status(), 302, "login succeeds");
@@ -555,7 +575,7 @@ async fn reaper_removes_expired_flows_and_sessions_keeps_valid() {
     // for a deterministic test), exercising the exact DAO calls the loop runs
     // against a real migrated Postgres + a running server instance.
     let srv = StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .workers(true)
         .with_oidc({
             let issuer = idp.issuer().to_string();
@@ -591,7 +611,7 @@ async fn reaper_removes_expired_flows_and_sessions_keeps_valid() {
 
     // --- session: one live row (via a real login) + one expired + one revoked. ---
     let (state, nonce) = begin_login(&srv).await;
-    idp.set_next_id_token(idp.id_claims("sub-ivan", "ivan", &nonce, json!([])))
+    idp.set_next_id_token(idp.id_claims("sub-ivan", "ivan@example.com", &nonce, json!([])))
         .await;
     let resp = callback(&srv, &state).await;
     assert_eq!(resp.status(), 302, "live-session login succeeds");

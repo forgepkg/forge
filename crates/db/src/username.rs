@@ -16,6 +16,14 @@
 //! A name that signs in with a password must also fit in an HTTP Basic
 //! `user-id` ([`canonical_password_username`]), which cannot hold a `:`.
 //!
+//! A **new** account is named by a UPN, `local-part@domain` ([`is_upn`],
+//! [`canonical_account_username`]): the name says which organization the
+//! account belongs to, two organizations' `alice` cannot collide, and it is
+//! the name Entra and Active Directory sign the person in with. Accounts
+//! created before that rule (`alice`, `admin`) keep their names, and lookups
+//! of stored rows never apply it. A credential-forwarding account keeps the
+//! name its upstream accepted ([`canonical_forwarded_username`]).
+//!
 //! A directory behind a credential-forwarding realm may fold more than this
 //! canonical form does (LDAP's `caseIgnoreMatch` and Active Directory ignore
 //! letter width, drop soft hyphens, ...). [`may_alias_upstream`] names the
@@ -27,6 +35,7 @@
 //! ([`canonical_account_username`]), and no password login is attempted for
 //! one.
 
+use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
 /// Longest accepted username, in bytes of its canonical form (the login
@@ -70,6 +79,10 @@ pub enum InvalidUsername {
     /// ([`canonical_account_username`]).
     #[error("username is reserved")]
     Reserved,
+    /// Not a UPN ([`is_upn`]), refused for a new account
+    /// ([`canonical_account_username`]).
+    #[error("username must be a UPN such as alice@example.com")]
+    NotUpn,
 }
 
 /// The canonical form of `raw` (see the [module docs](self)).
@@ -106,10 +119,12 @@ pub fn canonical_password_username(raw: &str) -> Result<String, InvalidUsername>
     Ok(canonical)
 }
 
-/// The canonical name for a **new** account: [`canonical_password_username`]
-/// when the account signs in with a password (`with_password`), else
-/// [`canonical_username`]; either way a [reserved](RESERVED_USERNAMES) name is
-/// refused. Lookups of existing rows keep using [`canonical_username`].
+/// The canonical name for a **new** local or `oidc`-provisioned account:
+/// [`canonical_password_username`] when the account signs in with a password
+/// (`with_password`), else [`canonical_username`]; either way a
+/// [reserved](RESERVED_USERNAMES) name is refused, and the name must be a UPN
+/// ([`is_upn`]). Lookups of existing rows keep using [`canonical_username`],
+/// so an account created before the UPN rule keeps signing in.
 pub fn canonical_account_username(
     raw: &str,
     with_password: bool,
@@ -122,7 +137,66 @@ pub fn canonical_account_username(
     if is_reserved_username(&canonical) {
         return Err(InvalidUsername::Reserved);
     }
+    if !is_upn(&canonical) {
+        return Err(InvalidUsername::NotUpn);
+    }
     Ok(canonical)
+}
+
+/// The canonical name for a new account a credential-forwarding realm
+/// provisions: [`canonical_password_username`], and never a
+/// [reserved](RESERVED_USERNAMES) name, but not necessarily a UPN. The account
+/// keeps the name the upstream accepted: rewriting it before or after
+/// forwarding would give one upstream account a second spelling (see
+/// [`may_alias_upstream`]).
+pub fn canonical_forwarded_username(raw: &str) -> Result<String, InvalidUsername> {
+    let canonical = canonical_password_username(raw)?;
+    if is_reserved_username(&canonical) {
+        return Err(InvalidUsername::Reserved);
+    }
+    Ok(canonical)
+}
+
+/// Longest DNS label of a UPN's domain, in characters.
+const MAX_DOMAIN_LABEL_CHARS: usize = 63;
+
+/// Whether the canonical `name` is a UPN, `local-part@domain`:
+///
+/// * exactly one `@`;
+/// * a non-empty local part without whitespace;
+/// * a domain that is a DNS name of at least two labels, without a trailing
+///   dot. Each label is 1 to 63 characters of letters, digits and `-`, and
+///   does not start or end with `-`; the last one is not all digits (so an
+///   IPv4 address is not a domain).
+///
+/// A Unicode domain counts in its canonical form (NFC, lowercased, as
+/// [`canonical_username`] leaves it), an `xn--` A-label as written.
+pub fn is_upn(name: &str) -> bool {
+    let mut parts = name.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if local.is_empty() || local.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|label| is_domain_label(label))
+        && !labels
+            .last()
+            .is_some_and(|tld| tld.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// One label of a UPN's domain (see [`is_upn`]). A letter is any Unicode
+/// letter, with the combining marks many scripts write theirs with.
+fn is_domain_label(label: &str) -> bool {
+    let len = label.chars().count();
+    (1..=MAX_DOMAIN_LABEL_CHARS).contains(&len)
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|c| c == '-' || c.is_alphanumeric() || is_combining_mark(c))
 }
 
 /// Whether a canonical `name` may stand for another account in a directory
@@ -261,17 +335,132 @@ mod tests {
             assert_eq!(canonical_username(raw).unwrap(), WORKLOAD_USERNAME);
         }
         assert_eq!(
-            canonical_account_username(" Alice ", true).unwrap(),
-            "alice"
+            canonical_account_username(" Alice@Example.COM ", true).unwrap(),
+            "alice@example.com"
         );
         assert_eq!(
-            canonical_account_username("oidc-2", false).unwrap(),
-            "oidc-2"
+            canonical_account_username("oidc-2@example.com", false).unwrap(),
+            "oidc-2@example.com"
         );
         // The password rules still apply first.
         assert_eq!(
             canonical_account_username("oidc:x", true),
             Err(InvalidUsername::Colon)
+        );
+    }
+
+    #[test]
+    fn new_accounts_need_a_upn() {
+        for raw in ["alice", "admin", "corp\\alice", "alice@corp"] {
+            for with_password in [true, false] {
+                assert_eq!(
+                    canonical_account_username(raw, with_password),
+                    Err(InvalidUsername::NotUpn),
+                    "{raw:?}"
+                );
+            }
+            // Stored legacy names are still looked up.
+            assert!(canonical_username(raw).is_ok(), "{raw:?}");
+        }
+        assert_eq!(
+            InvalidUsername::NotUpn.to_string(),
+            "username must be a UPN such as alice@example.com"
+        );
+    }
+
+    #[test]
+    fn upns_accept_subdomains_unicode_and_a_labels() {
+        for raw in [
+            "alice@example.com",
+            "alice.smith@corp.example.com",
+            "a@b.c",
+            "first.last+ci@mail.example.org",
+            "o'brien@example.ie",
+            "x-1@a-b.example",
+            // A Unicode domain in canonical form, and written decomposed
+            // (canonicalization composes it).
+            "jürgen@müller.example",
+            "J\u{00FC}rgen@M\u{0075}\u{0308}ller.Example",
+            "ñandú@bücher.example",
+            "user@例え.テスト",
+            "user@उदाहरण.परीक्षा",
+            // An A-label as written.
+            "jürgen@xn--mller-kva.example",
+            "alice@xn--bcher-kva.xn--tckwe",
+        ] {
+            let canonical = canonical_username(raw).unwrap();
+            assert!(is_upn(&canonical), "{raw:?} -> {canonical:?}");
+            assert_eq!(canonical_account_username(raw, true).unwrap(), canonical);
+        }
+        let label = "a".repeat(MAX_DOMAIN_LABEL_CHARS);
+        assert!(is_upn(&format!("alice@{label}.example")));
+        let unicode_label = "ü".repeat(MAX_DOMAIN_LABEL_CHARS);
+        assert!(is_upn(&format!("alice@{unicode_label}.example")));
+    }
+
+    #[test]
+    fn upns_refuse_malformed_names() {
+        let long_label = "a".repeat(MAX_DOMAIN_LABEL_CHARS + 1);
+        for raw in [
+            // No `@`, or two.
+            "alice",
+            "alice.example.com",
+            "alice@corp@example.com",
+            "@@example.com",
+            // An empty local part or domain.
+            "@example.com",
+            "alice@",
+            // Whitespace in the local part.
+            "alice smith@example.com",
+            "alice\u{00A0}smith@example.com",
+            // A single-label domain.
+            "alice@localhost",
+            "alice@corp",
+            // A trailing dot, or an empty label.
+            "alice@example.com.",
+            "alice@.example.com",
+            "alice@example..com",
+            // A leading or trailing hyphen.
+            "alice@-corp.example",
+            "alice@corp-.example",
+            "alice@corp.-example",
+            "alice@corp.example-",
+            // A label over 63 characters.
+            &format!("alice@{long_label}.example"),
+            &format!("alice@corp.{long_label}"),
+            // Characters a DNS label cannot hold.
+            "alice@corp_1.example",
+            "alice@corp example.com",
+            "alice@[127.0.0.1]",
+            "alice@exa*mple.com",
+            // An IPv4 address is not a domain.
+            "alice@127.0.0.1",
+        ] {
+            let canonical = canonical_username(raw).unwrap();
+            assert!(!is_upn(&canonical), "{raw:?}");
+            assert_eq!(
+                canonical_account_username(raw, false),
+                Err(InvalidUsername::NotUpn),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_accounts_keep_the_upstream_name() {
+        for raw in ["alice", "corp\\alice", "alice@corp", "Alice@Corp.Example"] {
+            assert_eq!(
+                canonical_forwarded_username(raw).unwrap(),
+                canonical_username(raw).unwrap()
+            );
+        }
+        assert_eq!(
+            canonical_forwarded_username("mallory:abc"),
+            Err(InvalidUsername::Colon)
+        );
+        assert_eq!(
+            canonical_forwarded_username(" OIDC "),
+            Err(InvalidUsername::Reserved)
         );
     }
 

@@ -844,23 +844,24 @@ fn default_negative_ttl() -> u64 {
 /// `auth.bootstrap_admin.*`
 ///
 /// Configured entirely through the environment in the container image
-/// (`FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD`, optionally `…__USERNAME`). A block
+/// (`FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` and `…__PASSWORD`). A block
 /// **without a (non-blank) password means "no bootstrap admin"**: the loader
 /// drops it ([`Config::load`]), so removing the password once real admins
 /// exist is a normal configuration, not a startup error.
 #[derive(Clone, Deserialize)]
 pub struct BootstrapAdmin {
-    /// Admin username to create on first run if absent. Default `admin`.
-    #[serde(default = "default_bootstrap_username")]
-    pub username: String,
+    /// Admin username to create on first run if absent: a UPN such as
+    /// `admin@example.com`. There is no default. While the account still has
+    /// to be created, startup refuses a missing or non-UPN name
+    /// ([`crate::app::ensure_bootstrap_admin`]); an install whose bootstrap
+    /// admin exists already (the name defaulted to `admin` before 1.2) keeps
+    /// it.
+    #[serde(default)]
+    pub username: Option<String>,
     /// Plaintext password (hashed with argon2id on creation). Required for the
     /// bootstrap admin to exist; **redacted** from `Debug`.
     #[serde(default)]
     pub password: String,
-}
-
-fn default_bootstrap_username() -> String {
-    "admin".into()
 }
 
 /// Manual `Debug` that **redacts the password**.
@@ -2212,10 +2213,17 @@ impl Config {
             self.auth.bootstrap_admin = None;
         }
         // The account is stored and looked up by its canonical username;
-        // `validate` reports a name that has none.
+        // `validate` reports a name that has none. A blank name is no name.
         if let Some(ba) = self.auth.bootstrap_admin.as_mut() {
-            if let Ok(canonical) = forge_core::auth::canonical_username(&ba.username) {
-                ba.username = canonical;
+            if ba.username.as_deref().is_some_and(|u| u.trim().is_empty()) {
+                ba.username = None;
+            }
+            if let Some(canonical) = ba
+                .username
+                .as_deref()
+                .and_then(|u| forge_core::auth::canonical_username(u).ok())
+            {
+                ba.username = Some(canonical);
             }
         }
         if self
@@ -2265,18 +2273,34 @@ impl Config {
         self.trusted_proxy_cidrs()?;
         self.validate_oidc()?;
         self.validate_auth_providers()?;
-        if let Some(ba) = &self.auth.bootstrap_admin {
+        if let Some(username) = self
+            .auth
+            .bootstrap_admin
+            .as_ref()
+            .and_then(|ba| ba.username.as_deref())
+        {
             // A local password account: its name must be one a password
-            // login accepts (no `:`) and not a reserved protocol name.
-            forge_core::auth::canonical_account_username(&ba.username, true).map_err(|e| {
-                ConfigError::Invalid(match e {
-                    forge_core::auth::InvalidUsername::Reserved => format!(
-                        "auth.bootstrap_admin.username: {:?} is reserved for workload identity",
-                        ba.username.trim()
-                    ),
-                    e => format!("auth.bootstrap_admin.username: {e}"),
+            // login accepts (no `:`) and not a reserved protocol name. Whether
+            // it must also be a UPN depends on whether the account exists
+            // already, which only the database knows
+            // ([`crate::app::ensure_bootstrap_admin`]).
+            forge_core::auth::canonical_password_username(username)
+                .and_then(|canonical| {
+                    if forge_core::auth::is_reserved_username(&canonical) {
+                        Err(forge_core::auth::InvalidUsername::Reserved)
+                    } else {
+                        Ok(canonical)
+                    }
                 })
-            })?;
+                .map_err(|e| {
+                    ConfigError::Invalid(match e {
+                        forge_core::auth::InvalidUsername::Reserved => format!(
+                            "auth.bootstrap_admin.username: {:?} is reserved for workload identity",
+                            username.trim()
+                        ),
+                        e => format!("auth.bootstrap_admin.username: {e}"),
+                    })
+                })?;
         }
         match self.auth.login_mode.as_str() {
             "identifier_first" | "combined" => {}
@@ -3265,7 +3289,7 @@ mod tests {
                 .bootstrap_admin
                 .as_ref()
                 .expect("bootstrap admin set via env");
-            assert_eq!(ba.username, "root");
+            assert_eq!(ba.username.as_deref(), Some("root"));
             assert_eq!(ba.password, "s3cret");
             assert_eq!(cfg.redis.url.as_deref(), Some("redis://localhost:6379"));
             assert_eq!(cfg.cache.l1_max_capacity, 42);
@@ -4383,11 +4407,11 @@ mod tests {
     fn bootstrap_admin_parsed() {
         let toml = MINIMAL.replace(
             "[auth]",
-            "[auth]\n[auth.bootstrap_admin]\nusername = \"admin\"\npassword = \"s3cret-Pw!\"",
+            "[auth]\n[auth.bootstrap_admin]\nusername = \" Admin@Example.COM \"\npassword = \"s3cret-Pw!\"",
         );
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
         let ba = cfg.auth.bootstrap_admin.expect("present");
-        assert_eq!(ba.username, "admin");
+        assert_eq!(ba.username.as_deref(), Some("admin@example.com"));
         assert_eq!(ba.password, "s3cret-Pw!");
         assert!(!cfg.server.allow_insecure_defaults, "off by default");
     }
@@ -4483,12 +4507,18 @@ mod tests {
             jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", "admin");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("starts");
             assert!(cfg.auth.bootstrap_admin.is_none());
-            // Password only: the username defaults to `admin`.
+            // Password only: there is no default name (startup refuses it
+            // only while the account still has to be created).
             jail.clear_env();
             jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD", "Real-Pw-1");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("starts");
             let ba = cfg.auth.bootstrap_admin.expect("bootstrap admin from env");
-            assert_eq!(ba.username, "admin");
+            assert_eq!(ba.username, None);
+            // A blank name is no name.
+            jail.set_env("FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME", " ");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("starts");
+            let ba = cfg.auth.bootstrap_admin.expect("bootstrap admin from env");
+            assert_eq!(ba.username, None);
             assert_eq!(ba.password, "Real-Pw-1");
             assert!(!format!("{ba:?}").contains("Real-Pw-1"), "Debug redacts");
             Ok(())
@@ -4519,8 +4549,8 @@ mod tests {
                 .bootstrap_admin
                 .expect("env-driven bootstrap admin");
             assert_eq!(
-                (ba.username.as_str(), ba.password.as_str()),
-                ("admin", "First-Run-Pw")
+                (ba.username.as_deref(), ba.password.as_str()),
+                (None, "First-Run-Pw")
             );
             Ok(())
         });

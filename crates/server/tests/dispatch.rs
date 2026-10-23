@@ -54,7 +54,7 @@ async fn unknown_repo_answers_like_a_denied_one() {
     let user = forge_db::user_dao::insert_user(
         &srv.pool,
         forge_db::user_dao::NewUser::local(
-            format!("nogrants{}", common::unique()),
+            format!("nogrants{}@example.com", common::unique()),
             "$argon2id$unused".into(),
             true,
         ),
@@ -433,7 +433,10 @@ async fn anonymous_read_when_allowed() {
         common::pool().await,
         ServerOpts {
             anonymous_mode: "all".into(),
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )

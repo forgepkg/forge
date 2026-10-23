@@ -76,7 +76,7 @@ cargo xtask dev
 That one command uses your **local Postgres on :5432** (creating the `forge`
 role + database if missing), brings up an S3 gateway (**:8422**) via
 `docker-compose.yml`, runs migrations, and starts the Rust API on **:8421** plus
-Vite HMR on **:8420**. A bootstrap admin **`admin` / `changeme`** is created on
+Vite HMR on **:8420**. A bootstrap admin **`admin@example.com` / `changeme`** is created on
 first run (dev only: the bundled `forge.toml` sets
 `server.allow_insecure_defaults = true`; any other config refuses to start with
 the `changeme` password or `minioadmin` S3 keys). (Requires a running local PostgreSQL with permission to create the
@@ -123,6 +123,7 @@ docker run --rm -p 8421:8421 \
   -e FORGE_DATABASE__URL=postgres://forge:forge@db:5432/forge \
   -e FORGE_S3__ENDPOINT=http://s3:8422 -e FORGE_S3__BUCKET=forge \
   -e FORGE_S3__ACCESS_KEY=… -e FORGE_S3__SECRET_KEY=… \
+  -e FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME=admin@example.com \
   -e FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD=… \
   forge:latest
 ```
@@ -132,7 +133,8 @@ credentials (`minioadmin` S3 keys, a `changeme` bootstrap password). Instead
 of S3 keys it can use short-lived credentials from the platform's workload
 identity (IRSA, EKS Pod Identity, STS web identity; see
 [docs/deployment.md](docs/deployment.md#short-lived-s3-credentials)). It
-bakes no bootstrap admin: `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start, and
+bakes no bootstrap admin: `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start,
+named by `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` (a UPN such as `admin@example.com`), and
 once it is removed the image simply starts without one. It defaults to
 `anonymous_mode = "off"` (set `FORGE_AUTH__ANONYMOUS_MODE=all` for public reads)
 and `allow_password_basic = false` (clients use API tokens; see
@@ -146,7 +148,7 @@ dotnet nuget push -s forge -k <TOKEN> your.1.0.0.nupkg
 dotnet add package <PackageId>          # in a project
 ```
 
-For a non-anonymous repo, pass `--username admin --password <TOKEN>
+For a non-anonymous repo, pass `--username admin@example.com --password <TOKEN>
 --store-password-in-clear-text` to the source (the password is a **token**, not
 the user password).
 
@@ -156,7 +158,7 @@ Create a docker repository (`"format": "docker"`) under **Admin →
 Repositories**, then log in with an API token as the password:
 
 ```bash
-docker login localhost:8421 -u admin              # password: an API token
+docker login localhost:8421 -u admin@example.com  # password: an API token
 docker tag alpine:3.20 localhost:8421/docker-hosted/team/alpine:3.20
 docker push localhost:8421/docker-hosted/team/alpine:3.20
 docker pull localhost:8421/docker-hosted/team/alpine:3.20

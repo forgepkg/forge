@@ -42,7 +42,7 @@ const SERVER_PORT = 28421
 // daemon's host — set FORGE_E2E_DOCKER_HOST to it.
 const DOCKER_HOST_NAME = process.env.FORGE_E2E_DOCKER_HOST ?? '127.0.0.1'
 
-export const ADMIN_USER = 'admin'
+export const ADMIN_USER = 'admin@example.com'
 export const ADMIN_PASS = 'changeme'
 export const BASE_URL = `http://127.0.0.1:${SERVER_PORT}`
 

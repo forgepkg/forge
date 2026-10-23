@@ -109,7 +109,10 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             ..Default::default()
         },
     )

@@ -27,7 +27,10 @@ async fn a_refused_web_identity_token_fails_startup_and_readiness() {
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
-            bootstrap_admin: Some((format!("admin{}", common::unique()), "adminpw".into())),
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
             s3_credentials: Some(format!(
                 "credentials = \"web_identity\"\n\
                  [s3.web_identity]\n\

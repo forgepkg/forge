@@ -467,6 +467,33 @@ describe('Login', () => {
       )
     })
 
+    it('says the identity provider sent no UPN and names the claim (username_not_upn)', async () => {
+      mockAuthApi({ options: combined })
+
+      await renderLogin('/login?error=username_not_upn&claim=preferred_username')
+
+      const alert = await screen.findByRole('alert')
+      expect(alert).toHaveTextContent(
+        'Forge names new accounts by a UPN such as alice@example.com, and your identity provider did not send one.',
+      )
+      expect(alert).toHaveTextContent(
+        'The username came from the preferred_username claim.',
+      )
+    })
+
+    it('never shows a claim that does not look like a claim name', async () => {
+      mockAuthApi({ options: combined })
+
+      await renderLogin(
+        '/login?error=username_not_upn&claim=' +
+          encodeURIComponent('call +1 555 for help'),
+      )
+
+      const alert = await screen.findByRole('alert')
+      expect(alert).toHaveTextContent('did not send one')
+      expect(alert).not.toHaveTextContent(/came from|555/)
+    })
+
     it('shows no message without an error parameter', async () => {
       mockAuthApi({ options: combined })
 

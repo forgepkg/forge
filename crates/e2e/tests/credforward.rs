@@ -59,7 +59,7 @@ async fn start_credforward_stack(
         admin_group,
     );
     StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_upstream_basic(block)
         .start()
         .await
@@ -236,7 +236,7 @@ async fn local_user_authenticates_without_hitting_upstream() {
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&admin_u, Some(&admin_p))
         .json(&serde_json::json!({
-            "username": "local-bob", "password": "bobpw", "is_admin": false
+            "username": "local-bob@example.com", "password": "bobpw", "is_admin": false
         }))
         .send()
         .await
@@ -246,7 +246,7 @@ async fn local_user_authenticates_without_hitting_upstream() {
 
     // local-bob authenticates via the FIRST provider (local-password); since the
     // chain stops at the first Authenticated, the upstream is never consulted.
-    let resp = me_basic(&srv, "local-bob", "bobpw").await;
+    let resp = me_basic(&srv, "local-bob@example.com", "bobpw").await;
     assert_eq!(resp.status(), 200, "local user authenticates");
     assert_eq!(
         mock.hits(),
@@ -482,7 +482,7 @@ async fn cross_instance_reauth_invalidates_peer_cache() {
     // entry — without the backplane B would keep serving its own cached verdict
     // until its TTL lapsed.
     let srv_a = StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_redis()
         .with_upstream_basic(block.clone())
         .start()
@@ -749,7 +749,7 @@ async fn upstream_demotion_drops_admin_and_ends_sessions_at_once() {
     // A long authorization-cache TTL: only an explicit invalidation can make
     // the demotion visible within this test.
     let srv = StackBuilder::default()
-        .bootstrap_admin("root", "rootpw")
+        .bootstrap_admin("root@example.com", "rootpw")
         .with_upstream_basic(block)
         .cache_ttl_seconds(300)
         .start()
