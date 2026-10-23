@@ -294,8 +294,8 @@ with the dependency's name and values): dict "ctx" $ "name" <chart name>. */}}
 {{- include "forge.dependencyFullname" (dict "ctx" . "name" "postgresql") }}
 {{- end }}
 
-{{- define "forge.redis.fullname" -}}
-{{- include "forge.dependencyFullname" (dict "ctx" . "name" "redis") }}
+{{- define "forge.valkey.fullname" -}}
+{{- include "forge.dependencyFullname" (dict "ctx" . "name" "valkey") }}
 {{- end }}
 
 {{- define "forge.versitygw.fullname" -}}
@@ -318,17 +318,18 @@ wins without a duplicate entry. */}}
 {{- $env = append $env (dict "name" "FORGE_DATABASE__URL" "value" (printf "postgres://%s:$(POSTGRES_PASSWORD)@%s:%d/%s"
       $pg.auth.username (include "forge.postgresql.fullname" .) (int $pg.service.port) $pg.auth.database)) }}
 {{- end }}
-{{- if .Values.redis.enabled }}
-{{- $redis := .Values.redis }}
-{{- if $redis.auth.enabled }}
-{{- $env = append $env (dict "name" "REDIS_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict
-      "name" (default (include "forge.redis.fullname" .) $redis.auth.existingSecret)
-      "key" $redis.auth.secretKey))) }}
-{{- $env = append $env (dict "name" "FORGE_REDIS__URL" "value" (printf "redis://:$(REDIS_PASSWORD)@%s:%d"
-      (include "forge.redis.fullname" .) (int $redis.service.port))) }}
+{{- if .Values.valkey.enabled }}
+{{- $valkey := .Values.valkey }}
+{{- /* Valkey speaks the Redis protocol: Forge reaches it with a redis:// URL. */}}
+{{- if $valkey.auth.enabled }}
+{{- $env = append $env (dict "name" "VALKEY_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict
+      "name" (default (include "forge.valkey.fullname" .) $valkey.auth.existingSecret)
+      "key" $valkey.auth.secretKey))) }}
+{{- $env = append $env (dict "name" "FORGE_REDIS__URL" "value" (printf "redis://:$(VALKEY_PASSWORD)@%s:%d"
+      (include "forge.valkey.fullname" .) (int $valkey.service.port))) }}
 {{- else }}
 {{- $env = append $env (dict "name" "FORGE_REDIS__URL" "value" (printf "redis://%s:%d"
-      (include "forge.redis.fullname" .) (int $redis.service.port))) }}
+      (include "forge.valkey.fullname" .) (int $valkey.service.port))) }}
 {{- end }}
 {{- end }}
 {{- if .Values.versitygw.enabled }}

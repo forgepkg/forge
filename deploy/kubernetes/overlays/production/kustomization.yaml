@@ -1,4 +1,4 @@
-# Production example: external PostgreSQL and S3, an in-cluster Redis, two
+# Production example: external PostgreSQL and S3, an in-cluster Valkey, two
 # instances behind an Ingress, reachable only through the ingress controller.
 # Copy this directory into your deployment repository and adjust it; there,
 # reference the base and components by the release tag so the image and the
@@ -24,7 +24,7 @@ resources:
 components:
   - ../../components/ingress
   - ../../components/network-policy
-  - ../../components/redis
+  - ../../components/valkey
   - ../../components/high-availability
 
 configMapGenerator:

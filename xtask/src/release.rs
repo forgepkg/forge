@@ -19,8 +19,10 @@
 //!
 //! When the default branch already carries the version (a release pull
 //! request merged by hand, or a run that stopped after the merge), nothing is
-//! committed: the run waits for the CI run of the default branch's head and
-//! tags that commit.
+//! committed: the run starts a manual CI run of the default branch, waits for
+//! it and tags its head. A push run runs only the jobs of what the push
+//! changed (#361), every job only for the release commit itself, while
+//! release.yml requires every job; a manual run runs them all.
 //!
 //! Three changelog guards keep the release notes (the version's section alone)
 //! whole. A release is refused while the changelog has a version section
@@ -171,9 +173,16 @@ pub fn release(args: &[String]) -> Result<(), String> {
         println!("  git tag -a {tag_name} -m {tag_name} <commit> && git push origin {tag_name}");
         return Ok(());
     };
-    let target = if contents.is_empty() {
-        println!("origin/{base} already carries {version}: tagging it once its CI run passed.");
-        git(&["rev-parse", "HEAD"])?
+    let (target, event) = if contents.is_empty() {
+        let head = git(&["rev-parse", "HEAD"])?;
+        println!(
+            "origin/{base} already carries {version}: starting a CI run of it, which runs every \
+             job (its push run may have skipped some), and tagging it once that run passed."
+        );
+        Cmd::new("gh")
+            .args(["workflow", "run", CI_WORKFLOW, "--ref", base.as_str()])
+            .run()?;
+        (head, "workflow_dispatch")
     } else {
         let branch = format!("release-{version}");
         let ref_name = format!("refs/heads/{branch}");
@@ -191,12 +200,15 @@ pub fn release(args: &[String]) -> Result<(), String> {
             "once the pull request is merged, run `cargo xtask release {version}` again on an \
              up-to-date `{base}` to tag the merge commit"
         );
-        merge_pull_request(&branch, &base, &tag_name)
-            .map_err(|e| format!("{e}; nothing is tagged: {resume}"))?
+        let merged = merge_pull_request(&branch, &base, &tag_name)
+            .map_err(|e| format!("{e}; nothing is tagged: {resume}"))?;
+        // The release commit sets the workspace version, so its push run runs
+        // every job (.github/scripts/ci-changes.sh).
+        (merged, "push")
     };
 
     println!("Waiting for the CI run of {} on `{base}`.", short(&target));
-    wait_for_ci(&target, &base, "push").map_err(|e| {
+    wait_for_ci(&target, &base, event).map_err(|e| {
         format!(
             "{e}; nothing is tagged: once a fix is merged, run `cargo xtask release {version}` \
              again on an up-to-date `{base}`"

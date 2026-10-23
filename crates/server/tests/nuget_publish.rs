@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{start_with, unique, ServerOpts, TestServer};
+use common::{unique, TestServer};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
@@ -161,41 +161,6 @@ async fn push_over_the_repository_upload_limit_is_413() {
     let view: Value = resp.json().await.unwrap();
     assert_eq!(view["max_upload_bytes"], Value::Null);
     let resp = push(&srv, &repo, multipart_body(b"", &nupkg).into()).await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-}
-
-/// The deprecated `server.max_upload_bytes` is still the default of a
-/// repository without a limit of its own, and a repository's limit
-/// replaces it, larger or smaller.
-#[tokio::test]
-async fn the_deprecated_server_limit_is_only_a_default() {
-    let srv = start_with(
-        common::fresh_pool().await,
-        ServerOpts {
-            server_extra: Some("max_upload_bytes = 4096".into()),
-            ..ServerOpts::default()
-        },
-    )
-    .await;
-    let (u, p) = srv.admin_basic();
-    let id = format!("Legacy.Limit{}", unique());
-    let nupkg = common::make_nupkg_with_payload(&id, "1.0.0", 64 * 1024);
-
-    let defaulted = hosted_repo(&srv).await;
-    let resp = push(&srv, &defaulted, multipart_body(b"", &nupkg).into()).await;
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-
-    let own = format!("nupub{}", unique());
-    let resp = srv
-        .client()
-        .post(format!("{}/admin/repositories", srv.base_url))
-        .basic_auth(&u, Some(&p))
-        .json(&json!({ "name": own, "kind": "hosted", "max_upload_bytes": 1048576 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let resp = push(&srv, &own, multipart_body(b"", &nupkg).into()).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 

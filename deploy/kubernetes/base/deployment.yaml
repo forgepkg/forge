@@ -6,7 +6,7 @@ metadata:
     app.kubernetes.io/name: forge
     app.kubernetes.io/component: server
 spec:
-  # One instance needs no Redis; ../components/high-availability runs two.
+  # One instance needs no Valkey; ../components/high-availability runs two.
   replicas: 1
   revisionHistoryLimit: 5
   strategy:

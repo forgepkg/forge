@@ -542,7 +542,7 @@
         }
       }
     },
-    "redis": {
+    "valkey": {
       "type": "object",
       "properties": {
         "enabled": {

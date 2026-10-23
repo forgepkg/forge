@@ -280,7 +280,6 @@ Key knobs:
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
 | `[blob_cache]` | Optional local disk cache for blobs (`path`, `max_bytes` = `"auto"` or bytes, `min_free_bytes`): hot downloads skip S3 and cached packages keep resolving while S3 is down. See [docs/deployment.md](./docs/deployment.md#local-blob-cache). |
 | repo `max_upload_bytes` | Largest accepted push to a hosted repository (docker: per blob), set in the web UI or admin API; streamed to disk, 413 above it. Unset: 512 MiB (docker 1 GiB). |
-| `server.max_upload_bytes` | **Deprecated.** Still the default of package repositories without their own limit; startup warns. |
 | `server.max_staging_bytes` | Temp space all staged pushes and proxy downloads may use at once (default 4 × the largest item, 4 GiB; `0` = no limit); 503 + `Retry-After` above it, and the ceiling of a repository's upload limit. `server.staging_dir` picks the directory. |
 | `database.max_connections` / `database.acquire_timeout_seconds` | Pool size (default 20) and how long a request waits for a connection (default 10 s). |
 | `[proxy]` | Upstream connect/read/metadata/download timeouts (15 s / 60 s / 60 s / 30 min), size caps (32 MiB metadata, 1 GiB packages) and the 2 MiB in-memory spool threshold — see `forge.toml.example`. |
@@ -706,10 +705,15 @@ SBOM attestation covers the npm packages and crates, not just Debian's.
 
 Every image the build and the deployment use is pinned by digest
 (`tag@sha256:…`): the base images, the Dockerfile frontend (`# syntax=`),
-BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Redis
+BuildKit and the SBOM generator in the workflows, and the PostgreSQL, Valkey
 and versitygw images in `deploy/`. `.github/scripts/image-pin-check.sh` (CI)
 fails on a reference without one; Forge's own image is exempt, since the
-release pins it. Dependabot bumps the base images and the `deploy/` images;
+release pins it. `deploy/` pulls PostgreSQL, Valkey and versitygw from
+byte-for-byte copies of their Docker Hub images on ghcr.io
+(`ghcr.io/forgepkg/forge/<name>`, the same digests), which
+`.github/workflows/mirror-images.yml` keeps in line with Docker Hub daily and
+fills with every newly pinned digest once it lands on `main`. Dependabot
+bumps the base images and the `deploy/` images (watching those ghcr.io tags);
 the frontend, BuildKit, the SBOM generator and ci.yml's `postgres` service
 are bumped by hand (tag and digest, from the registry's index of the tag).
 
@@ -755,14 +759,21 @@ queue and on every push to `main`. It runs on pull requests that target
 `main` only; a stacked one waits (see [Stacked pull
 requests](#stacked-pull-requests)).
 
-On a pull request and in the merge queue, a job runs only when the change
-touches what it checks (#353). The `changes` job
-(`.github/scripts/ci-changes.sh`) compares a pull request with its base
-branch, and a merge group with the commit it is built on: `main`, or the
-merge group ahead of it in the queue. A merge group therefore runs only the
-jobs its own pull request needs; the pull requests ahead of it are checked by
-their own groups, and the queue merges a group only once every group ahead
-of it passed too (see below). It sorts the change into groups of paths:
+A job runs only when the change touches what it checks (#353, #361). The
+`changes` job (`.github/scripts/ci-changes.sh`) compares:
+
+- a pull request with its base branch;
+- a merge group with the commit it is built on: `main`, or the merge group
+  ahead of it in the queue. A merge group therefore runs only the jobs its own
+  pull request needs; the pull requests ahead of it are checked by their own
+  groups, and the queue merges a group only once every group ahead of it
+  passed too (see below);
+- a push to `main` with `main`'s previous commit. With the merge queue, the
+  pushed commit is the merge group's own, which already passed;
+- a manual run given a `base` branch with the commit its branch forked off
+  that one (see [Stacked pull requests](#stacked-pull-requests)).
+
+It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
@@ -775,16 +786,17 @@ of it passed too (see below). It sorts the change into groups of paths:
 
 A change to the CI configuration counts for every group. A job left out is
 skipped, which passes a required check. If the `changes` job fails, every job
-runs. Pushes to `main` run every job, which the release gate requires, and
-so does a manual run, unless it names a `base` branch: then it compares the
-branch with the commit it forked off that one. A file that Rust code or its
-tests read from outside the crates belongs in the Rust group: add a new one
-to `ci-changes.sh`.
+runs. A manual run without a `base` (`gh workflow run ci.yml --ref main`)
+and the push of a release commit, which sets a new workspace version, run
+every job, which the release gate requires (see [Releasing](#releasing)). A
+file that Rust code or its tests read from outside the crates belongs in the
+Rust group: add a new one to `ci-changes.sh`.
 
 The image is built only when its own inputs change: clippy, test and web
 compile the Rust code and the SPA of every other change. A change that breaks
 only the image build, such as an `include_str!` of a file `.dockerignore`
-leaves out, therefore fails on the push to `main` rather than in the queue.
+leaves out, therefore fails in the next run that builds the image, the
+release's at the latest, rather than in the queue.
 
 `main` can use a GitHub merge queue: CI runs on `merge_group`, so each queued
 group is checked as the very commit that lands, with the jobs its changes
@@ -804,8 +816,9 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
    request must not land on the strength of a later group that skipped the
    jobs its own change needed.
 
-The push to `main` still runs CI once more, and the release workflow tags
-only commits whose push run passed (see [Releasing](#releasing)).
+The push to `main` runs CI once more, for what it changed, and the release
+workflow tags only commits whose CI run on `main` passed with every job (see
+[Releasing](#releasing)).
 
 ### Stacked pull requests
 
@@ -871,9 +884,11 @@ next milestone.
 ## Releasing
 
 A `v<version>` tag on the default branch publishes the release: the release
-workflow (`.github/workflows/release.yml`) builds, signs and pushes
-`ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned to that
-image's digest, pushes and signs it as `oci://ghcr.io/forgepkg/charts/forge`
+workflow (`.github/workflows/release.yml`) makes sure the dependency images
+`deploy/` pins are on ghcr.io and public (`mirror-images.yml`), builds, signs
+and pushes `ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned
+to that image's digest, pushes and signs it as
+`oci://ghcr.io/forgepkg/charts/forge`
 (version `<version>`), and creates the GitHub release from the matching
 `CHANGELOG.md` section with the chart attached. It refuses a tag unless the
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
@@ -899,7 +914,9 @@ a pull request, waits for the pull request's CI run and merges the pull
 request once that run passed; with a merge queue, it adds the pull request to
 the queue and waits (up to 90 minutes) for it to land. Then it waits for the
 merge commit's CI run on `main`, **including `e2e` and `web-e2e`**, which never
-run on the pull request. Every push to `main` gets its own CI run,
+run on the pull request. A push run runs only the jobs of what the push
+changed, but a release commit sets a new workspace version, so its push run
+runs every job. Every push to `main` gets its own CI run,
 which a later push never cancels. Once that run passed, it tags the merge
 commit `v1.0.1` and pushes the tag, which starts the release workflow. The
 release workflow checks CI as well: before it builds anything, it waits (up
@@ -909,8 +926,12 @@ job of it passed.
 When a step fails (the pull request's CI run, the merge, the CI run on
 `main`), nothing is tagged, and the xtask says what is left. Once the release
 pull request is merged (after a fix, or by hand), run it again on an
-up-to-date `main`: `main` already carries the version, so it commits nothing,
-waits for the CI run of `main`'s head and tags that commit.
+up-to-date `main`: `main` already carries the version, so it commits nothing.
+`main`'s head may be a later commit whose push run skipped jobs, so the xtask
+starts a manual CI run of `main`, which runs every job, waits for it and tags
+that commit. If the release workflow refuses a tag because the commit's push
+run skipped jobs, start such a run yourself while the commit is `main`'s head
+(`gh workflow run ci.yml --ref main`) and re-run the release workflow.
 
 Without `gh`, `cargo xtask release <version> --no-tag` only prepares the
 commit, on the current branch; the rest is manual:
@@ -976,6 +997,15 @@ organization's **Packages** tab → the package → **Package settings**):
 2. On the chart, under **Manage Actions access**, give the `forgepkg/forge`
    repository the **Write** role if it is not listed. Without it the next
    release's `helm push` fails after the image tags have already moved.
+
+The same goes for the dependency images' copies, which the first run of
+`mirror-images.yml` on `main` creates: `ghcr.io/forgepkg/forge/postgres`,
+`ghcr.io/forgepkg/forge/valkey` and `ghcr.io/forgepkg/forge/versitygw`. Make
+them **Public** and check that `forgepkg/forge` has the **Write** role under
+**Manage Actions access**; until then the mirror run warns, and the release
+refuses to publish a chart that pulls them. They keep Docker Hub's
+`org.opencontainers.image.source` (a byte-for-byte copy cannot change it),
+so GHCR does not link them to the repository on its own.
 
 Both packages name the repository in `org.opencontainers.image.source`: the
 image through `docker/metadata-action`, the chart because `helm push` copies

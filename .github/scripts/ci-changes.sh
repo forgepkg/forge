@@ -8,17 +8,23 @@
 # the base branch, or the merge group ahead of it in the queue. A group thus
 # runs the jobs its own pull requests need. The ones ahead are checked by
 # their own groups, and with "Only merge non-failing pull requests" the queue
-# merges a group only once every group ahead of it passed as well. A manual
-# run given a base branch (DISPATCH_BASE; stack.yml names the default branch
-# for a pull request retargeted to it) is compared with the commit it forked
-# off that branch, as GitHub's compare API finds it. Any other event (a push,
-# a manual run without a base), or a diff that fails, needs every group.
+# merges a group only once every group ahead of it passed as well. A push is
+# compared with the branch's previous commit (PUSH_BEFORE), so a push to main
+# runs the jobs of what it changed (#361): with the merge queue, the same
+# commit already passed as a merge group. A push that sets a new workspace
+# version (a release commit) needs every group, since the release gate wants
+# every job of its run. A manual run given a base branch (DISPATCH_BASE;
+# stack.yml names the default branch for a pull request retargeted to it) is
+# compared with the commit it forked off that branch, as GitHub's compare API
+# finds it. Any other event (a manual run without a base), a commit that
+# cannot be fetched, or a diff that fails, needs every group.
 #
 # The groups are git pathspecs, each also covering the CI configuration
 # (COMMON).
 #
-# Usage: ci-changes.sh   (env: EVENT, and MERGE_GROUP_BASE for merge groups,
-#                         DISPATCH_BASE and GH_TOKEN for manual runs)
+# Usage: ci-changes.sh   (env: EVENT; MERGE_GROUP_BASE for a merge group,
+#                          PUSH_BEFORE for a push, DISPATCH_BASE and GH_TOKEN
+#                          for a manual run)
 
 # The group arrays are read by name, in changed().
 # shellcheck disable=SC2034
@@ -61,21 +67,37 @@ JOB_GROUPS=(rust changelog audit web image kubernetes)
 out=${GITHUB_OUTPUT:-/dev/stdout}
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
 
+# use_base <commit>: compare with it, fetched unless the checkout has it.
+# Fails for no commit (a new branch's push names 40 zeros) or one that cannot
+# be fetched.
+use_base() {
+    [ -n "$1" ] && [ "$1" != 0000000000000000000000000000000000000000 ] || return 1
+    git cat-file -e "$1^{commit}" 2>/dev/null ||
+        git fetch --quiet --no-tags --depth=1 origin "$1" || return 1
+    base=$1
+}
+
 base=
+reason="${EVENT:-no event}, or no commit to compare with"
 case ${EVENT:-} in
 pull_request) base=HEAD^1 ;;
-merge_group)
-    if [ -n "${MERGE_GROUP_BASE:-}" ] &&
-        git fetch --quiet --no-tags --depth=1 origin "$MERGE_GROUP_BASE"; then
-        base=$MERGE_GROUP_BASE
+merge_group) use_base "${MERGE_GROUP_BASE:-}" ;;
+push)
+    if use_base "${PUSH_BEFORE:-}"; then
+        # Captured, not piped into grep: with pipefail, grep -q stopping
+        # early could fail the pipeline through git's SIGPIPE.
+        manifest=$(git diff "$base" HEAD -- Cargo.toml)
+        if grep -qE '^[-+]version = ' <<<"$manifest"; then
+            base=
+            reason="the push sets a new workspace version"
+        fi
     fi
     ;;
 workflow_dispatch)
     if [ -n "${DISPATCH_BASE:-}" ] &&
         fork=$(gh api "repos/$GITHUB_REPOSITORY/compare/$DISPATCH_BASE...$(git rev-parse HEAD)" \
-            --jq .merge_base_commit.sha) &&
-        git fetch --quiet --no-tags --depth=1 origin "$fork"; then
-        base=$fork
+            --jq .merge_base_commit.sha); then
+        use_base "$fork"
     fi
     ;;
 esac
@@ -98,7 +120,7 @@ for group in "${JOB_GROUPS[@]}"; do
     echo "| $group | $run |" >>"$summary"
 done
 if [ -z "$base" ]; then
-    echo "Every group runs (${EVENT:-no event}, or no base to compare with)." >>"$summary"
+    echo "Every group runs ($reason)." >>"$summary"
 else
     echo "Compared with $(git rev-parse --short "$base" 2>/dev/null || echo "$base")." >>"$summary"
 fi

@@ -1,4 +1,4 @@
-# CI: external PostgreSQL and S3, in-cluster Redis, several replicas behind a
+# CI: external PostgreSQL and S3, in-cluster Valkey, several replicas behind a
 # Gateway API HTTPRoute on the release's own ListenerSet, and most knobs set.
 host: forge.example.com
 replicaCount: 2
@@ -40,7 +40,7 @@ env:
         key: uri
   - name: RUST_LOG
     value: info,forge::audit=info
-redis:
+valkey:
   enabled: true
   extraArgs: [--maxmemory, 200mb, --maxmemory-policy, allkeys-lru]
 podDisruptionBudget:

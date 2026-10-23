@@ -45,10 +45,10 @@ pod in those ranges can claim any client address, past the login lockout and
 the anonymous-IP allowlist. List the pods that proxy to Forge (your gateway's
 data plane or ingress controller) in networkPolicy.from.
 {{- end }}
-{{- if and (gt (int .Values.replicaCount) 1) (not .Values.redis.enabled) }}
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.valkey.enabled) }}
 
-Several replicas share caches and invalidations through Redis: enable
-redis.enabled or set FORGE_REDIS__URL, or they converge only by TTL.
+Several replicas share caches and invalidations through Valkey or Redis:
+enable valkey.enabled or set FORGE_REDIS__URL, or they converge only by TTL.
 {{- end }}
 {{- if or .Values.postgresql.enabled .Values.versitygw.enabled }}
 
