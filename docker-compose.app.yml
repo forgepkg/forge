@@ -36,13 +36,10 @@ services:
       # leaves this unset.
       FORGE_SERVER__ALLOW_INSECURE_DEFAULTS: "true"
       # The image bakes no bootstrap admin (env only): the dev stack creates
-      # admin@example.com/changeme and, like ./forge.toml, accepts user passwords over
-      # Basic so `cargo xtask seed` and `curl -u admin@example.com:changeme` work.
+      # admin@example.com/changeme. Anonymous reads and passwords over Basic start
+      # off; `cargo xtask seed` turns both on (Admin → Settings in the web UI).
       FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME: "admin@example.com"
       FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: "changeme"
-      FORGE_AUTH__ALLOW_PASSWORD_BASIC: "true"
-      # The image defaults to no anonymous access; the dev stack opens reads.
-      FORGE_AUTH__ANONYMOUS_MODE: "all"
       RUST_LOG: "info"
     ports:
       - "8421:8421"

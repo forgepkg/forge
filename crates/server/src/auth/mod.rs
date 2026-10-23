@@ -62,6 +62,7 @@ use crate::state::AppState;
 mod issuer;
 mod realms;
 mod redirect;
+mod settings;
 mod token_exchange;
 mod wif;
 
@@ -76,6 +77,10 @@ pub use realms::{
     KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
+pub use settings::{
+    load as load_auth_settings, AnonymousMode, AuthSettings, AuthSettingsCache, AuthSettingsUpdate,
+    CurrentAuthSettings, LoginMode, SaveError, AUTH_SETTINGS_KEY,
+};
 pub use token_exchange::{token_exchange_router, TOKEN_EXCHANGE_PATH};
 pub use wif::WorkloadIdentitySource;
 pub(crate) use wif::{realm_current_now, workload_identity_config_sha256};
@@ -102,8 +107,9 @@ pub struct OidcRuntime {
 impl OidcRuntime {
     /// Build the runtime from the validated `[oidc]` config + how the client
     /// authenticates at the token endpoint (`auth`; the config's
-    /// `client_secret` is not read) + the DB pool + the public base URL (which
-    /// decides the cookie `Secure` attribute) + the shared cache.
+    /// `client_secret` is not read) + the session service a login signs in
+    /// with + the public base URL (which decides the cookie `Secure`
+    /// attribute) + the shared cache.
     ///
     /// The HTTP client follows no redirects and is https-only unless the realm
     /// allows a plain-http development issuer (see
@@ -111,7 +117,7 @@ impl OidcRuntime {
     pub fn build(
         oidc: &OidcConfig,
         auth: ClientAuth,
-        pool: sqlx::PgPool,
+        sessions: SessionService,
         public_base_url: &str,
         cache: Cache,
     ) -> anyhow::Result<Self> {
@@ -140,11 +146,6 @@ impl OidcRuntime {
             link_existing_by_username: oidc.link_existing_by_username,
         };
         let cookie_secure = public_base_url.trim().starts_with("https://");
-        let sessions = SessionService::new(
-            pool,
-            chrono::Duration::from_std(oidc.session_idle_ttl())?,
-            chrono::Duration::from_std(oidc.session_absolute_ttl())?,
-        );
 
         Ok(Self {
             meta,
@@ -853,7 +854,7 @@ async fn password_login(
             let retry_after = match refused {
                 AttemptRefused::Locked => {
                     tracing::warn!(%username, ip = %client_ip, "password login throttled");
-                    state.config.auth.login_failure_window_seconds.max(1)
+                    state.login_throttle.current_limits().1.as_secs().max(1)
                 }
                 AttemptRefused::Busy => {
                     tracing::warn!(%username, ip = %client_ip, "password login: too many concurrent attempts");
@@ -1067,8 +1068,8 @@ struct OidcLoginOption {
 /// `GET /auth/login-options` response: what the login screen should render.
 #[derive(Debug, Serialize)]
 struct LoginOptions {
-    /// `identifier_first` | `combined` (`auth.login_mode`).
-    mode: String,
+    /// `identifier_first` | `combined` (the `login_mode` auth setting).
+    mode: &'static str,
     /// Whether any password-capable realm is enabled (show the password form).
     password: bool,
     /// Enabled OIDC realm buttons (at most one).
@@ -1094,7 +1095,13 @@ async fn login_options(State(state): State<AppState>) -> Response {
         })
         .unwrap_or_default();
     Json(LoginOptions {
-        mode: state.config.auth.login_mode.clone(),
+        mode: state
+            .auth_settings
+            .current()
+            .await
+            .settings
+            .login_mode
+            .as_str(),
         password: snap.chain.is_some(),
         oidc,
     })
