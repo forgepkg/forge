@@ -205,7 +205,9 @@ docker pull forge.example.com/docker/nginx:1.27
   member is skipped; an offline proxy member still serves its cache.
 - **Pushes** to a group go to its `writable_member`, a hosted member (Nexus
   Pro's group deployment). Without one, pushes are refused. The caller needs
-  read on the group and write on that member.
+  read on the group and write on that member. The group keeps the member
+  when it is renamed; once it is deleted, the group has no writable member
+  until one is set again.
 - **Dependency-confusion guard**: an image under one of the group's
   `reserved_prefixes` (namespaces such as `envisia/`) is never served by a
   proxy member, and with `prefer_hosted` (on by default) neither is an image

@@ -154,6 +154,14 @@ until the release folds them in.
   or mounting a blob the image already had recorded none. Pushes and
   mounts record the use, and pulls record it every tenth of the TTL.
   ([#218](https://github.com/schmitch/forge/issues/218))
+- Docker groups named their `writable_member` by name: renaming that
+  repository broke group pushes, and a repository created later under the
+  old name silently became the push target. The member is stored by id
+  (migration 0037 converts existing groups; a name no hosted docker
+  repository has any more is dropped), and the admin API and web UI show
+  its current name. Downgrading to 1.1.0 leaves docker groups without a
+  writable member until it is set again.
+  ([#219](https://github.com/schmitch/forge/issues/219))
 
 ## [1.1.0]
 
