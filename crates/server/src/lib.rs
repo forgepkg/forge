@@ -1,6 +1,6 @@
 //! `forge-server`: configuration, application state, HTTP middleware, repository
 //! dispatch, the admin REST API, read-side browse endpoints, and background
-//! workers for envisia-forge.
+//! workers for Forge.
 
 // Handlers and their helpers use axum's `Result<T, Response>` error idiom, and
 // `http::Response<Body>` exceeds the 128-byte `Err` threshold clippy enforces

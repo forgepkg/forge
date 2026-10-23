@@ -1,6 +1,6 @@
 # forge-web
 
-The envisia-forge admin + browse UI: a **SPA** (TanStack Router, client-only)
+The Forge admin + browse UI: a **SPA** (TanStack Router, client-only)
 built by Vite. The Rust `server` serves the built assets from `dist/` at a
 **single origin**, so the browser calls the Rust HTTP API (`/admin/*`,
 `/browse/*`, `/v3/*`, `/v2/*`) **directly** with relative URLs. There is no Node server

@@ -1,4 +1,4 @@
-//! `forge-core`: format-agnostic domain logic for envisia-forge.
+//! `forge-core`: format-agnostic domain logic for Forge.
 //!
 //! This crate sits above [`forge_db`] and below the format plugins
 //! (`plugins/*`) and the server. It defines:

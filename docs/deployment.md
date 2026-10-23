@@ -1,6 +1,6 @@
 # Production deployment
 
-This is the operator guide for running the `envisia-forge` image in
+This is the operator guide for running the Forge image in
 production. For local development see [DEVELOPMENT.md](../DEVELOPMENT.md); for
 CI publishing without stored API keys see
 [trusted publishing](trusted-publishing.md).

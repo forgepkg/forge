@@ -14,7 +14,7 @@
 # Exempt on purpose:
 #   - Forge's own image, ghcr.io/forgepkg/forge, which the release pins
 #     itself: the published chart pulls it by the digest the release workflow
-#     signed (Chart.yaml annotation forge.envisia.de/image-digest), and the
+#     signed (Chart.yaml annotation forge/image-digest), and the
 #     Kubernetes base names the release's tag, which the release workflow
 #     attaches only to that signed digest and never moves on a re-run
 #     (components/image-latest follows :latest on purpose).

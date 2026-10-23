@@ -20,7 +20,7 @@ helm install forge oci://ghcr.io/forgepkg/charts/forge --version 1.2.0 \
 
 The chart's `appVersion` is the release it belongs to, and the image tag
 defaults to it. The release workflow also writes the digest of the image it
-built and signed into the published chart (the `forge.envisia.de/image-digest`
+built and signed into the published chart (the `forge/image-digest`
 annotation in `Chart.yaml`), so a published chart deploys exactly that image
 ([`ghcr.io/forgepkg/forge`](https://github.com/forgepkg/forge/pkgs/container/forge)):
 

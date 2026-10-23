@@ -3,7 +3,7 @@
 # the forge chart, which then sets FORGE_DATABASE__URL.
 apiVersion: v2
 name: postgresql
-description: Single-instance PostgreSQL for envisia-forge (evaluation / small installs)
+description: Single-instance PostgreSQL for Forge (evaluation / small installs)
 type: application
 version: 1.0.0
 appVersion: "17"

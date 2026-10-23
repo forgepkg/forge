@@ -2108,7 +2108,7 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     let mock = MockRegistry::start().await;
     let cfg = config("amd64");
     let manifest = image(&cfg, &[b"public"]);
-    for name in ["envisia/app", "public/app"] {
+    for name in ["acme/app", "public/app"] {
         mock.put(name, "1", OCI_MANIFEST, &manifest);
     }
     mock.put_blob(&cfg);
@@ -2130,7 +2130,7 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     .await;
     create_repo(
         &srv,
-        json!({"name": group, "kind": "group", "format": "docker", "reserved_prefixes": ["envisia/"]}),
+        json!({"name": group, "kind": "group", "format": "docker", "reserved_prefixes": ["acme/"]}),
     )
     .await;
     for (member, priority) in [(&hosted, 10), (&proxy, 5)] {
@@ -2144,7 +2144,7 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     let oci = admin_oci(&srv).await;
     // A reserved namespace is never served by the proxy member.
     assert_eq!(
-        oci.get(&format!("{group}/envisia/app"), "manifests/1")
+        oci.get(&format!("{group}/acme/app"), "manifests/1")
             .await
             .status(),
         404

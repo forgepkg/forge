@@ -1,4 +1,4 @@
-# envisia-forge — baked-in container base configuration.
+# Forge — baked-in container base configuration.
 #
 # This file ships INSIDE the Docker image at /app/forge.toml and is loaded via
 # $FORGE_CONFIG. It carries only NON-SECRET, deployment-stable defaults. Every

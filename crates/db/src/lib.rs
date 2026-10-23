@@ -1,4 +1,4 @@
-//! Database access layer for envisia-forge.
+//! Database access layer for Forge.
 //!
 //! Provides the connection pool, the migration runner, the row models, and a
 //! DAO module per table. DAOs use sqlx **compile-time-checked** queries

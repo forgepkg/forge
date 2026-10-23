@@ -1,4 +1,4 @@
-//! `forge-e2e` — end-to-end test harness for envisia-forge (plan Phase 11,
+//! `forge-e2e` — end-to-end test harness for Forge (plan Phase 11,
 //! spec §9).
 //!
 //! The whole crate is gated behind the `forge-e2e` feature so a plain

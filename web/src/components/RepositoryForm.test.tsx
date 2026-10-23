@@ -618,10 +618,10 @@ describe('docker repositories: create', () => {
 
     await user.selectOptions(screen.getByLabelText('Format'), 'docker')
     await user.selectOptions(screen.getByLabelText('Kind'), 'group')
-    expect(screen.getByText(/namespaces such as/)).toHaveTextContent('envisia/')
+    expect(screen.getByText(/namespaces such as/)).toHaveTextContent('acme/')
     expect(screen.queryByLabelText(/Immutable tags/)).toBeNull()
     await user.type(screen.getByLabelText('Name'), 'docker-group')
-    await user.type(screen.getByLabelText('Reserved prefixes'), 'envisia/')
+    await user.type(screen.getByLabelText('Reserved prefixes'), 'acme/')
     await user.type(screen.getByLabelText('Writable member'), 'docker-hosted')
     await create(user)
 
@@ -630,7 +630,7 @@ describe('docker repositories: create', () => {
       kind: 'group',
       format: 'docker',
       prefer_hosted: true,
-      reserved_prefixes: ['envisia/'],
+      reserved_prefixes: ['acme/'],
       writable_member: 'docker-hosted',
     })
     expect(body).not.toHaveProperty('immutable_tags')
