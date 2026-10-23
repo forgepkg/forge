@@ -89,8 +89,8 @@ impl fmt::Debug for PasswordCredential<'_> {
 
 /// The identity a provider vouches for after a successful authentication.
 ///
-/// `core` maps this to an `app_user` (lookup by `username`, auto-provision when
-/// the provider allows). The `groups` are the *raw, coarse* upstream
+/// `core` maps this to an existing `app_user` (lookup by `username`; no
+/// provider creates accounts). The `groups` are the *raw, coarse* upstream
 /// groups/roles, used at most as an allow/deny gate; they are not
 /// authoritative forge authz.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +100,8 @@ pub struct ProvenIdentity {
     /// Which provider/source vouched for this identity.
     pub source: AuthSource,
     /// Opaque upstream identifier when the source is not local. For
-    /// `upstream-basic` this is usually just the username.
+    /// `upstream-basic` this is the name sent upstream: the local part of the
+    /// username.
     pub external_subject: Option<String>,
     /// Raw upstream groups/roles (coarse). Empty for local.
     pub groups: Vec<String>,
@@ -109,23 +110,18 @@ pub struct ProvenIdentity {
     /// Whether [`Self::suggested_is_admin`] is an **authoritative** reading of
     /// the upstream's admin state: the realm configures an admin mapping AND the
     /// groups were freshly fetched for this login (not a cache hit, which
-    /// carries no groups). Only then may provisioning *revoke* admin; otherwise
-    /// the suggestion is ignored for existing users (see
+    /// carries no groups). Only then may the login grant or *revoke* admin;
+    /// otherwise the suggestion is ignored (see
     /// [`super::chain::provision_and_map`]). Always `false` for local.
     pub admin_authoritative: bool,
-    /// Whether the vouching provider is configured to auto-provision an
-    /// `app_user` for this identity on first success (per realm: each
-    /// credential-forwarding realm carries its own flag). Always `false` for
-    /// local.
-    pub auto_provision: bool,
     /// The `auth_realm.id` of the vouching realm, when the provider was built
-    /// from a realm row. Recorded as `app_user.realm_id` provenance on
-    /// provision; `None` for the built-in/static wiring.
+    /// from a realm row: only an account of that realm signs in
+    /// (`app_user.realm_id`). `None` for the built-in/static wiring.
     pub realm_id: Option<i64>,
     /// An argon2id hash of the presented password, set only when the vouching
     /// realm keeps password hashes (`capture_password_hash`, migration 0035)
     /// and this login asked the upstream, which accepted it (a cache hit
-    /// carries none). Provisioning keeps it on the account
+    /// carries none). The account keeps it
     /// ([`super::chain::provision_and_map`]). Always `None` for local.
     pub captured_password_hash: Option<CapturedPasswordHash>,
 }
@@ -167,7 +163,6 @@ impl ProvenIdentity {
             groups: Vec::new(),
             suggested_is_admin: false,
             admin_authoritative: false,
-            auto_provision: false,
             realm_id: None,
             captured_password_hash: None,
         }
@@ -239,7 +234,6 @@ mod tests {
         assert!(id.groups.is_empty());
         assert!(!id.suggested_is_admin);
         assert!(!id.admin_authoritative);
-        assert!(!id.auto_provision);
         assert!(id.realm_id.is_none());
         assert!(id.captured_password_hash.is_none());
     }

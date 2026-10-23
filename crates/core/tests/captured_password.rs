@@ -78,12 +78,21 @@ fn forwarding(pool: &PgPool, realm_id: i64, url: String, capture: bool) -> Upstr
         identity_path: String::new(),
         admin_group: String::new(),
         provider_id: format!("realm:test-{realm_id}"),
-        auto_provision: true,
         realm_id: Some(realm_id),
         capture_password_hash: capture,
     };
     let client = credential_forward_client(config.connect_timeout).expect("forwarding client");
     UpstreamBasicProvider::new(config, client, cache(pool, &realm_id.to_string()))
+}
+
+/// An account an administrator created for realm `realm_id` (forwarding
+/// signs in existing accounts only).
+async fn account(pool: &PgPool, realm_id: i64, prefix: &str) -> String {
+    let username = format!("{prefix}-{}@example.com", unique());
+    forge_db::user_dao::insert_forwarded_user(pool, &username, realm_id, true)
+        .await
+        .unwrap();
+    username
 }
 
 async fn upstream(status: u16, calls: u64) -> MockServer {
@@ -97,7 +106,7 @@ async fn upstream(status: u16, calls: u64) -> MockServer {
     server
 }
 
-/// Sign `username` in through `chain` and provision the account.
+/// Sign `username` in through `chain` and map the login onto its account.
 async fn sign_in(pool: &PgPool, chain: &Chain, username: &str, password: &str) -> Option<i64> {
     match chain.authenticate(&cred(username, password)).await {
         ChainOutcome::Authenticated { identity, .. } => provision_and_map(pool, &identity)
@@ -136,7 +145,7 @@ async fn an_accepted_password_is_kept_once_per_upstream_check() {
         format!("{}/status", server.uri()),
         true,
     ))]);
-    let username = format!("keep-{}", unique());
+    let username = account(&pool, realm_id, "keep").await;
 
     let id = sign_in(&pool, &chain, &username, "s3cret")
         .await
@@ -175,14 +184,14 @@ async fn nothing_is_kept_unless_the_realm_opts_in() {
         url.clone(),
         true,
     ))]);
-    let a = format!("keep-off-{}", unique());
+    let a = account(&pool, realm_off, "keep-off").await;
     let id = sign_in(&pool, &chain, &a, "pw").await.expect("signed in");
     assert_eq!(kept(&pool, id).await, (None, None));
 
     // The realm opts in, the provider was built without the option.
     let realm_on = realm(&pool, serde_json::json!({ "capture_password_hash": true })).await;
     let chain = Chain::new(vec![Box::new(forwarding(&pool, realm_on, url, false))]);
-    let b = format!("keep-off-{}", unique());
+    let b = account(&pool, realm_on, "keep-off").await;
     let id = sign_in(&pool, &chain, &b, "pw").await.expect("signed in");
     assert_eq!(kept(&pool, id).await, (None, None));
 }
@@ -192,7 +201,7 @@ async fn a_rejected_password_is_never_kept() {
     let pool = pool().await;
     let realm_id = realm(&pool, serde_json::json!({ "capture_password_hash": true })).await;
     let ok = upstream(200, 1).await;
-    let username = format!("keep-rej-{}", unique());
+    let username = account(&pool, realm_id, "keep-rej").await;
     let chain = Chain::new(vec![Box::new(forwarding(
         &pool,
         realm_id,
@@ -226,17 +235,13 @@ async fn a_realm_that_stops_forwarding_signs_in_with_the_kept_hash() {
         format!("{}/status", server.uri()),
         true,
     ))]);
-    let alice = format!("keep-only-{}", unique());
+    let alice = account(&pool, realm_id, "keep-only").await;
     let alice_id = sign_in(&pool, &chain, &alice, "alice-pw")
         .await
         .expect("signed in");
 
     // A second account of the realm that keeps no hash.
-    let bob = format!("keep-only-{}", unique());
-    forge_db::user_dao::provision_upstream_user(&pool, &bob, Some(realm_id))
-        .await
-        .unwrap()
-        .expect("provisioned");
+    let bob = account(&pool, realm_id, "keep-only").await;
 
     // The upstream is gone; the realm checks the kept hashes instead.
     drop(server);
@@ -254,7 +259,6 @@ async fn a_realm_that_stops_forwarding_signs_in_with_the_kept_hash() {
         panic!("the kept password signs in");
     };
     assert_eq!(identity.realm_id, Some(realm_id));
-    assert!(!identity.auto_provision);
     assert!(
         identity.captured_password_hash.is_none(),
         "nothing new is kept"
@@ -276,7 +280,7 @@ async fn a_realm_that_stops_forwarding_signs_in_with_the_kept_hash() {
     );
     assert_eq!(
         provider
-            .authenticate(&cred(&format!("nobody-{}", unique()), "x"))
+            .authenticate(&cred(&format!("nobody-{}@example.com", unique()), "x"))
             .await,
         AuthOutcome::Rejected
     );

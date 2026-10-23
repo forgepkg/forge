@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user SET username = '~upn-renaming~' || id WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b1e2fbee25708425c0fe3f40a30bf6c4068c9222c8e45036b6fcc438dce552bf"
+}

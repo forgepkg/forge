@@ -4,12 +4,18 @@
 //! Cutting a user off (review M5) works the same for every account kind,
 //! federated ones included: `PATCH /admin/users/{id}` with `{"active": false}`
 //! deactivates the account, revokes its sessions and purges its cached
-//! upstream verdicts. Deleting is *not* a block for federated users — an
-//! auto-provisioning realm re-creates a deleted account on its next valid
-//! upstream login — so deactivate instead.
+//! upstream verdicts. Deleting is *not* a block for OIDC users — an
+//! auto-provisioning OIDC realm re-creates a deleted account on its next
+//! login — so deactivate instead.
 //!
 //! Neither may remove the last active administrator: deactivating or deleting
 //! that user answers **409** ([`super::last_admin_conflict`]).
+//!
+//! Every account is named by a UPN. `POST /admin/users` creates a local
+//! account with a password, or, with `realm`, an account of that
+//! credential-forwarding realm: such a realm creates no accounts on its own,
+//! and signs in only those created here (forwarding the local part of the
+//! name to its upstream).
 //!
 //! A credential-forwarding account whose realm keeps password hashes
 //! (`capture_password_hash`) can be switched to a local account with the last
@@ -84,12 +90,18 @@ impl UserView {
     }
 }
 
-/// Create-user request.
+/// Create-user request: a local account (`password`), or an account of the
+/// credential-forwarding realm named `realm` (no password: it signs in with
+/// the upstream's).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUser {
     pub username: String,
-    pub password: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// The name of a `credential_forwarding` realm.
+    #[serde(default)]
+    pub realm: Option<String>,
     /// Assigns the built-in `admin` role.
     #[serde(default)]
     pub is_admin: bool,
@@ -153,21 +165,41 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
             return (StatusCode::BAD_REQUEST, format!("invalid username: {e}")).into_response()
         }
     };
-    if body.password.is_empty() {
-        return (StatusCode::BAD_REQUEST, "password is required").into_response();
-    }
-
-    let password_hash = match hash_password(body.password.clone()).await {
-        Ok(h) => h,
-        Err(resp) => return resp,
+    let account = match (body.realm.as_deref(), body.password) {
+        (Some(_), Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "an account of a credential-forwarding realm signs in with the upstream's \
+                 password: give realm or password, not both",
+            )
+                .into_response()
+        }
+        (Some(realm), None) => {
+            match forge_db::auth_realm_dao::find_realm_by_name(&state.pool, realm.trim()).await {
+                Ok(Some(r)) if r.kind == crate::auth::KIND_CRED_FORWARD => {
+                    NewAccount::Forwarded { realm_id: r.id }
+                }
+                Ok(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("no credential-forwarding realm is named {realm:?}"),
+                    )
+                        .into_response()
+                }
+                Err(e) => return db_error(e),
+            }
+        }
+        (None, Some(password)) if !password.is_empty() => match hash_password(password).await {
+            Ok(hash) => NewAccount::Local {
+                password_hash: hash,
+            },
+            Err(resp) => return resp,
+        },
+        (None, _) => return (StatusCode::BAD_REQUEST, "password is required").into_response(),
     };
 
-    let u = match insert_with_admin_role(
-        &state,
-        NewUser::local(username, password_hash, body.active),
-        body.is_admin,
-    )
-    .await
+    let u = match insert_with_admin_role(&state, &username, account, body.active, body.is_admin)
+        .await
     {
         Ok(u) => u,
         Err(e) if is_unique_violation(&e) => {
@@ -181,15 +213,36 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateUser>)
     }
 }
 
+/// The kind of account [`create`] makes.
+enum NewAccount {
+    /// A local account with this argon2id password hash.
+    Local { password_hash: String },
+    /// An account of this credential-forwarding realm.
+    Forwarded { realm_id: i64 },
+}
+
 /// Insert the user and, for an administrator, assign it the built-in
 /// `admin` role in the same transaction.
 async fn insert_with_admin_role(
     state: &AppState,
-    new: NewUser,
+    username: &str,
+    account: NewAccount,
+    active: bool,
     is_admin: bool,
 ) -> sqlx::Result<AppUser> {
     let mut tx = state.pool.begin().await?;
-    let user = user_dao::insert_user(&mut *tx, new).await?;
+    let user = match account {
+        NewAccount::Local { password_hash } => {
+            user_dao::insert_user(
+                &mut *tx,
+                NewUser::local(username.to_string(), password_hash, active),
+            )
+            .await?
+        }
+        NewAccount::Forwarded { realm_id } => {
+            user_dao::insert_forwarded_user(&mut *tx, username, realm_id, active).await?
+        }
+    };
     if is_admin {
         let role_id = authz_dao::role_id_by_name(&mut *tx, authz_dao::ADMIN_ROLE)
             .await?
@@ -212,11 +265,6 @@ async fn insert_with_admin_role(
 /// 3. the user's validated-credential verdicts are purged (all providers,
 ///    cluster-wide cache invalidation), so a later reactivation re-validates
 ///    against the upstream instead of trusting a pre-deactivation verdict.
-///
-/// For a credential-forwarding user, deactivation holds for the canonical
-/// username: an upstream that accepts another spelling of the same account
-/// (`DOMAIN\user`, `user@domain`) signs that spelling in as a new account
-/// unless the realm sets `identity_path` or turns `auto_provision` off.
 ///
 /// API tokens are refused while the user is inactive but not revoked, so a
 /// reactivated user's tokens work again; revoke them individually

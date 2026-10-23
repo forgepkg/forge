@@ -270,7 +270,7 @@ Key knobs:
 | `auth.anonymous_mode` | `off` / `allowlist` / `all`. Makes unauthenticated requests an *anonymous principal*. |
 | repo `anonymous_read` | **Also required** for anonymous reads — set it per-repo at create time. |
 | `auth.allow_password_basic` | Allow HTTP Basic with the user password (needed to use the admin API as the bootstrap admin). |
-| `auth.bootstrap_admin` | First-run admin username (a UPN such as `admin@example.com`, no default) / password. No or a blank password means no bootstrap admin. |
+| `auth.bootstrap_admin` | First-run admin username (a UPN, default `admin@example.com`) / password. No or a blank password means no bootstrap admin. |
 | `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme` or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
 | `auth.login_max_failures` / `auth.login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
@@ -329,32 +329,38 @@ could carry it. Form login answers such a name with 401, and admin user
 creation and the bootstrap admin refuse it. OIDC-provisioned names may still
 contain one.
 
-A **new** account is named by a UPN, `local-part@domain` (admin user
-creation, the bootstrap admin, `oidc` realm provisioning); accounts created
-before that rule keep their names, and credential-forwarding accounts keep the
-name the upstream accepted. The rule is `is_upn` in `crates/db/src/username.rs`
-(mirrored by `upnError` in `web/src/api/users.ts`); see
-[docs/deployment.md](docs/deployment.md#usernames).
+Every account is named by a UPN, `local-part@domain` (admin user creation,
+the bootstrap admin, `oidc` realm provisioning, credential-forwarding
+accounts). The rule is `is_upn` in `crates/db/src/username.rs` (mirrored by
+`upnError` in `web/src/api/users.ts`); see
+[docs/deployment.md](docs/deployment.md#usernames). Accounts from before 1.2
+are renamed at startup: `rename_legacy_usernames` in
+`crates/db/src/user_dao.rs`, run by `forge_db::migrate` after the SQL
+migrations, renames each name that is no UPN to `<name>@example.com` (logged
+as a warning), and moves the bootstrap admin's markers with it. It goes in
+1.3.0 (#389).
 
-A `credential_forwarding` realm forwards the **canonical** username with the
-password and, on success, signs the user in as that name. That is only safe
-when the upstream **binds the username to the secret**. Many do not: GitHub,
-Azure DevOps and GitLab accept a personal access token with *any* username,
-so anyone with a token could sign in as any Forge user. For such an upstream,
-set `identity_path` to where its JSON success response names the
-authenticated account (e.g. `login` for GitHub's `/user`): that name, in
-canonical form, must equal the username entered, or the login is rejected; a
-success without it fails closed.
+A `credential_forwarding` realm creates no accounts: an administrator creates
+each one (`POST /admin/users` with `realm`, or **Admin → Users**), and a login
+signs in only an active account of that realm. It forwards the **local part**
+of the canonical username with the password (`alice` for `alice@example.com`)
+and, on success, signs in the realm's account of that name; a name that is no
+UPN is never forwarded. That is only safe when the upstream **binds the
+username to the secret**. Many do not: GitHub, Azure DevOps and GitLab accept
+a personal access token with *any* username, so anyone with a token could sign
+in as any of the realm's accounts. For such an upstream, set `identity_path`
+to where its JSON success response names the authenticated account (e.g.
+`login` for GitHub's `/user`): that name, in canonical form, must equal the
+forwarded local part, or the login is rejected; a success without it fails
+closed.
 
-`identity_path` also matters for deactivation. A directory often accepts
-other spellings of one account (`CORP\mallory`, `mallory@corp`), and Forge
-provisions each spelling it forwards as an account of its own. Deactivating
-`mallory` then does not stop a login as `corp\mallory` unless the upstream
-names the account it authenticated (`identity_path`), or `auto_provision` is
-off, or the user is disabled in the directory too. Names a directory could
-fold onto another account by Unicode alone (full-width letters, a soft
-hyphen, zero-width characters) are never forwarded. Forge logs a warning for
-an auto-provisioning realm without `identity_path`.
+Since the realm creates no accounts, deactivating one holds for every
+spelling the directory accepts: `corp\mallory@example.com` or
+`mallory@other.example` forward a name the directory may take for `mallory`,
+but sign in no account unless an administrator created one of that name.
+Names a directory could fold onto another account by Unicode alone
+(full-width letters, a soft hyphen, zero-width characters) are never
+forwarded.
 
 Every login sends the user's password to the realm's `url`, so it must be
 `https` — plain `http` only for a loopback sidecar, or with `"allow_http":

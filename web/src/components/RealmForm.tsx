@@ -26,6 +26,7 @@ import {
   Legend,
 } from '~/components/catalyst/fieldset'
 import { Input } from '~/components/catalyst/input'
+import { Text } from '~/components/catalyst/text'
 import { Textarea } from '~/components/catalyst/textarea'
 import { Select } from '~/components/catalyst/select'
 import { ADMIN_ROLE } from '~/api/rbac'
@@ -221,8 +222,7 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
     kind: existing?.kind ?? 'oidc',
     name: existing?.name ?? '',
     enabled: existing?.enabled ?? true,
-    auto_provision:
-      (existing?.kind === 'oidc' ? oidc.auto_provision : fwd.auto_provision) ?? true,
+    auto_provision: oidc.auto_provision ?? true,
     issuer: (existing?.kind === 'workload_identity' ? wif.issuer : oidc.issuer) ?? '',
     client_id: oidc.client_id ?? '',
     // Never seed secrets — they are write-only and redacted on read.
@@ -976,13 +976,12 @@ export function RealmForm({
               stored={mode === 'edit' && hasStoredSecret(existing, 'key_pepper_set')}
             />
 
-            <CheckboxField>
-              <Checkbox
-                checked={values.auto_provision}
-                onChange={(c) => set('auto_provision', c)}
-              />
-              <Label>Auto-provision users on first successful check</Label>
-            </CheckboxField>
+            <Text>
+              The realm signs in only the accounts created for it under{' '}
+              <strong>Admin → Users</strong>, and sends the upstream the part
+              of their name before the <code>@</code>:{' '}
+              <code>alice@example.com</code> signs in as <code>alice</code>.
+            </Text>
             <CheckboxField>
               <Checkbox
                 checked={values.allow_http}
@@ -1667,7 +1666,6 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
   if (values.kind === 'credential_forwarding') {
     const config: CredentialForwardingConfig = {
       url: values.url.trim(),
-      auto_provision: values.auto_provision,
     }
     if (values.method.trim() !== '') config.method = values.method.trim().toUpperCase()
     const success = parseNumberList(values.success_status)

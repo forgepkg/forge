@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO app_user\n            (username, password_hash, active, auth_source,\n             external_subject, last_auth_source_at, realm_id)\n        VALUES ($1, NULL, true, 'upstream-basic', $1, now(), $2)\n        ON CONFLICT (username) DO UPDATE SET\n            last_auth_source_at = now()\n        WHERE app_user.auth_source = 'upstream-basic'\n          AND NOT app_user.realm_orphaned\n          AND app_user.realm_id IS NOT DISTINCT FROM EXCLUDED.realm_id\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
+  "query": "\n        INSERT INTO app_user\n            (username, password_hash, active, auth_source, external_subject, realm_id)\n        VALUES ($1, NULL, $2, 'upstream-basic', $3, $4)\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -95,6 +95,8 @@
     "parameters": {
       "Left": [
         "Text",
+        "Bool",
+        "Text",
         "Int8"
       ]
     },
@@ -109,5 +111,5 @@
       false
     ]
   },
-  "hash": "8080cafd012ed0ab7c453893a6bd17a2992a08c67e14a835bffca88ec9382034"
+  "hash": "48a90742216a0320a0314ddd6cfecf2d7895e25a3295bfd9b854f0e54ca1aba2"
 }

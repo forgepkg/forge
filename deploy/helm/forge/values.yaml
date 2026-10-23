@@ -51,7 +51,8 @@ config:
   #   # the gateway with networkPolicy.from.
   #   trusted_proxy_cidrs: [10.0.0.0/8]
   #   # The first administrator, created on the first start while
-  #   # FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD is set: a UPN, no default.
+  #   # FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD is set: a UPN, default
+  #   # admin@example.com.
   #   bootstrap_admin:
   #     username: admin@example.com
   # s3:
@@ -78,7 +79,7 @@ logLevel: info
 # FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY, FORGE_REDIS__URL,
 # FORGE_ROOT_KEY, FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD,
 # FORGE_OIDC__CLIENT_SECRET, ... The bootstrap admin's name is not secret:
-# config.auth.bootstrap_admin.username, a UPN such as admin@example.com.
+# config.auth.bootstrap_admin.username, a UPN (default admin@example.com).
 secretEnv: {}
 #   FORGE_DATABASE__URL: postgres://forge:<password>@postgres.example.internal:5432/forge
 #   FORGE_S3__ACCESS_KEY: <access key>
