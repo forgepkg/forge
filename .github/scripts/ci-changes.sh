@@ -41,8 +41,8 @@ COMMON=(.github/scripts/ci-changes.sh)
 CI=.github/workflows/ci.yml
 declare -A CI_JOB_GROUP=(
     [fmt]=changelog [clippy]=rust [audit]=audit [test]=rust
-    [docker]=image [kubernetes]=kubernetes [web]=web [oci-e2e]=rust
-    [raw-e2e]=rust [e2e]=rust [web-e2e]=web
+    [docker-platform]=image [docker]=image [kubernetes]=kubernetes [web]=web
+    [oci-e2e]=rust [raw-e2e]=rust [e2e]=rust [web-e2e]=web
 )
 
 # Rust: the workspace, what its build and tests read from outside the crates

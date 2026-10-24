@@ -206,9 +206,20 @@ credentials here.
 docker pull ghcr.io/<owner>/<repo>:1.0.0
 ```
 
+The image is published for `linux/amd64` and `linux/arm64` (from 2.0.0 on;
+earlier releases are amd64 only) as one multi-platform image: its tags and
+digest name an index of both platforms' images, from which `docker pull` and
+Kubernetes take the image of the node's platform. The Helm chart and the
+manifests therefore deploy to amd64 and arm64 nodes, mixed ones included,
+without a change. Each platform's image is built natively, not under
+emulation.
+
 Release images are signed with keyless cosign and carry an SBOM and a
-provenance attestation. The exact `cosign verify` command is in each GitHub
-release's notes, next to the commit the release was built from. It pins the
+provenance attestation for each platform (`docker buildx imagetools inspect
+ghcr.io/<owner>/<repo>:1.0.0` lists them). The release signs the index and
+each platform's image, and its notes list their digests. The exact `cosign
+verify` command is in each GitHub release's notes, next to the commit the
+release was built from; it passes for each of those digests. It pins the
 signer to this repository's release workflow at that release's tag, run by
 the push of the tag, on that commit:
 
@@ -226,8 +237,8 @@ another commit.
 
 Each release also publishes the Helm chart of the same version,
 `oci://ghcr.io/<owner>/charts/forge`, which pulls the image by the digest the
-release signed. It is signed the same way; its `cosign verify` command is in
-the release notes too.
+release signed, the index's, so each node pulls its platform's image. It is
+signed the same way; its `cosign verify` command is in the release notes too.
 
 `:latest` always names the newest stable release and `:<major>.<minor>` the
 newest release of that line; prereleases and patches to older lines never move
