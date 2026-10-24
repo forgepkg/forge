@@ -555,8 +555,11 @@ When `admin_groups` is set, admin is **recomputed on every login** from the
 current claims: membership in the built-in `admin` role (a user
 removed from the admin role loses admin on next login; existing sessions are not
 downgraded mid-session). With an empty `admin_groups` OIDC never touches admin.
-OIDC users are identified by the `(issuer, sub)` link. With `auto_provision =
-true` (default) a first-time login creates an `app_user`;
+OIDC users are identified by the `(issuer, sub)` link. A first-time login
+creates an `app_user` while the realm's **Auto-provision users on first
+login** is on: it is set for each realm on its page under **Admin →
+Authentication** (`auto_provision` in the realm's config), never in the
+`[oidc]` block, and a realm the block seeds starts with it on.
 `link_existing_by_username` is **off by default** — when enabled it links a new
 identity to an existing user of the same name, but never to an account that has
 a local password or is an admin, and an email claim is only used as the

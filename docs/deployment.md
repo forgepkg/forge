@@ -408,15 +408,17 @@ The rule applies wherever an account is created:
   account, or the login is refused and the login page names the claim. With
   Entra, `preferred_username` is the UPN. Elsewhere, map a claim that holds
   one, such as `email`. A name that is taken gets `-2`, `-3`, … on its local
-  part.
+  part. Whether a realm creates the account at all is set for each realm:
+  **Auto-provision users on first login** on its page under **Admin →
+  Authentication** (`auto_provision` in its config). The `[oidc]` block does
+  not set it; the realm it seeds starts with it on.
 - **Credential-forwarding realms create no accounts.** Create each one under
   **Admin → Users** with the realm as its sign-in (`POST /admin/users` with
   `"realm": "<name>"` and no password), named by a UPN whose local part is the
   upstream's username: Forge forwards the local part, so
   `alice@example.com` signs in as the upstream's `alice`. A login the
   upstream accepts but that names no account of the realm is refused. A
-  realm config that sets `auto_provision: true` is refused by the admin API,
-  and the `[auth.upstream_basic]` block's `auto_provision` is ignored.
+  realm config that sets `auto_provision: true` is refused by the admin API.
 
 ### Access and sign-in settings
 
