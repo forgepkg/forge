@@ -45,8 +45,11 @@ only at the person who opened it:
   request has to sign before it can be merged.
 - **Commits by AI coding agents.** Some agents (for example, Claude Code on
   the web) author commits under their own GitHub identity, which cannot sign
-  the CLA. You are responsible for that code as your contribution, so make
-  yourself the author before you push:
+  the CLA. GitHub Copilot's identities (`Copilot` and
+  `copilot-swe-agent[bot]`) are exempt from signing; human contributors to
+  those pull requests still need to sign. For other agents, you are
+  responsible for that code as your contribution, so make yourself the author
+  before you push:
 
   ```bash
   git rebase --exec 'git commit --amend --no-edit --reset-author' upstream/main

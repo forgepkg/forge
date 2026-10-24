@@ -48,6 +48,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          # Copilot cannot sign; human contributors still need to.
+          allowlist: 'Copilot,copilot-swe-agent[bot]'
           path-to-document: https://github.com/forgepkg/forge/blob/main/CLA.md
           # Bump the directory (version2, ...) when CLA.md changes materially,
           # so everyone signs the new text.
