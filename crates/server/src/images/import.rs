@@ -21,6 +21,9 @@
 //! * What the source recorded is kept: its publish time becomes the tag's
 //!   push time and the new manifest's creation time (retention's age rules),
 //!   its last download the manifest's last pull.
+//!
+//! The images format names the source's URLs and reads its manifests, as
+//! for a proxy's upstream.
 
 use std::sync::Arc;
 
@@ -32,16 +35,18 @@ use forge_core::net::upstream::RequestClass;
 use forge_core::repo::proxy::Credentials;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, LinkOutcome, TagWrite};
+use forge_plugin::api::images::{
+    ImageError, ManifestBlob, ParsedManifest, Reference, MAX_MANIFEST_BYTES,
+};
+use forge_plugin::api::UpstreamOp;
 use futures_util::TryStreamExt;
 use reqwest::Method;
 
-use crate::digest::{Algorithm, Digest};
-use crate::error::{Code, OciError, OciResult};
-use crate::manifest::{self, media, Descriptor, ParsedManifest, EMPTY_JSON_DIGEST};
-use crate::proxy::{content_type, read_limited, upstream_base, Upstream};
-use crate::push::require_linked;
-use crate::reference;
-use crate::service::{Registry, Target};
+use super::digest::ContentDigest;
+use super::dispatch::Target;
+use super::proxy::{content_type, read_limited, Upstream};
+use super::push::require_linked;
+use super::{Failure, ImgResult, Registry};
 
 /// How deep indexes may nest below the copied manifest.
 const MAX_DEPTH: usize = 4;
@@ -55,21 +60,21 @@ pub struct ImportSource {
 }
 
 impl ImportSource {
-    /// The registry API at `base_url` (`/v2` is appended), with Basic
-    /// `credentials` for it and for the token service its challenge names.
+    /// The registry API at `base_url`, with Basic `credentials` for it and
+    /// for the token service its challenge names.
     pub fn new(base_url: &str, credentials: Option<Credentials>, owner: String) -> Self {
         ImportSource {
-            base: upstream_base(base_url),
+            base: base_url.to_string(),
             credentials: credentials.map(Arc::new),
             owner,
         }
     }
 
-    fn upstream<'a>(&'a self, registry: &'a Registry) -> Upstream<'a> {
+    fn upstream<'a>(&self, registry: &'a Registry) -> Upstream<'a> {
         Upstream {
-            reg: registry,
+            http: &registry.inner.http,
             owner: self.owner.clone(),
-            base: self.base.clone(),
+            remote: self.base.clone(),
             creds: self.credentials.clone(),
         }
     }
@@ -127,7 +132,7 @@ pub struct ImportedImage {
 
 /// A manifest fetched from the source and checked against its digest.
 struct Fetched {
-    digest: Digest,
+    digest: ContentDigest,
     body: Bytes,
     parsed: ParsedManifest,
 }
@@ -144,11 +149,8 @@ impl Registry {
         tag: &str,
         expected: Option<&str>,
         options: &ImageImportOptions,
-    ) -> OciResult<ImportedImage> {
+    ) -> ImgResult<ImportedImage> {
         let t = self.import_target(repo, image, &options.principal).await?;
-        if !reference::valid_tag(tag) {
-            return Err(OciError::manifest_invalid(format!("invalid tag {tag:?}")));
-        }
         let pool = &self.inner.pool;
         let existing = oci_dao::find_tag(pool, repo.id, image, tag)
             .await?
@@ -179,7 +181,9 @@ impl Registry {
         }
 
         let upstream = source.upstream(self);
-        let fetched = self.fetch_manifest(&upstream, image, tag, None).await?;
+        let fetched = self
+            .fetch_manifest(&upstream, image, &Reference::Tag(tag.to_string()), None)
+            .await?;
         let digest = fetched.digest.to_string();
         let decided = |outcome| {
             Ok(ImportedImage {
@@ -256,10 +260,13 @@ impl Registry {
         image: &str,
         digest: &str,
         options: &ImageImportOptions,
-    ) -> OciResult<ImportedImage> {
+    ) -> ImgResult<ImportedImage> {
         let t = self.import_target(repo, image, &options.principal).await?;
-        let digest = Digest::parse(digest)
-            .map_err(|e| OciError::digest_invalid(format!("invalid digest {digest:?}: {e}")))?;
+        let digest = ContentDigest::parse(digest).ok_or_else(|| {
+            Failure::new(ImageError::ManifestInvalid(format!(
+                "invalid digest {digest:?}"
+            )))
+        })?;
         let pool = &self.inner.pool;
         // Held already: a referrer copied before, or a manifest an imported
         // tag brought along (an index's child), which is no referrer.
@@ -276,7 +283,12 @@ impl Registry {
         }
         let upstream = source.upstream(self);
         let fetched = self
-            .fetch_manifest(&upstream, image, digest.as_str(), Some(&digest))
+            .fetch_manifest(
+                &upstream,
+                image,
+                &Reference::Digest(digest.to_string()),
+                Some(&digest),
+            )
             .await?;
         let mut bytes = fetched.body.len() as u64;
         let decided = |outcome| {
@@ -292,7 +304,7 @@ impl Registry {
         if options.dry_run {
             return decided(ImageOutcome::Planned { replaces: false });
         }
-        if oci_dao::find_manifest(pool, repo.id, image, subject.digest.as_str())
+        if oci_dao::find_manifest(pool, repo.id, image, subject)
             .await?
             .is_none()
         {
@@ -337,29 +349,36 @@ impl Registry {
         })
     }
 
-    /// The image `image` of `repo` as an import target: a hosted docker
-    /// repository the import's administrator may push the image to.
+    /// The image `image` of `repo` as an import target: a hosted repository
+    /// of the images format the import's administrator may push the image
+    /// to.
     async fn import_target(
         &self,
         repo: &Repository,
         image: &str,
         principal: &Principal,
-    ) -> OciResult<Target> {
-        if !repo.is_docker() || repo.kind() != RepoKind::Hosted {
-            return Err(OciError::unsupported(
+    ) -> ImgResult<Target> {
+        if !self.serves(repo) || repo.kind() != RepoKind::Hosted {
+            return Err(Failure::unsupported(
+                405,
                 "images are imported into a hosted docker repository",
             ));
         }
-        if !reference::valid_name(image) {
-            return Err(OciError::name_invalid(image));
+        if self.plugin().validate_id(image).is_err() {
+            return Err(Failure::new(ImageError::NameInvalid {
+                name: image.to_string(),
+                hint: None,
+            }));
         }
         if !self
             .rbac_allows(principal, repo, image, Action::Write)
             .await
         {
-            return Err(OciError::denied(format!(
-                "the import may not push the image {image:?}"
-            )));
+            return Err(Failure::new(ImageError::Denied {
+                name: image.to_string(),
+                permission: forge_plugin::api::images::Permission::Write,
+            })
+            .with_text(format!("the import may not push the image {image:?}")));
         }
         Ok(Target {
             repo: repo.clone(),
@@ -378,27 +397,28 @@ impl Registry {
         fetched: &Fetched,
         options: &ImageImportOptions,
         depth: usize,
-    ) -> OciResult<u64> {
+    ) -> ImgResult<u64> {
         let pool = &self.inner.pool;
         let mut bytes = 0;
-        for child in fetched.parsed.manifest_references() {
-            if oci_dao::find_manifest(pool, t.repo.id, &t.image, child.digest.as_str())
+        for child in &fetched.parsed.manifests {
+            if oci_dao::find_manifest(pool, t.repo.id, &t.image, child)
                 .await?
                 .is_some()
             {
                 continue;
             }
             if depth >= MAX_DEPTH {
-                return Err(OciError::manifest_invalid(
-                    "the source's indexes nest too deep",
-                ));
+                return Err(Failure::new(ImageError::ManifestInvalid(
+                    "the source's indexes nest too deep".into(),
+                )));
             }
+            let digest = ContentDigest::named(child)?;
             let child = self
                 .fetch_manifest(
                     upstream,
                     &t.image,
-                    child.digest.as_str(),
-                    Some(&child.digest),
+                    &Reference::Digest(child.clone()),
+                    Some(&digest),
                 )
                 .await?;
             bytes += child.body.len() as u64;
@@ -426,12 +446,10 @@ impl Registry {
             )
             .await?;
         }
-        for blob in fetched.parsed.blob_references() {
-            // Non-distributable layers live elsewhere by definition; the
-            // empty JSON blob is linked by `commit_manifest` itself.
-            if media::is_non_distributable(&blob.media_type)
-                || blob.digest.as_str() == EMPTY_JSON_DIGEST
-            {
+        for blob in &fetched.parsed.blobs {
+            // Content that lives elsewhere by definition, and content the
+            // format knows (linked by `commit_manifest` itself).
+            if !blob.required || blob.known.is_some() {
                 continue;
             }
             bytes += self.copy_blob(t, upstream, blob).await?;
@@ -445,10 +463,10 @@ impl Registry {
         &self,
         t: &Target,
         upstream: &Upstream<'_>,
-        blob: &Descriptor,
-    ) -> OciResult<u64> {
+        blob: &ManifestBlob,
+    ) -> ImgResult<u64> {
         let pool = &self.inner.pool;
-        let digest = &blob.digest;
+        let digest = ContentDigest::named(&blob.digest)?;
         if oci_dao::find_link(pool, t.repo.id, &t.image, digest.as_str())
             .await?
             .is_some()
@@ -457,9 +475,9 @@ impl Registry {
         }
         // Another image of this repository holds it: its content is the
         // digest's, and the repository's readers can already read it.
-        if digest.algorithm() == Algorithm::Sha256 {
+        if let Some(sha256) = digest.sha256_hex() {
             if let Some((_, size)) =
-                oci_dao::blob_linked_in_repository(pool, t.repo.id, digest.hex()).await?
+                oci_dao::blob_linked_in_repository(pool, t.repo.id, sha256).await?
             {
                 let mut tx = pool.begin().await?;
                 match oci_dao::insert_link_existing(
@@ -467,7 +485,7 @@ impl Registry {
                     t.repo.id,
                     &t.image,
                     digest.as_str(),
-                    digest.hex(),
+                    sha256,
                     size,
                 )
                 .await?
@@ -481,21 +499,22 @@ impl Registry {
             }
         }
 
+        let url = self.image_url(
+            &upstream.remote,
+            &UpstreamOp::ImageBlob {
+                image: t.image.clone(),
+                digest: digest.to_string(),
+            },
+        )?;
         let response = upstream
-            .send(
-                Method::GET,
-                &format!("/v2/{}/blobs/{digest}", t.image),
-                &format!("repository:{}:pull", t.image),
-                None,
-                RequestClass::Download,
-            )
+            .send_url(Method::GET, &url, RequestClass::Download)
             .await?;
         if !response.status().is_success() {
             return Err(source_status(response.status(), digest.as_str()));
         }
         let max = self.blob_limit(&t.repo);
         if response.content_length().is_some_and(|l| l > max) {
-            return Err(OciError::too_large(max));
+            return Err(Failure::new(ImageError::TooLarge { limit: max }));
         }
         let body = response.bytes_stream().map_err(std::io::Error::other);
         let staged = self
@@ -504,7 +523,7 @@ impl Registry {
             .stage(tokio_util::io::StreamReader::new(body), max)
             .await?;
         if !digest.matches(&staged.sha256, &staged.sha512_base64) {
-            return Err(OciError::unavailable(format!(
+            return Err(Failure::unavailable(format!(
                 "the source served a blob that does not match its digest {digest}"
             )));
         }
@@ -521,7 +540,7 @@ impl Registry {
             stored.ingest_token,
         )
         .await
-        .map_err(OciError::from)
+        .map_err(Failure::from)
         .and_then(require_linked)?;
         tx.commit().await?;
         Ok(size)
@@ -535,53 +554,59 @@ impl Registry {
         &self,
         upstream: &Upstream<'_>,
         image: &str,
-        reference: &str,
-        expected: Option<&Digest>,
-    ) -> OciResult<Fetched> {
-        let accept = media::ACCEPT_ALL.join(", ");
+        reference: &Reference,
+        expected: Option<&ContentDigest>,
+    ) -> ImgResult<Fetched> {
+        let what = reference.as_str();
+        let url = self.image_url(
+            &upstream.remote,
+            &UpstreamOp::ImageManifest {
+                image: image.to_string(),
+                reference: reference.clone(),
+            },
+        )?;
         let response = upstream
-            .send(
-                Method::GET,
-                &format!("/v2/{image}/manifests/{reference}"),
-                &format!("repository:{image}:pull"),
-                Some(&accept),
-                RequestClass::Metadata,
-            )
+            .send_url(Method::GET, &url, RequestClass::Metadata)
             .await?;
         if !response.status().is_success() {
-            return Err(source_status(response.status(), reference));
+            return Err(source_status(response.status(), what));
         }
         let announced = response
             .headers()
             .get("docker-content-digest")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| Digest::parse(v).ok());
+            .and_then(ContentDigest::parse);
         let content_type = content_type(&response);
-        let body = read_limited(response, manifest::MAX_MANIFEST_BYTES).await?;
+        let body = read_limited(response, MAX_MANIFEST_BYTES).await?;
         let mismatch = || {
-            OciError::unavailable(format!(
-                "the source served a manifest for {image}:{reference} that does not match its digest"
+            Failure::unavailable(format!(
+                "the source served a manifest for {image}:{what} that does not match its digest"
             ))
         };
         let digest = match expected {
             Some(expected) => {
-                if Digest::of(expected.algorithm(), &body) != *expected {
+                if !expected.matches_bytes(&body) {
                     return Err(mismatch());
                 }
                 expected.clone()
             }
             None => {
                 if let Some(announced) = &announced {
-                    if Digest::of(announced.algorithm(), &body) != *announced {
+                    if !announced.matches_bytes(&body) {
                         return Err(mismatch());
                     }
                 }
-                Digest::sha256_of(&body)
+                ContentDigest::sha256_of(&body)
             }
         };
-        let parsed = manifest::parse(&body, content_type.as_deref()).map_err(|e| {
-            OciError::manifest_invalid(format!("the source's manifest {image}:{reference}: {e}"))
-        })?;
+        let parsed = self
+            .parse_manifest(&body, content_type.as_deref())
+            .map_err(|e| {
+                Failure::new(ImageError::ManifestInvalid(format!(
+                    "the source's manifest {image}:{what}: {}",
+                    e.message()
+                )))
+            })?;
         Ok(Fetched {
             digest,
             body,
@@ -591,22 +616,18 @@ impl Registry {
 }
 
 /// The error of a source answer that is not a success.
-fn source_status(status: reqwest::StatusCode, what: &str) -> OciError {
+fn source_status(status: reqwest::StatusCode, what: &str) -> Failure {
     match status.as_u16() {
-        404 => OciError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            Code::ManifestUnknown,
-            format!("the source does not have {what}"),
-        ),
-        401 | 403 => OciError::unavailable(format!(
+        404 => Failure::new(ImageError::ManifestUnknown {
+            reference: what.to_string(),
+        })
+        .with_text(format!("the source does not have {what}")),
+        401 | 403 => Failure::unavailable(format!(
             "the source registry refused the import's credentials ({status}) for {what}"
         )),
-        429 => OciError::new(
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            Code::TooManyRequests,
-            "the source registry rate-limits the import; retry later",
-        ),
-        _ => OciError::unavailable(format!("the source registry answered {status} for {what}")),
+        429 => Failure::new(ImageError::RateLimited)
+            .with_text("the source registry rate-limits the import; retry later"),
+        _ => Failure::unavailable(format!("the source registry answered {status} for {what}")),
     }
 }
 

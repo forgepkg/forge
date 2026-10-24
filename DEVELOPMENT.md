@@ -250,12 +250,12 @@ groups. See [docs/raw.md](docs/raw.md).
 
 ### Repositories of other formats (format plugins)
 
-Every package format is a format plugin, a crate in
+Every format is a format plugin, a crate in
 [`crates/formats/`](./crates/formats) linked into the server (see
-[docs/format-plugins.md](./docs/format-plugins.md)): NuGet and raw. A new
-format goes in `crates/formats/<id>` too, never in a `crates/format-<id>`
-crate or the server. Docker / OCI is in `crates/formats/docker` but still
-native, served by the server's registry under `/v2`. A repository of a plugin
+[docs/format-plugins.md](./docs/format-plugins.md)): Docker / OCI, NuGet and
+raw. A new format goes in `crates/formats/<id>` too, never in a
+`crates/format-<id>` crate or the server. Docker / OCI is an images format,
+served under `/v2` over the server's image store. A repository of a plugin
 format is created with `"format": "<id>"` (hosted, proxy or group; a plugin
 format has proxies when it implements the upstream side) and served under
 `/repository/<name>/` unless the plugin names another mount (NuGet's is

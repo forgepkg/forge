@@ -7,12 +7,9 @@ the design, the contract and how to write one.
 
 | Plugin | Format id | What it serves |
 | --- | --- | --- |
+| [`docker`](docker) | `docker` | Docker / OCI registries at `/v2`: push and pull images, indexes and artifacts (Helm charts, signatures, SBOMs); hosted, proxy and group repositories ([docs/docker.md](../../docs/docker.md)) |
 | [`nuget`](nuget) | `nuget` | NuGet V3 feeds at `/v3`: push, restore, search, unlist and relist; hosted, proxy and group repositories |
 | [`raw`](raw) | `raw` | Raw files at `/raw`: files under paths, uploads with `PUT` or a form, ranges, checksum sidecars, listings; hosted, proxy and group repositories ([docs/raw.md](../../docs/raw.md)) |
-
-[`docker`](docker) holds Docker / OCI (`forge-format-docker`), which is still
-native: the server's registry serves it under `/v2`, not through
-`FormatPlugin` ([docs/docker.md](../../docs/docker.md)).
 
 A plugin directory holds:
 
@@ -21,8 +18,9 @@ A plugin directory holds:
   Descriptor` that its `descriptor()` returns: the format id (also the
   directory's name), display name, version (`env!("CARGO_PKG_VERSION")`),
   description, mount, repository kinds (`Proxy` when it implements
-  `upstream`), its `storage` (`Packages`, or `Files` for a files format such
-  as raw) and its asset names.
+  `upstream`), its `storage` (`Packages`, `Files` for a files format such
+  as raw, or `Images` for an images format such as Docker) and its asset
+  names.
 
 The server installs it in `plugins::builtin()`
 ([`crates/server/src/plugins.rs`](../server/src/plugins.rs)), whose tests

@@ -79,13 +79,7 @@ fn the_index_is_the_service_indexs_resources() {
         UpstreamOp::Index,
         &docs([(FEED.into(), index)]),
     );
-    assert_eq!(
-        done.fetches,
-        [Fetch {
-            url: FEED.into(),
-            freshness: Freshness::Metadata
-        }]
-    );
+    assert_eq!(done.fetches, [Fetch::get(FEED, Freshness::Metadata)]);
     let UpstreamAnswer::Index(index) = done.answer else {
         panic!("{:?}", done.answer)
     };
@@ -281,10 +275,10 @@ fn dating_reads_the_catalog_of_unlisted_versions() {
     );
     assert_eq!(
         done.fetches.last().unwrap(),
-        &Fetch {
-            url: "https://up.example/catalog/1.0.0.json".into(),
-            freshness: Freshness::Immutable,
-        }
+        &Fetch::get(
+            "https://up.example/catalog/1.0.0.json",
+            Freshness::Immutable
+        )
     );
     let UpstreamAnswer::Metadata(metadata) = done.answer else {
         panic!("{:?}", done.answer)

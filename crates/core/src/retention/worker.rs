@@ -228,7 +228,12 @@ impl RetentionWorker {
         run_id: uuid::Uuid,
     ) -> Result<RunSummary, WorkerError> {
         let kind = RepoKind::from(repo.kind.as_str());
-        if repo.format == forge_db::model::DOCKER_FORMAT {
+        // An images format's repositories (Docker) hold images.
+        if self
+            .formats
+            .resolve(&repo.format)
+            .is_some_and(|format| format.stores_images())
+        {
             return self.process_images(repo, kind, run_id).await;
         }
         // A files format's repositories (raw) hold files under paths.

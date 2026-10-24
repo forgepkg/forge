@@ -118,6 +118,10 @@ pub const MAX_UPSTREAM_ROUNDS: usize = 4;
 /// The most fetches of one upstream conversation (as the host).
 pub const MAX_UPSTREAM_FETCHES: usize = 256;
 
+/// The most rounds of one upstream conversation of an images format (as
+/// the host): an upstream's tag list may take a page per round.
+pub const MAX_IMAGE_UPSTREAM_ROUNDS: usize = 12;
+
 /// What came of an upstream conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversed {
@@ -139,8 +143,31 @@ pub fn converse(
     op: &UpstreamOp,
     mut fetch: impl FnMut(&Fetch) -> Fetched,
 ) -> Result<Conversed, FormatError> {
+    converse_answered(plugin, remote, op, |want| FetchResult {
+        fetch: want.clone(),
+        outcome: fetch(want),
+        status: None,
+        headers: Vec::new(),
+    })
+}
+
+/// [`converse`], with `fetch` answering each fetch whole: its outcome, and
+/// for an images format the status and `link` headers of the upstream's
+/// answer. An images format's conversation may take
+/// [`MAX_IMAGE_UPSTREAM_ROUNDS`] rounds.
+pub fn converse_answered(
+    plugin: &dyn FormatPlugin,
+    remote: &Remote,
+    op: &UpstreamOp,
+    mut fetch: impl FnMut(&Fetch) -> FetchResult,
+) -> Result<Conversed, FormatError> {
+    let rounds = if plugin.descriptor().storage == crate::Storage::Images {
+        MAX_IMAGE_UPSTREAM_ROUNDS
+    } else {
+        MAX_UPSTREAM_ROUNDS
+    };
     let mut fetched: Vec<FetchResult> = Vec::new();
-    for _ in 0..MAX_UPSTREAM_ROUNDS {
+    for _ in 0..rounds {
         match plugin.upstream(remote, op, &fetched)? {
             UpstreamStep::Done(answer) => {
                 return Ok(Conversed {
@@ -157,16 +184,14 @@ pub fn converse(
                     )));
                 }
                 for want in wanted {
-                    let outcome = fetch(&want);
-                    fetched.push(FetchResult {
-                        fetch: want,
-                        outcome,
-                    });
+                    let mut answered = fetch(&want);
+                    answered.fetch = want;
+                    fetched.push(answered);
                 }
             }
         }
     }
     Err(FormatError::Internal(format!(
-        "needed more than {MAX_UPSTREAM_ROUNDS} rounds"
+        "needed more than {rounds} rounds"
     )))
 }

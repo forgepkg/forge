@@ -1,6 +1,7 @@
-//! The Docker / OCI registry (`/v2`), wired into the server: the route
-//! handler, the registry-token signing key, and the trusted-publishing
-//! ledger of workload pushes.
+//! The registry of the images format (Docker / OCI, `/v2`), wired into the
+//! server: the route handler, the registry-token signing key, and the
+//! trusted-publishing ledger of workload pushes. The image store and the
+//! request's conversation with the format are [`crate::images`].
 
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use base64::Engine;
 use forge_core::auth::Principal;
 use forge_core::repo::PublishPolicy;
@@ -16,11 +17,13 @@ use forge_crypto::service::EnvelopeService;
 use forge_crypto::{ExposeSecret, PlaintextSecret};
 use forge_db::model::Repository;
 use forge_db::{authz_dao, secret_dao, workload_api_key_dao};
-use forge_format_docker::token::TokenKeys;
+use forge_plugin::api::images::ImageError;
+use forge_plugin::FormatPlugin;
 use sha2::Digest;
 use sqlx::PgPool;
 
 use crate::config::Config;
+use crate::images::token::TokenKeys;
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -36,7 +39,7 @@ pub async fn registry(State(state): State<AppState>, req: Request<Body>) -> Resp
 /// Workload pushes go to the trusted-publishing ledger.
 pub(crate) struct LedgerRecorder;
 
-impl forge_format_docker::PublishRecorder for LedgerRecorder {
+impl crate::images::PublishRecorder for LedgerRecorder {
     fn for_repository(&self, repository: &Repository) -> Arc<dyn PublishPolicy> {
         crate::dispatch::workload_ledger_policy(repository)
     }
@@ -50,7 +53,7 @@ pub(crate) struct WorkloadLiveness {
 }
 
 #[async_trait::async_trait]
-impl forge_format_docker::WorkloadCheck for WorkloadLiveness {
+impl crate::images::WorkloadCheck for WorkloadLiveness {
     async fn still_valid(&self, principal: &Principal) -> Result<bool, String> {
         let Principal::Workload {
             realm_id,
@@ -84,25 +87,21 @@ impl forge_format_docker::WorkloadCheck for WorkloadLiveness {
 
 /// A 401 the authentication middleware answered itself (wrong credentials)
 /// on a `/v2` path, made a registry error: the Bearer challenge clients
-/// expect and the distribution-spec error body.
-pub(crate) fn amend_registry_rejection(public_base_url: &str, response: Response) -> Response {
+/// expect, and the images format's answer to invalid credentials.
+pub(crate) fn amend_registry_rejection(
+    public_base_url: &str,
+    images: &dyn FormatPlugin,
+    response: Response,
+) -> Response {
     if response.status() != StatusCode::UNAUTHORIZED
         || response.headers().contains_key(header::WWW_AUTHENTICATE)
     {
         return response;
     }
-    let (scheme, service) = forge_format_docker::registry_origin(public_base_url);
+    let (scheme, service) = crate::images::registry_origin(public_base_url);
     let challenge = format!("Bearer realm=\"{scheme}://{service}/v2/token\",service=\"{service}\"");
-    let body = serde_json::json!({
-        "errors": [{ "code": "UNAUTHORIZED", "message": "invalid credentials" }]
-    })
-    .to_string();
-    let mut amended = (
-        StatusCode::UNAUTHORIZED,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response();
+    let mut amended =
+        crate::images::dispatch::rendered(images.image_error(&ImageError::InvalidCredentials));
     if let Ok(value) = HeaderValue::from_str(&challenge) {
         amended
             .headers_mut()

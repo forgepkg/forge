@@ -576,7 +576,13 @@ impl ProxyRepo {
                             } else {
                                 (self.refuse(repo, &fetch.url), Vec::new(), false)
                             };
-                            (api::FetchResult { fetch, outcome }, named, down)
+                            let result = api::FetchResult {
+                                fetch,
+                                outcome,
+                                status: None,
+                                headers: Vec::new(),
+                            };
+                            (result, named, down)
                         }
                     })
                     .buffered(FETCH_CONCURRENCY)

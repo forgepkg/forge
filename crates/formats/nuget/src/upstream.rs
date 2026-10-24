@@ -139,6 +139,11 @@ pub(crate) fn step(
         UpstreamOp::Search(query) => search(&resources, query, fetched),
         // A feed holds packages: it has no files to fetch.
         UpstreamOp::File(_) => done(UpstreamAnswer::File(None)),
+        UpstreamOp::ImageName(_)
+        | UpstreamOp::ImageManifest { .. }
+        | UpstreamOp::ImageBlob { .. }
+        | UpstreamOp::ImageTags { .. }
+        | UpstreamOp::ImageReferrers { .. } => failed("a feed holds no images"),
     })
 }
 
@@ -151,10 +156,7 @@ fn failed(reason: impl Into<String>) -> UpstreamStep {
 }
 
 fn get(url: &str, freshness: Freshness) -> Fetch {
-    Fetch {
-        url: url.to_string(),
-        freshness,
-    }
+    Fetch::get(url, freshness)
 }
 
 /// How the fetch of `url` went, if it has been fetched.

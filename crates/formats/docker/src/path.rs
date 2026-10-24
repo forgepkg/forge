@@ -3,6 +3,11 @@
 //! A repository name may itself contain `/` (and words like `blobs` or
 //! `manifests` as components), but no reference, digest or upload id does,
 //! so endpoints are recognized from the **end** of the path.
+//!
+//! The host routes `/v2` and answers `/v2/`, `/v2/token` and `/v2/_catalog`
+//! itself; it hands the format the path below `/v2`, which [`split`] splits
+//! into the name and the rest, and then the rest, which [`of_name`] parses
+//! again with the name the host resolved.
 
 /// A `/v2/` endpoint, with the raw (not yet validated) name and argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +45,21 @@ impl Endpoint {
             | Endpoint::Referrers { name, .. } => Some(name),
         }
     }
+}
+
+/// A path below `/v2` (`/team/app/manifests/1`) as the endpoint of a name,
+/// with the part after the name (`/manifests/1`). `None` for anything that
+/// is not the endpoint of a name.
+pub fn split(path: &str) -> Option<(Endpoint, String)> {
+    let endpoint = parse(&format!("/v2{path}"))?;
+    let rest = path.strip_prefix('/')?.strip_prefix(endpoint.name()?)?;
+    let rest = rest.to_string();
+    Some((endpoint, rest))
+}
+
+/// The endpoint `rest` (what [`split`] left after the name) of `name`.
+pub fn of_name(name: &str, rest: &str) -> Option<Endpoint> {
+    parse(&format!("/v2/{name}{rest}")).filter(|endpoint| endpoint.name() == Some(name))
 }
 
 /// Parse a request path. `None` for anything that is not a `/v2` endpoint.
@@ -179,5 +199,30 @@ mod tests {
         assert_eq!(parse("/v2/tags/list"), None);
         assert_eq!(parse("/v2/x"), None);
         assert_eq!(parse("/v2/x/y"), None);
+    }
+
+    #[test]
+    fn splits_the_name_off_and_back_on() {
+        let (endpoint, rest) = split("/docker/team/app/manifests/1.0").unwrap();
+        assert_eq!(
+            endpoint,
+            Endpoint::Manifest {
+                name: "docker/team/app".into(),
+                reference: "1.0".into()
+            }
+        );
+        assert_eq!(rest, "/manifests/1.0");
+        assert_eq!(of_name("docker/team/app", &rest), Some(endpoint));
+        let (_, rest) = split("/a/blobs/uploads/").unwrap();
+        assert_eq!(rest, "/blobs/uploads/");
+        assert_eq!(
+            of_name("other", "/blobs/uploads/"),
+            Some(Endpoint::UploadStart {
+                name: "other".into()
+            })
+        );
+        assert_eq!(split("/token"), None);
+        assert_eq!(split("/x"), None);
+        assert_eq!(split(""), None);
     }
 }
