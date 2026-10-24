@@ -1,4 +1,4 @@
-# A Forge format plugin: NuGet V3 feeds (see plugins/README.md).
+# A Forge format plugin: NuGet V3 feeds (see crates/formats/README.md).
 [plugin]
 id = "nuget"
 name = "NuGet"

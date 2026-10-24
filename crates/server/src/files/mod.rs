@@ -1,8 +1,9 @@
 //! The file store: the repositories of a format whose `plugin.toml` says
 //! `storage = "files"` (raw) hold files under paths, like Nexus' raw-hosted,
 //! raw-proxy and raw-group repositories. The format's plugin owns the
-//! protocol (`plugins/raw`, served under its mount by [`crate::plugins`]);
-//! this module answers the file queries and actions it asks for:
+//! protocol (`crates/formats/raw`, served under its mount by
+//! [`crate::plugins`]); this module answers the file queries and actions it
+//! asks for:
 //!
 //! * `file` and `fetch-file`: [`Files::locate`] — the stored file; a proxy's
 //!   copy, re-validated with its upstream once it is due, or fetched from it

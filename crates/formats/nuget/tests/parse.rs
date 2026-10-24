@@ -10,7 +10,7 @@ use forge_plugin_api::{FormatError, FormatPlugin};
 
 fn fixture(name: &str) -> File {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("../../fixtures/nuget");
+    p.push("../../../fixtures/nuget");
     p.push(name);
     File::open(&p).unwrap_or_else(|e| panic!("open fixture {}: {e}", p.display()))
 }

@@ -13,9 +13,9 @@
 //! implements the protocol over the host's file store ([`Query::File`] …
 //! [`Query::Remove`], [`Action::ServeFile`]).
 //!
-//! A plugin is a crate under `plugins/<id>/` implementing [`FormatPlugin`],
-//! with a `plugin.toml` naming it, linked into the server and called
-//! directly (NuGet, raw).
+//! A plugin is a crate under `crates/formats/<id>/` implementing
+//! [`FormatPlugin`], with a `plugin.toml` naming it, linked into the server
+//! and called directly (NuGet, raw).
 
 pub mod files;
 mod types;

@@ -1,7 +1,7 @@
 //! NuGet's publish endpoints end to end, now that the NuGet plugin
-//! (`plugins/nuget`) routes them and the host's plugin dispatcher streams the
-//! upload: multipart framing, the upload limit, unlist and relist, and the
-//! answers for a method a path does not take.
+//! (`crates/formats/nuget`) routes them and the host's plugin dispatcher
+//! streams the upload: multipart framing, the upload limit, unlist and
+//! relist, and the answers for a method a path does not take.
 
 mod common;
 

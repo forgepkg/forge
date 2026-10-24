@@ -51,7 +51,7 @@ declare -A CI_JOB_GROUP=(
 # reads.
 RUST=(
     Cargo.toml Cargo.lock rust-toolchain.toml .cargo ':(exclude).cargo/audit.toml'
-    crates plugins xtask migrations .sqlx fixtures
+    crates xtask migrations .sqlx fixtures
     web/index.html docker/forge.docker.toml
     .github/scripts/test-parallel.sh .github/scripts/test-timings-runner.sh
     .github/scripts/test-timings-summary.sh .github/scripts/oci-e2e.sh

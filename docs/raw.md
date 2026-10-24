@@ -7,8 +7,9 @@ have no package manager of their own (the
 example), installers, firmware images, test fixtures, tool downloads.
 
 Files live in repositories of `format: "raw"`, a format plugin built into
-Forge like NuGet ([`plugins/raw`](../plugins/raw); `GET /admin/formats`
-lists it), served at `https://<host>/raw/<repository>/<path>`. The plugin
+Forge like NuGet ([`crates/formats/raw`](../crates/formats/raw);
+`GET /admin/formats` lists it), served at
+`https://<host>/raw/<repository>/<path>`. The plugin
 speaks the protocol below; the host's file store keeps the files
 ([format-plugins.md](format-plugins.md#files-formats)). They come in the
 usual three kinds:

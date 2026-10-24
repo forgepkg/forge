@@ -7,12 +7,12 @@
 name: Forge
 
 paths-ignore:
-  # Rust: every crate's integration tests (crates/*/tests, plugins/*/tests,
-  # xtask/tests), the end-to-end crate with its mock IdPs and upstreams, and
-  # the test helpers behind the `testing` feature. The unit tests inside the
-  # source files (`#[cfg(test)] mod tests`) cannot be left out by path: the
-  # workflow extracts the Rust code with `cfg(test)` off instead, as a release
-  # build compiles it.
+  # Rust: every crate's integration tests (crates/*/tests,
+  # crates/formats/*/tests, xtask/tests), the end-to-end crate with its mock
+  # IdPs and upstreams, and the test helpers behind the `testing` feature. The
+  # unit tests inside the source files (`#[cfg(test)] mod tests`) cannot be
+  # left out by path: the workflow extracts the Rust code with `cfg(test)` off
+  # instead, as a release build compiles it.
   - "**/tests"
   - crates/e2e
   - crates/plugin/src/testing.rs

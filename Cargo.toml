@@ -11,8 +11,8 @@ members = [
     "crates/format-oci",
     "crates/server",
     "crates/e2e",
-    "plugins/nuget",
-    "plugins/raw",
+    "crates/formats/nuget",
+    "crates/formats/raw",
     "xtask",
 ]
 

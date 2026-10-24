@@ -105,18 +105,18 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
     "vary",
 ];
 
-/// The format plugins built into this server: crates under `plugins/<id>/`,
-/// linked in and always installed (NuGet, raw). NuGet reads archives under
-/// `nuget_limits` (`[nuget]`).
+/// The format plugins built into this server: crates under
+/// `crates/formats/<id>/`, linked in and always installed (NuGet, raw). NuGet
+/// reads archives under `nuget_limits` (`[nuget]`).
 pub fn builtin(nuget_limits: forge_format_nuget::NupkgLimits) -> Vec<Arc<Plugin>> {
     vec![
         Plugin::builtin(
             forge_format_nuget::PLUGIN_TOML,
             forge_format_nuget::Nuget::with_limits(nuget_limits),
         )
-        .expect("plugins/nuget/plugin.toml is valid"),
+        .expect("crates/formats/nuget/plugin.toml is valid"),
         Plugin::builtin(forge_format_raw::PLUGIN_TOML, forge_format_raw::Raw)
-            .expect("plugins/raw/plugin.toml is valid"),
+            .expect("crates/formats/raw/plugin.toml is valid"),
     ]
 }
 

@@ -84,7 +84,7 @@ jobs:
           if touches web ':(glob)**/*.js' ':(glob)**/*.cjs' ':(glob)**/*.mjs' ':(glob)**/*.ts' ':(glob)**/*.tsx'; then
               languages+=(javascript-typescript)
           fi
-          if touches Cargo.toml Cargo.lock rust-toolchain.toml .cargo .sqlx crates plugins xtask; then
+          if touches Cargo.toml Cargo.lock rust-toolchain.toml .cargo .sqlx crates xtask; then
               languages+=(rust)
           fi
 
