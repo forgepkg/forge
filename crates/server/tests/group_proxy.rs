@@ -198,3 +198,66 @@ async fn downstream_proxy_does_not_cache_a_miss_while_a_group_member_is_failing(
         assert_eq!(get(path.clone()).await.unwrap().status(), 404, "{path}");
     }
 }
+
+/// #283: a proxy whose upstream cannot be reached, with nothing cached for
+/// the request, answers 503 with `Retry-After` (an upstream outage), not 500
+/// (a fault of Forge); so does a group whose member it is. What is answered
+/// locally (NuGet's service index) is still served.
+#[tokio::test]
+async fn a_proxy_of_an_unreachable_upstream_answers_503() {
+    // Nothing listens on the port: connection refused.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let creds = (srv.admin_user.clone().unwrap(), srv.admin_token().await);
+    let client = srv.client();
+    let s = common::unique();
+    let (nuget, group) = (format!("ndown{s}"), format!("gdown{s}"));
+    for body in [
+        json!({ "name": nuget, "kind": "proxy", "remote_url": format!("http://{closed}/v3/index.json") }),
+        json!({ "name": group, "kind": "group" }),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    }
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{group}/members",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "member": nuget, "priority": 10 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+    let get = |path: String| {
+        client
+            .get(format!("{}{path}", srv.base_url))
+            .basic_auth(&creds.0, Some(&creds.1))
+            .send()
+    };
+    for path in [
+        format!("/v3/{nuget}/flat/sample.lib/index.json"),
+        format!("/v3/{nuget}/registration/sample.lib/index.json"),
+        format!("/v3/{nuget}/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg"),
+        format!("/v3/{group}/flat/sample.lib/index.json"),
+        format!("/v3/{group}/registration/sample.lib/index.json"),
+    ] {
+        let resp = get(path.clone()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(resp.headers()["retry-after"], "30", "{path}");
+    }
+    let resp = get(format!("/v3/{nuget}/index.json")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

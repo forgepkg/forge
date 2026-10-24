@@ -549,8 +549,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
     };
-    // The format must be installed: Docker, raw, the built-in format plugin
-    // (NuGet) or a loaded WebAssembly one (`GET /admin/formats`), and support
+    // The format must be installed: Docker, raw or a format plugin (NuGet;
+    // `GET /admin/formats`), and support
     // the kind. It is fixed for the repository's lifetime.
     let Some(kinds) = state.formats.kinds(&body.format) else {
         let available: Vec<&str> = state.formats.ids().collect();

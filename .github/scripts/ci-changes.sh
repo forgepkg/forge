@@ -40,7 +40,7 @@ COMMON=(.github/scripts/ci-changes.sh)
 # jobs would hide a change from the jobs using it; ci.yml has none.)
 CI=.github/workflows/ci.yml
 declare -A CI_JOB_GROUP=(
-    [fmt]=changelog [clippy]=rust [audit]=audit [plugins]=rust [test]=rust
+    [fmt]=changelog [clippy]=rust [audit]=audit [test]=rust
     [docker]=image [kubernetes]=kubernetes [web]=web [oci-e2e]=rust
     [raw-e2e]=rust [e2e]=rust [web-e2e]=web
 )

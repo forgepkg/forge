@@ -9,9 +9,7 @@ Locally it runs as a single `forge-server` process backed by **PostgreSQL**
 ## Prerequisites
 
 - **Docker** (for Postgres + versitygw, and for the test suites).
-- **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`), with
-  the `wasm32-wasip2` target for the format plugins' component builds and the
-  tests that load them (`rustup target add wasm32-wasip2`).
+- **Rust** stable toolchain (`rustup`, pinned in `rust-toolchain.toml`).
 - **Node 26 + pnpm 11** (for the web UI in `web/`; `corepack enable` activates the
   pinned `pnpm@11.5.0` from `web/package.json`. Node 25+ no longer bundles
   corepack: `npm install -g corepack` first).
@@ -251,27 +249,16 @@ groups. See [docs/raw.md](docs/raw.md).
 
 ### Repositories of other formats (format plugins)
 
-Every package format is a format plugin, a crate in
-[`plugins/`](./plugins) (see [docs/format-plugins.md](./docs/format-plugins.md)),
-whether it runs built in only, as a WebAssembly component, or both: NuGet runs
-built in only. `plugins/helm`, classic Helm chart repositories, is the example
-plugin the plugin tests run; it is not built in (Helm charts are pushed to
-docker repositories, see [docs/docker.md](docs/docker.md#helm-charts)). A new
-format goes in `plugins/` too, never in a `crates/format-<id>` crate or the
-server. Docker / OCI (`crates/format-oci`) and raw (`crates/server/src/raw/`)
-are not there yet and are to move to `plugins/docker` and `plugins/raw`.
-
-To run a plugin as a WebAssembly component:
-
-```bash
-cargo xtask plugins     # builds plugins/* as components, prints the [plugins] section for forge.toml
-```
-
-A repository of a plugin format is created with `"format": "<id>"` (hosted,
-proxy or group; a plugin format has proxies when it implements the upstream
-side) and served under `/repository/<name>/` unless the plugin names another
-mount. A built-in plugin's component loads only under another id (rename its
-installed directory and the `id` in its `plugin.toml`).
+Every package format is a format plugin, a crate in [`plugins/`](./plugins)
+linked into the server (see [docs/format-plugins.md](./docs/format-plugins.md));
+NuGet is the one there is. A new format goes in `plugins/` too, never in a
+`crates/format-<id>` crate or the server. Docker / OCI (`crates/format-oci`)
+and raw (`crates/server/src/raw/`) are not there yet and are to move to
+`plugins/docker` and `plugins/raw`. A repository of a plugin format is created
+with `"format": "<id>"` (hosted, proxy or group; a plugin format has proxies
+when it implements the upstream side) and served under `/repository/<name>/`
+unless the plugin names another mount (NuGet's is `/v3`). Helm charts are
+pushed to docker repositories, see [docs/docker.md](docs/docker.md#helm-charts).
 
 ## Configuration
 
@@ -613,13 +600,7 @@ way (`mirror.gcr.io/library/<name>` for an official image).
 cargo xtask test    # unit + integration (cargo test --workspace)
 cargo xtask e2e     # end-to-end suite (cargo test -p forge-e2e --features forge-e2e)
 cargo xtask check   # cargo fmt --check + clippy -D warnings
-cargo xtask plugins-check   # the format plugins' component builds: clippy and build
 ```
-
-The format-plugin tests (`crates/plugin/tests`, `crates/server/tests/plugins.rs`)
-run the example plugin, `plugins/helm`: built in for the test, and built as a
-component themselves into `target/plugins/`; they need the `wasm32-wasip2`
-target.
 
 The e2e suite includes an optional `dotnet` smoke test that is skipped when the
 .NET SDK isn't installed.
@@ -750,9 +731,6 @@ server hashes its bootstrap admin password.
 `clippy` · `build` · `prepare` (regenerate sqlx offline data) · `psql` · `logs` ·
 `ps` · `clean`.
 
-Format plugins as components: `plugins` (build + install, prints the config) ·
-`plugins-check` (clippy and build).
-
 Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 (Vitest) · `web-e2e` (Playwright).
 
@@ -840,7 +818,7 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 ## CI and the merge queue
 
 CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
-`plugins`, `test`, `docker`, `kubernetes`, `web` and `oci-e2e`, and the slow
+`test`, `docker`, `kubernetes`, `web`, `oci-e2e` and `raw-e2e`, and the slow
 `e2e` and `web-e2e`, which pull requests skip: those two run in the merge
 queue and on every push to `main`. It runs on pull requests that target
 `main` only; a stacked one waits (see [Stacked pull
@@ -874,7 +852,7 @@ It sorts the change into groups of paths:
 
 A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
 counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
-`clippy`, `plugins`, `test`, `oci-e2e`, `raw-e2e` and `e2e` in Rust; `audit`
+`clippy`, `test`, `oci-e2e`, `raw-e2e` and `e2e` in Rust; `audit`
 in Audit; `web` and `web-e2e` in Web; `docker` in Image and `kubernetes` in
 Kubernetes. A change outside the jobs (the triggers, the settings, the
 `changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
@@ -920,8 +898,8 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
 1. Enable **Require merge queue**. Keep its **status check timeout** above
    the run time of `e2e` and `web-e2e` (60 minutes by default).
 2. Under **Require status checks to pass**, require `fmt`, `clippy`, `audit`,
-   `plugins`, `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`,
-   `e2e` and `web-e2e` from GitHub Actions: every job of `ci.yml` but
+   `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `e2e` and
+   `web-e2e` from GitHub Actions: every job of `ci.yml` but
    `changes`, the jobs the release workflow requires of the tagged commit
    (`REQUIRED_JOBS` in `.github/workflows/release.yml`). A job left out here
    can fail on a pull request that merges anyway, and the release then

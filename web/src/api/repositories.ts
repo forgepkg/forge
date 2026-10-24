@@ -183,16 +183,13 @@ export interface UpdateRepo {
 
 /**
  * An installed package format (`FormatView` of `GET /admin/formats`): the
- * built-in format plugin (NuGet), Docker, raw and every loaded WebAssembly
- * plugin.
+ * format plugins (NuGet), Docker and raw.
  */
 export interface FormatView {
   /** The format id (`RepoView.format`). */
   id: string
   /** Display name. */
   name: string
-  /** Built into the server rather than a WebAssembly plugin. */
-  builtin: boolean
   /** The repository kinds it supports (proxy only with a host-side upstream, e.g. NuGet). */
   kinds: RepoKind[]
   /** Where its repositories are served: `{mount}/{repository}`. */
@@ -201,8 +198,6 @@ export interface FormatView {
   version?: string
   /** Plugin description. */
   description?: string
-  /** SHA-256 of a WebAssembly plugin's component. */
-  sha256?: string
   /** The upload limit of its hosted repositories without one of their own. */
   default_max_upload_bytes?: number
   /** The largest upload limit a repository may be given; `null`: unbounded. */
@@ -220,7 +215,7 @@ export interface InvalidateProxyCache {
 
 /** What a proxy cache invalidation removed (`Invalidated`). */
 export interface ProxyCacheInvalidated {
-  /** Remembered upstream "not found" answers removed (NuGet, plugins). */
+  /** Remembered upstream "not found" answers removed (NuGet). */
   not_found_cleared: number
   /** Cached tags due for re-validation against the upstream (docker). */
   tags_expired: number

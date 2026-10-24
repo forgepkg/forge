@@ -231,8 +231,8 @@ describe('admin repositories', () => {
     mockApi({
       repositories: [],
       formats: [
-        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
-        { id: 'acme', name: 'Acme packages', builtin: false, kinds: ['hosted', 'group'], mount: '/repository' },
+        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+        { id: 'acme', name: 'Acme packages', kinds: ['hosted', 'group'], mount: '/repository' },
       ],
       onCreate: (body) => {
         posted = body
@@ -244,8 +244,7 @@ describe('admin repositories', () => {
     await renderAt('/manage/repositories/new')
 
     await user.type(await screen.findByLabelText('Name'), 'pkgs')
-    // A WebAssembly plugin is named with its id.
-    await screen.findByRole('option', { name: 'Acme packages (plugin acme)' })
+    await screen.findByRole('option', { name: 'Acme packages' })
     await user.selectOptions(screen.getByLabelText('Format'), 'acme')
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
 
@@ -277,8 +276,8 @@ describe('admin repositories', () => {
     mockApi({
       repositories: [],
       formats: [
-        { id: 'docker', name: 'Docker / OCI', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
-        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+        { id: 'docker', name: 'Docker / OCI', kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
+        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
       ],
       onCreate: (body) => {
         posted = body as Record<string, unknown>
@@ -317,8 +316,8 @@ describe('admin repositories', () => {
     mockApi({
       repositories: [],
       formats: [
-        { id: 'docker', name: 'Docker / OCI', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
-        { id: 'nuget', name: 'NuGet', builtin: true, kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+        { id: 'docker', name: 'Docker / OCI', kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
+        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
       ],
       onCreate: () =>
         new Response('another docker repository already answers on this host', {

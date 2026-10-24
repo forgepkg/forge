@@ -133,7 +133,6 @@ function originOf(url: string | null | undefined): string | null {
 export const NUGET_FORMAT: FormatView = {
   id: 'nuget',
   name: 'NuGet',
-  builtin: true,
   kinds: ['hosted', 'proxy', 'group'],
   mount: '/v3',
 }
@@ -145,7 +144,6 @@ export const NUGET_FORMAT: FormatView = {
 export const DOCKER_FORMAT: FormatView = {
   id: 'docker',
   name: 'Docker / OCI',
-  builtin: true,
   kinds: ['hosted', 'proxy', 'group'],
   mount: '/v2',
 }
@@ -158,7 +156,6 @@ export const DOCKER_FORMAT: FormatView = {
 export const RAW_FORMAT: FormatView = {
   id: 'raw',
   name: 'Raw files',
-  builtin: true,
   kinds: ['hosted', 'proxy', 'group'],
   mount: '/raw',
 }
@@ -412,7 +409,6 @@ export function RepositoryForm({
     [NUGET_FORMAT, DOCKER_FORMAT, RAW_FORMAT].find((f) => f.id === values.format) ?? {
     id: values.format,
     name: values.format,
-    builtin: false,
     kinds: ['hosted', 'group'],
     mount: '/repository',
   }
@@ -485,7 +481,7 @@ export function RepositoryForm({
               >
                 {available.map((f) => (
                   <option key={f.id} value={f.id}>
-                    {f.builtin ? f.name : `${f.name} (plugin ${f.id})`}
+                    {f.name}
                   </option>
                 ))}
               </SelectField>
@@ -493,7 +489,7 @@ export function RepositoryForm({
               <TextField
                 label="Format"
                 type="text"
-                value={format.builtin ? format.name : format.id}
+                value={format.name}
                 readOnly
                 aria-readonly="true"
                 description="The format cannot be changed after creation."

@@ -205,7 +205,7 @@ fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
     let web_assets_dir = opts.web_assets_dir.as_deref();
     let oidc_block = opts.oidc_block.as_deref();
     let crypto_block = opts.crypto_block.as_deref();
-    let plugins_block = opts.plugins_block.as_deref();
+    let extra_toml = opts.extra_toml.as_deref();
     let s3_credentials = opts
         .s3_credentials
         .clone()
@@ -259,12 +259,12 @@ poll_interval_seconds = 1
 {web}
 {oidc}
 {crypto}
-{plugins}
+{extra}
 "#,
         bucket = S3_BUCKET,
         oidc = oidc_block.unwrap_or(""),
         crypto = crypto_block.unwrap_or(""),
-        plugins = plugins_block.unwrap_or(""),
+        extra = extra_toml.unwrap_or(""),
     )
 }
 
@@ -314,9 +314,9 @@ pub struct ServerOpts {
     /// Extra raw TOML lines for the `[auth]` section (e.g.
     /// `realm_cache_ttl_seconds`).
     pub auth_extra: Option<String>,
-    /// When set, this raw TOML is appended last (the `[plugins]` section, or
-    /// any other), and the format plugins it lists are loaded.
-    pub plugins_block: Option<String>,
+    /// When set, this raw TOML is appended last (a section of its own, such
+    /// as `[docker]`).
+    pub extra_toml: Option<String>,
     /// Format plugins installed next to the built-in ones, as if built in.
     pub extra_plugins: Vec<std::sync::Arc<forge_plugin::Plugin>>,
     /// When set, this raw TOML replaces the static keys at the end of the
@@ -337,7 +337,7 @@ impl Default for ServerOpts {
             public_base_url: None,
             server_extra: None,
             auth_extra: None,
-            plugins_block: None,
+            extra_toml: None,
             extra_plugins: Vec::new(),
             s3_credentials: None,
         }
@@ -398,8 +398,6 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .expect("seed auth realms");
 
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
-    let mut plugins = forge_server::plugins::load(&config.plugins).expect("load format plugins");
-    plugins.extend(opts.extra_plugins.iter().cloned());
     let registry_keys =
         forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
             .await
@@ -407,7 +405,7 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
     let state = AppState::new(pool.clone(), store, cache, config)
         .with_envelope(envelope)
         .with_registry_keys(registry_keys)
-        .with_plugins(plugins)
+        .with_plugins(opts.extra_plugins.clone())
         .expect("install format plugins");
     let layer = principal_layer(&state).expect("principal layer");
 

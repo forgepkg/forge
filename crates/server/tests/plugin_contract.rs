@@ -198,7 +198,7 @@ async fn start_probe(extra_toml: Option<String>) -> TestServer {
         ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             extra_plugins: vec![Plugin::builtin(PROBE_TOML, Probe).unwrap()],
-            plugins_block: extra_toml,
+            extra_toml,
             ..Default::default()
         },
     )
@@ -347,6 +347,37 @@ async fn a_format_is_served_under_its_own_mount_and_kinds() {
         .find(|f| f["id"] == "nuget")
         .unwrap();
     assert_eq!(nuget["mount"], "/v3");
+}
+
+/// A repository of a format the server does not have (its plugin removed
+/// since) answers 503 under a plugin's mount, and so does an administrator's
+/// delete of one of its versions: it is never read as another format.
+#[tokio::test]
+async fn a_repository_whose_format_is_missing_is_unavailable() {
+    let srv = start_probe(None).await;
+    let name = format!("orphan{}", unique());
+    let mut row = forge_db::repository_dao::NewRepository::hosted(name.clone());
+    row.format = "gone".into();
+    forge_db::repository_dao::insert_repository(&srv.pool, row)
+        .await
+        .expect("insert repository");
+    let (u, p) = srv.admin_basic();
+    for (method, url) in [
+        (reqwest::Method::GET, format!("/probe/{name}/nothing")),
+        (
+            reqwest::Method::DELETE,
+            format!("/admin/repositories/{name}/packages/demo/1.0.0"),
+        ),
+    ] {
+        let resp = srv
+            .client()
+            .request(method, format!("{}{url}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{url}");
+    }
 }
 
 #[tokio::test]

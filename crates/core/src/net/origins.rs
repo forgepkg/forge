@@ -2,12 +2,11 @@
 //!
 //! A proxy repository's format says which documents to fetch from its
 //! upstream, and where a version's package is
-//! ([`crate::repo::proxy::ProxyRepo`]). The format may be a WebAssembly
-//! plugin, code from elsewhere with no network access of its own: these
-//! requests are its only reach beyond its sandbox, the host sends them from
-//! Forge's network position, and the plugin reads the answers back into what
-//! the proxy serves. So they go only where the upstream itself points
-//! ([`UpstreamOrigins`]):
+//! ([`crate::repo::proxy::ProxyRepo`]). The host sends these requests from
+//! Forge's network position, and the format reads the answers back into what
+//! the proxy serves, so a document an upstream serves must not be able to
+//! steer them at an internal service. They go only where the upstream itself
+//! points ([`UpstreamOrigins`]):
 //!
 //! * the origin (scheme, host, port) of the repository's `remote_url`;
 //! * an origin that an absolute `http`/`https` URL names in a document the

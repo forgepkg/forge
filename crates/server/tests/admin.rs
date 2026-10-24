@@ -3284,7 +3284,7 @@ async fn blob_cache_statistics_name_their_instance() {
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
             )),
-            plugins_block: Some(format!(
+            extra_toml: Some(format!(
                 "[blob_cache]\npath = {:?}\n",
                 dir.path().join("cache").display().to_string()
             )),

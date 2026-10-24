@@ -1,5 +1,4 @@
-//! The data a plugin and the host exchange: the records and variants of
-//! `wit/format.wit`, in Rust.
+//! The data a plugin and the host exchange.
 
 use std::fmt;
 

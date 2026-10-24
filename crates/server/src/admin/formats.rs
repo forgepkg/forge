@@ -1,6 +1,5 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: the built-in format plugin (NuGet), Docker, raw files,
-//! and every loaded WebAssembly plugin.
+//! repositories of: the format plugins (NuGet), Docker and raw files.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};
@@ -16,9 +15,6 @@ pub struct FormatView {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Whether the format is built into the server (Docker, raw and the
-    /// built-in plugins) rather than loaded as a WebAssembly plugin.
-    pub builtin: bool,
     /// The repository kinds it supports.
     pub kinds: Vec<&'static str>,
     /// Where its repositories are served: `{mount}/{repository}` (for
@@ -30,9 +26,6 @@ pub struct FormatView {
     /// The plugin's description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// SHA-256 of the plugin's component (WebAssembly plugins only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
     /// The upload limit of its hosted repositories without one of their own
     /// (for docker, per blob).
     pub default_max_upload_bytes: u64,
@@ -51,12 +44,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
         FormatView {
             id: plugin.id().to_string(),
             name: manifest.name.clone(),
-            builtin: plugin.is_builtin(),
             kinds: kinds(plugin.id()),
             mount: manifest.mount.clone(),
             version: Some(manifest.version.clone()),
             description: manifest.description.clone(),
-            sha256: plugin.sha256().map(str::to_string),
             default_max_upload_bytes: state.config.default_upload_limit(plugin.id()),
             max_upload_bytes_limit: ceiling,
         }
@@ -68,12 +59,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
     formats.push(FormatView {
         id: DOCKER_FORMAT.to_string(),
         name: "Docker / OCI".into(),
-        builtin: true,
         kinds: kinds(DOCKER_FORMAT),
         mount: "/v2".into(),
         version: None,
         description: None,
-        sha256: None,
         default_max_upload_bytes: state.config.default_upload_limit(DOCKER_FORMAT),
         max_upload_bytes_limit: ceiling,
     });
@@ -81,12 +70,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
     others.push(FormatView {
         id: RAW_FORMAT.to_string(),
         name: "Raw files".into(),
-        builtin: true,
         kinds: kinds(RAW_FORMAT),
         mount: crate::raw::MOUNT.into(),
         version: None,
         description: Some("Arbitrary files under arbitrary paths".into()),
-        sha256: None,
         default_max_upload_bytes: state.config.default_upload_limit(RAW_FORMAT),
         max_upload_bytes_limit: ceiling,
     });
