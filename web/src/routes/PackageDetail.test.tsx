@@ -13,6 +13,7 @@ import type { Me } from '~/api/me'
 import type { PackageDetail } from '~/api/packages'
 import { routeTree } from '~/routeTree.gen'
 import { textContent } from '~/test/text'
+import { searchOptions } from '~/lib/search'
 
 /**
  * Package-detail screen: renders versions + dependency groups; a delayed proxy
@@ -102,6 +103,7 @@ function testQueryClient() {
 async function renderDetail(path: string, queryClient = testQueryClient()) {
   const router = createRouter({
     routeTree,
+    ...searchOptions,
     context: { queryClient },
     history: createMemoryHistory({ initialEntries: [path] }),
   })

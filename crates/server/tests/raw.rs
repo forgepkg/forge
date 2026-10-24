@@ -1089,6 +1089,24 @@ async fn retention_deletes_old_files_and_keeps_the_newest() {
         {"id": "nightly", "path_prefix": "nightly/", "keep_newest_per_directory": 1},
         {"id": "old", "older_than_days": 25},
     ]});
+    // Before it is stored, a disabled draft of it previews what it would do.
+    let mut draft = policy.clone();
+    draft["enabled"] = json!(false);
+    let drafted: Value = srv
+        .client()
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/preview",
+            srv.base_url
+        ))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({ "policy": draft }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(drafted["counts"]["deleted"], 3, "{drafted}");
     let resp = srv
         .client()
         .put(format!(

@@ -309,7 +309,12 @@ curl -u admin@example.com:<admin-token> -X PUT -H 'content-type: application/jso
 ```
 
 `POST …/retention/preview` lists what a run would delete (`file_decisions`),
-and every run's decisions are audited like other formats'.
+and every run's decisions are audited like other formats'. The preview
+evaluates the stored policy, or a draft sent as `{"policy": {…}}`, which is
+checked like a `PUT` of it and not stored. The repository's **Retention**
+screen in the web UI (Repositories → the repository → Retention) does all of
+this: it edits the rules, previews them before they are saved, runs the
+policy and lists the audit log.
 
 ## Example: the pdfium binaries
 

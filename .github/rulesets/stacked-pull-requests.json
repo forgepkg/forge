@@ -8,7 +8,8 @@
       "exclude": [
         "~DEFAULT_BRANCH",
         "refs/heads/gh-readonly-queue/**",
-        "refs/heads/dependabot/**"
+        "refs/heads/dependabot/**",
+        "refs/heads/cla-signatures"
       ]
     }
   },

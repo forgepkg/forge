@@ -632,6 +632,14 @@ fn read_err(e: forge_core::repo::RepoError) -> Response {
         RepoError::Busy(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable").into_response()
         }
+        RepoError::Upstream(_) => {
+            tracing::warn!(error = %e, "browse: proxy upstream unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the upstream is unavailable, try again later",
+            )
+                .into_response()
+        }
         RepoError::FormatUnavailable(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "the repository's format is not installed on this server",

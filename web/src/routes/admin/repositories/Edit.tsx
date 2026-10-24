@@ -39,8 +39,9 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
  * is **write-only**: it is never seeded from the GET and is only included in
  * the update when the admin typed a new one (an empty field leaves the stored
  * secret unchanged); "Remove stored credentials" clears it explicitly. The
- * header links group repos to the Members editor and hosted NuGet and Docker
- * repositories to the import from Nexus. Beside the form: for proxies,
+ * header links group repos to the Members editor, hosted NuGet and Docker
+ * repositories to the import from Nexus, and every other repository to its
+ * retention policy. Beside the form: for proxies,
  * their cache invalidation, and the repository's anonymous access (the flag
  * together with the anonymous role's grants that cover it, read-only, linking
  * to the role).
@@ -135,6 +136,16 @@ function EditRepository() {
                   <span>Import from Nexus</span>
                 </Link>
               )}
+            {repo.data.kind !== 'group' && (
+              <Link
+                to="/manage/repositories/$repo/retention"
+                params={{ repo: repo.data.name }}
+                className="fg-btn fg-btn--secondary fg-btn--md"
+              >
+                <Icon name="Clock" size={16} />
+                <span>Retention</span>
+              </Link>
+            )}
           </>
         }
       >

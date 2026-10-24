@@ -130,12 +130,14 @@ use forge_plugin_api as api;
 use crate::authz::PackageFilter;
 use crate::format::Format;
 use crate::net::origins::{named_origins, UpstreamOrigins};
-use crate::net::upstream::{Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp};
+use crate::net::upstream::{
+    status_is_unavailable, Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp,
+};
 use crate::repo::downloads::DownloadTally;
 use crate::repo::hosted::BlobFetch;
 use crate::repo::{
     NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams, SearchQuery,
-    SearchResult, VersionEntry,
+    SearchResult, SharedRepoError, VersionEntry,
 };
 
 /// Cache namespace for resolved upstream indexes ([`api::UpstreamOp::Index`]),
@@ -239,9 +241,33 @@ enum CachedFetch {
     NotFound,
 }
 
-/// Map an upstream transport/size/parse failure onto the read-path error.
+/// Map an upstream transport/size/parse failure onto the read-path error:
+/// an unavailable upstream ([`UpstreamError::is_unavailable`]) is
+/// [`RepoError::Upstream`], any other failure the proxy's own.
 fn upstream_err(e: UpstreamError) -> RepoError {
-    RepoError::Storage(e.to_string())
+    if e.is_unavailable() {
+        RepoError::Upstream(e.to_string())
+    } else {
+        RepoError::Storage(e.to_string())
+    }
+}
+
+/// Why a fetch of [`ProxyRepo::fetch`] failed: the reason the format is told,
+/// and whether the upstream was unavailable ([`UpstreamError::is_unavailable`]).
+#[derive(Clone)]
+struct FetchFailure {
+    reason: String,
+    unavailable: bool,
+}
+
+impl FetchFailure {
+    /// A failure of the proxy itself, not of the upstream.
+    fn local(reason: String) -> Self {
+        Self {
+            reason,
+            unavailable: false,
+        }
+    }
 }
 
 /// Decrypted upstream Basic credentials, held only for one request.
@@ -489,6 +515,9 @@ impl ProxyRepo {
                 .unwrap_or_default(),
         );
         let mut fetched: Vec<api::FetchResult> = Vec::new();
+        // A fetch found the upstream unavailable: the format's failed answer
+        // is then the upstream's outage, not a fault of the proxy.
+        let mut unavailable = false;
         for _ in 0..MAX_UPSTREAM_ROUNDS {
             let format = self.format.clone();
             let (asked, round) = (remote.clone(), op.clone());
@@ -522,6 +551,9 @@ impl ProxyRepo {
                     );
                     return Ok((api::UpstreamAnswer::Failed(reason), origins));
                 }
+                api::UpstreamStep::Done(api::UpstreamAnswer::Failed(reason)) if unavailable => {
+                    return Err(RepoError::Upstream(reason));
+                }
                 api::UpstreamStep::Done(answer) => return Ok((answer, origins)),
                 api::UpstreamStep::Fetch(wanted) => wanted,
             };
@@ -534,24 +566,26 @@ impl ProxyRepo {
             }
             // Each fetch is judged by the origins known when the round
             // starts; what its document names counts from the next round.
-            let results: Vec<(api::FetchResult, Vec<Origin>)> = futures_util::stream::iter(wanted)
-                .map(|fetch| {
-                    let permitted = origins.permits(&fetch.url);
-                    async move {
-                        let (outcome, named) = if permitted {
-                            self.fetch(repo, &fetch).await
-                        } else {
-                            (self.refuse(repo, &fetch.url), Vec::new())
-                        };
-                        (api::FetchResult { fetch, outcome }, named)
-                    }
-                })
-                .buffered(FETCH_CONCURRENCY)
-                .collect()
-                .await;
-            for (result, named) in results {
+            let results: Vec<(api::FetchResult, Vec<Origin>, bool)> =
+                futures_util::stream::iter(wanted)
+                    .map(|fetch| {
+                        let permitted = origins.permits(&fetch.url);
+                        async move {
+                            let (outcome, named, down) = if permitted {
+                                self.fetch(repo, &fetch).await
+                            } else {
+                                (self.refuse(repo, &fetch.url), Vec::new(), false)
+                            };
+                            (api::FetchResult { fetch, outcome }, named, down)
+                        }
+                    })
+                    .buffered(FETCH_CONCURRENCY)
+                    .collect()
+                    .await;
+            for (result, named, down) in results {
                 origins.extend(named);
                 fetched.push(result);
+                unavailable |= down;
             }
         }
         Err(RepoError::Storage(format!(
@@ -577,19 +611,25 @@ impl ProxyRepo {
     /// A 404 is cached only for an immutable document: a metadata 404 (a
     /// package the upstream does not know yet) is what the not-found
     /// markers track, and they are cleared as soon as the package turns up.
-    async fn fetch(&self, repo: &Repository, fetch: &api::Fetch) -> (api::Fetched, Vec<Origin>) {
+    /// The flag says whether a failed fetch found the upstream unavailable
+    /// ([`UpstreamError::is_unavailable`]).
+    async fn fetch(
+        &self,
+        repo: &Repository,
+        fetch: &api::Fetch,
+    ) -> (api::Fetched, Vec<Origin>, bool) {
         let ttl = match fetch.freshness {
             api::Freshness::Metadata => Self::metadata_ttl(repo).to_std().unwrap_or_default(),
             api::Freshness::Immutable => IMMUTABLE_FETCH_TTL,
         };
         let key = format!("{}/{}", Self::upstream_scope(repo), fetch.url);
-        let cached: Result<CachedFetch, Option<String>> = self
+        let cached: Result<CachedFetch, Option<FetchFailure>> = self
             .cache
             .get_or_try_insert_local(NS_UPSTREAM_FETCH, &key, ttl, || async {
                 let creds = self
                     .credentials(repo)
                     .await
-                    .map_err(|e| Some(e.to_string()))?;
+                    .map_err(|e| Some(FetchFailure::local(e.to_string())))?;
                 let auth = creds.as_ref().map(Credentials::auth);
                 match self.http.get_bytes(&fetch.url, auth.as_ref()).await {
                     Ok(Some(bytes)) => {
@@ -600,7 +640,9 @@ impl ProxyRepo {
                             (bytes, named)
                         })
                         .await
-                        .map_err(|e| Some(format!("read {}: {e}", fetch.url)))?;
+                        .map_err(|e| {
+                            Some(FetchFailure::local(format!("read {}: {e}", fetch.url)))
+                        })?;
                         Ok(CachedFetch::Found {
                             body: base64::engine::general_purpose::STANDARD.encode(bytes),
                             named: named.into_iter().collect(),
@@ -610,22 +652,30 @@ impl ProxyRepo {
                         Ok(CachedFetch::NotFound)
                     }
                     Ok(None) => Err(None),
-                    Err(e) => Err(Some(e.to_string())),
+                    Err(e) => Err(Some(FetchFailure {
+                        unavailable: e.is_unavailable(),
+                        reason: e.to_string(),
+                    })),
                 }
             })
             .await;
         match cached {
             Ok(CachedFetch::Found { body, named }) => {
                 match base64::engine::general_purpose::STANDARD.decode(body) {
-                    Ok(bytes) => (api::Fetched::Found(bytes), named),
+                    Ok(bytes) => (api::Fetched::Found(bytes), named, false),
                     Err(e) => (
                         api::Fetched::Failed(format!("cached {}: {e}", fetch.url)),
                         Vec::new(),
+                        false,
                     ),
                 }
             }
-            Ok(CachedFetch::NotFound) | Err(None) => (api::Fetched::NotFound, Vec::new()),
-            Err(Some(e)) => (api::Fetched::Failed(e), Vec::new()),
+            Ok(CachedFetch::NotFound) | Err(None) => (api::Fetched::NotFound, Vec::new(), false),
+            Err(Some(failure)) => (
+                api::Fetched::Failed(failure.reason),
+                Vec::new(),
+                failure.unavailable,
+            ),
         }
     }
 
@@ -801,7 +851,8 @@ impl ProxyRepo {
 
         // The cache factory error must be `Clone` (moka coalescing shares an
         // `Arc<E>` across waiters); `RepoError` wraps non-`Clone` `sqlx::Error`,
-        // so the factory yields a `String` and we re-wrap it on the way out.
+        // so the factory yields a `SharedRepoError`, which keeps the error's
+        // kind (an unavailable upstream stays one).
         // Local-only (never read from Redis): the index decides which host
         // packages are downloaded from, and a downloaded package is cached for
         // good, so a forged index in Redis would substitute packages (and its
@@ -814,11 +865,11 @@ impl ProxyRepo {
                 || async {
                     self.resolve_index_uncached(repo, ttl, &remote_url)
                         .await
-                        .map_err(|e| e.to_string())
+                        .map_err(SharedRepoError::from)
                 },
             )
             .await
-            .map_err(RepoError::Storage)
+            .map_err(RepoError::from)
     }
 
     /// The uncached body of [`Self::upstream_index`]: DB-freshness
@@ -956,7 +1007,7 @@ impl ProxyRepo {
         // TTL, but stands only while the id's not-found marker does
         // (`not_found_ttl_seconds`, which may be shorter, or 0): past it,
         // the upstream is asked again.
-        if refreshed == Ok(false) && !self.negative_cached(repo, lower_id, "*").await? {
+        if matches!(refreshed, Ok(false)) && !self.negative_cached(repo, lower_id, "*").await? {
             self.cache
                 .invalidate(NS_UPSTREAM_VERSIONS, &Self::versions_key(repo, lower_id))
                 .await;
@@ -980,7 +1031,7 @@ impl ProxyRepo {
                     .await;
                 let rows = self.cached_rows(repo.id, lower_id).await?;
                 if rows.is_empty() {
-                    return Err(RepoError::Storage(e));
+                    return Err(e.into());
                 }
                 tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream version listing failed; serving cached versions for a minute");
                 Ok(rows)
@@ -1008,7 +1059,11 @@ impl ProxyRepo {
     /// was refreshed within the metadata TTL (the cache coalesces concurrent
     /// refreshes, across instances too). `Ok(false)`: the upstream does not
     /// know the id.
-    async fn listing_refreshed(&self, repo: &Repository, lower_id: &str) -> Result<bool, String> {
+    async fn listing_refreshed(
+        &self,
+        repo: &Repository,
+        lower_id: &str,
+    ) -> Result<bool, SharedRepoError> {
         let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
         self.cache
             .get_or_try_insert_with(
@@ -1018,7 +1073,7 @@ impl ProxyRepo {
                 || async {
                     Box::pin(self.refresh_versions(repo, lower_id))
                         .await
-                        .map_err(|e| e.to_string())
+                        .map_err(SharedRepoError::from)
                 },
             )
             .await
@@ -1326,10 +1381,12 @@ impl ProxyRepo {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(RepoError::Storage(format!(
-                "upstream nupkg fetch {url} returned {}",
-                resp.status()
-            )));
+            let reason = format!("upstream nupkg fetch {url} returned {}", resp.status());
+            return Err(if status_is_unavailable(resp.status()) {
+                RepoError::Upstream(reason)
+            } else {
+                RepoError::Storage(reason)
+            });
         }
 
         // Stream the body straight into a CAS temp file (size-capped while

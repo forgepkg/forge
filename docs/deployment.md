@@ -1035,7 +1035,7 @@ away, so a bucket copied *later* could already lack them. Either:
   references). Keep noncurrent versions longer than your backup retention; or
 - stop **every** Forge instance while both copies are taken (garbage
   collection runs on every instance and has no separate switch;
-  `retention.enabled = false` does not stop it).
+  switching retention runs off in Admin → Retention does not stop it).
 
 Objects written after the database snapshot are harmless: nothing in the
 restored database references them. They only use storage.

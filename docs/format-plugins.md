@@ -220,6 +220,15 @@ fetch says how long its document may be reused: for the repository's
 metadata TTL, or for a day when it never changes once published. One
 conversation gets at most 4 rounds and 256 fetches, 4 at a time.
 
+An unavailable upstream is an outage, not a fault of Forge. Unavailable
+means a fetch or a download got no answer (connection refused, a name that
+does not resolve, a timeout) or a 5xx or 429. When nothing cached answers in
+its place, the request answers **503** with `Retry-After`, and the host logs
+a warning that names the upstream URL. So does a group whose answer waits
+on such a member. Any other failure answers 500: an answer the plugin
+cannot use, a 401 or 403 for the proxy's credentials, a document over its
+size bound.
+
 The host sends a fetch only where the upstream points: to the origin (scheme,
 host and port) of `remote_url`, or to an origin that an absolute `http` or
 `https` URL names in a document the host fetched for the same operation (in an

@@ -34,8 +34,12 @@
 //! `scope: proxy_cached` rules evict a cached version when `not_pulled_for_days`
 //! is satisfied, comparing against `last_downloaded_at` or, when never pulled,
 //! `first_seen_at`. Only versions whose bytes are cached locally are
-//! candidates. Proxy entries are never unlisted — eviction always deletes the
-//! cached bytes (the version stays listed and re-caches on the next pull).
+//! candidates. Their protections work as on hosted rules, over each package's
+//! cached versions: `keep_last_n` keeps the newest N the upstream lists,
+//! `keep_n_most_downloaded` the N pulled last, and a version any proxy rule
+//! keeps is never evicted. Proxy entries are never unlisted — eviction always
+//! deletes the cached bytes (the version stays listed and re-caches on the
+//! next pull).
 
 use std::collections::HashMap;
 
@@ -69,10 +73,13 @@ pub struct CandidateComponent {
 pub struct ProxyCandidate {
     /// `proxy_cached_version.id`.
     pub cached_version_id: i64,
-    /// Lowercased package id, for prefix filtering.
+    /// Lowercased package id, for prefix filtering and grouping.
     pub package_name: String,
-    /// Normalized version string.
+    /// Normalized version string (ordered via [`Format::compare_versions`]).
     pub version: String,
+    /// Whether the upstream lists the version (`keep_last_n` counts only
+    /// listed versions).
+    pub listed: bool,
     /// When the entry was first cached (fallback for "never pulled").
     pub first_seen_at: DateTime<Utc>,
     /// Last pull timestamp, or `None` if never pulled since caching.
@@ -210,9 +217,63 @@ fn triggers_match(
     }
 }
 
+/// What a rule's protections look at in a candidate: a hosted component or a
+/// proxy's cached version.
+trait Protectable {
+    fn package_name(&self) -> &str;
+    fn version(&self) -> &str;
+    fn listed(&self) -> bool;
+    fn last_downloaded_at(&self) -> Option<DateTime<Utc>>;
+}
+
+impl Protectable for CandidateComponent {
+    fn package_name(&self) -> &str {
+        &self.package_name
+    }
+    fn version(&self) -> &str {
+        &self.version
+    }
+    fn listed(&self) -> bool {
+        self.listed
+    }
+    fn last_downloaded_at(&self) -> Option<DateTime<Utc>> {
+        self.last_downloaded_at
+    }
+}
+
+impl Protectable for ProxyCandidate {
+    fn package_name(&self) -> &str {
+        &self.package_name
+    }
+    fn version(&self) -> &str {
+        &self.version
+    }
+    fn listed(&self) -> bool {
+        self.listed
+    }
+    fn last_downloaded_at(&self) -> Option<DateTime<Utc>> {
+        self.last_downloaded_at
+    }
+}
+
+/// Group candidates by package name in one pass, in the order the packages
+/// first appear (each group keeps its candidates' snapshot order).
+fn group_by_package<C: Protectable>(candidates: &[C]) -> Vec<Vec<&C>> {
+    let mut groups: Vec<Vec<&C>> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for cand in candidates {
+        let i = *index.entry(cand.package_name()).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[i].push(cand);
+    }
+    groups
+}
+
 /// Compute which of a group's versions (indices into its newest-first
-/// ordering) are **protected**: the union, over every hosted rule, of that
-/// rule's `keep_last_n` / `keep_n_most_downloaded` protections.
+/// ordering) are **protected**: the union, over every rule of `scope`, of
+/// that rule's `keep_last_n` / `keep_n_most_downloaded` protections.
 ///
 /// Each rule's protections are computed over the versions the rule itself
 /// governs — those its `release_type` / `package_name_prefix` filters admit —
@@ -223,22 +284,31 @@ fn triggers_match(
 /// `keep_n_most_downloaded` ranks listed and unlisted versions alike by
 /// download recency (see [`Criteria`]).
 ///
-/// `ordered` is the group's components sorted newest-first (by version).
-fn protected_indices(policy: &RetentionPolicy, ordered: &[&CandidateComponent]) -> Vec<bool> {
+/// `ordered` is the group's candidates sorted newest-first (by version): a
+/// hosted package's components, or a proxy package's cached versions.
+fn protected_indices<C: Protectable>(
+    policy: &RetentionPolicy,
+    scope: Scope,
+    ordered: &[&C],
+) -> Vec<bool> {
     let mut protected = vec![false; ordered.len()];
 
-    for rule in policy.rules.iter().filter(|r| r.scope == Scope::Hosted) {
+    for rule in policy.rules.iter().filter(|r| r.scope == scope) {
         let c = &rule.criteria;
         if !c.has_protection() {
             continue;
         }
         // The rule's pool, still newest-first.
         let pool: Vec<usize> = (0..ordered.len())
-            .filter(|&i| rule_filters_match(rule, &ordered[i].package_name, &ordered[i].version))
+            .filter(|&i| rule_filters_match(rule, ordered[i].package_name(), ordered[i].version()))
             .collect();
 
         if let Some(n) = c.keep_last_n {
-            for &idx in pool.iter().filter(|&&i| ordered[i].listed).take(n as usize) {
+            for &idx in pool
+                .iter()
+                .filter(|&&i| ordered[i].listed())
+                .take(n as usize)
+            {
                 protected[idx] = true;
             }
         }
@@ -248,7 +318,10 @@ fn protected_indices(policy: &RetentionPolicy, ordered: &[&CandidateComponent]) 
             // sort is stable, so ties keep the pool's version-desc order.
             let mut by_download = pool.clone();
             by_download.sort_by(|&a, &b| {
-                match (ordered[a].last_downloaded_at, ordered[b].last_downloaded_at) {
+                match (
+                    ordered[a].last_downloaded_at(),
+                    ordered[b].last_downloaded_at(),
+                ) {
                     (Some(x), Some(y)) => y.cmp(&x), // more recent first
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -281,25 +354,13 @@ pub fn evaluate(
         return Vec::new();
     }
 
-    // Group candidates by package name in one pass, in the order the packages
-    // first appear (each group keeps its candidates' snapshot order).
-    let mut groups: Vec<Vec<&CandidateComponent>> = Vec::new();
-    let mut index: HashMap<&str, usize> = HashMap::new();
-    for cand in candidates {
-        let i = *index.entry(cand.package_name.as_str()).or_insert_with(|| {
-            groups.push(Vec::new());
-            groups.len() - 1
-        });
-        groups[i].push(cand);
-    }
-
     let mut decisions = Vec::new();
 
-    for mut group in groups {
+    for mut group in group_by_package(candidates) {
         // This group's components, newest-first by version.
         group.sort_by(|a, b| format.compare_versions(&b.version, &a.version)); // desc
 
-        let protected = protected_indices(policy, &group);
+        let protected = protected_indices(policy, Scope::Hosted, &group);
 
         for (idx, cand) in group.iter().enumerate() {
             if protected[idx] {
@@ -348,7 +409,13 @@ pub fn evaluate(
 
 /// Evaluate the proxy-cached eviction rules over a `proxy_cached_version`
 /// snapshot. **Pure**: no I/O. Only `scope: proxy_cached` rules participate.
+///
+/// `format` orders each package's cached versions newest-first, for the
+/// rules' `keep_last_n` protections; a version any proxy rule protects is
+/// never evicted. Like [`evaluate`], async callers run it on the blocking
+/// pool.
 pub fn evaluate_proxy(
+    format: &dyn Format,
     now: DateTime<Utc>,
     policy: &RetentionPolicy,
     candidates: &[ProxyCandidate],
@@ -359,48 +426,59 @@ pub fn evaluate_proxy(
 
     let mut decisions = Vec::new();
 
-    for cand in candidates {
-        let mut winning: Option<(&RetentionRule, u32)> = None;
-        for rule in policy
-            .rules
-            .iter()
-            .filter(|r| r.scope == Scope::ProxyCached)
-        {
-            // release_type / prefix filters apply to proxy entries too.
-            if !rule_filters_match(rule, &cand.package_name, &cand.version) {
-                continue;
-            }
-            let Some(days) = rule.criteria.not_pulled_for_days else {
-                continue;
-            };
-            // Use last pull, else first-seen (never pulled since caching).
-            let reference = cand.last_downloaded_at.unwrap_or(cand.first_seen_at);
-            if days_since(now, reference) < days as i64 {
-                continue;
-            }
-            // All proxy rules delete; first matching rule is enough, but keep
-            // the one with the smallest threshold for the most specific reason.
-            let take = match &winning {
-                None => true,
-                Some((_, cur_days)) => days < *cur_days,
-            };
-            if take {
-                winning = Some((rule, days));
-            }
-        }
+    for mut group in group_by_package(candidates) {
+        // This package's cached versions, newest-first by version.
+        group.sort_by(|a, b| format.compare_versions(&b.version, &a.version)); // desc
 
-        if let Some((rule, days)) = winning {
-            decisions.push(ProxyDecision {
-                cached_version_id: cand.cached_version_id,
-                package_name: cand.package_name.clone(),
-                version: cand.version.clone(),
-                rule_id: rule.id.clone(),
-                reason: DecisionReason {
-                    older_than_days: None,
-                    not_downloaded_for_days: None,
-                    not_pulled_for_days: Some(days),
-                },
-            });
+        let protected = protected_indices(policy, Scope::ProxyCached, &group);
+
+        for (idx, cand) in group.iter().enumerate() {
+            if protected[idx] {
+                continue; // protection always wins — never evict.
+            }
+
+            let mut winning: Option<(&RetentionRule, u32)> = None;
+            for rule in policy
+                .rules
+                .iter()
+                .filter(|r| r.scope == Scope::ProxyCached)
+            {
+                // release_type / prefix filters apply to proxy entries too.
+                if !rule_filters_match(rule, &cand.package_name, &cand.version) {
+                    continue;
+                }
+                let Some(days) = rule.criteria.not_pulled_for_days else {
+                    continue;
+                };
+                // Use last pull, else first-seen (never pulled since caching).
+                let reference = cand.last_downloaded_at.unwrap_or(cand.first_seen_at);
+                if days_since(now, reference) < days as i64 {
+                    continue;
+                }
+                // All proxy rules delete; first matching rule is enough, but keep
+                // the one with the smallest threshold for the most specific reason.
+                let take = match &winning {
+                    None => true,
+                    Some((_, cur_days)) => days < *cur_days,
+                };
+                if take {
+                    winning = Some((rule, days));
+                }
+            }
+
+            if let Some((rule, days)) = winning {
+                decisions.push(ProxyDecision {
+                    cached_version_id: cand.cached_version_id,
+                    package_name: cand.package_name.clone(),
+                    version: cand.version.clone(),
+                    rule_id: rule.id.clone(),
+                    reason: DecisionReason {
+                        older_than_days: None,
+                        not_downloaded_for_days: None,
+                        not_pulled_for_days: Some(days),
+                    },
+                });
+            }
         }
     }
 
@@ -1198,6 +1276,7 @@ mod tests {
             cached_version_id: id,
             package_name: name.into(),
             version: version.into(),
+            listed: true,
             first_seen_at: days_ago(first_seen_days),
             last_downloaded_at: last_dl_days.map(days_ago),
         }
@@ -1226,7 +1305,7 @@ mod tests {
             proxy(4, "lib", "4.0.0", 10, None),      // never pulled, seen 10d ago → warm
         ];
         let p = policy_with(vec![proxy_rule("evict", 30)]);
-        let d = evaluate_proxy(now(), &p, &cands);
+        let d = evaluate_proxy(&fmt(), now(), &p, &cands);
         let mut ids: Vec<i64> = d.iter().map(|x| x.cached_version_id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 3]);
@@ -1253,7 +1332,7 @@ mod tests {
         assert_eq!(hd.len(), 1);
         assert_eq!(hd[0].rule_id, "h");
         // proxy evaluator only sees the proxy rule
-        let pd = evaluate_proxy(now(), &p, &proxy_cands);
+        let pd = evaluate_proxy(&fmt(), now(), &p, &proxy_cands);
         assert_eq!(pd.len(), 1);
         assert_eq!(pd[0].rule_id, "p");
     }
@@ -1263,6 +1342,100 @@ mod tests {
         let cands = vec![proxy(1, "lib", "1.0.0", 100, None)];
         let mut p = policy_with(vec![proxy_rule("p", 1)]);
         p.enabled = false;
-        assert!(evaluate_proxy(now(), &p, &cands).is_empty());
+        assert!(evaluate_proxy(&fmt(), now(), &p, &cands).is_empty());
+    }
+
+    /// A proxy rule evicting what nobody pulled for 30 days, keeping the
+    /// newest `last` and the `pulled` most recently pulled versions.
+    fn proxy_keep_rule(id: &str, last: Option<u32>, pulled: Option<u32>) -> RetentionRule {
+        let mut rule = proxy_rule(id, 30);
+        rule.criteria.keep_last_n = last;
+        rule.criteria.keep_n_most_downloaded = pulled;
+        rule
+    }
+
+    /// Five cached versions of `lib`, all cold (pulled 40+ days ago, seen 100
+    /// days ago); 1.0.0 was pulled last, 5.0.0 first.
+    fn cold_versions() -> Vec<ProxyCandidate> {
+        vec![
+            proxy(1, "lib", "1.0.0", 100, Some(40)),
+            proxy(2, "lib", "2.0.0", 100, Some(50)),
+            proxy(3, "lib", "3.0.0", 100, Some(60)),
+            proxy(4, "lib", "4.0.0", 100, Some(70)),
+            proxy(5, "lib", "5.0.0", 100, Some(80)),
+        ]
+    }
+
+    fn evicted(p: &RetentionPolicy, cands: &[ProxyCandidate]) -> Vec<i64> {
+        let mut ids: Vec<i64> = evaluate_proxy(&fmt(), now(), p, cands)
+            .iter()
+            .map(|d| d.cached_version_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn proxy_keep_last_n_keeps_the_newest_cached_versions() {
+        let p = policy_with(vec![proxy_keep_rule("evict", Some(2), None)]);
+        assert_eq!(evicted(&p, &cold_versions()), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn proxy_keep_n_most_downloaded_keeps_the_versions_pulled_last() {
+        let p = policy_with(vec![proxy_keep_rule("evict", None, Some(2))]);
+        assert_eq!(evicted(&p, &cold_versions()), vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn proxy_protections_of_one_rule_are_unioned() {
+        // Newest 2 (5.0.0, 4.0.0) and pulled last 2 (1.0.0, 2.0.0).
+        let p = policy_with(vec![proxy_keep_rule("evict", Some(2), Some(2))]);
+        assert_eq!(evicted(&p, &cold_versions()), vec![3]);
+    }
+
+    #[test]
+    fn proxy_keep_last_n_skips_versions_the_upstream_unlisted() {
+        let mut cands = cold_versions();
+        cands[4].listed = false; // 5.0.0
+        let p = policy_with(vec![proxy_keep_rule("evict", Some(2), None)]);
+        // 4.0.0 and 3.0.0 are the newest listed; the unlisted 5.0.0 goes.
+        assert_eq!(evicted(&p, &cands), vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn proxy_protections_cover_the_versions_their_rule_filters_admit() {
+        let mut cands = cold_versions();
+        cands.push(proxy(6, "lib", "6.0.0-beta", 100, Some(90)));
+        let mut releases = proxy_keep_rule("releases", Some(1), None);
+        releases.release_type = ReleaseType::Releases;
+        let p = policy_with(vec![releases]);
+        // The newest release (5.0.0) is kept, not the newer prerelease,
+        // which the releases-only rule does not act on at all.
+        assert_eq!(evicted(&p, &cands), vec![1, 2, 3, 4]);
+        // Each package is protected on its own.
+        let mut two = cold_versions();
+        two.push(proxy(7, "other", "1.0.0", 100, Some(90)));
+        let p = policy_with(vec![proxy_keep_rule("evict", Some(1), None)]);
+        assert_eq!(evicted(&p, &two), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn proxy_protection_of_one_rule_shields_from_another() {
+        let keep = proxy_keep_rule("keep-newest", Some(1), None);
+        let sweep = proxy_rule("sweep", 7);
+        let p = policy_with(vec![keep, sweep]);
+        assert_eq!(evicted(&p, &cold_versions()), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn proxy_protected_versions_are_ordered_by_the_format() {
+        // Snapshot order must not matter: 10.0.0 is newer than 9.0.0.
+        let cands = vec![
+            proxy(1, "lib", "10.0.0", 100, Some(40)),
+            proxy(2, "lib", "9.0.0", 100, Some(40)),
+        ];
+        let p = policy_with(vec![proxy_keep_rule("evict", Some(1), None)]);
+        assert_eq!(evicted(&p, &cands), vec![2]);
     }
 }

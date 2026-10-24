@@ -14,6 +14,7 @@ import type { BrowseRepo, BrowseResult } from '~/api/packages'
 import type { ImagesResult } from '~/api/images'
 import { routeTree } from '~/routeTree.gen'
 import { textContent } from '~/test/text'
+import { searchOptions } from '~/lib/search'
 
 /**
  * Folder-view browse: the root lists the readable repositories (with kind and
@@ -161,6 +162,7 @@ async function renderBrowse(initialPath: string | string[] = '/') {
   const entries = Array.isArray(initialPath) ? initialPath : [initialPath]
   const router = createRouter({
     routeTree,
+    ...searchOptions,
     context: { queryClient },
     history: createMemoryHistory({
       initialEntries: entries,
@@ -316,6 +318,57 @@ describe('RepoBrowse (per-repo search)', () => {
     }
   })
 
+  it.each([
+    // A number to JSON (#403).
+    ['?q=1.0', '1.0'],
+    ['?q=true', 'true'],
+    // As the router wrote a numeric-looking query before.
+    ['?q=%221.0%22', '1.0'],
+  ])('a %s link searches for %s', async (search, q) => {
+    mockApi(() => jsonResponse(page(1, ['Alpha'])))
+
+    await renderBrowse(`/repos/nuget${search}`)
+
+    expect(await screen.findByRole('link', { name: /Alpha/ })).toBeInTheDocument()
+    expect(screen.getByLabelText('Search packages')).toHaveValue(q)
+    const searches = requestsTo('/browse/packages')
+    expect(searches.length).toBeGreaterThan(0)
+    for (const u of searches) expect(u.searchParams.get('q')).toBe(q)
+  })
+
+  it('reads back the prerelease and skip it writes on the first page', async () => {
+    // The search box writes `prerelease=false&skip=0`: neither is on.
+    mockApi((url) =>
+      jsonResponse(page(25, [url.searchParams.get('skip') === '20' ? 'Omega' : 'Alpha'])),
+    )
+
+    const user = userEvent.setup()
+    await renderBrowse('/repos/nuget?q=a&prerelease=false&skip=0')
+
+    expect(await screen.findByRole('link', { name: /Alpha/ })).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: /prerelease/i })).not.toBeChecked()
+    for (const u of requestsTo('/browse/packages')) {
+      expect(u.searchParams.get('prerelease')).toBeNull()
+      expect(u.searchParams.get('skip')).toBeNull()
+    }
+
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
+    expect(await screen.findByRole('link', { name: /Omega/ })).toBeInTheDocument()
+  })
+
+  it('a ?skip= link opens that page', async () => {
+    mockApi((url) =>
+      jsonResponse(page(25, [url.searchParams.get('skip') === '20' ? 'Omega' : 'Alpha'])),
+    )
+
+    await renderBrowse('/repos/nuget?skip=20')
+
+    expect(await screen.findByRole('link', { name: /Omega/ })).toBeInTheDocument()
+    expect(screen.getByRole('navigation', { name: 'Pagination' })).toHaveTextContent(
+      'Page 2 of 2',
+    )
+  })
+
   it('paginates: Next requests the next page and updates skip', async () => {
     // 25 total over a page size of 20 => two pages.
     mockApi((url) => {
@@ -332,7 +385,7 @@ describe('RepoBrowse (per-repo search)', () => {
     await user.click(screen.getByRole('button', { name: 'Next page' }))
 
     expect(await screen.findByRole('link', { name: /Omega/ })).toBeInTheDocument()
-    expect(router.state.location.search).toMatchObject({ skip: 20 })
+    expect(router.state.location.search).toMatchObject({ skip: '20' })
   })
 
   it('shows an empty state when there are no results', async () => {

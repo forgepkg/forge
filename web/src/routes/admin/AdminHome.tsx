@@ -12,7 +12,8 @@ const SECTIONS = [
     to: '/manage/repositories',
     title: 'Repositories',
     icon: 'Repository',
-    description: 'Hosted, proxy, and group repositories; group members and owners.',
+    description:
+      'Hosted, proxy, and group repositories; group members and owners; retention policies.',
   },
   {
     to: '/manage/users',
@@ -53,6 +54,13 @@ const SECTIONS = [
     description: 'The service Forge sends invitations and notifications through.',
   },
   {
+    to: '/manage/settings/retention',
+    title: 'Retention',
+    icon: 'Clock',
+    description:
+      'Whether retention runs, for every repository, and how long its audit log is kept.',
+  },
+  {
     to: '/manage/system',
     title: 'System',
     icon: 'Database',
@@ -69,8 +77,8 @@ const SECTIONS = [
  * Admin landing. Only reachable once the `AdminLayout` guard has confirmed
  * `is_admin`. A card per admin screen, with the rail's icon for it: the
  * repositories, users (incl. per-user tokens and roles), roles, content
- * selectors, authentication-realm, settings, email-service and system
- * screens; the header names what only the `/admin` API manages (CHANGELOG
+ * selectors, authentication-realm, settings, email-service, retention and
+ * system screens; the header names what only the `/admin` API manages (CHANGELOG
  * "Known limitations").
  */
 function AdminHome() {
@@ -80,11 +88,12 @@ function AdminHome() {
         title="Administration"
         description={
           <>
-            Manage repositories, users and their API tokens, roles and their
-            grants, content selectors, authentication realms, the sign-in
-            and anonymous-access settings, the email service, and the
-            secret encryption and blob cache. Retention and user
-            deactivation have no screen yet; use the <Code>/admin</Code> API.
+            Manage repositories and their retention policies, users and
+            their API tokens, roles and their grants, content selectors,
+            authentication realms, the sign-in and anonymous-access
+            settings, the email service, and the secret encryption and blob
+            cache. User deactivation has no screen yet; use the{' '}
+            <Code>/admin</Code> API.
           </>
         }
       />
