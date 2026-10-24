@@ -1819,32 +1819,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge-format-nuget"
-version = "1.0.0"
-dependencies = [
- "forge-plugin-api",
- "quick-xml",
- "serde",
- "serde_json",
- "thiserror",
- "zip",
-]
-
-[[package]]
-name = "forge-format-raw"
-version = "1.0.0"
-dependencies = [
- "base64 0.23.1",
- "forge-plugin-api",
- "httpdate",
- "percent-encoding",
- "serde",
- "serde_json",
- "url",
-]
-
-[[package]]
-name = "forge-oci"
+name = "forge-format-docker"
 version = "1.1.0"
 dependencies = [
  "async-trait",
@@ -1873,6 +1848,31 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "forge-format-nuget"
+version = "1.0.0"
+dependencies = [
+ "forge-plugin-api",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "zip",
+]
+
+[[package]]
+name = "forge-format-raw"
+version = "1.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "forge-plugin-api",
+ "httpdate",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -1907,9 +1907,9 @@ dependencies = [
  "forge-core",
  "forge-crypto",
  "forge-db",
+ "forge-format-docker",
  "forge-format-nuget",
  "forge-format-raw",
- "forge-oci",
  "forge-plugin",
  "forge-storage",
  "futures-util",

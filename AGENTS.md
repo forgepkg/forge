@@ -58,9 +58,9 @@ after its format id, linked into the server like `crates/formats/nuget`
 under `crates/` (no `crates/format-<id>`) or as a module of the server: it
 implements `FormatPlugin` with the layout
 [crates/formats/README.md](crates/formats/README.md) describes. Docker / OCI
-(`crates/format-oci`) is not there yet and is to move to
-`crates/formats/docker`, in a pull request of its own; until then it is not
-the model for a new format.
+is in `crates/formats/docker` but still native: the server's registry serves
+it under `/v2`, not through `FormatPlugin`. Until it implements
+`FormatPlugin`, it is not the model for a new format.
 
 ## Changelog: a fragment per change, never CHANGELOG.md
 

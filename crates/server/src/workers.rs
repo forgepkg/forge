@@ -323,7 +323,7 @@ fn spawn_registry_sweeper(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            match forge_oci::gc::sweep_once(
+            match forge_format_docker::gc::sweep_once(
                 &pool,
                 chrono::Duration::seconds(docker.upload_ttl_seconds as i64),
                 chrono::Duration::seconds(docker.unreferenced_blob_ttl_seconds as i64),
