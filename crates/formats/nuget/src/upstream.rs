@@ -573,6 +573,11 @@ fn year(raw: &str) -> Option<i32> {
 
 /// A page of the upstream's `SearchQueryService` results for `query`.
 fn search(resources: &Resources, query: &SearchQuery, fetched: &[FetchResult]) -> UpstreamStep {
+    // nuget.org limits skip to 3,000. Deeper pages use the proxy's local search
+    // rather than requesting a rejected offset or silently changing the page.
+    if query.skip > 3_000 {
+        return done(UpstreamAnswer::Search(None));
+    }
     let Some(service) = &resources.search_query_service else {
         return done(UpstreamAnswer::Search(None));
     };
