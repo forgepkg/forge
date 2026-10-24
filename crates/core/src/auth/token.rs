@@ -664,7 +664,7 @@ mod tests {
     #[async_trait::async_trait]
     impl PrincipalSource for StubSource {
         async fn resolve(&self, _h: &HeaderMap, _ip: IpAddr) -> SourceOutcome {
-            self.0
+            self.0.clone()
         }
     }
 
@@ -733,7 +733,7 @@ mod tests {
             method: crate::auth::AuthMethod::Token,
         };
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
-            Box::new(StubSource(SourceOutcome::Authenticated(authed))),
+            Box::new(StubSource(SourceOutcome::Authenticated(authed.clone()))),
             Box::new(StubSource(SourceOutcome::Invalid)),
         ];
         let res = resolve_principal(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off).await;
@@ -801,7 +801,7 @@ mod tests {
     #[async_trait::async_trait]
     impl PrincipalSource for AmbientStub {
         async fn resolve(&self, _h: &HeaderMap, _ip: IpAddr) -> SourceOutcome {
-            self.0
+            self.0.clone()
         }
         fn is_ambient(&self) -> bool {
             true
@@ -817,8 +817,8 @@ mod tests {
         };
         // An explicit credential wins before the cookie source: not ambient.
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
-            Box::new(StubSource(SourceOutcome::Authenticated(authed))),
-            Box::new(AmbientStub(SourceOutcome::Authenticated(authed))),
+            Box::new(StubSource(SourceOutcome::Authenticated(authed.clone()))),
+            Box::new(AmbientStub(SourceOutcome::Authenticated(authed.clone()))),
         ];
         let res =
             resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off)
@@ -829,7 +829,7 @@ mod tests {
         // Only the cookie authenticated: ambient.
         let sources: Vec<Box<dyn PrincipalSource>> = vec![
             Box::new(StubSource(SourceOutcome::NoCredentials)),
-            Box::new(AmbientStub(SourceOutcome::Authenticated(authed))),
+            Box::new(AmbientStub(SourceOutcome::Authenticated(authed.clone()))),
         ];
         let res =
             resolve_principal_with_origin(&sources, &HeaderMap::new(), ip(), &AnonPolicy::Off)
