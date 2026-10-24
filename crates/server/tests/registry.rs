@@ -410,7 +410,7 @@ async fn version_check_challenges_and_tokens_authenticate() {
 async fn token_requests_name_a_bounded_number_of_repositories() {
     use base64::Engine;
     let srv = common::start().await;
-    let max = forge_oci::token::MAX_SCOPES;
+    let max = forge_server::images::token::MAX_SCOPES;
     let request = |scopes: Vec<String>| {
         let mut req = srv
             .client()
@@ -1700,8 +1700,8 @@ impl MockRegistry {
             return resp;
         }
         let head = req.method() == Method::HEAD;
-        match forge_oci::path::parse(&path) {
-            Some(forge_oci::path::Endpoint::Manifest { name, reference }) => {
+        match forge_format_docker::path::parse(&path) {
+            Some(forge_format_docker::path::Endpoint::Manifest { name, reference }) => {
                 let found = self
                     .manifests
                     .lock()
@@ -1733,7 +1733,7 @@ impl MockRegistry {
                 )
                     .into_response()
             }
-            Some(forge_oci::path::Endpoint::Blob { digest, .. }) => {
+            Some(forge_format_docker::path::Endpoint::Blob { digest, .. }) => {
                 if head && self.lie_on_head.load(Ordering::SeqCst) {
                     return StatusCode::OK.into_response();
                 }
@@ -1759,7 +1759,7 @@ impl MockRegistry {
                 }
                 body.into_response()
             }
-            Some(forge_oci::path::Endpoint::TagsList { name }) => {
+            Some(forge_format_docker::path::Endpoint::TagsList { name }) => {
                 let query = req.uri().query().unwrap_or_default().to_string();
                 self.tag_queries.lock().unwrap().push(query.clone());
                 let mut n: Option<usize> = None;
@@ -2493,7 +2493,7 @@ async fn admin_validates_docker_repositories() {
         400
     );
     assert_eq!(
-        bad(json!({"name": format!("x{n}"), "kind": "hosted", "format": "npm"})).await,
+        bad(json!({"name": format!("x{n}"), "kind": "hosted", "format": "pypi"})).await,
         400
     );
     assert_eq!(
@@ -2711,7 +2711,7 @@ async fn deleting_an_image_never_frees_a_layer_another_image_uses() {
     assert_eq!(ref_count(&srv, &layer).await, Some(2), "one link per image");
 
     let sweep = || {
-        forge_oci::gc::sweep_once(
+        forge_server::images::gc::sweep_once(
             &srv.pool,
             chrono::Duration::zero(),
             chrono::Duration::zero(),
@@ -2878,7 +2878,7 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     assert_eq!(resp.status(), 202);
     let worker = forge_core::retention::RetentionWorker::new(
         srv.pool.clone(),
-        srv.state.formats.get("nuget").expect("NuGet is built in"),
+        forge_server::state::RegistryResolver(srv.state.formats.clone()),
         Arc::new(forge_core::repo::NoopCacheInvalidator),
         forge_core::retention::RetentionConfig::default(),
     );

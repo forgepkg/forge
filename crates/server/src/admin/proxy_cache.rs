@@ -80,11 +80,12 @@ pub async fn invalidate(
     if repo.kind() != RepoKind::Proxy {
         return bad_request("only a proxy repository caches what an upstream answered");
     }
-    let docker = repo.is_docker();
+    let stores_images = state.formats.stores_images(&repo.format);
     let stores_files = state.formats.stores_files(&repo.format);
 
-    // The package as the proxy stores it: a docker image under Docker Hub's
-    // `library/` spelling, any other id lowercased.
+    // The package as the proxy stores it: an image under the name its
+    // upstream knows it by (Docker Hub's `library/` spelling), any other id
+    // lowercased.
     let package = match body.and_then(|b| b.0.package) {
         None => None,
         Some(p) if stores_files => {
@@ -98,11 +99,15 @@ pub async fn invalidate(
                 Err(e) => return bad_request(format!("package: {e}")),
             }
         }
-        Some(p) if docker => {
-            if !forge_oci::reference::valid_name(&p) {
+        Some(p) if stores_images => {
+            let format = match state.formats.for_repository(&repo) {
+                Ok(format) => format,
+                Err(e) => return format_unavailable(e),
+            };
+            if format.validate_id(&p).is_err() {
                 return bad_request("package is not a valid image name");
             }
-            Some(forge_oci::proxied_image(&repo, &p))
+            Some(state.registry().proxied_image(&repo, &p))
         }
         Some(p) => {
             let format = match state.formats.for_repository(&repo) {
@@ -117,7 +122,15 @@ pub async fn invalidate(
         }
     };
 
-    match forget(&state, &repo, docker, stores_files, package.as_deref()).await {
+    match forget(
+        &state,
+        &repo,
+        stores_images,
+        stores_files,
+        package.as_deref(),
+    )
+    .await
+    {
         Ok(Some(invalidated)) => {
             tracing::info!(
                 repository = %repo.name,
@@ -140,7 +153,7 @@ pub async fn invalidate(
 async fn forget(
     state: &AppState,
     repo: &forge_db::model::Repository,
-    docker: bool,
+    stores_images: bool,
     stores_files: bool,
     package: Option<&str>,
 ) -> sqlx::Result<Option<Invalidated>> {
@@ -158,7 +171,7 @@ async fn forget(
         } else {
             raw_dao::expire_file_check(&mut *tx, repo.id, prefix).await?
         });
-    } else if docker {
+    } else if stores_images {
         invalidated.tags_expired = oci_dao::expire_tags(&mut tx, repo.id, package).await?;
     } else {
         invalidated.not_found_cleared =

@@ -230,6 +230,7 @@ impl Nexus {
                 origin: self.origin.clone(),
                 username,
                 password: password.expose_secret(),
+                bearer: false,
             }),
             _ => None,
         }

@@ -243,21 +243,22 @@ enum CachedFetch {
 
 /// Map an upstream transport/size/parse failure onto the read-path error:
 /// an unavailable upstream ([`UpstreamError::is_unavailable`]) is
-/// [`RepoError::Upstream`], any other failure the proxy's own.
+/// [`RepoError::Upstream`], a refusing one ([`UpstreamError::is_refusal`])
+/// [`RepoError::BadUpstream`], any other failure the proxy's own.
 fn upstream_err(e: UpstreamError) -> RepoError {
-    if e.is_unavailable() {
-        RepoError::Upstream(e.to_string())
-    } else {
-        RepoError::Storage(e.to_string())
+    match Trouble::of(&e) {
+        Trouble::Unavailable => RepoError::Upstream(e.to_string()),
+        Trouble::Refused => RepoError::BadUpstream(e.to_string()),
+        Trouble::None => RepoError::Storage(e.to_string()),
     }
 }
 
 /// Why a fetch of [`ProxyRepo::fetch`] failed: the reason the format is told,
-/// and whether the upstream was unavailable ([`UpstreamError::is_unavailable`]).
+/// and what it says about the upstream ([`Trouble`]).
 #[derive(Clone)]
 struct FetchFailure {
     reason: String,
-    unavailable: bool,
+    trouble: Trouble,
 }
 
 impl FetchFailure {
@@ -265,7 +266,31 @@ impl FetchFailure {
     fn local(reason: String) -> Self {
         Self {
             reason,
-            unavailable: false,
+            trouble: Trouble::None,
+        }
+    }
+}
+
+/// What a failed fetch says about the upstream, worst last.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Trouble {
+    /// Nothing: the fetch went well, or failed on this side.
+    #[default]
+    None,
+    /// It refused the proxy (a 401, a 403): [`RepoError::BadUpstream`].
+    Refused,
+    /// It cannot serve now: [`RepoError::Upstream`].
+    Unavailable,
+}
+
+impl Trouble {
+    fn of(e: &UpstreamError) -> Self {
+        if e.is_unavailable() {
+            Trouble::Unavailable
+        } else if e.is_refusal() {
+            Trouble::Refused
+        } else {
+            Trouble::None
         }
     }
 }
@@ -275,6 +300,7 @@ pub struct Credentials {
     origin: Option<Origin>,
     username: String,
     password: forge_crypto::PlaintextSecret,
+    bearer: bool,
 }
 
 impl Credentials {
@@ -285,7 +311,16 @@ impl Credentials {
             origin: Origin::of(url),
             username,
             password,
+            bearer: false,
         }
+    }
+
+    /// Send the password as an `Authorization: Bearer` token when there is
+    /// no username and `enabled` (a format whose upstreams take tokens so:
+    /// npm's `_authToken`).
+    pub fn bearer_without_username(mut self, enabled: bool) -> Self {
+        self.bearer = enabled && self.username.is_empty();
+        self
     }
 
     /// The credentials, scoped to the origin of the `remote_url` they were
@@ -295,6 +330,7 @@ impl Credentials {
             origin: self.origin.clone(),
             username: &self.username,
             password: self.password.expose_secret(),
+            bearer: self.bearer,
         }
     }
 
@@ -306,6 +342,7 @@ impl Credentials {
             origin: Some(origin),
             username: &self.username,
             password: self.password.expose_secret(),
+            bearer: self.bearer,
         }
     }
 }
@@ -344,6 +381,17 @@ async fn upstream_password(
     }
 }
 
+/// The upstream secret of `repo` alone, with the `remote_url` it belongs
+/// to: what a proxy sends as a Bearer token when it has no username (npm
+/// registries take a token). Decrypted like [`upstream_credentials`].
+pub async fn upstream_secret(
+    pool: &PgPool,
+    envelope: Option<&Arc<forge_crypto::service::EnvelopeService>>,
+    repo: &Repository,
+) -> Result<Option<(forge_crypto::PlaintextSecret, Option<String>)>, RepoError> {
+    upstream_password(pool, envelope, repo).await
+}
+
 /// The Basic credentials for `repo`'s upstream, if both a username and a
 /// password are configured. They are attached only to the origin of the
 /// `remote_url` the password was read (and, encrypted, bound) with, which
@@ -363,7 +411,31 @@ pub async fn upstream_credentials(
         origin: remote_url.as_deref().and_then(Origin::of),
         username,
         password,
+        bearer: false,
     }))
+}
+
+/// The credentials a proxy sends its upstream: Basic with a username
+/// ([`upstream_credentials`]), or, for a format whose upstreams take tokens
+/// so (`bearer_token`, [`Format::upstream_bearer_token`]), a password stored
+/// without one as a Bearer token.
+pub async fn upstream_auth(
+    pool: &PgPool,
+    envelope: Option<&Arc<forge_crypto::service::EnvelopeService>>,
+    repo: &Repository,
+    bearer_token: bool,
+) -> Result<Option<Credentials>, RepoError> {
+    if repo.upstream_username.is_none() && bearer_token {
+        return Ok(upstream_password(pool, envelope, repo)
+            .await?
+            .map(|(password, remote_url)| {
+                let url = remote_url
+                    .or_else(|| repo.remote_url.clone())
+                    .unwrap_or_default();
+                Credentials::for_url(&url, String::new(), password).bearer_without_username(true)
+            }));
+    }
+    upstream_credentials(pool, envelope, repo).await
 }
 
 /// Key of an in-flight first-time `.nupkg` fetch: `(repository id, lowercase
@@ -480,7 +552,13 @@ impl ProxyRepo {
     /// The Basic credentials for `repo`'s upstream (see
     /// [`upstream_credentials`]).
     async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, RepoError> {
-        upstream_credentials(&self.pool, self.envelope.as_ref(), repo).await
+        upstream_auth(
+            &self.pool,
+            self.envelope.as_ref(),
+            repo,
+            self.format.upstream_bearer_token(),
+        )
+        .await
     }
 
     /// Run one upstream conversation: ask the format what to fetch for `op`,
@@ -515,9 +593,10 @@ impl ProxyRepo {
                 .unwrap_or_default(),
         );
         let mut fetched: Vec<api::FetchResult> = Vec::new();
-        // A fetch found the upstream unavailable: the format's failed answer
-        // is then the upstream's outage, not a fault of the proxy.
-        let mut unavailable = false;
+        // A fetch found the upstream unavailable, or refusing the proxy: the
+        // format's failed answer is then the upstream's outage or refusal,
+        // not a fault of the proxy.
+        let mut trouble = Trouble::None;
         for _ in 0..MAX_UPSTREAM_ROUNDS {
             let format = self.format.clone();
             let (asked, round) = (remote.clone(), op.clone());
@@ -551,8 +630,26 @@ impl ProxyRepo {
                     );
                     return Ok((api::UpstreamAnswer::Failed(reason), origins));
                 }
-                api::UpstreamStep::Done(api::UpstreamAnswer::Failed(reason)) if unavailable => {
+                api::UpstreamStep::Done(api::UpstreamAnswer::Located(location))
+                    if !origins.permits(&location.url) =>
+                {
+                    tracing::warn!(format = %self.format.id(), repo = %repo.name, url = %location.url, "the format answered a package URL on an origin neither the remote_url nor a document fetched from the upstream names; not downloaded");
+                    let reason = format!(
+                        "upstream package {}: not downloaded, its origin is neither the \
+                             remote_url's nor named by a document fetched from the upstream",
+                        location.url
+                    );
+                    return Ok((api::UpstreamAnswer::Failed(reason), origins));
+                }
+                api::UpstreamStep::Done(api::UpstreamAnswer::Failed(reason))
+                    if trouble == Trouble::Unavailable =>
+                {
                     return Err(RepoError::Upstream(reason));
+                }
+                api::UpstreamStep::Done(api::UpstreamAnswer::Failed(reason))
+                    if trouble == Trouble::Refused =>
+                {
+                    return Err(RepoError::BadUpstream(reason));
                 }
                 api::UpstreamStep::Done(answer) => return Ok((answer, origins)),
                 api::UpstreamStep::Fetch(wanted) => wanted,
@@ -566,7 +663,7 @@ impl ProxyRepo {
             }
             // Each fetch is judged by the origins known when the round
             // starts; what its document names counts from the next round.
-            let results: Vec<(api::FetchResult, Vec<Origin>, bool)> =
+            let results: Vec<(api::FetchResult, Vec<Origin>, Trouble)> =
                 futures_util::stream::iter(wanted)
                     .map(|fetch| {
                         let permitted = origins.permits(&fetch.url);
@@ -574,9 +671,15 @@ impl ProxyRepo {
                             let (outcome, named, down) = if permitted {
                                 self.fetch(repo, &fetch).await
                             } else {
-                                (self.refuse(repo, &fetch.url), Vec::new(), false)
+                                (self.refuse(repo, &fetch.url), Vec::new(), Trouble::None)
                             };
-                            (api::FetchResult { fetch, outcome }, named, down)
+                            let result = api::FetchResult {
+                                fetch,
+                                outcome,
+                                status: None,
+                                headers: Vec::new(),
+                            };
+                            (result, named, down)
                         }
                     })
                     .buffered(FETCH_CONCURRENCY)
@@ -585,7 +688,7 @@ impl ProxyRepo {
             for (result, named, down) in results {
                 origins.extend(named);
                 fetched.push(result);
-                unavailable |= down;
+                trouble = trouble.max(down);
             }
         }
         Err(RepoError::Storage(format!(
@@ -611,18 +714,24 @@ impl ProxyRepo {
     /// A 404 is cached only for an immutable document: a metadata 404 (a
     /// package the upstream does not know yet) is what the not-found
     /// markers track, and they are cleared as soon as the package turns up.
-    /// The flag says whether a failed fetch found the upstream unavailable
-    /// ([`UpstreamError::is_unavailable`]).
+    /// The [`Trouble`] says whether a failed fetch found the upstream
+    /// unavailable ([`UpstreamError::is_unavailable`]) or refusing the proxy
+    /// ([`UpstreamError::is_refusal`]).
     async fn fetch(
         &self,
         repo: &Repository,
         fetch: &api::Fetch,
-    ) -> (api::Fetched, Vec<Origin>, bool) {
+    ) -> (api::Fetched, Vec<Origin>, Trouble) {
         let ttl = match fetch.freshness {
             api::Freshness::Metadata => Self::metadata_ttl(repo).to_std().unwrap_or_default(),
             api::Freshness::Immutable => IMMUTABLE_FETCH_TTL,
         };
-        let key = format!("{}/{}", Self::upstream_scope(repo), fetch.url);
+        // What the fetch accepts is part of what it is (npm's abbreviated
+        // and full packuments share a URL).
+        let key = match &fetch.accept {
+            Some(accept) => format!("{}/{}\n{accept}", Self::upstream_scope(repo), fetch.url),
+            None => format!("{}/{}", Self::upstream_scope(repo), fetch.url),
+        };
         let cached: Result<CachedFetch, Option<FetchFailure>> = self
             .cache
             .get_or_try_insert_local(NS_UPSTREAM_FETCH, &key, ttl, || async {
@@ -631,7 +740,11 @@ impl ProxyRepo {
                     .await
                     .map_err(|e| Some(FetchFailure::local(e.to_string())))?;
                 let auth = creds.as_ref().map(Credentials::auth);
-                match self.http.get_bytes(&fetch.url, auth.as_ref()).await {
+                match self
+                    .http
+                    .get_bytes_accepting(&fetch.url, auth.as_ref(), fetch.accept.as_deref())
+                    .await
+                {
                     Ok(Some(bytes)) => {
                         // A document may be megabytes: read off the async
                         // workers.
@@ -653,7 +766,7 @@ impl ProxyRepo {
                     }
                     Ok(None) => Err(None),
                     Err(e) => Err(Some(FetchFailure {
-                        unavailable: e.is_unavailable(),
+                        trouble: Trouble::of(&e),
                         reason: e.to_string(),
                     })),
                 }
@@ -662,19 +775,21 @@ impl ProxyRepo {
         match cached {
             Ok(CachedFetch::Found { body, named }) => {
                 match base64::engine::general_purpose::STANDARD.decode(body) {
-                    Ok(bytes) => (api::Fetched::Found(bytes), named, false),
+                    Ok(bytes) => (api::Fetched::Found(bytes), named, Trouble::None),
                     Err(e) => (
                         api::Fetched::Failed(format!("cached {}: {e}", fetch.url)),
                         Vec::new(),
-                        false,
+                        Trouble::None,
                     ),
                 }
             }
-            Ok(CachedFetch::NotFound) | Err(None) => (api::Fetched::NotFound, Vec::new(), false),
+            Ok(CachedFetch::NotFound) | Err(None) => {
+                (api::Fetched::NotFound, Vec::new(), Trouble::None)
+            }
             Err(Some(failure)) => (
                 api::Fetched::Failed(failure.reason),
                 Vec::new(),
-                failure.unavailable,
+                failure.trouble,
             ),
         }
     }
@@ -1309,7 +1424,7 @@ impl ProxyRepo {
         // Bytes rejected for their content recently: fail fast instead of
         // downloading them again on every client retry.
         if let Some(reason) = self.recent_rejection(repo, lower_id, version).await {
-            return Err(RepoError::Storage(format!(
+            return Err(RepoError::BadUpstream(format!(
                 "upstream package {lower_id} {version} was rejected recently: {reason}"
             )));
         }
@@ -1319,7 +1434,7 @@ impl ProxyRepo {
         // NuGet, `{flat container}{id}/{version}/{id}.{version}.nupkg`), on
         // an origin the upstream points at: [`Self::converse`] answers any
         // other as an upstream failure.
-        let url = match self
+        let (url, digests) = match self
             .converse_resolved(
                 repo,
                 api::UpstreamOp::Package(api::PackageRef {
@@ -1329,7 +1444,12 @@ impl ProxyRepo {
             )
             .await?
         {
-            api::UpstreamAnswer::Package(url) => url,
+            api::UpstreamAnswer::Package(url) => (url, None),
+            // The upstream publishes the package's digests: what is
+            // downloaded must match them.
+            api::UpstreamAnswer::Located(location) => {
+                (location.url, Some((location.sha512, location.sha1)))
+            }
             api::UpstreamAnswer::Failed(reason) => return Err(RepoError::Storage(reason)),
             _ => {
                 return Err(RepoError::Storage(
@@ -1381,9 +1501,14 @@ impl ProxyRepo {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            let reason = format!("upstream nupkg fetch {url} returned {}", resp.status());
+            let reason = format!("upstream package fetch {url} returned {}", resp.status());
             return Err(if status_is_unavailable(resp.status()) {
                 RepoError::Upstream(reason)
+            } else if matches!(
+                resp.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                RepoError::BadUpstream(reason)
             } else {
                 RepoError::Storage(reason)
             });
@@ -1424,6 +1549,25 @@ impl ProxyRepo {
             }
         };
 
+        if let Some((Some(sha512), _)) = &digests {
+            if *sha512 != staged.sha512_base64 {
+                return Err(self
+                    .reject(
+                        repo,
+                        lower_id,
+                        version,
+                        format!("upstream package {url} does not match the SHA-512 its upstream publishes"),
+                    )
+                    .await);
+            }
+        }
+        // Without a SHA-512, the SHA-1 the upstream publishes (npm's
+        // `shasum`), computed while the package is parsed.
+        let sha1 = match &digests {
+            Some((None, Some(sha1))) => Some(sha1.to_ascii_lowercase()),
+            _ => None,
+        };
+
         // Parse from the temp file on the blocking pool to obtain the canonical
         // identity and the manifest, and summarize the manifest for
         // registration and search (stored with the component, like a push).
@@ -1431,6 +1575,25 @@ impl ProxyRepo {
             let format = self.format.clone();
             let path = staged.read_path();
             tokio::task::spawn_blocking(move || {
+                if let Some(expected) = sha1 {
+                    use sha1::Digest;
+                    use std::io::Read;
+                    let mut hasher = sha1::Sha1::new();
+                    let mut file = std::fs::File::open(&path)?;
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        let n = file.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                    if hex::encode(hasher.finalize()) != expected {
+                        return Ok(Err(crate::domain::FormatError::InvalidPackage(
+                            "the package does not match the SHA-1 its upstream publishes".into(),
+                        )));
+                    }
+                }
                 let mut file = std::fs::File::open(&path)?;
                 Ok::<_, std::io::Error>(format.parse_upload(&mut file).map(|parsed| {
                     let summary = format.manifest_summary(&parsed.nuspec_bytes);
@@ -1684,7 +1847,7 @@ impl ProxyRepo {
                 })
                 .await;
         }
-        RepoError::Storage(reason)
+        RepoError::BadUpstream(reason)
     }
 
     /// Resolve the locally-stored `.nupkg` location for a cached version.
@@ -2043,12 +2206,14 @@ impl ProxyRepo {
     /// The registration entries of `id`: every listable version, or only
     /// those in `only` (normalized). The upstream's metadata is asked for the
     /// versions returned only, so a registration page or leaf reads just the
-    /// upstream documents covering its own versions.
+    /// upstream documents covering its own versions; `dated` asks it for
+    /// their publish times too ([`api::UpstreamOp::Dating`]).
     async fn registration_of(
         &self,
         repo: &str,
         id: &str,
         only: Option<&[String]>,
+        dated: bool,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
         let Some(lower) = self.upstream_id(id) else {
@@ -2072,7 +2237,7 @@ impl ProxyRepo {
 
         let wanted: Vec<String> = visible.iter().map(|r| r.version.clone()).collect();
         let upstream = self
-            .upstream_metadata(&repo_row, &lower, &wanted, false)
+            .upstream_metadata(&repo_row, &lower, &wanted, dated)
             .await;
 
         // Persist the upstream listing state so the flat index and search
@@ -2186,6 +2351,8 @@ impl ProxyRepo {
                 // Only the upstream knows the publish time (the cache time
                 // would be misleading).
                 published: leaf.and_then(|l| rfc3339(l.published.as_deref())),
+                // A proxy's deprecations are its upstream's, in the summary.
+                deprecation: None,
             });
         }
         Ok(out)
@@ -2252,6 +2419,56 @@ const SEARCH_ENRICH_CONCURRENCY: usize = 8;
 
 #[async_trait]
 impl RepoReadOps for ProxyRepo {
+    /// The upstream's tags ([`api::UpstreamOp::Tags`], read through the
+    /// fetch cache for the metadata TTL), kept in `package_tag`: what was
+    /// last read is served while the proxy is offline or the upstream
+    /// fails.
+    async fn tags(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let Some(lower) = self.upstream_id(id) else {
+            return Ok(std::collections::BTreeMap::new());
+        };
+        // A package the upstream does not know has no tags either.
+        if self.negative_cached(&repo_row, &lower, "*").await? {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        if repo_row.online {
+            match self
+                .converse_resolved(&repo_row, api::UpstreamOp::Tags(lower.clone()))
+                .await
+            {
+                Ok(api::UpstreamAnswer::Tags(Some(tags))) => {
+                    let tags: std::collections::BTreeMap<String, String> = tags
+                        .into_iter()
+                        .filter_map(|tag| {
+                            let version = self.format.normalize_version(&tag.version).ok()?;
+                            Some((tag.name, version))
+                        })
+                        .collect();
+                    let mut tx = self.pool.begin().await?;
+                    forge_db::tag_dao::replace_tags(&mut tx, repo_row.id, &lower, &tags).await?;
+                    tx.commit().await?;
+                    return Ok(tags);
+                }
+                Ok(api::UpstreamAnswer::Tags(None)) => return Ok(std::collections::BTreeMap::new()),
+                Ok(api::UpstreamAnswer::Failed(reason)) => {
+                    tracing::warn!(repo = %repo_row.name, id = %lower, %reason, "upstream tags unavailable; serving the last read");
+                }
+                Ok(_) => {
+                    tracing::warn!(repo = %repo_row.name, id = %lower, "upstream protocol answered tags with something else");
+                }
+                Err(e) => {
+                    tracing::warn!(repo = %repo_row.name, id = %lower, error = %e, "upstream tags unavailable; serving the last read");
+                }
+            }
+        }
+        Ok(forge_db::tag_dao::tags(&self.pool, repo_row.id, &lower).await?)
+    }
+
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
         let Some(lower) = self.upstream_id(id) else {
@@ -2395,7 +2612,15 @@ impl RepoReadOps for ProxyRepo {
         repo: &str,
         id: &str,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
-        self.registration_of(repo, id, None).await
+        self.registration_of(repo, id, None, false).await
+    }
+
+    async fn dated_registration(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        self.registration_of(repo, id, None, true).await
     }
 
     async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {
@@ -2425,7 +2650,7 @@ impl RepoReadOps for ProxyRepo {
         id: &str,
         versions: &[String],
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
-        self.registration_of(repo, id, Some(versions)).await
+        self.registration_of(repo, id, Some(versions), false).await
     }
 
     async fn registration_entry(
@@ -2435,7 +2660,7 @@ impl RepoReadOps for ProxyRepo {
         version: &str,
     ) -> Result<Option<RegistrationEntry>, RepoError> {
         Ok(self
-            .registration_of(repo, id, Some(&[version.to_string()]))
+            .registration_of(repo, id, Some(&[version.to_string()]), false)
             .await?
             .into_iter()
             .next())

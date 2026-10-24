@@ -116,7 +116,11 @@ export interface DetailDependency {
   range: string | null
 }
 
-/** A dependency group (per target framework) for one version. */
+/**
+ * A dependency group for one version: per target framework (NuGet), or per
+ * dependency kind (npm: `dependencies`, `optionalDependencies`,
+ * `peerDependencies`).
+ */
 export interface DetailDependencyGroup {
   target_framework: string | null
   dependencies: DetailDependency[]
@@ -131,6 +135,14 @@ export interface PackageDetail {
   versions: DetailVersion[]
   /** Dependency groups keyed by normalized version string. */
   dependency_groups_by_version: Record<string, DetailDependencyGroup[]>
+  /** The package's tags (npm's dist-tags), tag → version; absent when none. */
+  tags?: Record<string, string>
+  /** Version → its deprecation message; absent when none is deprecated. */
+  deprecated?: Record<string, string>
+  /** The latest version's description, when its manifest has one. */
+  description?: string
+  /** The latest version's README (Markdown), when its format reads one. */
+  readme?: string
 }
 
 /** Search parameters for the browse list (mirrors `BrowseQuery`). */

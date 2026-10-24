@@ -19,15 +19,17 @@ use std::collections::HashMap;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
+use forge_core::format::Format;
 use forge_core::net::ssrf::validate_url;
 use forge_db::model::{
     DeploymentPolicy, RepoKind, Repository, CONTENT_DISPOSITION_KEY, DEPLOYMENT_POLICY_KEY,
-    DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY,
+    DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY,
     MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY,
     WRITABLE_MEMBER_ID_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{component_dao, oci_dao, raw_dao};
+use forge_plugin::api::Storage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -70,7 +72,7 @@ pub struct RepoView {
     /// Hosted: the largest push it accepts (for docker, the largest blob),
     /// `None` for the default of its format (`GET /admin/formats`).
     pub max_upload_bytes: Option<u64>,
-    /// Hosted, of a files format (raw): `allow_redeploy` |
+    /// Hosted, of a files format (raw) or a package format: `allow_redeploy` |
     /// `disable_redeploy` | `read_only`.
     pub deployment_policy: Option<&'static str>,
     /// A files format (raw): `attachment` (files download) | `inline`
@@ -86,8 +88,9 @@ pub struct RepoView {
 
 impl RepoView {
     /// The view of `r`, naming its writable member as `names` (repository
-    /// names by id) does; `stores_files` when its format holds files.
-    fn new(r: &Repository, names: &HashMap<i64, String>, stores_files: bool) -> Self {
+    /// names by id) does; its format's repositories hold `storage`.
+    fn new(r: &Repository, names: &HashMap<i64, String>, storage: Storage) -> Self {
+        let stores_files = storage == Storage::Files;
         RepoView {
             id: r.id,
             name: r.name.clone(),
@@ -112,8 +115,8 @@ impl RepoView {
                 .writable_member_id()
                 .and_then(|id| names.get(&id).cloned()),
             max_upload_bytes: r.max_upload_bytes(),
-            deployment_policy: (stores_files && r.kind() == RepoKind::Hosted)
-                .then(|| r.deployment_policy().as_str()),
+            deployment_policy: (storage != Storage::Images && r.kind() == RepoKind::Hosted)
+                .then(|| deployment_policy_of(r).as_str()),
             content_disposition: stores_files.then(|| {
                 if r.inline_content() {
                     "inline"
@@ -123,13 +126,7 @@ impl RepoView {
             }),
             max_age_seconds: (stores_files && r.kind() == RepoKind::Proxy)
                 .then(|| r.max_age_seconds()),
-            storage: if r.is_docker() {
-                "images"
-            } else if stores_files {
-                "files"
-            } else {
-                "packages"
-            },
+            storage: storage.as_str(),
         }
     }
 }
@@ -142,11 +139,7 @@ async fn view(state: &AppState, r: &Repository) -> sqlx::Result<RepoView> {
             names.insert(id, member.name);
         }
     }
-    Ok(RepoView::new(
-        r,
-        &names,
-        state.formats.stores_files(&r.format),
-    ))
+    Ok(RepoView::new(r, &names, state.storage(&r.format)))
 }
 
 /// Create-repository request body. Unknown fields are rejected: a misspelled
@@ -194,15 +187,17 @@ pub struct CreateRepo {
     /// Hosted docker only: with `immutable_tags`, `latest` may still move.
     #[serde(default)]
     pub latest_mutable: Option<bool>,
-    /// Docker group only: the hosted member a push to the group goes to.
+    /// Docker or package group only: the hosted member of its format a
+    /// push or publish to the group goes to.
     #[serde(default)]
     pub writable_member: Option<String>,
     /// Hosted only: the largest push it accepts, in bytes (for docker, the
     /// largest blob). Absent: the default of its format.
     #[serde(default)]
     pub max_upload_bytes: Option<u64>,
-    /// Hosted raw only: `allow_redeploy`, `disable_redeploy` (default) or
-    /// `read_only`.
+    /// Hosted raw or package only: `allow_redeploy`, `disable_redeploy`
+    /// (default) or `read_only`. A package repository's `allow_redeploy`
+    /// says the same and may not contradict it.
     #[serde(default)]
     pub deployment_policy: Option<String>,
     /// Raw only: `attachment` (default) or `inline`.
@@ -238,14 +233,16 @@ pub struct CreateRepo {
 /// * Turning `anonymous_read` off also deletes the anonymous role's unscoped
 ///   `read` grant on the repository (the grant migration 0007 synthesized from
 ///   the flag), so anonymous access really ends.
-/// * Docker options (`host`, `immutable_tags`, `latest_mutable`,
-///   `writable_member`) follow the same rules (`host` and `writable_member`:
-///   `null` clears) and are refused on NuGet repositories.
+/// * Docker options (`host`, `immutable_tags`, `latest_mutable`) follow the
+///   same rules (`host`: `null` clears) and are refused on other formats; a
+///   docker or package group's `writable_member` too (`null` clears).
 /// * `max_upload_bytes` (hosted only): `null` clears it, back to the default
 ///   of the repository's format.
-/// * Raw options (`deployment_policy`, `content_disposition`,
-///   `max_age_seconds`) are refused on other formats; `max_age_seconds:
-///   null` goes back to the default.
+/// * Raw options (`content_disposition`, `max_age_seconds`) are refused on
+///   other formats; `max_age_seconds: null` goes back to the default. A
+///   hosted raw or package repository's `deployment_policy` sets its
+///   policy; a package repository's `allow_redeploy` follows it (and sets
+///   it, when given alone).
 /// * Unknown fields are rejected (a misspelled field would otherwise keep the
 ///   stored value).
 #[derive(Debug, Deserialize)]
@@ -393,11 +390,12 @@ const MAX_PACKAGE_DELAY_SECONDS: i32 = 365 * 24 * 60 * 60;
 /// Most reserved prefixes a group may carry.
 const MAX_RESERVED_PREFIXES: usize = 100;
 
-/// Validate and normalize a group's reserved id prefixes: each is a NuGet id
-/// prefix (`A-Z a-z 0-9 . _ -`, at most 100 bytes, an optional trailing `*`
-/// dropped), stored lowercase, deduplicated. A docker group's prefixes are
-/// image-name prefixes and may contain `/` (a namespace such as `acme/`).
-fn normalize_prefixes(raw: &[String], docker: bool) -> Result<Vec<String>, String> {
+/// Validate and normalize a group's reserved id prefixes: each is at most
+/// 100 bytes, an optional trailing `*` dropped, deduplicated, and what the
+/// group's format makes of it ([`Format::reserved_prefix`]: NuGet's
+/// `A-Z a-z 0-9 . _ -`, lowercase; npm's `@acme` is the scope `@acme/`;
+/// Docker's image-name prefixes may hold a namespace, `acme/`).
+fn normalize_prefixes(raw: &[String], format: Option<&dyn Format>) -> Result<Vec<String>, String> {
     if raw.len() > MAX_RESERVED_PREFIXES {
         return Err(format!(
             "at most {MAX_RESERVED_PREFIXES} reserved_prefixes are allowed"
@@ -407,30 +405,48 @@ fn normalize_prefixes(raw: &[String], docker: bool) -> Result<Vec<String>, Strin
     for prefix in raw {
         let prefix = prefix.trim();
         let prefix = prefix.strip_suffix('*').unwrap_or(prefix);
-        let valid = !prefix.is_empty()
-            && prefix.len() <= 100
-            && prefix.bytes().all(|b| {
-                b.is_ascii_alphanumeric()
-                    || matches!(b, b'.' | b'_' | b'-')
-                    || (docker && b == b'/')
-            });
-        if !valid {
-            return Err(if docker {
-                format!(
-                    "reserved_prefixes: {prefix:?} is not an image name prefix (letters, digits, '.', '_', '-', '/')"
-                )
-            } else {
-                format!(
-                    "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
-                )
-            });
+        if prefix.is_empty() || prefix.len() > 100 {
+            return Err(format!(
+                "reserved_prefixes: {prefix:?} must be 1-100 bytes long"
+            ));
         }
-        let prefix = prefix.to_ascii_lowercase();
+        let prefix = match format {
+            Some(format) => format.reserved_prefix(prefix).map_err(|e| match e {
+                forge_core::domain::FormatError::InvalidPackage(m) => {
+                    format!("reserved_prefixes: {m}")
+                }
+                e => format!("reserved_prefixes: {e}"),
+            })?,
+            None => {
+                let valid = prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+                if !valid {
+                    return Err(format!(
+                        "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
+                    ));
+                }
+                prefix.to_ascii_lowercase()
+            }
+        };
         if !out.contains(&prefix) {
             out.push(prefix);
         }
     }
     Ok(out)
+}
+
+/// What a hosted repository does with a publish of a version it has: the
+/// stored `deployment_policy`, or, for a package repository that has none
+/// yet, what `allow_redeploy` says.
+fn deployment_policy_of(r: &Repository) -> DeploymentPolicy {
+    if r.config.get(DEPLOYMENT_POLICY_KEY).is_some() {
+        r.deployment_policy()
+    } else if r.allow_redeploy {
+        DeploymentPolicy::AllowRedeploy
+    } else {
+        DeploymentPolicy::DisableRedeploy
+    }
 }
 
 /// Validate and normalize a docker repository's `host`: a lowercase DNS name
@@ -461,13 +477,17 @@ fn normalize_docker_host(raw: &str, public_base_url: &str) -> Result<String, Str
     Ok(host)
 }
 
-/// A docker group's `writable_member`: an existing hosted docker
-/// repository, whose id is stored.
-async fn validate_writable_member(state: &AppState, name: &str) -> Result<i64, Response> {
+/// A group's `writable_member`: an existing hosted repository of the
+/// group's `format`, whose id is stored.
+async fn validate_writable_member(
+    state: &AppState,
+    name: &str,
+    format: &str,
+) -> Result<i64, Response> {
     match repository_dao::find_repository_by_name(&state.pool, name).await {
-        Ok(Some(r)) if r.is_docker() && r.kind() == RepoKind::Hosted => Ok(r.id),
+        Ok(Some(r)) if r.format == format && r.kind() == RepoKind::Hosted => Ok(r.id),
         Ok(_) => Err(bad_request(format!(
-            "writable_member {name:?} must be a hosted docker repository (and a member of the group)"
+            "writable_member {name:?} must be a hosted {format} repository (and a member of the group)"
         ))),
         Err(e) => Err(db_error(e)),
     }
@@ -539,7 +559,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
                 repos.iter().map(|r| (r.id, r.name.clone())).collect();
             let views: Vec<RepoView> = repos
                 .iter()
-                .map(|r| RepoView::new(r, &names, state.formats.stores_files(&r.format)))
+                .map(|r| RepoView::new(r, &names, state.storage(&r.format)))
                 .collect();
             Json(views).into_response()
         }
@@ -586,11 +606,16 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             body.format
         ));
     }
-    let docker = body.format == DOCKER_FORMAT;
+    let storage = state.storage(&body.format);
+    let images = storage == Storage::Images;
+    let files = storage == Storage::Files;
+    // A package format plugin's (NuGet's, npm's): package versions.
+    let package = storage == Storage::Packages && state.formats.plugin(&body.format).is_some();
     let parsed_kind = RepoKind::from(kind.as_str());
     let docker_config = match docker_options(
         &state,
-        docker,
+        images.then_some(body.format.as_str()),
+        package.then_some(body.format.as_str()),
         parsed_kind,
         &body.name,
         DockerOptions {
@@ -606,15 +631,14 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         Ok(config) => config,
         Err(resp) => return resp,
     };
-    if docker && body.package_delay_seconds != 0 {
+    if images && body.package_delay_seconds != 0 {
         return bad_request("package_delay_seconds is not supported for docker repositories");
     }
-    if docker && body.allow_redeploy {
+    if images && body.allow_redeploy {
         return bad_request(
             "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
         );
     }
-    let files = state.formats.stores_files(&body.format);
     if files {
         if let Err(resp) = refuse_for_files(
             Some(body.package_delay_seconds),
@@ -625,8 +649,25 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             return resp;
         }
     }
+    // A package repository's redeploys follow its deployment policy, when
+    // it is given; `allow_redeploy` says the same.
+    let policy = body
+        .deployment_policy
+        .as_deref()
+        .and_then(DeploymentPolicy::parse);
+    if package
+        && body.allow_redeploy
+        && policy.is_some_and(|p| p != DeploymentPolicy::AllowRedeploy)
+    {
+        return bad_request("allow_redeploy contradicts deployment_policy");
+    }
+    let allow_redeploy = match policy {
+        Some(policy) if package => policy == DeploymentPolicy::AllowRedeploy,
+        _ => body.allow_redeploy,
+    };
     let docker_config = match file_options(
         files,
+        package,
         parsed_kind,
         FileOptions {
             deployment_policy: body.deployment_policy.clone(),
@@ -664,7 +705,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     let reserved_prefixes = match body
         .reserved_prefixes
         .as_deref()
-        .map(|p| normalize_prefixes(p, docker))
+        .map(|p| normalize_prefixes(p, state.formats.get(&body.format).as_deref()))
     {
         Some(Err(msg)) => return bad_request(&msg),
         Some(Ok(prefixes)) => Some(prefixes),
@@ -712,7 +753,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         },
         metadata_ttl_seconds: body.metadata_ttl_seconds,
         not_found_ttl_seconds: body.not_found_ttl_seconds,
-        allow_redeploy: body.allow_redeploy,
+        allow_redeploy,
     };
 
     // The row and its sealed secret commit together: a failed seal must not
@@ -785,26 +826,42 @@ impl DockerOptions {
 
 /// Validate the docker options against the repository's format and kind
 /// and merge them into `existing` (its stored config object). Returns the
-/// config object to store.
+/// config object to store. They are the image store's: only a repository
+/// of an images format (`images`: its format, Docker) takes them.
+///
+/// A group of a package format (`writable`: its format) takes a writable
+/// member too: where its clients' publishes and changes land.
 #[allow(clippy::result_large_err)]
 async fn docker_options(
     state: &AppState,
-    docker: bool,
+    images: Option<&str>,
+    writable: Option<&str>,
     kind: RepoKind,
     name: &str,
     options: DockerOptions,
     existing: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
     let mut config = existing.clone();
-    if !docker {
-        if options.any() {
+    let Some(images) = images else {
+        let writable_only = options.host.is_none()
+            && options.immutable_tags.is_none()
+            && options.latest_mutable.is_none();
+        if options.any() && !(writable_only && writable.is_some()) {
             return Err(bad_request(
-                "host, immutable_tags, latest_mutable and writable_member are only valid for docker repositories",
+                "host, immutable_tags and latest_mutable are only valid for docker repositories, writable_member for docker and package groups",
             ));
         }
-        return Ok(config);
-    }
-    if !forge_oci::reference::valid_name_component(name) {
+        return writable_member_option(state, writable, kind, options.writable_member, config)
+            .await;
+    };
+    // Path-based routing names an image `<repository>/<image>`: the
+    // repository's name must be a valid one (a single component, as a
+    // repository name has no `/`).
+    let valid_name = state
+        .formats
+        .get(images)
+        .is_some_and(|format| format.validate_id(name).is_ok());
+    if !valid_name {
         return Err(bad_request(format!(
             "invalid docker repository name {name:?}: image names start with it, so use \
              lowercase letters and digits, separated by '.', '_', '__' or '-'"
@@ -815,11 +872,6 @@ async fn docker_options(
     {
         return Err(bad_request(
             "immutable_tags and latest_mutable are only valid for hosted repositories",
-        ));
-    }
-    if options.writable_member.is_some() && kind != RepoKind::Group {
-        return Err(bad_request(
-            "writable_member is only valid for group repositories",
         ));
     }
     match options.host {
@@ -839,15 +891,33 @@ async fn docker_options(
     if let Some(latest) = options.latest_mutable {
         config.insert(LATEST_MUTABLE_KEY.into(), json!(latest));
     }
-    match options.writable_member {
-        Some(Some(member)) => {
-            let member = validate_writable_member(state, &member).await?;
+    writable_member_option(state, Some(images), kind, options.writable_member, config).await
+}
+
+/// Merge a group's `writable_member` (a hosted repository of `format`;
+/// `Some(None)`: cleared) into `config`.
+#[allow(clippy::result_large_err)]
+async fn writable_member_option(
+    state: &AppState,
+    format: Option<&str>,
+    kind: RepoKind,
+    member: Option<Option<String>>,
+    mut config: serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
+    if member.is_some() && kind != RepoKind::Group {
+        return Err(bad_request(
+            "writable_member is only valid for group repositories",
+        ));
+    }
+    match (member, format) {
+        (Some(Some(member)), Some(format)) => {
+            let member = validate_writable_member(state, &member, format).await?;
             config.insert(WRITABLE_MEMBER_ID_KEY.into(), json!(member));
         }
-        Some(None) => {
+        (Some(None), _) => {
             config.remove(WRITABLE_MEMBER_ID_KEY);
         }
-        None => {}
+        _ => {}
     }
     Ok(config)
 }
@@ -872,21 +942,24 @@ impl FileOptions {
 const MAX_FILE_MAX_AGE_SECONDS: u64 = 10 * 366 * 24 * 60 * 60;
 
 /// Validate the files options against the repository's format and kind and
-/// merge them into `config` (the config object to store).
+/// merge them into `config` (the config object to store). A package
+/// repository (`package`) takes the deployment policy too.
 #[allow(clippy::result_large_err)]
 fn file_options(
     files: bool,
+    package: bool,
     kind: RepoKind,
     options: FileOptions,
     mut config: serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
     if !files {
-        if options.any() {
+        let policy_only =
+            options.content_disposition.is_none() && options.max_age_seconds.is_none();
+        if options.any() && !(policy_only && package) {
             return Err(bad_request(
-                "deployment_policy, content_disposition and max_age_seconds are only valid for repositories of files (raw)",
+                "content_disposition and max_age_seconds are only valid for repositories of files (raw), deployment_policy for those and package repositories",
             ));
         }
-        return Ok(config);
     }
     if let Some(policy) = options.deployment_policy {
         if kind != RepoKind::Hosted {
@@ -1054,20 +1127,24 @@ pub async fn update(
         }
     }
 
-    let docker = existing.is_docker();
+    let storage = state.storage(&existing.format);
+    let images = storage == Storage::Images;
     let final_name = body.name.clone().unwrap_or_else(|| existing.name.clone());
-    if docker && body.package_delay_seconds.is_some_and(|d| d != 0) {
+    if images && body.package_delay_seconds.is_some_and(|d| d != 0) {
         return bad_request("package_delay_seconds is not supported for docker repositories");
     }
-    if docker && body.allow_redeploy == Some(true) {
+    if images && body.allow_redeploy == Some(true) {
         return bad_request(
             "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
         );
     }
+    let files = storage == Storage::Files;
+    let package = storage == Storage::Packages && state.formats.plugin(&existing.format).is_some();
     let stored_config = existing.config.as_object().cloned().unwrap_or_default();
     let config = match docker_options(
         &state,
-        docker,
+        images.then_some(existing.format.as_str()),
+        package.then_some(existing.format.as_str()),
         existing.kind(),
         &final_name,
         DockerOptions {
@@ -1083,11 +1160,40 @@ pub async fn update(
         Ok(config) => config,
         Err(resp) => return resp,
     };
+    // A package repository's deployment policy and `allow_redeploy` say
+    // the same: setting one sets the other.
+    let policy = body
+        .deployment_policy
+        .as_deref()
+        .and_then(DeploymentPolicy::parse);
+    let mut allow_redeploy = body.allow_redeploy.unwrap_or(existing.allow_redeploy);
+    let mut deployment_policy = body.deployment_policy.clone();
+    if package && existing.kind() == RepoKind::Hosted {
+        match (policy, body.allow_redeploy) {
+            (Some(policy), Some(allow)) if allow != (policy == DeploymentPolicy::AllowRedeploy) => {
+                return bad_request("allow_redeploy contradicts deployment_policy");
+            }
+            (Some(policy), _) => allow_redeploy = policy == DeploymentPolicy::AllowRedeploy,
+            (None, Some(allow)) if deployment_policy.is_none() => {
+                deployment_policy = Some(
+                    if allow {
+                        DeploymentPolicy::AllowRedeploy
+                    } else {
+                        DeploymentPolicy::DisableRedeploy
+                    }
+                    .as_str()
+                    .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
     let mut config = match file_options(
-        state.formats.stores_files(&existing.format),
+        files,
+        package,
         existing.kind(),
         FileOptions {
-            deployment_policy: body.deployment_policy.clone(),
+            deployment_policy,
             content_disposition: body.content_disposition.clone(),
             max_age_seconds: body.max_age_seconds,
         },
@@ -1109,10 +1215,11 @@ pub async fn update(
         if existing.kind() != RepoKind::Group {
             return bad_request("reserved_prefixes is only valid for group repositories");
         }
-        let prefixes = match normalize_prefixes(prefixes, docker) {
-            Ok(prefixes) => prefixes,
-            Err(msg) => return bad_request(&msg),
-        };
+        let prefixes =
+            match normalize_prefixes(prefixes, state.formats.get(&existing.format).as_deref()) {
+                Ok(prefixes) => prefixes,
+                Err(msg) => return bad_request(&msg),
+            };
         if !config.is_object() {
             config = json!({});
         }
@@ -1187,7 +1294,7 @@ pub async fn update(
         not_found_ttl_seconds: body
             .not_found_ttl_seconds
             .unwrap_or(existing.not_found_ttl_seconds),
-        allow_redeploy: body.allow_redeploy.unwrap_or(existing.allow_redeploy),
+        allow_redeploy,
     };
     if let Err(resp) = validate_timings(
         upd.package_delay_seconds,
@@ -1227,13 +1334,17 @@ pub async fn update(
         if let Err(e) = forge_db::proxy_dao::reset_for_new_upstream(&mut tx, updated.id).await {
             return db_error(e);
         }
+        // Its tags were the previous upstream's.
+        if let Err(e) = forge_db::tag_dao::delete_repository_tags(&mut *tx, updated.id).await {
+            return db_error(e);
+        }
         // A docker proxy's tags name what the previous upstream served:
         // the repointed proxy starts with an empty cache. Locked first, as
         // the purge requires: a fetch from the previous upstream still
         // inserting commits before the purge (which removes it), and one
         // inserting later finds the new upstream and caches nothing
         // (`oci_dao::lock_proxy_upstream`).
-        if existing.is_docker() {
+        if images {
             match repository_dao::lock_repository(&mut *tx, updated.id).await {
                 Ok(_) => {}
                 Err(e) => return db_error(e),
@@ -1361,7 +1472,7 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
     match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
         Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
         Ok(RepoDelete::NotFound) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
-        Ok(RepoDelete::HasPackages) if existing.is_docker() => (
+        Ok(RepoDelete::HasPackages) if state.formats.stores_images(&existing.format) => (
             StatusCode::CONFLICT,
             "repository still has images; delete their manifests first",
         )
@@ -1497,7 +1608,7 @@ pub async fn hard_delete_package(
         )
             .into_response();
     }
-    if repo.is_docker() {
+    if state.formats.stores_images(&repo.format) {
         return (
             StatusCode::BAD_REQUEST,
             "delete image manifests and tags through the registry API (DELETE /v2/<name>/manifests/<reference>)",

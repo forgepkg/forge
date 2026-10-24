@@ -5,8 +5,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use forge_core::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
+use std::sync::OnceLock;
+
 use forge_core::format::{Format, ReadSeek};
-use forge_plugin_api::{self as api, Assets, FormatPlugin, Storage};
+use forge_plugin_api::{self as api, Assets, FormatPlugin, Storage, UpstreamToken};
 
 use crate::Plugin;
 
@@ -30,11 +32,13 @@ const MAX_ID_LENGTH: usize = 512;
 
 /// A format plugin as a [`Format`]: what the hosted write path, the read
 /// ops, the proxy read path and retention work with.
+#[derive(Clone)]
 pub struct PluginFormat {
     id: &'static str,
     plugin: Arc<dyn FormatPlugin>,
     assets: Assets,
     storage: Storage,
+    upstream_token: UpstreamToken,
 }
 
 impl PluginFormat {
@@ -45,7 +49,119 @@ impl PluginFormat {
             plugin: plugin.implementation().clone(),
             assets: plugin.descriptor().assets,
             storage: plugin.descriptor().storage,
+            upstream_token: plugin.descriptor().upstream_token,
         }
+    }
+
+    /// The format of one publish through the plugin's protocol: the package
+    /// is parsed with the document it came in, when there is one
+    /// ([`FormatPlugin::parse_upload`]; the host sets
+    /// [`UploadFormat::document`] once the body is read, before the staged
+    /// package is parsed), must have the canonical id `expected_id`, when
+    /// one is given, and its identity is recorded in
+    /// [`UploadFormat::parsed`].
+    pub fn upload(
+        &self,
+        document: bool,
+        publisher: Option<String>,
+        expected_id: Option<String>,
+    ) -> UploadFormat {
+        UploadFormat {
+            format: self.clone(),
+            document: document.then(|| Arc::new(OnceLock::new())),
+            publisher,
+            expected_id,
+            parsed: Arc::new(OnceLock::new()),
+        }
+    }
+}
+
+/// See [`PluginFormat::upload`].
+pub struct UploadFormat {
+    format: PluginFormat,
+    /// The rest of the document the package came in, for an
+    /// [`api::Upload::Document`].
+    pub document: Option<Arc<OnceLock<Vec<u8>>>>,
+    /// The username of the account publishing.
+    publisher: Option<String>,
+    expected_id: Option<String>,
+    /// `(canonical id, normalized version)` of the package, once parsed.
+    pub parsed: Arc<OnceLock<(String, String)>>,
+}
+
+impl Format for UploadFormat {
+    fn id(&self) -> &'static str {
+        self.format.id()
+    }
+
+    fn package_asset_path(&self) -> &str {
+        self.format.package_asset_path()
+    }
+
+    fn package_content_type(&self) -> &str {
+        self.format.package_content_type()
+    }
+
+    fn manifest_asset_path(&self) -> &str {
+        self.format.manifest_asset_path()
+    }
+
+    fn manifest_content_type(&self) -> &str {
+        self.format.manifest_content_type()
+    }
+
+    fn parse_upload(&self, mut file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
+        file.rewind()?;
+        let parsed = match &self.document {
+            Some(document) => {
+                let document = document.get().ok_or_else(|| {
+                    FormatError::InvalidPackage("the upload's document is incomplete".into())
+                })?;
+                let upload = api::Uploaded {
+                    document,
+                    publisher: self.publisher.as_deref(),
+                };
+                self.format.plugin.parse_upload(&upload, &mut file)
+            }
+            None => self.format.plugin.parse_package(&mut file),
+        }
+        .map_err(format_error)
+        .and_then(parsed_upload)?;
+        if let Some(expected) = &self.expected_id {
+            if &parsed.id != expected {
+                return Err(FormatError::InvalidPackage(format!(
+                    "the package is {}, not {expected}",
+                    parsed.id
+                )));
+            }
+        }
+        let _ = self.parsed.set((parsed.id.clone(), parsed.version.clone()));
+        Ok(parsed)
+    }
+
+    fn parse_upload_file(&self, path: &Path) -> Result<ParsedUpload, FormatError> {
+        let mut file = std::fs::File::open(path)?;
+        self.parse_upload(&mut file)
+    }
+
+    fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
+        self.format.normalize_version(raw)
+    }
+
+    fn compare_versions(&self, a: &str, b: &str) -> Ordering {
+        self.format.compare_versions(a, b)
+    }
+
+    fn lower_id(&self, id: &str) -> String {
+        self.format.lower_id(id)
+    }
+
+    fn validate_id(&self, id: &str) -> Result<(), FormatError> {
+        self.format.validate_id(id)
+    }
+
+    fn manifest_summary(&self, manifest: &[u8]) -> Option<serde_json::Value> {
+        self.format.manifest_summary(manifest)
     }
 }
 
@@ -133,6 +249,10 @@ impl Format for PluginFormat {
         self.storage == Storage::Files
     }
 
+    fn stores_images(&self) -> bool {
+        self.storage == Storage::Images
+    }
+
     fn package_asset_path(&self) -> &str {
         self.assets.package
     }
@@ -201,6 +321,18 @@ impl Format for PluginFormat {
             .map_err(format_error)
     }
 
+    fn upstream_bearer_token(&self) -> bool {
+        self.upstream_token == UpstreamToken::Bearer
+    }
+
+    fn readme(&self, manifest: &[u8]) -> Option<String> {
+        self.plugin.readme(manifest)
+    }
+
+    fn reserved_prefix(&self, prefix: &str) -> Result<String, FormatError> {
+        self.plugin.reserved_prefix(prefix).map_err(format_error)
+    }
+
     fn manifest_summary(&self, manifest: &[u8]) -> Option<serde_json::Value> {
         let text = self.plugin.manifest_summary(manifest)?;
         match serde_json::from_str::<serde_json::Value>(&text) {
@@ -237,6 +369,7 @@ mod tests {
         kinds: &[api::RepositoryKind::Hosted, api::RepositoryKind::Group],
         storage: Storage::Packages,
         assets: Assets::DEFAULT,
+        upstream_token: UpstreamToken::None,
     };
 
     impl FormatPlugin for Unlimited {

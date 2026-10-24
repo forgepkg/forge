@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO package_tag (repository_id, package, tag, version)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT (repository_id, package, tag)\n        DO UPDATE SET version = EXCLUDED.version, updated_at = now()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6dac1d112d13d0be04e1ebdd06e39794c7735c62e54bc34fa3d0e8981c8dc0c"
+}

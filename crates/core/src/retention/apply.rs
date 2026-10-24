@@ -350,6 +350,13 @@ async fn apply_hosted(
         summary.skipped += 1;
         return Ok(());
     }
+    // A package tag (npm's `latest`, `next`, …) names it now: never touched,
+    // whatever the evaluation said.
+    if forge_db::tag_dao::is_tagged(&mut **tx, ctx.repository_id, &row.name, &row.version).await? {
+        audit_skipped(tx, ctx, d, "component").await?;
+        summary.skipped += 1;
+        return Ok(());
+    }
 
     match d.action {
         Action::Unlist => {

@@ -1,9 +1,10 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: the format plugins (NuGet, raw files) and Docker.
+//! repositories of: the format plugins (Docker / OCI, NuGet, raw files),
+//! each as its descriptor describes it.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};
-use forge_db::model::DOCKER_FORMAT;
+use forge_plugin::api::Storage;
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -37,8 +38,8 @@ pub struct FormatView {
     pub max_upload_bytes_limit: Option<u64>,
 }
 
-/// `GET /admin/formats`: NuGet first, then Docker, then the other formats
-/// (the other plugins, raw files among them) by id.
+/// `GET /admin/formats`: NuGet first, then the images formats (Docker),
+/// then the other formats (raw files among them), each group by id.
 pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
     let ceiling = state.config.max_repository_upload_bytes();
@@ -52,27 +53,19 @@ pub async fn list(State(state): State<AppState>) -> Response {
             mount: descriptor.mount.to_string(),
             version: Some(descriptor.version.to_string()),
             description: Some(descriptor.description.to_string()),
-            default_max_upload_bytes: state.config.default_upload_limit(plugin.id()),
+            default_max_upload_bytes: state.config.default_upload_limit(descriptor.storage),
             max_upload_bytes_limit: ceiling,
         }
     };
     let mut plugins: Vec<_> = state.formats.plugins().collect();
-    plugins.sort_by_key(|p| p.id());
-    let (nuget, others): (Vec<_>, Vec<_>) = plugins.into_iter().partition(|p| p.id() == "nuget");
-    let mut formats: Vec<FormatView> = nuget.into_iter().map(|p| view(p)).collect();
-    formats.push(FormatView {
-        id: DOCKER_FORMAT.to_string(),
-        name: "Docker / OCI".into(),
-        kinds: kinds(DOCKER_FORMAT),
-        storage: "images",
-        mount: "/v2".into(),
-        version: None,
-        description: None,
-        default_max_upload_bytes: state.config.default_upload_limit(DOCKER_FORMAT),
-        max_upload_bytes_limit: ceiling,
+    plugins.sort_by_key(|p| {
+        let group = match p.descriptor().storage {
+            _ if p.id() == "nuget" => 0,
+            Storage::Images => 1,
+            Storage::Packages | Storage::Files => 2,
+        };
+        (group, p.id())
     });
-    let mut others: Vec<FormatView> = others.into_iter().map(|p| view(p)).collect();
-    others.sort_by(|a, b| a.id.cmp(&b.id));
-    formats.extend(others);
+    let formats: Vec<FormatView> = plugins.into_iter().map(|p| view(p)).collect();
     Json(formats).into_response()
 }

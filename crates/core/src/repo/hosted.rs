@@ -274,6 +274,7 @@ impl HostedRepo {
             nuspec_bytes,
             manifest_summary,
             published: Some(row.created_at),
+            deprecation: row.deprecation,
         })
     }
 
@@ -350,6 +351,15 @@ impl HostedRepo {
 
 #[async_trait]
 impl RepoReadOps for HostedRepo {
+    async fn tags(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        Ok(forge_db::tag_dao::tags(&self.pool, repo_id, id).await?)
+    }
+
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
         let repo_id = self.repo_id(repo).await?;
         let comps = component_dao::list_versions(&self.pool, repo_id, id).await?;

@@ -23,21 +23,40 @@ import { RetentionBadge } from './RetentionBadge'
  * Forge first downloaded it from the upstream, not when it was published
  * there (and unknown for versions not downloaded yet), so the column is
  * labelled "Cached" for a proxy repository.
+ *
+ * An npm package's versions also show the dist-tags that point at them and
+ * whether they are deprecated (the message in the badge's title).
  */
 export function VersionTable({
   versions,
   repoKind,
   caption,
+<<<<<<< HEAD
   onDelete,
   deletePending,
+=======
+  distTags,
+  deprecated,
+>>>>>>> origin/main
 }: {
   versions: DetailVersion[]
   /** The package's repository kind: `hosted` | `proxy` | `group`. */
   repoKind: string
   caption?: string
+<<<<<<< HEAD
   onDelete?: (version: DetailVersion) => void
   deletePending?: boolean
+=======
+  /** npm: tag → version. */
+  distTags?: Record<string, string>
+  /** npm: version → deprecation message. */
+  deprecated?: Record<string, string>
+>>>>>>> origin/main
 }) {
+  const tagsOf = (version: string) =>
+    Object.entries(distTags ?? {})
+      .filter(([, v]) => v === version)
+      .map(([tag]) => tag)
   return (
     <Table caption={caption}>
       <TableHead>
@@ -67,6 +86,16 @@ export function VersionTable({
             </TableCell>
             <TableCell>
               <span className="fg-cell-badges">
+                {tagsOf(v.version).map((tag) => (
+                  <StatusBadge key={tag} tone="ok" dot={false} title={`dist-tag ${tag}`}>
+                    {tag}
+                  </StatusBadge>
+                ))}
+                {deprecated?.[v.version] != null && (
+                  <StatusBadge tone="warn" title={deprecated[v.version]}>
+                    deprecated
+                  </StatusBadge>
+                )}
                 {!v.listed && <StatusBadge>unlisted</StatusBadge>}
                 <DelayBadge status={v.delay_status} delayedUntil={v.delayed_until} />
                 <RetentionBadge status={v.retention_status} />

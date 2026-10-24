@@ -23,8 +23,8 @@ import {
 /**
  * Shared repository create/edit form. Kind-conditional fields:
  *
- *  - **hosted** → `allow_redeploy` (NuGet) / `immutable_tags` +
- *                 `latest_mutable` (docker), and the upload limit
+ *  - **hosted** → the deployment policy (raw, NuGet, npm) / `immutable_tags`
+ *                 + `latest_mutable` (docker), and the upload limit
  *                 (`max_upload_bytes`, entered in MiB; empty = the format's
  *                 default)
  *  - **proxy**  → `remote_url`, `package_delay_seconds` (not docker),
@@ -32,15 +32,15 @@ import {
  *                 (the password is never populated from a GET; the form
  *                 offers a "set new password" affordance and only sends it
  *                 when the admin types one)
- *  - **group**  → `prefer_hosted`, `reserved_prefixes`, and for docker the
- *                 optional `writable_member`; members are managed on a
+ *  - **group**  → `prefer_hosted`, `reserved_prefixes`, and the optional
+ *                 `writable_member` (not raw); members are managed on a
  *                 separate screen (`GroupMembers`)
  *  - **docker** (any kind) → the optional `host` the repository also answers
  *                 on at the root
- *  - **raw** → instead of the NuGet options: the deployment policy (hosted),
- *                 whether files display in the browser (any kind), and the
- *                 maximum age of a proxy's cached files; a raw group has no
- *                 dependency-confusion options
+ *  - **raw** → instead of the package options: whether files display in
+ *                 the browser (any kind), and the maximum age of a proxy's
+ *                 cached files; a raw group has no dependency-confusion
+ *                 options and no writable member
  *
  * On **create** `format` and `kind` are selectable (the kinds the format
  * supports: format plugins have no proxies); on **edit** both are fixed
@@ -160,6 +160,18 @@ export const RAW_FORMAT: FormatView = {
   mount: '/raw',
 }
 
+/**
+ * npm registries, built in: packages for npm, pnpm, Yarn and Bun, served
+ * under `/npm`. Hosted ones have a deployment policy, groups a writable
+ * member.
+ */
+export const NPM_FORMAT: FormatView = {
+  id: 'npm',
+  name: 'npm',
+  kinds: ['hosted', 'proxy', 'group'],
+  mount: '/npm',
+}
+
 /** Default maximum age of a raw proxy's cached files: a day. */
 export const DEFAULT_RAW_MAX_AGE_SECONDS = 86400
 
@@ -178,7 +190,6 @@ export interface RepoFormValues {
   kind: RepoKind
   anonymous_read: boolean
   online: boolean
-  allow_redeploy: boolean
   prefer_hosted: boolean
   /** Comma- or newline-separated id prefixes (group). */
   reserved_prefixes: string
@@ -197,11 +208,11 @@ export interface RepoFormValues {
   immutable_tags: boolean
   /** Hosted docker with immutable tags: `latest` may still be moved. */
   latest_mutable: boolean
-  /** Docker group: hosted member pushes go to; blank = pushes refused. */
+  /** Docker or package group: hosted member pushes go to; blank = pushes refused. */
   writable_member: string
   /** Hosted: the upload limit in MiB; blank = the format's default. */
   max_upload_mib: string
-  /** Hosted raw: what an upload to an existing path does. */
+  /** Hosted raw or package: what an upload to an existing path or version does. */
   deployment_policy: DeploymentPolicy
   /** Raw: files display in the browser instead of downloading. */
   inline_content: boolean
@@ -236,7 +247,6 @@ function seed(existing?: RepoView): RepoFormValues {
     kind: (existing?.kind as RepoKind) ?? 'hosted',
     anonymous_read: existing?.anonymous_read ?? false,
     online: existing?.online ?? true,
-    allow_redeploy: existing?.allow_redeploy ?? false,
     prefer_hosted: existing?.prefer_hosted ?? true,
     reserved_prefixes: (existing?.reserved_prefixes ?? []).join(', '),
     remote_url: existing?.remote_url ?? '',
@@ -259,7 +269,9 @@ function seed(existing?: RepoView): RepoFormValues {
     writable_member: existing?.writable_member ?? '',
     max_upload_mib:
       existing?.max_upload_bytes != null ? bytesToMib(existing.max_upload_bytes) : '',
-    deployment_policy: existing?.deployment_policy ?? 'disable_redeploy',
+    deployment_policy:
+      existing?.deployment_policy ??
+      (existing?.allow_redeploy ? 'allow_redeploy' : 'disable_redeploy'),
     inline_content: existing?.content_disposition === 'inline',
     max_age_seconds:
       existing?.max_age_seconds != null &&
@@ -301,6 +313,7 @@ function formatHelp(format: FormatView): string {
   if (format.id === RAW_FORMAT.id) {
     return 'Files under arbitrary paths (binaries, installers, fixtures), served under /raw.'
   }
+  if (format.id === NPM_FORMAT.id) return 'npm packages, for npm, pnpm, Yarn and Bun.'
   return 'A format plugin.'
 }
 
@@ -406,7 +419,7 @@ export function RepositoryForm({
   // load, or a plugin is not installed any more): the built-in formats are
   // known; any other one must have been a plugin format.
   const format: FormatView = available.find((f) => f.id === values.format) ??
-    [NUGET_FORMAT, DOCKER_FORMAT, RAW_FORMAT].find((f) => f.id === values.format) ?? {
+    [NUGET_FORMAT, DOCKER_FORMAT, RAW_FORMAT, NPM_FORMAT].find((f) => f.id === values.format) ?? {
     id: values.format,
     name: values.format,
     kinds: ['hosted', 'group'],
@@ -427,6 +440,9 @@ export function RepositoryForm({
   const isGroup = values.kind === 'group'
   const isDocker = values.format === DOCKER_FORMAT.id
   const isRaw = values.format === RAW_FORMAT.id
+  const isNpm = values.format === NPM_FORMAT.id
+  // NuGet, npm: packages with versions (not docker images, not raw files).
+  const isPackage = !isDocker && !isRaw
   // What the repository holds, for the help texts.
   const things = isDocker ? 'images' : isRaw ? 'files' : 'packages'
 
@@ -605,25 +621,25 @@ export function RepositoryForm({
                   }
                 />
               </>
-            ) : isRaw ? (
+            ) : (
               <SelectField
                 label="Deployment policy"
                 value={values.deployment_policy}
                 onChange={(e) =>
                   set('deployment_policy', e.target.value as DeploymentPolicy)
                 }
-                description="What an upload to a path that holds a file does: refused (uploading the same content again is accepted), replaces it (which needs the delete permission too), or every upload and delete is refused."
+                description={
+                  isRaw
+                    ? 'What an upload to a path that holds a file does: refused (uploading the same content again is accepted), replaces it (which needs the delete level), or every upload and delete is refused.'
+                    : isNpm
+                      ? 'What publishing a version that exists does: refused (as on the public registry, where a published version never changes), replaces it (which needs the delete level), or every publish, unpublish and dist-tag change is refused.'
+                      : 'What pushing a version that exists does: refused, replaces it (which needs the delete level), or every push, unlist and delete is refused.'
+                }
               >
                 <option value="disable_redeploy">Disable redeploy</option>
                 <option value="allow_redeploy">Allow redeploy</option>
                 <option value="read_only">Read-only</option>
               </SelectField>
-            ) : (
-              <Switch
-                label="Allow redeploy (re-push an existing version)"
-                checked={values.allow_redeploy}
-                onChange={(c) => set('allow_redeploy', c)}
-              />
             )}
             <TextField
               label="Maximum upload size (MiB)"
@@ -679,9 +695,11 @@ export function RepositoryForm({
                   ? 'https://registry-1.docker.io'
                   : isRaw
                     ? 'https://github.com/bblanchon/pdfium-binaries/releases/download/'
-                    : values.format === NUGET_FORMAT.id
-                      ? 'https://api.nuget.org/v3/index.json'
-                      : 'https://charts.example.com/stable'
+                    : isNpm
+                      ? 'https://registry.npmjs.org'
+                      : values.format === NUGET_FORMAT.id
+                        ? 'https://api.nuget.org/v3/index.json'
+                        : 'https://charts.example.com/stable'
               }
               error={announced(errors.remote_url)}
               description={
@@ -696,6 +714,12 @@ export function RepositoryForm({
                     The base URL files are under: a request for <Code>&lt;path&gt;</Code>{' '}
                     fetches <Code>&lt;remote URL&gt;/&lt;path&gt;</Code>, following
                     redirects. Credentials below are sent to this URL&apos;s host only.
+                  </>
+                ) : isNpm ? (
+                  <>
+                    The upstream registry, e.g. <Code>https://registry.npmjs.org</Code>.
+                    For a token, leave the username empty and put the token in the
+                    password: it is sent as a Bearer token, to this host only.
                   </>
                 ) : undefined
               }
@@ -863,9 +887,18 @@ export function RepositoryForm({
                 mono
                 value={values.reserved_prefixes}
                 onChange={(e) => set('reserved_prefixes', e.target.value)}
-                placeholder={isDocker ? 'acme/, team/' : 'Acme., Contoso.Internal.'}
+                placeholder={
+                  isDocker ? 'acme/, team/' : isNpm ? '@acme, @acme-internal' : 'Acme., Contoso.Internal.'
+                }
                 description={
-                  isDocker ? (
+                  isNpm ? (
+                    <>
+                      Scopes such as <Code>@acme</Code>, or name prefixes, whose packages
+                      are never served from proxy members — also before the first internal
+                      version is published — and stay out of the audits sent upstream.
+                      Comma separated.
+                    </>
+                  ) : isDocker ? (
                     <>
                       Image names starting with one of these — namespaces such as{' '}
                       <Code>acme/</Code> — are never served from proxy members, also
@@ -880,7 +913,7 @@ export function RepositoryForm({
                   )
                 }
               />
-              {isDocker && (
+              {(isDocker || isPackage) && (
                 <TextField
                   label="Writable member"
                   name="writable_member"
@@ -888,13 +921,27 @@ export function RepositoryForm({
                   autoComplete="off"
                   value={values.writable_member}
                   onChange={(e) => set('writable_member', e.target.value)}
-                  placeholder="docker-hosted"
+                  placeholder={`${format.id}-hosted`}
                   description={
-                    <>
-                      Optional. The hosted docker repository that <Code>docker push</Code>{' '}
-                      to this group stores images in (make it a member too). Leave empty
-                      to refuse pushes to the group.
-                    </>
+                    isNpm ? (
+                      <>
+                        Optional. The hosted npm repository that <Code>npm publish</Code>,
+                        dist-tag changes and unpublishes through this group go to (make it
+                        a member too). Leave empty to refuse them.
+                      </>
+                    ) : isPackage ? (
+                      <>
+                        Optional. The hosted repository of this format that pushes, unlists
+                        and deletes through this group go to (make it a member too). Leave
+                        empty to refuse them.
+                      </>
+                    ) : (
+                      <>
+                        Optional. The hosted docker repository that <Code>docker push</Code>{' '}
+                        to this group stores images in (make it a member too). Leave empty
+                        to refuse pushes to the group.
+                      </>
+                    )
                   }
                 />
               )}
@@ -973,6 +1020,7 @@ const DEPLOYMENT_POLICY_FACTS: Record<DeploymentPolicy, string | null> = {
 export function repositoryFacts(repo: RepoView): string[] {
   const docker = repo.format === DOCKER_FORMAT.id
   const raw = repo.format === RAW_FORMAT.id
+  const npm = repo.format === NPM_FORMAT.id
   const facts: string[] = []
   if (repo.kind === 'proxy' && repo.remote_url) {
     facts.push(`caches ${hostOf(repo.remote_url)}`)
@@ -984,11 +1032,11 @@ export function repositoryFacts(repo: RepoView): string[] {
     if (docker && repo.immutable_tags) {
       facts.push('immutable tags')
       if (repo.latest_mutable) facts.push('latest may move')
-    } else if (raw) {
-      const policy = DEPLOYMENT_POLICY_FACTS[repo.deployment_policy ?? 'disable_redeploy']
+    } else if (!docker) {
+      const policy = DEPLOYMENT_POLICY_FACTS[
+        repo.deployment_policy ?? (repo.allow_redeploy ? 'allow_redeploy' : 'disable_redeploy')
+      ]
       if (policy) facts.push(policy)
-    } else if (!docker && repo.allow_redeploy) {
-      facts.push('redeploy allowed')
     }
     if (repo.max_upload_bytes != null) {
       facts.push(`${bytesToMib(repo.max_upload_bytes)} MiB max. upload`)
@@ -998,7 +1046,9 @@ export function repositoryFacts(repo: RepoView): string[] {
     if (repo.prefer_hosted) facts.push(`prefers hosted ${docker ? 'images' : 'packages'}`)
     const n = repo.reserved_prefixes.length
     if (n > 0) facts.push(`${n} reserved ${n === 1 ? 'prefix' : 'prefixes'}`)
-    if (docker && repo.writable_member) facts.push(`pushes go to ${repo.writable_member}`)
+    if (repo.writable_member) {
+      facts.push(`${npm ? 'publishes' : 'pushes'} go to ${repo.writable_member}`)
+    }
   }
   if (docker && repo.host) facts.push(`also at ${repo.host}`)
   return facts
@@ -1012,7 +1062,7 @@ export function capitalize(text: string): string {
 /**
  * Build a `CreateRepo` body from validated form values. Sends the format and
  * only the fields relevant to it and the kind — docker options never for a
- * NuGet repository, `allow_redeploy` / `package_delay_seconds` never for a
+ * NuGet repository, `deployment_policy` / `package_delay_seconds` never for a
  * docker one (the server refuses both combinations); an empty TTL becomes
  * `null` (server default), and an empty proxy password, docker host or
  * writable member is omitted (none set). Exported so create + edit map
@@ -1037,10 +1087,8 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
     if (docker) {
       body.immutable_tags = values.immutable_tags
       body.latest_mutable = values.immutable_tags && values.latest_mutable
-    } else if (raw) {
-      body.deployment_policy = values.deployment_policy
     } else {
-      body.allow_redeploy = values.allow_redeploy
+      body.deployment_policy = values.deployment_policy
     }
     const maxUpload = mibToBytes(values.max_upload_mib)
     if (maxUpload != null) body.max_upload_bytes = maxUpload
@@ -1049,7 +1097,7 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
     body.prefer_hosted = values.prefer_hosted
     const prefixes = parsePrefixes(values.reserved_prefixes)
     if (prefixes.length > 0) body.reserved_prefixes = prefixes
-    if (docker && values.writable_member.trim() !== '') {
+    if (values.writable_member.trim() !== '') {
       body.writable_member = values.writable_member.trim()
     }
   }
@@ -1094,8 +1142,8 @@ export function parsePrefixes(raw: string): string[] {
  *  - the username is sent when changed (`null` when emptied); the password
  *    only when a new one was typed (it is write-only, so blank = keep);
  *  - "Remove stored credentials" sends both as `null`;
- *  - a docker `host` / `writable_member` is sent when changed, `null` when
- *    emptied (removes it);
+ *  - a docker `host`, a docker or package group's `writable_member` is sent
+ *    when changed, `null` when emptied (removes it);
  *  - the upload limit is sent when changed, `null` when emptied (back to the
  *    format's default).
  *
@@ -1118,21 +1166,14 @@ export function toUpdateBody(
   if (values.online !== before.online) body.online = values.online
   if (
     !docker &&
-    !raw &&
     values.kind === 'hosted' &&
-    values.allow_redeploy !== before.allow_redeploy
+    values.deployment_policy !== before.deployment_policy
   ) {
-    body.allow_redeploy = values.allow_redeploy
+    body.deployment_policy = values.deployment_policy
   }
   if (raw) {
     if (values.inline_content !== before.inline_content) {
       body.content_disposition = values.inline_content ? 'inline' : 'attachment'
-    }
-    if (
-      values.kind === 'hosted' &&
-      values.deployment_policy !== before.deployment_policy
-    ) {
-      body.deployment_policy = values.deployment_policy
     }
     if (
       values.kind === 'proxy' &&
@@ -1160,7 +1201,7 @@ export function toUpdateBody(
   ) {
     body.max_upload_bytes = mibToBytes(values.max_upload_mib)
   }
-  if (docker && values.kind === 'group') {
+  if (!raw && values.kind === 'group') {
     const member = values.writable_member.trim()
     if (member !== before.writable_member.trim()) {
       body.writable_member = member === '' ? null : member

@@ -1,0 +1,25 @@
+[package]
+name = "forge-format-docker"
+# The plugin's own version, its descriptor's.
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Docker / OCI registries for Forge, as a format plugin"
+
+[dependencies]
+forge-plugin-api = { path = "../../plugin-api" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Upstream URLs and the pages a tag list links to.
+url = { workspace = true }
+# Helm chart archives (.tgz), read for their README and values (`chart`).
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+
+[dev-dependencies]
+forge-plugin-api = { path = "../../plugin-api", features = ["testing"] }
+sha2 = { workspace = true }
+hex = { workspace = true }

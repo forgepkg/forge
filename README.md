@@ -1,7 +1,8 @@
 # Forge
 
-A self-hosted **NuGet package registry, Docker / OCI registry and raw file
-repository** written in Rust. It speaks the NuGet **V3** protocol and the **OCI Distribution Spec**
+A self-hosted **NuGet package registry, npm registry, Docker / OCI registry
+and raw file repository** written in Rust. It speaks the NuGet **V3**
+protocol, the **npm registry** protocol (npm, pnpm, Yarn, Bun) and the **OCI Distribution Spec**
 v1.1 (Docker, Podman, containerd, crane, Helm, cosign), and supports the
 three repository types you expect from an enterprise registry (more package
 formats come as **format plugins**, see below):
@@ -15,7 +16,11 @@ formats come as **format plugins**, see below):
   priority; tolerates a failing member and, by default, keeps public feeds
   from shadowing internal package ids (dependency-confusion guard).
 
-The same three types exist for container images and other OCI artifacts,
+The same three types exist for npm packages: publish with `npm publish`,
+log in with `npm login` (approved in the browser), proxies of
+`registry.npmjs.org` or any registry, and groups that keep your scopes
+internal and pass `npm audit` on — see **[docs/npm.md](./docs/npm.md)**;
+for container images and other OCI artifacts,
 Helm charts included (`helm push`, `helm install oci://…`): hosted image
 repositories, pull-through proxies of Docker Hub, GHCR, Quay or any OCI
 registry, and groups — see **[docs/docker.md](./docs/docker.md)** — and for plain files
@@ -50,22 +55,22 @@ A Cargo workspace of small crates plus the web SPA:
 | `storage` | `forge-storage` | CAS over S3, blob outbox / GC reconciler. |
 | `cache` | `forge-cache` | In-process L1 + optional Redis L2 with cross-instance invalidation (no Postgres advisory locks). |
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
-| `format-oci` | `forge-oci` | Docker / OCI registry: the distribution-spec `/v2` API, manifests, registry tokens, hosted/proxy/group resolution. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
 | `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
-| `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `nuget`, `raw`. |
-| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`, raw files at `/raw`), the file store of files formats, the Docker registry, `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
+| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`, npm at `/npm`, raw files at `/raw`, the Docker / OCI registry at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
-**Every format is a plugin in `crates/formats/`.** A package format is a
-crate in `crates/formats/<id>/` implementing `FormatPlugin`, linked into the
-server. Docker / OCI (`crates/format-oci`) is not there yet and is to move to
-`crates/formats/docker`.
+**Every format is a plugin in `crates/formats/`.** A format is a crate in
+`crates/formats/<id>/` implementing `FormatPlugin`, linked into the server.
+Docker / OCI is one too, an images format: the plugin speaks the protocol,
+and the server's image store (`crates/server/src/images`) keeps the
+images.
 
 **Single-origin serving.** `forge-server` mounts each format plugin's feed
-(NuGet at `/v3`, others at `/repository`), the Docker / OCI registry (`/v2`),
+(NuGet at `/v3`, npm at `/npm`, others at `/repository`), the Docker / OCI registry (`/v2`),
 raw file repositories (`/raw`),
 the admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
 from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
@@ -94,6 +99,7 @@ role/db; use `--db docker` if you don't have one — see below.)
 
 - **UI:** http://localhost:8420
 - **NuGet feed:** `http://localhost:8421/v3/{repo}/index.json`
+- **npm registry:** `http://localhost:8421/npm/{repo}/`
 
 Add demo data (anonymous-readable `nuget` repo + a pushed sample package) in a
 second terminal:
@@ -204,6 +210,10 @@ curl -u admin@example.com:<TOKEN> http://localhost:8421/raw/binaries/tools/1.0/t
 - **[Docker / OCI registry](./docs/docker.md)** — image repositories (hosted,
   proxy, group), naming and host-based routing, `docker login`, retention and
   garbage collection.
+- **[npm registries](./docs/npm.md)** — npm packages (hosted, proxy, group)
+  for npm, pnpm, Yarn and Bun: `.npmrc`, logins, publishing, dist-tags,
+  deprecations, unpublishing, proxies of `registry.npmjs.org`, internal
+  scopes, audits and retention.
 - **[Raw file repositories](./docs/raw.md)** — files under arbitrary paths
   (hosted, proxy, group): uploads with curl, ranges and checksum sidecars,
   listings, the deployment policy, proxies of release downloads (the pdfium

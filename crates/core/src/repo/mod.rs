@@ -71,6 +71,14 @@ pub enum RepoError {
     /// retry later → 503.
     #[error("upstream unavailable: {0}")]
     Upstream(String),
+    /// A proxy's upstream answered, but not usably, and nothing cached
+    /// answers: it refused the proxy (a 401 or a 403: its credentials are
+    /// missing or wrong) or served a package the proxy does not take (too
+    /// large, unreadable, not the one asked for or not matching its
+    /// published digest). Not an outage: retrying does not help until the
+    /// upstream or the proxy changes → 502.
+    #[error("bad upstream: {0}")]
+    BadUpstream(String),
     /// The repository's format is not installed on this server (a format
     /// plugin missing from the configuration) → 503: nothing of it is served
     /// until the format is back, and it is never read as another format.
@@ -103,6 +111,7 @@ impl From<SharedRepoError> for RepoError {
             RepoError::Storage(reason) => RepoError::Storage(reason.clone()),
             RepoError::Busy(reason) => RepoError::Busy(reason.clone()),
             RepoError::Upstream(reason) => RepoError::Upstream(reason.clone()),
+            RepoError::BadUpstream(reason) => RepoError::BadUpstream(reason.clone()),
             RepoError::FormatUnavailable(format) => RepoError::FormatUnavailable(format.clone()),
         })
     }
@@ -315,6 +324,9 @@ pub struct RegistrationEntry {
     /// When this version was published into the repository (`None` when
     /// unknown, e.g. a proxied version not cached yet).
     pub published: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why the version is deprecated, if it was deprecated in this
+    /// repository (`component.deprecation`).
+    pub deprecation: Option<String>,
 }
 
 /// A search hit: one package id with all of its (filtered) versions.
@@ -543,6 +555,19 @@ pub trait RepoReadOps: Send + Sync {
     async fn registration(&self, repo: &str, id: &str)
         -> Result<Vec<RegistrationEntry>, RepoError>;
 
+    /// [`Self::registration`] with every version's publish time, even where
+    /// that costs more: a proxy asks its upstream with
+    /// [`forge_plugin_api::UpstreamOp::Dating`] (npm: the full packument,
+    /// not the abbreviated one installs read). The default is
+    /// [`Self::registration`], whose times hosted repositories know.
+    async fn dated_registration(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        self.registration(repo, id).await
+    }
+
     /// The versions [`Self::registration`] lists for `id` (including
     /// unlisted), ascending by version precedence, without their metadata:
     /// what a registration index needs when it does not inline its leaves.
@@ -595,6 +620,18 @@ pub trait RepoReadOps: Send + Sync {
     /// Search packages in `repo` honoring listed/prerelease filtering and
     /// `skip`/`take` paging.
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError>;
+
+    /// The tags of package `id` in `repo`, tag → normalized version
+    /// (`package_tag`): a hosted repository's own, a proxy's upstream's, a
+    /// group's from its first serving member that has any. None by default.
+    async fn tags(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, RepoError> {
+        let _ = (repo, id);
+        Ok(std::collections::BTreeMap::new())
+    }
 
     /// Search with an authorization predicate applied **before** paging and
     /// total-count calculation.
@@ -763,6 +800,17 @@ impl RepoReadOps for PackageFilteredReadOps {
         self.inner.registration(repo, id).await
     }
 
+    async fn dated_registration(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        if !self.allows(id) {
+            return Ok(Vec::new());
+        }
+        self.inner.dated_registration(repo, id).await
+    }
+
     async fn registration_entry(
         &self,
         repo: &str,
@@ -792,6 +840,17 @@ impl RepoReadOps for PackageFilteredReadOps {
             return Ok(Vec::new());
         }
         self.inner.registration_entries(repo, id, versions).await
+    }
+
+    async fn tags(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, RepoError> {
+        if !self.allows(id) {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        self.inner.tags(repo, id).await
     }
 
     async fn search(&self, repo: &str, params: &SearchParams) -> Result<SearchResult, RepoError> {

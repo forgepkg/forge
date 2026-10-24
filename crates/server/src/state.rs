@@ -33,7 +33,7 @@ use forge_core::repo::{
 };
 use forge_core::retention::FormatResolver;
 use forge_core::session::SessionService;
-use forge_db::model::{RepoKind, Repository, DOCKER_FORMAT};
+use forge_db::model::{RepoKind, Repository};
 use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
@@ -99,7 +99,7 @@ pub struct AppState {
     /// install's shared one ([`crate::registry::load_token_keys`] via
     /// [`AppState::with_registry_keys`]) so every instance accepts every
     /// instance's tokens.
-    pub registry_keys: forge_oci::token::TokenKeys,
+    pub registry_keys: crate::images::token::TokenKeys,
     /// This process among the instances of an install, as per-instance
     /// reports (the local blob cache's statistics) name it.
     pub instance: Arc<Instance>,
@@ -140,15 +140,15 @@ impl Instance {
 
 /// Format registry: maps a format id (the `repository.format` column) to its
 /// [`Format`] and its plugin: the built-in format plugins
-/// ([`crate::plugins::builtin`]: NuGet, raw) and Docker.
+/// ([`crate::plugins::builtin`]: Docker / OCI, NuGet, npm, raw).
 ///
-/// Docker ([`DOCKER_FORMAT`]) is installed but has no [`Format`]: its
-/// repositories hold images (manifests and blobs), not package versions,
-/// and are served by the registry under `/v2` ([`crate::registry`]), so none
-/// of the package seams (parsing, version order, the read ops) apply to
-/// them. A files format (raw) has a [`Format`] whose
-/// [`Format::stores_files`] says so: its repositories hold files in the
-/// file store ([`crate::files`]).
+/// A files format (raw) has a [`Format`] whose [`Format::stores_files`] says
+/// so: its repositories hold files in the file store ([`crate::files`]). An
+/// images format (Docker) has one whose [`Format::stores_images`] says so:
+/// its repositories hold images (manifests and blobs) in the image store
+/// ([`crate::images`]) and are served under its mount, `/v2`, by the
+/// registry, so none of the package seams (parsing, version order, the read
+/// ops) apply to them.
 pub struct FormatRegistry {
     formats: BTreeMap<String, Arc<dyn Format>>,
     /// Every format's plugin, by format id: its client protocol.
@@ -157,13 +157,17 @@ pub struct FormatRegistry {
 
 impl FormatRegistry {
     /// A registry holding the built-in format plugins, NuGet reading
-    /// archives and upstream manifests under `nuget_limits`.
-    pub fn new(nuget_limits: forge_format_nuget::NupkgLimits) -> Self {
+    /// archives and upstream manifests under `nuget_limits`, npm requests
+    /// under `npm_limits`.
+    pub fn new(
+        nuget_limits: forge_format_nuget::NupkgLimits,
+        npm_limits: forge_format_npm::NpmLimits,
+    ) -> Self {
         let mut registry = FormatRegistry {
             formats: BTreeMap::new(),
             plugins: BTreeMap::new(),
         };
-        for plugin in crate::plugins::builtin(nuget_limits) {
+        for plugin in crate::plugins::builtin(nuget_limits, npm_limits) {
             registry = registry
                 .with_plugin(plugin)
                 .expect("built-in format ids are distinct");
@@ -172,12 +176,12 @@ impl FormatRegistry {
     }
 
     /// Add `format` under its [`Format::id`]. An id that is already taken
-    /// (NuGet's and Docker's included) is refused: a plugin never shadows
+    /// (a built-in format's included) is refused: a plugin never shadows
     /// another format.
     pub fn with_format(mut self, format: Arc<dyn Format>) -> Result<Self, String> {
         let id = format.id().to_string();
         if self.is_installed(&id) {
-            let built_in = Self::is_native(&id) || self.plugins.contains_key(&id);
+            let built_in = self.plugins.contains_key(&id);
             return Err(if built_in {
                 format!("format {id:?} is built into this server")
             } else {
@@ -212,15 +216,9 @@ impl FormatRegistry {
         self.plugins.values()
     }
 
-    /// Whether format `id` is one served natively, without a [`Format`]:
-    /// Docker.
-    pub fn is_native(id: &str) -> bool {
-        id == DOCKER_FORMAT
-    }
-
-    /// Whether format `id` is installed: Docker, or a format plugin.
+    /// Whether format `id` is installed.
     pub fn is_installed(&self, id: &str) -> bool {
-        Self::is_native(id) || self.formats.contains_key(id)
+        self.formats.contains_key(id)
     }
 
     /// Whether format `id`'s repositories hold files under paths (raw): it
@@ -229,12 +227,30 @@ impl FormatRegistry {
         self.formats.get(id).is_some_and(|f| f.stores_files())
     }
 
-    /// The mounts plugin formats are served under, sorted and distinct
-    /// (`/repository`, and any other a plugin names).
+    /// Whether format `id`'s repositories hold images (Docker / OCI): it is
+    /// installed and its descriptor says `Storage::Images`.
+    pub fn stores_images(&self, id: &str) -> bool {
+        self.formats.get(id).is_some_and(|f| f.stores_images())
+    }
+
+    /// The images format, served under its mount by the registry
+    /// ([`crate::images`]): the first, by id, whose repositories hold
+    /// images. The built-in formats have one, Docker.
+    pub fn images_plugin(&self) -> Option<Arc<forge_plugin::Plugin>> {
+        self.plugins
+            .values()
+            .find(|p| p.descriptor().storage == forge_plugin::api::Storage::Images)
+            .cloned()
+    }
+
+    /// The mounts plugin formats are served under by the plugin dispatcher
+    /// ([`crate::plugins`]), sorted and distinct (`/repository`, and any
+    /// other a plugin names). The images format's mount is the registry's.
     pub fn mounts(&self) -> Vec<&str> {
         let mut mounts: Vec<&str> = self
             .plugins
             .values()
+            .filter(|p| p.descriptor().storage != forge_plugin::api::Storage::Images)
             .map(|p| p.descriptor().mount)
             .collect();
         mounts.sort_unstable();
@@ -244,19 +260,13 @@ impl FormatRegistry {
 
     /// The installed format ids, sorted.
     pub fn ids(&self) -> impl Iterator<Item = &str> {
-        let mut ids: Vec<&str> = self.formats.keys().map(String::as_str).collect();
-        ids.push(DOCKER_FORMAT);
-        ids.sort_unstable();
-        ids.into_iter()
+        self.formats.keys().map(String::as_str)
     }
 
     /// The repository kinds format `id` supports, `None` when it is not
-    /// installed. Docker has every kind; a format plugin serves the kinds its
-    /// descriptor names (NuGet's and raw's all three).
+    /// installed: what its descriptor names (all three for every built-in
+    /// format: Docker's, NuGet's, npm's and raw's).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
-        if Self::is_native(id) {
-            return Some(vec!["hosted", "proxy", "group"]);
-        }
         let plugin = self.plugins.get(id)?;
         Some(
             plugin
@@ -353,7 +363,10 @@ impl AppState {
             cas,
             cache,
             authz,
-            formats: Arc::new(FormatRegistry::new(config.nuget.limits())),
+            formats: Arc::new(FormatRegistry::new(
+                config.nuget.limits(),
+                config.npm.limits(),
+            )),
             config,
             realms,
             sessions,
@@ -364,7 +377,7 @@ impl AppState {
             oidc_login_starts,
             envelope: None,
             upstream,
-            registry_keys: forge_oci::token::TokenKeys::new(vec![{
+            registry_keys: crate::images::token::TokenKeys::new(vec![{
                 use rand::Rng;
                 let mut key = vec![0u8; 32];
                 rand::rng().fill_bytes(&mut key);
@@ -382,14 +395,19 @@ impl AppState {
     }
 
     /// Use `keys` to sign and verify registry tokens.
-    pub fn with_registry_keys(mut self, keys: forge_oci::token::TokenKeys) -> Self {
+    pub fn with_registry_keys(mut self, keys: crate::images::token::TokenKeys) -> Self {
         self.registry_keys = keys;
         self
     }
 
-    /// The Docker / OCI registry service, wired to this state.
-    pub fn registry(&self) -> forge_oci::Registry {
-        forge_oci::Registry::new(forge_oci::RegistryParts {
+    /// The registry of the images format (Docker / OCI), wired to this
+    /// state.
+    pub fn registry(&self) -> crate::images::Registry {
+        let plugin = self
+            .formats
+            .images_plugin()
+            .expect("the images format is built in");
+        crate::images::Registry::new(crate::images::RegistryParts {
             pool: self.pool.clone(),
             cas: self.cas.clone(),
             store: self.blob_store.clone(),
@@ -397,10 +415,12 @@ impl AppState {
             authz: self.authz.clone(),
             http: self.upstream.clone(),
             envelope: self.envelope.clone(),
-            config: forge_oci::RegistryConfig {
+            config: crate::images::RegistryConfig {
                 public_base_url: self.config.public_base_url(),
                 max_blob_bytes: self.config.docker_max_blob_bytes(),
-                default_max_upload_bytes: self.config.default_upload_limit(DOCKER_FORMAT),
+                default_max_upload_bytes: self
+                    .config
+                    .default_upload_limit(forge_plugin::api::Storage::Images),
                 token_ttl_seconds: self.config.docker.token_ttl_seconds,
                 delete_grace: self.config.outbox.grace(),
                 max_group_depth: self.config.groups.max_nesting_depth.max(0) as u32,
@@ -415,6 +435,7 @@ impl AppState {
                 realms: self.realms.clone(),
                 pool: self.pool.clone(),
             })),
+            plugin: plugin.implementation().clone(),
         })
     }
 
@@ -458,7 +479,8 @@ impl AppState {
     /// tests' own). A plugin whose format id is taken (a built-in plugin, or
     /// another plugin) is an error.
     pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
-        let mut registry = FormatRegistry::new(self.config.nuget.limits());
+        let mut registry =
+            FormatRegistry::new(self.config.nuget.limits(), self.config.npm.limits());
         for plugin in plugins {
             registry = registry.with_plugin(plugin)?;
         }
@@ -471,7 +493,16 @@ impl AppState {
     /// ([`Config::default_upload_limit`]).
     pub fn upload_limit(&self, repo: &Repository) -> u64 {
         repo.max_upload_bytes()
-            .unwrap_or_else(|| self.config.default_upload_limit(&repo.format))
+            .unwrap_or_else(|| self.config.default_upload_limit(self.storage(&repo.format)))
+    }
+
+    /// What repositories of format `id` hold (packages when it is not
+    /// installed).
+    pub fn storage(&self, id: &str) -> forge_plugin::api::Storage {
+        self.formats
+            .plugin(id)
+            .map(|p| p.descriptor().storage)
+            .unwrap_or_default()
     }
 
     /// A blob-byte fetcher over the S3 store (serves `BlobFetch`/`PackageBytes`).
@@ -692,40 +723,50 @@ mod tests {
     }
 
     #[test]
-    fn docker_is_installed_without_a_package_format() {
-        let registry = FormatRegistry::new(Default::default());
-        assert!(registry.is_installed(DOCKER_FORMAT));
-        assert!(registry.get(DOCKER_FORMAT).is_none());
+    fn the_builtin_formats_and_their_storage() {
+        let registry = FormatRegistry::new(Default::default(), Default::default());
         assert_eq!(
             registry.ids().collect::<Vec<_>>(),
-            ["docker", "nuget", "raw"]
+            ["docker", "npm", "nuget", "raw"]
         );
-        // Raw is a built-in plugin whose repositories hold files.
+        // Raw is a built-in plugin whose repositories hold files, Docker one
+        // whose repositories hold images, served by the registry.
         assert!(registry.get("raw").is_some());
         assert!(registry.stores_files("raw"));
         assert!(!registry.stores_files("nuget"));
-        assert!(!registry.stores_files(DOCKER_FORMAT));
+        assert!(registry.stores_images("docker"));
+        assert!(!registry.stores_images("raw"));
+        assert!(!registry.stores_files("docker"));
+        assert_eq!(registry.images_plugin().map(|p| p.id()), Some("docker"));
         assert_eq!(
             registry.kinds("raw"),
             Some(vec!["hosted", "proxy", "group"])
         );
         assert_eq!(
-            registry.kinds(DOCKER_FORMAT),
+            registry.kinds("docker"),
             Some(vec!["hosted", "proxy", "group"])
         );
         assert_eq!(
             registry.kinds("nuget"),
             Some(vec!["hosted", "proxy", "group"])
         );
+        // npm is a built-in plugin, served under its own mount.
+        assert_eq!(
+            registry.kinds("npm"),
+            Some(vec!["hosted", "proxy", "group"])
+        );
+        assert!(registry.plugin("npm").is_some());
+        assert!(!registry.stores_files("npm"));
+        assert_eq!(registry.mounts(), ["/npm", "/raw", "/v3"]);
         assert_eq!(registry.kinds("helm"), None);
-        assert_eq!(registry.kinds("npm"), None);
-        assert!(!registry.is_installed("npm"));
+        assert_eq!(registry.kinds("maven"), None);
+        assert!(!registry.is_installed("maven"));
     }
 
     #[test]
     fn a_plugin_cannot_take_dockers_or_a_builtin_plugins_id() {
-        for id in ["docker", "nuget", "raw"] {
-            let registry = FormatRegistry::new(Default::default());
+        for id in ["docker", "nuget", "npm", "raw"] {
+            let registry = FormatRegistry::new(Default::default(), Default::default());
             let err = registry
                 .with_format(Arc::new(Named(id)))
                 .err()
