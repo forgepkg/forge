@@ -81,16 +81,17 @@ pub async fn invalidate(
         return bad_request("only a proxy repository caches what an upstream answered");
     }
     let docker = repo.is_docker();
+    let stores_files = state.formats.stores_files(&repo.format);
 
     // The package as the proxy stores it: a docker image under Docker Hub's
     // `library/` spelling, any other id lowercased.
     let package = match body.and_then(|b| b.0.package) {
         None => None,
-        Some(p) if repo.is_raw() => {
+        Some(p) if stores_files => {
             let normalized = if p.ends_with('/') {
-                crate::raw::path::normalize_directory(&p)
+                forge_plugin::api::files::normalize_directory(&p)
             } else {
-                crate::raw::path::normalize(&p)
+                forge_plugin::api::files::normalize(&p)
             };
             match normalized {
                 Ok(path) => Some(path),
@@ -116,7 +117,7 @@ pub async fn invalidate(
         }
     };
 
-    match forget(&state, &repo, docker, package.as_deref()).await {
+    match forget(&state, &repo, docker, stores_files, package.as_deref()).await {
         Ok(Some(invalidated)) => {
             tracing::info!(
                 repository = %repo.name,
@@ -140,6 +141,7 @@ async fn forget(
     state: &AppState,
     repo: &forge_db::model::Repository,
     docker: bool,
+    stores_files: bool,
     package: Option<&str>,
 ) -> sqlx::Result<Option<Invalidated>> {
     let mut tx = state.pool.begin().await?;
@@ -148,7 +150,7 @@ async fn forget(
         tags_expired: 0,
         files_expired: None,
     };
-    if repo.is_raw() {
+    if stores_files {
         // A file is the range of its own path; a directory, of its files.
         let prefix = package.unwrap_or("");
         invalidated.files_expired = Some(if prefix.is_empty() || prefix.ends_with('/') {

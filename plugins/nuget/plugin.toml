@@ -3,7 +3,7 @@
 id = "nuget"
 name = "NuGet"
 version = "1.0.0"
-api = "0.3.0"
+api = "0.4.0"
 description = "NuGet V3 feeds: push, restore and search with dotnet, nuget.exe and Visual Studio; proxies of nuget.org and other V3 feeds."
 mount = "/v3"
 # Proxies mirror another V3 feed through the plugin's upstream side.

@@ -137,6 +137,8 @@ pub(crate) fn step(
         UpstreamOp::Metadata(wanted) => metadata(&resources, wanted, false, fetched),
         UpstreamOp::Dating(wanted) => metadata(&resources, wanted, true, fetched),
         UpstreamOp::Search(query) => search(&resources, query, fetched),
+        // A feed holds packages: it has no files to fetch.
+        UpstreamOp::File(_) => done(UpstreamAnswer::File(None)),
     })
 }
 

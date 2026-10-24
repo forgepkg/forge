@@ -29,7 +29,7 @@ use std::cmp::Ordering;
 
 use forge_plugin_api::{
     Action, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource, ParsedPackage, Remote,
-    Rendered, Repository, Request, UpstreamOp, UpstreamStep,
+    Repository, Request, UpstreamOp, UpstreamStep,
 };
 
 pub use model::NupkgLimits;
@@ -82,7 +82,7 @@ impl FormatPlugin for Nuget {
         protocol::handle(repo, req)
     }
 
-    fn render(&self, repo: &Repository, req: &Request, data: &[Loaded]) -> Rendered {
+    fn render(&self, repo: &Repository, req: &Request, data: &[Loaded]) -> Action {
         protocol::render(repo, req, data)
     }
 

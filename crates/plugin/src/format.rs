@@ -8,7 +8,7 @@ use forge_core::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload}
 use forge_core::format::{Format, ReadSeek};
 use forge_plugin_api::{self as api, FormatPlugin};
 
-use crate::manifest::Assets;
+use crate::manifest::{Assets, Storage};
 use crate::Plugin;
 
 /// The longest version the host takes from a format plugin, in bytes: a
@@ -35,6 +35,7 @@ pub struct PluginFormat {
     id: &'static str,
     plugin: Arc<dyn FormatPlugin>,
     assets: Assets,
+    storage: Storage,
 }
 
 impl PluginFormat {
@@ -44,6 +45,7 @@ impl PluginFormat {
             id: plugin.id(),
             plugin: plugin.implementation().clone(),
             assets: plugin.manifest().assets.clone(),
+            storage: plugin.manifest().storage,
         }
     }
 }
@@ -126,6 +128,10 @@ fn parsed_upload(parsed: api::ParsedPackage) -> Result<ParsedUpload, FormatError
 impl Format for PluginFormat {
     fn id(&self) -> &'static str {
         self.id
+    }
+
+    fn stores_files(&self) -> bool {
+        self.storage == Storage::Files
     }
 
     fn package_asset_path(&self) -> &str {
@@ -263,8 +269,8 @@ mod tests {
             _repo: &api::Repository,
             _req: &api::Request,
             _data: &[api::Loaded],
-        ) -> api::Rendered {
-            api::Rendered::Respond(api::Response::text(404, "not found"))
+        ) -> api::Action {
+            api::Action::Respond(api::Response::text(404, "not found"))
         }
     }
 
@@ -284,7 +290,7 @@ mod tests {
     /// [`Unlimited`] as the host sees it.
     fn unlimited(normalized: Option<&str>, parsed: api::ParsedPackage) -> PluginFormat {
         let plugin = Plugin::builtin(
-            "[plugin]\nid = \"unlimited\"\nname = \"Unlimited\"\nversion = \"0.1.0\"\napi = \"0.3.0\"\n",
+            "[plugin]\nid = \"unlimited\"\nname = \"Unlimited\"\nversion = \"0.1.0\"\napi = \"0.4.0\"\n",
             Unlimited {
                 normalized: normalized.map(str::to_string),
                 parsed,
