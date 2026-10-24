@@ -312,7 +312,7 @@ async fn reader_role_can_publish_only_live_publisher_packages() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO repository_privilege (role_id, repository_id, action, selector_id) \
+        "INSERT INTO repository_privilege (role_id, repository_id, level, selector_id) \
          VALUES ($1, $2, 'write', $3)",
     )
     .bind(role_id)
