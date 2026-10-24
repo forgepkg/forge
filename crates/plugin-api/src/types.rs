@@ -79,6 +79,132 @@ pub enum RepositoryKind {
     Group,
 }
 
+impl RepositoryKind {
+    /// The name the admin API uses: `hosted`, `proxy` or `group`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepositoryKind::Hosted => "hosted",
+            RepositoryKind::Proxy => "proxy",
+            RepositoryKind::Group => "group",
+        }
+    }
+}
+
+/// What a format says about itself ([`FormatPlugin::descriptor`]): a
+/// `'static` value next to its `impl FormatPlugin`.
+///
+/// ```no_run
+/// use forge_plugin_api::{Assets, Descriptor, RepositoryKind, Storage, UpstreamToken};
+///
+/// pub const DESCRIPTOR: Descriptor = Descriptor {
+///     id: "example",
+///     name: "Example packages",
+///     version: env!("CARGO_PKG_VERSION"),
+///     description: "Example packages: push and pull with the example client.",
+///     mount: "/repository",
+///     kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
+///     storage: Storage::Packages,
+///     assets: Assets::DEFAULT,
+///     upstream_token: UpstreamToken::None,
+/// };
+/// ```
+///
+/// [`FormatPlugin::descriptor`]: crate::FormatPlugin::descriptor
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Descriptor {
+    /// The format id repositories are created with (`repository.format`):
+    /// 2–32 lowercase letters, digits and `-`, starting with a letter.
+    pub id: &'static str,
+    /// Display name.
+    pub name: &'static str,
+    /// The format's own version, its crate's (`env!("CARGO_PKG_VERSION")`).
+    pub version: &'static str,
+    /// One line on what the format serves.
+    pub description: &'static str,
+    /// Where its repositories are served, `{mount}/{repository}/…`:
+    /// [`DEFAULT_MOUNT`], or `/` and one lowercase word of its own.
+    pub mount: &'static str,
+    /// The repository kinds it supports, each once. `Proxy` only when the
+    /// format implements [`FormatPlugin::upstream`].
+    ///
+    /// [`FormatPlugin::upstream`]: crate::FormatPlugin::upstream
+    pub kinds: &'static [RepositoryKind],
+    /// What its repositories hold.
+    pub storage: Storage,
+    /// How a version's files are stored (a package format).
+    pub assets: Assets,
+    /// What a proxy given a password and no username does with it.
+    pub upstream_token: UpstreamToken,
+}
+
+/// What a proxy given a password and no username sends its upstream
+/// ([`Descriptor::upstream_token`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpstreamToken {
+    /// Nothing: a proxy authenticates with a username and a password only
+    /// (Basic).
+    #[default]
+    None,
+    /// The password is a token, sent as `Authorization: Bearer` (npm's
+    /// `_authToken`).
+    Bearer,
+}
+
+/// Where a format's repositories are served unless it names another mount.
+pub const DEFAULT_MOUNT: &str = "/repository";
+
+/// What a format's repositories hold ([`Descriptor::storage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Storage {
+    /// Package versions: an id, a version, a package file and its manifest
+    /// (NuGet).
+    #[default]
+    Packages,
+    /// Files under paths, with their digests (raw).
+    Files,
+}
+
+impl Storage {
+    /// The name the admin API uses: `packages` or `files`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Storage::Packages => "packages",
+            Storage::Files => "files",
+        }
+    }
+}
+
+/// The names (within a version) and content types of a version's package
+/// and manifest ([`Descriptor::assets`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Assets {
+    /// A plain file name: 1–64 letters, digits, `.`, `_` or `-`, not
+    /// starting with `.`.
+    pub package: &'static str,
+    /// `type/subtype`, parameters allowed.
+    pub package_type: &'static str,
+    /// A plain file name other than [`Self::package`].
+    pub manifest: &'static str,
+    /// `type/subtype`, parameters allowed.
+    pub manifest_type: &'static str,
+}
+
+impl Assets {
+    /// `package` and `manifest`, both `application/octet-stream`.
+    pub const DEFAULT: Assets = Assets {
+        package: "package",
+        package_type: "application/octet-stream",
+        manifest: "manifest",
+        manifest_type: "application/octet-stream",
+    };
+}
+
+impl Default for Assets {
+    fn default() -> Self {
+        Assets::DEFAULT
+    }
+}
+
 /// The repository a request is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {

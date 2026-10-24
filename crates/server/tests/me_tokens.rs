@@ -190,8 +190,9 @@ async fn self_token_scope_is_listed_and_unknown_keys_rejected() {
 
     for body in [
         json!({"name": "typo", "scope": {"repos": [1]}}),
-        json!({"name": "typo", "scope": {"actions": ["read"], "repository": [1]}}),
-        json!({"name": "typo", "scop": {"actions": ["read"]}}),
+        json!({"name": "typo", "scope": {"level": "read", "repository": [1]}}),
+        json!({"name": "typo", "scop": {"level": "read"}}),
+        json!({"name": "legacy", "scope": {"actions": ["read"]}}),
     ] {
         let resp = sess_u
             .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
@@ -216,13 +217,13 @@ async fn self_token_scope_is_listed_and_unknown_keys_rejected() {
 
     let resp = sess_u
         .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
-        .json(&json!({"name": "ro", "scope": {"actions": ["read"]}}))
+        .json(&json!({"name": "ro", "scope": {"level": "read"}}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
     let created: Value = resp.json().await.unwrap();
-    assert_eq!(created["scope"], json!({"actions": ["read"]}));
+    assert_eq!(created["scope"], json!({"level": "read"}));
     let listed: Value = sess_u
         .apply(client.get(format!("{}/admin/me/tokens", srv.base_url)))
         .send()
@@ -231,7 +232,7 @@ async fn self_token_scope_is_listed_and_unknown_keys_rejected() {
         .json()
         .await
         .unwrap();
-    assert_eq!(listed[0]["scope"], json!({"actions": ["read"]}));
+    assert_eq!(listed[0]["scope"], json!({"level": "read"}));
 }
 
 /// B4 leaves `/admin/me/tokens` as it was: an admin-scoped token still cannot
@@ -244,7 +245,7 @@ async fn admin_scoped_token_cannot_manage_own_tokens() {
     let sess_u = srv.login(&u, &p).await;
     let created: Value = sess_u
         .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
-        .json(&json!({"name": "automation", "scope": {"actions": ["admin"]}}))
+        .json(&json!({"name": "automation", "scope": {"admin": true}}))
         .send()
         .await
         .unwrap()

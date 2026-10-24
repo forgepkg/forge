@@ -1,6 +1,6 @@
 //! Format plugins: the built-in ones, and serving the repositories of their
 //! formats under each format's mount, `{mount}/{repo}/...` (`/repository`
-//! unless its `plugin.toml` names another; see `docs/format-plugins.md`).
+//! unless its descriptor names another; see `docs/format-plugins.md`).
 //!
 //! The dispatcher resolves the repository, authenticates the caller (an
 //! `Authorization: Bearer` API token too, as npm sends it), refuses an
@@ -49,7 +49,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_core::auth::principal::Principal;
 use forge_core::auth::token::{check_token, TokenCheck};
-use forge_core::authz::Action as Permission;
+use forge_core::authz::Level;
 use forge_core::format::Format;
 use forge_core::net::upstream::{RequestClass, SpooledBody};
 use forge_core::repo::{
@@ -69,7 +69,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
 
 use crate::dispatch::{
-    action_for_method, authz_denied, offline_response, offline_serves_nothing,
+    authz_denied, level_for_method, offline_response, offline_serves_nothing,
     principal_allows_protocol_mutations, HostedWriteAdapter,
 };
 use crate::files::store::{Content, Ingested, Part, Via};
@@ -77,9 +77,9 @@ use crate::files::{FileError, Files};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
-/// Where a plugin format's repositories are served unless its
-/// `plugin.toml` names another mount.
-pub const MOUNT: &str = forge_plugin::manifest::DEFAULT_MOUNT;
+/// Where a plugin format's repositories are served unless its descriptor
+/// names another mount.
+pub const MOUNT: &str = forge_plugin::api::DEFAULT_MOUNT;
 
 /// The most rounds of queries one request may load.
 pub const MAX_ROUNDS: usize = 4;
@@ -132,18 +132,9 @@ pub fn builtin(
     npm_limits: forge_format_npm::NpmLimits,
 ) -> Vec<Arc<Plugin>> {
     vec![
-        Plugin::builtin(
-            forge_format_nuget::PLUGIN_TOML,
-            forge_format_nuget::Nuget::with_limits(nuget_limits),
-        )
-        .expect("crates/formats/nuget/plugin.toml is valid"),
-        Plugin::builtin(
-            forge_format_npm::PLUGIN_TOML,
-            forge_format_npm::Npm::with_limits(npm_limits),
-        )
-        .expect("crates/formats/npm/plugin.toml is valid"),
-        Plugin::builtin(forge_format_raw::PLUGIN_TOML, forge_format_raw::Raw)
-            .expect("crates/formats/raw/plugin.toml is valid"),
+        Plugin::builtin(forge_format_nuget::Nuget::with_limits(nuget_limits)),
+        Plugin::builtin(forge_format_npm::Npm::with_limits(npm_limits)),
+        Plugin::builtin(forge_format_raw::Raw),
     ]
 }
 
@@ -156,7 +147,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
             let mut serving = state
                 .formats
                 .plugins()
-                .filter(|plugin| plugin.manifest().mount == mount);
+                .filter(|plugin| plugin.descriptor().mount == mount);
             match (serving.next(), serving.next()) {
                 (Some(plugin), None) => Some(plugin.clone()),
                 _ => None,
@@ -319,7 +310,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         };
     };
     // Each format is served under its own mount only.
-    if plugin.manifest().mount != mount {
+    if plugin.descriptor().mount != mount {
         return (StatusCode::NOT_FOUND, "repository is not served here").into_response();
     }
     let mut response = serve(&state, req, principal, &repo, plugin.clone(), mount, rest).await;
@@ -346,13 +337,12 @@ async fn serve(
     let stores_files = format.stores_files();
     // A files format's request is authorized by its method; a package
     // format's actions each by what they need (see `Ctx::act`).
-    let permission = action_for_method(&method);
+    let level = level_for_method(&method);
     if stores_files {
-        let allowed = match permission {
-            Permission::Read => state.authz.can_read(&principal, repo).await,
-            Permission::Write => state.authz.can_write(&principal, repo).await,
-            Permission::Delete => state.authz.can_delete(&principal, repo).await,
-            Permission::Admin => false,
+        let allowed = match level {
+            Level::Read => state.authz.can_read(&principal, repo).await,
+            Level::Write => state.authz.can_write(&principal, repo).await,
+            Level::Delete => state.authz.can_delete(&principal, repo).await,
         };
         if !allowed {
             return authz_denied(&principal);
@@ -419,7 +409,7 @@ async fn serve(
         headers: req.headers().clone(),
         plugin: plugin.clone(),
         format,
-        permission,
+        level,
         stores_files,
         ops,
         target,
@@ -465,9 +455,9 @@ struct Ctx<'a> {
     headers: HeaderMap,
     plugin: Arc<Plugin>,
     format: Arc<dyn Format>,
-    /// What the request's method is for; a files format's request was
-    /// authorized for it.
-    permission: Permission,
+    /// The level the request's method is for; a files format's request
+    /// was authorized for it.
+    level: Level,
     /// Whether the format's repositories hold files (its plugin asks for
     /// files, not packages).
     stores_files: bool,
@@ -509,19 +499,18 @@ impl Ctx<'_> {
             .map_err(|e| plugin_failed(self.repo, &e))
     }
 
-    /// Whether the caller may do `permission` on `repo`.
-    async fn may(&self, permission: Permission, repo: &Repository) -> bool {
-        match permission {
-            Permission::Read => self.state.authz.can_read(&self.principal, repo).await,
-            Permission::Write => self.state.authz.can_write(&self.principal, repo).await,
-            Permission::Delete => self.state.authz.can_delete(&self.principal, repo).await,
-            Permission::Admin => false,
+    /// Whether the caller has `level` on `repo`.
+    async fn may(&self, level: Level, repo: &Repository) -> bool {
+        match level {
+            Level::Read => self.state.authz.can_read(&self.principal, repo).await,
+            Level::Write => self.state.authz.can_write(&self.principal, repo).await,
+            Level::Delete => self.state.authz.can_delete(&self.principal, repo).await,
         }
     }
 
     /// The caller must read this repository.
     async fn require_read(&self) -> Result<(), Response> {
-        if self.may(Permission::Read, self.repo).await {
+        if self.may(Level::Read, self.repo).await {
             Ok(())
         } else {
             Err(authz_denied(&self.principal))
@@ -549,7 +538,7 @@ impl Ctx<'_> {
         match action {
             Action::Respond(response) => self.respond(response),
             Action::ServeFile(path) => {
-                if self.permission != Permission::Read {
+                if self.level != Level::Read {
                     return refused("serving a file");
                 }
                 self.serve_file(&path).await
@@ -761,7 +750,7 @@ impl Ctx<'_> {
                 Ok(Answer::Directory(page.map(directory_page)))
             }
             Query::Form => {
-                if self.permission != Permission::Write {
+                if self.level != Level::Write {
                     return Err(refused("receiving a form"));
                 }
                 let Some(req) = self.take_body() else {
@@ -804,7 +793,7 @@ impl Ctx<'_> {
                 Ok(Answer::Form(answer))
             }
             Query::Store(wanted) => {
-                if self.permission != Permission::Write {
+                if self.level != Level::Write {
                     return Err(refused("storing files"));
                 }
                 let mut uploads = Vec::with_capacity(wanted.len());
@@ -851,7 +840,7 @@ impl Ctx<'_> {
                 ))
             }
             Query::Remove(path) => {
-                if self.permission != Permission::Delete {
+                if self.level != Level::Delete {
                     return Err(refused("deleting a file"));
                 }
                 let removed = crate::files::store::remove(&files, self.repo, path, Via::Protocol)
@@ -1092,11 +1081,7 @@ impl Ctx<'_> {
     /// the repository itself when it is hosted, a group's writable member
     /// (reading the group is required too), with a package-client
     /// credential, and never for a GET or HEAD.
-    async fn write_target(
-        &self,
-        permission: Permission,
-        what: &str,
-    ) -> Result<Repository, Response> {
+    async fn write_target(&self, permission: Level, what: &str) -> Result<Repository, Response> {
         if !self.mutating() {
             return Err(refused(what));
         }
@@ -1110,7 +1095,7 @@ impl Ctx<'_> {
                     .into_response())
             }
             RepoKind::Group => {
-                if !self.may(Permission::Read, self.repo).await {
+                if !self.may(Level::Read, self.repo).await {
                     return Err(authz_denied(&self.principal));
                 }
                 let member = match self.repo.writable_member_id() {
@@ -1159,7 +1144,7 @@ impl Ctx<'_> {
         &self,
         target: &Repository,
         format: Arc<dyn Format>,
-        permission: Permission,
+        permission: Level,
     ) -> HostedWriteAdapter {
         let filter = self
             .state
@@ -1171,7 +1156,7 @@ impl Ctx<'_> {
         let replace_filter = self
             .state
             .authz
-            .package_filter_for(&self.principal, target, Permission::Delete)
+            .package_filter_for(&self.principal, target, Level::Delete)
             .await;
         HostedWriteAdapter::new(
             self.state,
@@ -1202,7 +1187,7 @@ impl Ctx<'_> {
         request: protocol::Request,
         req: Request<Body>,
     ) -> Response {
-        let target = match self.write_target(Permission::Write, "publish").await {
+        let target = match self.write_target(Level::Write, "publish").await {
             Ok(target) => target,
             Err(response) => return response,
         };
@@ -1216,9 +1201,7 @@ impl Ctx<'_> {
             self.publisher().await,
             expected_id,
         ));
-        let writer = self
-            .writer(&target, upload.clone(), Permission::Write)
-            .await;
+        let writer = self.writer(&target, upload.clone(), Level::Write).await;
         let limit = self.state.upload_limit(&target);
         if publish.upload == Upload::Document {
             return self
@@ -1396,11 +1379,11 @@ impl Ctx<'_> {
                 wanted.limit.min(MAX_BODY_BYTES)
             }
             BodyUse::Change => {
-                let needed = action_for_method(&self.method);
+                let needed = level_for_method(&self.method);
                 let allowed = match self.repo.kind() {
                     // A group's changes go to its writable member, checked
                     // there; reading the group comes first.
-                    RepoKind::Group => self.may(Permission::Read, self.repo).await,
+                    RepoKind::Group => self.may(Level::Read, self.repo).await,
                     _ => self.may(needed, self.repo).await,
                 };
                 if !self.mutating() || !allowed {
@@ -1498,7 +1481,7 @@ impl Ctx<'_> {
     /// Make `set`'s changes in order; the first that fails answers.
     async fn changes(&self, set: ChangeSet) -> Response {
         // Every permission the set needs first: a refusal changes nothing.
-        let mut checked: Vec<Permission> = Vec::new();
+        let mut checked: Vec<Level> = Vec::new();
         for change in &set.changes {
             let (needed, what) = needs(change);
             if !checked.contains(&needed) {
@@ -1636,7 +1619,7 @@ impl Ctx<'_> {
                     return Ok(None);
                 }
                 for (member, _) in repository_dao::group_members(&self.state.pool, repo.id).await? {
-                    if member.format != repo.format || !self.may(Permission::Read, &member).await {
+                    if member.format != repo.format || !self.may(Level::Read, &member).await {
                         continue;
                     }
                     if let Some(found) = Box::pin(self.forward_source(&member, depth + 1)).await? {
@@ -1825,13 +1808,13 @@ impl Ctx<'_> {
 }
 
 /// The permission `change` needs, and what it is called in a refusal.
-fn needs(change: &Change) -> (Permission, &'static str) {
+fn needs(change: &Change) -> (Level, &'static str) {
     match change {
-        Change::Unlist(_) => (Permission::Delete, "unlist"),
-        Change::Delete(_) => (Permission::Delete, "delete"),
-        Change::Relist(_) => (Permission::Write, "relist"),
-        Change::Deprecate { .. } => (Permission::Write, "deprecate"),
-        Change::Tag { .. } | Change::Untag { .. } => (Permission::Write, "tag"),
+        Change::Unlist(_) => (Level::Delete, "unlist"),
+        Change::Delete(_) => (Level::Delete, "delete"),
+        Change::Relist(_) => (Level::Write, "relist"),
+        Change::Deprecate { .. } => (Level::Write, "deprecate"),
+        Change::Tag { .. } | Change::Untag { .. } => (Level::Write, "tag"),
     }
 }
 
@@ -2165,6 +2148,55 @@ fn write_error(e: WriteError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The built-in formats' descriptors are checked here, not at startup: a
+    /// well-formed id that is not reserved and no other format has, a free
+    /// mount, kinds, asset names.
+    #[test]
+    fn the_builtin_formats_describe_themselves_well() {
+        let plugins = builtin(Default::default(), Default::default());
+        let descriptors: Vec<_> = plugins.iter().map(|p| p.descriptor()).collect();
+        assert_eq!(forge_plugin::descriptor::check(&descriptors), Ok(()));
+        let ids: Vec<_> = plugins.iter().map(|p| p.id()).collect();
+        assert_eq!(ids, ["nuget", "npm", "raw"]);
+        for plugin in &plugins {
+            assert_eq!(plugin.descriptor().version, "1.0.0", "{}", plugin.id());
+        }
+        // Only npm sends a proxy's token as a Bearer token.
+        let bearer: Vec<_> = plugins
+            .iter()
+            .filter(|p| p.descriptor().upstream_token == forge_plugin::api::UpstreamToken::Bearer)
+            .map(|p| p.id())
+            .collect();
+        assert_eq!(bearer, ["npm"]);
+
+        // The check refuses a malformed or reserved id, a second format
+        // with a built-in's id, and invalid asset names.
+        let nuget = forge_format_nuget::DESCRIPTOR;
+        for id in ["NuGet", "n", "docker", "v2"] {
+            let renamed = forge_plugin::Descriptor { id, ..nuget };
+            assert!(
+                forge_plugin::descriptor::check(&[&renamed]).is_err(),
+                "{id:?}"
+            );
+        }
+        let twin = forge_plugin::Descriptor {
+            id: "nuget",
+            mount: "/twin",
+            ..forge_format_raw::DESCRIPTOR
+        };
+        let mut with_twin = descriptors.clone();
+        with_twin.push(&twin);
+        assert!(forge_plugin::descriptor::check(&with_twin).is_err());
+        let bad_assets = forge_plugin::Descriptor {
+            assets: forge_plugin::api::Assets {
+                package: "../package.nupkg",
+                ..nuget.assets
+            },
+            ..nuget
+        };
+        assert!(forge_plugin::descriptor::check(&[&bad_assets]).is_err());
+    }
 
     #[test]
     fn splits_repository_paths() {

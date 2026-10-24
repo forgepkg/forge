@@ -3,7 +3,7 @@
 //! Admin-configured upstream URLs are **deliberately not restricted by IP
 //! range** (no private/loopback/link-local block): upstream URLs (proxy
 //! `remote_url`, the credential-forwarding IdP, OIDC issuers) are configurable
-//! only by admins (RBAC `can_admin`), so the threat model is a
+//! only by admins (RBAC `is_global_admin`), so the threat model is a
 //! trusted/compromised admin — and for that actor an IP-range block is a speed
 //! bump, not a boundary, while it would make every legitimate internal
 //! deployment (Nexus on RFC1918, self-hosted IdPs) need a confusing opt-out

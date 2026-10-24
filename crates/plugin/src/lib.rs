@@ -12,66 +12,46 @@
 //! to [`forge_core::Format`], so hosted publishing, reads, groups and
 //! retention work for it unchanged.
 
+pub mod descriptor;
 mod format;
-pub mod manifest;
 
 use std::sync::Arc;
 
 pub use forge_plugin_api as api;
-pub use forge_plugin_api::FormatPlugin;
+pub use forge_plugin_api::{Descriptor, FormatPlugin};
 pub use format::{PluginFormat, UploadFormat};
-pub use manifest::Manifest;
 
-/// Errors installing a plugin.
-#[derive(Debug, thiserror::Error)]
-pub enum PluginError {
-    /// `plugin.toml` is missing a key, malformed, or asks for too much.
-    #[error("invalid plugin.toml: {0}")]
-    Manifest(String),
-}
-
-/// An installed format plugin: its `plugin.toml` and its implementation.
+/// An installed format plugin: its implementation, which describes itself
+/// ([`FormatPlugin::descriptor`]).
 pub struct Plugin {
-    manifest: Manifest,
-    /// The format id, leaked once per plugin so [`forge_core::Format::id`]
-    /// can hand out a `&'static str`.
-    id: &'static str,
     implementation: Arc<dyn FormatPlugin>,
 }
 
 impl std::fmt::Debug for Plugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Plugin")
-            .field("id", &self.id)
-            .field("version", &self.manifest.version)
+            .field("id", &self.id())
+            .field("version", &self.descriptor().version)
             .finish_non_exhaustive()
     }
 }
 
 impl Plugin {
-    /// A plugin built into the server: `plugin_toml` is its crate's
-    /// `plugin.toml` ([`forge_plugin_api::plugin_toml!`]), `implementation`
-    /// the format.
-    pub fn builtin(
-        plugin_toml: &str,
-        implementation: impl FormatPlugin,
-    ) -> Result<Arc<Self>, PluginError> {
-        let manifest = Manifest::parse(plugin_toml)?;
-        Ok(Arc::new(Plugin {
-            id: Box::leak(manifest.id.clone().into_boxed_str()),
-            manifest,
+    /// A plugin built into the server.
+    pub fn builtin(implementation: impl FormatPlugin) -> Arc<Self> {
+        Arc::new(Plugin {
             implementation: Arc::new(implementation),
-        }))
+        })
     }
 
     /// The format id.
     pub fn id(&self) -> &'static str {
-        self.id
+        self.descriptor().id
     }
 
-    /// The parsed `plugin.toml`.
-    pub fn manifest(&self) -> &Manifest {
-        &self.manifest
+    /// What the format says about itself.
+    pub fn descriptor(&self) -> &'static Descriptor {
+        self.implementation.descriptor()
     }
 
     /// The format, as the plugin implements it.

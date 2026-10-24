@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM repository_privilege rp\n        USING role r\n        WHERE rp.role_id = r.id\n          AND r.name = $2\n          AND rp.repository_id = $1\n          AND rp.level = 'read'\n          AND rp.selector_id IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "14fb5945876037e2d50c1ee9a0c5fa4e63cab7ef65087e9ce872927e04291760"
+}

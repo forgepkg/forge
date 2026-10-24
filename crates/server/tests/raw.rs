@@ -843,7 +843,7 @@ async fn selectors_scope_paths() {
             srv.base_url, role["id"]
         ))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"repository": name, "action": "read", "selector_id": selector["id"]}))
+        .json(&json!({"repository": name, "level": "read", "selector_id": selector["id"]}))
         .send()
         .await
         .unwrap();

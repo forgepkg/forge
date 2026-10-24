@@ -1,6 +1,6 @@
 //! NuGet V3 feeds for Forge, as a format plugin.
 //!
-//! Served under `/v3/{repository}` (its `plugin.toml` names the mount):
+//! Served under `/v3/{repository}` (its [`DESCRIPTOR`] names the mount):
 //!
 //! * `GET /index.json` — the service index;
 //! * `GET /flat/{id}/index.json`, `/flat/{id}/{version}/{file}` — the flat
@@ -17,7 +17,7 @@
 //! Ids are matched case-insensitively (`ToLowerInvariant`); versions are
 //! NuGet versions, normalized (`1.0` → `1.0.0`).
 //!
-//! Forge links this plugin in ([`Nuget`], [`PLUGIN_TOML`]).
+//! Forge links this plugin in ([`Nuget`], [`DESCRIPTOR`]).
 
 pub mod model;
 pub mod nuspec;
@@ -28,14 +28,37 @@ pub mod version;
 use std::cmp::Ordering;
 
 use forge_plugin_api::{
-    Action, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource, ParsedPackage, Remote,
-    Repository, Request, UpstreamOp, UpstreamStep,
+    Action, Assets, Descriptor, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource,
+    ParsedPackage, Remote, Repository, RepositoryKind, Request, Storage, UpstreamOp, UpstreamStep,
+    UpstreamToken,
 };
 
 pub use model::NupkgLimits;
 
-/// This plugin's `plugin.toml`: its format id, name, version and mount.
-pub const PLUGIN_TOML: &str = forge_plugin_api::plugin_toml!();
+/// What NuGet says about itself: its format id, name, version and mount.
+pub const DESCRIPTOR: Descriptor = Descriptor {
+    id: "nuget",
+    name: "NuGet",
+    version: env!("CARGO_PKG_VERSION"),
+    description: "NuGet V3 feeds: push, restore and search with dotnet, nuget.exe and Visual \
+                  Studio; proxies of nuget.org and other V3 feeds.",
+    mount: "/v3",
+    // Proxies mirror another V3 feed through the plugin's upstream side.
+    kinds: &[
+        RepositoryKind::Hosted,
+        RepositoryKind::Proxy,
+        RepositoryKind::Group,
+    ],
+    storage: Storage::Packages,
+    // The asset names and content types NuGet has always stored.
+    assets: Assets {
+        package: "package.nupkg",
+        package_type: "application/octet-stream",
+        manifest: "package.nuspec",
+        manifest_type: "application/xml",
+    },
+    upstream_token: UpstreamToken::None,
+};
 
 /// The NuGet format, with the zip-bomb limits applied while parsing packages.
 #[derive(Debug, Clone, Default)]
@@ -51,6 +74,10 @@ impl Nuget {
 }
 
 impl FormatPlugin for Nuget {
+    fn descriptor(&self) -> &'static Descriptor {
+        &DESCRIPTOR
+    }
+
     fn canonical_id(&self, id: &str) -> String {
         nuspec::lower_id(id)
     }
@@ -99,21 +126,6 @@ impl FormatPlugin for Nuget {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn plugin_toml_names_this_crate() {
-        let value = |key: &str| {
-            PLUGIN_TOML
-                .lines()
-                .filter_map(|line| line.split_once('='))
-                .find(|(k, _)| k.trim() == key)
-                .map(|(_, v)| v.trim().trim_matches('"').to_string())
-        };
-        assert_eq!(value("id").as_deref(), Some("nuget"));
-        assert_eq!(value("version").as_deref(), Some(env!("CARGO_PKG_VERSION")));
-        assert_eq!(value("api").as_deref(), Some(forge_plugin_api::API));
-        assert_eq!(value("mount").as_deref(), Some("/v3"));
-    }
 
     #[test]
     fn the_rules_are_nugets() {

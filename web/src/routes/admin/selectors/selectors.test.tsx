@@ -32,9 +32,9 @@ describe('admin content selectors', () => {
     })
     api.state.roles.push({ id: 7, name: 'ci-pushers', description: '', builtin: false })
     api.state.grants.push(
-      { id: 30, role_id: 7, repository_id: 10, action: 'write', selector_id: 20 },
-      { id: 31, role_id: 2, repository_id: null, action: 'read', selector_id: 20 },
-      { id: 32, role_id: 7, repository_id: 10, action: 'read', selector_id: null },
+      { id: 30, role_id: 7, repository_id: 10, level: 'write', selector_id: 20 },
+      { id: 31, role_id: 2, repository_id: null, level: 'read', selector_id: 20 },
+      { id: 32, role_id: 7, repository_id: 10, level: 'read', selector_id: null },
     )
     vi.stubGlobal('fetch', vi.fn(api.fetch))
     setSession('admin-csrf')

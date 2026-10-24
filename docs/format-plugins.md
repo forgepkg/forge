@@ -18,13 +18,12 @@ files** ([`crates/formats/raw`](../crates/formats/raw),
 [Files formats](#files-formats)). Helm charts are served by the registry
 ([docker.md](docker.md#helm-charts)).
 
-> **Status: preview.** The plugin contract is `forge:format@0.4.0`. It may
-> change before 1.x of the contract; a plugin declares the contract version it
-> was built for, and the server refuses one it does not implement. 0.4.0 added
-> files formats ([Files formats](#files-formats)), and `render` returns an
-> action, like `handle`; and for npm, request bodies, document uploads,
-> changes (tags, deprecations), logins and forwards
-> ([npm as a plugin](#npm-as-a-plugin)).
+> **Status: preview.** The plugin contract may change in any release. The
+> plugins build with the server, so the compiler checks each of them against
+> the contract it is linked with. Contract 0.4.0 added files formats
+> ([Files formats](#files-formats)), and `render` returns an action, like
+> `handle`; and for npm, request bodies, document uploads, changes (tags,
+> deprecations), logins and forwards ([npm as a plugin](#npm-as-a-plugin)).
 
 ## Contents
 
@@ -39,21 +38,21 @@ files** ([`crates/formats/raw`](../crates/formats/raw),
 
 ## Layout
 
-A plugin is a workspace crate with a `plugin.toml`:
+A plugin is a workspace crate that describes itself in Rust:
 
 ```
 crates/formats/nuget/
-├── Cargo.toml
-├── plugin.toml    # id, name, version, contract version; mount "/v3", kinds hosted/proxy/group
-├── src/lib.rs     # impl FormatPlugin for Nuget
+├── Cargo.toml     # the plugin's version
+├── src/lib.rs     # DESCRIPTOR (id, name, mount "/v3", kinds hosted/proxy/group)
+│                  # and impl FormatPlugin for Nuget
 ├── src/protocol.rs  # the V3 protocol: handle and render
 ├── src/upstream.rs  # proxies: reading another V3 feed (upstream)
 └── tests/         # the protocol against canned answers (forge-plugin-api `testing`)
 
 crates/formats/raw/
 ├── Cargo.toml
-├── plugin.toml    # mount "/raw", storage "files", kinds hosted/proxy/group
-├── src/lib.rs     # impl FormatPlugin for Raw: paths, methods, upstream URLs
+├── src/lib.rs     # DESCRIPTOR (mount "/raw", storage files, kinds hosted/proxy/group)
+│                  # and impl FormatPlugin for Raw: paths, methods, upstream URLs
 ├── src/listing.rs # directory listings as HTML or JSON
 ├── src/sidecar.rs # .sha256/.sha512/.sha1/.md5 from the stored digests
 ├── src/form.rs    # multipart uploads, Nexus' field names
@@ -66,7 +65,7 @@ The pieces:
 | --- | --- |
 | [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, and, behind its `testing` feature, helpers that run a plugin's protocol against canned answers. Depends on nothing but `std`. |
 | [`crates/formats/<id>`](../crates/formats) | One crate per plugin, implementing `FormatPlugin`. |
-| [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin: its `plugin.toml` and its implementation) and `PluginFormat`, which adapts it to Forge's `Format` seam. |
+| [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin, which describes itself), `PluginFormat`, which adapts it to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
 | [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `{mount}/{repo}/...` dispatcher, and the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)). |
 
 ## How it fits together
@@ -86,7 +85,7 @@ The pieces:
 | Files (a files format) | Keeps files under paths, content-addressed with their digests: serving, ranges and validators, uploads under the deployment policy, listings, proxies and groups, selectors on paths, retention by path ([Files formats](#files-formats)) | Which path a request names, which file or directory it needs, what the response looks like |
 
 A request to a plugin repository is served under its format's mount,
-`{mount}/{repo}/...`: `/repository` unless the plugin's `plugin.toml` names
+`{mount}/{repo}/...`: `/repository` unless the plugin's descriptor names
 another (see [Writing a plugin](#writing-a-plugin)); NuGet's names `/v3`.
 A repository is served under its own format's mount only.
 The dispatcher
@@ -172,7 +171,7 @@ should stay small.
 
 ## Files formats
 
-A format whose `plugin.toml` says `storage = "files"` holds files under
+A format whose descriptor says `storage: Storage::Files` holds files under
 paths, not package versions: [raw](raw.md) is one. It keeps the defaults of
 the identity rules and `parse_package` (which refuse every id, version and
 package) and implements the protocol over the host's file store, which keeps
@@ -300,7 +299,7 @@ side (NuGet, npm and raw do). Docker has proxies of its own.
 
 A repository of a plugin's format is created like any other, with the
 plugin's format id, and served under the plugin's mount (`/repository`
-unless its `plugin.toml` names another):
+unless its descriptor names another):
 
 ```bash
 # Create a hosted repository of the plugin `example` (or use the web UI).
@@ -385,20 +384,43 @@ policy (an outbound proxy, a Kubernetes `NetworkPolicy`).
 
 ## Writing a plugin
 
-A plugin is a crate in `crates/formats/<id>/` with a `plugin.toml`, a member
-of the workspace, depending on `forge-plugin-api` and implementing its trait
-([`crates/formats/nuget`](../crates/formats/nuget) is a complete one):
+A plugin is a crate in `crates/formats/<id>/`, a member of the workspace,
+depending on `forge-plugin-api` and implementing its trait
+([`crates/formats/nuget`](../crates/formats/nuget) is a complete one). It
+describes itself with a `'static` [`Descriptor`](../crates/plugin-api/src/types.rs)
+that `descriptor()` returns:
 
 ```rust
-use forge_plugin_api::{Action, FormatPlugin, Loaded, Repository, Request /* … */};
+use forge_plugin_api::{
+    Action, Assets, Descriptor, FormatPlugin, Loaded, Repository, RepositoryKind, Request,
+    Storage, UpstreamToken, /* … */
+};
 
-/// This crate's plugin.toml (id, name, version).
-pub const PLUGIN_TOML: &str = forge_plugin_api::plugin_toml!();
+pub const DESCRIPTOR: Descriptor = Descriptor {
+    id: "example",                     // the format id repositories are created with
+    name: "Example packages",
+    version: env!("CARGO_PKG_VERSION"),
+    description: "Example packages: push and pull with the example client.",
+    mount: forge_plugin_api::DEFAULT_MOUNT, // served at /repository/{repo}/…
+    // The repository kinds it serves (`Proxy` too when it implements
+    // `upstream`).
+    kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
+    storage: Storage::Packages,        // or `Storage::Files` (Files formats)
+    // How a version's files are stored: `package` and `manifest`, both
+    // application/octet-stream, unless it names its own.
+    assets: Assets::DEFAULT,
+    // What a proxy given a password and no username sends upstream:
+    // nothing more (`None`), or the password as a Bearer token (npm).
+    upstream_token: UpstreamToken::None,
+};
 
 #[derive(Default)]
 pub struct MyFormat;
 
 impl FormatPlugin for MyFormat {
+    fn descriptor(&self) -> &'static Descriptor {
+        &DESCRIPTOR
+    }
     // identity: canonical_id, validate_id, normalize_version, compare_versions
     // packages: parse_package, manifest_summary (optional: readme, reserved_prefix)
     //   (a files format keeps the defaults of these, which refuse everything)
@@ -408,35 +430,17 @@ impl FormatPlugin for MyFormat {
 }
 ```
 
-```toml
-# plugin.toml
-[plugin]
-id = "example"                 # the format id repositories are created with
-name = "Example packages"
-version = "0.1.0"
-api = "0.4.0"                  # the forge:format contract
-mount = "/repository"          # optional: served at {mount}/{repo}/…
-kinds = ["hosted", "group"]    # optional: the repository kinds it serves
-                               # ("proxy" too when it implements `upstream`)
-storage = "packages"           # optional: or "files" (Files formats)
-upstream_token = "bearer"      # optional: a proxy's password without a
-                               # username is a token, sent as Bearer
-
-[assets]                       # optional: how a version's files are stored
-package = "package"
-package_type = "application/octet-stream"
-manifest = "manifest"
-manifest_type = "application/octet-stream"
-```
-
-A mount is `/` and one lowercase word; the server's own paths (`/admin`,
-`/auth`, `/browse`, `/v2`, the web UI's pages, …) are reserved, and plugins
-may share a mount. List `proxy` among the kinds only when the plugin
-implements `upstream`.
+An id is 2–32 lowercase letters, digits and `-`, starting with a letter,
+and no other format's. A mount is `/` and one lowercase word; the server's
+own paths (`/admin`, `/auth`, `/browse`, `/v2`, the web UI's pages, …) are
+reserved, and plugins may share a mount. List `Proxy` among the kinds only
+when the plugin implements `upstream`. Asset names are plain file names, and
+their content types `type/subtype`.
 
 Then build it in: add the crate to `forge-server`'s dependencies and to
 `plugins::builtin()` in
-[`crates/server/src/plugins.rs`](../crates/server/src/plugins.rs). A few
+[`crates/server/src/plugins.rs`](../crates/server/src/plugins.rs), whose
+tests check every built-in format's descriptor against these rules. A few
 rules hold:
 
 - **Keep methods pure.** The host may call any method from any thread, in

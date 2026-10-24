@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- 0046: package tags, deprecations and command-line logins (#41, npm)
+-- 0047: package tags, deprecations and command-line logins (#41, npm)
 -- ---------------------------------------------------------------------------
 --
 -- What a format plugin may keep about a package beyond its versions: the

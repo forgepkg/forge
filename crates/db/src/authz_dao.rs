@@ -21,16 +21,17 @@
 use serde_json::Value as JsonValue;
 use sqlx::{PgExecutor, PgPool};
 
-/// The fixed slug of the built-in admin role (allow-all short-circuit).
+/// The fixed slug of the built-in admin role (allow-all short-circuit; the
+/// only source of administration, which is no grant level).
 pub const ADMIN_ROLE: &str = "admin";
 /// The fixed slug of the built-in anonymous role (applied to anonymous callers).
 pub const ANONYMOUS_ROLE: &str = "anonymous";
-/// The fixed slug of the built-in `authenticated` role (read and write on
+/// The fixed slug of the built-in `authenticated` role (level `write` on
 /// every repository), for an administrator to assign.
 pub const AUTHENTICATED_ROLE: &str = "authenticated";
-/// The fixed slug of the built-in `writer` role (migration 0042): read and
-/// publish packages on every repository, without deleting them or any right
-/// to administer the instance.
+/// The fixed slug of the built-in `writer` role (migration 0042): level
+/// `write` on every repository, to read and publish packages without deleting
+/// them or any right to administer the instance.
 pub const WRITER_ROLE: &str = "writer";
 
 /// Shared shape of the effective-set query rows (user + anonymous variants).
@@ -38,7 +39,7 @@ pub const WRITER_ROLE: &str = "writer";
 /// same columns; [`into_query_row!`] converts each into this adapter so
 /// [`map_grant_row`] is reused across both call sites.
 struct EffectiveQueryRow {
-    action: String,
+    level: String,
     repository_id: Option<i64>,
     selector_id: Option<i64>,
     includes: Option<JsonValue>,
@@ -48,7 +49,7 @@ struct EffectiveQueryRow {
 macro_rules! into_query_row {
     ($r:expr) => {
         EffectiveQueryRow {
-            action: $r.action,
+            level: $r.level,
             repository_id: $r.repository_id,
             selector_id: $r.selector_id,
             includes: $r.includes,
@@ -65,8 +66,8 @@ macro_rules! into_query_row {
 /// grant; otherwise it holds the raw include/exclude jsonb arrays.
 #[derive(Debug, Clone)]
 pub struct EffectiveGrantRow {
-    /// The action verb (`read`/`write`/`delete`/`admin`).
-    pub action: String,
+    /// The level (`read`/`write`/`delete`).
+    pub level: String,
     /// `repository.id`, or `None` for an ANY-repo grant.
     pub repository_id: Option<i64>,
     /// The attached content selector's raw patterns, or `None` if unscoped.
@@ -159,7 +160,7 @@ pub async fn load_user_effective(pool: &PgPool, user_id: i64) -> sqlx::Result<Ef
     let rows = sqlx::query!(
         r#"
         SELECT
-            rp.action            AS action,
+            rp.level             AS level,
             rp.repository_id     AS repository_id,
             cs.id                AS "selector_id?",
             cs.includes          AS "includes?",
@@ -186,13 +187,13 @@ pub async fn load_user_effective(pool: &PgPool, user_id: i64) -> sqlx::Result<Ef
 ///
 /// On a fresh / un-migrated install the `anonymous` role has no grants, so this
 /// returns an empty set (deny-all) — anonymous access is opened by granting the
-/// `anonymous` role `read` on specific repos (the data migration converts each
+/// `anonymous` role `read` on specific repos (migration 0007 converted each
 /// repository's `anonymous_read` flag into exactly these grants).
 pub async fn load_anonymous_effective(pool: &PgPool) -> sqlx::Result<EffectiveRows> {
     let rows = sqlx::query!(
         r#"
         SELECT
-            rp.action            AS action,
+            rp.level             AS level,
             rp.repository_id     AS repository_id,
             cs.id                AS "selector_id?",
             cs.includes          AS "includes?",
@@ -241,7 +242,7 @@ pub async fn load_role_effective(pool: &PgPool, role_id: i64) -> sqlx::Result<Ef
     let rows = sqlx::query!(
         r#"
         SELECT
-            rp.action            AS "action!",
+            rp.level             AS "level!",
             rp.repository_id     AS repository_id,
             cs.id                AS "selector_id?",
             cs.includes          AS "includes?",
@@ -274,7 +275,7 @@ fn map_grant_row(r: EffectiveQueryRow) -> EffectiveGrantRow {
         _ => None,
     };
     EffectiveGrantRow {
-        action: r.action,
+        level: r.level,
         repository_id: r.repository_id,
         selector,
     }
@@ -450,14 +451,15 @@ pub async fn would_leave_no_admin(
     .await
 }
 
-/// Insert a repository-privilege grant for a role. `repository_id = None` ⇒ ANY
-/// repo; `selector_id = None` ⇒ unscoped. Idempotent via the unique index
-/// (COALESCE-folded NULLs). Accepts any executor.
+/// Give a role `level` on a repository: `repository_id = None` ⇒ ANY repo;
+/// `selector_id = None` ⇒ unscoped. A role holds one grant per (repository |
+/// ANY, selector) (the unique index, COALESCE-folded NULLs), so this sets the
+/// level of an existing one. Idempotent. Accepts any executor.
 pub async fn add_grant<'e, E>(
     executor: E,
     role_id: i64,
     repository_id: Option<i64>,
-    action: &str,
+    level: &str,
     selector_id: Option<i64>,
 ) -> sqlx::Result<()>
 where
@@ -465,14 +467,14 @@ where
 {
     sqlx::query!(
         r#"
-        INSERT INTO repository_privilege (role_id, repository_id, action, selector_id)
+        INSERT INTO repository_privilege (role_id, repository_id, level, selector_id)
         VALUES ($1, $2, $3, $4)
-        ON CONFLICT (role_id, COALESCE(repository_id, 0), action, COALESCE(selector_id, 0))
-        DO NOTHING
+        ON CONFLICT (role_id, COALESCE(repository_id, 0), COALESCE(selector_id, 0))
+        DO UPDATE SET level = EXCLUDED.level
         "#,
         role_id,
         repository_id,
-        action,
+        level,
         selector_id,
     )
     .execute(executor)
@@ -534,8 +536,8 @@ pub struct GrantRow {
     pub role_id: i64,
     /// `repository.id`, or `None` for an ANY-repo grant.
     pub repository_id: Option<i64>,
-    /// Action verb (`read`/`write`/`delete`/`admin`).
-    pub action: String,
+    /// Level (`read`/`write`/`delete`).
+    pub level: String,
     /// Attached content-selector id, or `None` if unscoped.
     pub selector_id: Option<i64>,
 }
@@ -653,7 +655,7 @@ pub async fn delete_role(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
 pub async fn list_grants_for_role(pool: &PgPool, role_id: i64) -> sqlx::Result<Vec<GrantRow>> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, role_id, repository_id, action, selector_id
+        SELECT id, role_id, repository_id, level, selector_id
         FROM repository_privilege
         WHERE role_id = $1
         ORDER BY id
@@ -668,7 +670,7 @@ pub async fn list_grants_for_role(pool: &PgPool, role_id: i64) -> sqlx::Result<V
             id: r.id,
             role_id: r.role_id,
             repository_id: r.repository_id,
-            action: r.action,
+            level: r.level,
             selector_id: r.selector_id,
         })
         .collect())
@@ -913,7 +915,7 @@ pub async fn list_grants_for_selector(
 ) -> sqlx::Result<Vec<GrantRow>> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, role_id, repository_id, action, selector_id
+        SELECT id, role_id, repository_id, level, selector_id
         FROM repository_privilege
         WHERE selector_id = $1
         ORDER BY role_id, id
@@ -928,7 +930,7 @@ pub async fn list_grants_for_selector(
             id: r.id,
             role_id: r.role_id,
             repository_id: r.repository_id,
-            action: r.action,
+            level: r.level,
             selector_id: r.selector_id,
         })
         .collect())
@@ -1041,7 +1043,8 @@ where
 
 /// Delete the unscoped `(anonymous role, repository, read)` grant — the grant
 /// migration 0007 synthesized from `repository.anonymous_read` — for
-/// `repository_id`. Returns whether a row was removed.
+/// `repository_id`. Returns whether a row was removed. A higher level the
+/// anonymous role was given there explicitly stays.
 ///
 /// Called in the same transaction that turns a repository's `anonymous_read`
 /// off: the seam honours the flag *and* the grant, so leaving the synthesized
@@ -1062,7 +1065,7 @@ where
         WHERE rp.role_id = r.id
           AND r.name = $2
           AND rp.repository_id = $1
-          AND rp.action = 'read'
+          AND rp.level = 'read'
           AND rp.selector_id IS NULL
         "#,
         repository_id,

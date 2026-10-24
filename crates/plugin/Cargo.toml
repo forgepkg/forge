@@ -10,8 +10,5 @@ publish.workspace = true
 forge-core = { path = "../core" }
 forge-plugin-api = { path = "../plugin-api" }
 
-serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
-toml = "1.1"

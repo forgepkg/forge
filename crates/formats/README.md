@@ -13,16 +13,16 @@ the design, the contract and how to write one.
 
 A plugin directory holds:
 
-- `Cargo.toml`: a member of the workspace;
-- `plugin.toml`: the format id (also the directory's name), display name,
-  version, the `forge:format` contract version it targets (`api`), and
-  optionally its mount, repository kinds (`proxy` when it implements
-  `upstream`), its `storage` (`packages`, or `files` for a files format such
-  as raw), how a proxy sends a token (`upstream_token`) and `[assets]`
-  names;
-- `src/`: `impl FormatPlugin`, and `pub const PLUGIN_TOML: &str =
-  forge_plugin_api::plugin_toml!();`.
+- `Cargo.toml`: a member of the workspace; its `version` is the plugin's;
+- `src/`: `impl FormatPlugin`, and the format's `pub const DESCRIPTOR:
+  Descriptor` that its `descriptor()` returns: the format id (also the
+  directory's name), display name, version (`env!("CARGO_PKG_VERSION")`),
+  description, mount, repository kinds (`Proxy` when it implements
+  `upstream`), its `storage` (`Packages`, or `Files` for a files format such
+  as raw), its asset names, and how a proxy sends a token
+  (`upstream_token`: `Bearer` for npm).
 
 The server installs it in `plugins::builtin()`
-([`crates/server/src/plugins.rs`](../server/src/plugins.rs)). The
+([`crates/server/src/plugins.rs`](../server/src/plugins.rs)), whose tests
+check every built-in format's descriptor (`forge_plugin::descriptor`). The
 workspace builds, lints and tests the plugins like every other crate.

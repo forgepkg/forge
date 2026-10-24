@@ -8,14 +8,14 @@
 //! storage key, or a whole package in memory.
 //!
 //! A format stores package versions, or files under paths (raw): its
-//! `plugin.toml` says which (`storage`). A files format has no identity
+//! [`Descriptor`] says which (`storage`). A files format has no identity
 //! rules and no packages to read: it keeps the defaults of those methods and
 //! implements the protocol over the host's file store ([`Query::File`] …
 //! [`Query::Remove`], [`Action::ServeFile`]).
 //!
 //! A plugin is a crate under `crates/formats/<id>/` implementing
-//! [`FormatPlugin`], with a `plugin.toml` naming it, linked into the server
-//! and called directly (NuGet, raw).
+//! [`FormatPlugin`], describing itself with a [`Descriptor`], linked into
+//! the server and called directly (NuGet, raw).
 
 pub mod files;
 mod types;
@@ -28,20 +28,6 @@ use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 pub use types::*;
-
-/// The `forge:format` contract version this crate implements: what a plugin
-/// built against it declares as `api` in its `plugin.toml`.
-pub const API: &str = "0.4.0";
-
-/// The `plugin.toml` of the crate this is expanded in: how a built-in plugin
-/// hands the server its id and name (`pub const PLUGIN_TOML: &str =
-/// forge_plugin_api::plugin_toml!();`).
-#[macro_export]
-macro_rules! plugin_toml {
-    () => {
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
-    };
-}
 
 /// A package the host staged, lent to [`FormatPlugin::parse_package`].
 pub trait PackageSource: Read + Seek {}
@@ -61,6 +47,11 @@ impl<T: Read + Seek + ?Sized> PackageSource for T {}
 /// files format has neither ids nor versions nor packages: it keeps their
 /// defaults, which refuse every id, version and package.
 pub trait FormatPlugin: Send + Sync + 'static {
+    /// What the format says about itself: its id, name, version, mount,
+    /// repository kinds, storage and asset names. A `'static` value the
+    /// crate defines next to its implementation (`pub const DESCRIPTOR`).
+    fn descriptor(&self) -> &'static Descriptor;
+
     /// The canonical form of a package id, used for lookups and uniqueness
     /// (e.g. lowercased). The default keeps the id as it is.
     fn canonical_id(&self, id: &str) -> String {
@@ -216,7 +207,7 @@ pub trait FormatPlugin: Send + Sync + 'static {
     /// only to the upstream's own origin; bounded in size and time, cached
     /// as [`Fetch::freshness`] says), downloads and verifies packages, and
     /// keeps the package delay, the not-found markers and the offline mode.
-    /// Only a plugin whose `plugin.toml` lists the `proxy` kind is asked;
+    /// Only a plugin whose descriptor lists the `proxy` kind is asked;
     /// the default says so.
     fn upstream(
         &self,

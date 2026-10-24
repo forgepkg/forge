@@ -108,17 +108,19 @@ pub struct OidcRuntime {
 }
 
 impl OidcRuntime {
-    /// Build the runtime from the validated `[oidc]` config + how the client
-    /// authenticates at the token endpoint (`auth`; the config's
-    /// `client_secret` is not read) + the session service a login signs in
-    /// with + the public base URL (which decides the cookie `Secure`
-    /// attribute) + the shared cache.
+    /// Build the runtime from the validated `[oidc]` config + whether a login
+    /// creates an unknown user's account (`auto_provision`, the realm's own
+    /// setting: the `[oidc]` block has none) + how the client authenticates
+    /// at the token endpoint (`auth`; the config's `client_secret` is not
+    /// read) + the session service a login signs in with + the public base
+    /// URL (which decides the cookie `Secure` attribute) + the shared cache.
     ///
     /// The HTTP client follows no redirects and is https-only unless the realm
     /// allows a plain-http development issuer (see
     /// [`outbound_metadata_client`]); it serves discovery/JWKS/token calls.
     pub fn build(
         oidc: &OidcConfig,
+        auto_provision: bool,
         auth: ClientAuth,
         sessions: SessionService,
         public_base_url: &str,
@@ -145,7 +147,7 @@ impl OidcRuntime {
             required_claims: oidc.required_claims.clone(),
         };
         let policy = ResolvePolicy {
-            auto_provision: oidc.auto_provision,
+            auto_provision,
             link_existing_by_username: oidc.link_existing_by_username,
         };
         let cookie_secure = public_base_url.trim().starts_with("https://");

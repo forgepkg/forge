@@ -31,16 +31,41 @@ use std::cmp::Ordering;
 use std::io::{Read, SeekFrom, Write};
 
 use forge_plugin_api::{
-    Action, AuthOutcome, Change, Dependency, DependencyGroup, FetchResult, FormatError,
-    FormatPlugin, Loaded, PackageRef, PackageSource, ParsedPackage, Remote, Repository, Request,
-    Response, Unpacked, Uploaded, UpstreamOp, UpstreamStep,
+    Action, Assets, AuthOutcome, Change, Dependency, DependencyGroup, Descriptor, FetchResult,
+    FormatError, FormatPlugin, Loaded, PackageRef, PackageSource, ParsedPackage, Remote,
+    Repository, RepositoryKind, Request, Response, Storage, Unpacked, Uploaded, UpstreamOp,
+    UpstreamStep, UpstreamToken,
 };
 use serde_json::Value;
 
 pub use name::PackageName;
 
-/// The plugin's `plugin.toml`, as the server installs it.
-pub const PLUGIN_TOML: &str = forge_plugin_api::plugin_toml!();
+/// What npm says about itself: its format id, name, version and mount.
+pub const DESCRIPTOR: Descriptor = Descriptor {
+    id: "npm",
+    name: "npm",
+    version: env!("CARGO_PKG_VERSION"),
+    description: "npm registries: publish, install and log in with npm, pnpm, Yarn and Bun; \
+                  dist-tags, deprecations and audits; proxies of registry.npmjs.org and other \
+                  registries.",
+    mount: "/npm",
+    // Proxies mirror another registry through the plugin's upstream side.
+    kinds: &[
+        RepositoryKind::Hosted,
+        RepositoryKind::Proxy,
+        RepositoryKind::Group,
+    ],
+    storage: Storage::Packages,
+    assets: Assets {
+        package: "package.tgz",
+        package_type: "application/octet-stream",
+        manifest: "package.json",
+        manifest_type: "application/json",
+    },
+    // A proxy given only a password (a registry token) sends it as a Bearer
+    // token, as npm clients do with `_authToken`.
+    upstream_token: UpstreamToken::Bearer,
+};
 
 /// What the plugin reads of a request, beyond the package the repository's
 /// upload limit bounds.
@@ -108,6 +133,10 @@ fn dependency_groups(manifest: &serde_json::Map<String, Value>) -> Vec<Dependenc
 }
 
 impl FormatPlugin for Npm {
+    fn descriptor(&self) -> &'static Descriptor {
+        &DESCRIPTOR
+    }
+
     fn canonical_id(&self, id: &str) -> String {
         id.to_string()
     }
