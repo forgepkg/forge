@@ -9,19 +9,25 @@ stays Forge's own. That covers storage, metadata, authentication, RBAC and
 package selectors, hosted, proxy and group repositories, retention, and the
 streaming of package bytes.
 
-Every plugin is built in: a crate under `plugins/<id>/` linked into the
-server and called directly, like any other Rust code. Plugins need no
-configuration. Forge ships one: **NuGet** ([`plugins/nuget`](../plugins/nuget)).
-Helm charts are served by the registry ([docker.md](docker.md#helm-charts)).
+Every plugin is built in: a crate under `crates/formats/<id>/` linked into
+the server and called directly, like any other Rust code. Plugins need no
+configuration. Forge ships two: **NuGet**
+([`crates/formats/nuget`](../crates/formats/nuget)) and **raw files**
+([`crates/formats/raw`](../crates/formats/raw),
+[Files formats](#files-formats)). Helm charts are served by the registry
+([docker.md](docker.md#helm-charts)).
 
-> **Status: preview.** The plugin contract is `forge:format@0.3.0`. It may
+> **Status: preview.** The plugin contract is `forge:format@0.4.0`. It may
 > change before 1.x of the contract; a plugin declares the contract version it
-> was built for, and the server refuses one it does not implement.
+> was built for, and the server refuses one it does not implement. 0.4.0 added
+> files formats ([Files formats](#files-formats)), and `render` returns an
+> action, like `handle`.
 
 ## Contents
 
 - [Layout](#layout)
 - [How it fits together](#how-it-fits-together)
+- [Files formats](#files-formats)
 - [Proxy repositories](#proxy-repositories)
 - [Using a plugin](#using-a-plugin)
 - [Security model](#security-model)
@@ -33,13 +39,22 @@ Helm charts are served by the registry ([docker.md](docker.md#helm-charts)).
 A plugin is a workspace crate with a `plugin.toml`:
 
 ```
-plugins/nuget/
+crates/formats/nuget/
 ├── Cargo.toml
 ├── plugin.toml    # id, name, version, contract version; mount "/v3", kinds hosted/proxy/group
 ├── src/lib.rs     # impl FormatPlugin for Nuget
 ├── src/protocol.rs  # the V3 protocol: handle and render
 ├── src/upstream.rs  # proxies: reading another V3 feed (upstream)
 └── tests/         # the protocol against canned answers (forge-plugin-api `testing`)
+
+crates/formats/raw/
+├── Cargo.toml
+├── plugin.toml    # mount "/raw", storage "files", kinds hosted/proxy/group
+├── src/lib.rs     # impl FormatPlugin for Raw: paths, methods, upstream URLs
+├── src/listing.rs # directory listings as HTML or JSON
+├── src/sidecar.rs # .sha256/.sha512/.sha1/.md5 from the stored digests
+├── src/form.rs    # multipart uploads, Nexus' field names
+└── tests/         # the protocol against canned answers
 ```
 
 The pieces:
@@ -47,9 +62,9 @@ The pieces:
 | Crate | What it holds |
 | --- | --- |
 | [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, and, behind its `testing` feature, helpers that run a plugin's protocol against canned answers. Depends on nothing but `std`. |
-| [`plugins/<id>`](../plugins) | One crate per plugin, implementing `FormatPlugin`. |
+| [`crates/formats/<id>`](../crates/formats) | One crate per plugin, implementing `FormatPlugin`. |
 | [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin: its `plugin.toml` and its implementation) and `PluginFormat`, which adapts it to Forge's `Format` seam. |
-| [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`) and the `{mount}/{repo}/...` dispatcher. |
+| [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `{mount}/{repo}/...` dispatcher, and the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)). |
 
 ## How it fits together
 
@@ -63,6 +78,7 @@ The pieces:
 | Proxies | Sends every upstream request (credentials only to the upstream's origin, bounded, cached), downloads and verifies packages, keeps the package delay, the not-found markers and the offline mode | `upstream`: which documents an operation needs, and what they say ([Proxy repositories](#proxy-repositories)) |
 | Groups | Merges members by priority; the dependency-confusion guards apply | Nothing: a group of plugin repositories just works |
 | Retention | Evaluates policies, ordering versions with the plugin's `compare_versions` | Nothing more |
+| Files (a files format) | Keeps files under paths, content-addressed with their digests: serving, ranges and validators, uploads under the deployment policy, listings, proxies and groups, selectors on paths, retention by path ([Files formats](#files-formats)) | Which path a request names, which file or directory it needs, what the response looks like |
 
 A request to a plugin repository is served under its format's mount,
 `{mount}/{repo}/...`: `/repository` unless the plugin's `plugin.toml` names
@@ -82,9 +98,11 @@ in this order:
 3. Act on the plugin's answer:
    - `respond`: send the response as given, keeping only the allowed headers.
    - `load(queries)`: run the queries, then call `render` with every query
-     and its answer. `render` either responds or asks for more data. One
-     request gets at most 4 rounds and 2,048 answers.
+     and its answer. `render` answers like `handle` does: a response, more
+     data to load, or one of the actions below. One request gets at most 4
+     rounds and 2,048 answers.
    - `download`: stream the stored package.
+   - `serve-file`: stream a stored file (a files format).
    - `publish`, `unlist`, `relist`, `delete`: go through the hosted write
      path, but only when the request's method was authorized for that action
      (a plugin cannot turn a GET into a delete). The repository must be
@@ -103,6 +121,9 @@ Its queries are targeted:
 | `manifest(id, version)` | The manifest stored at publish |
 | `search(text, skip, take, prerelease, semver2, upstream)` | Matching packages with their versions, the latest version's summary and the download total |
 
+A files format asks for files instead ([Files formats](#files-formats)); a
+query of the other kind fails the request.
+
 Prerelease filtering is the host's, and its rule is that a normalized version
 is a prerelease when it contains a `-`; `semver2` adds SemVer 2.0.0 versions
 (dotted prerelease labels, build metadata). Publish times are RFC 3339 in UTC
@@ -119,6 +140,58 @@ NuGet's).
 
 Every listing hands each version's summary to the plugin, so a summary
 should stay small.
+
+## Files formats
+
+A format whose `plugin.toml` says `storage = "files"` holds files under
+paths, not package versions: [raw](raw.md) is one. It keeps the defaults of
+the identity rules and `parse_package` (which refuse every id, version and
+package) and implements the protocol over the host's file store, which keeps
+everything a file repository is: the files, content-addressed, with their
+SHA-256, SHA-512, SHA-1 and MD5; uploads, under the repository's upload
+limit and deployment policy (`allow_redeploy`, `disable_redeploy`,
+`read_only`); serving with one `Range`, `If-Range`, `ETag`, `Last-Modified`
+and conditional requests, under the repository's content disposition;
+listings that walk an index; proxies that fetch on first use, follow
+redirects and re-validate after `max_age_seconds`; groups; package selectors
+on paths; retention by path prefix, age, downloads and the newest N per
+directory; and the web UI's upload, delete and the admin API's directory
+delete.
+
+The plugin decides what a request is, in the vocabulary of paths. A path is
+segments joined by `/`, without a leading or trailing `/`, none of them
+empty, `.` or `..`, nor holding a backslash or a control character
+([`forge_plugin_api::files`](../crates/plugin-api/src/files.rs) parses
+request paths by these rules); a directory is empty (the root) or a path
+ending in `/`. The host refuses any other path a plugin names.
+
+| Query | Answer |
+| --- | --- |
+| `file(path)` | The stored file with its size, content type, digests, modification and last download time, or none. A proxy re-validates its copy once it is due; a group answers with its first member, by priority, that has the path |
+| `fetch-file(path)` | `file`, and a proxy that has not cached the path asks its upstream (`upstream`'s `file` operation) |
+| `directory(directory, after, limit)` | A page of a directory: files and subdirectories in byte order of their names, and the `after` of the next page; none for a directory that does not exist. A group merges its members' entries |
+| `form` | Receives the request's `multipart/form-data` body: file parts are staged, other fields read |
+| `store(files)` | Stores files, each from the request body or a form part, all or none, under the deployment policy; what became of each (`created`, `replaced`, `unchanged`) |
+| `remove(path)` | Deletes a file; whether there was one |
+
+`form`, `store` and `remove` change the repository: each comes alone in its
+round, needs the method's permission (write, or delete for `remove`), a
+hosted repository and a package-client credential, and when one fails (403,
+405, 409, 413) the host answers with its own status. The action
+`serve-file(path)` serves a file as `fetch-file` finds it. The `repository`
+a request is for says whether its files are shown inline (`inline`), for
+responses the plugin renders itself.
+
+Raw maps its URLs onto these: `GET /raw/<repo>/<path>` is `file(path)`
+(and `file` of the file a checksum sidecar names), then `serve-file` or
+the sidecar rendered from the file's digests, else `fetch-file` in a proxy
+or group, else a `directory` probe for a redirect; `GET …/<dir>/` is a
+`directory` page rendered as HTML or JSON; `PUT` is a `store` of the body;
+`POST …/<dir>/` is a `form`, then a `store` of its parts with Nexus' field
+names applied; `DELETE` is a `remove`.
+[crates/formats/raw](../crates/formats/raw) is the whole protocol, in a few
+hundred lines; the file store is
+[`crates/server/src/files`](../crates/server/src/files).
 
 ## Proxy repositories
 
@@ -140,6 +213,7 @@ what they say:
 | `manifest(id, version)` | The manifest, verified to be that version's, without downloading the package |
 | `metadata(versions)`, `dating(versions)` | Per version: listing state, publish time, a manifest summary for a version not downloaded yet, and (`dating`) when it was created upstream, which the package delay counts from |
 | `search(query)` | A page of the upstream's search results |
+| `file(path)` | A files format: the file's URL, or none when the upstream cannot have it. The host downloads it (following redirects; credentials go to `remote_url`'s origin only), caches it, and re-validates it with a conditional GET once the repository's `max_age_seconds` has passed (raw: `<remote_url>/<path>`) |
 
 Each operation is a conversation: `upstream` either answers or asks for
 GETs (`fetch`), and is called again with every fetch so far and how it went
@@ -160,8 +234,8 @@ size bound.
 The host sends a fetch only where the upstream points: to the origin (scheme,
 host and port) of `remote_url`, or to an origin that an absolute `http` or
 `https` URL names in a document the host fetched for the same operation (in an
-earlier round), or while resolving `index`. The URL `package` answers is held
-to the same rule. Anything else is not sent: the fetch comes back as a
+earlier round), or while resolving `index`. The URLs `package` and `file`
+answer are held to the same rule. Anything else is not sent: the fetch comes back as a
 failure, a package URL fails the download like an upstream error, and the host
 logs a warning naming the format and the repository. What the plugin answers
 names no origin: its index is its own making (and the host keeps fields of its
@@ -183,11 +257,12 @@ cached.
 ## Using a plugin
 
 `GET /admin/formats` lists every format the server can create repositories
-of: the plugins (NuGet), Docker and raw files, each with the repository
-kinds it supports and where its repositories are served. The web UI's *New
-repository* form offers them. Plugins serve **hosted** and
+of: the plugins (NuGet, raw files) and Docker, each with the repository
+kinds it supports, what its repositories hold (`storage`: `packages`,
+`files`, or Docker's `images`) and where its repositories are served. The
+web UI's *New repository* form offers them. Plugins serve **hosted** and
 **group** repositories, and **proxies** when they implement the upstream
-side (NuGet does). Docker has proxies of its own.
+side (NuGet and raw do). Docker has proxies of its own.
 
 A repository of a plugin's format is created like any other, with the
 plugin's format id, and served under the plugin's mount (`/repository`
@@ -250,10 +325,10 @@ The host enforces these for every plugin:
   plugin cannot have Forge read `http://localhost:8421/admin/…` or an internal
   search cluster that its upstream does not point at, and pass the answers on
   through the proxy's metadata.
-- **Responses cannot attack the origin.** Only `cache-control`,
+- **Responses cannot attack the origin.** Only `allow`, `cache-control`,
   `content-disposition`, `content-language`, `content-type`, `etag`,
-  `last-modified` and `location` survive; `location` survives only when it
-  stays inside the repository. Every response gets the feed's hardening
+  `last-modified`, `link`, `location` and `vary` survive; `location` and
+  `link` survive only when they stay inside the repository. Every response gets the feed's hardening
   headers (`Content-Security-Policy: sandbox`, `nosniff`,
   `Content-Disposition: attachment`). A plugin cannot set cookies, CORS
   headers, or redirect a client elsewhere.
@@ -272,12 +347,12 @@ policy (an outbound proxy, a Kubernetes `NetworkPolicy`).
 
 ## Writing a plugin
 
-A plugin is a crate in `plugins/<id>/` with a `plugin.toml`, a member of the
-workspace, depending on `forge-plugin-api` and implementing its trait
-([`plugins/nuget`](../plugins/nuget) is a complete one):
+A plugin is a crate in `crates/formats/<id>/` with a `plugin.toml`, a member
+of the workspace, depending on `forge-plugin-api` and implementing its trait
+([`crates/formats/nuget`](../crates/formats/nuget) is a complete one):
 
 ```rust
-use forge_plugin_api::{Action, FormatPlugin, Loaded, Rendered, Repository, Request /* … */};
+use forge_plugin_api::{Action, FormatPlugin, Loaded, Repository, Request /* … */};
 
 /// This crate's plugin.toml (id, name, version).
 pub const PLUGIN_TOML: &str = forge_plugin_api::plugin_toml!();
@@ -288,6 +363,7 @@ pub struct MyFormat;
 impl FormatPlugin for MyFormat {
     // identity: canonical_id, validate_id, normalize_version, compare_versions
     // packages: parse_package, manifest_summary
+    //   (a files format keeps the defaults of these, which refuse everything)
     // protocol: handle, render
     // proxies (optional): upstream
 }
@@ -299,10 +375,11 @@ impl FormatPlugin for MyFormat {
 id = "example"                 # the format id repositories are created with
 name = "Example packages"
 version = "0.1.0"
-api = "0.3.0"                  # the forge:format contract
+api = "0.4.0"                  # the forge:format contract
 mount = "/repository"          # optional: served at {mount}/{repo}/…
 kinds = ["hosted", "group"]    # optional: the repository kinds it serves
                                # ("proxy" too when it implements `upstream`)
+storage = "packages"           # optional: or "files" (Files formats)
 
 [assets]                       # optional: how a version's files are stored
 package = "package"
@@ -327,14 +404,17 @@ rules hold:
   the staged package. Read only what you need, and bound everything you
   decompress: a gzip bomb should fail fast.
 - **Ask for data, don't assume it.** `handle` returns `Action::Load(queries)`;
-  `render` gets each query with its answer and may load more. Build absolute
+  `render` gets each query with its answer and may load more, respond, or
+  hand the request to the host (a download, a publish, serving a file). Build absolute
   URLs from the repository's `base_url`. Groups and kinds are already
   resolved by the time data reaches you.
 - **Test the protocol without a server.** `forge-plugin-api`'s `testing`
   feature runs `handle` and `render` against canned answers to the queries
-  (`testing::serve`), as [`plugins/nuget/tests/protocol.rs`](../plugins/nuget/tests/protocol.rs)
+  (`testing::serve`), as
+  [`crates/formats/nuget/tests/protocol.rs`](../crates/formats/nuget/tests/protocol.rs)
   does; `testing::converse` runs `upstream` against canned upstream
-  documents ([`plugins/nuget/tests/upstream.rs`](../plugins/nuget/tests/upstream.rs)).
+  documents
+  ([`crates/formats/nuget/tests/upstream.rs`](../crates/formats/nuget/tests/upstream.rs)).
 - **Test it in a server.** The crate's unit tests run with the workspace.
   [`crates/server/tests/plugin_contract.rs`](../crates/server/tests/plugin_contract.rs)
   runs a server with a small plugin of its own installed; copy it for a new
@@ -377,7 +457,7 @@ to lift them:
 
 ### NuGet as a plugin
 
-NuGet is a built-in plugin: [`plugins/nuget`](../plugins/nuget)
+NuGet is a built-in plugin: [`crates/formats/nuget`](../crates/formats/nuget)
 implements `FormatPlugin`, and the dispatcher serves it at `/v3/{repo}/...`
 with the same paths, status codes, messages and JSON as before. The pieces it
 needed from the contract are general ones: a mount, its own asset names,
@@ -385,7 +465,7 @@ ranged downloads, paged registrations (`packages-of`), the search options of
 the V3 search service, and publishing the first file of a multipart body.
 
 Its proxies read another V3 feed through the plugin's upstream side
-([`src/upstream.rs`](../plugins/nuget/src/upstream.rs)): the service
+([`src/upstream.rs`](../crates/formats/nuget/src/upstream.rs)): the service
 index's resources, the flat container, the registration (bounded to the
 newest pages a request needs), catalog entries for the package delay of
 unlisted versions, and the search service.
@@ -408,9 +488,11 @@ same way, a group holds members of its format only, and repositories, RBAC,
 package selectors (on image names), retention and the blob store are the
 same as for every other format.
 
-Raw file repositories ([raw.md](raw.md)) are native for similar reasons:
-they hold files under paths, not package versions, list directories, take
-several files in one form, always answer ranges and conditional requests,
-and their proxies follow redirects and re-validate with `If-None-Match`. They
-live in the server (`crates/server/src/raw`, served under `/raw`) and are
-registered like Docker, with selectors on paths.
+Raw file repositories ([raw.md](raw.md)) were native for similar reasons
+until contract 0.4.0: they hold files under paths, not package versions,
+list directories, take several files in one form, always answer ranges and
+conditional requests, and their proxies follow redirects and re-validate with
+`If-None-Match`. 0.4.0 gave the contract a second storage model, files
+([Files formats](#files-formats)), so raw is a plugin now
+([`crates/formats/raw`](../crates/formats/raw)) like NuGet, and what was the
+raw server module is the host's file store.

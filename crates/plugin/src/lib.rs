@@ -6,11 +6,11 @@
 //! storage, metadata, authentication and authorization, hosted/group
 //! semantics, retention, the streaming of package bytes.
 //!
-//! A [`Plugin`] is one installed plugin: a crate under `plugins/<id>/` linked
-//! into the server ([`Plugin::builtin`]) and called directly. The server holds
-//! it as an `Arc<dyn FormatPlugin>`; [`PluginFormat`] adapts it to
-//! [`forge_core::Format`], so hosted publishing, reads, groups and retention
-//! work for it unchanged.
+//! A [`Plugin`] is one installed plugin: a crate under `crates/formats/<id>/`
+//! linked into the server ([`Plugin::builtin`]) and called directly. The
+//! server holds it as an `Arc<dyn FormatPlugin>`; [`PluginFormat`] adapts it
+//! to [`forge_core::Format`], so hosted publishing, reads, groups and
+//! retention work for it unchanged.
 
 mod format;
 pub mod manifest;

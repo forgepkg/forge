@@ -11,7 +11,8 @@ members = [
     "crates/format-oci",
     "crates/server",
     "crates/e2e",
-    "plugins/nuget",
+    "crates/formats/nuget",
+    "crates/formats/raw",
     "xtask",
 ]
 
@@ -54,9 +55,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # compiles in the legacy hyper 0.14 / rustls 0.21 / h2 0.3 connector (never
 # used: the default HTTPS client is hyper 1 / rustls 0.23) and with it
 # RUSTSEC-2026-0258 (h2 0.3) and RUSTSEC-2026-0098/0099/0104 (rustls-webpki
-# 0.101). The list below is the SDK's default set minus `rustls`.
+# 0.101). The list below is the SDK's default set minus `rustls` and
+# `sigv4a`: SigV4a signs only requests to AWS Multi-Region Access Points,
+# which Forge neither documents nor tests, and compiles in crypto-bigint 0.5
+# (RUSTSEC-2026-0387, no fixed 0.5 release, and aws-sigv4 1.6 needs 0.5).
 aws-sdk-s3 = { version = "1.85", default-features = false, features = [
-    "sigv4a",
     "http-1x",
     "default-https-client",
     "rt-tokio",

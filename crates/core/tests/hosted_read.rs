@@ -25,7 +25,7 @@ fn nuget() -> forge_plugin::PluginFormat {
         forge_format_nuget::PLUGIN_TOML,
         forge_format_nuget::Nuget::default(),
     )
-    .expect("plugins/nuget/plugin.toml is valid");
+    .expect("crates/formats/nuget/plugin.toml is valid");
     forge_plugin::PluginFormat::new(&plugin)
 }
 

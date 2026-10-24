@@ -53,16 +53,16 @@ A Cargo workspace of small crates plus the web SPA:
 | `format-oci` | `forge-oci` | Docker / OCI registry: the distribution-spec `/v2` API, manifests, registry tokens, hosted/proxy/group resolution. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
 | `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
-| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`), the Docker registry, raw file repositories (`/raw`), `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `nuget`, `raw`. |
+| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`, raw files at `/raw`), the file store of files formats, the Docker registry, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
-| `plugins/` | `forge-format-*` | Format plugins, built into the server: `nuget`. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
-**Every format is a plugin in `plugins/`.** A package format is a crate in
-`plugins/<id>/` implementing `FormatPlugin`, linked into the server. Docker /
-OCI (`crates/format-oci`) and raw (in `forge-server`) are not there yet and
-are to move to `plugins/docker` and `plugins/raw`.
+**Every format is a plugin in `crates/formats/`.** A package format is a
+crate in `crates/formats/<id>/` implementing `FormatPlugin`, linked into the
+server. Docker / OCI (`crates/format-oci`) is not there yet and is to move to
+`crates/formats/docker`.
 
 **Single-origin serving.** `forge-server` mounts each format plugin's feed
 (NuGet at `/v3`, others at `/repository`), the Docker / OCI registry (`/v2`),
@@ -114,8 +114,9 @@ cargo xtask dev --db none    # assume the DB is already up; don't start one
 ### Run via the Docker image
 
 Every release publishes the signed image to GitHub Packages as
-[`ghcr.io/forgepkg/forge`](https://github.com/forgepkg/forge/pkgs/container/forge)
-(from 2.0.0 on; up to 1.1.0 `ghcr.io/schmitch/forge`; see
+[`ghcr.io/forgepkg/forge`](https://github.com/forgepkg/forge/pkgs/container/forge),
+for `linux/amd64` and `linux/arm64` (from 2.0.0 on; up to 1.1.0
+`ghcr.io/schmitch/forge`, amd64 only; see
 [docs/deployment.md](docs/deployment.md#image)). To build it from a
 checkout instead, the root `Dockerfile` packages the SPA **and** the Rust
 server into one image (no Node in prod):

@@ -52,17 +52,18 @@ permissions:
 # images under the same digests, without Docker Hub's pull rate limit): the
 # service, job and pre-pulled images by name, as the testcontainers harnesses
 # name them in their code, and the Dockerfile's through BuildKit's registry
-# mirror (docker job).
+# mirror (docker-platform job).
 
 # Build caches. A repository's Actions caches share a 10 GB quota, and an
 # entry past it evicts the least recently used. So:
 #   - the cargo caches (Swatinem/rust-cache) hold the registry and the
 #     dependencies' build output only, not the workspace crates or the test
 #     binaries, which every run rebuilds anyway (~19 GB of test binaries);
-#   - only pushes to the default branch save them (and the docker job's
-#     layer cache), in the jobs a push runs, that is when what they build
-#     from changed (#361); pull requests and the merge queue restore those,
-#     and their own copies, which no other ref can read, would evict them.
+#   - only pushes to the default branch save them (and the docker-platform
+#     job's layer caches, one per platform), in the jobs a push runs, that is
+#     when what they build from changed (#361); pull requests and the merge
+#     queue restore those, and their own copies, which no other ref can read,
+#     would evict them.
 
 env:
   CARGO_TERM_COLOR: always
@@ -199,7 +200,7 @@ jobs:
       # sqlx cache drift guard (A1). SQLX_OFFLINE is unset so the check talks
       # to the database.
       - name: Install sqlx-cli (prebuilt, no source compile)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: sqlx-cli@0.9.0
       - name: Run migrations
@@ -225,7 +226,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install cargo-audit (prebuilt, pinned)
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-audit@0.22.2
       - name: cargo audit
@@ -289,11 +290,22 @@ jobs:
   # started the way the Kubernetes manifests run it (#239): read-only root,
   # /tmp a tmpfs, user 10001, the baked forge.toml, a blob cache volume, and a
   # restart (.github/scripts/image-smoke.sh).
-  docker:
-    name: docker
-    runs-on: ubuntu-latest
+  # Once per platform the release publishes (release.yml's PLATFORMS), each
+  # natively on a runner of its own, so a change that breaks only the arm64
+  # image fails here and not in the release.
+  docker-platform:
+    name: docker (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.image != 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The BuildKit release.yml builds with (pinned by digest; keep in step),
@@ -308,21 +320,42 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          platforms: linux/${{ matrix.arch }}
           push: false
           # Into the runner's docker, for the smoke test.
           load: true
           tags: forge:ci
           build-args: |
             FORGE_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha
+          # A cache per platform: in one scope each platform's build would
+          # replace the other's.
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
           # Written by pushes to the default branch only (see the note on
           # build caches at the top).
-          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max' || '' }}
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=docker-{0}', matrix.arch) || '' }}
       - name: Smoke test the image (as the manifests run it)
         env:
           FORGE_SMOKE_POSTGRES_IMAGE: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
           FORGE_SMOKE_S3_IMAGE: mirror.gcr.io/versity/versitygw:v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f
         run: .github/scripts/image-smoke.sh forge:ci "${{ github.sha }}"
+
+  # The required check (and the one release.yml's ci job looks for): passes
+  # when the image of every platform built and passed its smoke test, and is
+  # skipped with them.
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    needs: [changes, docker-platform]
+    if: ${{ !cancelled() && needs.changes.outputs.image != 'false' }}
+    steps:
+      - name: Every platform's image built and passed the smoke test
+        env:
+          RESULT: ${{ needs.docker-platform.result }}
+        run: |
+          if [ "$RESULT" != success ]; then
+            echo "::error::the image of a platform failed (docker-platform: $RESULT)"
+            exit 1
+          fi
 
   # ── Kubernetes manifests (deploy/kubernetes) and Helm chart (deploy/helm) ──
   # Checks that every image reference (Dockerfile, deploy/, the workflows) is

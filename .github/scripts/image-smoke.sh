@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Smoke test of the built container image (used by ci.yml's docker job,
-# #239). Starts the image the way the Kubernetes manifests and the Helm chart
-# run it, checks that it serves, restarts it, and checks again:
+# Smoke test of the built container image (used by ci.yml's docker-platform
+# job on each platform, #239). Starts the image the way the Kubernetes
+# manifests and the Helm chart run it, checks that it serves, restarts it, and
+# checks again:
 #
 #   - read-only root filesystem, /tmp a tmpfs (the manifests' emptyDir), user
 #     10001:10001, every capability dropped, no privilege escalation;
@@ -14,14 +15,16 @@
 #   - PostgreSQL and versitygw (S3) in containers of their own.
 #
 # Each start must reach /readyz. The first checks /version names the commit,
-# serves the web UI and one of its assets, and pushes a NuGet package with an
+# serves the web UI and one of its assets, pushes a NuGet package with an
 # API token (staged in /tmp, stored in S3 and written through to the cache)
-# that downloads unchanged. After the restart (the same database and cache
-# volume, a fresh /tmp) the package downloads unchanged again, served from
-# the cache the startup scan found.
+# that downloads unchanged, and pushes a container image to a docker
+# repository with docker, logged in with the token, that pulls unchanged.
+# After the restart (the same database and cache volume, a fresh /tmp) the
+# package downloads unchanged again, served from the cache the startup scan
+# found.
 #
 # Usage: image-smoke.sh <image> [<commit>]
-# Needs on PATH: docker, curl, jq, cmp. Images (defaults match ci.yml):
+# Needs on PATH: docker, curl, jq, cmp, tar. Images (defaults match ci.yml):
 #   FORGE_SMOKE_POSTGRES_IMAGE (mirror.gcr.io/library/postgres:17)
 #   FORGE_SMOKE_S3_IMAGE       (mirror.gcr.io/versity/versitygw:v1.4.1)
 set -euo pipefail
@@ -39,10 +42,13 @@ s3_secret="smoke-$(openssl rand -hex 12)"
 root_key=$(openssl rand -base64 32)
 net=forge-smoke
 cache_volume=forge-smoke-cache
+# Docker treats a registry on a loopback address as one served over plain HTTP.
+pushed_image="127.0.0.1:$port/docker/smoke/hello:1"
 
 work=$(mktemp -d)
 cleanup() {
-  docker rm -f forge-smoke forge-smoke-db forge-smoke-s3 >/dev/null 2>&1 || true
+  docker rm -f forge-smoke forge-smoke-db forge-smoke-s3 forge-smoke-pulled >/dev/null 2>&1 || true
+  docker rmi "$pushed_image" >/dev/null 2>&1 || true
   docker volume rm "$cache_volume" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
   rm -rf "$work"
@@ -157,6 +163,25 @@ version=$(curl -fsS -u "$admin_user:$token" "$base/v3/nuget/flat/sample.lib/inde
 nupkg_url="$base/v3/nuget/flat/sample.lib/$version/sample.lib.$version.nupkg"
 download
 [ "$(admin GET /admin/blob-cache | jq .entries)" -ge 1 ] || fail "the push left the cache empty"
+
+step "push a container image with docker and pull it"
+admin POST /admin/repositories '{"name":"docker","kind":"hosted","format":"docker"}' >/dev/null \
+  || fail "creating a docker repository failed"
+# A one-layer image of a file only this run has: no other image has its
+# layer, so the pull downloads it. The login's credentials stay in a docker
+# config of its own.
+mkdir -p "$work/image"
+echo "image smoke test $(openssl rand -hex 12)" > "$work/image/hello.txt"
+tar -C "$work/image" -c hello.txt | docker import - "$pushed_image" >/dev/null
+echo "$token" | DOCKER_CONFIG="$work/docker" docker login "127.0.0.1:$port" -u "$admin_user" --password-stdin \
+  || fail "docker login failed"
+DOCKER_CONFIG="$work/docker" docker push "$pushed_image" || fail "docker push failed"
+docker rmi "$pushed_image" >/dev/null
+DOCKER_CONFIG="$work/docker" docker pull "$pushed_image" || fail "docker pull failed"
+# The image has no command to run; the file is copied out of a container.
+docker create --name forge-smoke-pulled "$pushed_image" /hello.txt >/dev/null
+docker cp forge-smoke-pulled:/hello.txt "$work/pulled.txt" >/dev/null
+cmp "$work/image/hello.txt" "$work/pulled.txt" || fail "the pulled image differs from the one pushed"
 
 step "restart on the same database and cache volume"
 docker stop -t 30 forge-smoke >/dev/null

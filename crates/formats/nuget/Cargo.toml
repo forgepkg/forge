@@ -9,7 +9,7 @@ publish.workspace = true
 description = "NuGet V3 feeds for Forge, as a format plugin"
 
 [dependencies]
-forge-plugin-api = { path = "../../crates/plugin-api" }
+forge-plugin-api = { path = "../../plugin-api" }
 
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -20,5 +20,5 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 quick-xml = { version = "0.42" }
 
 [dev-dependencies]
-forge-plugin-api = { path = "../../crates/plugin-api", features = ["testing"] }
+forge-plugin-api = { path = "../../plugin-api", features = ["testing"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }

@@ -1,17 +1,19 @@
 //! `plugin.toml`: what a plugin declares about itself, next to its crate's
-//! `Cargo.toml` (`plugins/<id>/plugin.toml`).
+//! `Cargo.toml` (`crates/formats/<id>/plugin.toml`).
 //!
 //! ```toml
 //! [plugin]
 //! id = "nuget"              # the format id repositories are created with
 //! name = "NuGet"
 //! version = "1.0.0"         # the plugin's own version (informational)
-//! api = "0.3.0"             # the forge:format contract it is built against
+//! api = "0.4.0"             # the forge:format contract it is built against
 //! mount = "/v3"             # optional: served at {mount}/{repository}/…
 //! kinds = ["hosted", "group"] # optional: the repository kinds it supports
 //!                           # ("proxy" too, when it implements `upstream`)
+//! storage = "packages"      # optional: what its repositories hold,
+//!                           # package versions or "files" under paths
 //!
-//! [assets]                  # optional: how its files are stored
+//! [assets]                  # optional: how a version's files are stored
 //! package = "package"
 //! package_type = "application/octet-stream"
 //! manifest = "manifest"
@@ -28,10 +30,9 @@ pub const SUPPORTED_APIS: &[&str] = &[forge_plugin_api::API];
 
 /// Format ids a plugin can never take: the built-in Docker registry's, and
 /// names the server routes or reserves. (A built-in plugin's id, such as
-/// NuGet's, is taken by that plugin: see the server's registry.)
+/// NuGet's or raw's, is taken by that plugin: see the server's registry.)
 const RESERVED_IDS: &[&str] = &[
     "docker",
-    "raw",
     "v2",
     "v3",
     "admin",
@@ -58,7 +59,6 @@ const RESERVED_MOUNTS: &[&str] = &[
     "login",
     "manage",
     "packages",
-    "raw",
     "readyz",
     "realms",
     "repos",
@@ -87,8 +87,31 @@ pub struct Manifest {
     /// The repository kinds the format supports. `proxy` means the plugin
     /// implements [`forge_plugin_api::FormatPlugin::upstream`].
     pub kinds: Vec<RepositoryKind>,
+    /// What the format's repositories hold.
+    pub storage: Storage,
     /// How a version's files are stored.
     pub assets: Assets,
+}
+
+/// What a format's repositories hold (`storage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Storage {
+    /// Package versions: an id, a version, a package file and its manifest
+    /// (NuGet, Helm).
+    #[default]
+    Packages,
+    /// Files under paths, with their digests (raw).
+    Files,
+}
+
+impl Storage {
+    /// The name `plugin.toml` and the admin API use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Storage::Packages => "packages",
+            Storage::Files => "files",
+        }
+    }
 }
 
 /// The `[assets]` table: the names (within a version) and content types of
@@ -131,6 +154,7 @@ struct RawPlugin {
     description: Option<String>,
     mount: Option<String>,
     kinds: Option<Vec<String>>,
+    storage: Option<String>,
 }
 
 impl Manifest {
@@ -155,6 +179,15 @@ impl Manifest {
             None => vec![RepositoryKind::Hosted, RepositoryKind::Group],
             Some(kinds) => parse_kinds(&kinds)?,
         };
+        let storage = match p.storage.as_deref() {
+            None | Some("packages") => Storage::Packages,
+            Some("files") => Storage::Files,
+            Some(other) => {
+                return Err(PluginError::Manifest(format!(
+                    "unknown storage {other:?} (packages, files)"
+                )))
+            }
+        };
         validate_assets(&raw.assets)?;
         Ok(Manifest {
             id: p.id,
@@ -164,6 +197,7 @@ impl Manifest {
             description: p.description,
             mount,
             kinds,
+            storage,
             assets: raw.assets,
         })
     }
@@ -287,7 +321,7 @@ mod tests {
         id = "helm"
         name = "Helm charts"
         version = "0.1.0"
-        api = "0.3.0"
+        api = "0.4.0"
     "#;
 
     #[test]
@@ -327,8 +361,8 @@ mod tests {
 
         let with = |plugin_keys: &str, tables: &str| {
             let text = GOOD.replace(
-                "api = \"0.3.0\"",
-                &format!("api = \"0.3.0\"\n{plugin_keys}"),
+                "api = \"0.4.0\"",
+                &format!("api = \"0.4.0\"\n{plugin_keys}"),
             );
             Manifest::parse(&format!("{text}\n{tables}"))
         };
@@ -354,6 +388,10 @@ mod tests {
         // A plugin with an upstream side serves proxies.
         let m = with("kinds = [\"hosted\", \"proxy\"]", "").unwrap();
         assert_eq!(m.kinds, [RepositoryKind::Hosted, RepositoryKind::Proxy]);
+        assert_eq!(m.storage, Storage::Packages);
+        let m = with("storage = \"files\"", "").unwrap();
+        assert_eq!(m.storage, Storage::Files);
+        assert!(with("storage = \"images\"", "").is_err());
         // `[proxy]` (0.2's host-side upstream protocols) is gone.
         assert!(with("", "[proxy]\nupstream = \"nuget-v3\"\n").is_err());
         for kinds in ["[]", "[\"mirror\"]", "[\"hosted\", \"hosted\"]"] {
@@ -401,9 +439,12 @@ mod tests {
 
     #[test]
     fn refuses_unknown_apis_and_keys() {
-        assert!(Manifest::parse(&GOOD.replace("api = \"0.3.0\"", "api = \"9.0.0\"")).is_err());
-        // 0.1.0 was a preview that no release shipped.
-        assert!(Manifest::parse(&GOOD.replace("api = \"0.3.0\"", "api = \"0.2.0\"")).is_err());
+        assert!(Manifest::parse(&GOOD.replace("api = \"0.4.0\"", "api = \"9.0.0\"")).is_err());
+        // Contracts before 0.4.0 had no files.
+        for old in ["0.2.0", "0.3.0"] {
+            let text = GOOD.replace("api = \"0.4.0\"", &format!("api = {old:?}"));
+            assert!(Manifest::parse(&text).is_err(), "{old} accepted");
+        }
         assert!(Manifest::parse(&format!("{GOOD}\nunknown = 1\n")).is_err());
         // What a WebAssembly component named is gone with it.
         assert!(Manifest::parse(&format!("{GOOD}component = \"helm.wasm\"\n")).is_err());

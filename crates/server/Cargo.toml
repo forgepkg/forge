@@ -22,8 +22,10 @@ forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
 forge-oci = { path = "../format-oci" }
-# The built-in format plugin (plugins/nuget), linked in.
-forge-format-nuget = { path = "../../plugins/nuget" }
+# The built-in format plugins (crates/formats/nuget, crates/formats/raw),
+# linked in.
+forge-format-nuget = { path = "../formats/nuget" }
+forge-format-raw = { path = "../formats/raw" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
 axum = { workspace = true, features = ["multipart"] }
@@ -62,9 +64,9 @@ argon2 = { workspace = true, features = ["password-hash"] }
 tokio-util = { workspace = true }
 # Format-plugin uploads: the named file part of a multipart body, streamed.
 multer = "3"
-# Raw repositories: the MD5 of uploads (the `.md5` sidecar), file paths in
-# URLs, HTTP dates (`Last-Modified`, `If-Modified-Since`) and content types
-# guessed from file names.
+# The file store: the MD5 of uploads (the `.md5` sidecar), file names in
+# headers, HTTP dates (`Last-Modified`, `If-Modified-Since`) and content
+# types guessed from file names.
 md-5 = "0.11"
 percent-encoding = "2.3"
 httpdate = "1"
@@ -88,7 +90,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-u
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 reqwest = { workspace = true, features = ["multipart", "query"] }
-forge-format-nuget = { path = "../../plugins/nuget" }
+forge-format-nuget = { path = "../formats/nuget" }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 figment = { version = "0.10", features = ["toml", "env", "test"] }

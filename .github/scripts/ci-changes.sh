@@ -41,8 +41,8 @@ COMMON=(.github/scripts/ci-changes.sh)
 CI=.github/workflows/ci.yml
 declare -A CI_JOB_GROUP=(
     [fmt]=changelog [clippy]=rust [audit]=audit [test]=rust
-    [docker]=image [kubernetes]=kubernetes [web]=web [oci-e2e]=rust
-    [raw-e2e]=rust [e2e]=rust [web-e2e]=web
+    [docker-platform]=image [docker]=image [kubernetes]=kubernetes [web]=web
+    [oci-e2e]=rust [raw-e2e]=rust [e2e]=rust [web-e2e]=web
 )
 
 # Rust: the workspace, what its build and tests read from outside the crates
@@ -51,7 +51,7 @@ declare -A CI_JOB_GROUP=(
 # reads.
 RUST=(
     Cargo.toml Cargo.lock rust-toolchain.toml .cargo ':(exclude).cargo/audit.toml'
-    crates plugins xtask migrations .sqlx fixtures
+    crates xtask migrations .sqlx fixtures
     web/index.html docker/forge.docker.toml
     .github/scripts/test-parallel.sh .github/scripts/test-timings-runner.sh
     .github/scripts/test-timings-summary.sh .github/scripts/oci-e2e.sh

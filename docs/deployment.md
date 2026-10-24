@@ -206,9 +206,20 @@ credentials here.
 docker pull ghcr.io/<owner>/<repo>:1.0.0
 ```
 
+The image is published for `linux/amd64` and `linux/arm64` (from 2.0.0 on;
+earlier releases are amd64 only) as one multi-platform image: its tags and
+digest name an index of both platforms' images, from which `docker pull` and
+Kubernetes take the image of the node's platform. The Helm chart and the
+manifests therefore deploy to amd64 and arm64 nodes, mixed ones included,
+without a change. Each platform's image is built natively, not under
+emulation.
+
 Release images are signed with keyless cosign and carry an SBOM and a
-provenance attestation. The exact `cosign verify` command is in each GitHub
-release's notes, next to the commit the release was built from. It pins the
+provenance attestation for each platform (`docker buildx imagetools inspect
+ghcr.io/<owner>/<repo>:1.0.0` lists them). The release signs the index and
+each platform's image, and its notes list their digests. The exact `cosign
+verify` command is in each GitHub release's notes, next to the commit the
+release was built from; it passes for each of those digests. It pins the
 signer to this repository's release workflow at that release's tag, run by
 the push of the tag, on that commit:
 
@@ -226,8 +237,8 @@ another commit.
 
 Each release also publishes the Helm chart of the same version,
 `oci://ghcr.io/<owner>/charts/forge`, which pulls the image by the digest the
-release signed. It is signed the same way; its `cosign verify` command is in
-the release notes too.
+release signed, the index's, so each node pulls its platform's image. It is
+signed the same way; its `cosign verify` command is in the release notes too.
 
 `:latest` always names the newest stable release and `:<major>.<minor>` the
 newest release of that line; prereleases and patches to older lines never move
@@ -359,6 +370,31 @@ email went out). `POST /admin/users/{id}/invitation` (`{"send_email": true |
 false, "email": "…"}`) makes a new invitation and `DELETE` revokes it. The
 invited user's page calls `POST /auth/invitations/lookup` and
 `POST /auth/invitations/accept` (`{"token", "password"}`).
+
+### Deactivating users
+
+To cut a user off without deleting the account, deactivate it on the user's
+page (**Admin → Users → <user> → Deactivate**, or `PATCH /admin/users/{id}`
+with `{"active": false}`):
+
+- every sign-in is refused: the password, the browser, OIDC, credential
+  forwarding and API tokens, and no realm provisions the name back to life;
+- the user's browser sessions end, their cached upstream verdicts are
+  dropped, and a pending invitation is revoked;
+- their tokens are refused but **not** revoked: reactivating
+  (`{"active": true}`) lets the unrevoked ones work again, so revoke those
+  that should not before reactivating.
+
+Deactivate, rather than delete, an account to suspend during an incident or
+to keep after its user left: deleting cannot be undone and takes the
+account's tokens, roles and identity links along, and an OIDC realm that
+provisions accounts re-creates a deleted one at its next login.
+
+**Sign out everywhere** (`POST /admin/users/{id}/reauth`) ends the user's
+browser sessions without deactivating the account. For a
+credential-forwarding account the next password is checked against the
+upstream again, and the tokens the user minted from a forwarded sign-in are
+revoked; tokens an administrator issued keep working.
 
 ### Usernames
 

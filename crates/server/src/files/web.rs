@@ -1,12 +1,15 @@
-//! The raw endpoints of the web UI and the admin API.
+//! The file store's endpoints of the web UI and the admin API, for the
+//! repositories of a files format (raw).
 //!
-//! The web UI reads listings from `/raw/<repo>/<dir>/` itself (as JSON, with
-//! its session). Changing files through `/raw` takes an API token, like
-//! every package client, so the UI changes them here, with its session
-//! (whose CSRF token the principal middleware checks):
+//! The web UI reads listings from its format's protocol itself
+//! (`/raw/<repo>/<dir>/` as JSON, with its session). Changing files through
+//! `/raw` takes an API token, like every package client, so the UI changes
+//! them here, with its session (whose CSRF token the principal middleware
+//! checks):
 //!
 //! * `POST /browse/raw/{repo}/files?directory=<dir>` — a multipart upload
-//!   into `<dir>` ([`upload::multipart`]);
+//!   into `<dir>`, each file part stored at its file name
+//!   ([`store::receive_form`], [`store::store`]);
 //! * `DELETE /browse/raw/{repo}/files?path=<file>` — delete a file.
 //!
 //! Both take the same permissions as `/raw`: write (and, to replace a
@@ -23,9 +26,11 @@ use axum::response::{IntoResponse, Json, Response};
 use forge_core::auth::principal::Principal;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{raw_dao, repository_dao};
+use forge_plugin::api::files;
 use serde::Deserialize;
 
-use super::{path, upload, Raw, RawError};
+use super::store::{self, Content, Part, Upload, Via};
+use super::{FileError, Files};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -44,7 +49,7 @@ pub struct PathQuery {
     pub path: String,
 }
 
-/// The raw repository `name` for a signed-in caller (`/browse` is for
+/// The repository of files `name` for a signed-in caller (`/browse` is for
 /// signed-in users only).
 async fn browse_target(
     state: &AppState,
@@ -55,9 +60,14 @@ async fn browse_target(
         return Err((StatusCode::UNAUTHORIZED, "authentication required").into_response());
     }
     match repository_dao::find_repository_by_name(&state.pool, name).await {
-        Ok(Some(repo)) if repo.is_raw() && state.authz.can_read(principal, &repo).await => Ok(repo),
+        Ok(Some(repo))
+            if state.formats.stores_files(&repo.format)
+                && state.authz.can_read(principal, &repo).await =>
+        {
+            Ok(repo)
+        }
         Ok(_) => Err((StatusCode::NOT_FOUND, "repository not found").into_response()),
-        Err(e) => Err(RawError::from(e).into_response()),
+        Err(e) => Err(FileError::from(e).into_response()),
     }
 }
 
@@ -73,17 +83,63 @@ pub async fn browse_upload(
         Ok(repo) => repo,
         Err(response) => return response,
     };
-    let directory = match path::normalize_directory(&query.directory) {
+    let directory = match files::normalize_directory(&query.directory) {
         Ok(dir) => dir,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let raw = Raw {
+    let files = Files {
         state: &state,
         principal,
     };
-    let response = upload::multipart(&raw, &repo, &directory, req, upload::Via::Browser).await;
+    let response = match upload(&files, &repo, &directory, req).await {
+        Ok(stored) => {
+            let status = if stored.iter().any(|f| f.status == "created") {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(serde_json::json!({ "files": stored }))).into_response()
+        }
+        Err(e) => e.into_response(),
+    };
     audit(&repo, "POST", &directory, &principal, &response);
     response
+}
+
+/// Store the file parts of the form `req` carries under `directory`, each
+/// at its file name.
+async fn upload(
+    files: &Files<'_>,
+    repo: &Repository,
+    directory: &str,
+    req: Request,
+) -> Result<Vec<store::Stored>, FileError> {
+    let parts = store::receive_form(files, repo, req, Via::Browser).await?;
+    let mut uploads = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            Part::File {
+                name,
+                content_type,
+                ingested,
+                ..
+            } => uploads.push(Upload {
+                path: files::join(directory, &name)
+                    .map_err(|e| FileError::BadRequest(format!("file name {name:?}: {e}")))?,
+                declared: content_type,
+                content: Content::Staged(*ingested),
+            }),
+            Part::Text { field, .. } => {
+                return Err(FileError::BadRequest(format!(
+                    "unknown form field {field:?} (only files are accepted)"
+                )))
+            }
+        }
+    }
+    if uploads.is_empty() {
+        return Err(FileError::BadRequest("the form holds no file".into()));
+    }
+    store::store(files, repo, uploads, Via::Browser).await
 }
 
 /// `DELETE /browse/raw/{repo}/files?path=<file>`
@@ -98,18 +154,22 @@ pub async fn browse_delete(
         Ok(repo) => repo,
         Err(response) => return response,
     };
-    let file = match path::normalize(&query.path) {
+    let file = match files::normalize(&query.path) {
         Ok(file) if !file.is_empty() && !query.path.ends_with('/') => file,
         Ok(_) => {
             return (StatusCode::BAD_REQUEST, "path must name a file").into_response();
         }
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
-    let raw = Raw {
+    let files = Files {
         state: &state,
         principal,
     };
-    let response = upload::delete(&raw, &repo, &file, upload::Via::Browser).await;
+    let response = match store::remove(&files, &repo, &file, Via::Browser).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => FileError::NotFound.into_response(),
+        Err(e) => e.into_response(),
+    };
     audit(&repo, "DELETE", &file, &principal, &response);
     response
 }
@@ -137,10 +197,10 @@ pub async fn admin_delete(
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => return crate::admin::db_error(e),
     };
-    if !repo.is_raw() {
+    if !state.formats.stores_files(&repo.format) {
         return (
             StatusCode::BAD_REQUEST,
-            "files are deleted from raw repositories",
+            "files are deleted from repositories of files (raw)",
         )
             .into_response();
     }
@@ -153,9 +213,9 @@ pub async fn admin_delete(
     }
     let directory = query.path.is_empty() || query.path.ends_with('/');
     let normalized = match if directory {
-        path::normalize_directory(&query.path)
+        files::normalize_directory(&query.path)
     } else {
-        path::normalize(&query.path)
+        files::normalize(&query.path)
     } {
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),

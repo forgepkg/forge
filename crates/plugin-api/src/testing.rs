@@ -4,7 +4,8 @@
 //! [`FormatPlugin::handle`], answers the queries the plugin asks for with
 //! `answer`, and calls [`FormatPlugin::render`] round by round, under the
 //! host's bounds. What only the host can do (a download, a publish, a
-//! change) comes back as the action, for the test to inspect.
+//! change, serving a file) comes back as the action, for the test to
+//! inspect.
 //!
 //! [`converse`] does the same for the upstream side of a proxy
 //! ([`FormatPlugin::upstream`]): it answers every fetch the plugin asks for
@@ -18,7 +19,7 @@
 //! assert_eq!(served.response().status, 200);
 //! ```
 
-use crate::{Action, Answer, FormatPlugin, Loaded, Query, Rendered, Repository, RepositoryKind};
+use crate::{Action, Answer, FormatPlugin, Loaded, Query, Repository, RepositoryKind};
 use crate::{Fetch, FetchResult, Fetched, FormatError, Remote, UpstreamAnswer, UpstreamOp};
 use crate::{Request, Response, UpstreamStep};
 
@@ -35,6 +36,7 @@ pub fn repository(kind: RepositoryKind, mount: &str) -> Repository {
         name: "repo".into(),
         kind,
         base_url: format!("https://forge.example.com{mount}/repo"),
+        inline: false,
     }
 }
 
@@ -97,13 +99,8 @@ pub fn serve(
             });
         }
         match plugin.render(repo, req, &data) {
-            Rendered::Respond(response) => {
-                return Served {
-                    outcome: Action::Respond(response),
-                    queries,
-                }
-            }
-            Rendered::Load(more) => pending = more,
+            Action::Load(more) => pending = more,
+            outcome => return Served { outcome, queries },
         }
     }
     Served {

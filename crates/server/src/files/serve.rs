@@ -1,69 +1,20 @@
-//! Answering for a stored file: its bytes (whole or one range), its
-//! validators and conditional requests, and its checksum sidecars.
+//! Serving a stored file (the `serve-file` action): its bytes (whole or one
+//! range), its validators and conditional requests, its content type and
+//! the repository's content disposition.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use forge_db::model::Repository;
 use forge_db::raw_dao::{self, RawFile};
+use forge_plugin::api::files;
 use forge_storage::BlobRef;
 
-use super::path;
 use crate::feed::{byte_range, ByteRange};
 use crate::state::AppState;
-
-/// A checksum sidecar: `<file>.<extension>` answered from the file's stored
-/// digests when no file of that name is stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Checksum {
-    Sha256,
-    Sha512,
-    Sha1,
-    Md5,
-}
-
-impl Checksum {
-    const ALL: [Checksum; 4] = [
-        Checksum::Sha256,
-        Checksum::Sha512,
-        Checksum::Sha1,
-        Checksum::Md5,
-    ];
-
-    fn extension(self) -> &'static str {
-        match self {
-            Checksum::Sha256 => ".sha256",
-            Checksum::Sha512 => ".sha512",
-            Checksum::Sha1 => ".sha1",
-            Checksum::Md5 => ".md5",
-        }
-    }
-
-    /// The digest of `file` as lowercase hex.
-    pub fn hex(self, file: &RawFile) -> String {
-        match self {
-            Checksum::Sha256 => file.blob_sha256.clone(),
-            Checksum::Sha512 => base64::engine::general_purpose::STANDARD
-                .decode(&file.sha512_base64)
-                .map(hex::encode)
-                .unwrap_or_default(),
-            Checksum::Sha1 => file.sha1.clone(),
-            Checksum::Md5 => file.md5.clone(),
-        }
-    }
-}
-
-/// The file a sidecar path is the checksum of, and which checksum.
-pub fn sidecar_of(path: &str) -> Option<(&str, Checksum)> {
-    Checksum::ALL.into_iter().find_map(|checksum| {
-        let base = path.strip_suffix(checksum.extension())?;
-        (!base.is_empty() && !base.ends_with('/')).then_some((base, checksum))
-    })
-}
 
 /// The `ETag` of a file: its SHA-256, a strong validator.
 pub fn etag(file: &RawFile) -> String {
@@ -122,7 +73,7 @@ pub fn content_disposition(repo: &Repository, file_path: &str) -> HeaderValue {
     } else {
         "attachment"
     };
-    let name = path::file_name(file_path);
+    let name = files::file_name(file_path);
     let plain = name
         .chars()
         .all(|c| c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\');
@@ -200,7 +151,7 @@ pub async fn file(
         match state.blob_store.open(blob, span.clone()).await {
             Ok(stream) => Body::from_stream(stream),
             Err(error) if error.is_unavailable() => {
-                tracing::warn!(%error, path = %file.path, "raw: object store unavailable");
+                tracing::warn!(%error, path = %file.path, "files: object store unavailable");
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     [(header::RETRY_AFTER, "30")],
@@ -209,7 +160,7 @@ pub async fn file(
                     .into_response();
             }
             Err(error) => {
-                tracing::error!(%error, path = %file.path, s3_key = %file.s3_key, "raw: blob read failed");
+                tracing::error!(%error, path = %file.path, s3_key = %file.s3_key, "files: blob read failed");
                 return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
             }
         }
@@ -240,53 +191,10 @@ pub async fn file(
         let id = file.id;
         tokio::spawn(async move {
             if let Err(error) = raw_dao::touch_downloaded(&pool, id).await {
-                tracing::debug!(%error, "raw: could not record a download");
+                tracing::debug!(%error, "files: could not record a download");
             }
         });
     }
-    response
-}
-
-/// Answer `GET`/`HEAD` of the `checksum` sidecar of `base`: the digest and
-/// the file name, as `sha256sum` and friends print them, so `sha256sum -c`
-/// checks a download against it.
-pub fn sidecar(
-    repo: &Repository,
-    sidecar_path: &str,
-    base: &RawFile,
-    checksum: Checksum,
-    request: &HeaderMap,
-    head: bool,
-) -> Response {
-    let etag = format!(
-        "\"{}{}\"",
-        base.blob_sha256,
-        checksum.extension().replace('.', "-")
-    );
-    let modified = http_date(base.updated_at);
-    if not_modified(request, &etag, base.updated_at) {
-        let mut response = StatusCode::NOT_MODIFIED.into_response();
-        validators(response.headers_mut(), &etag, &modified);
-        return response;
-    }
-    let text = format!("{}  {}\n", checksum.hex(base), path::file_name(&base.path));
-    let length = text.len();
-    let mut response = if head {
-        Response::new(Body::empty())
-    } else {
-        Response::new(Body::from(text))
-    };
-    let out = response.headers_mut();
-    out.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    out.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
-    out.insert(
-        header::CONTENT_DISPOSITION,
-        content_disposition(repo, sidecar_path),
-    );
-    validators(out, &etag, &modified);
     response
 }
 
@@ -306,8 +214,7 @@ mod tests {
             s3_key: "k".into(),
             size: 10,
             content_type: "application/gzip".into(),
-            // SHA-512 of nothing in particular: 64 zero bytes.
-            sha512_base64: base64::engine::general_purpose::STANDARD.encode([0u8; 64]),
+            sha512_base64: String::new(),
             sha1: "cd".repeat(20),
             md5: "ef".repeat(16),
             created_at: t,
@@ -317,21 +224,6 @@ mod tests {
             upstream_last_modified: None,
             checked_at: None,
         }
-    }
-
-    #[test]
-    fn sidecars_name_their_file() {
-        assert_eq!(
-            sidecar_of("a/x.tgz.sha256"),
-            Some(("a/x.tgz", Checksum::Sha256))
-        );
-        assert_eq!(sidecar_of("x.md5"), Some(("x", Checksum::Md5)));
-        assert_eq!(sidecar_of(".sha1"), None);
-        assert_eq!(sidecar_of("a/.sha1"), None);
-        assert_eq!(sidecar_of("a/x.tgz"), None);
-        let file = raw_file();
-        assert_eq!(Checksum::Sha512.hex(&file), "00".repeat(64));
-        assert_eq!(Checksum::Md5.hex(&file), "ef".repeat(16));
     }
 
     #[test]

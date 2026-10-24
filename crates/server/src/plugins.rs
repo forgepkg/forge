@@ -12,21 +12,26 @@
 //! * **Queries** the plugin asks for run through the same read ops as every
 //!   other read ([`AppState::read_ops_for`]): package selectors, group
 //!   members the caller cannot see, prefer-hosted and reserved prefixes all
-//!   apply, and an id the format does not accept is unknown. A request may
-//!   load at most [`MAX_QUERIES`] answers in at most [`MAX_ROUNDS`] rounds.
+//!   apply, and an id the format does not accept is unknown. A files
+//!   format's queries go to the file store ([`crate::files`]), with the same
+//!   selectors on paths. A request may load at most [`MAX_QUERIES`] answers
+//!   in at most [`MAX_ROUNDS`] rounds.
 //! * **Downloads** are streamed from the blob store and counted, exactly as
-//!   NuGet's, answering a single `Range` when the blob source serves ranges.
+//!   NuGet's, answering a single `Range` when the blob source serves ranges;
+//!   a file is served by the file store ([`crate::files::serve`]).
 //! * **Publishing, unlisting, relisting and deleting** go through the hosted
 //!   write path (CAS staging, size cap, selector and redeploy policy,
-//!   trusted-publishing audit), and only when the request's method was
+//!   trusted-publishing audit), and receiving, storing and deleting files
+//!   through the file store's, only when the request's method was
 //!   authorized for that action and carries an API token or workload
 //!   identity.
 //! * **Responses** the plugin renders keep only the headers in
-//!   [`PASSED_RESPONSE_HEADERS`] (no cookies, no CORS, no redirects off this
-//!   repository) and get the feed's hardening headers.
+//!   [`PASSED_RESPONSE_HEADERS`] (no cookies, no CORS, no redirects or links
+//!   off this repository) and get the feed's hardening headers.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::feed::{byte_range, ByteRange, PackageBytes};
 use axum::body::Body;
@@ -42,10 +47,11 @@ use forge_core::repo::{
     UploadReader, WriteError,
 };
 use forge_db::model::Repository;
+use forge_db::raw_dao::RawFile;
 use forge_db::repository_dao;
 use forge_plugin::api::{
     self as protocol, Action, Answer, ChangeRequest, FormatPlugin, Loaded, PackageInfo, PackageRef,
-    PublishRequest, Query, Rendered, Upload,
+    PublishRequest, Query, Upload,
 };
 use forge_plugin::Plugin;
 use futures_util::{StreamExt, TryStreamExt};
@@ -55,6 +61,8 @@ use crate::dispatch::{
     action_for_method, authz_denied, offline_response, offline_serves_nothing,
     principal_allows_protocol_mutations, HostedWriteAdapter,
 };
+use crate::files::store::{Content, Ingested, Part, Via};
+use crate::files::{FileError, Files};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -82,7 +90,8 @@ pub const PASSED_REQUEST_HEADERS: &[&str] = &[
     "user-agent",
 ];
 
-/// Response headers a plugin may set. `location` only within its repository.
+/// Response headers a plugin may set. `location` and `link` only within its
+/// repository.
 pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
     "allow",
     "cache-control",
@@ -91,18 +100,24 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
     "content-type",
     "etag",
     "last-modified",
+    "link",
     "location",
+    "vary",
 ];
 
-/// The format plugins built into this server: crates under `plugins/<id>/`,
-/// linked in and always installed (NuGet). NuGet reads archives under
-/// `nuget_limits` (`[nuget]`).
+/// The format plugins built into this server: crates under
+/// `crates/formats/<id>/`, linked in and always installed (NuGet, raw). NuGet
+/// reads archives under `nuget_limits` (`[nuget]`).
 pub fn builtin(nuget_limits: forge_format_nuget::NupkgLimits) -> Vec<Arc<Plugin>> {
-    vec![Plugin::builtin(
-        forge_format_nuget::PLUGIN_TOML,
-        forge_format_nuget::Nuget::with_limits(nuget_limits),
-    )
-    .expect("plugins/nuget/plugin.toml is valid")]
+    vec![
+        Plugin::builtin(
+            forge_format_nuget::PLUGIN_TOML,
+            forge_format_nuget::Nuget::with_limits(nuget_limits),
+        )
+        .expect("crates/formats/nuget/plugin.toml is valid"),
+        Plugin::builtin(forge_format_raw::PLUGIN_TOML, forge_format_raw::Raw)
+            .expect("crates/formats/raw/plugin.toml is valid"),
+    ]
 }
 
 /// Axum handler mounted at `/repository/{repo}` (and everything under it).
@@ -113,13 +128,14 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
 }
 
 /// `(mount, repository name, rest of the path)` of a `{mount}/{repo}/...`
-/// path, for one of `mounts`; the rest starts with `/`.
+/// path, for one of `mounts`; the rest starts with `/`, or is empty when the
+/// path ends with the repository's name.
 fn split_path<'p>(path: &'p str, mounts: &[&str]) -> Option<(&'p str, &'p str, &'p str)> {
     mounts.iter().find_map(|mount| {
         let rest = path.strip_prefix(mount)?.strip_prefix('/')?;
         let (name, rest) = match rest.find('/') {
             Some(i) => rest.split_at(i),
-            None => (rest, "/"),
+            None => (rest, ""),
         };
         (!name.is_empty()).then(|| (&path[..mount.len()], name, rest))
     })
@@ -182,13 +198,19 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         Ok(format) => format,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
+    let stores_files = format.stores_files();
     let package_filter = state
         .authz
         .package_filter_for(&principal, &repo, permission)
         .await;
-    let ops = match state.read_ops_for(&repo, principal).await {
-        Ok(ops) => ops,
-        Err(e) => return repo_error(e),
+    // A files format reads the file store, never the package read ops.
+    let ops = if stores_files {
+        None
+    } else {
+        match state.read_ops_for(&repo, principal).await {
+            Ok(ops) => Some(ops),
+            Err(e) => return repo_error(e),
+        }
     };
 
     let target = protocol::Repository {
@@ -199,6 +221,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
             RepoKind::Group => protocol::RepositoryKind::Group,
         },
         base_url: repository_url(&state, mount, &repo.name),
+        inline: stores_files && repo.inline_content(),
     };
     let request = protocol::Request {
         method: method.as_str().to_string(),
@@ -222,9 +245,13 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         headers: req.headers().clone(),
         plugin: plugin.implementation().clone(),
         format,
+        stores_files,
         ops,
         package_filter,
         target,
+        body: Mutex::new(Some(req)),
+        form: Mutex::new(None),
+        located: Mutex::new(HashMap::new()),
     };
     let handled = {
         let (target, request) = (ctx.target.clone(), request.clone());
@@ -232,7 +259,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
             .await
     };
     let response = match handled {
-        Ok(action) => ctx.perform(action, request, req).await,
+        Ok(action) => ctx.perform(action, request).await,
         Err(response) => response,
     };
     if permission != Permission::Read {
@@ -264,10 +291,21 @@ struct Ctx<'a> {
     headers: axum::http::HeaderMap,
     plugin: Arc<dyn FormatPlugin>,
     format: Arc<dyn Format>,
-    ops: Arc<dyn RepoReadOps>,
+    /// Whether the format's repositories hold files (its plugin asks for
+    /// files, not packages).
+    stores_files: bool,
+    /// The package read ops; `None` for a files format.
+    ops: Option<Arc<dyn RepoReadOps>>,
     /// The caller's package selector for [`Self::permission`].
     package_filter: PackageFilter,
     target: protocol::Repository,
+    /// The request, until a publish or a file query reads its body.
+    body: Mutex<Option<Request<Body>>>,
+    /// The file parts of the form the plugin had received, by their index
+    /// among its parts, until a store takes them.
+    form: Mutex<Option<Vec<Option<Ingested>>>>,
+    /// The files queries found, by path, for serving one of them.
+    located: Mutex<HashMap<String, RawFile>>,
 }
 
 impl Ctx<'_> {
@@ -283,26 +321,59 @@ impl Ctx<'_> {
             .map_err(|e| plugin_failed(self.repo, &e))
     }
 
-    async fn perform(
-        &self,
-        action: Action,
-        request: protocol::Request,
-        req: Request<Body>,
-    ) -> Response {
+    /// Do what the plugin decided, `handle` or the last round of `render`.
+    async fn perform(&self, action: Action, request: protocol::Request) -> Response {
+        if let Action::Load(queries) = action {
+            return self.render(queries, request).await;
+        }
+        self.act(action).await
+    }
+
+    /// Do an action other than loading data.
+    async fn act(&self, action: Action) -> Response {
+        let files_action = matches!(action, Action::ServeFile(_));
+        let package_action = !matches!(action, Action::Respond(_) | Action::ServeFile(_));
+        if (files_action && !self.stores_files) || (package_action && self.stores_files) {
+            return self.plugin_misused("an action of the other storage");
+        }
         match action {
             Action::Respond(response) => self.respond(response),
-            Action::Load(queries) => self.render(queries, request).await,
+            Action::Load(_) => self.plugin_misused("a load as an action"),
             Action::Download(target) => {
                 if self.permission != Permission::Read {
                     return refused("download");
                 }
                 self.download(&target).await
             }
-            Action::Publish(publish) => self.publish(publish, req).await,
+            Action::Publish(publish) => match self.take_body() {
+                Some(req) => self.publish(publish, req).await,
+                None => self.plugin_misused("a publish after the body was read"),
+            },
             Action::Unlist(change) => self.change(change, Change::Unlist).await,
             Action::Relist(change) => self.change(change, Change::Relist).await,
             Action::Delete(change) => self.change(change, Change::Delete).await,
+            Action::ServeFile(path) => {
+                if self.permission != Permission::Read {
+                    return refused("serving a file");
+                }
+                self.serve_file(&path).await
+            }
         }
+    }
+
+    /// The request, for the one query or action that reads its body.
+    fn take_body(&self) -> Option<Request<Body>> {
+        self.body
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// The plugin asked for something the contract does not allow: a bug in
+    /// the plugin, answered with a server error.
+    fn plugin_misused(&self, what: &str) -> Response {
+        tracing::error!(repo = %self.repo.name, format = %self.repo.format, "format plugin asked for {what}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "format plugin failed").into_response()
     }
 
     /// The canonical id the format makes of `raw`, if it is a valid id.
@@ -325,6 +396,9 @@ impl Ctx<'_> {
             if data.len() + queries.len() > MAX_QUERIES {
                 break;
             }
+            if let Err(response) = self.check_round(&queries) {
+                return response;
+            }
             let pending: Vec<_> = queries.iter().map(|query| self.answer(query)).collect();
             let answers: Vec<Answer> = match futures_util::stream::iter(pending)
                 .buffered(CONCURRENT_QUERIES)
@@ -332,7 +406,7 @@ impl Ctx<'_> {
                 .await
             {
                 Ok(answers) => answers,
-                Err(e) => return repo_error(e),
+                Err(response) => return response,
             };
             data.extend(
                 queries
@@ -348,11 +422,11 @@ impl Ctx<'_> {
                 })
                 .await;
             match rendered {
-                Ok((Rendered::Respond(response), _)) => return self.respond(response),
-                Ok((Rendered::Load(more), loaded)) => {
+                Ok((Action::Load(more), loaded)) => {
                     data = loaded;
                     queries = more;
                 }
+                Ok((action, _)) => return self.act(action).await,
                 Err(response) => return response,
             }
         }
@@ -368,12 +442,226 @@ impl Ctx<'_> {
             .into_response()
     }
 
-    async fn answer(&self, query: &Query) -> Result<Answer, RepoError> {
+    /// Whether a round of queries keeps to the contract: queries of the
+    /// format's storage only, and a change (`form`, `store`, `remove`) alone
+    /// in its round.
+    fn check_round(&self, queries: &[Query]) -> Result<(), Response> {
+        if queries.iter().any(|q| q.is_files() != self.stores_files) {
+            return Err(self.plugin_misused("a query of the other storage"));
+        }
+        if queries.len() > 1 && queries.iter().any(Query::is_change) {
+            return Err(self.plugin_misused("a change with other queries in its round"));
+        }
+        Ok(())
+    }
+
+    /// The answer to one query, or the response that ends the request
+    /// instead.
+    async fn answer(&self, query: &Query) -> Result<Answer, Response> {
+        if query.is_files() {
+            return self.answer_files(query).await;
+        }
+        let Some(ops) = &self.ops else {
+            return Err(self.plugin_misused("packages of a files format"));
+        };
+        self.answer_packages(ops.as_ref(), query)
+            .await
+            .map_err(repo_error)
+    }
+
+    /// The answer to a files query, from the file store.
+    async fn answer_files(&self, query: &Query) -> Result<Answer, Response> {
+        let files = Files {
+            state: self.state,
+            principal: self.principal,
+        };
+        let failed = |e: FileError| e.into_response();
+        match query {
+            Query::File(path) | Query::FetchFile(path) => {
+                if forge_plugin::api::files::validate_path(path).is_err() {
+                    return Err(self.plugin_misused("a file at an invalid path"));
+                }
+                let fetch = matches!(query, Query::FetchFile(_));
+                let found = files
+                    .locate(self.repo, path, fetch, Vec::new(), 0)
+                    .await
+                    .map_err(failed)?;
+                if let Some(file) = &found {
+                    self.located
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(path.clone(), file.clone());
+                }
+                Ok(Answer::File(found.as_ref().map(file_info)))
+            }
+            Query::Directory(wanted) => {
+                if forge_plugin::api::files::validate_directory(&wanted.directory).is_err() {
+                    return Err(self.plugin_misused("an invalid directory"));
+                }
+                let page = files
+                    .list(
+                        self.repo,
+                        &wanted.directory,
+                        wanted.after.as_deref(),
+                        wanted.limit as usize,
+                    )
+                    .await
+                    .map_err(failed)?;
+                Ok(Answer::Directory(page.map(directory_page)))
+            }
+            Query::Form => {
+                if self.permission != Permission::Write {
+                    return Err(refused("receiving a form"));
+                }
+                let Some(req) = self.take_body() else {
+                    return Err(self.plugin_misused("a form after the body was read"));
+                };
+                let parts =
+                    crate::files::store::receive_form(&files, self.repo, req, Via::Protocol)
+                        .await
+                        .map_err(failed)?;
+                let mut staged = Vec::with_capacity(parts.len());
+                let mut answer = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        Part::File {
+                            field,
+                            name,
+                            content_type,
+                            ingested,
+                        } => {
+                            answer.push(protocol::FormPart {
+                                field,
+                                content: protocol::FormContent::File(protocol::FormFile {
+                                    name,
+                                    content_type,
+                                    size: ingested.stored.size,
+                                }),
+                            });
+                            staged.push(Some(*ingested));
+                        }
+                        Part::Text { field, value } => {
+                            answer.push(protocol::FormPart {
+                                field,
+                                content: protocol::FormContent::Text(value),
+                            });
+                            staged.push(None);
+                        }
+                    }
+                }
+                *self.form.lock().unwrap_or_else(PoisonError::into_inner) = Some(staged);
+                Ok(Answer::Form(answer))
+            }
+            Query::Store(wanted) => {
+                if self.permission != Permission::Write {
+                    return Err(refused("storing files"));
+                }
+                let mut uploads = Vec::with_capacity(wanted.len());
+                for file in wanted {
+                    let content = match file.source {
+                        protocol::FileSource::Body => match self.take_body() {
+                            Some(req) => Content::Body(req),
+                            None => {
+                                return Err(self.plugin_misused("a store of a body already read"))
+                            }
+                        },
+                        protocol::FileSource::Part(index) => match self.take_part(index) {
+                            Some(ingested) => Content::Staged(ingested),
+                            None => {
+                                return Err(self.plugin_misused(
+                                    "a store of a form part that is not a file it may store",
+                                ))
+                            }
+                        },
+                    };
+                    uploads.push(crate::files::store::Upload {
+                        path: file.path.clone(),
+                        declared: file.content_type.clone(),
+                        content,
+                    });
+                }
+                let stored = crate::files::store::store(&files, self.repo, uploads, Via::Protocol)
+                    .await
+                    .map_err(failed)?;
+                Ok(Answer::Stored(
+                    stored
+                        .into_iter()
+                        .map(|stored| protocol::StoredFile {
+                            path: stored.path,
+                            size: stored.size,
+                            sha256: stored.sha256,
+                            status: match stored.status {
+                                "created" => protocol::StoreStatus::Created,
+                                "replaced" => protocol::StoreStatus::Replaced,
+                                _ => protocol::StoreStatus::Unchanged,
+                            },
+                        })
+                        .collect(),
+                ))
+            }
+            Query::Remove(path) => {
+                if self.permission != Permission::Delete {
+                    return Err(refused("deleting a file"));
+                }
+                let removed = crate::files::store::remove(&files, self.repo, path, Via::Protocol)
+                    .await
+                    .map_err(failed)?;
+                Ok(Answer::Removed(removed))
+            }
+            _ => Err(self.plugin_misused("a package query of a files format")),
+        }
+    }
+
+    /// The staged file part `index` of the form the plugin had received,
+    /// taken (a part is stored once).
+    fn take_part(&self, index: u32) -> Option<Ingested> {
+        self.form
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()?
+            .get_mut(usize::try_from(index).ok()?)?
+            .take()
+    }
+
+    /// Serve the file at `path`, as a query found it or as `fetch-file`
+    /// finds it now.
+    async fn serve_file(&self, path: &str) -> Response {
+        let found = self
+            .located
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path)
+            .cloned();
+        let file = match found {
+            Some(file) => file,
+            None => {
+                if forge_plugin::api::files::validate_path(path).is_err() {
+                    return self.plugin_misused("a file at an invalid path");
+                }
+                let files = Files {
+                    state: self.state,
+                    principal: self.principal,
+                };
+                match files.locate(self.repo, path, true, Vec::new(), 0).await {
+                    Ok(Some(file)) => file,
+                    Ok(None) => return FileError::NotFound.into_response(),
+                    Err(e) => return e.into_response(),
+                }
+            }
+        };
+        crate::files::serve::file(self.state, self.repo, &file, &self.headers, self.head).await
+    }
+
+    /// The answer to a package query, through the package read ops.
+    async fn answer_packages(
+        &self,
+        ops: &dyn RepoReadOps,
+        query: &Query,
+    ) -> Result<Answer, RepoError> {
         let repo = &self.repo.name;
         Ok(match query {
             Query::Versions(id) => Answer::Versions(match self.id(id) {
-                Some(id) => self
-                    .ops
+                Some(id) => ops
                     .list_versions(repo, &id)
                     .await?
                     .into_iter()
@@ -387,8 +675,7 @@ impl Ctx<'_> {
                 None => Vec::new(),
             }),
             Query::Packages(id) => Answer::Packages(match self.id(id) {
-                Some(id) => self
-                    .ops
+                Some(id) => ops
                     .registration(repo, &id)
                     .await?
                     .into_iter()
@@ -397,8 +684,7 @@ impl Ctx<'_> {
                 None => Vec::new(),
             }),
             Query::Package(target) => Answer::Package(match self.package(target) {
-                Some((id, version)) => self
-                    .ops
+                Some((id, version)) => ops
                     .registration_entry(repo, &id, &version)
                     .await?
                     .map(|entry| self.package_info(entry)),
@@ -415,7 +701,7 @@ impl Ctx<'_> {
                     let mut entries = if versions.is_empty() {
                         Vec::new()
                     } else {
-                        self.ops.registration_entries(repo, &id, &versions).await?
+                        ops.registration_entries(repo, &id, &versions).await?
                     };
                     entries.sort_by(|a, b| self.format.compare_versions(&a.version, &b.version));
                     entries
@@ -426,7 +712,7 @@ impl Ctx<'_> {
                 None => Vec::new(),
             }),
             Query::Manifest(target) => Answer::Manifest(match self.package(target) {
-                Some((id, version)) => self.ops.resolve_nuspec(repo, &id, &version).await?,
+                Some((id, version)) => ops.resolve_nuspec(repo, &id, &version).await?,
                 None => None,
             }),
             Query::Search(search) => {
@@ -439,7 +725,7 @@ impl Ctx<'_> {
                     include_semver2: search.semver2,
                     include_upstream: search.upstream,
                 };
-                let result = self.ops.search(repo, &params).await?;
+                let result = ops.search(repo, &params).await?;
                 Answer::Search(protocol::SearchResult {
                     total: u32::try_from(result.total_hits).unwrap_or(u32::MAX),
                     hits: result
@@ -467,6 +753,17 @@ impl Ctx<'_> {
                         .collect(),
                 })
             }
+            // Answered by `answer_files`.
+            Query::File(_)
+            | Query::FetchFile(_)
+            | Query::Directory(_)
+            | Query::Form
+            | Query::Store(_)
+            | Query::Remove(_) => {
+                return Err(RepoError::Storage(
+                    "a files query of a package format".into(),
+                ))
+            }
         })
     }
 
@@ -475,13 +772,14 @@ impl Ctx<'_> {
         let Some((id, version)) = self.package(target) else {
             return (StatusCode::NOT_FOUND, "package not found").into_response();
         };
+        let Some(ops) = &self.ops else {
+            return self.plugin_misused("a package download of a files format");
+        };
         // A HEAD (a probe, a mirror tool) is not a download.
         let resolved = if self.head {
-            self.ops
-                .resolve_nupkg_head(&self.repo.name, &id, &version)
-                .await
+            ops.resolve_nupkg_head(&self.repo.name, &id, &version).await
         } else {
-            self.ops.resolve_nupkg(&self.repo.name, &id, &version).await
+            ops.resolve_nupkg(&self.repo.name, &id, &version).await
         };
         let location = match resolved {
             Ok(Some(location)) => location,
@@ -705,6 +1003,9 @@ impl Ctx<'_> {
             if name == "location" && !self.within_repository(value) {
                 continue;
             }
+            if name == "link" && !self.links_within_repository(value) {
+                continue;
+            }
             let (Ok(name), Ok(value)) = (
                 header::HeaderName::from_bytes(name.as_bytes()),
                 HeaderValue::from_str(value),
@@ -713,10 +1014,13 @@ impl Ctx<'_> {
             };
             out.headers_mut().append(name, value);
         }
-        out.headers_mut().insert(
-            header::CONTENT_LENGTH,
-            HeaderValue::from(response.body.len()),
-        );
+        // A 204 or a 304 has no body, and says nothing of its length.
+        if !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED) {
+            out.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from(response.body.len()),
+            );
+        }
         if !self.head {
             *out.body_mut() = Body::from(response.body);
         }
@@ -729,6 +1033,12 @@ impl Ctx<'_> {
     /// backslashes (which browsers read as `/`).
     fn within_repository(&self, location: &str) -> bool {
         within(location, self.mount, &self.repo.name, &self.target.base_url)
+    }
+
+    /// Whether every target of a `Link` header (`<url>; rel=...`, comma
+    /// separated) stays inside this repository.
+    fn links_within_repository(&self, value: &str) -> bool {
+        links_within(value, self.mount, &self.repo.name, &self.target.base_url)
     }
 }
 
@@ -821,6 +1131,39 @@ fn multipart_reader(
     Ok(Box::new(StreamReader::new(stream)))
 }
 
+/// A stored file as the plugin sees it.
+fn file_info(file: &RawFile) -> protocol::FileInfo {
+    let time =
+        |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    protocol::FileInfo {
+        path: file.path.clone(),
+        size: u64::try_from(file.size).unwrap_or(0),
+        content_type: file.content_type.clone(),
+        sha256: file.blob_sha256.clone(),
+        sha512: file.sha512_base64.clone(),
+        sha1: file.sha1.clone(),
+        md5: file.md5.clone(),
+        modified: time(file.updated_at),
+        last_downloaded: file.last_downloaded_at.map(time),
+    }
+}
+
+/// A page of a directory as the plugin sees it.
+fn directory_page(page: crate::files::listing::Page) -> protocol::DirectoryPage {
+    use crate::files::listing::EntryKind;
+    protocol::DirectoryPage {
+        entries: page
+            .entries
+            .into_iter()
+            .map(|entry| match entry.kind {
+                EntryKind::File(file) => protocol::DirectoryEntry::File(file_info(&file)),
+                EntryKind::Directory(path) => protocol::DirectoryEntry::Directory(path),
+            })
+            .collect(),
+        next: page.next,
+    }
+}
+
 /// The absolute URL of repository `name` served under `mount`:
 /// `{public_base_url}{mount}/{name}`, the base its plugin builds URLs on and
 /// the address its clients are given.
@@ -831,17 +1174,46 @@ pub fn repository_url(state: &AppState, mount: &str, name: &str) -> String {
     )
 }
 
-/// See [`Ctx::within_repository`].
+/// See [`Ctx::within_repository`]. A path may also start with the path of
+/// `base_url` (a public base URL with a path of its own).
 fn within(location: &str, mount: &str, repo: &str, base_url: &str) -> bool {
     let path_prefix = format!("{mount}/{repo}/");
     let absolute_prefix = format!("{base_url}/");
+    let base_path_prefix = url::Url::parse(base_url)
+        .ok()
+        .map(|url| format!("{}/", url.path().trim_end_matches('/')));
     let lower = location.to_ascii_lowercase();
-    (location.starts_with(&path_prefix) || location.starts_with(&absolute_prefix))
+    (location.starts_with(&path_prefix)
+        || location.starts_with(&absolute_prefix)
+        || base_path_prefix
+            .as_deref()
+            .is_some_and(|prefix| prefix != "/" && location.starts_with(prefix)))
         && !location
             .split(['/', '?', '#'])
             .any(|seg| seg == ".." || seg == ".")
         && !lower.contains("%2e")
         && !location.contains('\\')
+}
+
+/// See [`Ctx::links_within_repository`]: every `<…>` of `value` is
+/// [`within`] the repository, and there is one at least.
+fn links_within(value: &str, mount: &str, repo: &str, base_url: &str) -> bool {
+    let mut targets = 0;
+    for link in value.split(',') {
+        let Some(target) = link
+            .trim()
+            .strip_prefix('<')
+            .and_then(|rest| rest.split_once('>'))
+            .map(|(target, _)| target)
+        else {
+            return false;
+        };
+        if !within(target, mount, repo, base_url) {
+            return false;
+        }
+        targets += 1;
+    }
+    targets > 0
 }
 
 /// A header value of ASCII digits and punctuation.
@@ -939,7 +1311,7 @@ mod tests {
         );
         assert_eq!(
             split("/repository/charts"),
-            Some(("/repository", "charts", "/"))
+            Some(("/repository", "charts", ""))
         );
         assert_eq!(
             split("/repository/charts/"),
@@ -961,6 +1333,28 @@ mod tests {
     }
 
     #[test]
+    fn links_stay_inside_the_repository() {
+        let base = "https://forge.example.com/raw/bin";
+        let ok = "<https://forge.example.com/raw/bin/a/?after=x>; rel=\"next\"";
+        assert!(links_within(ok, "/raw", "bin", base));
+        assert!(links_within(
+            "</raw/bin/a/?after=x>; rel=\"next\", </raw/bin/>; rel=\"up\"",
+            "/raw",
+            "bin",
+            base
+        ));
+        for bad in [
+            "<https://evil.example.com/>; rel=\"next\"",
+            "</raw/other/>; rel=\"next\"",
+            "</raw/bin/>; rel=\"next\", <https://evil.example.com/>; rel=\"preload\"",
+            "rel=\"next\"",
+            "",
+        ] {
+            assert!(!links_within(bad, "/raw", "bin", base), "{bad}");
+        }
+    }
+
+    #[test]
     fn redirects_stay_inside_the_repository() {
         let base = "https://forge.example.com/repository/charts";
         for ok in [
@@ -969,6 +1363,13 @@ mod tests {
         ] {
             assert!(within(ok, "/repository", "charts", base), "{ok}");
         }
+        // Behind a public base URL with a path, the repository's path.
+        assert!(within(
+            "/forge/repository/charts/index.yaml",
+            "/repository",
+            "charts",
+            "https://forge.example.com/forge/repository/charts"
+        ));
         for bad in [
             "https://evil.example.com/",
             "//evil.example.com/repository/charts/x",

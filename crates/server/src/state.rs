@@ -33,7 +33,7 @@ use forge_core::repo::{
 };
 use forge_core::retention::FormatResolver;
 use forge_core::session::SessionService;
-use forge_db::model::{RepoKind, Repository, DOCKER_FORMAT, RAW_FORMAT};
+use forge_db::model::{RepoKind, Repository, DOCKER_FORMAT};
 use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
@@ -137,15 +137,16 @@ impl Instance {
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
-/// [`Format`] and its plugin: the built-in format plugin
-/// ([`crate::plugins::builtin`]: NuGet), Docker and raw.
+/// [`Format`] and its plugin: the built-in format plugins
+/// ([`crate::plugins::builtin`]: NuGet, raw) and Docker.
 ///
-/// Docker ([`DOCKER_FORMAT`]) and raw ([`RAW_FORMAT`]) are installed but have
-/// no [`Format`]: their repositories hold images (manifests and blobs) or
-/// files under paths, not package versions, and are served by the registry
-/// under `/v2` ([`crate::registry`]) and under `/raw` ([`crate::raw`]), so
-/// none of the package seams (parsing, version order, the read ops) apply to
-/// them.
+/// Docker ([`DOCKER_FORMAT`]) is installed but has no [`Format`]: its
+/// repositories hold images (manifests and blobs), not package versions,
+/// and are served by the registry under `/v2` ([`crate::registry`]), so none
+/// of the package seams (parsing, version order, the read ops) apply to
+/// them. A files format (raw) has a [`Format`] whose
+/// [`Format::stores_files`] says so: its repositories hold files in the
+/// file store ([`crate::files`]).
 pub struct FormatRegistry {
     formats: BTreeMap<String, Arc<dyn Format>>,
     /// Every format's plugin, by format id: its client protocol.
@@ -210,14 +211,20 @@ impl FormatRegistry {
     }
 
     /// Whether format `id` is one served natively, without a [`Format`]:
-    /// Docker and raw.
+    /// Docker.
     pub fn is_native(id: &str) -> bool {
-        id == DOCKER_FORMAT || id == RAW_FORMAT
+        id == DOCKER_FORMAT
     }
 
-    /// Whether format `id` is installed: Docker, raw, or a format plugin.
+    /// Whether format `id` is installed: Docker, or a format plugin.
     pub fn is_installed(&self, id: &str) -> bool {
         Self::is_native(id) || self.formats.contains_key(id)
+    }
+
+    /// Whether format `id`'s repositories hold files under paths (raw): it
+    /// is installed and its `plugin.toml` says `storage = "files"`.
+    pub fn stores_files(&self, id: &str) -> bool {
+        self.formats.get(id).is_some_and(|f| f.stores_files())
     }
 
     /// The mounts plugin formats are served under, sorted and distinct
@@ -237,14 +244,13 @@ impl FormatRegistry {
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         let mut ids: Vec<&str> = self.formats.keys().map(String::as_str).collect();
         ids.push(DOCKER_FORMAT);
-        ids.push(RAW_FORMAT);
         ids.sort_unstable();
         ids.into_iter()
     }
 
     /// The repository kinds format `id` supports, `None` when it is not
-    /// installed. Docker and raw have every kind; a format plugin serves the
-    /// kinds its `plugin.toml` names (NuGet's all three).
+    /// installed. Docker has every kind; a format plugin serves the kinds its
+    /// `plugin.toml` names (NuGet's and raw's all three).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
         if Self::is_native(id) {
             return Some(vec!["hosted", "proxy", "group"]);
@@ -670,10 +676,13 @@ mod tests {
             registry.ids().collect::<Vec<_>>(),
             ["docker", "nuget", "raw"]
         );
-        assert!(registry.is_installed(RAW_FORMAT));
-        assert!(registry.get(RAW_FORMAT).is_none());
+        // Raw is a built-in plugin whose repositories hold files.
+        assert!(registry.get("raw").is_some());
+        assert!(registry.stores_files("raw"));
+        assert!(!registry.stores_files("nuget"));
+        assert!(!registry.stores_files(DOCKER_FORMAT));
         assert_eq!(
-            registry.kinds(RAW_FORMAT),
+            registry.kinds("raw"),
             Some(vec!["hosted", "proxy", "group"])
         );
         assert_eq!(
@@ -690,8 +699,8 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_cannot_take_dockers_or_raws_id() {
-        for id in ["docker", "raw"] {
+    fn a_plugin_cannot_take_dockers_or_a_builtin_plugins_id() {
+        for id in ["docker", "nuget", "raw"] {
             let registry = FormatRegistry::new(Default::default());
             let err = registry
                 .with_format(Arc::new(Named(id)))

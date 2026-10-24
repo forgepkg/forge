@@ -83,7 +83,7 @@ fn main() -> ExitCode {
         "prepare-check" => prepare_check(),
         "clean" => clean(),
         // Docker image (build it; run it against the dev infra)
-        "docker-build" => docker_build(),
+        "docker-build" => docker_build(rest),
         "docker-run" => docker_run(),
         // Release
         "changelog" => changelog::changelog(rest),
@@ -152,8 +152,12 @@ Rust build & quality:
   clean         Remove build artifacts (cargo clean).
 
 Docker image (single container: web SPA + Rust server):
-  docker-build  Build the application image from ./Dockerfile (multi-stage:
-                pnpm builds the SPA, cargo builds forge-server release).
+  docker-build [--platform <os/arch>]
+                Build the application image forge:latest from ./Dockerfile
+                (multi-stage: pnpm builds the SPA, cargo builds forge-server
+                release), for the host's platform unless --platform names
+                another one (linux/amd64, linux/arm64), passed to
+                `docker buildx build`.
   docker-run    Run the built image against the dev Postgres + versitygw
                 (docker-compose.yml + docker-compose.app.yml), API + SPA on :8421.
 
@@ -739,11 +743,46 @@ fn clean() -> Result<(), String> {
 /// Build the single application image from the root Dockerfile (multi-stage:
 /// pnpm builds the SPA, cargo builds forge-server release, slim runtime bundles
 /// both). The build is self-contained (SQLX_OFFLINE inside the image) and does
-/// not need a live DB.
-fn docker_build() -> Result<(), String> {
-    Cmd::new("docker")
-        .args(["build", "-t", "forge:latest", "-f", "Dockerfile", "."])
+/// not need a live DB. `--platform` builds the image of another platform than
+/// the host's (the release publishes linux/amd64 and linux/arm64), which needs
+/// a builder that runs it, natively or under QEMU emulation.
+fn docker_build(rest: &[String]) -> Result<(), String> {
+    let build = match parse_platform(rest)? {
+        None => Cmd::new("docker").arg("build"),
+        // `--load`: into the local image store, like `docker build`.
+        Some(platform) => Cmd::new("docker")
+            .args(["buildx", "build", "--load", "--platform"])
+            .arg(platform),
+    };
+    build
+        .args(["-t", "forge:latest", "-f", "Dockerfile", "."])
         .run()
+}
+
+/// `--platform <os/arch>` (or `--platform=<os/arch>`) of `docker-build`.
+fn parse_platform(rest: &[String]) -> Result<Option<&str>, String> {
+    let mut platform = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--platform" => {
+                let val = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--platform requires a value (e.g. linux/arm64)".to_string())?;
+                platform = Some(val.as_str());
+                i += 2;
+            }
+            other if other.starts_with("--platform=") => {
+                platform = Some(&other["--platform=".len()..]);
+                i += 1;
+            }
+            other => return Err(format!("unknown `docker-build` argument `{other}`")),
+        }
+    }
+    match platform {
+        Some("") => Err("--platform requires a value (e.g. linux/arm64)".to_string()),
+        _ => Ok(platform),
+    }
 }
 
 /// Run the built image against the dev Postgres + versitygw. Composes the base

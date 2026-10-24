@@ -13,8 +13,8 @@ use std::sync::Arc;
 use common::{start_with, unique, ServerOpts, TestServer};
 use forge_plugin::api::{
     Action, Answer, ChangeRequest, FormatError, FormatPlugin, Loaded, PackageInfo, PackageRef,
-    PackageSource, PackageVersions, ParsedPackage, PublishRequest, Query, Rendered, Repository,
-    Request, Response, SearchQuery, Upload,
+    PackageSource, PackageVersions, ParsedPackage, PublishRequest, Query, Repository, Request,
+    Response, SearchQuery, Upload,
 };
 use forge_plugin::Plugin;
 use reqwest::StatusCode;
@@ -25,7 +25,7 @@ const PROBE_TOML: &str = r#"
 id = "probe"
 name = "Probe"
 version = "0.0.1"
-api = "0.3.0"
+api = "0.4.0"
 mount = "/probe"
 kinds = ["hosted"]
 
@@ -164,7 +164,7 @@ impl FormatPlugin for Probe {
         }
     }
 
-    fn render(&self, _repo: &Repository, _req: &Request, data: &[Loaded]) -> Rendered {
+    fn render(&self, _repo: &Repository, _req: &Request, data: &[Loaded]) -> Action {
         let answers: Vec<Value> = data
             .iter()
             .map(|loaded| match &loaded.answer {
@@ -184,7 +184,7 @@ impl FormatPlugin for Probe {
                 other => json!(format!("{other:?}")),
             })
             .collect();
-        Rendered::Respond(Response::new(
+        Action::Respond(Response::new(
             200,
             "application/json",
             Value::Array(answers).to_string(),
