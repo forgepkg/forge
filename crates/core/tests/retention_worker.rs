@@ -152,6 +152,51 @@ async fn component_exists(pool: &PgPool, repo_id: i64, name: &str, version: &str
 }
 
 #[tokio::test]
+async fn size_budget_evicts_oldest_hosted_versions_and_keeps_newest() {
+    let pool = pool().await;
+    let n = unique();
+    let repo =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw-budget-{n}")))
+            .await
+            .unwrap();
+    for (i, (version, days)) in [("1.0.0", 30), ("2.0.0", 20), ("3.0.0", 10)]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, "lib", version, &sha, days).await;
+    }
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 250, "target_bytes": 100 },
+        "rules": []
+    });
+    arm(&pool, repo.id, &policy).await;
+
+    let summary = worker(&pool, config())
+        .tick_repo(repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(summary.deleted, 2);
+    assert_eq!(summary.size_before, Some(300));
+    assert_eq!(summary.size_after, Some(100));
+    assert_eq!(summary.target_reached, Some(true));
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert!(!component_exists(&pool, repo.id, "lib", "2.0.0").await);
+    assert!(component_exists(&pool, repo.id, "lib", "3.0.0").await);
+    let audit_reason: String = sqlx::query_scalar(
+        "SELECT rule_id FROM retention_audit WHERE repository_id = $1 ORDER BY id LIMIT 1",
+    )
+    .bind(repo.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_reason, "size_budget");
+}
+
+#[tokio::test]
 async fn tick_prunes_per_policy_and_drives_outbox() {
     let pool = pool().await;
     let n = unique();

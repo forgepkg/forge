@@ -317,6 +317,10 @@ screen in the web UI (Repositories → the repository → Retention) does all of
 this: it edits the rules, previews them before they are saved, runs the
 policy and lists the audit log.
 
+Retention policies may also include a `size_budget` to evict least-recently
+used files when the repository exceeds a logical size limit. See
+[Retention size budgets](retention.md) for configuration and size accounting.
+
 ## Example: the pdfium binaries
 
 The [pdfium binaries](https://github.com/bblanchon/pdfium-binaries) are

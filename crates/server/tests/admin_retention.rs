@@ -181,6 +181,23 @@ async fn put_validates_then_get_round_trips() {
     assert_eq!(stored["policy"]["size_budget"]["max_bytes"], 100);
     assert!(stored["current_size_bytes"].is_number());
 
+    let preview = client
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/preview",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), 200);
+    let preview: serde_json::Value = preview.json().await.unwrap();
+    assert_eq!(preview["size_before"], 10);
+    assert_eq!(preview["size_after"], 10);
+    assert_eq!(preview["target_bytes"], 80);
+    assert_eq!(preview["target_reached"], true);
+
     let invalid_budget = json!({
         "version": 1,
         "size_budget": { "max_bytes": 100, "target_bytes": 101 },
@@ -197,6 +214,23 @@ async fn put_validates_then_get_round_trips() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400, "target above maximum must be rejected");
+
+    let zero_max = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 0 },
+        "rules": []
+    });
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": zero_max}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "zero maximum must be rejected");
 
     // Invalid: a proxy-cached rule on a hosted repo is rejected → 400.
     let proxy_on_hosted = json!({

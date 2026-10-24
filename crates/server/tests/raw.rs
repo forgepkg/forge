@@ -1181,3 +1181,83 @@ async fn retention_deletes_old_files_and_keeps_the_newest() {
     assert_eq!(names(&files.json("nightly/").await), ["build-3.zip"]);
     assert_eq!(names(&files.json("release/").await), ["r2.zip", "r3.zip"]);
 }
+
+#[tokio::test]
+async fn size_budget_worker_evicts_oldest_raw_files_first() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let name = format!("ret-budget{}", unique());
+    let repo = create(
+        &srv,
+        json!({"name": name, "kind": "hosted", "format": "raw"}),
+    )
+    .await;
+    let files = Files::new(&srv, &name).await;
+    for (path, days) in [("old.bin", 30), ("middle.bin", 20), ("new.bin", 10)] {
+        files.put(path, &[b'x'; 10]).await;
+        sqlx::query(
+            "UPDATE raw_file SET updated_at = now() - make_interval(days => $3) \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo["id"].as_i64().unwrap())
+        .bind(path)
+        .bind(days)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    }
+    let resp = srv
+        .client()
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"policy": {
+            "version": 1,
+            "size_budget": { "max_bytes": 25, "target_bytes": 10 },
+            "rules": []
+        }}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    let resp = srv
+        .client()
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/run",
+            srv.base_url
+        ))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let worker = forge_core::retention::RetentionWorker::new(
+        srv.pool.clone(),
+        forge_server::state::RegistryResolver(srv.state.formats.clone()),
+        Arc::new(forge_core::repo::NoopCacheInvalidator),
+        forge_core::retention::RetentionConfig::default(),
+    );
+    let summary = worker
+        .tick_repo(repo["id"].as_i64().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.deleted, 2);
+    assert_eq!(summary.size_before, Some(30));
+    assert_eq!(summary.size_after, Some(10));
+    assert_eq!(files.get("old.bin").await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        files.get("middle.bin").await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(files.get("new.bin").await.status(), StatusCode::OK);
+}

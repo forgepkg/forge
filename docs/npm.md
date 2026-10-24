@@ -282,6 +282,10 @@ proxy's tags are its upstream's, as last read), so `latest`, `next` and
 every other tag keep installing. The preview of a policy lists such
 versions as kept.
 
+Package retention policies may include a `size_budget` to evict least-recently
+used eligible versions when a repository exceeds its logical size limit. See
+[Retention size budgets](retention.md) for configuration and size accounting.
+
 ## Limits
 
 ```toml

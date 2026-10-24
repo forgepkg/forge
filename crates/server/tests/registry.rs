@@ -2914,6 +2914,84 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     assert_eq!(audit, vec!["delete_tag", "delete_manifest"]);
 }
 
+#[tokio::test]
+async fn image_size_budget_worker_keeps_last_tag_when_target_is_unreachable() {
+    let srv = common::start().await;
+    let repo = repo_name("dock-budget");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    for i in 0..3 {
+        oci.push_image(
+            &name,
+            &format!("v{i}"),
+            "amd64",
+            format!("budget layer {i}").as_bytes(),
+        )
+        .await;
+    }
+    for (i, tag) in ["v0", "v1", "v2"].iter().enumerate() {
+        sqlx::query("UPDATE oci_tag SET updated_at = now() - make_interval(days => $1) WHERE repository_id = $2 AND tag = $3")
+            .bind(10 - i as i32)
+            .bind(repo_id)
+            .bind(tag)
+            .execute(&srv.pool)
+            .await
+            .unwrap();
+    }
+    let size_before = forge_db::oci_dao::repository_size(&srv.pool, repo_id)
+        .await
+        .unwrap();
+    assert!(size_before > 1);
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": size_before - 1, "target_bytes": 1 },
+        "rules": []
+    });
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": policy}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention/run"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), 202);
+
+    let worker = forge_core::retention::RetentionWorker::new(
+        srv.pool.clone(),
+        forge_server::state::RegistryResolver(srv.state.formats.clone()),
+        Arc::new(forge_core::repo::NoopCacheInvalidator),
+        forge_core::retention::RetentionConfig::default(),
+    );
+    let summary = worker.tick_repo(repo_id).await.unwrap().unwrap();
+    assert!(summary.deleted > 0);
+    assert_eq!(summary.size_before, Some(size_before));
+    assert_eq!(summary.target_bytes, Some(1));
+    assert_eq!(summary.target_reached, Some(false));
+    assert!(summary.size_after.unwrap() > 1);
+    assert_eq!(oci.get(&name, "manifests/v0").await.status(), 404);
+    assert_eq!(oci.get(&name, "manifests/v1").await.status(), 404);
+    assert_eq!(oci.get(&name, "manifests/v2").await.status(), 200);
+    let audit: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT rule_id FROM retention_audit WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_all(&srv.pool)
+            .await
+            .unwrap();
+    assert_eq!(audit, vec!["size_budget"]);
+}
+
 /// Claim `repo_id`'s retention run and evaluate its image policy as the
 /// worker does, stopping before the apply step so a test can change state
 /// in between.

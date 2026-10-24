@@ -316,6 +316,11 @@ A docker repository's retention policy (`PUT
   a tag pulled or pushed since, a tag that newer tags deleted meanwhile now
   keep, or a signature whose image was tagged again.
 
+An image retention policy may also include a `size_budget`; it evicts
+least-recently used unprotected manifests and tags after its ordinary rules.
+See [Retention size budgets](retention.md) for configuration and logical size
+accounting.
+
 ## Configuration
 
 ```toml
