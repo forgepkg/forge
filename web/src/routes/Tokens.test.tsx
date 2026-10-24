@@ -173,4 +173,21 @@ describe('self-service tokens', () => {
     expect(submit).toBeDisabled()
     expect(api.sent('POST', /^\/admin\/me\/tokens$/)).toHaveLength(0)
   })
+
+  it('accepts the minimum custom expiry date', async () => {
+    const u = userEvent.setup()
+    await renderApp('/tokens')
+    await u.type(await screen.findByLabelText('Token name'), 'tomorrow')
+    await u.selectOptions(screen.getByLabelText('Token expiry'), 'custom')
+    const date = screen.getByLabelText('Expiry date') as HTMLInputElement
+    fireEvent.change(date, { target: { value: date.min } })
+
+    const submit = screen.getByRole('button', { name: 'Create token' })
+    expect(submit).toBeEnabled()
+    await u.click(submit)
+    await waitFor(() => expect(api.sent('POST', /^\/admin\/me\/tokens$/)).toHaveLength(1))
+    expect(
+      (api.sent('POST', /^\/admin\/me\/tokens$/)[0]!.body as { expires_at: string }).expires_at,
+    ).toBe(`${date.min}T23:59:59.999Z`)
+  })
 })

@@ -36,7 +36,7 @@ export function TokenCreateForm({
   const [customDate, setCustomDate] = useState('')
   const problem = draftProblem(scope)
   const customDateProblem =
-    expiry === 'custom' && (!customDate || customDate <= minimumCustomDate())
+    expiry === 'custom' && (!customDate || customDate < minimumCustomDate())
       ? 'Choose a date in the future.'
       : null
 

@@ -911,6 +911,33 @@ describe('admin tokens', () => {
     )).toBe(false)
   })
 
+  it('accepts the minimum custom expiry date', async () => {
+    mockApi({ users: [user({ id: 2, username: 'alice' })], tokens: [] })
+    const u = userEvent.setup()
+    await renderAt('/manage/users/2')
+    await u.type(await screen.findByLabelText('Token name'), 'tomorrow')
+    await u.selectOptions(screen.getByLabelText('Token expiry'), 'custom')
+    const date = screen.getByLabelText('Expiry date') as HTMLInputElement
+    fireEvent.change(date, { target: { value: date.min } })
+
+    const submit = screen.getByRole('button', { name: 'Create token' })
+    expect(submit).toBeEnabled()
+    await u.click(submit)
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([input, init]) =>
+        new URL(String(input), 'http://localhost').pathname === '/admin/users/2/tokens' &&
+        init?.method === 'POST',
+      )).toBe(true),
+    )
+    const request = fetchMock.mock.calls.find(([input, init]) =>
+      new URL(String(input), 'http://localhost').pathname === '/admin/users/2/tokens' &&
+      init?.method === 'POST',
+    )
+    expect(JSON.parse(request![1]!.body as string).expires_at).toBe(
+      `${date.min}T23:59:59.999Z`,
+    )
+  })
+
   it('switches a forwarded account with a kept password to a local one', async () => {
     let converted: number | null = null
     let users = [
