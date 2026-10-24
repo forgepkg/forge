@@ -2749,7 +2749,7 @@ async fn admin_validates_docker_repositories() {
         .expect("docker is listed");
     assert!(docker.get("builtin").is_none(), "{docker}");
     assert_eq!(docker["kinds"], json!(["hosted", "proxy", "group"]));
-    assert_eq!(docker["mount"], "/v2");
+    assert!(docker.get("mount").is_none());
 
     // A hosted repository with images is not deleted; a proxy is purged.
     let repo = format!("a{n}");

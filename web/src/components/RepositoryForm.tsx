@@ -148,8 +148,8 @@ export const DOCKER_FORMAT: FormatView = {
 
 /**
  * Raw (generic file) repositories, built in: files under arbitrary paths,
- * served under `/raw`. They carry their own options (deployment policy,
- * content disposition, a proxy's maximum age).
+ * served under `/repository/<name>/`. They carry their own options (deployment
+ * policy, content disposition, a proxy's maximum age).
  */
 export const RAW_FORMAT: FormatView = {
   id: 'raw',
@@ -159,8 +159,8 @@ export const RAW_FORMAT: FormatView = {
 
 /**
  * npm registries, built in: packages for npm, pnpm, Yarn and Bun, served
- * under `/npm`. Hosted ones have a deployment policy, groups a writable
- * member.
+ * under `/repository/<name>/`. Hosted ones have a deployment policy, groups a
+ * writable member.
  */
 export const NPM_FORMAT: FormatView = {
   id: 'npm',

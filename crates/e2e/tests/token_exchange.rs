@@ -282,7 +282,7 @@ async fn npm_publish(
     let file = format!("{}-{version}.tgz", name.rsplit('/').next().unwrap());
     srv.client()
         .put(format!(
-            "{}/npm/{repo}/{}",
+            "{}/repository/{repo}/{}",
             srv.base_url,
             name.replacen('/', "%2f", 1)
         ))
@@ -333,7 +333,7 @@ async fn npm_oidc_exchanged_bearer_publishes_hosted_and_writable_group() {
         );
         let response = srv
             .client()
-            .get(format!("{}/npm/npm-hosted/{escaped}", srv.base_url))
+            .get(format!("{}/repository/npm-hosted/{escaped}", srv.base_url))
             .bearer_auth(&key)
             .send()
             .await

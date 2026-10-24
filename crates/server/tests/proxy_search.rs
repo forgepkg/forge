@@ -192,12 +192,12 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
     assert_eq!(hits(&body).len(), 3, "{body}");
     let only = hit(&body, "Upstream.Only");
     let registration =
-        format!("http://test.local/v3/{proxy}/registration/upstream.only/index.json");
+        format!("http://test.local/repository/{proxy}/registration/upstream.only/index.json");
     assert_eq!(only["@id"], registration);
     assert_eq!(only["registration"], registration);
     assert_eq!(
         only["versions"][1]["@id"],
-        format!("http://test.local/v3/{proxy}/registration/upstream.only/1.1.0.json")
+        format!("http://test.local/repository/{proxy}/registration/upstream.only/1.1.0.json")
     );
     assert_eq!(only["description"], "Upstream.Only from upstream");
     assert_eq!(only["totalDownloads"], 42);
@@ -217,7 +217,7 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
     let only = hit(&body, "Upstream.Only");
     assert_eq!(
         only["@id"],
-        format!("http://test.local/v3/{group}/registration/upstream.only/index.json")
+        format!("http://test.local/repository/{group}/registration/upstream.only/index.json")
     );
     assert_eq!(only["description"], "Upstream.Only from upstream");
 

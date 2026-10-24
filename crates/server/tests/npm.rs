@@ -474,7 +474,18 @@ async fn refuses_publishes_that_do_not_hold_up() {
     assert_eq!(npm.packument("d-pkg", true).await.0, 404);
     // An unknown token is refused, never read as anonymous.
     let bogus = Npm::new(&srv, &repo, Some("not-a-token".into()));
-    assert_eq!(bogus.packument("a-pkg", true).await.0, 401);
+    let resp = bogus
+        .req(reqwest::Method::GET, "a-pkg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    assert!(resp.headers().contains_key("www-authenticate"));
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"error": "invalid token"})
+    );
 }
 
 #[tokio::test]

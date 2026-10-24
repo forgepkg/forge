@@ -251,7 +251,20 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let uri = req.uri().clone();
     let principal = match with_bearer(&state, req.headers(), principal_of(&req)).await {
         Ok(principal) => principal,
-        Err(response) => return response,
+        Err(mut response) => {
+            if let Some((repo_name, _)) = split_path(uri.path()) {
+                if let Ok(Some(repo)) =
+                    repository_dao::find_repository_by_name(&state.pool, repo_name).await
+                {
+                    if let Some(plugin) = state.formats.plugin(&repo.format) {
+                        if plugin.descriptor().storage != protocol::Storage::Images {
+                            response.extensions_mut().insert(ServedBy(plugin));
+                        }
+                    }
+                }
+            }
+            return response;
+        }
     };
     let Some((repo_name, rest)) = split_path(uri.path()) else {
         return (StatusCode::NOT_FOUND, "repository not found").into_response();
@@ -2211,8 +2224,10 @@ mod tests {
         assert_eq!(split("/repository/"), None);
         assert_eq!(split("/repository"), None);
         assert_eq!(split("/repositoryx/a"), None);
-        assert_eq!(split("/repository/charts"), None);
-        assert_eq!(split("/repository/charts/file"), None);
+        assert_eq!(split("/v3/charts"), None);
+        assert_eq!(split("/raw/charts/file"), None);
+        assert_eq!(split("/npm/charts/file"), None);
+        assert_eq!(split("/v2/charts/file"), None);
     }
 
     #[test]
