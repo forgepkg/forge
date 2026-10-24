@@ -101,7 +101,9 @@ pub fn validate_file_policy(policy: &FileRetentionPolicy, kind: RepoKind) -> Res
     }
     if let Some(budget) = policy.size_budget {
         if budget.max_bytes == 0
-            || budget.target_bytes.is_some_and(|target| target > budget.max_bytes)
+            || budget
+                .target_bytes
+                .is_some_and(|target| target > budget.max_bytes)
         {
             return Err("size_budget.max_bytes must be greater than zero and target_bytes must not exceed max_bytes".into());
         }
@@ -159,12 +161,39 @@ pub struct FileDecision {
     pub reason: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileBudgetSummary {
+    pub size_before: u64,
+    pub size_after: u64,
+    pub target_bytes: u64,
+    pub target_reached: bool,
+}
+
 /// The directory a path is in (`""`, or ending in `/`).
 fn directory_of(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[..=i],
         None => "",
     }
+}
+
+fn protected_file_ids(policy: &FileRetentionPolicy, files: &[RetentionFile]) -> HashSet<i64> {
+    let mut protected = HashSet::new();
+    for rule in &policy.rules {
+        let mut directories: BTreeMap<&str, Vec<&RetentionFile>> = BTreeMap::new();
+        for file in files.iter().filter(|f| rule.matches(&f.path)) {
+            directories
+                .entry(directory_of(&file.path))
+                .or_default()
+                .push(file);
+        }
+        let keep = rule.keep_newest_per_directory.unwrap_or(0) as usize;
+        for group in directories.values_mut() {
+            group.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.path.cmp(&b.path)));
+            protected.extend(group.iter().take(keep).map(|f| f.id));
+        }
+    }
+    protected
 }
 
 /// Decide, purely, which of `files` (one repository's, or one directory's)
@@ -174,6 +203,14 @@ pub fn evaluate_files(
     policy: &FileRetentionPolicy,
     files: &[RetentionFile],
 ) -> Vec<FileDecision> {
+    evaluate_files_with_budget(now, policy, files).0
+}
+
+fn evaluate_files_with_budget(
+    now: DateTime<Utc>,
+    policy: &FileRetentionPolicy,
+    files: &[RetentionFile],
+) -> (Vec<FileDecision>, Option<FileBudgetSummary>) {
     let days = |d: u32| Duration::days(i64::from(d));
     let mut by_directory: BTreeMap<&str, Vec<&RetentionFile>> = BTreeMap::new();
     for f in files {
@@ -227,7 +264,71 @@ pub fn evaluate_files(
             }
         }
     }
-    out
+    let Some(budget) = policy.size_budget else {
+        return (out, None);
+    };
+    let target_bytes = budget.target_bytes();
+    let size_before = files
+        .iter()
+        .map(|f| u64::try_from(f.size).unwrap_or_default())
+        .fold(0u64, u64::saturating_add);
+    let already_deleted: HashSet<i64> = out.iter().map(|d| d.file_id).collect();
+    let mut size_after = size_before.saturating_sub(
+        files
+            .iter()
+            .filter(|f| already_deleted.contains(&f.id))
+            .map(|f| u64::try_from(f.size).unwrap_or_default())
+            .fold(0u64, u64::saturating_add),
+    );
+    if size_after > budget.max_bytes {
+        let protected = protected_file_ids(policy, files);
+        let mut eligible: Vec<&RetentionFile> = files
+            .iter()
+            .filter(|f| !already_deleted.contains(&f.id) && !protected.contains(&f.id))
+            .collect();
+        eligible.sort_by(|a, b| {
+            a.last_downloaded_at
+                .unwrap_or(a.updated_at)
+                .max(a.updated_at)
+                .cmp(
+                    &b.last_downloaded_at
+                        .unwrap_or(b.updated_at)
+                        .max(b.updated_at),
+                )
+                .then_with(|| a.updated_at.cmp(&b.updated_at))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        for file in eligible {
+            if size_after <= target_bytes {
+                break;
+            }
+            let size = u64::try_from(file.size).unwrap_or_default();
+            out.push(FileDecision {
+                file_id: file.id,
+                path: file.path.clone(),
+                blob_sha256: file.blob_sha256.clone(),
+                rule_id: "size_budget".into(),
+                reason: serde_json::json!({
+                    "size_budget": budget.max_bytes,
+                    "target_bytes": target_bytes,
+                    "size_bytes": size,
+                    "last_used_at": file.last_downloaded_at
+                        .unwrap_or(file.updated_at)
+                        .max(file.updated_at),
+                }),
+            });
+            size_after = size_after.saturating_sub(size);
+        }
+    }
+    (
+        out,
+        Some(FileBudgetSummary {
+            size_before,
+            size_after,
+            target_bytes,
+            target_reached: size_after <= target_bytes || size_after <= budget.max_bytes,
+        }),
+    )
 }
 
 /// Snapshot a repository and evaluate `policy` on it. Returns the decisions
@@ -237,14 +338,15 @@ pub async fn evaluate_repository(
     repository_id: i64,
     now: DateTime<Utc>,
     policy: &FileRetentionPolicy,
-) -> sqlx::Result<(Vec<FileDecision>, u64)> {
+) -> sqlx::Result<(Vec<FileDecision>, u64, Option<FileBudgetSummary>)> {
     let files = raw_dao::retention_files(pool, repository_id).await?;
     let evaluated = files.len() as u64;
     let policy = policy.clone();
-    let decisions = tokio::task::spawn_blocking(move || evaluate_files(now, &policy, &files))
-        .await
-        .map_err(|e| sqlx::Error::Protocol(format!("file retention evaluation failed: {e}")))?;
-    Ok((decisions, evaluated))
+    let (decisions, budget) =
+        tokio::task::spawn_blocking(move || evaluate_files_with_budget(now, &policy, &files))
+            .await
+            .map_err(|e| sqlx::Error::Protocol(format!("file retention evaluation failed: {e}")))?;
+    Ok((decisions, evaluated, budget))
 }
 
 /// What a file retention run's decisions were made under, re-checked before
@@ -317,12 +419,27 @@ pub async fn apply_files(
                 }
                 let locked =
                     raw_dao::lock_directory_for_retention(&mut tx, repository_id, dir).await?;
-                decided_now = Some(
+                let mut decided: HashSet<i64> =
                     evaluate_files(fence.evaluated_at, fence.policy, &locked)
                         .into_iter()
+                        .filter(|d| d.rule_id != "size_budget")
                         .map(|d| d.file_id)
-                        .collect(),
+                        .collect();
+                let protected = protected_file_ids(fence.policy, &locked);
+                decided.extend(
+                    batch
+                        .iter()
+                        .filter(|d| d.rule_id == "size_budget")
+                        .filter(|d| !protected.contains(&d.file_id))
+                        .filter(|d| {
+                            locked.iter().find(|f| f.id == d.file_id).is_some_and(|f| {
+                                f.updated_at <= fence.evaluated_at
+                                    && f.last_downloaded_at.is_none_or(|t| t <= fence.evaluated_at)
+                            })
+                        })
+                        .map(|d| d.file_id),
                 );
+                decided_now = Some(decided);
             }
             // Blob rows are locked in hash order, as every other writer
             // takes them.
@@ -388,6 +505,7 @@ mod tests {
             id,
             path: path.into(),
             blob_sha256: format!("sha{id}"),
+            size: 1,
             updated_at: at(deployed_days_ago),
             last_downloaded_at: downloaded.map(at),
         }
@@ -502,5 +620,33 @@ mod tests {
         assert!(validate_file_policy(&p, RepoKind::Hosted).is_ok());
         p.size_budget.as_mut().unwrap().max_bytes = 0;
         assert!(validate_file_policy(&p, RepoKind::Hosted).is_err());
+    }
+
+    #[test]
+    fn size_budget_deletes_oldest_file_but_keeps_each_directory_protection() {
+        let mut files = vec![
+            file(1, "dir/old", 100, Some(90)),
+            file(2, "dir/mid", 50, Some(20)),
+            file(3, "dir/new", 10, Some(1)),
+        ];
+        files[0].size = 3;
+        files[1].size = 2;
+        files[2].size = 1;
+        let mut policy = policy(vec![{
+            let mut keep = rule("keep");
+            keep.keep_newest_per_directory = Some(1);
+            keep.older_than_days = Some(1000);
+            keep
+        }]);
+        policy.size_budget = Some(SizeBudget {
+            max_bytes: 4,
+            target_bytes: Some(2),
+        });
+        let decisions = evaluate_files(at(0), &policy, &files);
+        assert_eq!(
+            decisions.iter().map(|d| d.file_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(decisions.iter().all(|d| d.rule_id == "size_budget"));
     }
 }

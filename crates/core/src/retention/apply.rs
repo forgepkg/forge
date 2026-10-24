@@ -47,7 +47,9 @@ use forge_db::retention_dao::{self, AuditRow, RunSummary};
 use forge_db::{asset_dao, blob_dao, component_dao};
 
 use crate::format::Format;
-use crate::retention::evaluate::{evaluate, CandidateComponent, Decision, ProxyDecision};
+use crate::retention::evaluate::{
+    evaluate, size_budget_protected_ids, CandidateComponent, Decision, ProxyDecision,
+};
 use crate::retention::model::{Action, RetentionPolicy};
 
 /// What a run's decisions were made under, re-checked before each one is
@@ -203,6 +205,7 @@ async fn decided_now(
     ctx: &ApplyContext<'_>,
     fence: &RunFence<'_>,
     package_name: &str,
+    size_budget: bool,
 ) -> Result<HashMap<i64, Action>, sqlx::Error> {
     let candidates: Vec<CandidateComponent> = retention_dao::lock_package_candidates(
         tx,
@@ -219,13 +222,25 @@ async fn decided_now(
         listed: r.listed,
         created_at: r.created_at,
         last_downloaded_at: r.last_downloaded_at,
+        size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
     })
     .collect();
     let now = ctx.evaluated_at.unwrap_or_else(chrono::Utc::now);
-    Ok(evaluate(fence.format, now, fence.policy, &candidates)
-        .into_iter()
-        .map(|again| (again.component_id, again.action))
-        .collect())
+    let mut decisions: HashMap<i64, Action> =
+        evaluate(fence.format, now, fence.policy, &candidates)
+            .into_iter()
+            .map(|again| (again.component_id, again.action))
+            .collect();
+    if size_budget && fence.policy.size_budget.is_some() {
+        let (protected, _) =
+            size_budget_protected_ids(fence.format, fence.policy, &candidates, &[]);
+        for candidate in &candidates {
+            if !protected.contains(&candidate.component_id) {
+                decisions.insert(candidate.component_id, Action::HardDelete);
+            }
+        }
+    }
+    Ok(decisions)
 }
 
 /// Record one hosted decision of a dry run: the audit row only.
@@ -289,7 +304,16 @@ async fn apply_hosted_batch(
             {
                 return Ok(Step::Stop);
             }
-            Some(decided_now(&mut tx, ctx, fence, &first.package_name).await?)
+            Some(
+                decided_now(
+                    &mut tx,
+                    ctx,
+                    fence,
+                    &first.package_name,
+                    batch.iter().any(|d| d.rule_id == "size_budget"),
+                )
+                .await?,
+            )
         }
         None => None,
     };
@@ -346,6 +370,16 @@ async fn apply_hosted(
         d.reason.not_downloaded_for_days.is_some(),
         row.last_downloaded_at,
     ) {
+        audit_skipped(tx, ctx, d, "component").await?;
+        summary.skipped += 1;
+        return Ok(());
+    }
+    if d.reason.size_budget.is_some()
+        && d.reason.last_used_at.is_some_and(|last_used| {
+            row.last_downloaded_at
+                .is_some_and(|downloaded| downloaded > last_used)
+        })
+    {
         audit_skipped(tx, ctx, d, "component").await?;
         summary.skipped += 1;
         return Ok(());
@@ -548,6 +582,18 @@ async fn apply_proxy(
         d.reason.not_pulled_for_days.is_some(),
         cached.last_downloaded_at,
     ) {
+        audit_skipped_proxy(&mut tx, ctx, d).await?;
+        tx.commit().await?;
+        summary.skipped += 1;
+        return Ok(Step::Continue);
+    }
+    if d.reason.size_budget.is_some()
+        && d.reason.last_used_at.is_some_and(|last_used| {
+            cached
+                .last_downloaded_at
+                .is_some_and(|downloaded| downloaded > last_used)
+        })
+    {
         audit_skipped_proxy(&mut tx, ctx, d).await?;
         tx.commit().await?;
         summary.skipped += 1;

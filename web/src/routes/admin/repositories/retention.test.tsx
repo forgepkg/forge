@@ -163,7 +163,12 @@ interface Handlers {
 }
 
 function mockApi(h: Handlers) {
-  let view: RetentionView = h.view ?? { policy: null, last_run: null, runs_enabled: true }
+  let view: RetentionView = h.view ?? {
+    policy: null,
+    last_run: null,
+    runs_enabled: true,
+    current_size_bytes: 0,
+  }
   fetchMock.mockImplementation(
     (input: RequestInfo | URL, init?: RequestInit) => {
       const raw = typeof input === 'string' ? input : input.toString()
@@ -256,6 +261,26 @@ describe('retention screen', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
     clearSession()
+  })
+
+  it('shows the current repository size and an unreached target warning', async () => {
+    mockApi({
+      repositories: [repo({})],
+      view: {
+        policy: null,
+        last_run: {
+          ...ledger,
+          last_run_summary: { target_reached: false, target_bytes: 1024 },
+        },
+        runs_enabled: true,
+        current_size_bytes: 1.5 * 1024 ** 3,
+      },
+    })
+    await renderAt('/manage/repositories/nuget-internal/retention')
+    expect(await screen.findByText(/Current logical size: 1.5 GiB/)).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: /Maximum size \(GiB\)/ })).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: /Target size \(GiB\)/ })).toBeInTheDocument()
+    expect(screen.getByText(/Size budget target not reached/)).toBeInTheDocument()
   })
 
   it('is linked from hosted and proxy repositories, not from a group', async () => {
@@ -420,7 +445,7 @@ describe('retention screen', () => {
   it('edits a stored policy, removes it after asking, and shows its runs', async () => {
     mockApi({
       repositories: [repo({})],
-      view: { policy: storedPolicy, last_run: ledger, runs_enabled: true },
+      view: { policy: storedPolicy, last_run: ledger, runs_enabled: true, current_size_bytes: 0 },
     })
     await renderAt('/manage/repositories/nuget-internal/retention')
     expect(await screen.findByRole('switch', { name: 'Dry run only' })).not.toBeChecked()
@@ -458,7 +483,7 @@ describe('retention screen', () => {
     )
     mockApi({
       repositories: [repo({})],
-      view: { policy: storedPolicy, last_run: ledger, runs_enabled: true },
+      view: { policy: storedPolicy, last_run: ledger, runs_enabled: true, current_size_bytes: 0 },
       audit: (q) => {
         if (q.get('run_id')) return [auditRow({ id: 7, run_id: q.get('run_id')! })]
         if (q.get('before') === '151') {
@@ -501,7 +526,7 @@ describe('retention screen', () => {
   it('says when retention runs are switched off, and offers no Run now', async () => {
     mockApi({
       repositories: [repo({})],
-      view: { policy: storedPolicy, last_run: ledger, runs_enabled: false },
+      view: { policy: storedPolicy, last_run: ledger, runs_enabled: false, current_size_bytes: 0 },
     })
     await renderAt('/manage/repositories/nuget-internal/retention')
     const runs = within(await screen.findByRole('complementary', { name: 'Runs' }))

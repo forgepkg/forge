@@ -72,6 +72,11 @@ export interface ImageRule {
 
 export type RetentionRule = PackageRule | FileRule | ImageRule
 
+export interface SizeBudget {
+  max_bytes: number
+  target_bytes?: number
+}
+
 /** A policy of any shape: the envelope and its rules. */
 export interface RetentionPolicy<R extends RetentionRule = RetentionRule> {
   version: number
@@ -81,6 +86,7 @@ export interface RetentionPolicy<R extends RetentionRule = RetentionRule> {
   dry_run_only?: boolean
   /** Default 3600. Runs are at least a minute apart whatever this says. */
   min_run_interval_seconds?: number
+  size_budget?: SizeBudget
   rules: R[]
 }
 
@@ -91,6 +97,10 @@ export interface RunSummary {
   deleted?: number
   blobs_enqueued?: number
   skipped?: number
+  size_before?: number
+  size_after?: number
+  target_bytes?: number
+  target_reached?: boolean
 }
 
 /** The run ledger (`retention_run`). */
@@ -112,6 +122,7 @@ export interface RetentionView {
    * off, no policy runs and Run now is refused.
    */
   runs_enabled: boolean
+  current_size_bytes: number
 }
 
 /** Why a version was selected: the triggers that held, with their days. */
@@ -169,6 +180,10 @@ export interface PreviewView {
   /** Raw repositories. */
   file_decisions?: FileDecision[]
   counts: { evaluated: number; unlisted: number; deleted: number }
+  size_before?: number
+  size_after?: number
+  target_bytes?: number
+  target_reached?: boolean
 }
 
 /**

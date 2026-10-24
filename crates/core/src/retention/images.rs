@@ -116,7 +116,9 @@ pub fn validate_image_policy(policy: &ImageRetentionPolicy, kind: RepoKind) -> R
     }
     if let Some(budget) = policy.size_budget {
         if budget.max_bytes == 0
-            || budget.target_bytes.is_some_and(|target| target > budget.max_bytes)
+            || budget
+                .target_bytes
+                .is_some_and(|target| target > budget.max_bytes)
         {
             return Err("size_budget.max_bytes must be greater than zero and target_bytes must not exceed max_bytes".into());
         }
@@ -186,6 +188,14 @@ pub struct ManifestDecision {
 pub struct ImageDecisions {
     pub tags: Vec<TagDecision>,
     pub manifests: Vec<ManifestDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBudgetSummary {
+    pub size_before: u64,
+    pub size_after: u64,
+    pub target_bytes: u64,
+    pub target_reached: bool,
 }
 
 /// Decide, purely, what `policy` deletes from `tags` and `manifests` (one
@@ -351,6 +361,331 @@ pub fn evaluate_images(
     decisions
 }
 
+/// Apply the repository size budget after rule decisions, considering the
+/// distinct blobs each remaining manifest holds.
+pub fn evaluate_image_size_budget(
+    policy: &ImageRetentionPolicy,
+    tags: &[RetentionTag],
+    manifests: &[RetentionManifest],
+    manifest_objects: &[oci_dao::RetentionManifestObject],
+    blob_refs: &[oci_dao::RetentionBlobRef],
+    decisions: &ImageDecisions,
+    size_before: u64,
+) -> (ImageDecisions, Option<ImageBudgetSummary>) {
+    let Some(budget) = policy.size_budget else {
+        return (ImageDecisions::default(), None);
+    };
+    let target_bytes = budget.target_bytes();
+    let mut object_sizes: HashMap<&str, u64> = HashMap::new();
+    let mut manifest_blobs: HashMap<i64, HashSet<String>> = HashMap::new();
+    for object in manifest_objects {
+        let size = u64::try_from(object.size).unwrap_or_default();
+        object_sizes.insert(&object.blob_sha256, size);
+        manifest_blobs
+            .entry(object.manifest_id)
+            .or_default()
+            .insert(object.blob_sha256.clone());
+    }
+    for reference in blob_refs {
+        let size = u64::try_from(reference.size).unwrap_or_default();
+        object_sizes.insert(&reference.blob_sha256, size);
+        manifest_blobs
+            .entry(reference.manifest_id)
+            .or_default()
+            .insert(reference.blob_sha256.clone());
+    }
+    let mut remaining: HashSet<i64> = manifests.iter().map(|m| m.id).collect();
+    let mut references: HashMap<String, usize> = HashMap::new();
+    for id in &remaining {
+        if let Some(blobs) = manifest_blobs.get(id) {
+            for blob in blobs {
+                *references.entry(blob.clone()).or_default() += 1;
+            }
+        }
+    }
+    let mut size_after = size_before;
+    let delete_rule_manifests: HashSet<i64> =
+        decisions.manifests.iter().map(|m| m.manifest_id).collect();
+    for manifest in manifests
+        .iter()
+        .filter(|m| delete_rule_manifests.contains(&m.id))
+    {
+        size_after = size_after.saturating_sub(remove_manifest_objects(
+            manifest.id,
+            &mut remaining,
+            &manifest_blobs,
+            &object_sizes,
+            &mut references,
+        ));
+    }
+    if size_after <= budget.max_bytes {
+        return (
+            ImageDecisions::default(),
+            Some(ImageBudgetSummary {
+                size_before,
+                size_after,
+                target_bytes,
+                target_reached: true,
+            }),
+        );
+    }
+    let deleted_rule_tags: HashSet<(&str, &str)> = decisions
+        .tags
+        .iter()
+        .map(|t| (t.image.as_str(), t.tag.as_str()))
+        .collect();
+    let mut remaining_tags: Vec<&RetentionTag> = tags
+        .iter()
+        .filter(|t| {
+            !deleted_rule_tags.contains(&(t.image.as_str(), t.tag.as_str()))
+                && remaining.contains(&t.manifest_id)
+        })
+        .collect();
+    let protected_tags = budget_protected_tags(policy, tags);
+    let manifest_by_id: HashMap<i64, &RetentionManifest> =
+        manifests.iter().map(|m| (m.id, m)).collect();
+    let manifest_by_digest: HashMap<(&str, &str), i64> = manifests
+        .iter()
+        .map(|m| ((m.image.as_str(), m.digest.as_str()), m.id))
+        .collect();
+    let mut budget_decisions = ImageDecisions::default();
+
+    let mut untagged: Vec<&RetentionManifest> = manifests
+        .iter()
+        .filter(|m| remaining.contains(&m.id))
+        .filter(|m| !remaining_tags.iter().any(|t| t.manifest_id == m.id))
+        .collect();
+    untagged.sort_by(|a, b| {
+        a.last_pulled_at
+            .unwrap_or(a.created_at)
+            .max(a.created_at)
+            .cmp(&b.last_pulled_at.unwrap_or(b.created_at).max(b.created_at))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    while size_after > target_bytes {
+        let kept = protected_manifests(
+            &remaining,
+            &remaining_tags,
+            &manifest_by_id,
+            &manifest_by_digest,
+        );
+        let candidate = untagged.iter().copied().find(|m| {
+            remaining.contains(&m.id)
+                && !kept.contains(&m.id)
+                && !manifests.iter().any(|parent| {
+                    remaining.contains(&parent.id)
+                        && parent.id != m.id
+                        && parent.children.contains(&m.digest)
+                })
+        });
+        let Some(manifest) = candidate else {
+            break;
+        };
+        size_after = size_after.saturating_sub(remove_manifest_objects(
+            manifest.id,
+            &mut remaining,
+            &manifest_blobs,
+            &object_sizes,
+            &mut references,
+        ));
+        budget_decisions.manifests.push(ManifestDecision {
+            image: manifest.image.clone(),
+            manifest_id: manifest.id,
+            digest: manifest.digest.clone(),
+            rule_id: "size_budget".into(),
+            reason: serde_json::json!({
+                "size_budget": budget.max_bytes,
+                "target_bytes": target_bytes,
+                "last_used_at": manifest.last_pulled_at.unwrap_or(manifest.created_at).max(manifest.created_at),
+            }),
+        });
+    }
+
+    let mut tag_candidates: Vec<&RetentionTag> = remaining_tags.clone();
+    tag_candidates.sort_by(|a, b| {
+        a.last_pulled_at
+            .unwrap_or(a.updated_at)
+            .max(a.updated_at)
+            .cmp(&b.last_pulled_at.unwrap_or(b.updated_at).max(b.updated_at))
+            .then_with(|| a.updated_at.cmp(&b.updated_at))
+            .then_with(|| a.tag.cmp(&b.tag))
+    });
+    for tag in tag_candidates {
+        if size_after <= target_bytes {
+            break;
+        }
+        if protected_tags.contains(&(tag.image.clone(), tag.tag.clone())) {
+            continue;
+        }
+        let image_tag_count = remaining_tags
+            .iter()
+            .filter(|t| t.image == tag.image)
+            .count();
+        if image_tag_count <= 1 {
+            continue;
+        }
+        remaining_tags.retain(|t| !(t.image == tag.image && t.tag == tag.tag));
+        budget_decisions.tags.push(TagDecision {
+            image: tag.image.clone(),
+            tag: tag.tag.clone(),
+            manifest_id: tag.manifest_id,
+            digest: tag.digest.clone(),
+            rule_id: "size_budget".into(),
+            reason: serde_json::json!({
+                "size_budget": budget.max_bytes,
+                "target_bytes": target_bytes,
+                "last_used_at": tag.last_pulled_at.unwrap_or(tag.updated_at).max(tag.updated_at),
+            }),
+        });
+        if !remaining_tags
+            .iter()
+            .any(|t| t.manifest_id == tag.manifest_id)
+        {
+            let kept = protected_manifests(
+                &remaining,
+                &remaining_tags,
+                &manifest_by_id,
+                &manifest_by_digest,
+            );
+            let can_delete = remaining.contains(&tag.manifest_id)
+                && !kept.contains(&tag.manifest_id)
+                && !manifests.iter().any(|parent| {
+                    remaining.contains(&parent.id)
+                        && parent.id != tag.manifest_id
+                        && parent.children.contains(&tag.digest)
+                });
+            if can_delete {
+                let manifest = manifest_by_id[&tag.manifest_id];
+                size_after = size_after.saturating_sub(remove_manifest_objects(
+                    manifest.id,
+                    &mut remaining,
+                    &manifest_blobs,
+                    &object_sizes,
+                    &mut references,
+                ));
+                budget_decisions.manifests.push(ManifestDecision {
+                    image: manifest.image.clone(),
+                    manifest_id: manifest.id,
+                    digest: manifest.digest.clone(),
+                    rule_id: "size_budget".into(),
+                    reason: serde_json::json!({
+                        "size_budget": budget.max_bytes,
+                        "target_bytes": target_bytes,
+                        "last_used_at": manifest.last_pulled_at.unwrap_or(manifest.created_at).max(manifest.created_at),
+                    }),
+                });
+            }
+        }
+    }
+
+    (
+        budget_decisions,
+        Some(ImageBudgetSummary {
+            size_before,
+            size_after,
+            target_bytes,
+            target_reached: size_after <= target_bytes || size_after <= budget.max_bytes,
+        }),
+    )
+}
+
+fn remove_manifest_objects(
+    manifest_id: i64,
+    remaining: &mut HashSet<i64>,
+    manifest_blobs: &HashMap<i64, HashSet<String>>,
+    object_sizes: &HashMap<&str, u64>,
+    references: &mut HashMap<String, usize>,
+) -> u64 {
+    if !remaining.remove(&manifest_id) {
+        return 0;
+    }
+    manifest_blobs
+        .get(&manifest_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|blob| {
+            let count = references.get_mut(blob)?;
+            *count -= 1;
+            (*count == 0).then(|| object_sizes.get(blob.as_str()).copied().unwrap_or_default())
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+fn budget_protected_tags(
+    policy: &ImageRetentionPolicy,
+    tags: &[RetentionTag],
+) -> HashSet<(String, String)> {
+    let mut protected = HashSet::new();
+    let mut by_image: HashMap<&str, Vec<&RetentionTag>> = HashMap::new();
+    for tag in tags {
+        by_image.entry(&tag.image).or_default().push(tag);
+    }
+    for rule in &policy.rules {
+        for (image, image_tags) in &by_image {
+            if !rule.matches(image) {
+                continue;
+            }
+            protected.extend(
+                image_tags
+                    .iter()
+                    .filter(|t| rule.protected_tags.iter().any(|p| p == &t.tag))
+                    .map(|t| (t.image.clone(), t.tag.clone())),
+            );
+            if let Some(keep) = rule.keep_last_n_tags {
+                let mut ordered: Vec<_> = image_tags
+                    .iter()
+                    .filter(|t| !rule.protected_tags.iter().any(|p| p == &t.tag))
+                    .copied()
+                    .collect();
+                ordered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.tag.cmp(&b.tag)));
+                protected.extend(
+                    ordered
+                        .into_iter()
+                        .take(keep as usize)
+                        .map(|t| (t.image.clone(), t.tag.clone())),
+                );
+            }
+        }
+    }
+    protected
+}
+
+fn protected_manifests(
+    remaining: &HashSet<i64>,
+    tags: &[&RetentionTag],
+    by_id: &HashMap<i64, &RetentionManifest>,
+    by_digest: &HashMap<(&str, &str), i64>,
+) -> HashSet<i64> {
+    let mut kept: HashSet<i64> = tags
+        .iter()
+        .map(|t| t.manifest_id)
+        .filter(|id| remaining.contains(id))
+        .collect();
+    loop {
+        let mut grew = false;
+        for manifest in by_id.values().filter(|m| remaining.contains(&m.id)) {
+            if kept.contains(&manifest.id) {
+                for child in &manifest.children {
+                    if let Some(id) = by_digest.get(&(manifest.image.as_str(), child.as_str())) {
+                        grew |= kept.insert(*id);
+                    }
+                }
+            } else if let Some(subject) = &manifest.subject_digest {
+                if by_digest
+                    .get(&(manifest.image.as_str(), subject.as_str()))
+                    .is_some_and(|id| kept.contains(id))
+                {
+                    grew |= kept.insert(manifest.id);
+                }
+            }
+        }
+        if !grew {
+            return kept;
+        }
+    }
+}
+
 /// Snapshot a repository and evaluate `policy` on it. Returns the decisions
 /// and how many tags and manifests were inspected.
 pub async fn evaluate_repository(
@@ -358,18 +693,39 @@ pub async fn evaluate_repository(
     repository_id: i64,
     now: DateTime<Utc>,
     policy: &ImageRetentionPolicy,
-) -> sqlx::Result<(ImageDecisions, u64)> {
+) -> sqlx::Result<(ImageDecisions, u64, Option<ImageBudgetSummary>)> {
     let tags = oci_dao::retention_tags(pool, repository_id).await?;
     let manifests = oci_dao::retention_manifests(pool, repository_id).await?;
     let evaluated = (tags.len() + manifests.len()) as u64;
+    let (manifest_objects, blob_refs, size_before) = if policy.size_budget.is_some() {
+        let (objects, refs) = oci_dao::retention_manifest_objects(pool, repository_id).await?;
+        let size = oci_dao::repository_size(pool, repository_id).await?;
+        (objects, refs, Some(size))
+    } else {
+        (Vec::new(), Vec::new(), None)
+    };
     let policy = policy.clone();
-    let decisions =
-        tokio::task::spawn_blocking(move || evaluate_images(now, &policy, &tags, &manifests))
-            .await
-            .map_err(|e| {
-                sqlx::Error::Protocol(format!("image retention evaluation failed: {e}"))
-            })?;
-    Ok((decisions, evaluated))
+    let (decisions, budget) = tokio::task::spawn_blocking(move || {
+        let mut decisions = evaluate_images(now, &policy, &tags, &manifests);
+        let budget = size_before.and_then(|size| {
+            let (budget_decisions, summary) = evaluate_image_size_budget(
+                &policy,
+                &tags,
+                &manifests,
+                &manifest_objects,
+                &blob_refs,
+                &decisions,
+                size,
+            );
+            decisions.tags.extend(budget_decisions.tags);
+            decisions.manifests.extend(budget_decisions.manifests);
+            summary
+        });
+        (decisions, budget)
+    })
+    .await
+    .map_err(|e| sqlx::Error::Protocol(format!("image retention evaluation failed: {e}")))?;
+    Ok((decisions, evaluated, budget))
 }
 
 /// What an image retention run's decisions were made under, re-checked
@@ -462,7 +818,7 @@ pub async fn apply_images(
                 summary.skipped += remaining as u64;
                 return Ok(summary);
             }
-            decided = Some(decided_now(&mut tx, repository_id, image, fence).await?);
+            decided = Some(decided_now(&mut tx, repository_id, image, fence, batch).await?);
         }
         for &d in batch {
             let still = decided.as_ref().is_none_or(|now| now.contains(d));
@@ -516,17 +872,109 @@ async fn decided_now(
     repository_id: i64,
     image: &str,
     fence: &ImageRunFence<'_>,
+    batch: &[ImageDecision<'_>],
 ) -> sqlx::Result<DecidedNow> {
     let (tags, manifests) = oci_dao::lock_image_for_retention(tx, repository_id, image).await?;
-    let now = evaluate_images(fence.evaluated_at, fence.policy, &tags, &manifests);
+    let evaluated = evaluate_images(fence.evaluated_at, fence.policy, &tags, &manifests);
+    let mut selected_tags: HashSet<(String, i64)> = evaluated
+        .tags
+        .iter()
+        .map(|t| (t.tag.clone(), t.manifest_id))
+        .collect();
+    let mut selected_manifests: HashSet<i64> =
+        evaluated.manifests.iter().map(|m| m.manifest_id).collect();
+    let mut remaining_tags: Vec<&RetentionTag> = tags
+        .iter()
+        .filter(|t| !selected_tags.contains(&(t.tag.clone(), t.manifest_id)))
+        .collect();
+    let protected_tags = budget_protected_tags(fence.policy, &tags);
+    for decision in batch {
+        let ImageDecision::Tag(tag) = decision else {
+            continue;
+        };
+        if tag.rule_id != "size_budget"
+            || protected_tags.contains(&(tag.image.clone(), tag.tag.clone()))
+            || remaining_tags
+                .iter()
+                .filter(|t| t.image == tag.image)
+                .count()
+                <= 1
+        {
+            continue;
+        }
+        let Some(current) = tags
+            .iter()
+            .find(|t| t.image == tag.image && t.tag == tag.tag && t.manifest_id == tag.manifest_id)
+        else {
+            continue;
+        };
+        if reason_time(&tag.reason).is_some_and(|cutoff| {
+            current
+                .last_pulled_at
+                .unwrap_or(current.updated_at)
+                .max(current.updated_at)
+                > cutoff
+        }) {
+            continue;
+        }
+        selected_tags.insert((tag.tag.clone(), tag.manifest_id));
+        remaining_tags.retain(|t| !(t.image == tag.image && t.tag == tag.tag));
+    }
+    let remaining_manifests: HashSet<i64> = manifests
+        .iter()
+        .map(|m| m.id)
+        .filter(|id| !selected_manifests.contains(id))
+        .collect();
+    let manifest_by_id: HashMap<i64, &RetentionManifest> =
+        manifests.iter().map(|m| (m.id, m)).collect();
+    let manifest_by_digest: HashMap<(&str, &str), i64> = manifests
+        .iter()
+        .map(|m| ((m.image.as_str(), m.digest.as_str()), m.id))
+        .collect();
+    let protected = protected_manifests(
+        &remaining_manifests,
+        &remaining_tags,
+        &manifest_by_id,
+        &manifest_by_digest,
+    );
+    for decision in batch {
+        let ImageDecision::Manifest(manifest) = decision else {
+            continue;
+        };
+        if manifest.rule_id != "size_budget"
+            || protected.contains(&manifest.manifest_id)
+            || remaining_tags
+                .iter()
+                .any(|t| t.manifest_id == manifest.manifest_id)
+        {
+            continue;
+        }
+        let Some(current) = manifest_by_id.get(&manifest.manifest_id) else {
+            continue;
+        };
+        if reason_time(&manifest.reason).is_some_and(|cutoff| {
+            current
+                .last_pulled_at
+                .unwrap_or(current.created_at)
+                .max(current.created_at)
+                > cutoff
+        }) {
+            continue;
+        }
+        selected_manifests.insert(manifest.manifest_id);
+    }
     Ok(DecidedNow {
-        tags: now
-            .tags
-            .into_iter()
-            .map(|t| (t.tag, t.manifest_id))
-            .collect(),
-        manifests: now.manifests.into_iter().map(|m| m.manifest_id).collect(),
+        tags: selected_tags,
+        manifests: selected_manifests,
     })
+}
+
+fn reason_time(reason: &serde_json::Value) -> Option<DateTime<Utc>> {
+    reason
+        .get("last_used_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 /// Apply one decision inside its batch's transaction (unless `dry_run`, or
@@ -765,5 +1213,97 @@ mod tests {
         assert!(validate_image_policy(&p, RepoKind::Hosted).is_ok());
         p.size_budget.as_mut().unwrap().target_bytes = Some(101);
         assert!(validate_image_policy(&p, RepoKind::Hosted).is_err());
+    }
+
+    #[test]
+    fn size_budget_deletes_untagged_manifests_and_counts_shared_blobs_once() {
+        let tags = vec![tag("app", "latest", 2, 1)];
+        let manifests = vec![
+            manifest("app", 1, Some(90), &[], None),
+            manifest("app", 2, None, &[], None),
+        ];
+        let objects = vec![
+            oci_dao::RetentionManifestObject {
+                manifest_id: 1,
+                blob_sha256: "manifest-1".into(),
+                size: 10,
+            },
+            oci_dao::RetentionManifestObject {
+                manifest_id: 2,
+                blob_sha256: "manifest-2".into(),
+                size: 10,
+            },
+        ];
+        let blobs = vec![
+            oci_dao::RetentionBlobRef {
+                manifest_id: 1,
+                blob_sha256: "shared".into(),
+                size: 50,
+            },
+            oci_dao::RetentionBlobRef {
+                manifest_id: 2,
+                blob_sha256: "shared".into(),
+                size: 50,
+            },
+            oci_dao::RetentionBlobRef {
+                manifest_id: 1,
+                blob_sha256: "unique".into(),
+                size: 20,
+            },
+        ];
+        let mut p = policy(Vec::new());
+        p.size_budget = Some(SizeBudget {
+            max_bytes: 80,
+            target_bytes: Some(60),
+        });
+        let (decisions, summary) = evaluate_image_size_budget(
+            &p,
+            &tags,
+            &manifests,
+            &objects,
+            &blobs,
+            &ImageDecisions::default(),
+            90,
+        );
+        assert!(decisions.tags.is_empty());
+        assert_eq!(
+            decisions
+                .manifests
+                .iter()
+                .map(|m| m.manifest_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let summary = summary.unwrap();
+        assert_eq!(summary.size_after, 60);
+        assert!(summary.target_reached);
+    }
+
+    #[test]
+    fn size_budget_never_removes_an_images_last_tag() {
+        let tags = vec![tag("app", "latest", 2, 1)];
+        let manifests = vec![manifest("app", 2, None, &[], None)];
+        let objects = vec![oci_dao::RetentionManifestObject {
+            manifest_id: 2,
+            blob_sha256: "manifest-2".into(),
+            size: 100,
+        }];
+        let mut p = policy(Vec::new());
+        p.size_budget = Some(SizeBudget {
+            max_bytes: 10,
+            target_bytes: Some(5),
+        });
+        let (decisions, summary) = evaluate_image_size_budget(
+            &p,
+            &tags,
+            &manifests,
+            &objects,
+            &[],
+            &ImageDecisions::default(),
+            100,
+        );
+        assert!(decisions.tags.is_empty());
+        assert!(decisions.manifests.is_empty());
+        assert!(!summary.unwrap().target_reached);
     }
 }

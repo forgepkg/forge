@@ -392,6 +392,8 @@ export interface PolicyDraft {
   dryRunOnly: boolean
   interval: string
   intervalUnit: IntervalUnit
+  sizeBudgetMaxGiB: string
+  sizeBudgetTargetGiB: string
   rules: RuleDraft[]
 }
 
@@ -459,6 +461,8 @@ export function draftFromPolicy(
       dryRunOnly: true,
       interval: '1',
       intervalUnit: 'hours',
+      sizeBudgetMaxGiB: '',
+      sizeBudgetTargetGiB: '',
       rules: [example],
     }
   }
@@ -470,6 +474,14 @@ export function draftFromPolicy(
     dryRunOnly: policy.dry_run_only ?? false,
     interval: interval.value,
     intervalUnit: interval.unit,
+    sizeBudgetMaxGiB:
+      policy.size_budget === undefined
+        ? ''
+        : String(policy.size_budget.max_bytes / GIB),
+    sizeBudgetTargetGiB:
+      policy.size_budget?.target_bytes === undefined
+        ? ''
+        : String(policy.size_budget.target_bytes / GIB),
     rules: rules.map((r) => ruleFromJson(shape, r as unknown as Record<string, unknown>)),
   }
 }
@@ -477,6 +489,8 @@ export function draftFromPolicy(
 /** What is wrong with the form, field by field. */
 export interface DraftErrors {
   interval?: string
+  sizeBudgetMaxGiB?: string
+  sizeBudgetTargetGiB?: string
   /** A message for the rules as a whole. */
   rules?: string
   /** Per rule key, per field key. */
@@ -484,6 +498,7 @@ export interface DraftErrors {
 }
 
 const WHOLE = /^\d+$/
+const GIB = 1024 ** 3
 
 /** The browser's checks; `null` when the form can be sent. */
 export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErrors | null {
@@ -494,8 +509,31 @@ export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErro
     errors.interval = 'Enter a whole number of at least 1.'
     failed = true
   }
-  if (draft.rules.length === 0) {
-    errors.rules = 'Add a rule, or remove the policy.'
+  const maxGiB = draft.sizeBudgetMaxGiB.trim()
+  const targetGiB = draft.sizeBudgetTargetGiB.trim()
+  const validMax = maxGiB !== '' && /^\d+(\.\d+)?$/.test(maxGiB) && Number(maxGiB) > 0
+  if (maxGiB !== '' && !validMax) {
+    errors.sizeBudgetMaxGiB = 'Enter a positive size in GiB, or leave it empty.'
+    failed = true
+  }
+  if (validMax && Number(maxGiB) * GIB > Number.MAX_SAFE_INTEGER) {
+    errors.sizeBudgetMaxGiB = 'The maximum exceeds the supported byte range.'
+    failed = true
+  }
+  if (targetGiB !== '') {
+    if (!/^\d+(\.\d+)?$/.test(targetGiB) || Number(targetGiB) <= 0) {
+      errors.sizeBudgetTargetGiB = 'Enter a positive size in GiB, or leave it empty.'
+      failed = true
+    } else if (!validMax) {
+      errors.sizeBudgetTargetGiB = 'Set a maximum size first.'
+      failed = true
+    } else if (Number(targetGiB) > Number(maxGiB)) {
+      errors.sizeBudgetTargetGiB = 'The target must not exceed the maximum.'
+      failed = true
+    }
+  }
+  if (draft.rules.length === 0 && !validMax) {
+    errors.rules = 'Add a rule or set a size budget.'
     failed = true
   }
   const seen = new Set<string>()
@@ -541,8 +579,19 @@ export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPo
     }
     return json as unknown as RetentionRule
   })
+  const base = structuredClone(draft.base)
+  if (draft.sizeBudgetMaxGiB.trim() === '') {
+    delete base.size_budget
+  } else {
+    base.size_budget = {
+      max_bytes: Math.floor(Number(draft.sizeBudgetMaxGiB) * GIB),
+      ...(draft.sizeBudgetTargetGiB.trim() === ''
+        ? {}
+        : { target_bytes: Math.floor(Number(draft.sizeBudgetTargetGiB) * GIB) }),
+    }
+  }
   return {
-    ...structuredClone(draft.base),
+    ...base,
     version: (draft.base.version as number | undefined) ?? 1,
     enabled: draft.enabled,
     dry_run_only: draft.dryRunOnly,
@@ -555,6 +604,7 @@ export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPo
 /** Whether runs of `policy` delete anything (rather than only unlist). */
 export function policyDeletes(shape: PolicyShape, policy: RetentionPolicy): boolean {
   if (policy.enabled === false || policy.dry_run_only) return false
+  if (policy.size_budget) return true
   if (shape !== 'package') return policy.rules.length > 0
   return policy.rules.some((r) => 'action' in r && r.action === 'hard_delete')
 }
@@ -566,19 +616,28 @@ function plural(n: number, one: string, many = `${one}s`): string {
 /** One sentence of what a preview found. */
 export function summarizePreview(shape: PolicyShape, preview: PreviewView): string {
   const { evaluated, deleted, unlisted } = preview.counts
+  let summary: string
   switch (shape) {
     case 'package':
-      return `Of ${plural(evaluated, 'version')}, ${deleted.toLocaleString()} would be deleted and ${unlisted.toLocaleString()} unlisted.`
+      summary = `Of ${plural(evaluated, 'version')}, ${deleted.toLocaleString()} would be deleted and ${unlisted.toLocaleString()} unlisted.`
+      break
     case 'proxy':
-      return `Of ${plural(evaluated, 'cached version')}, ${deleted.toLocaleString()} would be evicted.`
+      summary = `Of ${plural(evaluated, 'cached version')}, ${deleted.toLocaleString()} would be evicted.`
+      break
     case 'file':
-      return `Of ${plural(evaluated, 'file')}, ${deleted.toLocaleString()} would be deleted.`
+      summary = `Of ${plural(evaluated, 'file')}, ${deleted.toLocaleString()} would be deleted.`
+      break
     case 'image': {
       const tags = preview.image_decisions?.tags.length ?? 0
       const manifests = preview.image_decisions?.manifests.length ?? 0
-      return `Of ${plural(evaluated, 'tag and manifest', 'tags and manifests')}, ${plural(tags, 'tag')} and ${plural(manifests, 'manifest')} would be deleted.`
+      summary = `Of ${plural(evaluated, 'tag and manifest', 'tags and manifests')}, ${plural(tags, 'tag')} and ${plural(manifests, 'manifest')} would be deleted.`
+      break
     }
   }
+  if (preview.target_bytes !== undefined && preview.size_before !== undefined) {
+    summary += ` Size would go from ${formatSize(preview.size_before)} to ${formatSize(preview.size_after ?? preview.size_before)} against a ${formatSize(preview.target_bytes)} target; ${preview.target_reached ? 'the target would be reached' : 'protected content would keep it above target'}.`
+  }
+  return summary
 }
 
 function days(n: number): string {
@@ -594,6 +653,14 @@ const REASONS: Record<string, (n: number) => string> = {
   tag_older_than_days: (n) => `pushed over ${days(n)} ago`,
   tag_not_pulled_for_days: (n) => `not pulled for ${days(n)}`,
   delete_untagged_after_days: (n) => `untagged for ${days(n)}`,
+  size_budget: (n) => `repository exceeds ${formatSize(n)}`,
+  target_bytes: (n) => `target ${formatSize(n)}`,
+  size_bytes: (n) => `${formatSize(n)} removed`,
+}
+
+function formatSize(bytes: number): string {
+  const gib = bytes / (1024 ** 3)
+  return `${gib.toLocaleString(undefined, { maximumFractionDigits: 2 })} GiB`
 }
 
 /** Why a rule selected something, from a decision's or audit row's `reason`. */
@@ -614,11 +681,13 @@ export function RetentionPolicyForm({
   shape,
   draft,
   errors,
+  currentSizeBytes = 0,
   onChange,
 }: {
   shape: PolicyShape
   draft: PolicyDraft
   errors: DraftErrors | null
+  currentSizeBytes?: number
   onChange: (draft: PolicyDraft) => void
 }) {
   const spec = SHAPES[shape]
@@ -676,6 +745,40 @@ export function RetentionPolicyForm({
           <option value="seconds">Seconds</option>
         </SelectField>
       </div>
+
+      <Fieldset
+        legend="Size budget"
+        description="After the rules run, delete least-recently used content until the repository reaches the target. This counts logical repository content, not deduplicated object-store usage."
+      >
+        <p className="fg-text">
+          Current logical size: {(currentSizeBytes / GIB).toLocaleString(undefined, {
+            maximumFractionDigits: 2,
+          })}{' '}
+          GiB
+        </p>
+        <div className="fg-fieldrow">
+          <TextField
+            label="Maximum size (GiB)"
+            optional
+            mono
+            inputMode="decimal"
+            value={draft.sizeBudgetMaxGiB}
+            onChange={(e) => onChange({ ...draft, sizeBudgetMaxGiB: e.target.value })}
+            error={errors?.sizeBudgetMaxGiB}
+            description="Eviction starts when the repository grows past this size."
+          />
+          <TextField
+            label="Target size (GiB)"
+            optional
+            mono
+            inputMode="decimal"
+            value={draft.sizeBudgetTargetGiB}
+            onChange={(e) => onChange({ ...draft, sizeBudgetTargetGiB: e.target.value })}
+            error={errors?.sizeBudgetTargetGiB}
+            description="Defaults to 90% of the maximum to avoid deleting content on every run."
+          />
+        </div>
+      </Fieldset>
 
       <p className="fg-text">{spec.rulesNote}</p>
       {draft.rules.map((rule, i) => (

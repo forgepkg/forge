@@ -2949,7 +2949,7 @@ async fn claim_image_run(
     let policy: forge_core::retention::images::ImageRetentionPolicy =
         serde_json::from_value(claimed.policy.clone()).unwrap();
     let now = forge_db::db_now(&srv.pool).await.unwrap();
-    let (decisions, _) =
+    let (decisions, _, _) =
         forge_core::retention::images::evaluate_repository(&srv.pool, repo_id, now, &policy)
             .await
             .unwrap();

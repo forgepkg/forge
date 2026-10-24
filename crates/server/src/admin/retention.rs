@@ -76,6 +76,25 @@ pub struct RetentionView {
     /// Whether retention runs at all (`/admin/settings/retention`): while it
     /// is off, no policy runs.
     pub runs_enabled: bool,
+    /// Current logical content size in bytes.
+    pub current_size_bytes: u64,
+}
+
+async fn current_size_bytes(
+    state: &AppState,
+    repo: &forge_db::model::Repository,
+) -> Result<u64, Response> {
+    if repo.kind() == RepoKind::Group {
+        return Ok(0);
+    }
+    let size = if state.formats.stores_images(&repo.format) {
+        forge_db::oci_dao::repository_size(&state.pool, repo.id).await
+    } else if state.formats.stores_files(&repo.format) {
+        forge_db::raw_dao::repository_size(&state.pool, repo.id).await
+    } else {
+        retention_dao::package_repository_size(&state.pool, repo.id).await
+    };
+    size.map_err(db_error)
 }
 
 /// Whether retention runs for every repository (the stored settings).
@@ -105,11 +124,16 @@ pub async fn get(State(state): State<AppState>, Path(name): Path<String>) -> Res
         Ok(on) => on,
         Err(resp) => return resp,
     };
+    let current_size_bytes = match current_size_bytes(&state, &repo).await {
+        Ok(size) => size,
+        Err(resp) => return resp,
+    };
 
     Json(RetentionView {
         policy,
         last_run,
         runs_enabled,
+        current_size_bytes,
     })
     .into_response()
 }
@@ -188,15 +212,22 @@ pub async fn put(
     };
 
     match retention_dao::write_policy(&state.pool, repo.id, Some(&policy_json)).await {
-        Ok(true) => Json(RetentionView {
-            policy: Some(policy_json),
-            last_run: retention_dao::get_run(&state.pool, repo.id)
-                .await
-                .ok()
-                .flatten(),
-            runs_enabled: runs_enabled(&state).await.unwrap_or(false),
-        })
-        .into_response(),
+        Ok(true) => {
+            let current_size_bytes = match current_size_bytes(&state, &repo).await {
+                Ok(size) => size,
+                Err(resp) => return resp,
+            };
+            Json(RetentionView {
+                policy: Some(policy_json),
+                last_run: retention_dao::get_run(&state.pool, repo.id)
+                    .await
+                    .ok()
+                    .flatten(),
+                runs_enabled: runs_enabled(&state).await.unwrap_or(false),
+                current_size_bytes,
+            })
+            .into_response()
+        }
         Ok(false) => not_found(),
         Err(e) => db_error(e),
     }
@@ -300,6 +331,14 @@ pub struct PreviewView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_decisions: Option<Vec<FileDecision>>,
     pub counts: PreviewCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_reached: Option<bool>,
 }
 
 /// `POST /admin/repositories/{name}/retention/preview` — **dry run**.
@@ -336,6 +375,10 @@ pub async fn preview(
                         .then(ImageDecisions::default),
                     file_decisions: state.formats.stores_files(&repo.format).then(Vec::new),
                     counts: PreviewCounts::default(),
+                    size_before: None,
+                    size_after: None,
+                    target_bytes: None,
+                    target_reached: None,
                 })
                 .into_response()
             }
@@ -362,6 +405,10 @@ pub async fn preview(
             image_decisions: None,
             file_decisions: None,
             counts: PreviewCounts::default(),
+            size_before: None,
+            size_after: None,
+            target_bytes: None,
+            target_reached: None,
         })
         .into_response();
     }
@@ -394,6 +441,7 @@ pub async fn preview(
                     listed: r.listed,
                     created_at: r.created_at,
                     last_downloaded_at: r.last_downloaded_at,
+                    size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
                 })
                 .collect(),
             Err(e) => return db_error(e),
@@ -412,6 +460,7 @@ pub async fn preview(
                     listed: r.listed,
                     first_seen_at: r.first_seen_at,
                     last_downloaded_at: r.last_downloaded_at,
+                    size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
                 })
                 .collect(),
             Err(e) => return db_error(e),
@@ -423,14 +472,32 @@ pub async fn preview(
     let evaluated = hosted.len() + proxy.len();
     // The evaluator is CPU-bound and grows with the repository: run it on the
     // blocking pool so a large preview does not stall a runtime worker thread.
+    let size_before = if policy.size_budget.is_some() {
+        match retention_dao::package_repository_size(&state.pool, repo.id).await {
+            Ok(size) => size,
+            Err(e) => return db_error(e),
+        }
+    } else {
+        0
+    };
     let evaluation = tokio::task::spawn_blocking(move || {
-        (
-            evaluate(format.as_ref(), now, &policy, &hosted),
-            evaluate_proxy(format.as_ref(), now, &policy, &proxy),
-        )
+        let decisions = evaluate(format.as_ref(), now, &policy, &hosted);
+        let proxy_decisions = evaluate_proxy(format.as_ref(), now, &policy, &proxy);
+        let budget = policy.size_budget.map(|_| {
+            forge_core::retention::evaluate::evaluate_size_budget(
+                format.as_ref(),
+                &policy,
+                &hosted,
+                &proxy,
+                &decisions,
+                &proxy_decisions,
+                size_before,
+            )
+        });
+        (decisions, proxy_decisions, budget)
     })
     .await;
-    let (mut decisions, proxy_decisions) = match evaluation {
+    let (mut decisions, mut proxy_decisions, mut budget) = match evaluation {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, repo = %repo.name, "retention preview evaluation failed");
@@ -442,6 +509,35 @@ pub async fn preview(
         forge_core::retention::spare_protected(&state.pool, repo.id, &mut decisions).await
     {
         return db_error(e);
+    }
+    if let Some(plan) = &mut budget {
+        let selected_bytes_before: u64 = plan
+            .hosted
+            .iter()
+            .filter_map(|d| d.reason.size_bytes)
+            .fold(0u64, u64::saturating_add);
+        if let Err(e) =
+            forge_core::retention::spare_protected(&state.pool, repo.id, &mut plan.hosted).await
+        {
+            return db_error(e);
+        }
+        let selected_bytes_after: u64 = plan
+            .hosted
+            .iter()
+            .filter_map(|d| d.reason.size_bytes)
+            .fold(0u64, u64::saturating_add);
+        plan.size_after = plan
+            .size_after
+            .saturating_add(selected_bytes_before.saturating_sub(selected_bytes_after));
+        plan.target_reached = plan.size_after <= plan.target_bytes;
+        let budget_deleted: std::collections::HashSet<i64> =
+            plan.hosted.iter().map(|d| d.component_id).collect();
+        decisions.retain(|d| {
+            d.action != forge_core::retention::model::Action::Unlist
+                || !budget_deleted.contains(&d.component_id)
+        });
+        decisions.append(&mut plan.hosted);
+        proxy_decisions.append(&mut plan.proxy);
     }
 
     use forge_core::retention::model::Action;
@@ -465,6 +561,10 @@ pub async fn preview(
             unlisted,
             deleted,
         },
+        size_before: budget.as_ref().map(|b| b.size_before),
+        size_after: budget.as_ref().map(|b| b.size_after),
+        target_bytes: budget.as_ref().map(|b| b.target_bytes),
+        target_reached: budget.as_ref().map(|b| b.target_reached),
     })
     .into_response()
 }
@@ -493,6 +593,10 @@ async fn preview_images(
             evaluated,
             ..PreviewCounts::default()
         },
+        size_before: None,
+        size_after: None,
+        target_bytes: None,
+        target_reached: None,
     };
     if !source.enable(&mut policy.enabled) {
         return Json(empty(0)).into_response();
@@ -507,7 +611,7 @@ async fn preview_images(
     match forge_core::retention::images::evaluate_repository(&state.pool, repo.id, now, &policy)
         .await
     {
-        Ok((decisions, evaluated)) => {
+        Ok((decisions, evaluated, budget)) => {
             let deleted = decisions.tags.len() + decisions.manifests.len();
             Json(PreviewView {
                 decisions: Vec::new(),
@@ -519,6 +623,10 @@ async fn preview_images(
                     unlisted: 0,
                     deleted,
                 },
+                size_before: budget.as_ref().map(|b| b.size_before),
+                size_after: budget.as_ref().map(|b| b.size_after),
+                target_bytes: budget.as_ref().map(|b| b.target_bytes),
+                target_reached: budget.as_ref().map(|b| b.target_reached),
             })
             .into_response()
         }
@@ -550,6 +658,10 @@ async fn preview_files(
             deleted: decisions.len(),
         },
         file_decisions: Some(decisions),
+        size_before: None,
+        size_after: None,
+        target_bytes: None,
+        target_reached: None,
     };
     if !source.enable(&mut policy.enabled) {
         return Json(view(Vec::new(), 0)).into_response();
@@ -564,7 +676,14 @@ async fn preview_files(
     match forge_core::retention::files::evaluate_repository(&state.pool, repo.id, now, &policy)
         .await
     {
-        Ok((decisions, evaluated)) => Json(view(decisions, evaluated as usize)).into_response(),
+        Ok((decisions, evaluated, budget)) => {
+            let mut result = view(decisions, evaluated as usize);
+            result.size_before = budget.as_ref().map(|b| b.size_before);
+            result.size_after = budget.as_ref().map(|b| b.size_after);
+            result.target_bytes = budget.as_ref().map(|b| b.target_bytes);
+            result.target_reached = budget.as_ref().map(|b| b.target_reached);
+            Json(result).into_response()
+        }
         Err(e) => db_error(e),
     }
 }

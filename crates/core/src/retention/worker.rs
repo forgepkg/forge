@@ -301,6 +301,7 @@ impl RetentionWorker {
                 listed: r.listed,
                 created_at: r.created_at,
                 last_downloaded_at: r.last_downloaded_at,
+                size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
             })
             .collect()
         };
@@ -316,10 +317,17 @@ impl RetentionWorker {
                     listed: r.listed,
                     first_seen_at: r.first_seen_at,
                     last_downloaded_at: r.last_downloaded_at,
+                    size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
                 })
                 .collect()
         } else {
             Vec::new()
+        };
+
+        let budget_size_before = if policy.size_budget.is_some() {
+            Some(retention_dao::package_repository_size(&self.pool, repo.repository_id).await?)
+        } else {
+            None
         };
 
         // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
@@ -328,20 +336,33 @@ impl RetentionWorker {
             let format = Arc::clone(&format);
             let policy = policy.clone();
             tokio::task::spawn_blocking(move || {
-                (
-                    evaluate(format.as_ref(), now, &policy, &hosted),
-                    evaluate_proxy(format.as_ref(), now, &policy, &proxy),
-                )
+                let hosted_decisions = evaluate(format.as_ref(), now, &policy, &hosted);
+                let proxy_decisions = evaluate_proxy(format.as_ref(), now, &policy, &proxy);
+                let budget = budget_size_before
+                    .zip(policy.size_budget)
+                    .map(|(size_before, _)| {
+                        crate::retention::evaluate::evaluate_size_budget(
+                            format.as_ref(),
+                            &policy,
+                            &hosted,
+                            &proxy,
+                            &hosted_decisions,
+                            &proxy_decisions,
+                            size_before,
+                        )
+                    });
+                (hosted_decisions, proxy_decisions, budget)
             })
         };
         // A panic there (e.g. a panicking `Format`) fails the run like a panic
         // anywhere else in `process`.
-        let (mut hosted_decisions, proxy_decisions) = evaluation.await.map_err(|e| {
-            WorkerError::Panicked(match e.try_into_panic() {
-                Ok(panic) => panic_message(&*panic),
-                Err(e) => e.to_string(), // cancelled: the runtime is shutting down
-            })
-        })?;
+        let (mut hosted_decisions, mut proxy_decisions, mut budget_plan) =
+            evaluation.await.map_err(|e| {
+                WorkerError::Panicked(match e.try_into_panic() {
+                    Ok(panic) => panic_message(&*panic),
+                    Err(e) => e.to_string(), // cancelled: the runtime is shutting down
+                })
+            })?;
         // A version a package tag names is never touched.
         let spared = crate::retention::spare_protected(
             &self.pool,
@@ -351,6 +372,37 @@ impl RetentionWorker {
         .await?;
         if spared > 0 {
             tracing::info!(repo = %repo.name, spared, "retention spared tagged versions");
+        }
+
+        if let Some(plan) = &mut budget_plan {
+            let selected_bytes_before: u64 = plan
+                .hosted
+                .iter()
+                .filter_map(|d| d.reason.size_bytes)
+                .fold(0u64, u64::saturating_add);
+            let spared =
+                crate::retention::spare_protected(&self.pool, repo.repository_id, &mut plan.hosted)
+                    .await?;
+            if spared > 0 {
+                tracing::info!(repo = %repo.name, spared, "size budget spared tagged versions");
+            }
+            let selected_bytes_after: u64 = plan
+                .hosted
+                .iter()
+                .filter_map(|d| d.reason.size_bytes)
+                .fold(0u64, u64::saturating_add);
+            plan.size_after = plan
+                .size_after
+                .saturating_add(selected_bytes_before.saturating_sub(selected_bytes_after));
+            plan.target_reached = plan.size_after <= plan.target_bytes;
+            let budget_deleted: std::collections::HashSet<i64> =
+                plan.hosted.iter().map(|d| d.component_id).collect();
+            hosted_decisions.retain(|d| {
+                d.action != crate::retention::model::Action::Unlist
+                    || !budget_deleted.contains(&d.component_id)
+            });
+            hosted_decisions.append(&mut plan.hosted);
+            proxy_decisions.append(&mut plan.proxy);
         }
 
         // Affected package names (for cache invalidation after the run).
@@ -377,7 +429,18 @@ impl RetentionWorker {
                 format: format.as_ref(),
             }),
         };
-        let summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
+        let mut summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
+        if let Some(plan) = budget_plan {
+            let size_after = if policy.dry_run_only {
+                plan.size_after
+            } else {
+                retention_dao::package_repository_size(&self.pool, repo.repository_id).await?
+            };
+            summary.size_before = Some(plan.size_before);
+            summary.size_after = Some(size_after);
+            summary.target_bytes = Some(plan.target_bytes);
+            summary.target_reached = Some(size_after <= plan.target_bytes);
+        }
 
         // ── Finish: record summary, advance schedule, clear lease. ──
         if !retention_dao::finish_run(
@@ -429,7 +492,7 @@ impl RetentionWorker {
                 .max(self.config.default_run_interval);
         let mut summary = RunSummary::default();
         if policy.enabled {
-            let (decisions, evaluated) =
+            let (decisions, evaluated, budget) =
                 images::evaluate_repository(&self.pool, repo.repository_id, now, &policy).await?;
             let fence = images::ImageRunFence {
                 stored_policy: &repo.policy,
@@ -447,6 +510,17 @@ impl RetentionWorker {
             )
             .await?;
             summary.evaluated = evaluated;
+            if let Some(budget) = budget {
+                let size_after = if policy.dry_run_only {
+                    budget.size_after
+                } else {
+                    forge_db::oci_dao::repository_size(&self.pool, repo.repository_id).await?
+                };
+                summary.size_before = Some(budget.size_before);
+                summary.size_after = Some(size_after);
+                summary.target_bytes = Some(budget.target_bytes);
+                summary.target_reached = Some(size_after <= budget.target_bytes);
+            }
         }
         if !retention_dao::finish_run(
             &self.pool,
@@ -486,7 +560,7 @@ impl RetentionWorker {
                 .max(self.config.default_run_interval);
         let mut summary = RunSummary::default();
         if policy.enabled {
-            let (decisions, evaluated) =
+            let (decisions, evaluated, budget) =
                 files::evaluate_repository(&self.pool, repo.repository_id, now, &policy).await?;
             let fence = files::FileRunFence {
                 stored_policy: &repo.policy,
@@ -504,6 +578,17 @@ impl RetentionWorker {
             )
             .await?;
             summary.evaluated = evaluated;
+            if let Some(budget) = budget {
+                let size_after = if policy.dry_run_only {
+                    budget.size_after
+                } else {
+                    forge_db::raw_dao::repository_size(&self.pool, repo.repository_id).await?
+                };
+                summary.size_before = Some(budget.size_before);
+                summary.size_after = Some(size_after);
+                summary.target_bytes = Some(budget.target_bytes);
+                summary.target_reached = Some(size_after <= budget.target_bytes);
+            }
         }
         if !retention_dao::finish_run(
             &self.pool,

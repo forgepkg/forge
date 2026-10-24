@@ -160,6 +160,44 @@ async fn put_validates_then_get_round_trips() {
         .unwrap();
     assert_eq!(resp.status(), 400, "empty-rules policy must be rejected");
 
+    // A valid size budget can be the policy's only content.
+    let budget_only = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 100, "target_bytes": 80 },
+        "rules": []
+    });
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": budget_only}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "budget-only policy must be accepted");
+    let stored: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(stored["policy"]["size_budget"]["max_bytes"], 100);
+    assert!(stored["current_size_bytes"].is_number());
+
+    let invalid_budget = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 100, "target_bytes": 101 },
+        "rules": []
+    });
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": invalid_budget}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "target above maximum must be rejected");
+
     // Invalid: a proxy-cached rule on a hosted repo is rejected → 400.
     let proxy_on_hosted = json!({
         "version": 1, "enabled": true, "dry_run_only": false,

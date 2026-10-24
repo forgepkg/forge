@@ -80,6 +80,24 @@ describe('retention policy model', () => {
     expect(newRule('file', ['rule-2', 'keep-recent']).values.id).toBe('rule-3')
   })
 
+  it('builds a budget-only policy in GiB and validates its low watermark', () => {
+    const draft = draftFromPolicy('file', null)
+    draft.rules = []
+    draft.sizeBudgetMaxGiB = '2'
+    draft.sizeBudgetTargetGiB = '1.5'
+    expect(validateDraft('file', draft)).toBeNull()
+    expect(buildPolicy('file', draft).size_budget).toEqual({
+      max_bytes: 2 * 1024 ** 3,
+      target_bytes: 1.5 * 1024 ** 3,
+    })
+    expect(draftFromPolicy('file', buildPolicy('file', draft)).sizeBudgetMaxGiB).toBe('2')
+
+    draft.sizeBudgetTargetGiB = '2.5'
+    expect(validateDraft('file', draft)?.sizeBudgetTargetGiB).toMatch(/must not exceed/)
+    draft.sizeBudgetMaxGiB = '0'
+    expect(validateDraft('file', draft)?.sizeBudgetMaxGiB).toMatch(/positive size/)
+  })
+
   it('refuses empty and duplicate ids, bad numbers and no rules', () => {
     const draft = draftFromPolicy('image', null)
     const second = newRule('image', [])
@@ -123,5 +141,8 @@ describe('retention policy model', () => {
     ).toBe('not among the 3 newest in its directory')
     expect(describeReason({})).toBe('')
     expect(describeReason(null)).toBe('')
+    expect(describeReason({ size_budget: 1024 ** 3, target_bytes: 512 * 1024 ** 2 })).toBe(
+      'repository exceeds 1 GiB, target 0.5 GiB',
+    )
   })
 })

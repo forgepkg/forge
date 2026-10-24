@@ -64,9 +64,8 @@ pub struct SizeBudget {
 impl SizeBudget {
     /// Target watermark, defaulting to 90% of the maximum.
     pub fn target_bytes(self) -> u64 {
-        self.target_bytes.unwrap_or_else(|| {
-            (self.max_bytes / 10) * 9 + ((self.max_bytes % 10) * 9) / 10
-        })
+        self.target_bytes
+            .unwrap_or_else(|| (self.max_bytes / 10) * 9 + ((self.max_bytes % 10) * 9) / 10)
     }
 }
 
@@ -321,7 +320,9 @@ pub fn validate_policy(policy: &RetentionPolicy, repo_kind: RepoKind) -> Result<
     }
     if let Some(budget) = policy.size_budget {
         if budget.max_bytes == 0
-            || budget.target_bytes.is_some_and(|target| target > budget.max_bytes)
+            || budget
+                .target_bytes
+                .is_some_and(|target| target > budget.max_bytes)
         {
             return Err(PolicyError::InvalidSizeBudget);
         }

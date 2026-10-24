@@ -829,6 +829,7 @@ async fn claim_and_evaluate(
                     listed: r.listed,
                     created_at: r.created_at,
                     last_downloaded_at: r.last_downloaded_at,
+                    size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
                 },
             )
             .collect();
