@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use std::process::Command;
 
 const AUD: &str = "forge-ci";
-const NPM_AUD: &str = "https://registry.npmjs.org";
+const NPM_AUD: &str = "npm:forge.example.com";
 
 /// A GitLab-shaped job: the claims the `gitlab-ci` realm's rule matches.
 fn job_claims(idp: &MockOidc) -> Value {
@@ -217,7 +217,7 @@ async fn setup_npm(srv: &TestServer, idp: &MockOidc, level: &str, ttl: i64) {
         .fetch_one(&srv.pool)
         .await
         .unwrap();
-    for repo in ["npm-hosted", "npm-group"] {
+    for (repo, level) in [("npm-hosted", level), ("npm-group", "read")] {
         assert_eq!(
             srv.add_grant(role, Some(repo), level, None).await.status(),
             StatusCode::CREATED

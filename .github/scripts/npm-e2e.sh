@@ -39,11 +39,11 @@ port="${FORGE_E2E_PORT:-8431}"
 upstream_port="${FORGE_E2E_UPSTREAM_PORT:-5021}"
 base="http://127.0.0.1:$port"
 upstream="http://127.0.0.1:$upstream_port"
+oidc_audience="npm:127.0.0.1"
 admin_user="admin@example.com"
 admin_password="e2e-$(openssl rand -hex 12)"
 
-work="$results/work-$$"
-mkdir -m 700 "$work"
+work=$(mktemp -d)
 server_pid=""
 upstream_pid=""
 cleanup() {
@@ -97,16 +97,16 @@ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
 cat > "$work/upstream.py" <<'EOF'
 import base64, glob, hashlib, http.server, json, os, subprocess, sys, tarfile, threading, time, urllib.parse, uuid
 
-root, port, key = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+root, port, key, audience = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 issuer = f"http://127.0.0.1:{port}/oidc"
 
 def b64url(data):
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
-if sys.argv[4:] == ["--token"]:
+if sys.argv[5:] == ["--token"]:
     now = int(time.time())
     claims = {
-        "iss": issuer, "aud": "forge-npm-e2e",
+        "iss": issuer, "aud": audience,
         "sub": "project_path:acme/app:ref_type:branch:ref:main",
         "iat": now, "nbf": now - 5, "exp": now + 300, "jti": str(uuid.uuid4()),
         "job_project_id": "1001", "ref_protected": True,
@@ -209,7 +209,8 @@ class Registry(http.server.BaseHTTPRequestHandler):
 
 http.server.ThreadingHTTPServer(("127.0.0.1", port), Registry).serve_forever()
 EOF
-python3 -u "$work/upstream.py" "$work/upstream" "$upstream_port" "$work/oidc-key.pem" > "$work/upstream.log" 2>&1 &
+python3 -u "$work/upstream.py" "$work/upstream" "$upstream_port" "$work/oidc-key.pem" \
+  "$oidc_audience" > "$work/upstream.log" 2>&1 &
 upstream_pid=$!
 for _ in $(seq 1 30); do curl -fsS "$upstream/e2e-public" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS "$upstream/e2e-public" >/dev/null || fail "the mock upstream did not start"
@@ -377,10 +378,10 @@ step "trusted publishing with npm's OIDC exchange (no saved token)"
 role=$(admin POST /admin/roles '{"name":"npm-ci-publisher"}' | jq -er .id)
 admin PUT "/admin/roles/$role/grants" '{"repository":"npm-hosted","level":"write"}' >/dev/null
 admin PUT "/admin/roles/$role/grants" '{"repository":"npm-all","level":"read"}' >/dev/null
-admin POST /admin/realms "$(jq -n --arg issuer "$upstream/oidc" '{
+admin POST /admin/realms "$(jq -n --arg issuer "$upstream/oidc" --arg audience "$oidc_audience" '{
   kind: "workload_identity", name: "npm-gitlab-ci",
   config: {
-    issuer: $issuer, allow_http_issuer: true, allowed_audiences: ["forge-npm-e2e"],
+    issuer: $issuer, allow_http_issuer: true, allowed_audiences: [$audience],
     rules: [{role: "npm-ci-publisher", conditions: [
       {claim: "job_project_id", any_of: ["1001"]},
       {claim: "ref_protected", any_of: ["true"]}
@@ -395,7 +396,8 @@ for repo in npm-hosted npm-all; do
   name="e2e-oidc-$repo"
   dir="$work/oidc/$repo"
   package "$dir" "$name" 1.0.0
-  id_token=$(python3 "$work/upstream.py" "$work/upstream" "$upstream_port" "$work/oidc-key.pem" --token)
+  id_token=$(python3 "$work/upstream.py" "$work/upstream" "$upstream_port" "$work/oidc-key.pem" \
+    "$oidc_audience" --token)
   (
     cd "$dir"
     unset NODE_AUTH_TOKEN NPM_TOKEN npm_config__auth npm_config__authToken
