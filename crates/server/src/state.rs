@@ -224,7 +224,7 @@ impl FormatRegistry {
     }
 
     /// Whether format `id`'s repositories hold files under paths (raw): it
-    /// is installed and its `plugin.toml` says `storage = "files"`.
+    /// is installed and its descriptor says `Storage::Files`.
     pub fn stores_files(&self, id: &str) -> bool {
         self.formats.get(id).is_some_and(|f| f.stores_files())
     }
@@ -235,7 +235,7 @@ impl FormatRegistry {
         let mut mounts: Vec<&str> = self
             .plugins
             .values()
-            .map(|p| p.manifest().mount.as_str())
+            .map(|p| p.descriptor().mount)
             .collect();
         mounts.sort_unstable();
         mounts.dedup();
@@ -252,7 +252,7 @@ impl FormatRegistry {
 
     /// The repository kinds format `id` supports, `None` when it is not
     /// installed. Docker has every kind; a format plugin serves the kinds its
-    /// `plugin.toml` names (NuGet's and raw's all three).
+    /// descriptor names (NuGet's and raw's all three).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
         if Self::is_native(id) {
             return Some(vec!["hosted", "proxy", "group"]);
@@ -260,14 +260,10 @@ impl FormatRegistry {
         let plugin = self.plugins.get(id)?;
         Some(
             plugin
-                .manifest()
+                .descriptor()
                 .kinds
                 .iter()
-                .map(|kind| match kind {
-                    forge_plugin::api::RepositoryKind::Hosted => "hosted",
-                    forge_plugin::api::RepositoryKind::Proxy => "proxy",
-                    forge_plugin::api::RepositoryKind::Group => "group",
-                })
+                .map(|kind| kind.as_str())
                 .collect(),
         )
     }
