@@ -42,6 +42,13 @@ async fn unknown_repo_is_404() {
 /// list them anyway, still gets 404: [`unknown_repo_is_404`].)
 #[tokio::test]
 async fn unknown_repo_answers_like_a_denied_one() {
+    #[derive(Clone, Copy, Debug)]
+    enum Credentials {
+        Anonymous,
+        InvalidBearer,
+        SignedIn,
+    }
+
     let srv = common::start().await;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
@@ -80,10 +87,12 @@ async fn unknown_repo_answers_like_a_denied_one() {
     .unwrap();
     let session = srv.session_for(user.id).await;
 
-    let answer = |path: String, signed_in: bool| {
+    let answer = |path: String, credentials: Credentials| {
         let mut req = client.get(format!("{}{path}", srv.base_url));
-        if signed_in {
-            req = session.apply(req);
+        match credentials {
+            Credentials::Anonymous => {}
+            Credentials::InvalidBearer => req = req.bearer_auth("not-a-token"),
+            Credentials::SignedIn => req = session.apply(req),
         }
         async move {
             let resp = req.send().await.unwrap();
@@ -91,22 +100,29 @@ async fn unknown_repo_answers_like_a_denied_one() {
         }
     };
     let unknown = format!("absent{}", common::unique());
-    for (path, signed_in, status) in [
-        ("/repository/{}/index.json", false, 401),
-        ("/repository/{}/index.json", true, 403),
-        ("/browse/packages/{}/Foo", true, 403),
+    for (path, credentials, status) in [
+        ("/repository/{}/index.json", Credentials::Anonymous, 401),
+        ("/repository/{}/index.json", Credentials::SignedIn, 403),
+        ("/browse/packages/{}/Foo", Credentials::SignedIn, 403),
     ] {
-        let denied = answer(path.replace("{}", &private), signed_in).await;
-        let missing = answer(path.replace("{}", &unknown), signed_in).await;
+        let denied = answer(path.replace("{}", &private), credentials).await;
+        let missing = answer(path.replace("{}", &unknown), credentials).await;
         assert_eq!(denied.0, status, "{path} on a private repository");
         assert_eq!(missing, denied, "{path}: unknown answers like denied");
     }
-    for (signed_in, status) in [(false, 401), (true, 403)] {
-        let path = "/repository/{}/";
-        let denied = answer(path.replace("{}", &npm_private), signed_in).await;
-        let missing = answer(path.replace("{}", &unknown), signed_in).await;
-        assert_eq!(denied.0, status, "npm repository");
-        assert_eq!(missing, denied, "npm: unknown answers like denied");
+    for (credentials, status) in [
+        (Credentials::Anonymous, 401),
+        (Credentials::InvalidBearer, 401),
+        (Credentials::SignedIn, 403),
+    ] {
+        let path = "/repository/{}/left-pad";
+        let denied = answer(path.replace("{}", &npm_private), credentials).await;
+        let missing = answer(path.replace("{}", &unknown), credentials).await;
+        assert_eq!(denied.0, status, "npm repository with {credentials:?}");
+        assert_eq!(
+            missing, denied,
+            "npm: unknown answers like denied with {credentials:?}"
+        );
     }
 }
 
