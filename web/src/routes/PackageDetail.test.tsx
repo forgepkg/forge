@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import userEvent from '@testing-library/user-event'
 import {
   RouterProvider,
   createMemoryHistory,
@@ -10,7 +11,7 @@ import {
 import { clearSession } from '~/lib/auth'
 import { makeQueryClient } from '~/lib/queryClient'
 import type { Me } from '~/api/me'
-import type { PackageDetail } from '~/api/packages'
+import { pkgKeys, type PackageDetail } from '~/api/packages'
 import { routeTree } from '~/routeTree.gen'
 import { textContent } from '~/test/text'
 import { searchOptions } from '~/lib/search'
@@ -67,18 +68,51 @@ const proxyDetail: PackageDetail = {
 }
 
 const fetchMock = vi.fn()
+const adminMe: Me = {
+  ...anonMe,
+  user: { ...anonMe.user, id: 1, username: 'admin', is_admin: true },
+  is_admin: true,
+}
+const hostedDetail: PackageDetail = {
+  ...proxyDetail,
+  repo: 'internal',
+  repo_kind: 'hosted',
+  versions: proxyDetail.versions.map((v) => ({ ...v, delay_status: null })),
+}
 
-function mockApi(detail: (repo: string, id: string) => Response) {
-  fetchMock.mockImplementation((input: RequestInfo | URL) => {
+function mockApi(
+  detail: (repo: string, id: string) => Response,
+  {
+    me = anonMe,
+    format = 'nuget',
+    deleteVersion,
+  }: {
+    me?: Me
+    format?: string
+    deleteVersion?: () => Response | Promise<Response>
+  } = {},
+) {
+  fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
     const raw = typeof input === 'string' ? input : input.toString()
     const url = new URL(raw, 'http://localhost')
     if (url.pathname.endsWith('/admin/me')) {
       return Promise.resolve(
-        new Response(JSON.stringify(anonMe), {
+        new Response(JSON.stringify(me), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         }),
       )
+    }
+    if (url.pathname.endsWith('/browse/repos')) {
+      return Promise.resolve(jsonResponse([
+        { id: 1, name: 'internal', kind: 'hosted', online: true, format },
+      ]))
+    }
+    if (init?.method === 'DELETE' && deleteVersion) {
+      return Promise.resolve(deleteVersion())
+    }
+    if (url.pathname.endsWith('/browse/packages')) {
+      return Promise.resolve(jsonResponse({ total: 0, items: [] }))
     }
     const m = url.pathname.match(/\/browse\/packages\/([^/]+)\/([^/]+)$/)
     if (m) return Promise.resolve(detail(m[1], m[2]))
@@ -126,6 +160,125 @@ describe('PackageDetail', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
     clearSession()
+  })
+
+  it.each(['nuget', 'helm'])('confirms and deletes a hosted %s version, refreshing package queries', async (format) => {
+    const user = userEvent.setup()
+    const version = { ...hostedDetail.versions[0], version_original: '13.0.3+build.1' }
+    let current = { ...hostedDetail, versions: [version, hostedDetail.versions[1]] }
+    const deleteVersion = vi.fn(() => {
+      current = { ...current, versions: [hostedDetail.versions[1]], dependency_groups_by_version: {} }
+      return new Response(null, { status: 204 })
+    })
+    mockApi(() => jsonResponse(current), { me: adminMe, format, deleteVersion })
+    const client = testQueryClient()
+    const repoListKey = pkgKeys.search({ repo: 'internal' })
+    const searchKey = pkgKeys.search({ q: 'newtonsoft' })
+    client.setQueryData(repoListKey, { total: 1, items: [] })
+    client.setQueryData(searchKey, { total: 1, items: [] })
+    const router = await renderDetail('/packages/internal/newtonsoft.json', client)
+    const table = await screen.findByRole('table', { name: 'Versions of Newtonsoft.Json' })
+    expect(within(table).getAllByRole('button', { name: 'Delete' })).toHaveLength(2)
+    await user.click(within(table).getAllByRole('button', { name: 'Delete' })[0])
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toHaveTextContent('internal')
+    expect(dialog).toHaveTextContent('Newtonsoft.Json')
+    expect(dialog).toHaveTextContent('13.0.3+build.1')
+    expect(dialog).toHaveTextContent('This cannot be undone')
+    expect(dialog).toHaveTextContent('Clients that already downloaded this version keep their copy')
+    expect(deleteVersion).not.toHaveBeenCalled()
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(deleteVersion).not.toHaveBeenCalled()
+    await user.click(within(table).getAllByRole('button', { name: 'Delete' })[0])
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete version' }))
+    await waitFor(() => expect(within(table).queryByText('13.0.3+build.1')).not.toBeInTheDocument())
+    expect(deleteVersion).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/admin/repositories/internal/packages/newtonsoft.json/13.0.3%2Bbuild.1',
+      expect.objectContaining({ method: 'DELETE', credentials: 'same-origin' }),
+    )
+    expect(client.getQueryState(repoListKey)?.isInvalidated).toBe(true)
+    expect(client.getQueryState(searchKey)?.isInvalidated).toBe(true)
+    expect(router.state.location.pathname).toBe('/packages/internal/newtonsoft.json')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.queryByText('System.Text.Json')).not.toBeInTheDocument()
+    if (format === 'nuget') {
+      expect(screen.getByText('dotnet add package Newtonsoft.Json --version 14.0.0-beta')).toBeInTheDocument()
+    }
+  })
+
+  it.each(['404', 'empty'])('returns to the repository after deleting the last version (%s)', async (result) => {
+    const user = userEvent.setup()
+    let deleted = false
+    mockApi(
+      () => deleted
+        ? result === '404'
+          ? new Response('package not found', { status: 404 })
+          : jsonResponse({ ...hostedDetail, versions: [] })
+        : jsonResponse({ ...hostedDetail, versions: [hostedDetail.versions[0]] }),
+      {
+        me: adminMe,
+        deleteVersion: () => {
+          deleted = true
+          return new Response(null, { status: 204 })
+        },
+      },
+    )
+    const router = await renderDetail('/packages/internal/newtonsoft.json')
+    await user.click(await screen.findByRole('button', { name: 'Delete' }))
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete version' }))
+    await waitFor(() => expect(router.state.location.pathname).toBe('/repos/internal'))
+  })
+
+  it('keeps the version and reports a failed deletion, allowing a retry', async () => {
+    const user = userEvent.setup()
+    const deleteVersion = vi.fn()
+      .mockReturnValueOnce(new Response('deletion failed', { status: 500 }))
+      .mockReturnValue(new Response(null, { status: 204 }))
+    mockApi(() => jsonResponse(hostedDetail), { me: adminMe, deleteVersion })
+    await renderDetail('/packages/internal/newtonsoft.json')
+    await user.click((await screen.findAllByRole('button', { name: 'Delete' }))[0])
+    const dialog = screen.getByRole('dialog')
+    await user.click(within(dialog).getByRole('button', { name: 'Delete version' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('deletion failed')
+    expect(within(screen.getByRole('table', { name: 'Versions of Newtonsoft.Json' })).getByText('13.0.3')).toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Delete version' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(deleteVersion).toHaveBeenCalledTimes(2)
+  })
+
+  it('disables duplicate deletion while a request is pending', async () => {
+    const user = userEvent.setup()
+    let finish!: (response: Response) => void
+    const deleteVersion = vi.fn(() => new Promise<Response>((resolve) => { finish = resolve }))
+    mockApi(() => jsonResponse(hostedDetail), { me: adminMe, deleteVersion })
+    await renderDetail('/packages/internal/newtonsoft.json')
+    await user.click((await screen.findAllByRole('button', { name: 'Delete' }))[0])
+    const dialog = screen.getByRole('dialog')
+    await user.click(within(dialog).getByRole('button', { name: 'Delete version' }))
+    expect(within(dialog).getByRole('button', { name: 'Deleting…' })).toBeDisabled()
+    for (const button of screen.getAllByRole('button', { name: 'Delete' })) {
+      expect(button).toBeDisabled()
+    }
+    await user.keyboard('{Escape}')
+    expect(dialog).toBeInTheDocument()
+    expect(deleteVersion).toHaveBeenCalledTimes(1)
+    finish(new Response(null, { status: 204 }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
+  it.each([
+    { me: anonMe, kind: 'hosted', format: 'nuget' },
+    { me: adminMe, kind: 'proxy', format: 'nuget' },
+    { me: adminMe, kind: 'group', format: 'nuget' },
+    { me: adminMe, kind: 'hosted', format: 'docker' },
+  ])('hides deletion for is_admin=$me.is_admin, $kind, $format', async ({ me, kind, format }) => {
+    mockApi(() => jsonResponse({ ...hostedDetail, repo_kind: kind }), { me, format })
+    await renderDetail('/packages/internal/newtonsoft.json')
+    await screen.findByRole('table', { name: 'Versions of Newtonsoft.Json' })
+    expect(screen.queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('columnheader', { name: 'Actions' })).not.toBeInTheDocument()
   })
 
   it('renders versions and dependency groups', async () => {
