@@ -13,7 +13,7 @@ logins. Repositories of `format: "npm"` are served at
 
 npm is a format plugin built into Forge ([`crates/formats/npm`](../crates/formats/npm),
 [format-plugins.md](format-plugins.md)): tarballs are blobs in the
-content-addressed store, and repositories, permissions, package selectors,
+content-addressed store, and repositories, access levels, package selectors,
 retention and the web UI are the same as for every other format.
 
 ## Contents
@@ -81,9 +81,9 @@ npmAuthToken: "<token>"
 ```
 
 The token is an API token: one `npm login` mints (below), or one you create
-under **Your tokens** in the web UI. Any API token of yours works for every
-repository you may read; Forge sees whose it is, not which repository it
-was minted for. A repository that allows anonymous reads needs no token to
+under **Your tokens** in the web UI. An API token of yours works for every
+repository you may read, unless its scope limits it; Forge sees whose it
+is, not which repository it was minted for. A repository that allows anonymous reads needs no token to
 install from.
 
 ## Logging in
@@ -133,7 +133,7 @@ yarn npm publish            # with npmRegistryServer / npmPublishRegistry set
 bun publish --registry https://forge.example.com/npm/npm-hosted/
 ```
 
-Publishing needs the **write** permission and an API token (a password typed
+Publishing needs the level **write** and an API token (a password typed
 at the web login is not a publishing credential); CI jobs can use a
 [trusted publishing](trusted-publishing.md) token instead. Publishing to a
 group goes to its writable member.
@@ -151,7 +151,7 @@ Forge checks what it stores:
 
 A version that exists is refused (409), as on the public registry, unless
 the repository's **deployment policy** allows redeploys (which needs the
-delete permission too). The policy *read-only* refuses every publish,
+level `delete`). The policy *read-only* refuses every publish,
 unpublish, deprecation and dist-tag change:
 
 ```bash
@@ -180,10 +180,10 @@ npm unpublish @acme/ui --force             # every version
   version left. Deleting a version drops its tags.
 - A **deprecated** version still installs; clients warn with its message.
 - **Unpublishing** deletes the version (or every version) and needs the
-  **delete** permission. Unlike on the public registry there is no time
+  level **delete**. Unlike on the public registry there is no time
   limit, and a version unpublished may be published again.
 
-Dist-tags and deprecations need the write permission. The web UI shows a
+Dist-tags and deprecations need `write`. The web UI shows a
 package's dist-tags, deprecated versions with their messages, and the
 README of its `latest` version.
 
@@ -255,21 +255,24 @@ A group serves its members, by priority:
 passes the request on to its upstream with its credentials, and a group to
 its first proxy member; a group leaves the packages under its reserved
 prefixes out, so your internal package names stay inside. A hosted
-repository has no upstream to ask (404). Auditing needs the read
-permission.
+repository has no upstream to ask (404). Auditing needs `read`.
 
 ## Permissions
 
-| What | Permission |
+Each access level includes the ones below it
+([deployment.md](deployment.md#access-levels)):
+
+| What | Level |
 | --- | --- |
 | Install, `npm view`, search, audit | read |
 | Publish, `npm dist-tag add` / `rm`, `npm deprecate` | write |
 | Unpublish (a version or the whole package); a redeploy | delete |
 | `npm login`, `npm logout`, `npm whoami` | none (a login checks the password) |
 
-An unknown repository answers like one the caller may not read. A
-read-only deployment policy refuses every change, whatever the caller's
-permissions.
+Content selectors match package names (`@acme/*`), for every level a grant
+includes. An unknown repository answers like one the caller may not read.
+A read-only deployment policy refuses every change, whatever the caller's
+level.
 
 ## Retention
 
