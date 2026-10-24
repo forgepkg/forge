@@ -2961,17 +2961,26 @@ async fn group_search_bounds_upstream_pages_and_preserves_totals() {
         }
     }
 
-    // A restricted caller must not learn the upstream's unfiltered total.
+    // A restricted search fetches past the initial prefix so filtering cannot
+    // remove a matching package before group pagination.
     let result = group_ops
         .search_with_package_filter(
             &group.name,
             &SearchParams::default(),
-            &PackageFilter::Predicate(Arc::new(|id| id == "Package00")),
+            &PackageFilter::Predicate(Arc::new(|id| id == "Package20")),
         )
         .await
         .unwrap();
     assert_eq!(result.hits.len(), 1);
-    assert_eq!(result.total_hits, 3, "one visible id plus paging sentinels");
+    assert_eq!(result.hits[0].original_id, "Package20");
+    assert_eq!(result.total_hits, 1);
+    for mock in [&first, &second] {
+        let query = mock.search_queries().last().unwrap().clone();
+        assert!(
+            query.split('&').any(|part| part == "take=1000"),
+            "restricted search must fetch the full bounded prefix: {query}"
+        );
+    }
 
     // Upstreams may rank by relevance rather than id. Only the bounded
     // candidates are alphabetized; this is not a full upstream corpus sort.
@@ -3005,6 +3014,39 @@ async fn group_search_bounds_upstream_pages_and_preserves_totals() {
         (40..60)
             .map(|n| format!("Package{n:02}"))
             .collect::<Vec<_>>()
+    );
+
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object(\
+         'prefer_hosted', true, 'reserved_prefixes', '[\"acme.\"]'::jsonb) WHERE id = $1",
+    )
+    .bind(group.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            (0..60)
+                .map(|n| search_entry(&format!("Acme.Package{n:02}"), &["1.0.0"]))
+                .collect(),
+            100,
+        );
+    }
+    let result = group_ops
+        .search(
+            &group.name,
+            &SearchParams {
+                q: "reserved-prefix".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.hits.is_empty());
+    assert_eq!(
+        result.total_hits, 0,
+        "reserved-prefix hits must not contribute opaque upstream totals"
     );
 }
 

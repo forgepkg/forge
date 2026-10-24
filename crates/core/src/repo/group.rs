@@ -245,6 +245,16 @@ impl GroupGraph {
             .any(|guard| guard.prefer_hosted && !guard.owners.contains(&leaf_id))
     }
 
+    /// Whether a group guard can exclude ids from `leaf_id` without inspecting
+    /// the individual hits.
+    fn may_exclude_leaf(&self, leaf_id: i64) -> bool {
+        self.guards.values().any(|guard| {
+            !guard.owners.contains(&leaf_id)
+                && (!guard.reserved_prefixes.is_empty()
+                    || (guard.prefer_hosted && !guard.owners.is_empty()))
+        })
+    }
+
     /// The prefer-hosted groups whose owners have the id, given the hosted
     /// leaves that have it.
     fn owned_in(&self, having: &HashSet<i64>) -> HashSet<i64> {
@@ -848,8 +858,10 @@ impl GroupRepo {
         for (member, leaf) in graph.leaves.iter().enumerate() {
             let ops = self.member_ops(leaf)?;
             member_ops.push(ops.clone());
+            let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
             let bounded_proxy = params.include_upstream && leaf.kind() == RepoKind::Proxy;
-            member_params.take = if bounded_proxy {
+            let unrestricted = matches!(&leaf_filter, PackageFilter::AllowAll);
+            member_params.take = if bounded_proxy && unrestricted {
                 params
                     .skip
                     .saturating_add(params.effective_take())
@@ -857,7 +869,6 @@ impl GroupRepo {
             } else {
                 SearchParams::MAX_TAKE
             };
-            let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
             let result = match ops
                 .search_unenriched(&leaf.name, &member_params, &leaf_filter)
                 .await
@@ -871,9 +882,10 @@ impl GroupRepo {
                     continue;
                 }
             };
-            if bounded_proxy {
+            if bounded_proxy && unrestricted && !graph.may_exclude_leaf(leaf.id) {
                 // Deduplicate the returned ids below. Unfetched upstream ids
                 // cannot be deduplicated, so their contribution is an estimate.
+                // Group guards make that estimate unsafe when they may hide ids.
                 unseen_hits =
                     unseen_hits.saturating_add(result.total_hits.saturating_sub(result.hits.len()));
             }
