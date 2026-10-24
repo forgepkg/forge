@@ -2972,6 +2972,40 @@ async fn group_search_bounds_upstream_pages_and_preserves_totals() {
         .unwrap();
     assert_eq!(result.hits.len(), 1);
     assert_eq!(result.total_hits, 3, "one visible id plus paging sentinels");
+
+    // Upstreams may rank by relevance rather than id. Only the bounded
+    // candidates are alphabetized; this is not a full upstream corpus sort.
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            (0..60)
+                .rev()
+                .map(|n| search_entry(&format!("Package{n:02}"), &["1.0.0"]))
+                .collect(),
+            100,
+        );
+    }
+    let result = group_ops
+        .search(
+            &single.name,
+            &SearchParams {
+                q: "relevance-order".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.total_hits, 100);
+    assert_eq!(
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.original_id.clone())
+            .collect::<Vec<_>>(),
+        (40..60)
+            .map(|n| format!("Package{n:02}"))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Record a `proxy_cached_version` row as the listing and download paths do.

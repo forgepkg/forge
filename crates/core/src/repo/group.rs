@@ -826,6 +826,9 @@ impl GroupRepo {
     ///
     /// Members answer unenriched; only the merged, paged result is enriched
     /// ([`Self::enrich_page`]).
+    /// Upstream-enabled proxies supply only a bounded prefix in upstream order.
+    /// Sorting those candidates by id makes upstream-backed paging best-effort,
+    /// not an exhaustive alphabetical listing of the upstream corpus.
     async fn search_filtered(
         &self,
         repo: &str,
