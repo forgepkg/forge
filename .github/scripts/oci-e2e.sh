@@ -53,6 +53,7 @@ step() { echo; echo "── $* ──"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 step "start forge-server"
+head -c 32 /dev/urandom | base64 > "$work/root.key"
 cat > "$work/forge.toml" <<EOF
 [server]
 bind = "127.0.0.1:8421"
@@ -66,6 +67,9 @@ bucket = "forge-e2e"
 access_key = "forge-e2e-key"
 secret_key = "forge-e2e-secret"
 force_path_style = true
+[crypto.root]
+provider = "file"
+root_key_path = "$work/root.key"
 [auth.bootstrap_admin]
 username = "$admin_user"
 password = "$admin_password"

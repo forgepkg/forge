@@ -149,6 +149,9 @@ function startServer() {
     // outbox: drain quickly so a pushed package becomes visible fast.
     FORGE_OUTBOX__POLL_INTERVAL_SECONDS: '1',
     FORGE_OUTBOX__GRACE_SECONDS: '0',
+    // secret encryption (required), with a fixed *test* root key.
+    FORGE_CRYPTO__ROOT__PROVIDER: 'env',
+    FORGE_ROOT_KEY: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=',
   }
   serverProc = spawn('cargo', ['run', '-p', 'forge-server'], {
     cwd: repoRoot,

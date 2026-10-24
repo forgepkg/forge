@@ -32,6 +32,13 @@ secret_key = "minioadmin"
 force_path_style = true          # required for versitygw / MinIO
 # multipart_threshold = 8388608  # 8 MiB (default)
 
+# Secret encryption at rest (required): the root key comes from FORGE_ROOT_KEY.
+# DEV ONLY: `cargo xtask run` / `dev` export a fixed development key there
+# unless it is set (the one docker-compose.app.yml sets too). A real
+# deployment generates its own (`openssl rand -base64 32`).
+[crypto.root]
+provider = "env"
+
 [auth]
 # Anonymous access, the login screen, passwords over HTTP Basic, the session
 # lifetimes and the login lockout are not set here: they are auth settings,

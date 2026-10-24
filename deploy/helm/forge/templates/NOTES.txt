@@ -55,16 +55,6 @@ enable valkey.enabled or set FORGE_REDIS__URL, or they converge only by TTL.
 The in-cluster PostgreSQL / S3 gateway are single instances without backups,
 meant for evaluation and small installs.
 {{- end }}
-{{- $crypto := or .Values.config.crypto .Values.existingSecret }}
-{{- range $name, $_ := .Values.secretEnv }}
-{{- if hasPrefix "FORGE_CRYPTO__" $name }}{{ $crypto = true }}{{ end }}
-{{- end }}
-{{- range .Values.env }}
-{{- if hasPrefix "FORGE_CRYPTO__" (toString .name) }}{{ $crypto = true }}{{ end }}
-{{- end }}
-{{- if not $crypto }}
 
-Turn on secret encryption at rest (config.crypto.root.provider and
-FORGE_ROOT_KEY) before you configure proxy repositories or auth realms; see
-docs/deployment.md.
-{{- end }}
+Keep the root key (FORGE_ROOT_KEY) with your backups: without it the stored
+secrets cannot be read.

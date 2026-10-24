@@ -93,7 +93,6 @@ impl RepoView {
             remote_url: r.remote_url.clone(),
             package_delay_seconds: r.package_delay_seconds,
             upstream_username: r.upstream_username.clone(),
-            // True for an encrypted blob OR a (pre-backfill) plaintext.
             has_upstream_password: r.has_upstream_password(),
             metadata_ttl_seconds: r.metadata_ttl_seconds,
             not_found_ttl_seconds: r.not_found_ttl_seconds,
@@ -208,17 +207,14 @@ pub struct CreateRepo {
 ///   A new `name` is validated like on create.
 /// * `upstream_username`, `upstream_password`, `metadata_ttl_seconds`,
 ///   `not_found_ttl_seconds`: **absent = keep, JSON `null` = clear, value =
-///   set.** A cleared TTL falls back to the server default. Clearing the
-///   password removes both the plaintext column and the encrypted blob.
+///   set.** A cleared TTL falls back to the server default. A password is
+///   stored sealed; clearing it removes the sealed blob.
 /// * **Origin change.** When `remote_url` moves to a different origin (scheme,
 ///   host and port) and the request does not set a new `upstream_password`,
 ///   the stored `upstream_username` and password are dropped, so a private
 ///   feed's credentials are never sent to the new host. (A username sent in
 ///   the same request is still applied.) The response then carries
 ///   `"upstream_credentials_dropped": true` and a warning is logged.
-/// * With secret encryption enabled the plaintext `upstream_password` column
-///   is always left `NULL` by an update: a new password is sealed, and a kept
-///   legacy plaintext value is sealed in the same transaction.
 /// * Turning `anonymous_read` off also deletes the anonymous role's unscoped
 ///   `read` grant on the repository (the grant migration 0007 synthesized from
 ///   the flag), so anonymous access really ends.
@@ -672,10 +668,9 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         }
     }
 
-    // With encryption enabled the password is NOT inserted as plaintext; the
-    // row is created first (the AAD binds the ciphertext to the row id, which
-    // does not exist before the INSERT) and the secret is sealed below.
-    let encrypting = state.envelope.is_some();
+    // The row is created first (the AAD binds the sealed password to the row
+    // id, which does not exist before the INSERT) and the password is sealed
+    // below.
     let new = NewRepository {
         name: body.name.clone(),
         format: body.format.clone(),
@@ -686,11 +681,6 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         remote_url: body.remote_url.clone(),
         package_delay_seconds: body.package_delay_seconds,
         upstream_username: body.upstream_username.clone(),
-        upstream_password: if encrypting {
-            None
-        } else {
-            body.upstream_password.clone()
-        },
         metadata_ttl_seconds: body.metadata_ttl_seconds,
         not_found_ttl_seconds: body.not_found_ttl_seconds,
         allow_redeploy: body.allow_redeploy,
@@ -716,16 +706,16 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         }
         Err(e) => return db_error(e),
     };
-    let sealed = match (&state.envelope, &body.upstream_password) {
-        (Some(envelope), Some(pw)) => {
+    let sealed = match &body.upstream_password {
+        Some(pw) => {
             if let Err(resp) =
-                store_encrypted_password(&mut tx, envelope, repo.id, pw.clone()).await
+                store_encrypted_password(&mut tx, &state.envelope, repo.id, pw.clone()).await
             {
                 return resp;
             }
             true
         }
-        _ => false,
+        None => false,
     };
     if let Err(e) = tx.commit().await {
         return db_error(e);
@@ -1137,18 +1127,8 @@ pub async fn update(
         None if drop_credentials => PasswordChange::Clear,
         None => PasswordChange::Keep,
     };
-    // The plaintext column value, and whether the sealed blob is cleared too.
-    // With encryption enabled the plaintext column is always NULL after
-    // an update — a new password is sealed below, and a kept legacy plaintext
-    // value is sealed as well (it is not carried forward).
-    let (upstream_password, clear_upstream_password_enc) = match (&state.envelope, &password) {
-        (Some(_), PasswordChange::Clear) => (None, true),
-        (Some(_), _) => (None, false),
-        (None, PasswordChange::Keep) => (existing.upstream_password.clone(), false),
-        (None, PasswordChange::Clear) => (None, true),
-        // A stale sealed blob would shadow the new plaintext password.
-        (None, PasswordChange::Set(pw)) => (Some(pw.clone()), true),
-    };
+    // Whether the sealed password is cleared; a new one is sealed below.
+    let clear_upstream_password_enc = matches!(password, PasswordChange::Clear);
 
     let upd = RepositoryUpdate {
         name: body.name.clone().unwrap_or(existing.name.clone()),
@@ -1160,7 +1140,6 @@ pub async fn update(
             .package_delay_seconds
             .unwrap_or(existing.package_delay_seconds),
         upstream_username,
-        upstream_password,
         clear_upstream_password_enc,
         metadata_ttl_seconds: body
             .metadata_ttl_seconds
@@ -1251,21 +1230,18 @@ pub async fn update(
         false
     };
 
-    // Seal a new password through the envelope, or re-seal a kept legacy
-    // plaintext one (the update above nulled its column).
-    let to_seal = match (&state.envelope, password) {
-        (Some(envelope), PasswordChange::Set(pw)) => Some((envelope, pw)),
-        (Some(envelope), PasswordChange::Keep) if existing.upstream_password_enc.is_none() => {
-            existing.upstream_password.clone().map(|pw| (envelope, pw))
+    // Seal a new password.
+    let sealed = match password {
+        PasswordChange::Set(pw) => {
+            if let Err(resp) =
+                store_encrypted_password(&mut tx, &state.envelope, updated.id, pw).await
+            {
+                return resp;
+            }
+            true
         }
-        _ => None,
+        PasswordChange::Keep | PasswordChange::Clear => false,
     };
-    let sealed = to_seal.is_some();
-    if let Some((envelope, pw)) = to_seal {
-        if let Err(resp) = store_encrypted_password(&mut tx, envelope, updated.id, pw).await {
-            return resp;
-        }
-    }
     if let Err(e) = tx.commit().await {
         return db_error(e);
     }

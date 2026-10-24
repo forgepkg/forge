@@ -95,8 +95,8 @@ pub struct WorkerHandles {
     pub registry_key_refresh: JoinHandle<()>,
     /// Re-reads, creates and rotates forge's OIDC issuer keys.
     pub issuer_refresh: JoinHandle<()>,
-    /// Secret-encryption rotation/backfill worker. Present only when
-    /// `[crypto]` is enabled and its rotation worker is not turned off.
+    /// Secret-encryption rotation worker. Present unless it is turned off
+    /// (`crypto.rotation.enabled = false`).
     /// Cluster-coordinated via a Postgres advisory lock (see
     /// [`crate::crypto::spawn_worker`]) — the one exception to the
     /// no-advisory-locks rule of the other loops.
@@ -251,25 +251,22 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     };
 
-    // Crypto rotation/backfill worker: only when secret encryption is
-    // enabled. One instance at a time performs a pass (advisory lock); every
-    // step is idempotent/resumable so crashes are harmless.
-    let crypto_rotation = match (&state.envelope, state.config.crypto.as_ref()) {
-        (Some(envelope), Some(crypto_cfg)) if crypto_cfg.rotation.enabled => {
-            let (pool, envelope, crypto_cfg) =
-                (state.pool.clone(), envelope.clone(), crypto_cfg.clone());
-            Some(supervise("crypto-rotation", move || {
-                crate::crypto::spawn_worker(pool.clone(), envelope.clone(), &crypto_cfg)
-                    .unwrap_or_else(|| tokio::spawn(std::future::pending()))
-            }))
-        }
-        (Some(_), Some(_)) => {
-            tracing::info!(
-                "crypto rotation worker disabled (FORGE_CRYPTO__ROTATION__ENABLED=false)"
-            );
-            None
-        }
-        _ => None,
+    // Crypto rotation worker. One instance at a time performs a pass
+    // (advisory lock); every step is idempotent/resumable so crashes are
+    // harmless.
+    let crypto_rotation = if state.config.crypto.rotation.enabled {
+        let (pool, envelope, crypto_cfg) = (
+            state.pool.clone(),
+            state.envelope.clone(),
+            state.config.crypto.clone(),
+        );
+        Some(supervise("crypto-rotation", move || {
+            crate::crypto::spawn_worker(pool.clone(), envelope.clone(), &crypto_cfg)
+                .unwrap_or_else(|| tokio::spawn(std::future::pending()))
+        }))
+    } else {
+        tracing::info!("crypto rotation worker disabled (FORGE_CRYPTO__ROTATION__ENABLED=false)");
+        None
     };
 
     // Local blob cache (per instance): pick up a resized volume or a disk

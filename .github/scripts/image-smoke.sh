@@ -5,7 +5,8 @@
 #
 #   - read-only root filesystem, /tmp a tmpfs (the manifests' emptyDir), user
 #     10001:10001, every capability dropped, no privilege escalation;
-#   - the baked /app/forge.toml, configured through FORGE_* only, without
+#   - the baked /app/forge.toml, configured through FORGE_* only (the root
+#     key of the secret encryption included), without
 #     server.allow_insecure_defaults;
 #   - a local blob cache in a volume prepared like a new persistent volume
 #     under fsGroup 10001 (root's, group 10001, setgid and group-writable), at
@@ -35,6 +36,7 @@ base="http://127.0.0.1:$port"
 admin_user="admin@example.com"
 admin_password="smoke-$(openssl rand -hex 12)"
 s3_secret="smoke-$(openssl rand -hex 12)"
+root_key=$(openssl rand -base64 32)
 net=forge-smoke
 cache_volume=forge-smoke-cache
 
@@ -88,6 +90,8 @@ start_forge() {
     -e FORGE_SERVER__PUBLIC_BASE_URL="$base" \
     -e FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME="$admin_user" \
     -e FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD="$admin_password" \
+    -e FORGE_CRYPTO__ROOT__PROVIDER=env \
+    -e FORGE_ROOT_KEY="$root_key" \
     -e FORGE_BLOB_CACHE__PATH=/var/cache/forge/blobs \
     -e FORGE_BLOB_CACHE__MAX_BYTES=1073741824 \
     "$image" >/dev/null

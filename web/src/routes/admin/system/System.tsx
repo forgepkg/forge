@@ -134,7 +134,7 @@ function SecretEncryption() {
       title="Secret encryption"
       description="Proxy passwords, realm secrets, the email credentials, the registry-token key and the OIDC signing keys are encrypted with a data key (DEK), which a key-encryption key (KEK) wraps, which the root key from the configuration wraps."
       footer={
-        data?.enabled && (
+        data && (
           <FormActions>
             {(['dek', 'kek', 'root'] as const).map((layer) => (
               <Button
@@ -155,27 +155,10 @@ function SecretEncryption() {
     >
       {!data ? (
         <Skeleton label="Loading the encryption keys…" />
-      ) : !data.enabled ? (
-        <Notice tone="warn" title="Secrets are stored in plaintext">
-          This server has no <Code>[crypto]</Code> section, so the secrets
-          above are kept in the database unencrypted. Configure a root key as
-          “Secret encryption at rest” in the deployment guide describes; Forge
-          encrypts the stored secrets at its next start.
-        </Notice>
       ) : (
         <>
           <FactList
-            items={[
-              { term: 'Root key version', value: data.root_key_version, mono: true },
-              {
-                term: 'Plaintext secrets',
-                value: data.plaintext_backfill_pending ? (
-                  <StatusBadge tone="warn">waiting for encryption</StatusBadge>
-                ) : (
-                  <StatusBadge tone="ok">none left</StatusBadge>
-                ),
-              },
-            ]}
+            items={[{ term: 'Root key version', value: data.root_key_version, mono: true }]}
           />
           <KeyTable keys={data.keys} />
         </>

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Lint and render the Helm chart (deploy/helm/forge) and validate the output
-# (used by ci.yml): `helm lint --strict` and `helm template` with the default
-# values and with each file in the chart's ci/ directory, kubeconform against
-# the Kubernetes schemas (plus the Gateway API and cert-manager CRDs), every
+# (used by ci.yml): `helm template` refusing the default values, which have no
+# root key; `helm lint --strict` and `helm template` with the default values
+# plus a root key and with each file in the chart's ci/ directory; kubeconform
+# against the Kubernetes schemas (plus the Gateway API and cert-manager CRDs), every
 # rendered forge.toml parsed as TOML, a Recreate strategy rendered without
 # rollingUpdate, and the pod annotations that roll the pods on a secret change
 # salted.
@@ -25,12 +26,25 @@ render() { # <output name> [helm values args...]
   helm template forge "$chart" --namespace forge --kube-version "$k8s_version" "$@" > "$work/$name.yaml"
 }
 
-render default
+# Without a root key the chart refuses to render, naming the setting.
+if helm template forge "$chart" --namespace forge --kube-version "$k8s_version" \
+  > /dev/null 2> "$work/no-root-key.log"; then
+  echo "the chart renders without a root key" >&2
+  exit 1
+fi
+grep -q 'set FORGE_ROOT_KEY in secretEnv' "$work/no-root-key.log" \
+  || { cat "$work/no-root-key.log"; exit 1; }
+rm -f "$work/no-root-key.log"
+echo "no root key: refused" >&2
+
+root_key=(--set-string secretEnv.FORGE_ROOT_KEY=check-only)
+render default "${root_key[@]}"
 for values in "$chart"/ci/*.yaml; do
   render "$(basename "$values" .yaml)" --values "$values"
 done
 # Numbers given with --set arrive as integers, not as YAML's floats.
-render set-flags --set config.server.max_staging_bytes=8589934592 --set replicaCount=2
+render set-flags --set config.server.max_staging_bytes=8589934592 --set replicaCount=2 \
+  "${root_key[@]}"
 rm -f "$work/lint.log"
 
 kubeconform -strict -summary -kubernetes-version "$k8s_version" \
@@ -135,6 +149,7 @@ for salt in "" check-salt; do
   helm template forge "$chart" --namespace forge --kube-version "$k8s_version" \
     --set valkey.enabled=true \
     --set-string secretEnv.FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD=check-only \
+    "${root_key[@]}" \
     --set-string valkey.auth.password=check-only \
     --set-string secretEnvChecksumSalt="$salt" --set-string valkey.auth.checksumSalt="$salt" \
     --set-json extraObjects="$plain" > "$work/salted-${salt:-generated}.yaml"

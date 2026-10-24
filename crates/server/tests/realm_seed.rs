@@ -17,6 +17,7 @@ use sqlx::PgPool;
 const MARKER_KEY: &str = "auth_realm_seed_credential_forwarding";
 
 fn config(pepper: &str, request_timeout_ms: u64) -> Config {
+    let root_key_env = common::ensure_test_root_key();
     let toml = format!(
         r#"
         [server]
@@ -31,6 +32,10 @@ fn config(pepper: &str, request_timeout_ms: u64) -> Config {
         bucket = "forge"
         access_key = "test"
         secret_key = "test"
+
+        [crypto.root]
+        provider = "env"
+        root_key_env = "{root_key_env}"
 
         [auth]
         providers = ["local-password", "upstream-basic"]
@@ -47,8 +52,20 @@ fn config(pepper: &str, request_timeout_ms: u64) -> Config {
         .expect("valid config")
 }
 
+/// The envelope service the realm's secrets are sealed with, its keys
+/// created in `pool`.
+async fn envelope(pool: &PgPool) -> std::sync::Arc<forge_crypto::service::EnvelopeService> {
+    let config = config("pepper-one", 5000);
+    let envelope = forge_server::crypto::build_envelope(&config, pool).expect("envelope service");
+    forge_server::crypto::bootstrap(pool, &envelope, &config.crypto)
+        .await
+        .expect("bootstrap secret encryption");
+    envelope
+}
+
 async fn seed(pool: &PgPool, config: &Config) {
-    forge_server::app::ensure_auth_realms(config, pool, None)
+    let envelope = envelope(pool).await;
+    forge_server::app::ensure_auth_realms(config, pool, &envelope)
         .await
         .expect("seed auth realms");
 }
@@ -66,7 +83,8 @@ async fn seeded_config(pool: &PgPool) -> (i64, JsonValue) {
         .unwrap()
         .expect("seeded realm");
     assert_eq!(realm.kind, KIND_CRED_FORWARD);
-    let config = forge_db::secret_dao::realm_config(None, &realm)
+    let envelope = envelope(pool).await;
+    let config = forge_db::secret_dao::realm_config(&envelope, &realm)
         .await
         .unwrap();
     (realm.id, config)

@@ -79,7 +79,7 @@ pub struct StoredEmail {
 /// Read the stored email settings, `None` when there are none.
 pub async fn load_stored(
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
 ) -> Result<Option<StoredEmail>, String> {
     let Some(row) = email_settings_dao::get(pool)
         .await
@@ -114,7 +114,7 @@ struct Snapshot {
 /// This instance's sender (see the [module docs](self)).
 pub struct Mailer {
     pool: PgPool,
-    envelope: Option<Arc<EnvelopeService>>,
+    envelope: Arc<EnvelopeService>,
     public_base_url: String,
     ttl: Duration,
     snapshot: tokio::sync::RwLock<Option<Snapshot>>,
@@ -128,7 +128,7 @@ impl Mailer {
     /// `issuer`.
     pub fn new(
         pool: PgPool,
-        envelope: Option<Arc<EnvelopeService>>,
+        envelope: Arc<EnvelopeService>,
         issuer: AssertionIssuer,
         config: &Config,
     ) -> Self {
@@ -191,7 +191,7 @@ impl Mailer {
                 return Ok(s.active.clone());
             }
         }
-        let active = match load_stored(&self.pool, self.envelope.as_deref())
+        let active = match load_stored(&self.pool, &self.envelope)
             .await
             .map_err(SendError::Unavailable)?
         {
@@ -224,7 +224,7 @@ impl Mailer {
         if let Ok(Some(config)) = self.active().await {
             return config.invitation_ttl_hours;
         }
-        match load_stored(&self.pool, self.envelope.as_deref()).await {
+        match load_stored(&self.pool, &self.envelope).await {
             Ok(Some(stored)) => stored.config.invitation_ttl_hours,
             _ => settings::DEFAULT_INVITATION_TTL_HOURS,
         }

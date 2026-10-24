@@ -148,6 +148,7 @@ else http://localhost:<containerPort> (kubectl port-forward). */}}
 {{/* .Values.config with the settings the chart derives (server.bind, the
 public URL, the in-cluster S3 gateway); a value set in .Values.config wins. */}}
 {{- define "forge.config" -}}
+{{- include "forge.requireRootKey" . }}
 {{- $server := dict "bind" (printf "0.0.0.0:%d" (int .Values.containerPort)) "public_base_url" (include "forge.publicBaseUrl" .) }}
 {{- $derived := dict "server" $server }}
 {{- if .Values.versitygw.enabled }}
@@ -161,6 +162,25 @@ public URL, the in-cluster S3 gateway); a value set in .Values.config wins. */}}
 {{- $_ := set $derived "s3" (mergeOverwrite (default dict $derived.s3) $credentials) }}
 {{- end }}
 {{- include "forge.toml" (mergeOverwrite $derived (deepCopy .Values.config)) }}
+{{- end }}
+
+{{/* Fail unless Forge gets the root key its secret encryption needs
+(docs/deployment.md, "Secret encryption at rest"): the env provider's
+variable (FORGE_ROOT_KEY) in secretEnv or env, existingSecret or envFrom
+(whose keys the chart cannot see), or the file provider's root_key_path. */}}
+{{- define "forge.requireRootKey" -}}
+{{- $root := default dict (default dict .Values.config.crypto).root }}
+{{- $var := default "FORGE_ROOT_KEY" $root.root_key_env }}
+{{- $found := or .Values.existingSecret .Values.envFrom (and (eq (toString $root.provider) "file") $root.root_key_path) }}
+{{- range $name := list $var "FORGE_CRYPTO__ROOT__ROOT_KEY_PATH" }}
+{{- if hasKey $.Values.secretEnv $name }}{{ $found = true }}{{ end }}
+{{- range $.Values.env }}
+{{- if eq (toString .name) $name }}{{ $found = true }}{{ end }}
+{{- end }}
+{{- end }}
+{{- if not $found }}
+{{- fail (printf "Forge needs a root key for its secret encryption: set %s in secretEnv (generate one with `openssl rand -base64 32` and keep it with your backups), or provide it through existingSecret or env (docs/deployment.md, \"Secret encryption at rest\")" $var) }}
+{{- end }}
 {{- end }}
 
 {{/* The s3.credentials settings of .Values.s3 (YAML; empty for the default

@@ -127,7 +127,7 @@ impl Raw<'_> {
     }
 
     async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, RawError> {
-        upstream_credentials(&self.state.pool, self.state.envelope.as_ref(), repo)
+        upstream_credentials(&self.state.pool, &self.state.envelope, repo)
             .await
             .map_err(|e| RawError::Internal(format!("proxy credentials: {e}")))
     }

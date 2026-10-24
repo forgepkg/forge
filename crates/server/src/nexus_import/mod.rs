@@ -318,10 +318,9 @@ impl Run<'_> {
             return Err(gone());
         }
 
-        let password =
-            secret_dao::get_import_password(pool, self.state.envelope.as_deref(), import.id)
-                .await
-                .map_err(|e| End::Failed(format!("the import's password cannot be read: {e}")))?;
+        let password = secret_dao::get_import_password(pool, &self.state.envelope, import.id)
+            .await
+            .map_err(|e| End::Failed(format!("the import's password cannot be read: {e}")))?;
         if import.username.is_some() && password.is_none() {
             return Err(End::Failed(
                 "the import has no password; resume it with the Nexus password".into(),

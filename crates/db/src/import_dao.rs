@@ -28,7 +28,7 @@ pub struct NexusImport {
     pub source_repository: String,
     pub registry_url: Option<String>,
     pub username: Option<String>,
-    /// Whether a password is stored (sealed or plaintext).
+    /// Whether a password is stored.
     pub has_password: bool,
     /// `skip`, `overwrite` or `fail`.
     pub on_conflict: String,
@@ -113,7 +113,7 @@ where
         NexusImport,
         r#"
         SELECT id, repository_id, base_url, source_repository, registry_url, username,
-               (password IS NOT NULL OR password_enc IS NOT NULL) AS "has_password!",
+               (password_enc IS NOT NULL) AS "has_password!",
                on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,
                cancel_requested, assets_seen, bytes_seen, nexus_version, last_error,
                created_by, created_at, started_at, finished_at, updated_at
@@ -132,7 +132,7 @@ pub async fn list(pool: &PgPool, repository_id: i64, limit: i64) -> sqlx::Result
         NexusImport,
         r#"
         SELECT id, repository_id, base_url, source_repository, registry_url, username,
-               (password IS NOT NULL OR password_enc IS NOT NULL) AS "has_password!",
+               (password_enc IS NOT NULL) AS "has_password!",
                on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,
                cancel_requested, assets_seen, bytes_seen, nexus_version, last_error,
                created_by, created_at, started_at, finished_at, updated_at
@@ -325,7 +325,6 @@ pub async fn finish(
             run_id = NULL,
             locked_until = NULL,
             cancel_requested = false,
-            password = CASE WHEN $3 = 'completed' THEN NULL ELSE password END,
             password_enc = CASE WHEN $3 = 'completed' THEN NULL ELSE password_enc END
         WHERE id = $1 AND run_id = $2 AND state = 'running'
         "#,

@@ -5,10 +5,10 @@ import { httpClient } from '~/lib/httpClient'
  * (`crates/server/src/admin/crypto.rs`, `blob_cache.rs`).
  *
  *  - `GET /admin/crypto/keys` lists key **metadata** (never key bytes) of the
- *    KEK and DEK layers; `enabled: false` without a `[crypto]` section.
+ *    KEK and DEK layers, and the root key version.
  *  - `POST /admin/crypto/rotate/{dek|kek|root}` rotates one layer now. A 409
- *    means encryption is off, or another rotation (the worker's, or another
- *    admin's) holds the cluster-wide lock; the latter can simply be retried.
+ *    means another rotation (the worker's, or another admin's) holds the
+ *    cluster-wide lock; it can simply be retried.
  *  - `GET /admin/blob-cache` reports the local blob cache of the instance
  *    that answered (`instance`); each replica has a cache of its own.
  */
@@ -37,16 +37,11 @@ export interface KeyView {
 }
 
 /** `GET /admin/crypto/keys`. */
-export type CryptoKeys =
-  | { enabled: false; keys: KeyView[] }
-  | {
-      enabled: true
-      /** The root key version KEKs are wrapped under now. */
-      root_key_version: string
-      /** Plaintext secrets are still waiting to be encrypted. */
-      plaintext_backfill_pending: boolean
-      keys: KeyView[]
-    }
+export interface CryptoKeys {
+  /** The root key version KEKs are wrapped under now. */
+  root_key_version: string
+  keys: KeyView[]
+}
 
 /** What a rotation rotates: a new DEK, a new KEK, or a re-wrap under the root. */
 export type RotationLayer = 'dek' | 'kek' | 'root'

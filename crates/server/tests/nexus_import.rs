@@ -392,7 +392,7 @@ fn percent_decode(s: &str) -> String {
 
 /// A server over a database of its own, so no other test's worker runs its
 /// imports.
-async fn forge(crypto_block: Option<String>) -> TestServer {
+async fn forge() -> TestServer {
     common::start_with(
         common::fresh_pool().await,
         ServerOpts {
@@ -400,7 +400,6 @@ async fn forge(crypto_block: Option<String>) -> TestServer {
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
             )),
-            crypto_block,
             ..Default::default()
         },
     )
@@ -521,7 +520,7 @@ fn repo_name(prefix: &str) -> String {
 
 #[tokio::test]
 async fn nuget_import_keeps_bytes_and_dates_and_a_second_run_copies_only_what_is_new() {
-    let srv = forge(None).await;
+    let srv = forge().await;
     let nexus = Nexus::start().await;
     nexus.repo("nuget-hosted", "nuget", "hosted");
     let core = make_nupkg("Acme.Core", "1.0.0");
@@ -562,14 +561,11 @@ async fn nuget_import_keeps_bytes_and_dates_and_a_second_run_copies_only_what_is
     assert_eq!(done["nexus_version"], "Nexus/3.70.1-02 (OSS)");
     // The password is gone once the import completed.
     assert_eq!(done["has_password"], false);
-    let row = sqlx::query!(
-        "SELECT password, password_enc FROM nexus_import WHERE id = $1",
-        id
-    )
-    .fetch_one(&srv.pool)
-    .await
-    .unwrap();
-    assert!(row.password.is_none() && row.password_enc.is_none());
+    let sealed = sqlx::query_scalar!("SELECT password_enc FROM nexus_import WHERE id = $1", id)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert!(sealed.is_none());
 
     // Bytes and dates.
     assert_eq!(
@@ -615,7 +611,7 @@ async fn nuget_import_keeps_bytes_and_dates_and_a_second_run_copies_only_what_is
 
 #[tokio::test]
 async fn a_killed_import_resumes_without_duplicating_anything() {
-    let srv = forge(None).await;
+    let srv = forge().await;
     let nexus = Nexus::start().await;
     nexus.repo("nuget-hosted", "nuget", "hosted");
     for i in 0..6 {
@@ -699,7 +695,7 @@ async fn a_killed_import_resumes_without_duplicating_anything() {
 
 #[tokio::test]
 async fn conflict_policies_and_the_dry_run() {
-    let srv = forge(None).await;
+    let srv = forge().await;
     let nexus = Nexus::start().await;
     nexus.repo("nuget-hosted", "nuget", "hosted");
     // Nexus and Forge hold different bytes for Acme.Core 1.0.0.
@@ -813,7 +809,7 @@ async fn conflict_policies_and_the_dry_run() {
 
 #[tokio::test]
 async fn a_failed_item_is_retried_on_its_own() {
-    let srv = forge(None).await;
+    let srv = forge().await;
     let nexus = Nexus::start().await;
     nexus.repo("nuget-hosted", "nuget", "hosted");
     nexus.nuget(
@@ -881,7 +877,7 @@ async fn a_failed_item_is_retried_on_its_own() {
 
 #[tokio::test]
 async fn cancel_resume_delete_and_one_import_at_a_time() {
-    let srv = forge(None).await;
+    let srv = forge().await;
     let nexus = Nexus::start().await;
     nexus.repo("nuget-hosted", "nuget", "hosted");
     nexus.nuget(
@@ -961,7 +957,7 @@ async fn cancel_resume_delete_and_one_import_at_a_time() {
 
 #[tokio::test]
 async fn the_preflight_refuses_what_cannot_be_imported() {
-    let srv = forge(None).await;
+    let srv = forge().await;
     let nexus = Nexus::start().await;
     nexus.repo("nuget-hosted", "nuget", "hosted");
     nexus.repo("nuget-proxy", "nuget", "proxy");
@@ -1039,7 +1035,7 @@ fn image(config: &[u8], layer: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn docker_import_copies_indexes_signatures_and_referrers_with_their_digests() {
-    let srv = forge(None).await;
+    let srv = forge().await;
     let nexus = Nexus::start().await;
     nexus.repo("docker-hosted", "docker", "hosted");
     let name = "team/app";
@@ -1202,13 +1198,8 @@ async fn docker_import_copies_indexes_signatures_and_referrers_with_their_digest
 // ── Secret encryption ───────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn with_crypto_the_password_is_sealed_at_rest() {
-    const VAR: &str = "FORGE_TEST_NEXUS_IMPORT_ROOT_KEY";
-    std::env::set_var(VAR, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
-    let srv = forge(Some(format!(
-        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{VAR}\"\n[crypto.rotation]\nenabled = false\n"
-    )))
-    .await;
+async fn the_password_is_sealed_at_rest() {
+    let srv = forge().await;
     let nexus = Nexus::start().await;
     nexus.repo("nuget-hosted", "nuget", "hosted");
     nexus.nuget(
@@ -1221,21 +1212,14 @@ async fn with_crypto_the_password_is_sealed_at_rest() {
     let repo = repo_name("nuget-sealed");
     create_repo(&srv, json!({"name": repo, "kind": "hosted"})).await;
     let id = start(&srv, &repo, source(&nexus, "nuget-hosted")).await;
-    let row = sqlx::query!(
-        "SELECT password, password_enc FROM nexus_import WHERE id = $1",
-        id
-    )
-    .fetch_one(&srv.pool)
-    .await
-    .unwrap();
-    assert!(row.password.is_none());
-    let sealed = row.password_enc.expect("sealed password");
+    let sealed = sqlx::query_scalar!("SELECT password_enc FROM nexus_import WHERE id = $1", id)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap()
+        .expect("sealed password");
     assert!(!sealed
         .windows(PASSWORD.len())
         .any(|w| w == PASSWORD.as_bytes()));
-    assert!(forge_db::secret_dao::sealed_secrets_present(&srv.pool)
-        .await
-        .unwrap());
 
     let done = run(&srv, &repo, id).await;
     assert_eq!(done["state"], "completed", "{done}");

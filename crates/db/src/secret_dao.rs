@@ -1,6 +1,6 @@
 //! Encrypted secret columns: transparent encrypt-on-write / decrypt-on-read for
-//! `repository.upstream_password_enc`, plus the plaintext **backfill** job and
-//! the DEK-rotation **re-encrypt sweep**.
+//! `repository.upstream_password_enc`, plus the DEK-rotation **re-encrypt
+//! sweep**. Every secret is sealed: there is no plaintext storage.
 //!
 //! Callers see [`PlaintextSecret`] only; the envelope blob never leaves this
 //! module's helpers undecrypted except as the opaque `bytea` column value. The
@@ -12,21 +12,21 @@
 //! origin changes): the password is never sent anywhere else.
 //!
 //! This module is the seam secret columns adopt: one `(table, column)`
-//! constant pair + the same set/get/backfill/sweep helpers per column. Auth
+//! constant pair + the same set/get/sweep helpers per column. Auth
 //! realm secrets (OIDC `client_secret`, credential-forwarding `key_pepper`,
 //! review P1.5) use it too: the secret keys of a realm `config` are sealed as
 //! one JSON object into `auth_realm.secrets_enc`, AAD-bound to
 //! `('auth_realm', 'secrets_enc', <row id>)` plus the config fields the
 //! secret belongs to ([`realm_secret_binding_keys`]: an OIDC realm's issuer
-//! and client id), and stripped from the plaintext `config` (see
+//! and client id), and stripped from the stored `config` (see
 //! [`insert_realm_with_secrets`] / [`realm_config`]).
 //!
 //! Secrets kept in `forge_setting` ([`SECRET_SETTINGS`]: the generated
-//! registry-token key, the OIDC issuer keys) are text values, `sealed:<base64 envelope>` with the
-//! envelope service and `plain:<secret>` without it, AAD-bound to
-//! `('forge_setting', 'value', 0)` plus the setting's key. They take part in
-//! the backfill, the re-encrypt sweep and the DEK reference scan like the
-//! secret columns ([`store_secret_setting`], [`open_secret_setting`]).
+//! registry-token key, the OIDC issuer keys) are text values,
+//! `sealed:<base64 envelope>`, AAD-bound to `('forge_setting', 'value', 0)`
+//! plus the setting's key. They take part in the re-encrypt sweep and the DEK
+//! reference scan like the secret columns ([`store_secret_setting`],
+//! [`open_secret_setting`]).
 //!
 //! The email service's transport secrets (the SMTP password, the Graph
 //! client secret) are sealed as one JSON object into
@@ -34,15 +34,14 @@
 //! `('email_settings', 'secrets_enc', 1)` plus the transport kind and the
 //! fields the secret belongs to ([`email_secret_binding_keys`]: the SMTP host
 //! and username, the Graph tenant and client id), and stripped from the
-//! plaintext `config`
+//! stored `config`
 //! ([`store_email_settings`], [`email_config`]).
 //!
 //! An import from Nexus keeps the Nexus password in
 //! `nexus_import.password_enc` until it completes, AAD-bound to
 //! `('nexus_import', 'password_enc', <row id>)` plus the origins it is sent
-//! to ([`import_destination`]); without an envelope service it is kept in the
-//! plaintext `password` column, which the backfill seals once encryption is
-//! enabled ([`set_import_password`], [`get_import_password`]).
+//! to ([`import_destination`]) ([`set_import_password`],
+//! [`get_import_password`]).
 //!
 //! ## DEK revocation vs. concurrent writers
 //!
@@ -115,25 +114,17 @@ pub enum SecretDbError {
     /// sealed for the previous one; nothing was written.
     #[error("repository {0} changed its remote_url concurrently")]
     DestinationChanged(i64),
-    /// A realm's secrets are encrypted but no envelope service is configured
-    /// (or the decrypted document is malformed): fail closed.
+    /// A realm's decrypted secrets document is malformed: fail closed.
     #[error("auth realm {0} secrets unavailable: {1}")]
     RealmSecrets(i64, &'static str),
-    /// The email settings' secrets are encrypted but no envelope service is
-    /// configured (or the decrypted document is malformed): fail closed.
+    /// The email settings' decrypted secrets document is malformed: fail
+    /// closed.
     #[error("email settings secrets unavailable: {0}")]
     EmailSecrets(&'static str),
-    /// A secret setting's value is neither `plain:` nor a readable `sealed:`
-    /// envelope: it can never be opened.
+    /// A secret setting's value is not a readable `sealed:` envelope: it can
+    /// never be opened.
     #[error("setting {0} is malformed")]
     MalformedSetting(String),
-    /// A secret setting is sealed but no envelope service is configured:
-    /// fail closed (and never overwrite it with a plaintext value).
-    #[error("setting {0} is sealed but secret encryption is not configured")]
-    SettingSealedWithoutEnvelope(String),
-    /// An import's password is sealed but no envelope service is configured.
-    #[error("the password of import {0} is sealed but secret encryption is not configured")]
-    ImportSealedWithoutEnvelope(i64),
     /// The referenced import row does not exist.
     #[error("import {0} not found")]
     ImportNotFound(i64),
@@ -141,9 +132,7 @@ pub enum SecretDbError {
 
 /// Store (or clear) a repository's upstream password, **encrypted** under the
 /// active DEK with the AAD bound to the row and its current `remote_url`
-/// origin. The plaintext `upstream_password` column is cleared in the same
-/// statement: once a secret is written through the envelope, plaintext never
-/// reappears for that row.
+/// origin.
 ///
 /// Takes a connection (a transaction's, from the admin API) so it can commit
 /// atomically with the repository metadata it belongs to (a new `remote_url`
@@ -185,7 +174,7 @@ pub async fn set_upstream_password(
             FOR SHARE
         ), upd AS (
             UPDATE repository
-            SET upstream_password_enc = $2, upstream_password = NULL
+            SET upstream_password_enc = $2
             WHERE id = $1 AND ($4::int4 IS NULL OR EXISTS (SELECT 1 FROM dek))
               AND remote_url IS NOT DISTINCT FROM $5
             RETURNING id
@@ -254,19 +243,14 @@ async fn lock_sealing_dek(
 /// row: the URL whose origin the password is bound to, and so the only place
 /// it may be sent.
 pub struct UpstreamPassword {
-    /// The decrypted (or legacy plaintext) password.
+    /// The decrypted password.
     pub secret: PlaintextSecret,
     /// The row's `remote_url` at the time of the read.
     pub remote_url: Option<String>,
 }
 
 /// Read a repository's upstream password, decrypting the envelope blob.
-///
-/// Backfill compatibility: a row that has not been backfilled yet (plaintext
-/// column set, `_enc` still NULL — e.g. written before encryption was enabled)
-/// falls back to the plaintext value so the proxy keeps authenticating until
-/// the backfill pass moves it. Returns `None` when the repository stores no
-/// password at all.
+/// Returns `None` when the repository stores no password.
 pub async fn get_upstream_password(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -287,7 +271,7 @@ pub async fn get_upstream_credential(
 ) -> Result<Option<UpstreamPassword>, SecretDbError> {
     let row = sqlx::query!(
         r#"
-        SELECT upstream_password_enc, upstream_password, remote_url
+        SELECT upstream_password_enc, remote_url
         FROM repository
         WHERE id = $1
         "#,
@@ -297,84 +281,15 @@ pub async fn get_upstream_credential(
     .await?
     .ok_or(SecretDbError::RepoNotFound(repo_id))?;
 
-    let secret = match row.upstream_password_enc {
-        Some(blob) => {
-            let destination = upstream_destination(row.remote_url.as_deref());
-            envelope.open(&blob, binding(repo_id, &destination)).await?
-        }
-        None => match row.upstream_password {
-            Some(plaintext) => PlaintextSecret::from(plaintext),
-            None => return Ok(None),
-        },
+    let Some(blob) = row.upstream_password_enc else {
+        return Ok(None);
     };
+    let destination = upstream_destination(row.remote_url.as_deref());
+    let secret = envelope.open(&blob, binding(repo_id, &destination)).await?;
     Ok(Some(UpstreamPassword {
         secret,
         remote_url: row.remote_url,
     }))
-}
-
-/// One batch of the plaintext → encrypted **backfill**.
-///
-/// Up to `batch` rows whose plaintext column is set and whose `_enc` column is
-/// still NULL are sealed; the plaintext is NULLed **in the same guarded
-/// UPDATE** (guarded on the exact plaintext read and `_enc IS NULL`, and on
-/// the sealing DEK still being usable), so a row is never left with both
-/// values and a concurrent admin write is never overwritten.
-///
-/// Returns how many rows were changed; `0` means no plaintext is left.
-/// Idempotent and resumable — processed rows leave the predicate.
-pub async fn backfill_upstream_passwords(
-    pool: &PgPool,
-    envelope: &EnvelopeService,
-    batch: i64,
-) -> Result<usize, SecretDbError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, upstream_password AS "upstream_password!", remote_url
-        FROM repository
-        WHERE upstream_password IS NOT NULL AND upstream_password_enc IS NULL
-        ORDER BY id
-        LIMIT $1
-        "#,
-        batch,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut done = 0;
-    for row in rows {
-        let secret = PlaintextSecret::from(row.upstream_password.clone());
-        let destination = upstream_destination(row.remote_url.as_deref());
-        let blob = envelope
-            .seal(&secret, binding(row.id, &destination))
-            .await?;
-        let dek_version = EnvelopeService::blob_dek_version(&blob)?;
-        let res = sqlx::query!(
-            r#"
-            WITH dek AS (
-                SELECT 1 FROM encryption_key
-                WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'
-                FOR SHARE
-            )
-            UPDATE repository
-            SET upstream_password_enc = $2, upstream_password = NULL
-            WHERE id = $1 AND upstream_password = $3
-              AND upstream_password_enc IS NULL
-              AND remote_url IS NOT DISTINCT FROM $6
-              AND EXISTS (SELECT 1 FROM dek)
-            "#,
-            row.id,
-            &blob,
-            row.upstream_password,
-            envelope.scope(),
-            dek_version,
-            row.remote_url,
-        )
-        .execute(pool)
-        .await?;
-        done += usize::try_from(res.rows_affected()).unwrap_or(0);
-    }
-    Ok(done)
 }
 
 /// The re-sealed blob for a sweep, or `None` when `blob` is already sealed
@@ -627,76 +542,6 @@ async fn scan_referenced_dek_versions(
     Ok(versions)
 }
 
-/// Whether any repository row still carries a plaintext upstream password,
-/// or any import a plaintext Nexus password (operator visibility: with
-/// encryption enabled this must reach `false` once the backfill pass has
-/// run).
-pub async fn plaintext_passwords_pending(pool: &PgPool) -> Result<bool, SecretDbError> {
-    let row = sqlx::query!(
-        r#"
-        SELECT EXISTS (
-            SELECT 1 FROM repository WHERE upstream_password IS NOT NULL
-        ) OR EXISTS (
-            SELECT 1 FROM nexus_import WHERE password IS NOT NULL
-        ) AS "pending!"
-        "#,
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(row.pending)
-}
-
-/// Whether any secret is stored sealed (an upstream password, realm secrets,
-/// an import's Nexus password, the email settings' secrets or a
-/// [`SECRET_SETTINGS`] value): such a
-/// database needs the envelope
-/// service to be usable.
-pub async fn sealed_secrets_present(pool: &PgPool) -> Result<bool, SecretDbError> {
-    let row = sqlx::query!(
-        r#"
-        SELECT EXISTS (
-            SELECT 1 FROM repository WHERE upstream_password_enc IS NOT NULL
-        ) OR EXISTS (
-            SELECT 1 FROM auth_realm WHERE secrets_enc IS NOT NULL
-        ) OR EXISTS (
-            SELECT 1 FROM nexus_import WHERE password_enc IS NOT NULL
-        ) AS "present!"
-        "#,
-    )
-    .fetch_one(pool)
-    .await?;
-    if row.present {
-        return Ok(true);
-    }
-    let email: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM email_settings WHERE secrets_enc IS NOT NULL)",
-    )
-    .fetch_one(pool)
-    .await?;
-    if email {
-        return Ok(true);
-    }
-    let mut conn = pool.acquire().await?;
-    Ok(!sealed_settings(&mut conn).await?.is_empty())
-}
-
-/// Whether any auth realm still carries one of its secret keys
-/// (`secret_keys_for(kind)`) in its plaintext `config` (the realm half of the
-/// operator's "plaintext backfill pending" signal).
-pub async fn plaintext_realm_secrets_pending(
-    pool: &PgPool,
-    secret_keys_for: impl Fn(&str) -> &'static [&'static str],
-) -> Result<bool, SecretDbError> {
-    Ok(auth_realm_dao::list_realms(pool)
-        .await?
-        .iter()
-        .any(|realm| {
-            !split_realm_secrets(&realm.config, secret_keys_for(&realm.kind))
-                .1
-                .is_empty()
-        }))
-}
-
 /// Revoke every `retiring` DEK that no stored ciphertext references anymore
 /// (the tail of the DEK-rotation sweep). Returns how many DEKs were revoked.
 ///
@@ -812,22 +657,16 @@ pub fn split_realm_secrets(
     (stripped, secrets)
 }
 
-/// The **logical** config of a realm row: the plaintext `config` with the
-/// decrypted `secrets_enc` keys merged in (encrypted values win over any
-/// legacy plaintext copy). A row without `secrets_enc` is returned as-is
-/// (legacy plaintext / encryption disabled). Encrypted secrets without an
-/// envelope service fail closed.
+/// The **logical** config of a realm row: the stored `config` with the
+/// decrypted `secrets_enc` keys merged in. A row without `secrets_enc` (a
+/// realm without secrets) is returned as is.
 pub async fn realm_config(
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     realm: &AuthRealm,
 ) -> Result<JsonValue, SecretDbError> {
     let Some(blob) = realm.secrets_enc.as_deref() else {
         return Ok(realm.config.clone());
     };
-    let envelope = envelope.ok_or(SecretDbError::RealmSecrets(
-        realm.id,
-        "secrets are encrypted but secret encryption is not configured",
-    ))?;
     let destination = realm_destination(&realm.kind, &realm.config);
     let plaintext = envelope
         .open(blob, realm_binding(realm.id, &destination))
@@ -857,19 +696,16 @@ async fn seal_realm_secrets(
         .await?)
 }
 
-/// Insert a realm whose `new.config` is the full logical document. With an
-/// envelope, the `secret_keys` are stripped from the stored `config` and sealed
-/// into `secrets_enc` in the same transaction (the row id is part of the AAD,
-/// so the insert comes first); without one the config is stored as-is.
+/// Insert a realm whose `new.config` is the full logical document. The
+/// `secret_keys` are stripped from the stored `config` and sealed into
+/// `secrets_enc` in the same transaction (the row id is part of the AAD, so
+/// the insert comes first).
 pub async fn insert_realm_with_secrets(
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     mut new: NewAuthRealm,
     secret_keys: &[&str],
 ) -> Result<AuthRealm, SecretDbError> {
-    let Some(envelope) = envelope else {
-        return Ok(auth_realm_dao::insert_realm(pool, new).await?);
-    };
     let (stripped, secrets) = split_realm_secrets(&new.config, secret_keys);
     if secrets.is_empty() {
         return Ok(auth_realm_dao::insert_realm(pool, new).await?);
@@ -899,46 +735,35 @@ pub async fn insert_realm_with_secrets(
     Ok(row)
 }
 
-/// Update a realm whose `upd.config` is the full logical document. With an
-/// envelope the secrets are (re-)encrypted into `secrets_enc` and stripped from
-/// `config`; without one they are stored in plaintext and `secrets_enc` is
-/// cleared (behaves as before encryption existed). Returns `None` when the id
-/// does not exist.
+/// Update a realm whose `upd.config` is the full logical document: the
+/// secrets are (re-)encrypted into `secrets_enc` and stripped from `config`,
+/// and `secrets_enc` is cleared when there are none. Returns `None` when the
+/// id does not exist.
 pub async fn update_realm_with_secrets(
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     id: i64,
     mut upd: AuthRealmUpdate,
     secret_keys: &[&str],
 ) -> Result<Option<AuthRealm>, SecretDbError> {
-    let blob = match envelope {
-        None => None,
-        Some(envelope) => {
-            let (stripped, secrets) = split_realm_secrets(&upd.config, secret_keys);
-            upd.config = stripped;
-            if secrets.is_empty() {
-                None
-            } else {
-                // The kind never changes, so the destination is taken from
-                // the config this update writes.
-                let Some(kind) =
-                    sqlx::query_scalar!(r#"SELECT kind FROM auth_realm WHERE id = $1"#, id)
-                        .fetch_optional(pool)
-                        .await?
-                else {
-                    return Ok(None);
-                };
-                Some(seal_realm_secrets(envelope, id, &kind, &upd.config, &secrets).await?)
-            }
-        }
+    let (stripped, secrets) = split_realm_secrets(&upd.config, secret_keys);
+    upd.config = stripped;
+    if secrets.is_empty() {
+        return Ok(auth_realm_dao::update_realm_and_secrets(pool, id, upd, None).await?);
+    }
+    // The kind never changes, so the destination is taken from the config
+    // this update writes.
+    let Some(kind) = sqlx::query_scalar!(r#"SELECT kind FROM auth_realm WHERE id = $1"#, id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
     };
-    let (Some(envelope), Some(sealed)) = (envelope, blob.as_deref()) else {
-        return Ok(auth_realm_dao::update_realm_and_secrets(pool, id, upd, blob.as_deref()).await?);
-    };
+    let sealed = seal_realm_secrets(envelope, id, &kind, &upd.config, &secrets).await?;
     // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
     let mut tx = pool.begin().await?;
-    lock_sealing_dek(&mut tx, envelope, sealed).await?;
-    let row = auth_realm_dao::update_realm_and_secrets(&mut *tx, id, upd, Some(sealed)).await?;
+    lock_sealing_dek(&mut tx, envelope, &sealed).await?;
+    let row = auth_realm_dao::update_realm_and_secrets(&mut *tx, id, upd, Some(&sealed)).await?;
     tx.commit().await?;
     Ok(row)
 }
@@ -949,23 +774,21 @@ pub async fn update_realm_with_secrets(
 /// changed or is gone; nothing is written then.
 pub async fn update_realm_with_secrets_if_unchanged(
     conn: &mut sqlx::PgConnection,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     expected: &AuthRealm,
     mut upd: AuthRealmUpdate,
     secret_keys: &[&str],
 ) -> Result<Option<AuthRealm>, SecretDbError> {
     let mut blob = None;
-    if let Some(envelope) = envelope {
-        let (stripped, secrets) = split_realm_secrets(&upd.config, secret_keys);
-        upd.config = stripped;
-        if !secrets.is_empty() {
-            let sealed =
-                seal_realm_secrets(envelope, expected.id, &expected.kind, &upd.config, &secrets)
-                    .await?;
-            // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
-            lock_sealing_dek(conn, envelope, &sealed).await?;
-            blob = Some(sealed);
-        }
+    let (stripped, secrets) = split_realm_secrets(&upd.config, secret_keys);
+    upd.config = stripped;
+    if !secrets.is_empty() {
+        let sealed =
+            seal_realm_secrets(envelope, expected.id, &expected.kind, &upd.config, &secrets)
+                .await?;
+        // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
+        lock_sealing_dek(conn, envelope, &sealed).await?;
+        blob = Some(sealed);
     }
     Ok(auth_realm_dao::update_realm_and_secrets_if_unchanged(
         &mut *conn,
@@ -974,66 +797,6 @@ pub async fn update_realm_with_secrets_if_unchanged(
         blob.as_deref(),
     )
     .await?)
-}
-
-/// Plaintext → encrypted **backfill** for realm secrets: every realm whose
-/// plaintext `config` still carries one of its `secret_keys_for(kind)` keys is
-/// re-stored with those keys moved into `secrets_enc`.
-///
-/// Each realm is written only while it is still the row read here
-/// ([`update_realm_with_secrets_if_unchanged`]), so a concurrent admin edit is
-/// never undone; a row that changed is left for the next pass. A row whose
-/// `secrets_enc` does not decrypt is logged and left as is. Idempotent;
-/// returns how many realms were re-encrypted.
-pub async fn backfill_realm_secrets(
-    pool: &PgPool,
-    envelope: &EnvelopeService,
-    secret_keys_for: impl Fn(&str) -> &'static [&'static str],
-) -> Result<usize, SecretDbError> {
-    let mut done = 0;
-    for realm in auth_realm_dao::list_realms(pool).await? {
-        let keys = secret_keys_for(&realm.kind);
-        if split_realm_secrets(&realm.config, keys).1.is_empty() {
-            continue;
-        }
-        let config = match realm_config(Some(envelope), &realm).await {
-            Ok(config) => config,
-            Err(SecretDbError::Crypto(e)) if is_blob_error(&e) => {
-                tracing::warn!(
-                    realm_id = realm.id,
-                    error = %e,
-                    "stored realm secrets are unreadable; left as is (enter them again through \
-                     the admin API)"
-                );
-                continue;
-            }
-            Err(SecretDbError::RealmSecrets(_, why)) => {
-                tracing::warn!(
-                    realm_id = realm.id,
-                    why,
-                    "stored realm secrets are unreadable; left as is (enter them again through \
-                     the admin API)"
-                );
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        let upd = AuthRealmUpdate {
-            name: realm.name.clone(),
-            enabled: realm.enabled,
-            priority: realm.priority,
-            config,
-        };
-        let mut tx = pool.begin().await?;
-        let written =
-            update_realm_with_secrets_if_unchanged(&mut tx, Some(envelope), &realm, upd, keys)
-                .await?;
-        tx.commit().await?;
-        if written.is_some() {
-            done += 1;
-        }
-    }
-    Ok(done)
 }
 
 /// DEK-rotation re-encrypt sweep over `auth_realm.secrets_enc` (the table is
@@ -1178,19 +941,15 @@ pub fn split_email_secrets(config: &JsonValue) -> (JsonValue, Map<String, JsonVa
 }
 
 /// The **logical** email config: the stored `config` with the decrypted
-/// secrets merged into `transport`. A row without `secrets_enc` is returned
-/// as is (no secret, or secret encryption off). Encrypted secrets without an
-/// envelope service fail closed.
+/// secrets merged into `transport`. A row without `secrets_enc` (a transport
+/// without secrets) is returned as is.
 pub async fn email_config(
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     row: &EmailSettingsRow,
 ) -> Result<JsonValue, SecretDbError> {
     let Some(blob) = row.secrets_enc.as_deref() else {
         return Ok(row.config.clone());
     };
-    let envelope = envelope.ok_or(SecretDbError::EmailSecrets(
-        "secrets are encrypted but secret encryption is not configured",
-    ))?;
     let destination = email_destination(&row.config);
     let plaintext = envelope.open(blob, email_binding(&destination)).await?;
     let secrets: Map<String, JsonValue> = serde_json::from_str(plaintext.expose_secret())
@@ -1216,18 +975,14 @@ async fn seal_email_secrets(
 }
 
 /// Store the email settings whose `config` is the full logical document
-/// (secrets included). With an envelope the transport secrets are sealed into
-/// `secrets_enc` and stripped from `config`; without one they are stored in
-/// `config` as they are.
+/// (secrets included). The transport secrets are sealed into `secrets_enc`
+/// and stripped from `config`.
 pub async fn store_email_settings(
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     enabled: bool,
     config: &JsonValue,
 ) -> Result<EmailSettingsRow, SecretDbError> {
-    let Some(envelope) = envelope else {
-        return Ok(email_settings_dao::put(pool, enabled, config, None).await?);
-    };
     let (stripped, secrets) = split_email_secrets(config);
     if secrets.is_empty() {
         return Ok(email_settings_dao::put(pool, enabled, &stripped, None).await?);
@@ -1248,13 +1003,10 @@ pub async fn store_email_settings(
 /// outcome is kept. `None` when the row changed or is gone.
 pub async fn update_email_settings(
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     expected: &EmailSettingsRow,
     config: &JsonValue,
 ) -> Result<Option<EmailSettingsRow>, SecretDbError> {
-    let Some(envelope) = envelope else {
-        return Ok(email_settings_dao::put_if_unchanged(pool, expected, config, None).await?);
-    };
     let (stripped, secrets) = split_email_secrets(config);
     if secrets.is_empty() {
         return Ok(email_settings_dao::put_if_unchanged(pool, expected, &stripped, None).await?);
@@ -1266,62 +1018,6 @@ pub async fn update_email_settings(
         email_settings_dao::put_if_unchanged(&mut *tx, expected, &stripped, Some(&blob)).await?;
     tx.commit().await?;
     Ok(row)
-}
-
-/// Whether the stored email `config` still carries a transport secret in
-/// plaintext (the email half of the operator's "plaintext backfill pending"
-/// signal).
-pub async fn plaintext_email_secrets_pending(pool: &PgPool) -> Result<bool, SecretDbError> {
-    Ok(email_settings_dao::get(pool)
-        .await?
-        .is_some_and(|row| !split_email_secrets(&row.config).1.is_empty()))
-}
-
-/// Plaintext → encrypted **backfill** for the email settings: a stored config
-/// that still carries a transport secret is re-stored with it sealed, while
-/// the row is still the one read here (a concurrent admin edit is never
-/// undone; a changed row is left for the next pass). A `secrets_enc` that does
-/// not decrypt is logged and left as is. Returns whether the row was
-/// re-encrypted.
-pub async fn backfill_email_secrets(
-    pool: &PgPool,
-    envelope: &EnvelopeService,
-) -> Result<bool, SecretDbError> {
-    let Some(row) = email_settings_dao::get(pool).await? else {
-        return Ok(false);
-    };
-    if split_email_secrets(&row.config).1.is_empty() {
-        return Ok(false);
-    }
-    let config = match email_config(Some(envelope), &row).await {
-        Ok(config) => config,
-        Err(SecretDbError::Crypto(e)) if is_blob_error(&e) => {
-            tracing::warn!(
-                error = %e,
-                "stored email settings secrets are unreadable; left as is (enter them again on \
-                 the email settings page)"
-            );
-            return Ok(false);
-        }
-        Err(SecretDbError::EmailSecrets(why)) => {
-            tracing::warn!(
-                why,
-                "stored email settings secrets are unreadable; left as is (enter them again on \
-                 the email settings page)"
-            );
-            return Ok(false);
-        }
-        Err(e) => return Err(e),
-    };
-    let (stripped, secrets) = split_email_secrets(&config);
-    let blob = seal_email_secrets(envelope, &stripped, &secrets).await?;
-    let mut tx = pool.begin().await?;
-    lock_sealing_dek(&mut tx, envelope, &blob).await?;
-    let written = email_settings_dao::put_if_unchanged(&mut *tx, &row, &stripped, Some(&blob))
-        .await?
-        .is_some();
-    tx.commit().await?;
-    Ok(written)
 }
 
 /// DEK-rotation re-encrypt sweep over `email_settings.secrets_enc`: re-seals a
@@ -1380,8 +1076,6 @@ pub const SECRET_SETTINGS: &[&str] = &[REGISTRY_TOKEN_KEY_SETTING, OIDC_ISSUER_K
 
 /// Prefix of a sealed secret setting: `sealed:<base64 envelope>`.
 const SEALED_SETTING: &str = "sealed:";
-/// Prefix of a plaintext secret setting: `plain:<secret>`.
-const PLAIN_SETTING: &str = "plain:";
 
 /// The AAD binding of the secret setting `key`.
 fn setting_binding(key: &str) -> AeadBinding<'_> {
@@ -1418,19 +1112,13 @@ async fn sealed_settings(
     .await?)
 }
 
-/// Open the stored `value` of the secret setting `key`. A `sealed:` value
-/// needs `envelope`.
+/// Open the stored `value` of the secret setting `key`.
 pub async fn open_secret_setting(
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     key: &str,
     value: &str,
 ) -> Result<PlaintextSecret, SecretDbError> {
-    if let Some(plain) = value.strip_prefix(PLAIN_SETTING) {
-        return Ok(PlaintextSecret::from(plain.to_string()));
-    }
     let blob = sealed_setting_blob(key, value)?;
-    let envelope =
-        envelope.ok_or_else(|| SecretDbError::SettingSealedWithoutEnvelope(key.to_string()))?;
     Ok(envelope.open(&blob, setting_binding(key)).await?)
 }
 
@@ -1446,36 +1134,21 @@ pub fn is_unreadable_setting(e: &SecretDbError) -> bool {
     }
 }
 
-/// Store `secret` as the secret setting `key`: sealed with `envelope`, else
-/// `plain:`. With `expected`, only while the stored value is still that
-/// (compare-and-swap); without, only while the key is unset. Returns the
-/// stored value, or `None` when another writer got there first.
+/// Store `secret`, sealed, as the secret setting `key`. With `expected`,
+/// only while the stored value is still that (compare-and-swap); without,
+/// only while the key is unset. Returns the stored value, or `None` when
+/// another writer got there first.
 ///
-/// A sealed write holds `FOR SHARE` on its DEK (module docs). A plaintext
-/// value never replaces a sealed one.
+/// The write holds `FOR SHARE` on its DEK (module docs).
 pub async fn store_secret_setting(
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     key: &str,
     secret: &PlaintextSecret,
     expected: Option<&str>,
 ) -> Result<Option<String>, SecretDbError> {
-    match envelope {
-        Some(envelope) => {
-            let blob = envelope.seal(secret, setting_binding(key)).await?;
-            write_sealed_setting(pool, envelope, key, &blob, expected).await
-        }
-        None if expected.is_some_and(|v| v.starts_with(SEALED_SETTING)) => {
-            Err(SecretDbError::SettingSealedWithoutEnvelope(key.to_string()))
-        }
-        None => {
-            let value = format!("{PLAIN_SETTING}{}", secret.expose_secret());
-            let mut tx = pool.begin().await?;
-            let written = write_setting(&mut tx, key, &value, expected).await?;
-            tx.commit().await?;
-            Ok(written.then_some(value))
-        }
-    }
+    let blob = envelope.seal(secret, setting_binding(key)).await?;
+    write_sealed_setting(pool, envelope, key, &blob, expected).await
 }
 
 /// [`store_secret_setting`] of an envelope `blob` sealed for `key`, holding
@@ -1524,43 +1197,6 @@ async fn write_setting(
                 > 0
         }
     })
-}
-
-/// Seal every [`SECRET_SETTINGS`] value still stored `plain:` (written
-/// before `[crypto]` was enabled). Returns how many were sealed.
-pub async fn backfill_secret_settings(
-    pool: &PgPool,
-    envelope: &EnvelopeService,
-) -> Result<usize, SecretDbError> {
-    let mut sealed = 0;
-    for key in SECRET_SETTINGS {
-        let Some(value) = crate::authz_dao::get_setting(pool, key).await? else {
-            continue;
-        };
-        let Some(plain) = value.strip_prefix(PLAIN_SETTING) else {
-            continue;
-        };
-        let secret = PlaintextSecret::from(plain.to_string());
-        if store_secret_setting(pool, Some(envelope), key, &secret, Some(&value))
-            .await?
-            .is_some()
-        {
-            sealed += 1;
-        }
-    }
-    Ok(sealed)
-}
-
-/// Whether any [`SECRET_SETTINGS`] value is still stored `plain:` (the
-/// settings' half of the operator's "plaintext backfill pending" signal).
-pub async fn plaintext_settings_pending(pool: &PgPool) -> Result<bool, SecretDbError> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM forge_setting \
-         WHERE key = ANY($1) AND value LIKE 'plain:%')",
-    )
-    .bind(SECRET_SETTINGS)
-    .fetch_one(pool)
-    .await?)
 }
 
 /// The DEK re-encrypt sweep over the sealed [`SECRET_SETTINGS`]: re-seal a
@@ -1626,12 +1262,12 @@ fn import_binding(import_id: i64, destination: &str) -> AeadBinding<'_> {
     }
 }
 
-/// Store an import's Nexus password: sealed with `envelope` (bound to the
-/// row and to [`import_destination`]), or in the plaintext column without
-/// one. Runs on the connection of the transaction that created the import.
+/// Store an import's Nexus password, sealed (bound to the row and to
+/// [`import_destination`]). Runs on the connection of the transaction that
+/// created the import.
 pub async fn set_import_password(
     conn: &mut sqlx::PgConnection,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     import_id: i64,
     secret: &PlaintextSecret,
 ) -> Result<(), SecretDbError> {
@@ -1642,23 +1278,13 @@ pub async fn set_import_password(
     .fetch_optional(&mut *conn)
     .await?
     .ok_or(SecretDbError::ImportNotFound(import_id))?;
-    let Some(envelope) = envelope else {
-        sqlx::query!(
-            r#"UPDATE nexus_import SET password = $2, password_enc = NULL WHERE id = $1"#,
-            import_id,
-            secret.expose_secret(),
-        )
-        .execute(&mut *conn)
-        .await?;
-        return Ok(());
-    };
     let destination = import_destination(&row.base_url, row.registry_url.as_deref());
     let blob = envelope
         .seal(secret, import_binding(import_id, &destination))
         .await?;
     lock_sealing_dek(conn, envelope, &blob).await?;
     sqlx::query!(
-        r#"UPDATE nexus_import SET password_enc = $2, password = NULL WHERE id = $1"#,
+        r#"UPDATE nexus_import SET password_enc = $2 WHERE id = $1"#,
         import_id,
         &blob,
     )
@@ -1668,16 +1294,15 @@ pub async fn set_import_password(
 }
 
 /// An import's Nexus password, `None` when it has none (an anonymous
-/// source, or the import completed). A sealed password without an envelope
-/// service fails closed.
+/// source, or the import completed).
 pub async fn get_import_password(
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     import_id: i64,
 ) -> Result<Option<PlaintextSecret>, SecretDbError> {
     let row = sqlx::query!(
         r#"
-        SELECT base_url, registry_url, password, password_enc
+        SELECT base_url, registry_url, password_enc
         FROM nexus_import WHERE id = $1
         "#,
         import_id,
@@ -1685,63 +1310,14 @@ pub async fn get_import_password(
     .fetch_optional(pool)
     .await?
     .ok_or(SecretDbError::ImportNotFound(import_id))?;
-    match (row.password_enc, row.password) {
-        (Some(blob), _) => {
-            let envelope = envelope.ok_or(SecretDbError::ImportSealedWithoutEnvelope(import_id))?;
-            let destination = import_destination(&row.base_url, row.registry_url.as_deref());
-            let secret = envelope
-                .open(&blob, import_binding(import_id, &destination))
-                .await?;
-            Ok(Some(secret))
-        }
-        (None, Some(plaintext)) => Ok(Some(PlaintextSecret::from(plaintext))),
-        (None, None) => Ok(None),
-    }
-}
-
-/// Seal the import passwords stored in plaintext (written before secret
-/// encryption was enabled). Returns how many were sealed.
-pub async fn backfill_import_passwords(
-    pool: &PgPool,
-    envelope: &EnvelopeService,
-) -> Result<usize, SecretDbError> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, base_url, registry_url, password AS "password!"
-        FROM nexus_import WHERE password IS NOT NULL
-        ORDER BY id
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut done = 0;
-    for row in rows {
-        let destination = import_destination(&row.base_url, row.registry_url.as_deref());
-        let secret = PlaintextSecret::from(row.password.clone());
-        let blob = envelope
-            .seal(&secret, import_binding(row.id, &destination))
-            .await?;
-        let res = sqlx::query!(
-            r#"
-            WITH dek AS (
-                SELECT 1 FROM encryption_key
-                WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'
-                FOR SHARE
-            )
-            UPDATE nexus_import SET password_enc = $2, password = NULL
-            WHERE id = $1 AND password = $3 AND EXISTS (SELECT 1 FROM dek)
-            "#,
-            row.id,
-            &blob,
-            row.password,
-            envelope.scope(),
-            EnvelopeService::blob_dek_version(&blob)?,
-        )
-        .execute(pool)
+    let Some(blob) = row.password_enc else {
+        return Ok(None);
+    };
+    let destination = import_destination(&row.base_url, row.registry_url.as_deref());
+    let secret = envelope
+        .open(&blob, import_binding(import_id, &destination))
         .await?;
-        done += usize::try_from(res.rows_affected()).unwrap_or(0);
-    }
-    Ok(done)
+    Ok(Some(secret))
 }
 
 /// The DEK re-encrypt sweep over the sealed import passwords. Returns how

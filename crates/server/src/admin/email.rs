@@ -114,7 +114,7 @@ pub(super) fn view(stored: &StoredEmail, mailer: &Mailer) -> JsonValue {
 }
 
 async fn load(state: &AppState) -> Result<Option<StoredEmail>, Response> {
-    email::load_stored(&state.pool, state.envelope.as_deref())
+    email::load_stored(&state.pool, &state.envelope)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "email settings unreadable");
@@ -176,25 +176,21 @@ pub async fn put(State(state): State<AppState>, Json(body): Json<PutEmailSetting
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
-    let row = match secret_dao::store_email_settings(
-        &state.pool,
-        state.envelope.as_deref(),
-        body.enabled,
-        &doc,
-    )
-    .await
-    {
-        Ok(row) => row,
-        Err(SecretDbError::Db(e)) => return db_error(e),
-        Err(e) => {
-            tracing::error!(error = %e, "email settings secret encryption failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "email settings secret encryption failed",
-            )
-                .into_response();
-        }
-    };
+    let row =
+        match secret_dao::store_email_settings(&state.pool, &state.envelope, body.enabled, &doc)
+            .await
+        {
+            Ok(row) => row,
+            Err(SecretDbError::Db(e)) => return db_error(e),
+            Err(e) => {
+                tracing::error!(error = %e, "email settings secret encryption failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "email settings secret encryption failed",
+                )
+                    .into_response();
+            }
+        };
     state.mailer.invalidate().await;
     // The OAuth client and authorization of the settings before, when these
     // no longer use them.

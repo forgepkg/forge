@@ -110,7 +110,7 @@ fn internal() -> Response {
 
 /// The stored settings and their `smtp_oauth` transport.
 async fn load_oauth(state: &AppState) -> Result<(StoredEmail, SmtpOauthConfig), Response> {
-    let stored = match email::load_stored(&state.pool, state.envelope.as_deref()).await {
+    let stored = match email::load_stored(&state.pool, &state.envelope).await {
         Ok(Some(stored)) => stored,
         Ok(None) => return Err(conflict("no email service is configured")),
         Err(e) => {
@@ -171,7 +171,7 @@ async fn update_oauth(
     change: impl Fn(&mut SmtpOauthConfig),
 ) -> Result<StoredEmail, StoreError> {
     for _ in 0..3 {
-        let stored = match email::load_stored(&state.pool, state.envelope.as_deref()).await {
+        let stored = match email::load_stored(&state.pool, &state.envelope).await {
             Ok(Some(stored)) if !stored.secrets_unreadable => stored,
             Ok(_) => return Err(StoreError::Changed),
             Err(e) => {
@@ -191,13 +191,8 @@ async fn update_oauth(
             tracing::error!(error = %e, "email settings did not serialize");
             StoreError::Failed
         })?;
-        match secret_dao::update_email_settings(
-            &state.pool,
-            state.envelope.as_deref(),
-            &stored.row,
-            &doc,
-        )
-        .await
+        match secret_dao::update_email_settings(&state.pool, &state.envelope, &stored.row, &doc)
+            .await
         {
             Ok(Some(row)) => {
                 state.mailer.invalidate().await;

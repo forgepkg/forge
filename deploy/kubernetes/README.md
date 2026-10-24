@@ -84,10 +84,11 @@ gateway uses Forge's own `FORGE_S3__ACCESS_KEY`/`FORGE_S3__SECRET_KEY`
 (s3-versitygw). The Postgres and Valkey passwords are pasted into a URL, so
 generate URL-safe values: `openssl rand -hex 24`.
 
-Turn on secret encryption at rest before you configure proxy repositories or
-auth realms (`FORGE_CRYPTO__ROOT__PROVIDER` and `FORGE_ROOT_KEY` in
-`forge.env`; the production example has them), and keep the root key with
-your backups.
+Secret encryption at rest is required: the base sets
+`FORGE_CRYPTO__ROOT__PROVIDER=env`, and `forge.env` holds the root key,
+`FORGE_ROOT_KEY` (`openssl rand -base64 32`; both examples have it). Forge
+refuses to start without it. Keep the root key with your backups: without it
+the stored secrets cannot be read.
 
 ## Quick start (evaluation)
 

@@ -436,13 +436,14 @@ async fn settings_keep_their_secret_write_only() {
     assert!(view["transport"].get("password").is_none());
     assert!(!view.to_string().contains(SMTP_PASSWORD));
 
-    // Without [crypto] the password is in the stored config; the API still
-    // never returns it.
-    let stored: Value = sqlx::query_scalar("SELECT config FROM email_settings")
-        .fetch_one(&srv.pool)
-        .await
-        .unwrap();
-    assert_eq!(stored["transport"]["password"], json!(SMTP_PASSWORD));
+    // The password is sealed, never in the stored config.
+    let (stored, sealed): (Value, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT config, secrets_enc FROM email_settings")
+            .fetch_one(&srv.pool)
+            .await
+            .unwrap();
+    assert!(stored["transport"].get("password").is_none(), "{stored}");
+    assert!(sealed.is_some());
 
     // An update without the password keeps it...
     let mut update = settings.clone();
@@ -547,28 +548,11 @@ async fn settings_keep_their_secret_write_only() {
     assert!(!srv.state.mailer.is_configured().await);
 }
 
-/// With `[crypto]` the password is sealed at rest, and the settings still
-/// work.
+/// The password is sealed at rest, and the settings still work.
 #[tokio::test]
-async fn the_password_is_sealed_at_rest_with_crypto() {
-    std::env::set_var(
-        "FORGE_TEST_EMAIL_ROOT_KEY",
-        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
-    );
+async fn the_password_is_sealed_at_rest() {
     test_tls();
-    let srv = common::start_with(
-        common::fresh_pool().await,
-        common::ServerOpts {
-            crypto_block: Some(
-                "[crypto]\n[crypto.root]\nprovider = \"env\"\n\
-                 root_key_env = \"FORGE_TEST_EMAIL_ROOT_KEY\"\n\
-                 [crypto.rotation]\nenabled = false\n"
-                    .into(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await;
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
     let mailpit = Mailpit::start(ServerTls::Implicit, true).await;
     let resp = admin(
         &srv,

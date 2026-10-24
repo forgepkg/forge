@@ -32,8 +32,8 @@ pub async fn find_repository_by_host(
         r#"
         SELECT
             id, name, format, kind, anonymous_read, online, config,
-            remote_url, package_delay_seconds, upstream_username, upstream_password,
-            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,
+            remote_url, package_delay_seconds, upstream_username, upstream_password_enc,
+            metadata_ttl_seconds, not_found_ttl_seconds,
             allow_redeploy, created_at, updated_at
         FROM repository
         WHERE format = 'docker' AND config ? 'host' AND lower(config->>'host') = lower($1)

@@ -42,7 +42,7 @@ them like this:
 | --- | --- |
 | `config` | `forge.toml` in a ConfigMap, loaded through `FORGE_CONFIG`. Any key of [forge.toml.example](../../../forge.toml.example), as YAML, nested by section. |
 | `host` | `server.public_base_url` (`https://<host>`), and the default host of the HTTPRoute, the ListenerSet listener and the Certificate. |
-| `secretEnv` | A Secret the chart creates (`<fullname>-secret-env`), loaded with `envFrom`: `FORGE_DATABASE__URL`, `FORGE_S3__ACCESS_KEY`, `FORGE_ROOT_KEY`, … |
+| `secretEnv` | A Secret the chart creates (`<fullname>-secret-env`), loaded with `envFrom`: `FORGE_DATABASE__URL`, `FORGE_S3__ACCESS_KEY`, `FORGE_ROOT_KEY` (required), … |
 | `existingSecret` | An existing Secret loaded with `envFrom` (External Secrets, Sealed Secrets, SOPS, …); it wins over `secretEnv` for a key in both. Any name but the chart's own `<fullname>-secret-env`. |
 | `env`, `envFrom` | Further variables; `valueFrom` reads single Secret keys. They win over the chart's own. |
 
@@ -85,9 +85,6 @@ config:
     region: eu-central-1
     bucket: forge
     force_path_style: false
-  crypto:
-    root:
-      provider: env                     # secret encryption at rest
 
 existingSecret: forge-credentials       # FORGE_DATABASE__URL, FORGE_S3__ACCESS_KEY,
                                         # FORGE_S3__SECRET_KEY, FORGE_ROOT_KEY,
@@ -110,10 +107,14 @@ httpRoute:
       sectionName: https
 ```
 
-Turn on secret encryption at rest (`config.crypto` and `FORGE_ROOT_KEY`)
-before you configure proxy repositories or auth realms, and keep the root key
-with your backups. Every other value is documented in
-[values.yaml](values.yaml).
+Secret encryption at rest is required: Forge seals the secrets it stores
+(proxy passwords, realm secrets, the email credentials, its signing keys)
+under a root key, `FORGE_ROOT_KEY` (`openssl rand -base64 32`). The chart
+defaults to the `env` provider (`config.crypto.root.provider`) and refuses to
+render unless `secretEnv`, `existingSecret` or `env` provides the key (or
+`config.crypto.root` names a key file). Keep the root key with your backups:
+without it the stored secrets cannot be read. Every other value is documented
+in [values.yaml](values.yaml).
 
 ## Short-lived S3 credentials
 

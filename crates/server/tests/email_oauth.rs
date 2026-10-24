@@ -334,7 +334,7 @@ async fn register(srv: &common::TestServer) -> Value {
 
 /// The stored transport, secrets and all.
 async fn stored_transport(srv: &common::TestServer) -> Value {
-    let stored = forge_server::email::load_stored(&srv.state.pool, srv.state.envelope.as_deref())
+    let stored = forge_server::email::load_stored(&srv.state.pool, &srv.state.envelope)
         .await
         .unwrap()
         .expect("stored");

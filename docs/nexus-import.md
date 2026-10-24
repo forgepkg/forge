@@ -118,11 +118,11 @@ time, then a final one just before DNS or the clients switch to Forge.
 
 ## Credentials and workers
 
-The Nexus password is stored sealed with the secret encryption (`[crypto]`;
-without it, it is stored like proxy passwords), sent only to the Nexus
-origin (and the registry's), and deleted when the import completes. A
-cancelled or failed import keeps it, to be resumed; retrying the failed items
-of a completed import asks for it again.
+The Nexus password is stored sealed with the secret encryption
+(`[crypto]`), sent only to the Nexus origin (and the registry's), and
+deleted when the import completes. A cancelled or failed import keeps it, to
+be resumed; retrying the failed items of a completed import asks for it
+again.
 
 Every instance runs the import worker; an import runs on one instance at a
 time, which holds it with a lease in Postgres that it renews while it works.

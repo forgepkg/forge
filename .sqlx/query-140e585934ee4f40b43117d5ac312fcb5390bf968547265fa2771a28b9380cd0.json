@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, base_url, registry_url, password AS \"password!\"\n        FROM nexus_import WHERE password IS NOT NULL\n        ORDER BY id\n        ",
+  "query": "\n        SELECT base_url, registry_url, password_enc\n        FROM nexus_import WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "nexus_import",
-            "name": "id"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "base_url",
         "type_info": "Text",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "registry_url",
         "type_info": "Text",
         "origin": {
@@ -37,26 +26,27 @@
         }
       },
       {
-        "ordinal": 3,
-        "name": "password!",
-        "type_info": "Text",
+        "ordinal": 2,
+        "name": "password_enc",
+        "type_info": "Bytea",
         "origin": {
           "Table": {
             "table": "nexus_import",
-            "name": "password"
+            "name": "password_enc"
           }
         }
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Int8"
+      ]
     },
     "nullable": [
-      false,
       false,
       true,
       true
     ]
   },
-  "hash": "9c1161eca377034e74c2c2597c95937aea0a260eb5af35eb26a8cf8a2d1076ca"
+  "hash": "140e585934ee4f40b43117d5ac312fcb5390bf968547265fa2771a28b9380cd0"
 }

@@ -14,3 +14,5 @@ extraVolumes:
 extraVolumeMounts:
   - name: blob-cache
     mountPath: /var/cache/forge
+secretEnv:
+  FORGE_ROOT_KEY: check-only

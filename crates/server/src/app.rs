@@ -532,13 +532,12 @@ fn warn_placeholder(username: &str) {
 /// `auth_realm` rows. Delegates to [`crate::auth::seed_auth_realms`]; call on
 /// every boot — the first boot inserts the realms, later boots re-apply a
 /// changed block only while its seeded row is untouched by the admin API (see
-/// there for the drift detection). Pass the (bootstrapped) envelope service
-/// when secret encryption is enabled so seeded realm secrets are encrypted at
-/// rest.
+/// there for the drift detection). Seeded realm secrets are sealed with the
+/// (bootstrapped) envelope service.
 pub async fn ensure_auth_realms(
     config: &Config,
     pool: &PgPool,
-    envelope: Option<&forge_crypto::service::EnvelopeService>,
+    envelope: &forge_crypto::service::EnvelopeService,
 ) -> anyhow::Result<()> {
     crate::auth::seed_auth_realms(config, pool, envelope)
         .await

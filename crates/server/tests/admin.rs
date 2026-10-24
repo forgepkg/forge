@@ -1206,42 +1206,24 @@ async fn group_member_owner_flag() {
 
 // ── secret encryption at rest ───────────────────────────────────────────────
 
-/// Serializes the crypto-enabled tests of this binary: they share the
+/// Serializes the key-rotation tests of this binary: they share the
 /// cluster-wide rotation advisory lock (and the `default` key scope). Each
-/// runs on a database of its own (`common::fresh_pool`): a server with
-/// `[crypto]` seals install-wide secrets, such as the registry token key,
-/// that a server without it refuses to open or replace.
+/// runs on a database of its own (`common::fresh_pool`): they rotate and
+/// revoke the install-wide keys.
 static CRYPTO_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Root-key env var for the crypto-enabled server below. One fixed key for the
-/// whole test binary: the Postgres container (and so the `encryption_key`
-/// rows) is shared, so every crypto-enabled server must reach the same root.
-fn ensure_crypto_root_env() -> &'static str {
-    const VAR: &str = "FORGE_TEST_SERVER_ROOT_KEY";
-    // 32 fixed bytes, base64 — a *test* root key, never used outside tests.
-    std::env::set_var(VAR, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
-    VAR
-}
-
-/// With `[crypto]` enabled: a created proxy password is stored as an envelope
-/// blob (plaintext column NULL, ciphertext free of the plaintext), responses
-/// stay redacted, `/admin/crypto/keys` returns metadata only (and is
-/// admin-gated), and a DEK rotation re-seals the stored secret while it keeps
-/// decrypting to the original value.
+/// A created proxy password is stored as an envelope blob (ciphertext free
+/// of the plaintext), responses stay redacted, `/admin/crypto/keys` returns
+/// metadata only (and is admin-gated), and a DEK rotation re-seals the stored
+/// secret while it keeps decrypting to the original value.
 #[tokio::test]
 async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
     let _serial = CRYPTO_SERIAL.lock().await;
-    let var = ensure_crypto_root_env();
-    let crypto_block = format!(
-        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
-         [crypto.rotation]\nenabled = false\n"
-    );
     let admin = format!("admin{}@example.com", common::unique());
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin, "adminpw".into())),
-            crypto_block: Some(crypto_block),
             ..Default::default()
         },
     )
@@ -1270,23 +1252,22 @@ async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
     assert!(body.get("upstream_password").is_none());
     let repo_id = body["id"].as_i64().expect("repo id");
 
-    // At rest: plaintext column NULL, envelope blob present + plaintext-free.
-    let row = sqlx::query!(
-        r#"SELECT upstream_password, upstream_password_enc FROM repository WHERE id = $1"#,
+    // At rest: an envelope blob, plaintext-free.
+    let blob = sqlx::query_scalar!(
+        r#"SELECT upstream_password_enc FROM repository WHERE id = $1"#,
         repo_id
     )
     .fetch_one(&srv.pool)
     .await
-    .unwrap();
-    assert!(row.upstream_password.is_none(), "no plaintext column value");
-    let blob = row.upstream_password_enc.expect("envelope blob stored");
+    .unwrap()
+    .expect("envelope blob stored");
     assert!(
         !blob.windows(14).any(|w| w == b"s3cret-at-rest"),
         "ciphertext must not contain the plaintext"
     );
 
     // The sanctioned decrypt path returns the original plaintext.
-    let envelope = srv.state.envelope.as_ref().expect("envelope enabled");
+    let envelope = &srv.state.envelope;
     let secret = forge_db::secret_dao::get_upstream_password(&srv.pool, envelope, repo_id)
         .await
         .unwrap()
@@ -1314,7 +1295,7 @@ async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
     assert!(!raw.contains("wrapped_key"), "no key bytes in {raw}");
     assert!(!raw.contains("s3cret-at-rest"), "no plaintext in {raw}");
     let keys: Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(keys["enabled"], json!(true));
+    assert!(keys["root_key_version"].is_string(), "{keys}");
     assert!(keys["keys"]
         .as_array()
         .expect("keys array")
@@ -1388,17 +1369,11 @@ async fn crypto_encrypts_proxy_password_at_rest_and_rotates() {
 #[tokio::test]
 async fn crypto_rotation_is_serialized_with_the_rotation_worker() {
     let _serial = CRYPTO_SERIAL.lock().await;
-    let var = ensure_crypto_root_env();
-    let crypto_block = format!(
-        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
-         [crypto.rotation]\nenabled = false\n"
-    );
     let admin = format!("admin{}@example.com", common::unique());
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin, "adminpw".into())),
-            crypto_block: Some(crypto_block),
             ..Default::default()
         },
     )
@@ -1468,18 +1443,12 @@ async fn crypto_rotation_is_serialized_with_the_rotation_worker() {
 #[tokio::test]
 async fn registry_token_key_survives_dek_rotation() {
     let _serial = CRYPTO_SERIAL.lock().await;
-    let var = ensure_crypto_root_env();
-    let crypto_block = format!(
-        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
-         [crypto.rotation]\nenabled = false\n"
-    );
     let admin = format!("admin{}@example.com", common::unique());
     // A database of its own: the key and the DEKs are install-wide.
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin, "adminpw".into())),
-            crypto_block: Some(crypto_block),
             ..Default::default()
         },
     )
@@ -1507,13 +1476,10 @@ async fn registry_token_key_survives_dek_rotation() {
     let after = stored().await;
     assert_ne!(after, before, "re-sealed under the new DEK");
 
-    let restarted = forge_server::registry::load_token_keys(
-        &srv.state.config,
-        &srv.pool,
-        srv.state.envelope.as_deref(),
-    )
-    .await
-    .unwrap();
+    let restarted =
+        forge_server::registry::load_token_keys(&srv.state.config, &srv.pool, &srv.state.envelope)
+            .await
+            .unwrap();
     assert_eq!(stored().await, after, "not replaced");
     let now = chrono::Utc::now().timestamp();
     let claims = forge_oci::token::Claims {
@@ -1540,17 +1506,11 @@ async fn registry_token_key_survives_dek_rotation() {
 #[tokio::test]
 async fn oidc_issuer_keys_are_sealed_and_survive_dek_rotation() {
     let _serial = CRYPTO_SERIAL.lock().await;
-    let var = ensure_crypto_root_env();
-    let crypto_block = format!(
-        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
-         [crypto.rotation]\nenabled = false\n"
-    );
     let admin = format!("admin{}@example.com", common::unique());
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin, "adminpw".into())),
-            crypto_block: Some(crypto_block),
             ..Default::default()
         },
     )
@@ -1592,31 +1552,255 @@ async fn oidc_issuer_keys_are_sealed_and_survive_dek_rotation() {
     assert_eq!(stored().await, after, "not replaced");
 }
 
-/// Without `[crypto]`, rotation is a 409 and `/admin/crypto/keys` reports
-/// disabled.
-#[tokio::test]
-async fn crypto_disabled_reports_and_rejects() {
-    let srv = common::start().await;
-    let (u, p) = srv.admin_basic();
-    let client = srv.client();
+/// The secrets [`root_rotation_on_running_instances_keeps_every_secret_readable`]
+/// stores, one of every kind, and what they open to.
+struct StoredSecrets {
+    repo_id: i64,
+    realm_id: i64,
+    registry_key: String,
+    issuer_keys: String,
+}
 
-    let resp = client
-        .get(format!("{}/admin/crypto/keys", srv.base_url))
+/// Open every kind of secret with `srv`'s envelope service, its unwrapped
+/// keys dropped first so that they are unwrapped with its root keys again.
+async fn assert_secrets_open(srv: &common::TestServer, secrets: &StoredSecrets, step: &str) {
+    use forge_crypto::store::KeyLayer;
+    use forge_crypto::ExposeSecret;
+    use forge_db::secret_dao;
+
+    let envelope = &srv.state.envelope;
+    for layer in [KeyLayer::Kek, KeyLayer::Dek] {
+        for key in envelope.list_keys(layer).await.unwrap() {
+            envelope.forget_unwrapped(layer, key.version).await;
+        }
+    }
+    let password = secret_dao::get_upstream_password(&srv.pool, envelope, secrets.repo_id)
+        .await
+        .unwrap_or_else(|e| panic!("{step}: the proxy password: {e}"))
+        .expect("stored");
+    assert_eq!(password.expose_secret(), "proxy-secret", "{step}");
+    let realm = forge_db::auth_realm_dao::find_realm_by_id(&srv.pool, secrets.realm_id)
+        .await
+        .unwrap()
+        .expect("realm");
+    let config = secret_dao::realm_config(envelope, &realm)
+        .await
+        .unwrap_or_else(|e| panic!("{step}: the OIDC client secret: {e}"));
+    assert_eq!(config["client_secret"], "oidc-secret", "{step}");
+    let email = forge_db::email_settings_dao::get(&srv.pool)
+        .await
+        .unwrap()
+        .expect("email settings");
+    let config = secret_dao::email_config(envelope, &email)
+        .await
+        .unwrap_or_else(|e| panic!("{step}: the email password: {e}"));
+    assert_eq!(config["transport"]["password"], "smtp-secret", "{step}");
+    for (key, expected) in [
+        (
+            secret_dao::REGISTRY_TOKEN_KEY_SETTING,
+            &secrets.registry_key,
+        ),
+        (secret_dao::OIDC_ISSUER_KEYS_SETTING, &secrets.issuer_keys),
+    ] {
+        let stored = forge_db::authz_dao::get_setting(&srv.pool, key)
+            .await
+            .unwrap()
+            .expect("stored setting");
+        let opened = secret_dao::open_secret_setting(envelope, key, &stored)
+            .await
+            .unwrap_or_else(|e| panic!("{step}: {key}: {e}"));
+        assert_eq!(opened.expose_secret(), expected, "{step}: {key}");
+    }
+}
+
+/// The root-key rotation of `docs/deployment.md` ("Rotating the root key on
+/// a running cluster") on two instances of one database, step by step:
+///
+/// 1. the new key is added as the previous key on every instance;
+/// 2. the two keys are swapped;
+/// 3. the KEKs are re-wrapped (`POST /admin/crypto/rotate/root`);
+/// 4. the old key is dropped.
+///
+/// Each instance is restarted in turn, and after every restart both running
+/// instances open every kind of secret: a proxy password, an OIDC client
+/// secret, the email password, the registry-token key and the issuer keys.
+/// Afterwards no KEK is left on the old root.
+#[tokio::test]
+async fn root_rotation_on_running_instances_keeps_every_secret_readable() {
+    let _serial = CRYPTO_SERIAL.lock().await;
+    // Two *test* root keys, 32 fixed bytes each.
+    const OLD: &str = "FORGE_TEST_ROTATION_OLD_ROOT_KEY";
+    const NEW: &str = "FORGE_TEST_ROTATION_NEW_ROOT_KEY";
+    std::env::set_var(OLD, "ERERERERERERERERERERERERERERERERERERERERERE=");
+    std::env::set_var(NEW, "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=");
+    let pool = common::fresh_pool().await;
+    let admin = format!("admin{}@example.com", common::unique());
+    // An instance whose root key is in `current`, and the previous one in
+    // `previous`.
+    let instance = |current: &str, previous: Option<&str>| {
+        let previous = previous.map_or(String::new(), |var| {
+            format!("root_key_env_previous = \"{var}\"\n")
+        });
+        let opts = common::ServerOpts {
+            bootstrap_admin: Some((admin.clone(), "adminpw".into())),
+            crypto_block: Some(format!(
+                "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{current}\"\n\
+                 {previous}[crypto.rotation]\nenabled = false\n"
+            )),
+            ..Default::default()
+        };
+        common::start_with(pool.clone(), opts)
+    };
+    let root_key_version = |srv: &common::TestServer| {
+        let (u, p) = srv.admin_basic();
+        let request = srv
+            .client()
+            .get(format!("{}/admin/crypto/keys", srv.base_url))
+            .basic_auth(u, Some(p));
+        async move {
+            let keys: Value = request.send().await.unwrap().json().await.unwrap();
+            keys["root_key_version"].as_str().unwrap().to_string()
+        }
+    };
+
+    let a = instance(OLD, None).await;
+    let b = instance(OLD, None).await;
+    let old_root = root_key_version(&a).await;
+
+    // One secret of every kind, stored through `a`.
+    let (u, p) = a.admin_basic();
+    let resp = a
+        .client()
+        .post(format!("{}/admin/repositories", a.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "name": format!("rootrot{}", common::unique()),
+            "kind": "proxy",
+            "remote_url": "https://feed.example.com/v3/index.json",
+            "upstream_username": "svc",
+            "upstream_password": "proxy-secret",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let repo_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let resp = a
+        .client()
+        .post(format!("{}/admin/realms", a.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "kind": "oidc",
+            "name": format!("rootrot{}", common::unique()),
+            "enabled": false,
+            "config": {
+                "issuer": "https://login.example.com/tenant/v2.0",
+                "client_id": "forge",
+                "client_secret": "oidc-secret",
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let realm_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    let resp = a
+        .client()
+        .put(format!("{}/admin/settings/email", a.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "from_address": "forge@example.com",
+            "transport": {
+                "kind": "smtp", "host": "smtp.example.com", "port": 465, "tls": "implicit",
+                "username": "forge", "password": "smtp-secret",
+            },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    // The registry-token key is generated at startup, the issuer keys on
+    // first use.
+    a.state.assertion_issuer.ensure().await.unwrap();
+    let mut opened = Vec::new();
+    for key in [
+        forge_db::secret_dao::REGISTRY_TOKEN_KEY_SETTING,
+        forge_db::secret_dao::OIDC_ISSUER_KEYS_SETTING,
+    ] {
+        let stored = forge_db::authz_dao::get_setting(&pool, key)
+            .await
+            .unwrap()
+            .expect("stored setting");
+        let secret = forge_db::secret_dao::open_secret_setting(&a.state.envelope, key, &stored)
+            .await
+            .unwrap();
+        opened.push(forge_crypto::ExposeSecret::expose_secret(&secret).to_string());
+    }
+    let secrets = StoredSecrets {
+        repo_id,
+        realm_id,
+        issuer_keys: opened.pop().unwrap(),
+        registry_key: opened.pop().unwrap(),
+    };
+    assert_secrets_open(&a, &secrets, "before").await;
+    assert_secrets_open(&b, &secrets, "before").await;
+
+    // 1. The new key is added as the previous key.
+    drop(a);
+    let a = instance(OLD, Some(NEW)).await;
+    assert_secrets_open(&a, &secrets, "1: a restarted").await;
+    assert_secrets_open(&b, &secrets, "1: a restarted").await;
+    drop(b);
+    let b = instance(OLD, Some(NEW)).await;
+    assert_secrets_open(&a, &secrets, "1: b restarted").await;
+    assert_secrets_open(&b, &secrets, "1: b restarted").await;
+
+    // 2. The two keys are swapped. The first instance to start with the new
+    // key wraps the KEKs under it; the other one still opens them.
+    drop(a);
+    let a = instance(NEW, Some(OLD)).await;
+    let new_root = root_key_version(&a).await;
+    assert_ne!(new_root, old_root);
+    assert_secrets_open(&a, &secrets, "2: a restarted").await;
+    assert_secrets_open(&b, &secrets, "2: a restarted").await;
+    drop(b);
+    let b = instance(NEW, Some(OLD)).await;
+    assert_secrets_open(&a, &secrets, "2: b restarted").await;
+    assert_secrets_open(&b, &secrets, "2: b restarted").await;
+
+    // 3. The KEKs are re-wrapped: none is left on the old root.
+    let (u, p) = a.admin_basic();
+    let resp = a
+        .client()
+        .post(format!("{}/admin/crypto/rotate/root", a.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["enabled"], json!(false));
+    assert_eq!(resp.json::<Value>().await.unwrap()["rotated"], "root");
+    let roots: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT root_key_version FROM encryption_key WHERE layer = 'kek'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(!roots.is_empty());
+    assert!(
+        roots
+            .iter()
+            .all(|root| root.as_deref() == Some(new_root.as_str())),
+        "every KEK on the new root {new_root}: {roots:?}"
+    );
 
-    let resp = client
-        .post(format!("{}/admin/crypto/rotate/dek", srv.base_url))
-        .basic_auth(&u, Some(&p))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 409, "rotation without [crypto] must 409");
+    // 4. The old key is dropped.
+    drop(a);
+    let a = instance(NEW, None).await;
+    assert_secrets_open(&a, &secrets, "4: a restarted").await;
+    assert_secrets_open(&b, &secrets, "4: a restarted").await;
+    drop(b);
+    let b = instance(NEW, None).await;
+    assert_secrets_open(&a, &secrets, "4: b restarted").await;
+    assert_secrets_open(&b, &secrets, "4: b restarted").await;
 }
 
 /// Create a local user through the admin API and sign it in through
@@ -2067,30 +2251,20 @@ async fn reauth_revokes_sessions() {
 
 // ── repository update semantics (M2), names (M18), anonymous_read (M20) ─────
 
-/// Whether any password (plaintext column or sealed blob) is stored. Tests on
-/// a crypto-less server use this rather than the plaintext column: a
-/// crypto-enabled server started by a parallel test backfills plaintext
-/// passwords of the shared database into sealed blobs.
+/// Whether a (sealed) password is stored.
 async fn has_password(pool: &sqlx::PgPool, id: i64) -> bool {
-    let (_, pw, enc, ..) = stored_creds(pool, id).await;
-    pw.is_some() || enc
+    stored_creds(pool, id).await.1
 }
 
 /// The stored credential columns of a repository:
-/// `(username, plaintext password, has encrypted blob, metadata ttl, not-found ttl)`.
+/// `(username, has a sealed password, metadata ttl, not-found ttl)`.
 async fn stored_creds(
     pool: &sqlx::PgPool,
     id: i64,
-) -> (
-    Option<String>,
-    Option<String>,
-    bool,
-    Option<i32>,
-    Option<i32>,
-) {
+) -> (Option<String>, bool, Option<i32>, Option<i32>) {
     let row = sqlx::query!(
         r#"
-        SELECT upstream_username, upstream_password, upstream_password_enc,
+        SELECT upstream_username, upstream_password_enc,
                metadata_ttl_seconds, not_found_ttl_seconds
         FROM repository WHERE id = $1
         "#,
@@ -2101,11 +2275,30 @@ async fn stored_creds(
     .unwrap();
     (
         row.upstream_username,
-        row.upstream_password,
         row.upstream_password_enc.is_some(),
         row.metadata_ttl_seconds,
         row.not_found_ttl_seconds,
     )
+}
+
+/// Store `svc` and a sealed password as a repository's credentials, as an
+/// earlier admin request did.
+async fn store_creds(srv: &common::TestServer, id: i64) {
+    sqlx::query!(
+        "UPDATE repository SET upstream_username = 'svc' WHERE id = $1",
+        id
+    )
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    forge_db::secret_dao::set_upstream_password(
+        &mut srv.pool.acquire().await.unwrap(),
+        &srv.state.envelope,
+        id,
+        Some(&forge_crypto::PlaintextSecret::from("pat".to_string())),
+    )
+    .await
+    .unwrap();
 }
 
 /// Create a proxy with credentials and TTLs via the admin API; returns its id.
@@ -2236,7 +2429,7 @@ async fn repo_update_absent_keeps_null_clears() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["upstream_credentials_dropped"], json!(false));
     assert_eq!(body["has_upstream_password"], json!(true));
-    let (user, _, _, meta, nf) = stored_creds(&srv.pool, id).await;
+    let (user, _, meta, nf) = stored_creds(&srv.pool, id).await;
     assert_eq!(
         (user.as_deref(), meta, nf),
         (Some("svc"), Some(60), Some(30))
@@ -2251,7 +2444,7 @@ async fn repo_update_absent_keeps_null_clears() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    let (user, _, _, meta, nf) = stored_creds(&srv.pool, id).await;
+    let (user, _, meta, nf) = stored_creds(&srv.pool, id).await;
     assert_eq!(
         (user.as_deref(), meta, nf),
         (Some("svc2"), Some(120), Some(30))
@@ -2276,10 +2469,7 @@ async fn repo_update_absent_keeps_null_clears() {
     assert_eq!(body["has_upstream_password"], json!(false));
     assert_eq!(body["metadata_ttl_seconds"], Value::Null);
     assert_eq!(body["not_found_ttl_seconds"], Value::Null);
-    assert_eq!(
-        stored_creds(&srv.pool, id).await,
-        (None, None, false, None, None)
-    );
+    assert_eq!(stored_creds(&srv.pool, id).await, (None, false, None, None));
 }
 
 /// M2: credentials stay with their origin. A same-origin path change keeps
@@ -2330,21 +2520,15 @@ async fn repo_update_origin_change_drops_credentials() {
         "http://api.nuget.org/v3/index.json",      // scheme
         "http://api.nuget.org:8080/v3/index.json", // port
     ] {
-        sqlx::query!(
-            "UPDATE repository SET upstream_username = 'svc', upstream_password = 'pat' WHERE id = $1",
-            id
-        )
-        .execute(&srv.pool)
-        .await
-        .unwrap();
+        store_creds(&srv, id).await;
         let resp = put_repo(&srv, &name, json!({"remote_url": url})).await;
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["upstream_credentials_dropped"], json!(true), "{url}");
         assert_eq!(body["has_upstream_password"], json!(false), "{url}");
         assert_eq!(body["upstream_username"], Value::Null, "{url}");
-        let (user, pw, enc, ..) = stored_creds(&srv.pool, id).await;
-        assert_eq!((user, pw, enc), (None, None, false), "{url}");
+        let (user, enc, ..) = stored_creds(&srv.pool, id).await;
+        assert_eq!((user, enc), (None, false), "{url}");
     }
 
     // Nothing stored: nothing reported as dropped.
@@ -2358,13 +2542,7 @@ async fn repo_update_origin_change_drops_credentials() {
     assert_eq!(body["upstream_credentials_dropped"], json!(false));
 
     // A username sent along an origin change is applied; the old password is not.
-    sqlx::query!(
-        "UPDATE repository SET upstream_username = 'svc', upstream_password = 'pat' WHERE id = $1",
-        id
-    )
-    .execute(&srv.pool)
-    .await
-    .unwrap();
+    store_creds(&srv, id).await;
     let resp = put_repo(
         &srv,
         &name,
@@ -2377,16 +2555,10 @@ async fn repo_update_origin_change_drops_credentials() {
     assert!(!has_password(&srv.pool, id).await, "old password dropped");
 }
 
-/// M2 with secret encryption: an origin change drops the encrypted blob too,
-/// a kept legacy plaintext password is sealed (never carried forward), and
-/// `null` clears the blob.
+/// M2 with the sealed password: an update that keeps it keeps the blob, an
+/// origin change drops it, a new one is sealed, and `null` clears it.
 #[tokio::test]
-async fn repo_update_with_encryption_never_keeps_plaintext() {
-    let var = ensure_crypto_root_env();
-    let crypto_block = format!(
-        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
-         [crypto.rotation]\nenabled = false\n"
-    );
+async fn repo_update_keeps_drops_and_clears_the_sealed_password() {
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
@@ -2394,49 +2566,26 @@ async fn repo_update_with_encryption_never_keeps_plaintext() {
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
             )),
-            crypto_block: Some(crypto_block),
             ..Default::default()
         },
     )
     .await;
-    let envelope = srv.state.envelope.as_ref().expect("envelope enabled");
+    let envelope = &srv.state.envelope;
     let name = format!("credenc{}", common::unique());
     let id = create_cred_proxy(&srv, &name, "https://feed.example.com/v3/index.json").await;
-    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
-    assert_eq!((pw, enc), (None, true), "sealed at create");
+    assert!(has_password(&srv.pool, id).await, "sealed at create");
 
-    // A legacy (pre-backfill) plaintext value on a kept password is sealed.
-    sqlx::query!(
-        "UPDATE repository SET upstream_password = 'legacy-pat', upstream_password_enc = NULL WHERE id = $1",
-        id
-    )
-    .execute(&srv.pool)
-    .await
-    .unwrap();
+    // An update that leaves the password alone keeps the sealed blob.
     let resp = put_repo(&srv, &name, json!({"online": true})).await;
     assert_eq!(resp.status(), 200);
-    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
-    assert_eq!((pw, enc), (None, true), "plaintext not carried forward");
     let secret = forge_db::secret_dao::get_upstream_password(&srv.pool, envelope, id)
         .await
         .unwrap()
         .expect("still stored");
     assert_eq!(
         forge_crypto::ExposeSecret::expose_secret(&secret),
-        "legacy-pat"
+        "private-pat"
     );
-
-    // Both a plaintext leftover and a blob: the update nulls the plaintext.
-    sqlx::query!(
-        "UPDATE repository SET upstream_password = 'leftover' WHERE id = $1",
-        id
-    )
-    .execute(&srv.pool)
-    .await
-    .unwrap();
-    put_repo(&srv, &name, json!({"online": true})).await;
-    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
-    assert_eq!((pw, enc), (None, true));
 
     // An origin change without a new password drops the sealed blob.
     let resp = put_repo(
@@ -2447,16 +2596,18 @@ async fn repo_update_with_encryption_never_keeps_plaintext() {
     .await;
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["upstream_credentials_dropped"], json!(true));
-    let (user, pw, enc, ..) = stored_creds(&srv.pool, id).await;
-    assert_eq!((user, pw, enc), (None, None, false));
+    let (user, enc, ..) = stored_creds(&srv.pool, id).await;
+    assert_eq!((user, enc), (None, false));
 
     // Set, then clear with `null`.
     put_repo(&srv, &name, json!({"upstream_password": "fresh"})).await;
-    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
-    assert_eq!((pw, enc), (None, true));
+    let secret = forge_db::secret_dao::get_upstream_password(&srv.pool, envelope, id)
+        .await
+        .unwrap()
+        .expect("sealed");
+    assert_eq!(forge_crypto::ExposeSecret::expose_secret(&secret), "fresh");
     put_repo(&srv, &name, json!({"upstream_password": null})).await;
-    let (_, pw, enc, ..) = stored_creds(&srv.pool, id).await;
-    assert_eq!((pw, enc), (None, false));
+    assert!(!has_password(&srv.pool, id).await);
 }
 
 /// An OIDC realm whose sealed client secret no longer decrypts (its issuer
@@ -2465,11 +2616,6 @@ async fn repo_update_with_encryption_never_keeps_plaintext() {
 /// the sealed copy is left alone), and one that carries it re-seals it.
 #[tokio::test]
 async fn realm_with_undecryptable_secrets_is_repaired_through_patch() {
-    let var = ensure_crypto_root_env();
-    let crypto_block = format!(
-        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
-         [crypto.rotation]\nenabled = false\n"
-    );
     let srv = common::start_with(
         common::fresh_pool().await,
         common::ServerOpts {
@@ -2477,12 +2623,11 @@ async fn realm_with_undecryptable_secrets_is_repaired_through_patch() {
                 format!("admin{}@example.com", common::unique()),
                 "adminpw".into(),
             )),
-            crypto_block: Some(crypto_block),
             ..Default::default()
         },
     )
     .await;
-    let envelope = srv.state.envelope.as_ref().expect("envelope enabled");
+    let envelope = &srv.state.envelope;
     let (u, p) = srv.admin_basic();
     let client = srv.client();
     let resp = client
@@ -2513,7 +2658,7 @@ async fn realm_with_undecryptable_secrets_is_repaired_through_patch() {
     let sealed = || forge_db::auth_realm_dao::find_realm_by_id(&srv.pool, id);
     let broken = sealed().await.unwrap().unwrap();
     assert!(
-        forge_db::secret_dao::realm_config(Some(envelope), &broken)
+        forge_db::secret_dao::realm_config(envelope, &broken)
             .await
             .is_err(),
         "the secret is bound to the old issuer"
@@ -2549,7 +2694,7 @@ async fn realm_with_undecryptable_secrets_is_repaired_through_patch() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["config"]["client_secret_set"], json!(true));
     let repaired = sealed().await.unwrap().unwrap();
-    let config = forge_db::secret_dao::realm_config(Some(envelope), &repaired)
+    let config = forge_db::secret_dao::realm_config(envelope, &repaired)
         .await
         .expect("re-sealed for the new issuer");
     assert_eq!(config["client_secret"], json!("second-secret"));

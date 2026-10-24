@@ -471,7 +471,7 @@ impl Registry {
             .remote_url
             .as_deref()
             .ok_or_else(|| OciError::internal("proxy", "proxy repository without remote_url"))?;
-        let creds = upstream_credentials(&self.inner.pool, self.inner.envelope.as_ref(), repo)
+        let creds = upstream_credentials(&self.inner.pool, &self.inner.envelope, repo)
             .await
             .map_err(|e| OciError::internal("proxy credentials", e))?;
         Ok(Upstream {
@@ -1146,7 +1146,6 @@ mod tests {
             remote_url: None,
             package_delay_seconds: 0,
             upstream_username: None,
-            upstream_password: None,
             upstream_password_enc: None,
             metadata_ttl_seconds: None,
             not_found_ttl_seconds: None,

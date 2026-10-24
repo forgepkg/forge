@@ -12,12 +12,10 @@
 //!   writes invalidate the local snapshot immediately; other instances
 //!   converge within `auth.realm_cache_ttl_seconds` (the table is the shared
 //!   authority — no in-memory-only state, no advisory locks);
-//! * **secrets at rest** (review P1.5): with `[crypto]` enabled the secret
-//!   keys of a realm config are stripped from the stored jsonb and sealed into
-//!   `auth_realm.secrets_enc` via [`forge_db::secret_dao`]; every reader goes
-//!   through the *logical* config ([`forge_db::secret_dao::realm_config`]),
-//!   legacy plaintext rows keep working and are re-encrypted on write / by the
-//!   crypto backfill;
+//! * **secrets at rest** (review P1.5): the secret keys of a realm config are
+//!   stripped from the stored jsonb and sealed into `auth_realm.secrets_enc`
+//!   via [`forge_db::secret_dao`]; every reader goes through the *logical*
+//!   config ([`forge_db::secret_dao::realm_config`]);
 //! * the **legacy-config import** ([`seed_auth_realms`]): the `[oidc]` and
 //!   `[auth.upstream_basic]` TOML blocks become realm rows, with
 //!   drift detection — a changed block keeps re-applying only while the row is
@@ -355,7 +353,7 @@ fn default_admin_claim() -> String {
 // ─── validation / redaction / secret merge ──────────────────────────────────
 
 /// Which json keys of a realm `config` are secrets (write-only, redacted,
-/// encrypted at rest when `[crypto]` is enabled).
+/// encrypted at rest).
 pub fn secret_keys(kind: &str) -> &'static [&'static str] {
     match kind {
         KIND_OIDC => &["client_secret"],
@@ -635,8 +633,8 @@ pub struct RealmAuth {
     snapshot: tokio::sync::RwLock<Option<Arc<RealmSnapshot>>>,
     /// When [`RealmAuth::refreshed`] last rebuilt the snapshot.
     last_refresh: std::sync::Mutex<Option<Instant>>,
-    /// Decrypts `auth_realm.secrets_enc` when secret encryption is enabled.
-    envelope: Option<Arc<EnvelopeService>>,
+    /// Decrypts `auth_realm.secrets_enc`.
+    envelope: Arc<EnvelopeService>,
     /// Per-provider bounds on concurrent upstream credential forwards
     /// (`auth.credential_forward_max_concurrent`). Lives here, not in the
     /// snapshot, so a snapshot rebuild never resets a bound while forwards
@@ -655,13 +653,15 @@ impl RealmAuth {
     /// Build the (empty) cache; the first `snapshot()` call populates it.
     /// A `federated_credential` OIDC realm signs its client assertions with
     /// `assertion_issuer`; `settings` say whether passwords are accepted over
-    /// HTTP Basic and own the session service OIDC logins use.
+    /// HTTP Basic and own the session service OIDC logins use; `envelope`
+    /// opens the realms' sealed secrets.
     pub fn new(
         pool: PgPool,
         cache: Cache,
         config: Arc<Config>,
         assertion_issuer: AssertionIssuer,
         settings: Arc<AuthSettingsCache>,
+        envelope: Arc<EnvelopeService>,
     ) -> Self {
         let ttl = Duration::from_secs(config.auth.realm_cache_ttl_seconds.max(1));
         let forward_limits = Arc::new(ForwardLimits::new(
@@ -679,7 +679,7 @@ impl RealmAuth {
             ttl,
             snapshot: tokio::sync::RwLock::new(None),
             last_refresh: std::sync::Mutex::new(None),
-            envelope: None,
+            envelope,
             forward_limits,
             password_limiter,
             assertion_issuer,
@@ -691,13 +691,6 @@ impl RealmAuth {
     /// permits to observe whether a verification runs).
     pub fn with_password_limiter(mut self, limiter: Arc<PasswordHashLimiter>) -> Self {
         self.password_limiter = limiter;
-        self
-    }
-
-    /// Attach the secret-encryption service so encrypted realm secrets can be
-    /// read (`None` ⇒ only plaintext realm configs are usable).
-    pub fn with_envelope(mut self, envelope: Option<Arc<EnvelopeService>>) -> Self {
-        self.envelope = envelope;
         self
     }
 
@@ -780,7 +773,7 @@ impl RealmAuth {
         for realm in realms.iter().filter(|r| r.enabled) {
             // The logical config (encrypted secrets merged in). A realm whose
             // secrets cannot be decrypted is skipped: fail closed.
-            let config = match secret_dao::realm_config(self.envelope.as_deref(), realm).await {
+            let config = match secret_dao::realm_config(&self.envelope, realm).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(realm = %realm.name, error = %e, "realm secrets unreadable; realm skipped");
@@ -1131,12 +1124,12 @@ pub async fn forget_seed(pool: &PgPool, realm: &forge_db::model::AuthRealm) -> s
 /// initial `local`-realm priority adjustment (which must not fight later
 /// manual reorders).
 ///
-/// Seeded secrets go through the envelope (`envelope = Some`) like admin
-/// writes, and the drift fingerprint is taken over the *logical* config.
+/// Seeded secrets are sealed with `envelope` like admin writes, and the
+/// drift fingerprint is taken over the *logical* config.
 pub async fn seed_auth_realms(
     config: &Config,
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
 ) -> anyhow::Result<()> {
     let first_import =
         authz_dao::get_setting(pool, REALMS_SEEDED_KEY).await? != Some("true".to_string());
@@ -1252,7 +1245,7 @@ pub async fn seed_auth_realms(
 /// [`seed_auth_realms`] for the drift-detection contract).
 async fn apply_seed(
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
     kind: &str,
     priority: i32,
     config: JsonValue,
