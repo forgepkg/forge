@@ -373,7 +373,7 @@ impl Run<'_> {
                 format,
                 repo.id,
                 repo.name.clone(),
-                principal,
+                principal.clone(),
                 filter,
                 replace,
             )))
@@ -717,7 +717,7 @@ impl Run<'_> {
             .find(|a| a.path.contains("/manifests/"))
             .or(source.assets.first());
         let options = ImageImportOptions {
-            principal: ctx.principal,
+            principal: ctx.principal.clone(),
             overwrite: self.import.on_conflict == "overwrite",
             dry_run: self.import.dry_run,
             published_at: asset.and_then(|a| published_at(ctx.images(), a)),

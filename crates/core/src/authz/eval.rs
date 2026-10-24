@@ -127,7 +127,7 @@ impl SelectorPatterns {
     /// lowercased here at compile time (NuGet ids are case-insensitive). An
     /// empty include list compiles to a sentinel "match-all" so the predicate is
     /// uniform.
-    fn compile(&self) -> Result<CompiledSelector, SelectorCompileError> {
+    pub fn compile(&self) -> Result<CompiledSelector, SelectorCompileError> {
         let includes = build_globset(&self.includes)?;
         let excludes = build_globset(&self.excludes)?;
         Ok(CompiledSelector {
@@ -521,6 +521,8 @@ pub enum PackageFilter {
     /// push a compact reachability check into each unique leaf search without
     /// expanding every root-to-leaf path into a separate backend query.
     Predicate(Arc<dyn Fn(&str) -> bool + Send + Sync>),
+    /// A package is visible when any nested filter allows it.
+    Any(Vec<PackageFilter>),
 }
 
 impl fmt::Debug for PackageFilter {
@@ -533,6 +535,7 @@ impl fmt::Debug for PackageFilter {
             }
             PackageFilter::All(filters) => f.debug_tuple("All").field(filters).finish(),
             PackageFilter::Predicate(_) => f.write_str("Predicate(..)"),
+            PackageFilter::Any(filters) => f.debug_tuple("Any").field(filters).finish(),
         }
     }
 }
@@ -546,6 +549,7 @@ impl PackageFilter {
             PackageFilter::Selectors(sels) => sels.iter().any(|s| s.matches(package_name)),
             PackageFilter::All(filters) => filters.iter().all(|f| f.allows(package_name)),
             PackageFilter::Predicate(predicate) => predicate(package_name),
+            PackageFilter::Any(filters) => filters.iter().any(|f| f.allows(package_name)),
         }
     }
 
@@ -559,6 +563,13 @@ impl PackageFilter {
             (PackageFilter::All(mut lhs), PackageFilter::All(rhs)) => {
                 lhs.extend(rhs);
                 PackageFilter::All(lhs)
+            }
+            (PackageFilter::Any(mut lhs), PackageFilter::Any(rhs)) => {
+                lhs.extend(rhs);
+                PackageFilter::Any(lhs)
+            }
+            (PackageFilter::Any(filters), rhs) | (rhs, PackageFilter::Any(filters)) => {
+                PackageFilter::All(vec![PackageFilter::Any(filters), rhs])
             }
             (PackageFilter::All(mut lhs), rhs) => {
                 lhs.push(rhs);

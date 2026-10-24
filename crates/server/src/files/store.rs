@@ -225,7 +225,7 @@ async fn record(
         return Ok(());
     }
     let context = PublishAuthorizationContext {
-        principal: files.principal,
+        principal: files.principal.clone(),
         action,
         package_id: path.to_string(),
         package_version: sha256.to_string(),

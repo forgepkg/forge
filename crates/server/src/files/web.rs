@@ -89,7 +89,7 @@ pub async fn browse_upload(
     };
     let files = Files {
         state: &state,
-        principal,
+        principal: principal.clone(),
     };
     let response = match upload(&files, &repo, &directory, req).await {
         Ok(stored) => {
@@ -163,7 +163,7 @@ pub async fn browse_delete(
     };
     let files = Files {
         state: &state,
-        principal,
+        principal: principal.clone(),
     };
     let response = match store::remove(&files, &repo, &file, Via::Browser).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),

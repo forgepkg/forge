@@ -780,7 +780,7 @@ impl Registry {
             return Ok(());
         };
         let context = PublishAuthorizationContext {
-            principal: *principal,
+            principal: principal.clone(),
             action,
             package_id: t.image.clone(),
             package_version: version,

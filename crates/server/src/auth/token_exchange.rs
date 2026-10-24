@@ -38,6 +38,7 @@ use axum::Router;
 use chrono::{DateTime, Utc};
 use forge_core::auth::{generate_workload_key, is_workload_key, workload_key_sha256, Principal};
 use forge_db::trusted_publish_audit_dao;
+use forge_db::trusted_publisher_dao;
 use forge_db::workload_api_key_dao::{self, NewWorkloadApiKey, Redemption};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -300,6 +301,7 @@ async fn redeem(
         config_sha256,
         subject_sha256,
         jti_sha256: Some(jti_sha256),
+        matched_publishers,
         issued_at,
         key_id: None,
         expires_at,
@@ -315,6 +317,13 @@ async fn redeem(
     };
 
     let api_key = generate_workload_key();
+    let db_matched_publishers: Vec<_> = matched_publishers
+        .iter()
+        .map(|matched| forge_db::trusted_publisher_dao::TrustedPublisherMatch {
+            id: matched.id,
+            definition_sha256: matched.definition_sha256,
+        })
+        .collect();
     let stored = store_key(
         pool,
         NewWorkloadApiKey {
@@ -329,11 +338,12 @@ async fn redeem(
             token_expires_at,
             token_leeway_seconds: workload.clock_skew_seconds,
             ttl_seconds: i64::try_from(workload.api_key_ttl_seconds).unwrap_or(i64::MAX),
+            matched_publishers: &db_matched_publishers,
         },
     )
     .await;
     match stored {
-        Ok(Stored::Issued(expires)) => Ok(Redeemed {
+        Ok(Stored::Issued { expires_at: expires, .. }) => Ok(Redeemed {
             api_key,
             expires,
             realm_id,
@@ -371,6 +381,10 @@ async fn redeem(
             );
             Err(Refusal::RealmChanged)
         }
+        Ok(Stored::PublisherChanged) => refuse(
+            StatusCode::UNAUTHORIZED,
+            "a trusted publisher changed during the exchange; request a new CI token",
+        ),
         Err(e) => {
             tracing::error!(error = %e, "storing a workload API key failed");
             refuse(
@@ -383,7 +397,10 @@ async fn redeem(
 
 /// What [`store_key`] did.
 enum Stored {
-    Issued(DateTime<Utc>),
+    Issued {
+        id: i64,
+        expires_at: DateTime<Utc>,
+    },
     /// The token was exchanged before.
     Replayed,
     /// The token has expired by the database's clock.
@@ -391,6 +408,8 @@ enum Stored {
     /// The realm was disabled, deleted or edited (or the role deleted)
     /// since the token was verified against it.
     RealmChanged,
+    /// One of the trusted publishers changed while the token was exchanged.
+    PublisherChanged,
 }
 
 /// Store `new` while holding the realm and role rows, and only while the
@@ -412,13 +431,17 @@ async fn store_key(pool: &PgPool, new: NewWorkloadApiKey<'_>) -> sqlx::Result<St
     if issuer != *new.issuer_sha256 || config.as_ref() != Some(new.config_sha256) {
         return Ok(Stored::RealmChanged);
     }
-    let expires = match workload_api_key_dao::insert(&mut tx, new).await? {
-        Redemption::Issued(expires) => expires,
+    if !trusted_publisher_dao::lock_matches(&mut tx, new.matched_publishers).await? {
+        return Ok(Stored::PublisherChanged);
+    }
+    match workload_api_key_dao::insert(&mut tx, new).await? {
+        Redemption::Issued { id, expires_at } => {
+            tx.commit().await?;
+            return Ok(Stored::Issued { id, expires_at });
+        }
         Redemption::Replayed => return Ok(Stored::Replayed),
         Redemption::TokenExpired => return Ok(Stored::TokenExpired),
     };
-    tx.commit().await?;
-    Ok(Stored::Issued(expires))
 }
 
 #[cfg(test)]

@@ -7,6 +7,8 @@
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool, Row};
 
+use crate::trusted_publisher_dao::{self, TrustedPublisherMatch};
+
 /// A key to store for a freshly verified, exchanged CI token.
 #[derive(Debug, Clone)]
 pub struct NewWorkloadApiKey<'a> {
@@ -22,6 +24,7 @@ pub struct NewWorkloadApiKey<'a> {
     /// The clock skew the token's `exp` was accepted with (its realm's
     /// `clock_skew_seconds`, at most [`MAX_TOKEN_LEEWAY_SECONDS`]).
     pub token_leeway_seconds: u64,
+    pub matched_publishers: &'a [TrustedPublisherMatch],
     /// The key's lifetime from now, in seconds (> 0).
     pub ttl_seconds: i64,
 }
@@ -39,7 +42,7 @@ pub const REAP_MARGIN_SECONDS: u64 = 10 * 60;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Redemption {
     /// The key was stored; it expires then.
-    Issued(DateTime<Utc>),
+    Issued { id: i64, expires_at: DateTime<Utc> },
     /// The CI token was exchanged before.
     Replayed,
     /// By the database's clock the CI token has expired (past its leeway),
@@ -60,6 +63,7 @@ pub struct WorkloadApiKey {
     pub jti_sha256: [u8; 32],
     pub token_issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub matched_publishers: Vec<TrustedPublisherMatch>,
 }
 
 /// Store a key, redeeming its CI token: [`Redemption::Issued`] with the
@@ -98,7 +102,7 @@ pub async fn insert(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
                 now() + make_interval(secs => $10))
         ON CONFLICT (issuer_sha256, jti_sha256) DO NOTHING
-        RETURNING expires_at
+        RETURNING id, expires_at
         "#,
     )
     .bind(new.key_sha256.as_slice())
@@ -111,10 +115,17 @@ pub async fn insert(
     .bind(new.token_issued_at)
     .bind(new.token_expires_at)
     .bind(new.ttl_seconds as f64)
-    .fetch_optional(conn)
+    .fetch_optional(&mut *conn)
     .await?;
     match row {
-        Some(row) => Ok(Redemption::Issued(row.try_get("expires_at")?)),
+        Some(row) => {
+            let id: i64 = row.try_get("id")?;
+            trusted_publisher_dao::store_key_matches(conn, id, new.matched_publishers).await?;
+            Ok(Redemption::Issued {
+                id,
+                expires_at: row.try_get("expires_at")?,
+            })
+        }
         None => Ok(Redemption::Replayed),
     }
 }
@@ -157,21 +168,25 @@ pub async fn find_live(
     .bind(key_sha256.as_slice())
     .fetch_optional(pool)
     .await?;
-    row.map(|row| {
-        Ok(WorkloadApiKey {
-            id: row.try_get("id")?,
-            key_sha256: digest(&row, "key_sha256")?,
-            realm_id: row.try_get("realm_id")?,
-            role_id: row.try_get("role_id")?,
-            issuer_sha256: digest(&row, "issuer_sha256")?,
-            config_sha256: digest(&row, "config_sha256")?,
-            subject_sha256: digest(&row, "subject_sha256")?,
-            jti_sha256: digest(&row, "jti_sha256")?,
-            token_issued_at: row.try_get("token_issued_at")?,
-            expires_at: row.try_get("expires_at")?,
-        })
-    })
-    .transpose()
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: i64 = row.try_get("id")?;
+    let mut conn = pool.acquire().await?;
+    let matched_publishers = trusted_publisher_dao::load_key_matches(&mut conn, id).await?;
+    Ok(Some(WorkloadApiKey {
+        id,
+        key_sha256: digest(&row, "key_sha256")?,
+        realm_id: row.try_get("realm_id")?,
+        role_id: row.try_get("role_id")?,
+        issuer_sha256: digest(&row, "issuer_sha256")?,
+        config_sha256: digest(&row, "config_sha256")?,
+        subject_sha256: digest(&row, "subject_sha256")?,
+        jti_sha256: digest(&row, "jti_sha256")?,
+        token_issued_at: row.try_get("token_issued_at")?,
+        expires_at: row.try_get("expires_at")?,
+        matched_publishers,
+    }))
 }
 
 /// Whether the key `id` has not ended (expired or revoked). A key whose row

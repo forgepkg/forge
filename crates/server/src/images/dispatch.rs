@@ -306,16 +306,18 @@ impl Registry {
             config_sha256,
             key_id,
             ..
-        } = principal
+        } = &principal
         {
             let Some(check) = self.inner.workloads.clone() else {
                 return Ok(Some(principal));
             };
             let key = format!(
-                "{realm_id}:{}:{}",
+                "{}:{}:{}",
+                realm_id,
                 hex::encode(config_sha256),
                 key_id.map_or_else(|| "token".to_string(), |id| id.to_string())
             );
+            let checked_principal = principal.clone();
             let live: Result<bool, String> = self
                 .inner
                 .cache
@@ -323,7 +325,7 @@ impl Registry {
                     "oci:workload",
                     &key,
                     std::time::Duration::from_secs(10),
-                    || async move { check.still_valid(&principal).await },
+                    || async move { check.still_valid(&checked_principal).await },
                 )
                 .await;
             return match live {

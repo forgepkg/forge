@@ -181,7 +181,7 @@ pub async fn verify_password(
 }
 
 /// Result of asking a [`PrincipalSource`] to resolve credentials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceOutcome {
     /// Credentials were present and valid.
     Authenticated(Principal),
@@ -547,7 +547,7 @@ pub async fn resolve_principal(
 }
 
 /// A resolved principal plus how it was authenticated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPrincipal {
     /// The resolved principal.
     pub principal: Principal,

@@ -776,7 +776,7 @@ impl HostedWrite {
             self.publish_policy
                 .as_ref()
                 .map(|(principal, _)| PublishAuthorizationContext {
-                    principal: *principal,
+                    principal: principal.clone(),
                     action: PackageMutation::Publish,
                     package_id: parsed.id.clone(),
                     package_version: parsed.version.clone(),
@@ -1370,7 +1370,7 @@ impl HostedWrite {
             return Ok(());
         };
         let context = PublishAuthorizationContext {
-            principal: *principal,
+            principal: principal.clone(),
             action,
             package_id: lower.to_string(),
             package_version: version.to_string(),

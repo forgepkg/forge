@@ -375,9 +375,10 @@ pub(crate) fn auth_unavailable() -> Response {
 /// layer placed on the request. Panics only if the layer is missing (a wiring
 /// bug), which is preferable to silently treating every caller as anonymous.
 pub fn principal_of<B>(req: &Request<B>) -> Principal {
-    *req.extensions()
+    req.extensions()
         .get::<Principal>()
         .expect("principal extension missing; attach_principal layer not mounted")
+        .clone()
 }
 
 #[cfg(test)]

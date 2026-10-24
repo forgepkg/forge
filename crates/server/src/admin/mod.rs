@@ -60,6 +60,7 @@ pub mod roles;
 pub mod settings;
 pub mod token_scope;
 pub mod tokens;
+pub mod trusted_publishers;
 pub mod user_roles;
 pub mod users;
 
@@ -224,6 +225,15 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/repositories/{name}/members/{member}",
             axum::routing::patch(members::update).delete(members::remove),
+        )
+        .route(
+            "/repositories/{name}/trusted-publishers",
+            get(trusted_publishers::list).post(trusted_publishers::create),
+        )
+        .route(
+            "/repositories/{name}/trusted-publishers/{id}",
+            axum::routing::put(trusted_publishers::update)
+                .delete(trusted_publishers::delete),
         )
         .route("/users", get(users::list).post(users::create))
         .route(

@@ -56,7 +56,7 @@ pub use login_throttle::{
     client_network, username_for_log, AttemptRefused, KnownNetworkStore, LoginAttempt,
     LoginThrottle, PgKnownNetworks, WindowLimiter, MAX_USERNAME_BYTES,
 };
-pub use principal::{AuthMethod, Principal, UserPrincipal};
+pub use principal::{AuthMethod, Principal, TrustedPublisherMatch, UserPrincipal};
 pub use provider::{
     AuthOutcome, AuthProvider, AuthSource, CapturedPasswordHash, PasswordCredential, ProvenIdentity,
 };

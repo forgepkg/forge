@@ -363,7 +363,7 @@ async fn serve(
     let ops = if stores_files {
         None
     } else {
-        match state.read_ops_for(repo, principal).await {
+        match state.read_ops_for(repo, principal.clone()).await {
             Ok(ops) => Some(ops),
             Err(e) => return repo_error(e),
         }
@@ -406,7 +406,7 @@ async fn serve(
         state,
         repo,
         mount,
-        principal,
+        principal: principal.clone(),
         method: method.clone(),
         client_ip: crate::auth::login_client_ip(state, peer, req.headers()),
         headers: req.headers().clone(),
@@ -724,7 +724,7 @@ impl Ctx<'_> {
     async fn answer_files(&self, query: &Query) -> Result<Answer, Response> {
         let files = Files {
             state: self.state,
-            principal: self.principal,
+            principal: self.principal.clone(),
         };
         let failed = |e: FileError| e.into_response();
         match query {
@@ -891,7 +891,7 @@ impl Ctx<'_> {
                 }
                 let files = Files {
                     state: self.state,
-                    principal: self.principal,
+                    principal: self.principal.clone(),
                 };
                 match files.locate(self.repo, path, true, Vec::new(), 0).await {
                     Ok(Some(file)) => file,
@@ -1180,7 +1180,7 @@ impl Ctx<'_> {
             format,
             target.id,
             target.name.clone(),
-            self.principal,
+            self.principal.clone(),
             filter,
             replace_filter,
         )
@@ -1188,8 +1188,8 @@ impl Ctx<'_> {
 
     /// The username publishing, recorded by formats that keep it.
     async fn publisher(&self) -> Option<String> {
-        match self.principal {
-            Principal::User { user_id, .. } => user_dao::find_user_by_id(&self.state.pool, user_id)
+        match &self.principal {
+            Principal::User { user_id, .. } => user_dao::find_user_by_id(&self.state.pool, *user_id)
                 .await
                 .ok()
                 .flatten()
@@ -1468,7 +1468,7 @@ impl Ctx<'_> {
     /// A login, a logout or `whoami` ([`crate::cli_auth`]), answered by the
     /// plugin.
     async fn auth(&self, auth: AuthRequest, request: &protocol::Request) -> Response {
-        match crate::cli_auth::perform(self.state, self.repo, self.principal, self.client_ip, auth)
+        match crate::cli_auth::perform(self.state, self.repo, self.principal.clone(), self.client_ip, auth)
             .await
         {
             Ok(outcome) => {

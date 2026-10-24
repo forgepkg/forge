@@ -86,7 +86,9 @@ pub use settings::{
 };
 pub(crate) use token_exchange::NPM_TOKEN_EXCHANGE_PATH;
 pub use token_exchange::{token_exchange_router, TOKEN_EXCHANGE_PATH};
-pub use wif::WorkloadIdentitySource;
+pub use wif::{
+    validate_trusted_publisher_conditions, ClaimCondition, WorkloadIdentitySource,
+};
 pub(crate) use wif::{realm_current_now, workload_identity_config_sha256};
 
 /// Everything the `/auth` handlers need, assembled once at startup. Cheap to

@@ -12,7 +12,7 @@
 
 use std::sync::{Arc, PoisonError, RwLock};
 
-use forge_core::auth::{AuthMethod, Principal};
+use forge_core::auth::{AuthMethod, Principal, TrustedPublisherMatch};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +113,8 @@ pub enum TokenPrincipal {
         /// When that credential ends (Unix seconds); the token's `exp` is
         /// capped at it.
         ends: i64,
+        #[serde(default)]
+        publishers: Vec<TrustedPublisherMatch>,
     },
 }
 
@@ -120,16 +122,16 @@ impl TokenPrincipal {
     /// The token principal of a resolved request principal. A browser
     /// session is not a registry credential and maps to anonymous.
     pub fn of(principal: &Principal) -> Self {
-        match *principal {
+        match principal {
             Principal::User {
                 user_id,
                 token_id,
                 method,
                 ..
-            } if method != AuthMethod::Session => TokenPrincipal::User {
-                uid: user_id,
-                tid: token_id,
-                pw: method == AuthMethod::Password,
+            } if *method != AuthMethod::Session => TokenPrincipal::User {
+                uid: *user_id,
+                tid: *token_id,
+                pw: *method == AuthMethod::Password,
             },
             Principal::Workload {
                 realm_id,
@@ -141,16 +143,18 @@ impl TokenPrincipal {
                 issued_at,
                 key_id,
                 expires_at,
+                matched_publishers,
             } => TokenPrincipal::Workload {
-                realm: realm_id,
-                role: role_id,
+                realm: *realm_id,
+                role: *role_id,
                 iss: hex::encode(issuer_sha256),
                 cfg: hex::encode(config_sha256),
                 sub: hex::encode(subject_sha256),
-                jti: jti_sha256.map(hex::encode),
-                iat: issued_at,
-                key: key_id,
-                ends: expires_at,
+                jti: (*jti_sha256).map(hex::encode),
+                iat: *issued_at,
+                key: *key_id,
+                ends: *expires_at,
+                publishers: matched_publishers.clone(),
             },
             _ => TokenPrincipal::Anonymous,
         }
@@ -186,6 +190,7 @@ impl TokenPrincipal {
                 iat,
                 key,
                 ends,
+                publishers,
             } => Principal::Workload {
                 realm_id: *realm,
                 role_id: *role,
@@ -199,6 +204,7 @@ impl TokenPrincipal {
                 issued_at: *iat,
                 key_id: *key,
                 expires_at: *ends,
+                matched_publishers: publishers.clone(),
             },
         })
     }
@@ -504,6 +510,7 @@ mod tests {
             issued_at: 5,
             key_id: Some(6),
             expires_at: 7,
+            matched_publishers: vec![],
         };
         let tp = TokenPrincipal::of(&p);
         assert_eq!(tp.credential_ends(), Some(7));
@@ -518,6 +525,7 @@ mod tests {
             issued_at: 5,
             key_id: None,
             expires_at: 7,
+            matched_publishers: vec![],
         };
         let tp = TokenPrincipal::of(&direct);
         assert!(!serde_json::to_string(&tp).unwrap().contains("\"key\""));

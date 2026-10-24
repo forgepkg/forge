@@ -63,7 +63,9 @@ use sqlx::PgPool;
 
 use super::principal::Principal;
 use crate::authz::cache as authz_cache;
-use crate::authz::{parse_token_scope, EffectiveSet, Level, PackageFilter, TokenScope};
+use crate::authz::{
+    parse_token_scope, EffectiveSet, Level, PackageFilter, SelectorPatterns, TokenScope,
+};
 
 /// The authorization decision service (the single RBAC decision point).
 ///
@@ -143,6 +145,7 @@ impl Authz {
     /// (it is not, by default). Fail-closed.
     pub async fn can_write(&self, principal: &Principal, repo: &Repository) -> bool {
         self.allows(principal, Level::Write, repo.id).await
+            || self.publisher_allows(principal, repo, Level::Write).await
     }
 
     /// May `principal` delete / unlist a package from `repo`?
@@ -151,6 +154,7 @@ impl Authz {
     /// allowed to add and relist packages without being able to remove them.
     pub async fn can_delete(&self, principal: &Principal, repo: &Repository) -> bool {
         self.allows(principal, Level::Delete, repo.id).await
+            || self.publisher_allows(principal, repo, Level::Delete).await
     }
 
     /// Is `principal` a **global admin** — i.e. a member of the built-in `admin`
@@ -213,9 +217,96 @@ impl Authz {
             self.effective(principal).await
         };
         match eff {
-            Ok(eff) => eff.package_filter_for(required, repo.id),
+            Ok(eff) => {
+                let role_filter = eff.package_filter_for(required, repo.id);
+                if required == Level::Read {
+                    return role_filter;
+                }
+                let publishers = match self.publisher_matches(principal, repo).await {
+                    Ok(publishers) => publishers,
+                    Err(()) => return PackageFilter::DenyAll,
+                };
+                let mut filters = vec![role_filter];
+                for publisher in publishers.into_iter().filter(|publisher| {
+                    publisher.actions.contains(&required.as_str().to_string())
+                }) {
+                    let patterns = match (
+                        serde_json::from_value::<Vec<String>>(publisher.includes),
+                        serde_json::from_value::<Vec<String>>(publisher.excludes),
+                    ) {
+                        (Ok(includes), Ok(excludes)) => SelectorPatterns { includes, excludes },
+                        (Err(error), _) | (_, Err(error)) => {
+                            tracing::error!(
+                                error = %error,
+                                publisher_id = publisher.id,
+                                "malformed trusted-publisher selector; denying"
+                            );
+                            continue;
+                        }
+                    };
+                    match patterns.compile() {
+                        Ok(compiled) => {
+                            filters.push(PackageFilter::Selectors(vec![Arc::new(compiled)]));
+                        }
+                        Err(error) => tracing::error!(
+                            error = %error,
+                            publisher_id = publisher.id,
+                            "invalid trusted-publisher selector; denying"
+                        ),
+                    }
+                }
+                if filters.len() == 1 {
+                    filters.pop().expect("one role filter")
+                } else {
+                    PackageFilter::Any(filters)
+                }
+            }
             Err(()) => PackageFilter::DenyAll,
         }
+    }
+
+    async fn publisher_allows(
+        &self,
+        principal: &Principal,
+        repo: &Repository,
+        required: Level,
+    ) -> bool {
+        match self.publisher_matches(principal, repo).await {
+            Ok(publishers) => publishers
+                .iter()
+                .any(|publisher| publisher.actions.iter().any(|action| action == required.as_str())),
+            Err(()) => false,
+        }
+    }
+
+    async fn publisher_matches(
+        &self,
+        principal: &Principal,
+        repo: &Repository,
+    ) -> Result<Vec<forge_db::trusted_publisher_dao::TrustedPublisher>, ()> {
+        let Principal::Workload {
+            matched_publishers,
+            ..
+        } = principal
+        else {
+            return Ok(Vec::new());
+        };
+        let matches: Vec<_> = matched_publishers
+            .iter()
+            .map(|matched| forge_db::trusted_publisher_dao::TrustedPublisherMatch {
+                id: matched.id,
+                definition_sha256: matched.definition_sha256,
+            })
+            .collect();
+        forge_db::trusted_publisher_dao::find_live_matches(&self.pool, &matches, repo.id)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    error = %error,
+                    repository_id = repo.id,
+                    "trusted-publisher authorization lookup failed"
+                )
+            })
     }
 
     /// Resolve the principal's effective set and test the repo-level gate.

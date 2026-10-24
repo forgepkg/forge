@@ -36,6 +36,8 @@ pub struct NewTrustedPublishAudit<'a> {
     pub token_issued_at: DateTime<Utc>,
     /// `publish` | `unlist` | `relist` | `delete`.
     pub action: &'a str,
+    pub trusted_publisher_id: Option<i64>,
+    pub trusted_publisher_name: Option<&'a str>,
 }
 
 /// Lock and snapshot the active workload realm and mapped role. Returning
@@ -91,8 +93,9 @@ pub async fn insert(
             repository_id, repository_name, package_name, package_version,
             realm_id, realm_name, issuer, role_id, role_name,
             subject_sha256, jti_sha256, token_issued_at, action
+            , trusted_publisher_id, trusted_publisher_name
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         "#,
     )
     .bind(row.repository_id)
@@ -108,6 +111,8 @@ pub async fn insert(
     .bind(row.jti_sha256.map(|digest| digest.as_slice()))
     .bind(row.token_issued_at)
     .bind(row.action)
+    .bind(row.trusted_publisher_id)
+    .bind(row.trusted_publisher_name)
     .execute(&mut **tx)
     .await?;
     Ok(())
