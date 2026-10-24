@@ -327,7 +327,10 @@ package "$work/src/pnpm-made" pnpm-made 1.0.0
 (cd "$work/src/pnpm-made" && pnpm publish --no-git-checks --registry "$(reg npm-hosted)") >/dev/null
 npm view @acme/core version --registry "$(reg npm-hosted)" | grep -qx 1.0.0 \
   || fail "a publish through the group did not land in npm-hosted"
-if (cd "$work/src/hosted-1.0.0" && npm publish --registry "$(reg npm-hosted)") > "$work/republish.out" 2>&1; then
+# --force: npm 11 refuses a version the registry lists by itself; the
+# server must refuse it too.
+if (cd "$work/src/hosted-1.0.0" && npm publish --force --registry "$(reg npm-hosted)") \
+  > "$work/republish.out" 2>&1; then
   fail "a republish of e2e-hosted@1.0.0 was accepted"
 fi
 grep -q "409 Conflict.*e2e-hosted 1.0.0 already exists" "$work/republish.out" \
