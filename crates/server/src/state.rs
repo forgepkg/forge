@@ -97,7 +97,7 @@ pub struct AppState {
     /// install's shared one ([`crate::registry::load_token_keys`] via
     /// [`AppState::with_registry_keys`]) so every instance accepts every
     /// instance's tokens.
-    pub registry_keys: forge_oci::token::TokenKeys,
+    pub registry_keys: forge_format_docker::token::TokenKeys,
     /// This process among the instances of an install, as per-instance
     /// reports (the local blob cache's statistics) name it.
     pub instance: Arc<Instance>,
@@ -254,7 +254,7 @@ impl FormatRegistry {
 
     /// The repository kinds format `id` supports, `None` when it is not
     /// installed. Docker has every kind; a format plugin serves the kinds its
-    /// descriptor names (NuGet's and raw's all three).
+    /// descriptor names (NuGet's, npm's and raw's all three).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
         if Self::is_native(id) {
             return Some(vec!["hosted", "proxy", "group"]);
@@ -378,7 +378,7 @@ impl AppState {
             invitation_throttle,
             oidc_login_starts,
             upstream,
-            registry_keys: forge_oci::token::TokenKeys::new(vec![{
+            registry_keys: forge_format_docker::token::TokenKeys::new(vec![{
                 use rand::Rng;
                 let mut key = vec![0u8; 32];
                 rand::rng().fill_bytes(&mut key);
@@ -397,14 +397,14 @@ impl AppState {
     }
 
     /// Use `keys` to sign and verify registry tokens.
-    pub fn with_registry_keys(mut self, keys: forge_oci::token::TokenKeys) -> Self {
+    pub fn with_registry_keys(mut self, keys: forge_format_docker::token::TokenKeys) -> Self {
         self.registry_keys = keys;
         self
     }
 
     /// The Docker / OCI registry service, wired to this state.
-    pub fn registry(&self) -> forge_oci::Registry {
-        forge_oci::Registry::new(forge_oci::RegistryParts {
+    pub fn registry(&self) -> forge_format_docker::Registry {
+        forge_format_docker::Registry::new(forge_format_docker::RegistryParts {
             pool: self.pool.clone(),
             cas: self.cas.clone(),
             store: self.blob_store.clone(),
@@ -412,7 +412,7 @@ impl AppState {
             authz: self.authz.clone(),
             http: self.upstream.clone(),
             envelope: self.envelope.clone(),
-            config: forge_oci::RegistryConfig {
+            config: forge_format_docker::RegistryConfig {
                 public_base_url: self.config.public_base_url(),
                 max_blob_bytes: self.config.docker_max_blob_bytes(),
                 default_max_upload_bytes: self.config.default_upload_limit(DOCKER_FORMAT),

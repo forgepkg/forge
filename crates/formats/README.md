@@ -11,6 +11,10 @@ the design, the contract and how to write one.
 | [`npm`](npm) | `npm` | npm registries at `/npm` for npm, pnpm, Yarn and Bun: publish, install, dist-tags, deprecations, unpublishing, search, audits and logins; hosted, proxy and group repositories ([docs/npm.md](../../docs/npm.md)) |
 | [`raw`](raw) | `raw` | Raw files at `/raw`: files under paths, uploads with `PUT` or a form, ranges, checksum sidecars, listings; hosted, proxy and group repositories ([docs/raw.md](../../docs/raw.md)) |
 
+[`docker`](docker) holds Docker / OCI (`forge-format-docker`), which is still
+native: the server's registry serves it under `/v2`, not through
+`FormatPlugin` ([docs/docker.md](../../docs/docker.md)).
+
 A plugin directory holds:
 
 - `Cargo.toml`: a member of the workspace; its `version` is the plugin's;

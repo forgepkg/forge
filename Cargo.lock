@@ -1735,6 +1735,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-format-docker"
+version = "1.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "chrono",
+ "flate2",
+ "forge-cache",
+ "forge-core",
+ "forge-crypto",
+ "forge-db",
+ "forge-storage",
+ "futures-util",
+ "hex",
+ "jsonwebtoken",
+ "rand 0.10.3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "forge-format-npm"
 version = "1.0.0"
 dependencies = [
@@ -1778,38 +1810,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge-oci"
-version = "1.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.23.1",
- "bytes",
- "chrono",
- "flate2",
- "forge-cache",
- "forge-core",
- "forge-crypto",
- "forge-db",
- "forge-storage",
- "futures-util",
- "hex",
- "jsonwebtoken",
- "rand 0.10.3",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "sqlx",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "forge-plugin"
 version = "1.1.0"
 dependencies = [
@@ -1841,10 +1841,10 @@ dependencies = [
  "forge-core",
  "forge-crypto",
  "forge-db",
+ "forge-format-docker",
  "forge-format-npm",
  "forge-format-nuget",
  "forge-format-raw",
- "forge-oci",
  "forge-plugin",
  "forge-storage",
  "futures-util",

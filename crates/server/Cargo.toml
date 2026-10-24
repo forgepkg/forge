@@ -21,7 +21,8 @@ forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
-forge-oci = { path = "../format-oci" }
+# Docker / OCI, still native: the registry under /v2 (crate::registry).
+forge-format-docker = { path = "../formats/docker" }
 # The built-in format plugins (crates/formats/nuget, crates/formats/npm,
 # crates/formats/raw), linked in.
 forge-format-nuget = { path = "../formats/nuget" }

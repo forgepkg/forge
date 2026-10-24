@@ -57,6 +57,15 @@ crates/formats/raw/
 ├── src/sidecar.rs # .sha256/.sha512/.sha1/.md5 from the stored digests
 ├── src/form.rs    # multipart uploads, Nexus' field names
 └── tests/         # the protocol against canned answers
+
+crates/formats/npm/
+├── Cargo.toml
+├── src/lib.rs     # DESCRIPTOR (mount "/npm", kinds hosted/proxy/group, Bearer
+│                  # upstream tokens) and impl FormatPlugin for Npm
+├── src/protocol.rs  # the registry API: packuments, publishes, dist-tags, logins
+├── src/publish.rs # the tarball inside a publish document, as it streams
+├── src/proxy.rs   # proxies: reading another registry (upstream)
+└── tests/         # the protocol against canned answers
 ```
 
 The pieces:
@@ -543,7 +552,7 @@ with Bearer tokens, read layers with `Range` requests, and expect proxies of
 Docker Hub and other registries. Every one of those is on the roadmap above
 or outside the contract altogether.
 
-So Docker is a native format (`crates/format-oci`, served under `/v2`),
+So Docker is a native format (`crates/formats/docker`, served under `/v2`),
 registered next to the plugins: `GET /admin/formats` lists it with all three
 repository kinds, the admin API and the web UI create its repositories the
 same way, a group holds members of its format only, and repositories, RBAC,

@@ -25,8 +25,8 @@ use chrono::{DateTime, Utc};
 use forge_core::auth::principal::Principal;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
-use forge_oci::chart;
-use forge_oci::manifest::{self, ManifestKind, MAX_MANIFEST_BYTES};
+use forge_format_docker::chart;
+use forge_format_docker::manifest::{self, ManifestKind, MAX_MANIFEST_BYTES};
 use forge_storage::BlobRef;
 use serde::{Deserialize, Serialize};
 
@@ -119,7 +119,7 @@ pub struct ImageDetail {
 
 /// The registry host of the server (`host[:port]` of `public_base_url`).
 fn registry_host(state: &AppState) -> String {
-    forge_oci::registry_origin(&state.config.public_base_url()).1
+    forge_format_docker::registry_origin(&state.config.public_base_url()).1
 }
 
 /// Where `repo`'s images are pulled from: its own host, or
@@ -266,7 +266,7 @@ pub async fn image_detail(
         Ok(repo) => repo,
         Err(resp) => return resp,
     };
-    if !forge_oci::reference::valid_name(&image) {
+    if !forge_format_docker::reference::valid_name(&image) {
         return (StatusCode::NOT_FOUND, "image not found").into_response();
     }
     let sources = match sources(&state, &principal, &repo).await {
@@ -521,8 +521,8 @@ pub async fn chart_detail(
     };
     let not_found = || (StatusCode::NOT_FOUND, "chart not found").into_response();
     let image = query.image;
-    if !forge_oci::reference::valid_name(&image)
-        || forge_oci::digest::Digest::parse(&query.digest).is_err()
+    if !forge_format_docker::reference::valid_name(&image)
+        || forge_format_docker::digest::Digest::parse(&query.digest).is_err()
     {
         return not_found();
     }

@@ -1,5 +1,5 @@
 [package]
-name = "forge-oci"
+name = "forge-format-docker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,11 +7,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-forge-core = { path = "../core" }
-forge-db = { path = "../db" }
-forge-storage = { path = "../storage" }
-forge-cache = { path = "../cache" }
-forge-crypto = { path = "../crypto" }
+forge-core = { path = "../../core" }
+forge-db = { path = "../../db" }
+forge-storage = { path = "../../storage" }
+forge-cache = { path = "../../cache" }
+forge-crypto = { path = "../../crypto" }
 
 axum = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }

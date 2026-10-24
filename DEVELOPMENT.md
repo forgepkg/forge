@@ -262,10 +262,10 @@ Every package format is a format plugin, a crate in
 [`crates/formats/`](./crates/formats) linked into the server (see
 [docs/format-plugins.md](./docs/format-plugins.md)): NuGet, npm and raw. A
 new format goes in `crates/formats/<id>` too, never in a `crates/format-<id>`
-crate or the server. Docker / OCI (`crates/format-oci`) is not there yet and
-is to move to `crates/formats/docker`. A repository of a plugin format is
-created with `"format": "<id>"` (hosted, proxy or group; a plugin format has
-proxies when it implements the upstream side) and served under
+crate or the server. Docker / OCI is in `crates/formats/docker` but still
+native, served by the server's registry under `/v2`. A repository of a plugin
+format is created with `"format": "<id>"` (hosted, proxy or group; a plugin
+format has proxies when it implements the upstream side) and served under
 `/repository/<name>/` unless the plugin names another mount (NuGet's is
 `/v3`, npm's `/npm`). Helm charts are pushed to docker repositories, see
 [docs/docker.md](docs/docker.md#helm-charts).

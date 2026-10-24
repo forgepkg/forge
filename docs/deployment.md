@@ -308,8 +308,8 @@ it:
 | Level | Covers (in Nexus's terms) | In Forge |
 | --- | --- | --- |
 | `read` | browse, read | Download, list and search packages, images and files. |
-| `write` | browse, read, add, edit | `read`, plus push and relist: a NuGet push, a container image or Helm chart push, a raw file upload. |
-| `delete` | browse, read, add, edit, delete | `write`, plus unlist and delete versions, delete tags, delete or replace raw files, and redeploy a version. |
+| `write` | browse, read, add, edit | `read`, plus push and relist: a NuGet push, an npm publish, a container image or Helm chart push, a raw file upload; and npm's dist-tags and deprecations. |
+| `delete` | browse, read, add, edit, delete | `write`, plus unlist and delete versions (`npm unpublish` too), delete image tags, delete or replace raw files, and redeploy a version. |
 
 A check passes when a grant covering the repository has the level it needs or
 a higher one. A role holds one grant per repository (or every repository) and
@@ -335,7 +335,7 @@ Every install has four built-in roles, which cannot be deleted or renamed:
 | Role | Grants | For |
 | --- | --- | --- |
 | `admin` | Everything: every repository at every level, and administering the instance (repositories, users, roles, authentication, settings). It holds no grant; membership is the administration. | Administrators. |
-| `writer` | `write` on every repository, ones created later included. No `delete`, no administration. | People and CI that publish packages: a NuGet push, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
+| `writer` | `write` on every repository, ones created later included. No `delete`, no administration. | People and CI that publish packages: a NuGet push, an npm publish, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
 | `authenticated` | `write` on every repository. | Legacy: what every user could do before roles existed, kept for upgraded installs. |
 | `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). Its grants reach signed-in users too, as `read`, under the anonymous mode `all`. | Anonymous access. |
 

@@ -25,7 +25,7 @@
 //!      (`action = "import"`). A version Forge holds with the same SHA-256
 //!      is skipped without a download;
 //!    * a Docker tag is copied through the Nexus repository's registry API
-//!      ([`forge_oci::Registry::import_tag`]): digests are kept,
+//!      ([`forge_format_docker::Registry::import_tag`]): digests are kept,
 //!      multi-platform indexes arrive with every child manifest, and a
 //!      referrer is copied once its subject is in Forge;
 //!    * what Nexus recorded is kept: the publish time (`blobCreated`, for a
@@ -63,7 +63,7 @@ use forge_crypto::PlaintextSecret;
 use forge_db::import_dao::{self, ImportItem, NewItem, NexusImport};
 use forge_db::model::{Repository, DOCKER_FORMAT};
 use forge_db::{repository_dao, secret_dao, user_dao};
-use forge_oci::import::{ImageImportOptions, ImageOutcome, ImportSource};
+use forge_format_docker::import::{ImageImportOptions, ImageOutcome, ImportSource};
 use forge_storage::StagedBlob;
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
@@ -210,7 +210,7 @@ enum Target {
     /// Docker, through the registry, from the Nexus repository's registry
     /// API.
     Images {
-        registry: forge_oci::Registry,
+        registry: forge_format_docker::Registry,
         source: ImportSource,
     },
 }
@@ -704,7 +704,7 @@ impl Run<'_> {
     async fn copy_image(
         &self,
         ctx: &Ctx,
-        registry: &forge_oci::Registry,
+        registry: &forge_format_docker::Registry,
         from: &ImportSource,
         kind: &str,
         source: &SourceItem,
