@@ -8,7 +8,8 @@
 #      `@`, which every Forge account has), checks whoami, and logs out;
 #   2. publishes a scoped and an unscoped package with npm, one with pnpm,
 #      and one through the group (to its writable member); a republish is
-#      refused;
+#      refused; publishes with npm's OIDC token exchange, without a saved
+#      token, both directly and through the group's writable member;
 #   3. installs with npm and pnpm from the hosted repository, from the proxy
 #      of the mock upstream and from the group, checks that the lockfiles
 #      point at Forge, and that the proxy's full packument carries the
@@ -21,7 +22,7 @@
 #      internal scope's packages out.
 #
 # Usage: npm-e2e.sh <forge-server binary> <results dir>
-# Needs on PATH: curl, jq, python3, node, npm, pnpm, tar, openssl. Yarn 2+ is
+# Needs on PATH: curl, jq, python3, node, npm >=11.5.1, pnpm, tar, openssl. Yarn 2+ is
 # YARN_BERRY (a yarn.js), else fetched from the npm registry with npm pack.
 # Postgres and S3 come from the environment (defaults match ci.yml):
 #   FORGE_E2E_DATABASE_URL  (postgres://forge:forge@localhost:5432/forge)
@@ -38,6 +39,7 @@ port="${FORGE_E2E_PORT:-8431}"
 upstream_port="${FORGE_E2E_UPSTREAM_PORT:-5021}"
 base="http://127.0.0.1:$port"
 upstream="http://127.0.0.1:$upstream_port"
+oidc_audience="npm:127.0.0.1"
 admin_user="admin@example.com"
 admin_password="e2e-$(openssl rand -hex 12)"
 
@@ -55,6 +57,11 @@ trap cleanup EXIT
 
 step() { echo; echo "── $* ──"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+npm_version=$(npm --version)
+node -e '
+  const [major, minor, patch] = process.argv[1].split(".").map(Number);
+  process.exit(major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1))) ? 0 : 1);
+' "$npm_version" || fail "npm >=11.5.1 is required for OIDC publishing (found $npm_version)"
 # The clients' configuration and caches stay inside the work directory.
 export HOME="$work/home" NPM_CONFIG_USERCONFIG="$work/home/.npmrc"
 export npm_config_cache="$work/npm-cache" npm_config_update_notifier=false
@@ -84,10 +91,43 @@ pack "$work/src/up-public-1.0.0" e2e-public 1.0.0
 pack "$work/src/up-public-1.1.0" e2e-public 1.1.0 '{"e2e-dep":"^2.0.0"}'
 pack "$work/src/up-dep-2.0.0" e2e-dep 2.0.0
 pack "$work/src/up-acme-ui" @acme/ui 9.9.9
+# The same mock serves a workload-only issuer, like MockOidc in crates/e2e.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -pkeyopt rsa_keygen_pubexp:65537 -out "$work/oidc-key.pem" 2>/dev/null
 cat > "$work/upstream.py" <<'EOF'
-import base64, glob, hashlib, http.server, json, os, sys, tarfile, threading, urllib.parse
+import base64, glob, hashlib, http.server, json, os, subprocess, sys, tarfile, threading, time, urllib.parse, uuid
 
-root, port = sys.argv[1], int(sys.argv[2])
+root, port, key, audience = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+issuer = f"http://127.0.0.1:{port}/oidc"
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+if sys.argv[5:] == ["--token"]:
+    now = int(time.time())
+    claims = {
+        "iss": issuer, "aud": audience,
+        "sub": "project_path:acme/app:ref_type:branch:ref:main",
+        "iat": now, "nbf": now - 5, "exp": now + 300, "jti": str(uuid.uuid4()),
+        "job_project_id": "1001", "ref_protected": True,
+    }
+    payload = ".".join(b64url(json.dumps(value).encode()) for value in [
+        {"alg": "RS256", "typ": "JWT", "kid": "npm-e2e"}, claims,
+    ])
+    signature = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", key],
+        input=payload.encode(), capture_output=True, check=True,
+    ).stdout
+    print(payload + "." + b64url(signature))
+    sys.exit(0)
+
+modulus = subprocess.check_output(
+    ["openssl", "rsa", "-in", key, "-noout", "-modulus"], text=True,
+).strip().split("=", 1)[1]
+jwks = {"keys": [{
+    "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "npm-e2e",
+    "n": b64url(bytes.fromhex(modulus)), "e": "AQAB",
+}]}
 packages, tarballs = {}, {}
 for path in sorted(glob.glob(os.path.join(root, "*.tgz"))):
     data = open(path, "rb").read()
@@ -131,7 +171,13 @@ class Registry(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.unquote(self.path.split("?")[0])
         auth = f"auth={'Authorization' in self.headers}"
-        if path in tarballs:
+        if path == "/oidc/.well-known/openid-configuration":
+            log(f"GET {path} {auth}")
+            self.answer(200, json.dumps({"issuer": issuer, "jwks_uri": issuer + "/jwks"}).encode())
+        elif path == "/oidc/jwks":
+            log(f"GET {path} {auth}")
+            self.answer(200, json.dumps(jwks).encode())
+        elif path in tarballs:
             log(f"GET {path} {auth}")
             self.answer(200, tarballs[path], "application/octet-stream")
         elif path.lstrip("/") in packages:
@@ -163,7 +209,8 @@ class Registry(http.server.BaseHTTPRequestHandler):
 
 http.server.ThreadingHTTPServer(("127.0.0.1", port), Registry).serve_forever()
 EOF
-python3 -u "$work/upstream.py" "$work/upstream" "$upstream_port" > "$work/upstream.log" 2>&1 &
+python3 -u "$work/upstream.py" "$work/upstream" "$upstream_port" "$work/oidc-key.pem" \
+  "$oidc_audience" > "$work/upstream.log" 2>&1 &
 upstream_pid=$!
 for _ in $(seq 1 30); do curl -fsS "$upstream/e2e-public" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS "$upstream/e2e-public" >/dev/null || fail "the mock upstream did not start"
@@ -322,7 +369,6 @@ if npm view @acme/ui --registry "$(reg npm-all)" > "$work/guard.out" 2>&1; then
 fi
 grep -q E404 "$work/guard.out" || fail "the guard: $(cat "$work/guard.out")"
 
-step "publish with npm and pnpm"
 package() { # <dir> <name> <version> [dependencies json]
   mkdir -p "$1"
   jq -n --arg name "$2" --arg version "$3" --argjson deps "${4:-{\}}" \
@@ -331,6 +377,49 @@ package() { # <dir> <name> <version> [dependencies json]
   echo "module.exports = '$2@$3'" > "$1/index.js"
   printf '# %s\n\nPublished by the npm e2e.\n' "$2" > "$1/README.md"
 }
+
+step "trusted publishing with npm's OIDC exchange (no saved token)"
+role=$(admin POST /admin/roles '{"name":"npm-ci-publisher"}' | jq -er .id)
+admin PUT "/admin/roles/$role/grants" '{"repository":"npm-hosted","level":"write"}' >/dev/null
+admin PUT "/admin/roles/$role/grants" '{"repository":"npm-all","level":"read"}' >/dev/null
+admin POST /admin/realms "$(jq -n --arg issuer "$upstream/oidc" --arg audience "$oidc_audience" '{
+  kind: "workload_identity", name: "npm-gitlab-ci",
+  config: {
+    issuer: $issuer, allow_http_issuer: true, allowed_audiences: [$audience],
+    rules: [{role: "npm-ci-publisher", conditions: [
+      {claim: "job_project_id", any_of: ["1001"]},
+      {claim: "ref_protected", any_of: ["true"]}
+    ]}]
+  }
+}')" >/dev/null
+# Isolate user/global/project config so the admin's _authToken cannot mask
+# a broken exchange. Each publish has its own jti: exchanges are one-use.
+mkdir -p "$work/oidc"
+touch "$work/oidc/user.npmrc" "$work/oidc/global.npmrc"
+for repo in npm-hosted npm-all; do
+  name="e2e-oidc-$repo"
+  dir="$work/oidc/$repo"
+  package "$dir" "$name" 1.0.0
+  id_token=$(python3 "$work/upstream.py" "$work/upstream" "$upstream_port" "$work/oidc-key.pem" \
+    "$oidc_audience" --token)
+  (
+    cd "$dir"
+    unset NODE_AUTH_TOKEN NPM_TOKEN npm_config__auth npm_config__authToken
+    GITLAB_CI=true NPM_ID_TOKEN="$id_token" \
+      NPM_CONFIG_USERCONFIG="$work/oidc/user.npmrc" \
+      NPM_CONFIG_GLOBALCONFIG="$work/oidc/global.npmrc" \
+      npm publish --registry "$(reg "$repo")" --provenance=false --loglevel=http
+  ) > "$work/oidc-$repo.out" 2>&1 \
+    || fail "npm OIDC publish to $repo: $(cat "$work/oidc-$repo.out")"
+  grep -Fq "POST 200 $base/-/npm/v1/oidc/token/exchange/package/$name" "$work/oidc-$repo.out" \
+    || fail "npm did not exchange its OIDC token: $(cat "$work/oidc-$repo.out")"
+  [ "$(npm view "$name" version --registry "$(reg npm-hosted)")" = 1.0.0 ] \
+    || fail "npm OIDC publish to $repo did not land in npm-hosted"
+done
+grep -q '^GET /oidc/jwks auth=False' "$work/upstream.log" \
+  || fail "the workload verifier never fetched the issuer's signing keys"
+
+step "publish with npm and pnpm"
 package "$work/src/acme-ui" @acme/ui 1.0.0
 package "$work/src/hosted-1.0.0" e2e-hosted 1.0.0
 package "$work/src/hosted-1.1.0" e2e-hosted 1.1.0 '{"@acme/ui":"^1.0.0"}'

@@ -94,6 +94,50 @@ async fn self_token_lifecycle() {
     assert_eq!(resp.status(), 401, "revoked token must not authenticate");
 }
 
+#[tokio::test]
+async fn token_creation_rejects_expiry_in_the_past() {
+    let srv = common::start().await;
+    let client = srv.client();
+    let (username, password) = make_user(&srv).await;
+    let session = srv.login(&username, &password).await;
+
+    let resp = session
+        .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
+        .json(&json!({"name": "expired", "expires_at": "2000-01-01T00:00:00Z"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let (admin, password) = srv.admin_basic();
+    let users: Value = client
+        .get(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["username"] == json!(admin))
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{}/admin/users/{admin_id}/tokens", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({"name": "expired", "expires_at": "2000-01-01T00:00:00Z"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
 /// A token-authenticated caller cannot manage tokens (403) — tokens are feed /
 /// API credentials, not a login, and must not be able to mint further tokens.
 #[tokio::test]

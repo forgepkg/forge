@@ -351,3 +351,20 @@ fn search_forwards_the_query_and_reads_the_hits() {
         UpstreamAnswer::Search(None)
     );
 }
+
+#[test]
+fn search_offsets_beyond_nuget_orgs_limit_request_local_fallback() {
+    for skip in [3_001, u32::MAX] {
+        let query = SearchQuery {
+            text: "contoso".into(),
+            skip,
+            take: 20,
+            prerelease: false,
+            semver2: true,
+            upstream: true,
+        };
+        let done = run(&remote(&resources()), UpstreamOp::Search(query), &docs([]));
+        assert_eq!(done.answer, UpstreamAnswer::Search(None));
+        assert!(done.fetches.is_empty());
+    }
+}

@@ -359,6 +359,68 @@ describe('admin repositories', () => {
     expect(posted).toBe(false)
   })
 
+  it.each([
+    ['nuget', 512],
+    ['docker', 1024],
+  ])('edit loads the %s upload default and staging ceiling', async (format, defaultMib) => {
+    const onUpdate = vi.fn((_name: string, body: unknown) =>
+      json(repo({ ...(body as Partial<RepoView>) })),
+    )
+    mockApi({
+      repositories: [repo({ format })],
+      formats: [{
+        id: format,
+        name: format,
+        kinds: ['hosted', 'proxy', 'group'],
+        mount: format === 'docker' ? '/v2' : '/v3',
+        default_max_upload_bytes: defaultMib * 1024 * 1024,
+        max_upload_bytes_limit: 2048 * 1024 * 1024,
+      }],
+      onUpdate,
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/hosted-1')
+
+    const limit = await screen.findByPlaceholderText(`Default: ${defaultMib}`)
+    expect(limit).toHaveValue(null)
+    await user.type(limit, '2049')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "At most 2048 MiB: larger pushes do not fit the server's staging space.",
+    )
+    expect(onUpdate).not.toHaveBeenCalled()
+
+    await user.clear(limit)
+    await user.type(limit, '2048')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() =>
+      expect(onUpdate).toHaveBeenCalledWith('hosted-1', {
+        max_upload_bytes: 2048 * 1024 * 1024,
+      }),
+    )
+  })
+
+  it('edit loads a plugin format name and custom feed mount', async () => {
+    mockApi({
+      repositories: [repo({ format: 'helm' })],
+      formats: [{
+        id: 'helm',
+        name: 'Helm charts',
+        kinds: ['hosted', 'proxy', 'group'],
+        mount: '/charts',
+      }],
+    })
+
+    await renderAt('/manage/repositories/hosted-1')
+
+    expect(await screen.findByDisplayValue('Helm charts')).toHaveAttribute('readonly')
+    expect(screen.getByLabelText('Name')).toHaveAccessibleDescription(
+      'Part of the feed URL (/charts/<name>/): letters, digits, ".", "_" and "-", up to 64 characters.',
+    )
+  })
+
   it('edit PUTs only what changed; "Remove stored credentials" sends explicit nulls', async () => {
     const stored = repo({
       id: 7,

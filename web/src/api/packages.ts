@@ -95,7 +95,7 @@ export interface DetailVersion {
   version_original: string
   /** Whether the version is listed. */
   listed: boolean
-  /** `.nupkg` byte size, if a stored asset is known (null when not cached). */
+  /** Package-asset byte size, if known (null when not cached). */
   size: number | null
   /**
    * When the version reached Forge (`component.created_at`), if known: the

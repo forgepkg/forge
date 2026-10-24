@@ -1231,6 +1231,7 @@ pub async fn list_images(
     offset: i64,
     limit: i64,
 ) -> sqlx::Result<Vec<ImageSummary>> {
+    let query = query.to_ascii_lowercase();
     sqlx::query_as!(
         ImageSummary,
         r#"
@@ -1256,6 +1257,7 @@ pub async fn list_images(
 
 /// How many images [`list_images`] would list in total.
 pub async fn count_images(pool: &PgPool, repository_id: i64, query: &str) -> sqlx::Result<i64> {
+    let query = query.to_ascii_lowercase();
     sqlx::query_scalar!(
         r#"
         SELECT count(DISTINCT image) AS "count!"

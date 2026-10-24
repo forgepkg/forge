@@ -1171,6 +1171,195 @@ fn helm_chart(name: &str, version: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (config, archive, manifest)
 }
 
+/// Seed enough image metadata to cross the former per-member browse limit,
+/// without making thousands of registry uploads.
+async fn populated_image_repo(srv: &TestServer) -> String {
+    let repo = repo_name("image-pages");
+    let row = create_repo(
+        srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = row["id"].as_i64().unwrap();
+    admin_oci(srv)
+        .await
+        .push_image(
+            &format!("{repo}/team/app-00000"),
+            "latest",
+            "amd64",
+            b"layer",
+        )
+        .await;
+    sqlx::query(
+        r#"
+        INSERT INTO oci_manifest
+            (repository_id, image, digest, blob_sha256, media_type, size, summary)
+        SELECT repository_id, 'team/app-' || lpad(n::text, 5, '0'),
+               digest, blob_sha256, media_type, size, summary
+        FROM oci_manifest CROSS JOIN generate_series(1, 5002) AS n
+        WHERE repository_id = $1 AND image = 'team/app-00000'
+        "#,
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    repo
+}
+
+async fn browse_image_page(
+    srv: &TestServer,
+    session: &common::BrowserSession,
+    query: &str,
+) -> Value {
+    let resp = session
+        .apply(
+            srv.client()
+                .get(format!("{}/browse/images?{query}", srv.base_url)),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    resp.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn browse_images_pages_past_5000_and_searches_case_insensitively() {
+    let srv = common::start().await;
+    let repo = populated_image_repo(&srv).await;
+    let other = repo_name("other");
+    let group = repo_name("image-group");
+    create_repo(
+        &srv,
+        json!({"name": other, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker"}),
+    )
+    .await;
+    for (member, priority) in [(&repo, 20), (&other, 10)] {
+        assert_eq!(
+            admin_post(
+                &srv,
+                &format!("/admin/repositories/{group}/members"),
+                json!({"member": member, "priority": priority}),
+            )
+            .await
+            .status(),
+            201
+        );
+    }
+    let oci = admin_oci(&srv).await;
+    for image in ["team/app-05001", "team/other"] {
+        oci.push_image(&format!("{other}/{image}"), "latest", "amd64", b"other")
+            .await;
+    }
+    let session = srv
+        .login(srv.admin_user.as_deref().unwrap(), "adminpw")
+        .await;
+    for (name, total) in [(&repo, 5003), (&group, 5004)] {
+        for (skip, expected) in [
+            (0, json!(["team/app-00000", "team/app-00001"])),
+            (5000, json!(["team/app-05000", "team/app-05001"])),
+            (6000, json!([])),
+        ] {
+            let page =
+                browse_image_page(&srv, &session, &format!("repo={name}&skip={skip}&take=2")).await;
+            assert_eq!(page["total"], total);
+            let names: Vec<_> = page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["image"].clone())
+                .collect();
+            assert_eq!(json!(names), expected);
+            if skip == 5000 {
+                assert_eq!(page["items"][1]["tag_count"], 0, "first member wins");
+            }
+        }
+        let page =
+            browse_image_page(&srv, &session, &format!("repo={name}&skip=5002&take=2")).await;
+        assert_eq!(page["items"][0]["image"], "team/app-05002");
+        assert_eq!(page["items"].as_array().unwrap().len(), total - 5002);
+        for q in ["team/app-0500", "Team/App-0500", "TEAM/APP-0500"] {
+            let page =
+                browse_image_page(&srv, &session, &format!("repo={name}&q={q}&take=2")).await;
+            assert_eq!(page["total"], 3);
+            assert_eq!(page["items"][0]["image"], "team/app-05000");
+            assert_eq!(page["items"][1]["image"], "team/app-05001");
+        }
+        let page = browse_image_page(&srv, &session, &format!("repo={name}&q=missing")).await;
+        assert_eq!(page["total"], 0);
+        assert_eq!(page["items"], json!([]));
+    }
+}
+
+#[tokio::test]
+async fn browse_images_selector_counts_and_pages_after_filtering() {
+    let srv = common::start().await;
+    let repo = populated_image_repo(&srv).await;
+    let (username, _, user_id) = user_with_token(&srv).await;
+    let selector: Value = admin_post(
+        &srv,
+        "/admin/content-selectors",
+        json!({"name": repo_name("late-images"), "includes": ["team/app-0500*"]}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let role: Value = admin_post(
+        &srv,
+        "/admin/roles",
+        json!({"name": repo_name("image-reader")}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let role_id = role["id"].as_i64().unwrap();
+    assert_eq!(
+        admin_put(
+            &srv,
+            &format!("/admin/roles/{role_id}/grants"),
+            json!({"repository": repo, "level": "read", "selector_id": selector["id"]}),
+        )
+        .await
+        .status(),
+        201
+    );
+    assert_eq!(
+        admin_put(
+            &srv,
+            &format!("/admin/users/{user_id}/roles"),
+            json!({"role_id": role_id}),
+        )
+        .await
+        .status(),
+        204
+    );
+    let session = srv.login(&username, "pw-pw-pw-pw-pw").await;
+    for (skip, expected) in [
+        (0, json!(["team/app-05000", "team/app-05001"])),
+        (2, json!(["team/app-05002"])),
+        (3, json!([])),
+    ] {
+        let page =
+            browse_image_page(&srv, &session, &format!("repo={repo}&skip={skip}&take=2")).await;
+        assert_eq!(page["total"], 3);
+        let names: Vec<_> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["image"].clone())
+            .collect();
+        assert_eq!(json!(names), expected);
+    }
+}
+
 /// Helm charts pushed as artifacts: the image page lists them by their
 /// config type, and `/browse/chart` reads their metadata, README and values
 /// from the blobs Forge holds, through a group too.

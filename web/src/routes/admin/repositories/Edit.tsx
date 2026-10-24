@@ -3,6 +3,7 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import type { RepoView } from '~/api/repositories'
 import {
+  useFormats,
   useRepository,
   useUpdateRepository,
 } from '~/queries/useRepositories'
@@ -51,6 +52,7 @@ function EditRepository() {
   const navigate = useNavigate()
   const toast = useToast()
   const repo = useRepository(name)
+  const formats = useFormats()
   const update = useUpdateRepository(name)
   // The view the server returned for the last save: the form is re-seeded
   // from it, so a typed password or a "remove credentials" choice is not
@@ -167,6 +169,7 @@ function EditRepository() {
           key={`${name}:${saved?.n ?? 0}`}
           mode="edit"
           existing={current}
+          formats={formats.data}
           submitting={update.isPending}
           serverError={
             update.isError ? update.error.body || update.error.message : null
