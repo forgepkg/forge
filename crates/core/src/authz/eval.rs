@@ -5,29 +5,32 @@
 //! the [`EffectiveSet`] — and the pure decision functions over it:
 //!
 //! * [`EffectiveSet::allows_repo`] — the **repo-level gate** used by
-//!   `can_read` / `can_write` / `can_admin`. "Does any held grant for this
-//!   action cover this repo?" Content selectors are *ignored* for the gate (a
-//!   selector-scoped read grant still lets you reach the repo — it only filters
-//!   *which packages* are visible inside it, see below).
+//!   `can_read` / `can_write` / `can_delete`. "Does any held grant of the
+//!   required level or a higher one cover this repo?" Content selectors are
+//!   *ignored* for the gate (a selector-scoped grant still lets you reach the
+//!   repo — it only filters *which packages* are visible inside it, see below).
 //! * [`EffectiveSet::package_filter`] — the **package-level filter** used when
 //!   listing/serving packages. Returns a [`PackageFilter`] predicate: a package
-//!   is visible iff at least one held `read` grant covering the repo either has
-//!   no selector or matches the package name.
+//!   is visible iff at least one held grant covering the repo either has no
+//!   selector or matches the package name.
 //!
 //! ## Model
 //!
 //! A principal holds a flat, **additive** set of [`Grant`]s (the union of all
-//! its roles' grants). Each grant is `(action, repo|ANY, selector?)`. There are
-//! **no explicit-deny rows**: "no access" is the absence of a matching grant —
-//! the evaluator is **fail-closed** (default DENY). Membership in the built-in
-//! `admin` role is represented by [`EffectiveSet::is_admin`] and short-circuits
-//! to allow-all.
+//! its roles' grants). Each grant is `(level, repo|ANY, selector?)`, where the
+//! [`Level`]s are ordered, `read` < `write` < `delete`, and each includes the
+//! ones below it. There are **no explicit-deny rows**: "no access" is the
+//! absence of a matching grant — the evaluator is **fail-closed** (default
+//! DENY). Administration is no grant: membership in the built-in `admin` role
+//! is represented by [`EffectiveSet::is_admin`] and short-circuits to
+//! allow-all.
 //!
 //! Per-token scoping is applied here by [`EffectiveSet::intersect_scope`]: a
-//! token may only ever *narrow* its owner's set, never widen it, and it holds
-//! `admin` only when its scope names that action explicitly. The DB loads
-//! the owner's set (cached); the token scope is intersected **after** the cache
-//! lookup so the owner set stays shared across that user's tokens.
+//! token may only ever *narrow* its owner's set, never widen it, and it keeps
+//! the owner's `admin` role only when its scope opts in with `admin: true`.
+//! The DB loads the owner's set (cached); the token scope is intersected
+//! **after** the cache lookup so the owner set stays shared across that
+//! user's tokens.
 //!
 //! ## Selector semantics (content scoping)
 //!
@@ -41,44 +44,51 @@ use std::fmt;
 use std::sync::Arc;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-/// The four authorization verbs. Mirrors the seeded `privilege` reference table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The three ordered access levels a grant or a token scope gives. Each
+/// includes the ones below it (`read` < `write` < `delete`), so a check for a
+/// level passes on a grant of that level or a higher one. The values of
+/// `repository_privilege.level`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Action {
-    /// Download / list / search.
+pub enum Level {
+    /// Browse and read: download, list, search.
     Read,
-    /// Push / relist.
+    /// `read`, plus add and edit: push, relist.
     Write,
-    /// Unlist / delete.
+    /// `write`, plus delete: unlist, delete.
     Delete,
-    /// Repository config + privilege management. Administration is global:
-    /// the grants API and the table refuse an `admin` grant on one repository.
-    Admin,
 }
 
-impl Action {
-    /// The wire/DB string for this action (matches `privilege.action`).
+impl Level {
+    /// Every level, lowest first.
+    pub const ALL: [Level; 3] = [Level::Read, Level::Write, Level::Delete];
+
+    /// The wire/DB string for this level (matches `repository_privilege.level`).
     pub fn as_str(self) -> &'static str {
         match self {
-            Action::Read => "read",
-            Action::Write => "write",
-            Action::Delete => "delete",
-            Action::Admin => "admin",
+            Level::Read => "read",
+            Level::Write => "write",
+            Level::Delete => "delete",
         }
     }
 
-    /// Parse an action from its DB string. Unknown verbs are rejected (an
-    /// unrecognized action must never silently widen access).
-    pub fn parse(s: &str) -> Option<Action> {
+    /// Parse a level from its DB string. Unknown values are rejected (an
+    /// unrecognized level must never silently widen access).
+    pub fn parse(s: &str) -> Option<Level> {
         match s {
-            "read" => Some(Action::Read),
-            "write" => Some(Action::Write),
-            "delete" => Some(Action::Delete),
-            "admin" => Some(Action::Admin),
+            "read" => Some(Level::Read),
+            "write" => Some(Level::Write),
+            "delete" => Some(Level::Delete),
             _ => None,
         }
+    }
+}
+
+impl fmt::Display for Level {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -186,13 +196,13 @@ impl CompiledSelector {
     }
 }
 
-/// A single resolved grant held by a principal: "may perform `action` on
+/// A single resolved grant held by a principal: "may act up to `level` on
 /// `repo` (or any repo when `repo == None`), optionally scoped to packages
 /// matching `selector`".
 #[derive(Debug, Clone)]
 pub struct Grant {
-    /// The action this grant authorizes.
-    pub action: Action,
+    /// The level this grant gives (and every level below it).
+    pub level: Level,
     /// The repository the grant applies to; `None` means **ANY** repository
     /// (the `*`/`ANY` wildcard).
     pub repo: Option<i64>,
@@ -202,10 +212,18 @@ pub struct Grant {
 }
 
 impl Grant {
-    /// Does this grant cover `action` on repository `repo_id`, ignoring any
-    /// selector (the repo-level gate)?
-    fn covers_repo(&self, action: Action, repo_id: i64) -> bool {
-        self.action == action && self.repo.map(|r| r == repo_id).unwrap_or(true)
+    /// Does this grant give `required` (or a higher level) on repository
+    /// `repo_id`, ignoring any selector (the repo-level gate)?
+    fn covers_repo(&self, required: Level, repo_id: i64) -> bool {
+        self.level >= required && self.repo.map(|r| r == repo_id).unwrap_or(true)
+    }
+
+    /// This grant with its level lowered to at most `cap`.
+    fn capped(&self, cap: Level) -> Grant {
+        Grant {
+            level: self.level.min(cap),
+            ..self.clone()
+        }
     }
 }
 
@@ -214,9 +232,9 @@ impl Grant {
 /// [`EffectiveSet`] is built via [`EffectiveSet::build`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawGrant {
-    /// The action string (`read`/`write`/`delete`/`admin`). Unknown actions are
-    /// dropped at build time (fail-closed; an unrecognized verb grants nothing).
-    pub action: String,
+    /// The level string (`read`/`write`/`delete`). Unknown levels are dropped
+    /// at build time (fail-closed; an unrecognized level grants nothing).
+    pub level: String,
     /// `repository.id`, or `None` for an ANY-repo grant.
     pub repo: Option<i64>,
     /// Raw selector patterns, or `None` for an unscoped grant.
@@ -258,14 +276,14 @@ pub struct EffectiveSet {
 impl EffectiveSet {
     /// Build (and compile) an effective set from its raw DB/cache form.
     ///
-    /// Grants whose `action` is not a known verb are **dropped** (fail-closed).
+    /// Grants whose `level` is not a known level are **dropped** (fail-closed).
     /// A selector that fails to compile fails the whole build (the caller then
     /// denies) — we never silently treat an unparseable selector as "no scope".
     pub fn build(raw: &RawEffectiveSet) -> Result<EffectiveSet, SelectorCompileError> {
         let mut grants = Vec::with_capacity(raw.grants.len());
         for g in &raw.grants {
-            let Some(action) = Action::parse(&g.action) else {
-                // Unknown action verb: drop it (cannot widen access).
+            let Some(level) = Level::parse(&g.level) else {
+                // Unknown level: drop it (cannot widen access).
                 continue;
             };
             let selector = match &g.selector {
@@ -273,7 +291,7 @@ impl EffectiveSet {
                 None => None,
             };
             grants.push(Grant {
-                action,
+                level,
                 repo: g.repo,
                 selector,
             });
@@ -298,54 +316,59 @@ impl EffectiveSet {
         self.is_admin
     }
 
-    /// **Repo-level gate.** May this principal perform `action` on repository
-    /// `repo_id`?
+    /// **Repo-level gate.** Does this principal hold `required` (or a higher
+    /// level) on repository `repo_id`?
     ///
     /// `admin`-role membership allows everything. Otherwise: true iff at least
-    /// one held grant covers `(action, repo_id)`. **Selectors are ignored here**
-    /// — a selector-scoped read grant still passes the repo gate; package
-    /// filtering happens separately in [`Self::package_filter`].
-    pub fn allows_repo(&self, action: Action, repo_id: i64) -> bool {
+    /// one held grant covering `repo_id` has the required level or a higher
+    /// one. **Selectors are ignored here** — a selector-scoped grant still
+    /// passes the repo gate; package filtering happens separately in
+    /// [`Self::package_filter_for`].
+    pub fn allows_repo(&self, required: Level, repo_id: i64) -> bool {
         if self.is_admin {
             return true;
         }
-        self.grants.iter().any(|g| g.covers_repo(action, repo_id))
+        self.grants.iter().any(|g| g.covers_repo(required, repo_id))
     }
 
-    /// Whether this principal may perform `action` on **every** repository,
-    /// including ones created later and every package in them: the `admin`
-    /// role, or an unscoped grant of `action` on ANY repository (what the
-    /// built-in `writer` role holds for `write`).
-    pub fn allows_every_repo(&self, action: Action) -> bool {
+    /// Whether this principal holds `required` (or a higher level) on
+    /// **every** repository, including ones created later and every package
+    /// in them: the `admin` role, or an unscoped grant of that level or a
+    /// higher one on ANY repository (what the built-in `writer` role holds for
+    /// `write`).
+    pub fn allows_every_repo(&self, required: Level) -> bool {
         self.is_admin
             || self
                 .grants
                 .iter()
-                .any(|g| g.action == action && g.repo.is_none() && g.selector.is_none())
+                .any(|g| g.level >= required && g.repo.is_none() && g.selector.is_none())
     }
 
-    /// **Package-level filter** for `action` on `repo_id`.
+    /// **Package-level filter** for `required` on `repo_id`.
     ///
-    /// Returns the predicate to apply when listing/serving packages from the
-    /// repo. Admin and any unscoped `read` grant covering the repo ⇒
-    /// [`PackageFilter::AllowAll`]. Otherwise the visible packages are the union
-    /// of every selector-scoped read grant covering the repo
-    /// ([`PackageFilter::Selectors`]). If no read grant covers the repo at all,
-    /// returns [`PackageFilter::DenyAll`] (the repo gate should have already
-    /// denied, but this stays fail-closed independently).
-    pub fn package_filter_for(&self, action: Action, repo_id: i64) -> PackageFilter {
+    /// Returns the predicate to apply when listing/serving/changing packages
+    /// of the repo. Only grants of the required level or a higher one count:
+    /// a selector-scoped `write` grant also filters what its holder reads,
+    /// while a `read` grant never lets anything be written. Admin and any
+    /// unscoped counting grant covering the repo ⇒ [`PackageFilter::AllowAll`].
+    /// Otherwise the allowed packages are the union of every selector-scoped
+    /// counting grant covering the repo ([`PackageFilter::Selectors`]). If no
+    /// counting grant covers the repo at all, returns
+    /// [`PackageFilter::DenyAll`] (the repo gate should have already denied,
+    /// but this stays fail-closed independently).
+    pub fn package_filter_for(&self, required: Level, repo_id: i64) -> PackageFilter {
         if self.is_admin {
             return PackageFilter::AllowAll;
         }
         let mut selectors: Vec<Arc<CompiledSelector>> = Vec::new();
         let mut covers = false;
         for g in &self.grants {
-            if !g.covers_repo(action, repo_id) {
+            if !g.covers_repo(required, repo_id) {
                 continue;
             }
             covers = true;
             match &g.selector {
-                // An unscoped read grant covering the repo ⇒ everything visible.
+                // An unscoped grant covering the repo ⇒ every package.
                 None => return PackageFilter::AllowAll,
                 Some(sel) => selectors.push(sel.clone()),
             }
@@ -361,9 +384,9 @@ impl EffectiveSet {
     ///
     /// Kept as the read-oriented convenience API used by existing callers;
     /// package-aware mutations use [`Self::package_filter_for`] with their own
-    /// action so a read grant can never authorize a write or delete.
+    /// level so a `read` grant can never authorize a write or delete.
     pub fn package_filter(&self, repo_id: i64) -> PackageFilter {
-        self.package_filter_for(Action::Read, repo_id)
+        self.package_filter_for(Level::Read, repo_id)
     }
 
     /// Apply a token scope, returning a **narrowed** set (never widened).
@@ -372,55 +395,48 @@ impl EffectiveSet {
     /// is evaluated as [`TokenScope::default()`] — so the rules below are the
     /// whole token policy:
     ///
-    /// * Each grant is kept only if the scope permits its action AND its repo.
-    /// * **`admin` is opt-in.** `actions: None` (or no scope at all) permits
-    ///   the owner's `read` / `write` / `delete` but **not** `admin`: a token
-    ///   carries `admin` — a per-repo `admin` grant or the server-wide
-    ///   short-circuit — only when its scope lists `"admin"` explicitly. A
-    ///   leaked feed token therefore never reaches `/admin/*` (privilege
-    ///   management, user creation, minting further tokens).
+    /// * Each grant is kept only if the scope permits its repo, and its level
+    ///   is lowered to the scope's `level` (a `delete` grant under a `read`
+    ///   scope reads). No `level` keeps the owner's levels.
+    /// * **`admin` is opt-in.** Without `admin: true` (or with no scope at
+    ///   all) the token never keeps the owner's `admin` role: a leaked feed
+    ///   token therefore never reaches `/admin/*` (privilege management, user
+    ///   creation, minting further tokens).
     /// * **Admin** (the allow-all short-circuit) survives only when the scope
-    ///   explicitly allows `admin` and does not restrict repositories: a token
-    ///   scoped to some repositories must never keep server-wide admin (it
-    ///   would reach every repo and the privilege-management API). When admin is
-    ///   dropped, the owner's allow-all is replaced by explicit `read` / `write`
-    ///   / `delete` grants — filtered by the scope's allowed actions — on the
-    ///   scoped repos (or on ANY repo when repos are unrestricted), so an
-    ///   admin's ordinary CI token can still push everywhere (or to exactly its
-    ///   scoped repos) without being an admin credential.
+    ///   sets `admin: true` and does not restrict repositories: a token scoped
+    ///   to some repositories must never keep server-wide admin (it would
+    ///   reach every repo and the privilege-management API). When admin is
+    ///   dropped, the owner's allow-all is replaced by an unscoped grant of
+    ///   the scope's level (`delete` without one) on the scoped repos (or on
+    ///   ANY repo when repos are unrestricted), so an admin's ordinary CI
+    ///   token can still push everywhere (or to exactly its scoped repos)
+    ///   without being an admin credential. A kept admin short-circuit allows
+    ///   every level, whatever the scope's `level`.
     ///
     /// The automation scope for a token that must call the admin API is
-    /// `{"actions": ["admin"]}` (optionally listing `read` / `write` / `delete`
-    /// too, which the admin short-circuit already implies), with **no**
-    /// `repositories`. Issued to an admin account, such a token is a full
-    /// admin credential (it can create users and mint tokens), so give it an
-    /// `expires_at` and keep it out of `NuGet.config`.
+    /// `{"admin": true}`, with **no** `repositories`. Issued to an admin
+    /// account, such a token is a full admin credential (it can create users
+    /// and mint tokens), so give it an `expires_at` and keep it out of
+    /// `NuGet.config`.
     ///
     /// Note: a grant for `repo == ANY` (None) is narrowed to the scope's repo
     /// allowlist when the scope restricts repos — the ANY grant is expanded into
     /// one grant per allowed repo id so the token can never reach a repo outside
     /// its scope. When the scope does not restrict repos, ANY is preserved.
     pub fn intersect_scope(&self, scope: &TokenScope) -> EffectiveSet {
-        let action_ok = |a: Action| match &scope.actions {
-            // Unrestricted actions still exclude `admin`: it must be named.
-            None => a != Action::Admin,
-            Some(allowed) => allowed.contains(&a),
-        };
-        // Allow-all survives only an unrestricted-repo scope that names admin.
-        let keep_admin = self.is_admin && scope.repositories.is_none() && action_ok(Action::Admin);
+        let cap = scope.level.unwrap_or(Level::Delete);
+        // Allow-all survives only an unrestricted-repo scope that opts in.
+        let keep_admin = self.is_admin && scope.admin && scope.repositories.is_none();
 
         let mut grants = Vec::new();
         for g in &self.grants {
-            if !action_ok(g.action) {
-                continue;
-            }
             match (&scope.repositories, g.repo) {
-                // Scope does not restrict repos: keep the grant as-is.
-                (None, _) => grants.push(g.clone()),
+                // Scope does not restrict repos: keep the grant, capped.
+                (None, _) => grants.push(g.capped(cap)),
                 // Grant is repo-specific: keep iff that repo is in the scope.
                 (Some(allowed), Some(repo_id)) => {
                     if allowed.contains(&repo_id) {
-                        grants.push(g.clone());
+                        grants.push(g.capped(cap));
                     }
                 }
                 // Grant is ANY-repo but scope restricts repos: expand ANY into
@@ -428,9 +444,8 @@ impl EffectiveSet {
                 (Some(allowed), None) => {
                     for &repo_id in allowed {
                         grants.push(Grant {
-                            action: g.action,
                             repo: Some(repo_id),
-                            selector: g.selector.clone(),
+                            ..g.capped(cap)
                         });
                     }
                 }
@@ -438,24 +453,19 @@ impl EffectiveSet {
         }
 
         if self.is_admin && !keep_admin {
-            // The owner could do anything; the token keeps the package-level
-            // verbs (never `admin`) within its scope.
-            for action in [Action::Read, Action::Write, Action::Delete] {
-                if !action_ok(action) {
-                    continue;
-                }
-                match &scope.repositories {
-                    None => grants.push(Grant {
-                        action,
-                        repo: None,
-                        selector: None,
-                    }),
-                    Some(allowed) => grants.extend(allowed.iter().map(|&repo_id| Grant {
-                        action,
-                        repo: Some(repo_id),
-                        selector: None,
-                    })),
-                }
+            // The owner could do anything; the token keeps every package level
+            // up to the scope's (never `admin`) within its repositories.
+            match &scope.repositories {
+                None => grants.push(Grant {
+                    level: cap,
+                    repo: None,
+                    selector: None,
+                }),
+                Some(allowed) => grants.extend(allowed.iter().map(|&repo_id| Grant {
+                    level: cap,
+                    repo: Some(repo_id),
+                    selector: None,
+                })),
             }
         }
 
@@ -465,32 +475,27 @@ impl EffectiveSet {
         }
     }
 
-    /// Add the **public read** reach to this set: every `read` grant of
-    /// `public` (the built-in `anonymous` role's effective set) plus, when
+    /// Add the **public read** reach to this set: every grant of `public` (the
+    /// built-in `anonymous` role's effective set) capped at `read`, plus, when
     /// `anonymous_read_repo` is `Some(id)`, an unscoped `read` grant on that
     /// repository (its `anonymous_read` flag).
     ///
     /// This is how a signed-in principal reads at least what an anonymous
-    /// caller can. Only `read` grants are ever added and `public`'s admin flag
-    /// is ignored, so it can never add `write` / `delete` / `admin`. For a
-    /// token the seam applies it **before** [`Self::intersect_scope`], so the
-    /// public reach is still cut down to the token's scope (a token scoped to
-    /// other repositories, or to `write` only, gains nothing from it).
+    /// caller can. Every added grant is capped at `read` and `public`'s admin
+    /// flag is ignored, so it can never add `write` / `delete` / `admin`. For
+    /// a token the seam applies it **before** [`Self::intersect_scope`], so
+    /// the public reach is still cut down to the token's scope (a token scoped
+    /// to other repositories gains nothing from it).
     pub fn with_public_read(
         mut self,
         public: &EffectiveSet,
         anonymous_read_repo: Option<i64>,
     ) -> EffectiveSet {
-        self.grants.extend(
-            public
-                .grants
-                .iter()
-                .filter(|g| g.action == Action::Read)
-                .cloned(),
-        );
+        self.grants
+            .extend(public.grants.iter().map(|g| g.capped(Level::Read)));
         if let Some(repo_id) = anonymous_read_repo {
             self.grants.push(Grant {
-                action: Action::Read,
+                level: Level::Read,
                 repo: Some(repo_id),
                 selector: None,
             });
@@ -571,28 +576,74 @@ impl PackageFilter {
 /// An optional per-token privilege scope (from `token.scope` jsonb).
 ///
 /// A token's effective set is `owner_set ∩ scope`. `None` on a field means that
-/// dimension is not restricted (the token inherits the owner's repos, and all
-/// of the owner's actions **except `admin`**, which a scope must name
-/// explicitly). A scope can only ever **narrow**; see
+/// dimension is not restricted (the token inherits the owner's repos and
+/// levels), and `admin` is `false` unless the scope opts in to the owner's
+/// `admin` role. A scope can only ever **narrow**; see
 /// [`EffectiveSet::intersect_scope`].
 ///
-/// Unknown fields are **rejected** (`deny_unknown_fields`): a mistyped key such
-/// as `{"repos": [3]}` must fail to parse (a 400 at the admin API, fail-closed
-/// deny-all at evaluation) rather than silently produce an unscoped token.
-/// Stored scopes are always the canonical serialization of this struct (the
-/// admin API re-serializes what it validated), so they keep parsing.
+/// Unknown fields are **rejected**: a mistyped key such as `{"repos": [3]}`
+/// must fail to parse (a 400 at the admin API, fail-closed deny-all at
+/// evaluation) rather than silently produce an unscoped token. `actions`, the
+/// list of verbs that `level` and `admin` replaced, fails with a message naming
+/// them. Stored scopes are always the canonical serialization of this struct
+/// (the admin API re-serializes what it validated), so they keep parsing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "TokenScopeWire")]
 pub struct TokenScope {
-    /// Allowed actions; `None` ⇒ the owner's `read` / `write` / `delete`
-    /// (never `admin`, which must be listed explicitly).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actions: Option<Vec<Action>>,
+    /// The highest level the token keeps; `None` ⇒ the owner's levels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<Level>,
+    /// The opt-in to the admin API: the token keeps its owner's `admin` role
+    /// (only while `repositories` is unrestricted).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
     /// Allowed repository ids; `None` ⇒ all repos the owner can touch. A group
     /// listed here grants no read on its members (as for any principal): to
     /// read through a group, list the members it should serve from as well.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub repositories: Option<Vec<i64>>,
+}
+
+/// What a [`TokenScope`] deserializes from: its fields, plus `actions` to
+/// refuse by name.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenScopeWire {
+    #[serde(default)]
+    level: Option<Level>,
+    #[serde(default, deserialize_with = "null_is_false")]
+    admin: bool,
+    #[serde(default)]
+    repositories: Option<Vec<i64>>,
+    #[serde(default, deserialize_with = "present")]
+    actions: Option<()>,
+}
+
+impl TryFrom<TokenScopeWire> for TokenScope {
+    type Error = &'static str;
+
+    fn try_from(wire: TokenScopeWire) -> Result<Self, Self::Error> {
+        if wire.actions.is_some() {
+            return Err("`actions` is replaced by `level` (read, write or delete) \
+                        and `admin` (true to reach the admin API)");
+        }
+        Ok(TokenScope {
+            level: wire.level,
+            admin: wire.admin,
+            repositories: wire.repositories,
+        })
+    }
+}
+
+/// `admin: null` is `admin: false`, as an explicit `null` is an absent field
+/// for the other keys.
+fn null_is_false<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+    Option::<bool>::deserialize(de).map(Option::unwrap_or_default)
+}
+
+/// `Some(())` for a key that is present, whatever its value.
+fn present<'de, D: Deserializer<'de>>(de: D) -> Result<Option<()>, D::Error> {
+    serde::de::IgnoredAny::deserialize(de).map(|_| Some(()))
 }
 
 /// Parse a token's raw `scope` jsonb (`Option<serde_json::Value>` as loaded from
@@ -627,17 +678,17 @@ pub struct TokenScopeParseError(String);
 mod tests {
     use super::*;
 
-    /// Build an [`EffectiveSet`] from `(action, repo, selector)` tuples.
+    /// Build an [`EffectiveSet`] from `(level, repo, selector)` tuples.
     fn set(
         is_admin: bool,
-        grants: &[(Action, Option<i64>, Option<SelectorPatterns>)],
+        grants: &[(Level, Option<i64>, Option<SelectorPatterns>)],
     ) -> EffectiveSet {
         let raw = RawEffectiveSet {
             is_admin,
             grants: grants
                 .iter()
-                .map(|(a, r, s)| RawGrant {
-                    action: a.as_str().to_string(),
+                .map(|(l, r, s)| RawGrant {
+                    level: l.as_str().to_string(),
                     repo: *r,
                     selector: s.clone(),
                 })
@@ -653,82 +704,114 @@ mod tests {
         }
     }
 
+    fn scope(level: Option<Level>, admin: bool, repositories: Option<Vec<i64>>) -> TokenScope {
+        TokenScope {
+            level,
+            admin,
+            repositories,
+        }
+    }
+
+    // --- levels -------------------------------------------------------------
+
+    #[test]
+    fn levels_are_ordered() {
+        assert!(Level::Read < Level::Write);
+        assert!(Level::Write < Level::Delete);
+        assert_eq!(Level::ALL, [Level::Read, Level::Write, Level::Delete]);
+    }
+
+    #[test]
+    fn level_roundtrips_through_str() {
+        for l in Level::ALL {
+            assert_eq!(Level::parse(l.as_str()), Some(l));
+            assert_eq!(l.to_string(), l.as_str());
+        }
+        assert_eq!(Level::parse("admin"), None, "admin is no level");
+        assert_eq!(Level::parse("nope"), None);
+    }
+
     // --- repo-level gate matrix --------------------------------------------
 
     #[test]
     fn empty_set_denies_everything() {
         let s = EffectiveSet::empty();
-        for a in [Action::Read, Action::Write, Action::Delete, Action::Admin] {
-            assert!(!s.allows_repo(a, 1), "empty must deny {a:?}");
-            assert!(!s.allows_repo(a, 2));
+        for l in Level::ALL {
+            assert!(!s.allows_repo(l, 1), "empty must deny {l:?}");
+            assert!(!s.allows_repo(l, 2));
         }
         assert!(!s.is_admin());
     }
 
     #[test]
-    fn admin_allows_all_actions_and_repos() {
+    fn admin_allows_all_levels_and_repos() {
         let s = set(true, &[]);
-        for a in [Action::Read, Action::Write, Action::Delete, Action::Admin] {
-            assert!(s.allows_repo(a, 1));
-            assert!(s.allows_repo(a, 999));
+        for l in Level::ALL {
+            assert!(s.allows_repo(l, 1));
+            assert!(s.allows_repo(l, 999));
         }
         assert!(s.is_admin());
     }
 
     #[test]
     fn read_grant_on_repo_a_only() {
-        let s = set(false, &[(Action::Read, Some(1), None)]);
-        assert!(s.allows_repo(Action::Read, 1), "read on A");
-        assert!(!s.allows_repo(Action::Read, 2), "deny read on B");
-        assert!(!s.allows_repo(Action::Write, 1), "deny write on A");
-        assert!(!s.allows_repo(Action::Admin, 1));
+        let s = set(false, &[(Level::Read, Some(1), None)]);
+        assert!(s.allows_repo(Level::Read, 1), "read on A");
+        assert!(!s.allows_repo(Level::Read, 2), "deny read on B");
+        assert!(!s.allows_repo(Level::Write, 1), "deny write on A");
+        assert!(!s.allows_repo(Level::Delete, 1), "deny delete on A");
+    }
+
+    /// Each level includes the ones below it, and none above.
+    #[test]
+    fn a_grant_passes_its_level_and_every_lower_one() {
+        for granted in Level::ALL {
+            let s = set(false, &[(granted, Some(1), None)]);
+            for required in Level::ALL {
+                assert_eq!(
+                    s.allows_repo(required, 1),
+                    required <= granted,
+                    "{granted:?} grant, {required:?} check"
+                );
+            }
+        }
     }
 
     #[test]
     fn any_repo_grant_covers_every_repo() {
-        let s = set(false, &[(Action::Write, None, None)]);
-        assert!(s.allows_repo(Action::Write, 1));
-        assert!(s.allows_repo(Action::Write, 42));
-        assert!(
-            !s.allows_repo(Action::Read, 1),
-            "write ANY does not grant read"
-        );
+        let s = set(false, &[(Level::Write, None, None)]);
+        assert!(s.allows_repo(Level::Write, 1));
+        assert!(s.allows_repo(Level::Write, 42));
+        assert!(s.allows_repo(Level::Read, 1), "write includes read");
+        assert!(!s.allows_repo(Level::Delete, 1), "write excludes delete");
     }
 
     #[test]
     fn only_an_unscoped_any_repo_grant_covers_every_repo_ever() {
-        let writer = set(
-            false,
-            &[(Action::Read, None, None), (Action::Write, None, None)],
-        );
-        assert!(writer.allows_every_repo(Action::Write));
-        assert!(writer.allows_every_repo(Action::Read));
-        assert!(!writer.allows_every_repo(Action::Delete));
-        assert!(!writer.allows_every_repo(Action::Admin));
-        assert!(set(true, &[]).allows_every_repo(Action::Write), "admin");
+        let writer = set(false, &[(Level::Write, None, None)]);
+        assert!(writer.allows_every_repo(Level::Write));
+        assert!(writer.allows_every_repo(Level::Read));
+        assert!(!writer.allows_every_repo(Level::Delete));
+        assert!(set(true, &[]).allows_every_repo(Level::Delete), "admin");
         // One repository, or a package scope, is not every repository.
-        assert!(!set(false, &[(Action::Write, Some(1), None)]).allows_every_repo(Action::Write));
+        assert!(!set(false, &[(Level::Write, Some(1), None)]).allows_every_repo(Level::Write));
         assert!(
-            !set(false, &[(Action::Write, None, Some(sel(&["acme.*"], &[])))])
-                .allows_every_repo(Action::Write)
+            !set(false, &[(Level::Delete, None, Some(sel(&["acme.*"], &[])))])
+                .allows_every_repo(Level::Write)
         );
-        assert!(!EffectiveSet::empty().allows_every_repo(Action::Write));
+        assert!(!EffectiveSet::empty().allows_every_repo(Level::Read));
     }
 
     #[test]
     fn multiple_grants_union() {
         let s = set(
             false,
-            &[
-                (Action::Read, Some(1), None),
-                (Action::Write, Some(1), None),
-                (Action::Read, Some(2), None),
-            ],
+            &[(Level::Write, Some(1), None), (Level::Read, Some(2), None)],
         );
-        assert!(s.allows_repo(Action::Read, 1));
-        assert!(s.allows_repo(Action::Write, 1));
-        assert!(s.allows_repo(Action::Read, 2));
-        assert!(!s.allows_repo(Action::Write, 2), "no write grant on B");
+        assert!(s.allows_repo(Level::Read, 1));
+        assert!(s.allows_repo(Level::Write, 1));
+        assert!(s.allows_repo(Level::Read, 2));
+        assert!(!s.allows_repo(Level::Write, 2), "only read on B");
     }
 
     // --- selector semantics -------------------------------------------------
@@ -738,10 +821,10 @@ mod tests {
         // A selector-scoped read grant must still pass the repo-level gate.
         let s = set(
             false,
-            &[(Action::Read, Some(1), Some(sel(&["company.*"], &[])))],
+            &[(Level::Read, Some(1), Some(sel(&["company.*"], &[])))],
         );
         assert!(
-            s.allows_repo(Action::Read, 1),
+            s.allows_repo(Level::Read, 1),
             "selector-scoped read still reaches the repo"
         );
     }
@@ -751,7 +834,7 @@ mod tests {
         let s = set(
             false,
             &[(
-                Action::Read,
+                Level::Read,
                 Some(1),
                 Some(sel(&["company.*"], &["company.secret*"])),
             )],
@@ -773,7 +856,7 @@ mod tests {
     fn empty_include_means_match_all_minus_excludes() {
         let s = set(
             false,
-            &[(Action::Read, Some(1), Some(sel(&[], &["internal.*"])))],
+            &[(Level::Read, Some(1), Some(sel(&[], &["internal.*"])))],
         );
         let f = s.package_filter(1);
         assert!(f.allows("Anything.Goes"));
@@ -781,21 +864,38 @@ mod tests {
     }
 
     #[test]
-    fn unscoped_read_grant_yields_allow_all_filter() {
-        let s = set(false, &[(Action::Read, Some(1), None)]);
+    fn unscoped_grant_yields_allow_all_filter() {
+        let s = set(false, &[(Level::Read, Some(1), None)]);
         assert!(matches!(s.package_filter(1), PackageFilter::AllowAll));
+        let s = set(false, &[(Level::Delete, Some(1), None)]);
+        assert!(
+            matches!(s.package_filter(1), PackageFilter::AllowAll),
+            "a delete grant reads every package too"
+        );
     }
 
     #[test]
-    fn no_read_grant_yields_deny_all_filter() {
-        let s = set(false, &[(Action::Write, Some(1), None)]);
+    fn no_grant_yields_deny_all_filter() {
+        let s = set(false, &[(Level::Read, Some(2), None)]);
         assert!(matches!(s.package_filter(1), PackageFilter::DenyAll));
+        let s = set(false, &[(Level::Read, Some(1), None)]);
+        assert!(
+            matches!(
+                s.package_filter_for(Level::Write, 1),
+                PackageFilter::DenyAll
+            ),
+            "a read grant writes nothing"
+        );
     }
 
     #[test]
     fn admin_filter_is_allow_all() {
         let s = set(true, &[]);
         assert!(matches!(s.package_filter(7), PackageFilter::AllowAll));
+        assert!(matches!(
+            s.package_filter_for(Level::Delete, 7),
+            PackageFilter::AllowAll
+        ));
     }
 
     #[test]
@@ -804,8 +904,8 @@ mod tests {
         let s = set(
             false,
             &[
-                (Action::Read, Some(1), Some(sel(&["a.*"], &[]))),
-                (Action::Read, Some(1), Some(sel(&["b.*"], &[]))),
+                (Level::Read, Some(1), Some(sel(&["a.*"], &[]))),
+                (Level::Read, Some(1), Some(sel(&["b.*"], &[]))),
             ],
         );
         let f = s.package_filter(1);
@@ -821,8 +921,8 @@ mod tests {
         let s = set(
             false,
             &[
-                (Action::Read, Some(1), Some(sel(&["a.*"], &[]))),
-                (Action::Read, Some(1), None),
+                (Level::Read, Some(1), Some(sel(&["a.*"], &[]))),
+                (Level::Read, None, None),
             ],
         );
         assert!(matches!(s.package_filter(1), PackageFilter::AllowAll));
@@ -830,48 +930,72 @@ mod tests {
 
     #[test]
     fn any_repo_selector_grant_filters_each_repo() {
-        let s = set(false, &[(Action::Read, None, Some(sel(&["pub.*"], &[])))]);
-        assert!(s.allows_repo(Action::Read, 1));
-        assert!(s.allows_repo(Action::Read, 2));
+        let s = set(false, &[(Level::Read, None, Some(sel(&["pub.*"], &[])))]);
+        assert!(s.allows_repo(Level::Read, 1));
+        assert!(s.allows_repo(Level::Read, 2));
         let f1 = s.package_filter(1);
         assert!(f1.allows("Pub.A"));
         assert!(!f1.allows("Priv.A"));
     }
 
+    /// A selector-scoped grant filters every level it includes: what its
+    /// holder may write it may read too, and only a grant of the level counts.
     #[test]
-    fn package_filters_are_action_specific() {
+    fn package_filters_follow_the_level_order() {
         let s = set(
             false,
             &[
-                (Action::Read, Some(1), Some(sel(&["public.*"], &[]))),
-                (Action::Write, Some(1), Some(sel(&["publish.*"], &[]))),
-                (Action::Delete, Some(1), Some(sel(&["retire.*"], &[]))),
+                (Level::Read, Some(1), Some(sel(&["public.*"], &[]))),
+                (Level::Write, Some(1), Some(sel(&["publish.*"], &[]))),
+                (Level::Delete, Some(1), Some(sel(&["retire.*"], &[]))),
             ],
         );
 
-        let read = s.package_filter_for(Action::Read, 1);
+        let read = s.package_filter_for(Level::Read, 1);
         assert!(read.allows("Public.Tools"));
-        assert!(!read.allows("Publish.Tools"));
+        assert!(read.allows("Publish.Tools"), "a write grant reads too");
+        assert!(read.allows("Retire.Tools"), "a delete grant reads too");
+        assert!(!read.allows("Other.Tools"));
 
-        let write = s.package_filter_for(Action::Write, 1);
+        let write = s.package_filter_for(Level::Write, 1);
         assert!(write.allows("Publish.Tools"));
-        assert!(!write.allows("Public.Tools"));
+        assert!(write.allows("Retire.Tools"), "a delete grant writes too");
+        assert!(!write.allows("Public.Tools"), "a read grant writes nothing");
 
-        let delete = s.package_filter_for(Action::Delete, 1);
+        let delete = s.package_filter_for(Level::Delete, 1);
         assert!(delete.allows("Retire.Tools"));
         assert!(!delete.allows("Publish.Tools"));
+        assert!(!delete.allows("Public.Tools"));
+    }
+
+    /// The gap the levels close: a selector-scoped `write` grant used to say
+    /// nothing about reads, so its holder could push a package it could not
+    /// read. Now the same selector filters both.
+    #[test]
+    fn a_selector_scoped_write_grant_also_filters_reads() {
+        let s = set(
+            false,
+            &[(Level::Write, Some(1), Some(sel(&["acme.*"], &[])))],
+        );
+        assert!(s.allows_repo(Level::Read, 1));
+        let read = s.package_filter(1);
+        assert!(read.allows("Acme.Lib"));
+        assert!(!read.allows("Other.Lib"), "the selector filters reads");
+        let write = s.package_filter_for(Level::Write, 1);
+        assert!(write.allows("Acme.Lib"));
+        assert!(!write.allows("Other.Lib"));
     }
 
     #[test]
     fn intersect_requires_every_group_path_filter() {
         let outer = set(
             false,
-            &[(Action::Read, Some(1), Some(sel(&["company.*"], &[])))],
+            &[(Level::Read, Some(1), Some(sel(&["company.*"], &[])))],
         )
         .package_filter(1);
         let leaf = set(
             false,
-            &[(Action::Read, Some(2), Some(sel(&["*.public"], &[])))],
+            &[(Level::Read, Some(2), Some(sel(&["*.public"], &[])))],
         )
         .package_filter(2);
         let combined = outer.intersect(leaf);
@@ -884,201 +1008,170 @@ mod tests {
     // --- token scoping ------------------------------------------------------
 
     #[test]
-    fn default_scope_keeps_package_actions() {
+    fn default_scope_keeps_owner_levels() {
         let s = set(
             false,
-            &[
-                (Action::Read, Some(1), None),
-                (Action::Write, Some(1), None),
-                (Action::Delete, None, None),
-            ],
+            &[(Level::Write, Some(1), None), (Level::Delete, None, None)],
         );
         let scoped = s.intersect_scope(&TokenScope::default());
-        assert!(scoped.allows_repo(Action::Read, 1));
-        assert!(scoped.allows_repo(Action::Write, 1));
-        assert!(scoped.allows_repo(Action::Delete, 7), "ANY preserved");
+        assert!(scoped.allows_repo(Level::Write, 1));
+        assert!(scoped.allows_repo(Level::Delete, 7), "ANY preserved");
     }
 
     /// B4: an unscoped token (evaluated as the default scope) never carries
-    /// `admin` — neither an admin owner's short-circuit nor a per-repo grant.
+    /// the owner's `admin` role.
     #[test]
     fn default_scope_drops_admin() {
         let admin = set(true, &[]);
         let scoped = admin.intersect_scope(&TokenScope::default());
         assert!(!scoped.is_admin(), "unscoped admin token is not an admin");
-        assert!(!scoped.allows_repo(Action::Admin, 1));
         // …but keeps the admin's package-level reach everywhere.
-        for a in [Action::Read, Action::Write, Action::Delete] {
-            assert!(scoped.allows_repo(a, 1), "{a:?} kept");
-            assert!(scoped.allows_repo(a, 99), "{a:?} kept on ANY repo");
+        for l in Level::ALL {
+            assert!(scoped.allows_repo(l, 1), "{l:?} kept");
+            assert!(scoped.allows_repo(l, 99), "{l:?} kept on ANY repo");
         }
 
-        let repo_admin = set(
-            false,
-            &[
-                (Action::Admin, Some(1), None),
-                (Action::Read, Some(1), None),
-            ],
-        );
-        let scoped = repo_admin.intersect_scope(&TokenScope::default());
-        assert!(!scoped.allows_repo(Action::Admin, 1), "repo admin dropped");
-        assert!(scoped.allows_repo(Action::Read, 1));
-
-        // An actions-unrestricted but repo-restricted scope drops it too.
-        let scoped = repo_admin.intersect_scope(&TokenScope {
-            actions: None,
-            repositories: Some(vec![1]),
-        });
-        assert!(!scoped.allows_repo(Action::Admin, 1));
-
-        // Naming `admin` keeps the per-repo grant.
-        let scoped = repo_admin.intersect_scope(&TokenScope {
-            actions: Some(vec![Action::Admin]),
-            repositories: None,
-        });
-        assert!(scoped.allows_repo(Action::Admin, 1));
-        assert!(!scoped.allows_repo(Action::Read, 1), "read not named");
+        // A level-restricted scope without the opt-in drops it too.
+        let scoped = admin.intersect_scope(&scope(Some(Level::Read), false, None));
+        assert!(!scoped.is_admin());
     }
 
+    /// The scope's level caps every grant: lowered, never dropped, never raised.
     #[test]
-    fn scope_narrows_actions() {
+    fn scope_level_caps_grants() {
         let s = set(
             false,
             &[
-                (Action::Read, Some(1), None),
-                (Action::Write, Some(1), None),
+                (Level::Read, Some(1), None),
+                (Level::Write, Some(2), None),
+                (Level::Delete, Some(3), None),
             ],
         );
-        let scoped = s.intersect_scope(&TokenScope {
-            actions: Some(vec![Action::Read]),
-            repositories: None,
-        });
-        assert!(scoped.allows_repo(Action::Read, 1), "read kept");
-        assert!(!scoped.allows_repo(Action::Write, 1), "write dropped");
+        let scoped = s.intersect_scope(&scope(Some(Level::Write), false, None));
+        assert!(scoped.allows_repo(Level::Read, 1));
+        assert!(!scoped.allows_repo(Level::Write, 1), "read is not raised");
+        assert!(scoped.allows_repo(Level::Write, 2));
+        assert!(
+            scoped.allows_repo(Level::Write, 3),
+            "delete lowered to write"
+        );
+        assert!(!scoped.allows_repo(Level::Delete, 3), "delete capped");
+
+        let read_only = s.intersect_scope(&scope(Some(Level::Read), false, None));
+        for repo in [1, 2, 3] {
+            assert!(read_only.allows_repo(Level::Read, repo));
+            assert!(!read_only.allows_repo(Level::Write, repo));
+        }
     }
 
     #[test]
     fn scope_narrows_repositories() {
         let s = set(
             false,
-            &[(Action::Read, Some(1), None), (Action::Read, Some(2), None)],
+            &[(Level::Read, Some(1), None), (Level::Read, Some(2), None)],
         );
-        let scoped = s.intersect_scope(&TokenScope {
-            actions: None,
-            repositories: Some(vec![1]),
-        });
-        assert!(scoped.allows_repo(Action::Read, 1));
-        assert!(!scoped.allows_repo(Action::Read, 2), "repo 2 outside scope");
+        let scoped = s.intersect_scope(&scope(None, false, Some(vec![1])));
+        assert!(scoped.allows_repo(Level::Read, 1));
+        assert!(!scoped.allows_repo(Level::Read, 2), "repo 2 outside scope");
     }
 
     #[test]
     fn scope_cannot_widen_beyond_owner() {
-        // Owner only has repo 1; scoping to repo 2 grants nothing on repo 2.
-        let s = set(false, &[(Action::Read, Some(1), None)]);
-        let scoped = s.intersect_scope(&TokenScope {
-            actions: None,
-            repositories: Some(vec![2]),
-        });
+        // Owner only reads repo 1; scoping to repo 2 or a higher level grants
+        // nothing more.
+        let s = set(false, &[(Level::Read, Some(1), None)]);
+        let scoped = s.intersect_scope(&scope(Some(Level::Delete), true, Some(vec![2])));
         assert!(
-            !scoped.allows_repo(Action::Read, 2),
+            !scoped.allows_repo(Level::Read, 2),
             "scope can't grant repo owner lacks"
         );
-        assert!(!scoped.allows_repo(Action::Read, 1), "repo 1 not in scope");
+        assert!(!scoped.allows_repo(Level::Read, 1), "repo 1 not in scope");
+        let scoped = s.intersect_scope(&scope(Some(Level::Delete), true, None));
+        assert!(!scoped.allows_repo(Level::Write, 1), "level not raised");
+        assert!(!scoped.is_admin(), "admin opt-in needs an admin owner");
     }
 
     #[test]
     fn scope_expands_any_grant_to_allowed_repos_only() {
-        // Owner has read on ANY repo; scope restricts to repo 1 only.
-        let s = set(false, &[(Action::Read, None, None)]);
-        let scoped = s.intersect_scope(&TokenScope {
-            actions: None,
-            repositories: Some(vec![1]),
-        });
-        assert!(scoped.allows_repo(Action::Read, 1));
-        assert!(
-            !scoped.allows_repo(Action::Read, 2),
-            "ANY narrowed to scope"
-        );
+        // Owner writes on ANY repo; scope restricts to repo 1 at read.
+        let s = set(false, &[(Level::Write, None, None)]);
+        let scoped = s.intersect_scope(&scope(Some(Level::Read), false, Some(vec![1])));
+        assert!(scoped.allows_repo(Level::Read, 1));
+        assert!(!scoped.allows_repo(Level::Write, 1), "capped at read");
+        assert!(!scoped.allows_repo(Level::Read, 2), "ANY narrowed to scope");
     }
 
     #[test]
-    fn scope_drops_admin_unless_scoped_to_admin() {
+    fn scope_drops_admin_unless_it_opts_in() {
         let s = set(true, &[]);
-        let read_only = s.intersect_scope(&TokenScope {
-            actions: Some(vec![Action::Read]),
-            repositories: None,
-        });
+        let read_only = s.intersect_scope(&scope(Some(Level::Read), false, None));
         assert!(!read_only.is_admin(), "read-scoped token loses admin");
-        assert!(!read_only.allows_repo(Action::Admin, 1));
         // …but keeps the owner's (admin-implied) read everywhere.
-        assert!(read_only.allows_repo(Action::Read, 1));
-        assert!(!read_only.allows_repo(Action::Write, 1));
+        assert!(read_only.allows_repo(Level::Read, 1));
+        assert!(!read_only.allows_repo(Level::Write, 1));
 
-        let admin_scoped = s.intersect_scope(&TokenScope {
-            actions: Some(vec![Action::Admin]),
-            repositories: None,
-        });
+        let admin_scoped = s.intersect_scope(&scope(None, true, None));
         assert!(admin_scoped.is_admin(), "admin-scoped token keeps admin");
+        // The kept short-circuit allows every level, whatever the scope's.
+        let admin_read = s.intersect_scope(&scope(Some(Level::Read), true, None));
+        assert!(admin_read.is_admin());
+        assert!(admin_read.allows_repo(Level::Delete, 1));
     }
 
     #[test]
     fn repo_scoped_token_never_keeps_admin() {
         let s = set(true, &[]);
-        // Repo restriction only (actions unrestricted): admin must NOT survive.
-        let scoped = s.intersect_scope(&TokenScope {
-            actions: None,
-            repositories: Some(vec![1]),
-        });
+        // Repo restriction only (level unrestricted): admin must NOT survive.
+        let scoped = s.intersect_scope(&scope(None, false, Some(vec![1])));
         assert!(!scoped.is_admin(), "repo-scoped token loses global admin");
-        assert!(!scoped.allows_repo(Action::Admin, 1));
         // The admin's package-level reach is kept on the scoped repo only.
-        for a in [Action::Read, Action::Write, Action::Delete] {
-            assert!(scoped.allows_repo(a, 1), "{a:?} on scoped repo");
-            assert!(!scoped.allows_repo(a, 2), "{a:?} outside scope denied");
+        for l in Level::ALL {
+            assert!(scoped.allows_repo(l, 1), "{l:?} on scoped repo");
+            assert!(!scoped.allows_repo(l, 2), "{l:?} outside scope denied");
         }
         assert!(matches!(
-            scoped.package_filter_for(Action::Write, 1),
+            scoped.package_filter_for(Level::Write, 1),
             PackageFilter::AllowAll
         ));
 
-        // Even explicitly allowing `admin` does not restore it for a repo scope.
-        let with_admin = s.intersect_scope(&TokenScope {
-            actions: Some(vec![Action::Admin, Action::Write]),
-            repositories: Some(vec![1, 3]),
-        });
+        // Even opting in to `admin` does not restore it for a repo scope.
+        let with_admin = s.intersect_scope(&scope(Some(Level::Write), true, Some(vec![1, 3])));
         assert!(!with_admin.is_admin());
-        assert!(with_admin.allows_repo(Action::Write, 3));
-        assert!(!with_admin.allows_repo(Action::Read, 1), "read not allowed");
-        assert!(!with_admin.allows_repo(Action::Admin, 1));
+        assert!(with_admin.allows_repo(Level::Write, 3));
+        assert!(!with_admin.allows_repo(Level::Delete, 1), "capped at write");
+        assert!(!with_admin.allows_repo(Level::Read, 2));
     }
 
     #[test]
     fn scope_preserves_selectors() {
-        let s = set(false, &[(Action::Read, Some(1), Some(sel(&["a.*"], &[])))]);
-        let scoped = s.intersect_scope(&TokenScope {
-            actions: Some(vec![Action::Read]),
-            repositories: Some(vec![1]),
-        });
+        let s = set(false, &[(Level::Delete, Some(1), Some(sel(&["a.*"], &[])))]);
+        let scoped = s.intersect_scope(&scope(Some(Level::Read), false, Some(vec![1])));
         let f = scoped.package_filter(1);
         assert!(f.allows("A.One"));
         assert!(!f.allows("B.One"));
+        assert!(matches!(
+            scoped.package_filter_for(Level::Write, 1),
+            PackageFilter::DenyAll
+        ));
     }
 
     // --- build / parsing edge cases ----------------------------------------
 
     #[test]
-    fn unknown_action_is_dropped_fail_closed() {
-        let raw = RawEffectiveSet {
-            is_admin: false,
-            grants: vec![RawGrant {
-                action: "superuser".to_string(),
-                repo: Some(1),
-                selector: None,
-            }],
-        };
-        let s = EffectiveSet::build(&raw).expect("build");
-        for a in [Action::Read, Action::Write, Action::Delete, Action::Admin] {
-            assert!(!s.allows_repo(a, 1), "unknown action grants nothing");
+    fn unknown_level_is_dropped_fail_closed() {
+        for level in ["admin", "superuser"] {
+            let raw = RawEffectiveSet {
+                is_admin: false,
+                grants: vec![RawGrant {
+                    level: level.to_string(),
+                    repo: Some(1),
+                    selector: None,
+                }],
+            };
+            let s = EffectiveSet::build(&raw).expect("build");
+            for l in Level::ALL {
+                assert!(!s.allows_repo(l, 1), "{level} grants nothing");
+            }
         }
     }
 
@@ -1087,7 +1180,7 @@ mod tests {
         let raw = RawEffectiveSet {
             is_admin: false,
             grants: vec![RawGrant {
-                action: "read".to_string(),
+                level: "read".to_string(),
                 repo: Some(1),
                 selector: Some(SelectorPatterns {
                     includes: vec!["a[".to_string()], // unterminated class
@@ -1103,19 +1196,11 @@ mod tests {
     }
 
     #[test]
-    fn action_roundtrips_through_str() {
-        for a in [Action::Read, Action::Write, Action::Delete, Action::Admin] {
-            assert_eq!(Action::parse(a.as_str()), Some(a));
-        }
-        assert_eq!(Action::parse("nope"), None);
-    }
-
-    #[test]
     fn raw_set_serde_roundtrip() {
         let raw = RawEffectiveSet {
             is_admin: false,
             grants: vec![RawGrant {
-                action: "read".to_string(),
+                level: "write".to_string(),
                 repo: None,
                 selector: Some(sel(&["x.*"], &["x.secret"])),
             }],
@@ -1130,106 +1215,113 @@ mod tests {
     fn token_scope_rejects_unknown_fields() {
         assert!(parse_token_scope(Some(serde_json::json!({"repos": [3]}))).is_err());
         assert!(parse_token_scope(Some(serde_json::json!({
-            "actions": ["read"],
+            "level": "read",
             "repository": [3]
         })))
         .is_err());
+        assert!(parse_token_scope(Some(serde_json::json!({"level": "admin"}))).is_err());
         // Every canonical (serialized) form still parses.
         for scope in [
             TokenScope::default(),
-            TokenScope {
-                actions: Some(vec![Action::Read, Action::Admin]),
-                repositories: None,
-            },
-            TokenScope {
-                actions: None,
-                repositories: Some(vec![1, 2]),
-            },
-            TokenScope {
-                actions: Some(vec![]),
-                repositories: Some(vec![]),
-            },
+            scope(Some(Level::Read), true, None),
+            scope(None, false, Some(vec![1, 2])),
+            scope(Some(Level::Delete), false, Some(vec![])),
         ] {
             let stored = serde_json::to_value(&scope).unwrap();
             assert_eq!(parse_token_scope(Some(stored)).unwrap(), Some(scope));
         }
         // Explicit nulls are the same as absent fields.
         assert_eq!(
-            parse_token_scope(Some(serde_json::json!({"actions": null}))).unwrap(),
+            parse_token_scope(Some(serde_json::json!({
+                "level": null,
+                "admin": null,
+                "repositories": null
+            })))
+            .unwrap(),
             Some(TokenScope::default())
         );
+    }
+
+    /// `actions`, which `level` and `admin` replaced, is refused by name —
+    /// stored or sent, with any value — instead of being read as unscoped.
+    #[test]
+    fn token_scope_refuses_actions_naming_level() {
+        for actions in [
+            serde_json::json!(["read"]),
+            serde_json::json!(["admin"]),
+            serde_json::json!([]),
+            serde_json::Value::Null,
+        ] {
+            let err = parse_token_scope(Some(serde_json::json!({ "actions": actions })))
+                .expect_err("actions refused");
+            let message = err.to_string();
+            assert!(message.contains("`level`"), "{message}");
+            assert!(message.contains("`admin`"), "{message}");
+        }
     }
 
     // --- public read (anonymous reach for signed-in principals) ------------
 
     #[test]
-    fn public_read_adds_only_read_grants() {
-        let owner = set(false, &[(Action::Write, Some(1), None)]);
+    fn public_read_adds_the_anonymous_grants_capped_at_read() {
+        let owner = set(false, &[(Level::Write, Some(1), None)]);
         let public = set(
             false,
             &[
-                (Action::Read, Some(2), Some(sel(&["pub.*"], &[]))),
-                (Action::Write, Some(2), None),
-                (Action::Admin, Some(2), None),
+                (Level::Read, Some(2), Some(sel(&["pub.*"], &[]))),
+                (Level::Delete, Some(4), None),
             ],
         );
         let s = owner.with_public_read(&public, Some(3));
-        assert!(s.allows_repo(Action::Write, 1), "own grants kept");
-        assert!(s.allows_repo(Action::Read, 2), "anonymous-role read added");
-        assert!(
-            !s.allows_repo(Action::Write, 2),
-            "anonymous write not added"
-        );
-        assert!(
-            !s.allows_repo(Action::Admin, 2),
-            "anonymous admin not added"
-        );
-        assert!(s.allows_repo(Action::Read, 3), "anonymous_read flag added");
+        assert!(s.allows_repo(Level::Write, 1), "own grants kept");
+        assert!(s.allows_repo(Level::Read, 2), "anonymous-role read added");
+        assert!(s.allows_repo(Level::Read, 4), "anonymous delete reads");
+        assert!(!s.allows_repo(Level::Write, 4), "…capped at read");
+        assert!(!s.allows_repo(Level::Delete, 4));
+        assert!(s.allows_repo(Level::Read, 3), "anonymous_read flag added");
+        assert!(!s.allows_repo(Level::Write, 3));
         assert!(matches!(s.package_filter(3), PackageFilter::AllowAll));
         let f = s.package_filter(2);
         assert!(f.allows("Pub.Lib"), "selector preserved");
         assert!(!f.allows("Priv.Lib"));
         assert!(!s.is_admin());
+
+        // The public set's admin flag is never carried over.
+        let s = EffectiveSet::empty().with_public_read(&set(true, &[]), None);
+        assert!(!s.is_admin());
+        assert!(!s.allows_repo(Level::Read, 1));
     }
 
     #[test]
     fn public_read_never_widens_a_token_scope() {
         let owner = set(false, &[]);
-        let public = set(false, &[(Action::Read, None, None)]);
+        let public = set(false, &[(Level::Read, None, None)]);
         let with_public = owner.with_public_read(&public, Some(5));
-        assert!(with_public.allows_repo(Action::Read, 5));
-        assert!(with_public.allows_repo(Action::Read, 6));
+        assert!(with_public.allows_repo(Level::Read, 5));
+        assert!(with_public.allows_repo(Level::Read, 6));
 
         // A token scoped to repo 7 reaches only repo 7 (via the ANY grant).
-        let scoped = with_public.intersect_scope(&TokenScope {
-            actions: None,
-            repositories: Some(vec![7]),
-        });
+        let scoped = with_public.intersect_scope(&scope(None, false, Some(vec![7])));
         assert!(
-            !scoped.allows_repo(Action::Read, 5),
+            !scoped.allows_repo(Level::Read, 5),
             "flag repo out of scope"
         );
-        assert!(!scoped.allows_repo(Action::Read, 6), "ANY narrowed");
-        assert!(scoped.allows_repo(Action::Read, 7));
-
-        // A write-only token gains no read at all.
-        let scoped = with_public.intersect_scope(&TokenScope {
-            actions: Some(vec![Action::Write]),
-            repositories: None,
-        });
-        assert!(!scoped.allows_repo(Action::Read, 5));
-        assert!(!scoped.allows_repo(Action::Read, 6));
+        assert!(!scoped.allows_repo(Level::Read, 6), "ANY narrowed");
+        assert!(scoped.allows_repo(Level::Read, 7));
+        assert!(!scoped.allows_repo(Level::Write, 7), "nor raised");
     }
 
     #[test]
-    fn token_scope_serde_omits_none_fields() {
-        let scope = TokenScope {
-            actions: Some(vec![Action::Read]),
-            repositories: None,
-        };
-        let json = serde_json::to_string(&scope).unwrap();
-        assert_eq!(json, r#"{"actions":["read"]}"#);
+    fn token_scope_serde_omits_unset_fields() {
+        let s = scope(Some(Level::Read), false, None);
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"level":"read"}"#);
         let back: TokenScope = serde_json::from_str(&json).unwrap();
-        assert_eq!(scope, back);
+        assert_eq!(s, back);
+
+        let s = scope(None, true, Some(vec![4]));
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"admin":true,"repositories":[4]}"#);
+        assert_eq!(serde_json::to_string(&TokenScope::default()).unwrap(), "{}");
     }
 }

@@ -206,7 +206,7 @@ async function mintAdminToken({ cookie, csrf }: AdminSession): Promise<string> {
   const tokRes = await fetch(`${BASE_URL}/admin/me/tokens`, {
     method: 'POST',
     headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'e2e', scope: { actions: ['admin'] } }),
+    body: JSON.stringify({ name: 'e2e', scope: { admin: true } }),
   })
   if (!tokRes.ok) throw new Error(`POST /admin/me/tokens -> ${tokRes.status}`)
   const body: { token: string } = await tokRes.json()

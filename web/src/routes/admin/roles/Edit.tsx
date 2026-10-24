@@ -2,9 +2,11 @@ import { useState } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import {
-  ACTIONS,
   ANONYMOUS_ROLE,
-  type Action,
+  LEVEL_COVERS,
+  LEVELS,
+  levelLabel,
+  type Level,
   type RoleView,
 } from '~/api/rbac'
 import { authSourceLabel } from '~/api/users'
@@ -43,9 +45,9 @@ import {
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import {
-  ActionBadge,
   byId,
   InlineError,
+  LevelBadge,
   RepositoryLabel,
   repoNames,
   SelectorLabel,
@@ -59,9 +61,9 @@ export const Route = createFileRoute('/_app/manage/roles/$roleId')({
 /** What each built-in role means, shown on its page. */
 const BUILTIN_NOTES: Record<string, string> = {
   admin:
-    'Its members may do everything, on every repository and in this administration, whatever its grants say.',
+    'Its members may do everything, on every repository and in this administration. Administration is this role, not a grant level.',
   anonymous:
-    'Its grants apply to callers who do not sign in. Its read grants apply to every signed-in user too.',
+    'Its grants apply to callers who do not sign in. They apply to every signed-in user too, as read only.',
   authenticated:
     'It reads and writes every repository: the open access from before roles existed. No user gets it automatically; assign it like any other role.',
 }
@@ -73,8 +75,8 @@ const BUILTIN_NOTES: Record<string, string> = {
 const ADD_STRIP = 'grid gap-4 border-b border-line px-5 py-4'
 
 /**
- * One role: its description, its grants (repository or every repository, an
- * action, and optionally a content selector) and its members. Admins add and
+ * One role: its description, its grants (repository or every repository, a
+ * level, and optionally a content selector) and its members. Admins add and
  * remove grants and members here; a role that is not built in can be deleted
  * after a confirmation dialog naming what it takes along.
  */
@@ -189,7 +191,7 @@ function Grants({ role }: { role: RoleView }) {
     <Panel
       title="Grants"
       count={grants.data?.length}
-      description="What the role's holders may do. A content selector narrows a grant to the packages it matches."
+      description="What the role's holders may do: one level per repository, each level including the ones below it. A content selector narrows a grant to the packages it matches."
       flush
     >
       <AddGrantForm role={role} />
@@ -212,7 +214,7 @@ function Grants({ role }: { role: RoleView }) {
         <Table caption={`Grants of ${role.name}`}>
           <TableHead>
             <TableHeader>Repository</TableHeader>
-            <TableHeader width="120px">Action</TableHeader>
+            <TableHeader width="120px">Level</TableHeader>
             <TableHeader>Packages</TableHeader>
             <TableHeader align="right" width="96px">
               <span className="fg-sr">Actions</span>
@@ -225,7 +227,7 @@ function Grants({ role }: { role: RoleView }) {
                   <RepositoryLabel id={g.repository_id} names={names} />
                 </TableCell>
                 <TableCell>
-                  <ActionBadge action={g.action} />
+                  <LevelBadge level={g.level} />
                 </TableCell>
                 <TableCell>
                   <SelectorLabel id={g.selector_id} selectors={selectorMap} />
@@ -252,27 +254,22 @@ function Grants({ role }: { role: RoleView }) {
 }
 
 /**
- * Add a grant: a repository (or all of them), an action and optionally a
- * content selector. `admin` is offered only with all repositories, as the
- * API accepts it.
+ * Add a grant: a repository (or all of them), a level labelled with the Nexus
+ * actions it covers, and optionally a content selector. A role holds one
+ * grant per repository and selector, so adding one again sets its level.
  */
 function AddGrantForm({ role }: { role: RoleView }) {
   const repos = useRepositories()
   const selectors = useSelectors()
   const add = useAddGrant(role.id)
   const [repository, setRepository] = useState('')
-  const [action, setAction] = useState<Action>('read')
+  const [level, setLevel] = useState<Level>('read')
   const [selector, setSelector] = useState('')
-
-  function chooseRepository(value: string) {
-    setRepository(value)
-    if (value !== '' && action === 'admin') setAction('read')
-  }
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
     add.mutate({
-      action,
+      level,
       ...(repository !== '' ? { repository_id: Number(repository) } : {}),
       ...(selector !== '' ? { selector_id: Number(selector) } : {}),
     })
@@ -288,7 +285,7 @@ function AddGrantForm({ role }: { role: RoleView }) {
         <SelectField
           label="Repository"
           value={repository}
-          onChange={(e) => chooseRepository(e.target.value)}
+          onChange={(e) => setRepository(e.target.value)}
         >
           <option value="">All repositories</option>
           {sortedRepos.map((r) => (
@@ -298,18 +295,14 @@ function AddGrantForm({ role }: { role: RoleView }) {
           ))}
         </SelectField>
         <SelectField
-          label="Action"
-          value={action}
-          onChange={(e) => setAction(e.target.value as Action)}
-          description={
-            action === 'admin'
-              ? 'Accepted on all repositories only. Administration itself comes from holding the built-in admin role.'
-              : undefined
-          }
+          label="Level"
+          value={level}
+          onChange={(e) => setLevel(e.target.value as Level)}
+          description={`Covers ${LEVEL_COVERS[level]}.`}
         >
-          {ACTIONS.map((a) => (
-            <option key={a} value={a} disabled={a === 'admin' && repository !== ''}>
-              {a}
+          {LEVELS.map((l) => (
+            <option key={l} value={l}>
+              {levelLabel(l)}
             </option>
           ))}
         </SelectField>

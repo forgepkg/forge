@@ -228,8 +228,8 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # username_claim     = "preferred_username"  # (default)
 # email_claim        = "email"               # (default)
 # display_name_claim = "name"                # (default)
-# # provisioning
-# auto_provision             = true          # (default) create app_user on first login
+# # provisioning; whether a first login creates the account is set for each
+# # realm in the admin UI (Admin → Authentication), not here
 # link_existing_by_username  = false         # (default) opt-in; never links password accounts or admins
 # # admin assignment — empty admin_groups means OIDC never grants admin (safe default)
 # admin_groups = ["forge-admins"]            # group/role values that grant is_admin

@@ -14,9 +14,9 @@ import { renderApp } from '~/test/renderApp'
  *  - creating a role opens its page;
  *  - deleting a role first names the users and grants it takes along, in
  *    a confirmation dialog;
- *  - the role page adds grants (offering `admin` only on all repositories)
- *    and removes them, adds and removes members, and shows why the last
- *    administrator keeps `admin`;
+ *  - the role page adds grants (one level, labelled with the Nexus actions
+ *    it covers; adding one again sets its level) and removes them, adds and
+ *    removes members, and shows why the last administrator keeps `admin`;
  *  - a repository's page shows its anonymous access: the flag together with
  *    the anonymous role's grants, linking to the role.
  */
@@ -41,10 +41,10 @@ function seed() {
   api.state.roles.push({ id: 7, name: 'ci-pushers', description: 'CI', builtin: false })
   api.state.assignments.push([1, 1], [2, 7], [3, 7])
   api.state.grants.push(
-    { id: 30, role_id: 7, repository_id: 10, action: 'write', selector_id: null },
-    { id: 31, role_id: 7, repository_id: null, action: 'read', selector_id: 20 },
-    { id: 32, role_id: 2, repository_id: 11, action: 'read', selector_id: null },
-    { id: 33, role_id: 2, repository_id: 10, action: 'read', selector_id: 20 },
+    { id: 30, role_id: 7, repository_id: 10, level: 'write', selector_id: null },
+    { id: 31, role_id: 7, repository_id: null, level: 'read', selector_id: 20 },
+    { id: 32, role_id: 2, repository_id: 11, level: 'read', selector_id: null },
+    { id: 33, role_id: 2, repository_id: 10, level: 'read', selector_id: 20 },
   )
   vi.stubGlobal('fetch', vi.fn(api.fetch))
 }
@@ -117,24 +117,33 @@ describe('admin roles', () => {
     )
   })
 
-  it('adds a grant, offering admin only on all repositories', async () => {
+  it('adds a grant of one level, labelled with the Nexus actions', async () => {
     const u = userEvent.setup()
     await renderApp('/manage/roles/7')
 
     const form = await screen.findByRole('form', { name: 'Add grant' })
     const repository = within(form).getByLabelText('Repository')
-    const action = within(form).getByLabelText('Action')
+    const level = within(form).getByLabelText('Level')
     await waitFor(() =>
       expect(within(repository).getByRole('option', { name: 'internal' })).toBeInTheDocument(),
     )
 
-    // admin is offered with "All repositories" only.
-    await u.selectOptions(action, 'admin')
-    await u.selectOptions(repository, 'internal')
-    expect(action).toHaveValue('read')
-    expect(within(action).getByRole('option', { name: 'admin' })).toBeDisabled()
+    // Three ordered levels, each with what it covers; no admin.
+    expect(
+      within(level)
+        .getAllByRole('option')
+        .map((o) => o.textContent),
+    ).toEqual([
+      'read (browse, read)',
+      'write (browse, read, add, edit)',
+      'delete (browse, read, add, edit, delete)',
+    ])
+    expect(level).toHaveValue('read')
+    expect(within(form).getByText('Covers browse, read.')).toBeInTheDocument()
 
-    await u.selectOptions(action, 'delete')
+    await u.selectOptions(repository, 'internal')
+    await u.selectOptions(level, 'delete')
+    expect(within(form).getByText('Covers browse, read, add, edit, delete.')).toBeInTheDocument()
     await waitFor(() =>
       expect(within(form).getByRole('option', { name: 'acme' })).toBeInTheDocument(),
     )
@@ -143,7 +152,7 @@ describe('admin roles', () => {
 
     await waitFor(() => expect(api.sent('PUT', /\/grants$/)).toHaveLength(1))
     expect(api.sent('PUT', /\/grants$/)[0].body).toEqual({
-      action: 'delete',
+      level: 'delete',
       repository_id: 10,
       selector_id: 20,
     })
@@ -153,6 +162,27 @@ describe('admin roles', () => {
     const added = within(table).getByText('delete').closest('tr')!
     expect(within(added).getByRole('link', { name: 'internal' })).toBeInTheDocument()
     expect(within(added).getByRole('link', { name: 'acme' })).toBeInTheDocument()
+  })
+
+  it('sets the level of a grant the role has on that repository', async () => {
+    const u = userEvent.setup()
+    await renderApp('/manage/roles/7')
+
+    const form = await screen.findByRole('form', { name: 'Add grant' })
+    const repository = within(form).getByLabelText('Repository')
+    await waitFor(() =>
+      expect(within(repository).getByRole('option', { name: 'internal' })).toBeInTheDocument(),
+    )
+    await u.selectOptions(repository, 'internal')
+    await u.selectOptions(within(form).getByLabelText('Level'), 'read')
+    await u.click(within(form).getByRole('button', { name: 'Add grant' }))
+
+    await waitFor(() => expect(api.sent('PUT', /\/grants$/)).toHaveLength(1))
+    const grants = screen.getAllByRole('table')[0]
+    await waitFor(() => expect(within(grants).queryByText('write')).toBeNull())
+    const internal = within(grants).getByRole('link', { name: 'internal' }).closest('tr')!
+    expect(within(internal).getByText('read')).toBeInTheDocument()
+    expect(api.state.grants.filter((g) => g.role_id === 7)).toHaveLength(2)
   })
 
   it('removes a grant', async () => {

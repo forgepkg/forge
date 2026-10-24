@@ -1,7 +1,13 @@
 import type { ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 
-import type { Action, GrantView, RoleView, SelectorView } from '~/api/rbac'
+import {
+  LEVEL_COVERS,
+  type GrantView,
+  type Level,
+  type RoleView,
+  type SelectorView,
+} from '~/api/rbac'
 import { Notice, StatusBadge, type Tone } from '~/components/ui'
 
 /**
@@ -25,19 +31,22 @@ export function byId<T extends { id: number }>(
   return new Map((items ?? []).map((i) => [i.id, i]))
 }
 
-/** `admin` in heat (as everywhere admin shows), `delete` as a warning. */
-const ACTION_TONES: Record<Action, Tone> = {
-  admin: 'heat',
+/** `delete`, the level that removes versions, as a warning. */
+const LEVEL_TONES: Record<Level, Tone> = {
   delete: 'warn',
   write: 'neutral',
   read: 'neutral',
 }
 
-/** A grant's action as a badge. */
-export function ActionBadge({ action }: { action: Action }) {
+/** A grant's level as a badge, titled with the Nexus actions it covers. */
+export function LevelBadge({ level }: { level: Level }) {
   return (
-    <StatusBadge tone={ACTION_TONES[action] ?? 'neutral'} dot={false}>
-      {action}
+    <StatusBadge
+      tone={LEVEL_TONES[level] ?? 'neutral'}
+      dot={false}
+      title={`Covers ${LEVEL_COVERS[level]}`}
+    >
+      {level}
     </StatusBadge>
   )
 }
@@ -127,7 +136,7 @@ export function RoleLabel({
  * `write on nuget-internal (packages of acme)`.
  */
 export function grantText(
-  grant: Pick<GrantView, 'action' | 'repository_id' | 'selector_id'>,
+  grant: Pick<GrantView, 'level' | 'repository_id' | 'selector_id'>,
   names: RepoNames,
   selectors: ReadonlyMap<number, SelectorView>,
 ): string {
@@ -139,7 +148,7 @@ export function grantText(
     grant.selector_id == null
       ? ''
       : ` (packages of ${selectors.get(grant.selector_id)?.name ?? `selector #${grant.selector_id}`})`
-  return `${grant.action} on ${repo}${packages}`
+  return `${grant.level} on ${repo}${packages}`
 }
 
 /** A refused write or a failed load, where it happened (`role="alert"`). */

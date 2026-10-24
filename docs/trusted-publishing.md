@@ -411,10 +411,11 @@ metadata according to the configured anonymous policy.
   rules that map to the built-in global `admin` role.
 - Keep all rules for one issuer in one enabled realm. Forge rejects duplicate
   enabled WIF issuers so routing cannot depend on realm order.
-- Grant selector-scoped `read` **and** `write` on the intended hosted repository,
-  using the same include/exclude package selector such as `Acme.Widgets.*`.
-  `read` is required for a private feed's service-index GET; it does not widen
-  access beyond that selector on package-addressed routes.
+- Grant a selector-scoped `write` level (which includes `read`) on the
+  intended hosted repository, using an include/exclude package selector such
+  as `Acme.Widgets.*`. The `read` it includes serves a private feed's
+  service-index GET; it does not widen access beyond that selector on
+  package-addressed routes.
 - Prefer numeric provider IDs and add a protected ref/environment condition.
   A ref or environment is an additional boundary, not a workload identity by
   itself. Forge does not require one: a rule that pins only the repository or

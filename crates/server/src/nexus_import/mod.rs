@@ -55,7 +55,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use forge_core::auth::principal::{AuthMethod, Principal};
-use forge_core::authz::Action;
+use forge_core::authz::Level;
 use forge_core::repo::hosted::HostedWrite;
 use forge_core::repo::proxy::Credentials;
 use forge_core::repo::{ImportOptions, ImportOutcome, RepoKind, WriteError};
@@ -362,10 +362,10 @@ impl Run<'_> {
                 .map_err(|e| End::Failed(e.to_string()))?;
             let authz = &self.state.authz;
             let filter = authz
-                .package_filter_for(&principal, &repo, Action::Write)
+                .package_filter_for(&principal, &repo, Level::Write)
                 .await;
             let replace = authz
-                .package_filter_for(&principal, &repo, Action::Delete)
+                .package_filter_for(&principal, &repo, Level::Delete)
                 .await;
             Target::Packages(Box::new(crate::dispatch::hosted_write(
                 self.state,

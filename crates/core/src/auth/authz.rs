@@ -6,10 +6,11 @@
 //! [`Cache`] (the resolved effective-permission set, with cross-node
 //! invalidation) — and exposes the predicates the whole codebase routes through:
 //!
-//! * [`Authz::can_read`] — download / list / search.
-//! * [`Authz::can_write`] — push / relist.
-//! * [`Authz::can_delete`] — unlist / delete.
-//! * [`Authz::can_admin`] — repository config + privilege management.
+//! * [`Authz::can_read`] — download / list / search (level `read`).
+//! * [`Authz::can_write`] — push / relist (level `write`).
+//! * [`Authz::can_delete`] — unlist / delete (level `delete`).
+//! * [`Authz::is_global_admin`] — repository config + privilege management:
+//!   membership in the built-in `admin` role, never a grant.
 //! * [`Authz::package_filter`] — the package-level visibility predicate applied
 //!   when listing/serving packages and re-applied on direct download.
 //!
@@ -21,7 +22,9 @@
 //!
 //! ## Behavior (fine-grained RBAC)
 //! Each predicate resolves the principal's **effective set** (the additive union
-//! of its roles' grants) and asks the pure evaluator:
+//! of its roles' grants) and asks the pure evaluator whether a grant covering
+//! the repository has the required level or a higher one (`read` < `write` <
+//! `delete`):
 //!
 //! * **User** — its `user_role`-derived grants, loaded once per user and cached
 //!   ([`crate::authz::cache`]). Membership in the built-in `admin` role makes it
@@ -30,15 +33,15 @@
 //!   one shared key). On an un-migrated install that role has no grants ⇒ deny.
 //! * **Public read** — for `read` (the [`Authz::can_read`] gate and the read
 //!   package filter) every principal additionally holds the anonymous reach:
-//!   the `anonymous` role's `read` grants and the repository's
+//!   the `anonymous` role's grants capped at `read`, and the repository's
 //!   `anonymous_read` flag. Signing in therefore never loses access an
 //!   anonymous caller would have. This is added to the owner set *before* any
 //!   token scope is applied, so it is still cut down to the token's scope.
 //! * **Token-scoped** — when the principal carries a `token_id`, the token's
 //!   optional `scope` is loaded (outside the per-user cache) and **intersected**
 //!   with the owner's effective set *after* the cache lookup. A token can only
-//!   narrow, never widen, and it holds `admin` only when its scope lists the
-//!   `admin` action explicitly; an unscoped token (`NULL` scope) is evaluated
+//!   narrow, never widen, and it keeps the owner's `admin` role only when its
+//!   scope sets `admin: true`; an unscoped token (`NULL` scope) is evaluated
 //!   as the default scope, i.e. the owner's set without `admin`. See
 //!   [`EffectiveSet::intersect_scope`].
 //! * **Unauthenticated** — always denied.
@@ -60,7 +63,7 @@ use sqlx::PgPool;
 
 use super::principal::Principal;
 use crate::authz::cache as authz_cache;
-use crate::authz::{parse_token_scope, Action, EffectiveSet, PackageFilter, TokenScope};
+use crate::authz::{parse_token_scope, EffectiveSet, Level, PackageFilter, TokenScope};
 
 /// The authorization decision service (the single RBAC decision point).
 ///
@@ -120,7 +123,7 @@ impl Authz {
     ///
     /// With [`Self::with_public_read_for_signed_in`] (anonymous mode `all`),
     /// authenticated principals (users, tokens, workloads) hold the same public
-    /// reach — the flag and the `anonymous` role's `read` grants — on top of
+    /// reach — the flag and the `anonymous` role's grants capped at `read` — on top of
     /// their own grants, so a signed-in user without grants is not denied a repo
     /// any anonymous caller may read. For a token this is still intersected
     /// with the token's scope.
@@ -128,45 +131,37 @@ impl Authz {
     /// Fail-closed: an evaluation error logs and denies.
     pub async fn can_read(&self, principal: &Principal, repo: &Repository) -> bool {
         match self.read_effective(principal, repo).await {
-            Ok(eff) => eff.allows_repo(Action::Read, repo.id),
+            Ok(eff) => eff.allows_repo(Level::Read, repo.id),
             Err(()) => false,
         }
     }
 
     /// May `principal` write (push / relist) to `repo`?
     ///
-    /// Writing always requires a held `write` grant; anonymous callers can only
-    /// write if the `anonymous` role was explicitly granted `write` (it is not,
-    /// by default). Fail-closed.
+    /// Writing requires a held `write` or `delete` grant; anonymous callers
+    /// can only write if the `anonymous` role was explicitly granted `write`
+    /// (it is not, by default). Fail-closed.
     pub async fn can_write(&self, principal: &Principal, repo: &Repository) -> bool {
-        self.allows(principal, Action::Write, repo.id).await
+        self.allows(principal, Level::Write, repo.id).await
     }
 
     /// May `principal` delete / unlist a package from `repo`?
     ///
-    /// Delete is deliberately distinct from write so a publisher can be
+    /// `delete` is the highest level, above `write`, so a publisher can be
     /// allowed to add and relist packages without being able to remove them.
     pub async fn can_delete(&self, principal: &Principal, repo: &Repository) -> bool {
-        self.allows(principal, Action::Delete, repo.id).await
-    }
-
-    /// May `principal` perform admin operations on `repo`?
-    ///
-    /// Admin is the `admin`-role short-circuit; a per-repo `admin` grant also
-    /// satisfies it. Fail-closed.
-    pub async fn can_admin(&self, principal: &Principal, repo: &Repository) -> bool {
-        self.allows(principal, Action::Admin, repo.id).await
+        self.allows(principal, Level::Delete, repo.id).await
     }
 
     /// Is `principal` a **global admin** — i.e. a member of the built-in `admin`
     /// role?
     ///
-    /// This is the repo-less admin gate used by the privilege-management admin
-    /// API (`/admin/roles`, `/admin/users/{id}/roles`, …), which has no single
-    /// repository to scope against. It is satisfied **only** by the allow-all
-    /// `admin` short-circuit, never by a per-repo `admin` grant — managing roles
-    /// and grants is a server-wide capability. Fail-closed: an evaluation error
-    /// (or an anonymous / unauthenticated principal) denies.
+    /// This is the admin gate: the admin API (`/admin/*`) and every
+    /// administrative operation needs it. Administration is no grant level:
+    /// it is satisfied **only** by the allow-all `admin` short-circuit
+    /// (membership in the built-in `admin` role, and for a token the scope's
+    /// `admin: true` opt-in). Fail-closed: an evaluation error (or an
+    /// anonymous / unauthenticated principal) denies.
     pub async fn is_global_admin(&self, principal: &Principal) -> bool {
         match self.effective(principal).await {
             Ok(eff) => eff.is_admin(),
@@ -176,12 +171,12 @@ impl Authz {
 
     /// May `principal` write (publish) to **every** repository, ones created
     /// later included, with no package scope? True for the `admin` role and
-    /// for an unscoped `write` grant on ANY repository, such as the built-in
-    /// `writer` role's; a token scope narrows it like every other check.
-    /// Fail-closed.
+    /// for an unscoped `write` (or `delete`) grant on ANY repository, such as
+    /// the built-in `writer` role's; a token scope narrows it like every other
+    /// check. Fail-closed.
     pub async fn can_write_every_repository(&self, principal: &Principal) -> bool {
         match self.effective(principal).await {
-            Ok(eff) => eff.allows_every_repo(Action::Write),
+            Ok(eff) => eff.allows_every_repo(Level::Write),
             Err(()) => false,
         }
     }
@@ -193,10 +188,10 @@ impl Authz {
     /// (the caller returns 404, not 403, to avoid leaking existence). An
     /// evaluation error fails closed to [`PackageFilter::DenyAll`].
     pub async fn package_filter(&self, principal: &Principal, repo: &Repository) -> PackageFilter {
-        self.package_filter_for(principal, repo, Action::Read).await
+        self.package_filter_for(principal, repo, Level::Read).await
     }
 
-    /// The package predicate for a specific action on `repo`.
+    /// The package predicate for a required level on `repo`.
     ///
     /// The repo-level gate and package-level predicate intentionally remain
     /// separate: a selector-scoped grant reaches the repository, but only a
@@ -206,28 +201,28 @@ impl Authz {
         &self,
         principal: &Principal,
         repo: &Repository,
-        action: Action,
+        required: Level,
     ) -> PackageFilter {
         // Reads use the same set as `can_read` (own grants + public reach,
         // then the token scope): `anonymous_read` grants full package
         // visibility; without it, an anon-readable repo's gate would pass but
         // every package would be filtered out on a default-deny RBAC install.
-        let eff = if action == Action::Read {
+        let eff = if required == Level::Read {
             self.read_effective(principal, repo).await
         } else {
             self.effective(principal).await
         };
         match eff {
-            Ok(eff) => eff.package_filter_for(action, repo.id),
+            Ok(eff) => eff.package_filter_for(required, repo.id),
             Err(()) => PackageFilter::DenyAll,
         }
     }
 
     /// Resolve the principal's effective set and test the repo-level gate.
     /// Any error is logged and denied.
-    async fn allows(&self, principal: &Principal, action: Action, repo_id: i64) -> bool {
+    async fn allows(&self, principal: &Principal, required: Level, repo_id: i64) -> bool {
         match self.effective(principal).await {
-            Ok(eff) => eff.allows_repo(action, repo_id),
+            Ok(eff) => eff.allows_repo(required, repo_id),
             Err(()) => false,
         }
     }
@@ -240,7 +235,7 @@ impl Authz {
     }
 
     /// The effective set for **reading** `repo`: the principal's own set plus
-    /// the public read reach (the `anonymous` role's `read` grants and
+    /// the public read reach (the `anonymous` role's grants capped at `read`, and
     /// `repo.anonymous_read`), with any token scope applied *after* the union
     /// so a token can never read beyond its scope.
     async fn read_effective(
@@ -333,8 +328,8 @@ impl Authz {
     ///
     /// The scope is read **outside** the per-user cache (the cache holds the
     /// shared owner set). `NULL` scope ⇒ the default scope: the owner's
-    /// `read` / `write` / `delete` reach, never `admin` (B4: an API token is not
-    /// an admin credential unless its scope names `admin`). A malformed scope is
+    /// levels, never `admin` (B4: an API token is not an admin credential
+    /// unless its scope sets `admin: true`). A malformed scope is
     /// fail-closed: rather than fall back to the owner's full set (which would
     /// silently widen the token), the token is treated as carrying an
     /// **empty-allowlist** scope — it can touch nothing — and the error is logged.
@@ -359,12 +354,13 @@ impl Authz {
     }
 }
 
-/// A scope that allows no actions and no repositories — intersecting any owner
-/// set with it yields the empty (deny-all) set. Used as the fail-closed fallback
-/// for a token whose stored scope is malformed.
+/// A scope that allows no repositories — intersecting any owner set with it
+/// yields the empty (deny-all) set. Used as the fail-closed fallback for a
+/// token whose stored scope is malformed.
 fn deny_all_scope() -> TokenScope {
     TokenScope {
-        actions: Some(Vec::new()),
+        level: Some(Level::Read),
+        admin: false,
         repositories: Some(Vec::new()),
     }
 }
@@ -397,21 +393,21 @@ mod tests {
     }
 
     #[test]
-    fn deny_all_scope_is_empty_allowlists() {
+    fn deny_all_scope_is_an_empty_allowlist() {
         let s = deny_all_scope();
-        assert_eq!(s.actions, Some(Vec::new()));
+        assert!(!s.admin);
         assert_eq!(s.repositories, Some(Vec::new()));
     }
 
     #[tokio::test]
     async fn unauthenticated_denies_without_db() {
         // Unauthenticated short-circuits to the empty set: no DB touched, all
-        // actions denied. (The lazy pool would panic if queried.)
+        // levels denied. (The lazy pool would panic if queried.)
         let az = authz();
         let eff = az.effective(&Principal::Unauthenticated).await.expect("ok");
-        assert!(!eff.allows_repo(Action::Read, 1));
-        assert!(!eff.allows_repo(Action::Write, 1));
-        assert!(!eff.allows_repo(Action::Admin, 1));
+        for level in Level::ALL {
+            assert!(!eff.allows_repo(level, 1));
+        }
         assert!(!eff.is_admin());
     }
 

@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 
-use forge_core::authz::Action;
+use forge_core::authz::Level;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
 
@@ -120,7 +120,7 @@ impl Registry {
                 }
                 let serving = walk.serving
                     && self
-                        .rbac_allows(&caller.principal, &member, image, Action::Read)
+                        .rbac_allows(&caller.principal, &member, image, Level::Read)
                         .await;
                 // Without flags every hosted member owns; with flags only
                 // the flagged ones (and what flagged groups own).

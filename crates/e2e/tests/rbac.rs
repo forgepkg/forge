@@ -122,7 +122,7 @@ async fn matrix_read_write_any_and_fail_closed() {
     assert_eq!(
         delete_without_grant.status(),
         StatusCode::FORBIDDEN,
-        "write does not imply the distinct delete privilege"
+        "write does not include delete, the level above it"
     );
 
     // The bootstrap admin (admin role) is allow-all: it can read repo-b which the
@@ -155,12 +155,11 @@ async fn token_scope_narrows_below_owner() {
         );
     }
 
-    // Owner holds read+write on ANY repo.
+    // Owner holds write (with read) on ANY repo.
     let uid = srv
         .create_user("scoped-user@example.com", "pw-e2e-user-12")
         .await;
     let role = srv.create_role("rw-any").await;
-    assert_eq!(srv.add_grant(role, None, "read", None).await.status(), 201);
     assert_eq!(srv.add_grant(role, None, "write", None).await.status(), 201);
     assert_eq!(srv.assign_role(uid, role).await.status(), 204);
 
@@ -186,8 +185,8 @@ async fn token_scope_narrows_below_owner() {
         "unscoped token inherits the owner's write reach"
     );
 
-    // A token scoped to {actions:[read], repositories:[scoped-a]}.
-    let scope = serde_json::json!({"actions": ["read"], "repositories": [a_id]});
+    // A token scoped to {level: read, repositories: [scoped-a]}.
+    let scope = serde_json::json!({"level": "read", "repositories": [a_id]});
     let limited = srv.issue_token(uid, Some(scope)).await;
 
     assert_eq!(
@@ -209,7 +208,7 @@ async fn token_scope_narrows_below_owner() {
     );
 }
 
-/// A token's scope can never out-grant its owner: scoping a token to an action /
+/// A token's scope can never out-grant its owner: scoping a token to a level /
 /// repo the owner lacks contributes nothing (intersection, never union).
 #[tokio::test]
 async fn token_scope_cannot_widen_owner() {
@@ -234,8 +233,8 @@ async fn token_scope_cannot_widen_owner() {
     );
     assert_eq!(srv.assign_role(uid, role).await.status(), 204);
 
-    // A scope that *claims* write does not grant it — the owner has no write.
-    let scope = serde_json::json!({"actions": ["read", "write", "delete", "admin"]});
+    // A scope that *claims* delete does not grant it — the owner has no write.
+    let scope = serde_json::json!({"level": "delete", "admin": true});
     let token = srv.issue_token(uid, Some(scope)).await;
 
     assert_eq!(
@@ -361,14 +360,12 @@ async fn content_selector_filters_reads_and_package_mutations() {
         .create_user("selector-user@example.com", "pw-e2e-user-12")
         .await;
     let role = srv.create_role("selector-role").await;
-    for action in ["read", "write", "delete"] {
-        assert_eq!(
-            srv.add_grant(role, Some("selected"), action, Some(selector))
-                .await
-                .status(),
-            201
-        );
-    }
+    assert_eq!(
+        srv.add_grant(role, Some("selected"), "delete", Some(selector))
+            .await
+            .status(),
+        201
+    );
     assert_eq!(srv.assign_role(user, role).await.status(), 204);
     let token = srv.issue_token(user, None).await;
 
@@ -950,7 +947,7 @@ async fn admin_api_requires_admin_scoped_token() {
     );
 
     let automation = srv
-        .issue_token(admin_id, Some(serde_json::json!({"actions": ["admin"]})))
+        .issue_token(admin_id, Some(serde_json::json!({"admin": true})))
         .await;
     assert_eq!(
         mint(automation.clone()).await,

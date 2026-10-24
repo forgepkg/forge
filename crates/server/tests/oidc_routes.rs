@@ -900,15 +900,15 @@ async fn logout_revokes_session_and_clears_cookie() {
 
 // ── /auth/me + /auth/tokens (session-authenticated) ──────────────────────────
 
-/// Drive a full login and return `(session_cookie, csrf_token)` for the
-/// provisioned user. Shared by the /auth/me + token-minting tests.
-async fn login_and_get_cookie(
+/// Drive a login through the enabled OIDC realm and return the callback's
+/// response.
+async fn sign_in(
     idp: &MockIdp,
     srv: &common::TestServer,
     sub: &str,
     username: &str,
     roles: Value,
-) -> (String, String) {
+) -> reqwest::Response {
     let resp = no_redirect_client()
         .get(format!("{}/auth/oidc/login", srv.base_url))
         .send()
@@ -920,7 +920,7 @@ async fn login_and_get_cookie(
     let nonce = peek_nonce(&srv.pool, &state).await;
     idp.mount_token_with_claims(id_claims(&idp.issuer, sub, username, &nonce, roles))
         .await;
-    let resp = no_redirect_client()
+    no_redirect_client()
         .get(format!(
             "{}/auth/oidc/callback?code=c&state={state}",
             srv.base_url
@@ -928,7 +928,19 @@ async fn login_and_get_cookie(
         .header("cookie", &flow)
         .send()
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// Drive a full login and return `(session_cookie, csrf_token)` for the
+/// provisioned user. Shared by the /auth/me + token-minting tests.
+async fn login_and_get_cookie(
+    idp: &MockIdp,
+    srv: &common::TestServer,
+    sub: &str,
+    username: &str,
+    roles: Value,
+) -> (String, String) {
+    let resp = sign_in(idp, srv, sub, username, roles).await;
     let set_cookie = resp
         .headers()
         .get("set-cookie")
@@ -1165,6 +1177,91 @@ async fn required_claims_gate_the_callback() {
             .any(|v| v.to_str().unwrap_or("").starts_with("forge_session="));
         assert_eq!(sets_session, allowed, "tid = {tid}");
     }
+}
+
+/// #313: whether a login creates an unknown user's account is each OIDC
+/// realm's own `auto_provision`. The realm the `[oidc]` block seeds has it
+/// on and creates the account; another realm of the same IdP, created with
+/// it off, refuses the next unknown user.
+#[tokio::test]
+async fn each_oidc_realm_decides_whether_a_login_creates_the_account() {
+    let idp = MockIdp::start().await;
+    // A database of its own: the test adds a second OIDC realm.
+    let srv = start_with(
+        common::fresh_pool().await,
+        ServerOpts {
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (admin, password) = srv.admin_basic();
+    let seeded = forge_db::auth_realm_dao::find_realm_by_name(&srv.pool, "oidc")
+        .await
+        .unwrap()
+        .expect("seeded realm");
+    assert_eq!(seeded.config["auto_provision"], json!(true));
+
+    // Created disabled: one OIDC realm is enabled at a time.
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "kind": "oidc",
+            "name": "invited-only",
+            "enabled": false,
+            "config": {
+                "issuer": idp.issuer,
+                "client_id": CLIENT_ID,
+                "client_secret": "shh-secret",
+                "allow_http_issuer": true,
+                "auto_provision": false,
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    let invited_only = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+
+    let n = common::unique();
+    let created = format!("first-{n}@corp.example");
+    let resp = sign_in(&idp, &srv, &format!("sub-a-{n}"), &created, json!([])).await;
+    assert_eq!(resp.status(), 302);
+    assert!(resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|c| c.to_str().unwrap().starts_with("forge_session=")));
+    assert!(
+        forge_db::user_dao::find_user_by_username(&srv.pool, &created)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    for (id, enabled) in [(seeded.id, false), (invited_only, true)] {
+        let resp = srv
+            .client()
+            .patch(format!("{}/admin/realms/{id}", srv.base_url))
+            .basic_auth(&admin, Some(&password))
+            .json(&json!({ "enabled": enabled }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    }
+
+    let refused = format!("second-{n}@corp.example");
+    let resp = sign_in(&idp, &srv, &format!("sub-b-{n}"), &refused, json!([])).await;
+    assert_login_error(&resp, "not_permitted");
+    assert!(
+        forge_db::user_dao::find_user_by_username(&srv.pool, &refused)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Starting an OIDC login stores a flow row, so starts are rate-limited per

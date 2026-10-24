@@ -1,26 +1,28 @@
 import type { TokenScope } from '~/api/tokens'
-import { ACTIONS, type Action } from '~/api/rbac'
+import { LEVELS, levelLabel, type Level } from '~/api/rbac'
 import { parseTokenScope } from '~/components/TokenBadges'
 import { Checkbox, RadioGroup } from '~/components/ui'
 
 /**
  * The scope of a token being created or changed, as a form edits it. A scope
  * only narrows the owner's access: without one the token carries the owner's
- * read, write and delete (never admin) on every repository the owner can
- * reach.
+ * levels (never admin) on every repository the owner can reach.
  */
 export interface ScopeDraft {
-  /** `false`: the owner's read / write / delete; `true`: `actions` only. */
-  limitActions: boolean
-  actions: Action[]
+  /** `false`: the owner's levels; `true`: at most `level`. */
+  limitLevel: boolean
+  level: Level
+  /** Keep the owner's admin role (the admin API); not with `limitRepositories`. */
+  admin: boolean
   /** `false`: every repository the owner reaches; `true`: `repositories` only. */
   limitRepositories: boolean
   repositories: number[]
 }
 
 export const UNSCOPED: ScopeDraft = {
-  limitActions: false,
-  actions: ['read'],
+  limitLevel: false,
+  level: 'read',
+  admin: false,
   limitRepositories: false,
   repositories: [],
 }
@@ -30,8 +32,9 @@ export function draftFromScope(scope: unknown): ScopeDraft {
   const parsed = parseTokenScope(scope)
   if (parsed == null || parsed === 'invalid') return UNSCOPED
   return {
-    limitActions: parsed.actions !== undefined,
-    actions: (parsed.actions ?? ['read']) as Action[],
+    limitLevel: parsed.level !== undefined,
+    level: parsed.level ?? 'read',
+    admin: parsed.admin === true,
     limitRepositories: parsed.repositories !== undefined,
     repositories: parsed.repositories ?? [],
   }
@@ -42,43 +45,29 @@ export function draftFromScope(scope: unknown): ScopeDraft {
  * repository restriction, where the server would not keep it anyway.
  */
 export function scopeFromDraft(draft: ScopeDraft): TokenScope | null {
-  if (!draft.limitActions && !draft.limitRepositories) return null
+  const admin = draft.admin && !draft.limitRepositories
+  if (!draft.limitLevel && !draft.limitRepositories && !admin) return null
   const scope: TokenScope = {}
-  if (draft.limitActions) {
-    scope.actions = ACTIONS.filter(
-      (a) =>
-        draft.actions.includes(a) &&
-        !(a === 'admin' && draft.limitRepositories),
-    )
-  }
+  if (draft.limitLevel) scope.level = draft.level
+  if (admin) scope.admin = true
   if (draft.limitRepositories) scope.repositories = [...draft.repositories]
   return scope
 }
 
 /** Why the draft cannot be saved, or `null`. */
 export function draftProblem(draft: ScopeDraft): string | null {
-  if (draft.limitActions && (scopeFromDraft(draft)?.actions ?? []).length === 0) {
-    return 'Choose at least one action.'
-  }
   if (draft.limitRepositories && draft.repositories.length === 0) {
     return 'Choose at least one repository.'
   }
   return null
 }
 
-const ACTION_HELP: Record<Action, string> = {
-  read: 'Download and browse packages and images.',
-  write: 'Push packages and images.',
-  delete: 'Delete (and, where allowed, overwrite) versions.',
-  admin:
-    'Call the admin API, when the owner is an administrator. Only with every repository.',
-}
-
 /**
- * The scope fields of a token form: which actions and which repositories,
- * side by side (stacked on narrow screens). Choosing "Only these …" opens
- * the checkboxes under it. `repositories` are those the picker offers (an
- * admin sees all of them; a user the ones they can read).
+ * The scope fields of a token form: which level (and the admin API) and which
+ * repositories, side by side (stacked on narrow screens). Choosing "At most
+ * this level" or "Only these repositories" opens the choices under it.
+ * `repositories` are those the picker offers (an admin sees all of them; a
+ * user the ones they can read).
  */
 export function TokenScopeFields({
   value,
@@ -89,12 +78,6 @@ export function TokenScopeFields({
   onChange: (draft: ScopeDraft) => void
   repositories: ReadonlyArray<{ id: number; name: string }>
 }) {
-  function toggleAction(action: Action, on: boolean) {
-    const actions = on
-      ? [...value.actions, action]
-      : value.actions.filter((a) => a !== action)
-    onChange({ ...value, actions })
-  }
   function toggleRepository(id: number, on: boolean) {
     const repos = on
       ? [...value.repositories, id]
@@ -112,35 +95,41 @@ export function TokenScopeFields({
     <div className="fg-fieldrow">
       <div className="grid content-start gap-3">
         <RadioGroup
-          legend="Actions"
-          value={value.limitActions ? 'only' : 'owner'}
-          onChange={(v) => onChange({ ...value, limitActions: v === 'only' })}
+          legend="Level"
+          value={value.limitLevel ? 'only' : 'owner'}
+          onChange={(v) => onChange({ ...value, limitLevel: v === 'only' })}
           options={[
             {
               value: 'owner',
-              label: "The owner's read, write and delete",
-              description: 'Never admin.',
+              label: "The owner's levels",
+              description: 'Up to delete, wherever the owner has it.',
             },
-            { value: 'only', label: 'Only these actions' },
+            { value: 'only', label: 'At most this level' },
           ]}
         />
-        {value.limitActions && (
-          <div role="group" aria-label="Actions of the token" className="fg-choice-list pl-6">
-            {ACTIONS.map((action) => {
-              const disabled = action === 'admin' && value.limitRepositories
-              return (
-                <Checkbox
-                  key={action}
-                  label={action}
-                  description={ACTION_HELP[action]}
-                  checked={value.actions.includes(action) && !disabled}
-                  disabled={disabled}
-                  onChange={(c) => toggleAction(action, c)}
-                />
-              )
-            })}
+        {value.limitLevel && (
+          <div role="group" aria-label="Level of the token" className="pl-6">
+            <RadioGroup
+              value={value.level}
+              onChange={(level) => onChange({ ...value, level })}
+              options={LEVELS.map((level) => ({
+                value: level,
+                label: levelLabel(level),
+              }))}
+            />
           </div>
         )}
+        <Checkbox
+          label="Admin API"
+          description={
+            value.limitRepositories
+              ? 'Only with every repository.'
+              : 'Call the admin API, when the owner is an administrator.'
+          }
+          checked={value.admin && !value.limitRepositories}
+          disabled={value.limitRepositories}
+          onChange={(admin) => onChange({ ...value, admin })}
+        />
       </div>
 
       <div className="grid content-start gap-3">
