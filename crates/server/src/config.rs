@@ -731,11 +731,6 @@ pub struct UpstreamBasicAuthConfig {
     /// fetches the groups re-applies it (grants and demotes).
     #[serde(default)]
     pub admin_group: String,
-    /// Ignored since 2.0: credential forwarding creates no accounts (an
-    /// administrator creates each one). Still accepted so an existing block
-    /// keeps loading.
-    #[serde(default)]
-    pub auto_provision: Option<bool>,
     /// Validated-credential cache TTLs + the secret pepper.
     #[serde(default)]
     pub cache: CredCacheConfig,
@@ -757,7 +752,6 @@ impl std::fmt::Debug for UpstreamBasicAuthConfig {
             .field("groups_path", &self.groups_path)
             .field("identity_path", &self.identity_path)
             .field("admin_group", &self.admin_group)
-            .field("auto_provision", &self.auto_provision)
             .field("cache", &self.cache) // cache's own Debug redacts the pepper
             .finish()
     }
@@ -1544,8 +1538,12 @@ fn default_web_assets_dir() -> String {
 /// rest when `[crypto]` is enabled.
 ///
 /// Unknown keys are refused, like in a realm config set through the admin
-/// API: a misspelled `required_claims` or `auto_provision` would otherwise
-/// seed the realm with that gate turned off.
+/// API: a misspelled `required_claims` would otherwise seed the realm with
+/// that gate turned off.
+///
+/// Whether the realm creates an account on a user's first login is not set
+/// here: it is the realm's own `auto_provision`, on its page in the admin UI
+/// (the seed creates the realm with it on).
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OidcConfig {
@@ -1604,9 +1602,6 @@ pub struct OidcConfig {
     pub display_name_claim: String,
 
     // ---- provisioning ----
-    /// Create an `app_user` on first successful login when no link exists.
-    #[serde(default = "default_true")]
-    pub auto_provision: bool,
     /// Link a new OIDC identity to an existing `app_user` whose `username`
     /// matches the resolved username claim. Off by default (the claim is
     /// IdP-controlled); even when on, accounts with a local password or admin
@@ -1685,7 +1680,6 @@ impl std::fmt::Debug for OidcConfig {
             .field("username_claim", &self.username_claim)
             .field("email_claim", &self.email_claim)
             .field("display_name_claim", &self.display_name_claim)
-            .field("auto_provision", &self.auto_provision)
             .field("link_existing_by_username", &self.link_existing_by_username)
             .field("admin_groups", &self.admin_groups)
             .field("admin_claim", &self.admin_claim)
@@ -3126,7 +3120,6 @@ mod tests {
             jail.set_env("FORGE_OIDC__USERNAME_CLAIM", "preferred_username");
             jail.set_env("FORGE_OIDC__EMAIL_CLAIM", "email");
             jail.set_env("FORGE_OIDC__DISPLAY_NAME_CLAIM", "name");
-            jail.set_env("FORGE_OIDC__AUTO_PROVISION", "false");
             jail.set_env("FORGE_OIDC__LINK_EXISTING_BY_USERNAME", "false");
             jail.set_env("FORGE_OIDC__ADMIN_GROUPS", "[forge-admins]");
             jail.set_env("FORGE_OIDC__ADMIN_CLAIM", "groups");
@@ -3172,7 +3165,6 @@ mod tests {
             assert_eq!(oidc.username_claim, "preferred_username");
             assert_eq!(oidc.email_claim, "email");
             assert_eq!(oidc.display_name_claim, "name");
-            assert!(!oidc.auto_provision);
             assert!(!oidc.link_existing_by_username);
             assert_eq!(oidc.admin_groups, vec!["forge-admins".to_string()]);
             assert_eq!(oidc.admin_claim, "groups");
@@ -3699,7 +3691,6 @@ mod tests {
         assert_eq!(oidc.username_claim, "preferred_username");
         assert_eq!(oidc.email_claim, "email");
         assert_eq!(oidc.display_name_claim, "name");
-        assert!(oidc.auto_provision);
         assert!(
             !oidc.link_existing_by_username,
             "linking by username is opt-in"
@@ -3889,13 +3880,11 @@ mod tests {
                 "https://forge.test/auth/oidc/callback",
             );
             jail.set_env("FORGE_OIDC__ADMIN_GROUPS", "[forge-admins]");
-            jail.set_env("FORGE_OIDC__AUTO_PROVISION", "false");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
             let oidc = cfg.oidc.expect("present via env");
             assert_eq!(oidc.client_id, "cid");
             assert_eq!(oidc.client_secret, "csecret");
             assert_eq!(oidc.admin_groups, vec!["forge-admins".to_string()]);
-            assert!(!oidc.auto_provision);
             Ok(())
         });
     }
@@ -3945,6 +3934,23 @@ mod tests {
         let oidc = minimal_with_oidc("\nrequired_claims = { tid = [\"tenant\"] }");
         let cfg = Config::from_figment(fig_from_toml(&oidc)).expect("valid");
         assert_eq!(cfg.oidc.unwrap().required_claims["tid"], vec!["tenant"]);
+    }
+
+    /// #313: whether a realm creates accounts is set on the realm alone, so
+    /// neither seed block knows `auto_provision` any more; a block that still
+    /// sets it fails to load like one with any other unknown key.
+    #[test]
+    fn legacy_realm_seeds_refuse_auto_provision() {
+        let upstream = minimal_with_upstream("").replace(
+            "[auth.upstream_basic.cache]",
+            "auto_provision = false\n[auth.upstream_basic.cache]",
+        );
+        let err = Config::from_figment(fig_from_toml(&upstream)).unwrap_err();
+        assert!(err.to_string().contains("auto_provision"), "{err}");
+
+        let oidc = minimal_with_oidc("\nauto_provision = false");
+        let err = Config::from_figment(fig_from_toml(&oidc)).unwrap_err();
+        assert!(err.to_string().contains("auto_provision"), "{err}");
     }
 
     /// `HTTPS://` and surrounding whitespace pass validation, so they must
@@ -4167,7 +4173,6 @@ mod tests {
         assert_eq!(ub.reject_status, vec![401, 403]);
         assert_eq!(ub.connect_timeout_ms, 2000);
         assert_eq!(ub.request_timeout_ms, 5000);
-        assert_eq!(ub.auto_provision, None, "ignored since 2.0");
         assert_eq!(ub.cache.positive_ttl_secs, 300);
         assert_eq!(ub.cache.negative_ttl_secs, 30);
         // to_core mirrors the block.

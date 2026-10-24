@@ -80,8 +80,8 @@ pub enum ResolveError {
 }
 
 /// How identity resolution should provision / link users. Built by the server
-/// from its `OidcConfig`; kept in `core` so the resolution logic is testable
-/// without the server crate.
+/// from an `oidc` realm's config; kept in `core` so the resolution logic is
+/// testable without the server crate.
 #[derive(Debug, Clone)]
 pub struct ResolvePolicy {
     /// Create a fresh `app_user` on first login when no link/match exists.
