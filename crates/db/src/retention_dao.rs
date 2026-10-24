@@ -578,16 +578,11 @@ pub async fn lock_proxy_package_candidates(
     repository_id: i64,
     name: &str,
 ) -> sqlx::Result<Vec<ProxyCandidateRow>> {
+    crate::proxy_dao::lock_cached_package(conn, repository_id, name).await?;
     sqlx::query_as::<_, ProxyCandidateRow>(
         r#"
         SELECT p.id AS cached_version_id, p.name, p.version, p.listed, p.first_seen_at,
-               p.last_downloaded_at,
-               COALESCE((
-                   SELECT SUM(a.size)
-                   FROM component c JOIN asset a ON a.component_id = c.id
-                   WHERE c.repository_id = p.repository_id
-                     AND c.name = p.name AND c.version = p.version
-               ), 0)::bigint AS size_bytes
+               p.last_downloaded_at, 0::bigint AS size_bytes
         FROM proxy_cached_version p
         WHERE p.repository_id = $1 AND p.name = $2
           AND p.downloaded AND p.not_found = false

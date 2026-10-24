@@ -1231,14 +1231,17 @@ async fn proxy_size_budget_rechecks_keep_last_n_after_a_newer_version_is_unliste
     )
     .await
     .unwrap();
-    for (i, (version, pulled_days_ago)) in [("1.0.0", 60), ("2.0.0", 1)].into_iter().enumerate() {
+    for (i, (version, pulled_days_ago)) in [("1.0.0", 60), ("2.0.0", 20), ("3.0.0", 1)]
+        .into_iter()
+        .enumerate()
+    {
         let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
         seed_component(&pool, repo.id, "lib", version, &sha, 100).await;
         seed_cached_version(&pool, repo.id, version, true, Some(pulled_days_ago)).await;
     }
     let policy_json = json!({
         "version": 1,
-        "size_budget": { "max_bytes": 150, "target_bytes": 100 },
+        "size_budget": { "max_bytes": 250, "target_bytes": 100 },
         "rules": [{
             "id": "keep-latest",
             "action": "hard_delete",
@@ -1299,14 +1302,14 @@ async fn proxy_size_budget_rechecks_keep_last_n_after_a_newer_version_is_unliste
             .iter()
             .map(|decision| decision.version.as_str())
             .collect::<Vec<_>>(),
-        vec!["1.0.0"]
+        vec!["1.0.0", "2.0.0"]
     );
     let mut decisions = ordinary;
     decisions.append(&mut plan.proxy);
 
     sqlx::query(
         "UPDATE proxy_cached_version SET listed = false \
-         WHERE repository_id = $1 AND name = 'lib' AND version = '2.0.0'",
+         WHERE repository_id = $1 AND name = 'lib' AND version = '3.0.0'",
     )
     .bind(repo.id)
     .execute(&pool)
@@ -1330,12 +1333,26 @@ async fn proxy_size_budget_rechecks_keep_last_n_after_a_newer_version_is_unliste
     let summary = forge_core::retention::apply::apply(&ctx, &[], &decisions)
         .await
         .unwrap();
-    assert_eq!((summary.deleted, summary.skipped), (0, 1));
+    assert_eq!((summary.deleted, summary.skipped), (1, 1));
     assert!(
-        cached_row(&pool, repo.id, "1.0.0")
+        !cached_row(&pool, repo.id, "1.0.0")
             .await
             .unwrap()
             .downloaded
     );
-    assert!(component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert!(
+        cached_row(&pool, repo.id, "2.0.0")
+            .await
+            .unwrap()
+            .downloaded
+    );
+    assert!(
+        cached_row(&pool, repo.id, "3.0.0")
+            .await
+            .unwrap()
+            .downloaded
+    );
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert!(component_exists(&pool, repo.id, "lib", "2.0.0").await);
+    assert!(component_exists(&pool, repo.id, "lib", "3.0.0").await);
 }

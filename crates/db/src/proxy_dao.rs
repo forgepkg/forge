@@ -1,7 +1,7 @@
 //! Data access for `proxy_cached_version` and `proxy_upstream_index`.
 
 use serde_json::Value as JsonValue;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 use crate::model::{ProxyCachedVersion, ProxyUpstreamIndex};
 
@@ -14,6 +14,22 @@ pub struct NewProxyCachedVersion {
     pub listed: bool,
     pub downloaded: bool,
     pub not_found: bool,
+}
+
+/// Serialize package-wide cached-version writes with retention revalidation.
+///
+/// Call inside the transaction that will update or lock the package rows.
+pub async fn lock_cached_package(
+    conn: &mut PgConnection,
+    repository_id: i64,
+    name: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($2, $1))")
+        .bind(repository_id)
+        .bind(name)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// Insert a cached-version marker, ignoring conflicts on the
@@ -64,6 +80,8 @@ pub async fn upsert_cached_versions(
     if versions.is_empty() {
         return Ok(0);
     }
+    let mut tx = pool.begin().await?;
+    lock_cached_package(&mut tx, repository_id, name).await?;
     let res = sqlx::query!(
         r#"
         INSERT INTO proxy_cached_version (
@@ -92,8 +110,9 @@ pub async fn upsert_cached_versions(
         name,
         versions,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 
@@ -117,6 +136,7 @@ pub async fn reconcile_listing(
     confirm_after_secs: i64,
 ) -> sqlx::Result<u64> {
     let mut tx = pool.begin().await?;
+    lock_cached_package(&mut tx, repository_id, name).await?;
     let flagged = sqlx::query!(
         r#"
         WITH seen AS (
@@ -504,6 +524,8 @@ pub async fn set_listed(
     if versions.is_empty() {
         return Ok(0);
     }
+    let mut tx = pool.begin().await?;
+    lock_cached_package(&mut tx, repository_id, name).await?;
     let res = sqlx::query!(
         r#"
         UPDATE proxy_cached_version AS p
@@ -517,8 +539,9 @@ pub async fn set_listed(
         versions,
         listed,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(res.rows_affected())
 }
 

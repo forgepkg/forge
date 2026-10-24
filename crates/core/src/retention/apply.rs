@@ -124,6 +124,7 @@ fn reason_json<R: serde::Serialize>(reason: &R) -> JsonValue {
 /// per decision, so a package with thousands of versions costs one lock of
 /// its versions per hundred decisions.
 const HOSTED_BATCH: usize = 100;
+const PROXY_BATCH: usize = 100;
 
 /// Apply a set of hosted + proxy decisions, returning the run summary.
 ///
@@ -157,11 +158,43 @@ pub async fn apply(
             done += batch.len();
         }
     }
-    for d in proxy {
-        if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
-            return Ok(stopped(ctx, summary, total - done));
+    if ctx.dry_run {
+        for d in proxy {
+            if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
+                return Ok(stopped(ctx, summary, total - done));
+            }
+            done += 1;
         }
-        done += 1;
+    } else {
+        for d in proxy.iter().filter(|d| d.reason.size_budget.is_none()) {
+            if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
+                return Ok(stopped(ctx, summary, total - done));
+            }
+            done += 1;
+        }
+
+        let revalidate_protections = ctx.fence.as_ref().is_some_and(|fence| {
+            fence
+                .policy
+                .rules
+                .iter()
+                .any(|rule| rule.criteria.has_protection())
+        });
+        if revalidate_protections {
+            for batch in proxy_budget_batches(proxy) {
+                if apply_proxy_budget_batch(ctx, &batch, &mut summary).await? == Step::Stop {
+                    return Ok(stopped(ctx, summary, total - done));
+                }
+                done += batch.len();
+            }
+        } else {
+            for d in proxy.iter().filter(|d| d.reason.size_budget.is_some()) {
+                if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
+                    return Ok(stopped(ctx, summary, total - done));
+                }
+                done += 1;
+            }
+        }
     }
 
     Ok(summary)
@@ -182,6 +215,23 @@ fn package_batches(hosted: &[Decision]) -> Vec<Vec<&Decision>> {
     packages
         .iter()
         .flat_map(|decisions| decisions.chunks(HOSTED_BATCH).map(<[_]>::to_vec))
+        .collect()
+}
+
+/// `proxy` budget decisions grouped by package and split into bounded batches.
+fn proxy_budget_batches(proxy: &[ProxyDecision]) -> Vec<Vec<&ProxyDecision>> {
+    let mut packages: Vec<Vec<&ProxyDecision>> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for d in proxy.iter().filter(|d| d.reason.size_budget.is_some()) {
+        let i = *index.entry(d.package_name.as_str()).or_insert_with(|| {
+            packages.push(Vec::new());
+            packages.len() - 1
+        });
+        packages[i].push(d);
+    }
+    packages
+        .iter()
+        .flat_map(|decisions| decisions.chunks(PROXY_BATCH).map(<[_]>::to_vec))
         .collect()
 }
 
@@ -424,7 +474,7 @@ async fn apply_hosted(
                     ref_count_after: None,
                     blob_delete_enqueued: false,
                     dry_run: false,
-                    reason,
+                    reason: reason_json(&d.reason),
                 },
             )
             .await?;
@@ -608,55 +658,123 @@ async fn apply_proxy(
         summary.skipped += 1;
         return Ok(Step::Continue);
     }
-    if d.reason.size_budget.is_some() {
-        if let Some(fence) = &ctx.fence {
-            let candidates: Vec<ProxyCandidate> = retention_dao::lock_proxy_package_candidates(
-                &mut tx,
-                ctx.repository_id,
-                &cached.name,
-            )
-            .await?
-            .into_iter()
-            .map(|r| ProxyCandidate {
-                cached_version_id: r.cached_version_id,
-                package_name: r.name,
-                version: r.version,
-                listed: r.listed,
-                first_seen_at: r.first_seen_at,
-                last_downloaded_at: r.last_downloaded_at,
-                size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
-            })
-            .collect();
-            let ordinary = evaluate_proxy(
-                fence.format,
-                ctx.evaluated_at.unwrap_or_else(chrono::Utc::now),
-                fence.policy,
-                &candidates,
-            );
-            let (_, protected) = size_budget_protected_ids(
-                fence.format,
-                fence.policy,
-                &[],
-                &candidates,
-                &[],
-                &ordinary,
-            );
-            if protected.contains(&cached.id) {
-                audit_skipped_proxy(&mut tx, ctx, d).await?;
-                tx.commit().await?;
-                summary.skipped += 1;
-                return Ok(Step::Continue);
+    evict_proxy_cached_tx(
+        &mut tx,
+        ctx,
+        d,
+        cached.id,
+        &cached.name,
+        &cached.version,
+        summary,
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(Step::Continue)
+}
+
+async fn apply_proxy_budget_batch(
+    ctx: &ApplyContext<'_>,
+    decisions: &[&ProxyDecision],
+    summary: &mut RunSummary,
+) -> Result<Step, sqlx::Error> {
+    let Some(first) = decisions.first() else {
+        return Ok(Step::Continue);
+    };
+    let Some(fence) = &ctx.fence else {
+        for d in decisions {
+            if apply_proxy(ctx, d, summary).await? == Step::Stop {
+                return Ok(Step::Stop);
             }
         }
+        return Ok(Step::Continue);
+    };
+
+    let mut tx = ctx.pool.begin().await?;
+    if !retention_dao::lock_run_fence(&mut tx, ctx.repository_id, ctx.run_id, fence.stored_policy)
+        .await?
+    {
+        return Ok(Step::Stop);
     }
 
+    let candidates: Vec<ProxyCandidate> = retention_dao::lock_proxy_package_candidates(
+        &mut tx,
+        ctx.repository_id,
+        &first.package_name,
+    )
+    .await?
+    .into_iter()
+    .map(|r| ProxyCandidate {
+        cached_version_id: r.cached_version_id,
+        package_name: r.name,
+        version: r.version,
+        listed: r.listed,
+        first_seen_at: r.first_seen_at,
+        last_downloaded_at: r.last_downloaded_at,
+        size_bytes: 0,
+    })
+    .collect();
+    let ordinary = evaluate_proxy(
+        fence.format,
+        ctx.evaluated_at.unwrap_or_else(chrono::Utc::now),
+        fence.policy,
+        &candidates,
+    );
+    let (_, protected) =
+        size_budget_protected_ids(fence.format, fence.policy, &[], &candidates, &[], &ordinary);
+    let candidates_by_id: HashMap<i64, &ProxyCandidate> = candidates
+        .iter()
+        .map(|candidate| (candidate.cached_version_id, candidate))
+        .collect();
+
+    for d in decisions {
+        let Some(candidate) = candidates_by_id.get(&d.cached_version_id) else {
+            audit_skipped_proxy(&mut tx, ctx, d).await?;
+            summary.skipped += 1;
+            continue;
+        };
+        let pulled_since_plan = d.reason.last_used_at.is_some_and(|last_used| {
+            candidate
+                .last_downloaded_at
+                .is_some_and(|downloaded| downloaded > last_used)
+        });
+        if pulled_since_plan || protected.contains(&candidate.cached_version_id) {
+            audit_skipped_proxy(&mut tx, ctx, d).await?;
+            summary.skipped += 1;
+            continue;
+        }
+        evict_proxy_cached_tx(
+            &mut tx,
+            ctx,
+            d,
+            candidate.cached_version_id,
+            &candidate.package_name,
+            &candidate.version,
+            summary,
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(Step::Continue)
+}
+
+async fn evict_proxy_cached_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ctx: &ApplyContext<'_>,
+    d: &ProxyDecision,
+    cached_id: i64,
+    cached_name: &str,
+    cached_version: &str,
+    summary: &mut RunSummary,
+) -> Result<(), sqlx::Error> {
     // Delete the parallel component + its assets (decref their blobs), if any.
     let mut audit_blob: Option<String> = None;
     let mut audit_ref_after: Option<i64> = None;
     let mut audit_enqueued = false;
 
     if let Some(comp) =
-        component_dao::find_component(&mut *tx, ctx.repository_id, &cached.name, &cached.version)
+        component_dao::find_component(&mut **tx, ctx.repository_id, cached_name, cached_version)
             .await?
     {
         // Lock the component so a concurrent re-cache serializes behind us.
@@ -664,25 +782,22 @@ async fn apply_proxy(
             r#"SELECT id FROM component WHERE id = $1 FOR UPDATE"#,
             comp.id
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
-        let assets = asset_dao::assets_for_component(&mut *tx, comp.id).await?;
+        let assets = asset_dao::assets_for_component(&mut **tx, comp.id).await?;
         for asset in &assets {
             sqlx::query!(r#"DELETE FROM asset WHERE id = $1"#, asset.id)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
-            let enqueued = blob_dao::decref_and_maybe_enqueue_delete(
-                &mut tx,
-                &asset.blob_sha256,
-                ctx.delete_grace,
-            )
-            .await?;
+            let enqueued =
+                blob_dao::decref_and_maybe_enqueue_delete(tx, &asset.blob_sha256, ctx.delete_grace)
+                    .await?;
             let ref_after: i64 = sqlx::query_scalar!(
                 r#"SELECT ref_count FROM blob WHERE sha256 = $1"#,
                 asset.blob_sha256,
             )
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .unwrap_or(0);
             if enqueued {
@@ -695,7 +810,7 @@ async fn apply_proxy(
             }
         }
 
-        component_dao::delete_component(&mut *tx, ctx.repository_id, &cached.name, &cached.version)
+        component_dao::delete_component(&mut **tx, ctx.repository_id, cached_name, cached_version)
             .await?;
     }
 
@@ -703,13 +818,13 @@ async fn apply_proxy(
     // next pull re-fetches the bytes from upstream.
     sqlx::query!(
         r#"UPDATE proxy_cached_version SET downloaded = false WHERE id = $1"#,
-        cached.id,
+        cached_id,
     )
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     retention_dao::insert_audit(
-        &mut *tx,
+        &mut **tx,
         &AuditRow {
             repository_id: ctx.repository_id,
             run_id: ctx.run_id,
@@ -723,14 +838,12 @@ async fn apply_proxy(
             ref_count_after: audit_ref_after,
             blob_delete_enqueued: audit_enqueued,
             dry_run: false,
-            reason,
+            reason: reason_json(&d.reason),
         },
     )
     .await?;
-    tx.commit().await?;
     summary.deleted += 1;
-
-    Ok(Step::Continue)
+    Ok(())
 }
 
 fn action_str(a: Action) -> &'static str {
