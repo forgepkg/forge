@@ -21,7 +21,7 @@
 //! paths, groups, and proxies, whose file `<path>` is the upstream's
 //! `<remote_url>/<path>` ([`upstream_url`]).
 //!
-//! Forge links this plugin in ([`Raw`], [`PLUGIN_TOML`]), like NuGet.
+//! Forge links this plugin in ([`Raw`], [`DESCRIPTOR`]), like NuGet.
 
 pub mod form;
 pub mod listing;
@@ -29,19 +29,41 @@ pub mod sidecar;
 
 use forge_plugin_api::files::{self, Target};
 use forge_plugin_api::{
-    Action, Answer, DirectoryQuery, FetchResult, FileSource, FormatError, FormatPlugin, Loaded,
-    NewFile, Query, Remote, Repository, RepositoryKind, Request, Response, StoreStatus,
-    UpstreamAnswer, UpstreamOp, UpstreamStep,
+    Action, Answer, Assets, Descriptor, DirectoryQuery, FetchResult, FileSource, FormatError,
+    FormatPlugin, Loaded, NewFile, Query, Remote, Repository, RepositoryKind, Request, Response,
+    Storage, StoreStatus, UpstreamAnswer, UpstreamOp, UpstreamStep,
 };
 
-/// This plugin's `plugin.toml`: its format id, name and version.
-pub const PLUGIN_TOML: &str = forge_plugin_api::plugin_toml!();
+/// What raw says about itself: its format id, name, version and mount.
+pub const DESCRIPTOR: Descriptor = Descriptor {
+    id: "raw",
+    name: "Raw files",
+    version: env!("CARGO_PKG_VERSION"),
+    description: "Arbitrary files under arbitrary paths, like Nexus' raw repositories: uploads \
+                  with PUT or a form, downloads with ranges and checksum sidecars, directory \
+                  listings; proxies of any HTTP(S) base URL.",
+    mount: "/raw",
+    // Proxies cache the files under an HTTP(S) base URL through the
+    // plugin's upstream side.
+    kinds: &[
+        RepositoryKind::Hosted,
+        RepositoryKind::Proxy,
+        RepositoryKind::Group,
+    ],
+    // Its repositories hold files under paths, in the host's file store.
+    storage: Storage::Files,
+    assets: Assets::DEFAULT,
+};
 
 /// The raw format.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Raw;
 
 impl FormatPlugin for Raw {
+    fn descriptor(&self) -> &'static Descriptor {
+        &DESCRIPTOR
+    }
+
     fn handle(&self, repo: &Repository, req: &Request) -> Action {
         let target = match target(req) {
             Ok(Some(target)) => target,

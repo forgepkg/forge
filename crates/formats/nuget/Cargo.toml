@@ -1,6 +1,6 @@
 [package]
 name = "forge-format-nuget"
-# The plugin's own version: keep it equal to `version` in plugin.toml.
+# The plugin's own version, its descriptor's.
 version = "1.0.0"
 edition.workspace = true
 rust-version.workspace = true

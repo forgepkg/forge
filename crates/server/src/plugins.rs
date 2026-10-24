@@ -1,6 +1,6 @@
 //! Format plugins: the built-in ones, and serving the repositories of their
 //! formats under each format's mount, `{mount}/{repo}/...` (`/repository`
-//! unless its `plugin.toml` names another; see `docs/format-plugins.md`).
+//! unless its descriptor names another; see `docs/format-plugins.md`).
 //!
 //! The dispatcher does what [`crate::dispatch`] does for the NuGet feed —
 //! resolve the repository, authorize the request's action (GET/HEAD read,
@@ -66,9 +66,9 @@ use crate::files::{FileError, Files};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
-/// Where a plugin format's repositories are served unless its
-/// `plugin.toml` names another mount.
-pub const MOUNT: &str = forge_plugin::manifest::DEFAULT_MOUNT;
+/// Where a plugin format's repositories are served unless its descriptor
+/// names another mount.
+pub const MOUNT: &str = forge_plugin::api::DEFAULT_MOUNT;
 
 /// The most rounds of queries one request may load.
 pub const MAX_ROUNDS: usize = 4;
@@ -110,13 +110,8 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
 /// reads archives under `nuget_limits` (`[nuget]`).
 pub fn builtin(nuget_limits: forge_format_nuget::NupkgLimits) -> Vec<Arc<Plugin>> {
     vec![
-        Plugin::builtin(
-            forge_format_nuget::PLUGIN_TOML,
-            forge_format_nuget::Nuget::with_limits(nuget_limits),
-        )
-        .expect("crates/formats/nuget/plugin.toml is valid"),
-        Plugin::builtin(forge_format_raw::PLUGIN_TOML, forge_format_raw::Raw)
-            .expect("crates/formats/raw/plugin.toml is valid"),
+        Plugin::builtin(forge_format_nuget::Nuget::with_limits(nuget_limits)),
+        Plugin::builtin(forge_format_raw::Raw),
     ]
 }
 
@@ -190,7 +185,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         };
     };
     // Each format is served under its own mount only.
-    if plugin.manifest().mount != mount {
+    if plugin.descriptor().mount != mount {
         return (StatusCode::NOT_FOUND, "repository is not served here").into_response();
     }
     let format = match state.formats.for_repository(&repo) {
@@ -1299,6 +1294,48 @@ fn write_error(e: WriteError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The built-in formats' descriptors are checked here, not at startup: a
+    /// well-formed id that is not reserved and no other format has, a free
+    /// mount, kinds, asset names.
+    #[test]
+    fn the_builtin_formats_describe_themselves_well() {
+        let plugins = builtin(forge_format_nuget::NupkgLimits::default());
+        let descriptors: Vec<_> = plugins.iter().map(|p| p.descriptor()).collect();
+        assert_eq!(forge_plugin::descriptor::check(&descriptors), Ok(()));
+        let ids: Vec<_> = plugins.iter().map(|p| p.id()).collect();
+        assert_eq!(ids, ["nuget", "raw"]);
+        for plugin in &plugins {
+            assert_eq!(plugin.descriptor().version, "1.0.0", "{}", plugin.id());
+        }
+
+        // The check refuses a malformed or reserved id, a second format
+        // with a built-in's id, and invalid asset names.
+        let nuget = forge_format_nuget::DESCRIPTOR;
+        for id in ["NuGet", "n", "docker", "v2"] {
+            let renamed = forge_plugin::Descriptor { id, ..nuget };
+            assert!(
+                forge_plugin::descriptor::check(&[&renamed]).is_err(),
+                "{id:?}"
+            );
+        }
+        let twin = forge_plugin::Descriptor {
+            id: "nuget",
+            mount: "/twin",
+            ..forge_format_raw::DESCRIPTOR
+        };
+        let mut with_twin = descriptors.clone();
+        with_twin.push(&twin);
+        assert!(forge_plugin::descriptor::check(&with_twin).is_err());
+        let bad_assets = forge_plugin::Descriptor {
+            assets: forge_plugin::api::Assets {
+                package: "../package.nupkg",
+                ..nuget.assets
+            },
+            ..nuget
+        };
+        assert!(forge_plugin::descriptor::check(&[&bad_assets]).is_err());
+    }
 
     #[test]
     fn splits_repository_paths() {

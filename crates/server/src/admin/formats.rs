@@ -43,15 +43,15 @@ pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
     let ceiling = state.config.max_repository_upload_bytes();
     let view = |plugin: &forge_plugin::Plugin| {
-        let manifest = plugin.manifest();
+        let descriptor = plugin.descriptor();
         FormatView {
             id: plugin.id().to_string(),
-            name: manifest.name.clone(),
+            name: descriptor.name.to_string(),
             kinds: kinds(plugin.id()),
-            storage: manifest.storage.as_str(),
-            mount: manifest.mount.clone(),
-            version: Some(manifest.version.clone()),
-            description: manifest.description.clone(),
+            storage: descriptor.storage.as_str(),
+            mount: descriptor.mount.to_string(),
+            version: Some(descriptor.version.to_string()),
+            description: Some(descriptor.description.to_string()),
             default_max_upload_bytes: state.config.default_upload_limit(plugin.id()),
             max_upload_bytes_limit: ceiling,
         }

@@ -21,11 +21,7 @@ use sqlx::PgPool;
 /// NuGet, the built-in format plugin, as the `Format` the repository code
 /// works with.
 fn nuget() -> forge_plugin::PluginFormat {
-    let plugin = forge_plugin::Plugin::builtin(
-        forge_format_nuget::PLUGIN_TOML,
-        forge_format_nuget::Nuget::default(),
-    )
-    .expect("crates/formats/nuget/plugin.toml is valid");
+    let plugin = forge_plugin::Plugin::builtin(forge_format_nuget::Nuget::default());
     forge_plugin::PluginFormat::new(&plugin)
 }
 

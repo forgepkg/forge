@@ -6,9 +6,8 @@ use std::sync::Arc;
 
 use forge_core::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
 use forge_core::format::{Format, ReadSeek};
-use forge_plugin_api::{self as api, FormatPlugin};
+use forge_plugin_api::{self as api, Assets, FormatPlugin, Storage};
 
-use crate::manifest::{Assets, Storage};
 use crate::Plugin;
 
 /// The longest version the host takes from a format plugin, in bytes: a
@@ -44,8 +43,8 @@ impl PluginFormat {
         PluginFormat {
             id: plugin.id(),
             plugin: plugin.implementation().clone(),
-            assets: plugin.manifest().assets.clone(),
-            storage: plugin.manifest().storage,
+            assets: plugin.descriptor().assets,
+            storage: plugin.descriptor().storage,
         }
     }
 }
@@ -135,19 +134,19 @@ impl Format for PluginFormat {
     }
 
     fn package_asset_path(&self) -> &str {
-        &self.assets.package
+        self.assets.package
     }
 
     fn package_content_type(&self) -> &str {
-        &self.assets.package_type
+        self.assets.package_type
     }
 
     fn manifest_asset_path(&self) -> &str {
-        &self.assets.manifest
+        self.assets.manifest
     }
 
     fn manifest_content_type(&self) -> &str {
-        &self.assets.manifest_type
+        self.assets.manifest_type
     }
 
     fn parse_upload(&self, mut file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
@@ -229,7 +228,22 @@ mod tests {
         parsed: api::ParsedPackage,
     }
 
+    const UNLIMITED: api::Descriptor = api::Descriptor {
+        id: "unlimited",
+        name: "Unlimited",
+        version: "0.1.0",
+        description: "Every id, every version.",
+        mount: api::DEFAULT_MOUNT,
+        kinds: &[api::RepositoryKind::Hosted, api::RepositoryKind::Group],
+        storage: Storage::Packages,
+        assets: Assets::DEFAULT,
+    };
+
     impl FormatPlugin for Unlimited {
+        fn descriptor(&self) -> &'static api::Descriptor {
+            &UNLIMITED
+        }
+
         fn canonical_id(&self, id: &str) -> String {
             id.to_ascii_lowercase()
         }
@@ -289,14 +303,10 @@ mod tests {
 
     /// [`Unlimited`] as the host sees it.
     fn unlimited(normalized: Option<&str>, parsed: api::ParsedPackage) -> PluginFormat {
-        let plugin = Plugin::builtin(
-            "[plugin]\nid = \"unlimited\"\nname = \"Unlimited\"\nversion = \"0.1.0\"\napi = \"0.4.0\"\n",
-            Unlimited {
-                normalized: normalized.map(str::to_string),
-                parsed,
-            },
-        )
-        .unwrap();
+        let plugin = Plugin::builtin(Unlimited {
+            normalized: normalized.map(str::to_string),
+            parsed,
+        });
         PluginFormat::new(&plugin)
     }
 
