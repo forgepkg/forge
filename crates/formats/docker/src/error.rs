@@ -1,7 +1,10 @@
-//! Distribution-spec error responses: `{"errors":[{"code","message","detail"}]}`.
+//! Distribution-spec error responses:
+//! `{"errors":[{"code","message","detail"}]}`, for the errors of the
+//! protocol and for what the host refused or failed ([`ImageError`]).
 
-use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use forge_plugin_api::images::{ImageError, Permission};
+use forge_plugin_api::Response;
+use serde_json::{json, Value};
 
 /// The error codes of the distribution spec (plus Docker's `UNAVAILABLE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,19 +50,18 @@ impl Code {
 }
 
 /// An error answered to a registry client.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OciError {
-    pub status: StatusCode,
+    pub status: u16,
     pub code: Code,
     pub message: String,
-    pub detail: Option<serde_json::Value>,
-    /// Extra response headers (a `WWW-Authenticate` challenge, `Range` of an
-    /// upload, `Retry-After`).
-    pub headers: Vec<(header::HeaderName, HeaderValue)>,
+    pub detail: Option<Value>,
+    /// Extra response headers (`Range` of an upload, `Retry-After`).
+    pub headers: Vec<(String, String)>,
 }
 
 impl OciError {
-    pub fn new(status: StatusCode, code: Code, message: impl Into<String>) -> Self {
+    pub fn new(status: u16, code: Code, message: impl Into<String>) -> Self {
         OciError {
             status,
             code,
@@ -69,238 +71,248 @@ impl OciError {
         }
     }
 
-    pub fn with_detail(mut self, detail: serde_json::Value) -> Self {
+    pub fn with_detail(mut self, detail: Value) -> Self {
         self.detail = Some(detail);
         self
     }
 
-    pub fn with_header(mut self, name: header::HeaderName, value: HeaderValue) -> Self {
-        self.headers.push((name, value));
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
         self
     }
 
     pub fn blob_unknown(digest: &str) -> Self {
-        Self::new(
-            StatusCode::NOT_FOUND,
-            Code::BlobUnknown,
-            "blob unknown to registry",
-        )
-        .with_detail(serde_json::json!({ "digest": digest }))
+        Self::new(404, Code::BlobUnknown, "blob unknown to registry")
+            .with_detail(json!({ "digest": digest }))
     }
 
     pub fn manifest_unknown(reference: &str) -> Self {
-        Self::new(
-            StatusCode::NOT_FOUND,
-            Code::ManifestUnknown,
-            "manifest unknown",
-        )
-        .with_detail(serde_json::json!({ "reference": reference }))
+        Self::new(404, Code::ManifestUnknown, "manifest unknown")
+            .with_detail(json!({ "reference": reference }))
     }
 
     pub fn name_unknown(name: &str) -> Self {
         Self::new(
-            StatusCode::NOT_FOUND,
+            404,
             Code::NameUnknown,
             "repository name not known to registry",
         )
-        .with_detail(serde_json::json!({ "name": name }))
+        .with_detail(json!({ "name": name }))
     }
 
     pub fn name_invalid(name: &str) -> Self {
-        Self::new(
-            StatusCode::BAD_REQUEST,
-            Code::NameInvalid,
-            "invalid repository name",
-        )
-        .with_detail(serde_json::json!({ "name": name }))
+        Self::new(400, Code::NameInvalid, "invalid repository name")
+            .with_detail(json!({ "name": name }))
     }
 
     pub fn upload_unknown() -> Self {
         Self::new(
-            StatusCode::NOT_FOUND,
+            404,
             Code::BlobUploadUnknown,
             "blob upload unknown to registry",
         )
     }
 
     pub fn digest_invalid(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, Code::DigestInvalid, message)
+        Self::new(400, Code::DigestInvalid, message)
     }
 
     pub fn manifest_invalid(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, Code::ManifestInvalid, message)
+        Self::new(400, Code::ManifestInvalid, message)
     }
 
     pub fn denied(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::FORBIDDEN, Code::Denied, message)
+        Self::new(403, Code::Denied, message)
     }
 
     pub fn unsupported(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::METHOD_NOT_ALLOWED, Code::Unsupported, message)
+        Self::new(405, Code::Unsupported, message)
     }
 
     pub fn too_large(limit: u64) -> Self {
         Self::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
+            413,
             Code::SizeInvalid,
             format!("content exceeds the limit of {limit} bytes"),
         )
     }
 
-    /// The service cannot answer now (staging full, upstream down, offline
-    /// repository): 503 with `Retry-After`.
+    /// An upload chunk that does not fit: 416 with the `Range` received so
+    /// far.
+    pub fn chunk(message: &str, size: u64) -> Self {
+        Self::new(416, Code::BlobUploadInvalid, message).with_header("range", &upload_range(size))
+    }
+
+    /// The service cannot answer now: 503 with `Retry-After`.
     pub fn unavailable(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable, message)
-            .with_header(header::RETRY_AFTER, HeaderValue::from_static("30"))
+        Self::new(503, Code::Unavailable, message).with_header("retry-after", "30")
     }
 
-    /// An internal failure; the details go to the log, not the client.
-    pub fn internal(context: &str, error: impl std::fmt::Display) -> Self {
-        tracing::error!(error = %error, "registry: {context}");
-        Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Code::Unavailable,
-            "internal error",
-        )
-    }
-}
-
-impl From<sqlx::Error> for OciError {
-    fn from(e: sqlx::Error) -> Self {
-        OciError::internal("database error", e)
-    }
-}
-
-impl OciError {
-    /// A failed read from the object store (through the local blob cache):
-    /// 503 with `Retry-After` while S3 cannot be reached, a server error
-    /// otherwise.
-    pub(crate) fn storage_read(context: &str, error: forge_storage::S3Error) -> Self {
-        if error.is_unavailable() {
-            tracing::warn!(%error, "registry: {context}: the object store is unavailable");
-            OciError::object_store_unavailable()
-        } else {
-            OciError::internal(context, error)
-        }
-    }
-
-    fn object_store_unavailable() -> Self {
-        OciError::unavailable("the object store is unavailable; retry later")
-    }
-}
-
-/// A request body that could not be read: the client aborted it, or it
-/// stalled past the idle timeout. Travels inside the I/O error staging the
-/// body fails with.
-#[derive(Debug)]
-pub(crate) struct RequestBodyError(pub axum::Error);
-
-impl std::fmt::Display for RequestBodyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "reading the request body: {}", self.0)
-    }
-}
-
-impl std::error::Error for RequestBodyError {}
-
-impl From<forge_storage::CasError> for OciError {
-    fn from(e: forge_storage::CasError) -> Self {
-        match e {
-            forge_storage::CasError::TooLarge { limit } => OciError::too_large(limit),
-            forge_storage::CasError::StagingFull { .. } => {
-                OciError::unavailable("temporary storage is full; retry later")
-            }
-            e if e.is_unavailable() => {
-                tracing::warn!(error = %e, "registry: the object store is unavailable");
-                OciError::object_store_unavailable()
-            }
-            forge_storage::CasError::Io(e)
-                if e.get_ref()
-                    .is_some_and(|inner| inner.is::<RequestBodyError>()) =>
-            {
-                tracing::debug!(error = %e, "registry: the upload body could not be read");
-                OciError::new(
-                    StatusCode::BAD_REQUEST,
-                    Code::BlobUploadInvalid,
-                    "the request body could not be read",
-                )
-            }
-            other => OciError::internal("storage error", other),
-        }
-    }
-}
-
-impl IntoResponse for OciError {
-    fn into_response(self) -> Response {
-        let mut error = serde_json::json!({
+    /// The JSON response.
+    pub fn into_response(self) -> Response {
+        let mut error = json!({
             "code": self.code.as_str(),
             "message": self.message,
         });
         if let Some(detail) = self.detail {
             error["detail"] = detail;
         }
-        let body = serde_json::json!({ "errors": [error] }).to_string();
-        let mut response = (
-            self.status,
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            )],
-            body,
-        )
-            .into_response();
-        for (name, value) in self.headers {
-            response.headers_mut().insert(name, value);
-        }
+        let body = json!({ "errors": [error] }).to_string();
+        let mut response = Response::new(self.status, "application/json", body);
+        response.headers.extend(self.headers);
         response
     }
 }
 
-/// Result alias of registry handlers.
-pub type OciResult<T> = Result<T, OciError>;
+/// `Range` of an upload: the inclusive end of the bytes received.
+pub fn upload_range(size: u64) -> String {
+    format!("0-{}", size.saturating_sub(1))
+}
+
+/// The token-scope actions a permission needs.
+pub fn scope_actions(permission: Permission) -> &'static str {
+    match permission {
+        Permission::Read => "pull",
+        Permission::Write => "pull,push",
+        Permission::Delete => "delete",
+    }
+}
+
+/// What the host refused or failed, as the client sees it.
+pub fn of(error: &ImageError) -> OciError {
+    match error {
+        ImageError::NotAnEndpoint => {
+            OciError::new(404, Code::NameUnknown, "not a registry endpoint")
+        }
+        ImageError::NameInvalid { name, hint } => {
+            let invalid = OciError::name_invalid(name);
+            match hint {
+                Some(hint) => invalid.with_detail(json!({ "name": name, "hint": hint })),
+                None => invalid,
+            }
+        }
+        ImageError::NameUnknown { name } => OciError::name_unknown(name),
+        ImageError::AuthenticationRequired { scope } => {
+            let required = OciError::new(401, Code::Unauthorized, "authentication required");
+            match scope {
+                Some((name, permission)) => required
+                    .with_detail(json!({ "name": name, "action": scope_actions(*permission) })),
+                None => required,
+            }
+        }
+        ImageError::InvalidToken => {
+            OciError::new(401, Code::Unauthorized, "invalid or expired registry token")
+        }
+        ImageError::InvalidCredentials => {
+            OciError::new(401, Code::Unauthorized, "invalid credentials")
+        }
+        ImageError::Denied { name, permission } => {
+            OciError::denied("requested access to the resource is denied")
+                .with_detail(json!({ "name": name, "action": scope_actions(*permission) }))
+        }
+        ImageError::Unsupported { status, message } => {
+            OciError::new(*status, Code::Unsupported, message.clone())
+        }
+        ImageError::Offline => OciError::unavailable("repository is offline"),
+        ImageError::BlobUnknown { digest } => OciError::blob_unknown(digest),
+        ImageError::ManifestUnknown { reference } => OciError::manifest_unknown(reference),
+        ImageError::UploadUnknown => OciError::upload_unknown(),
+        ImageError::DigestMismatch => {
+            OciError::digest_invalid("the uploaded content does not match the digest")
+        }
+        ImageError::ChunkOutOfOrder { size } => {
+            OciError::chunk("the chunk does not continue the upload", *size)
+        }
+        ImageError::ChunkLength { size } => {
+            OciError::chunk("the chunk length does not match its Content-Range", *size)
+        }
+        ImageError::TooLarge { limit } => OciError::too_large(*limit),
+        ImageError::BodyUnreadable => OciError::new(
+            400,
+            Code::BlobUploadInvalid,
+            "the request body could not be read",
+        ),
+        ImageError::ManifestInvalid(message) => OciError::manifest_invalid(message.clone()),
+        ImageError::ManifestBlobUnknown { digest, manifest } => OciError::new(
+            400,
+            Code::ManifestBlobUnknown,
+            if *manifest {
+                "the index references a manifest unknown to this repository"
+            } else {
+                "the manifest references a blob unknown to this repository"
+            },
+        )
+        .with_detail(json!({ "digest": digest })),
+        ImageError::TagImmutable { tag } => OciError::denied(format!(
+            "tag {tag:?} already exists and tags are immutable in this repository"
+        ))
+        .with_detail(json!({ "tag": tag })),
+        ImageError::BlobReferenced { digest } => OciError::new(
+            409,
+            Code::Denied,
+            "the blob is referenced by a manifest of this image; delete the manifest first",
+        )
+        .with_detail(json!({ "digest": digest })),
+        ImageError::NoLongerAllowed => {
+            OciError::denied("the workload identity may no longer change this repository")
+        }
+        ImageError::RateLimited => OciError::new(
+            429,
+            Code::TooManyRequests,
+            "the upstream registry rate-limits this proxy; retry later",
+        ),
+        ImageError::Unavailable(message) => OciError::unavailable(message.clone()),
+        ImageError::Internal => OciError::new(500, Code::Unavailable, "internal error"),
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use forge_storage::{CasError, S3Error};
-
     use super::*;
 
-    fn down() -> S3Error {
-        S3Error::Unavailable("connection refused".into())
+    fn body(response: &Response) -> Value {
+        serde_json::from_slice(&response.body).unwrap()
+    }
+
+    fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+        response
+            .headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
     }
 
     #[test]
-    fn an_unavailable_object_store_answers_503_with_retry_after() {
-        // Also when a stream read from S3 failed while it was staged (the
-        // finish of a chunked upload).
-        for e in [
-            CasError::S3(down()),
-            CasError::Io(std::io::Error::other(down())),
-        ] {
-            let e = OciError::from(e);
-            assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(e.code, Code::Unavailable);
-            assert!(e
-                .headers
-                .iter()
-                .any(|(name, _)| name == header::RETRY_AFTER));
-        }
-        let e = OciError::storage_read("blob read", down());
-        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
-        let e = OciError::storage_read("blob read", S3Error::S3("access denied".into()));
-        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+    fn errors_carry_their_code_status_and_detail() {
+        let response = of(&ImageError::Denied {
+            name: "docker/app".into(),
+            permission: Permission::Write,
+        })
+        .into_response();
+        assert_eq!(response.status, 403);
+        let denied = body(&response);
+        assert_eq!(denied["errors"][0]["code"], "DENIED");
+        assert_eq!(denied["errors"][0]["detail"]["action"], "pull,push");
+
+        let response = of(&ImageError::ChunkOutOfOrder { size: 100 }).into_response();
+        assert_eq!(response.status, 416);
+        assert_eq!(header(&response, "range"), Some("0-99"));
+
+        let response =
+            of(&ImageError::Unavailable("the object store is down".into())).into_response();
+        assert_eq!(response.status, 503);
+        assert_eq!(header(&response, "retry-after"), Some("30"));
+        assert_eq!(body(&response)["errors"][0]["code"], "UNAVAILABLE");
+
+        let response = of(&ImageError::Internal).into_response();
+        assert_eq!(response.status, 500);
+        assert_eq!(body(&response)["errors"][0]["message"], "internal error");
     }
 
     #[test]
-    fn an_unreadable_request_body_is_the_clients_error() {
-        let aborted = std::io::Error::other(RequestBodyError(axum::Error::new(
-            "connection reset by peer",
-        )));
-        let e = OciError::from(CasError::Io(aborted));
-        assert_eq!(e.status, StatusCode::BAD_REQUEST);
-        assert_eq!(e.code, Code::BlobUploadInvalid);
-        // Staging's own I/O errors stay server errors.
-        let e = OciError::from(CasError::Io(std::io::Error::other("disk full")));
-        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+    fn upload_ranges() {
+        assert_eq!(upload_range(0), "0-0");
+        assert_eq!(upload_range(1), "0-0");
+        assert_eq!(upload_range(100), "0-99");
     }
 }

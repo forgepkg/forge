@@ -249,6 +249,10 @@ impl Format for PluginFormat {
         self.storage == Storage::Files
     }
 
+    fn stores_images(&self) -> bool {
+        self.storage == Storage::Images
+    }
+
     fn package_asset_path(&self) -> &str {
         self.assets.package
     }

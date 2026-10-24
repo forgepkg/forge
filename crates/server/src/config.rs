@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
+use forge_plugin::api::Storage;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
@@ -2367,12 +2368,12 @@ impl Config {
     fn largest_staged_item_and_setting(&self) -> (u64, &'static str) {
         [
             (
-                self.default_upload_limit(forge_db::model::NUGET_FORMAT),
+                self.default_upload_limit(Storage::Packages),
                 "the default upload limit of package repositories",
             ),
             (self.proxy.max_package_bytes, "proxy.max_package_bytes"),
             (
-                self.default_upload_limit(forge_db::model::DOCKER_FORMAT),
+                self.default_upload_limit(Storage::Images),
                 "the default upload limit of docker repositories",
             ),
             (self.docker_max_blob_bytes(), "docker.max_blob_bytes"),
@@ -2413,15 +2414,15 @@ impl Config {
             .unwrap_or_else(|| self.docker_default(DEFAULT_DOCKER_MAX_BLOB_BYTES))
     }
 
-    /// The upload limit of a hosted repository of `format` without one of
-    /// its own: for docker [`DEFAULT_DOCKER_MAX_UPLOAD_BYTES`] per blob (as
-    /// far as an explicit staging budget allows, [`Self::docker_default`]),
-    /// for a package format [`DEFAULT_MAX_UPLOAD_BYTES`].
-    pub fn default_upload_limit(&self, format: &str) -> u64 {
-        if format == forge_db::model::DOCKER_FORMAT {
-            self.docker_default(DEFAULT_DOCKER_MAX_UPLOAD_BYTES)
-        } else {
-            DEFAULT_MAX_UPLOAD_BYTES
+    /// The upload limit of a hosted repository of a format of `storage`
+    /// without one of its own: for images (docker)
+    /// [`DEFAULT_DOCKER_MAX_UPLOAD_BYTES`] per blob (as far as an explicit
+    /// staging budget allows, [`Self::docker_default`]), for packages and
+    /// files [`DEFAULT_MAX_UPLOAD_BYTES`].
+    pub fn default_upload_limit(&self, storage: Storage) -> u64 {
+        match storage {
+            Storage::Images => self.docker_default(DEFAULT_DOCKER_MAX_UPLOAD_BYTES),
+            Storage::Packages | Storage::Files => DEFAULT_MAX_UPLOAD_BYTES,
         }
     }
 
@@ -2645,7 +2646,7 @@ impl Config {
                     .to_string(),
             );
         }
-        let docker_push = self.default_upload_limit(forge_db::model::DOCKER_FORMAT);
+        let docker_push = self.default_upload_limit(Storage::Images);
         if docker_push < DEFAULT_DOCKER_MAX_UPLOAD_BYTES
             || (self.docker.max_blob_bytes.is_none()
                 && self.docker_max_blob_bytes() < DEFAULT_DOCKER_MAX_BLOB_BYTES)
@@ -4215,7 +4216,7 @@ mod tests {
             + "\n[proxy]\nmax_package_bytes = 268435456\n";
         let cfg = Config::from_figment(fig_from_toml(&budget)).expect("a small budget starts");
         let fits = 768 * MIB - cfg.nuget.max_nuspec_bytes;
-        assert_eq!(cfg.default_upload_limit("docker"), fits);
+        assert_eq!(cfg.default_upload_limit(Storage::Images), fits);
         assert_eq!(cfg.docker_max_blob_bytes(), fits);
         assert_eq!(cfg.max_repository_upload_bytes(), Some(fits));
         let warnings = cfg.deployment_warnings();
@@ -4254,7 +4255,7 @@ mod tests {
         ] {
             let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
             assert_eq!(
-                cfg.default_upload_limit("docker"),
+                cfg.default_upload_limit(Storage::Images),
                 DEFAULT_DOCKER_MAX_UPLOAD_BYTES
             );
             assert_eq!(cfg.docker_max_blob_bytes(), DEFAULT_DOCKER_MAX_BLOB_BYTES);
@@ -4270,9 +4271,12 @@ mod tests {
     #[test]
     fn default_upload_limits_and_the_repository_ceiling() {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
-        assert_eq!(cfg.default_upload_limit("nuget"), DEFAULT_MAX_UPLOAD_BYTES);
         assert_eq!(
-            cfg.default_upload_limit("docker"),
+            cfg.default_upload_limit(Storage::Packages),
+            DEFAULT_MAX_UPLOAD_BYTES
+        );
+        assert_eq!(
+            cfg.default_upload_limit(Storage::Images),
             DEFAULT_DOCKER_MAX_UPLOAD_BYTES
         );
         // A repository may hold up to what a push can stage.

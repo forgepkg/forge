@@ -38,7 +38,7 @@ use chrono::{DateTime, Utc};
 use forge_core::auth::principal::Principal;
 use forge_core::net::ssrf::validate_url;
 use forge_db::import_dao::{self, NewImport, NexusImport};
-use forge_db::model::{RepoKind, Repository, DOCKER_FORMAT};
+use forge_db::model::{RepoKind, Repository};
 use forge_db::{repository_dao, secret_dao};
 use serde::{Deserialize, Serialize};
 
@@ -350,12 +350,12 @@ pub async fn create(
     if !(1..=16).contains(&body.concurrency) {
         return bad_request("concurrency must be between 1 and 16");
     }
-    let docker = repo.format == DOCKER_FORMAT;
+    let images = state.formats.stores_images(&repo.format);
     let registry_url = match body
         .registry_url
         .map(|u| u.trim().trim_end_matches('/').to_string())
     {
-        Some(_) if !docker => {
+        Some(_) if !images => {
             return bad_request("registry_url applies to Docker repositories only")
         }
         Some(u) if u.is_empty() => None,
@@ -399,7 +399,7 @@ pub async fn create(
         }
         Err(e) => return preflight_error("listing the Nexus repositories", e),
     }
-    if docker {
+    if images {
         let registry = registry_url
             .clone()
             .unwrap_or_else(|| default_registry_url(&url, &source_repository));

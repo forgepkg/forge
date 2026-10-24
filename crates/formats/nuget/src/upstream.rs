@@ -141,6 +141,11 @@ pub(crate) fn step(
         UpstreamOp::File(_) => done(UpstreamAnswer::File(None)),
         // NuGet has no tags.
         UpstreamOp::Tags(_) => done(UpstreamAnswer::Tags(None)),
+        UpstreamOp::ImageName(_)
+        | UpstreamOp::ImageManifest { .. }
+        | UpstreamOp::ImageBlob { .. }
+        | UpstreamOp::ImageTags { .. }
+        | UpstreamOp::ImageReferrers { .. } => failed("a feed holds no images"),
     })
 }
 

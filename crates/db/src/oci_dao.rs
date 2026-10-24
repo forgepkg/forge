@@ -21,11 +21,12 @@ const TOUCH_INTERVAL_SECS: f64 = 3600.0;
 
 // ── Repositories ────────────────────────────────────────────────────────────
 
-/// The docker repository that serves the host name `host` (host-based
-/// routing, `config.host`), case-insensitively.
+/// The repository of the images format `format` that serves the host name
+/// `host` (host-based routing, `config.host`), case-insensitively.
 pub async fn find_repository_by_host(
     pool: &PgPool,
     host: &str,
+    format: &str,
 ) -> sqlx::Result<Option<Repository>> {
     sqlx::query_as!(
         Repository,
@@ -36,9 +37,10 @@ pub async fn find_repository_by_host(
             metadata_ttl_seconds, not_found_ttl_seconds,
             allow_redeploy, created_at, updated_at
         FROM repository
-        WHERE format = 'docker' AND config ? 'host' AND lower(config->>'host') = lower($1)
+        WHERE format = $2 AND config ? 'host' AND lower(config->>'host') = lower($1)
         "#,
         host,
+        format,
     )
     .fetch_optional(pool)
     .await
@@ -838,57 +840,59 @@ pub async fn set_manifest_summary(
     Ok(())
 }
 
-/// Record the platform of the image config `config_digest` on the image's
-/// manifests that name it and have none yet (a proxy caches a manifest
-/// before its config).
-pub async fn set_config_platform(
+/// The media type of the config `config_digest`, as a manifest of the image
+/// that names it as its config says (its summary's `config_digest` and
+/// `config_media_type`), if one does.
+pub async fn config_media_type(
     pool: &PgPool,
     repository_id: i64,
     image: &str,
     config_digest: &str,
-    platform: &str,
-) -> sqlx::Result<()> {
-    sqlx::query!(
+) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
         r#"
-        UPDATE oci_manifest
-        SET summary = summary || jsonb_build_object('platform', $4::text)
+        SELECT summary->>'config_media_type' FROM oci_manifest
         WHERE repository_id = $1 AND image = $2
           AND summary->>'config_digest' = $3
-          AND NOT summary ? 'platform'
+          AND summary ? 'config_media_type'
+        LIMIT 1
         "#,
-        repository_id,
-        image,
-        config_digest,
-        platform,
     )
+    .bind(repository_id)
+    .bind(image)
+    .bind(config_digest)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Merge `part`, what the config `config_digest` holds, into the summaries
+/// of the image's manifests that name it as their config and hold none of
+/// `keys` yet (a proxy caches a manifest before its config).
+pub async fn complete_config_summary(
+    pool: &PgPool,
+    repository_id: i64,
+    image: &str,
+    config_digest: &str,
+    part: &JsonValue,
+    keys: &[String],
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE oci_manifest
+        SET summary = summary || $4
+        WHERE repository_id = $1 AND image = $2
+          AND summary->>'config_digest' = $3
+          AND NOT summary ?| $5
+        "#,
+    )
+    .bind(repository_id)
+    .bind(image)
+    .bind(config_digest)
+    .bind(part)
+    .bind(keys)
     .execute(pool)
     .await?;
     Ok(())
-}
-
-/// Whether a manifest of the image names `config_digest` as its config and
-/// has no platform recorded yet.
-pub async fn config_needs_platform(
-    pool: &PgPool,
-    repository_id: i64,
-    image: &str,
-    config_digest: &str,
-) -> sqlx::Result<bool> {
-    sqlx::query_scalar!(
-        r#"
-        SELECT EXISTS (
-            SELECT 1 FROM oci_manifest
-            WHERE repository_id = $1 AND image = $2
-              AND summary->>'config_digest' = $3
-              AND NOT summary ? 'platform'
-        ) AS "exists!"
-        "#,
-        repository_id,
-        image,
-        config_digest,
-    )
-    .fetch_one(pool)
-    .await
 }
 
 /// Which of `digests` are manifests of the image.

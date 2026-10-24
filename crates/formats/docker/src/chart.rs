@@ -22,12 +22,11 @@ pub mod media {
     pub const PROVENANCE: &str = "application/vnd.cncf.helm.chart.provenance.v1.prov";
 }
 
-/// Largest config blob read for its metadata.
-pub const MAX_CONFIG_BYTES: i64 = 1024 * 1024;
-
-/// Largest chart archive read for its README and values, as stored
-/// (compressed). Charts are a few KiB to a few hundred KiB.
-pub const MAX_ARCHIVE_BYTES: i64 = 16 * 1024 * 1024;
+/// Whether a layer of a chart is its packaged archive: Helm's media type,
+/// or the plain one of the experimental OCI support of Helm before 3.8.
+pub fn is_archive(media_type: &str) -> bool {
+    media_type == media::CONTENT || media_type == "application/tar+gzip"
+}
 
 /// Most bytes of an archive decompressed while looking for its README and
 /// values: Helm's own limit on a whole chart (`MaxDecompressedChartSize`).
@@ -169,7 +168,7 @@ pub struct ChartFiles {
 /// `<chart>/charts/<sub>/README.md` a subchart's. At most
 /// [`MAX_UNPACKED_BYTES`] are decompressed; an archive that is not gzip or
 /// tar, or ends early, yields what was found before.
-pub fn read_files(archive: &[u8]) -> ChartFiles {
+pub fn read_files(archive: impl Read) -> ChartFiles {
     let mut found = ChartFiles::default();
     let decoder = flate2::read::MultiGzDecoder::new(archive);
     let mut tar = TarReader {
@@ -491,7 +490,7 @@ mod tests {
             ("demo/values.yaml", b"replicas: 1\n"),
             ("demo/templates/values.yaml", b"not: this\n"),
         ]);
-        let files = read_files(&archive);
+        let files = read_files(&archive[..]);
         let readme = files.readme.unwrap();
         assert_eq!(readme.name, "Readme.MD");
         assert_eq!(readme.text, "# Demo\n");
@@ -523,7 +522,7 @@ mod tests {
         let pax = format!("{length}{line}");
         entry(&mut tar, "PaxHeaders/values", pax.as_bytes(), b'x');
         entry(&mut tar, "values.yaml-short", b"x: 1\n", b'0');
-        let files = read_files(&gzip(tar));
+        let files = read_files(&gzip(tar)[..]);
         let readme = files.readme.unwrap();
         assert!(readme.truncated);
         assert_eq!(readme.text.len(), MAX_FILE_TEXT);
@@ -532,14 +531,14 @@ mod tests {
 
     #[test]
     fn what_is_not_a_chart_yields_nothing() {
-        assert_eq!(read_files(b"not gzip"), ChartFiles::default());
+        assert_eq!(read_files(&b"not gzip"[..]), ChartFiles::default());
         assert_eq!(
-            read_files(&gzip(b"not a tar header".to_vec())),
+            read_files(&gzip(b"not a tar header".to_vec())[..]),
             ChartFiles::default()
         );
         // Paths outside the chart, or the chart's directory alone.
         let archive = tgz(&[("demo/../README.md", b"out"), ("README.md", b"top")]);
-        assert_eq!(read_files(&archive), ChartFiles::default());
+        assert_eq!(read_files(&archive[..]), ChartFiles::default());
         // A truncated archive keeps what came before the cut.
         let mut noise = Vec::with_capacity(64 * 1024);
         let mut x: u32 = 1;

@@ -49,6 +49,7 @@ use forge_core::auth::principal::Principal;
 use forge_core::repo::SearchParams;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{component_dao, repository_dao};
+use forge_plugin::api::Storage;
 use serde::{Deserialize, Serialize};
 
 use crate::admin::db_error;
@@ -92,8 +93,8 @@ pub struct BrowseRepo {
     pub format: String,
     /// The address clients use for the repository (`{public_base_url}{mount}/{name}`,
     /// for raw `{public_base_url}/raw/{name}`), for the UI's client
-    /// snippets. Absent for docker repositories, whose registry
-    /// `/browse/images` names, and for a format not installed here.
+    /// snippets. Absent for an images format's (Docker's) repositories, whose
+    /// registry `/browse/images` names, and for a format not installed here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// What the repository holds: `packages`, `files` (a files format: raw,
@@ -142,16 +143,18 @@ pub async fn list_repos(
                 kind: repo.kind.clone(),
                 online: repo.online,
                 format: repo.format.clone(),
-                url: state.formats.plugin(&repo.format).map(|plugin| {
-                    crate::plugins::repository_url(&state, plugin.descriptor().mount, &repo.name)
-                }),
-                storage: if repo.is_docker() {
-                    "images"
-                } else if state.formats.stores_files(&repo.format) {
-                    "files"
-                } else {
-                    "packages"
-                },
+                url: state
+                    .formats
+                    .plugin(&repo.format)
+                    .filter(|plugin| plugin.descriptor().storage != Storage::Images)
+                    .map(|plugin| {
+                        crate::plugins::repository_url(
+                            &state,
+                            plugin.descriptor().mount,
+                            &repo.name,
+                        )
+                    }),
+                storage: state.storage(&repo.format).as_str(),
             });
         }
     }
@@ -250,7 +253,7 @@ pub async fn search_packages(
         }
         // Package search covers the package formats; images are listed by
         // /browse/images, files (raw) by their repository's listings.
-        if repo.is_docker() || state.formats.stores_files(&repo.format) {
+        if state.storage(&repo.format) != Storage::Packages {
             continue;
         }
         if state.authz.can_read(&principal, repo).await {
@@ -423,9 +426,9 @@ pub async fn package_detail(
     }
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
-        // A docker repository holds images (`/browse/images`) and a files
-        // (raw) one files (its listings), not packages.
-        Ok(Some(r)) if !r.is_docker() && !state.formats.stores_files(&r.format) => r,
+        // An images (Docker) repository holds images (`/browse/images`) and
+        // a files (raw) one files (its listings), not packages.
+        Ok(Some(r)) if state.storage(&r.format) == Storage::Packages => r,
         // An unknown name answers like an unreadable repository (no name
         // enumeration), except to a global admin.
         Ok(_) if state.authz.is_global_admin(&principal).await => {

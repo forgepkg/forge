@@ -1,26 +1,19 @@
 //! What a format's [`Descriptor`] may say: a well-formed id that no other
 //! format and none of the server's names takes, a mount the server leaves
-//! free, its repository kinds once each, plain asset names and content
+//! free (an images format's: the registry's, [`IMAGES_MOUNT`], and only one
+//! format's), its repository kinds once each, plain asset names and content
 //! types. A test over the server's built-in formats
 //! (`plugins::builtin`) checks them, so a bad descriptor fails `cargo test`.
 
-use forge_plugin_api::{Assets, Descriptor};
+use forge_plugin_api::{Assets, Descriptor, Storage, IMAGES_MOUNT};
 
-/// Format ids a plugin can never take: the built-in Docker registry's, and
-/// names the server routes or reserves.
-const RESERVED_IDS: &[&str] = &[
-    "docker",
-    "v2",
-    "v3",
-    "admin",
-    "browse",
-    "auth",
-    "repository",
-];
+/// Format ids a plugin can never take: names the server routes or
+/// reserves.
+const RESERVED_IDS: &[&str] = &["v2", "v3", "admin", "browse", "auth", "repository"];
 
 /// Mounts a plugin can never take: the server's own routes, the web UI's
 /// pages (the first segment of every route in `web/src/routes.ts`) and the
-/// Docker registry.
+/// registry's, which only an images format takes ([`IMAGES_MOUNT`]).
 const RESERVED_MOUNTS: &[&str] = &[
     "admin",
     "api",
@@ -45,12 +38,21 @@ const RESERVED_MOUNTS: &[&str] = &[
 ];
 
 /// Check the descriptors of the formats one server holds: each on its own
-/// ([`check_one`]), and no two with the same id.
+/// ([`check_one`]), no two with the same id, and at most one images format
+/// (the registry serves one).
 pub fn check(formats: &[&Descriptor]) -> Result<(), String> {
     for (i, format) in formats.iter().enumerate() {
         check_one(format)?;
-        if formats[..i].iter().any(|other| other.id == format.id) {
+        let before = &formats[..i];
+        if before.iter().any(|other| other.id == format.id) {
             return Err(format!("two formats have the id {:?}", format.id));
+        }
+        let images = |d: &Descriptor| d.storage == Storage::Images;
+        if images(format) && before.iter().any(|other| images(other)) {
+            return Err(format!(
+                "format {:?}: only one format may store images",
+                format.id
+            ));
         }
     }
     Ok(())
@@ -63,7 +65,15 @@ pub fn check_one(descriptor: &Descriptor) -> Result<(), String> {
     if descriptor.name.trim().is_empty() {
         return Err(format!("format {id:?}: the name must not be empty"));
     }
-    validate_mount(descriptor.mount).map_err(|e| format!("format {id:?}: {e}"))?;
+    if descriptor.storage == Storage::Images {
+        if descriptor.mount != IMAGES_MOUNT {
+            return Err(format!(
+                "format {id:?}: an images format's mount is {IMAGES_MOUNT:?}"
+            ));
+        }
+    } else {
+        validate_mount(descriptor.mount).map_err(|e| format!("format {id:?}: {e}"))?;
+    }
     let kinds = descriptor.kinds;
     if kinds.is_empty() {
         return Err(format!("format {id:?}: kinds must not be empty"));
@@ -195,7 +205,6 @@ mod tests {
             "Helm",
             "1helm",
             "helm_charts",
-            "docker",
             "v2",
             "v3",
             "admin",
@@ -235,6 +244,29 @@ mod tests {
             let bad = Descriptor { kinds, ..GOOD };
             assert!(check(&[&bad]).is_err(), "{kinds:?} accepted");
         }
+    }
+
+    #[test]
+    fn an_images_format_takes_the_registrys_mount_alone() {
+        let images = Descriptor {
+            id: "oci",
+            mount: IMAGES_MOUNT,
+            storage: Storage::Images,
+            ..GOOD
+        };
+        assert_eq!(check(&[&GOOD, &images]), Ok(()));
+        // Its mount is the registry's, and only its.
+        let elsewhere = Descriptor {
+            mount: "/oci",
+            ..images
+        };
+        assert!(check(&[&elsewhere]).is_err());
+        let second = Descriptor {
+            id: "oci-two",
+            ..images
+        };
+        let err = check(&[&images, &second]).unwrap_err();
+        assert!(err.contains("only one format may store images"), "{err}");
     }
 
     #[test]

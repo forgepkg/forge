@@ -23,12 +23,13 @@ use forge_core::format::Format;
 use forge_core::net::ssrf::validate_url;
 use forge_db::model::{
     DeploymentPolicy, RepoKind, Repository, CONTENT_DISPOSITION_KEY, DEPLOYMENT_POLICY_KEY,
-    DOCKER_FORMAT, DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY,
+    DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY,
     MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY,
     WRITABLE_MEMBER_ID_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{component_dao, oci_dao, raw_dao};
+use forge_plugin::api::Storage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -87,8 +88,9 @@ pub struct RepoView {
 
 impl RepoView {
     /// The view of `r`, naming its writable member as `names` (repository
-    /// names by id) does; `stores_files` when its format holds files.
-    fn new(r: &Repository, names: &HashMap<i64, String>, stores_files: bool) -> Self {
+    /// names by id) does; its format's repositories hold `storage`.
+    fn new(r: &Repository, names: &HashMap<i64, String>, storage: Storage) -> Self {
+        let stores_files = storage == Storage::Files;
         RepoView {
             id: r.id,
             name: r.name.clone(),
@@ -112,7 +114,7 @@ impl RepoView {
                 .writable_member_id()
                 .and_then(|id| names.get(&id).cloned()),
             max_upload_bytes: r.max_upload_bytes(),
-            deployment_policy: (!r.is_docker() && r.kind() == RepoKind::Hosted)
+            deployment_policy: (storage != Storage::Images && r.kind() == RepoKind::Hosted)
                 .then(|| deployment_policy_of(r).as_str()),
             content_disposition: stores_files.then(|| {
                 if r.inline_content() {
@@ -123,13 +125,7 @@ impl RepoView {
             }),
             max_age_seconds: (stores_files && r.kind() == RepoKind::Proxy)
                 .then(|| r.max_age_seconds()),
-            storage: if r.is_docker() {
-                "images"
-            } else if stores_files {
-                "files"
-            } else {
-                "packages"
-            },
+            storage: storage.as_str(),
         }
     }
 }
@@ -142,11 +138,7 @@ async fn view(state: &AppState, r: &Repository) -> sqlx::Result<RepoView> {
             names.insert(id, member.name);
         }
     }
-    Ok(RepoView::new(
-        r,
-        &names,
-        state.formats.stores_files(&r.format),
-    ))
+    Ok(RepoView::new(r, &names, state.storage(&r.format)))
 }
 
 /// Create-repository request body. Unknown fields are rejected: a misspelled
@@ -395,16 +387,11 @@ const MAX_PACKAGE_DELAY_SECONDS: i32 = 365 * 24 * 60 * 60;
 const MAX_RESERVED_PREFIXES: usize = 100;
 
 /// Validate and normalize a group's reserved id prefixes: each is at most
-/// 100 bytes, an optional trailing `*` dropped, deduplicated. A docker
-/// group's are image-name prefixes (`A-Z a-z 0-9 . _ - /`, a namespace such
-/// as `acme/`), stored lowercase; a package group's are what its format
-/// makes of them ([`Format::reserved_prefix`]: NuGet's `A-Z a-z 0-9 . _ -`,
-/// lowercase; npm's `@acme` is the scope `@acme/`).
-fn normalize_prefixes(
-    raw: &[String],
-    docker: bool,
-    format: Option<&dyn Format>,
-) -> Result<Vec<String>, String> {
+/// 100 bytes, an optional trailing `*` dropped, deduplicated, and what the
+/// group's format makes of it ([`Format::reserved_prefix`]: NuGet's
+/// `A-Z a-z 0-9 . _ -`, lowercase; npm's `@acme` is the scope `@acme/`;
+/// Docker's image-name prefixes may hold a namespace, `acme/`).
+fn normalize_prefixes(raw: &[String], format: Option<&dyn Format>) -> Result<Vec<String>, String> {
     if raw.len() > MAX_RESERVED_PREFIXES {
         return Err(format!(
             "at most {MAX_RESERVED_PREFIXES} reserved_prefixes are allowed"
@@ -419,7 +406,7 @@ fn normalize_prefixes(
                 "reserved_prefixes: {prefix:?} must be 1-100 bytes long"
             ));
         }
-        let prefix = match format.filter(|_| !docker) {
+        let prefix = match format {
             Some(format) => format.reserved_prefix(prefix).map_err(|e| match e {
                 forge_core::domain::FormatError::InvalidPackage(m) => {
                     format!("reserved_prefixes: {m}")
@@ -427,21 +414,13 @@ fn normalize_prefixes(
                 e => format!("reserved_prefixes: {e}"),
             })?,
             None => {
-                let valid = prefix.bytes().all(|b| {
-                    b.is_ascii_alphanumeric()
-                        || matches!(b, b'.' | b'_' | b'-')
-                        || (docker && b == b'/')
-                });
+                let valid = prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
                 if !valid {
-                    return Err(if docker {
-                        format!(
-                            "reserved_prefixes: {prefix:?} is not an image name prefix (letters, digits, '.', '_', '-', '/')"
-                        )
-                    } else {
-                        format!(
-                            "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
-                        )
-                    });
+                    return Err(format!(
+                        "reserved_prefixes: {prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
+                    ));
                 }
                 prefix.to_ascii_lowercase()
             }
@@ -576,7 +555,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
                 repos.iter().map(|r| (r.id, r.name.clone())).collect();
             let views: Vec<RepoView> = repos
                 .iter()
-                .map(|r| RepoView::new(r, &names, state.formats.stores_files(&r.format)))
+                .map(|r| RepoView::new(r, &names, state.storage(&r.format)))
                 .collect();
             Json(views).into_response()
         }
@@ -623,14 +602,15 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             body.format
         ));
     }
-    let docker = body.format == DOCKER_FORMAT;
-    let files = state.formats.stores_files(&body.format);
+    let storage = state.storage(&body.format);
+    let images = storage == Storage::Images;
+    let files = storage == Storage::Files;
     // A package format plugin's (NuGet's, npm's): package versions.
-    let package = !files && state.formats.plugin(&body.format).is_some();
+    let package = storage == Storage::Packages && state.formats.plugin(&body.format).is_some();
     let parsed_kind = RepoKind::from(kind.as_str());
     let docker_config = match docker_options(
         &state,
-        docker,
+        images.then_some(body.format.as_str()),
         package.then_some(body.format.as_str()),
         parsed_kind,
         &body.name,
@@ -647,10 +627,10 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         Ok(config) => config,
         Err(resp) => return resp,
     };
-    if docker && body.package_delay_seconds != 0 {
+    if images && body.package_delay_seconds != 0 {
         return bad_request("package_delay_seconds is not supported for docker repositories");
     }
-    if docker && body.allow_redeploy {
+    if images && body.allow_redeploy {
         return bad_request(
             "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
         );
@@ -721,7 +701,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     let reserved_prefixes = match body
         .reserved_prefixes
         .as_deref()
-        .map(|p| normalize_prefixes(p, docker, state.formats.get(&body.format).as_deref()))
+        .map(|p| normalize_prefixes(p, state.formats.get(&body.format).as_deref()))
     {
         Some(Err(msg)) => return bad_request(&msg),
         Some(Ok(prefixes)) => Some(prefixes),
@@ -836,14 +816,15 @@ impl DockerOptions {
 
 /// Validate the docker options against the repository's format and kind
 /// and merge them into `existing` (its stored config object). Returns the
-/// config object to store.
+/// config object to store. They are the image store's: only a repository
+/// of an images format (`images`: its format, Docker) takes them.
 ///
 /// A group of a package format (`writable`: its format) takes a writable
 /// member too: where its clients' publishes and changes land.
 #[allow(clippy::result_large_err)]
 async fn docker_options(
     state: &AppState,
-    docker: bool,
+    images: Option<&str>,
     writable: Option<&str>,
     kind: RepoKind,
     name: &str,
@@ -851,7 +832,7 @@ async fn docker_options(
     existing: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
     let mut config = existing.clone();
-    if !docker {
+    let Some(images) = images else {
         let writable_only = options.host.is_none()
             && options.immutable_tags.is_none()
             && options.latest_mutable.is_none();
@@ -862,8 +843,15 @@ async fn docker_options(
         }
         return writable_member_option(state, writable, kind, options.writable_member, config)
             .await;
-    }
-    if !forge_format_docker::reference::valid_name_component(name) {
+    };
+    // Path-based routing names an image `<repository>/<image>`: the
+    // repository's name must be a valid one (a single component, as a
+    // repository name has no `/`).
+    let valid_name = state
+        .formats
+        .get(images)
+        .is_some_and(|format| format.validate_id(name).is_ok());
+    if !valid_name {
         return Err(bad_request(format!(
             "invalid docker repository name {name:?}: image names start with it, so use \
              lowercase letters and digits, separated by '.', '_', '__' or '-'"
@@ -893,14 +881,7 @@ async fn docker_options(
     if let Some(latest) = options.latest_mutable {
         config.insert(LATEST_MUTABLE_KEY.into(), json!(latest));
     }
-    writable_member_option(
-        state,
-        Some(DOCKER_FORMAT),
-        kind,
-        options.writable_member,
-        config,
-    )
-    .await
+    writable_member_option(state, Some(images), kind, options.writable_member, config).await
 }
 
 /// Merge a group's `writable_member` (a hosted repository of `format`;
@@ -1136,22 +1117,23 @@ pub async fn update(
         }
     }
 
-    let docker = existing.is_docker();
+    let storage = state.storage(&existing.format);
+    let images = storage == Storage::Images;
     let final_name = body.name.clone().unwrap_or_else(|| existing.name.clone());
-    if docker && body.package_delay_seconds.is_some_and(|d| d != 0) {
+    if images && body.package_delay_seconds.is_some_and(|d| d != 0) {
         return bad_request("package_delay_seconds is not supported for docker repositories");
     }
-    if docker && body.allow_redeploy == Some(true) {
+    if images && body.allow_redeploy == Some(true) {
         return bad_request(
             "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
         );
     }
-    let files = state.formats.stores_files(&existing.format);
-    let package = !files && state.formats.plugin(&existing.format).is_some();
+    let files = storage == Storage::Files;
+    let package = storage == Storage::Packages && state.formats.plugin(&existing.format).is_some();
     let stored_config = existing.config.as_object().cloned().unwrap_or_default();
     let config = match docker_options(
         &state,
-        docker,
+        images.then_some(existing.format.as_str()),
         package.then_some(existing.format.as_str()),
         existing.kind(),
         &final_name,
@@ -1223,14 +1205,11 @@ pub async fn update(
         if existing.kind() != RepoKind::Group {
             return bad_request("reserved_prefixes is only valid for group repositories");
         }
-        let prefixes = match normalize_prefixes(
-            prefixes,
-            docker,
-            state.formats.get(&existing.format).as_deref(),
-        ) {
-            Ok(prefixes) => prefixes,
-            Err(msg) => return bad_request(&msg),
-        };
+        let prefixes =
+            match normalize_prefixes(prefixes, state.formats.get(&existing.format).as_deref()) {
+                Ok(prefixes) => prefixes,
+                Err(msg) => return bad_request(&msg),
+            };
         if !config.is_object() {
             config = json!({});
         }
@@ -1344,7 +1323,7 @@ pub async fn update(
         // inserting commits before the purge (which removes it), and one
         // inserting later finds the new upstream and caches nothing
         // (`oci_dao::lock_proxy_upstream`).
-        if existing.is_docker() {
+        if images {
             match repository_dao::lock_repository(&mut *tx, updated.id).await {
                 Ok(_) => {}
                 Err(e) => return db_error(e),
@@ -1469,7 +1448,7 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
     match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
         Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
         Ok(RepoDelete::NotFound) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
-        Ok(RepoDelete::HasPackages) if existing.is_docker() => (
+        Ok(RepoDelete::HasPackages) if state.formats.stores_images(&existing.format) => (
             StatusCode::CONFLICT,
             "repository still has images; delete their manifests first",
         )
@@ -1605,7 +1584,7 @@ pub async fn hard_delete_package(
         )
             .into_response();
     }
-    if repo.is_docker() {
+    if state.formats.stores_images(&repo.format) {
         return (
             StatusCode::BAD_REQUEST,
             "delete image manifests and tags through the registry API (DELETE /v2/<name>/manifests/<reference>)",

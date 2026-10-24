@@ -1,5 +1,7 @@
-//! Browse API of docker repositories: the images of a repository and an
-//! image's tags and manifests (digests, sizes, platforms), for the SPA.
+//! Browse API of the repositories of an images format (Docker): the images
+//! of a repository and an image's tags and manifests (digests, sizes,
+//! platforms), for the SPA. It reads the image store and the summaries the
+//! format made of the manifests.
 //!
 //! The same rules as the package browse apply: a signed-in user, per-repo
 //! read authorization, the caller's content selectors on image names, and a
@@ -14,9 +16,12 @@
 //!   with the `docker pull` name.
 //! * `GET /browse/chart?repo=<name>&image=<image>&digest=<manifest digest>`
 //!   → a Helm chart pushed as an artifact (`helm push`): its `Chart.yaml`
-//!   metadata, README and default values, read from the blobs Forge holds.
+//!   metadata, README and default values, read from the blobs Forge holds
+//!   with the format ([`FormatPlugin::parse_manifest`],
+//!   [`FormatPlugin::config_summary`], [`FormatPlugin::artifact_files`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
@@ -25,15 +30,23 @@ use chrono::{DateTime, Utc};
 use forge_core::auth::principal::Principal;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
-use forge_format_docker::chart;
-use forge_format_docker::manifest::{self, ManifestKind, MAX_MANIFEST_BYTES};
+use forge_plugin::api::images::{ArtifactFiles, TextFile, MAX_FILES_BYTES, MAX_MANIFEST_BYTES};
+use forge_plugin::FormatPlugin;
 use forge_storage::BlobRef;
 use serde::{Deserialize, Serialize};
 
 use crate::admin::db_error;
 use crate::dispatch::{offline_response, offline_serves_nothing};
+use crate::images::digest::ContentDigest;
 use crate::middleware::principal_of;
 use crate::state::AppState;
+
+/// The largest config blob read for a chart's metadata.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// The summary key under which the format keeps a chart's metadata
+/// ([`FormatPlugin::config_summary`]).
+const CHART_KEY: &str = "chart";
 
 /// Most images considered per repository when listing.
 const MAX_IMAGES: i64 = 5000;
@@ -119,7 +132,7 @@ pub struct ImageDetail {
 
 /// The registry host of the server (`host[:port]` of `public_base_url`).
 fn registry_host(state: &AppState) -> String {
-    forge_format_docker::registry_origin(&state.config.public_base_url()).1
+    crate::images::registry_origin(&state.config.public_base_url()).1
 }
 
 /// Where `repo`'s images are pulled from: its own host, or
@@ -134,17 +147,18 @@ fn pull_prefix(state: &AppState, repo: &Repository) -> (String, String) {
     }
 }
 
-/// The readable docker repository `name`, or the response to send.
-async fn readable_docker_repo(
+/// The readable repository `name` of an images format, with the format, or
+/// the response to send.
+async fn readable_images_repo(
     state: &AppState,
     principal: &Principal,
     name: &str,
-) -> Result<Repository, Response> {
+) -> Result<(Repository, Arc<dyn FormatPlugin>), Response> {
     if !matches!(principal, Principal::User { .. }) {
         return Err((StatusCode::UNAUTHORIZED, "authentication required").into_response());
     }
     let repo = match repository_dao::find_repository_by_name(&state.pool, name).await {
-        Ok(Some(r)) if r.is_docker() => r,
+        Ok(Some(r)) if state.formats.stores_images(&r.format) => r,
         Ok(_) if state.authz.is_global_admin(principal).await => {
             return Err((StatusCode::NOT_FOUND, "repository not found").into_response())
         }
@@ -159,11 +173,15 @@ async fn readable_docker_repo(
     if offline_serves_nothing(&repo) {
         return Err(offline_response());
     }
-    Ok(repo)
+    let Some(plugin) = state.formats.plugin(&repo.format) else {
+        return Err((StatusCode::NOT_FOUND, "repository not found").into_response());
+    };
+    let format = plugin.implementation().clone();
+    Ok((repo, format))
 }
 
 /// The repositories whose images `repo` shows the caller, in priority order:
-/// itself, or a group's readable docker members (nested groups expanded).
+/// itself, or a group's readable members (nested groups expanded).
 async fn sources(
     state: &AppState,
     principal: &Principal,
@@ -186,7 +204,10 @@ async fn sources(
         for (member, _) in members {
             // An offline hosted or group member serves nothing through the
             // group; an offline proxy still serves its cache.
-            if !member.is_docker() || offline_serves_nothing(&member) || !seen.insert(member.id) {
+            if member.format != repo.format
+                || offline_serves_nothing(&member)
+                || !seen.insert(member.id)
+            {
                 continue;
             }
             if !state.authz.can_read(principal, &member).await {
@@ -210,8 +231,8 @@ pub async fn list_images(
     req: axum::extract::Request,
 ) -> Response {
     let principal = principal_of(&req);
-    let repo = match readable_docker_repo(&state, &principal, &query.repo).await {
-        Ok(repo) => repo,
+    let (repo, _) = match readable_images_repo(&state, &principal, &query.repo).await {
+        Ok(found) => found,
         Err(resp) => return resp,
     };
     let sources = match sources(&state, &principal, &repo).await {
@@ -262,11 +283,11 @@ pub async fn image_detail(
     req: axum::extract::Request,
 ) -> Response {
     let principal = principal_of(&req);
-    let repo = match readable_docker_repo(&state, &principal, &repo_name).await {
-        Ok(repo) => repo,
+    let (repo, format) = match readable_images_repo(&state, &principal, &repo_name).await {
+        Ok(found) => found,
         Err(resp) => return resp,
     };
-    if !forge_format_docker::reference::valid_name(&image) {
+    if format.validate_id(&image).is_err() {
         return (StatusCode::NOT_FOUND, "image not found").into_response();
     }
     let sources = match sources(&state, &principal, &repo).await {
@@ -404,12 +425,12 @@ pub struct ChartQuery {
 pub struct ChartFileView {
     pub name: String,
     pub text: String,
-    /// Whether the text was cut at [`chart::MAX_FILE_TEXT`] bytes.
+    /// Whether the text was cut (the format bounds it).
     pub truncated: bool,
 }
 
-impl From<chart::ChartFile> for ChartFileView {
-    fn from(file: chart::ChartFile) -> Self {
+impl From<TextFile> for ChartFileView {
+    fn from(file: TextFile) -> Self {
         Self {
             name: file.name,
             text: file.text,
@@ -436,12 +457,6 @@ pub struct ChartDetail {
     pub source: Option<String>,
 }
 
-/// The chart archive layer's media types: Helm's, and the plain one of the
-/// experimental OCI support of Helm before 3.8.
-fn is_chart_layer(media_type: &str) -> bool {
-    media_type == chart::media::CONTENT || media_type == "application/tar+gzip"
-}
-
 /// Why a stored blob could not be read.
 enum ReadFailure {
     Missing,
@@ -455,13 +470,13 @@ async fn read_linked(
     repo: &Repository,
     image: &str,
     digest: &str,
-    max: i64,
+    max: u64,
 ) -> Result<Vec<u8>, ReadFailure> {
     let link = oci_dao::find_link(&state.pool, repo.id, image, digest)
         .await
         .map_err(|e| ReadFailure::Response(db_error(e)))?
         .ok_or(ReadFailure::Missing)?;
-    if link.size > max {
+    if link.size.max(0) as u64 > max {
         return Err(ReadFailure::Missing);
     }
     read_blob(state, &link.blob_sha256, &link.s3_key, link.size)
@@ -515,15 +530,13 @@ pub async fn chart_detail(
     req: axum::extract::Request,
 ) -> Response {
     let principal = principal_of(&req);
-    let repo = match readable_docker_repo(&state, &principal, &query.repo).await {
-        Ok(repo) => repo,
+    let (repo, format) = match readable_images_repo(&state, &principal, &query.repo).await {
+        Ok(found) => found,
         Err(resp) => return resp,
     };
     let not_found = || (StatusCode::NOT_FOUND, "chart not found").into_response();
     let image = query.image;
-    if !forge_format_docker::reference::valid_name(&image)
-        || forge_format_docker::digest::Digest::parse(&query.digest).is_err()
-    {
+    if format.validate_id(&image).is_err() || ContentDigest::parse(&query.digest).is_none() {
         return not_found();
     }
     let sources = match sources(&state, &principal, &repo).await {
@@ -561,60 +574,46 @@ pub async fn chart_detail(
         Ok(bytes) => bytes,
         Err(resp) => return resp,
     };
-    let Ok(parsed) = manifest::parse(&bytes, Some(&row.media_type)) else {
+    // A chart is an artifact with files to show (its archive).
+    let Ok(parsed) = format.parse_manifest(&bytes, Some(&row.media_type)) else {
         return not_found();
     };
-    let config = parsed.config.as_ref();
-    let is_chart = parsed.kind == ManifestKind::Image
-        && (config.is_some_and(|c| c.media_type == chart::media::CONFIG)
-            || parsed.artifact_type.as_deref() == Some(chart::media::CONFIG));
-    if !is_chart {
+    let Some(archive) = parsed.files else {
         return not_found();
-    }
+    };
 
     let mut metadata = None;
-    if let Some(config) = config.filter(|c| c.media_type == chart::media::CONFIG) {
-        match read_linked(
-            &state,
-            &source,
-            &image,
-            config.digest.as_str(),
-            chart::MAX_CONFIG_BYTES,
-        )
-        .await
-        {
-            Ok(bytes) => metadata = chart::metadata(&bytes),
-            Err(ReadFailure::Missing) => {}
-            Err(ReadFailure::Response(resp)) => return resp,
-        }
-    }
-    let mut files = chart::ChartFiles::default();
-    let mut archive_stored = false;
-    if let Some(layer) = parsed.layers.iter().find(|l| is_chart_layer(&l.media_type)) {
-        match read_linked(
-            &state,
-            &source,
-            &image,
-            layer.digest.as_str(),
-            chart::MAX_ARCHIVE_BYTES,
-        )
-        .await
-        {
-            Ok(archive) => {
-                archive_stored = true;
-                files = match tokio::task::spawn_blocking(move || chart::read_files(&archive)).await
-                {
-                    Ok(files) => files,
-                    Err(e) => {
-                        tracing::error!(error = %e, "browse: reading a chart archive failed");
-                        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-                            .into_response();
-                    }
-                };
+    if let Some(config) = parsed.config {
+        match read_linked(&state, &source, &image, &config.digest, MAX_CONFIG_BYTES).await {
+            Ok(bytes) => {
+                metadata = format
+                    .config_summary(&config.media_type, &bytes)
+                    .and_then(|part| serde_json::from_str::<serde_json::Value>(&part).ok())
+                    .and_then(|mut part| part.get_mut(CHART_KEY).map(serde_json::Value::take));
             }
             Err(ReadFailure::Missing) => {}
             Err(ReadFailure::Response(resp)) => return resp,
         }
+    }
+    let mut files = ArtifactFiles::default();
+    let mut archive_stored = false;
+    match read_linked(&state, &source, &image, &archive.digest, MAX_FILES_BYTES).await {
+        Ok(archive) => {
+            archive_stored = true;
+            files = match tokio::task::spawn_blocking(move || {
+                format.artifact_files(&mut std::io::Cursor::new(archive))
+            })
+            .await
+            {
+                Ok(files) => files,
+                Err(e) => {
+                    tracing::error!(error = %e, "browse: reading a chart archive failed");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+                }
+            };
+        }
+        Err(ReadFailure::Missing) => {}
+        Err(ReadFailure::Response(resp)) => return resp,
     }
     let group = repo.kind() == RepoKind::Group;
     Json(ChartDetail {

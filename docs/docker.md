@@ -7,10 +7,12 @@ and docker-group repositories do. It speaks the
 v1.1 that Docker, Podman, containerd, crane, skopeo, oras, Helm and cosign
 use. CI runs the spec's conformance suite against Forge on every change.
 
-Images live in repositories of `format: "docker"`, a format built into
-Forge like NuGet (`GET /admin/formats` lists it; see
-[format plugins](format-plugins.md#why-docker-is-not-a-plugin) for why it is
-not a plugin). They come in the same three kinds as NuGet repositories:
+Images live in repositories of `format: "docker"`, a format plugin built
+into Forge like NuGet and raw (`GET /admin/formats` lists it, with `storage:
+images`). It is an [images format](format-plugins.md#images-formats): the
+plugin, [`crates/formats/docker`](../crates/formats/docker), speaks the
+protocol, and Forge's image store keeps the images. They come in the same
+three kinds as NuGet repositories:
 
 - **hosted**: push and pull your own images;
 - **proxy**: a pull-through cache of an upstream registry: Docker Hub, GHCR,

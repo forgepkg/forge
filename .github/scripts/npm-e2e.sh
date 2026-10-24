@@ -85,7 +85,7 @@ pack "$work/src/up-public-1.1.0" e2e-public 1.1.0 '{"e2e-dep":"^2.0.0"}'
 pack "$work/src/up-dep-2.0.0" e2e-dep 2.0.0
 pack "$work/src/up-acme-ui" @acme/ui 9.9.9
 cat > "$work/upstream.py" <<'EOF'
-import base64, glob, hashlib, http.server, json, os, sys, tarfile, urllib.parse
+import base64, glob, hashlib, http.server, json, os, sys, tarfile, threading, urllib.parse
 
 root, port = sys.argv[1], int(sys.argv[2])
 packages, tarballs = {}, {}
@@ -107,6 +107,16 @@ for path in sorted(glob.glob(os.path.join(root, "*.tgz"))):
     doc["time"][version] = "2020-01-01T00:00:00.000Z"
     doc["dist-tags"]["latest"] = version
 
+# Requests are handled on threads of their own: each logs one whole line at
+# a time, or two lines written at once run together and the checks that
+# count them miss one.
+log_lock = threading.Lock()
+
+def log(line):
+    with log_lock:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
 class Registry(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -122,13 +132,13 @@ class Registry(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.unquote(self.path.split("?")[0])
         auth = f"auth={'Authorization' in self.headers}"
         if path in tarballs:
-            print(f"GET {path} {auth}", flush=True)
+            log(f"GET {path} {auth}")
             self.answer(200, tarballs[path], "application/octet-stream")
         elif path.lstrip("/") in packages:
             # Which packument the proxy asked for: the abbreviated one
             # installs need, or the full one.
             abbreviated = "application/vnd.npm.install-v1+json" in self.headers.get("Accept", "")
-            print(f"GET {path} {auth} packument={'abbreviated' if abbreviated else 'full'}", flush=True)
+            log(f"GET {path} {auth} packument={'abbreviated' if abbreviated else 'full'}")
             self.answer(200, json.dumps(packages[path.lstrip("/")]).encode())
         elif path == "/-/v1/search":
             self.answer(200, b'{"objects":[],"total":0,"time":"2020-01-01T00:00:00.000Z"}')
@@ -137,7 +147,7 @@ class Registry(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        print(f"POST {self.path} {body.decode()}", flush=True)
+        log(f"POST {self.path} {body.decode()}")
         if self.path != "/-/npm/v1/security/advisories/bulk":
             self.answer(404, b'{"error":"not found"}')
             return
@@ -286,7 +296,10 @@ mkdir -p "$work/yarn-project"
   python3 "$work/answer.py" Username "$admin_user" Password "$admin_password" -- \
     node "$yarn_js" npm login > "$work/yarn-login.out" 2>&1 \
     || fail "yarn npm login: $(cat "$work/yarn-login.out")"
-  node "$yarn_js" npm whoami | grep -q "$admin_user" || fail "yarn npm whoami"
+  # Read the output whole: a `| grep -q` that exits at its match leaves Yarn
+  # writing into a closed pipe, which it dies of (EPIPE).
+  who=$(node "$yarn_js" npm whoami 2>&1) || fail "yarn npm whoami: $who"
+  [[ "$who" == *"$admin_user"* ]] || fail "yarn npm whoami: $who"
 )
 grep -q npmAuthToken "$HOME/.yarnrc.yml" || fail "yarn stored no token"
 # A wrong password is refused.
@@ -302,7 +315,7 @@ code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $throwa
 [ "$code" = 401 ] || fail "a logged-out token answered $code"
 
 step "the group keeps the internal scope internal"
-npm view @acme/ui version --registry "$(reg npm-proxy)" | grep -qx 9.9.9 \
+[ "$(npm view @acme/ui version --registry "$(reg npm-proxy)")" = 9.9.9 ] \
   || fail "the proxy does not see the upstream's @acme/ui"
 if npm view @acme/ui --registry "$(reg npm-all)" > "$work/guard.out" 2>&1; then
   fail "the group served the upstream's @acme/ui: $(cat "$work/guard.out")"
@@ -329,7 +342,7 @@ package "$work/src/pnpm-made" pnpm-made 1.0.0
 # Through the group: it lands in the writable member.
 (cd "$work/src/acme-core" && npm publish --registry "$(reg npm-all)") >/dev/null
 (cd "$work/src/pnpm-made" && pnpm publish --no-git-checks --registry "$(reg npm-hosted)") >/dev/null
-npm view @acme/core version --registry "$(reg npm-hosted)" | grep -qx 1.0.0 \
+[ "$(npm view @acme/core version --registry "$(reg npm-hosted)")" = 1.0.0 ] \
   || fail "a publish through the group did not land in npm-hosted"
 # --force: npm 11 refuses a version the registry lists by itself; the
 # server must refuse it too.
@@ -410,7 +423,8 @@ grep -qx 'latest: 1.1.0' "$work/tags.out" && grep -qx 'legacy: 1.0.0' "$work/tag
 (cd "$work/use-hosted" && npm install e2e-hosted@legacy) >/dev/null
 [ "$(version_of "$work/use-hosted/node_modules/e2e-hosted")" = 1.0.0 ] || fail "install by dist-tag"
 npm dist-tag rm e2e-hosted legacy "${hosted[@]}" >/dev/null
-npm dist-tag ls e2e-hosted "${hosted[@]}" | grep -q legacy && fail "dist-tag rm"
+tags=$(npm dist-tag ls e2e-hosted "${hosted[@]}") || fail "npm dist-tag ls"
+[[ "$tags" != *legacy* ]] || fail "dist-tag rm: $tags"
 npm deprecate e2e-hosted@1.0.0 "use 1.1.0" "${hosted[@]}" >/dev/null
 [ "$(npm view e2e-hosted@1.0.0 deprecated "${hosted[@]}")" = "use 1.1.0" ] || fail "npm deprecate"
 rm -rf "$work/use-hosted/node_modules"

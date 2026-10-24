@@ -19,11 +19,12 @@ use forge_core::authz::Level;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
 
-use crate::digest::Digest;
-use crate::error::{OciError, OciResult};
-use crate::pull::{BlobHit, ManifestHit, ReferrerDescriptor, TagPage};
-use crate::reference::Reference;
-use crate::service::{Caller, Registry};
+use forge_plugin::api::images::{ManifestInfo, Reference, TagPage};
+
+use super::digest::ContentDigest;
+use super::dispatch::Caller;
+use super::pull::{BlobHit, ManifestHit};
+use super::{Failure, ImgResult, Registry};
 
 /// A leaf member serving a group pull, in priority order.
 struct Leaf {
@@ -48,7 +49,7 @@ impl Registry {
         group: &Repository,
         image: &str,
         depth: u32,
-    ) -> OciResult<Vec<Repository>> {
+    ) -> ImgResult<Vec<Repository>> {
         let mut leaves = Vec::new();
         let mut owners = HashSet::new();
         let mut path = HashSet::from([group.id]);
@@ -103,7 +104,7 @@ impl Registry {
         leaves: &'a mut Vec<Leaf>,
         owners: &'a mut HashSet<i64>,
         walk: Walk,
-    ) -> futures_util::future::BoxFuture<'a, OciResult<()>> {
+    ) -> futures_util::future::BoxFuture<'a, ImgResult<()>> {
         Box::pin(async move {
             if depth >= self.inner.config.max_group_depth.max(1) {
                 return Ok(());
@@ -115,7 +116,7 @@ impl Registry {
                 .into_iter()
                 .collect();
             for (member, _priority) in members {
-                if !member.is_docker() || path.contains(&member.id) {
+                if !self.serves(&member) || path.contains(&member.id) {
                     continue;
                 }
                 let serving = walk.serving
@@ -174,8 +175,8 @@ impl Registry {
         image: &str,
         reference: &Reference,
         depth: u32,
-    ) -> OciResult<Option<ManifestHit>> {
-        let mut failure: Option<OciError> = None;
+    ) -> ImgResult<Option<ManifestHit>> {
+        let mut failure: Option<Failure> = None;
         for member in self.serving_members(caller, group, image, depth).await? {
             match self
                 .manifest_from(caller, &member, image, reference, depth + 1)
@@ -184,7 +185,7 @@ impl Registry {
                 Ok(Some(hit)) => return Ok(Some(hit)),
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(group = %group.name, member = %member.name, error = %e.message, "registry group: member failed");
+                    tracing::warn!(group = %group.name, member = %member.name, error = %e.message(), "registry group: member failed");
                     failure = Some(e);
                 }
             }
@@ -197,10 +198,10 @@ impl Registry {
         caller: &Caller,
         group: &Repository,
         image: &str,
-        digest: &Digest,
+        digest: &ContentDigest,
         depth: u32,
-    ) -> OciResult<Option<BlobHit>> {
-        let mut failure: Option<OciError> = None;
+    ) -> ImgResult<Option<BlobHit>> {
+        let mut failure: Option<Failure> = None;
         for member in self.serving_members(caller, group, image, depth).await? {
             match self
                 .blob_from(caller, &member, image, digest, depth + 1)
@@ -209,7 +210,7 @@ impl Registry {
                 Ok(Some(hit)) => return Ok(Some(hit)),
                 Ok(None) => {}
                 Err(e) => {
-                    tracing::warn!(group = %group.name, member = %member.name, error = %e.message, "registry group: member failed");
+                    tracing::warn!(group = %group.name, member = %member.name, error = %e.message(), "registry group: member failed");
                     failure = Some(e);
                 }
             }
@@ -225,9 +226,9 @@ impl Registry {
         last: Option<&str>,
         limit: usize,
         depth: u32,
-    ) -> OciResult<Option<TagPage>> {
+    ) -> ImgResult<Option<TagPage>> {
         let mut known = false;
-        let mut failure: Option<OciError> = None;
+        let mut failure: Option<Failure> = None;
         let mut tags: Vec<String> = Vec::new();
         // The smallest last tag of a member page that left tags out: the
         // merged page ends there, since the member's next page may hold
@@ -272,10 +273,10 @@ impl Registry {
         caller: &Caller,
         group: &Repository,
         image: &str,
-        subject: &Digest,
+        subject: &ContentDigest,
         depth: u32,
-    ) -> OciResult<Vec<ReferrerDescriptor>> {
-        let mut out: Vec<ReferrerDescriptor> = Vec::new();
+    ) -> ImgResult<Vec<ManifestInfo>> {
+        let mut out: Vec<ManifestInfo> = Vec::new();
         let mut seen = HashSet::new();
         for member in self.serving_members(caller, group, image, depth).await? {
             match self
@@ -290,7 +291,7 @@ impl Registry {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(group = %group.name, member = %member.name, error = %e.message, "registry group: member failed");
+                    tracing::warn!(group = %group.name, member = %member.name, error = %e.message(), "registry group: member failed");
                 }
             }
         }
