@@ -1,12 +1,12 @@
 //! Integration tests of npm repositories (`/npm`): publishing and the
 //! packument documents, the redeploy policy, dist-tags, deprecation and
-//! unpublishing, Bearer tokens, `npm login` (legacy and web) and
-//! `npm logout`, proxies of a mock registry (caching, stale serving,
-//! integrity checks, the publication delay, Bearer credentials), groups
-//! (merging, the reserved-scope and prefer-hosted guards, the writable
-//! member), `npm audit` and retention. Requires Docker (Postgres +
-//! versitygw via the shared harness), or `FORGE_TEST_DATABASE_URL` /
-//! `FORGE_TEST_S3_ENDPOINT`.
+//! unpublishing, access levels and content selectors, Bearer tokens,
+//! `npm login` (legacy and web) and `npm logout`, proxies of a mock
+//! registry (caching, stale serving, integrity checks, the publication
+//! delay, Bearer credentials), groups (merging, the reserved-scope and
+//! prefer-hosted guards, the writable member), `npm audit` and retention.
+//! Requires Docker (Postgres + versitygw via the shared harness), or
+//! `FORGE_TEST_DATABASE_URL` / `FORGE_TEST_S3_ENDPOINT`.
 //!
 //! The same flows run with the real `npm` and `pnpm` in CI
 //! (`.github/scripts/npm-e2e.sh`).
@@ -686,7 +686,7 @@ async fn dist_tags_deprecations_and_unpublishing() {
 }
 
 #[tokio::test]
-async fn unpublishing_takes_the_delete_permission() {
+async fn unpublishing_takes_the_delete_level() {
     let srv = common::start().await;
     let repo = format!("npm{}", unique());
     create(
@@ -762,6 +762,140 @@ async fn unpublishing_takes_the_delete_permission() {
             .unwrap()
             .len(),
         2
+    );
+}
+
+#[tokio::test]
+async fn a_selector_on_a_write_grant_scopes_publishes_and_reads() {
+    let srv = common::start().await;
+    let repo = format!("npm{}", unique());
+    create(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let admin_npm = Npm::new(&srv, &repo, Some(srv.admin_token().await));
+    for name in ["@acme/ui", "outside"] {
+        assert_eq!(
+            admin_npm.publish(name, "1.0.0", &["latest"]).await.status(),
+            201
+        );
+    }
+
+    // A user whose one grant is `write` on `@acme/*` of this repository.
+    let username = format!("acme{}@example.com", unique());
+    let user_id = srv
+        .create_user(&username, "acme-password-1", "reader")
+        .await;
+    let selector: Value = admin(
+        &srv,
+        reqwest::Method::POST,
+        "/admin/content-selectors",
+        json!({"name": format!("s{}", unique()), "includes": ["@acme/*"], "excludes": []}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let role: Value = admin(
+        &srv,
+        reqwest::Method::POST,
+        "/admin/roles",
+        json!({"name": format!("r{}", unique())}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let resp = admin(
+        &srv,
+        reqwest::Method::PUT,
+        &format!("/admin/roles/{}/grants", role["id"]),
+        json!({"repository": repo, "level": "write", "selector_id": selector["id"]}),
+    )
+    .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    let resp = admin(
+        &srv,
+        reqwest::Method::PUT,
+        &format!("/admin/users/{user_id}/roles"),
+        json!({"role_id": role["id"]}),
+    )
+    .await;
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let npm = Npm::new(
+        &srv,
+        &repo,
+        Some(token_of(&srv, &username, "acme-password-1").await),
+    );
+
+    // It publishes and changes the scope's packages...
+    assert_eq!(
+        npm.publish("@acme/widget", "1.0.0", &["latest"])
+            .await
+            .status(),
+        201
+    );
+    let resp = npm
+        .req(reqwest::Method::PUT, "-/package/@acme%2fui/dist-tags/next")
+        .json(&json!("1.0.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    // ...and reads them only: the selector filters reads too.
+    npm.ok_packument("@acme/ui", true).await;
+    assert_eq!(npm.packument("outside", true).await.0, 404);
+    assert_eq!(npm.packument("outside", false).await.0, 404);
+    assert_eq!(
+        npm.req(reqwest::Method::GET, "outside/-/outside-1.0.0.tgz")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let found: Value = npm
+        .req(reqwest::Method::GET, "-/v1/search?text=e&size=20")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut names: Vec<&str> = found["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["package"]["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["@acme/ui", "@acme/widget"], "{found}");
+
+    // Nothing outside the scope: no publish, no tag, no deprecation.
+    let resp = npm.publish("outside", "2.0.0", &["latest"]).await;
+    assert_eq!(resp.status(), 403, "{}", resp.text().await.unwrap());
+    let resp = npm
+        .req(reqwest::Method::PUT, "-/package/outside/dist-tags/next")
+        .json(&json!("1.0.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let mut doc = admin_npm.ok_packument("outside", false).await;
+    doc["versions"]["1.0.0"]["deprecated"] = json!("old");
+    let resp = npm
+        .req(reqwest::Method::PUT, "outside")
+        .json(&doc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let full = admin_npm.ok_packument("outside", false).await;
+    assert_eq!(full["dist-tags"], json!({"latest": "1.0.0"}));
+    assert!(
+        full["versions"]["1.0.0"].get("deprecated").is_none(),
+        "{full}"
     );
 }
 

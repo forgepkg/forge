@@ -265,7 +265,7 @@ impl FormatRegistry {
 
     /// The repository kinds format `id` supports, `None` when it is not
     /// installed: what its descriptor names (all three for every built-in
-    /// format).
+    /// format: Docker's, NuGet's, npm's and raw's).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
         let plugin = self.plugins.get(id)?;
         Some(

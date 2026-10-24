@@ -630,10 +630,10 @@ export function RepositoryForm({
                 }
                 description={
                   isRaw
-                    ? 'What an upload to a path that holds a file does: refused (uploading the same content again is accepted), replaces it (which needs the delete permission too), or every upload and delete is refused.'
+                    ? 'What an upload to a path that holds a file does: refused (uploading the same content again is accepted), replaces it (which needs the delete level), or every upload and delete is refused.'
                     : isNpm
-                      ? 'What publishing a version that exists does: refused (as on the public registry, where a published version never changes), replaces it (which needs the delete permission too), or every publish, unpublish and dist-tag change is refused.'
-                      : 'What pushing a version that exists does: refused, replaces it (which needs the delete permission too), or every push, unlist and delete is refused.'
+                      ? 'What publishing a version that exists does: refused (as on the public registry, where a published version never changes), replaces it (which needs the delete level), or every publish, unpublish and dist-tag change is refused.'
+                      : 'What pushing a version that exists does: refused, replaces it (which needs the delete level), or every push, unlist and delete is refused.'
                 }
               >
                 <option value="disable_redeploy">Disable redeploy</option>
