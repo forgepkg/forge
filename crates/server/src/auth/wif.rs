@@ -37,7 +37,7 @@ use forge_core::net::ssrf;
 use forge_core::oidc::{IdTokenClaims, OidcError, OidcMetadataClient, Verified};
 use forge_db::authz_dao;
 use forge_db::model::AuthRealm;
-use forge_db::{trusted_publisher_dao, workload_api_key_dao};
+use forge_db::workload_api_key_dao;
 use http::header::AUTHORIZATION;
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -830,28 +830,14 @@ impl WorkloadIdentitySource {
             key_id = row.id,
             "workload API key authenticated"
         );
-        let mut conn = match self.pool.acquire().await {
-            Ok(conn) => conn,
-            Err(error) => {
-                tracing::error!(error = %error, key_id = row.id, "workload publisher snapshot connection failed");
-                return SourceOutcome::Unavailable;
-            }
-        };
-        let matched_publishers = match trusted_publisher_dao::load_key_matches(&mut conn, row.id)
-            .await
-        {
-            Ok(matches) => matches
-                .into_iter()
-                .map(|matched| TrustedPublisherMatch {
-                    id: matched.id,
-                    definition_sha256: matched.definition_sha256,
-                })
-                .collect(),
-            Err(error) => {
-                tracing::error!(error = %error, key_id = row.id, "workload publisher snapshot lookup failed");
-                return SourceOutcome::Unavailable;
-            }
-        };
+        let matched_publishers = row
+            .matched_publishers
+            .into_iter()
+            .map(|matched| TrustedPublisherMatch {
+                id: matched.id,
+                definition_sha256: matched.definition_sha256,
+            })
+            .collect();
         SourceOutcome::Authenticated(Principal::Workload {
             realm_id: row.realm_id,
             role_id: row.role_id,

@@ -88,6 +88,7 @@ interface ApiHandlers {
     repository: string,
     body: TrustedPublisherBody,
   ) => Response
+  onRemoveTrustedPublisher?: (repository: string, id: number) => Response
   onUpdate?: (name: string, body: unknown) => Response
   onAddMember?: (body: unknown) => Response
   onPatchMember?: (member: string, body: unknown) => Response
@@ -126,6 +127,19 @@ function mockApi(h: ApiHandlers) {
                 body,
               )
             : json(body, 201),
+        )
+      }
+      const trustedPublisherMatch = path.match(
+        /\/admin\/repositories\/([^/]+)\/trusted-publishers\/(\d+)$/,
+      )
+      if (trustedPublisherMatch && method === 'DELETE') {
+        return Promise.resolve(
+          h.onRemoveTrustedPublisher
+            ? h.onRemoveTrustedPublisher(
+                decodeURIComponent(trustedPublisherMatch[1]),
+                Number(trustedPublisherMatch[2]),
+              )
+            : new Response(null, { status: 204 }),
         )
       }
       if (path.endsWith('/admin/formats') && h.formats) {
@@ -636,6 +650,67 @@ describe('admin repositories', () => {
         actions: ['write'],
       },
     ])
+  })
+
+  it('uses provider templates only for exact issuer hosts', async () => {
+    mockApi({
+      repositories: [repo({ name: 'releases' })],
+      realms: [
+        {
+          id: 9,
+          kind: 'workload_identity',
+          name: 'untrusted',
+          enabled: true,
+          priority: 1,
+          config: {
+            issuer:
+              'https://evil.example/gitlab.com/token.actions.githubusercontent.com',
+            allowed_audiences: ['https://forge.example.com'],
+            rules: [],
+          },
+          created_at: '',
+          updated_at: '',
+        },
+      ],
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/releases')
+    await user.click(
+      await screen.findByRole('button', { name: 'Add trusted publisher' }),
+    )
+
+    expect(screen.getByLabelText('Claim conditions (JSON array)')).toHaveValue(
+      '[\n  {\n    "claim": "sub",\n    "any_of": [\n      ""\n    ]\n  }\n]',
+    )
+  })
+
+  it('shows a failed trusted-publisher deletion', async () => {
+    const publisher: TrustedPublisherView = {
+      id: 4,
+      realm_id: 9,
+      issuer: 'https://token.actions.githubusercontent.com',
+      name: 'widgets-release',
+      description: '',
+      realm: 'github-ci',
+      packages: { includes: ['widgets.*'], excludes: [] },
+      conditions: [{ claim: 'repository_id', any_of: ['1001'] }],
+      actions: ['write'],
+    }
+    mockApi({
+      repositories: [repo({ name: 'releases' })],
+      trustedPublishers: [publisher],
+      onRemoveTrustedPublisher: () =>
+        new Response('revocation failed', { status: 500 }),
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/releases')
+    await user.click(await screen.findByRole('button', { name: 'Delete' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /Could not delete trusted publisher\s*revocation failed/,
+    )
   })
 
   it('group members editor blocks a duplicate priority before requesting', async () => {

@@ -13,7 +13,7 @@ use std::io::Cursor;
 use axum::body::Body;
 use bytes::Bytes;
 use forge_core::auth::Principal;
-use forge_core::authz::Level;
+use forge_core::authz::{Level, PackageFilter};
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, LinkOutcome, NewManifest, TagWrite, UploadRow};
@@ -528,6 +528,9 @@ impl Registry {
             .await?;
         let stored = self.inner.cas.commit(staged).await?;
 
+        let role_filters = self
+            .role_filters_for_mutation(principal, &t.repo, PackageMutation::Publish)
+            .await;
         let mut tx = self.inner.pool.begin().await?;
         let linked: HashSet<String> =
             oci_dao::lock_links(&mut tx, t.repo.id, &t.image, &required_blobs)
@@ -587,8 +590,15 @@ impl Registry {
             }
         }
         let version = tags.first().cloned().unwrap_or_else(|| digest.to_string());
-        self.record_mutation(principal, t, PackageMutation::Publish, version, &mut tx)
-            .await?;
+        self.record_mutation(
+            principal,
+            t,
+            PackageMutation::Publish,
+            version,
+            role_filters,
+            &mut tx,
+        )
+        .await?;
         tx.commit().await?;
         Ok(CommittedManifest {
             id: manifest_id,
@@ -710,6 +720,9 @@ impl Registry {
         t: &Target,
         reference: &Reference,
     ) -> ImgResult<()> {
+        let role_filters = self
+            .role_filters_for_mutation(principal, &t.repo, PackageMutation::Delete)
+            .await;
         let mut tx = self.inner.pool.begin().await?;
         let deleted = match reference {
             Reference::Tag(tag) => oci_dao::delete_tag(&mut tx, t.repo.id, &t.image, tag).await?,
@@ -723,8 +736,15 @@ impl Registry {
             }));
         }
         let version = reference.as_str().to_string();
-        self.record_mutation(principal, t, PackageMutation::Delete, version, &mut tx)
-            .await?;
+        self.record_mutation(
+            principal,
+            t,
+            PackageMutation::Delete,
+            version,
+            role_filters,
+            &mut tx,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -740,6 +760,9 @@ impl Registry {
                 digest: digest.to_string(),
             })
         };
+        let role_filters = self
+            .role_filters_for_mutation(principal, &t.repo, PackageMutation::Delete)
+            .await;
         let mut tx = self.inner.pool.begin().await?;
         // Lock first, check after: a manifest naming the blob that commits
         // while this waits for the lock is seen by the check.
@@ -758,8 +781,15 @@ impl Registry {
             return Err(unknown());
         }
         let version = digest.to_string();
-        self.record_mutation(principal, t, PackageMutation::Delete, version, &mut tx)
-            .await?;
+        self.record_mutation(
+            principal,
+            t,
+            PackageMutation::Delete,
+            version,
+            role_filters,
+            &mut tx,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -768,39 +798,55 @@ impl Registry {
     /// change's transaction: a workload's pushes and deletes go to the
     /// trusted-publishing ledger, and fail when its realm or role changed
     /// since the request was authenticated.
+    async fn role_filters_for_mutation(
+        &self,
+        principal: &Principal,
+        repository: &Repository,
+        action: PackageMutation,
+    ) -> Option<(PackageFilter, PackageFilter)> {
+        if self.inner.recorder.is_none() || !matches!(principal, Principal::Workload { .. }) {
+            return None;
+        }
+        let level = match action {
+            PackageMutation::Unlist | PackageMutation::Delete => Level::Delete,
+            PackageMutation::Publish | PackageMutation::Relist => Level::Write,
+        };
+        let role_filter = self
+            .inner
+            .authz
+            .role_package_filter_for(principal, repository, level)
+            .await;
+        let role_replace_filter = self
+            .inner
+            .authz
+            .role_package_filter_for(principal, repository, Level::Delete)
+            .await;
+        Some((role_filter, role_replace_filter))
+    }
+
     async fn record_mutation(
         &self,
         principal: &Principal,
         t: &Target,
         action: PackageMutation,
         version: String,
+        role_filters: Option<(PackageFilter, PackageFilter)>,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> ImgResult<()> {
+        if !matches!(principal, Principal::Workload { .. }) {
+            return Ok(());
+        }
         let Some(recorder) = &self.inner.recorder else {
             return Ok(());
         };
-        let role_filter = self
-            .inner
-            .authz
-            .role_package_filter_for(
-                principal,
-                &t.repo,
-                match action {
-                    PackageMutation::Unlist | PackageMutation::Delete => Level::Delete,
-                    PackageMutation::Publish | PackageMutation::Relist => Level::Write,
-                },
-            )
-            .await;
-        let role_replace_filter = self
-            .inner
-            .authz
-            .role_package_filter_for(principal, &t.repo, Level::Delete)
-            .await;
+        let (role_filter, role_replace_filter) =
+            role_filters.expect("workload recorder filters resolved before transaction");
         let context = PublishAuthorizationContext {
             principal: principal.clone(),
             action,
             package_id: t.image.clone(),
             package_version: version,
+            requires_delete: false,
         };
         recorder
             .for_repository(&t.repo, role_filter, role_replace_filter)

@@ -219,6 +219,7 @@ async fn record(
     action: PackageMutation,
     path: &str,
     sha256: &str,
+    requires_delete: bool,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), FileError> {
     if !matches!(files.principal, Principal::Workload { .. }) {
@@ -229,6 +230,7 @@ async fn record(
         action,
         package_id: path.to_string(),
         package_version: sha256.to_string(),
+        requires_delete,
     };
     let role_filter = files
         .state
@@ -351,6 +353,7 @@ async fn record_all(
                 PackageMutation::Publish,
                 &file.path,
                 &stored.sha256,
+                status == "replaced",
                 &mut tx,
             )
             .await?;
@@ -537,6 +540,7 @@ pub async fn remove(
         PackageMutation::Delete,
         path,
         &file.blob_sha256,
+        false,
         &mut tx,
     )
     .await?;

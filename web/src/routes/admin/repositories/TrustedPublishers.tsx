@@ -33,12 +33,19 @@ function emptyDraft(realm?: RealmView): Draft {
       : ''
   const identityClaims =
     config && 'identity_claims' in config ? config.identity_claims : undefined
-  const identity = issuer.includes('gitlab.com')
+  const issuerHost = (() => {
+    try {
+      return new URL(issuer).hostname
+    } catch {
+      return ''
+    }
+  })()
+  const identity = issuerHost === 'gitlab.com'
     ? [
         { claim: 'job_project_id', any_of: [''] },
         { claim: 'job_namespace_id', any_of: [''] },
       ]
-    : issuer.includes('token.actions.githubusercontent.com')
+    : issuerHost === 'token.actions.githubusercontent.com'
       ? [
           { claim: 'repository_id', any_of: [''] },
           { claim: 'repository_owner_id', any_of: [''] },
@@ -137,6 +144,11 @@ export function TrustedPublishers({ repository }: { repository: string }) {
       {publishers.isError && (
         <Notice tone="danger" title="Could not load trusted publishers">
           {publishers.error.message}
+        </Notice>
+      )}
+      {remove.isError && (
+        <Notice tone="danger" title="Could not delete trusted publisher">
+          {remove.error.body || remove.error.message}
         </Notice>
       )}
       {publishers.data?.map((publisher) => (

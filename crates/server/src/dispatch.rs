@@ -305,14 +305,29 @@ impl PublishPolicy for SelectorPublishPolicy {
             forge_core::repo::PackageMutation::Publish
             | forge_core::repo::PackageMutation::Relist => "write",
         };
-        let mut trusted_publisher = None;
-        for publisher in current_publishers.iter().filter(|publisher| {
-            publisher.repository_id == self.repository_id
-                && publisher
-                    .actions
-                    .iter()
-                    .any(|action| action == required_action)
-        }) {
+        let role_action_filter = if required_action == "delete" {
+            &self.role_replace_filter
+        } else {
+            &self.role_filter
+        };
+        let role_allows_action = role_action_filter.allows(&context.package_id);
+        let role_allows_delete =
+            !context.requires_delete || self.role_replace_filter.allows(&context.package_id);
+        let role_authorized = role_allows_action && role_allows_delete;
+        let needs_publisher_action = !role_allows_action;
+        let needs_publisher_delete =
+            context.requires_delete && !self.role_replace_filter.allows(&context.package_id);
+        let mut publisher_action = None;
+        let mut publisher_delete = None;
+        for publisher in current_publishers
+            .iter()
+            .filter(|publisher| publisher.repository_id == self.repository_id)
+        {
+            if (!needs_publisher_action || publisher_action.is_some())
+                && (!needs_publisher_delete || publisher_delete.is_some())
+            {
+                break;
+            }
             let patterns = match (
                 serde_json::from_value::<Vec<String>>(publisher.includes.clone()),
                 serde_json::from_value::<Vec<String>>(publisher.excludes.clone()),
@@ -325,22 +340,33 @@ impl PublishPolicy for SelectorPublishPolicy {
                     continue;
                 }
             };
-            if patterns.matches(&context.package_id).unwrap_or(false) {
-                trusted_publisher = Some((publisher.id, publisher.name.as_str()));
-                break;
+            if !patterns.matches(&context.package_id).unwrap_or(false) {
+                continue;
+            }
+            if needs_publisher_action
+                && publisher
+                    .actions
+                    .iter()
+                    .any(|action| action == required_action)
+            {
+                publisher_action = Some((publisher.id, publisher.name.as_str()));
+            }
+            if needs_publisher_delete && publisher.actions.iter().any(|action| action == "delete") {
+                publisher_delete = Some((publisher.id, publisher.name.as_str()));
             }
         }
-        let role_filter = match context.action {
-            forge_core::repo::PackageMutation::Unlist
-            | forge_core::repo::PackageMutation::Delete => &self.role_replace_filter,
-            forge_core::repo::PackageMutation::Publish
-            | forge_core::repo::PackageMutation::Relist => &self.role_filter,
-        };
-        if trusted_publisher.is_none() && !role_filter.allows(&context.package_id) {
+        if (needs_publisher_action && publisher_action.is_none())
+            || (needs_publisher_delete && publisher_delete.is_none())
+        {
             return Err(WriteError::ForbiddenPackage {
                 id: context.package_id.clone(),
             });
         }
+        let trusted_publisher = if role_authorized {
+            None
+        } else {
+            publisher_action.or(publisher_delete)
+        };
         trusted_publish_audit_dao::insert(
             tx,
             NewTrustedPublishAudit {

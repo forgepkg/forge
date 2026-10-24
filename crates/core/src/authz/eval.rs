@@ -564,9 +564,8 @@ impl PackageFilter {
                 lhs.extend(rhs);
                 PackageFilter::All(lhs)
             }
-            (PackageFilter::Any(mut lhs), PackageFilter::Any(rhs)) => {
-                lhs.extend(rhs);
-                PackageFilter::Any(lhs)
+            (lhs @ PackageFilter::Any(_), rhs @ PackageFilter::Any(_)) => {
+                PackageFilter::All(vec![lhs, rhs])
             }
             (PackageFilter::Any(filters), rhs) | (rhs, PackageFilter::Any(filters)) => {
                 PackageFilter::All(vec![PackageFilter::Any(filters), rhs])
@@ -1014,6 +1013,21 @@ mod tests {
         assert!(combined.allows("Company.Public"));
         assert!(!combined.allows("Company.Secret"));
         assert!(!combined.allows("Other.Public"));
+    }
+
+    #[test]
+    fn intersect_preserves_both_any_filter_boundaries() {
+        let company = PackageFilter::Any(vec![PackageFilter::Predicate(Arc::new(|name| {
+            name.starts_with("company.")
+        }))]);
+        let public = PackageFilter::Any(vec![PackageFilter::Predicate(Arc::new(|name| {
+            name.ends_with(".public")
+        }))]);
+        let combined = company.intersect(public);
+
+        assert!(combined.allows("company.public"));
+        assert!(!combined.allows("company.secret"));
+        assert!(!combined.allows("other.public"));
     }
 
     // --- token scoping ------------------------------------------------------

@@ -179,7 +179,7 @@ function EditRepository() {
           onCancel={() => void navigate({ to: '/manage/repositories' })}
         />
         {current.kind === 'hosted' && (
-          <TrustedPublishers repository={current.name} />
+          <TrustedPublishers key={current.name} repository={current.name} />
         )}
       </Columns>
     </Page>
