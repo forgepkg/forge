@@ -29,7 +29,11 @@ import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
 import { TokenCreateForm } from '~/components/TokenCreateForm'
-import { TokenScopeBadges, TokenStatusBadge } from '~/components/TokenBadges'
+import {
+  formatTokenExpiry,
+  TokenScopeBadges,
+  TokenStatusBadge,
+} from '~/components/TokenBadges'
 
 export const Route = createFileRoute('/_app/tokens')({
   component: MyTokens,
@@ -75,11 +79,18 @@ function MyTokens() {
       />
 
       {created && (
-        <ShowOnceSecret
-          secret={created.token}
-          label="Token"
-          onDismiss={() => setCreated(null)}
-        />
+        <>
+          <ShowOnceSecret
+            secret={created.token}
+            label="Token"
+            onDismiss={() => setCreated(null)}
+          />
+          <p className="fg-text fg-text--small">
+            {created.expires_at === null
+              ? 'This token never expires; it stays valid until revoked.'
+              : `This token expires ${formatTokenExpiry(created.expires_at)}.`}
+          </p>
+        </>
       )}
 
       <TokenCreateForm
@@ -127,6 +138,7 @@ function MyTokens() {
               <TableHead>
                 <TableHeader>Name</TableHeader>
                 <TableHeader>Created</TableHeader>
+                <TableHeader>Expires</TableHeader>
                 <TableHeader>Last used</TableHeader>
                 <TableHeader>Scope</TableHeader>
                 <TableHeader>Status</TableHeader>
@@ -186,6 +198,7 @@ function TokenRow({
         {token.name}
       </TableCell>
       <TableCell nowrap>{formatTs(token.created_at)}</TableCell>
+      <TableCell nowrap>{formatTokenExpiry(token.expires_at)}</TableCell>
       <TableCell nowrap>{formatTs(token.last_used_at)}</TableCell>
       <TableCell>
         <TokenScopeBadges scope={token.scope} />

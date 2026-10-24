@@ -226,13 +226,20 @@ describe('admin user roles', () => {
     expect(screen.getByText('Choose at least one repository.')).toBeInTheDocument()
     await u.click(await screen.findByRole('checkbox', { name: 'internal' }))
     await u.click(screen.getByRole('button', { name: 'Create token' }))
-
     await waitFor(() =>
-      expect(api.sent('POST', /^\/admin\/users\/2\/tokens$/)[0]?.body).toEqual({
-        name: 'ci',
-        scope: { level: 'write', repositories: [10] },
-      }),
+      expect(api.sent('POST', /^\/admin\/users\/2\/tokens$/)[0]?.body).toEqual(
+        expect.objectContaining({
+          name: 'ci',
+          scope: { level: 'write', repositories: [10] },
+        }),
+      ),
     )
+    expect(
+      Date.parse(
+        (api.sent('POST', /^\/admin\/users\/2\/tokens$/)[0]?.body as { expires_at: string })
+          .expires_at,
+      ),
+    ).toBeGreaterThan(Date.now())
     expect(await screen.findByText('plaintext-secret')).toBeInTheDocument()
     const row = (await screen.findByText('ci', { selector: 'td' })).closest('tr')!
     expect(within(row).getByText('write')).toBeInTheDocument()
@@ -245,9 +252,15 @@ describe('admin user roles', () => {
 
     await u.type(await screen.findByLabelText('Token name'), 'laptop')
     await u.click(screen.getByRole('button', { name: 'Create token' }))
-    await waitFor(() =>
-      expect(api.sent('POST', /\/tokens$/)[0]?.body).toEqual({ name: 'laptop' }),
-    )
+    await waitFor(() => expect(api.sent('POST', /\/tokens$/)).toHaveLength(1))
+    const body = api.sent('POST', /\/tokens$/)[0]?.body as {
+      name: string
+      expires_at: string
+      scope?: unknown
+    }
+    expect(body.name).toBe('laptop')
+    expect(Date.parse(body.expires_at)).toBeGreaterThan(Date.now())
+    expect(body).not.toHaveProperty('scope')
   })
 
   it("changes a token's scope", async () => {

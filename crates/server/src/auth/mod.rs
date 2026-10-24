@@ -84,6 +84,7 @@ pub use settings::{
     load as load_auth_settings, AnonymousMode, AuthSettings, AuthSettingsCache, AuthSettingsUpdate,
     CurrentAuthSettings, LoginMode, SaveError, AUTH_SETTINGS_KEY,
 };
+pub(crate) use token_exchange::NPM_TOKEN_EXCHANGE_PATH;
 pub use token_exchange::{token_exchange_router, TOKEN_EXCHANGE_PATH};
 pub use wif::WorkloadIdentitySource;
 pub(crate) use wif::{realm_current_now, workload_identity_config_sha256};

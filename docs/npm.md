@@ -135,7 +135,9 @@ bun publish --registry https://forge.example.com/npm/npm-hosted/
 
 Publishing needs the level **write** and an API token (a password typed
 at the web login is not a publishing credential); CI jobs can use a
-[trusted publishing](trusted-publishing.md) token instead. Publishing to a
+[trusted publishing](trusted-publishing.md#npm) token instead: npm 11.5.1+
+automatically exchanges GitHub Actions or GitLab CI (including self-hosted
+GitLab) identity tokens, with no stored `_authToken`. Publishing to a
 group goes to its writable member.
 
 Forge checks what it stores:

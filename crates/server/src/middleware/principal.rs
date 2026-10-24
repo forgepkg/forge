@@ -262,6 +262,17 @@ pub async fn attach_principal(
         return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
     }
 
+    // npm's exchange authenticates its ****** including JSON refusals.
+    // Do not let the ordinary credential chain reject it with a plain-text 401.
+    if req.method() == axum::http::Method::POST
+        && req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_some_and(|path| path.as_str() == crate::auth::NPM_TOKEN_EXCHANGE_PATH)
+    {
+        return next.run(req).await;
+    }
+
     let xff = forwarded_for(req.headers());
     let client = resolve_client(peer, xff.as_deref(), &layer.trusted_proxies);
     let client_ip = client.ip;
@@ -896,6 +907,55 @@ mod tests {
             .unwrap();
         // Even though anon=All would otherwise allow anonymous, bad creds → 401.
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn npm_exchange_checks_its_own_credentials_but_not_cross_site_requests() {
+        let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StubSource {
+            outcome: SourceOutcome::Invalid,
+            require_header: true,
+        })];
+        let app = Router::new()
+            .route(
+                crate::auth::NPM_TOKEN_EXCHANGE_PATH,
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        axum::Json(serde_json::json!({"error": "exchange refused"})),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                layer(sources, AnonPolicy::Off),
+                attach_principal,
+            ));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/-/npm/v1/oidc/token/exchange/package/@acme%2fui")
+                .header(AUTHORIZATION, "******")
+        };
+        let response = app
+            .clone()
+            .oneshot(request().body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"exchange refused"}"#
+        );
+        let response = app
+            .oneshot(
+                request()
+                    .header("sec-fetch-site", "cross-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

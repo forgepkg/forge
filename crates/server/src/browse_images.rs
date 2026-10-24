@@ -28,6 +28,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
 use forge_core::auth::principal::Principal;
+use forge_core::authz::PackageFilter;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
 use forge_plugin::api::images::{ArtifactFiles, TextFile, MAX_FILES_BYTES, MAX_MANIFEST_BYTES};
@@ -48,8 +49,8 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// ([`FormatPlugin::config_summary`]).
 const CHART_KEY: &str = "chart";
 
-/// Most images considered per repository when listing.
-const MAX_IMAGES: i64 = 5000;
+/// Rows read at a time when visibility filtering or merging needs every image.
+const IMAGE_BATCH_SIZE: i64 = 1000;
 const DEFAULT_TAKE: usize = 50;
 const MAX_TAKE: usize = 200;
 
@@ -239,33 +240,24 @@ pub async fn list_images(
         Ok(s) => s,
         Err(e) => return db_error(e),
     };
-    let mut merged: BTreeMap<String, ImageItem> = BTreeMap::new();
-    for source in &sources {
-        let filter = state.authz.package_filter(&principal, source).await;
-        let images =
-            match oci_dao::list_images(&state.pool, source.id, &query.q, 0, MAX_IMAGES).await {
-                Ok(images) => images,
-                Err(e) => return db_error(e),
-            };
-        for image in images {
-            if !filter.allows(&image.image) {
-                continue;
-            }
-            merged.entry(image.image.clone()).or_insert(ImageItem {
-                image: image.image,
-                tag_count: image.tag_count,
-                manifest_count: image.manifest_count,
-                last_pushed_at: image.last_pushed_at,
-            });
-        }
-    }
     let take = if query.take == 0 {
         DEFAULT_TAKE
     } else {
         query.take.min(MAX_TAKE)
     };
-    let total = merged.len();
-    let items = merged.into_values().skip(query.skip).take(take).collect();
+    let (total, images) = match image_page(&state, &principal, &sources, &query, take).await {
+        Ok(page) => page,
+        Err(e) => return db_error(e),
+    };
+    let items = images
+        .into_iter()
+        .map(|image| ImageItem {
+            image: image.image,
+            tag_count: image.tag_count,
+            manifest_count: image.manifest_count,
+            last_pushed_at: image.last_pushed_at,
+        })
+        .collect();
     let (registry, pull_prefix) = pull_prefix(&state, &repo);
     Json(ImagesResult {
         total,
@@ -274,6 +266,53 @@ pub async fn list_images(
         pull_prefix,
     })
     .into_response()
+}
+
+async fn image_page(
+    state: &AppState,
+    principal: &Principal,
+    sources: &[Repository],
+    query: &ImagesQuery,
+    take: usize,
+) -> sqlx::Result<(usize, Vec<oci_dao::ImageSummary>)> {
+    let mut merged = BTreeMap::new();
+    for source in sources {
+        let filter = state.authz.package_filter(principal, source).await;
+        if sources.len() == 1 && matches!(filter, PackageFilter::AllowAll) {
+            let total = oci_dao::count_images(&state.pool, source.id, &query.q).await?;
+            let images = oci_dao::list_images(
+                &state.pool,
+                source.id,
+                &query.q,
+                i64::try_from(query.skip).unwrap_or(i64::MAX),
+                take as i64,
+            )
+            .await?;
+            return Ok((total as usize, images));
+        }
+        if matches!(filter, PackageFilter::DenyAll) {
+            continue;
+        }
+        let mut offset = 0;
+        loop {
+            let images =
+                oci_dao::list_images(&state.pool, source.id, &query.q, offset, IMAGE_BATCH_SIZE)
+                    .await?;
+            let count = images.len() as i64;
+            for image in images {
+                if filter.allows(&image.image) {
+                    merged.entry(image.image.clone()).or_insert(image);
+                }
+            }
+            if count < IMAGE_BATCH_SIZE {
+                break;
+            }
+            offset += count;
+        }
+    }
+    let total = merged.len();
+    let images = merged.into_values().skip(query.skip).take(take).collect();
+    Ok((total, images))
 }
 
 /// `GET /browse/images/{repo}/{*image}`

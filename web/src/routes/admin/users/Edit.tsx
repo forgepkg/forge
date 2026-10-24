@@ -71,6 +71,7 @@ import {
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
 import { TokenCreateForm } from '~/components/TokenCreateForm'
 import {
+  formatTokenExpiry,
   TokenScopeBadges,
   TokenStatusBadge,
   tokenStatus,
@@ -467,11 +468,18 @@ function UserTokens({ userId, inactive }: { userId: number; inactive: boolean })
   return (
     <>
       {created && (
-        <ShowOnceSecret
-          secret={created.token}
-          label="Token"
-          onDismiss={() => setCreated(null)}
-        />
+        <>
+          <ShowOnceSecret
+            secret={created.token}
+            label="Token"
+            onDismiss={() => setCreated(null)}
+          />
+          <p className="fg-text fg-text--small">
+            {created.expires_at === null
+              ? 'This token never expires; it stays valid until revoked.'
+              : `This token expires ${formatTokenExpiry(created.expires_at)}.`}
+          </p>
+        </>
       )}
 
       <TokenCreateForm
@@ -549,6 +557,7 @@ function UserTokens({ userId, inactive }: { userId: number; inactive: boolean })
             <TableHead>
               <TableHeader>Name</TableHeader>
               <TableHeader>Created</TableHeader>
+              <TableHeader>Expires</TableHeader>
               <TableHeader>Last used</TableHeader>
               <TableHeader>Scope</TableHeader>
               <TableHeader width="100px">Status</TableHeader>
@@ -958,6 +967,7 @@ function TokenRow({
         {token.name}
       </TableCell>
       <TableCell nowrap>{formatTs(token.created_at)}</TableCell>
+      <TableCell nowrap>{formatTokenExpiry(token.expires_at)}</TableCell>
       <TableCell nowrap>{formatTs(token.last_used_at)}</TableCell>
       <TableCell>
         <TokenScopeBadges scope={token.scope} />

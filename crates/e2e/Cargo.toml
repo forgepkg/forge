@@ -60,6 +60,7 @@ aws-sigv4 = "1.6"
 aws-credential-types = { workspace = true }
 
 [dev-dependencies]
+forge-format-npm = { path = "../formats/npm" }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }

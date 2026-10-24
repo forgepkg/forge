@@ -146,7 +146,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // endpoints answer 404 themselves when no enabled oidc realm exists.
         .merge(auth_router())
         // Trusted publishing: a CI job's OIDC token for a short-lived API key
-        // (`POST /api/v2/token`, nuget.org's path and shape).
+        // (the native NuGet and npm exchange paths and response shapes).
         .merge(crate::auth::token_exchange_router())
         // Forge's own OIDC issuer (discovery + JWKS), public: what an IdP
         // verifies the client assertions of a `federated_credential` realm

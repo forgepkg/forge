@@ -3214,9 +3214,12 @@ async fn search_falls_back_to_cached_packages_when_the_upstream_search_fails() {
         q: "sample".into(),
         ..Default::default()
     };
-    // The search service answers 404 (then 500): the cache answers, and for
-    // a minute after a failure the upstream search is not tried again.
-    for status in [None, Some(StatusCode::INTERNAL_SERVER_ERROR)] {
+    // A 404 affects only this request; a subsequent 500 backs off for a minute.
+    for status in [
+        None,
+        Some(StatusCode::INTERNAL_SERVER_ERROR),
+        Some(StatusCode::SERVICE_UNAVAILABLE),
+    ] {
         if let Some(status) = status {
             mock.set_search(status, vec![search_entry("Other.Lib", &["1.0.0"])], 1);
         }
@@ -3226,8 +3229,8 @@ async fn search_falls_back_to_cached_packages_when_the_upstream_search_fails() {
     }
     assert_eq!(
         mock.search_queries().len(),
-        1,
-        "backed off after the failure"
+        2,
+        "backed off only after the server error"
     );
 
     // An offline proxy never asks.
@@ -3239,7 +3242,137 @@ async fn search_falls_back_to_cached_packages_when_the_upstream_search_fails() {
     );
     let result = px.search(&offline, &params).await.unwrap();
     assert!(result.hits.is_empty());
-    assert_eq!(mock.search_queries().len(), 1);
+    assert_eq!(mock.search_queries().len(), 2);
+}
+
+#[tokio::test]
+async fn search_client_errors_do_not_back_off_other_queries() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.0.0")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    px.list_versions(&repo, "sample.lib").await.unwrap();
+
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::TOO_MANY_REQUESTS,
+    ] {
+        mock.set_search(status, vec![], 0);
+        let rejected = forge_core::repo::SearchParams {
+            q: format!("sample {status}"),
+            ..Default::default()
+        };
+        px.search(&repo, &rejected).await.unwrap();
+
+        mock.set_search(
+            StatusCode::OK,
+            vec![search_entry("Other.Lib", &["1.0.0"])],
+            1,
+        );
+        let normal = forge_core::repo::SearchParams {
+            q: format!("other {status}"),
+            ..Default::default()
+        };
+        let result = px.search(&repo, &normal).await.unwrap();
+        assert_eq!(result.hits[0].original_id, "Other.Lib", "{status}");
+    }
+    assert_eq!(mock.search_queries().len(), 12);
+}
+
+#[tokio::test]
+async fn search_timeouts_still_back_off_other_queries() {
+    use forge_core::net::upstream::{UpstreamHttp, UpstreamHttpConfig};
+    use std::time::Duration;
+
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.0.0")).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let count = attempts.clone();
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/query",
+            get(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<StatusCode>()
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    mock.override_index(serde_json::json!({ "version": "3.0.0", "resources": [
+        { "@id": format!("{}/flat/", mock.base), "@type": "PackageBaseAddress/3.0.0" },
+        { "@id": format!("http://{addr}/query"), "@type": "SearchQueryService/3.5.0" },
+    ] }));
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let http = UpstreamHttp::new(UpstreamHttpConfig {
+        metadata_timeout: Duration::from_millis(250),
+        ..Default::default()
+    })
+    .unwrap();
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128)).with_http(http);
+    px.list_versions(&repo, "sample.lib").await.unwrap();
+
+    for q in ["sample", "sample.lib"] {
+        let params = forge_core::repo::SearchParams {
+            q: q.into(),
+            ..Default::default()
+        };
+        let result = px.search(&repo, &params).await.unwrap();
+        assert_eq!(result.total_hits, 1);
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn search_excessive_skip_uses_local_pagination_without_disabling_upstream() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.0.0")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    px.list_versions(&repo, "sample.lib").await.unwrap();
+
+    for skip in [3_001, u32::MAX as usize, usize::MAX] {
+        let params = forge_core::repo::SearchParams {
+            q: "sample".into(),
+            skip,
+            ..Default::default()
+        };
+        let result = px.search(&repo, &params).await.unwrap();
+        assert_eq!(result.total_hits, 1);
+        assert!(result.hits.is_empty(), "local skip is not clamped");
+    }
+    assert!(mock.search_queries().is_empty());
+
+    mock.set_search(StatusCode::OK, vec![], 4_000);
+    let boundary = forge_core::repo::SearchParams {
+        skip: 3_000,
+        ..Default::default()
+    };
+    assert_eq!(px.search(&repo, &boundary).await.unwrap().total_hits, 4_000);
+    assert!(mock.search_queries()[0]
+        .split('&')
+        .any(|p| p == "skip=3000"));
+
+    mock.set_search(
+        StatusCode::OK,
+        vec![search_entry("Other.Lib", &["1.0.0"])],
+        1,
+    );
+    let result = px
+        .search(&repo, &forge_core::repo::SearchParams::default())
+        .await
+        .unwrap();
+    assert_eq!(result.hits[0].original_id, "Other.Lib");
+    assert_eq!(mock.search_queries().len(), 2);
 }
 
 /// #112: upstream hits honor the caller's package filter, live not-found

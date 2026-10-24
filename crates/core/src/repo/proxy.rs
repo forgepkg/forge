@@ -247,7 +247,7 @@ enum CachedFetch {
 /// [`RepoError::BadUpstream`], any other failure the proxy's own.
 fn upstream_err(e: UpstreamError) -> RepoError {
     match Trouble::of(&e) {
-        Trouble::Unavailable => RepoError::Upstream(e.to_string()),
+        Trouble::Unavailable | Trouble::RateLimited => RepoError::Upstream(e.to_string()),
         Trouble::Refused => RepoError::BadUpstream(e.to_string()),
         Trouble::None => RepoError::Storage(e.to_string()),
     }
@@ -279,13 +279,18 @@ enum Trouble {
     None,
     /// It refused the proxy (a 401, a 403): [`RepoError::BadUpstream`].
     Refused,
+    /// It rate-limited this request (a 429).
+    RateLimited,
     /// It cannot serve now: [`RepoError::Upstream`].
     Unavailable,
 }
 
 impl Trouble {
     fn of(e: &UpstreamError) -> Self {
-        if e.is_unavailable() {
+        if matches!(e, UpstreamError::Status { status, .. } if *status == reqwest::StatusCode::TOO_MANY_REQUESTS)
+        {
+            Trouble::RateLimited
+        } else if e.is_unavailable() {
             Trouble::Unavailable
         } else if e.is_refusal() {
             Trouble::Refused
@@ -620,7 +625,9 @@ impl ProxyRepo {
                     return Ok((api::UpstreamAnswer::Failed(reason), origins));
                 }
                 api::UpstreamStep::Done(api::UpstreamAnswer::Failed(reason))
-                    if trouble == Trouble::Unavailable =>
+                    if trouble == Trouble::Unavailable
+                        || (trouble == Trouble::RateLimited
+                            && !matches!(op, api::UpstreamOp::Search(_))) =>
                 {
                     return Err(RepoError::Upstream(reason));
                 }
@@ -2708,7 +2715,7 @@ impl ProxyRepo {
     /// Search `repo` through the upstream's `SearchQueryService` when the
     /// caller allows it ([`SearchParams::include_upstream`]), the proxy is
     /// online and the upstream advertises one; otherwise, and when the
-    /// upstream search fails (and for [`UPSTREAM_SEARCH_BACKOFF`] after),
+    /// upstream search fails (and for [`UPSTREAM_SEARCH_BACKOFF`] after an outage),
     /// search the cached packages ([`Self::search_filtered`]).
     async fn search_through_upstream(
         &self,
@@ -2730,7 +2737,7 @@ impl ProxyRepo {
                         .await;
                 }
                 Ok(None) => {}
-                Err(e) => {
+                Err(RepoError::Upstream(e)) => {
                     tracing::warn!(repo = %repo_row.name, error = %e, "upstream search failed; searching the cached packages for a minute");
                     let _ = self
                         .cache
@@ -2741,6 +2748,9 @@ impl ProxyRepo {
                             || async { Ok::<_, ()>(true) },
                         )
                         .await;
+                }
+                Err(e) => {
+                    tracing::warn!(repo = %repo_row.name, error = %e, "upstream search failed; searching the cached packages");
                 }
             }
         }
