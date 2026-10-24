@@ -1,4 +1,4 @@
-# A Forge format plugin: raw file repositories (see plugins/README.md).
+# A Forge format plugin: raw file repositories (see crates/formats/README.md).
 [plugin]
 id = "raw"
 name = "Raw files"

@@ -9,10 +9,11 @@ stays Forge's own. That covers storage, metadata, authentication, RBAC and
 package selectors, hosted, proxy and group repositories, retention, and the
 streaming of package bytes.
 
-Every plugin is built in: a crate under `plugins/<id>/` linked into the
-server and called directly, like any other Rust code. Plugins need no
-configuration. Forge ships two: **NuGet** ([`plugins/nuget`](../plugins/nuget))
-and **raw files** ([`plugins/raw`](../plugins/raw),
+Every plugin is built in: a crate under `crates/formats/<id>/` linked into
+the server and called directly, like any other Rust code. Plugins need no
+configuration. Forge ships two: **NuGet**
+([`crates/formats/nuget`](../crates/formats/nuget)) and **raw files**
+([`crates/formats/raw`](../crates/formats/raw),
 [Files formats](#files-formats)). Helm charts are served by the registry
 ([docker.md](docker.md#helm-charts)).
 
@@ -38,7 +39,7 @@ and **raw files** ([`plugins/raw`](../plugins/raw),
 A plugin is a workspace crate with a `plugin.toml`:
 
 ```
-plugins/nuget/
+crates/formats/nuget/
 ├── Cargo.toml
 ├── plugin.toml    # id, name, version, contract version; mount "/v3", kinds hosted/proxy/group
 ├── src/lib.rs     # impl FormatPlugin for Nuget
@@ -46,7 +47,7 @@ plugins/nuget/
 ├── src/upstream.rs  # proxies: reading another V3 feed (upstream)
 └── tests/         # the protocol against canned answers (forge-plugin-api `testing`)
 
-plugins/raw/
+crates/formats/raw/
 ├── Cargo.toml
 ├── plugin.toml    # mount "/raw", storage "files", kinds hosted/proxy/group
 ├── src/lib.rs     # impl FormatPlugin for Raw: paths, methods, upstream URLs
@@ -61,7 +62,7 @@ The pieces:
 | Crate | What it holds |
 | --- | --- |
 | [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, and, behind its `testing` feature, helpers that run a plugin's protocol against canned answers. Depends on nothing but `std`. |
-| [`plugins/<id>`](../plugins) | One crate per plugin, implementing `FormatPlugin`. |
+| [`crates/formats/<id>`](../crates/formats) | One crate per plugin, implementing `FormatPlugin`. |
 | [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin: its `plugin.toml` and its implementation) and `PluginFormat`, which adapts it to Forge's `Format` seam. |
 | [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `{mount}/{repo}/...` dispatcher, and the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)). |
 
@@ -187,8 +188,9 @@ the sidecar rendered from the file's digests, else `fetch-file` in a proxy
 or group, else a `directory` probe for a redirect; `GET …/<dir>/` is a
 `directory` page rendered as HTML or JSON; `PUT` is a `store` of the body;
 `POST …/<dir>/` is a `form`, then a `store` of its parts with Nexus' field
-names applied; `DELETE` is a `remove`. [plugins/raw](../plugins/raw) is the
-whole protocol, in a few hundred lines; the file store is
+names applied; `DELETE` is a `remove`.
+[crates/formats/raw](../crates/formats/raw) is the whole protocol, in a few
+hundred lines; the file store is
 [`crates/server/src/files`](../crates/server/src/files).
 
 ## Proxy repositories
@@ -345,9 +347,9 @@ policy (an outbound proxy, a Kubernetes `NetworkPolicy`).
 
 ## Writing a plugin
 
-A plugin is a crate in `plugins/<id>/` with a `plugin.toml`, a member of the
-workspace, depending on `forge-plugin-api` and implementing its trait
-([`plugins/nuget`](../plugins/nuget) is a complete one):
+A plugin is a crate in `crates/formats/<id>/` with a `plugin.toml`, a member
+of the workspace, depending on `forge-plugin-api` and implementing its trait
+([`crates/formats/nuget`](../crates/formats/nuget) is a complete one):
 
 ```rust
 use forge_plugin_api::{Action, FormatPlugin, Loaded, Repository, Request /* … */};
@@ -408,9 +410,11 @@ rules hold:
   resolved by the time data reaches you.
 - **Test the protocol without a server.** `forge-plugin-api`'s `testing`
   feature runs `handle` and `render` against canned answers to the queries
-  (`testing::serve`), as [`plugins/nuget/tests/protocol.rs`](../plugins/nuget/tests/protocol.rs)
+  (`testing::serve`), as
+  [`crates/formats/nuget/tests/protocol.rs`](../crates/formats/nuget/tests/protocol.rs)
   does; `testing::converse` runs `upstream` against canned upstream
-  documents ([`plugins/nuget/tests/upstream.rs`](../plugins/nuget/tests/upstream.rs)).
+  documents
+  ([`crates/formats/nuget/tests/upstream.rs`](../crates/formats/nuget/tests/upstream.rs)).
 - **Test it in a server.** The crate's unit tests run with the workspace.
   [`crates/server/tests/plugin_contract.rs`](../crates/server/tests/plugin_contract.rs)
   runs a server with a small plugin of its own installed; copy it for a new
@@ -453,7 +457,7 @@ to lift them:
 
 ### NuGet as a plugin
 
-NuGet is a built-in plugin: [`plugins/nuget`](../plugins/nuget)
+NuGet is a built-in plugin: [`crates/formats/nuget`](../crates/formats/nuget)
 implements `FormatPlugin`, and the dispatcher serves it at `/v3/{repo}/...`
 with the same paths, status codes, messages and JSON as before. The pieces it
 needed from the contract are general ones: a mount, its own asset names,
@@ -461,7 +465,7 @@ ranged downloads, paged registrations (`packages-of`), the search options of
 the V3 search service, and publishing the first file of a multipart body.
 
 Its proxies read another V3 feed through the plugin's upstream side
-([`src/upstream.rs`](../plugins/nuget/src/upstream.rs)): the service
+([`src/upstream.rs`](../crates/formats/nuget/src/upstream.rs)): the service
 index's resources, the flat container, the registration (bounded to the
 newest pages a request needs), catalog entries for the package delay of
 unlisted versions, and the search service.
@@ -490,5 +494,5 @@ list directories, take several files in one form, always answer ranges and
 conditional requests, and their proxies follow redirects and re-validate with
 `If-None-Match`. 0.4.0 gave the contract a second storage model, files
 ([Files formats](#files-formats)), so raw is a plugin now
-([`plugins/raw`](../plugins/raw)) like NuGet, and what was the raw server
-module is the host's file store.
+([`crates/formats/raw`](../crates/formats/raw)) like NuGet, and what was the
+raw server module is the host's file store.

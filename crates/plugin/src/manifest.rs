@@ -1,5 +1,5 @@
 //! `plugin.toml`: what a plugin declares about itself, next to its crate's
-//! `Cargo.toml` (`plugins/<id>/plugin.toml`).
+//! `Cargo.toml` (`crates/formats/<id>/plugin.toml`).
 //!
 //! ```toml
 //! [plugin]

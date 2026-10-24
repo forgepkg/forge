@@ -241,8 +241,8 @@ password: `docker login localhost:8421 -u admin@example.com`, then
 `docker push localhost:8421/docker-hosted/team/app:1`. See
 [docs/docker.md](docs/docker.md).
 
-Raw repositories (`"format":"raw"`, the built-in plugin `plugins/raw`) hold
-files under arbitrary paths, served under `/raw/`: `curl -u
+Raw repositories (`"format":"raw"`, the built-in plugin `crates/formats/raw`)
+hold files under arbitrary paths, served under `/raw/`: `curl -u
 admin@example.com:<token> --upload-file x.tgz
 localhost:8421/raw/binaries/tools/x.tgz`, a proxy of any HTTP(S) base URL
 (`"remote_url":"https://github.com/<owner>/<repo>/releases/download/"`), and
@@ -250,16 +250,17 @@ groups. See [docs/raw.md](docs/raw.md).
 
 ### Repositories of other formats (format plugins)
 
-Every package format is a format plugin, a crate in [`plugins/`](./plugins)
-linked into the server (see [docs/format-plugins.md](./docs/format-plugins.md));
-NuGet is the one there is. A new format goes in `plugins/` too, never in a
-`crates/format-<id>` crate or the server. Docker / OCI (`crates/format-oci`)
-and raw (`crates/server/src/raw/`) are not there yet and are to move to
-`plugins/docker` and `plugins/raw`. A repository of a plugin format is created
-with `"format": "<id>"` (hosted, proxy or group; a plugin format has proxies
-when it implements the upstream side) and served under `/repository/<name>/`
-unless the plugin names another mount (NuGet's is `/v3`). Helm charts are
-pushed to docker repositories, see [docs/docker.md](docs/docker.md#helm-charts).
+Every package format is a format plugin, a crate in
+[`crates/formats/`](./crates/formats) linked into the server (see
+[docs/format-plugins.md](./docs/format-plugins.md)): NuGet and raw. A new
+format goes in `crates/formats/<id>` too, never in a `crates/format-<id>`
+crate or the server. Docker / OCI (`crates/format-oci`) is not there yet and
+is to move to `crates/formats/docker`. A repository of a plugin format is
+created with `"format": "<id>"` (hosted, proxy or group; a plugin format has
+proxies when it implements the upstream side) and served under
+`/repository/<name>/` unless the plugin names another mount (NuGet's is
+`/v3`). Helm charts are pushed to docker repositories, see
+[docs/docker.md](docs/docker.md#helm-charts).
 
 ## Configuration
 
@@ -843,7 +844,7 @@ It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
-| Rust | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh` | `fmt`, `clippy`, `plugins`, `test`, `oci-e2e`, `raw-e2e`, `e2e`, `web-e2e` |
+| Rust | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh` | `fmt`, `clippy`, `test`, `oci-e2e`, `raw-e2e`, `e2e`, `web-e2e` |
 | Changelog | `docs/changes/` | `fmt` |
 | Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
@@ -995,7 +996,7 @@ only when a change touches its code:
 
 | Language | Paths |
 |---|---|
-| `rust` | `crates/`, `plugins/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `.sqlx/` |
+| `rust` | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `.sqlx/` |
 | `javascript-typescript` | `web/`, and every `.js`, `.cjs`, `.mjs`, `.ts` and `.tsx` file |
 | `actions` | `.github/workflows/`, and every `action.yml` and `action.yaml` |
 
