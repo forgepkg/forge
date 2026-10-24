@@ -36,6 +36,7 @@ describe('self-service tokens', () => {
   })
   afterEach(() => {
     vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
     clearSession()
   })
 
@@ -189,5 +190,31 @@ describe('self-service tokens', () => {
     expect(
       (api.sent('POST', /^\/admin\/me\/tokens$/)[0]!.body as { expires_at: string }).expires_at,
     ).toBe(`${date.min}T23:59:59.999Z`)
+  })
+
+  it('keeps a custom expiry on the selected date in a non-UTC timezone', async () => {
+    vi.stubEnv('TZ', 'Asia/Tokyo')
+    const u = userEvent.setup()
+    await renderApp('/tokens')
+    await u.type(await screen.findByLabelText('Token name'), 'tokyo')
+    await u.selectOptions(screen.getByLabelText('Token expiry'), 'custom')
+    const date = screen.getByLabelText('Expiry date') as HTMLInputElement
+    fireEvent.change(date, { target: { value: date.min } })
+
+    await u.click(screen.getByRole('button', { name: 'Create token' }))
+    await waitFor(() => expect(api.sent('POST', /^\/admin\/me\/tokens$/)).toHaveLength(1))
+    const body = api.sent('POST', /^\/admin\/me\/tokens$/)[0]!.body as {
+      expires_at: string
+    }
+    const [year, month, day] = date.min.split('-').map(Number)
+    const expected = new Date(year!, month! - 1, day!, 23, 59, 59, 999).toISOString()
+    expect(body.expires_at).toBe(expected)
+    expect(body.expires_at).not.toBe(`${date.min}T23:59:59.999Z`)
+    const selectedDate = new Date(`${date.min}T12:00:00`).toLocaleDateString(undefined, {
+      dateStyle: 'medium',
+    })
+    expect(
+      await screen.findByText(`This token expires ${selectedDate}.`),
+    ).toBeInTheDocument()
   })
 })

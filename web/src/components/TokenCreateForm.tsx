@@ -124,12 +124,19 @@ type ExpiryChoice = '30-days' | '90-days' | '1-year' | 'custom' | 'never'
 
 function minimumCustomDate(): string {
   const tomorrow = new Date()
-  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1)
-  return tomorrow.toISOString().slice(0, 10)
+  tomorrow.setDate(tomorrow.getDate() + 1)
+  return [
+    tomorrow.getFullYear(),
+    String(tomorrow.getMonth() + 1).padStart(2, '0'),
+    String(tomorrow.getDate()).padStart(2, '0'),
+  ].join('-')
 }
 
 function expiryDate(choice: Exclude<ExpiryChoice, 'never'>, customDate: string): string {
-  if (choice === 'custom') return `${customDate}T23:59:59.999Z`
+  if (choice === 'custom') {
+    const [year, month, day] = customDate.split('-').map(Number)
+    return new Date(year!, month! - 1, day!, 23, 59, 59, 999).toISOString()
+  }
   const date = new Date()
   if (choice === '1-year') date.setUTCFullYear(date.getUTCFullYear() + 1)
   else date.setUTCDate(date.getUTCDate() + (choice === '30-days' ? 30 : 90))
