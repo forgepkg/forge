@@ -32,7 +32,7 @@ use forge_db::token_dao::{self, NewToken};
 use forge_db::user_dao;
 
 use crate::admin::db_error;
-use crate::admin::tokens::{store_scope, CreateToken, CreatedToken, TokenView};
+use crate::admin::tokens::{store_scope, validate_expiry, CreateToken, CreatedToken, TokenView};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -114,6 +114,9 @@ pub async fn create(State(state): State<AppState>, req: axum::extract::Request) 
         Ok(b) => b,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid body: {e}")).into_response(),
     };
+    if let Err(response) = validate_expiry(body.expires_at) {
+        return response;
+    }
 
     // A session of an upstream-basic account was established by credential
     // forwarding: such a token must not outlive an admin-forced reauth.

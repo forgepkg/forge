@@ -371,7 +371,13 @@ export class FakeRbacApi {
       const uid = Number(m[1])
       if (method === 'GET') return json(s.tokens.filter((t) => t.user_id === uid))
       if (method === 'POST') {
-        const t = token({ id: this.nextId++, user_id: uid, name: body.name, scope: body.scope ?? null })
+        const t = token({
+          id: this.nextId++,
+          user_id: uid,
+          name: body.name,
+          expires_at: body.expires_at ?? null,
+          scope: body.scope ?? null,
+        })
         s.tokens.push(t)
         return json({ ...t, token: 'plaintext-secret' }, 201)
       }
@@ -385,7 +391,13 @@ export class FakeRbacApi {
     if (path === '/admin/me/tokens') {
       if (method === 'GET') return json(s.myTokens)
       if (method === 'POST') {
-        const t = token({ id: this.nextId++, user_id: s.me.user.id, name: body.name, scope: body.scope ?? null })
+        const t = token({
+          id: this.nextId++,
+          user_id: s.me.user.id,
+          name: body.name,
+          expires_at: body.expires_at ?? null,
+          scope: body.scope ?? null,
+        })
         s.myTokens.push(t)
         return json({ ...t, token: 'my-plaintext-secret' }, 201)
       }

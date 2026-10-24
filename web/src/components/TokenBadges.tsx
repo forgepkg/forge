@@ -33,6 +33,14 @@ export function TokenStatusBadge({ token }: { token: TokenView }) {
   }
 }
 
+export function formatTokenExpiry(expiresAt: string | null): string {
+  if (expiresAt === null) return 'never'
+  const date = new Date(expiresAt)
+  return Number.isNaN(date.getTime())
+    ? expiresAt
+    : date.toLocaleDateString(undefined, { dateStyle: 'medium' })
+}
+
 const LEVEL_SET = new Set<string>(LEVELS)
 
 /**
