@@ -436,6 +436,21 @@ async fn uploads_take_the_first_part_and_assets_their_names() {
     .await
     .unwrap();
     assert_eq!(paths, ["probe.bin", "probe.txt"]);
+
+    let resp = srv
+        .client()
+        .get(format!("{}/browse/packages/{repo}/demo", srv.base_url))
+        .basic_auth(&creds.0, Some(&creds.1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail: Value = resp.json().await.unwrap();
+    assert_eq!(detail["description"], json!("Demo 1.0.0"));
+    assert_eq!(
+        detail["versions"][0]["size"],
+        json!("Demo 1.0.0\nbody".len())
+    );
 }
 
 #[tokio::test]
