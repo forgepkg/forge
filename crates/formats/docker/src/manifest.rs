@@ -9,7 +9,9 @@
 //! what a manifest keeps alive in the CAS and what a proxy fetches.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 
+use crate::chart;
 use crate::digest::Digest;
 
 /// The media types Forge stores as manifests.
@@ -63,7 +65,14 @@ pub const EMPTY_JSON_DIGEST: &str =
 
 /// Largest manifest Forge accepts or proxies. The spec asks registries to
 /// accept at least 4 MiB.
-pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_MANIFEST_BYTES: usize = forge_plugin_api::images::MAX_MANIFEST_BYTES;
+
+/// Config blobs larger than this are not read for the summary.
+pub const MAX_CONFIG_SUMMARY_BYTES: i64 = 1024 * 1024;
+
+/// Most bytes of a manifest's annotations kept in its summary (for the
+/// referrers API), so one manifest cannot bloat every listing.
+const MAX_SUMMARY_ANNOTATIONS: usize = 16 * 1024;
 
 /// Whether the manifest is a single image/artifact or a list of manifests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +164,86 @@ impl ParsedManifest {
     pub fn layers_size(&self) -> i64 {
         self.layers.iter().map(|l| l.size).sum()
     }
+
+    /// Whether it is a Helm chart (`helm push`): its config is the chart's
+    /// metadata.
+    pub fn is_chart(&self) -> bool {
+        self.kind == ManifestKind::Image
+            && (self
+                .config
+                .as_ref()
+                .is_some_and(|c| c.media_type == chart::media::CONFIG)
+                || self.artifact_type.as_deref() == Some(chart::media::CONFIG))
+    }
+
+    /// The config whose content completes the summary: an image's (its
+    /// platform) or a chart's (its metadata), when it is small enough to
+    /// read.
+    pub fn summary_config(&self) -> Option<&Descriptor> {
+        self.config.as_ref().filter(|c| {
+            (is_image_config(&c.media_type) || c.media_type == chart::media::CONFIG)
+                && c.size <= MAX_CONFIG_SUMMARY_BYTES
+        })
+    }
+
+    /// A chart's packaged archive, whose README and values the web UI shows.
+    pub fn chart_archive(&self) -> Option<&Descriptor> {
+        if !self.is_chart() {
+            return None;
+        }
+        self.layers
+            .iter()
+            .find(|l| chart::is_archive(&l.media_type))
+    }
+
+    /// Display data of the manifest itself: an index's platforms; an image's
+    /// layer count and total, and its config's media type and digest; its
+    /// annotations, for the referrers API. Its config's part comes from
+    /// [`config_summary`] once the config is at hand.
+    pub fn summary(&self) -> Value {
+        let mut summary = Map::new();
+        match self.kind {
+            ManifestKind::Index => {
+                let platforms: Vec<String> = self
+                    .manifests
+                    .iter()
+                    .filter_map(|m| m.platform.as_ref())
+                    .filter(|p| !p.architecture.is_empty() && p.architecture != "unknown")
+                    .map(|p| p.label())
+                    .collect();
+                summary.insert("platforms".into(), json!(platforms));
+            }
+            ManifestKind::Image => {
+                summary.insert("layers_size".into(), json!(self.layers_size()));
+                summary.insert("layers".into(), json!(self.layers.len()));
+                if let Some(config) = &self.config {
+                    summary.insert("config_media_type".into(), json!(config.media_type));
+                    summary.insert("config_digest".into(), json!(config.digest.as_str()));
+                }
+            }
+        }
+        if let Some(annotations) = &self.annotations {
+            let value = Value::Object(annotations.clone());
+            if value.to_string().len() <= MAX_SUMMARY_ANNOTATIONS {
+                summary.insert("annotations".into(), value);
+            }
+        }
+        Value::Object(summary)
+    }
+}
+
+/// The part of a summary a config holds: an image config's platform, a
+/// chart's metadata. `None` when it holds nothing worth showing.
+pub fn config_summary(media_type: &str, config: &[u8]) -> Option<Value> {
+    if is_image_config(media_type) {
+        let platform = config_platform(config)?;
+        return Some(json!({ "platform": platform.label() }));
+    }
+    if media_type == chart::media::CONFIG {
+        let metadata = chart::metadata(config)?;
+        return Some(json!({ "chart": metadata }));
+    }
+    None
 }
 
 /// Why a manifest was refused.
@@ -478,7 +567,9 @@ mod tests {
 
     #[test]
     fn empty_json_digest_is_right() {
-        assert_eq!(Digest::sha256_of(EMPTY_JSON).as_str(), EMPTY_JSON_DIGEST);
+        use sha2::Digest as _;
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(EMPTY_JSON)));
+        assert_eq!(digest, EMPTY_JSON_DIGEST);
     }
 
     #[test]
@@ -486,5 +577,67 @@ mod tests {
         let p = config_platform(br#"{"architecture":"amd64","os":"linux","rootfs":{}}"#).unwrap();
         assert_eq!(p.label(), "linux/amd64");
         assert!(config_platform(b"{}").is_none());
+    }
+
+    #[test]
+    fn summaries_name_platforms_layers_and_the_config() {
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": media::OCI_INDEX,
+            "manifests": [
+                {"mediaType": media::OCI_MANIFEST, "digest": d(4), "size": 7,
+                 "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"}},
+                {"mediaType": media::OCI_MANIFEST, "digest": d(5), "size": 7,
+                 "platform": {"architecture": "unknown", "os": "unknown"}}
+            ]
+        });
+        let summary = parse(index.to_string().as_bytes(), None).unwrap().summary();
+        assert_eq!(summary["platforms"], serde_json::json!(["linux/arm64/v8"]));
+
+        let image = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": media::OCI_MANIFEST,
+            "config": {"mediaType": media::OCI_IMAGE_CONFIG, "digest": d(1), "size": 10},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": d(2), "size": 100}],
+            "annotations": {"org.opencontainers.image.title": "app"}
+        });
+        let parsed = parse(image.to_string().as_bytes(), None).unwrap();
+        let summary = parsed.summary();
+        assert_eq!(summary["layers_size"], 100);
+        assert_eq!(summary["config_digest"], d(1));
+        assert_eq!(
+            summary["annotations"]["org.opencontainers.image.title"],
+            "app"
+        );
+        assert_eq!(parsed.summary_config().unwrap().digest.as_str(), d(1));
+        assert!(!parsed.is_chart());
+        assert_eq!(
+            config_summary(
+                media::OCI_IMAGE_CONFIG,
+                br#"{"architecture":"amd64","os":"linux"}"#
+            ),
+            Some(serde_json::json!({"platform": "linux/amd64"}))
+        );
+        assert_eq!(config_summary("application/vnd.example", b"{}"), None);
+    }
+
+    #[test]
+    fn a_chart_names_its_metadata_and_archive() {
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": media::OCI_MANIFEST,
+            "config": {"mediaType": chart::media::CONFIG, "digest": d(1), "size": 100},
+            "layers": [{"mediaType": chart::media::CONTENT, "digest": d(2), "size": 1000}]
+        });
+        let parsed = parse(body.to_string().as_bytes(), None).unwrap();
+        assert!(parsed.is_chart());
+        assert_eq!(parsed.chart_archive().unwrap().digest.as_str(), d(2));
+        assert_eq!(parsed.summary_config().unwrap().digest.as_str(), d(1));
+        let part = config_summary(
+            chart::media::CONFIG,
+            br#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(part["chart"]["name"], "demo");
     }
 }

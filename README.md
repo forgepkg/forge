@@ -57,17 +57,17 @@ A Cargo workspace of small crates plus the web SPA:
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
 | `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
-| `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `nuget`, `npm`, `raw`. |
-| `formats/docker` | `forge-format-docker` | Docker / OCI registry, still native: the distribution-spec `/v2` API, manifests, registry tokens, hosted/proxy/group resolution. |
-| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`, npm at `/npm`, raw files at `/raw`), the file store of files formats, the Docker registry, `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
+| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`, npm at `/npm`, raw files at `/raw`, the Docker / OCI registry at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
-**Every format is a plugin in `crates/formats/`.** A package format is a
-crate in `crates/formats/<id>/` implementing `FormatPlugin`, linked into the
-server. Docker / OCI is in `crates/formats/docker` but still native: the
-server's registry serves it under `/v2`, not through `FormatPlugin`.
+**Every format is a plugin in `crates/formats/`.** A format is a crate in
+`crates/formats/<id>/` implementing `FormatPlugin`, linked into the server.
+Docker / OCI is one too, an images format: the plugin speaks the protocol,
+and the server's image store (`crates/server/src/images`) keeps the
+images.
 
 **Single-origin serving.** `forge-server` mounts each format plugin's feed
 (NuGet at `/v3`, npm at `/npm`, others at `/repository`), the Docker / OCI registry (`/v2`),

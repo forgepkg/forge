@@ -1,5 +1,6 @@
-//! Pulls: manifests, blobs, tag lists and referrers, served from hosted,
-//! proxy and group repositories alike.
+//! Pulls: manifests, blobs, tag lists and referrers, read from hosted,
+//! proxy and group repositories alike, and serving a manifest or a blob the
+//! format asked for.
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -7,28 +8,13 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, ManifestRow};
+use forge_plugin::api::images::{BlobInfo, ManifestInfo, Reference, TagPage, MAX_MANIFEST_BYTES};
 use forge_storage::BlobRef;
 use futures_util::future::BoxFuture;
 
-use crate::digest::{Digest, DigestError};
-use crate::error::{Code, OciError, OciResult};
-use crate::manifest::{media, MAX_MANIFEST_BYTES};
-use crate::reference::{Reference, ReferenceError};
-use crate::service::{location, Caller, Registry, RequestCtx};
-
-/// Tags returned by one `tags/list` page when the client sets no `n`.
-const DEFAULT_TAG_PAGE: usize = 10_000;
-
-/// One page of an image's tags: the tags after `last`, in byte order, at
-/// most as many as asked for.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct TagPage {
-    pub tags: Vec<String>,
-    /// The source has tags after these that the page leaves out: the full
-    /// page did not hold them, or the source could not list them all at
-    /// once (a proxy's upstream that pages its tags).
-    pub more: bool,
-}
+use super::digest::ContentDigest;
+use super::dispatch::Caller;
+use super::{header_value, Failure, ImgResult, Registry};
 
 /// A manifest found for a pull.
 #[derive(Debug, Clone)]
@@ -38,6 +24,9 @@ pub(crate) struct ManifestHit {
     pub digest: String,
     pub media_type: String,
     pub size: i64,
+    pub artifact_type: Option<String>,
+    pub subject_digest: Option<String>,
+    pub summary: serde_json::Value,
     pub blob_sha256: String,
     pub s3_key: String,
     /// The bytes, when they are already in memory (a proxy just fetched
@@ -61,9 +50,28 @@ impl ManifestHit {
             digest: row.digest,
             media_type: row.media_type,
             size: row.size,
+            artifact_type: row.artifact_type,
+            subject_digest: row.subject_digest,
+            summary: row.summary,
             blob_sha256: row.blob_sha256,
             s3_key: row.s3_key,
             bytes: None,
+        }
+    }
+
+    /// What the format learns of it.
+    pub fn info(&self) -> ManifestInfo {
+        ManifestInfo {
+            digest: self.digest.clone(),
+            media_type: self.media_type.clone(),
+            size: self.size.max(0) as u64,
+            artifact_type: self.artifact_type.clone(),
+            subject: self.subject_digest.clone(),
+            summary: self
+                .summary
+                .as_object()
+                .filter(|s| !s.is_empty())
+                .map(|_| self.summary.to_string()),
         }
     }
 }
@@ -91,56 +99,14 @@ impl BlobHit {
             size: self.size.max(0) as u64,
         }
     }
-}
 
-/// A referrer descriptor.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ReferrerDescriptor {
-    pub media_type: String,
-    pub digest: String,
-    pub size: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifact_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<serde_json::Value>,
-}
-
-impl ReferrerDescriptor {
-    pub fn from_row(row: &ManifestRow) -> Self {
-        ReferrerDescriptor {
-            media_type: row.media_type.clone(),
-            digest: row.digest.clone(),
-            size: row.size,
-            artifact_type: row.artifact_type.clone(),
-            annotations: row
-                .summary
-                .get("annotations")
-                .filter(|a| a.as_object().is_some_and(|o| !o.is_empty()))
-                .cloned(),
+    /// What the format learns of it.
+    pub fn info(&self) -> BlobInfo {
+        BlobInfo {
+            digest: self.digest.clone(),
+            size: self.size.max(0) as u64,
         }
     }
-}
-
-pub(crate) fn parse_digest(raw: &str) -> OciResult<Digest> {
-    Digest::parse(raw).map_err(|e| match e {
-        DigestError::Invalid(_) => OciError::digest_invalid(format!("invalid digest {raw:?}")),
-        DigestError::Unsupported(_) => OciError::new(
-            StatusCode::BAD_REQUEST,
-            Code::DigestInvalid,
-            format!("unsupported digest algorithm in {raw:?}: use sha256 or sha512"),
-        ),
-    })
-}
-
-pub(crate) fn parse_reference(raw: &str) -> OciResult<Reference> {
-    Reference::parse(raw).map_err(|e| match e {
-        ReferenceError::InvalidTag => OciError::manifest_invalid(format!("invalid tag {raw:?}"))
-            .with_detail(serde_json::json!({ "reference": raw })),
-        ReferenceError::Digest(_) => parse_digest(raw)
-            .err()
-            .unwrap_or_else(|| OciError::digest_invalid(format!("invalid digest {raw:?}"))),
-    })
 }
 
 impl Registry {
@@ -154,7 +120,7 @@ impl Registry {
         image: &'a str,
         reference: &'a Reference,
         depth: u32,
-    ) -> BoxFuture<'a, OciResult<Option<ManifestHit>>> {
+    ) -> BoxFuture<'a, ImgResult<Option<ManifestHit>>> {
         Box::pin(async move {
             match repo.kind() {
                 RepoKind::Hosted => self.hosted_manifest(repo, image, reference).await,
@@ -173,9 +139,9 @@ impl Registry {
         caller: &'a Caller,
         repo: &'a Repository,
         image: &'a str,
-        digest: &'a Digest,
+        digest: &'a ContentDigest,
         depth: u32,
-    ) -> BoxFuture<'a, OciResult<Option<BlobHit>>> {
+    ) -> BoxFuture<'a, ImgResult<Option<BlobHit>>> {
         Box::pin(async move {
             match repo.kind() {
                 RepoKind::Hosted => self.hosted_blob(repo, image, digest).await,
@@ -195,7 +161,7 @@ impl Registry {
         last: Option<&'a str>,
         limit: usize,
         depth: u32,
-    ) -> BoxFuture<'a, OciResult<Option<TagPage>>> {
+    ) -> BoxFuture<'a, ImgResult<Option<TagPage>>> {
         Box::pin(async move {
             match repo.kind() {
                 RepoKind::Hosted => self.local_tags(repo, image, last, limit).await,
@@ -214,9 +180,9 @@ impl Registry {
         caller: &'a Caller,
         repo: &'a Repository,
         image: &'a str,
-        subject: &'a Digest,
+        subject: &'a ContentDigest,
         depth: u32,
-    ) -> BoxFuture<'a, OciResult<Vec<ReferrerDescriptor>>> {
+    ) -> BoxFuture<'a, ImgResult<Vec<ManifestInfo>>> {
         Box::pin(async move {
             match repo.kind() {
                 RepoKind::Hosted => self.local_referrers(repo, image, subject).await,
@@ -236,14 +202,14 @@ impl Registry {
         repo: &Repository,
         image: &str,
         reference: &Reference,
-    ) -> OciResult<Option<ManifestHit>> {
+    ) -> ImgResult<Option<ManifestHit>> {
         let pool = &self.inner.pool;
         let row = match reference {
             Reference::Tag(tag) => oci_dao::find_tag(pool, repo.id, image, tag)
                 .await?
                 .map(|t| t.manifest),
             Reference::Digest(digest) => {
-                oci_dao::find_manifest(pool, repo.id, image, digest.as_str()).await?
+                oci_dao::find_manifest(pool, repo.id, image, digest).await?
             }
         };
         Ok(row.map(ManifestHit::from_row))
@@ -253,8 +219,8 @@ impl Registry {
         &self,
         repo: &Repository,
         image: &str,
-        digest: &Digest,
-    ) -> OciResult<Option<BlobHit>> {
+        digest: &ContentDigest,
+    ) -> ImgResult<Option<BlobHit>> {
         let pool = &self.inner.pool;
         if let Some(link) = oci_dao::find_link(pool, repo.id, image, digest.as_str()).await? {
             return Ok(Some(BlobHit {
@@ -290,7 +256,7 @@ impl Registry {
         image: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OciResult<Option<TagPage>> {
+    ) -> ImgResult<Option<TagPage>> {
         let pool = &self.inner.pool;
         let asked = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let mut tags = oci_dao::list_tags(pool, repo.id, image, last, asked).await?;
@@ -307,18 +273,21 @@ impl Registry {
         &self,
         repo: &Repository,
         image: &str,
-        subject: &Digest,
-    ) -> OciResult<Vec<ReferrerDescriptor>> {
+        subject: &ContentDigest,
+    ) -> ImgResult<Vec<ManifestInfo>> {
         let rows =
             oci_dao::list_referrers(&self.inner.pool, repo.id, image, subject.as_str()).await?;
-        Ok(rows.iter().map(ReferrerDescriptor::from_row).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| ManifestHit::from_row(row).info())
+            .collect())
     }
 
-    /// Read a stored manifest's (or image config's) bytes, through the
-    /// local blob cache.
-    pub(crate) async fn read_manifest_bytes(&self, blob: BlobRef<'_>) -> OciResult<Bytes> {
+    /// Read a stored manifest's (or a config's) bytes, through the local
+    /// blob cache.
+    pub(crate) async fn read_manifest_bytes(&self, blob: BlobRef<'_>) -> ImgResult<Bytes> {
         let too_large = || {
-            OciError::internal(
+            Failure::internal(
                 "manifest read",
                 format!("stored manifest {} is too large", blob.s3_key),
             )
@@ -331,9 +300,9 @@ impl Registry {
             .store
             .read_all(blob)
             .await
-            .map_err(|e| OciError::storage_read("manifest read", e))?;
+            .map_err(|e| Failure::storage_read("manifest read", e))?;
         if bytes.len() as u64 != blob.size {
-            return Err(OciError::internal(
+            return Err(Failure::internal(
                 "manifest read",
                 format!(
                     "stored manifest {} has {} bytes, expected {}",
@@ -346,28 +315,14 @@ impl Registry {
         Ok(Bytes::from(bytes))
     }
 
-    // ── Handlers ────────────────────────────────────────────────────────────
+    // ── Serving ─────────────────────────────────────────────────────────────
 
-    pub(crate) async fn get_manifest(
+    /// Serve a manifest the format asked for, as its media type.
+    pub(crate) async fn serve_manifest(
         &self,
-        ctx: &RequestCtx,
-        reference: &str,
+        hit: &ManifestHit,
         head: bool,
-        _headers: &HeaderMap,
-    ) -> OciResult<Response> {
-        let reference = parse_reference(reference).map_err(|e| {
-            // A malformed reference names nothing that can exist.
-            if e.code == Code::ManifestInvalid {
-                OciError::manifest_unknown(reference)
-            } else {
-                e
-            }
-        })?;
-        let t = &ctx.target;
-        let hit = self
-            .manifest_from(&ctx.caller, &t.repo, &t.image, &reference, 0)
-            .await?
-            .ok_or_else(|| OciError::manifest_unknown(reference.as_str()))?;
+    ) -> ImgResult<Response> {
         let mut response = if head {
             Response::new(Body::empty())
         } else {
@@ -392,19 +347,14 @@ impl Registry {
         Ok(response)
     }
 
-    pub(crate) async fn get_blob(
+    /// Serve a blob the format asked for, with one `Range`, and record the
+    /// pull of its link.
+    pub(crate) async fn serve_blob(
         &self,
-        ctx: &RequestCtx,
-        digest: &str,
+        hit: &BlobHit,
         head: bool,
         headers: &HeaderMap,
-    ) -> OciResult<Response> {
-        let digest = parse_digest(digest)?;
-        let t = &ctx.target;
-        let hit = self
-            .blob_from(&ctx.caller, &t.repo, &t.image, &digest, 0)
-            .await?
-            .ok_or_else(|| OciError::blob_unknown(digest.as_str()))?;
+    ) -> ImgResult<Response> {
         if hit.linked {
             if let Err(e) = oci_dao::touch_link(
                 &self.inner.pool,
@@ -444,7 +394,7 @@ impl Registry {
                     .store
                     .open(hit.blob(), range.map(|(start, end)| start..end + 1))
                     .await
-                    .map_err(|e| OciError::storage_read("blob read", e))?;
+                    .map_err(|e| Failure::storage_read("blob read", e))?;
                 match range {
                     Some((start, end)) => (
                         StatusCode::PARTIAL_CONTENT,
@@ -473,99 +423,6 @@ impl Registry {
         }
         Ok(response)
     }
-
-    pub(crate) async fn tags_list(&self, ctx: &RequestCtx, query: &str) -> OciResult<Response> {
-        let mut n: Option<usize> = None;
-        let mut last: Option<String> = None;
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            match key.as_ref() {
-                "n" => {
-                    n = Some(value.parse().map_err(|_| {
-                        OciError::new(
-                            StatusCode::BAD_REQUEST,
-                            Code::Unsupported,
-                            format!("invalid n {value:?}"),
-                        )
-                    })?)
-                }
-                "last" => last = Some(value.into_owned()),
-                _ => {}
-            }
-        }
-        let page = n.unwrap_or(DEFAULT_TAG_PAGE).min(DEFAULT_TAG_PAGE);
-        let t = &ctx.target;
-        let listed = if page == 0 {
-            Some(TagPage::default())
-        } else {
-            self.tags_from(&ctx.caller, &t.repo, &t.image, last.as_deref(), page, 0)
-                .await?
-        };
-        let Some(TagPage { tags, more }) = listed else {
-            return Err(OciError::name_unknown(&t.name));
-        };
-        let body = serde_json::json!({ "name": t.name, "tags": tags });
-        let mut response = (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            body.to_string(),
-        )
-            .into_response();
-        if more {
-            if let Some(last) = tags.last() {
-                let next: String = url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("n", &page.to_string())
-                    .append_pair("last", last)
-                    .finish();
-                let link = format!("<{}?{next}>; rel=\"next\"", location(&t.name, "tags/list"));
-                response
-                    .headers_mut()
-                    .insert(header::LINK, header_value(&link));
-            }
-        }
-        Ok(response)
-    }
-
-    pub(crate) async fn referrers(
-        &self,
-        ctx: &RequestCtx,
-        digest: &str,
-        query: &str,
-    ) -> OciResult<Response> {
-        let subject = parse_digest(digest)?;
-        let artifact_type = url::form_urlencoded::parse(query.as_bytes())
-            .find(|(k, _)| k == "artifactType")
-            .map(|(_, v)| v.into_owned());
-        let t = &ctx.target;
-        let mut referrers = self
-            .referrers_from(&ctx.caller, &t.repo, &t.image, &subject, 0)
-            .await?;
-        if let Some(filter) = &artifact_type {
-            referrers.retain(|r| r.artifact_type.as_deref() == Some(filter.as_str()));
-        }
-        let body = serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": media::OCI_INDEX,
-            "manifests": referrers,
-        });
-        let mut response = (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, media::OCI_INDEX)],
-            body.to_string(),
-        )
-            .into_response();
-        if artifact_type.is_some() {
-            response.headers_mut().insert(
-                "oci-filters-applied",
-                HeaderValue::from_static("artifactType"),
-            );
-        }
-        Ok(response)
-    }
-}
-
-/// A header value from text Forge produced or validated.
-pub(crate) fn header_value(s: &str) -> HeaderValue {
-    HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static("invalid"))
 }
 
 /// One `bytes=` range of a `size`-byte object, as inclusive offsets. `None`

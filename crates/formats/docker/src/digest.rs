@@ -1,15 +1,12 @@
 //! OCI content digests (`<algorithm>:<encoded>`).
 //!
-//! The CAS is keyed by SHA-256, and every staged file is hashed with SHA-256
-//! and SHA-512 at once, so both registered algorithms of the image spec are
-//! supported: a `sha512:` digest names the same CAS blob as its `sha256:`
-//! twin, it is only verified against the other hash. Any other algorithm is
-//! refused as unsupported.
+//! Both registered algorithms of the image spec are supported, `sha256` and
+//! `sha512`: the host hashes everything it stores with both, and verifies
+//! content against either. Any other algorithm is refused as unsupported.
+//! A digest crosses the plugin contract in the canonical form [`Digest`]
+//! keeps.
 
 use std::fmt;
-
-use base64::Engine;
-use sha2::{Digest as _, Sha256, Sha512};
 
 /// A digest algorithm Forge can verify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,24 +75,6 @@ impl Digest {
         Ok(Digest(s.to_string()))
     }
 
-    /// The SHA-256 digest of `bytes`.
-    pub fn sha256_of(bytes: &[u8]) -> Self {
-        Digest(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
-    }
-
-    /// The digest of `bytes` with `algorithm`.
-    pub fn of(algorithm: Algorithm, bytes: &[u8]) -> Self {
-        match algorithm {
-            Algorithm::Sha256 => Self::sha256_of(bytes),
-            Algorithm::Sha512 => Digest(format!("sha512:{}", hex::encode(Sha512::digest(bytes)))),
-        }
-    }
-
-    /// A `sha256:` digest from the CAS's lowercase hex key.
-    pub fn from_sha256_hex(hex: &str) -> Result<Self, DigestError> {
-        Self::parse(&format!("sha256:{hex}"))
-    }
-
     pub fn algorithm(&self) -> Algorithm {
         if self.0.starts_with("sha512:") {
             Algorithm::Sha512
@@ -113,16 +92,9 @@ impl Digest {
         &self.0
     }
 
-    /// Whether this digest names content with the given CAS hashes (the
-    /// lowercase hex SHA-256 and the standard-base64 SHA-512 the CAS
-    /// computes while staging).
-    pub fn matches(&self, sha256_hex: &str, sha512_base64: &str) -> bool {
-        match self.algorithm() {
-            Algorithm::Sha256 => self.hex() == sha256_hex,
-            Algorithm::Sha512 => base64::engine::general_purpose::STANDARD
-                .decode(sha512_base64)
-                .is_ok_and(|raw| hex::encode(raw) == self.hex()),
-        }
+    /// The canonical text, as the plugin contract carries digests.
+    pub fn into_string(self) -> String {
+        self.0
     }
 }
 
@@ -160,6 +132,8 @@ fn valid_encoded_grammar(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest as _, Sha512};
+
     use super::*;
 
     const EMPTY_SHA256: &str =
@@ -170,11 +144,13 @@ mod tests {
         let d = Digest::parse(EMPTY_SHA256).unwrap();
         assert_eq!(d.algorithm(), Algorithm::Sha256);
         assert_eq!(d.hex().len(), 64);
-        assert_eq!(Digest::sha256_of(b""), d);
+        assert_eq!(d.as_str(), EMPTY_SHA256);
 
-        let d512 = Digest::of(Algorithm::Sha512, b"");
-        assert_eq!(Digest::parse(d512.as_str()).unwrap(), d512);
+        let empty512 = format!("sha512:{}", hex::encode(Sha512::digest(b"")));
+        let d512 = Digest::parse(&empty512).unwrap();
         assert_eq!(d512.algorithm(), Algorithm::Sha512);
+        assert_eq!(d512.hex().len(), 128);
+        assert_eq!(d512.into_string(), empty512);
     }
 
     #[test]
@@ -199,15 +175,5 @@ mod tests {
             Digest::parse("md5:d41d8cd98f00b204e9800998ecf8427e"),
             Err(DigestError::Unsupported(_))
         ));
-    }
-
-    #[test]
-    fn matches_cas_hashes() {
-        let sha256 = hex::encode(Sha256::digest(b"hello"));
-        let sha512 = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(b"hello"));
-        assert!(Digest::sha256_of(b"hello").matches(&sha256, &sha512));
-        assert!(Digest::of(Algorithm::Sha512, b"hello").matches(&sha256, &sha512));
-        assert!(!Digest::sha256_of(b"world").matches(&sha256, &sha512));
-        assert!(!Digest::of(Algorithm::Sha512, b"world").matches(&sha256, &sha512));
     }
 }

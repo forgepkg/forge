@@ -163,6 +163,11 @@ pub fn upstream(remote: &Remote, op: &UpstreamOp, fetched: &[FetchResult]) -> Up
         UpstreamOp::Search(query) => search(remote, query, fetched),
         // A registry holds packages: it has no files to fetch.
         UpstreamOp::File(_) => done(UpstreamAnswer::File(None)),
+        UpstreamOp::ImageName(_)
+        | UpstreamOp::ImageManifest { .. }
+        | UpstreamOp::ImageBlob { .. }
+        | UpstreamOp::ImageTags { .. }
+        | UpstreamOp::ImageReferrers { .. } => failed("a registry of packages holds no images"),
     }
 }
 

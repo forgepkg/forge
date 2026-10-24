@@ -157,7 +157,7 @@ impl TokenPrincipal {
     }
 
     /// Back to a request principal. Whether the user is still active is
-    /// re-read by the caller (see [`crate::service`]); `fallback` is the
+    /// re-read by the caller (see [`super::dispatch`]); `fallback` is the
     /// request's own principal, used for anonymous tokens.
     pub fn to_principal(&self, fallback: Principal) -> Option<Principal> {
         fn arr(hex_str: &str) -> Option<[u8; 32]> {

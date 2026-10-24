@@ -25,7 +25,7 @@
 //!      (`action = "import"`). A version Forge holds with the same SHA-256
 //!      is skipped without a download;
 //!    * a Docker tag is copied through the Nexus repository's registry API
-//!      ([`forge_format_docker::Registry::import_tag`]): digests are kept,
+//!      ([`crate::images::Registry::import_tag`]): digests are kept,
 //!      multi-platform indexes arrive with every child manifest, and a
 //!      referrer is copied once its subject is in Forge;
 //!    * what Nexus recorded is kept: the publish time (`blobCreated`, for a
@@ -61,9 +61,8 @@ use forge_core::repo::proxy::Credentials;
 use forge_core::repo::{ImportOptions, ImportOutcome, RepoKind, WriteError};
 use forge_crypto::PlaintextSecret;
 use forge_db::import_dao::{self, ImportItem, NewItem, NexusImport};
-use forge_db::model::{Repository, DOCKER_FORMAT};
+use forge_db::model::Repository;
 use forge_db::{repository_dao, secret_dao, user_dao};
-use forge_format_docker::import::{ImageImportOptions, ImageOutcome, ImportSource};
 use forge_storage::StagedBlob;
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
@@ -71,11 +70,13 @@ use sha2::Digest as _;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::images::import::{ImageImportOptions, ImageOutcome, ImportSource};
 use crate::state::AppState;
 use nexus::{Listing, Nexus, SourceAsset, SourceItem};
 
-/// The formats an import copies (Nexus calls them by the same names).
-pub const FORMATS: &[&str] = &["nuget", DOCKER_FORMAT];
+/// The formats an import copies, by the names Nexus and Forge share: NuGet
+/// packages, and Docker images into the image store.
+pub const FORMATS: &[&str] = &["nuget", "docker"];
 
 /// How often an idle instance looks for an import to run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -210,7 +211,7 @@ enum Target {
     /// Docker, through the registry, from the Nexus repository's registry
     /// API.
     Images {
-        registry: forge_format_docker::Registry,
+        registry: crate::images::Registry,
         source: ImportSource,
     },
 }
@@ -228,7 +229,8 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn docker(&self) -> bool {
+    /// Whether the items are images (Docker).
+    fn images(&self) -> bool {
         matches!(self.target, Target::Images { .. })
     }
 }
@@ -334,7 +336,7 @@ impl Run<'_> {
             password.clone(),
         );
 
-        let target = if repo.format == DOCKER_FORMAT {
+        let target = if self.state.formats.stores_images(&repo.format) {
             let registry_url = import.registry_url.clone().unwrap_or_else(|| {
                 default_registry_url(&import.base_url, &import.source_repository)
             });
@@ -408,10 +410,10 @@ impl Run<'_> {
         loop {
             self.check().await?;
             let page = self.page(ctx, listing, cursor.as_deref()).await?;
-            let scanned = scanned_items(&ctx.repo.format, listing, &page.items);
+            let scanned = scanned_items(&ctx.repo.format, ctx.images(), listing, &page.items);
             let (next_listing, next_cursor, phase) = match page.next {
                 Some(next) => (listing, Some(next), "scan"),
-                None if ctx.docker() && listing == Listing::Components => {
+                None if ctx.images() && listing == Listing::Components => {
                     (Listing::Assets, None, "scan")
                 }
                 None => (listing, None, "copy"),
@@ -430,7 +432,7 @@ impl Run<'_> {
                     name: &item.name,
                     version: &item.version,
                     size: primary.and_then(|a| a.size),
-                    published_at: primary.and_then(|a| published_at(&ctx.repo.format, a)),
+                    published_at: primary.and_then(|a| published_at(ctx.images(), a)),
                     downloaded_at: primary.and_then(|a| a.downloaded),
                     uploader: primary.and_then(|a| a.uploader.as_deref()),
                     source,
@@ -678,7 +680,7 @@ impl Run<'_> {
         let options = ImportOptions {
             overwrite,
             dry_run: false,
-            published_at: published_at(&ctx.repo.format, asset),
+            published_at: published_at(ctx.images(), asset),
             downloaded_at: asset.downloaded,
             uploader: asset.uploader.clone(),
             source: ctx.source.clone(),
@@ -705,7 +707,7 @@ impl Run<'_> {
     async fn copy_image(
         &self,
         ctx: &Ctx,
-        registry: &forge_format_docker::Registry,
+        registry: &crate::images::Registry,
         from: &ImportSource,
         kind: &str,
         source: &SourceItem,
@@ -719,7 +721,7 @@ impl Run<'_> {
             principal: ctx.principal,
             overwrite: self.import.on_conflict == "overwrite",
             dry_run: self.import.dry_run,
-            published_at: asset.and_then(|a| published_at(&ctx.repo.format, a)),
+            published_at: asset.and_then(|a| published_at(ctx.images(), a)),
             downloaded_at: asset.and_then(|a| a.downloaded),
             uploader: asset.and_then(|a| a.uploader.clone()),
             source: ctx.source.clone(),
@@ -743,7 +745,7 @@ impl Run<'_> {
                 )
                 .await
         }
-        .map_err(|e| e.message)?;
+        .map_err(|e| e.message())?;
         let bytes = imported.bytes_copied;
         Ok(match imported.outcome {
             ImageOutcome::Created => item("imported", imported.digest, bytes),
@@ -799,8 +801,8 @@ pub fn default_registry_url(base_url: &str, repository: &str) -> String {
 /// When Nexus says an asset was published: for a Docker tag when it last
 /// moved (`lastModified`), for a package when its bytes were stored
 /// (`blobCreated`).
-fn published_at(format: &str, asset: &SourceAsset) -> Option<chrono::DateTime<chrono::Utc>> {
-    if format == DOCKER_FORMAT {
+fn published_at(images: bool, asset: &SourceAsset) -> Option<chrono::DateTime<chrono::Utc>> {
+    if images {
         asset.modified.or(asset.created)
     } else {
         asset.created.or(asset.modified)
@@ -834,8 +836,12 @@ struct Scanned<'a> {
 /// (Docker) asset listing, the manifests held by digest. Every asset is
 /// counted once: a package component's in the components listing, a
 /// Docker repository's (blobs included) in the asset listing.
-fn scanned_items<'a>(format: &str, listing: Listing, page: &'a [SourceItem]) -> Scanned<'a> {
-    let docker = format == DOCKER_FORMAT;
+fn scanned_items<'a>(
+    format: &str,
+    images: bool,
+    listing: Listing,
+    page: &'a [SourceItem],
+) -> Scanned<'a> {
     let mut scanned = Scanned {
         items: Vec::new(),
         assets: 0,
@@ -844,7 +850,7 @@ fn scanned_items<'a>(format: &str, listing: Listing, page: &'a [SourceItem]) -> 
     for item in page {
         match listing {
             Listing::Components => {
-                let primary = if docker {
+                let primary = if images {
                     item.assets.iter().find(|a| a.path.contains("/manifests/"))
                 } else {
                     scanned.assets += item.assets.len() as i64;
@@ -1060,7 +1066,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let scanned = scanned_items(DOCKER_FORMAT, Listing::Assets, &page);
+        let scanned = scanned_items("docker", true, Listing::Assets, &page);
         assert_eq!(scanned.assets, 3);
         assert_eq!(scanned.bytes, 120);
         assert_eq!(scanned.items.len(), 1);

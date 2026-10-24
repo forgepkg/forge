@@ -2,6 +2,10 @@
 
 use std::fmt;
 
+use crate::images::{
+    ImageAnswer, ImageName, ImageQuery, ImageUrl, ManifestInfo, Reference, TagPage,
+};
+
 /// A dependency on another package of the same format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependency {
@@ -122,7 +126,9 @@ pub struct Descriptor {
     /// One line on what the format serves.
     pub description: &'static str,
     /// Where its repositories are served, `{mount}/{repository}/…`:
-    /// [`DEFAULT_MOUNT`], or `/` and one lowercase word of its own.
+    /// [`DEFAULT_MOUNT`], or `/` and one lowercase word of its own. An
+    /// images format's is [`IMAGES_MOUNT`]: its clients name an image
+    /// `{host}/{repository}/{image}` and ask for it under `/v2`.
     pub mount: &'static str,
     /// The repository kinds it supports, each once. `Proxy` only when the
     /// format implements [`FormatPlugin::upstream`].
@@ -153,6 +159,10 @@ pub enum UpstreamToken {
 /// Where a format's repositories are served unless it names another mount.
 pub const DEFAULT_MOUNT: &str = "/repository";
 
+/// The mount of an images format ([`Storage::Images`]): the registry API's
+/// root, where every distribution-spec client asks.
+pub const IMAGES_MOUNT: &str = "/v2";
+
 /// What a format's repositories hold ([`Descriptor::storage`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Storage {
@@ -162,14 +172,18 @@ pub enum Storage {
     Packages,
     /// Files under paths, with their digests (raw).
     Files,
+    /// Images: blobs and manifests by digest, tags, upload sessions
+    /// (Docker / OCI; see [`crate::images`]).
+    Images,
 }
 
 impl Storage {
-    /// The name the admin API uses: `packages` or `files`.
+    /// The name the admin API uses: `packages`, `files` or `images`.
     pub fn as_str(self) -> &'static str {
         match self {
             Storage::Packages => "packages",
             Storage::Files => "files",
+            Storage::Images => "images",
         }
     }
 }
@@ -237,11 +251,18 @@ pub struct Request {
     pub query: String,
     /// The request headers the host passes on (lowercase names): accept,
     /// accept-language, content-type, if-match, if-modified-since,
-    /// if-none-match, user-agent. Never credentials or cookies.
+    /// if-none-match, user-agent, and to an images format content-range.
+    /// Never credentials or cookies.
     pub headers: Vec<(String, String)>,
     /// The request body, once the plugin asked for it ([`Action::ReadBody`]);
     /// `None` before. A `Content-Encoding: gzip` body is inflated.
     pub body: Option<Vec<u8>>,
+    /// Images formats: the image the request is for, as the host resolved
+    /// the name [`FormatPlugin::image_path`] split off the path; the path
+    /// is then the endpoint. `None` for every other format.
+    ///
+    /// [`FormatPlugin::image_path`]: crate::FormatPlugin::image_path
+    pub image: Option<ImageName>,
 }
 
 impl Request {
@@ -255,12 +276,23 @@ impl Request {
             query: query.to_string(),
             headers: Vec::new(),
             body: None,
+            image: None,
         }
     }
 
     /// The request with its body read ([`Action::ReadBody`]).
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = Some(body.into());
+        self
+    }
+
+    /// The request for `image` (images formats), the client having named
+    /// it `name`.
+    pub fn with_image(mut self, image: &str, name: &str) -> Self {
+        self.image = Some(ImageName {
+            image: image.to_string(),
+            name: name.to_string(),
+        });
         self
     }
 
@@ -597,13 +629,24 @@ pub enum Query {
     Store(Vec<NewFile>),
     /// Delete the file at a path.
     Remove(String),
+    /// What an images format asks of the image store ([`crate::images`]).
+    Image(ImageQuery),
 }
 
 impl Query {
     /// Whether the query changes the repository (it is asked alone in its
     /// round).
     pub fn is_change(&self) -> bool {
-        matches!(self, Query::Form | Query::Store(_) | Query::Remove(_))
+        match self {
+            Query::Form | Query::Store(_) | Query::Remove(_) => true,
+            Query::Image(query) => query.is_change(),
+            _ => false,
+        }
+    }
+
+    /// Whether the query is about images.
+    pub fn is_images(&self) -> bool {
+        matches!(self, Query::Image(_))
     }
 
     /// Whether the query is about files rather than packages.
@@ -703,6 +746,8 @@ pub enum Answer {
     Stored(Vec<StoredFile>),
     /// Whether there was a file to delete.
     Removed(bool),
+    /// The answer to [`Query::Image`].
+    Image(ImageAnswer),
 }
 
 /// A query with its answer.
@@ -945,6 +990,16 @@ pub enum Action {
     /// requests and one range, sets its content type and the repository's
     /// content disposition, and counts the download.
     ServeFile(String),
+    /// Images formats: serve a blob of the image that a
+    /// [`ImageQuery::Blob`] of this request found (read requests). The host
+    /// streams it with its `Docker-Content-Digest` and `ETag`, answers one
+    /// `Range`, and records the pull.
+    ServeBlob { image: String, digest: String },
+    /// Images formats: serve a manifest of the image that a
+    /// [`ImageQuery::Manifest`] of this request found (read requests), as
+    /// its media type, with its `Docker-Content-Digest` and `ETag`, and
+    /// record the pull.
+    ServeManifest { image: String, reference: Reference },
 }
 
 /// The upstream a proxy repository mirrors ([`FormatPlugin::upstream`]).
@@ -993,6 +1048,31 @@ pub enum UpstreamOp {
     /// caches it as the file, and re-validates it with a conditional request
     /// once the repository's maximum age has passed.
     File(String),
+    /// Images formats: the name the upstream knows an image by, which a
+    /// proxy caches it under (Docker Hub's `library/` namespace). The other
+    /// image operations get this name.
+    ImageName(String),
+    /// Images formats: where to ask for a manifest of an image
+    /// ([`UpstreamAnswer::ImageUrl`]). The host sends a `HEAD` to
+    /// re-validate a tag it cached and a `GET` for the manifest, checks it
+    /// against its digest (the reference's, else the upstream's
+    /// `Docker-Content-Digest`), reads it with `parse_manifest`, and caches
+    /// it.
+    ImageManifest { image: String, reference: Reference },
+    /// Images formats: where to ask for a blob of an image
+    /// ([`UpstreamAnswer::ImageUrl`]). The host downloads it, checks it
+    /// against its digest and caches it.
+    ImageBlob { image: String, digest: String },
+    /// Images formats: up to `n` of the upstream's tags of an image after
+    /// `last`, in byte order ([`UpstreamAnswer::ImageTags`]).
+    ImageTags {
+        image: String,
+        last: Option<String>,
+        n: u32,
+    },
+    /// Images formats: the upstream's referrers of a manifest
+    /// ([`UpstreamAnswer::ImageReferrers`]).
+    ImageReferrers { image: String, digest: String },
 }
 
 /// How long the host may reuse a fetched document.
@@ -1021,12 +1101,20 @@ pub enum Freshness {
 /// The host sends the repository's credentials only to the origin of
 /// [`Remote::url`], bounds the response's size and time, inflates a
 /// gzip-encoded body, and refuses link-local and cloud-metadata targets.
+///
+/// An images format's fetches go to the origin of [`Remote::url`] only; the
+/// host answers an upstream registry's Bearer challenge with a token from
+/// the registry's token service, and does not keep what it fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetch {
     pub url: String,
     pub freshness: Freshness,
-    /// The `Accept` header to send, if any (npm's abbreviated metadata).
+    /// The `Accept` header to send, if any (npm's abbreviated metadata, an
+    /// images format's manifest media types).
     pub accept: Option<String>,
+    /// Images formats: the scope of the token to ask the upstream's token
+    /// service for when it answers 401 with a Bearer challenge naming none.
+    pub scope: Option<String>,
 }
 
 impl Fetch {
@@ -1036,6 +1124,7 @@ impl Fetch {
             url: url.into(),
             freshness,
             accept: None,
+            scope: None,
         }
     }
 
@@ -1063,6 +1152,11 @@ pub enum Fetched {
 pub struct FetchResult {
     pub fetch: Fetch,
     pub outcome: Fetched,
+    /// Images formats: the status of the upstream's answer, when one came.
+    pub status: Option<u16>,
+    /// Images formats: the `link` headers of the upstream's answer (a page
+    /// of a listing names the next one there).
+    pub headers: Vec<(String, String)>,
 }
 
 /// The upstream's metadata of one version.
@@ -1153,6 +1247,16 @@ pub enum UpstreamAnswer {
     /// The file's URL, on an origin a [`Fetch`] may reach; `None`: the
     /// upstream cannot have the path.
     File(Option<String>),
+    /// The answer to [`UpstreamOp::ImageName`].
+    ImageName(String),
+    /// The answer to [`UpstreamOp::ImageManifest`] and
+    /// [`UpstreamOp::ImageBlob`].
+    ImageUrl(ImageUrl),
+    /// `None`: the upstream does not know the image.
+    ImageTags(Option<TagPage>),
+    /// `None`: the upstream offers no referrers API (the host lists the
+    /// referrers its cache holds).
+    ImageReferrers(Option<Vec<ManifestInfo>>),
     /// The upstream answered something unusable: the host serves what it
     /// has cached.
     Failed(String),
