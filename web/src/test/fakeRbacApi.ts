@@ -1,11 +1,12 @@
 import type { Me } from '~/api/me'
 import type { BrowseRepo } from '~/api/packages'
-import type {
-  Action,
-  EffectiveView,
-  GrantView,
-  RoleView,
-  SelectorView,
+import {
+  LEVELS,
+  type EffectiveView,
+  type GrantView,
+  type Level,
+  type RoleView,
+  type SelectorView,
 } from '~/api/rbac'
 import type { RepoView } from '~/api/repositories'
 import type { TokenView } from '~/api/tokens'
@@ -16,9 +17,10 @@ import type { UserView } from '~/api/users'
  * content selectors, user roles, effective access, tokens and their scopes),
  * for the screen tests: a test seeds it, drives the real route tree against
  * it, and asserts on its state and on the requests it got. It answers like
- * the server where the screens depend on it: 400 for `admin` on one
- * repository, 403 for deleting a built-in role, 409 for taking `admin` from
- * the last administrator, cascading deletes, and the selector match.
+ * the server where the screens depend on it: 400 for a grant without a level
+ * (or with `action`), one grant per repository and selector, 403 for
+ * deleting a built-in role, 409 for taking `admin` from the last
+ * administrator, cascading deletes, and the selector match.
  */
 
 export const adminMe: Me = {
@@ -257,16 +259,29 @@ export class FakeRbacApi {
       const id = Number(m[1])
       if (method === 'GET') return json(s.grants.filter((g) => g.role_id === id))
       if (method === 'PUT') {
-        if (body.action === 'admin' && body.repository_id != null) {
-          return text('repository admin is not supported', 400)
+        if ('action' in body) return text('action is replaced by level', 400)
+        if (!LEVELS.includes(body.level)) {
+          return text('level must be one of read/write/delete', 400)
         }
-        s.grants.push({
-          id: this.nextId++,
-          role_id: id,
-          repository_id: body.repository_id ?? null,
-          action: body.action as Action,
-          selector_id: body.selector_id ?? null,
-        })
+        const repositoryId = body.repository_id ?? null
+        const selectorId = body.selector_id ?? null
+        const existing = s.grants.find(
+          (g) =>
+            g.role_id === id &&
+            g.repository_id === repositoryId &&
+            g.selector_id === selectorId,
+        )
+        if (existing) {
+          existing.level = body.level as Level
+        } else {
+          s.grants.push({
+            id: this.nextId++,
+            role_id: id,
+            repository_id: repositoryId,
+            level: body.level as Level,
+            selector_id: selectorId,
+          })
+        }
         return new Response(null, { status: 201 })
       }
     }
@@ -340,7 +355,7 @@ export class FakeRbacApi {
           .map((g) => {
             const sel = s.selectors.find((x) => x.id === g.selector_id)
             return {
-              action: g.action,
+              level: g.level,
               repository_id: g.repository_id,
               selector_id: g.selector_id,
               includes: sel?.includes ?? null,

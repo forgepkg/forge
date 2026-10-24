@@ -40,8 +40,8 @@ export const Route = createFileRoute('/_app/tokens')({
  * revoke their **own** registry tokens here (`/admin/me/tokens` — not
  * admin-gated). Tokens authenticate NuGet clients against the feed and Docker
  * clients against the registry (`docker login`, the token as the password);
- * they cannot be used to sign in to this UI. A token can be scoped to some
- * actions and to some of the repositories the user can read. The plaintext is
+ * they cannot be used to sign in to this UI. A token can be scoped to a level
+ * and to some of the repositories the user can read. The plaintext is
  * shown **once** via `ShowOnceSecret`, held in transient component state, and
  * never written into a query cache.
  */

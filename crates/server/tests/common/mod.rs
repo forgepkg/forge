@@ -278,8 +278,8 @@ pub struct TestServer {
     pub state: AppState,
     pub admin_user: Option<String>,
     pub admin_pass: Option<String>,
-    /// An admin-scoped API token of the bootstrap admin (`{"actions":
-    /// ["admin"]}`): the admin API refuses a password sent over Basic, so
+    /// An admin-scoped API token of the bootstrap admin (`{"admin":
+    /// true}`): the admin API refuses a password sent over Basic, so
     /// [`TestServer::admin_basic`] carries this in the password field.
     pub admin_scoped_token: Option<String>,
     handle: tokio::task::JoinHandle<()>,
@@ -510,7 +510,7 @@ pub async fn mint_admin_scoped_token(pool: &PgPool, username: &str) -> Option<St
     forge_db::token_dao::set_token_scope(
         pool,
         token.id,
-        Some(&serde_json::json!({ "actions": ["admin"] })),
+        Some(&serde_json::json!({ "admin": true })),
     )
     .await
     .expect("scope admin token");

@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use forge_cache::Cache;
 use forge_core::auth::authz::Authz;
 use forge_core::auth::{AuthMethod, Principal};
-use forge_core::authz::Action;
+use forge_core::authz::Level;
 use forge_core::net::upstream::UpstreamHttp;
 use forge_core::repo::PublishPolicy;
 use forge_db::model::{RepoKind, Repository};
@@ -194,8 +194,8 @@ impl Registry {
                 return Err(self.refusal(&caller, &site, &name, action, Decision::Deny));
             }
         };
-        let write_target = if action == Action::Read {
-            let decision = self.decide(&caller, &target, Action::Read).await;
+        let write_target = if action == Level::Read {
+            let decision = self.decide(&caller, &target, Level::Read).await;
             if decision != Decision::Allow {
                 return Err(self.refusal(&caller, &site, &name, action, decision));
             }
@@ -251,7 +251,7 @@ impl Registry {
             }
             _ => Err(OciError::unsupported("method not allowed on this endpoint")),
         };
-        if action != Action::Read {
+        if action != Level::Read {
             let status = match &response {
                 Ok(r) => r.status().as_u16(),
                 Err(e) => e.status.as_u16(),
@@ -453,12 +453,7 @@ impl Registry {
     /// Whether the caller may `action` the target's image: the repository
     /// permission and its content selectors, then a registry token's scope
     /// (checked against the name the client used).
-    pub(crate) async fn decide(
-        &self,
-        caller: &Caller,
-        target: &Target,
-        action: Action,
-    ) -> Decision {
+    pub(crate) async fn decide(&self, caller: &Caller, target: &Target, action: Level) -> Decision {
         if !self
             .rbac_allows(&caller.principal, &target.repo, &target.image, action)
             .await
@@ -477,14 +472,13 @@ impl Registry {
         principal: &Principal,
         repo: &Repository,
         image: &str,
-        action: Action,
+        action: Level,
     ) -> bool {
         let authz = &self.inner.authz;
         let allowed = match action {
-            Action::Read => authz.can_read(principal, repo).await,
-            Action::Write => authz.can_write(principal, repo).await,
-            Action::Delete => authz.can_delete(principal, repo).await,
-            Action::Admin => false,
+            Level::Read => authz.can_read(principal, repo).await,
+            Level::Write => authz.can_write(principal, repo).await,
+            Level::Delete => authz.can_delete(principal, repo).await,
         };
         allowed
             && authz
@@ -501,7 +495,7 @@ impl Registry {
         caller: &Caller,
         site: &Site,
         target: &Target,
-        action: Action,
+        action: Level,
     ) -> OciResult<Target> {
         if !mutation_credential(&caller.principal) {
             return Err(self.refusal(caller, site, &target.name, action, Decision::Deny));
@@ -509,9 +503,9 @@ impl Registry {
         let landing = match target.repo.kind() {
             RepoKind::Hosted => target.clone(),
             RepoKind::Proxy | RepoKind::Group => {
-                let decision = self.decide(caller, target, Action::Read).await;
+                let decision = self.decide(caller, target, Level::Read).await;
                 if decision != Decision::Allow {
-                    return Err(self.refusal(caller, site, &target.name, Action::Read, decision));
+                    return Err(self.refusal(caller, site, &target.name, Level::Read, decision));
                 }
                 let member = match target.repo.kind() {
                     RepoKind::Group => self.writable_member(&target.repo).await?,
@@ -576,7 +570,7 @@ impl Registry {
         caller: &Caller,
         site: &Site,
         name: &str,
-        action: Action,
+        action: Level,
         decision: Decision,
     ) -> OciError {
         let authenticated = mutation_credential(&caller.principal);
@@ -593,7 +587,7 @@ impl Registry {
         &self,
         site: &Site,
         name: &str,
-        action: Action,
+        action: Level,
         error: Option<&str>,
     ) -> OciError {
         let scope = format!("repository:{name}:{}", scope_actions(action));
@@ -697,32 +691,30 @@ pub(crate) fn mutation_credential(principal: &Principal) -> bool {
     }
 }
 
-/// The token-scope actions an RBAC action needs.
-fn scope_actions(action: Action) -> &'static str {
+/// The token-scope actions a request of an access level needs.
+fn scope_actions(action: Level) -> &'static str {
     match action {
-        Action::Read => "pull",
-        Action::Write => "pull,push",
-        Action::Delete => "delete",
-        Action::Admin => "*",
+        Level::Read => "pull",
+        Level::Write => "pull,push",
+        Level::Delete => "delete",
     }
 }
 
-fn claims_allow(claims: &Claims, name: &str, action: Action) -> bool {
+fn claims_allow(claims: &Claims, name: &str, action: Level) -> bool {
     match action {
-        Action::Read => claims.grants(name, "pull"),
-        Action::Write => claims.grants(name, "push"),
-        Action::Delete => claims.grants(name, "delete"),
-        Action::Admin => false,
+        Level::Read => claims.grants(name, "pull"),
+        Level::Write => claims.grants(name, "push"),
+        Level::Delete => claims.grants(name, "delete"),
     }
 }
 
-/// The RBAC action of a request.
-fn action_of(endpoint: &Endpoint, method: &Method) -> Action {
+/// The access level a request needs.
+fn action_of(endpoint: &Endpoint, method: &Method) -> Level {
     match (endpoint, method) {
-        (Endpoint::UploadStart { .. } | Endpoint::Upload { .. }, _) => Action::Write,
-        (_, &Method::PUT | &Method::POST | &Method::PATCH) => Action::Write,
-        (_, &Method::DELETE) => Action::Delete,
-        _ => Action::Read,
+        (Endpoint::UploadStart { .. } | Endpoint::Upload { .. }, _) => Level::Write,
+        (_, &Method::PUT | &Method::POST | &Method::PATCH) => Level::Write,
+        (_, &Method::DELETE) => Level::Delete,
+        _ => Level::Read,
     }
 }
 
@@ -847,16 +839,16 @@ mod tests {
             name: "a/b".into(),
             reference: "x".into(),
         };
-        assert_eq!(action_of(&m, &Method::GET), Action::Read);
-        assert_eq!(action_of(&m, &Method::HEAD), Action::Read);
-        assert_eq!(action_of(&m, &Method::PUT), Action::Write);
-        assert_eq!(action_of(&m, &Method::DELETE), Action::Delete);
+        assert_eq!(action_of(&m, &Method::GET), Level::Read);
+        assert_eq!(action_of(&m, &Method::HEAD), Level::Read);
+        assert_eq!(action_of(&m, &Method::PUT), Level::Write);
+        assert_eq!(action_of(&m, &Method::DELETE), Level::Delete);
         let u = Endpoint::Upload {
             name: "a/b".into(),
             id: "x".into(),
         };
-        assert_eq!(action_of(&u, &Method::GET), Action::Write);
-        assert_eq!(action_of(&u, &Method::DELETE), Action::Write);
+        assert_eq!(action_of(&u, &Method::GET), Level::Write);
+        assert_eq!(action_of(&u, &Method::DELETE), Level::Write);
     }
 
     #[test]

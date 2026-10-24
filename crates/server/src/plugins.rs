@@ -1,6 +1,6 @@
 //! Format plugins: the built-in ones, and serving the repositories of their
 //! formats under each format's mount, `{mount}/{repo}/...` (`/repository`
-//! unless its `plugin.toml` names another; see `docs/format-plugins.md`).
+//! unless its descriptor names another; see `docs/format-plugins.md`).
 //!
 //! The dispatcher does what [`crate::dispatch`] does for the NuGet feed —
 //! resolve the repository, authorize the request's action (GET/HEAD read,
@@ -40,7 +40,7 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_core::auth::principal::Principal;
-use forge_core::authz::{Action as Permission, PackageFilter};
+use forge_core::authz::{Level, PackageFilter};
 use forge_core::format::Format;
 use forge_core::repo::{
     DeleteOutcome, RegistrationEntry, RepoError, RepoKind, RepoReadOps, RepoWriteOps, SearchParams,
@@ -58,7 +58,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
 
 use crate::dispatch::{
-    action_for_method, authz_denied, offline_response, offline_serves_nothing,
+    authz_denied, level_for_method, offline_response, offline_serves_nothing,
     principal_allows_protocol_mutations, HostedWriteAdapter,
 };
 use crate::files::store::{Content, Ingested, Part, Via};
@@ -66,9 +66,9 @@ use crate::files::{FileError, Files};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
-/// Where a plugin format's repositories are served unless its
-/// `plugin.toml` names another mount.
-pub const MOUNT: &str = forge_plugin::manifest::DEFAULT_MOUNT;
+/// Where a plugin format's repositories are served unless its descriptor
+/// names another mount.
+pub const MOUNT: &str = forge_plugin::api::DEFAULT_MOUNT;
 
 /// The most rounds of queries one request may load.
 pub const MAX_ROUNDS: usize = 4;
@@ -110,13 +110,8 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
 /// reads archives under `nuget_limits` (`[nuget]`).
 pub fn builtin(nuget_limits: forge_format_nuget::NupkgLimits) -> Vec<Arc<Plugin>> {
     vec![
-        Plugin::builtin(
-            forge_format_nuget::PLUGIN_TOML,
-            forge_format_nuget::Nuget::with_limits(nuget_limits),
-        )
-        .expect("crates/formats/nuget/plugin.toml is valid"),
-        Plugin::builtin(forge_format_raw::PLUGIN_TOML, forge_format_raw::Raw)
-            .expect("crates/formats/raw/plugin.toml is valid"),
+        Plugin::builtin(forge_format_nuget::Nuget::with_limits(nuget_limits)),
+        Plugin::builtin(forge_format_raw::Raw),
     ]
 }
 
@@ -164,12 +159,11 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         }
     };
 
-    let permission = action_for_method(&method);
-    let allowed = match permission {
-        Permission::Read => state.authz.can_read(&principal, &repo).await,
-        Permission::Write => state.authz.can_write(&principal, &repo).await,
-        Permission::Delete => state.authz.can_delete(&principal, &repo).await,
-        Permission::Admin => false,
+    let level = level_for_method(&method);
+    let allowed = match level {
+        Level::Read => state.authz.can_read(&principal, &repo).await,
+        Level::Write => state.authz.can_write(&principal, &repo).await,
+        Level::Delete => state.authz.can_delete(&principal, &repo).await,
     };
     if !allowed {
         return authz_denied(&principal);
@@ -191,7 +185,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         };
     };
     // Each format is served under its own mount only.
-    if plugin.manifest().mount != mount {
+    if plugin.descriptor().mount != mount {
         return (StatusCode::NOT_FOUND, "repository is not served here").into_response();
     }
     let format = match state.formats.for_repository(&repo) {
@@ -201,7 +195,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let stores_files = format.stores_files();
     let package_filter = state
         .authz
-        .package_filter_for(&principal, &repo, permission)
+        .package_filter_for(&principal, &repo, level)
         .await;
     // A files format reads the file store, never the package read ops.
     let ops = if stores_files {
@@ -240,7 +234,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         repo: &repo,
         mount,
         principal,
-        permission,
+        level,
         head: method == Method::HEAD,
         headers: req.headers().clone(),
         plugin: plugin.implementation().clone(),
@@ -262,7 +256,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         Ok(action) => ctx.perform(action, request).await,
         Err(response) => response,
     };
-    if permission != Permission::Read {
+    if level != Level::Read {
         // The same audit trail as the NuGet feed's package mutations.
         tracing::info!(
             target: "forge::audit",
@@ -284,8 +278,8 @@ struct Ctx<'a> {
     /// The format's mount (`/repository`).
     mount: &'a str,
     principal: Principal,
-    /// What the request's method was authorized for.
-    permission: Permission,
+    /// The level the request's method was authorized for.
+    level: Level,
     head: bool,
     /// The request's headers, for a download's `Range`.
     headers: axum::http::HeaderMap,
@@ -296,7 +290,7 @@ struct Ctx<'a> {
     stores_files: bool,
     /// The package read ops; `None` for a files format.
     ops: Option<Arc<dyn RepoReadOps>>,
-    /// The caller's package selector for [`Self::permission`].
+    /// The caller's package selector for [`Self::level`].
     package_filter: PackageFilter,
     target: protocol::Repository,
     /// The request, until a publish or a file query reads its body.
@@ -340,7 +334,7 @@ impl Ctx<'_> {
             Action::Respond(response) => self.respond(response),
             Action::Load(_) => self.plugin_misused("a load as an action"),
             Action::Download(target) => {
-                if self.permission != Permission::Read {
+                if self.level != Level::Read {
                     return refused("download");
                 }
                 self.download(&target).await
@@ -353,7 +347,7 @@ impl Ctx<'_> {
             Action::Relist(change) => self.change(change, Change::Relist).await,
             Action::Delete(change) => self.change(change, Change::Delete).await,
             Action::ServeFile(path) => {
-                if self.permission != Permission::Read {
+                if self.level != Level::Read {
                     return refused("serving a file");
                 }
                 self.serve_file(&path).await
@@ -510,7 +504,7 @@ impl Ctx<'_> {
                 Ok(Answer::Directory(page.map(directory_page)))
             }
             Query::Form => {
-                if self.permission != Permission::Write {
+                if self.level != Level::Write {
                     return Err(refused("receiving a form"));
                 }
                 let Some(req) = self.take_body() else {
@@ -553,7 +547,7 @@ impl Ctx<'_> {
                 Ok(Answer::Form(answer))
             }
             Query::Store(wanted) => {
-                if self.permission != Permission::Write {
+                if self.level != Level::Write {
                     return Err(refused("storing files"));
                 }
                 let mut uploads = Vec::with_capacity(wanted.len());
@@ -600,7 +594,7 @@ impl Ctx<'_> {
                 ))
             }
             Query::Remove(path) => {
-                if self.permission != Permission::Delete {
+                if self.level != Level::Delete {
                     return Err(refused("deleting a file"));
                 }
                 let removed = crate::files::store::remove(&files, self.repo, path, Via::Protocol)
@@ -861,8 +855,8 @@ impl Ctx<'_> {
 
     /// Whether this request may change packages: a hosted repository, a
     /// method authorized for `needed`, and a package-client credential.
-    fn may_change(&self, needed: Permission, what: &str) -> Result<(), Response> {
-        if self.permission != needed {
+    fn may_change(&self, needed: Level, what: &str) -> Result<(), Response> {
+        if self.level != needed {
             return Err(refused(what));
         }
         if self.repo.kind() != RepoKind::Hosted {
@@ -898,15 +892,15 @@ impl Ctx<'_> {
     }
 
     async fn publish(&self, publish: PublishRequest, req: Request<Body>) -> Response {
-        if let Err(response) = self.may_change(Permission::Write, "publish") {
+        if let Err(response) = self.may_change(Level::Write, "publish") {
             return response;
         }
-        // A redeploy replaces a version's bytes: it takes the delete
-        // permission's selector as well.
+        // A redeploy replaces a version's bytes: it takes the `delete`
+        // level's selector as well.
         let replace_filter = self
             .state
             .authz
-            .package_filter_for(&self.principal, self.repo, Permission::Delete)
+            .package_filter_for(&self.principal, self.repo, Level::Delete)
             .await;
         let writer = HostedWriteAdapter::new(
             self.state,
@@ -953,9 +947,9 @@ impl Ctx<'_> {
 
     async fn change(&self, change: ChangeRequest, kind: Change) -> Response {
         let (needed, what) = match kind {
-            Change::Unlist => (Permission::Delete, "unlist"),
-            Change::Relist => (Permission::Write, "relist"),
-            Change::Delete => (Permission::Delete, "delete"),
+            Change::Unlist => (Level::Delete, "unlist"),
+            Change::Relist => (Level::Write, "relist"),
+            Change::Delete => (Level::Delete, "delete"),
         };
         if let Err(response) = self.may_change(needed, what) {
             return response;
@@ -1300,6 +1294,48 @@ fn write_error(e: WriteError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The built-in formats' descriptors are checked here, not at startup: a
+    /// well-formed id that is not reserved and no other format has, a free
+    /// mount, kinds, asset names.
+    #[test]
+    fn the_builtin_formats_describe_themselves_well() {
+        let plugins = builtin(forge_format_nuget::NupkgLimits::default());
+        let descriptors: Vec<_> = plugins.iter().map(|p| p.descriptor()).collect();
+        assert_eq!(forge_plugin::descriptor::check(&descriptors), Ok(()));
+        let ids: Vec<_> = plugins.iter().map(|p| p.id()).collect();
+        assert_eq!(ids, ["nuget", "raw"]);
+        for plugin in &plugins {
+            assert_eq!(plugin.descriptor().version, "1.0.0", "{}", plugin.id());
+        }
+
+        // The check refuses a malformed or reserved id, a second format
+        // with a built-in's id, and invalid asset names.
+        let nuget = forge_format_nuget::DESCRIPTOR;
+        for id in ["NuGet", "n", "docker", "v2"] {
+            let renamed = forge_plugin::Descriptor { id, ..nuget };
+            assert!(
+                forge_plugin::descriptor::check(&[&renamed]).is_err(),
+                "{id:?}"
+            );
+        }
+        let twin = forge_plugin::Descriptor {
+            id: "nuget",
+            mount: "/twin",
+            ..forge_format_raw::DESCRIPTOR
+        };
+        let mut with_twin = descriptors.clone();
+        with_twin.push(&twin);
+        assert!(forge_plugin::descriptor::check(&with_twin).is_err());
+        let bad_assets = forge_plugin::Descriptor {
+            assets: forge_plugin::api::Assets {
+                package: "../package.nupkg",
+                ..nuget.assets
+            },
+            ..nuget
+        };
+        assert!(forge_plugin::descriptor::check(&[&bad_assets]).is_err());
+    }
 
     #[test]
     fn splits_repository_paths() {

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO repository_privilege (role_id, repository_id, level, selector_id)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT (role_id, COALESCE(repository_id, 0), COALESCE(selector_id, 0))\n        DO UPDATE SET level = EXCLUDED.level\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fa88c06e62dbd1e5bbd6be12152562c950be32f8be70399095f44c3d3e68baed"
+}

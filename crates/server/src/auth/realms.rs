@@ -21,6 +21,8 @@
 //!   drift detection — a changed block keeps re-applying only while the row is
 //!   untouched since the last seed; the moment an admin edits the row through
 //!   the API, the database is the authority and the TOML stops clobbering it.
+//!   Whether an `oidc` realm creates accounts (`auto_provision`) is never the
+//!   block's: the realm keeps its own.
 //!
 //! ## Fail-closed posture
 //! A snapshot rebuild error (DB down, malformed realm config) never *grants*:
@@ -994,7 +996,6 @@ impl RealmAuth {
             username_claim: cfg.username_claim.clone(),
             email_claim: cfg.email_claim.clone(),
             display_name_claim: cfg.display_name_claim.clone(),
-            auto_provision: cfg.auto_provision,
             link_existing_by_username: cfg.link_existing_by_username,
             admin_groups: cfg.admin_groups.clone(),
             admin_claim: cfg.admin_claim.clone(),
@@ -1005,6 +1006,7 @@ impl RealmAuth {
         };
         let runtime = OidcRuntime::build(
             &oidc_config,
+            cfg.auto_provision,
             auth,
             self.settings.sessions().clone(),
             &base,
@@ -1119,6 +1121,8 @@ pub async fn forget_seed(pool: &PgPool, realm: &forge_db::model::AuthRealm) -> s
 ///   is the authority). The fingerprint covers the non-secret fields only
 ///   ([`seed_fingerprint`]).
 /// * A renamed/deleted seeded row is left alone (the operator took over).
+/// * No block sets an `oidc` realm's `auto_provision` (#313): the seed creates
+///   the realm with it on, the default, and a re-apply keeps the stored value.
 ///
 /// The one-shot `forge_setting` marker [`REALMS_SEEDED_KEY`] gates only the
 /// initial `local`-realm priority adjustment (which must not fight later
@@ -1214,7 +1218,8 @@ pub async fn seed_auth_realms(
             username_claim: o.username_claim.clone(),
             email_claim: o.email_claim.clone(),
             display_name_claim: o.display_name_claim.clone(),
-            auto_provision: o.auto_provision,
+            // The realm's own: a re-apply keeps the stored value (`apply_seed`).
+            auto_provision: true,
             link_existing_by_username: o.link_existing_by_username,
             admin_groups: o.admin_groups.clone(),
             admin_claim: o.admin_claim.clone(),
@@ -1251,7 +1256,6 @@ async fn apply_seed(
     config: JsonValue,
 ) -> anyhow::Result<()> {
     let name = seed_name(kind).expect("a seeded realm kind");
-    let fingerprint = seed_fingerprint(kind, &config);
     let key = seed_fingerprint_key(kind);
 
     match auth_realm_dao::find_realm_by_name(pool, name).await? {
@@ -1261,6 +1265,7 @@ async fn apply_seed(
             // renamed the row or created their own realm of this kind has
             // taken over and the TOML block is ignored.
             if !auth_realm_dao::kind_exists(pool, kind).await? {
+                let fingerprint = seed_fingerprint(kind, &config);
                 secret_dao::insert_realm_with_secrets(
                     pool,
                     envelope,
@@ -1303,9 +1308,22 @@ async fn apply_seed(
                 return Ok(());
             }
             let marker = last_seed;
+            // The block does not set `auto_provision`: the realm keeps its own.
+            let mut config = config;
+            if kind == KIND_OIDC {
+                if let (Some(map), Some(kept)) = (
+                    config.as_object_mut(),
+                    existing_config.get("auto_provision"),
+                ) {
+                    map.insert("auto_provision".to_string(), kept.clone());
+                }
+            }
             if existing_config == config {
                 return Ok(());
             }
+            // The marker covers the config as written, the kept value
+            // included: the next boot compares it with the row.
+            let fingerprint = seed_fingerprint(kind, &config);
             // The row is written only while it is still the one compared
             // above, and the marker only while it is still `marker`.
             let mut tx = pool.begin().await?;

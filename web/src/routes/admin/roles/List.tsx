@@ -45,7 +45,9 @@ function RolesList() {
         title="Roles"
         description={
           <>
-            A role grants actions on repositories to the users who hold it. The
+            A role gives the users who hold it a level on repositories:{' '}
+            <strong>read</strong>, <strong>write</strong> or{' '}
+            <strong>delete</strong>, each including the ones below it. The
             built-in roles cannot be deleted: <strong>admin</strong> may do
             everything, <strong>anonymous</strong> applies to callers who do not
             sign in (and its reads to everyone), and{' '}

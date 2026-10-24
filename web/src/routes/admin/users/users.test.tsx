@@ -902,13 +902,13 @@ describe('admin tokens', () => {
         token({
           id: 6,
           name: 'ops',
-          scope: { actions: ['admin'] },
+          scope: { admin: true },
         }),
         token({
           id: 7,
           name: 'push',
           expires_at: '2999-01-01T00:00:00Z',
-          scope: { actions: ['read', 'write'], repositories: [3, 4] },
+          scope: { level: 'write', repositories: [3, 4] },
         }),
       ],
     })
@@ -927,7 +927,7 @@ describe('admin tokens', () => {
     expect(within(ops).getByText('active')).toBeInTheDocument()
 
     const push = await row('push')
-    expect(within(push).getByText('read, write')).toBeInTheDocument()
+    expect(within(push).getByText('write')).toBeInTheDocument()
     expect(within(push).getByText('2 repositories')).toBeInTheDocument()
     expect(within(push).getByText('active')).toBeInTheDocument()
   })

@@ -179,7 +179,7 @@ curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/rep
 curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/me/tokens \
   -H 'content-type: application/json' -d '{"name":"local"}'
 # -> {"token":"<SECRET>", ...}   (shown once)
-# For scripted administration, mint one with '{"name":"ops","scope":{"actions":["admin"]}}'
+# For scripted administration, mint one with '{"name":"ops","scope":{"admin":true}}'
 # and send it as the Basic password (curl -u admin@example.com:<SECRET>) or X-NuGet-ApiKey.
 
 # push a package, then read it back
@@ -239,7 +239,7 @@ password supplied to NuGet should be a **token**.
   the members it may read itself. The same holds for a token whose `scope`
   lists repositories: scoped to the group alone it sees an empty feed, so
   list the group **and** every member it should be served from, e.g.
-  `{"scope": {"actions": ["read"], "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
+  `{"scope": {"level": "read", "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
 
 The same three types exist for container images with `"format":"docker"`
 (`{"name":"docker-hosted","kind":"hosted","format":"docker"}`, a proxy with
@@ -564,8 +564,11 @@ When `admin_groups` is set, admin is **recomputed on every login** from the
 current claims: membership in the built-in `admin` role (a user
 removed from the admin role loses admin on next login; existing sessions are not
 downgraded mid-session). With an empty `admin_groups` OIDC never touches admin.
-OIDC users are identified by the `(issuer, sub)` link. With `auto_provision =
-true` (default) a first-time login creates an `app_user`;
+OIDC users are identified by the `(issuer, sub)` link. A first-time login
+creates an `app_user` while the realm's **Auto-provision users on first
+login** is on: it is set for each realm on its page under **Admin →
+Authentication** (`auto_provision` in the realm's config), never in the
+`[oidc]` block, and a realm the block seeds starts with it on.
 `link_existing_by_username` is **off by default** — when enabled it links a new
 identity to an existing user of the same name, but never to an account that has
 a local password or is an admin, and an email claim is only used as the

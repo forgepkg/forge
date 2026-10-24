@@ -290,8 +290,8 @@ async fn user_with_token(srv: &TestServer) -> (String, String, i64) {
     (username, token["token"].as_str().unwrap().to_string(), id)
 }
 
-/// Grant `actions` on `repo` to the user (through a fresh role).
-async fn grant(srv: &TestServer, user_id: i64, repo: &str, actions: &[&str]) {
+/// Grant `level` on `repo` to the user (through a fresh role).
+async fn grant(srv: &TestServer, user_id: i64, repo: &str, level: &str) {
     let role: Value = admin_post(
         srv,
         "/admin/roles",
@@ -302,15 +302,13 @@ async fn grant(srv: &TestServer, user_id: i64, repo: &str, actions: &[&str]) {
     .await
     .unwrap();
     let role_id = role["id"].as_i64().unwrap();
-    for action in actions {
-        let resp = admin_put(
-            srv,
-            &format!("/admin/roles/{role_id}/grants"),
-            json!({"repository": repo, "action": action}),
-        )
-        .await;
-        assert!(resp.status().is_success(), "grant: {}", resp.status());
-    }
+    let resp = admin_put(
+        srv,
+        &format!("/admin/roles/{role_id}/grants"),
+        json!({"repository": repo, "level": level}),
+    )
+    .await;
+    assert!(resp.status().is_success(), "grant: {}", resp.status());
     let resp = admin_put(
         srv,
         &format!("/admin/users/{user_id}/roles"),
@@ -464,7 +462,7 @@ async fn tokens_grant_only_what_rbac_allows() {
     )
     .await;
     let (user, secret, user_id) = user_with_token(&srv).await;
-    grant(&srv, user_id, &repo, &["read"]).await;
+    grant(&srv, user_id, &repo, "read").await;
 
     let decode = |jwt: &str| -> Value {
         use base64::Engine;
@@ -1322,7 +1320,7 @@ async fn cross_repository_mount_needs_read_on_the_source() {
 
     // A user who may push to b but not read a cannot mount from a.
     let (user, secret, user_id) = user_with_token(&srv).await;
-    grant(&srv, user_id, &b, &["read", "write"]).await;
+    grant(&srv, user_id, &b, "write").await;
     let dev = Oci::new(&srv, Some((user, secret)));
     let target = format!("{b}/dst");
     let token = dev
@@ -2461,8 +2459,8 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     // The guard holds for a caller who cannot read the hosted member: it gets
     // nothing, never the proxy's image of the same name.
     let (user, token, uid) = user_with_token(&srv).await;
-    grant(&srv, uid, &group, &["read"]).await;
-    grant(&srv, uid, &proxy, &["read"]).await;
+    grant(&srv, uid, &group, "read").await;
+    grant(&srv, uid, &proxy, "read").await;
     let dev = Oci::new(&srv, Some((user, token)));
     assert_eq!(
         dev.get(&format!("{group}/public/app"), "manifests/1")

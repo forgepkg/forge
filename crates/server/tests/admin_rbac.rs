@@ -225,7 +225,7 @@ async fn grant_changes_decision_and_invalidates_cache() {
     let resp = client
         .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"repository": repo, "action": "read"}))
+        .json(&json!({"repository": repo, "level": "read"}))
         .send()
         .await
         .unwrap();
@@ -266,7 +266,7 @@ async fn grant_changes_decision_and_invalidates_cache() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|g| g["action"] == json!("read"));
+        .any(|g| g["level"] == json!("read"));
     assert!(has_read, "effective set must include the read grant: {eff}");
 
     // The user can now read (the role-grant mutation invalidated the cache).
@@ -345,29 +345,42 @@ async fn rbac_bodies_reject_unknown_fields() {
     };
 
     // The listing's own shape, sent back.
-    let resp = put(json!({"repository_id": repo_id, "action": "read"}))
+    let resp = put(json!({"repository_id": repo_id, "level": "read"}))
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
     // A mistyped field, and both names at once, are refused.
-    let resp = put(json!({"repo": repo, "action": "write"})).await.unwrap();
+    let resp = put(json!({"repo": repo, "level": "write"})).await.unwrap();
     assert!(resp.status().is_client_error(), "{}", resp.status());
-    let resp = put(json!({"repository": repo, "repository_id": repo_id, "action": "write"}))
+    let resp = put(json!({"repository": repo, "repository_id": repo_id, "level": "write"}))
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
-    // `admin` on one repository delegates nothing (administration is
-    // global), so it is refused rather than stored, by name or by id.
+    // `action`, which `level` replaced (#411), is refused naming `level`,
+    // alone or next to it.
     for body in [
-        json!({"repository": repo, "action": "admin"}),
+        json!({"repository": repo, "action": "read"}),
         json!({"repository_id": repo_id, "action": "admin"}),
+        json!({"repository": repo, "level": "read", "action": "read"}),
     ] {
-        let resp = put(body).await.unwrap();
-        assert_eq!(resp.status(), 400);
+        let resp = put(body.clone()).await.unwrap();
+        assert_eq!(resp.status(), 400, "{body}");
         let text = resp.text().await.unwrap();
-        assert!(text.contains("repository admin is not supported"), "{text}");
+        assert!(text.contains("replaced by level"), "{text}");
     }
-    // The table refuses one written past the API as well.
+    // `admin` is no level (administration is the admin role), nor is anything
+    // else; and the level is required.
+    for body in [
+        json!({"repository": repo, "level": "admin"}),
+        json!({"repository": repo, "level": "frobnicate"}),
+        json!({"repository": repo}),
+    ] {
+        let resp = put(body.clone()).await.unwrap();
+        assert_eq!(resp.status(), 400, "{body}");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("level must be one of"), "{text}");
+    }
+    // The table refuses `admin` written past the API as well.
     let role_id = role["id"].as_i64().unwrap();
     let direct =
         forge_db::authz_dao::add_grant(&srv.pool, role_id, Some(repo_id), "admin", None).await;
@@ -385,7 +398,25 @@ async fn rbac_bodies_reject_unknown_fields() {
     let grants = grants.as_array().unwrap();
     assert_eq!(grants.len(), 1, "{grants:?}");
     assert_eq!(grants[0]["repository_id"], repo_id);
-    assert_eq!(grants[0]["action"], "read");
+    assert_eq!(grants[0]["level"], "read");
+
+    // A role holds one grant per repository and selector: PUT sets its level.
+    let resp = put(json!({"repository_id": repo_id, "level": "delete"}))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let grants: Value = client
+        .get(&grants_url)
+        .basic_auth(&au, Some(&ap))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grants = grants.as_array().unwrap();
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0]["level"], "delete");
 
     let resp = client
         .post(format!("{}/admin/content-selectors", srv.base_url))
@@ -421,7 +452,7 @@ async fn unassign_role_denies() {
     client
         .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"repository": repo, "action": "read"}))
+        .json(&json!({"repository": repo, "level": "read"}))
         .send()
         .await
         .unwrap();
@@ -579,11 +610,12 @@ async fn role_counts_members_and_user_roles() {
     assert_eq!(role["grant_count"], json!(0));
     assert_eq!(role["user_count"], json!(0));
 
-    for action in ["read", "write"] {
+    let other = make_repo(&srv).await;
+    for (repo, level) in [(&repo, "write"), (&other, "read")] {
         let resp = client
             .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
             .basic_auth(&au, Some(&ap))
-            .json(&json!({"repository": repo, "action": action}))
+            .json(&json!({"repository": repo, "level": level}))
             .send()
             .await
             .unwrap();
@@ -718,7 +750,7 @@ async fn content_selector_grants_and_match() {
     let resp = client
         .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"repository": repo, "action": "read", "selector_id": sel_id}))
+        .json(&json!({"repository": repo, "level": "read", "selector_id": sel_id}))
         .send()
         .await
         .unwrap();
@@ -739,7 +771,7 @@ async fn content_selector_grants_and_match() {
     let grants = grants.as_array().unwrap();
     assert_eq!(grants.len(), 1);
     assert_eq!(grants[0]["role_id"], json!(role_id));
-    assert_eq!(grants[0]["action"], json!("read"));
+    assert_eq!(grants[0]["level"], json!("read"));
     assert_eq!(grants[0]["selector_id"], json!(sel_id));
     let resp = client
         .get(format!(
@@ -815,16 +847,14 @@ async fn redeploy_needs_delete_as_well_as_write() {
         .await
         .unwrap();
     let role_id = role["id"].as_i64().unwrap();
-    let grant = |action: &'static str| {
+    let grant = |level: &'static str| {
         client
             .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
             .basic_auth(&au, Some(&ap))
-            .json(&json!({"repository": repo, "action": action}))
+            .json(&json!({"repository": repo, "level": level}))
             .send()
     };
-    for action in ["read", "write"] {
-        assert_eq!(grant(action).await.unwrap().status(), 201);
-    }
+    assert_eq!(grant("write").await.unwrap().status(), 201);
     let resp = client
         .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -847,9 +877,12 @@ async fn redeploy_needs_delete_as_well_as_write() {
 
     let push = || publish_with_token(&srv, &repo, &token, "Acme.Core", "1.2.0");
     assert_eq!(push().await, 201, "a new version needs write only");
-    assert_eq!(push().await, 403, "replacing it needs delete too");
+    assert_eq!(push().await, 403, "replacing it needs delete");
     assert_eq!(grant("delete").await.unwrap().status(), 201);
-    assert!(push().await.is_success(), "write + delete may redeploy");
+    assert!(
+        push().await.is_success(),
+        "delete (with write) may redeploy"
+    );
 }
 
 /// #318: the built-in `writer` role reads and publishes on every repository,
@@ -974,7 +1007,7 @@ async fn token_scope_narrows_to_read_only() {
     let (user_id, _username, _password) = make_user(&srv).await;
     let repo = make_repo(&srv).await;
 
-    // Give the user read+write on the repo via a role.
+    // Give the user write (with read) on the repo via a role.
     let role_name = format!("rw-{}", common::unique());
     let role: Value = client
         .post(format!("{}/admin/roles", srv.base_url))
@@ -987,15 +1020,13 @@ async fn token_scope_narrows_to_read_only() {
         .await
         .unwrap();
     let role_id = role["id"].as_i64().unwrap();
-    for action in ["read", "write"] {
-        client
-            .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
-            .basic_auth(&au, Some(&ap))
-            .json(&json!({"repository": repo, "action": action}))
-            .send()
-            .await
-            .unwrap();
-    }
+    client
+        .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
+        .basic_auth(&au, Some(&ap))
+        .json(&json!({"repository": repo, "level": "write"}))
+        .send()
+        .await
+        .unwrap();
     client
         .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -1008,7 +1039,7 @@ async fn token_scope_narrows_to_read_only() {
     let created: Value = client
         .post(format!("{}/admin/users/{user_id}/tokens", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"name": "ci", "scope": {"actions": ["read"]}}))
+        .json(&json!({"name": "ci", "scope": {"level": "read"}}))
         .send()
         .await
         .unwrap()
@@ -1110,7 +1141,7 @@ async fn a_token_scoped_to_a_group_reads_only_the_members_it_lists() {
             let created: Value = client
                 .post(format!("{srv_url}/admin/users/{admin_id}/tokens"))
                 .basic_auth(&au, Some(&ap))
-                .json(&json!({"name": "ci", "scope": {"actions": ["read"],
+                .json(&json!({"name": "ci", "scope": {"level": "read",
                                                        "repositories": repositories}}))
                 .send()
                 .await
@@ -1330,7 +1361,7 @@ async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role(
     let resp = client
         .put(format!("{}/admin/roles/{anon_role}/grants", srv.base_url))
         .basic_auth(&au, Some(&ap))
-        .json(&json!({"repository": repo, "action": "read"}))
+        .json(&json!({"repository": repo, "level": "read"}))
         .send()
         .await
         .unwrap();

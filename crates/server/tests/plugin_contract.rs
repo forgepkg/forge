@@ -12,29 +12,29 @@ use std::sync::Arc;
 
 use common::{start_with, unique, ServerOpts, TestServer};
 use forge_plugin::api::{
-    Action, Answer, ChangeRequest, FormatError, FormatPlugin, Loaded, PackageInfo, PackageRef,
-    PackageSource, PackageVersions, ParsedPackage, PublishRequest, Query, Repository, Request,
-    Response, SearchQuery, Upload,
+    Action, Answer, Assets, ChangeRequest, Descriptor, FormatError, FormatPlugin, Loaded,
+    PackageInfo, PackageRef, PackageSource, PackageVersions, ParsedPackage, PublishRequest, Query,
+    Repository, RepositoryKind, Request, Response, SearchQuery, Storage, Upload,
 };
 use forge_plugin::Plugin;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
-const PROBE_TOML: &str = r#"
-[plugin]
-id = "probe"
-name = "Probe"
-version = "0.0.1"
-api = "0.4.0"
-mount = "/probe"
-kinds = ["hosted"]
-
-[assets]
-package = "probe.bin"
-package_type = "application/x-probe"
-manifest = "probe.txt"
-manifest_type = "text/plain"
-"#;
+const PROBE: Descriptor = Descriptor {
+    id: "probe",
+    name: "Probe",
+    version: "0.0.1",
+    description: "Reports what the host answers.",
+    mount: "/probe",
+    kinds: &[RepositoryKind::Hosted],
+    storage: Storage::Packages,
+    assets: Assets {
+        package: "probe.bin",
+        package_type: "application/x-probe",
+        manifest: "probe.txt",
+        manifest_type: "text/plain",
+    },
+};
 
 /// A package is text whose first line is `<id> <version>`.
 struct Probe;
@@ -58,6 +58,10 @@ fn package_info_json(p: &PackageInfo) -> Value {
 }
 
 impl FormatPlugin for Probe {
+    fn descriptor(&self) -> &'static Descriptor {
+        &PROBE
+    }
+
     fn canonical_id(&self, id: &str) -> String {
         id.to_ascii_lowercase()
     }
@@ -197,7 +201,7 @@ async fn start_probe(extra_toml: Option<String>) -> TestServer {
         common::pool().await,
         ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
-            extra_plugins: vec![Plugin::builtin(PROBE_TOML, Probe).unwrap()],
+            extra_plugins: vec![Plugin::builtin(Probe)],
             extra_toml,
             ..Default::default()
         },
@@ -623,16 +627,14 @@ async fn mutations_outside_the_selector_are_unknown() {
     .await
     .unwrap();
     let role_id = role["id"].as_i64().unwrap();
-    for action in ["read", "delete"] {
-        let resp = admin(
-            reqwest::Method::PUT,
-            &format!("/admin/roles/{role_id}/grants"),
-            json!({ "repository": repo, "action": action, "selector_id": selector["id"] }),
-        )
-        .await
-        .unwrap();
-        assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
-    }
+    let resp = admin(
+        reqwest::Method::PUT,
+        &format!("/admin/roles/{role_id}/grants"),
+        json!({ "repository": repo, "level": "delete", "selector_id": selector["id"] }),
+    )
+    .await
+    .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
     let resp = admin(
         reqwest::Method::PUT,
         &format!("/admin/users/{user_id}/roles"),
@@ -682,7 +684,11 @@ async fn mutations_outside_the_selector_are_unknown() {
 /// The probe is a valid built-in plugin; nothing in it relies on the server.
 #[test]
 fn the_probe_is_a_plugin() {
-    let plugin = Plugin::builtin(PROBE_TOML, Probe).unwrap();
-    assert_eq!(plugin.manifest().mount, "/probe");
+    let plugin = Plugin::builtin(Probe);
+    assert_eq!(plugin.descriptor().mount, "/probe");
+    assert_eq!(
+        forge_plugin::descriptor::check(&[plugin.descriptor()]),
+        Ok(())
+    );
     let _: Arc<dyn FormatPlugin> = plugin.implementation().clone();
 }

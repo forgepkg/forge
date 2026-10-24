@@ -298,27 +298,55 @@ that account, or removing its `admin` role, is refused with `409 Conflict`.
 So the replacement admin has to exist first; an OIDC or credential-forwarding
 admin counts once they have signed in.
 
-### Built-in roles
+### Access levels
 
 What a user may do follows from the roles they hold (**Admin → Roles**,
-`/admin/roles`). Every install has four built-in roles, which cannot be
-deleted or renamed:
+`/admin/roles`). A role's grants each give one of three ordered levels on a
+repository, or on every repository, and each level includes the ones below
+it:
+
+| Level | Covers (in Nexus's terms) | In Forge |
+| --- | --- | --- |
+| `read` | browse, read | Download, list and search packages, images and files. |
+| `write` | browse, read, add, edit | `read`, plus push and relist: a NuGet push, a container image or Helm chart push, a raw file upload. |
+| `delete` | browse, read, add, edit, delete | `write`, plus unlist and delete versions, delete tags, delete or replace raw files, and redeploy a version. |
+
+A check passes when a grant covering the repository has the level it needs or
+a higher one. A role holds one grant per repository (or every repository) and
+content selector: giving it another level there replaces the level
+(`PUT /admin/roles/{id}/grants` with `{"repository": "<name>", "level":
+"write"}`, or **Add grant** on the role's page). A content selector narrows a
+grant to the packages it matches, for every level the grant includes: a
+`write` grant scoped to `acme.*` reads and publishes `acme.*` only.
+
+Administration is no level: it is membership in the built-in `admin` role.
+
+An API token carries its owner's levels, never `admin`, unless its scope says
+otherwise. `"scope": {"level": "read"}` caps every grant at that level (a
+`delete` grant reads only), `"repositories": [<id>, ...]` limits the
+repositories, and `"admin": true` keeps the owner's `admin` role, for
+automation, when the scope does not limit repositories. A scope can only
+narrow what its owner may do.
+
+### Built-in roles
+
+Every install has four built-in roles, which cannot be deleted or renamed:
 
 | Role | Grants | For |
 | --- | --- | --- |
-| `admin` | Everything: every repository, and administering the instance (repositories, users, roles, authentication, settings). | Administrators. |
-| `writer` | `read` and `write` on every repository, ones created later included. No `delete`, no `admin`. | People and CI that publish packages: a NuGet push, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
-| `authenticated` | `read` and `write` on every repository. | Legacy: what every user could do before roles existed, kept for upgraded installs. |
-| `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). | Anonymous access. |
+| `admin` | Everything: every repository at every level, and administering the instance (repositories, users, roles, authentication, settings). It holds no grant; membership is the administration. | Administrators. |
+| `writer` | `write` on every repository, ones created later included. No `delete`, no administration. | People and CI that publish packages: a NuGet push, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
+| `authenticated` | `write` on every repository. | Legacy: what every user could do before roles existed, kept for upgraded installs. |
+| `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). Its grants reach signed-in users too, as `read`, under the anonymous mode `all`. | Anonymous access. |
 
 A user who holds neither `admin` nor `writer` is a **reader**: they read what
 their other roles and anonymous access allow. **Admin → Users** shows each
 user's level (admin, writer or reader), and the user's page switches it.
 
 A writer cannot unlist or delete package versions, delete image tags, or
-delete or replace raw files:
-deleting stays with administrators and custom roles that grant `delete`, so a
-leaked CI token cannot remove published versions. Nor can a writer reach the
+delete or replace raw files: deleting stays with administrators and custom
+roles that grant `delete`, so a leaked CI token cannot remove published
+versions. Nor can a writer reach the
 admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
 `repo.write` capability). A writer mints their own API tokens on the
 **Tokens** page; a token never carries more than its owner's rights.
@@ -419,15 +447,17 @@ The rule applies wherever an account is created:
   account, or the login is refused and the login page names the claim. With
   Entra, `preferred_username` is the UPN. Elsewhere, map a claim that holds
   one, such as `email`. A name that is taken gets `-2`, `-3`, … on its local
-  part.
+  part. Whether a realm creates the account at all is set for each realm:
+  **Auto-provision users on first login** on its page under **Admin →
+  Authentication** (`auto_provision` in its config). The `[oidc]` block does
+  not set it; the realm it seeds starts with it on.
 - **Credential-forwarding realms create no accounts.** Create each one under
   **Admin → Users** with the realm as its sign-in (`POST /admin/users` with
   `"realm": "<name>"` and no password), named by a UPN whose local part is the
   upstream's username: Forge forwards the local part, so
   `alice@example.com` signs in as the upstream's `alice`. A login the
   upstream accepts but that names no account of the realm is refused. A
-  realm config that sets `auto_provision: true` is refused by the admin API,
-  and the `[auth.upstream_basic]` block's `auto_provision` is ignored.
+  realm config that sets `auto_provision: true` is refused by the admin API.
 
 ### Access and sign-in settings
 
@@ -472,7 +502,7 @@ A password sent over Basic is a **feed** credential only: the admin API
 because NuGet clients store that password and replay it on every request.
 Administer through a browser session (the web UI, or `POST /auth/login` plus
 the returned CSRF token), or mint an admin-scoped token
-(`{"scope": {"actions": ["admin"]}}`) for automation.
+(`{"scope": {"admin": true}}`) for automation.
 
 ## Email
 
@@ -1116,7 +1146,7 @@ disabled, and then nobody can sign in. API tokens keep working, so restores
 and pushes continue. To turn the `local` realm back on:
 
 - **With an admin-scoped API token**, minted beforehand with
-  `{"scope": {"actions": ["admin"]}}` (keep one for this): look up the
+  `{"scope": {"admin": true}}` (keep one for this): look up the
   realm's id, then enable it. The token can also go in the Basic password.
 
   ```bash

@@ -96,14 +96,8 @@ async fn setup(srv: &TestServer, idp: &MockOidc) {
             .status(),
         201
     );
-    // The forge role the WIF rule grants: read + write on the repo.
+    // The forge role the WIF rule grants: write (with read) on the repo.
     let role = srv.create_role("ci-pub").await;
-    assert_eq!(
-        srv.add_grant(role, Some("ci-hosted"), "read", None)
-            .await
-            .status(),
-        201
-    );
     assert_eq!(
         srv.add_grant(role, Some("ci-hosted"), "write", None)
             .await
@@ -526,14 +520,12 @@ async fn native_dotnet_push_uses_wif_for_private_index_and_package_put() {
     let selector = srv
         .create_content_selector("native-wif-packages", &["native.trusted.*"], &[])
         .await;
-    for action in ["read", "write"] {
-        assert_eq!(
-            srv.add_grant(role, Some("native-wif"), action, Some(selector))
-                .await
-                .status(),
-            StatusCode::CREATED
-        );
-    }
+    assert_eq!(
+        srv.add_grant(role, Some("native-wif"), "write", Some(selector))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
     assert_eq!(
         create_wif_realm(
             &srv,

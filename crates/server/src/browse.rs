@@ -147,7 +147,7 @@ pub async fn list_repos(
                 online: repo.online,
                 format: repo.format.clone(),
                 url: state.formats.plugin(&repo.format).map(|plugin| {
-                    crate::plugins::repository_url(&state, &plugin.manifest().mount, &repo.name)
+                    crate::plugins::repository_url(&state, plugin.descriptor().mount, &repo.name)
                 }),
                 storage: if repo.is_docker() {
                     "images"
