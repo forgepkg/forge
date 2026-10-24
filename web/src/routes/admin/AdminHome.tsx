@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from '@tanstack/react-router'
 
-import { Code, Icon, Page, PageHeader, type IconName } from '~/components/ui'
+import { Icon, Page, PageHeader, type IconName } from '~/components/ui'
 
 export const Route = createFileRoute('/_app/manage/')({
   component: AdminHome,
@@ -20,7 +20,7 @@ const SECTIONS = [
     title: 'Users & tokens',
     icon: 'Users',
     description:
-      'Create and delete accounts; assign their roles; issue, scope and revoke their registry tokens.',
+      'Invite, deactivate and delete accounts; assign their roles; issue, scope and revoke their registry tokens.',
   },
   {
     to: '/manage/roles',
@@ -78,8 +78,7 @@ const SECTIONS = [
  * `is_admin`. A card per admin screen, with the rail's icon for it: the
  * repositories, users (incl. per-user tokens and roles), roles, content
  * selectors, authentication-realm, settings, email-service, retention and
- * system screens; the header names what only the `/admin` API manages (CHANGELOG
- * "Known limitations").
+ * system screens.
  */
 function AdminHome() {
   return (
@@ -92,8 +91,7 @@ function AdminHome() {
             their API tokens, roles and their grants, content selectors,
             authentication realms, the sign-in and anonymous-access
             settings, the email service, and the secret encryption and blob
-            cache. User deactivation has no screen yet; use the{' '}
-            <Code>/admin</Code> API.
+            cache.
           </>
         }
       />

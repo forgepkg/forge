@@ -39,8 +39,10 @@ export const Route = createFileRoute('/_app/manage/users')({
  * (admin, writer or reader, from their role assignments), the other roles
  * they hold and their status (active, inactive, or invited: their user has
  * not chosen a password yet), links to the create page
- * (`/manage/users/new`) and each user's roles-and-tokens screen, and deletes
- * after a confirmation dialog. Every account is named by a UPN.
+ * (`/manage/users/new`) and each user's page (where an account is
+ * deactivated, reactivated or signed out everywhere), and deletes after a
+ * confirmation dialog, which suggests deactivating an active account instead
+ * when it should be kept. Every account is named by a UPN.
  */
 function UsersList() {
   const users = useUsers()
@@ -77,7 +79,27 @@ function UsersList() {
           icon="Trash"
           tone="danger"
           title={`Delete ${doomed.username}?`}
-          description="Their sessions, tokens and role assignments go with the account, and clients that use its tokens start failing. This cannot be undone."
+          description={
+            <>
+              Their sessions, tokens and role assignments go with the account,
+              and clients that use its tokens start failing. This cannot be
+              undone.
+              {doomed.active && (
+                <>
+                  {' '}
+                  To keep the account, deactivate it on{' '}
+                  <Link
+                    to="/manage/users/$userId"
+                    params={{ userId: String(doomed.id) }}
+                    className="fg-link"
+                  >
+                    its page
+                  </Link>{' '}
+                  instead: every sign-in is refused, and it can be reactivated.
+                </>
+              )}
+            </>
+          }
           confirmLabel={del.isPending ? 'Deleting…' : 'Delete user'}
           confirmVariant="danger-solid"
           confirmDisabled={del.isPending}
