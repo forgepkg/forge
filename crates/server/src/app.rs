@@ -151,13 +151,20 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Forge's own OIDC issuer (discovery + JWKS), public: what an IdP
         // verifies the client assertions of a `federated_credential` realm
         // against. 404 until forge has signing keys.
-        .merge(crate::auth::issuer_router())
-        // The Docker / OCI registry: clients always talk to `/v2/` at the
-        // host root; the registry resolves repositories from the name (or
-        // the host) itself.
-        .route("/v2", any(crate::registry::registry))
-        .route("/v2/", any(crate::registry::registry))
-        .route("/v2/{*rest}", any(crate::registry::registry));
+        .merge(crate::auth::issuer_router());
+    // The registry of the images format (Docker / OCI) under its mount,
+    // `/v2`: clients always talk to `/v2/` at the host root; the registry
+    // resolves repositories from the name (or the host) itself.
+    let images = state.formats.images_plugin();
+    if let Some(mount) = images.as_ref().map(|p| p.descriptor().mount) {
+        app = app
+            .route(mount, any(crate::registry::registry))
+            .route(&format!("{mount}/"), any(crate::registry::registry))
+            .route(
+                &format!("{mount}/{{*rest}}"),
+                any(crate::registry::registry),
+            );
+    }
     // Repositories, each served by its format's plugin under the format's
     // mount (`crate::plugins`; NuGet at `/v3`, raw files at `/raw`). `any` covers
     // GET/HEAD/PUT/POST/DELETE; the dispatcher authorizes per method.
@@ -183,6 +190,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
 
     let hsts = state.cookie_secure;
     let public_base_url = state.config.public_base_url();
+    let images = images.map(|p| p.implementation().clone());
     let server = state.config.server.clone();
     let app = app
         .layer(axum::middleware::from_fn_with_state(
@@ -192,7 +200,14 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Caching and transport policy for every response, including the
         // ones the principal middleware answers itself.
         .layer(axum::middleware::from_fn(move |req, next| {
-            response_policy(hsts, feeds.clone(), public_base_url.clone(), req, next)
+            response_policy(
+                hsts,
+                feeds.clone(),
+                public_base_url.clone(),
+                images.clone(),
+                req,
+                next,
+            )
         }));
     // A stalled upload or a handler that never answers must not pin a task
     // and a connection forever (header reads are bounded in `serve`).
@@ -274,6 +289,7 @@ async fn response_policy(
     hsts: bool,
     feeds: std::sync::Arc<Vec<String>>,
     public_base_url: String,
+    images: Option<std::sync::Arc<dyn forge_plugin::FormatPlugin>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -281,15 +297,18 @@ async fn response_policy(
     let under = |prefix: &str| crate::web_ui::is_under(path, prefix);
     let api = under("/admin") || under("/auth") || under("/browse") || under("/api");
     let feed = feeds.iter().any(|mount| under(mount));
-    let registry = under("/v2");
+    let registry = images
+        .as_ref()
+        .filter(|images| under(images.descriptor().mount));
     let headers = req.headers();
     let credentials = headers.contains_key(header::AUTHORIZATION)
         || headers.contains_key("x-nuget-apikey")
         || headers.contains_key(header::COOKIE);
     let mut resp = next.run(req).await;
-    if registry {
-        resp = crate::registry::amend_registry_rejection(&public_base_url, resp);
+    if let Some(images) = registry {
+        resp = crate::registry::amend_registry_rejection(&public_base_url, images.as_ref(), resp);
     }
+    let registry = registry.is_some();
     let out = resp.headers_mut();
     if api || ((feed || registry) && credentials) {
         out.insert(

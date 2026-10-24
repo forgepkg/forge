@@ -20,8 +20,10 @@ import { httpClient } from '~/lib/httpClient'
  *    `writable_member` — which the server refuses on a NuGet repository (and
  *    `package_delay_seconds` / `allow_redeploy` on a docker one). Raw
  *    repositories (`format: "raw"`, served at `/raw/`) likewise —
- *    `deployment_policy`, `content_disposition`, `max_age_seconds`. Both
- *    bodies reject unknown fields.
+ *    `deployment_policy`, `content_disposition`, `max_age_seconds`. npm
+ *    repositories (`format: "npm"`, served at `/npm/`) take a hosted
+ *    repository's `deployment_policy` (not `allow_redeploy`) and a group's
+ *    `writable_member`. Both bodies reject unknown fields.
  *  - `MemberView` / `AddMember` / `UpdateMember`
  *    (`crates/server/src/admin/members.rs`) drive the group editor; `priority`
  *    is unique within a group (a duplicate → 409). A member may itself be a

@@ -163,7 +163,7 @@ pub async fn put(
             return bad_request(format!("invalid retention policy: {e}"));
         }
         serde_json::to_value(&policy)
-    } else if repo.is_docker() {
+    } else if state.formats.stores_images(&repo.format) {
         let policy: ImageRetentionPolicy = match serde_json::from_value(body.policy) {
             Ok(p) => p,
             Err(e) => return unprocessable(e),
@@ -330,7 +330,10 @@ pub async fn preview(
                 return Json(PreviewView {
                     decisions: Vec::new(),
                     proxy_decisions: Vec::new(),
-                    image_decisions: repo.is_docker().then(ImageDecisions::default),
+                    image_decisions: state
+                        .formats
+                        .stores_images(&repo.format)
+                        .then(ImageDecisions::default),
                     file_decisions: state.formats.stores_files(&repo.format).then(Vec::new),
                     counts: PreviewCounts::default(),
                 })
@@ -339,7 +342,7 @@ pub async fn preview(
             Err(e) => return db_error(e),
         },
     };
-    if repo.is_docker() {
+    if state.formats.stores_images(&repo.format) {
         return preview_images(&state, &repo, policy_json, source, at).await;
     }
     if state.formats.stores_files(&repo.format) {
@@ -427,13 +430,19 @@ pub async fn preview(
         )
     })
     .await;
-    let (decisions, proxy_decisions) = match evaluation {
+    let (mut decisions, proxy_decisions) = match evaluation {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, repo = %repo.name, "retention preview evaluation failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
+    // As the worker does: a tagged version (npm's dist-tags) is never touched.
+    if let Err(e) =
+        forge_core::retention::spare_protected(&state.pool, repo.id, &mut decisions).await
+    {
+        return db_error(e);
+    }
 
     use forge_core::retention::model::Action;
     let unlisted = decisions

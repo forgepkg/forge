@@ -21,10 +21,11 @@ forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
-forge-oci = { path = "../format-oci" }
-# The built-in format plugins (crates/formats/nuget, crates/formats/raw),
-# linked in.
+# The built-in format plugins (crates/formats/docker, crates/formats/nuget,
+# crates/formats/npm, crates/formats/raw), linked in.
+forge-format-docker = { path = "../formats/docker" }
 forge-format-nuget = { path = "../formats/nuget" }
+forge-format-npm = { path = "../formats/npm" }
 forge-format-raw = { path = "../formats/raw" }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "signal"] }
@@ -64,6 +65,8 @@ argon2 = { workspace = true, features = ["password-hash"] }
 tokio-util = { workspace = true }
 # Format-plugin uploads: the named file part of a multipart body, streamed.
 multer = "3"
+# npm audits: a gzip-compressed request body.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 # The file store: the MD5 of uploads (the `.md5` sidecar), file names in
 # headers, HTTP dates (`Last-Modified`, `If-Modified-Since`) and content
 # types guessed from file names.
@@ -77,6 +80,8 @@ bytes = "1"
 uuid = { workspace = true }
 # Registry token signing key generation.
 rand = { workspace = true }
+# Registry Bearer tokens (HS256), the same crate the OIDC verifier uses.
+jsonwebtoken = { workspace = true }
 # Outgoing email (invitations): SMTP submission.
 lettre = { workspace = true }
 

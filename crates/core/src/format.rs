@@ -53,6 +53,13 @@ pub trait Format: Send + Sync {
         false
     }
 
+    /// Whether the format's repositories hold images (Docker / OCI): their
+    /// contents are the image store's (`oci_*`), served by the registry, and
+    /// none of the package seams below apply to them.
+    fn stores_images(&self) -> bool {
+        false
+    }
+
     /// Parse an uploaded package into format-neutral [`ParsedUpload`] data.
     fn parse_upload(&self, file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError>;
 
@@ -126,6 +133,36 @@ pub trait Format: Send + Sync {
         } else {
             Err(FormatError::InvalidPackage(format!(
                 "invalid package id {id:?}"
+            )))
+        }
+    }
+
+    /// Whether a proxy of this format with a password and no username sends
+    /// the password as an `Authorization: Bearer` token (npm's registry
+    /// tokens) rather than no credentials at all.
+    fn upstream_bearer_token(&self) -> bool {
+        false
+    }
+
+    /// The README a manifest carries, for the web UI's package page.
+    fn readme(&self, manifest: &[u8]) -> Option<String> {
+        let _ = manifest;
+        None
+    }
+
+    /// A group's reserved prefix as stored, from what an administrator typed
+    /// (trimmed, a trailing `*` dropped); refused when it cannot start an
+    /// id. The default takes letters, digits, `.`, `_` and `-`, lowercased.
+    fn reserved_prefix(&self, prefix: &str) -> Result<String, FormatError> {
+        let valid = !prefix.is_empty()
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if valid {
+            Ok(prefix.to_ascii_lowercase())
+        } else {
+            Err(FormatError::InvalidPackage(format!(
+                "{prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
             )))
         }
     }

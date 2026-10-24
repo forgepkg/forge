@@ -1570,8 +1570,8 @@ async fn registry_token_key_survives_dek_rotation() {
     .unwrap();
     assert_eq!(stored().await, after, "not replaced");
     let now = chrono::Utc::now().timestamp();
-    let claims = forge_oci::token::Claims {
-        iss: forge_oci::token::issuer("https://forge.example.com"),
+    let claims = forge_server::images::token::Claims {
+        iss: forge_server::images::token::issuer("https://forge.example.com"),
         aud: "forge.example.com".into(),
         sub: "anonymous".into(),
         iat: now,
@@ -1579,11 +1579,11 @@ async fn registry_token_key_survives_dek_rotation() {
         exp: now + 300,
         jti: "j".into(),
         access: Vec::new(),
-        fp: forge_oci::token::TokenPrincipal::Anonymous,
+        fp: forge_server::images::token::TokenPrincipal::Anonymous,
     };
-    let token = forge_oci::token::issue(&srv.state.registry_keys, &claims).unwrap();
+    let token = forge_server::images::token::issue(&srv.state.registry_keys, &claims).unwrap();
     assert!(
-        forge_oci::token::verify(&restarted, &token, &claims.iss, &claims.aud).is_some(),
+        forge_server::images::token::verify(&restarted, &token, &claims.iss, &claims.aud).is_some(),
         "a restarted instance accepts the running instance's tokens"
     );
 }

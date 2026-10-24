@@ -119,7 +119,7 @@ cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8421
 cargo xtask web-dev                 # terminal 2: Vite on :8420
 ```
 
-The Vite dev server proxies `/admin`, `/browse`, `/v2`, `/v3`, `/raw`, `/auth`
+The Vite dev server proxies `/admin`, `/browse`, `/v2`, `/v3`, `/npm`, `/raw`, `/auth`
 to the Rust origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
@@ -250,17 +250,23 @@ groups. See [docs/raw.md](docs/raw.md).
 
 ### Repositories of other formats (format plugins)
 
-Every package format is a format plugin, a crate in
+Every format is a format plugin, a crate in
 [`crates/formats/`](./crates/formats) linked into the server (see
-[docs/format-plugins.md](./docs/format-plugins.md)): NuGet and raw. A new
-format goes in `crates/formats/<id>` too, never in a `crates/format-<id>`
-crate or the server. Docker / OCI (`crates/format-oci`) is not there yet and
-is to move to `crates/formats/docker`. A repository of a plugin format is
-created with `"format": "<id>"` (hosted, proxy or group; a plugin format has
-proxies when it implements the upstream side) and served under
+[docs/format-plugins.md](./docs/format-plugins.md)): Docker / OCI, NuGet, npm
+and raw. A new format goes in `crates/formats/<id>` too, never in a
+`crates/format-<id>` crate or the server. Docker / OCI is an images format,
+served under `/v2` over the server's image store. A repository of a plugin
+format is created with `"format": "<id>"` (hosted, proxy or group; a plugin
+format has proxies when it implements the upstream side) and served under
 `/repository/<name>/` unless the plugin names another mount (NuGet's is
-`/v3`). Helm charts are pushed to docker repositories, see
+`/v3`, npm's `/npm`). Helm charts are pushed to docker repositories, see
 [docs/docker.md](docs/docker.md#helm-charts).
+
+npm repositories (`"format":"npm"`) are served under `/npm/`: `npm publish
+--registry http://localhost:8421/npm/<name>/` with an API token in
+`.npmrc` (`//localhost:8421/npm/<name>/:_authToken=<token>`), or after
+`npm login --registry …`, which opens the web UI's approval page. See
+[docs/npm.md](docs/npm.md).
 
 ## Configuration
 
@@ -633,6 +639,21 @@ cargo build -p forge-server
 .github/scripts/raw-e2e.sh target/debug/forge-server target/raw-e2e
 ```
 
+npm repositories have theirs, CI's `npm-e2e` job: the real clients against a
+live server and a mock upstream registry (npm's browser login, approved
+through the page's API, and Yarn's password login; logout; publishes with
+npm and pnpm, also through a group; installs with npm, pnpm and, when it is
+installed, Bun from a hosted repository, a proxy and a group; dist-tags,
+deprecation, unpublishing; the group's dependency-confusion guard and
+`npm audit`). It needs node with npm, pnpm, curl, jq, python3 and openssl
+(Yarn is fetched with `npm pack`, or given as `YARN_BERRY`), a Postgres and
+an S3 endpoint:
+
+```bash
+cargo build -p forge-server
+.github/scripts/npm-e2e.sh target/debug/forge-server target/npm-e2e
+```
+
 The container image has a smoke test, which CI's `docker` job runs on the
 image of each platform it built (#239). It starts the image the way the Kubernetes manifests
 and the Helm chart run it: read-only root filesystem, `/tmp` a tmpfs, user
@@ -833,7 +854,7 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 ## CI and the merge queue
 
 CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
-`test`, `docker`, `kubernetes`, `web`, `oci-e2e` and `raw-e2e`, and the slow
+`test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e` and `npm-e2e`, and the slow
 `e2e` and `web-e2e`, which pull requests skip: those two run in the merge
 queue and on every push to `main`. It runs on pull requests that target
 `main` only; a stacked one waits (see [Stacked pull
@@ -864,7 +885,7 @@ It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
-| Rust | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh` | `fmt`, `clippy`, `test`, `oci-e2e`, `raw-e2e`, `e2e`, `web-e2e` |
+| Rust | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh`, `npm-e2e.sh` | `fmt`, `clippy`, `test`, `oci-e2e`, `raw-e2e`, `npm-e2e`, `e2e`, `web-e2e` |
 | Changelog | `docs/changes/` | `fmt` |
 | Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
@@ -874,7 +895,7 @@ It sorts the change into groups of paths:
 
 A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
 counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
-`clippy`, `test`, `oci-e2e`, `raw-e2e` and `e2e` in Rust; `audit`
+`clippy`, `test`, `oci-e2e`, `raw-e2e`, `npm-e2e` and `e2e` in Rust; `audit`
 in Audit; `web` and `web-e2e` in Web; `docker` and `docker-platform` in
 Image and `kubernetes` in Kubernetes. A change outside the jobs (the triggers, the settings, the
 `changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
@@ -920,8 +941,8 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
 1. Enable **Require merge queue**. Keep its **status check timeout** above
    the run time of `e2e` and `web-e2e` (60 minutes by default).
 2. Under **Require status checks to pass**, require `fmt`, `clippy`, `audit`,
-   `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `e2e` and
-   `web-e2e` from GitHub Actions: every job of `ci.yml` but
+   `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `npm-e2e`,
+   `e2e` and `web-e2e` from GitHub Actions: every job of `ci.yml` but
    `changes`, the jobs the release workflow requires of the tagged commit
    (`REQUIRED_JOBS` in `.github/workflows/release.yml`). A job left out here
    can fail on a pull request that merges anyway, and the release then
@@ -940,68 +961,47 @@ workflow tags only commits whose CI run on `main` passed with every job (see
 
 ### Stacked pull requests
 
-A stacked pull request targets the branch of the pull request below it (see
-[AGENTS.md](AGENTS.md)). It must not be merged there, or its fix lands in
-that other pull request. The `Stack` workflow (`.github/workflows/stack.yml`)
-gives every pull request whose base is not `main` the commit status `stack`,
-pending and naming the branch it waits for. Once the pull request below has
-merged, GitHub retargets the stacked one to `main` and `stack` turns to
-success. A pull request opened against `main` gets no `stack` status.
+A stacked pull request targets the branch of the pull request below it. It
+must not be merged there, or its fix lands in that other pull request: a
+pull request merges into `main` only.
 
-The ruleset that enforces it is
-`.github/rulesets/stacked-pull-requests.json`; import it under **Settings →
-Rules → Rulesets → New ruleset → Import a ruleset**. It requires `stack` on
-every branch except `main`, the merge queue's `gh-readonly-queue/` branches,
-Dependabot's, and `cla-signatures`, where the `CLA` workflow
-(`.github/workflows/cla.yml`) commits the contributors' signatures:
+The ruleset that enforces it is `.github/rulesets/merge-into-main-only.json`;
+import it under **Settings → Rules → Rulesets → New ruleset → Import a
+ruleset**. GitHub has no rule that limits the branches a pull request may
+merge into, so the ruleset requires a status check that nothing reports,
+`merge into main only`, on every branch except `main`, the merge queue's
+`gh-readonly-queue/` branches, Dependabot's, and `cla-signatures`, where the
+`CLA` workflow (`.github/workflows/cla.yml`) commits the contributors'
+signatures:
 
-- A stacked pull request cannot be merged into the branch below it, and
-  auto-merge enabled on it does not merge it there. Once it targets `main`,
-  `main`'s own rules decide. A pull request whose branch predates the
-  workflow has no `stack` status at all, which blocks it just the same.
+- A pull request into any of those branches shows `merge into main only` as
+  expected, and its merge button stays blocked; auto-merge enabled on it does
+  not merge it there either. Once the pull request below has merged and
+  GitHub has retargeted the stacked one to `main`, the ruleset no longer
+  applies and `main`'s own rules decide.
 - A required status check guards pushes too: a branch only moves to a
   commit that already carries it. So repository admins, maintainers and
   writers, and organization owners, bypass the ruleset: their pushes to a
-  pull request's branch go through as before, and they can still merge a
-  stacked pull request, but only by ticking **Merge without waiting for
+  pull request's branch go through, and they can still merge a pull request
+  into another branch, but only by ticking **Merge without waiting for
   requirements to be met (bypass rules)**. A GitHub App pushing with its own
-  token, such as the stack App below, has to be added to the bypass list.
+  token has to be added to the bypass list.
 
 CI runs only on pull requests that target `main`, so a stacked pull request
-runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
-on every pull request above it. When a pull request is retargeted to `main`,
-the `Stack` workflow merges `main` into its branch, as the pull request's
-**Update branch** button does, and that push runs CI on the pull request.
-A retarget alone starts no CI run, and a manual run's checks would not
-count: GitHub shows a pull request only the checks of `pull_request`,
-`push` and a few other runs, and only those satisfy its required checks.
-The workflow pushes the merge with a GitHub App's token, since a push with
-a workflow's own `GITHUB_TOKEN` starts no workflow. Without the App, the
-workflow warns, and the **Update branch** button starts CI instead. When
-`main` does not merge cleanly, the `stack-status` check fails: merge `main`
-by hand and push.
-
-To set up the stack App:
-
-1. Create a GitHub App (**Settings → Developer settings → GitHub Apps → New
-   GitHub App**), without a webhook, with the repository permissions
-   **Contents**, **Pull requests** and **Workflows**, each **Read and
-   write**. Install it on this repository only.
-2. Generate a private key for it. Save the App's client ID as the repository
-   variable `STACK_APP_CLIENT_ID`, and the key as the repository secret
-   `STACK_APP_PRIVATE_KEY` (**Settings → Secrets and variables → Actions**).
-3. If the stacked pull requests ruleset is active, add the App to its bypass
-   list, or it refuses the merge on the pull request's branch.
-
-The App's merge, like the button's, dismisses the pull request's approvals
-under a rule that dismisses stale ones.
+runs none, and a fix merged up a stack does not run CI on every pull request
+above it. A retarget to `main` starts no CI run either: the next push to the
+pull request's branch does, such as the merge of its **Update branch**
+button (a branch that already holds `main` has no such button and needs a
+push of its own). A manual run's checks would not count: GitHub shows a pull
+request only the checks of `pull_request`, `push` and a few other runs, and
+only those satisfy its required checks.
 
 To check a stacked branch before its retarget, run CI on it by hand:
 **Actions → CI → Run workflow**, or
 `gh workflow run ci.yml --ref <branch> -f base=main`. The run compares the
 branch with the commit it forked off `main`, so it runs the jobs the pull
 request's change needs; its results show under **Actions**, not on the pull
-request. A pull request from a fork gets no merge: a push to it starts CI.
+request.
 
 ## Code scanning (CodeQL)
 

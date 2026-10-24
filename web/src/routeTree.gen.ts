@@ -15,6 +15,7 @@ import { Route as LoginRouteImport } from './routes/Login'
 import { Route as BrowseRouteImport } from './routes/Browse'
 import { Route as AdminLayoutRouteImport } from './routes/AdminLayout'
 import { Route as TokensRouteImport } from './routes/Tokens'
+import { Route as CliLoginRouteImport } from './routes/CliLogin'
 import { Route as adminAdminHomeRouteImport } from './routes/admin/AdminHome'
 import { Route as adminSelectorsListRouteImport } from './routes/admin/selectors/List'
 import { Route as adminRealmsListRouteImport } from './routes/admin/realms/List'
@@ -68,6 +69,11 @@ const AdminLayoutRoute = AdminLayoutRouteImport.update({
 const TokensRoute = TokensRouteImport.update({
   id: '/tokens',
   path: '/tokens',
+  getParentRoute: () => AppLayoutRoute,
+} as any)
+const CliLoginRoute = CliLoginRouteImport.update({
+  id: '/cli-login/$secret',
+  path: '/cli-login/$secret',
   getParentRoute: () => AppLayoutRoute,
 } as any)
 const adminAdminHomeRoute = adminAdminHomeRouteImport.update({
@@ -206,6 +212,7 @@ export interface FileRoutesByFullPath {
   '/manage': typeof AdminLayoutRouteWithChildren
   '/tokens': typeof TokensRoute
   '/manage/': typeof adminAdminHomeRoute
+  '/cli-login/$secret': typeof CliLoginRoute
   '/manage/content-selectors': typeof adminSelectorsListRoute
   '/manage/realms': typeof adminRealmsListRoute
   '/manage/repositories': typeof adminRepositoriesListRoute
@@ -237,6 +244,7 @@ export interface FileRoutesByTo {
   '/': typeof BrowseRoute
   '/tokens': typeof TokensRoute
   '/manage': typeof adminAdminHomeRoute
+  '/cli-login/$secret': typeof CliLoginRoute
   '/manage/content-selectors': typeof adminSelectorsListRoute
   '/manage/realms': typeof adminRealmsListRoute
   '/manage/repositories': typeof adminRepositoriesListRoute
@@ -271,6 +279,7 @@ export interface FileRoutesById {
   '/_app/manage': typeof AdminLayoutRouteWithChildren
   '/_app/tokens': typeof TokensRoute
   '/_app/manage/': typeof adminAdminHomeRoute
+  '/_app/cli-login/$secret': typeof CliLoginRoute
   '/_app/manage/content-selectors': typeof adminSelectorsListRoute
   '/_app/manage/realms': typeof adminRealmsListRoute
   '/_app/manage/repositories': typeof adminRepositoriesListRoute
@@ -305,6 +314,7 @@ export interface FileRouteTypes {
     | '/manage'
     | '/tokens'
     | '/manage/'
+    | '/cli-login/$secret'
     | '/manage/content-selectors'
     | '/manage/realms'
     | '/manage/repositories'
@@ -336,6 +346,7 @@ export interface FileRouteTypes {
     | '/'
     | '/tokens'
     | '/manage'
+    | '/cli-login/$secret'
     | '/manage/content-selectors'
     | '/manage/realms'
     | '/manage/repositories'
@@ -369,6 +380,7 @@ export interface FileRouteTypes {
     | '/_app/manage'
     | '/_app/tokens'
     | '/_app/manage/'
+    | '/_app/cli-login/$secret'
     | '/_app/manage/content-selectors'
     | '/_app/manage/realms'
     | '/_app/manage/repositories'
@@ -443,6 +455,13 @@ declare module '@tanstack/react-router' {
       path: '/tokens'
       fullPath: '/tokens'
       preLoaderRoute: typeof TokensRouteImport
+      parentRoute: typeof AppLayoutRoute
+    }
+    '/_app/cli-login/$secret': {
+      id: '/_app/cli-login/$secret'
+      path: '/cli-login/$secret'
+      fullPath: '/cli-login/$secret'
+      preLoaderRoute: typeof CliLoginRouteImport
       parentRoute: typeof AppLayoutRoute
     }
     '/_app/manage/': {
@@ -681,6 +700,7 @@ interface AppLayoutRouteChildren {
   BrowseRoute: typeof BrowseRoute
   AdminLayoutRoute: typeof AdminLayoutRouteWithChildren
   TokensRoute: typeof TokensRoute
+  CliLoginRoute: typeof CliLoginRoute
   RepoBrowseRoute: typeof RepoBrowseRoute
   ImageDetailRoute: typeof ImageDetailRoute
   PackageDetailRoute: typeof PackageDetailRoute
@@ -690,6 +710,7 @@ const AppLayoutRouteChildren: AppLayoutRouteChildren = {
   BrowseRoute: BrowseRoute,
   AdminLayoutRoute: AdminLayoutRouteWithChildren,
   TokensRoute: TokensRoute,
+  CliLoginRoute: CliLoginRoute,
   RepoBrowseRoute: RepoBrowseRoute,
   ImageDetailRoute: ImageDetailRoute,
   PackageDetailRoute: PackageDetailRoute,
