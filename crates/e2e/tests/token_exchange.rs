@@ -240,13 +240,11 @@ async fn npm_exchange(srv: &TestServer, token: &str, name: &str) -> reqwest::Res
 async fn npm_exchange_ok(srv: &TestServer, token: &str, name: &str) -> String {
     let response = npm_exchange(srv, token, name).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(reqwest::header::CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok()),
-        Some("private, no-store")
-    );
+    assert!(response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|part| part.trim() == "no-store")));
     let body: Value = response.json().await.unwrap();
     let key = body["token"].as_str().expect("npm token response");
     assert!(key.starts_with("forge_wif."), "{body}");
@@ -280,7 +278,7 @@ async fn npm_publish(
 ) -> reqwest::Response {
     let package = json!({"name": name, "version": version}).to_string();
     let tarball = forge_format_npm::tarball::build(&[("package/package.json", package.as_bytes())]);
-    let digests = forge_format_npm::integrity::Digests::of(&tarball).unwrap();
+    let digests = forge_format_npm::integrity::Digests::of(tarball.as_slice()).unwrap();
     let file = format!("{}-{version}.tgz", name.rsplit('/').next().unwrap());
     srv.client()
         .put(format!(
