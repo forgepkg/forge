@@ -2400,11 +2400,14 @@ async fn a_diamond_serves_what_its_unguarded_path_admits() {
 /// A proxy member searching its upstream, which ranks `ids` in that order and
 /// reports `total` hits: a search returns the first `take` ids but those in
 /// `dropped`, which it takes off its total too, as a proxy leaves out a
-/// version inside its package delay. It records every `take` asked.
+/// version inside its package delay. It records every `take` asked. With a
+/// `fallback`, a search for more than its `take` fails upstream and the
+/// proxy answers from its cache: those ids.
 struct RankedUpstream {
     ids: Vec<String>,
     total: usize,
     dropped: std::collections::HashSet<String>,
+    fallback: Option<(usize, Vec<String>)>,
     takes: std::sync::Mutex<Vec<usize>>,
 }
 
@@ -2414,6 +2417,7 @@ impl RankedUpstream {
             ids,
             total,
             dropped: Default::default(),
+            fallback: None,
             takes: Default::default(),
         })
     }
@@ -2465,6 +2469,23 @@ impl RepoReadOps for RankedUpstream {
         params: &SearchParams,
     ) -> Result<forge_core::repo::SearchResult, RepoError> {
         self.takes.lock().unwrap().push(params.take);
+        if let Some((_, cached)) = self
+            .fallback
+            .as_ref()
+            .filter(|(take, _)| params.take > *take)
+        {
+            return Ok(forge_core::repo::SearchResult {
+                total_hits: cached.len(),
+                hits: cached
+                    .iter()
+                    .map(|id| forge_core::repo::SearchHit {
+                        original_id: id.clone(),
+                        latest_version: "1.0.0".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            });
+        }
         let returned: Vec<&String> = self
             .ids
             .iter()
@@ -2706,6 +2727,7 @@ async fn hits_a_proxy_drops_widen_the_upstream_window() {
         ids: all.clone(),
         total: 100,
         dropped: all.iter().skip(1).step_by(2).cloned().collect(),
+        fallback: None,
         takes: Default::default(),
     });
     let g = upstream_group_repo(
@@ -2829,4 +2851,90 @@ async fn an_offline_proxy_is_searched_like_a_local_member() {
     assert_eq!(pages[0], ids("Cached", 0..20));
     assert_eq!(totals[0], 60);
     assert_eq!(upstream.takes(), [SearchParams::MAX_TAKE]);
+}
+
+/// Only the upstream search whose hits hold the page back is widened: one
+/// that shows a hit in 64 is asked for more, another whose first window
+/// fills its share is not.
+#[tokio::test]
+async fn only_the_search_holding_the_page_back_is_widened() {
+    let pool = common::pool().await;
+    let sparse = seed_proxy_member(&pool).await;
+    let full = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, sparse.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, full.id, 10)
+        .await
+        .unwrap();
+    let delayed: Vec<String> = (0..1000).map(|n| format!("Sparse.{n:03}")).collect();
+    let a = Arc::new(RankedUpstream {
+        ids: delayed.clone(),
+        total: 1000,
+        dropped: delayed
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| n % 64 != 0)
+            .map(|(_, id)| id.clone())
+            .collect(),
+        fallback: None,
+        takes: Default::default(),
+    });
+    let b = RankedUpstream::new(ids("Full", 0..100), 100);
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&sparse, &a), (&full, &b)],
+    );
+
+    let (pages, _) = search_pages(&g, &group.name, "", 20, 1).await;
+    assert_eq!(
+        pages[0][..4],
+        ["Sparse.000", "Full.00", "Sparse.064", "Full.01"]
+    );
+    assert_eq!(pages[0].len(), 20);
+    assert_eq!(a.takes(), [32, 128, 512, SearchParams::MAX_TAKE]);
+    assert_eq!(b.takes(), [32], "its first 32 hits fill its share");
+}
+
+/// A wider search whose upstream fails is answered from the proxy's cache,
+/// with other hits: the group keeps the hits the upstream returned first.
+#[tokio::test]
+async fn a_cache_answer_to_a_wider_search_keeps_the_first_hits() {
+    let pool = common::pool().await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object(\
+         'reserved_prefixes', jsonb_build_array('fallback.reserved.')) WHERE id = $1",
+    )
+    .bind(group.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let public = ids("Fallback.Public", 0..40);
+    for cached in [Vec::new(), ids("Fallback.Cached", 0..3)] {
+        let upstream = Arc::new(RankedUpstream {
+            ids: [ids("Fallback.Reserved", 0..20), public.clone()].concat(),
+            total: 60,
+            dropped: Default::default(),
+            fallback: Some((32, cached)),
+            takes: Default::default(),
+        });
+        let g = upstream_group_repo(
+            &pool,
+            StubBlobs::default(),
+            user(&pool).await,
+            &[(&proxy, &upstream)],
+        );
+        let (pages, totals) = search_pages(&g, &group.name, "Fallback", 20, 1).await;
+        assert_eq!(pages[0], public[..12], "the 12 public hits of the first 32");
+        assert_eq!(upstream.takes(), [32, 128]);
+        assert!(totals[0] > 12, "the hits past them are still estimated");
+    }
 }

@@ -104,10 +104,13 @@
 //! upstream, like browse's) is asked for its first
 //! [`SearchParams::MAX_TAKE`]. A proxy searching its upstream is asked for
 //! its first `skip + take`, rounded up to a power of two
-//! (`upstream_window`), and for four times as many, up to `MAX_TAKE`,
-//! while the hits it returned do not settle the page (the proxy or the
-//! group's guards left some out). A caller or a selector whose filter hides
-//! packages has it asked for `MAX_TAKE` at once.
+//! (`upstream_window`). While the hits returned do not settle the page (the
+//! proxy or the group's guards left some out), the searches that returned
+//! the fewest are asked for four times as many, up to `MAX_TAKE`. A wider
+//! search that fails, or that answers other hits first (a proxy whose
+//! upstream failed answers from its cache), keeps the hits it returned
+//! before. A caller or a selector whose filter hides packages has it asked
+//! for `MAX_TAKE` at once.
 //!
 //! The merge serves each id once, from the highest-priority member whose
 //! hits include it. The local members' ids come first, ordered by id; then
@@ -921,8 +924,15 @@ impl GroupRepo {
             if merged.settled >= wanted || !searches.iter().any(MemberSearch::growable) {
                 break merged;
             }
+            // Only the searches whose hits end the settled rounds hold the
+            // page back: widen those, then merge again.
+            let shortest = searches
+                .iter()
+                .filter(|search| search.growable())
+                .map(|search| search.hits.len())
+                .min();
             for (member, search) in searches.iter_mut().enumerate() {
-                if !search.growable() {
+                if !search.growable() || Some(search.hits.len()) != shortest {
                     continue;
                 }
                 let Some(window) = search.window else {
@@ -945,12 +955,18 @@ impl GroupRepo {
                 )
                 .await
                 {
-                    Ok(result) => {
+                    Ok(result) if search.extended_by(&result) => {
                         *search = MemberSearch::new(search.upstream, Some(window), result)
+                    }
+                    // A proxy whose upstream search failed answers from its
+                    // cache instead, with other hits.
+                    Ok(_) => {
+                        tracing::warn!(member = %leaf.name, "group search: a member's wider search returned other hits; keeping its first hits");
+                        search.stalled = true;
                     }
                     Err(e) => {
                         tracing::warn!(member = %leaf.name, error = %e, "group search: widening a member's upstream search failed; keeping its first hits");
-                        search.window = None;
+                        search.stalled = true;
                     }
                 }
             }
@@ -1079,7 +1095,7 @@ impl GroupRepo {
             .iter()
             .map(|&member| &searches[member])
             .zip(upstream.iter().map(|&member| credited[member]))
-            .filter(|(search, _)| search.growable() && !search.hits.is_empty())
+            .filter(|(search, _)| search.incomplete() && !search.hits.is_empty())
             .map(|(search, credited)| {
                 let more = search
                     .total
@@ -1495,6 +1511,9 @@ struct MemberSearch {
     hits: Vec<SearchHit>,
     /// The member's total.
     total: usize,
+    /// A wider search failed, or answered other hits than these first ones:
+    /// the member is asked for no more.
+    stalled: bool,
 }
 
 impl MemberSearch {
@@ -1504,6 +1523,7 @@ impl MemberSearch {
             window,
             hits: result.hits,
             total: result.total_hits,
+            stalled: false,
         }
     }
 
@@ -1514,14 +1534,31 @@ impl MemberSearch {
             window: None,
             hits: Vec::new(),
             total: 0,
+            stalled: false,
         }
     }
 
     /// Whether a larger window would return more hits.
-    fn growable(&self) -> bool {
+    fn incomplete(&self) -> bool {
         self.window
             .is_some_and(|window| window < SearchParams::MAX_TAKE)
             && self.hits.len() < self.total
+    }
+
+    /// Whether the member is to be asked for a larger window.
+    fn growable(&self) -> bool {
+        self.incomplete() && !self.stalled
+    }
+
+    /// Whether `result`, for a larger window, extends the hits returned so
+    /// far: the same ids first, in the same order.
+    fn extended_by(&self, result: &SearchResult) -> bool {
+        result.hits.len() >= self.hits.len()
+            && self
+                .hits
+                .iter()
+                .zip(&result.hits)
+                .all(|(had, got)| had.original_id == got.original_id)
     }
 }
 
