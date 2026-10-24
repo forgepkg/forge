@@ -140,7 +140,7 @@ impl Instance {
 
 /// Format registry: maps a format id (the `repository.format` column) to its
 /// [`Format`] and its plugin: the built-in format plugins
-/// ([`crate::plugins::builtin`]: NuGet, raw) and Docker.
+/// ([`crate::plugins::builtin`]: NuGet, npm, raw) and Docker.
 ///
 /// Docker ([`DOCKER_FORMAT`]) is installed but has no [`Format`]: its
 /// repositories hold images (manifests and blobs), not package versions,
@@ -157,13 +157,17 @@ pub struct FormatRegistry {
 
 impl FormatRegistry {
     /// A registry holding the built-in format plugins, NuGet reading
-    /// archives and upstream manifests under `nuget_limits`.
-    pub fn new(nuget_limits: forge_format_nuget::NupkgLimits) -> Self {
+    /// archives and upstream manifests under `nuget_limits`, npm requests
+    /// under `npm_limits`.
+    pub fn new(
+        nuget_limits: forge_format_nuget::NupkgLimits,
+        npm_limits: forge_format_npm::NpmLimits,
+    ) -> Self {
         let mut registry = FormatRegistry {
             formats: BTreeMap::new(),
             plugins: BTreeMap::new(),
         };
-        for plugin in crate::plugins::builtin(nuget_limits) {
+        for plugin in crate::plugins::builtin(nuget_limits, npm_limits) {
             registry = registry
                 .with_plugin(plugin)
                 .expect("built-in format ids are distinct");
@@ -353,7 +357,10 @@ impl AppState {
             cas,
             cache,
             authz,
-            formats: Arc::new(FormatRegistry::new(config.nuget.limits())),
+            formats: Arc::new(FormatRegistry::new(
+                config.nuget.limits(),
+                config.npm.limits(),
+            )),
             config,
             realms,
             sessions,
@@ -458,7 +465,8 @@ impl AppState {
     /// tests' own). A plugin whose format id is taken (a built-in plugin, or
     /// another plugin) is an error.
     pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
-        let mut registry = FormatRegistry::new(self.config.nuget.limits());
+        let mut registry =
+            FormatRegistry::new(self.config.nuget.limits(), self.config.npm.limits());
         for plugin in plugins {
             registry = registry.with_plugin(plugin)?;
         }
@@ -693,12 +701,12 @@ mod tests {
 
     #[test]
     fn docker_is_installed_without_a_package_format() {
-        let registry = FormatRegistry::new(Default::default());
+        let registry = FormatRegistry::new(Default::default(), Default::default());
         assert!(registry.is_installed(DOCKER_FORMAT));
         assert!(registry.get(DOCKER_FORMAT).is_none());
         assert_eq!(
             registry.ids().collect::<Vec<_>>(),
-            ["docker", "nuget", "raw"]
+            ["docker", "npm", "nuget", "raw"]
         );
         // Raw is a built-in plugin whose repositories hold files.
         assert!(registry.get("raw").is_some());
@@ -717,15 +725,23 @@ mod tests {
             registry.kinds("nuget"),
             Some(vec!["hosted", "proxy", "group"])
         );
+        // npm is a built-in plugin, served under its own mount.
+        assert_eq!(
+            registry.kinds("npm"),
+            Some(vec!["hosted", "proxy", "group"])
+        );
+        assert!(registry.plugin("npm").is_some());
+        assert!(!registry.stores_files("npm"));
+        assert_eq!(registry.mounts(), ["/npm", "/raw", "/v3"]);
         assert_eq!(registry.kinds("helm"), None);
-        assert_eq!(registry.kinds("npm"), None);
-        assert!(!registry.is_installed("npm"));
+        assert_eq!(registry.kinds("maven"), None);
+        assert!(!registry.is_installed("maven"));
     }
 
     #[test]
     fn a_plugin_cannot_take_dockers_or_a_builtin_plugins_id() {
-        for id in ["docker", "nuget", "raw"] {
-            let registry = FormatRegistry::new(Default::default());
+        for id in ["docker", "nuget", "npm", "raw"] {
+            let registry = FormatRegistry::new(Default::default(), Default::default());
             let err = registry
                 .with_format(Arc::new(Named(id)))
                 .err()

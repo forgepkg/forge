@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE cli_login SET user_id = $2, approved_at = now()\n        WHERE login_hash = $1 AND expires_at > now() AND user_id IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4e0afd23c132ed31eb2380f3f809f0e708d99b38037deaf4cba0cc0987e33d5d"
+}

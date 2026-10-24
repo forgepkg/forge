@@ -22,17 +22,23 @@ export function DependencyGroups({
   repo,
   byVersion,
   caption,
+  npm = false,
 }: {
   repo: string
   /** Dependency groups keyed by version, as the detail API returns them. */
   byVersion: Record<string, DetailDependencyGroup[]>
   caption?: string
+  /**
+   * An npm package's: the groups are dependency kinds, and package names are
+   * exact (NuGet ids are linked in lower case).
+   */
+  npm?: boolean
 }) {
   return (
     <Table caption={caption}>
       <TableHead>
         <TableHeader width="150px">Version</TableHeader>
-        <TableHeader width="170px">Target framework</TableHeader>
+        <TableHeader width="170px">{npm ? 'Kind' : 'Target framework'}</TableHeader>
         <TableHeader>Package</TableHeader>
         <TableHeader width="160px">Version range</TableHeader>
       </TableHead>
@@ -71,7 +77,7 @@ export function DependencyGroups({
                     <TableCell>
                       <Link
                         to="/packages/$repo/$id"
-                        params={{ repo, id: dep.id.toLowerCase() }}
+                        params={{ repo, id: npm ? dep.id : dep.id.toLowerCase() }}
                         className="fg-link-strong"
                       >
                         {dep.id}
