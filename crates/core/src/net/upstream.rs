@@ -164,6 +164,20 @@ impl UpstreamError {
     }
 }
 
+impl UpstreamError {
+    /// Whether the upstream refused the request (a 401 or a 403): the
+    /// proxy's credentials are missing or wrong, or they may not read it.
+    /// Asking again will not help until the proxy is fixed.
+    pub fn is_refusal(&self) -> bool {
+        matches!(
+            self,
+            UpstreamError::Status { status, .. }
+                if *status == reqwest::StatusCode::UNAUTHORIZED
+                    || *status == reqwest::StatusCode::FORBIDDEN
+        )
+    }
+}
+
 /// Whether an upstream's `status` says it cannot serve now: a 5xx, a 429.
 pub fn status_is_unavailable(status: reqwest::StatusCode) -> bool {
     status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -304,6 +318,9 @@ pub struct UpstreamAuth<'a> {
     pub username: &'a str,
     /// Basic-auth password.
     pub password: &'a str,
+    /// Send `password` as `Authorization: Bearer` instead (a registry token
+    /// stored without a username, for a format that takes tokens so).
+    pub bearer: bool,
 }
 
 /// Scheme + host + port triple used to scope credentials, and the requests
@@ -472,11 +489,27 @@ impl UpstreamHttp {
     /// (registries redirect blobs to a CDN or an object store).
     pub async fn send(
         &self,
+        method: reqwest::Method,
+        url: &str,
+        class: RequestClass,
+        headers: reqwest::header::HeaderMap,
+        auth: Option<&UpstreamAuth<'_>>,
+    ) -> Result<reqwest::Response, UpstreamError> {
+        self.send_with_body(method, url, class, headers, auth, None)
+            .await
+    }
+
+    /// [`Self::send`] with a request `body` (an `npm audit` passed to a
+    /// registry). A redirect keeps it, except a `303`, which is followed
+    /// with a GET.
+    pub async fn send_with_body(
+        &self,
         mut method: reqwest::Method,
         url: &str,
         class: RequestClass,
         mut headers: reqwest::header::HeaderMap,
         auth: Option<&UpstreamAuth<'_>>,
+        mut body: Option<Vec<u8>>,
     ) -> Result<reqwest::Response, UpstreamError> {
         let timeout = match class {
             RequestClass::Metadata => self.config.metadata_timeout,
@@ -502,9 +535,16 @@ impl UpstreamHttp {
                 .request(method.clone(), &hop)
                 .headers(headers.clone())
                 .timeout(remaining);
+            if let Some(body) = &body {
+                req = req.body(body.clone());
+            }
             if let Some(auth) = auth {
                 if auth.origin.is_some() && auth.origin == Origin::of(&hop) {
-                    req = req.basic_auth(auth.username, Some(auth.password));
+                    req = if auth.bearer {
+                        req.bearer_auth(auth.password)
+                    } else {
+                        req.basic_auth(auth.username, Some(auth.password))
+                    };
                 } else {
                     tracing::debug!(url = %hop, "upstream resource is off-origin; not sending proxy credentials");
                 }
@@ -530,9 +570,10 @@ impl UpstreamHttp {
             }
             hops += 1;
             // A 303 is answered with a GET; the other redirects keep the
-            // method (the registry sends only GET and HEAD).
+            // method and the body.
             if resp.status() == reqwest::StatusCode::SEE_OTHER && method != reqwest::Method::HEAD {
                 method = reqwest::Method::GET;
+                body = None;
             }
             tracing::debug!(from = %hop, to = %next, "following upstream redirect");
             hop = next.into();
@@ -587,7 +628,7 @@ impl UpstreamHttp {
         url: &str,
         auth: Option<&UpstreamAuth<'_>>,
     ) -> Result<Option<JsonValue>, UpstreamError> {
-        let Some(spool) = self.get_metadata_body(url, auth).await? else {
+        let Some(spool) = self.get_metadata_body(url, auth, None).await? else {
             return Ok(None);
         };
         let url_owned = url.to_string();
@@ -609,7 +650,17 @@ impl UpstreamHttp {
         url: &str,
         auth: Option<&UpstreamAuth<'_>>,
     ) -> Result<Option<Vec<u8>>, UpstreamError> {
-        let Some(spool) = self.get_metadata_body(url, auth).await? else {
+        self.get_bytes_accepting(url, auth, None).await
+    }
+
+    /// [`Self::get_bytes`] with an `Accept` header.
+    pub async fn get_bytes_accepting(
+        &self,
+        url: &str,
+        auth: Option<&UpstreamAuth<'_>>,
+        accept: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, UpstreamError> {
+        let Some(spool) = self.get_metadata_body(url, auth, accept).await? else {
             return Ok(None);
         };
         let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
@@ -628,8 +679,21 @@ impl UpstreamHttp {
         &self,
         url: &str,
         auth: Option<&UpstreamAuth<'_>>,
+        accept: Option<&str>,
     ) -> Result<Option<SpooledBody>, UpstreamError> {
-        let resp = self.get(url, RequestClass::Metadata, auth).await?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(accept) = accept.and_then(|a| reqwest::header::HeaderValue::from_str(a).ok()) {
+            headers.insert(reqwest::header::ACCEPT, accept);
+        }
+        let resp = self
+            .send(
+                reqwest::Method::GET,
+                url,
+                RequestClass::Metadata,
+                headers,
+                auth,
+            )
+            .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -744,7 +808,7 @@ impl SpooledBody {
 
     /// Inflate a gzip-encoded body into a new spool, failing as soon as the
     /// decoded size exceeds `limit`. Blocking: call from the blocking pool.
-    fn gunzip(
+    pub fn gunzip(
         self,
         url: &str,
         limit: u64,

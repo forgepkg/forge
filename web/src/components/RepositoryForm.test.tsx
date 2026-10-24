@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event'
 import type { FormatView, RepoView } from '~/api/repositories'
 import {
   DOCKER_FORMAT,
+  NPM_FORMAT,
   NUGET_FORMAT,
   RAW_FORMAT,
   RepositoryForm,
@@ -20,7 +21,7 @@ import {
 /**
  * RepositoryForm:
  *  - a create-hosted submission produces the right `CreateRepo` body (kind +
- *    hosted-only `allow_redeploy`, no proxy fields);
+ *    hosted-only `deployment_policy`, no proxy fields);
  *  - the proxy upstream password is **write-only**: never seeded from an
  *    existing repo's GET, and only sent when typed;
  *  - validation blocks an empty name and a proxy without a remote URL;
@@ -44,7 +45,7 @@ function lastValues(onSubmit: ReturnType<typeof vi.fn>): RepoFormValues {
 }
 
 describe('RepositoryForm', () => {
-  it('builds a hosted CreateRepo body with allow_redeploy and no proxy fields', async () => {
+  it('builds a hosted CreateRepo body with a deployment policy and no proxy fields', async () => {
     const user = userEvent.setup()
     const onSubmit = vi.fn()
     render(
@@ -57,10 +58,8 @@ describe('RepositoryForm', () => {
     )
 
     await user.type(screen.getByLabelText('Name'), 'my-hosted')
-    // kind defaults to hosted; toggle allow_redeploy on.
-    await user.click(
-      screen.getByLabelText(/Allow redeploy/),
-    )
+    // kind defaults to hosted; let versions be pushed again.
+    await user.selectOptions(screen.getByLabelText('Deployment policy'), 'allow_redeploy')
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
 
     expect(onSubmit).toHaveBeenCalledTimes(1)
@@ -68,8 +67,9 @@ describe('RepositoryForm', () => {
     expect(body).toMatchObject({
       name: 'my-hosted',
       kind: 'hosted',
-      allow_redeploy: true,
+      deployment_policy: 'allow_redeploy',
     })
+    expect(body).not.toHaveProperty('allow_redeploy')
     expect(body).not.toHaveProperty('remote_url')
     expect(body).not.toHaveProperty('upstream_password')
     // NuGet is the server's default format: not sent.
@@ -784,7 +784,7 @@ describe('docker repositories: update body', () => {
     const values = {
       ...lastValuesOf(dockerProxy),
       package_delay_seconds: '3600',
-      allow_redeploy: true,
+      deployment_policy: 'allow_redeploy' as const,
     }
     expect(toUpdateBody(values, dockerProxy)).toEqual({})
 
@@ -1053,7 +1053,115 @@ describe('raw repositories', () => {
     }
     const values = lastValuesOf(hosted)
     expect(
-      toUpdateBody({ ...values, deployment_policy: 'read_only', allow_redeploy: true }, hosted),
+      toUpdateBody({ ...values, deployment_policy: 'read_only' }, hosted),
     ).toEqual({ deployment_policy: 'read_only' })
+  })
+})
+
+describe('npm repositories', () => {
+  function renderNpmCreate() {
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[NUGET_FORMAT, NPM_FORMAT]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    return onSubmit
+  }
+
+  it('hosted: a deployment policy instead of allow_redeploy', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderNpmCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'npm')
+    expect(screen.queryByLabelText(/Allow redeploy \(re-push/)).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'npm-hosted')
+    await user.selectOptions(screen.getByLabelText('Deployment policy'), 'read_only')
+    await create(user)
+
+    expect(toCreateBody(lastValues(onSubmit))).toEqual({
+      name: 'npm-hosted',
+      kind: 'hosted',
+      format: 'npm',
+      anonymous_read: false,
+      online: true,
+      deployment_policy: 'read_only',
+    })
+  })
+
+  it('proxy: the public registry as placeholder, with a package delay', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderNpmCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'npm')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
+    expect(screen.getByLabelText('Remote URL')).toHaveAttribute(
+      'placeholder',
+      'https://registry.npmjs.org',
+    )
+    await user.type(screen.getByLabelText('Name'), 'npmjs')
+    await user.type(screen.getByLabelText('Remote URL'), 'https://registry.npmjs.org')
+    await user.clear(screen.getByLabelText('Package delay (seconds)'))
+    await user.type(screen.getByLabelText('Package delay (seconds)'), '86400')
+    await create(user)
+
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      kind: 'proxy',
+      format: 'npm',
+      remote_url: 'https://registry.npmjs.org',
+      package_delay_seconds: 86400,
+    })
+  })
+
+  it('group: reserved scopes and the writable member publishes go to', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderNpmCreate()
+
+    await user.selectOptions(screen.getByLabelText('Format'), 'npm')
+    await user.selectOptions(screen.getByLabelText('Kind'), 'group')
+    await user.type(screen.getByLabelText('Name'), 'npm-all')
+    await user.type(screen.getByLabelText('Reserved prefixes'), '@acme, @acme-internal')
+    await user.type(screen.getByLabelText('Writable member'), 'npm-hosted')
+    await create(user)
+
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      kind: 'group',
+      format: 'npm',
+      prefer_hosted: true,
+      reserved_prefixes: ['@acme', '@acme-internal'],
+      writable_member: 'npm-hosted',
+    })
+  })
+
+  it('on edit, diffs the deployment policy and the writable member', () => {
+    const hosted: RepoView = {
+      ...storedProxy,
+      name: 'npm-hosted',
+      format: 'npm',
+      kind: 'hosted',
+      remote_url: null,
+      deployment_policy: 'disable_redeploy',
+    }
+    const values = lastValuesOf(hosted)
+    expect(toUpdateBody(values, hosted)).toEqual({})
+    expect(
+      toUpdateBody({ ...values, deployment_policy: 'allow_redeploy' }, hosted),
+    ).toEqual({ deployment_policy: 'allow_redeploy' })
+
+    const group: RepoView = {
+      ...storedProxy,
+      name: 'npm-all',
+      format: 'npm',
+      kind: 'group',
+      remote_url: null,
+      writable_member: 'npm-hosted',
+    }
+    expect(toUpdateBody({ ...lastValuesOf(group), writable_member: '' }, group)).toEqual({
+      writable_member: null,
+    })
   })
 })

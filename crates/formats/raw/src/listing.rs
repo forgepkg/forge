@@ -351,6 +351,7 @@ mod tests {
             kind: RepositoryKind::Hosted,
             base_url: "https://forge.example.com/raw/bin".into(),
             inline: false,
+            reserved_prefixes: Vec::new(),
         }
     }
 

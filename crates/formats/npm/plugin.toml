@@ -1,0 +1,19 @@
+# A Forge format plugin: npm registries (see crates/formats/README.md).
+[plugin]
+id = "npm"
+name = "npm"
+version = "1.0.0"
+api = "0.4.0"
+description = "npm registries: publish, install and log in with npm, pnpm, Yarn and Bun; dist-tags, deprecations and audits; proxies of registry.npmjs.org and other registries."
+mount = "/npm"
+# Proxies mirror another registry through the plugin's upstream side.
+kinds = ["hosted", "proxy", "group"]
+# A proxy given only a password (a registry token) sends it as a Bearer
+# token, as npm clients do with `_authToken`.
+upstream_token = "bearer"
+
+[assets]
+package = "package.tgz"
+package_type = "application/octet-stream"
+manifest = "package.json"
+manifest_type = "application/json"

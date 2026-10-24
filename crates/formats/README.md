@@ -8,6 +8,7 @@ the design, the contract and how to write one.
 | Plugin | Format id | What it serves |
 | --- | --- | --- |
 | [`nuget`](nuget) | `nuget` | NuGet V3 feeds at `/v3`: push, restore, search, unlist and relist; hosted, proxy and group repositories |
+| [`npm`](npm) | `npm` | npm registries at `/npm` for npm, pnpm, Yarn and Bun: publish, install, dist-tags, deprecations, unpublishing, search, audits and logins; hosted, proxy and group repositories ([docs/npm.md](../../docs/npm.md)) |
 | [`raw`](raw) | `raw` | Raw files at `/raw`: files under paths, uploads with `PUT` or a form, ranges, checksum sidecars, listings; hosted, proxy and group repositories ([docs/raw.md](../../docs/raw.md)) |
 
 A plugin directory holds:
@@ -17,7 +18,8 @@ A plugin directory holds:
   version, the `forge:format` contract version it targets (`api`), and
   optionally its mount, repository kinds (`proxy` when it implements
   `upstream`), its `storage` (`packages`, or `files` for a files format such
-  as raw) and `[assets]` names;
+  as raw), how a proxy sends a token (`upstream_token`) and `[assets]`
+  names;
 - `src/`: `impl FormatPlugin`, and `pub const PLUGIN_TOML: &str =
   forge_plugin_api::plugin_toml!();`.
 

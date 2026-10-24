@@ -1119,6 +1119,7 @@ impl RepoReadOps for FakeProxy {
                 nuspec_bytes: None,
                 manifest_summary: None,
                 published: None,
+                deprecation: None,
             })
             .collect())
     }

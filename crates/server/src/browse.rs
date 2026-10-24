@@ -56,10 +56,6 @@ use crate::dispatch::{offline_response, offline_serves_nothing};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
-/// Canonical asset path of the stored `.nupkg` (mirrors
-/// `forge_core::repo::NUPKG_ASSET_PATH`).
-const NUPKG_ASSET_PATH: &str = "package.nupkg";
-
 /// Hard cap on the cross-repo browse page size.
 const MAX_TAKE: usize = 100;
 /// Default browse page size.
@@ -401,6 +397,18 @@ pub struct PackageDetail {
     /// Dependency groups keyed by normalized version string.
     pub dependency_groups_by_version:
         std::collections::BTreeMap<String, Vec<DetailDependencyGroup>>,
+    /// The package's tags (npm's dist-tags), tag → version.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tags: std::collections::BTreeMap<String, String>,
+    /// The message of each deprecated version.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub deprecated: std::collections::BTreeMap<String, String>,
+    /// The latest version's description, when its manifest has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The latest version's README, when its format reads one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readme: Option<String>,
 }
 
 /// `GET /browse/packages/{repo}/{id}` — package detail.
@@ -498,7 +506,18 @@ pub async fn package_detail(
         .unwrap_or_else(|| id.clone());
 
     let mut dependency_groups_by_version = std::collections::BTreeMap::new();
+    let mut deprecated = std::collections::BTreeMap::new();
     for entry in &registration {
+        // Deprecated here, or (a proxy's) upstream.
+        let upstream_deprecation = entry
+            .manifest_summary
+            .as_ref()
+            .and_then(|s| s.get("deprecated"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|m| !m.is_empty());
+        if let Some(message) = entry.deprecation.as_deref().or(upstream_deprecation) {
+            deprecated.insert(entry.version.clone(), message.to_string());
+        }
         let groups = forge_format_nuget::nuspec::summary_of(
             entry.manifest_summary.as_ref(),
             entry.nuspec_bytes.as_deref(),
@@ -524,7 +543,7 @@ pub async fn package_detail(
     // Per-version size / published_at from the local component rows when
     // present (one query for every version, not two per version).
     let local: std::collections::HashMap<String, (DateTime<Utc>, Option<i64>)> =
-        component_dao::version_sizes(&state.pool, repo.id, &lower, NUPKG_ASSET_PATH)
+        component_dao::version_sizes(&state.pool, repo.id, &lower, format.package_asset_path())
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "browse: version sizes lookup failed");
@@ -566,6 +585,50 @@ pub async fn package_detail(
     // the UI can render a delay badge alongside any downloadable versions.
     detail_versions.extend(delayed);
 
+    let tags = ops.tags(&repo.name, &lower).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "browse: tags lookup failed");
+        Default::default()
+    });
+    // The latest version: the one tagged so, else the highest.
+    let latest = tags
+        .get("latest")
+        .and_then(|l| registration.iter().find(|e| &e.version == l))
+        .or_else(|| {
+            registration
+                .iter()
+                .max_by(|a, b| format.compare_versions(&a.version, &b.version))
+        });
+    let description = latest.and_then(|entry| {
+        let summary = entry.manifest_summary.as_ref();
+        summary
+            .and_then(|s| s.get("description"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                forge_format_nuget::nuspec::summary_of(summary, entry.nuspec_bytes.as_deref())
+                    .metadata
+                    .description
+            })
+            .filter(|d| !d.trim().is_empty())
+    });
+    let readme = match latest {
+        Some(entry) => match ops.resolve_nuspec(&repo.name, &lower, &entry.version).await {
+            Ok(Some(manifest)) => {
+                let format = format.clone();
+                tokio::task::spawn_blocking(move || format.readme(&manifest))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "browse: README lookup failed");
+                None
+            }
+        },
+        None => None,
+    };
+
     Json(PackageDetail {
         repo: repo.name.clone(),
         repo_kind: repo.kind.clone(),
@@ -573,6 +636,10 @@ pub async fn package_detail(
         original_id,
         versions: detail_versions,
         dependency_groups_by_version,
+        tags,
+        deprecated,
+        description,
+        readme,
     })
     .into_response()
 }
@@ -637,6 +704,15 @@ fn read_err(e: forge_core::repo::RepoError) -> Response {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the upstream is unavailable, try again later",
+            )
+                .into_response()
+        }
+        RepoError::BadUpstream(_) => {
+            tracing::warn!(error = %e, "browse: proxy upstream answered unusably");
+            (
+                StatusCode::BAD_GATEWAY,
+                "the upstream refused this proxy (are its credentials right?) or served a package \
+                 it does not take",
             )
                 .into_response()
         }
