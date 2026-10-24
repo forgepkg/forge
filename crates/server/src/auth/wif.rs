@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use forge_cache::Cache;
 use forge_core::auth::token::{PrincipalSource, SourceOutcome};
-use forge_core::auth::{Principal, TrustedPublisherMatch};
 use forge_core::auth::{is_workload_key, WORKLOAD_USERNAME};
+use forge_core::auth::{Principal, TrustedPublisherMatch};
 use forge_core::net::ssrf;
 use forge_core::oidc::{IdTokenClaims, OidcError, OidcMetadataClient, Verified};
 use forge_db::authz_dao;
@@ -212,7 +212,12 @@ pub fn validate_trusted_publisher_conditions(
     let normalized = validate_workload_identity_config(&cfg)?;
     let parsed: WorkloadIdentityRealmConfig =
         serde_json::from_value(normalized).map_err(|e| format!("invalid config: {e}"))?;
-    let normalized = parsed.rules.into_iter().next().expect("one rule").conditions;
+    let normalized = parsed
+        .rules
+        .into_iter()
+        .next()
+        .expect("one rule")
+        .conditions;
     if normalize_issuer(issuer) == GITLAB_COM_ISSUER
         && !(normalized
             .iter()
@@ -222,8 +227,7 @@ pub fn validate_trusted_publisher_conditions(
                 .any(|condition| condition.claim == "job_namespace_id"))
     {
         return Err(
-            "GitLab.com trusted publishers must include job_project_id and job_namespace_id"
-                .into(),
+            "GitLab.com trusted publishers must include job_project_id and job_namespace_id".into(),
         );
     }
     Ok(normalized)
@@ -727,10 +731,9 @@ impl WorkloadIdentitySource {
                 let matched_publishers = publishers
                     .into_iter()
                     .filter_map(|publisher| {
-                        let conditions = serde_json::from_value::<Vec<ClaimCondition>>(
-                            publisher.conditions,
-                        )
-                        .ok()?;
+                        let conditions =
+                            serde_json::from_value::<Vec<ClaimCondition>>(publisher.conditions)
+                                .ok()?;
                         trusted_publisher_conditions_match(
                             &verified.claims,
                             &realm.config.issuer,
@@ -834,11 +837,16 @@ impl WorkloadIdentitySource {
                 return SourceOutcome::Unavailable;
             }
         };
-        let matched_publishers = match trusted_publisher_dao::load_key_matches(&mut conn, row.id).await {
-            Ok(matches) => matches.into_iter().map(|matched| TrustedPublisherMatch {
-                id: matched.id,
-                definition_sha256: matched.definition_sha256,
-            }).collect(),
+        let matched_publishers = match trusted_publisher_dao::load_key_matches(&mut conn, row.id)
+            .await
+        {
+            Ok(matches) => matches
+                .into_iter()
+                .map(|matched| TrustedPublisherMatch {
+                    id: matched.id,
+                    definition_sha256: matched.definition_sha256,
+                })
+                .collect(),
             Err(error) => {
                 tracing::error!(error = %error, key_id = row.id, "workload publisher snapshot lookup failed");
                 return SourceOutcome::Unavailable;
@@ -1469,12 +1477,10 @@ mod tests {
                 any_of: vec!["456".into()],
             },
         ];
-        assert!(validate_trusted_publisher_conditions(
-            GITHUB_ACTIONS_ISSUER,
-            &[],
-            github.clone(),
-        )
-        .is_ok());
+        assert!(
+            validate_trusted_publisher_conditions(GITHUB_ACTIONS_ISSUER, &[], github.clone(),)
+                .is_ok()
+        );
         assert!(validate_trusted_publisher_conditions(
             GITHUB_ACTIONS_ISSUER,
             &[],
@@ -1492,12 +1498,7 @@ mod tests {
                 any_of: vec!["2001".into()],
             },
         ];
-        assert!(validate_trusted_publisher_conditions(
-            GITLAB_COM_ISSUER,
-            &[],
-            gitlab,
-        )
-        .is_ok());
+        assert!(validate_trusted_publisher_conditions(GITLAB_COM_ISSUER, &[], gitlab,).is_ok());
         assert!(validate_trusted_publisher_conditions(
             GITLAB_COM_ISSUER,
             &[],

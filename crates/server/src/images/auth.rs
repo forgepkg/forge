@@ -30,7 +30,7 @@ impl Registry {
         let principal = if caller.claims.is_some() {
             Principal::Unauthenticated
         } else {
-            caller.principal
+            caller.principal.clone()
         };
         let mut scopes = Vec::new();
         let mut account = None;

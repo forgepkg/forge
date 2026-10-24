@@ -227,9 +227,10 @@ impl Authz {
                     Err(()) => return PackageFilter::DenyAll,
                 };
                 let mut filters = vec![role_filter];
-                for publisher in publishers.into_iter().filter(|publisher| {
-                    publisher.actions.contains(&required.as_str().to_string())
-                }) {
+                for publisher in publishers
+                    .into_iter()
+                    .filter(|publisher| publisher.actions.contains(&required.as_str().to_string()))
+                {
                     let patterns = match (
                         serde_json::from_value::<Vec<String>>(publisher.includes),
                         serde_json::from_value::<Vec<String>>(publisher.excludes),
@@ -265,6 +266,26 @@ impl Authz {
         }
     }
 
+    /// The package filter from role grants alone, without workload publisher
+    /// grants. Used by the transaction fence to preserve independent role access
+    /// when a previously matched publisher has since been edited or deleted.
+    pub async fn role_package_filter_for(
+        &self,
+        principal: &Principal,
+        repo: &Repository,
+        required: Level,
+    ) -> PackageFilter {
+        let effective = if required == Level::Read {
+            self.read_effective(principal, repo).await
+        } else {
+            self.effective(principal).await
+        };
+        match effective {
+            Ok(effective) => effective.package_filter_for(required, repo.id),
+            Err(()) => PackageFilter::DenyAll,
+        }
+    }
+
     async fn publisher_allows(
         &self,
         principal: &Principal,
@@ -272,9 +293,12 @@ impl Authz {
         required: Level,
     ) -> bool {
         match self.publisher_matches(principal, repo).await {
-            Ok(publishers) => publishers
-                .iter()
-                .any(|publisher| publisher.actions.iter().any(|action| action == required.as_str())),
+            Ok(publishers) => publishers.iter().any(|publisher| {
+                publisher
+                    .actions
+                    .iter()
+                    .any(|action| action == required.as_str())
+            }),
             Err(()) => false,
         }
     }
@@ -285,18 +309,19 @@ impl Authz {
         repo: &Repository,
     ) -> Result<Vec<forge_db::trusted_publisher_dao::TrustedPublisher>, ()> {
         let Principal::Workload {
-            matched_publishers,
-            ..
+            matched_publishers, ..
         } = principal
         else {
             return Ok(Vec::new());
         };
         let matches: Vec<_> = matched_publishers
             .iter()
-            .map(|matched| forge_db::trusted_publisher_dao::TrustedPublisherMatch {
-                id: matched.id,
-                definition_sha256: matched.definition_sha256,
-            })
+            .map(
+                |matched| forge_db::trusted_publisher_dao::TrustedPublisherMatch {
+                    id: matched.id,
+                    definition_sha256: matched.definition_sha256,
+                },
+            )
             .collect();
         forge_db::trusted_publisher_dao::find_live_matches(&self.pool, &matches, repo.id)
             .await

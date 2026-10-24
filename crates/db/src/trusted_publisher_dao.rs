@@ -113,10 +113,7 @@ pub async fn find_for_repository(
     row.as_ref().map(from_row).transpose()
 }
 
-pub async fn list_for_realm(
-    pool: &PgPool,
-    realm_id: i64,
-) -> sqlx::Result<Vec<TrustedPublisher>> {
+pub async fn list_for_realm(pool: &PgPool, realm_id: i64) -> sqlx::Result<Vec<TrustedPublisher>> {
     let rows = sqlx::query(
         r#"
         SELECT id, repository_id, realm_id, name, description, includes,
@@ -132,10 +129,7 @@ pub async fn list_for_realm(
     rows.iter().map(from_row).collect()
 }
 
-pub async fn create(
-    pool: &PgPool,
-    new: NewTrustedPublisher<'_>,
-) -> sqlx::Result<TrustedPublisher> {
+pub async fn create(pool: &PgPool, new: NewTrustedPublisher<'_>) -> sqlx::Result<TrustedPublisher> {
     let row = sqlx::query(
         r#"
         INSERT INTO trusted_publisher (
@@ -191,13 +185,11 @@ pub async fn update(
 }
 
 pub async fn delete(pool: &PgPool, repository_id: i64, id: i64) -> sqlx::Result<bool> {
-    let result = sqlx::query(
-        "DELETE FROM trusted_publisher WHERE repository_id = $1 AND id = $2",
-    )
-    .bind(repository_id)
-    .bind(id)
-    .execute(pool)
-    .await?;
+    let result = sqlx::query("DELETE FROM trusted_publisher WHERE repository_id = $1 AND id = $2")
+        .bind(repository_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() != 0)
 }
 
@@ -231,9 +223,7 @@ pub async fn find_live_matches(
         .collect::<sqlx::Result<Vec<_>>>()
         .map(|rows| {
             rows.into_iter()
-                .filter(|publisher| {
-                    wanted.get(&publisher.id) == Some(&publisher.definition_sha256)
-                })
+                .filter(|publisher| wanted.get(&publisher.id) == Some(&publisher.definition_sha256))
                 .collect()
         })
 }
@@ -303,12 +293,12 @@ pub async fn load_key_matches(
             let bytes: Vec<u8> = row.try_get("definition_sha256")?;
             Ok(TrustedPublisherMatch {
                 id: row.try_get("trusted_publisher_id")?,
-                definition_sha256: bytes.try_into().map_err(
-                    |bytes: Vec<u8>| sqlx::Error::ColumnDecode {
+                definition_sha256: bytes.try_into().map_err(|bytes: Vec<u8>| {
+                    sqlx::Error::ColumnDecode {
                         index: "definition_sha256".into(),
                         source: format!("expected 32 bytes, got {}", bytes.len()).into(),
-                    },
-                )?,
+                    }
+                })?,
             })
         })
         .collect()
@@ -337,12 +327,10 @@ pub async fn store_key_matches(
 }
 
 pub async fn hosted_repository(pool: &PgPool, repository_id: i64) -> sqlx::Result<bool> {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM repository WHERE id = $1 AND kind = 'hosted')",
-    )
-    .bind(repository_id)
-    .fetch_one(pool)
-    .await
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM repository WHERE id = $1 AND kind = 'hosted')")
+        .bind(repository_id)
+        .fetch_one(pool)
+        .await
 }
 
 pub fn validate_repository(repository: &Repository) -> bool {

@@ -319,10 +319,12 @@ async fn redeem(
     let api_key = generate_workload_key();
     let db_matched_publishers: Vec<_> = matched_publishers
         .iter()
-        .map(|matched| forge_db::trusted_publisher_dao::TrustedPublisherMatch {
-            id: matched.id,
-            definition_sha256: matched.definition_sha256,
-        })
+        .map(
+            |matched| forge_db::trusted_publisher_dao::TrustedPublisherMatch {
+                id: matched.id,
+                definition_sha256: matched.definition_sha256,
+            },
+        )
         .collect();
     let stored = store_key(
         pool,
@@ -343,7 +345,10 @@ async fn redeem(
     )
     .await;
     match stored {
-        Ok(Stored::Issued { expires_at: expires, .. }) => Ok(Redeemed {
+        Ok(Stored::Issued {
+            expires_at: expires,
+            ..
+        }) => Ok(Redeemed {
             api_key,
             expires,
             realm_id,
@@ -398,7 +403,6 @@ async fn redeem(
 /// What [`store_key`] did.
 enum Stored {
     Issued {
-        id: i64,
         expires_at: DateTime<Utc>,
     },
     /// The token was exchanged before.
@@ -435,9 +439,9 @@ async fn store_key(pool: &PgPool, new: NewWorkloadApiKey<'_>) -> sqlx::Result<St
         return Ok(Stored::PublisherChanged);
     }
     match workload_api_key_dao::insert(&mut tx, new).await? {
-        Redemption::Issued { id, expires_at } => {
+        Redemption::Issued { expires_at, .. } => {
             tx.commit().await?;
-            return Ok(Stored::Issued { id, expires_at });
+            return Ok(Stored::Issued { expires_at });
         }
         Redemption::Replayed => return Ok(Stored::Replayed),
         Redemption::TokenExpired => return Ok(Stored::TokenExpired),

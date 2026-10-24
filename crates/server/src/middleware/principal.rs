@@ -408,7 +408,7 @@ mod tests {
             if self.require_header && !headers.contains_key(AUTHORIZATION) {
                 return SourceOutcome::NoCredentials;
             }
-            self.outcome
+            self.outcome.clone()
         }
     }
 

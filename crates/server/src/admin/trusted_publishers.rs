@@ -107,7 +107,10 @@ fn validate_body(body: &mut TrustedPublisherBody) -> Result<(), Response> {
             "invalid content-selector glob: {error}"
         )));
     }
-    if body.actions.iter().any(|action| action != "write" && action != "delete")
+    if body
+        .actions
+        .iter()
+        .any(|action| action != "write" && action != "delete")
         || !body.actions.iter().any(|action| action == "write")
     {
         return Err(bad_request(
@@ -144,7 +147,9 @@ async fn view(
     let realm = auth_realm_dao::find_realm_by_id(&state.pool, publisher.realm_id)
         .await
         .map_err(super::db_error)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "trusted publisher realm not found").into_response())?;
+        .ok_or_else(|| {
+            (StatusCode::NOT_FOUND, "trusted publisher realm not found").into_response()
+        })?;
     let issuer = realm
         .config
         .get("issuer")
@@ -219,9 +224,11 @@ pub async fn create(
             Ok(publisher) => (StatusCode::CREATED, Json(publisher)).into_response(),
             Err(response) => response,
         },
-        Err(error) if unique_violation(&error) => {
-            (StatusCode::CONFLICT, "trusted publisher name already exists").into_response()
-        }
+        Err(error) if unique_violation(&error) => (
+            StatusCode::CONFLICT,
+            "trusted publisher name already exists",
+        )
+            .into_response(),
         Err(error) => super::db_error(error),
     }
 }
@@ -258,9 +265,11 @@ pub async fn update(
             Err(response) => response,
         },
         Ok(None) => (StatusCode::NOT_FOUND, "trusted publisher not found").into_response(),
-        Err(error) if unique_violation(&error) => {
-            (StatusCode::CONFLICT, "trusted publisher name already exists").into_response()
-        }
+        Err(error) if unique_violation(&error) => (
+            StatusCode::CONFLICT,
+            "trusted publisher name already exists",
+        )
+            .into_response(),
         Err(error) => super::db_error(error),
     }
 }

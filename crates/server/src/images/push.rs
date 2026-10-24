@@ -779,6 +779,23 @@ impl Registry {
         let Some(recorder) = &self.inner.recorder else {
             return Ok(());
         };
+        let role_filter = self
+            .inner
+            .authz
+            .role_package_filter_for(
+                principal,
+                &t.repo,
+                match action {
+                    PackageMutation::Unlist | PackageMutation::Delete => Level::Delete,
+                    PackageMutation::Publish | PackageMutation::Relist => Level::Write,
+                },
+            )
+            .await;
+        let role_replace_filter = self
+            .inner
+            .authz
+            .role_package_filter_for(principal, &t.repo, Level::Delete)
+            .await;
         let context = PublishAuthorizationContext {
             principal: principal.clone(),
             action,
@@ -786,7 +803,7 @@ impl Registry {
             package_version: version,
         };
         recorder
-            .for_repository(&t.repo)
+            .for_repository(&t.repo, role_filter, role_replace_filter)
             .record_in_transaction(&context, tx)
             .await
             .map_err(|e| match e {

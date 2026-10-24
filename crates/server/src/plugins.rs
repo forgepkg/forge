@@ -1175,6 +1175,16 @@ impl Ctx<'_> {
             .authz
             .package_filter_for(&self.principal, target, Level::Delete)
             .await;
+        let role_filter = self
+            .state
+            .authz
+            .role_package_filter_for(&self.principal, target, permission)
+            .await;
+        let role_replace_filter = self
+            .state
+            .authz
+            .role_package_filter_for(&self.principal, target, Level::Delete)
+            .await;
         HostedWriteAdapter::new(
             self.state,
             format,
@@ -1183,17 +1193,21 @@ impl Ctx<'_> {
             self.principal.clone(),
             filter,
             replace_filter,
+            role_filter,
+            role_replace_filter,
         )
     }
 
     /// The username publishing, recorded by formats that keep it.
     async fn publisher(&self) -> Option<String> {
         match &self.principal {
-            Principal::User { user_id, .. } => user_dao::find_user_by_id(&self.state.pool, *user_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|u| u.username),
+            Principal::User { user_id, .. } => {
+                user_dao::find_user_by_id(&self.state.pool, *user_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|u| u.username)
+            }
             _ => None,
         }
     }
@@ -1468,8 +1482,14 @@ impl Ctx<'_> {
     /// A login, a logout or `whoami` ([`crate::cli_auth`]), answered by the
     /// plugin.
     async fn auth(&self, auth: AuthRequest, request: &protocol::Request) -> Response {
-        match crate::cli_auth::perform(self.state, self.repo, self.principal.clone(), self.client_ip, auth)
-            .await
+        match crate::cli_auth::perform(
+            self.state,
+            self.repo,
+            self.principal.clone(),
+            self.client_ip,
+            auth,
+        )
+        .await
         {
             Ok(outcome) => {
                 let (target, request) = (self.target.clone(), request.clone());

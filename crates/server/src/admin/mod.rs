@@ -232,8 +232,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/repositories/{name}/trusted-publishers/{id}",
-            axum::routing::put(trusted_publishers::update)
-                .delete(trusted_publishers::delete),
+            axum::routing::put(trusted_publishers::update).delete(trusted_publishers::delete),
         )
         .route("/users", get(users::list).post(users::create))
         .route(

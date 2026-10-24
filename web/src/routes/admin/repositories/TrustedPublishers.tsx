@@ -4,6 +4,7 @@ import type {
   TrustedPublisherBody,
   TrustedPublisherView,
 } from '~/api/repositories'
+import type { RealmView } from '~/api/realms'
 import { useRealms } from '~/queries/useRealms'
 import {
   useCreateTrustedPublisher,
@@ -24,14 +25,32 @@ interface Draft {
   delete: boolean
 }
 
-function emptyDraft(realm = ''): Draft {
+function emptyDraft(realm?: RealmView): Draft {
+  const config = realm?.config
+  const issuer =
+    config && 'issuer' in config && typeof config.issuer === 'string'
+      ? config.issuer
+      : ''
+  const identityClaims =
+    config && 'identity_claims' in config ? config.identity_claims : undefined
+  const identity = issuer.includes('gitlab.com')
+    ? [
+        { claim: 'job_project_id', any_of: [''] },
+        { claim: 'job_namespace_id', any_of: [''] },
+      ]
+    : issuer.includes('token.actions.githubusercontent.com')
+      ? [
+          { claim: 'repository_id', any_of: [''] },
+          { claim: 'repository_owner_id', any_of: [''] },
+        ]
+      : [{ claim: identityClaims?.[0] ?? 'sub', any_of: [''] }]
   return {
     name: '',
     description: '',
-    realm,
+    realm: realm?.name ?? '',
     includes: '',
     excludes: '',
-    conditions: '[\n  {\n    "claim": "repository_id",\n    "any_of": [""]\n  },\n  {\n    "claim": "repository_owner_id",\n    "any_of": [""]\n  }\n]',
+    conditions: JSON.stringify(identity, null, 2),
     delete: false,
   }
 }
@@ -73,7 +92,7 @@ export function TrustedPublishers({ repository }: { repository: string }) {
 
   function edit(publisher?: TrustedPublisherView) {
     setFormError(null)
-    setDraft(publisher ? fromPublisher(publisher) : emptyDraft(workloadRealms[0]?.name))
+    setDraft(publisher ? fromPublisher(publisher) : emptyDraft(workloadRealms[0]))
   }
 
   function submit(event: React.FormEvent<HTMLFormElement>) {
@@ -175,7 +194,7 @@ export function TrustedPublishers({ repository }: { repository: string }) {
                 (create.error ?? update.error)?.message}
             </Notice>
           )}
-          <label className="fg-label" htmlFor="trusted-publisher-name">Name</label>
+          <label className="fg-label" htmlFor="trusted-publisher-name">Publisher name</label>
           <Input
             id="trusted-publisher-name"
             required

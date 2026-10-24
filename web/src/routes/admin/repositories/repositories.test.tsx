@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -11,7 +11,13 @@ import {
 import { makeQueryClient } from '~/lib/queryClient'
 import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
-import type { MemberView, RepoView } from '~/api/repositories'
+import type {
+  MemberView,
+  RepoView,
+  TrustedPublisherBody,
+  TrustedPublisherView,
+} from '~/api/repositories'
+import type { RealmView } from '~/api/realms'
 import { routeTree } from '~/routeTree.gen'
 import { searchOptions } from '~/lib/search'
 
@@ -75,7 +81,13 @@ interface ApiHandlers {
   /** `GET /admin/formats`; unanswered (404) when absent. */
   formats?: unknown[]
   members?: MemberView[]
+  realms?: RealmView[]
+  trustedPublishers?: TrustedPublisherView[]
   onCreate?: (body: unknown) => Response
+  onCreateTrustedPublisher?: (
+    repository: string,
+    body: TrustedPublisherBody,
+  ) => Response
   onUpdate?: (name: string, body: unknown) => Response
   onAddMember?: (body: unknown) => Response
   onPatchMember?: (member: string, body: unknown) => Response
@@ -94,6 +106,28 @@ function mockApi(h: ApiHandlers) {
 
       if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
 
+      if (path.endsWith('/admin/realms') && method === 'GET') {
+        return Promise.resolve(json(h.realms ?? []))
+      }
+      const trustedPublishersMatch = path.match(
+        /\/admin\/repositories\/([^/]+)\/trusted-publishers$/,
+      )
+      if (trustedPublishersMatch && method === 'GET') {
+        return Promise.resolve(json(h.trustedPublishers ?? []))
+      }
+      if (trustedPublishersMatch && method === 'POST') {
+        const body = init?.body
+          ? (JSON.parse(init.body as string) as TrustedPublisherBody)
+          : ({} as TrustedPublisherBody)
+        return Promise.resolve(
+          h.onCreateTrustedPublisher
+            ? h.onCreateTrustedPublisher(
+                decodeURIComponent(trustedPublishersMatch[1]),
+                body,
+              )
+            : json(body, 201),
+        )
+      }
       if (path.endsWith('/admin/formats') && h.formats) {
         return Promise.resolve(json(h.formats))
       }
@@ -541,6 +575,67 @@ describe('admin repositories', () => {
     expect(
       screen.queryByRole('button', { name: 'Invalidate cache' }),
     ).toBeNull()
+  })
+
+  it('creates a repository-scoped trusted publisher', async () => {
+    const posted: [string, TrustedPublisherBody][] = []
+    mockApi({
+      repositories: [repo({ name: 'releases' })],
+      realms: [
+        {
+          id: 9,
+          kind: 'workload_identity',
+          name: 'github-ci',
+          enabled: true,
+          priority: 1,
+          config: {
+            issuer: 'https://token.actions.githubusercontent.com',
+            allowed_audiences: ['https://forge.example.com'],
+            rules: [],
+          },
+          created_at: '',
+          updated_at: '',
+        },
+      ],
+      onCreateTrustedPublisher: (repository, body) => {
+        posted.push([repository, body])
+        return json({ ...body, id: 4, realm_id: 9, issuer: 'https://token.actions.githubusercontent.com' }, 201)
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/releases')
+    await user.click(
+      await screen.findByRole('button', { name: 'Add trusted publisher' }),
+    )
+    await user.type(screen.getByLabelText('Publisher name'), 'widgets-release')
+    await user.type(
+      screen.getByLabelText('Package includes (one glob per line)'),
+      'Acme.Widgets.*',
+    )
+    fireEvent.change(screen.getByLabelText('Claim conditions (JSON array)'), {
+      target: {
+        value:
+          '[{"claim":"repository_id","any_of":["1001"]},{"claim":"repository_owner_id","any_of":["2001"]}]',
+      },
+    })
+    await user.click(screen.getByRole('button', { name: 'Create' }))
+
+    await waitFor(() => expect(posted).toHaveLength(1))
+    expect(posted[0]).toEqual([
+      'releases',
+      {
+        name: 'widgets-release',
+        description: '',
+        realm: 'github-ci',
+        packages: { includes: ['Acme.Widgets.*'], excludes: [] },
+        conditions: [
+          { claim: 'repository_id', any_of: ['1001'] },
+          { claim: 'repository_owner_id', any_of: ['2001'] },
+        ],
+        actions: ['write'],
+      },
+    ])
   })
 
   it('group members editor blocks a duplicate priority before requesting', async () => {

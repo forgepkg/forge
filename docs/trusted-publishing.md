@@ -3,7 +3,9 @@
 Forge can authenticate a CI job with its short-lived OIDC identity token instead
 of a stored API key. The token is validated against the configured
 issuer's discovery document and JWKS, matched against explicit claim rules, and
-mapped to an ordinary Forge RBAC role. No user or browser session is created.
+mapped to an ordinary Forge RBAC role. A matching trusted publisher can add
+package-scoped write or delete rights on one hosted repository. No user or
+browser session is created.
 
 A job uses its token in one of two ways:
 
@@ -50,9 +52,11 @@ A workload token is accepted only when all of these checks pass:
   claim the realm declares in `identity_claims` (for a CI system with its own
   workload identifier); claims such as `actor` or `event_name` can be shared
   by unrelated jobs and never count as an identity; and
-- the mapped role authorizes both the target repository and canonical package
-  ID. Use package selectors on publisher roles to bind a CI identity to the
-  package namespace it owns.
+- a realm rule must accept the token and map it to a role; a trusted publisher
+  alone never authenticates a workload. The role continues to grant base access,
+  commonly `read` on hosted and proxy repositories, while a trusted publisher
+  adds write or delete rights only for its hosted repository and matching
+  canonical package IDs.
 
 Positive signature-verification results may be cached only when the token has a
 `jti`. The cache key includes the complete token digest and validation-policy
@@ -67,22 +71,24 @@ consumption ledger there. Keep provider token lifetimes short and set
 Every successful workload publish — and every unlist, relist and delete a
 workload performs — appends a `trusted_publish_audit` row (its `action` says
 which) in the same PostgreSQL transaction as the package change, behind the
-same realm fence described below. It snapshots repository, realm,
-issuer, role, canonical package ID/version, validated token `iat`, and SHA-256
-digests of subject and `jti`; raw claims and bearer tokens are not retained.
-Immediately before commit, Forge locks the current realm and role and compares
-the complete normalized realm-config digest with the config that authenticated
-the request. A stale peer realm snapshot is therefore denied after an audience,
-claim-rule, token-lifetime, or other realm-config edit. Repository grants and
-selectors are enforced before this hook; they are not re-evaluated by the audit
-insert itself.
+same realm and publisher fences described below. It snapshots repository,
+realm, issuer, role, canonical package ID/version, validated token `iat`, and
+SHA-256 digests of subject and `jti`; raw claims and bearer tokens are not
+retained. When a trusted publisher authorized the write, the audit also records
+its id and name snapshot; both are null when the role authorized it. Immediately
+before commit, Forge locks the current realm and role and compares the complete
+normalized realm-config digest with the config that authenticated the request.
+It also rechecks matched publisher definition digests. A realm edit revokes that
+realm's keys; editing or deleting a publisher withdraws only its rights from
+already issued keys and registry tokens. Repository grants and selectors are
+enforced before this hook; they are not re-evaluated by the audit insert itself.
 The table has no cascading foreign keys and a database trigger rejects UPDATE
 or DELETE, so ordinary application-level repository/realm/role removal preserves
 the snapshotted names. This is an internal append-only application ledger, not a
 tamper-evident or external transparency log: a database owner can still disable
 the trigger or truncate the table, and the row does not capture every provider
-claim, matched rule, source commit, or ref. An admin API/UI and externally
-verifiable attestations are follow-up work.
+claim, matched rule, source commit, or ref. Externally verifiable attestations
+remain future work.
 
 ### Token exchange
 
@@ -95,6 +101,26 @@ Authorization: Bearer <CI OIDC token>
 Content-Type: application/json
 
 {"username": "oidc", "tokenType": "ApiKey"}
+```
+
+Add a trusted publisher to the hosted `releases` repository. GitLab's protected
+environment deploy access determines which jobs may use `nuget-release`; Forge
+checks the signed claims and does not make that provider-side decision:
+
+```json
+{
+  "name": "widgets-release",
+  "description": "Protected GitLab release environment for Acme.Widgets",
+  "realm": "gitlab-com",
+  "packages": { "includes": ["Acme.Widgets.*"], "excludes": [] },
+  "actions": ["write"],
+  "conditions": [
+    { "claim": "job_project_id", "any_of": ["1001"] },
+    { "claim": "job_namespace_id", "any_of": ["2001"] },
+    { "claim": "environment", "any_of": ["nuget-release"] },
+    { "claim": "environment_protected", "any_of": ["true"] }
+  ]
+}
 ```
 
 ```json
@@ -112,9 +138,9 @@ Content-Type: application/json
 - The key lives for the realm's `api_key_ttl_seconds` (60 to 86400, default
   3600, nuget.org's lifetime), independent of the token's own `exp`. That
   matters for GitLab, whose token lives as long as the job's timeout.
-- The key authorizes as the token's workload: same realm, role and audit
-  identity. A publish with it records the exchanged token's subject and `jti`
-  digests and its `iat` in `trusted_publish_audit`.
+- The key authorizes as the token's workload: same realm, role, matched trusted
+  publishers and audit identity. A publish with it records the exchanged
+  token's subject and `jti` digests and its `iat` in `trusted_publish_audit`.
 - **Revocation:** a key is honoured only while its realm is enabled with the
   very configuration it was issued under. Editing anything in the realm
   (rules, audiences, lifetimes, its name) or disabling or deleting it revokes
@@ -122,8 +148,10 @@ Content-Type: application/json
   realm again or reverting the edit does not bring them back. A key issued
   under the new configuration works on every instance at once, also on
   those that have not reloaded the realm yet. Deleting the role leaves the
-  key without rights. A registry token `docker login -u oidc` got with a
-  key stops working within 10 seconds of the same changes, and expires no
+  key without role rights. Editing or deleting a trusted publisher similarly
+  revokes only that publisher's rights from existing keys and registry tokens;
+  the realm's other keys keep working. A registry token `docker login -u oidc`
+  got with a key stops working within 10 seconds of these changes, and expires no
   later than the key. Forge stores only SHA-256 digests of the key, subject
   and `jti` (table `workload_api_key`), and the auth reaper deletes a row
   once the key has expired and the token has been expired for 15 minutes
@@ -160,9 +188,11 @@ it is the one name that can never mean an account.
 
 ## GitHub Actions
 
-Create a `workload_identity` realm under **Admin → Authentication**. Use stable
-numeric identity claims rather than repository/owner names, which can be
-renamed. A protected environment or exact ref is a useful additional boundary.
+Create a `workload_identity` realm under **Admin → Authentication**. Give its
+reader role `read` access to this hosted repository and the feeds the project
+restores from. Its realm rule accepts the project's jobs and maps them to that
+role. Use stable numeric identity claims rather than repository/owner names,
+which can be renamed.
 
 Also pin **which workflow** may publish and **how it was triggered**:
 `job_workflow_ref` (e.g.
@@ -181,18 +211,37 @@ triggers you did not intend.
   "positive_cache_seconds": 60,
   "rules": [
     {
-      "role": "github-widgets-publisher",
+      "role": "ci-reader",
       "conditions": [
         { "claim": "repository_id", "any_of": ["987654321"] },
-        { "claim": "repository_owner_id", "any_of": ["1234567"] },
-        { "claim": "ref", "any_of": ["refs/heads/main"] },
-        {
-          "claim": "job_workflow_ref",
-          "any_of": ["acme/widgets/.github/workflows/release.yml@refs/heads/main"]
-        },
-        { "claim": "event_name", "any_of": ["push"] }
+        { "claim": "repository_owner_id", "any_of": ["1234567"] }
       ]
     }
+  ]
+}
+```
+
+Then add a trusted publisher on the hosted repository at
+**Admin → Repositories → releases → Trusted publishers**. This pins publishing
+to the release workflow while the realm rule above keeps all jobs in the
+repository eligible for read access:
+
+```json
+{
+  "name": "widgets-release",
+  "description": "Protected GitHub release workflow for Acme.Widgets packages",
+  "realm": "github-actions",
+  "packages": { "includes": ["Acme.Widgets.*"], "excludes": [] },
+  "actions": ["write"],
+  "conditions": [
+    { "claim": "repository_id", "any_of": ["987654321"] },
+    { "claim": "repository_owner_id", "any_of": ["1234567"] },
+    { "claim": "ref", "any_of": ["refs/heads/main"] },
+    {
+      "claim": "job_workflow_ref",
+      "any_of": ["acme/widgets/.github/workflows/release.yml@refs/heads/main"]
+    },
+    { "claim": "event_name", "any_of": ["push"] }
   ]
 }
 ```
@@ -385,10 +434,9 @@ forward this root path to Forge, not only `/npm/`. The answer is
 
 Both exchange endpoints share the same one-redemption-per-`(issuer, jti)`
 ledger, realm checks and `api_key_ttl_seconds`. The named package does not
-scope the issued key: the realm's role and package selectors authorize its
-use. The exchange has no repository, so a role without write permission can
-receive a key but its publish is refused with 403. Per-package trusted
-publishers are not implemented yet.
+scope the issued key: the realm's role and matched trusted publishers authorize
+its use. The exchange has no repository, so a key may be issued even when the
+workload has no publisher for that package; its publish is refused with 403.
 
 npm silently falls back to configured credentials when the exchange fails;
 omit stored tokens in jobs intended to require trusted publishing. Forge
@@ -399,8 +447,10 @@ Forge rejects provenance statements until attestations can be stored.
 
 ## GitLab CI
 
-Use GitLab's immutable numeric project/namespace claims and require protected
-refs or a protected environment for release jobs:
+Give the realm's reader role `read` access to the hosted repository and the
+feeds the project restores from. The realm rule accepts jobs from the project,
+so every pipeline can restore; a separate trusted publisher limits writes to
+the protected release environment and selected packages.
 
 ```json
 {
@@ -411,11 +461,10 @@ refs or a protected environment for release jobs:
   "positive_cache_seconds": 60,
   "rules": [
     {
-      "role": "gitlab-widgets-publisher",
+      "role": "ci-reader",
       "conditions": [
         { "claim": "job_project_id", "any_of": ["1001"] },
-        { "claim": "job_namespace_id", "any_of": ["2001"] },
-        { "claim": "ref_protected", "any_of": ["true"] }
+        { "claim": "job_namespace_id", "any_of": ["2001"] }
       ]
     }
   ]
@@ -433,6 +482,8 @@ to the publish URL with `--no-service-endpoint` (see GitHub Actions above):
 
 ```yaml
 publish:
+  environment:
+    name: nuget-release
   id_tokens:
     FORGE_ID_TOKEN:
       aud: https://forge.example.com

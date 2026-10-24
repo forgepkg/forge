@@ -40,8 +40,13 @@ pub async fn registry(State(state): State<AppState>, req: Request<Body>) -> Resp
 pub(crate) struct LedgerRecorder;
 
 impl crate::images::PublishRecorder for LedgerRecorder {
-    fn for_repository(&self, repository: &Repository) -> Arc<dyn PublishPolicy> {
-        crate::dispatch::workload_ledger_policy(repository)
+    fn for_repository(
+        &self,
+        repository: &Repository,
+        role_filter: forge_core::authz::PackageFilter,
+        role_replace_filter: forge_core::authz::PackageFilter,
+    ) -> Arc<dyn PublishPolicy> {
+        crate::dispatch::workload_ledger_policy(repository, role_filter, role_replace_filter)
     }
 }
 

@@ -230,7 +230,24 @@ async fn record(
         package_id: path.to_string(),
         package_version: sha256.to_string(),
     };
-    crate::dispatch::workload_ledger_policy(repo)
+    let role_filter = files
+        .state
+        .authz
+        .role_package_filter_for(
+            &files.principal,
+            repo,
+            match action {
+                PackageMutation::Unlist | PackageMutation::Delete => Level::Delete,
+                PackageMutation::Publish | PackageMutation::Relist => Level::Write,
+            },
+        )
+        .await;
+    let role_replace_filter = files
+        .state
+        .authz
+        .role_package_filter_for(&files.principal, repo, Level::Delete)
+        .await;
+    crate::dispatch::workload_ledger_policy(repo, role_filter, role_replace_filter)
         .record_in_transaction(&context, tx)
         .await
         .map_err(|e| match e {

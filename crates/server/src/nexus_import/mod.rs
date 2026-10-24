@@ -368,6 +368,12 @@ impl Run<'_> {
             let replace = authz
                 .package_filter_for(&principal, &repo, Level::Delete)
                 .await;
+            let role_filter = authz
+                .role_package_filter_for(&principal, &repo, Level::Write)
+                .await;
+            let role_replace = authz
+                .role_package_filter_for(&principal, &repo, Level::Delete)
+                .await;
             Target::Packages(Box::new(crate::dispatch::hosted_write(
                 self.state,
                 format,
@@ -376,6 +382,8 @@ impl Run<'_> {
                 principal.clone(),
                 filter,
                 replace,
+                role_filter,
+                role_replace,
             )))
         };
         Ok(Ctx {
