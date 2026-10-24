@@ -21,10 +21,9 @@ forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
-# Docker / OCI, still native: the registry under /v2 (crate::registry).
+# The built-in format plugins (crates/formats/docker, crates/formats/nuget,
+# crates/formats/raw), linked in.
 forge-format-docker = { path = "../formats/docker" }
-# The built-in format plugins (crates/formats/nuget, crates/formats/raw),
-# linked in.
 forge-format-nuget = { path = "../formats/nuget" }
 forge-format-raw = { path = "../formats/raw" }
 
@@ -78,6 +77,8 @@ bytes = "1"
 uuid = { workspace = true }
 # Registry token signing key generation.
 rand = { workspace = true }
+# Registry Bearer tokens (HS256), the same crate the OIDC verifier uses.
+jsonwebtoken = { workspace = true }
 # Outgoing email (invitations): SMTP submission.
 lettre = { workspace = true }
 

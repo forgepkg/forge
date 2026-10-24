@@ -202,9 +202,6 @@ impl Repository {
 /// `repository.format` of NuGet repositories (the column default).
 pub const NUGET_FORMAT: &str = "nuget";
 
-/// `repository.format` of Docker / OCI registry repositories.
-pub const DOCKER_FORMAT: &str = "docker";
-
 /// `repository.config` key of [`Repository::docker_host`].
 pub const DOCKER_HOST_KEY: &str = "host";
 
@@ -221,11 +218,6 @@ pub const WRITABLE_MEMBER_ID_KEY: &str = "writable_member_id";
 pub const MAX_UPLOAD_BYTES_KEY: &str = "max_upload_bytes";
 
 impl Repository {
-    /// Whether this is a Docker / OCI registry repository.
-    pub fn is_docker(&self) -> bool {
-        self.format == DOCKER_FORMAT
-    }
-
     /// Docker option (`config.host`): the host name this repository answers
     /// on by itself (host-based routing), so its images keep short names.
     pub fn docker_host(&self) -> Option<&str> {

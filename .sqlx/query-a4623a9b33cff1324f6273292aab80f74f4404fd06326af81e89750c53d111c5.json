@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        WHERE format = 'docker' AND config ? 'host' AND lower(config->>'host') = lower($1)\n        ",
+  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        WHERE format = $2 AND config ? 'host' AND lower(config->>'host') = lower($1)\n        ",
   "describe": {
     "columns": [
       {
@@ -193,6 +193,7 @@
     ],
     "parameters": {
       "Left": [
+        "Text",
         "Text"
       ]
     },
@@ -216,5 +217,5 @@
       false
     ]
   },
-  "hash": "2523846362d2e9c13f843174d4c4f7077f782b2f4f02113d54d90532e726fd26"
+  "hash": "a4623a9b33cff1324f6273292aab80f74f4404fd06326af81e89750c53d111c5"
 }

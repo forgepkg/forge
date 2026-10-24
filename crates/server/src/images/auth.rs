@@ -12,10 +12,11 @@ use axum::response::{IntoResponse, Response};
 use forge_core::auth::Principal;
 use forge_core::authz::Action;
 use forge_db::model::RepoKind;
+use forge_plugin::api::images::ImageError;
 
-use crate::error::{Code, OciError, OciResult};
-use crate::service::{mutation_credential, Caller, Registry, Site};
-use crate::token::{self, Access, Claims, TokenPrincipal};
+use super::dispatch::{mutation_credential, Caller, Site};
+use super::token::{self, Access, Claims, TokenPrincipal};
+use super::{Failure, ImgResult, Registry};
 
 impl Registry {
     pub(crate) async fn token(
@@ -23,7 +24,7 @@ impl Registry {
         caller: &Caller,
         site: &Site,
         query: &str,
-    ) -> OciResult<Response> {
+    ) -> ImgResult<Response> {
         // A registry token is never a credential for another one: it would
         // let a short-lived token renew itself forever.
         let principal = if caller.claims.is_some() {
@@ -38,9 +39,8 @@ impl Registry {
                 "scope" => {
                     for scope in token::parse_scopes(&value) {
                         if !token::add_scope(&mut scopes, scope) {
-                            return Err(OciError::new(
-                                StatusCode::BAD_REQUEST,
-                                Code::Unsupported,
+                            return Err(Failure::unsupported(
+                                400,
                                 format!(
                                     "a token request may name at most {} repositories",
                                     token::MAX_SCOPES
@@ -56,15 +56,12 @@ impl Registry {
         let token_principal = TokenPrincipal::of(&principal);
         if account.is_some() && token_principal == TokenPrincipal::Anonymous {
             // `docker login` must fail without valid credentials.
-            return Err(OciError::new(
-                StatusCode::UNAUTHORIZED,
-                Code::Unauthorized,
-                "authentication required",
-            )
-            .with_header(
-                header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("Basic realm=\"Forge\""),
-            ));
+            return Err(
+                Failure::new(ImageError::AuthenticationRequired { scope: None }).with_header(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Basic realm=\"Forge\""),
+                ),
+            );
         }
 
         let mut access = Vec::new();
@@ -102,7 +99,7 @@ impl Registry {
             fp: token_principal,
         };
         let jwt = token::issue(&self.inner.keys, &claims)
-            .map_err(|e| OciError::internal("token signing", e))?;
+            .map_err(|e| Failure::internal("token signing", e))?;
         if matches!(claims.fp, TokenPrincipal::Anonymous) {
             tracing::debug!(scopes = ?claims.access, "registry: anonymous token issued");
         } else {
@@ -131,7 +128,8 @@ impl Registry {
     }
 
     /// The subset of `requested` actions the principal may perform on the
-    /// repository `name`. An unknown repository grants nothing.
+    /// repository `name`. An unknown repository, or a name not in the
+    /// format's grammar, grants nothing.
     async fn granted(
         &self,
         principal: &Principal,
@@ -139,6 +137,9 @@ impl Registry {
         name: &str,
         requested: &[String],
     ) -> Vec<String> {
+        if self.plugin().validate_id(name).is_err() {
+            return Vec::new();
+        }
         let Ok(Some(target)) = self.resolve(site, name).await else {
             return Vec::new();
         };

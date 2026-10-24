@@ -53,6 +53,13 @@ pub trait Format: Send + Sync {
         false
     }
 
+    /// Whether the format's repositories hold images (Docker / OCI): their
+    /// contents are the image store's (`oci_*`), served by the registry, and
+    /// none of the package seams below apply to them.
+    fn stores_images(&self) -> bool {
+        false
+    }
+
     /// Parse an uploaded package into format-neutral [`ParsedUpload`] data.
     fn parse_upload(&self, file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError>;
 

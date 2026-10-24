@@ -1,7 +1,6 @@
 # Format plugins
 
-Forge serves the Docker / OCI registry natively ([docker.md](docker.md)).
-Every package format comes from a **format plugin**: a Rust crate that
+Every format Forge serves comes from a **format plugin**: a Rust crate that
 teaches Forge the format's rules, its client protocol and, for proxies, how
 to read an upstream, by implementing one trait,
 [`FormatPlugin`](../crates/plugin-api/src/lib.rs). The repository machinery
@@ -11,23 +10,26 @@ streaming of package bytes.
 
 Every plugin is built in: a crate under `crates/formats/<id>/` linked into
 the server and called directly, like any other Rust code. Plugins need no
-configuration. Forge ships two: **NuGet**
+configuration. Forge ships three: **Docker / OCI**
+([`crates/formats/docker`](../crates/formats/docker),
+[Images formats](#images-formats), [docker.md](docker.md)), **NuGet**
 ([`crates/formats/nuget`](../crates/formats/nuget)) and **raw files**
 ([`crates/formats/raw`](../crates/formats/raw),
-[Files formats](#files-formats)). Helm charts are served by the registry
-([docker.md](docker.md#helm-charts)).
+[Files formats](#files-formats)). Helm charts are pushed to Docker
+repositories ([docker.md](docker.md#helm-charts)).
 
 > **Status: preview.** The plugin contract may change in any release. The
 > plugins build with the server, so the compiler checks each of them against
 > the contract it is linked with. Contract 0.4.0 added files formats
 > ([Files formats](#files-formats)), and `render` returns an action, like
-> `handle`.
+> `handle`; images formats followed ([Images formats](#images-formats)).
 
 ## Contents
 
 - [Layout](#layout)
 - [How it fits together](#how-it-fits-together)
 - [Files formats](#files-formats)
+- [Images formats](#images-formats)
 - [Proxy repositories](#proxy-repositories)
 - [Using a plugin](#using-a-plugin)
 - [Security model](#security-model)
@@ -55,6 +57,15 @@ crates/formats/raw/
 ├── src/sidecar.rs # .sha256/.sha512/.sha1/.md5 from the stored digests
 ├── src/form.rs    # multipart uploads, Nexus' field names
 └── tests/         # the protocol against canned answers
+
+crates/formats/docker/
+├── Cargo.toml
+├── src/lib.rs     # DESCRIPTOR (mount "/v2", storage images, kinds hosted/proxy/group)
+│                  # and impl FormatPlugin for Docker: paths, manifests, charts
+├── src/protocol.rs  # the distribution-spec API: handle and render
+├── src/upstream.rs  # proxies: URLs, tag pages and referrers of an upstream registry
+├── src/error.rs   # the distribution-spec error answers
+└── src/manifest.rs, chart.rs, path.rs, reference.rs, digest.rs
 ```
 
 The pieces:
@@ -64,7 +75,7 @@ The pieces:
 | [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, and, behind its `testing` feature, helpers that run a plugin's protocol against canned answers. Depends on nothing but `std`. |
 | [`crates/formats/<id>`](../crates/formats) | One crate per plugin, implementing `FormatPlugin`. |
 | [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin, which describes itself), `PluginFormat`, which adapts it to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
-| [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `{mount}/{repo}/...` dispatcher, and the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)). |
+| [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `{mount}/{repo}/...` dispatcher, the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)), and the image store and token service of images formats, under `/v2` ([`crates/server/src/images`](../crates/server/src/images)). |
 
 ## How it fits together
 
@@ -193,6 +204,114 @@ names applied; `DELETE` is a `remove`.
 hundred lines; the file store is
 [`crates/server/src/files`](../crates/server/src/files).
 
+## Images formats
+
+A format whose descriptor says `storage: Storage::Images` holds images:
+content-addressed blobs and manifests linked into each image (`team/app`),
+tags that point at manifests, indexes that name other manifests, referrers,
+and uploads in sessions of several requests. [Docker / OCI](docker.md) is
+one ([`crates/formats/docker`](../crates/formats/docker)). Its mount is
+`/v2` (`IMAGES_MOUNT`), where every registry client asks, so a server holds
+one images format at most.
+
+The split is the one files formats have. The format owns the protocol: the
+grammar of paths, names, references and digests, what a manifest names and
+says, the error answers, the response headers, and the URLs of an upstream
+registry. The host owns the image store
+([`crates/server/src/images`](../crates/server/src/images)), which keeps
+everything else:
+
+- `/v2/` (the version check), `/v2/token` (the token service and its signing
+  keys) and `/v2/_catalog` (refused), answered by the host itself;
+- resolving a name to a repository and an image, by path
+  (`<repository>/<image>`) or on a repository's own host (`host`);
+- authorization: the Bearer challenge and a token's scopes, RBAC and package
+  selectors on image names, and where a change lands (a group's writable
+  member);
+- the store: blobs and manifests by digest in the content-addressed store,
+  tags (immutable ones too), upload sessions and their chunks, mounts from
+  other images, the references between manifests, and the trusted-publishing
+  ledger;
+- groups, a proxy's caching, retention, garbage collection, and the Nexus
+  import;
+- serving a blob or a manifest, with one `Range`, `Docker-Content-Digest`
+  and `ETag`, and the registry's response hardening on every answer.
+
+The plugin never sees credentials, never touches storage and never holds a
+blob in memory. A request goes through three steps:
+
+1. `image_path` splits the path below the mount into the name the client
+   wrote and the endpoint (`/manifests/latest`), and says what the request
+   needs: read, write (every request of an upload session included) or
+   delete.
+2. The host resolves the name and authorizes the request. What it refuses
+   (an unknown name, a missing token, a denied scope, an offline
+   repository) it hands to the format as an `ImageError`, and `image_error`
+   renders it, the host adding its Bearer challenge.
+3. `handle` gets the request with the endpoint as its path and the resolved
+   image as `request.image`, and answers as for any format: a response,
+   queries, or an action.
+
+| Query | Answer |
+| --- | --- |
+| `manifest(image, reference)` | A manifest by tag or digest: digest, media type, size, artifact type, subject, the stored summary |
+| `blob(image, digest)` | A blob's digest and size; a manifest is content too |
+| `tags(image, last, n)` | A page of the image's tags in byte order, and whether more follow |
+| `referrers(image, digest, artifact_type)` | The manifests whose subject is a manifest, of one artifact type when one is given |
+| `start-upload(image, mount)` | An upload session, or a blob mounted from another image without one |
+| `upload-status(id)`, `append-upload(id, range)` | How far a session got, after appending the request body (at `range`, when the client gave one) |
+| `finish-upload(id, digest, range)` | Appends the body, ends the session and links its content into the image as `digest` |
+| `cancel-upload(id)` | Ends a session without a blob |
+| `put-manifest(image, reference, tags)` | Stores the request body as a manifest under `reference` and points `tags` at it |
+| `delete-manifest(image, reference)`, `delete-blob(image, digest)` | Deletes a tag or a manifest, or unlinks a blob no manifest names |
+
+A query that changes the repository comes alone in its round. Every answer
+is a result: a query that failed (a blob unknown, a digest that does not
+match, a manifest naming a blob the image lacks, a tag that is immutable, an
+upload too large) comes back to `render` as its `ImageError`, and the format
+answers it with its own error codes and status, which registry clients read.
+The actions `serve-blob(image, digest)` and `serve-manifest(image,
+reference)` stream what a query of the same request found. A response the
+format renders keeps `content-type`, `docker-content-digest`,
+`docker-upload-uuid`, `link`, `location`, `oci-filters-applied`,
+`oci-subject`, `oci-tag`, `range` and `retry-after`; `location` and `link`
+only when they stay under `/v2/`.
+
+Manifests are the format's to read. The host stages a pushed manifest (at
+most 4 MiB), and `parse_manifest` says what it is served as, the blobs and
+manifests it names (which the push needs in the image), its subject and
+artifact type, and a JSON summary stored with it. A proxy's manifests are
+read the same way. When the manifest names a config small enough to read
+(an image's, a Helm chart's), the host reads it once the image holds it,
+and merges what `config_summary` makes of it (the platform, the chart's
+metadata) into the summary; the summary names the config under
+`config_digest` and `config_media_type`, so a proxy completes the summaries
+of the manifests it cached before their config. The web UI reads
+`layers_size`, `platform`, `platforms` and `chart` from a summary, and shows a
+chart's README and values with `artifact_files`, over the archive blob the
+host lends it (at most 16 MiB).
+
+A proxy's upstream operations name where things are, and the host fetches
+them:
+
+| Operation | The plugin answers |
+| --- | --- |
+| `image-name(image)` | The name the upstream knows the image by, which the proxy caches it under (Docker Hub's `library/` namespace) |
+| `image-manifest(image, reference)` | The manifest's URL, the `Accept` header to send and the scope of a token for it. The host re-validates a cached tag with a `HEAD`, downloads the manifest, checks it against its digest and reads it with `parse_manifest` |
+| `image-blob(image, digest)` | The blob's URL; the host streams it into the store and checks its digest |
+| `image-tags(image, last, n)` | A page of the upstream's tags, following the upstream's `Link` pages (a conversation of fetches) |
+| `image-referrers(image, digest)` | The upstream's referrers of a manifest |
+
+An images format's fetches go to the origin of `remote_url` only, carry the
+`Accept` header the plugin names, and come back with their status and `Link`
+headers. When the upstream answers 401 with a Bearer challenge, the host asks
+the realm the challenge names for a token (with the repository's
+credentials, if it has any) and sends the request again, as Docker Hub
+requires; the token is the host's, cached for its lifetime.
+
+`testing::converse_answered` runs `upstream` against canned answers with
+their status and headers, as the Docker plugin's tests do.
+
 ## Proxy repositories
 
 A plugin that lists `proxy` among its kinds implements the upstream side of
@@ -257,12 +376,12 @@ cached.
 ## Using a plugin
 
 `GET /admin/formats` lists every format the server can create repositories
-of: the plugins (NuGet, raw files) and Docker, each with the repository
-kinds it supports, what its repositories hold (`storage`: `packages`,
-`files`, or Docker's `images`) and where its repositories are served. The
+of: the plugins (Docker, NuGet, raw files), each from its descriptor, with
+the repository kinds it supports, what its repositories hold (`storage`:
+`packages`, `files` or `images`) and where its repositories are served. The
 web UI's *New repository* form offers them. Plugins serve **hosted** and
 **group** repositories, and **proxies** when they implement the upstream
-side (NuGet and raw do). Docker has proxies of its own.
+side (all three do).
 
 A repository of a plugin's format is created like any other, with the
 plugin's format id, and served under the plugin's mount (`/repository`
@@ -369,6 +488,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // `upstream`).
     kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
     storage: Storage::Packages,        // or `Storage::Files` (Files formats)
+                                       // or `Storage::Images` (Images formats)
     // How a version's files are stored: `package` and `manifest`, both
     // application/octet-stream, unless it names its own.
     assets: Assets::DEFAULT,
@@ -392,7 +512,8 @@ impl FormatPlugin for MyFormat {
 An id is 2–32 lowercase letters, digits and `-`, starting with a letter,
 and no other format's. A mount is `/` and one lowercase word; the server's
 own paths (`/admin`, `/auth`, `/browse`, `/v2`, the web UI's pages, …) are
-reserved, and plugins may share a mount. List `Proxy` among the kinds only
+reserved, and plugins may share a mount. An images format's mount is `/v2`,
+and only one format of a server may store images. List `Proxy` among the kinds only
 when the plugin implements `upstream`. Asset names are plain file names, and
 their content types `type/subtype`.
 
@@ -429,11 +550,13 @@ rules hold:
 These are the current limits of the preview, roughly in the order we expect
 to lift them:
 
-- **Proxies fetch whole documents with GET.** An upstream request carries
-  no headers but the repository's Basic credentials, and its body is read
-  whole up to `proxy.max_metadata_bytes` before the plugin sees it. An
-  upstream that needs a token exchange (Docker Hub's) or streams a listing
-  too large to hold needs more from the contract.
+- **Proxies fetch whole documents with GET.** A package or files format's
+  upstream request carries no headers but the repository's Basic
+  credentials, and its body is read whole up to `proxy.max_metadata_bytes`
+  before the plugin sees it. An upstream that streams a listing too large to
+  hold needs more from the contract. (An images format's fetches carry an
+  `Accept` header and get a Bearer token exchange, and the host streams the
+  blobs and manifests they name: [Images formats](#images-formats).)
 - **Requests carry no body into the plugin.** A publish streams its body
   straight into the store, and other requests' bodies are not passed on.
   npm's login and audit endpoints, for example, need a small body.
@@ -473,30 +596,3 @@ Its proxies read another V3 feed through the plugin's upstream side
 index's resources, the flat container, the registration (bounded to the
 newest pages a request needs), catalog entries for the package delay of
 unlisted versions, and the search service.
-
-### Why Docker is not a plugin
-
-The contract models a repository as package versions, each one file with an
-id, a version and a manifest. A container registry is a different model:
-content-addressed blobs and manifests linked per image, tags that move,
-indexes that refer to other manifests, referrers, and uploads in sessions of
-several requests with bodies the plugin would have to see. Its clients log in
-with Bearer tokens, read layers with `Range` requests, and expect proxies of
-Docker Hub and other registries. Every one of those is on the roadmap above
-or outside the contract altogether.
-
-So Docker is a native format (`crates/formats/docker`, served under `/v2`),
-registered next to the plugins: `GET /admin/formats` lists it with all three
-repository kinds, the admin API and the web UI create its repositories the
-same way, a group holds members of its format only, and repositories, RBAC,
-package selectors (on image names), retention and the blob store are the
-same as for every other format.
-
-Raw file repositories ([raw.md](raw.md)) were native for similar reasons
-until contract 0.4.0: they hold files under paths, not package versions,
-list directories, take several files in one form, always answer ranges and
-conditional requests, and their proxies follow redirects and re-validate with
-`If-None-Match`. 0.4.0 gave the contract a second storage model, files
-([Files formats](#files-formats)), so raw is a plugin now
-([`crates/formats/raw`](../crates/formats/raw)) like NuGet, and what was the
-raw server module is the host's file store.

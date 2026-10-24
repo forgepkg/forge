@@ -106,10 +106,11 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
 ];
 
 /// The format plugins built into this server: crates under
-/// `crates/formats/<id>/`, linked in and always installed (NuGet, raw). NuGet
-/// reads archives under `nuget_limits` (`[nuget]`).
+/// `crates/formats/<id>/`, linked in and always installed (Docker / OCI,
+/// NuGet, raw). NuGet reads archives under `nuget_limits` (`[nuget]`).
 pub fn builtin(nuget_limits: forge_format_nuget::NupkgLimits) -> Vec<Arc<Plugin>> {
     vec![
+        Plugin::builtin(forge_format_docker::Docker),
         Plugin::builtin(forge_format_nuget::Nuget::with_limits(nuget_limits)),
         Plugin::builtin(forge_format_raw::Raw),
     ]
@@ -174,8 +175,8 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     }
     let Some(plugin) = state.formats.plugin(&repo.format) else {
         return if state.formats.is_installed(&repo.format) {
-            // A built-in format has its own mount (NuGet: `/v3`, Docker:
-            // `/v2`).
+            // A format without a protocol (a test's own) is served under
+            // no mount.
             (StatusCode::NOT_FOUND, "repository is not served here").into_response()
         } else {
             (
@@ -228,6 +229,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
             .filter(|(name, _)| PASSED_REQUEST_HEADERS.contains(&name.as_str()))
             .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_string())))
             .collect(),
+        image: None,
     };
 
     let ctx = Ctx {
@@ -353,6 +355,10 @@ impl Ctx<'_> {
                 }
                 self.serve_file(&path).await
             }
+            // Images are the registry's (`crate::images`).
+            Action::ServeBlob { .. } | Action::ServeManifest { .. } => {
+                self.plugin_misused("an image action")
+            }
         }
     }
 
@@ -441,6 +447,10 @@ impl Ctx<'_> {
     /// format's storage only, and a change (`form`, `store`, `remove`) alone
     /// in its round.
     fn check_round(&self, queries: &[Query]) -> Result<(), Response> {
+        // Images are the registry's (`crate::images`).
+        if queries.iter().any(Query::is_images) {
+            return Err(self.plugin_misused("an image query"));
+        }
         if queries.iter().any(|q| q.is_files() != self.stores_files) {
             return Err(self.plugin_misused("a query of the other storage"));
         }
@@ -757,6 +767,12 @@ impl Ctx<'_> {
             | Query::Remove(_) => {
                 return Err(RepoError::Storage(
                     "a files query of a package format".into(),
+                ))
+            }
+            // Refused by `check_round`.
+            Query::Image(_) => {
+                return Err(RepoError::Storage(
+                    "an image query of a package format".into(),
                 ))
             }
         })
@@ -1305,15 +1321,16 @@ mod tests {
         let descriptors: Vec<_> = plugins.iter().map(|p| p.descriptor()).collect();
         assert_eq!(forge_plugin::descriptor::check(&descriptors), Ok(()));
         let ids: Vec<_> = plugins.iter().map(|p| p.id()).collect();
-        assert_eq!(ids, ["nuget", "raw"]);
+        assert_eq!(ids, ["docker", "nuget", "raw"]);
         for plugin in &plugins {
             assert_eq!(plugin.descriptor().version, "1.0.0", "{}", plugin.id());
         }
 
         // The check refuses a malformed or reserved id, a second format
-        // with a built-in's id, and invalid asset names.
+        // with a built-in's id (Docker's included), a second images format,
+        // and invalid asset names.
         let nuget = forge_format_nuget::DESCRIPTOR;
-        for id in ["NuGet", "n", "docker", "v2"] {
+        for id in ["NuGet", "n", "v2"] {
             let renamed = forge_plugin::Descriptor { id, ..nuget };
             assert!(
                 forge_plugin::descriptor::check(&[&renamed]).is_err(),
@@ -1328,6 +1345,20 @@ mod tests {
         let mut with_twin = descriptors.clone();
         with_twin.push(&twin);
         assert!(forge_plugin::descriptor::check(&with_twin).is_err());
+        let docker_twin = forge_plugin::Descriptor {
+            id: "docker",
+            ..nuget
+        };
+        let mut with_twin = descriptors.clone();
+        with_twin.push(&docker_twin);
+        assert!(forge_plugin::descriptor::check(&with_twin).is_err());
+        let second_images = forge_plugin::Descriptor {
+            id: "oci",
+            ..forge_format_docker::DESCRIPTOR
+        };
+        let mut with_second = descriptors.clone();
+        with_second.push(&second_images);
+        assert!(forge_plugin::descriptor::check(&with_second).is_err());
         let bad_assets = forge_plugin::Descriptor {
             assets: forge_plugin::api::Assets {
                 package: "../package.nupkg",

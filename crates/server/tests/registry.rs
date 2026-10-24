@@ -412,7 +412,7 @@ async fn version_check_challenges_and_tokens_authenticate() {
 async fn token_requests_name_a_bounded_number_of_repositories() {
     use base64::Engine;
     let srv = common::start().await;
-    let max = forge_format_docker::token::MAX_SCOPES;
+    let max = forge_server::images::token::MAX_SCOPES;
     let request = |scopes: Vec<String>| {
         let mut req = srv
             .client()
@@ -2713,7 +2713,7 @@ async fn deleting_an_image_never_frees_a_layer_another_image_uses() {
     assert_eq!(ref_count(&srv, &layer).await, Some(2), "one link per image");
 
     let sweep = || {
-        forge_format_docker::gc::sweep_once(
+        forge_server::images::gc::sweep_once(
             &srv.pool,
             chrono::Duration::zero(),
             chrono::Duration::zero(),
@@ -2880,7 +2880,7 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     assert_eq!(resp.status(), 202);
     let worker = forge_core::retention::RetentionWorker::new(
         srv.pool.clone(),
-        srv.state.formats.get("nuget").expect("NuGet is built in"),
+        forge_server::state::RegistryResolver(srv.state.formats.clone()),
         Arc::new(forge_core::repo::NoopCacheInvalidator),
         forge_core::retention::RetentionConfig::default(),
     );

@@ -3347,10 +3347,12 @@ async fn a_format_cannot_reach_an_origin_its_upstream_does_not_name() {
         scripted_proxy(&pool, cas, move |nuget, remote, op, fetched| match op {
             // The listing reads the internal service first, then lists
             // what the upstream lists, as NuGet does.
-            UpstreamOp::Versions(_) if fetched.is_empty() => Ok(UpstreamStep::Fetch(vec![Fetch {
-                url: secret.clone(),
-                freshness: Freshness::Metadata,
-            }])),
+            UpstreamOp::Versions(_) if fetched.is_empty() => {
+                Ok(UpstreamStep::Fetch(vec![Fetch::get(
+                    secret.clone(),
+                    Freshness::Metadata,
+                )]))
+            }
             UpstreamOp::Versions(_) => {
                 *seen.lock().unwrap() = fetched
                     .iter()

@@ -25,6 +25,7 @@ pub mod email;
 pub mod feed;
 pub mod files;
 pub mod health;
+pub mod images;
 pub mod invitations;
 pub mod me;
 pub mod me_tokens;

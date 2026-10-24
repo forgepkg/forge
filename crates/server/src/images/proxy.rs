@@ -9,47 +9,41 @@
 //!   tag is served.
 //! * Multi-arch indexes are cached as they are; their child manifests are
 //!   fetched when a client asks for them.
-//! * Docker Hub's implicit `library/` namespace applies to one-component
-//!   names (`nginx` is `library/nginx`), locally as well, so both spellings
-//!   share one cache.
+//! * The images format names what to ask the upstream for
+//!   ([`UpstreamOp`]): the name the upstream knows an image by (Docker Hub's
+//!   `library/` namespace, so both spellings share one cache), a manifest's
+//!   and a blob's URL, and it reads the upstream's tag lists and referrers.
 //!
 //! Upstream requests go through the shared [`UpstreamHttp`] client (metadata
-//! guard, timeouts, redirects without credentials). Docker's token flow is
-//! followed: a `401` with a `Bearer` challenge sends the upstream credentials
-//! to the token realm that challenge names, and the token is cached until it
-//! expires.
+//! guard, timeouts, redirects without credentials), to the origin of the
+//! repository's `remote_url` only. Docker's token flow is followed: a `401`
+//! with a `Bearer` challenge sends the upstream credentials to the token
+//! realm that challenge names, and the token is cached until it expires.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use axum::http::StatusCode;
 use bytes::Bytes;
-use forge_core::net::upstream::{Origin, RequestClass};
+use forge_core::net::upstream::{Origin, RequestClass, UpstreamHttp};
 use forge_core::repo::proxy::{upstream_credentials, Credentials};
 use forge_db::model::Repository;
 use forge_db::oci_dao::{self, LinkOutcome};
+use forge_plugin::api::images::ImageError;
+use forge_plugin::api::images::{ImageUrl, ManifestInfo, Reference, TagPage, MAX_MANIFEST_BYTES};
+use forge_plugin::api::{
+    FetchResult, Fetched, FormatError, Remote, UpstreamAnswer, UpstreamOp, UpstreamStep,
+};
 use forge_storage::BlobRef;
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 use reqwest::Method;
 
-use crate::digest::Digest;
-use crate::error::{Code, OciError, OciResult};
-use crate::manifest::{self, media, MAX_MANIFEST_BYTES};
-use crate::pull::{BlobHit, ManifestHit, ReferrerDescriptor, TagPage};
-use crate::push::require_linked;
-use crate::reference::{self, Reference};
-use crate::service::{Registry, Target};
-
-/// Hosts of Docker Hub's registry, whose one-component names live in
-/// `library/`.
-const DOCKER_HUB_HOSTS: &[&str] = &[
-    "registry-1.docker.io",
-    "index.docker.io",
-    "docker.io",
-    "registry.hub.docker.com",
-];
+use super::digest::ContentDigest;
+use super::dispatch::Target;
+use super::pull::{BlobHit, ManifestHit};
+use super::push::{merge, require_linked};
+use super::{Failure, ImgResult, Registry};
 
 /// How long a tag is served without asking the upstream, unless the
 /// repository sets `metadata_ttl_seconds`.
@@ -59,16 +53,15 @@ const DEFAULT_TAG_TTL_SECS: i64 = 600;
 /// sets `not_found_ttl_seconds`.
 const DEFAULT_NOT_FOUND_TTL_SECS: u64 = 60;
 
-/// Largest blob read as a possible image config.
+/// Largest blob read as a possible config.
 const MAX_CONFIG_BYTES: i64 = 1024 * 1024;
 
 /// Largest upstream tag list or referrers document read.
 const MAX_LISTING_BYTES: usize = 16 * 1024 * 1024;
 
-/// Pages of an upstream's tag list followed (`Link: rel="next"`) to fill
-/// one page of Forge's: an upstream that pages in small steps is listed
-/// further on the client's next request.
-const MAX_UPSTREAM_TAG_PAGES: usize = 10;
+/// The most rounds of one upstream conversation of the images format: an
+/// upstream's tag list may take a page per round.
+const MAX_UPSTREAM_ROUNDS: usize = 12;
 
 /// Cached upstream registry tokens: key → (token, expiry). Bounded: the key
 /// names an image a client chose, and the token and its lifetime are the
@@ -132,44 +125,6 @@ fn cache_token(key: String, token: String, ttl: Duration) {
     tokens.insert(key, (token, now + ttl.min(MAX_TOKEN_TTL)));
 }
 
-/// The upstream base URL of a proxy: `remote_url` without a trailing `/`
-/// (and without a `/v2` suffix an admin may have pasted).
-pub(crate) fn upstream_base(remote_url: &str) -> String {
-    let base = remote_url.trim_end_matches('/');
-    base.strip_suffix("/v2").unwrap_or(base).to_string()
-}
-
-/// The `next` page a response's `Link` header names (RFC 8288), as a path
-/// under `base`, resolved against the response's URL: only a link back to
-/// the upstream itself is followed, never one to another host.
-fn next_link(response: &reqwest::Response, base: &str) -> Option<String> {
-    response
-        .headers()
-        .get_all(reqwest::header::LINK)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .find_map(|link| {
-            let mut parts = link.split(';');
-            let target = parts.next()?.trim().strip_prefix('<')?.strip_suffix('>')?;
-            let next = parts.any(|param| {
-                let param = param.trim().replace(' ', "");
-                param.eq_ignore_ascii_case("rel=\"next\"") || param.eq_ignore_ascii_case("rel=next")
-            });
-            if !next {
-                return None;
-            }
-            let url = response.url().join(target).ok()?;
-            // Both as the URL parser writes them (lowercase host, no
-            // default port).
-            let base = url::Url::parse(base).ok()?;
-            url.as_str()
-                .strip_prefix(base.as_str().trim_end_matches('/'))
-                .filter(|path| path.starts_with("/v2/"))
-                .map(str::to_string)
-        })
-}
-
 /// Inside a transaction that caches what `repo`'s upstream served: lock the
 /// repository row and make sure the proxy still points at the upstream the
 /// content came from ([`oci_dao::lock_proxy_upstream`]). A proxy repointed
@@ -178,28 +133,13 @@ fn next_link(response: &reqwest::Response, base: &str) -> Option<String> {
 pub(crate) async fn still_upstream(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repo: &Repository,
-) -> OciResult<()> {
+) -> ImgResult<()> {
     if oci_dao::lock_proxy_upstream(tx, repo.id, repo.remote_url.as_deref()).await? {
         Ok(())
     } else {
-        Err(OciError::unavailable(
+        Err(Failure::unavailable(
             "the proxy was pointed at another upstream while this was fetched; retry",
         ))
-    }
-}
-
-fn is_docker_hub(remote_url: &str) -> bool {
-    url::Url::parse(remote_url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-        .is_some_and(|h| DOCKER_HUB_HOSTS.contains(&h.as_str()))
-}
-
-/// The image name a proxy stores and asks its upstream for.
-pub fn proxied_image(repo: &Repository, image: &str) -> String {
-    match &repo.remote_url {
-        Some(remote) if is_docker_hub(remote) && !image.contains('/') => format!("library/{image}"),
-        _ => image.to_string(),
     }
 }
 
@@ -250,42 +190,38 @@ fn parse_challenge(value: &str) -> Option<Challenge> {
 }
 
 /// Read at most `limit` bytes of an upstream body.
-pub(crate) async fn read_limited(response: reqwest::Response, limit: usize) -> OciResult<Bytes> {
+pub(crate) async fn read_limited(response: reqwest::Response, limit: usize) -> ImgResult<Bytes> {
     if response.content_length().is_some_and(|l| l > limit as u64) {
-        return Err(OciError::unavailable("the upstream response is too large"));
+        return Err(Failure::unavailable("the upstream response is too large"));
     }
     let mut stream = response.bytes_stream();
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| upstream_unreachable(&e))?;
         if out.len() + chunk.len() > limit {
-            return Err(OciError::unavailable("the upstream response is too large"));
+            return Err(Failure::unavailable("the upstream response is too large"));
         }
         out.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(out))
 }
 
-fn upstream_unreachable(e: &dyn std::fmt::Display) -> OciError {
+fn upstream_unreachable(e: &dyn std::fmt::Display) -> Failure {
     tracing::warn!(error = %e, "registry proxy: upstream request failed");
-    OciError::unavailable("the upstream registry is unreachable")
+    Failure::unavailable("the upstream registry is unreachable")
 }
 
 /// The error a non-success upstream status turns into.
-fn upstream_status(status: reqwest::StatusCode) -> OciError {
+fn upstream_status(status: reqwest::StatusCode) -> Failure {
     match status.as_u16() {
-        429 => OciError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            Code::TooManyRequests,
-            "the upstream registry rate-limits this proxy; retry later",
-        ),
+        429 => Failure::new(ImageError::RateLimited),
         401 | 403 => {
             tracing::warn!(%status, "registry proxy: upstream refused the request");
-            OciError::unavailable("the upstream registry refused the proxy's credentials")
+            Failure::unavailable("the upstream registry refused the proxy's credentials")
         }
         _ => {
             tracing::warn!(%status, "registry proxy: upstream answered with an error");
-            OciError::unavailable("the upstream registry answered with an error")
+            Failure::unavailable("the upstream registry answered with an error")
         }
     }
 }
@@ -293,16 +229,25 @@ fn upstream_status(status: reqwest::StatusCode) -> OciError {
 /// An upstream registry (a proxy repository's, or an import's source), for
 /// one request.
 pub(crate) struct Upstream<'a> {
-    pub(crate) reg: &'a Registry,
+    pub(crate) http: &'a UpstreamHttp,
     /// Who the cached tokens belong to: a proxy repository's id, an import.
     pub(crate) owner: String,
-    pub(crate) base: String,
+    /// The upstream's URL, as configured: requests go to its origin only.
+    pub(crate) remote: String,
     pub(crate) creds: Option<Arc<Credentials>>,
 }
 
 impl Upstream<'_> {
     fn token_key(&self, scope: &str) -> String {
-        format!("{}:{}:{scope}", self.owner, self.base)
+        format!("{}:{}:{scope}", self.owner, self.remote)
+    }
+
+    /// What the images format sees of the upstream.
+    pub(crate) fn as_remote(&self) -> Remote {
+        Remote {
+            url: self.remote.clone(),
+            index: None,
+        }
     }
 
     async fn attempt(
@@ -313,7 +258,7 @@ impl Upstream<'_> {
         class: RequestClass,
         bearer: Option<&str>,
         basic: bool,
-    ) -> OciResult<reqwest::Response> {
+    ) -> ImgResult<reqwest::Response> {
         let mut headers = HeaderMap::new();
         if let Some(accept) = accept {
             if let Ok(v) = HeaderValue::from_str(accept) {
@@ -330,36 +275,36 @@ impl Upstream<'_> {
         } else {
             None
         };
-        self.reg
-            .inner
-            .http
+        self.http
             .send(method, url, class, headers, auth.as_ref())
             .await
             .map_err(|e| upstream_unreachable(&e))
     }
 
-    /// Send a request for `path` (`/v2/…`), answering the upstream's
-    /// authentication challenge once.
+    /// Send a request to `url`, answering the upstream's authentication
+    /// challenge once, with a token for its scope (else `scope`). Only to
+    /// the origin of the upstream's URL: the images format names no other.
     pub(crate) async fn send(
         &self,
         method: Method,
-        path: &str,
-        scope: &str,
+        url: &str,
+        scope: Option<&str>,
         accept: Option<&str>,
         class: RequestClass,
-    ) -> OciResult<reqwest::Response> {
-        let url = format!("{}{path}", self.base);
+    ) -> ImgResult<reqwest::Response> {
+        let origin = Origin::of(&self.remote);
+        if origin.is_none() || Origin::of(url) != origin {
+            tracing::warn!(%url, remote = %self.remote, "images format named an URL off its upstream; not sent");
+            return Err(Failure::internal(
+                "upstream request",
+                format!("{url} is not on the upstream's origin"),
+            ));
+        }
+        let scope = scope.unwrap_or_default();
         let key = self.token_key(scope);
         let cached = cached_token(&key);
         let response = self
-            .attempt(
-                method.clone(),
-                &url,
-                accept,
-                class,
-                cached.as_deref(),
-                false,
-            )
+            .attempt(method.clone(), url, accept, class, cached.as_deref(), false)
             .await?;
         if response.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(response);
@@ -367,7 +312,7 @@ impl Upstream<'_> {
         // Only the upstream itself names where its credentials go: a 401
         // from a host it redirected to (a CDN, an object store) is answered
         // as the failure it is, never followed to the realm it names.
-        if Origin::of(response.url().as_str()) != Origin::of(&self.base) {
+        if Origin::of(response.url().as_str()) != origin {
             return Ok(response);
         }
         let challenge = response
@@ -384,11 +329,11 @@ impl Upstream<'_> {
                 let scope = challenged.unwrap_or_else(|| scope.to_string());
                 let token = self.fetch_token(&realm, service.as_deref(), &scope).await?;
                 cache_token(key, token.0.clone(), token.1);
-                self.attempt(method, &url, accept, class, Some(&token.0), false)
+                self.attempt(method, url, accept, class, Some(&token.0), false)
                     .await
             }
             Some(Challenge::Basic) if self.creds.is_some() => {
-                self.attempt(method, &url, accept, class, None, true).await
+                self.attempt(method, url, accept, class, None, true).await
             }
             _ => Ok(response),
         }
@@ -402,14 +347,14 @@ impl Upstream<'_> {
         realm: &str,
         service: Option<&str>,
         scope: &str,
-    ) -> OciResult<(String, Duration)> {
+    ) -> ImgResult<(String, Duration)> {
         let parsed = url::Url::parse(realm)
-            .map_err(|_| OciError::unavailable("the upstream named an invalid token realm"))?;
-        let upstream_https = self.base.starts_with("https://");
+            .map_err(|_| Failure::unavailable("the upstream named an invalid token realm"))?;
+        let upstream_https = self.remote.starts_with("https://");
         if !matches!(parsed.scheme(), "https" | "http")
             || (upstream_https && parsed.scheme() != "https")
         {
-            return Err(OciError::unavailable(
+            return Err(Failure::unavailable(
                 "the upstream named a token realm Forge will not send credentials to",
             ));
         }
@@ -419,15 +364,15 @@ impl Upstream<'_> {
             if let Some(service) = service {
                 q.append_pair("service", service);
             }
-            q.append_pair("scope", scope);
+            if !scope.is_empty() {
+                q.append_pair("scope", scope);
+            }
         }
         let auth = match (&self.creds, Origin::of(realm)) {
             (Some(creds), Some(origin)) => Some(creds.auth_for(origin)),
             _ => None,
         };
         let response = self
-            .reg
-            .inner
             .http
             .send(
                 Method::GET,
@@ -449,12 +394,12 @@ impl Upstream<'_> {
             expires_in: Option<u64>,
         }
         let parsed: TokenResponse = serde_json::from_slice(&body)
-            .map_err(|_| OciError::unavailable("the upstream token service answered nonsense"))?;
+            .map_err(|_| Failure::unavailable("the upstream token service answered nonsense"))?;
         let token = parsed
             .token
             .or(parsed.access_token)
             .filter(|t| !t.is_empty())
-            .ok_or_else(|| OciError::unavailable("the upstream token service sent no token"))?;
+            .ok_or_else(|| Failure::unavailable("the upstream token service sent no token"))?;
         let ttl = parsed
             .expires_in
             .unwrap_or(60)
@@ -463,23 +408,172 @@ impl Upstream<'_> {
             .max(10);
         Ok((token, Duration::from_secs(ttl)))
     }
+
+    /// Send the request the images format named for a manifest or a blob.
+    pub(crate) async fn send_url(
+        &self,
+        method: Method,
+        url: &ImageUrl,
+        class: RequestClass,
+    ) -> ImgResult<reqwest::Response> {
+        self.send(
+            method,
+            &url.url,
+            url.scope.as_deref(),
+            url.accept.as_deref(),
+            class,
+        )
+        .await
+    }
+
+    /// Run an upstream conversation of the images format: what it answers
+    /// at once, or after the fetches it asks for (sent to the upstream's
+    /// origin, with its token exchange, not kept).
+    pub(crate) async fn converse(
+        &self,
+        reg: &Registry,
+        op: &UpstreamOp,
+    ) -> ImgResult<UpstreamAnswer> {
+        let remote = self.as_remote();
+        let mut fetched: Vec<FetchResult> = Vec::new();
+        for _ in 0..MAX_UPSTREAM_ROUNDS {
+            let step = reg
+                .plugin()
+                .upstream(&remote, op, &fetched)
+                .map_err(|e| format_failure("upstream", e))?;
+            let wanted = match step {
+                UpstreamStep::Done(answer) => return Ok(answer),
+                UpstreamStep::Fetch(wanted) => wanted,
+            };
+            if wanted.is_empty() {
+                return Err(Failure::internal(
+                    "upstream",
+                    "the images format asked for no fetch",
+                ));
+            }
+            for fetch in wanted {
+                let response = self
+                    .send(
+                        Method::GET,
+                        &fetch.url,
+                        fetch.scope.as_deref(),
+                        fetch.accept.as_deref(),
+                        RequestClass::Metadata,
+                    )
+                    .await;
+                let result = match response {
+                    Ok(response) => {
+                        let status = response.status();
+                        let headers: Vec<(String, String)> = response
+                            .headers()
+                            .get_all(reqwest::header::LINK)
+                            .iter()
+                            .filter_map(|v| v.to_str().ok())
+                            .map(|v| ("link".to_string(), v.to_string()))
+                            .collect();
+                        let outcome = if status == reqwest::StatusCode::NOT_FOUND {
+                            Fetched::NotFound
+                        } else if !status.is_success() {
+                            Fetched::Failed(upstream_status(status).message())
+                        } else {
+                            match read_limited(response, MAX_LISTING_BYTES).await {
+                                Ok(body) => Fetched::Found(body.to_vec()),
+                                Err(failure) => Fetched::Failed(failure.message()),
+                            }
+                        };
+                        FetchResult {
+                            fetch,
+                            outcome,
+                            status: Some(status.as_u16()),
+                            headers,
+                        }
+                    }
+                    Err(failure) => FetchResult {
+                        fetch,
+                        outcome: Fetched::Failed(failure.message()),
+                        status: None,
+                        headers: Vec::new(),
+                    },
+                };
+                fetched.push(result);
+            }
+        }
+        Err(Failure::internal(
+            "upstream",
+            format!("the images format needed more than {MAX_UPSTREAM_ROUNDS} rounds"),
+        ))
+    }
+}
+
+/// A format error of the upstream side: a reference it does not take (an
+/// import's tag), else the format's bug.
+fn format_failure(context: &str, e: FormatError) -> Failure {
+    match e {
+        FormatError::InvalidVersion(m) | FormatError::InvalidId(m) => {
+            Failure::new(ImageError::ManifestInvalid(m))
+        }
+        other => Failure::internal(context, other),
+    }
 }
 
 impl Registry {
-    async fn upstream<'a>(&'a self, repo: &'a Repository) -> OciResult<Upstream<'a>> {
+    pub(crate) async fn upstream<'a>(&'a self, repo: &Repository) -> ImgResult<Upstream<'a>> {
         let remote = repo
             .remote_url
             .as_deref()
-            .ok_or_else(|| OciError::internal("proxy", "proxy repository without remote_url"))?;
+            .ok_or_else(|| Failure::internal("proxy", "proxy repository without remote_url"))?;
         let creds = upstream_credentials(&self.inner.pool, self.inner.envelope.as_ref(), repo)
             .await
-            .map_err(|e| OciError::internal("proxy credentials", e))?;
+            .map_err(|e| Failure::internal("proxy credentials", e))?;
         Ok(Upstream {
-            reg: self,
+            http: &self.inner.http,
             owner: repo.id.to_string(),
-            base: upstream_base(remote),
+            remote: remote.to_string(),
             creds: creds.map(Arc::new),
         })
+    }
+
+    /// The images format's answer to an operation it answers without
+    /// fetching anything (a name, a URL), for the upstream at `remote`.
+    pub(crate) fn upstream_answer(
+        &self,
+        remote: &str,
+        op: &UpstreamOp,
+    ) -> ImgResult<UpstreamAnswer> {
+        let remote = Remote {
+            url: remote.to_string(),
+            index: None,
+        };
+        match self.plugin().upstream(&remote, op, &[]) {
+            Ok(UpstreamStep::Done(answer)) => Ok(answer),
+            Ok(UpstreamStep::Fetch(_)) => Err(Failure::internal(
+                "upstream",
+                "the images format asked for a fetch to name a URL",
+            )),
+            Err(e) => Err(format_failure("upstream", e)),
+        }
+    }
+
+    /// Where the upstream at `remote` has the manifest or blob `op` names.
+    pub(crate) fn image_url(&self, remote: &str, op: &UpstreamOp) -> ImgResult<ImageUrl> {
+        match self.upstream_answer(remote, op)? {
+            UpstreamAnswer::ImageUrl(url) => Ok(url),
+            other => Err(Failure::internal(
+                "upstream",
+                format!("the images format answered {other:?} for a URL"),
+            )),
+        }
+    }
+
+    /// The image name a proxy stores and asks its upstream for.
+    pub(crate) fn proxied_image(&self, repo: &Repository, image: &str) -> String {
+        let Some(remote) = &repo.remote_url else {
+            return image.to_string();
+        };
+        match self.upstream_answer(remote, &UpstreamOp::ImageName(image.to_string())) {
+            Ok(UpstreamAnswer::ImageName(name)) => name,
+            _ => image.to_string(),
+        }
     }
 
     /// Keyed by the repository's `updated_at` too, so an administrator's
@@ -531,35 +625,33 @@ impl Registry {
         repo: &Repository,
         image: &str,
         reference: &Reference,
-    ) -> OciResult<Option<ManifestHit>> {
-        let local = proxied_image(repo, image);
+    ) -> ImgResult<Option<ManifestHit>> {
+        let local = self.proxied_image(repo, image);
         let target = Target {
             repo: repo.clone(),
             image: local.clone(),
             name: local.clone(),
         };
         let pool = &self.inner.pool;
-        let accept = media::ACCEPT_ALL.join(", ");
-        let scope = format!("repository:{local}:pull");
         match reference {
             Reference::Digest(digest) => {
-                if let Some(row) =
-                    oci_dao::find_manifest(pool, repo.id, &local, digest.as_str()).await?
-                {
+                if let Some(row) = oci_dao::find_manifest(pool, repo.id, &local, digest).await? {
                     return Ok(Some(ManifestHit::from_row(row)));
                 }
-                if !repo.online || self.negative_cached(repo, &local, digest.as_str()).await {
+                if !repo.online || self.negative_cached(repo, &local, digest).await {
                     return Ok(None);
                 }
+                let digest = ContentDigest::named(digest)?;
                 let upstream = self.upstream(repo).await?;
+                let url = self.image_url(
+                    &upstream.remote,
+                    &UpstreamOp::ImageManifest {
+                        image: local.clone(),
+                        reference: reference.clone(),
+                    },
+                )?;
                 let response = upstream
-                    .send(
-                        Method::GET,
-                        &format!("/v2/{local}/manifests/{digest}"),
-                        &scope,
-                        Some(&accept),
-                        RequestClass::Metadata,
-                    )
+                    .send_url(Method::GET, &url, RequestClass::Metadata)
                     .await?;
                 if response.status() == reqwest::StatusCode::NOT_FOUND {
                     self.remember_not_found(repo, &local, digest.as_str()).await;
@@ -570,17 +662,17 @@ impl Registry {
                 }
                 let content_type = content_type(&response);
                 let body = read_limited(response, MAX_MANIFEST_BYTES).await?;
-                if Digest::of(digest.algorithm(), &body) != *digest {
+                if !digest.matches_bytes(&body) {
                     tracing::warn!(repo = %repo.name, image = %local, %digest, "registry proxy: upstream manifest does not match its digest");
-                    return Err(OciError::unavailable(
+                    return Err(Failure::unavailable(
                         "the upstream served a manifest that does not match its digest",
                     ));
                 }
-                let parsed = manifest::parse(&body, content_type.as_deref()).map_err(|_| {
-                    OciError::unavailable("the upstream served an invalid manifest")
-                })?;
+                let parsed = self
+                    .parse_manifest(&body, content_type.as_deref())
+                    .map_err(|_| Failure::unavailable("the upstream served an invalid manifest"))?;
                 let row = self
-                    .store_proxied_manifest(&target, digest, &parsed, &body, None)
+                    .store_proxied_manifest(&target, &digest, &parsed, &body, None)
                     .await?;
                 let mut hit = ManifestHit::from_row(row);
                 hit.bytes = Some(body);
@@ -604,14 +696,14 @@ impl Registry {
                     return Ok(None);
                 }
                 match self
-                    .revalidate_tag(repo, &target, tag, &scope, &accept, cached.as_ref())
+                    .revalidate_tag(repo, &target, reference, tag, cached.as_ref())
                     .await
                 {
                     Ok(found) => Ok(found),
                     Err(e) => match cached {
                         Some(c) => {
                             tracing::warn!(
-                                repo = %repo.name, image = %local, %tag, error = %e.message,
+                                repo = %repo.name, image = %local, %tag, error = %e.message(),
                                 "registry proxy: upstream unavailable; serving the cached tag"
                             );
                             Ok(Some(ManifestHit::from_row(c.manifest)))
@@ -628,23 +720,22 @@ impl Registry {
         &self,
         repo: &Repository,
         target: &Target,
+        reference: &Reference,
         tag: &str,
-        scope: &str,
-        accept: &str,
         cached: Option<&oci_dao::TaggedManifest>,
-    ) -> OciResult<Option<ManifestHit>> {
+    ) -> ImgResult<Option<ManifestHit>> {
         let local = &target.image;
         let upstream = self.upstream(repo).await?;
-        let path = format!("/v2/{local}/manifests/{tag}");
+        let url = self.image_url(
+            &upstream.remote,
+            &UpstreamOp::ImageManifest {
+                image: local.clone(),
+                reference: reference.clone(),
+            },
+        )?;
         if let Some(c) = cached {
             let head = upstream
-                .send(
-                    Method::HEAD,
-                    &path,
-                    scope,
-                    Some(accept),
-                    RequestClass::Metadata,
-                )
+                .send_url(Method::HEAD, &url, RequestClass::Metadata)
                 .await?;
             if head.status() == reqwest::StatusCode::NOT_FOUND {
                 self.remember_not_found(repo, local, tag).await;
@@ -669,13 +760,7 @@ impl Registry {
             // usefully: fetch the manifest.
         }
         let response = upstream
-            .send(
-                Method::GET,
-                &path,
-                scope,
-                Some(accept),
-                RequestClass::Metadata,
-            )
+            .send_url(Method::GET, &url, RequestClass::Metadata)
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             self.remember_not_found(repo, local, tag).await;
@@ -688,20 +773,21 @@ impl Registry {
             .headers()
             .get("docker-content-digest")
             .and_then(|v| v.to_str().ok())
-            .and_then(|d| Digest::parse(d).ok());
+            .and_then(ContentDigest::parse);
         let content_type = content_type(&response);
         let body = read_limited(response, MAX_MANIFEST_BYTES).await?;
         if let Some(declared) = &declared {
-            if Digest::of(declared.algorithm(), &body) != *declared {
+            if !declared.matches_bytes(&body) {
                 tracing::warn!(repo = %repo.name, image = %local, %tag, "registry proxy: upstream manifest does not match its Docker-Content-Digest");
-                return Err(OciError::unavailable(
+                return Err(Failure::unavailable(
                     "the upstream served a manifest that does not match its digest",
                 ));
             }
         }
-        let digest = Digest::sha256_of(&body);
-        let parsed = manifest::parse(&body, content_type.as_deref())
-            .map_err(|_| OciError::unavailable("the upstream served an invalid manifest"))?;
+        let digest = ContentDigest::sha256_of(&body);
+        let parsed = self
+            .parse_manifest(&body, content_type.as_deref())
+            .map_err(|_| Failure::unavailable("the upstream served an invalid manifest"))?;
         let row = self
             .store_proxied_manifest(target, &digest, &parsed, &body, Some(tag))
             .await?;
@@ -714,9 +800,9 @@ impl Registry {
         &self,
         repo: &Repository,
         image: &str,
-        digest: &Digest,
-    ) -> OciResult<Option<BlobHit>> {
-        let local = proxied_image(repo, image);
+        digest: &ContentDigest,
+    ) -> ImgResult<Option<BlobHit>> {
+        let local = self.proxied_image(repo, image);
         if let Some(hit) = self.hosted_blob(repo, &local, digest).await? {
             return Ok(Some(hit));
         }
@@ -729,8 +815,13 @@ impl Registry {
             return Ok(Some(hit));
         }
         let upstream = self.upstream(repo).await?;
-        let scope = format!("repository:{local}:pull");
-        let path = format!("/v2/{local}/blobs/{digest}");
+        let url = self.image_url(
+            &upstream.remote,
+            &UpstreamOp::ImageBlob {
+                image: local.clone(),
+                digest: digest.to_string(),
+            },
+        )?;
         let pool = &self.inner.pool;
 
         // A layer another image of this proxy already holds (served by this
@@ -738,12 +829,12 @@ impl Registry {
         // upstream confirms this image has it, without downloading it again.
         // Anything else in the CAS is fetched and verified like a new blob:
         // the upstream's HEAD must never reach content it did not serve.
-        if digest.algorithm() == crate::digest::Algorithm::Sha256 {
+        if let Some(sha256) = digest.sha256_hex() {
             if let Some((_, size)) =
-                oci_dao::blob_linked_in_repository(pool, repo.id, digest.hex()).await?
+                oci_dao::blob_linked_in_repository(pool, repo.id, sha256).await?
             {
                 let head = upstream
-                    .send(Method::HEAD, &path, &scope, None, RequestClass::Metadata)
+                    .send_url(Method::HEAD, &url, RequestClass::Metadata)
                     .await?;
                 if head.status().is_success() {
                     let mut tx = pool.begin().await?;
@@ -753,7 +844,7 @@ impl Registry {
                         repo.id,
                         &local,
                         digest.as_str(),
-                        digest.hex(),
+                        sha256,
                         size,
                     )
                     .await?
@@ -763,7 +854,7 @@ impl Registry {
                             tx.commit().await?;
                             let hit = self.hosted_blob(repo, &local, digest).await?;
                             if let Some(hit) = &hit {
-                                self.backfill_platform(
+                                self.complete_summaries(
                                     repo,
                                     &local,
                                     digest,
@@ -784,7 +875,7 @@ impl Registry {
         }
 
         let response = upstream
-            .send(Method::GET, &path, &scope, None, RequestClass::Download)
+            .send_url(Method::GET, &url, RequestClass::Download)
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             self.remember_not_found(repo, &local, digest.as_str()).await;
@@ -795,7 +886,7 @@ impl Registry {
         }
         let max = self.inner.config.max_blob_bytes;
         if response.content_length().is_some_and(|l| l > max) {
-            return Err(OciError::too_large(max));
+            return Err(Failure::new(ImageError::TooLarge { limit: max }));
         }
         let body = response.bytes_stream().map_err(std::io::Error::other);
         let staged = self
@@ -805,11 +896,11 @@ impl Registry {
             .await?;
         if !digest.matches(&staged.sha256, &staged.sha512_base64) {
             tracing::warn!(repo = %repo.name, image = %local, %digest, "registry proxy: upstream blob does not match its digest");
-            return Err(OciError::unavailable(
+            return Err(Failure::unavailable(
                 "the upstream served a blob that does not match its digest",
             ));
         }
-        // A small blob may be an image config (read while it is at hand).
+        // A small blob may be a config (read while it is at hand).
         let small = if staged.size <= MAX_CONFIG_BYTES as u64 {
             tokio::fs::read(&staged.temp_path).await.ok()
         } else {
@@ -828,24 +919,25 @@ impl Registry {
             stored.ingest_token,
         )
         .await
-        .map_err(OciError::from)
+        .map_err(Failure::from)
         .and_then(require_linked)?;
         tx.commit().await?;
         if let Some(bytes) = small {
-            self.backfill_platform(repo, &local, digest, bytes.len() as i64, None, Some(bytes))
+            self.complete_summaries(repo, &local, digest, bytes.len() as i64, None, Some(bytes))
                 .await;
         }
         self.hosted_blob(repo, &local, digest).await
     }
 
     /// A proxy caches a manifest before its config: once the config blob
-    /// `digest` is cached, its platform completes the summaries of the
-    /// image's manifests that name it. Best effort.
-    async fn backfill_platform(
+    /// `digest` is cached, what it holds (an image's platform, a chart's
+    /// metadata) completes the summaries of the image's manifests that name
+    /// it as their config. Best effort.
+    async fn complete_summaries(
         &self,
         repo: &Repository,
         image: &str,
-        digest: &Digest,
+        digest: &ContentDigest,
         size: i64,
         stored: Option<BlobRef<'_>>,
         bytes: Option<Vec<u8>>,
@@ -854,14 +946,15 @@ impl Registry {
             return;
         }
         let pool = &self.inner.pool;
-        match oci_dao::config_needs_platform(pool, repo.id, image, digest.as_str()).await {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(e) => {
-                tracing::warn!(error = %e, "registry proxy: platform lookup failed");
-                return;
-            }
-        }
+        let media_type =
+            match oci_dao::config_media_type(pool, repo.id, image, digest.as_str()).await {
+                Ok(Some(media_type)) => media_type,
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::warn!(error = %e, "registry proxy: summary lookup failed");
+                    return;
+                }
+            };
         let bytes = match (bytes, stored) {
             (Some(bytes), _) => bytes,
             (None, Some(blob)) => match self.read_manifest_bytes(blob).await {
@@ -870,14 +963,17 @@ impl Registry {
             },
             (None, None) => return,
         };
-        let Some(platform) = manifest::config_platform(&bytes) else {
+        let Some(part) = self.config_summary_part(&media_type, &bytes) else {
             return;
         };
+        let keys: Vec<String> = part.keys().cloned().collect();
+        let mut merged = serde_json::json!({});
+        merge(&mut merged, part);
         if let Err(e) =
-            oci_dao::set_config_platform(pool, repo.id, image, digest.as_str(), &platform.label())
+            oci_dao::complete_config_summary(pool, repo.id, image, digest.as_str(), &merged, &keys)
                 .await
         {
-            tracing::warn!(error = %e, "registry proxy: recording an image platform failed");
+            tracing::warn!(error = %e, "registry proxy: completing manifest summaries failed");
         }
     }
 
@@ -887,14 +983,14 @@ impl Registry {
         image: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OciResult<Option<TagPage>> {
-        let local = proxied_image(repo, image);
+    ) -> ImgResult<Option<TagPage>> {
+        let local = self.proxied_image(repo, image);
         if repo.online {
             match self.upstream_tags(repo, &local, last, limit).await {
                 Ok(Some(tags)) => return Ok(Some(tags)),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(
-                    repo = %repo.name, image = %local, error = %e.message,
+                    repo = %repo.name, image = %local, error = %e.message(),
                     "registry proxy: upstream tag list unavailable; listing cached tags"
                 ),
             }
@@ -902,104 +998,44 @@ impl Registry {
         self.local_tags(repo, &local, last, limit).await
     }
 
-    /// Up to `limit` of the upstream's tags of `local` after `last`. Asks
-    /// for one more than that, to know whether there are more, and follows
-    /// the upstream's own pages (`Link: rel="next"`, back to the upstream
-    /// only) for up to [`MAX_UPSTREAM_TAG_PAGES`] requests. An upstream that
-    /// refuses so large an `n` (400, as registries that cap it answer) is
-    /// asked again without one: its own page size and links take over.
+    /// Up to `limit` of the upstream's tags of `local` after `last`, as the
+    /// images format reads them.
     async fn upstream_tags(
         &self,
         repo: &Repository,
         local: &str,
         last: Option<&str>,
         limit: usize,
-    ) -> OciResult<Option<TagPage>> {
+    ) -> ImgResult<Option<TagPage>> {
         let upstream = self.upstream(repo).await?;
-        let first = |n: Option<usize>| {
-            let mut query = url::form_urlencoded::Serializer::new(String::new());
-            if let Some(n) = n {
-                query.append_pair("n", &n.to_string());
-            }
-            if let Some(last) = last {
-                query.append_pair("last", last);
-            }
-            let query = query.finish();
-            if query.is_empty() {
-                format!("/v2/{local}/tags/list")
-            } else {
-                format!("/v2/{local}/tags/list?{query}")
-            }
+        let op = UpstreamOp::ImageTags {
+            image: local.to_string(),
+            last: last.map(str::to_string),
+            n: u32::try_from(limit).unwrap_or(u32::MAX),
         };
-        let scope = format!("repository:{local}:pull");
-        let mut tags: BTreeSet<String> = BTreeSet::new();
-        let mut path = Some(first(Some(limit.saturating_add(1))));
-        let mut sized = true;
-        let mut pages = 0;
-        let mut left_out = false;
-        while let Some(current) = path.take() {
-            let response = upstream
-                .send(Method::GET, &current, &scope, None, RequestClass::Metadata)
-                .await?;
-            if pages == 0 {
-                if response.status() == reqwest::StatusCode::NOT_FOUND {
-                    return Ok(None);
-                }
-                if response.status() == reqwest::StatusCode::BAD_REQUEST && sized {
-                    sized = false;
-                    path = Some(first(None));
-                    continue;
-                }
-            }
-            if !response.status().is_success() {
-                return Err(upstream_status(response.status()));
-            }
-            pages += 1;
-            let next = next_link(&response, &upstream.base);
-            #[derive(serde::Deserialize)]
-            struct TagList {
-                #[serde(default)]
-                tags: Option<Vec<String>>,
-            }
-            let body = read_limited(response, MAX_LISTING_BYTES).await?;
-            let list: TagList = serde_json::from_slice(&body)
-                .map_err(|_| OciError::unavailable("the upstream served an invalid tag list"))?;
-            tags.extend(
-                list.tags
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|t| reference::valid_tag(t))
-                    .filter(|t| last.is_none_or(|l| t.as_bytes() > l.as_bytes())),
-            );
-            if tags.len() > limit {
-                break;
-            }
-            match next {
-                Some(next) if pages < MAX_UPSTREAM_TAG_PAGES => path = Some(next),
-                Some(_) => left_out = true,
-                None => {}
-            }
+        match upstream.converse(self, &op).await? {
+            UpstreamAnswer::ImageTags(page) => Ok(page),
+            UpstreamAnswer::Failed(reason) => Err(Failure::unavailable(reason)),
+            other => Err(Failure::internal(
+                "upstream tags",
+                format!("the images format answered {other:?}"),
+            )),
         }
-        let more = left_out || tags.len() > limit;
-        Ok(Some(TagPage {
-            tags: tags.into_iter().take(limit).collect(),
-            more,
-        }))
     }
 
     pub(crate) async fn proxy_referrers(
         &self,
         repo: &Repository,
         image: &str,
-        subject: &Digest,
-    ) -> OciResult<Vec<ReferrerDescriptor>> {
-        let local = proxied_image(repo, image);
+        subject: &ContentDigest,
+    ) -> ImgResult<Vec<ManifestInfo>> {
+        let local = self.proxied_image(repo, image);
         if repo.online {
             match self.upstream_referrers(repo, &local, subject).await {
                 Ok(Some(referrers)) => return Ok(referrers),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(
-                    repo = %repo.name, image = %local, error = %e.message,
+                    repo = %repo.name, image = %local, error = %e.message(),
                     "registry proxy: upstream referrers unavailable; listing cached ones"
                 ),
             }
@@ -1011,54 +1047,21 @@ impl Registry {
         &self,
         repo: &Repository,
         local: &str,
-        subject: &Digest,
-    ) -> OciResult<Option<Vec<ReferrerDescriptor>>> {
+        subject: &ContentDigest,
+    ) -> ImgResult<Option<Vec<ManifestInfo>>> {
         let upstream = self.upstream(repo).await?;
-        let response = upstream
-            .send(
-                Method::GET,
-                &format!("/v2/{local}/referrers/{subject}"),
-                &format!("repository:{local}:pull"),
-                Some(media::OCI_INDEX),
-                RequestClass::Metadata,
-            )
-            .await?;
-        if !response.status().is_success() {
-            // 404: the upstream has no referrers API (clients fall back to
-            // the tag scheme, which a proxy serves like any tag).
-            return Ok(None);
+        let op = UpstreamOp::ImageReferrers {
+            image: local.to_string(),
+            digest: subject.to_string(),
+        };
+        match upstream.converse(self, &op).await? {
+            UpstreamAnswer::ImageReferrers(found) => Ok(found),
+            UpstreamAnswer::Failed(reason) => Err(Failure::unavailable(reason)),
+            other => Err(Failure::internal(
+                "upstream referrers",
+                format!("the images format answered {other:?}"),
+            )),
         }
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Desc {
-            media_type: Option<String>,
-            digest: String,
-            size: i64,
-            artifact_type: Option<String>,
-            annotations: Option<serde_json::Value>,
-        }
-        #[derive(serde::Deserialize)]
-        struct Index {
-            #[serde(default)]
-            manifests: Vec<Desc>,
-        }
-        let body = read_limited(response, MAX_LISTING_BYTES).await?;
-        let index: Index = serde_json::from_slice(&body)
-            .map_err(|_| OciError::unavailable("the upstream served an invalid referrers list"))?;
-        Ok(Some(
-            index
-                .manifests
-                .into_iter()
-                .filter(|d| Digest::parse(&d.digest).is_ok() && d.size >= 0)
-                .map(|d| ReferrerDescriptor {
-                    media_type: d.media_type.unwrap_or_else(|| media::OCI_MANIFEST.into()),
-                    digest: d.digest,
-                    size: d.size,
-                    artifact_type: d.artifact_type,
-                    annotations: d.annotations,
-                })
-                .collect(),
-        ))
     }
 }
 
@@ -1117,42 +1120,5 @@ mod tests {
         );
         assert_eq!(parse_challenge("Negotiate"), None);
         assert_eq!(parse_challenge("Bearer service=\"x\""), None);
-    }
-
-    #[test]
-    fn docker_hub_library_names() {
-        let mut repo = test_repo();
-        repo.remote_url = Some("https://registry-1.docker.io".into());
-        assert_eq!(proxied_image(&repo, "nginx"), "library/nginx");
-        assert_eq!(proxied_image(&repo, "bitnami/nginx"), "bitnami/nginx");
-        repo.remote_url = Some("https://ghcr.io".into());
-        assert_eq!(proxied_image(&repo, "nginx"), "nginx");
-        assert_eq!(upstream_base("https://ghcr.io/v2/"), "https://ghcr.io");
-        assert_eq!(
-            upstream_base("https://r.example/prefix/"),
-            "https://r.example/prefix"
-        );
-    }
-
-    fn test_repo() -> Repository {
-        Repository {
-            id: 1,
-            name: "hub".into(),
-            format: "docker".into(),
-            kind: "proxy".into(),
-            anonymous_read: false,
-            online: true,
-            config: serde_json::json!({}),
-            remote_url: None,
-            package_delay_seconds: 0,
-            upstream_username: None,
-            upstream_password: None,
-            upstream_password_enc: None,
-            metadata_ttl_seconds: None,
-            not_found_ttl_seconds: None,
-            allow_redeploy: false,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
     }
 }

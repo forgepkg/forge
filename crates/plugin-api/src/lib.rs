@@ -7,17 +7,22 @@
 //! package bytes — so a plugin is small and never sees a credential, a
 //! storage key, or a whole package in memory.
 //!
-//! A format stores package versions, or files under paths (raw): its
-//! [`Descriptor`] says which (`storage`). A files format has no identity
-//! rules and no packages to read: it keeps the defaults of those methods and
-//! implements the protocol over the host's file store ([`Query::File`] …
-//! [`Query::Remove`], [`Action::ServeFile`]).
+//! A format stores package versions, files under paths (raw), or images
+//! (Docker / OCI): its [`Descriptor`] says which (`storage`). A files format
+//! has no identity rules and no packages to read: it keeps the defaults of
+//! those methods and implements the protocol over the host's file store
+//! ([`Query::File`] … [`Query::Remove`], [`Action::ServeFile`]). An images
+//! format implements it over the host's image store ([`images`]): it splits
+//! request paths ([`FormatPlugin::image_path`]), reads manifests
+//! ([`FormatPlugin::parse_manifest`]) and answers in its own words what the
+//! host refused ([`FormatPlugin::image_error`]).
 //!
 //! A plugin is a crate under `crates/formats/<id>/` implementing
 //! [`FormatPlugin`], describing itself with a [`Descriptor`], linked into
 //! the server and called directly (NuGet, raw).
 
 pub mod files;
+pub mod images;
 mod types;
 
 #[cfg(feature = "testing")]
@@ -28,6 +33,8 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 pub use types::*;
+
+use images::{ArtifactFiles, ImageError, ImagePath, ParsedManifest};
 
 /// A package the host staged, lent to [`FormatPlugin::parse_package`].
 pub trait PackageSource: Read + Seek {}
@@ -141,5 +148,57 @@ pub trait FormatPlugin: Send + Sync + 'static {
         Err(FormatError::Internal(
             "this format has no proxy repositories".into(),
         ))
+    }
+
+    /// Images formats: split the path of a request below the format's mount
+    /// (`/docker-hosted/team/app/manifests/latest`) into the name the
+    /// client wrote and the endpoint, with what the request needs. The host
+    /// resolves the name and authorizes the request with it before
+    /// [`Self::handle`]; an error is answered with [`Self::image_error`].
+    /// The default knows no endpoint.
+    fn image_path(&self, method: &str, path: &str) -> Result<ImagePath, ImageError> {
+        let _ = (method, path);
+        Err(ImageError::NotAnEndpoint)
+    }
+
+    /// Images formats: the response to a request the host refused, or to
+    /// what failed while it served it outside a query ([`ImageError`]).
+    /// The host adds its own headers (a Bearer challenge). The default is
+    /// a plain-text error.
+    fn image_error(&self, error: &ImageError) -> Response {
+        Response::text(500, &format!("{error:?}"))
+    }
+
+    /// Images formats: what a manifest names and says. `content_type` is
+    /// the one it was pushed or fetched with, if any. The host stages a
+    /// pushed manifest (at most [`images::MAX_MANIFEST_BYTES`]) and checks
+    /// what it names before it commits it; a proxy's manifests are read the
+    /// same way. The default reads none.
+    fn parse_manifest(
+        &self,
+        manifest: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<ParsedManifest, FormatError> {
+        let _ = (manifest, content_type);
+        Err(FormatError::MalformedManifest(
+            "this format stores no images".into(),
+        ))
+    }
+
+    /// Images formats: the part of a manifest's summary its config blob
+    /// ([`ParsedManifest::config`], of `media_type`) holds, as a JSON object
+    /// the host merges into the summary (an image's platform, a chart's
+    /// metadata). The default has none.
+    fn config_summary(&self, media_type: &str, config: &[u8]) -> Option<String> {
+        let _ = (media_type, config);
+        None
+    }
+
+    /// Images formats: the files the web UI shows of an artifact, read
+    /// from the blob [`ParsedManifest::files`] names, which the host lends
+    /// positioned at its start. The default reads none.
+    fn artifact_files(&self, blob: &mut dyn PackageSource) -> ArtifactFiles {
+        let _ = blob;
+        ArtifactFiles::default()
     }
 }
