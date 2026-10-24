@@ -35,6 +35,12 @@ services:
       # bootstrap admin@example.com/changeme below); a real deployment overrides them and
       # leaves this unset.
       FORGE_SERVER__ALLOW_INSECURE_DEFAULTS: "true"
+      # DEV ONLY: secret encryption with the development root key that
+      # `cargo xtask run` / `dev` use too (base64 of
+      # dev-root-key-for-local-forge-001). A real deployment generates its own
+      # (`openssl rand -base64 32`) and keeps it with its backups.
+      FORGE_CRYPTO__ROOT__PROVIDER: "env"
+      FORGE_ROOT_KEY: "ZGV2LXJvb3Qta2V5LWZvci1sb2NhbC1mb3JnZS0wMDE="
       # The image bakes no bootstrap admin (env only): the dev stack creates
       # admin@example.com/changeme. Anonymous reads and passwords over Basic start
       # off; `cargo xtask seed` turns both on (Admin → Settings in the web UI).

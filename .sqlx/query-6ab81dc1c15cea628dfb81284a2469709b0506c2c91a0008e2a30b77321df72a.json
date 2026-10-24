@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository SET upstream_username = 'svc' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6ab81dc1c15cea628dfb81284a2469709b0506c2c91a0008e2a30b77321df72a"
+}

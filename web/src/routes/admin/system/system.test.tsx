@@ -10,8 +10,7 @@ import { renderApp } from '~/test/renderApp'
 /**
  * The system screen (`/manage/system`), driven against the real route tree
  * and query hooks:
- *  - the secret encryption's keys, or the plaintext warning without
- *    `[crypto]` (and then no rotation);
+ *  - the secret encryption's keys and root key version;
  *  - each rotation asks first, posts to its layer, reports what it did and
  *    reads the keys again; a held rotation lock reads as a retryable conflict;
  *  - the blob cache's numbers, or its absence, with the answering instance.
@@ -25,10 +24,8 @@ const adminMe: Me = {
 
 const instance = { host: 'forge-7d9c', started_at: '2026-10-23T06:00:00Z' }
 
-const enabledKeys: CryptoKeys = {
-  enabled: true,
+const cryptoKeys: CryptoKeys = {
   root_key_version: 'v2',
-  plaintext_backfill_pending: false,
   keys: [
     {
       layer: 'dek',
@@ -109,7 +106,7 @@ function mockApi(h: ApiHandlers) {
     const path = new URL(raw, 'http://localhost').pathname
     const method = (init?.method ?? 'GET').toUpperCase()
     if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
-    if (path.endsWith('/admin/crypto/keys')) return Promise.resolve(json(h.keys ?? enabledKeys))
+    if (path.endsWith('/admin/crypto/keys')) return Promise.resolve(json(h.keys ?? cryptoKeys))
     const rotate = /\/admin\/crypto\/rotate\/(\w+)$/.exec(path)
     if (rotate && method === 'POST') {
       return Promise.resolve(h.onRotate ? h.onRotate(rotate[1]) : json({}))
@@ -152,16 +149,7 @@ describe('admin system screen', () => {
     expect(within(rows[0]).getByText('root v2')).toBeInTheDocument()
     expect(within(rows[2]).getByText('KEK 2')).toBeInTheDocument()
     const panel = screen.getByRole('region', { name: 'Secret encryption' })
-    expect(within(panel).getByText('none left')).toBeInTheDocument()
-  })
-
-  it('warns about plaintext secrets and offers no rotation without [crypto]', async () => {
-    mockApi({ keys: { enabled: false, keys: [] } })
-    await renderApp('/manage/system')
-
-    expect(await screen.findByText('Secrets are stored in plaintext')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Rotate DEK' })).toBeNull()
-    expect(screen.queryByRole('table', { name: 'Encryption keys' })).toBeNull()
+    expect(within(panel).getByText('Root key version')).toBeInTheDocument()
   })
 
   it('rotates the data key after confirming, reports it and reads the keys again', async () => {

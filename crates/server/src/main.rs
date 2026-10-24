@@ -97,39 +97,30 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("ensure bootstrap admin")?;
 
-    // Secret encryption at rest. Building the envelope service reads
-    // the root key (env/file) and FAILS STARTUP on a bad/missing key — an
-    // operator who configured encryption never gets a silently-plaintext
-    // instance. Bootstrap then idempotently creates the active KEK/DEK and
-    // backfills the secrets still stored in plaintext.
+    // Secret encryption at rest. Building the envelope service reads the
+    // root key (env/file) and FAILS STARTUP on a bad/missing key. Bootstrap
+    // then idempotently creates the active KEK/DEK.
     let envelope = forge_server::crypto::build_envelope(&config, &pool)
         .context("build secret-encryption envelope service")?;
-    if let (Some(env), Some(crypto_cfg)) = (&envelope, config.crypto.as_ref()) {
-        forge_server::crypto::bootstrap(&pool, env, crypto_cfg)
-            .await
-            .context("bootstrap secret encryption")?;
-    }
-    if envelope.is_none() {
-        forge_server::crypto::refuse_sealed_secrets_without_envelope(&pool).await?;
-    }
+    forge_server::crypto::bootstrap(&pool, &envelope, &config.crypto)
+        .await
+        .context("bootstrap secret encryption")?;
 
     // Import of the legacy [oidc] / [auth.upstream_basic] blocks into
     // auth_realm rows (drift-detected); the DB is the authority. After the
     // crypto bootstrap so seeded realm secrets are encrypted at rest.
-    ensure_auth_realms(&config, &pool, envelope.as_deref())
+    ensure_auth_realms(&config, &pool, &envelope)
         .await
         .context("ensure auth realms")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
     // Registry (`/v2`) tokens are signed with one key shared by every
     // instance: docker.token_secret, or the install's generated key.
-    let registry_keys =
-        forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
-            .await
-            .context("load the registry token key")?;
-    let state = AppState::new(pool, blob_store, cache, config)
-        .with_envelope(envelope)
-        .with_registry_keys(registry_keys);
+    let registry_keys = forge_server::registry::load_token_keys(&config, &pool, &envelope)
+        .await
+        .context("load the registry token key")?;
+    let state =
+        AppState::new(pool, blob_store, cache, config, envelope).with_registry_keys(registry_keys);
     let layer = principal_layer(&state)?;
     let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);
 

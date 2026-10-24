@@ -1678,7 +1678,7 @@ impl Ctx<'_> {
         let url = format!("{}{}", remote.trim_end_matches('/'), forward.path);
         let credentials = match forge_core::repo::proxy::upstream_auth(
             &self.state.pool,
-            self.state.envelope.as_ref(),
+            &self.state.envelope,
             &source,
             self.format.upstream_bearer_token(),
         )

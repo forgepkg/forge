@@ -115,7 +115,7 @@ impl Files<'_> {
     }
 
     async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, FileError> {
-        upstream_credentials(&self.state.pool, self.state.envelope.as_ref(), repo)
+        upstream_credentials(&self.state.pool, &self.state.envelope, repo)
             .await
             .map_err(|e| FileError::Internal(format!("proxy credentials: {e}")))
     }

@@ -268,15 +268,15 @@ no quoting, and configuration errors never print their values.
 | `FORGE_S3__ACCESS_KEY` / `FORGE_S3__SECRET_KEY` | Object-store credentials, or instead `FORGE_S3__CREDENTIALS` for [short-lived credentials](#short-lived-s3-credentials). |
 | `FORGE_S3__FORCE_PATH_STYLE` | `true` for MinIO and most self-hosted stores, `false` for AWS. |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` / `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin, named by a [UPN](#usernames) (default `admin@example.com`), and its password. Without the password no bootstrap admin is created. |
-| `FORGE_CRYPTO__ROOT__PROVIDER` + root key | Turns on secret encryption at rest; see below. |
+| `FORGE_CRYPTO__ROOT__PROVIDER` + root key | **Required**: the root key of the [secret encryption](#secret-encryption-at-rest), e.g. `FORGE_CRYPTO__ROOT__PROVIDER=env` with `FORGE_ROOT_KEY=<openssl rand -base64 32>`. |
 | `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. Every address in these ranges chooses the client IP Forge sees: a whole pod network trusts every pod in the cluster, which can then get around the login lockout and the anonymous allowlist. Keep the ranges as narrow as the proxies allow, and let only the proxies reach Forge (see [Reverse proxy](#reverse-proxy): on Kubernetes the Helm chart's `networkPolicy.from`, the kustomize `network-policy` component). |
 
 Startup refuses the known placeholder credentials (a `changeme` bootstrap
 password, `minioadmin` S3 keys, and a secret still holding a `<…>` placeholder
-of the example env files, such as `<initial admin password>`). It logs a
-warning when `public_base_url` is
-not https, points at localhost, or secret encryption is off. Treat those
-warnings as deployment errors.
+of the example env files, such as `<initial admin password>`) and a
+configuration without a root key. It logs a warning when `public_base_url`
+is not https or points at localhost. Treat those warnings as deployment
+errors.
 
 Never set `FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` in production. It is
 meant only for the local compose stack.
@@ -536,8 +536,8 @@ email.
   secret and refresh token) are write-only: the page and
   `GET /admin/settings/email` say only whether one is set. Saving without it
   keeps the stored one, unless the SMTP host or username, the Graph tenant
-  or app, or the OAuth issuer or mailbox changed. With [secret
-  encryption](#secret-encryption-at-rest) on they are sealed at rest.
+  or app, or the OAuth issuer or mailbox changed. They are sealed at rest
+  ([secret encryption](#secret-encryption-at-rest)).
 - **Send test email** sends a message with the stored settings, to the
   address you enter or to your own (your UPN), even while sending is turned
   off, and shows the server's error when it fails. The page also shows the
@@ -684,9 +684,9 @@ client secret ([Email](#email)), the generated registry-token key
 (without `docker.token_secret`) and the keys Forge signs its OIDC client
 assertions with (a realm with a federated credential) are stored with
 double-envelope encryption:
-DEK → KEK → a root key that never enters the database. Without a `[crypto]`
-section these values are stored in **plaintext**. Enable it before you
-configure proxies or realms:
+DEK → KEK → a root key that never enters the database. Encryption is
+**required**: the `[crypto]` section names exactly one root provider, and
+Forge refuses to start without a usable root key, naming what to set:
 
 ```bash
 openssl rand -base64 32          # generate the root key once; store it in your secret manager
@@ -697,19 +697,20 @@ FORGE_ROOT_KEY=<base64 32 bytes>
 # FORGE_CRYPTO__ROOT__ROOT_KEY_PATH=/run/secrets/forge_root_key
 ```
 
-The root key is part of your backup. Without it, stored secrets cannot be
-recovered, although packages and metadata are unaffected. AWS KMS is not
-supported yet.
+The Helm chart uses the `env` provider and refuses to render without
+`FORGE_ROOT_KEY` (in `secretEnv`, `existingSecret` or `env`); the kustomize
+base sets the provider, and `forge.env` holds the key.
 
-Enabling encryption on an existing installation is safe, but enable it on
-**every instance at once** (a full restart, not a rolling one): at startup
-(and on every pass of the rotation worker) existing plaintext proxy passwords,
-realm secrets, the registry-token key and the OIDC issuer keys are encrypted
-and the plaintext
-copies are removed, and an
-instance still running without `[crypto]` cannot read them from then on.
-Turning encryption off again is not supported: an instance without `[crypto]`
-refuses to start while the database holds encrypted secrets.
+The root key is part of your backup. Without it, stored secrets cannot be
+recovered: they have to be entered again (proxy passwords, realm secrets,
+the email credentials), and Forge generates a new registry-token key and new
+issuer keys. Packages and metadata are unaffected. AWS KMS is not supported
+yet.
+
+There is no plaintext mode: every instance needs the same root key, and a
+secret is never written unencrypted. An install upgraded from 1.x that ran
+without `[crypto]` enables it on 1.x first (the 1.x startup encrypts the
+stored secrets); see the 2.0.0 upgrade notes in the changelog.
 
 Each encrypted secret is bound to its row and to where it is sent: a proxy
 password to the origin (scheme, host and port) of the repository's
@@ -723,8 +724,8 @@ be entered again through the API. For a realm, that is an edit
 (`PATCH /admin/realms/{id}` or the realm form) that includes the secret:
 until then the realm is skipped at login, and an edit without the secret
 answers 400 naming it.
-`GET /admin/crypto/keys` reports `plaintext_backfill_pending: false` once no
-plaintext secret is left. Key rotations (`POST /admin/crypto/rotate/{dek,kek,root}`
+`GET /admin/crypto/keys` reports the keys' metadata and the current
+`root_key_version`. Key rotations (`POST /admin/crypto/rotate/{dek,kek,root}`
 and the worker's age-based rotation) are serialized across all instances; a
 rotation requested while another one runs is answered with `409 Conflict` and
 can simply be retried.
@@ -851,7 +852,7 @@ probes rather than a Docker `HEALTHCHECK`.
 
 Forge starts listening only **after** startup work is done: database
 migrations, the bucket check, the bootstrap admin, the secret-encryption
-bootstrap and backfill. On the first start of a new version (migrations) or
+bootstrap. On the first start of a new version (migrations) or
 against a slow database this can take a while, and `/healthz` does not answer
 until then. Give the container a **startup probe** on `/healthz` with a
 generous budget, so the liveness probe does not restart it mid-migration.

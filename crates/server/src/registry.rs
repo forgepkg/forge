@@ -116,9 +116,8 @@ pub(crate) fn amend_registry_rejection(
 
 /// The registry-token signing keys: derived from `docker.token_secret`, or
 /// the install's generated key (created on first use and shared by every
-/// instance through `forge_setting`; sealed with the envelope service when
-/// secret encryption is enabled, and re-sealed by DEK rotation like every
-/// other secret).
+/// instance through `forge_setting`; sealed with the envelope service, and
+/// re-sealed by DEK rotation like every other secret).
 ///
 /// A stored key is replaced only when it can never be opened (malformed, or
 /// sealed under a data key that does not open it). A database, key store or
@@ -127,7 +126,7 @@ pub(crate) fn amend_registry_rejection(
 pub async fn load_token_keys(
     config: &Config,
     pool: &PgPool,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
 ) -> anyhow::Result<TokenKeys> {
     if let Some(secret) = &config.docker.token_secret {
         let mut hasher = sha2::Sha256::new();
@@ -199,7 +198,7 @@ pub fn spawn_token_key_refresh(state: AppState) -> tokio::task::JoinHandle<()> {
             if seen.as_deref() == Some(stored.as_str()) {
                 continue;
             }
-            match open_key(&stored, state.envelope.as_deref()).await {
+            match open_key(&stored, &state.envelope).await {
                 Ok(key) => {
                     if state.registry_keys.rotate_to(key) {
                         tracing::info!("picked up a new registry token key");
@@ -229,7 +228,7 @@ fn new_key() -> Vec<u8> {
 /// setting). Bad key material counts as malformed.
 async fn open_key(
     stored: &str,
-    envelope: Option<&EnvelopeService>,
+    envelope: &EnvelopeService,
 ) -> Result<Vec<u8>, secret_dao::SecretDbError> {
     let malformed = || secret_dao::SecretDbError::MalformedSetting(TOKEN_KEY_SETTING.to_string());
     let secret = secret_dao::open_secret_setting(envelope, TOKEN_KEY_SETTING, stored).await?;

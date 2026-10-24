@@ -206,6 +206,14 @@ impl AnonMode {
     }
 }
 
+/// The root key every stack seals its secrets under: 32 fixed bytes, base64
+/// — a *test* key, never used outside tests. One key for every stack: stacks
+/// sharing a database (the `encryption_key` rows) must reach the same root.
+const ROOT_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+/// The env var the stacks' `[crypto]` section reads [`ROOT_KEY`] from.
+const ROOT_KEY_VAR: &str = "FORGE_E2E_ROOT_KEY";
+
 #[allow(clippy::too_many_arguments)]
 fn config_toml(
     db_url: &str,
@@ -248,6 +256,7 @@ fn config_toml(
         let quoted: Vec<String> = trusted_proxies.iter().map(|t| format!("{t:?}")).collect();
         format!("trusted_proxy_cidrs = [{}]\n", quoted.join(", "))
     };
+    std::env::set_var(ROOT_KEY_VAR, ROOT_KEY);
     format!(
         r#"
 [server]
@@ -262,6 +271,10 @@ endpoint = "{s3_endpoint}"
 bucket = "{bucket}"
 force_path_style = true
 {s3_credentials}
+
+[crypto.root]
+provider = "env"
+root_key_env = "{ROOT_KEY_VAR}"
 
 [auth]
 {trusted}{auth_block}{bootstrap}
@@ -522,8 +535,15 @@ impl StackBuilder {
             .await
             .expect("bootstrap admin");
 
+        // Secret encryption, as `main` builds and bootstraps it.
+        let envelope =
+            forge_server::crypto::build_envelope(&config, &pool).expect("envelope service");
+        forge_server::crypto::bootstrap(&pool, &envelope, &config.crypto)
+            .await
+            .expect("bootstrap secret encryption");
+
         // Seed auth realms from the [oidc]/[auth.upstream_basic] config blocks.
-        forge_server::app::ensure_auth_realms(&config, &pool, None)
+        forge_server::app::ensure_auth_realms(&config, &pool, &envelope)
             .await
             .expect("seed auth realms");
 
@@ -533,11 +553,11 @@ impl StackBuilder {
                 .expect("connect redis L2"),
             None => Cache::l1_only(config.cache.l1_max_capacity),
         };
-        let registry_keys = forge_server::registry::load_token_keys(&config, &pool, None)
+        let registry_keys = forge_server::registry::load_token_keys(&config, &pool, &envelope)
             .await
             .expect("registry token key");
-        let state =
-            AppState::new(pool.clone(), store, cache, config).with_registry_keys(registry_keys);
+        let state = AppState::new(pool.clone(), store, cache, config, envelope)
+            .with_registry_keys(registry_keys);
         // The access policy is stored in the database: password Basic on
         // (tests sign in over Basic), the stack's anonymous mode, and any
         // further settings. A peer on the same database stores the same.

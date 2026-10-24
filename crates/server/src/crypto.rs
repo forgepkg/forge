@@ -1,23 +1,22 @@
 //! Secret-encryption wiring: build the envelope service from config, bootstrap
-//! the key hierarchy at startup, and run the cluster-coordinated
-//! rotation/backfill worker.
+//! the key hierarchy at startup, and run the cluster-coordinated rotation
+//! worker.
 //!
-//! ## Enable story
+//! ## Startup
 //!
-//! Encryption is **opt-in** via the `[crypto]` config section (TOML +
-//! `FORGE_CRYPTO__*` env). Absent/disabled ⇒ secrets are stored in plaintext.
-//! Enabled ⇒
+//! Encryption is **mandatory**: the `[crypto]` config section (TOML +
+//! `FORGE_CRYPTO__*` env) is required, and every secret is sealed.
 //!
 //! 1. startup builds the root provider (env/file) and **refuses to boot** on a
-//!    missing/short root key (fail closed, never silently plaintext);
+//!    missing/short root key;
 //! 2. [`bootstrap`] idempotently creates the active KEK + DEK (atomic
 //!    create-if-absent in the key store — two instances starting together
-//!    create exactly one) and runs a first backfill pass so existing plaintext
-//!    `upstream_password` rows and auth-realm secrets are wrapped immediately;
-//! 3. the [`spawn_worker`] loop keeps the system converged: plaintext
-//!    backfill, the DEK re-encrypt sweep, retire/revoke bookkeeping, age-based
-//!    DEK/KEK rotation, and the root re-wrap sweep (after an operator swaps
-//!    the root key).
+//!    create exactly one) and checks every KEK opens under the configured
+//!    root(s);
+//! 3. the [`spawn_worker`] loop keeps the system converged: the DEK
+//!    re-encrypt sweep, retire/revoke bookkeeping, age-based DEK/KEK
+//!    rotation, and the root re-wrap sweep (after an operator swaps the root
+//!    key).
 //!
 //! ## Cluster coordination
 //!
@@ -121,39 +120,10 @@ pub async fn try_rotation_lock(pool: &PgPool) -> anyhow::Result<Option<RotationL
     Ok(Some(guard))
 }
 
-/// Refuse to run without an envelope service while the database holds sealed
-/// secrets. Such an instance would serve 500 for every proxy with
-/// credentials, skip the OIDC and credential-forwarding realms whose secrets
-/// are sealed, and store new secrets in plaintext; that is what a deployment
-/// gets when a manifest drops `FORGE_CRYPTO__ROOT__PROVIDER`.
-pub async fn refuse_sealed_secrets_without_envelope(pool: &PgPool) -> anyhow::Result<()> {
-    let sealed = secret_dao::sealed_secrets_present(pool)
-        .await
-        .context("check for sealed secrets")?;
-    if sealed {
-        anyhow::bail!(
-            "the database holds encrypted secrets but secret encryption is not configured \
-             (no [crypto] section / FORGE_CRYPTO__ROOT__PROVIDER): restore the crypto \
-             configuration and its root key; turning encryption off once secrets are \
-             sealed is not supported"
-        );
-    }
-    Ok(())
-}
-
-/// Build the [`EnvelopeService`] from the `[crypto]` config, or `None` when
-/// the section is absent/disabled. Errors (unknown provider, missing or
-/// malformed root key) must abort startup — an operator who configured
-/// encryption never gets a silently-plaintext instance.
-pub fn build_envelope(
-    config: &Config,
-    pool: &PgPool,
-) -> anyhow::Result<Option<Arc<EnvelopeService>>> {
-    let Some(crypto) = config.crypto.as_ref().filter(|c| c.enabled) else {
-        tracing::info!("secret encryption at rest is disabled (no [crypto] config)");
-        return Ok(None);
-    };
-
+/// Build the [`EnvelopeService`] from the `[crypto]` config. Errors (unknown
+/// provider, missing or malformed root key) must abort startup.
+pub fn build_envelope(config: &Config, pool: &PgPool) -> anyhow::Result<Arc<EnvelopeService>> {
+    let crypto = &config.crypto;
     let algorithm = Algorithm::parse(&crypto.algorithm)
         .map_err(|e| anyhow::anyhow!("crypto.algorithm: {e}"))?;
 
@@ -197,17 +167,14 @@ pub fn build_envelope(
     tracing::info!(
         provider = %crypto.root.provider,
         algorithm = %algorithm,
-        "secret encryption at rest enabled"
+        "secret encryption root key loaded"
     );
-    Ok(Some(Arc::new(service)))
+    Ok(Arc::new(service))
 }
 
-/// Startup bootstrap: ensure the active KEK + DEK exist and run a first
-/// backfill pass so plaintext rows (written before encryption was enabled) are
-/// wrapped — and their plaintext cleared — right away (the worker keeps
-/// backfilling if this instance loses the race / more rows appear).
-/// Also verifies every KEK is unwrappable under the configured root(s) so a
-/// botched root rotation surfaces at boot, not at the first secret read.
+/// Startup bootstrap: ensure the active KEK + DEK exist, and verify every KEK
+/// is unwrappable under the configured root(s) so a botched root rotation
+/// surfaces at boot, not at the first secret read.
 pub async fn bootstrap(
     pool: &PgPool,
     envelope: &Arc<EnvelopeService>,
@@ -227,54 +194,10 @@ pub async fn bootstrap(
         .await
         .context("verify/re-wrap KEKs under the configured root")?;
 
-    let batch = crypto.rotation.sweep_batch_size.max(1);
-    let mut total = 0usize;
-    loop {
-        let done = secret_dao::backfill_upstream_passwords(pool, envelope, batch)
-            .await
-            .context("backfill plaintext upstream passwords")?;
-        total += done;
-        if done < usize::try_from(batch).unwrap_or(usize::MAX) {
-            break;
-        }
-    }
-    if total > 0 {
-        tracing::info!(
-            rows = total,
-            "moved plaintext upstream passwords into envelopes (plaintext cleared)"
-        );
-    }
-    let realms = secret_dao::backfill_realm_secrets(pool, envelope, crate::auth::secret_keys)
-        .await
-        .context("backfill plaintext realm secrets")?;
-    if realms > 0 {
-        tracing::info!(realms, "encrypted plaintext auth-realm secrets at rest");
-    }
-    let settings = secret_dao::backfill_secret_settings(pool, envelope)
-        .await
-        .context("backfill plaintext secret settings")?;
-    if settings > 0 {
-        tracing::info!(settings, "encrypted plaintext secret settings at rest");
-    }
-    let imports = secret_dao::backfill_import_passwords(pool, envelope)
-        .await
-        .context("backfill plaintext import passwords")?;
-    if imports > 0 {
-        tracing::info!(
-            imports,
-            "encrypted plaintext Nexus import passwords at rest"
-        );
-    }
-    if secret_dao::backfill_email_secrets(pool, envelope)
-        .await
-        .context("backfill plaintext email settings secrets")?
-    {
-        tracing::info!("encrypted the plaintext email settings secrets at rest");
-    }
-
     // Secrets sealed by earlier builds are bound to their row only: re-seal
     // them for the destination they are sent to (the rotation worker repeats
     // this, but it may be disabled). Rows already converged cost one open.
+    let batch = crypto.rotation.sweep_batch_size.max(1);
     let resealed = reseal_all(pool, envelope, batch)
         .await
         .context("re-seal secrets for their destination")?;
@@ -313,7 +236,7 @@ async fn reseal_all(
     Ok(resealed)
 }
 
-/// Spawn the rotation/backfill worker loop. Each tick tries the cluster-wide
+/// Spawn the rotation worker loop. Each tick tries the cluster-wide
 /// advisory lock and, when held, runs one full [`rotation_pass`]. Returns
 /// `None` when the worker is disabled by config.
 pub fn spawn_worker(
@@ -359,9 +282,8 @@ async fn locked_rotation_pass(
 ///    keys within the same pass;
 /// 2. **root re-wrap** (no-op unless the operator rotated the root);
 /// 3. **DEK re-wrap under the active KEK** (no-op unless a KEK rotated);
-/// 4. **plaintext backfill** (no-op once every row is wrapped);
-/// 5. **DEK re-encrypt sweep** over secret ciphertext;
-/// 6. **revoke** now-unreferenced retiring DEKs/KEKs.
+/// 4. **DEK re-encrypt sweep** over secret ciphertext;
+/// 5. **revoke** now-unreferenced retiring DEKs/KEKs.
 async fn rotation_pass(
     pool: &PgPool,
     envelope: &Arc<EnvelopeService>,
@@ -397,35 +319,13 @@ async fn rotation_pass(
     envelope.rewrap_keks().await.context("root re-wrap sweep")?;
     envelope.rewrap_deks().await.context("KEK re-wrap sweep")?;
 
-    // 4. Plaintext backfill (resumable; processed rows leave the predicate).
+    // 4. DEK re-encrypt sweep (keyset-paginated over the secret columns).
     let batch = cfg.sweep_batch_size.max(1);
-    loop {
-        let done = secret_dao::backfill_upstream_passwords(pool, envelope, batch)
-            .await
-            .context("plaintext backfill")?;
-        if done < usize::try_from(batch).unwrap_or(usize::MAX) {
-            break;
-        }
-    }
-    secret_dao::backfill_realm_secrets(pool, envelope, crate::auth::secret_keys)
-        .await
-        .context("realm secrets backfill")?;
-    secret_dao::backfill_secret_settings(pool, envelope)
-        .await
-        .context("secret settings backfill")?;
-    secret_dao::backfill_import_passwords(pool, envelope)
-        .await
-        .context("import passwords backfill")?;
-    secret_dao::backfill_email_secrets(pool, envelope)
-        .await
-        .context("email settings secrets backfill")?;
-
-    // 5. DEK re-encrypt sweep (keyset-paginated over the secret columns).
     reseal_all(pool, envelope, batch)
         .await
         .context("DEK re-encrypt sweep")?;
 
-    // 6. Revoke keys nothing references anymore.
+    // 5. Revoke keys nothing references anymore.
     secret_dao::revoke_unreferenced_deks(pool, envelope)
         .await
         .context("revoke unreferenced DEKs")?;

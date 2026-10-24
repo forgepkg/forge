@@ -93,9 +93,8 @@ expires no later than the key or CI token it was got with. Registry tokens
 are accepted under `/v2` only.
 
 Registry tokens are signed with `docker.token_secret` when set, otherwise
-with a key Forge generates once and keeps in the database (sealed with the
-`[crypto]` envelope key when secret encryption is enabled, and re-sealed by
-DEK rotation like the other secrets), so every instance accepts every
+with a key Forge generates once and keeps in the database (sealed by the
+secret encryption, and re-sealed by DEK rotation like the other secrets), so every instance accepts every
 instance's tokens. An instance replaces the stored key only when it can
 never be opened (a database or key-store error fails startup instead); the
 running instances pick the new key up within 30 seconds and keep accepting
@@ -187,7 +186,7 @@ docker pull forge.example.com/docker-hub/nginx:1.27
 - Upstream credentials are optional; give Docker Hub ones to raise its pull
   rate limit. They are sent to the upstream and to the token service its
   `401` challenge names (Docker Hub's `auth.docker.io`), over https when the
-  upstream is https. With secret encryption they are sealed at rest.
+  upstream is https. They are sealed at rest.
 - Blobs and manifests pulled by digest are verified against their digest and
   cached for good. A tag is served from the cache for `metadata_ttl_seconds`
   (default 600) and then re-validated with a `HEAD`, which Docker Hub does not

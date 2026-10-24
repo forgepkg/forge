@@ -746,7 +746,7 @@ jobs:
             helm package "$CHART_DIR" --destination "$RUNNER_TEMP/chart"
             package="$RUNNER_TEMP/chart/forge-${VERSION}.tgz"
           fi
-          rendered=$(helm template forge "$package" --show-only templates/deployment.yaml | sed -n 's/^ *image: *//p' | tr -d '"')
+          rendered=$(helm template forge "$package" --show-only templates/deployment.yaml --set secretEnv.FORGE_ROOT_KEY=check-only | sed -n 's/^ *image: *//p' | tr -d '"')
           if [ "$rendered" != "${IMAGE}:${VERSION}@${DIGEST}" ]; then
             echo "::error::the packaged chart deploys '$rendered', not ${IMAGE}:${VERSION}@${DIGEST}"
             exit 1

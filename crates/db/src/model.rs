@@ -94,14 +94,6 @@ pub struct Repository {
     pub remote_url: Option<String>,
     pub package_delay_seconds: i32,
     pub upstream_username: Option<String>,
-    /// Plaintext upstream password: the storage of deployments **without**
-    /// secret encryption at rest. With `[crypto]` enabled it is
-    /// superseded by [`Self::upstream_password_enc`]: new writes go through
-    /// the envelope service (which clears this column), and the backfill pass
-    /// moves existing values into the envelope and NULLs this column in the
-    /// same guarded UPDATE. Until a row is backfilled it remains that row's
-    /// read fallback.
-    pub upstream_password: Option<String>,
     /// Envelope-encrypted upstream password: an opaque AEAD blob
     /// bound to this row. Decrypted **only** via
     /// [`crate::secret_dao::get_upstream_password`] at the proxy upstream
@@ -114,9 +106,8 @@ pub struct Repository {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Manual `Debug` that **redacts the upstream password**: the plaintext column
-/// value must never land in a log line, and the ciphertext blob is reduced to
-/// its byte length (its content is opaque and only adds noise).
+/// Manual `Debug` that reduces the sealed upstream password to its byte length
+/// (its content is opaque and only adds noise).
 impl std::fmt::Debug for Repository {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Repository")
@@ -130,10 +121,6 @@ impl std::fmt::Debug for Repository {
             .field("remote_url", &self.remote_url)
             .field("package_delay_seconds", &self.package_delay_seconds)
             .field("upstream_username", &self.upstream_username)
-            .field(
-                "upstream_password",
-                &self.upstream_password.as_ref().map(|_| "<redacted>"),
-            )
             .field(
                 "upstream_password_enc",
                 &self
@@ -156,10 +143,10 @@ impl Repository {
         RepoKind::from(self.kind.as_str())
     }
 
-    /// Whether an upstream password is stored (encrypted or, pre-backfill,
-    /// plaintext). The value itself is never exposed through the model.
+    /// Whether an upstream password is stored. The value itself is never
+    /// exposed through the model.
     pub fn has_upstream_password(&self) -> bool {
-        self.upstream_password_enc.is_some() || self.upstream_password.is_some()
+        self.upstream_password_enc.is_some()
     }
 
     /// Group option (stored in `config.prefer_hosted`, default **on**): when a

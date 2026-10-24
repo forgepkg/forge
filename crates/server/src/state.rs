@@ -82,12 +82,10 @@ pub struct AppState {
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
     pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
-    /// Secret encryption at rest. `None` ⇒ disabled: secrets use the legacy
-    /// plaintext columns and `/admin/crypto/*` reports disabled.
+    /// Secret encryption at rest: seals and opens every secret Forge keeps.
     /// Built fallibly by [`crate::crypto::build_envelope`] **before**
-    /// [`AppState::new`] (a configured-but-broken root key must abort startup)
-    /// and attached via [`AppState::with_envelope`].
-    pub envelope: Option<std::sync::Arc<forge_crypto::service::EnvelopeService>>,
+    /// [`AppState::new`] (a missing or broken root key must abort startup).
+    pub envelope: Arc<forge_crypto::service::EnvelopeService>,
     /// Pooled, timeout- and size-bounded client for proxy upstream traffic,
     /// built once from `[proxy]` and shared by every proxy repository.
     pub upstream: UpstreamHttp,
@@ -298,7 +296,9 @@ impl FormatResolver for RegistryResolver {
 }
 
 impl AppState {
-    /// Construct state from its parts.
+    /// Construct state from its parts. `envelope` seals the secrets: the realm
+    /// secrets, the issuer keys, the email settings' secrets and the upstream
+    /// passwords.
     ///
     /// Authentication runtimes (the password chain, the OIDC login flow) are
     /// **not** built here: they live behind [`RealmAuth`], which rebuilds them
@@ -306,7 +306,13 @@ impl AppState {
     /// shared by every login path; it, the lockout and authorization's public
     /// read follow the auth settings ([`AuthSettingsCache`]), read from the
     /// database on demand too.
-    pub fn new(pool: PgPool, blob_store: BlobStore, cache: Cache, config: Config) -> Self {
+    pub fn new(
+        pool: PgPool,
+        blob_store: BlobStore,
+        cache: Cache,
+        config: Config,
+        envelope: Arc<forge_crypto::service::EnvelopeService>,
+    ) -> Self {
         let staging = forge_storage::Staging::new(config.staging_dir(), config.staging_budget())
             .unwrap_or_else(|e| {
                 // main() already created the directory at startup; this only
@@ -338,13 +344,15 @@ impl AppState {
         );
         let sessions = auth_settings.sessions().clone();
         let cookie_secure = config.public_base_url().starts_with("https://");
-        let assertion_issuer = AssertionIssuer::new(pool.clone(), None, config.public_base_url());
+        let assertion_issuer =
+            AssertionIssuer::new(pool.clone(), envelope.clone(), config.public_base_url());
         let realms = Arc::new(RealmAuth::new(
             pool.clone(),
             cache.clone(),
             config.clone(),
             assertion_issuer.clone(),
             auth_settings.clone(),
+            envelope.clone(),
         ));
         let upstream = UpstreamHttp::new(config.proxy.upstream_http()).unwrap_or_else(|e| {
             tracing::error!(error = %e, "failed to build the configured proxy upstream client; using defaults");
@@ -375,7 +383,6 @@ impl AppState {
             login_throttle,
             invitation_throttle,
             oidc_login_starts,
-            envelope: None,
             upstream,
             registry_keys: crate::images::token::TokenKeys::new(vec![{
                 use rand::Rng;
@@ -386,11 +393,12 @@ impl AppState {
             instance: Arc::new(Instance::current()),
             mailer: Arc::new(crate::email::Mailer::new(
                 pool_for_mailer,
-                None,
+                envelope.clone(),
                 assertion_issuer.clone(),
                 &config_for_mailer,
             )),
             assertion_issuer,
+            envelope,
         }
     }
 
@@ -437,42 +445,6 @@ impl AppState {
             })),
             plugin: plugin.implementation().clone(),
         })
-    }
-
-    /// Attach the secret-encryption envelope service. Kept out of
-    /// [`AppState::new`] because building it reads the root key and must be
-    /// able to fail startup; `None` keeps encryption disabled.
-    pub fn with_envelope(
-        mut self,
-        envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
-    ) -> Self {
-        // Realm secrets may be encrypted too (P1.5), and so are the issuer
-        // keys: rebuild both (still unshared and empty) with the envelope
-        // attached.
-        self.assertion_issuer = AssertionIssuer::new(
-            self.pool.clone(),
-            envelope.clone(),
-            self.config.public_base_url(),
-        );
-        self.realms = Arc::new(
-            RealmAuth::new(
-                self.pool.clone(),
-                self.cache.clone(),
-                self.config.clone(),
-                self.assertion_issuer.clone(),
-                self.auth_settings.clone(),
-            )
-            .with_envelope(envelope.clone()),
-        );
-        // The email settings' secrets are sealed with it too.
-        self.mailer = Arc::new(crate::email::Mailer::new(
-            self.pool.clone(),
-            envelope.clone(),
-            self.assertion_issuer.clone(),
-            &self.config,
-        ));
-        self.envelope = envelope;
-        self
     }
 
     /// Install further format plugins next to the built-in formats (the
@@ -560,8 +532,8 @@ impl AppState {
             format,
             self.cas.clone(),
             self.cache.clone(),
+            self.envelope.clone(),
         )
-        .with_envelope(self.envelope.clone())
         .with_http(self.upstream.clone())
         .with_blob_fetch(self.blob_bytes())
         .with_download_tally(self.downloads.clone())
@@ -652,7 +624,7 @@ pub struct MemberFactory {
     cache: Cache,
     formats: Arc<FormatRegistry>,
     /// Proxy members decrypt their upstream password through this.
-    envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
+    envelope: Arc<forge_crypto::service::EnvelopeService>,
     /// Shared proxy upstream client.
     upstream: UpstreamHttp,
     /// Shared download counts.
@@ -679,8 +651,8 @@ impl MemberOpsFactory for MemberFactory {
                     format,
                     self.cas.clone(),
                     self.cache.clone(),
+                    self.envelope.clone(),
                 )
-                .with_envelope(self.envelope.clone())
                 .with_http(self.upstream.clone())
                 .with_blob_fetch(Arc::new(BlobBytes {
                     store: self.blob_store.clone(),

@@ -16,9 +16,6 @@ config:
     region: eu-central-1
     bucket: forge
     force_path_style: false
-  crypto:
-    root:
-      provider: env
   oidc:
     issuer: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0
     client_id: 00000000-0000-0000-0000-000000000000

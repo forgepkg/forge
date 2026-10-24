@@ -82,14 +82,12 @@ pub struct Config {
     /// for an `oidc` auth realm (see [`OidcConfig`]).
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
-    /// Optional secret encryption at rest. Absent/disabled ⇒ secrets stay in
-    /// the legacy plaintext columns (no key bootstrap, rotation worker, or
-    /// backfill). Present + enabled ⇒ proxy `upstream_password` writes are
-    /// envelope-encrypted under the root → KEK → DEK hierarchy, existing
-    /// plaintext is backfilled at startup, and the `/admin/crypto/*` endpoints
-    /// are live.
+    /// Secret encryption at rest, required: every secret Forge keeps in
+    /// PostgreSQL is sealed under the root → KEK → DEK hierarchy, and the
+    /// `/admin/crypto/*` endpoints rotate it. Without a root provider
+    /// validation refuses the configuration, naming what to set.
     #[serde(default)]
-    pub crypto: Option<CryptoConfig>,
+    pub crypto: CryptoConfig,
     /// Optional local disk cache for blobs. Absent (no `path`) ⇒ every
     /// download reads S3.
     #[serde(default)]
@@ -685,8 +683,7 @@ fn default_providers() -> Vec<String> {
 /// status/whoami endpoint). The `key_pepper` is a **secret**: it keys the
 /// validated-credential cache HMAC and is **redacted** from `Debug` (and any
 /// config dump), like the proxy `upstream_password` and the OIDC
-/// `client_secret`; once seeded into a realm it is encrypted at rest when
-/// `[crypto]` is enabled.
+/// `client_secret`; once seeded into a realm it is encrypted at rest.
 ///
 /// Unknown keys are refused, like in a realm config set through the admin
 /// API: a misspelled `identity_path` or `required_groups` would otherwise
@@ -1382,8 +1379,8 @@ pub struct DockerConfig {
     #[serde(default = "default_docker_token_ttl_seconds")]
     pub token_ttl_seconds: u64,
     /// Secret the registry tokens are signed with (at least 32 characters).
-    /// Unset: a random key is generated once and kept in the database (sealed
-    /// with `[crypto]` when that is enabled), shared by every instance.
+    /// Unset: a random key is generated once and kept in the database
+    /// (sealed), shared by every instance.
     #[serde(default)]
     pub token_secret: Option<String>,
     /// An upload session idle this long is abandoned and removed. Default
@@ -1643,7 +1640,7 @@ fn default_web_assets_dir() -> String {
 /// `client_secret` is read from env/file and **redacted** from the `Debug`
 /// impl (and must be redacted from any admin API that echoes config), like
 /// the proxy `upstream_password`; once seeded into a realm it is encrypted at
-/// rest when `[crypto]` is enabled.
+/// rest.
 ///
 /// Unknown keys are refused, like in a realm config set through the admin
 /// API: a misspelled `required_claims` would otherwise seed the realm with
@@ -1831,7 +1828,8 @@ fn default_admin_claim() -> String {
     "roles".into()
 }
 
-/// `crypto.*` — secret encryption at rest.
+/// `crypto.*` — secret encryption at rest (required: a configuration without
+/// a root provider is refused).
 ///
 /// No field here is itself a secret: the **env provider** stores the *name* of
 /// the environment variable holding the base64 root key and the **file
@@ -1840,16 +1838,13 @@ fn default_admin_claim() -> String {
 /// zeroizing, Debug-redacted newtypes). The derived `Debug` is therefore safe.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CryptoConfig {
-    /// Master switch. `false` parses but keeps encryption off (lets an
-    /// operator stage the block before flipping it on).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// AEAD for new keys and new secret envelopes:
     /// `aes-256-gcm` (default) or `xchacha20-poly1305`. Existing material
     /// keeps the algorithm recorded on its key row / blob header.
     #[serde(default = "default_crypto_algorithm")]
     pub algorithm: String,
     /// Where the root key lives.
+    #[serde(default)]
     pub root: CryptoRootConfig,
     /// Unwrapped-key cache tuning.
     #[serde(default)]
@@ -1863,7 +1858,9 @@ pub struct CryptoConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CryptoRootConfig {
     /// `"env"` | `"file"`. (`"aws-kms"` is reserved for the later KMS provider
-    /// and is rejected at startup until it ships.)
+    /// and is rejected at startup until it ships.) Empty (the default) is
+    /// refused: secret encryption needs a root key.
+    #[serde(default)]
     pub provider: String,
     /// env provider: name of the env var holding the base64 32-byte root key.
     #[serde(default = "default_root_key_env")]
@@ -1881,6 +1878,29 @@ pub struct CryptoRootConfig {
     /// file provider: optional path of the **previous** root key.
     #[serde(default)]
     pub root_key_path_previous: Option<String>,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        CryptoConfig {
+            algorithm: default_crypto_algorithm(),
+            root: CryptoRootConfig::default(),
+            cache: CryptoCacheConfig::default(),
+            rotation: CryptoRotationConfig::default(),
+        }
+    }
+}
+
+impl Default for CryptoRootConfig {
+    fn default() -> Self {
+        CryptoRootConfig {
+            provider: String::new(),
+            root_key_env: default_root_key_env(),
+            root_key_env_previous: None,
+            root_key_path: None,
+            root_key_path_previous: None,
+        }
+    }
 }
 
 /// `crypto.cache.*` — the bounded, zeroizing L1 of unwrapped keys.
@@ -1904,11 +1924,11 @@ impl Default for CryptoCacheConfig {
     }
 }
 
-/// `crypto.rotation.*` — the cluster-coordinated rotation/backfill worker.
+/// `crypto.rotation.*` — the cluster-coordinated rotation worker.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CryptoRotationConfig {
-    /// Run the background worker (backfill, sweeps, age-based rotation) on
-    /// this instance. Admin-triggered rotation works regardless.
+    /// Run the background worker (sweeps, age-based rotation) on this
+    /// instance. Admin-triggered rotation works regardless.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Worker poll interval (seconds).
@@ -1922,7 +1942,7 @@ pub struct CryptoRotationConfig {
     /// `0` disables age-based KEK rotation.
     #[serde(default = "default_kek_max_age_days")]
     pub kek_max_age_days: i64,
-    /// Rows per backfill / re-encrypt sweep batch (each batch is its own
+    /// Rows per re-encrypt sweep batch (each batch is its own
     /// transaction-free unit; the sweep is keyset-paginated and resumable).
     #[serde(default = "default_sweep_batch_size")]
     pub sweep_batch_size: i64,
@@ -2574,12 +2594,10 @@ impl Config {
             "database.acquire_timeout_seconds",
             self.database.acquire_timeout_seconds > 0,
         )?;
-        if let Some(crypto) = self.crypto.as_ref().filter(|c| c.enabled) {
-            positive(
-                "crypto.rotation.poll_interval_seconds",
-                !crypto.rotation.enabled || crypto.rotation.poll_interval_seconds > 0,
-            )?;
-        }
+        positive(
+            "crypto.rotation.poll_interval_seconds",
+            !self.crypto.rotation.enabled || self.crypto.rotation.poll_interval_seconds > 0,
+        )?;
         Ok(())
     }
 
@@ -2611,13 +2629,6 @@ impl Config {
                 "server.public_base_url ({base}) is not https: session cookies are issued \
                  without Secure; terminate TLS in front of Forge and use an https:// URL"
             ));
-        }
-        if !self.crypto.as_ref().is_some_and(|c| c.enabled) {
-            warnings.push(
-                "secret encryption at rest is disabled (no [crypto] section): upstream \
-                 passwords and auth-realm secrets are stored in plaintext in PostgreSQL"
-                    .to_string(),
-            );
         }
         let plain_sts = self.s3.credentials == S3CredentialsMode::WebIdentity
             && self
@@ -2738,20 +2749,25 @@ impl Config {
         )))
     }
 
-    /// Validate the optional `[crypto]` section when present and enabled: the
-    /// algorithm name must parse and the root provider must be a supported
-    /// kind with the fields it needs. The root key **bytes** are deliberately
-    /// not read here — that happens once at startup when the provider is
-    /// built, so a missing/short key still refuses to boot, just with the more
-    /// precise root-provider error.
+    /// Validate the required `[crypto]` section: the algorithm name must
+    /// parse and the root provider must be a supported kind with the fields it
+    /// needs. The root key **bytes** are deliberately not read here — that
+    /// happens once at startup when the provider is built, so a missing/short
+    /// key still refuses to boot, just with the more precise root-provider
+    /// error.
     fn validate_crypto(&self) -> Result<(), ConfigError> {
-        let Some(crypto) = &self.crypto else {
-            return Ok(());
-        };
-        if !crypto.enabled {
-            return Ok(());
+        let crypto = &self.crypto;
+        if crypto.root.provider.is_empty() {
+            return Err(ConfigError::Invalid(
+                "secret encryption needs a root key: set crypto.root.provider to \"env\" \
+                 (FORGE_CRYPTO__ROOT__PROVIDER=env) with the base64 32-byte key in \
+                 FORGE_ROOT_KEY (generate one with `openssl rand -base64 32`), or to \
+                 \"file\" (FORGE_CRYPTO__ROOT__PROVIDER=file) with the path of a file \
+                 holding it in crypto.root.root_key_path \
+                 (FORGE_CRYPTO__ROOT__ROOT_KEY_PATH)"
+                    .into(),
+            ));
         }
-
         at_most_100_years(
             "crypto.cache.unwrapped_key_ttl_secs",
             i128::from(crypto.cache.unwrapped_key_ttl_secs),
@@ -3059,6 +3075,28 @@ mod tests {
         access_key = "test"
         secret_key = "test"
 
+        [crypto.root]
+        provider = "env"
+
+        [auth]
+    "#;
+
+    /// [`MINIMAL`] without its `[crypto]` section, for the tests that write
+    /// their own.
+    const NO_CRYPTO: &str = r#"
+        [server]
+        bind = "0.0.0.0:8080"
+        public_base_url = "https://forge.example.com/"
+
+        [database]
+        url = "postgres://forge:forge@localhost/forge"
+
+        [s3]
+        endpoint = "http://localhost:7070"
+        bucket = "forge"
+        access_key = "test"
+        secret_key = "test"
+
         [auth]
     "#;
 
@@ -3067,16 +3105,15 @@ mod tests {
     }
 
     #[test]
-    fn deployment_warnings_flag_http_loopback_and_plaintext_secrets() {
+    fn deployment_warnings_flag_http_and_loopback() {
         let https = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
         let w = https.deployment_warnings();
-        assert_eq!(w.len(), 1, "only the missing [crypto] section: {w:?}");
-        assert!(w[0].contains("plaintext"));
+        assert!(w.is_empty(), "{w:?}");
 
         let local = MINIMAL.replace("https://forge.example.com/", "http://localhost:8421");
         let cfg = Config::from_figment(fig_from_toml(&local)).expect("valid");
         let w = cfg.deployment_warnings();
-        assert_eq!(w.len(), 3, "{w:?}");
+        assert_eq!(w.len(), 2, "{w:?}");
         assert!(w.iter().any(|m| m.contains("not https")));
         assert!(w.iter().any(|m| m.contains("NuGet clients")));
 
@@ -4545,6 +4582,7 @@ mod tests {
             jail.set_env("FORGE_DATABASE__URL", "postgres://forge:pw@db/forge");
             jail.set_env("FORGE_S3__ACCESS_KEY", "real-access");
             jail.set_env("FORGE_S3__SECRET_KEY", "real-secret");
+            jail.set_env("FORGE_CRYPTO__ROOT__PROVIDER", "env");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml")))
                 .expect("the image starts without any bootstrap password");
             assert!(cfg.auth.bootstrap_admin.is_none());
@@ -4574,6 +4612,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.create_file("forge.toml", baked)?;
             jail.set_env("FORGE_DATABASE__URL", "postgres://forge:pw@db/forge");
+            jail.set_env("FORGE_CRYPTO__ROOT__PROVIDER", "env");
             let err = Config::load(Some(std::path::Path::new("forge.toml"))).unwrap_err();
             assert!(err.to_string().contains("FORGE_S3__ACCESS_KEY"), "{err}");
 
@@ -4743,17 +4782,30 @@ mod tests {
     // ── [crypto] secret encryption at rest ───────────────────────────────────
 
     #[test]
-    fn crypto_absent_means_disabled() {
-        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
-        assert!(cfg.crypto.is_none());
+    fn crypto_is_required() {
+        for toml in [
+            NO_CRYPTO.to_string(),
+            format!("{NO_CRYPTO}\n[crypto]\nalgorithm = \"aes-256-gcm\"\n"),
+            format!("{NO_CRYPTO}\n[crypto.root]\nroot_key_env = \"FORGE_ROOT_KEY\"\n"),
+        ] {
+            let err = Config::from_figment(fig_from_toml(&toml))
+                .unwrap_err()
+                .to_string();
+            for setting in [
+                "FORGE_CRYPTO__ROOT__PROVIDER",
+                "FORGE_ROOT_KEY",
+                "FORGE_CRYPTO__ROOT__ROOT_KEY_PATH",
+            ] {
+                assert!(err.contains(setting), "{setting} not named: {err}");
+            }
+        }
     }
 
     #[test]
     fn crypto_env_provider_parses_with_defaults() {
-        let toml = format!("{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"env\"\n");
+        let toml = format!("{NO_CRYPTO}\n[crypto]\n[crypto.root]\nprovider = \"env\"\n");
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
-        let crypto = cfg.crypto.expect("present");
-        assert!(crypto.enabled);
+        let crypto = cfg.crypto;
         assert_eq!(crypto.algorithm, "aes-256-gcm");
         assert_eq!(crypto.root.provider, "env");
         assert_eq!(crypto.root.root_key_env, "FORGE_ROOT_KEY");
@@ -4769,28 +4821,28 @@ mod tests {
 
     #[test]
     fn crypto_file_provider_requires_path() {
-        let toml = format!("{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"file\"\n");
+        let toml = format!("{NO_CRYPTO}\n[crypto]\n[crypto.root]\nprovider = \"file\"\n");
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("root_key_path"), "{err}");
 
         let toml = format!(
-            "{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"file\"\nroot_key_path = \"/run/secrets/forge_root_key\"\n"
+            "{NO_CRYPTO}\n[crypto]\n[crypto.root]\nprovider = \"file\"\nroot_key_path = \"/run/secrets/forge_root_key\"\n"
         );
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
         assert_eq!(
-            cfg.crypto.unwrap().root.root_key_path.as_deref(),
+            cfg.crypto.root.root_key_path.as_deref(),
             Some("/run/secrets/forge_root_key")
         );
     }
 
     #[test]
     fn crypto_unknown_provider_and_algorithm_rejected() {
-        let toml = format!("{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"vault\"\n");
+        let toml = format!("{NO_CRYPTO}\n[crypto]\n[crypto.root]\nprovider = \"vault\"\n");
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("crypto.root.provider"), "{err}");
 
         let toml = format!(
-            "{MINIMAL}\n[crypto]\nalgorithm = \"rot13\"\n[crypto.root]\nprovider = \"env\"\n"
+            "{NO_CRYPTO}\n[crypto]\nalgorithm = \"rot13\"\n[crypto.root]\nprovider = \"env\"\n"
         );
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("crypto.algorithm"), "{err}");
@@ -4817,7 +4869,7 @@ mod tests {
             ("rotation", "kek_max_age_days"),
         ] {
             let toml = format!(
-                "{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"env\"\n[crypto.{section}]\n{key} = {max}\n"
+                "{NO_CRYPTO}\n[crypto]\n[crypto.root]\nprovider = \"env\"\n[crypto.{section}]\n{key} = {max}\n"
             );
             let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
             assert!(
@@ -4829,25 +4881,16 @@ mod tests {
 
     #[test]
     fn crypto_aws_kms_rejected_until_it_ships() {
-        let toml = format!("{MINIMAL}\n[crypto]\n[crypto.root]\nprovider = \"aws-kms\"\n");
+        let toml = format!("{NO_CRYPTO}\n[crypto]\n[crypto.root]\nprovider = \"aws-kms\"\n");
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("not supported yet"), "{err}");
-    }
-
-    #[test]
-    fn crypto_disabled_block_skips_validation() {
-        // A staged-but-disabled block with an invalid provider must parse.
-        let toml =
-            format!("{MINIMAL}\n[crypto]\nenabled = false\n[crypto.root]\nprovider = \"vault\"\n");
-        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("disabled block is inert");
-        assert!(!cfg.crypto.unwrap().enabled);
     }
 
     #[test]
     #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
     fn crypto_env_overrides_nested_keys() {
         figment::Jail::expect_with(|jail| {
-            jail.create_file("forge.toml", MINIMAL)?;
+            jail.create_file("forge.toml", NO_CRYPTO)?;
             jail.set_env("FORGE_CRYPTO__ALGORITHM", "xchacha20-poly1305");
             jail.set_env("FORGE_CRYPTO__ROOT__PROVIDER", "env");
             jail.set_env("FORGE_CRYPTO__ROOT__ROOT_KEY_ENV", "MY_ROOT_KEY");
@@ -4859,7 +4902,7 @@ mod tests {
             jail.set_env("FORGE_CRYPTO__ROTATION__DEK_MAX_AGE_DAYS", "7");
             jail.set_env("FORGE_CRYPTO__ROTATION__ENABLED", "false");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
-            let crypto = cfg.crypto.expect("present via env");
+            let crypto = cfg.crypto;
             assert_eq!(crypto.algorithm, "xchacha20-poly1305");
             assert_eq!(crypto.root.root_key_env, "MY_ROOT_KEY");
             assert_eq!(

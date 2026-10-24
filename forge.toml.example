@@ -91,6 +91,44 @@ conditional_writes = "auto"     # (default: "auto")
 # session_name = "forge"          # (default: "forge") RoleSessionName
 # duration_seconds = 3600         # 900..43200 (default: the STS default)
 
+[crypto]
+# Secret encryption at rest, REQUIRED: proxy passwords, realm secrets, the
+# email credentials, the registry-token key and the OIDC issuer keys are
+# sealed under a DEK, wrapped by a KEK, wrapped by a root key held outside the
+# database. Startup refuses a configuration without a usable root key. Keep
+# the root key with your backups: without it the stored secrets cannot be
+# read. See docs/deployment.md, "Secret encryption at rest".
+algorithm = "aes-256-gcm"         # (default) | "xchacha20-poly1305"
+
+[crypto.root]
+# Exactly one provider: "env" or "file".
+provider = "env"
+# env: the NAME of the variable holding the base64 32-byte root key
+# (generate it once with `openssl rand -base64 32`).
+root_key_env = "FORGE_ROOT_KEY"   # (default)
+# Root rotation on a running cluster (docs/deployment.md): the previous key,
+# reachable until every KEK is re-wrapped under the current one.
+# root_key_env_previous = "FORGE_ROOT_KEY_PREVIOUS"
+# file: the path of a file holding the key (a mounted Kubernetes secret).
+# provider = "file"
+# root_key_path = "/run/secrets/forge_root_key"
+# root_key_path_previous = "/run/secrets/forge_root_key_previous"
+
+[crypto.cache]
+# The unwrapped keys in memory (zeroized on eviction).
+unwrapped_key_ttl_secs = 300      # (default: 300)
+unwrapped_key_max = 64            # (default: 64)
+
+[crypto.rotation]
+# The rotation worker: age-based rotation, the re-encrypt sweep and the
+# KEK re-wrap after a root rotation. One instance runs a pass at a time; the
+# admin POST /admin/crypto/rotate/* endpoints take the same lock.
+enabled = true                    # (default: true)
+poll_interval_seconds = 300       # (default: 300)
+dek_max_age_days = 30             # (default: 30; 0 disables)
+kek_max_age_days = 365            # (default: 365; 0 disables)
+sweep_batch_size = 500            # (default: 500) rows per re-encrypt batch
+
 [auth]
 # Anonymous access (mode and IP allowlist), the login screen, passwords over
 # HTTP Basic, the session lifetimes and the login lockout are not configured
@@ -176,7 +214,7 @@ web_login_ttl_seconds = 600  # (default: 600; 60-3600) how long a login approved
 # max_blob_bytes              = 1073741824  # (default: 1 GiB, or what an explicit server.max_staging_bytes holds) largest layer a proxy downloads; staged on disk (pushes follow the repository's upload limit)
 token_ttl_seconds             = 300         # (default: 300) registry token lifetime, 60-3600
 # Signs registry tokens (at least 32 characters). Unset: a key generated once
-# and kept in the database, sealed when [crypto] is enabled.
+# and kept in the database, sealed by the secret encryption.
 # token_secret = "…"
 upload_ttl_seconds            = 86400       # (default: 24 h) abandoned upload sessions expire
 unreferenced_blob_ttl_seconds = 86400       # (default: 24 h, at least 1 h) unused blobs no manifest references

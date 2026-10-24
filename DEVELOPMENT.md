@@ -61,6 +61,12 @@ the full command list.
 > credentials (and the `minioadmin` S3 keys) are only accepted because the dev
 > `forge.toml` sets `server.allow_insecure_defaults = true`; without it the
 > server refuses to start with them.
+>
+> Secret encryption is required, also locally: the dev `forge.toml` reads the
+> root key from `FORGE_ROOT_KEY`, and `cargo xtask run` / `dev` export a fixed
+> development key there unless it is set (`docker-compose.app.yml` sets the
+> same one). Keep using that key with your dev database: the secrets stored in
+> it (proxy passwords, realm secrets, the email settings) are sealed with it.
 
 ### Add demo data (optional)
 
@@ -154,7 +160,9 @@ e2e:list` still enumerates the specs and `pnpm run e2e:tsc` typechecks them.
 
 ```bash
 cargo xtask up                # infra only
-SQLX_OFFLINE=true cargo run -p forge-server   # or: cargo xtask run
+# The dev root key cargo xtask run sets (base64 of dev-root-key-for-local-forge-001).
+FORGE_ROOT_KEY=ZGV2LXJvb3Qta2V5LWZvci1sb2NhbC1mb3JnZS0wMDE= \
+  SQLX_OFFLINE=true cargo run -p forge-server   # or: cargo xtask run
 
 # sign in: the admin API takes a session (or an admin-scoped token), never a
 # password over HTTP Basic. Keep the cookie and echo the CSRF token.
@@ -542,8 +550,8 @@ or stored besides those keys, which Forge generates and rotates itself.
    otherwise internal only needs these two paths exposed.
 
 The keys are RSA-2048 (RS256, the only algorithm Entra accepts from another
-issuer), shared by every instance through the database and sealed like other
-secrets with `[crypto]`. Forge creates them when such a realm is saved or
+issuer), shared by every instance through the database and sealed like the
+other secrets. Forge creates them when such a realm is saved or
 enabled, adds a new key every 30 days and publishes it two days before it
 signs (Entra caches an issuer's keys for up to a day), and keeps the previous
 keys published until the next rotation. An assertion is valid for five

@@ -9,6 +9,9 @@
 # be supplied at runtime via env:
 #   FORGE_DATABASE__URL   FORGE_S3__ENDPOINT   FORGE_S3__BUCKET
 #   FORGE_S3__ACCESS_KEY  FORGE_S3__SECRET_KEY
+#   FORGE_CRYPTO__ROOT__PROVIDER=env with FORGE_ROOT_KEY (the root key of the
+#   secret encryption, `openssl rand -base64 32`), or
+#   FORGE_CRYPTO__ROOT__PROVIDER=file with FORGE_CRYPTO__ROOT__ROOT_KEY_PATH
 # (or, instead of the two keys, short-lived credentials: FORGE_S3__CREDENTIALS
 # = default_chain | web_identity; see docs/deployment.md)
 # and you should set:

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT upstream_password_enc, upstream_password, remote_url\n        FROM repository\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT upstream_password_enc, remote_url\n        FROM repository\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -16,17 +16,6 @@
       },
       {
         "ordinal": 1,
-        "name": "upstream_password",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "repository",
-            "name": "upstream_password"
-          }
-        }
-      },
-      {
-        "ordinal": 2,
         "name": "remote_url",
         "type_info": "Text",
         "origin": {
@@ -44,9 +33,8 @@
     },
     "nullable": [
       true,
-      true,
       true
     ]
   },
-  "hash": "7703bba2bb65f184915f65650abf7da3c161795daa6a736bd7aa5d7a526c5986"
+  "hash": "41186b0bdb462e38fe1d5c42563096c35e97c313c0eee08f6acc1908457b7362"
 }

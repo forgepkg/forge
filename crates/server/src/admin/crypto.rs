@@ -12,10 +12,6 @@
 //!   every KEK under the provider's current root (run it after swapping the
 //!   root key; DEKs + ciphertext untouched).
 //!
-//! When encryption is disabled, `keys` reports `enabled: false` and rotation
-//! returns **409 Conflict** (the operator asked for something the deployment
-//! is not configured to do).
-//!
 //! Rotations take the same cluster-wide advisory lock as the background
 //! rotation worker ([`crate::crypto::try_rotation_lock`]), so at most one
 //! rotation (admin or worker, on any instance) runs at a time; a request that
@@ -89,20 +85,9 @@ fn rotation_in_progress() -> Response {
         .into_response()
 }
 
-fn disabled() -> Response {
-    (
-        StatusCode::CONFLICT,
-        "secret encryption at rest is not enabled (configure [crypto])",
-    )
-        .into_response()
-}
-
 /// `GET /admin/crypto/keys`
 pub async fn list_keys(State(state): State<AppState>) -> Response {
-    let Some(envelope) = &state.envelope else {
-        return Json(json!({ "enabled": false, "keys": [] })).into_response();
-    };
-
+    let envelope = &state.envelope;
     let mut keys = Vec::new();
     for layer in [KeyLayer::Kek, KeyLayer::Dek] {
         match envelope.list_keys(layer).await {
@@ -114,34 +99,8 @@ pub async fn list_keys(State(state): State<AppState>) -> Response {
         Ok(v) => v,
         Err(e) => return crypto_error(e),
     };
-    let backfill_pending = match secret_dao::plaintext_passwords_pending(&state.pool).await {
-        Ok(p) => p,
-        Err(e) => return crypto_error(e),
-    };
-    let realm_backfill_pending =
-        match secret_dao::plaintext_realm_secrets_pending(&state.pool, crate::auth::secret_keys)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => return crypto_error(e),
-        };
-    let settings_backfill_pending = match secret_dao::plaintext_settings_pending(&state.pool).await
-    {
-        Ok(p) => p,
-        Err(e) => return crypto_error(e),
-    };
-    let email_backfill_pending =
-        match secret_dao::plaintext_email_secrets_pending(&state.pool).await {
-            Ok(p) => p,
-            Err(e) => return crypto_error(e),
-        };
     Json(json!({
-        "enabled": true,
         "root_key_version": root_version,
-        "plaintext_backfill_pending": backfill_pending
-            || realm_backfill_pending
-            || settings_backfill_pending
-            || email_backfill_pending,
         "keys": keys,
     }))
     .into_response()
@@ -149,9 +108,6 @@ pub async fn list_keys(State(state): State<AppState>) -> Response {
 
 /// `POST /admin/crypto/rotate/{layer}` with `layer` ∈ `dek` | `kek` | `root`.
 pub async fn rotate(State(state): State<AppState>, Path(layer): Path<String>) -> Response {
-    let Some(envelope) = &state.envelope else {
-        return disabled();
-    };
     if !matches!(layer.as_str(), "dek" | "kek" | "root") {
         return (
             StatusCode::BAD_REQUEST,
@@ -164,7 +120,7 @@ pub async fn rotate(State(state): State<AppState>, Path(layer): Path<String>) ->
         Ok(None) => return rotation_in_progress(),
         Err(e) => return crypto_error(format!("{e:#}")),
     };
-    let response = rotate_locked(&state, envelope, &layer).await;
+    let response = rotate_locked(&state, &state.envelope, &layer).await;
     lock.release().await;
     response
 }

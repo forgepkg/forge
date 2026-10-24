@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password,\n            upstream_password_enc, metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        FROM repository\n        ORDER BY name\n        ",
+  "query": "\n        UPDATE repository SET\n            name = $2,\n            anonymous_read = $3,\n            online = $4,\n            config = $5,\n            remote_url = $6,\n            package_delay_seconds = $7,\n            upstream_username = $8,\n            metadata_ttl_seconds = $9,\n            not_found_ttl_seconds = $10,\n            allow_redeploy = $11,\n            upstream_password_enc = CASE WHEN $12 THEN NULL ELSE upstream_password_enc END,\n            updated_at = now()\n        WHERE id = $1\n        RETURNING\n            id, name, format, kind, anonymous_read, online, config,\n            remote_url, package_delay_seconds, upstream_username, upstream_password_enc,\n            metadata_ttl_seconds, not_found_ttl_seconds,\n            allow_redeploy, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -115,17 +115,6 @@
       },
       {
         "ordinal": 10,
-        "name": "upstream_password",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "repository",
-            "name": "upstream_password"
-          }
-        }
-      },
-      {
-        "ordinal": 11,
         "name": "upstream_password_enc",
         "type_info": "Bytea",
         "origin": {
@@ -136,7 +125,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "metadata_ttl_seconds",
         "type_info": "Int4",
         "origin": {
@@ -147,7 +136,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "not_found_ttl_seconds",
         "type_info": "Int4",
         "origin": {
@@ -158,7 +147,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "allow_redeploy",
         "type_info": "Bool",
         "origin": {
@@ -169,7 +158,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -180,7 +169,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 15,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -192,7 +181,20 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Int8",
+        "Text",
+        "Bool",
+        "Bool",
+        "Jsonb",
+        "Text",
+        "Int4",
+        "Text",
+        "Int4",
+        "Int4",
+        "Bool",
+        "Bool"
+      ]
     },
     "nullable": [
       false,
@@ -208,11 +210,10 @@
       true,
       true,
       true,
-      true,
       false,
       false,
       false
     ]
   },
-  "hash": "b445e0044620e60626c4f5eaaa9904b062db4d76fb5a7cf18c08a96876fa427b"
+  "hash": "3d34b14d3b62f6cfdbdb53243f81a457a4e90b88364d5bea27dd6a1ec8de91e4"
 }

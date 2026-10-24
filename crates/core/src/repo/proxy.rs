@@ -349,36 +349,22 @@ impl Credentials {
 
 /// Resolve the upstream password for the outbound Basic header — the
 /// **single sanctioned decrypt site** of the proxy credential,
-/// shared by every format's proxy: an encrypted row decrypts through
+/// shared by every format's proxy: the sealed password decrypts through
 /// `forge_db::secret_dao` (re-reading the row so the AAD binds to fresh data,
-/// its `remote_url` origin included); a not-yet-backfilled row falls back to
-/// the legacy plaintext column. Returns the password with the `remote_url` it
-/// belongs to. Fail closed: an encrypted blob without a configured envelope
-/// service is an error, not an anonymous fetch.
+/// its `remote_url` origin included). Returns the password with the
+/// `remote_url` it belongs to.
 async fn upstream_password(
     pool: &PgPool,
-    envelope: Option<&Arc<forge_crypto::service::EnvelopeService>>,
+    envelope: &forge_crypto::service::EnvelopeService,
     repo: &Repository,
 ) -> Result<Option<(forge_crypto::PlaintextSecret, Option<String>)>, RepoError> {
-    match (&repo.upstream_password_enc, envelope) {
-        (Some(_), Some(envelope)) => {
-            forge_db::secret_dao::get_upstream_credential(pool, envelope, repo.id)
-                .await
-                .map(|found| found.map(|p| (p.secret, p.remote_url)))
-                .map_err(|e| RepoError::Storage(format!("decrypt upstream password: {e}")))
-        }
-        (Some(_), None) => Err(RepoError::Storage(
-            "repository stores an encrypted upstream password but secret encryption is not \
-             configured (missing [crypto] config)"
-                .into(),
-        )),
-        (None, _) => Ok(repo.upstream_password.clone().map(|password| {
-            (
-                forge_crypto::PlaintextSecret::from(password),
-                repo.remote_url.clone(),
-            )
-        })),
+    if repo.upstream_password_enc.is_none() {
+        return Ok(None);
     }
+    forge_db::secret_dao::get_upstream_credential(pool, envelope, repo.id)
+        .await
+        .map(|found| found.map(|p| (p.secret, p.remote_url)))
+        .map_err(|e| RepoError::Storage(format!("decrypt upstream password: {e}")))
 }
 
 /// The upstream secret of `repo` alone, with the `remote_url` it belongs
@@ -386,7 +372,7 @@ async fn upstream_password(
 /// registries take a token). Decrypted like [`upstream_credentials`].
 pub async fn upstream_secret(
     pool: &PgPool,
-    envelope: Option<&Arc<forge_crypto::service::EnvelopeService>>,
+    envelope: &forge_crypto::service::EnvelopeService,
     repo: &Repository,
 ) -> Result<Option<(forge_crypto::PlaintextSecret, Option<String>)>, RepoError> {
     upstream_password(pool, envelope, repo).await
@@ -398,7 +384,7 @@ pub async fn upstream_secret(
 /// may be newer than the cached `repo` row.
 pub async fn upstream_credentials(
     pool: &PgPool,
-    envelope: Option<&Arc<forge_crypto::service::EnvelopeService>>,
+    envelope: &forge_crypto::service::EnvelopeService,
     repo: &Repository,
 ) -> Result<Option<Credentials>, RepoError> {
     let Some(username) = repo.upstream_username.clone() else {
@@ -421,7 +407,7 @@ pub async fn upstream_credentials(
 /// without one as a Bearer token.
 pub async fn upstream_auth(
     pool: &PgPool,
-    envelope: Option<&Arc<forge_crypto::service::EnvelopeService>>,
+    envelope: &forge_crypto::service::EnvelopeService,
     repo: &Repository,
     bearer_token: bool,
 ) -> Result<Option<Credentials>, RepoError> {
@@ -482,12 +468,8 @@ pub struct ProxyRepo {
     /// Byte access to locally stored blobs (the cached `.nuspec`). `None` ⇒
     /// manifests are only served from upstream.
     blobs: Option<Arc<dyn BlobFetch>>,
-    /// Envelope service decrypting the encrypted `upstream_password_enc`.
-    /// `None` ⇒ secret encryption is not configured; only the
-    /// legacy plaintext column can be used and a row that holds an encrypted
-    /// blob fails the fetch (fail closed — never a silent unauthenticated
-    /// request against a credentialed upstream).
-    envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
+    /// Envelope service decrypting the sealed `upstream_password_enc`.
+    envelope: Arc<forge_crypto::service::EnvelopeService>,
     /// Counts `.nupkg` downloads and writes them in batches.
     downloads: Arc<DownloadTally>,
 }
@@ -503,10 +485,17 @@ impl ProxyRepo {
         self.format.validate_id(&lower).ok().map(|()| lower)
     }
 
-    /// Build a proxy read facade over the process-wide default upstream client.
-    /// It counts downloads in a tally of its own unless it is given the
-    /// process's ([`Self::with_download_tally`]).
-    pub fn new(pool: PgPool, format: Arc<dyn Format>, cas: Cas, cache: Cache) -> Self {
+    /// Build a proxy read facade over the process-wide default upstream client,
+    /// decrypting the upstream password with `envelope`. It counts downloads
+    /// in a tally of its own unless it is given the process's
+    /// ([`Self::with_download_tally`]).
+    pub fn new(
+        pool: PgPool,
+        format: Arc<dyn Format>,
+        cas: Cas,
+        cache: Cache,
+        envelope: Arc<forge_crypto::service::EnvelopeService>,
+    ) -> Self {
         ProxyRepo {
             downloads: DownloadTally::new(pool.clone()),
             pool,
@@ -515,7 +504,7 @@ impl ProxyRepo {
             cache,
             http: UpstreamHttp::shared_default(),
             blobs: None,
-            envelope: None,
+            envelope,
         }
     }
 
@@ -538,23 +527,12 @@ impl ProxyRepo {
         self
     }
 
-    /// Attach the envelope service so this proxy can decrypt an encrypted
-    /// `upstream_password_enc`. Without it, only legacy plaintext
-    /// passwords work and encrypted rows fail closed.
-    pub fn with_envelope(
-        mut self,
-        envelope: Option<Arc<forge_crypto::service::EnvelopeService>>,
-    ) -> Self {
-        self.envelope = envelope;
-        self
-    }
-
     /// The Basic credentials for `repo`'s upstream (see
     /// [`upstream_credentials`]).
     async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, RepoError> {
         upstream_auth(
             &self.pool,
-            self.envelope.as_ref(),
+            &self.envelope,
             repo,
             self.format.upstream_bearer_token(),
         )

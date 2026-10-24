@@ -438,8 +438,7 @@ pub async fn create(
         )
         .await?;
         if let Some(password) = &password {
-            secret_dao::set_import_password(&mut tx, state.envelope.as_deref(), id, password)
-                .await?;
+            secret_dao::set_import_password(&mut tx, &state.envelope, id, password).await?;
         }
         tx.commit().await?;
         Ok::<_, secret_dao::SecretDbError>(id)
@@ -576,13 +575,8 @@ pub async fn resume(
         let retried = import_dao::requeue(&mut tx, import.id, retry, body.items.as_deref()).await?;
         if retried.is_some() {
             if let Some(password) = &password {
-                secret_dao::set_import_password(
-                    &mut tx,
-                    state.envelope.as_deref(),
-                    import.id,
-                    password,
-                )
-                .await?;
+                secret_dao::set_import_password(&mut tx, &state.envelope, import.id, password)
+                    .await?;
             }
             tx.commit().await?;
         }

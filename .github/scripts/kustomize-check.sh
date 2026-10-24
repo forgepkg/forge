@@ -57,6 +57,7 @@ secretGenerator:
       - VALKEY_PASSWORD=check
       - FORGE_S3__ACCESS_KEY=check
       - FORGE_S3__SECRET_KEY=check
+      - FORGE_ROOT_KEY=check
 EOF
   render "component-$name" "$scratch/$name"
 done

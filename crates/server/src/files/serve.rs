@@ -287,7 +287,6 @@ mod tests {
             remote_url: None,
             package_delay_seconds: 0,
             upstream_username: None,
-            upstream_password: None,
             upstream_password_enc: None,
             metadata_ttl_seconds: None,
             not_found_ttl_seconds: None,

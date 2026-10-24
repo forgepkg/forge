@@ -4,10 +4,10 @@
 //! Secrets inside a realm `config` (OIDC `client_secret`, credential-forwarding
 //! `key_pepper`) are **write-only**: every response carries a redacted config
 //! (`<key>_set` markers instead of values) and an update that omits/blanks a
-//! secret keeps the stored one. With `[crypto]` enabled they are encrypted at
-//! rest in `auth_realm.secrets_enc` (every write re-encrypts; legacy plaintext
-//! rows are still read). Sealed secrets that no longer decrypt count as
-//! absent: the realm is repaired by an update that sends them again.
+//! secret keeps the stored one. They are encrypted at rest in
+//! `auth_realm.secrets_enc` (every write re-encrypts). Sealed secrets that no
+//! longer decrypt count as absent: the realm is repaired by an update that
+//! sends them again.
 //!
 //! Every successful write invalidates the local realm snapshot so this
 //! instance converges immediately; peers converge within
@@ -284,7 +284,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRealm>
         };
         match secret_dao::insert_realm_with_secrets(
             &state.pool,
-            state.envelope.as_deref(),
+            &state.envelope,
             new,
             secret_keys(&body.kind),
         )
@@ -350,8 +350,7 @@ pub async fn update(
     // outside the API) count as absent, so the update must carry them again:
     // that is how such a realm is repaired.
     let mut secrets_unreadable = false;
-    let existing_config = match secret_dao::realm_config(state.envelope.as_deref(), &existing).await
-    {
+    let existing_config = match secret_dao::realm_config(&state.envelope, &existing).await {
         Ok(c) => c,
         Err(SecretDbError::Crypto(CryptoError::DecryptFailed)) => {
             tracing::warn!(
@@ -390,7 +389,7 @@ pub async fn update(
                 Err(message) => return bad_request(message),
             }
         }
-        // Re-stored below, which also (re-)encrypts legacy plaintext secrets.
+        // Re-stored below, which re-encrypts the secrets.
         None => existing_config,
     };
     if existing.kind == KIND_WORKLOAD_IDENTITY && enabled {
@@ -638,7 +637,7 @@ async fn write_realm_update(
     }
     let row = match secret_dao::update_realm_with_secrets_if_unchanged(
         &mut tx,
-        state.envelope.as_deref(),
+        &state.envelope,
         existing,
         upd,
         secret_keys(&existing.kind),

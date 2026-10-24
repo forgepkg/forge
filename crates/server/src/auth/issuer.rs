@@ -5,8 +5,8 @@
 //!
 //! * [`AssertionIssuer`] — the install's issuer key set. Every instance
 //!   shares it through the `forge_setting` [`ISSUER_KEYS_SETTING`] (sealed
-//!   with the envelope service when secret encryption is enabled, and
-//!   re-sealed by DEK rotation like every other secret). It is created on
+//!   with the envelope service, and re-sealed by DEK rotation like every
+//!   other secret). It is created on
 //!   first use (a federated realm is saved, enabled or signs in), re-read by
 //!   every instance every [`ISSUER_REFRESH`], and rotated by whichever
 //!   instance first finds a rotation due: a compare-and-swap on the setting,
@@ -66,7 +66,7 @@ pub struct AssertionIssuer {
 
 struct Inner {
     pool: PgPool,
-    envelope: Option<Arc<EnvelopeService>>,
+    envelope: Arc<EnvelopeService>,
     /// The issuer URL (`server.public_base_url`, no trailing `/`).
     issuer: String,
     current: RwLock<Current>,
@@ -85,8 +85,8 @@ struct Current {
 
 impl AssertionIssuer {
     /// The issuer `issuer` (the public base URL), keeping its keys in `pool`,
-    /// sealed with `envelope` when secret encryption is enabled.
-    pub fn new(pool: PgPool, envelope: Option<Arc<EnvelopeService>>, issuer: String) -> Self {
+    /// sealed with `envelope`.
+    pub fn new(pool: PgPool, envelope: Arc<EnvelopeService>, issuer: String) -> Self {
         AssertionIssuer {
             inner: Arc::new(Inner {
                 pool,
@@ -243,12 +243,9 @@ impl AssertionIssuer {
     /// Open a stored key set. Key material that does not parse counts as
     /// malformed.
     async fn open(&self, stored: &str) -> Result<IssuerKeySet, secret_dao::SecretDbError> {
-        let secret = secret_dao::open_secret_setting(
-            self.inner.envelope.as_deref(),
-            ISSUER_KEYS_SETTING,
-            stored,
-        )
-        .await?;
+        let secret =
+            secret_dao::open_secret_setting(&self.inner.envelope, ISSUER_KEYS_SETTING, stored)
+                .await?;
         IssuerKeySet::from_stored(secret.expose_secret()).map_err(|error| {
             tracing::warn!(%error, "stored issuer keys do not parse");
             secret_dao::SecretDbError::MalformedSetting(ISSUER_KEYS_SETTING.to_string())
@@ -265,7 +262,7 @@ impl AssertionIssuer {
     ) -> anyhow::Result<Option<String>> {
         secret_dao::store_secret_setting(
             &self.inner.pool,
-            self.inner.envelope.as_deref(),
+            &self.inner.envelope,
             ISSUER_KEYS_SETTING,
             &PlaintextSecret::from(keys.to_stored()),
             expected,

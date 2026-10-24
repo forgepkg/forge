@@ -639,7 +639,7 @@ pub const REFRESH_LOCK_KEY: i64 = 0x666f_7267_6565_6d6c;
 pub struct OauthTokens {
     http: reqwest::Client,
     pool: PgPool,
-    envelope: Option<Arc<EnvelopeService>>,
+    envelope: Arc<EnvelopeService>,
     tokens: tokio::sync::Mutex<HashMap<String, CachedToken>>,
     metadata: tokio::sync::Mutex<HashMap<String, CachedMetadata>>,
 }
@@ -667,7 +667,7 @@ impl std::fmt::Display for AccessError {
 }
 
 impl OauthTokens {
-    pub fn new(pool: PgPool, envelope: Option<Arc<EnvelopeService>>) -> Self {
+    pub fn new(pool: PgPool, envelope: Arc<EnvelopeService>) -> Self {
         OauthTokens {
             http: http_client(),
             pool,
@@ -843,7 +843,7 @@ impl OauthTokens {
         let Some(row) = row else {
             return Ok(None);
         };
-        let doc = secret_dao::email_config(self.envelope.as_deref(), &row)
+        let doc = secret_dao::email_config(&self.envelope, &row)
             .await
             .map_err(|e| AccessError::Failed(format!("the email settings cannot be read: {e}")))?;
         let config: EmailConfig = serde_json::from_value(doc)
@@ -886,14 +886,7 @@ impl OauthTokens {
                     return;
                 }
             };
-            match secret_dao::update_email_settings(
-                &self.pool,
-                self.envelope.as_deref(),
-                &row,
-                &doc,
-            )
-            .await
-            {
+            match secret_dao::update_email_settings(&self.pool, &self.envelope, &row, &doc).await {
                 Ok(Some(_)) => return,
                 // Changed meanwhile: read it again.
                 Ok(None) => continue,

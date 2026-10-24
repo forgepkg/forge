@@ -505,7 +505,13 @@ async fn make_proxy(
 }
 
 fn proxy_repo(pool: &PgPool, cas: forge_storage::Cas, cache: Cache) -> ProxyRepo {
-    ProxyRepo::new(pool.clone(), Arc::new(nuget()), cas, cache)
+    ProxyRepo::new(
+        pool.clone(),
+        Arc::new(nuget()),
+        cas,
+        cache,
+        common::envelope(pool),
+    )
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -862,11 +868,21 @@ async fn credentialed_upstream_gets_basic_auth_on_every_request() {
     let mock = start_mock_with_auth(sample_corpus("1.2.3"), Some(expected)).await;
 
     let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
-    sqlx::query!(
-        r#"UPDATE repository SET upstream_username = 'svc', upstream_password = 's3cret' WHERE name = $1"#,
+    let repo_id = sqlx::query_scalar!(
+        r#"UPDATE repository SET upstream_username = 'svc' WHERE name = $1 RETURNING id"#,
         repo
     )
-    .execute(&pool)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let envelope = common::envelope(&pool);
+    envelope.ensure_active_keys().await.unwrap();
+    forge_db::secret_dao::set_upstream_password(
+        &mut pool.acquire().await.unwrap(),
+        &envelope,
+        repo_id,
+        Some(&forge_crypto::PlaintextSecret::from("s3cret".to_string())),
+    )
     .await
     .unwrap();
     let px = proxy_repo(&pool, cas, Cache::l1_only(128));
@@ -3286,7 +3302,13 @@ fn scripted_proxy(
         nuget: nuget(),
         script: Box::new(script),
     };
-    ProxyRepo::new(pool.clone(), Arc::new(format), cas, Cache::l1_only(128))
+    ProxyRepo::new(
+        pool.clone(),
+        Arc::new(format),
+        cas,
+        Cache::l1_only(128),
+        common::envelope(pool),
+    )
 }
 
 /// NuGet's own upstream side, with its resolved index changed by `edit`.

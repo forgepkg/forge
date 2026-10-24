@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, repository_id, base_url, source_repository, registry_url, username,\n               (password IS NOT NULL OR password_enc IS NOT NULL) AS \"has_password!\",\n               on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,\n               cancel_requested, assets_seen, bytes_seen, nexus_version, last_error,\n               created_by, created_at, started_at, finished_at, updated_at\n        FROM nexus_import\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT id, repository_id, base_url, source_repository, registry_url, username,\n               (password_enc IS NOT NULL) AS \"has_password!\",\n               on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,\n               cancel_requested, assets_seen, bytes_seen, nexus_version, last_error,\n               created_by, created_at, started_at, finished_at, updated_at\n        FROM nexus_import\n        WHERE repository_id = $1\n        ORDER BY id DESC\n        LIMIT $2\n        ",
   "describe": {
     "columns": [
       {
@@ -265,6 +265,7 @@
     ],
     "parameters": {
       "Left": [
+        "Int8",
         "Int8"
       ]
     },
@@ -295,5 +296,5 @@
       false
     ]
   },
-  "hash": "1f90bbb9cfdd84b7b5b4c64ebab7a3ab55dc03c416051e3d31f6741c38ce5e34"
+  "hash": "b76fec429ab9b2826c95429795c138f7a72c1822f254b8315099035d6155bfeb"
 }

@@ -171,6 +171,7 @@ curl -fsS "$upstream/e2e-public" >/dev/null || fail "the mock upstream did not s
 step "start forge-server"
 mkdir -p "$work/web"
 echo '<!doctype html><title>Forge</title>' > "$work/web/index.html"
+head -c 32 /dev/urandom | base64 > "$work/root.key"
 cat > "$work/forge.toml" <<EOF
 [server]
 bind = "127.0.0.1:$port"
@@ -184,6 +185,9 @@ bucket = "forge-npm-e2e"
 access_key = "forge-e2e-key"
 secret_key = "forge-e2e-secret"
 force_path_style = true
+[crypto.root]
+provider = "file"
+root_key_path = "$work/root.key"
 [auth.bootstrap_admin]
 username = "$admin_user"
 password = "$admin_password"

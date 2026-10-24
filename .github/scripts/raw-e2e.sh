@@ -58,6 +58,7 @@ expect_status() { # <status> <curl args...>
 }
 
 step "start forge-server"
+head -c 32 /dev/urandom | base64 > "$work/root.key"
 cat > "$work/forge.toml" <<EOF
 [server]
 bind = "127.0.0.1:$port"
@@ -71,6 +72,9 @@ bucket = "forge-raw-e2e"
 access_key = "forge-e2e-key"
 secret_key = "forge-e2e-secret"
 force_path_style = true
+[crypto.root]
+provider = "file"
+root_key_path = "$work/root.key"
 [auth.bootstrap_admin]
 username = "admin@example.com"
 password = "$admin_password"

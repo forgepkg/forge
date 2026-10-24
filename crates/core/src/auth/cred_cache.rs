@@ -31,7 +31,7 @@
 //! `cred_key = hex(HMAC-SHA256(pepper, len(provider) ‖ provider ‖ len(user) ‖
 //! user ‖ password))`, where `pepper` is a server-held secret
 //! ([`CredKeyPepper`], redacted in `Debug`; kept with the realm's secrets,
-//! which are encrypted at rest when that is enabled).
+//! which are encrypted at rest).
 //!
 //! * **No plaintext at rest.** Only the HMAC is ever stored / cached.
 //! * **Pepper, not a bare hash.** A bare hash of the password would be offline-
@@ -137,9 +137,9 @@ fn user_cache_tag(username: &str) -> String {
 ///
 /// Treated like a repository's `upstream_password`: **redacted** in `Debug` so
 /// it can never leak through a log line or error body, and kept with the
-/// realm's secrets, which are encrypted at rest when that is enabled. Rotating
-/// it invalidates the whole cache (every key changes), which merely causes
-/// re-forwards — acceptable.
+/// realm's secrets, which are encrypted at rest. Rotating it invalidates the
+/// whole cache (every key changes), which merely causes re-forwards —
+/// acceptable.
 #[derive(Clone)]
 pub struct CredKeyPepper(Vec<u8>);
 

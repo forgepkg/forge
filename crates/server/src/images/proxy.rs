@@ -522,7 +522,7 @@ impl Registry {
             .remote_url
             .as_deref()
             .ok_or_else(|| Failure::internal("proxy", "proxy repository without remote_url"))?;
-        let creds = upstream_credentials(&self.inner.pool, self.inner.envelope.as_ref(), repo)
+        let creds = upstream_credentials(&self.inner.pool, &self.inner.envelope, repo)
             .await
             .map_err(|e| Failure::internal("proxy credentials", e))?;
         Ok(Upstream {

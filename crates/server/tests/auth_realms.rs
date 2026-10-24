@@ -676,8 +676,9 @@ async fn instances_share_and_rotate_the_issuer_keys() {
     use forge_server::auth::{AssertionIssuer, ISSUER_KEYS_SETTING};
 
     let pool = common::fresh_pool().await;
-    let a = AssertionIssuer::new(pool.clone(), None, "https://forge.test/".into());
-    let b = AssertionIssuer::new(pool.clone(), None, "https://forge.test".into());
+    let envelope = common::envelope(&pool).await;
+    let a = AssertionIssuer::new(pool.clone(), envelope.clone(), "https://forge.test/".into());
+    let b = AssertionIssuer::new(pool.clone(), envelope.clone(), "https://forge.test".into());
     assert_eq!(a.issuer(), "https://forge.test");
     let kids = |keys: &IssuerKeySet| {
         keys.keys()
@@ -702,7 +703,7 @@ async fn instances_share_and_rotate_the_issuer_keys() {
     let old = IssuerKeySet::generate(chrono::Utc::now() - KEY_ROTATION).unwrap();
     forge_db::secret_dao::store_secret_setting(
         &pool,
-        None,
+        &envelope,
         ISSUER_KEYS_SETTING,
         &forge_crypto::PlaintextSecret::from(old.to_stored()),
         Some(&stored),
@@ -870,6 +871,8 @@ async fn unknown_names_pay_the_dummy_hash_while_the_forwarding_realm_is_broken()
             bucket = "forge"
             access_key = "test"
             secret_key = "test"
+            [crypto.root]
+            provider = "env"
             "#,
         )),
     )
@@ -896,8 +899,12 @@ async fn unknown_names_pay_the_dummy_hash_while_the_forwarding_realm_is_broken()
         Arc::new(tokio::sync::Semaphore::new(0)),
         std::time::Duration::from_millis(10),
     ));
-    let issuer =
-        forge_server::auth::AssertionIssuer::new(pool.clone(), None, config.public_base_url());
+    let envelope = common::envelope(&pool).await;
+    let issuer = forge_server::auth::AssertionIssuer::new(
+        pool.clone(),
+        envelope.clone(),
+        config.public_base_url(),
+    );
     let settings = Arc::new(forge_server::auth::AuthSettingsCache::new(
         pool.clone(),
         std::time::Duration::from_secs(10),
@@ -908,6 +915,7 @@ async fn unknown_names_pay_the_dummy_hash_while_the_forwarding_realm_is_broken()
         Arc::new(config),
         issuer,
         settings,
+        envelope,
     )
     .with_password_limiter(no_slot);
     let snapshot = realms.snapshot().await.expect("snapshot");

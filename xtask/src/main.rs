@@ -39,6 +39,12 @@ const VITE_DEV_PORT: u16 = 8420;
 /// Default bootstrap admin credentials from forge.toml (used by `seed`).
 const DEFAULT_ADMIN: &str = "admin@example.com:changeme";
 
+/// The root key of the local development stack, exported as `FORGE_ROOT_KEY`
+/// unless it is set (forge.toml reads it from there): base64 of
+/// `dev-root-key-for-local-forge-001`, the key docker-compose.app.yml sets
+/// too. Development only.
+const DEV_ROOT_KEY: &str = "ZGV2LXJvb3Qta2V5LWZvci1sb2NhbC1mb3JnZS0wMDE=";
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("help");
@@ -225,7 +231,11 @@ fn cargo(args: &[&str]) -> Cmd {
 }
 
 fn run_server_cmd() -> Cmd {
-    cargo(&["run", "-p", "forge-server"])
+    let cmd = cargo(&["run", "-p", "forge-server"]);
+    match env::var_os("FORGE_ROOT_KEY") {
+        Some(_) => cmd,
+        None => cmd.env("FORGE_ROOT_KEY", DEV_ROOT_KEY),
+    }
 }
 
 fn print_forge_portal() {

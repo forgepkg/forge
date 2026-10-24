@@ -213,3 +213,24 @@ pub async fn blob_store() -> BlobStore {
 pub async fn cas(pool: &PgPool) -> Cas {
     Cas::new(blob_store().await, pool.clone())
 }
+
+/// The envelope service a proxy opens its upstream password with: a fixed
+/// test root key, in a key scope of its own (the `forge-db` tests clear the
+/// `default` scope's keys). Its keys are created by `ensure_active_keys`,
+/// which only a test that seals a password needs.
+pub fn envelope(pool: &PgPool) -> std::sync::Arc<forge_crypto::service::EnvelopeService> {
+    use forge_crypto::service::{EnvelopeService, EnvelopeServiceConfig};
+    std::sync::Arc::new(EnvelopeService::new(
+        std::sync::Arc::new(forge_db::encryption_key_dao::PgKeyStore::new(pool.clone())),
+        std::sync::Arc::new(forge_crypto::kms::StaticRootProvider::new(
+            "env",
+            forge_crypto::envelope::Algorithm::Aes256Gcm,
+            forge_crypto::KeyBytes::from_slice(&[7u8; 32]).expect("32 bytes"),
+            vec![],
+        )),
+        EnvelopeServiceConfig {
+            scope: "core-tests".to_string(),
+            ..Default::default()
+        },
+    ))
+}

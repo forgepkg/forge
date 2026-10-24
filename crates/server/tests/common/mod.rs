@@ -204,7 +204,10 @@ fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
         .map(|(u, p)| (u.as_str(), p.as_str()));
     let web_assets_dir = opts.web_assets_dir.as_deref();
     let oidc_block = opts.oidc_block.as_deref();
-    let crypto_block = opts.crypto_block.as_deref();
+    let crypto_block = opts
+        .crypto_block
+        .clone()
+        .unwrap_or_else(default_crypto_block);
     let extra_toml = opts.extra_toml.as_deref();
     let s3_credentials = opts
         .s3_credentials
@@ -263,7 +266,7 @@ poll_interval_seconds = 1
 "#,
         bucket = S3_BUCKET,
         oidc = oidc_block.unwrap_or(""),
-        crypto = crypto_block.unwrap_or(""),
+        crypto = crypto_block,
         extra = extra_toml.unwrap_or(""),
     )
 }
@@ -292,6 +295,53 @@ impl Drop for TestServer {
     }
 }
 
+/// The root key every test server seals its secrets under: 32 fixed bytes,
+/// base64 — a *test* key, never used outside tests. One key for all of them:
+/// servers sharing a database (the `encryption_key` rows) must reach the
+/// same root.
+pub const TEST_ROOT_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+/// The env var holding [`TEST_ROOT_KEY`] for [`default_crypto_block`].
+pub const TEST_ROOT_KEY_VAR: &str = "FORGE_TEST_ROOT_KEY";
+
+/// Export [`TEST_ROOT_KEY`] as [`TEST_ROOT_KEY_VAR`]; returns the var's name.
+pub fn ensure_test_root_key() -> &'static str {
+    std::env::set_var(TEST_ROOT_KEY_VAR, TEST_ROOT_KEY);
+    TEST_ROOT_KEY_VAR
+}
+
+/// The `[crypto]` section of a test server: the env provider reading
+/// [`TEST_ROOT_KEY`], without the rotation worker (a test rotates through the
+/// admin API, or names a block of its own).
+pub fn default_crypto_block() -> String {
+    let var = ensure_test_root_key();
+    format!(
+        "[crypto]\n[crypto.root]\nprovider = \"env\"\nroot_key_env = \"{var}\"\n\
+         [crypto.rotation]\nenabled = false\n"
+    )
+}
+
+/// The envelope service a test server over `pool` builds: the
+/// [`TEST_ROOT_KEY`], the `default` key scope, its keys created.
+pub async fn envelope(pool: &PgPool) -> std::sync::Arc<forge_crypto::EnvelopeService> {
+    let root = forge_crypto::StaticRootProvider::from_env(
+        forge_crypto::Algorithm::Aes256Gcm,
+        ensure_test_root_key(),
+        None,
+    )
+    .expect("test root key");
+    let envelope = forge_crypto::EnvelopeService::new(
+        std::sync::Arc::new(forge_db::encryption_key_dao::PgKeyStore::new(pool.clone())),
+        std::sync::Arc::new(root),
+        forge_crypto::EnvelopeServiceConfig::default(),
+    );
+    envelope
+        .ensure_active_keys()
+        .await
+        .expect("bootstrap encryption keys");
+    std::sync::Arc::new(envelope)
+}
+
 /// Options for spinning up a test server.
 pub struct ServerOpts {
     pub bootstrap_admin: Option<(String, String)>,
@@ -302,9 +352,10 @@ pub struct ServerOpts {
     /// When set, this raw TOML is appended as the `[oidc]` section so the server
     /// builds an `OidcRuntime` + mounts the `/auth/oidc/*` routes.
     pub oidc_block: Option<String>,
-    /// When set, this raw TOML is appended as the `[crypto]` section so the
-    /// server builds the secret-encryption envelope service. The caller is
-    /// responsible for exporting the root-key env var it references.
+    /// When set, this raw TOML replaces the `[crypto]` section
+    /// ([`default_crypto_block`]: the [`TEST_ROOT_KEY`], no rotation worker).
+    /// The caller is responsible for exporting the root-key env var it
+    /// references.
     pub crypto_block: Option<String>,
     /// `server.public_base_url` (default `http://test.local`); an `https://`
     /// URL makes the server issue `Secure` (`__Host-`) cookies.
@@ -381,29 +432,24 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .await
         .expect("bootstrap admin");
 
-    // Build + bootstrap the envelope service when the test enabled the
-    // [crypto] block (no-op otherwise).
+    // Build + bootstrap the envelope service, as `main` does.
     let envelope =
         forge_server::crypto::build_envelope(&config, &pool).expect("build envelope service");
-    if let (Some(env), Some(crypto_cfg)) = (&envelope, config.crypto.as_ref()) {
-        forge_server::crypto::bootstrap(&pool, env, crypto_cfg)
-            .await
-            .expect("bootstrap secret encryption");
-    }
+    forge_server::crypto::bootstrap(&pool, &envelope, &config.crypto)
+        .await
+        .expect("bootstrap secret encryption");
 
     // Import any [oidc]/[auth.upstream_basic] block into auth_realm rows
     // (drift-detected) so the realm-driven runtime sees them.
-    forge_server::app::ensure_auth_realms(&config, &pool, envelope.as_deref())
+    forge_server::app::ensure_auth_realms(&config, &pool, &envelope)
         .await
         .expect("seed auth realms");
 
     let cache = Cache::l1_only(config.cache.l1_max_capacity);
-    let registry_keys =
-        forge_server::registry::load_token_keys(&config, &pool, envelope.as_deref())
-            .await
-            .expect("registry token key");
-    let state = AppState::new(pool.clone(), store, cache, config)
-        .with_envelope(envelope)
+    let registry_keys = forge_server::registry::load_token_keys(&config, &pool, &envelope)
+        .await
+        .expect("registry token key");
+    let state = AppState::new(pool.clone(), store, cache, config, envelope)
         .with_registry_keys(registry_keys)
         .with_plugins(opts.extra_plugins.clone())
         .expect("install format plugins");

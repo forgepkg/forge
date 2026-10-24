@@ -10,3 +10,4 @@ config:
       username: admin@example.com
 secretEnv:
   FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: check-only
+  FORGE_ROOT_KEY: check-only
