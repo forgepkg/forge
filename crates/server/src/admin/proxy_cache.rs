@@ -99,10 +99,10 @@ pub async fn invalidate(
             }
         }
         Some(p) if docker => {
-            if !forge_oci::reference::valid_name(&p) {
+            if !forge_format_docker::reference::valid_name(&p) {
                 return bad_request("package is not a valid image name");
             }
-            Some(forge_oci::proxied_image(&repo, &p))
+            Some(forge_format_docker::proxied_image(&repo, &p))
         }
         Some(p) => {
             let format = match state.formats.for_repository(&repo) {
