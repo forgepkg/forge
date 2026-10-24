@@ -480,12 +480,8 @@ async fn refuses_publishes_that_do_not_hold_up() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
-    assert_eq!(resp.headers()["content-type"], "application/json");
     assert!(resp.headers().contains_key("www-authenticate"));
-    assert_eq!(
-        resp.json::<Value>().await.unwrap(),
-        json!({"error": "invalid token"})
-    );
+    assert_eq!(resp.text().await.unwrap(), "invalid token");
 }
 
 #[tokio::test]

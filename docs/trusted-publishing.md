@@ -338,7 +338,7 @@ steps:
     with:
       node-version: '26'
   - run: npm ci
-  - run: npm publish --provenance=false --registry https://forge.example.com/npm/npm-all/
+  - run: npm publish --provenance=false --registry https://forge.example.com/repository/npm-all/
 ```
 
 npm requests the GitHub job's ID token with the `npm:forge.example.com`
@@ -360,7 +360,7 @@ publish:
       aud: npm:forge.example.com
   script:
     - npm ci
-    - npm publish --registry https://forge.example.com/npm/npm-all/
+    - npm publish --registry https://forge.example.com/repository/npm-all/
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
 ```
@@ -378,8 +378,8 @@ instance. Do not enable `allow_http_issuer` for production. Set
 ### Exchange and limitations
 
 npm calls `POST /-/npm/v1/oidc/token/exchange/package/<escaped-name>` at the
-**host root**, even when the registry is `/npm/npm-all/`. Reverse proxies must
-forward this root path to Forge, not only `/npm/`. The answer is
+**host root**, even when the registry is `/repository/npm-all/`. Reverse proxies must
+forward this root path to Forge, not only `/repository/`. The answer is
 `{"token":"forge_wif.…"}`; invalid requests or credentials receive a JSON
 `error` and 400 or 401 (temporary authentication failures receive 503).
 

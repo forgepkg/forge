@@ -69,7 +69,7 @@ use tokio_util::io::StreamReader;
 
 use crate::dispatch::{
     authz_denied, level_for_method, offline_response, offline_serves_nothing,
-    principal_allows_protocol_mutations, HostedWriteAdapter,
+    principal_allows_protocol_mutations, AuthzDenied, HostedWriteAdapter,
 };
 use crate::files::store::{Content, Ingested, Part, Via};
 use crate::files::{FileError, Files};
@@ -165,6 +165,7 @@ async fn in_format(plugin: &Plugin, response: Response) -> Response {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error())
         || response.extensions().get::<PluginWritten>().is_some()
+        || response.extensions().get::<AuthzDenied>().is_some()
     {
         return response;
     }
@@ -251,20 +252,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let uri = req.uri().clone();
     let principal = match with_bearer(&state, req.headers(), principal_of(&req)).await {
         Ok(principal) => principal,
-        Err(mut response) => {
-            if let Some((repo_name, _)) = split_path(uri.path()) {
-                if let Ok(Some(repo)) =
-                    repository_dao::find_repository_by_name(&state.pool, repo_name).await
-                {
-                    if let Some(plugin) = state.formats.plugin(&repo.format) {
-                        if plugin.descriptor().storage != protocol::Storage::Images {
-                            response.extensions_mut().insert(ServedBy(plugin));
-                        }
-                    }
-                }
-            }
-            return response;
-        }
+        Err(response) => return response,
     };
     let Some((repo_name, rest)) = split_path(uri.path()) else {
         return (StatusCode::NOT_FOUND, "repository not found").into_response();
@@ -286,8 +274,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
 
     let Some(plugin) = state.formats.plugin(&repo.format) else {
         return if state.formats.is_installed(&repo.format) {
-            // A format without a protocol (a test's own) is served under
-            // no mount.
+            // A format without a protocol (a test's own) is not served here.
             (StatusCode::NOT_FOUND, "repository is not served here").into_response()
         } else {
             (
@@ -2146,8 +2133,8 @@ mod tests {
     use super::*;
 
     /// The built-in formats' descriptors are checked here, not at startup: a
-    /// well-formed id that is not reserved and no other format has, a free
-    /// mount, kinds, asset names.
+    /// well-formed id that is not reserved and no other format has, kinds,
+    /// asset names.
     #[test]
     fn the_builtin_formats_describe_themselves_well() {
         let plugins = builtin(Default::default(), Default::default());

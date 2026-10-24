@@ -68,7 +68,7 @@ pub struct Config {
     /// and blob-link expiry.
     #[serde(default)]
     pub docker: DockerConfig,
-    /// npm registries (`/npm`): what the npm plugin reads of a request.
+    /// npm registries (`/repository/<name>/`): what the npm plugin reads of a request.
     #[serde(default)]
     pub npm: NpmConfig,
     /// Logins of command-line clients (`npm login`): their tokens and the

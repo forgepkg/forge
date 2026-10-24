@@ -3,7 +3,7 @@
 //!
 //! The web UI reads listings from its format's protocol itself
 //! (`/repository/<repo>/<dir>/` as JSON, with its session). Changing files through
-//! `/raw` takes an API token, like every package client, so the UI changes
+//! the repository URL takes an API token, like every package client, so the UI changes
 //! them here, with its session (whose CSRF token the principal middleware
 //! checks):
 //!
@@ -12,7 +12,7 @@
 //!   ([`store::receive_form`], [`store::store`]);
 //! * `DELETE /browse/raw/{repo}/files?path=<file>` — delete a file.
 //!
-//! Both take the same permissions as `/raw`: write (and, to replace a
+//! Both take the same permissions as the repository URL: write (and, to replace a
 //! file, delete) on the repository and its selectors.
 //!
 //! * `DELETE /admin/repositories/{name}/files?path=<path>` (admin API) —

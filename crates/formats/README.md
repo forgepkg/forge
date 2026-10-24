@@ -9,8 +9,8 @@ the design, the contract and how to write one.
 | --- | --- | --- |
 | [`docker`](docker) | `docker` | Docker / OCI registries at `/v2`: push and pull images, indexes and artifacts (Helm charts, signatures, SBOMs); hosted, proxy and group repositories ([docs/docker.md](../../docs/docker.md)) |
 | [`nuget`](nuget) | `nuget` | NuGet V3 feeds at `/repository/{repo}`: push, restore, search, unlist and relist; hosted, proxy and group repositories |
-| [`npm`](npm) | `npm` | npm registries at `/npm` for npm, pnpm, Yarn and Bun: publish, install, dist-tags, deprecations, unpublishing, search, audits and logins; hosted, proxy and group repositories ([docs/npm.md](../../docs/npm.md)) |
-| [`raw`](raw) | `raw` | Raw files at `/raw`: files under paths, uploads with `PUT` or a form, ranges, checksum sidecars, listings; hosted, proxy and group repositories ([docs/raw.md](../../docs/raw.md)) |
+| [`npm`](npm) | `npm` | npm registries at `/repository/{repo}` for npm, pnpm, Yarn and Bun: publish, install, dist-tags, deprecations, unpublishing, search, audits and logins; hosted, proxy and group repositories ([docs/npm.md](../../docs/npm.md)) |
+| [`raw`](raw) | `raw` | Raw files at `/repository/{repo}`: files under paths, uploads with `PUT` or a form, ranges, checksum sidecars, listings; hosted, proxy and group repositories ([docs/raw.md](../../docs/raw.md)) |
 
 A plugin directory holds:
 

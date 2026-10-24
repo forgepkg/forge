@@ -54,6 +54,20 @@ async fn unknown_repo_answers_like_a_denied_one() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
+    let npm_private = format!("npm-private{}", common::unique());
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({
+            "name": npm_private,
+            "kind": "hosted",
+            "format": "npm",
+            "anonymous_read": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
     let user = forge_db::user_dao::insert_user(
         &srv.pool,
         forge_db::user_dao::NewUser::local(
@@ -86,6 +100,13 @@ async fn unknown_repo_answers_like_a_denied_one() {
         let missing = answer(path.replace("{}", &unknown), signed_in).await;
         assert_eq!(denied.0, status, "{path} on a private repository");
         assert_eq!(missing, denied, "{path}: unknown answers like denied");
+    }
+    for (signed_in, status) in [(false, 401), (true, 403)] {
+        let path = "/repository/{}/";
+        let denied = answer(path.replace("{}", &npm_private), signed_in).await;
+        let missing = answer(path.replace("{}", &unknown), signed_in).await;
+        assert_eq!(denied.0, status, "npm repository");
+        assert_eq!(missing, denied, "npm: unknown answers like denied");
     }
 }
 
