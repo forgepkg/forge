@@ -8,12 +8,12 @@ name: CI
 # without a PR can be checked on demand via `workflow_dispatch`.
 #
 # Only a pull request that targets the default branch runs CI. A stacked pull
-# request, which targets the branch of the one below it, runs the Stack
-# workflow alone; once GitHub retargets it to the default branch, stack.yml
-# merges the default branch into it, and that push runs this workflow. A
-# `workflow_dispatch` run of a pull request's branch would not do: GitHub
-# neither shows its checks on the pull request nor counts them as its
-# required checks.
+# request, which targets the branch of the one below it, runs none; once
+# GitHub retargets it to the default branch, its next push runs this workflow
+# (a retarget is no event it takes), such as the merge of the pull request's
+# Update branch button. A `workflow_dispatch` run of a pull request's branch
+# would not do: GitHub neither shows its checks on the pull request nor counts
+# them as its required checks.
 on:
   push:
     branches: [main, master]

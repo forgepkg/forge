@@ -961,68 +961,47 @@ workflow tags only commits whose CI run on `main` passed with every job (see
 
 ### Stacked pull requests
 
-A stacked pull request targets the branch of the pull request below it (see
-[AGENTS.md](AGENTS.md)). It must not be merged there, or its fix lands in
-that other pull request. The `Stack` workflow (`.github/workflows/stack.yml`)
-gives every pull request whose base is not `main` the commit status `stack`,
-pending and naming the branch it waits for. Once the pull request below has
-merged, GitHub retargets the stacked one to `main` and `stack` turns to
-success. A pull request opened against `main` gets no `stack` status.
+A stacked pull request targets the branch of the pull request below it. It
+must not be merged there, or its fix lands in that other pull request: a
+pull request merges into `main` only.
 
-The ruleset that enforces it is
-`.github/rulesets/stacked-pull-requests.json`; import it under **Settings →
-Rules → Rulesets → New ruleset → Import a ruleset**. It requires `stack` on
-every branch except `main`, the merge queue's `gh-readonly-queue/` branches,
-Dependabot's, and `cla-signatures`, where the `CLA` workflow
-(`.github/workflows/cla.yml`) commits the contributors' signatures:
+The ruleset that enforces it is `.github/rulesets/merge-into-main-only.json`;
+import it under **Settings → Rules → Rulesets → New ruleset → Import a
+ruleset**. GitHub has no rule that limits the branches a pull request may
+merge into, so the ruleset requires a status check that nothing reports,
+`merge into main only`, on every branch except `main`, the merge queue's
+`gh-readonly-queue/` branches, Dependabot's, and `cla-signatures`, where the
+`CLA` workflow (`.github/workflows/cla.yml`) commits the contributors'
+signatures:
 
-- A stacked pull request cannot be merged into the branch below it, and
-  auto-merge enabled on it does not merge it there. Once it targets `main`,
-  `main`'s own rules decide. A pull request whose branch predates the
-  workflow has no `stack` status at all, which blocks it just the same.
+- A pull request into any of those branches shows `merge into main only` as
+  expected, and its merge button stays blocked; auto-merge enabled on it does
+  not merge it there either. Once the pull request below has merged and
+  GitHub has retargeted the stacked one to `main`, the ruleset no longer
+  applies and `main`'s own rules decide.
 - A required status check guards pushes too: a branch only moves to a
   commit that already carries it. So repository admins, maintainers and
   writers, and organization owners, bypass the ruleset: their pushes to a
-  pull request's branch go through as before, and they can still merge a
-  stacked pull request, but only by ticking **Merge without waiting for
+  pull request's branch go through, and they can still merge a pull request
+  into another branch, but only by ticking **Merge without waiting for
   requirements to be met (bypass rules)**. A GitHub App pushing with its own
-  token, such as the stack App below, has to be added to the bypass list.
+  token has to be added to the bypass list.
 
 CI runs only on pull requests that target `main`, so a stacked pull request
-runs the `Stack` workflow alone, and a fix merged up a stack does not run CI
-on every pull request above it. When a pull request is retargeted to `main`,
-the `Stack` workflow merges `main` into its branch, as the pull request's
-**Update branch** button does, and that push runs CI on the pull request.
-A retarget alone starts no CI run, and a manual run's checks would not
-count: GitHub shows a pull request only the checks of `pull_request`,
-`push` and a few other runs, and only those satisfy its required checks.
-The workflow pushes the merge with a GitHub App's token, since a push with
-a workflow's own `GITHUB_TOKEN` starts no workflow. Without the App, the
-workflow warns, and the **Update branch** button starts CI instead. When
-`main` does not merge cleanly, the `stack-status` check fails: merge `main`
-by hand and push.
-
-To set up the stack App:
-
-1. Create a GitHub App (**Settings → Developer settings → GitHub Apps → New
-   GitHub App**), without a webhook, with the repository permissions
-   **Contents**, **Pull requests** and **Workflows**, each **Read and
-   write**. Install it on this repository only.
-2. Generate a private key for it. Save the App's client ID as the repository
-   variable `STACK_APP_CLIENT_ID`, and the key as the repository secret
-   `STACK_APP_PRIVATE_KEY` (**Settings → Secrets and variables → Actions**).
-3. If the stacked pull requests ruleset is active, add the App to its bypass
-   list, or it refuses the merge on the pull request's branch.
-
-The App's merge, like the button's, dismisses the pull request's approvals
-under a rule that dismisses stale ones.
+runs none, and a fix merged up a stack does not run CI on every pull request
+above it. A retarget to `main` starts no CI run either: the next push to the
+pull request's branch does, such as the merge of its **Update branch**
+button (a branch that already holds `main` has no such button and needs a
+push of its own). A manual run's checks would not count: GitHub shows a pull
+request only the checks of `pull_request`, `push` and a few other runs, and
+only those satisfy its required checks.
 
 To check a stacked branch before its retarget, run CI on it by hand:
 **Actions → CI → Run workflow**, or
 `gh workflow run ci.yml --ref <branch> -f base=main`. The run compares the
 branch with the commit it forked off `main`, so it runs the jobs the pull
 request's change needs; its results show under **Actions**, not on the pull
-request. A pull request from a fork gets no merge: a push to it starts CI.
+request.
 
 ## Code scanning (CodeQL)
 
