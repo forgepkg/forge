@@ -306,9 +306,9 @@ for the current claim set and subject customization options.
 ## npm
 
 npm 11.5.1 and later can exchange a CI identity token automatically during
-`npm publish` (and `npm dist-tag`), without a stored `_authToken` or a curl
-step. Use a current npm release with this support; pnpm, Yarn and Bun do not
-perform npm's exchange.
+`npm publish`, without a stored `_authToken` or a curl step. npm 11.21 and
+later also supports the exchange for `npm dist-tag`. Use a current npm release
+with this support; pnpm, Yarn and Bun do not perform npm's exchange.
 
 Configure a `workload_identity` realm under **Admin → Authentication**, using
 the GitHub Actions or GitLab claim rules shown in this document, but set
@@ -338,7 +338,7 @@ steps:
     with:
       node-version: '26'
   - run: npm ci
-  - run: npm publish --registry https://forge.example.com/npm/npm-all/
+  - run: npm publish --provenance=false --registry https://forge.example.com/npm/npm-all/
 ```
 
 npm requests the GitHub job's ID token with the `npm:forge.example.com`
@@ -392,9 +392,10 @@ publishers are not implemented yet.
 
 npm silently falls back to configured credentials when the exchange fails;
 omit stored tokens in jobs intended to require trusted publishing. Forge
-does not serve npm's package-visibility endpoint, so npm does not
-automatically enable provenance. Do not pass `--provenance`: Forge still
-rejects provenance statements until attestations can be stored.
+does not serve npm's package-visibility endpoint. npm 11.5.1 can enable
+provenance automatically for public GitHub repositories without checking that
+endpoint, so pass `--provenance=false` to `npm publish` for those clients.
+Forge rejects provenance statements until attestations can be stored.
 
 ## GitLab CI
 
