@@ -570,6 +570,37 @@ where
     Ok(rows.into_iter().collect())
 }
 
+/// Lock and load the cached versions of one proxy package for retention
+/// revalidation. Like [`load_proxy_candidates`], only cached, found versions
+/// are candidates.
+pub async fn lock_proxy_package_candidates(
+    conn: &mut sqlx::PgConnection,
+    repository_id: i64,
+    name: &str,
+) -> sqlx::Result<Vec<ProxyCandidateRow>> {
+    sqlx::query_as::<_, ProxyCandidateRow>(
+        r#"
+        SELECT p.id AS cached_version_id, p.name, p.version, p.listed, p.first_seen_at,
+               p.last_downloaded_at,
+               COALESCE((
+                   SELECT SUM(a.size)
+                   FROM component c JOIN asset a ON a.component_id = c.id
+                   WHERE c.repository_id = p.repository_id
+                     AND c.name = p.name AND c.version = p.version
+               ), 0)::bigint AS size_bytes
+        FROM proxy_cached_version p
+        WHERE p.repository_id = $1 AND p.name = $2
+          AND p.downloaded AND p.not_found = false
+        ORDER BY p.id
+        FOR UPDATE OF p
+        "#,
+    )
+    .bind(repository_id)
+    .bind(name)
+    .fetch_all(conn)
+    .await
+}
+
 /// The logical size of a hosted or proxy package repository, counting its
 /// assets (including assets shared by multiple versions).
 pub async fn package_repository_size(pool: &PgPool, repository_id: i64) -> sqlx::Result<u64> {

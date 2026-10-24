@@ -1151,6 +1151,15 @@ async fn decided_now(
         .iter()
         .map(|m| ((m.image.as_str(), m.digest.as_str()), m.id))
         .collect();
+    let mut parents_by_digest: HashMap<(&str, &str), Vec<i64>> = HashMap::new();
+    for parent in &manifests {
+        for child in &parent.children {
+            parents_by_digest
+                .entry((parent.image.as_str(), child.as_str()))
+                .or_default()
+                .push(parent.id);
+        }
+    }
     let protected = protected_manifests(
         &remaining_manifests,
         &remaining_tags,
@@ -1169,11 +1178,19 @@ async fn decided_now(
             .as_deref()
             .and_then(|subject| manifest_by_digest.get(&(current.image.as_str(), subject)))
             .is_some_and(|subject_id| remaining_manifests.contains(subject_id));
+        let parent_remains = parents_by_digest
+            .get(&(current.image.as_str(), current.digest.as_str()))
+            .is_some_and(|parents| {
+                parents
+                    .iter()
+                    .any(|parent_id| remaining_manifests.contains(parent_id))
+            });
         if manifest.rule_id != "size_budget"
             || protected.contains(&manifest.manifest_id)
             || remaining_tags
                 .iter()
                 .any(|t| t.manifest_id == manifest.manifest_id)
+            || parent_remains
             || subject_remains
         {
             continue;

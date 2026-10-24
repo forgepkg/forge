@@ -3262,6 +3262,103 @@ async fn image_retention_re_evaluates_each_image_under_its_lock() {
     }
 }
 
+#[tokio::test]
+async fn image_budget_keeps_a_child_and_its_referrer_when_a_new_index_uses_it() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("retention child {}", unique()).into_bytes();
+    let child = oci.push_image(&name, "child", "amd64", &layer).await;
+    let child_manifest = image(&config("amd64"), &[&layer]);
+    let sig = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha(b"{}"), "size": 2},
+        "layers": [],
+        "subject": {"mediaType": OCI_MANIFEST, "digest": child, "size": child_manifest.len()},
+    })
+    .to_string()
+    .into_bytes();
+    assert_eq!(
+        oci.put_manifest(&name, &sha(&sig), OCI_MANIFEST, &sig)
+            .await
+            .status(),
+        201
+    );
+    assert_eq!(oci.delete(&name, "manifests/child").await.status(), 202);
+    let sig_digest = sha(&sig);
+    sqlx::query(
+        "UPDATE oci_manifest SET untagged_since = now() - interval '30 days' \
+         WHERE repository_id = $1 AND image = 'app' AND digest = ANY($2)",
+    )
+    .bind(repo_id)
+    .bind(vec![child.clone(), sig_digest.clone()])
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 1, "target_bytes": 0 },
+        "rules": []
+    });
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": policy}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+    let mut decided: Vec<_> = decisions
+        .manifests
+        .iter()
+        .map(|manifest| manifest.digest.as_str())
+        .collect();
+    decided.sort_unstable();
+    let mut expected = vec![child.as_str(), sig_digest.as_str()];
+    expected.sort_unstable();
+    assert_eq!(decided, expected);
+
+    let index = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST,
+            "digest": child,
+            "size": child_manifest.len(),
+            "platform": {"architecture": "amd64", "os": "linux"}
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    let index_digest = sha(&index);
+    let response = oci
+        .put_manifest(&name, &index_digest, OCI_INDEX, &index)
+        .await;
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+
+    let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+    assert_eq!((summary.deleted, summary.skipped), (0, 2));
+    for digest in [&child, &sig_digest] {
+        assert_eq!(
+            oci.get(&name, &format!("manifests/{digest}"))
+                .await
+                .status(),
+            200,
+            "{digest}"
+        );
+    }
+}
+
 /// A tag that clients only resolve with a HEAD, as containerd does while it
 /// holds the digest, counts as pulled for `tag_not_pulled_for_days` (#197).
 #[tokio::test]

@@ -477,11 +477,11 @@ export function draftFromPolicy(
     sizeBudgetMaxGiB:
       policy.size_budget === undefined
         ? ''
-        : (policy.size_budget.max_bytes / GIB).toFixed(20).replace(/\.?0+$/, ''),
+        : (policy.size_budget.max_bytes / GIB).toFixed(30).replace(/\.?0+$/, ''),
     sizeBudgetTargetGiB:
       policy.size_budget?.target_bytes === undefined
         ? ''
-        : (policy.size_budget.target_bytes / GIB).toFixed(20).replace(/\.?0+$/, ''),
+        : (policy.size_budget.target_bytes / GIB).toFixed(30).replace(/\.?0+$/, ''),
     rules: rules.map((r) => ruleFromJson(shape, r as unknown as Record<string, unknown>)),
   }
 }

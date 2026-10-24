@@ -48,7 +48,8 @@ use forge_db::{asset_dao, blob_dao, component_dao};
 
 use crate::format::Format;
 use crate::retention::evaluate::{
-    evaluate, size_budget_protected_ids, CandidateComponent, Decision, ProxyDecision,
+    evaluate, evaluate_proxy, size_budget_protected_ids, CandidateComponent, Decision,
+    ProxyCandidate, ProxyDecision,
 };
 use crate::retention::model::{Action, RetentionPolicy};
 
@@ -606,6 +607,47 @@ async fn apply_proxy(
         tx.commit().await?;
         summary.skipped += 1;
         return Ok(Step::Continue);
+    }
+    if d.reason.size_budget.is_some() {
+        if let Some(fence) = &ctx.fence {
+            let candidates: Vec<ProxyCandidate> = retention_dao::lock_proxy_package_candidates(
+                &mut tx,
+                ctx.repository_id,
+                &cached.name,
+            )
+            .await?
+            .into_iter()
+            .map(|r| ProxyCandidate {
+                cached_version_id: r.cached_version_id,
+                package_name: r.name,
+                version: r.version,
+                listed: r.listed,
+                first_seen_at: r.first_seen_at,
+                last_downloaded_at: r.last_downloaded_at,
+                size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
+            })
+            .collect();
+            let ordinary = evaluate_proxy(
+                fence.format,
+                ctx.evaluated_at.unwrap_or_else(chrono::Utc::now),
+                fence.policy,
+                &candidates,
+            );
+            let (_, protected) = size_budget_protected_ids(
+                fence.format,
+                fence.policy,
+                &[],
+                &candidates,
+                &[],
+                &ordinary,
+            );
+            if protected.contains(&cached.id) {
+                audit_skipped_proxy(&mut tx, ctx, d).await?;
+                tx.commit().await?;
+                summary.skipped += 1;
+                return Ok(Step::Continue);
+            }
+        }
     }
 
     // Delete the parallel component + its assets (decref their blobs), if any.

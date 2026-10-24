@@ -110,6 +110,19 @@ describe('retention policy model', () => {
       max_bytes: 100,
       target_bytes: 0,
     })
+
+    for (const bytes of [2, 10]) {
+      const stored = {
+        version: 1,
+        size_budget: { max_bytes: bytes, target_bytes: bytes },
+        rules: [],
+      } as unknown as RetentionPolicy
+      const draft = draftFromPolicy('file', stored)
+      expect(buildPolicy('file', draft).size_budget).toEqual({
+        max_bytes: bytes,
+        target_bytes: bytes,
+      })
+    }
   })
 
   it('refuses empty and duplicate ids, bad numbers and no rules', () => {
