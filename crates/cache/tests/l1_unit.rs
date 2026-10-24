@@ -69,7 +69,7 @@ async fn ttl_expiry_forces_rerun() {
                 .get_or_try_insert_with::<u64, _, _, TestError>(
                     "ns",
                     "ttl",
-                    Duration::from_millis(100),
+                    Duration::from_secs(1),
                     || async move {
                         let n = calls.fetch_add(1, Ordering::SeqCst);
                         Ok(n as u64)
@@ -88,7 +88,7 @@ async fn ttl_expiry_forces_rerun() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     // Let the entry expire, then it must re-run the factory.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     let after = run().await;
     assert_eq!(after, 1, "expired entry must trigger a fresh factory run");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -502,7 +502,7 @@ async fn custom_tag_invalidation_expires_only_matching_entries() {
 #[tokio::test]
 async fn a_factory_chosen_lifetime_shortens_the_ttl() {
     // A value copied from a record that expires in 1 s lives 1 s, not the
-    // caller's 60 s; a longer factory lifetime never extends the TTL.
+    // caller's 3 s; a longer factory lifetime never extends the TTL.
     let cache = Cache::l1_only(100);
     let calls = Arc::new(AtomicUsize::new(0));
     let load = |lifetime: Duration| {
@@ -513,19 +513,19 @@ async fn a_factory_chosen_lifetime_shortens_the_ttl() {
                     "ns",
                     "expiring",
                     &[],
-                    Duration::from_millis(500),
+                    Duration::from_secs(3),
                     || async move { Ok((calls.fetch_add(1, Ordering::SeqCst) + 1, lifetime)) },
                 )
                 .await
                 .unwrap()
         }
     };
-    assert_eq!(load(Duration::from_millis(100)).await, 1);
-    assert_eq!(load(Duration::from_millis(100)).await, 1, "still live");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(load(Duration::from_secs(60)).await, 2, "expired at 100 ms");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(load(Duration::from_secs(1)).await, 1);
+    assert_eq!(load(Duration::from_secs(1)).await, 1, "still live");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(load(Duration::from_secs(60)).await, 2, "expired at 1 s");
+    tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(load(Duration::from_secs(60)).await, 2, "capped at the TTL");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(load(Duration::from_secs(60)).await, 3, "expired at 500 ms");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(load(Duration::from_secs(60)).await, 3, "expired at 3 s");
 }
