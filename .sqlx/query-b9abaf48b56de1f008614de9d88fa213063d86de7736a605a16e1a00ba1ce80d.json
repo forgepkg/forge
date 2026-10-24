@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM cli_login WHERE login_hash = $1 AND user_id IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b9abaf48b56de1f008614de9d88fa213063d86de7736a605a16e1a00ba1ce80d"
+}

@@ -29,3 +29,25 @@ pub use model::{
     Scope, POLICY_VERSION,
 };
 pub use worker::{FormatResolver, RetentionConfig, RetentionWorker, WorkerError};
+
+/// Leave out of `decisions` the versions retention never touches: every
+/// version a package tag names (npm's dist-tags, `latest` included).
+/// Returns how many decisions were dropped. The apply path checks again,
+/// with the version locked.
+pub async fn spare_protected(
+    pool: &sqlx::PgPool,
+    repository_id: i64,
+    decisions: &mut Vec<Decision>,
+) -> sqlx::Result<usize> {
+    if decisions.is_empty() {
+        return Ok(0);
+    }
+    let tagged: std::collections::HashSet<(String, String)> =
+        forge_db::tag_dao::tagged_versions(pool, repository_id)
+            .await?
+            .into_iter()
+            .collect();
+    let before = decisions.len();
+    decisions.retain(|d| !tagged.contains(&(d.package_name.clone(), d.version.clone())));
+    Ok(before - decisions.len())
+}

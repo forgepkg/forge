@@ -903,8 +903,9 @@ async fn credentialed_upstream_gets_basic_auth_on_every_request() {
     assert_eq!(mock.nupkg_hits(), 1);
 }
 
-/// Without credentials the same upstream is a hard error, never a silent
-/// empty listing that clients would treat as "package does not exist".
+/// Without credentials the same upstream is a hard error (a bad upstream:
+/// the server answers 502), never a silent empty listing that clients would
+/// treat as "package does not exist".
 #[tokio::test]
 async fn unauthorized_upstream_is_an_error_not_an_empty_listing() {
     let pool = common::pool().await;
@@ -914,14 +915,14 @@ async fn unauthorized_upstream_is_an_error_not_an_empty_listing() {
     let px = proxy_repo(&pool, cas, Cache::l1_only(128));
     assert!(matches!(
         px.list_versions(&repo, "Sample.Lib").await,
-        Err(RepoError::Storage(_))
+        Err(RepoError::BadUpstream(_))
     ));
 }
 
 /// #283: an upstream that does not answer (nothing listens on its port), or
 /// answers 5xx, while nothing is cached is unavailable (the server answers
 /// 503 with `Retry-After`), not a failure of the proxy (500). An upstream
-/// refusing the proxy's credentials stays one (above).
+/// refusing the proxy's credentials is a bad upstream (above).
 #[tokio::test]
 async fn an_unavailable_upstream_is_an_upstream_error() {
     let pool = common::pool().await;
@@ -3369,10 +3370,12 @@ async fn a_format_cannot_reach_an_origin_its_upstream_does_not_name() {
         scripted_proxy(&pool, cas, move |nuget, remote, op, fetched| match op {
             // The listing reads the internal service first, then lists
             // what the upstream lists, as NuGet does.
-            UpstreamOp::Versions(_) if fetched.is_empty() => Ok(UpstreamStep::Fetch(vec![Fetch {
-                url: secret.clone(),
-                freshness: Freshness::Metadata,
-            }])),
+            UpstreamOp::Versions(_) if fetched.is_empty() => {
+                Ok(UpstreamStep::Fetch(vec![Fetch::new(
+                    secret.clone(),
+                    Freshness::Metadata,
+                )]))
+            }
             UpstreamOp::Versions(_) => {
                 *seen.lock().unwrap() = fetched
                     .iter()

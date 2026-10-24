@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 pub use forge_plugin_api as api;
 pub use forge_plugin_api::{Descriptor, FormatPlugin};
-pub use format::PluginFormat;
+pub use format::{PluginFormat, UploadFormat};
 
 /// An installed format plugin: its implementation, which describes itself
 /// ([`FormatPlugin::descriptor`]).

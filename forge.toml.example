@@ -197,6 +197,18 @@ max_total_uncompressed_bytes = 17179869184  # (default: 16 GiB) total declared s
 max_nuspec_bytes             = 1048576      # (default: 1 MiB) also caps an upstream .nuspec a proxy verifies
 max_nuspec_compression_ratio = 200          # (default: 200)
 
+[npm]
+# What the npm registries (/npm, see docs/npm.md) read of a request. A
+# tarball itself is bounded by its repository's upload limit.
+max_document_bytes = 33554432    # (default: 32 MiB) a publish document without its tarball, an unpublish, an audit
+max_unpacked_bytes = 1073741824  # (default: 1 GiB) the most a published or proxied tarball may unpack to
+
+[cli_login]
+# Logins of command-line clients (`npm login`, `yarn npm login`), with a
+# password or approved in the browser (which needs the web UI).
+token_lifetime_days   = 90   # (default: 90; 0: never expires) the API token a login mints
+web_login_ttl_seconds = 600  # (default: 600; 60-3600) how long a login approved in the browser waits
+
 [docker]
 # The Docker / OCI registry under /v2 (see docs/docker.md).
 # max_blob_bytes              = 1073741824  # (default: 1 GiB, or what an explicit server.max_staging_bytes holds) largest layer a proxy downloads; staged on disk (pushes follow the repository's upload limit)
