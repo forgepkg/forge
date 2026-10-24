@@ -249,6 +249,7 @@ pub(crate) fn handle(repo: &Repository, req: &Request) -> Action {
         Route::Push => Action::Publish(PublishRequest {
             // The first part is the raw `.nupkg`, whatever its name.
             upload: Upload::FirstPart,
+            id: None,
             // Both create and redeploy answer 201.
             done: empty(201),
         }),

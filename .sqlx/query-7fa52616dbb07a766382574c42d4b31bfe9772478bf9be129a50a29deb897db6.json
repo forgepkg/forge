@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM package_tag\n        WHERE repository_id = $1 AND package = $2 AND ($3::text IS NULL OR version = $3)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7fa52616dbb07a766382574c42d4b31bfe9772478bf9be129a50a29deb897db6"
+}

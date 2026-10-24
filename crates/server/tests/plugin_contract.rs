@@ -124,10 +124,12 @@ impl FormatPlugin for Probe {
         match (req.method.as_str(), segments.as_slice()) {
             ("PUT", ["upload"]) => Action::Publish(PublishRequest {
                 upload: Upload::FirstPart,
+                id: None,
                 done: Response::text(201, "saved"),
             }),
             ("POST", ["upload"]) => Action::Publish(PublishRequest {
                 upload: Upload::Body,
+                id: None,
                 done: Response::text(201, "saved"),
             }),
             (_, ["files", id, version]) if read => Action::Download(target(id, version)),

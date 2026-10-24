@@ -66,9 +66,40 @@ const proxyDetail: PackageDetail = {
   },
 }
 
+/** A scoped npm package of a hosted repository. */
+const npmDetail: PackageDetail = {
+  repo: 'npm-hosted',
+  repo_kind: 'hosted',
+  id: '@acme/ui',
+  original_id: '@acme/ui',
+  versions: ['1.0.0', '1.1.0', '2.0.0-rc.1'].map((version) => ({
+    version,
+    version_original: version,
+    listed: true,
+    size: 2048,
+    published_at: '2026-06-01T00:00:00Z',
+    delay_status: null,
+    delayed_until: null,
+    retention_status: null,
+  })),
+  dependency_groups_by_version: {
+    '1.1.0': [
+      { target_framework: 'dependencies', dependencies: [{ id: '@acme/core', range: '^2.0.0' }] },
+      { target_framework: 'peerDependencies', dependencies: [{ id: 'react', range: '>=18' }] },
+    ],
+  },
+  tags: { latest: '1.1.0', next: '2.0.0-rc.1' },
+  deprecated: { '1.0.0': 'use 1.1.0' },
+  readme: '# @acme/ui\n\nButtons.',
+  description: 'Acme UI components',
+}
+
 const fetchMock = vi.fn()
 
-function mockApi(detail: (repo: string, id: string) => Response) {
+function mockApi(
+  detail: (repo: string, id: string) => Response,
+  repos: { name: string; format: string }[] = [],
+) {
   fetchMock.mockImplementation((input: RequestInfo | URL) => {
     const raw = typeof input === 'string' ? input : input.toString()
     const url = new URL(raw, 'http://localhost')
@@ -78,6 +109,13 @@ function mockApi(detail: (repo: string, id: string) => Response) {
           status: 200,
           headers: { 'content-type': 'application/json' },
         }),
+      )
+    }
+    if (url.pathname.endsWith('/browse/repos')) {
+      return Promise.resolve(
+        jsonResponse(
+          repos.map((r, i) => ({ id: i + 1, kind: 'hosted', online: true, ...r })),
+        ),
       )
     }
     const m = url.pathname.match(/\/browse\/packages\/([^/]+)\/([^/]+)$/)
@@ -245,5 +283,38 @@ describe('PackageDetail', () => {
 
     const alert = await screen.findByRole('alert')
     expect(within(alert).getByText('Could not load package')).toBeInTheDocument()
+  })
+
+  it('shows an npm package\'s dist-tags, deprecations, README and install commands', async () => {
+    mockApi(() => jsonResponse(npmDetail), [{ name: 'npm-hosted', format: 'npm' }])
+
+    await renderDetail('/packages/npm-hosted/%40acme%2Fui')
+
+    await screen.findByRole('heading', { name: '@acme/ui' })
+    const detailCalls = fetchMock.mock.calls.map(([input]) => String(input))
+    expect(detailCalls.some((u) => u.endsWith('/browse/packages/npm-hosted/%40acme%2Fui'))).toBe(
+      true,
+    )
+    const table = screen.getByRole('table', { name: 'Versions of @acme/ui' })
+    const row = (v: string) => within(table).getByText(textContent(v)).closest('tr') as HTMLElement
+    expect(within(row('1.1.0')).getByText('latest')).toBeInTheDocument()
+    expect(within(row('2.0.0-rc.1')).getByText('next')).toBeInTheDocument()
+    expect(within(row('1.0.0')).getByText('deprecated')).toHaveAttribute('title', 'use 1.1.0')
+
+    // The README, as text.
+    expect(screen.getByLabelText('README of @acme/ui')).toHaveTextContent('# @acme/ui Buttons.')
+    // Dependency kinds stand where target frameworks do; names stay exact.
+    expect(screen.getByRole('columnheader', { name: 'Kind' })).toBeInTheDocument()
+    expect(screen.getByText('peerDependencies')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '@acme/core' })).toHaveAttribute(
+      'href',
+      '/packages/npm-hosted/%40acme%2Fcore',
+    )
+    // Install commands start at `latest`, not the newest prerelease.
+    expect(await screen.findByText(textContent('npm install @acme/ui@1.1.0'))).toBeInTheDocument()
+    expect(screen.getByText(textContent('pnpm add @acme/ui@1.1.0'))).toBeInTheDocument()
+    // The dist-tags, and the latest version's description.
+    expect(screen.getByRole('heading', { name: 'Dist-tags' })).toBeInTheDocument()
+    expect(screen.getByText('Acme UI components')).toBeInTheDocument()
   })
 })

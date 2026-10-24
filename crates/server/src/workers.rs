@@ -23,7 +23,8 @@
 //!    then read the freshly-populated row/cache.
 //!
 //! 4. **Auth reaper** — periodically deletes expired/used `oidc_flow` and
-//!    `email_oauth_flow` rows, revoked/expired `session` rows and `login_known_network` rows past the
+//!    `email_oauth_flow` rows, revoked/expired `session` rows, expired `cli_login`
+//!    rows and `login_known_network` rows past the
 //!    login throttle's 30-day memory. All are pure `DELETE`s (no advisory
 //!    locks, no leases): the auth-code-flow rows are single-use and
 //!    short-lived, sessions carry their own validity predicate, so running the
@@ -433,6 +434,13 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted dead session rows"),
                 Err(e) => tracing::error!(error = %e, "session reap failed"),
+            }
+            // Command-line logins (`npm login`) nobody finished in the
+            // browser.
+            match forge_db::cli_login_dao::delete_expired(&pool).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted expired cli logins"),
+                Err(e) => tracing::error!(error = %e, "cli login reap failed"),
             }
             // Exchanged workload keys whose CI token has expired as well,
             // well past any clock skew a realm accepts (until then the row

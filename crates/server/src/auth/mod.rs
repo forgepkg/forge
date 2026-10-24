@@ -190,6 +190,10 @@ pub fn auth_router() -> Router<AppState> {
         .route("/auth/me", get(me))
         .route("/auth/tokens", get(list_tokens).post(create_token))
         .route("/auth/tokens/{id}", delete(revoke_token))
+        .route(
+            "/auth/cli-login/{secret}",
+            get(cli_login_info).post(cli_login_decide),
+        )
 }
 
 /// Resolve the realm snapshot or produce the fail-closed error response.
@@ -223,7 +227,7 @@ async fn oidc_login(
     headers: HeaderMap,
     Query(q): Query<LoginQuery>,
 ) -> Response {
-    let client_ip = login_client_ip(&state, connect, &headers);
+    let client_ip = login_client_ip(&state, connect.map(|Extension(ci)| ci.0), &headers);
     if !state.oidc_login_starts.allow(client_ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -798,6 +802,112 @@ async fn revoke_token(
     }
 }
 
+// ── CLI logins in the browser (`npm login`, see `crate::cli_auth`) ──────────
+
+/// `GET /auth/cli-login/{secret}` answer: what the approval page shows of a
+/// pending CLI login.
+#[derive(Debug, Serialize)]
+struct CliLoginView {
+    /// The client: the repository's format (`npm`).
+    client: String,
+    /// The repository the CLI logs in to.
+    repository: String,
+    /// The host name the CLI reported.
+    hostname: Option<String>,
+    /// Where the request came from.
+    client_ip: Option<String>,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+/// `GET /auth/cli-login/{secret}` — the pending CLI login whose login URL
+/// carries `secret`, for the signed-in user's approval page. 404 once it
+/// expired, was decided or never existed.
+async fn cli_login_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(secret): Path<String>,
+) -> Response {
+    let rt = SessionAuthCtx::of(&state);
+    if let Err(e) = require_session(&rt, &headers).await {
+        return e.into_response();
+    }
+    let login = match forge_db::cli_login_dao::find(&state.pool, &hash_token(&secret)).await {
+        Ok(Some(login)) if login.user_id.is_none() => login,
+        Ok(_) => return (StatusCode::NOT_FOUND, "no such login request").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "cli login lookup failed");
+            return auth_unavailable();
+        }
+    };
+    let repository =
+        match forge_db::repository_dao::find_repository_by_id(&state.pool, login.repository_id)
+            .await
+        {
+            Ok(Some(repo)) => repo.name,
+            Ok(None) => return (StatusCode::NOT_FOUND, "no such login request").into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "cli login repository lookup failed");
+                return auth_unavailable();
+            }
+        };
+    Json(CliLoginView {
+        client: login.client,
+        repository,
+        hostname: login.hostname,
+        client_ip: login.client_ip,
+        created_at: login.created_at,
+        expires_at: login.expires_at,
+    })
+    .into_response()
+}
+
+/// `POST /auth/cli-login/{secret}` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliLoginDecision {
+    /// `true` signs the CLI in as the session's user; `false` refuses it.
+    approve: bool,
+}
+
+/// `POST /auth/cli-login/{secret}` — approve (or refuse) a pending CLI
+/// login as the session's user (CSRF-protected). The CLI collects its token
+/// on its next poll. 204, or 404 when the request is gone.
+async fn cli_login_decide(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(secret): Path<String>,
+    Json(body): Json<CliLoginDecision>,
+) -> Response {
+    let rt = SessionAuthCtx::of(&state);
+    let ActiveSession { user, .. } = match require_session_csrf(&rt, &headers).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let hash = hash_token(&secret);
+    let decided = if body.approve {
+        forge_db::cli_login_dao::approve(&state.pool, &hash, user.id).await
+    } else {
+        forge_db::cli_login_dao::deny(&state.pool, &hash).await
+    };
+    match decided {
+        Ok(true) => {
+            tracing::info!(
+                target: "forge::audit",
+                user_id = user.id,
+                approved = body.approve,
+                "cli login decided"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, "no such login request").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "cli login decision failed");
+            auth_unavailable()
+        }
+    }
+}
+
 // ── password login + identifier-first UX ────────────────────────────────────
 
 /// `POST /auth/login` request body.
@@ -807,45 +917,66 @@ struct LoginBody {
     password: String,
 }
 
-/// `POST /auth/login` — authenticate a username/password through the realm
-/// chain (local + credential-forwarding realms, in priority order) and mint a
-/// browser session.
-///
-/// This is the form-login counterpart of the wire Basic path: it runs the SAME
-/// chain with the same fail-closed semantics, but is **not** gated by
-/// `auth.allow_password_basic` (that flag governs API Basic auth only). The
-/// response mirrors `/auth/me` so the SPA can bootstrap immediately; failures
-/// are a uniform 401 (no username-exists oracle). A username over
-/// [`MAX_USERNAME_BYTES`], or one containing `:`, is refused the same way
-/// before any lookup or lockout bookkeeping (it is never counted, so it cannot
-/// grow the lockout map).
-async fn password_login(
-    State(state): State<AppState>,
-    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
-    headers: HeaderMap,
-    Json(body): Json<LoginBody>,
-) -> Response {
-    let snap = match snapshot_or_resp(&state).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+/// Why a password login was refused ([`verify_password_login`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginRefusal {
+    /// Wrong credentials, or none the chain accepts: a uniform 401.
+    Invalid,
+    /// The lockout holds the `(client IP, username)` pair: 429, with how
+    /// many seconds to wait.
+    Throttled { retry_after: u64 },
+    /// Forge could not decide (its database failed): 503.
+    Unavailable,
+}
+
+impl IntoResponse for LoginRefusal {
+    fn into_response(self) -> Response {
+        match self {
+            LoginRefusal::Invalid => {
+                (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
+            }
+            LoginRefusal::Throttled { retry_after } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after.to_string())],
+                "too many failed sign-in attempts; try again later",
+            )
+                .into_response(),
+            LoginRefusal::Unavailable => auth_unavailable(),
+        }
+    }
+}
+
+/// Check a username and password as an interactive login does: through the
+/// realm chain (local and credential-forwarding realms, in priority order),
+/// under the login lockout, and never for a secret that is a token Forge
+/// issued. Not gated by `allow_password_basic`, which governs passwords on
+/// the feeds only. Returns the signed-in user and the canonical username.
+/// `POST /auth/login` and `npm login` sign in through it.
+pub(crate) async fn verify_password_login(
+    state: &AppState,
+    client_ip: IpAddr,
+    username: &str,
+    password: &str,
+) -> Result<(forge_core::auth::principal::UserPrincipal, String), LoginRefusal> {
+    let snap = snapshot_or_resp(state)
+        .await
+        .map_err(|_| LoginRefusal::Unavailable)?;
     let Some(chain) = snap.chain.clone() else {
         // No enabled password-capable realm. Uniform denial (the UI learns
         // whether to even offer the form from /auth/login-options).
-        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        return Err(LoginRefusal::Invalid);
     };
-    if body.username.len() > MAX_USERNAME_BYTES || body.password.is_empty() {
-        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    if username.len() > MAX_USERNAME_BYTES || password.is_empty() {
+        return Err(LoginRefusal::Invalid);
     }
     // The lockout, the chain and the account lookup all key on the canonical
     // username (trimmed, NFC, lowercased). A name with a `:` cannot sign in
     // with a password (a forwarding realm's upstream would split it, and Basic
     // cannot carry one); like an oversized one it is never counted.
-    let Ok(username) = forge_core::auth::canonical_password_username(&body.username) else {
-        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+    let Ok(username) = forge_core::auth::canonical_password_username(username) else {
+        return Err(LoginRefusal::Invalid);
     };
 
-    let client_ip = login_client_ip(&state, connect, &headers);
     // Reserve the attempt against the (IP, username) lockout budget before
     // running the chain; a locked pair is refused without any provider work
     // (no argon2, nothing forwarded upstream).
@@ -866,12 +997,7 @@ async fn password_login(
                     1
                 }
             };
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, retry_after.to_string())],
-                "too many failed sign-in attempts; try again later",
-            )
-                .into_response();
+            return Err(LoginRefusal::Throttled { retry_after });
         }
     };
     // A token Forge issued is never a password, even one that cannot be used
@@ -879,24 +1005,24 @@ async fn password_login(
     // credential-forwarding realm would send it upstream), and it does not
     // sign in either: a session carries its owner's rights, not the token's
     // scope. The same holds for a workload API key.
-    if forge_core::auth::is_workload_key(&body.password) {
+    if forge_core::auth::is_workload_key(password) {
         attempt.failed();
-        return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        return Err(LoginRefusal::Invalid);
     }
-    match check_token(&state.pool, &body.password).await {
+    match check_token(&state.pool, password).await {
         Ok(TokenCheck::Unknown) => {}
         Ok(TokenCheck::Live(_) | TokenCheck::Unusable) => {
             attempt.failed();
-            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+            return Err(LoginRefusal::Invalid);
         }
         Err(_) => {
             attempt.released();
-            return auth_unavailable();
+            return Err(LoginRefusal::Unavailable);
         }
     }
     let cred = PasswordCredential {
         username: &username,
-        password: &body.password,
+        password,
         client_ip,
     };
     let identity = match chain.authenticate(&cred).await {
@@ -907,16 +1033,16 @@ async fn password_login(
         // towards the lockout.
         ChainOutcome::Unavailable => {
             attempt.released();
-            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+            return Err(LoginRefusal::Invalid);
         }
         // Forge's own database failed: not a verdict on the credentials.
         ChainOutcome::Failed => {
             attempt.released();
-            return auth_unavailable();
+            return Err(LoginRefusal::Unavailable);
         }
         ChainOutcome::Rejected | ChainOutcome::NoCredentials => {
             attempt.failed();
-            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+            return Err(LoginRefusal::Invalid);
         }
     };
 
@@ -924,12 +1050,12 @@ async fn password_login(
         Ok(Some(p)) => p,
         Ok(None) => {
             attempt.failed();
-            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+            return Err(LoginRefusal::Invalid);
         }
         Err(e) => {
             tracing::error!(error = %e, "login principal mapping failed");
             attempt.released();
-            return auth_unavailable();
+            return Err(LoginRefusal::Unavailable);
         }
     };
     attempt.succeeded();
@@ -938,6 +1064,33 @@ async fn password_login(
         // effective set so the new session sees it immediately.
         forge_core::authz::invalidate_user(&state.cache, principal.user_id).await;
     }
+    Ok((principal, username))
+}
+
+/// `POST /auth/login` — authenticate a username/password through the realm
+/// chain (local + credential-forwarding realms, in priority order) and mint a
+/// browser session.
+///
+/// This is the form-login counterpart of the wire Basic path: it runs the SAME
+/// chain with the same fail-closed semantics, but is **not** gated by
+/// `auth.allow_password_basic` (that flag governs API Basic auth only). The
+/// response mirrors `/auth/me` so the SPA can bootstrap immediately; failures
+/// are a uniform 401 (no username-exists oracle). A username over
+/// [`MAX_USERNAME_BYTES`], or one containing `:`, is refused the same way
+/// before any lookup or lockout bookkeeping (it is never counted, so it cannot
+/// grow the lockout map).
+async fn password_login(
+    State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    Json(body): Json<LoginBody>,
+) -> Response {
+    let client_ip = login_client_ip(&state, connect.map(|Extension(ci)| ci.0), &headers);
+    let (principal, username) =
+        match verify_password_login(&state, client_ip, &body.username, &body.password).await {
+            Ok(verified) => verified,
+            Err(refusal) => return refusal.into_response(),
+        };
 
     // Fresh session per login (fixation-proof), same as the OIDC callback.
     let issued = match state
@@ -1020,7 +1173,7 @@ async fn lookup_invitation(
     headers: HeaderMap,
     Json(body): Json<InvitationBody>,
 ) -> Response {
-    let client_ip = login_client_ip(&state, connect, &headers);
+    let client_ip = login_client_ip(&state, connect.map(|Extension(ci)| ci.0), &headers);
     let Ok(attempt) = state
         .invitation_throttle
         .begin(client_ip, INVITATION_THROTTLE_KEY)
@@ -1067,7 +1220,7 @@ async fn accept_invitation(
         )
             .into_response();
     }
-    let client_ip = login_client_ip(&state, connect, &headers);
+    let client_ip = login_client_ip(&state, connect.map(|Extension(ci)| ci.0), &headers);
     let Ok(attempt) = state
         .invitation_throttle
         .begin(client_ip, INVITATION_THROTTLE_KEY)
@@ -1122,13 +1275,13 @@ async fn accept_invitation(
 /// every `X-Forwarded-For` line behind the configured trusted proxies and
 /// canonicalizes IPv4-mapped addresses, mirroring the principal middleware.
 /// Loopback when no connect info is available (in-process router tests).
-fn login_client_ip(
+pub(crate) fn login_client_ip(
     state: &AppState,
-    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    connect: Option<SocketAddr>,
     headers: &HeaderMap,
 ) -> IpAddr {
     let peer = connect
-        .map(|Extension(ci)| ci.0.ip())
+        .map(|addr| addr.ip())
         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     let xff = forwarded_for(headers);
     let trusted = state.config.trusted_proxy_cidrs().unwrap_or_default();

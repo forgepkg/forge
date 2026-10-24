@@ -676,6 +676,63 @@ impl GroupRepo {
             .collect())
     }
 
+    /// The leaf repositories (hosted and proxy) that serve `package_id`
+    /// through group `repo` for this caller, highest priority first: the
+    /// members [`RepoReadOps`] reads it from, after every group's guards
+    /// (see [`Self::serving_members_for_id`]).
+    pub async fn serving_leaves(
+        &self,
+        repo: &str,
+        package_id: &str,
+    ) -> Result<Vec<Repository>, RepoError> {
+        let graph = self.group_graph(repo).await?;
+        Ok(self
+            .serving_members_for_id(&graph, package_id)
+            .await?
+            .into_iter()
+            .map(|member| member.repo)
+            .collect())
+    }
+
+    /// The members' registrations of `id` merged, deduplicated by version,
+    /// the highest-priority member's entry winning; `dated`: their
+    /// [`RepoReadOps::dated_registration`]s.
+    async fn merged_registration(
+        &self,
+        repo: &str,
+        id: &str,
+        dated: bool,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        let graph = self.group_graph(repo).await?;
+        let members = self.serving_members_for_id(&graph, id).await?;
+
+        // Merge, dedup by version (id is fixed here), highest-priority wins.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut merged: Vec<RegistrationEntry> = Vec::new();
+        let mut failures = MemberFailures::default();
+        for m in &members {
+            let entries = if dated {
+                m.ops.dated_registration(&m.repo.name, id).await
+            } else {
+                m.ops.registration(&m.repo.name, id).await
+            };
+            match entries {
+                Ok(entries) => {
+                    failures.ok();
+                    for entry in entries {
+                        if seen.insert(entry.version.clone()) {
+                            merged.push(entry);
+                        }
+                    }
+                }
+                Err(e) => failures.failed(&m.repo.name, e),
+            }
+        }
+        failures.into_merged_result(merged.is_empty())?;
+        merged.sort_by(|a, b| self.compare_versions(&a.version, &b.version));
+        Ok(merged)
+    }
+
     /// The members allowed to serve `package_id`, in priority order: the
     /// visible members that every group on their way lets through
     /// ([`GroupGraph::serving_leaves`]). A group lets only its owners serve an
@@ -887,6 +944,27 @@ impl GroupRepo {
 
 #[async_trait]
 impl RepoReadOps for GroupRepo {
+    /// The tags of the first serving member, by priority, that has any: a
+    /// tag names a version of the member that set it. A member that fails
+    /// is skipped, as for versions.
+    async fn tags(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, RepoError> {
+        let graph = self.group_graph(repo).await?;
+        for m in self.serving_members_for_id(&graph, id).await? {
+            match m.ops.tags(&m.repo.name, id).await {
+                Ok(tags) if !tags.is_empty() => return Ok(tags),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(group = %repo, member = %m.repo.name, error = %e, "group member tags failed; skipped");
+                }
+            }
+        }
+        Ok(std::collections::BTreeMap::new())
+    }
+
     async fn list_versions(&self, repo: &str, id: &str) -> Result<Vec<VersionEntry>, RepoError> {
         let graph = self.group_graph(repo).await?;
         let members = self.serving_members_for_id(&graph, id).await?;
@@ -960,29 +1038,15 @@ impl RepoReadOps for GroupRepo {
         repo: &str,
         id: &str,
     ) -> Result<Vec<RegistrationEntry>, RepoError> {
-        let graph = self.group_graph(repo).await?;
-        let members = self.serving_members_for_id(&graph, id).await?;
+        self.merged_registration(repo, id, false).await
+    }
 
-        // Merge, dedup by version (id is fixed here), highest-priority wins.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut merged: Vec<RegistrationEntry> = Vec::new();
-        let mut failures = MemberFailures::default();
-        for m in &members {
-            match m.ops.registration(&m.repo.name, id).await {
-                Ok(entries) => {
-                    failures.ok();
-                    for entry in entries {
-                        if seen.insert(entry.version.clone()) {
-                            merged.push(entry);
-                        }
-                    }
-                }
-                Err(e) => failures.failed(&m.repo.name, e),
-            }
-        }
-        failures.into_merged_result(merged.is_empty())?;
-        merged.sort_by(|a, b| self.compare_versions(&a.version, &b.version));
-        Ok(merged)
+    async fn dated_registration(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<RegistrationEntry>, RepoError> {
+        self.merged_registration(repo, id, true).await
     }
 
     async fn registration_versions(&self, repo: &str, id: &str) -> Result<Vec<String>, RepoError> {

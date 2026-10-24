@@ -53,6 +53,7 @@ const RESERVED_MOUNTS: &[&str] = &[
     "assets",
     "auth",
     "browse",
+    "cli-login",
     "healthz",
     "images",
     "invite",
@@ -91,6 +92,21 @@ pub struct Manifest {
     pub storage: Storage,
     /// How a version's files are stored.
     pub assets: Assets,
+    /// How a proxy given a password and no username authenticates to its
+    /// upstream (`upstream_token`).
+    pub upstream_token: UpstreamToken,
+}
+
+/// The `upstream_token` key: what a proxy does with a password stored
+/// without a username.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpstreamToken {
+    /// Nothing: a proxy authenticates only with a username and a password
+    /// (Basic).
+    #[default]
+    None,
+    /// `bearer`: the password is a token, sent as `Authorization: Bearer`.
+    Bearer,
 }
 
 /// What a format's repositories hold (`storage`).
@@ -155,6 +171,7 @@ struct RawPlugin {
     mount: Option<String>,
     kinds: Option<Vec<String>>,
     storage: Option<String>,
+    upstream_token: Option<String>,
 }
 
 impl Manifest {
@@ -189,6 +206,15 @@ impl Manifest {
             }
         };
         validate_assets(&raw.assets)?;
+        let upstream_token = match p.upstream_token.as_deref() {
+            None => UpstreamToken::None,
+            Some("bearer") => UpstreamToken::Bearer,
+            Some(other) => {
+                return Err(PluginError::Manifest(format!(
+                    "upstream_token {other:?} is not supported (bearer)"
+                )))
+            }
+        };
         Ok(Manifest {
             id: p.id,
             name: p.name,
@@ -199,6 +225,7 @@ impl Manifest {
             kinds,
             storage,
             assets: raw.assets,
+            upstream_token,
         })
     }
 }

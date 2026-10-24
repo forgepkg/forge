@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 pub use forge_plugin_api as api;
 pub use forge_plugin_api::FormatPlugin;
-pub use format::PluginFormat;
+pub use format::{PluginFormat, UploadFormat};
 pub use manifest::Manifest;
 
 /// Errors installing a plugin.

@@ -130,6 +130,36 @@ pub trait Format: Send + Sync {
         }
     }
 
+    /// Whether a proxy of this format with a password and no username sends
+    /// the password as an `Authorization: Bearer` token (npm's registry
+    /// tokens) rather than no credentials at all.
+    fn upstream_bearer_token(&self) -> bool {
+        false
+    }
+
+    /// The README a manifest carries, for the web UI's package page.
+    fn readme(&self, manifest: &[u8]) -> Option<String> {
+        let _ = manifest;
+        None
+    }
+
+    /// A group's reserved prefix as stored, from what an administrator typed
+    /// (trimmed, a trailing `*` dropped); refused when it cannot start an
+    /// id. The default takes letters, digits, `.`, `_` and `-`, lowercased.
+    fn reserved_prefix(&self, prefix: &str) -> Result<String, FormatError> {
+        let valid = !prefix.is_empty()
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if valid {
+            Ok(prefix.to_ascii_lowercase())
+        } else {
+            Err(FormatError::InvalidPackage(format!(
+                "{prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
+            )))
+        }
+    }
+
     /// One step of the upstream side of a proxy repository
     /// ([`forge_plugin_api::FormatPlugin::upstream`]): what to fetch from
     /// `remote` for `op`, or what came of it. The proxy read path
