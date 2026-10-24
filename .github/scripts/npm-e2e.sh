@@ -85,7 +85,7 @@ pack "$work/src/up-public-1.1.0" e2e-public 1.1.0 '{"e2e-dep":"^2.0.0"}'
 pack "$work/src/up-dep-2.0.0" e2e-dep 2.0.0
 pack "$work/src/up-acme-ui" @acme/ui 9.9.9
 cat > "$work/upstream.py" <<'EOF'
-import base64, glob, hashlib, http.server, json, os, sys, tarfile, urllib.parse
+import base64, glob, hashlib, http.server, json, os, sys, tarfile, threading, urllib.parse
 
 root, port = sys.argv[1], int(sys.argv[2])
 packages, tarballs = {}, {}
@@ -107,6 +107,16 @@ for path in sorted(glob.glob(os.path.join(root, "*.tgz"))):
     doc["time"][version] = "2020-01-01T00:00:00.000Z"
     doc["dist-tags"]["latest"] = version
 
+# Requests are handled on threads of their own: each logs one whole line at
+# a time, or two lines written at once run together and the checks that
+# count them miss one.
+log_lock = threading.Lock()
+
+def log(line):
+    with log_lock:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
 class Registry(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -122,13 +132,13 @@ class Registry(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.unquote(self.path.split("?")[0])
         auth = f"auth={'Authorization' in self.headers}"
         if path in tarballs:
-            print(f"GET {path} {auth}", flush=True)
+            log(f"GET {path} {auth}")
             self.answer(200, tarballs[path], "application/octet-stream")
         elif path.lstrip("/") in packages:
             # Which packument the proxy asked for: the abbreviated one
             # installs need, or the full one.
             abbreviated = "application/vnd.npm.install-v1+json" in self.headers.get("Accept", "")
-            print(f"GET {path} {auth} packument={'abbreviated' if abbreviated else 'full'}", flush=True)
+            log(f"GET {path} {auth} packument={'abbreviated' if abbreviated else 'full'}")
             self.answer(200, json.dumps(packages[path.lstrip("/")]).encode())
         elif path == "/-/v1/search":
             self.answer(200, b'{"objects":[],"total":0,"time":"2020-01-01T00:00:00.000Z"}')
@@ -137,7 +147,7 @@ class Registry(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        print(f"POST {self.path} {body.decode()}", flush=True)
+        log(f"POST {self.path} {body.decode()}")
         if self.path != "/-/npm/v1/security/advisories/bulk":
             self.answer(404, b'{"error":"not found"}')
             return
