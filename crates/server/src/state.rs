@@ -241,21 +241,6 @@ impl FormatRegistry {
             .cloned()
     }
 
-    /// The mounts plugin formats are served under by the plugin dispatcher
-    /// ([`crate::plugins`]), sorted and distinct (`/repository`, and any
-    /// other a plugin names). The images format's mount is the registry's.
-    pub fn mounts(&self) -> Vec<&str> {
-        let mut mounts: Vec<&str> = self
-            .plugins
-            .values()
-            .filter(|p| p.descriptor().storage != forge_plugin::api::Storage::Images)
-            .map(|p| p.descriptor().mount)
-            .collect();
-        mounts.sort_unstable();
-        mounts.dedup();
-        mounts
-    }
-
     /// The installed format ids, sorted.
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         self.formats.keys().map(String::as_str)
@@ -722,14 +707,13 @@ mod tests {
             registry.kinds("nuget"),
             Some(vec!["hosted", "proxy", "group"])
         );
-        // npm is a built-in plugin, served under its own mount.
+        // npm is a built-in plugin.
         assert_eq!(
             registry.kinds("npm"),
             Some(vec!["hosted", "proxy", "group"])
         );
         assert!(registry.plugin("npm").is_some());
         assert!(!registry.stores_files("npm"));
-        assert_eq!(registry.mounts(), ["/npm", "/raw", "/v3"]);
         assert_eq!(registry.kinds("helm"), None);
         assert_eq!(registry.kinds("maven"), None);
         assert!(!registry.is_installed("maven"));

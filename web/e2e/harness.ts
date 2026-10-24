@@ -6,7 +6,7 @@
  * This deliberately drives the **actual Rust server binary** against the same
  * container images the Rust testcontainers harness uses (Postgres 17 +
  * versity/versitygw:v1.4.1), proving the single-origin serving model end to end:
- * the browser hits `/`, `/admin/*`, `/browse/*`, `/v3/*` on one origin with no
+ * the browser hits `/`, `/admin/*`, `/browse/*`, `/repository/*` on one origin with no
  * Node proxy.
  *
  * Lifecycle is owned by Playwright's globalSetup/globalTeardown; the resolved

@@ -54,7 +54,7 @@ export type ButtonProps = ButtonOwnProps &
  * form), or a link when `href` is set. Label it with a verb in sentence case.
  *
  * A link to a path inside the SPA navigates with the router; one with
- * `download` or `target` (a file the server serves, such as `/raw/…`), or to
+ * `download` or `target` (a file the server serves, such as `/repository/…`), or to
  * another origin, is a plain `<a>`.
  */
 export const Button = forwardRef<HTMLButtonElement | HTMLAnchorElement, ButtonProps>(

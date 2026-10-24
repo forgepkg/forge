@@ -2,7 +2,7 @@
 //! repositories of a files format (raw).
 //!
 //! The web UI reads listings from its format's protocol itself
-//! (`/raw/<repo>/<dir>/` as JSON, with its session). Changing files through
+//! (`/repository/<repo>/<dir>/` as JSON, with its session). Changing files through
 //! `/raw` takes an API token, like every package client, so the UI changes
 //! them here, with its session (whose CSRF token the principal middleware
 //! checks):

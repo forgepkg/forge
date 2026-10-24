@@ -1,6 +1,6 @@
 //! NuGet V3 feeds for Forge, as a format plugin.
 //!
-//! Served under `/v3/{repository}` (its [`DESCRIPTOR`] names the mount):
+//! Served under `/repository/{repository}`:
 //!
 //! * `GET /index.json` — the service index;
 //! * `GET /flat/{id}/index.json`, `/flat/{id}/{version}/{file}` — the flat
@@ -35,14 +35,13 @@ use forge_plugin_api::{
 
 pub use model::NupkgLimits;
 
-/// What NuGet says about itself: its format id, name, version and mount.
+/// What NuGet says about itself: its format id, name and version.
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "nuget",
     name: "NuGet",
     version: env!("CARGO_PKG_VERSION"),
     description: "NuGet V3 feeds: push, restore and search with dotnet, nuget.exe and Visual \
                   Studio; proxies of nuget.org and other V3 feeds.",
-    mount: "/v3",
     // Proxies mirror another V3 feed through the plugin's upstream side.
     kinds: &[
         RepositoryKind::Hosted,

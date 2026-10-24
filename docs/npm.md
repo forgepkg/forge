@@ -3,7 +3,7 @@
 Forge serves npm packages to npm, pnpm, Yarn (1 and 2+) and Bun: publish,
 install, dist-tags, deprecations, unpublishing, search, `npm audit` and the
 logins. Repositories of `format: "npm"` are served at
-`https://<host>/npm/<repository>/`, in the usual three kinds:
+`https://<host>/repository/<repository>/`, in the usual three kinds:
 
 - **hosted**: publish and install your own packages;
 - **proxy**: a cache of another registry, `https://registry.npmjs.org` or a
@@ -61,21 +61,21 @@ ready to copy.
 **npm, pnpm, Bun and Yarn 1** read `.npmrc` (the project's, or `~/.npmrc`):
 
 ```ini
-registry=https://forge.example.com/npm/npm-all/
-//forge.example.com/npm/npm-all/:_authToken=<token>
+registry=https://forge.example.com/repository/npm-all/
+//forge.example.com/repository/npm-all/:_authToken=<token>
 ```
 
 Only one scope from Forge, the rest from elsewhere:
 
 ```ini
-@acme:registry=https://forge.example.com/npm/npm-all/
-//forge.example.com/npm/npm-all/:_authToken=<token>
+@acme:registry=https://forge.example.com/repository/npm-all/
+//forge.example.com/repository/npm-all/:_authToken=<token>
 ```
 
 **Yarn 2 and later** read `.yarnrc.yml`:
 
 ```yaml
-npmRegistryServer: "https://forge.example.com/npm/npm-all/"
+npmRegistryServer: "https://forge.example.com/repository/npm-all/"
 npmAlwaysAuth: true
 npmAuthToken: "<token>"
 ```
@@ -94,8 +94,8 @@ OIDC provider), check the client, repository and host name it shows, and
 approve; the client then stores a new API token in `.npmrc`:
 
 ```bash
-npm login --registry https://forge.example.com/npm/npm-all/
-npm whoami --registry https://forge.example.com/npm/npm-all/
+npm login --registry https://forge.example.com/repository/npm-all/
+npm whoami --registry https://forge.example.com/repository/npm-all/
 ```
 
 Without a browser on the machine (`--browser=false`), npm prints the page's
@@ -127,10 +127,10 @@ web_login_ttl_seconds = 600
 ## Publishing
 
 ```bash
-npm publish --registry https://forge.example.com/npm/npm-hosted/
-pnpm publish --registry https://forge.example.com/npm/npm-hosted/
+npm publish --registry https://forge.example.com/repository/npm-hosted/
+pnpm publish --registry https://forge.example.com/repository/npm-hosted/
 yarn npm publish            # with npmRegistryServer / npmPublishRegistry set
-bun publish --registry https://forge.example.com/npm/npm-hosted/
+bun publish --registry https://forge.example.com/repository/npm-hosted/
 ```
 
 Publishing needs the level **write** and an API token (a password typed

@@ -22,7 +22,7 @@ fn repo(kind: RepositoryKind) -> Repository {
     Repository {
         name: "main".into(),
         kind,
-        base_url: format!("{BASE}/v3/main"),
+        base_url: format!("{BASE}/repository/main"),
         inline: false,
         reserved_prefixes: Vec::new(),
     }
@@ -164,19 +164,19 @@ fn service_index_hosted_advertises_publish_with_absolute_ids() {
     };
     assert_eq!(
         by_type("SearchQueryService/3.5.0").as_deref(),
-        Some("https://forge.example.com/v3/main/query")
+        Some("https://forge.example.com/repository/main/query")
     );
     assert_eq!(
         by_type("RegistrationsBaseUrl/3.6.0").as_deref(),
-        Some("https://forge.example.com/v3/main/registration/")
+        Some("https://forge.example.com/repository/main/registration/")
     );
     assert_eq!(
         by_type("PackageBaseAddress/3.0.0").as_deref(),
-        Some("https://forge.example.com/v3/main/flat/")
+        Some("https://forge.example.com/repository/main/flat/")
     );
     assert_eq!(
         by_type("PackagePublish/2.0.0").as_deref(),
-        Some("https://forge.example.com/v3/main/package")
+        Some("https://forge.example.com/repository/main/package")
     );
 }
 
@@ -429,7 +429,7 @@ fn registration_inlined_page_shape() {
     assert_eq!(ce["packageHashAlgorithm"], "SHA512");
     assert_eq!(
         ce["packageContent"],
-        "https://forge.example.com/v3/main/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg"
+        "https://forge.example.com/repository/main/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg"
     );
     assert_eq!(leaf0["packageContent"], ce["packageContent"]);
 
@@ -484,9 +484,9 @@ fn registration_pages_large_packages() {
     let page_url = pages[1]["@id"].as_str().unwrap();
     assert_eq!(
         page_url,
-        format!("{BASE}/v3/main/registration/big.lib/page/1.0.64/1.0.127.json")
+        format!("{BASE}/repository/main/registration/big.lib/page/1.0.64/1.0.127.json")
     );
-    let served = mock.get(&page_url[format!("{BASE}/v3/main").len()..]);
+    let served = mock.get(&page_url[format!("{BASE}/repository/main").len()..]);
     let Some(Query::PackagesOf(set)) = served.queries.last() else {
         panic!("a page loads its versions: {:?}", served.queries);
     };
@@ -530,7 +530,7 @@ fn registration_page_urls_survive_a_rechunk() {
     assert_eq!(page["upper"], "1.0.127");
     assert_eq!(
         page["@id"],
-        format!("{BASE}/v3/main/registration/big.lib/page/1.0.64/1.0.127.json")
+        format!("{BASE}/repository/main/registration/big.lib/page/1.0.64/1.0.127.json")
     );
 }
 
@@ -568,7 +568,7 @@ fn registration_leaf_and_catalog_documents_resolve() {
     let path = leaf["@id"]
         .as_str()
         .unwrap()
-        .strip_prefix("https://forge.example.com/v3/main")
+        .strip_prefix("https://forge.example.com/repository/main")
         .unwrap()
         .to_string();
     let doc = json_of(&mock.get(&path));
@@ -580,7 +580,7 @@ fn registration_leaf_and_catalog_documents_resolve() {
     let path = doc["catalogEntry"]
         .as_str()
         .unwrap()
-        .strip_prefix("https://forge.example.com/v3/main")
+        .strip_prefix("https://forge.example.com/repository/main")
         .unwrap()
         .to_string();
     assert_eq!(json_of(&mock.get(&path))["authors"], "Alice, Bob");
@@ -664,7 +664,7 @@ fn search_shape_with_total_hits_and_versions() {
     assert_eq!(versions[0]["downloads"], 0);
     assert_eq!(
         versions[0]["@id"],
-        "https://forge.example.com/v3/main/registration/sample.lib/1.0.0.json"
+        "https://forge.example.com/repository/main/registration/sample.lib/1.0.0.json"
     );
 }
 
@@ -766,7 +766,7 @@ fn search_hits_carry_manifest_metadata_and_downloads() {
     assert_eq!(hit["totalDownloads"], 42);
     assert_eq!(
         hit["registration"],
-        "https://forge.example.com/v3/main/registration/sample.lib/index.json"
+        "https://forge.example.com/repository/main/registration/sample.lib/index.json"
     );
 }
 

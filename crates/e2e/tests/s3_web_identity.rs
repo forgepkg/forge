@@ -72,7 +72,7 @@ async fn packages_are_stored_with_temporary_keys_from_versitygw_sts() {
     let download = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/flat/forge.webidentity/1.0.0/forge.webidentity.1.0.0.nupkg",
+            "{}/repository/{repo}/flat/forge.webidentity/1.0.0/forge.webidentity.1.0.0.nupkg",
             srv.base_url
         ))
         .send()

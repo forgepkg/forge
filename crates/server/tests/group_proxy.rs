@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 /// The in-process feeds the test server talks to.
 struct Feeds {
     base: String,
-    /// The group's real base (`{server}/v3/{group}`).
+    /// The group's real base (`{server}/repository/{group}`).
     group_base: String,
     /// While set, the public feed answers every request with 503.
     down: AtomicBool,
@@ -110,7 +110,7 @@ async fn downstream_proxy_does_not_cache_a_miss_while_a_group_member_is_failing(
         format!("ggrp{s}"),
         format!("gdown{s}"),
     );
-    let feeds = start_feeds(format!("{}/v3/{group}", srv.base_url)).await;
+    let feeds = start_feeds(format!("{}/repository/{group}", srv.base_url)).await;
 
     // Group G = hosted H (answers, has nothing) + proxy P of the public feed;
     // D proxies G, reading it anonymously like a second Forge would.
@@ -158,7 +158,7 @@ async fn downstream_proxy_does_not_cache_a_miss_while_a_group_member_is_failing(
     }
     let get = |path: String| {
         client
-            .get(format!("{}/v3/{path}", srv.base_url))
+            .get(format!("{}/repository/{path}", srv.base_url))
             .basic_auth(&u, Some(&p))
             .send()
     };
@@ -217,7 +217,7 @@ async fn a_proxy_of_an_unreachable_upstream_answers_503() {
     let s = common::unique();
     let (nuget, group) = (format!("ndown{s}"), format!("gdown{s}"));
     for body in [
-        json!({ "name": nuget, "kind": "proxy", "remote_url": format!("http://{closed}/v3/index.json") }),
+        json!({ "name": nuget, "kind": "proxy", "remote_url": format!("http://{closed}/repository/index.json") }),
         json!({ "name": group, "kind": "group" }),
     ] {
         let resp = client
@@ -248,16 +248,18 @@ async fn a_proxy_of_an_unreachable_upstream_answers_503() {
             .send()
     };
     for path in [
-        format!("/v3/{nuget}/flat/sample.lib/index.json"),
-        format!("/v3/{nuget}/registration/sample.lib/index.json"),
-        format!("/v3/{nuget}/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg"),
-        format!("/v3/{group}/flat/sample.lib/index.json"),
-        format!("/v3/{group}/registration/sample.lib/index.json"),
+        format!("/repository/{nuget}/flat/sample.lib/index.json"),
+        format!("/repository/{nuget}/registration/sample.lib/index.json"),
+        format!("/repository/{nuget}/flat/sample.lib/1.0.0/sample.lib.1.0.0.nupkg"),
+        format!("/repository/{group}/flat/sample.lib/index.json"),
+        format!("/repository/{group}/registration/sample.lib/index.json"),
     ] {
         let resp = get(path.clone()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
         assert_eq!(resp.headers()["retry-after"], "30", "{path}");
     }
-    let resp = get(format!("/v3/{nuget}/index.json")).await.unwrap();
+    let resp = get(format!("/repository/{nuget}/index.json"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }

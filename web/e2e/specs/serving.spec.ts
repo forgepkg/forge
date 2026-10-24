@@ -84,7 +84,7 @@ test.describe('single-origin serving', () => {
       anonymous_read: true,
     })
     expect([200, 201, 409]).toContain(created.status)
-    const res = await request.get(`${f.baseUrl}/v3/svcidx/index.json`)
+    const res = await request.get(`${f.baseUrl}/repository/svcidx/index.json`)
     expect(res.ok()).toBeTruthy()
     const body = await res.json()
     expect(JSON.stringify(body)).toContain('PackagePublish')

@@ -1,4 +1,4 @@
-//! Integration tests of raw (generic file) repositories (`/raw`): hosted
+//! Integration tests of raw (generic file) repositories (`/repository/{repo}`): hosted
 //! uploads, downloads with ranges, validators and checksum sidecars, the
 //! deployment policy, listings, path traversal, proxies (redirects to a
 //! second host, re-validation, misses, an unreachable upstream), groups,
@@ -77,7 +77,7 @@ impl Files {
     async fn new(srv: &TestServer, repo: &str) -> Self {
         let token = srv.admin_token().await;
         Files {
-            base: format!("{}/raw/{repo}", srv.base_url),
+            base: format!("{}/repository/{repo}", srv.base_url),
             client: srv.client(),
             token: Some((srv.admin_user.clone().unwrap(), token)),
         }
@@ -436,19 +436,20 @@ async fn path_traversal_is_refused() {
         "safe%00file.txt",
     ] {
         for method in ["GET", "PUT", "DELETE"] {
-            let status = raw_status(&srv, method, &format!("/raw/{name}/{path}"), &auth).await;
+            let status =
+                raw_status(&srv, method, &format!("/repository/{name}/{path}"), &auth).await;
             assert_eq!(status, 400, "{method} {path}");
         }
     }
     // A backslash hyper lets through is refused like its encoded form; one
     // it does not is refused before the handler.
-    let status = raw_status(&srv, "PUT", &format!("/raw/{name}/a\\b"), &auth).await;
+    let status = raw_status(&srv, "PUT", &format!("/repository/{name}/a\\b"), &auth).await;
     assert_eq!(status, 400);
     // Nothing was stored outside, and the file is untouched.
     assert_eq!(names(&files.json("").await), ["safe/"]);
     assert_eq!(names(&files.json("safe/").await), ["file.txt"]);
     // The repository name itself cannot climb out either.
-    let status = raw_status(&srv, "GET", "/raw/../admin/repositories", &auth).await;
+    let status = raw_status(&srv, "GET", "/repository/../admin/repositories", &auth).await;
     assert_ne!(status, 200);
 }
 
@@ -858,7 +859,7 @@ async fn selectors_scope_paths() {
     let session = srv.login(&username, "pw12345678-raw").await;
     let get = |path: String| {
         session
-            .apply(client.get(format!("{}/raw/{name}/{path}", srv.base_url)))
+            .apply(client.get(format!("{}/repository/{name}/{path}", srv.base_url)))
             .header(header::ACCEPT, "application/json")
             .send()
     };
@@ -1020,7 +1021,7 @@ async fn forms_the_web_ui_and_the_admin_api() {
         .iter()
         .find(|f| f["id"] == "raw")
         .expect("raw listed");
-    assert_eq!(raw["mount"], "/raw");
+    assert!(raw.get("mount").is_none());
     assert_eq!(raw["kinds"], json!(["hosted", "proxy", "group"]));
     for (body, why) in [
         (

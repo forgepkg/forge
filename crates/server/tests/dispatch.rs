@@ -25,7 +25,10 @@ async fn unknown_repo_is_404() {
     let (u, p) = srv.admin_basic();
     let resp = srv
         .client()
-        .get(format!("{}/v3/does-not-exist/index.json", srv.base_url))
+        .get(format!(
+            "{}/repository/does-not-exist/index.json",
+            srv.base_url
+        ))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -75,8 +78,8 @@ async fn unknown_repo_answers_like_a_denied_one() {
     };
     let unknown = format!("absent{}", common::unique());
     for (path, signed_in, status) in [
-        ("/v3/{}/index.json", false, 401),
-        ("/v3/{}/index.json", true, 403),
+        ("/repository/{}/index.json", false, 401),
+        ("/repository/{}/index.json", true, 403),
         ("/browse/packages/{}/Foo", true, 403),
     ] {
         let denied = answer(path.replace("{}", &private), signed_in).await;
@@ -86,7 +89,7 @@ async fn unknown_repo_answers_like_a_denied_one() {
     }
 }
 
-/// Every `/v3` response — also the ones the dispatcher answers itself before
+/// Every `/repository` response — also the ones the dispatcher answers itself before
 /// the per-repository router runs — is a sandboxed, script-free download, so
 /// publisher-controlled feed content can never execute on the admin origin.
 #[tokio::test]
@@ -105,10 +108,10 @@ async fn feed_responses_are_sandboxed_downloads() {
     assert_eq!(resp.status(), 201);
 
     for (path, authenticated) in [
-        ("/v3/does-not-exist/index.json".to_string(), true),
-        (format!("/v3/{repo}/index.json"), false),
-        (format!("/v3/{repo}/index.json"), true),
-        (format!("/v3/{repo}/flat/x/1.0.0/x.nuspec"), true),
+        ("/repository/does-not-exist/index.json".to_string(), true),
+        (format!("/repository/{repo}/index.json"), false),
+        (format!("/repository/{repo}/index.json"), true),
+        (format!("/repository/{repo}/flat/x/1.0.0/x.nuspec"), true),
     ] {
         let mut req = client.get(format!("{}{path}", srv.base_url));
         if authenticated {
@@ -161,7 +164,7 @@ async fn read_authz_and_service_index() {
 
     // Anonymous read → 401 (anon mode off).
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
@@ -176,7 +179,7 @@ async fn read_authz_and_service_index() {
 
     // Authenticated read → 200, with PackagePublish advertised (hosted).
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -196,7 +199,7 @@ async fn read_authz_and_service_index() {
     // Absolute @id from public_base_url.
     let first_id = body["resources"][0]["@id"].as_str().unwrap();
     assert!(
-        first_id.starts_with("http://test.local/v3/"),
+        first_id.starts_with("http://test.local/repository/"),
         "got {first_id}"
     );
 }
@@ -231,7 +234,7 @@ async fn hosted_publish_and_restore() {
         .unwrap();
     let form = reqwest::multipart::Form::new().part("package", part);
     let resp = client
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", &api_key)
         .multipart(form)
         .send()
@@ -246,7 +249,7 @@ async fn hosted_publish_and_restore() {
         .unwrap();
     let form = reqwest::multipart::Form::new().part("package", part);
     let resp = client
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .multipart(form)
         .send()
         .await
@@ -256,7 +259,7 @@ async fn hosted_publish_and_restore() {
     // Flat-container version listing.
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/index.json",
+            "{}/repository/{repo}/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -270,7 +273,7 @@ async fn hosted_publish_and_restore() {
     // Download the .nupkg bytes back and compare.
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
+            "{}/repository/{repo}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -308,7 +311,7 @@ async fn push_of_an_overlong_version_is_400_and_stores_nothing() {
         .mime_str("application/octet-stream")
         .unwrap();
     let resp = client
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", srv.admin_token().await)
         .multipart(reqwest::multipart::Form::new().part("package", part))
         .send()
@@ -320,7 +323,7 @@ async fn push_of_an_overlong_version_is_400_and_stores_nothing() {
 
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/index.json",
+            "{}/repository/{repo}/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -330,7 +333,7 @@ async fn push_of_an_overlong_version_is_400_and_stores_nothing() {
     assert_eq!(resp.status(), 404, "nothing was stored");
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/{version}/{lower}.{version}.nupkg",
+            "{}/repository/{repo}/flat/{lower}/{version}/{lower}.{version}.nupkg",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -390,7 +393,7 @@ async fn session_plus_junk_authorization_header_cannot_publish() {
             .mime_str("application/octet-stream")
             .unwrap();
         let mut req = client
-            .put(format!("{}/v3/{repo}/package", srv.base_url))
+            .put(format!("{}/repository/{repo}/package", srv.base_url))
             .header("cookie", &cookie)
             .header("authorization", "Unrelated session-bypass")
             .multipart(reqwest::multipart::Form::new().part("package", part));
@@ -473,7 +476,7 @@ async fn anonymous_read_when_allowed() {
 
     // No credentials, anon mode all + anonymous-role read grant → 200.
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
@@ -507,7 +510,7 @@ async fn large_package_push_and_restore_round_trip() {
         .mime_str("application/octet-stream")
         .unwrap();
     let resp = client
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", &api_key)
         .multipart(reqwest::multipart::Form::new().part("package", part))
         .send()
@@ -516,7 +519,7 @@ async fn large_package_push_and_restore_round_trip() {
     assert_eq!(resp.status(), 201, "a 9 MiB push must be accepted");
 
     let url = format!(
-        "{}/v3/{repo}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
+        "{}/repository/{repo}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
         srv.base_url
     );
     let head = client
@@ -591,7 +594,7 @@ async fn offline_hosted_and_group_repositories_answer_503() {
             .unwrap();
         assert_eq!(resp.status(), 201, "{body}");
     }
-    let index = |repo: &str| format!("{}/v3/{repo}/index.json", srv.base_url);
+    let index = |repo: &str| format!("{}/repository/{repo}/index.json", srv.base_url);
     for repo in [&hosted, &group, &proxy] {
         let resp = client
             .get(index(repo))
@@ -626,7 +629,7 @@ async fn offline_hosted_and_group_repositories_answer_503() {
         .mime_str("application/octet-stream")
         .unwrap();
     let resp = client
-        .put(format!("{}/v3/{hosted}/package", srv.base_url))
+        .put(format!("{}/repository/{hosted}/package", srv.base_url))
         .header("X-NuGet-ApiKey", srv.admin_token().await)
         .multipart(reqwest::multipart::Form::new().part("package", part))
         .send()

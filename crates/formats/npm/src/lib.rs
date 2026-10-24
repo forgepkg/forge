@@ -1,5 +1,5 @@
 //! npm registries for Forge, as a built-in format plugin: what npm, pnpm,
-//! Yarn and Bun read and write under `/npm/<repository>/`.
+//! Yarn and Bun read and write under `/repository/<repository>/`.
 //!
 //! [`Npm`] implements [`FormatPlugin`]: the rules of package names and
 //! versions, reading a tarball, and the registry protocol
@@ -40,7 +40,7 @@ use serde_json::Value;
 
 pub use name::PackageName;
 
-/// What npm says about itself: its format id, name, version and mount.
+/// What npm says about itself: its format id, name and version.
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "npm",
     name: "npm",
@@ -48,7 +48,6 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     description: "npm registries: publish, install and log in with npm, pnpm, Yarn and Bun; \
                   dist-tags, deprecations and audits; proxies of registry.npmjs.org and other \
                   registries.",
-    mount: "/npm",
     // Proxies mirror another registry through the plugin's upstream side.
     kinds: &[
         RepositoryKind::Hosted,

@@ -54,8 +54,8 @@ impl<T: Read + Seek + ?Sized> PackageSource for T {}
 /// files format has neither ids nor versions nor packages: it keeps their
 /// defaults, which refuse every id, version and package.
 pub trait FormatPlugin: Send + Sync + 'static {
-    /// What the format says about itself: its id, name, version, mount,
-    /// repository kinds, storage and asset names. A `'static` value the
+    /// What the format says about itself: its id, name, version, repository
+    /// kinds, storage and asset names. A `'static` value the
     /// crate defines next to its implementation (`pub const DESCRIPTOR`).
     fn descriptor(&self) -> &'static Descriptor;
 

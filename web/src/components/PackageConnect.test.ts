@@ -17,32 +17,32 @@ describe('connectSnippets', () => {
 
   it('leaves the push command out unless the repository takes pushes', () => {
     const labels = (canPush: boolean) =>
-      connectSnippets('nuget', 'feed', 'https://f/v3/feed', canPush).map((s) => s.label)
+      connectSnippets('nuget', 'feed', 'https://f/repository/feed', canPush).map((s) => s.label)
     expect(labels(true)).toEqual(['Add the source', 'Push a package'])
     expect(labels(false)).toEqual(['Add the source'])
   })
 
   it('points npm at the registry URL with its trailing slash', () => {
-    const snippets = connectSnippets('npm', 'npm-all', 'https://f.example/npm/npm-all', false)
+    const snippets = connectSnippets('npm', 'npm-all', 'https://f.example/repository/npm-all', false)
     expect(snippets.map((s) => s.command)).toEqual([
-      'npm config set registry https://f.example/npm/npm-all/',
-      'npm config set @<scope>:registry https://f.example/npm/npm-all/',
-      'npm login --registry https://f.example/npm/npm-all/',
+      'npm config set registry https://f.example/repository/npm-all/',
+      'npm config set @<scope>:registry https://f.example/repository/npm-all/',
+      'npm login --registry https://f.example/repository/npm-all/',
     ])
     expect(
-      connectSnippets('npm', 'npm-hosted', 'https://f.example/npm/npm-hosted', true).at(-1)
+      connectSnippets('npm', 'npm-hosted', 'https://f.example/repository/npm-hosted', true).at(-1)
         ?.command,
-    ).toBe('npm publish --registry https://f.example/npm/npm-hosted/')
+    ).toBe('npm publish --registry https://f.example/repository/npm-hosted/')
   })
 })
 
 describe('npmrc', () => {
   it('scopes the token to the registry, without the scheme', () => {
-    expect(npmrc('https://f.example/npm/npm-all')).toBe(
-      'registry=https://f.example/npm/npm-all/\n//f.example/npm/npm-all/:_authToken=<token>',
+    expect(npmrc('https://f.example/repository/npm-all')).toBe(
+      'registry=https://f.example/repository/npm-all/\n//f.example/repository/npm-all/:_authToken=<token>',
     )
-    expect(yarnrc('http://localhost:8080/npm/x')).toContain(
-      'npmRegistryServer: "http://localhost:8080/npm/x/"',
+    expect(yarnrc('http://localhost:8080/repository/x')).toContain(
+      'npmRegistryServer: "http://localhost:8080/repository/x/"',
     )
   })
 })

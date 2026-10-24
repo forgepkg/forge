@@ -112,7 +112,7 @@ async fn matrix_read_write_any_and_fail_closed() {
     let delete_without_grant = srv
         .client()
         .delete(format!(
-            "{}/v3/repo-a/package/Matrix.Pkg/1.0.0",
+            "{}/repository/repo-a/package/Matrix.Pkg/1.0.0",
             srv.base_url
         ))
         .header("X-NuGet-ApiKey", &token)
@@ -130,7 +130,7 @@ async fn matrix_read_write_any_and_fail_closed() {
     let (u, p) = srv.admin_basic();
     let resp = srv
         .client()
-        .get(format!("{}/v3/repo-b/index.json", srv.base_url))
+        .get(format!("{}/repository/repo-b/index.json", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -284,7 +284,7 @@ async fn anonymous_role_grant_enables_anon_read() {
 
     let resp = srv
         .client()
-        .get(format!("{}/v3/anon-pub/index.json", srv.base_url))
+        .get(format!("{}/repository/anon-pub/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
@@ -296,7 +296,7 @@ async fn anonymous_role_grant_enables_anon_read() {
 
     let resp = srv
         .client()
-        .get(format!("{}/v3/anon-priv/index.json", srv.base_url))
+        .get(format!("{}/repository/anon-priv/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
@@ -319,7 +319,7 @@ async fn anonymous_role_grant_enables_anon_read() {
     );
     let resp = srv
         .client()
-        .get(format!("{}/v3/anon-flag/index.json", srv.base_url))
+        .get(format!("{}/repository/anon-flag/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
@@ -382,7 +382,7 @@ async fn content_selector_filters_reads_and_package_mutations() {
             .send()
     };
     assert_eq!(
-        get("/v3/selected/flat/company.allowed/index.json")
+        get("/repository/selected/flat/company.allowed/index.json")
             .await
             .unwrap()
             .status(),
@@ -390,9 +390,9 @@ async fn content_selector_filters_reads_and_package_mutations() {
         "matching flat-container id remains visible"
     );
     for path in [
-        "/v3/selected/flat/other.hidden/index.json",
-        "/v3/selected/registration/other.hidden/index.json",
-        "/v3/selected/flat/other.hidden/1.0.0/other.hidden.1.0.0.nupkg",
+        "/repository/selected/flat/other.hidden/index.json",
+        "/repository/selected/registration/other.hidden/index.json",
+        "/repository/selected/flat/other.hidden/1.0.0/other.hidden.1.0.0.nupkg",
         "/browse/packages/selected/other.hidden",
     ] {
         assert_eq!(
@@ -402,7 +402,7 @@ async fn content_selector_filters_reads_and_package_mutations() {
         );
     }
 
-    let search: Value = get("/v3/selected/query?q=&prerelease=true")
+    let search: Value = get("/repository/selected/query?q=&prerelease=true")
         .await
         .unwrap()
         .json()
@@ -462,7 +462,7 @@ async fn content_selector_filters_reads_and_package_mutations() {
         srv.client()
             .request(
                 method,
-                format!("{}/v3/selected/package/{id}/1.0.0", srv.base_url),
+                format!("{}/repository/selected/package/{id}/1.0.0", srv.base_url),
             )
             .header("X-NuGet-ApiKey", &token)
             .send()
@@ -577,7 +577,7 @@ async fn nested_group_visibility_honors_privileges() {
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/g-outer/flat/{lower}/index.json",
+            "{}/repository/g-outer/flat/{lower}/index.json",
             srv.base_url
         ))
         .header("X-NuGet-ApiKey", &token)
@@ -603,7 +603,7 @@ async fn nested_group_visibility_honors_privileges() {
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/g-outer/flat/{lower}/2.0.0/{lower}.2.0.0.nupkg",
+            "{}/repository/g-outer/flat/{lower}/2.0.0/{lower}.2.0.0.nupkg",
             srv.base_url
         ))
         .header("X-NuGet-ApiKey", &token)
@@ -619,7 +619,7 @@ async fn nested_group_visibility_honors_privileges() {
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/g-outer/flat/other.hidden/index.json",
+            "{}/repository/g-outer/flat/other.hidden/index.json",
             srv.base_url
         ))
         .header("X-NuGet-ApiKey", &token)
@@ -637,7 +637,7 @@ async fn nested_group_visibility_honors_privileges() {
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/g-outer/flat/{lower}/index.json",
+            "{}/repository/g-outer/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -709,7 +709,10 @@ async fn group_cycle_rejected_config_and_safe_at_resolve() {
     let (u, p) = srv.admin_basic();
     let fut = srv
         .client()
-        .get(format!("{}/v3/c1/flat/anything/index.json", srv.base_url))
+        .get(format!(
+            "{}/repository/c1/flat/anything/index.json",
+            srv.base_url
+        ))
         .basic_auth(&u, Some(&p))
         .send();
     let resp = tokio::time::timeout(Duration::from_secs(10), fut)
@@ -862,7 +865,7 @@ async fn fresh_install_defaults_closed_over_http() {
     let (u, p) = srv.admin_basic();
     let resp = srv
         .client()
-        .get(format!("{}/v3/fresh-repo/index.json", srv.base_url))
+        .get(format!("{}/repository/fresh-repo/index.json", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await

@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(parse("/v2/"), Some(Endpoint::Base));
         assert_eq!(parse("/v2/token"), Some(Endpoint::Token));
         assert_eq!(parse("/v2/_catalog"), Some(Endpoint::Catalog));
-        assert_eq!(parse("/v3/x"), None);
+        assert_eq!(parse("/repository/x"), None);
         assert_eq!(parse("/v2x"), None);
     }
 

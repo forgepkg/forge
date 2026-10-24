@@ -26,14 +26,14 @@ async fn anon_mode_off_requires_auth() {
     .await;
 
     let resp = client
-        .get(format!("{}/v3/off-repo/index.json", srv.base_url))
+        .get(format!("{}/repository/off-repo/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "anon read denied with mode=off");
 
     let resp = client
-        .get(format!("{}/v3/off-repo/index.json", srv.base_url))
+        .get(format!("{}/repository/off-repo/index.json", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -59,14 +59,14 @@ async fn anon_mode_all_allows_anonymous_read_repos() {
     .await;
 
     let resp = client
-        .get(format!("{}/v3/all-pub/index.json", srv.base_url))
+        .get(format!("{}/repository/all-pub/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "anon read of anonymous_read repo");
 
     let resp = client
-        .get(format!("{}/v3/all-priv/index.json", srv.base_url))
+        .get(format!("{}/repository/all-priv/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
@@ -96,7 +96,7 @@ async fn anon_mode_allowlist_gates_by_ip() {
 
     // Allowed IP → 200.
     let resp = client
-        .get(format!("{}/v3/al-repo/index.json", srv.base_url))
+        .get(format!("{}/repository/al-repo/index.json", srv.base_url))
         .header("X-Forwarded-For", ALLOWED_IP)
         .send()
         .await
@@ -105,7 +105,7 @@ async fn anon_mode_allowlist_gates_by_ip() {
 
     // Denied IP → 401.
     let resp = client
-        .get(format!("{}/v3/al-repo/index.json", srv.base_url))
+        .get(format!("{}/repository/al-repo/index.json", srv.base_url))
         .header("X-Forwarded-For", DENIED_IP)
         .send()
         .await
@@ -135,7 +135,7 @@ async fn malformed_forwarded_for_is_never_allowlisted_as_the_proxy() {
     )
     .await;
     srv.grant_anonymous_read("xff-repo").await;
-    let url = format!("{}/v3/xff-repo/index.json", srv.base_url);
+    let url = format!("{}/repository/xff-repo/index.json", srv.base_url);
 
     // The proxy host itself (no forwarded hop) is allowlisted.
     let resp = client.get(&url).send().await.unwrap();

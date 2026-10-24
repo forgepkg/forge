@@ -94,7 +94,10 @@ async fn invalidation_forgets_the_upstreams_not_found_answers() {
 
     let versions = |id: &str| {
         let request = client
-            .get(format!("{}/v3/{proxy}/flat/{id}/index.json", srv.base_url))
+            .get(format!(
+                "{}/repository/{proxy}/flat/{id}/index.json",
+                srv.base_url
+            ))
             .basic_auth(&u, Some(&p));
         async move {
             let resp = request.send().await.unwrap();

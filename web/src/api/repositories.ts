@@ -19,9 +19,9 @@ import { httpClient } from '~/lib/httpClient'
  *    own options — `host`, `immutable_tags`, `latest_mutable`,
  *    `writable_member` — which the server refuses on a NuGet repository (and
  *    `package_delay_seconds` / `allow_redeploy` on a docker one). Raw
- *    repositories (`format: "raw"`, served at `/raw/`) likewise —
+ *    repositories (`format: "raw"`, served at `/repository/`) likewise —
  *    `deployment_policy`, `content_disposition`, `max_age_seconds`. npm
- *    repositories (`format: "npm"`, served at `/npm/`) take a hosted
+ *    repositories (`format: "npm"`, served at `/repository/`) take a hosted
  *    repository's `deployment_policy` (not `allow_redeploy`) and a group's
  *    `writable_member`. Both bodies reject unknown fields.
  *  - `MemberView` / `AddMember` / `UpdateMember`
@@ -194,8 +194,6 @@ export interface FormatView {
   name: string
   /** The repository kinds it supports (proxy only with a host-side upstream, e.g. NuGet). */
   kinds: RepoKind[]
-  /** Where its repositories are served: `{mount}/{repository}`. */
-  mount: string
   /** Plugin version. */
   version?: string
   /** Plugin description. */

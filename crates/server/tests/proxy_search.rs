@@ -164,7 +164,7 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
         .mime_str("application/octet-stream")
         .unwrap();
     let resp = client
-        .put(format!("{}/v3/{hosted}/package", srv.base_url))
+        .put(format!("{}/repository/{hosted}/package", srv.base_url))
         .header("X-NuGet-ApiKey", srv.admin_token().await)
         .multipart(reqwest::multipart::Form::new().part("package", part))
         .send()
@@ -175,7 +175,7 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
     let search = |repo: String| {
         let request = client
             .get(format!(
-                "{}/v3/{repo}/query?q=lib&semVerLevel=2.0.0",
+                "{}/repository/{repo}/query?q=lib&semVerLevel=2.0.0",
                 srv.base_url
             ))
             .basic_auth(&u, Some(&p));

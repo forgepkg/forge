@@ -771,9 +771,9 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   pod network: admit only the ingress controller or gateway with a
   NetworkPolicy (the Helm chart's `networkPolicy.from`, the kustomize
   `network-policy` component; the CNI must enforce it).
-- Allow large request bodies for `PUT /v3/{repo}/package` (package pushes),
+- Allow large request bodies for `PUT /repository/{repo}/package` (package pushes),
   for image pushes under `/v2`, where docker sends a whole layer in one
-  request, and for file uploads under `/raw` (and the web UI's
+  request, and for file uploads under `/repository` (and the web UI's
   `/browse/raw`). In nginx that is `client_max_body_size`. Match it to the
   largest upload limit a repository has (set per repository in the web UI;
   512 MiB for package and raw repositories and 1 GiB per blob for docker by
@@ -795,8 +795,8 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   `Vary: Authorization, Cookie, X-NuGet-ApiKey` and registry responses
   `Vary: Authorization, Cookie, Accept`: keep a caching proxy from
   overriding either.
-- With the anonymous mode `allowlist`, do not let a shared cache store `/v3`
-  (or `/raw`) responses at all. Anonymous feed responses carry no `Cache-Control`, and
+- With the anonymous mode `allowlist`, do not let a shared cache store
+  `/repository` responses at all. Anonymous feed responses carry no `Cache-Control`, and
   whether Forge serves one depends on the client's address, which the cache
   does not key on: a cache that stores responses without caching headers
   (Varnish's default does) would serve what an allowlisted client fetched to

@@ -1,6 +1,6 @@
 //! The host side of the plugin contract, through a small native test plugin
-//! (`probe`) that serves its own mount and reports what the host answers:
-//! mounts and kinds, asset names, first-part uploads, ranged downloads, the
+//! (`probe`) that serves the shared repository path and reports what the host answers:
+//! kinds, asset names, first-part uploads, ranged downloads, the
 //! queries (`packages-of`, search options, publish times, summaries,
 //! download totals) and mutations outside the caller's package selector.
 
@@ -25,7 +25,6 @@ const PROBE: Descriptor = Descriptor {
     name: "Probe",
     version: "0.0.1",
     description: "Reports what the host answers.",
-    mount: "/probe",
     kinds: &[RepositoryKind::Hosted],
     storage: Storage::Packages,
     assets: Assets {
@@ -251,7 +250,7 @@ async fn upload(
     package: &str,
 ) -> StatusCode {
     srv.client()
-        .post(format!("{}/probe/{repo}/upload", srv.base_url))
+        .post(format!("{}/repository/{repo}/upload", srv.base_url))
         .basic_auth(&creds.0, Some(&creds.1))
         .body(package.to_string())
         .send()
@@ -273,24 +272,25 @@ async fn get_json(srv: &TestServer, url: &str, creds: &(String, String)) -> Valu
 }
 
 #[tokio::test]
-async fn a_format_is_served_under_its_own_mount_and_kinds() {
+async fn every_non_docker_format_is_served_under_the_repository_prefix() {
     let srv = start_probe(None).await;
     let creds = credentials(&srv).await;
     let repo = probe_repo(&srv).await;
 
     let resp = srv
         .client()
-        .get(format!("{}/probe/{repo}/nothing", srv.base_url))
+        .get(format!("{}/repository/{repo}/nothing", srv.base_url))
         .basic_auth(&creds.0, Some(&creds.1))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(resp.text().await.unwrap(), "nothing here");
-    // Not under another format's mount, and the other way around.
+    // The old format-specific prefixes are no longer repository routes.
     for url in [
-        format!("/repository/{repo}/nothing"),
+        format!("/probe/{repo}/nothing"),
         format!("/v3/{repo}/index.json"),
+        format!("/raw/{repo}/file"),
     ] {
         let resp = srv
             .client()
@@ -311,7 +311,27 @@ async fn a_format_is_served_under_its_own_mount_and_kinds() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let resp = srv
         .client()
-        .get(format!("{}/probe/{feed}/nothing", srv.base_url))
+        .get(format!("{}/repository/{feed}/nothing", srv.base_url))
+        .basic_auth(&creds.0, Some(&creds.1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_ne!(resp.text().await.unwrap(), "repository is not served here");
+
+    let docker = format!("image{}", unique());
+    assert_eq!(
+        create_repo(
+            &srv,
+            json!({ "name": docker, "kind": "hosted", "format": "docker" }),
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    let resp = srv
+        .client()
+        .get(format!("{}/repository/{docker}/latest", srv.base_url))
         .basic_auth(&creds.0, Some(&creds.1))
         .send()
         .await
@@ -345,7 +365,7 @@ async fn a_format_is_served_under_its_own_mount_and_kinds() {
         .iter()
         .find(|f| f["id"] == "probe")
         .unwrap();
-    assert_eq!(probe["mount"], "/probe");
+    assert!(probe.get("mount").is_none());
     assert_eq!(probe["kinds"], json!(["hosted"]));
     let nuget = formats
         .as_array()
@@ -353,7 +373,7 @@ async fn a_format_is_served_under_its_own_mount_and_kinds() {
         .iter()
         .find(|f| f["id"] == "nuget")
         .unwrap();
-    assert_eq!(nuget["mount"], "/v3");
+    assert!(nuget.get("mount").is_none());
 }
 
 /// A repository of a format the server does not have (its plugin removed
@@ -370,7 +390,7 @@ async fn a_repository_whose_format_is_missing_is_unavailable() {
         .expect("insert repository");
     let (u, p) = srv.admin_basic();
     for (method, url) in [
-        (reqwest::Method::GET, format!("/probe/{name}/nothing")),
+        (reqwest::Method::GET, format!("/repository/{name}/nothing")),
         (
             reqwest::Method::DELETE,
             format!("/admin/repositories/{name}/packages/demo/1.0.0"),
@@ -402,7 +422,7 @@ async fn uploads_take_the_first_part_and_assets_their_names() {
         .text("note", "ignored");
     let resp = srv
         .client()
-        .put(format!("{}/probe/{repo}/upload", srv.base_url))
+        .put(format!("{}/repository/{repo}/upload", srv.base_url))
         .basic_auth(&creds.0, Some(&creds.1))
         .multipart(form)
         .send()
@@ -417,7 +437,10 @@ async fn uploads_take_the_first_part_and_assets_their_names() {
 
     let resp = srv
         .client()
-        .get(format!("{}/probe/{repo}/files/demo/1.0.0", srv.base_url))
+        .get(format!(
+            "{}/repository/{repo}/files/demo/1.0.0",
+            srv.base_url
+        ))
         .basic_auth(&creds.0, Some(&creds.1))
         .send()
         .await
@@ -452,7 +475,7 @@ async fn downloads_answer_a_range() {
         upload(&srv, &repo, &creds, "Demo 1.0.0\n0123456789").await,
         StatusCode::CREATED
     );
-    let url = format!("{}/probe/{repo}/files/demo/1.0.0", srv.base_url);
+    let url = format!("{}/repository/{repo}/files/demo/1.0.0", srv.base_url);
     let get = |range: &'static str| {
         srv.client()
             .get(&url)
@@ -499,7 +522,10 @@ async fn downloads_ignore_a_range_without_the_blob_cache() {
     );
     let resp = srv
         .client()
-        .get(format!("{}/probe/{repo}/files/demo/1.0.0", srv.base_url))
+        .get(format!(
+            "{}/repository/{repo}/files/demo/1.0.0",
+            srv.base_url
+        ))
         .basic_auth(&creds.0, Some(&creds.1))
         .header("range", "bytes=11-14")
         .send()
@@ -533,7 +559,7 @@ async fn queries_answer_what_the_repository_holds() {
     // Some versions, ascending, the unknown and malformed ones left out.
     let answer = get_json(
         &srv,
-        &format!("/probe/{repo}/packages-of/DEMO?v=2.0.0&v=1.0.0&v=9.9.9&v=x&v=1.10.0"),
+        &format!("/repository/{repo}/packages-of/DEMO?v=2.0.0&v=1.0.0&v=9.9.9&v=x&v=1.10.0"),
         &creds,
     )
     .await;
@@ -563,7 +589,7 @@ async fn queries_answer_what_the_repository_holds() {
     // default page; downloads are counted.
     let answer = get_json(
         &srv,
-        &format!("/probe/{repo}/search?q=demo&prerelease=true"),
+        &format!("/repository/{repo}/search?q=demo&prerelease=true"),
         &creds,
     )
     .await;
@@ -573,7 +599,7 @@ async fn queries_answer_what_the_repository_holds() {
     assert_eq!(hit["summary"], json!(r#"{"description":"Demo 2.0.0"}"#));
     let answer = get_json(
         &srv,
-        &format!("/probe/{repo}/search?q=demo&prerelease=true&semver2=true"),
+        &format!("/repository/{repo}/search?q=demo&prerelease=true&semver2=true"),
         &creds,
     )
     .await;
@@ -581,7 +607,7 @@ async fn queries_answer_what_the_repository_holds() {
         answer[0]["hits"][0]["versions"],
         json!(["1.0.0", "1.10.0", "2.0.0", "3.0.0-rc.1"])
     );
-    let answer = get_json(&srv, &format!("/probe/{repo}/search?take=0"), &creds).await;
+    let answer = get_json(&srv, &format!("/repository/{repo}/search?take=0"), &creds).await;
     assert_eq!(answer[0]["total"], json!(2));
     assert_eq!(answer[0]["hits"].as_array().unwrap().len(), 2);
 }
@@ -660,7 +686,10 @@ async fn mutations_outside_the_selector_are_unknown() {
 
     let delete = |id: &'static str| {
         srv.client()
-            .delete(format!("{}/probe/{repo}/files/{id}/1.0.0", srv.base_url))
+            .delete(format!(
+                "{}/repository/{repo}/files/{id}/1.0.0",
+                srv.base_url
+            ))
             .basic_auth(&username, Some(&token))
             .send()
     };
@@ -676,7 +705,10 @@ async fn mutations_outside_the_selector_are_unknown() {
     // The other package is still there.
     let resp = srv
         .client()
-        .get(format!("{}/probe/{repo}/files/other/1.0.0", srv.base_url))
+        .get(format!(
+            "{}/repository/{repo}/files/other/1.0.0",
+            srv.base_url
+        ))
         .basic_auth(&creds.0, Some(&creds.1))
         .send()
         .await
@@ -688,7 +720,6 @@ async fn mutations_outside_the_selector_are_unknown() {
 #[test]
 fn the_probe_is_a_plugin() {
     let plugin = Plugin::builtin(Probe);
-    assert_eq!(plugin.descriptor().mount, "/probe");
     assert_eq!(
         forge_plugin::descriptor::check(&[plugin.descriptor()]),
         Ok(())

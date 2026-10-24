@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn renders_the_abbreviated_metadata() {
-        let doc = packument().render("https://forge/npm/r", true);
+        let doc = packument().render("https://forge/repository/r", true);
         assert_eq!(doc["name"], "@acme/a");
         assert_eq!(doc["modified"], "2026-01-04T00:00:00.000Z");
         assert_eq!(
@@ -259,7 +259,7 @@ mod tests {
         let v = &doc["versions"]["1.2.0"];
         assert_eq!(
             v["dist"]["tarball"],
-            "https://forge/npm/r/@acme/a/-/a-1.2.0.tgz"
+            "https://forge/repository/r/@acme/a/-/a-1.2.0.tgz"
         );
         assert_eq!(v["dist"]["integrity"], "sha512-x");
         assert_eq!(v["dependencies"], json!({"b": "^1"}));
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn renders_the_full_document() {
-        let doc = packument().render("https://forge/npm/r", false);
+        let doc = packument().render("https://forge/repository/r", false);
         assert_eq!(doc["_id"], "@acme/a");
         assert_eq!(doc["description"], "v1.10.0");
         assert_eq!(doc["readme"], "# A");

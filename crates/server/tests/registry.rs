@@ -2518,7 +2518,7 @@ async fn admin_validates_docker_repositories() {
     // A docker repository is not a NuGet feed.
     let resp = srv
         .client()
-        .get(format!("{}/v3/a{n}/index.json", srv.base_url))
+        .get(format!("{}/repository/a{n}/index.json", srv.base_url))
         .basic_auth(
             srv.admin_user.clone().unwrap(),
             Some(srv.admin_scoped_token.clone().unwrap()),

@@ -71,7 +71,7 @@ async fn listed_versions(srv: &TestServer, repo: &str, lower: &str) -> Vec<Strin
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/index.json",
+            "{}/repository/{repo}/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -416,7 +416,7 @@ async fn unlist_action_hides_without_deleting_blob() {
     let (su, sp) = srv.admin_basic();
     let search: Value = srv
         .client()
-        .get(format!("{}/v3/{repo}/query?q={id}", srv.base_url))
+        .get(format!("{}/repository/{repo}/query?q={id}", srv.base_url))
         .basic_auth(&su, Some(&sp))
         .send()
         .await
@@ -447,7 +447,7 @@ async fn unlist_action_hides_without_deleting_blob() {
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
+            "{}/repository/{repo}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -865,7 +865,7 @@ async fn proxy_evicts_cold_cached_versions_only() {
     let (u, p) = srv.admin_basic();
     let pull = |v: &'static str| {
         let url = format!(
-            "{}/v3/{repo}/flat/{lower}/{v}/{lower}.{v}.nupkg",
+            "{}/repository/{repo}/flat/{lower}/{v}/{lower}.{v}.nupkg",
             srv.base_url
         );
         let req = srv.client().get(url).basic_auth(&u, Some(&p));

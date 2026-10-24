@@ -1,5 +1,5 @@
 //! The registry protocol: what npm clients request under a repository,
-//! `/npm/<repo>/…`, and what they get.
+//! `/repository/<repo>/…`, and what they get.
 //!
 //! A package is named in one path segment, `left-pad` or `@scope%2fname`
 //! (npm's `escapedName`, `%2f` or `%2F`), or in two, `@scope/name` (how

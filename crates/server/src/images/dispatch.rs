@@ -96,7 +96,7 @@ impl Registry {
     }
 
     async fn route(&self, principal: Principal, req: Request<Body>) -> ImgResult<Response> {
-        let mount = self.plugin().descriptor().mount;
+        let mount = forge_plugin::api::IMAGES_MOUNT;
         let rest = req
             .uri()
             .path()
@@ -678,7 +678,7 @@ impl Conversation<'_> {
             base_url: format!(
                 "{}{}",
                 self.reg.inner.config.public_base_url,
-                self.reg.plugin().descriptor().mount
+                forge_plugin::api::IMAGES_MOUNT
             ),
             inline: false,
             // A group's reserved prefixes are the host's to apply

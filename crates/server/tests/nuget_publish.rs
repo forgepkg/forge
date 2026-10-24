@@ -41,7 +41,7 @@ fn multipart_body(preamble: &[u8], package: &[u8]) -> Vec<u8> {
 
 async fn push(srv: &TestServer, repo: &str, body: reqwest::Body) -> reqwest::Response {
     srv.client()
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", srv.admin_token().await)
         .header(
             "content-type",
@@ -58,7 +58,7 @@ async fn versions(srv: &TestServer, repo: &str, lower: &str) -> (StatusCode, Val
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/index.json",
+            "{}/repository/{repo}/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -237,7 +237,7 @@ async fn push_that_is_not_multipart_is_400() {
     let id = format!("Not.Multi{}", unique());
     let resp = srv
         .client()
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", srv.admin_token().await)
         .header("content-type", "application/octet-stream")
         .body(common::make_nupkg(&id, "1.0.0"))
@@ -270,7 +270,7 @@ async fn listed(srv: &TestServer, repo: &str, lower: &str) -> Value {
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/registration/{lower}/index.json",
+            "{}/repository/{repo}/registration/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -293,7 +293,7 @@ async fn change(
     srv.client()
         .request(
             method,
-            format!("{}/v3/{repo}/package/{id}/{version}", srv.base_url),
+            format!("{}/repository/{repo}/package/{id}/{version}", srv.base_url),
         )
         .header("X-NuGet-ApiKey", key)
         .send()
@@ -352,7 +352,7 @@ async fn a_method_a_path_does_not_take_is_405_with_allow() {
     let client = srv.client();
 
     let resp = client
-        .post(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .post(format!("{}/repository/{repo}/index.json", srv.base_url))
         .header("X-NuGet-ApiKey", &key)
         .send()
         .await
@@ -361,7 +361,7 @@ async fn a_method_a_path_does_not_take_is_405_with_allow() {
     assert_eq!(resp.headers()["allow"], "GET,HEAD");
 
     let resp = client
-        .get(format!("{}/v3/{repo}/package", srv.base_url))
+        .get(format!("{}/repository/{repo}/package", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -370,7 +370,7 @@ async fn a_method_a_path_does_not_take_is_405_with_allow() {
     assert_eq!(resp.headers()["allow"], "PUT");
 
     let resp = client
-        .get(format!("{}/v3/{repo}/no/such/path", srv.base_url))
+        .get(format!("{}/repository/{repo}/no/such/path", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await

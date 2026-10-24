@@ -24,7 +24,7 @@ fn file(path: &str) -> FileInfo {
 }
 
 fn hosted() -> forge_plugin_api::Repository {
-    repository(RepositoryKind::Hosted, "/raw")
+    repository(RepositoryKind::Hosted)
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn a_sidecar_is_computed_from_its_file() {
 
 #[test]
 fn a_proxy_fetches_what_it_has_not_cached() {
-    let proxy = repository(RepositoryKind::Proxy, "/raw");
+    let proxy = repository(RepositoryKind::Proxy);
     let served = serve(&Raw, &proxy, &Request::new("GET", "/x.bin"), |q| match q {
         Query::File(_) => Answer::File(None),
         Query::FetchFile(p) => Answer::File(Some(file(p))),
@@ -138,7 +138,7 @@ fn a_directory_named_without_its_slash_redirects() {
         directory(Some(page)),
     );
     assert_eq!(served.response().status, 301);
-    assert_eq!(served.header("location"), Some("/raw/repo/pdfium/"));
+    assert_eq!(served.header("location"), Some("/repository/repo/pdfium/"));
     // A hosted repository asks no upstream.
     assert!(!served
         .queries
@@ -159,7 +159,7 @@ fn the_repository_url_without_its_slash_redirects() {
         panic!("unexpected {q:?}")
     });
     assert_eq!(served.response().status, 301);
-    assert_eq!(served.header("location"), Some("/raw/repo/"));
+    assert_eq!(served.header("location"), Some("/repository/repo/"));
     let served = serve(&Raw, &hosted(), &Request::new("PUT", ""), |q| {
         panic!("unexpected {q:?}")
     });
@@ -185,7 +185,7 @@ fn listings_render_the_page_the_host_loaded() {
     assert_eq!(served.header("content-type"), Some("application/json"));
     assert_eq!(
         served.header("link"),
-        Some("</raw/repo/a/?after=x.tgz&limit=1&format=json>; rel=\"next\"")
+        Some("</repository/repo/a/?after=x.tgz&limit=1&format=json>; rel=\"next\"")
     );
     let page: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(page["entries"][0]["name"], "x.tgz");

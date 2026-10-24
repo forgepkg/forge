@@ -39,7 +39,7 @@ const repos: BrowseRepo[] = [
     kind: 'proxy',
     online: true,
     format: 'nuget',
-    url: 'https://forge.example.com/v3/nuget',
+    url: 'https://forge.example.com/repository/nuget',
   },
   {
     id: 2,
@@ -47,7 +47,7 @@ const repos: BrowseRepo[] = [
     kind: 'hosted',
     online: true,
     format: 'nuget',
-    url: 'https://forge.example.com/v3/internal',
+    url: 'https://forge.example.com/repository/internal',
   },
   {
     id: 3,
@@ -55,7 +55,7 @@ const repos: BrowseRepo[] = [
     kind: 'hosted',
     online: false,
     format: 'nuget',
-    url: 'https://forge.example.com/v3/releases',
+    url: 'https://forge.example.com/repository/releases',
   },
   { id: 4, name: 'docker-hosted', kind: 'hosted', online: true, format: 'docker' },
   {
@@ -518,7 +518,7 @@ describe('RepoBrowse connect snippets of package repositories', () => {
     const connect = await screen.findByRole('region', { name: 'Connect' })
     expect(
       within(connect).getByText(
-        textContent('dotnet nuget add source https://forge.example.com/v3/internal/index.json --name internal --username <username> --password <token> --store-password-in-clear-text'),
+        textContent('dotnet nuget add source https://forge.example.com/repository/internal/index.json --name internal --username <username> --password <token> --store-password-in-clear-text'),
       ),
     ).toBeInTheDocument()
     expect(

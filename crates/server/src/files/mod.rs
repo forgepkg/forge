@@ -1,7 +1,7 @@
 //! The file store: the repositories of a format whose descriptor says
 //! `Storage::Files` (raw) hold files under paths, like Nexus' raw-hosted,
 //! raw-proxy and raw-group repositories. The format's plugin owns the
-//! protocol (`crates/formats/raw`, served under its mount by
+//! protocol (`crates/formats/raw`, served under `/repository` by
 //! [`crate::plugins`]); this module answers the file queries and actions it
 //! asks for:
 //!

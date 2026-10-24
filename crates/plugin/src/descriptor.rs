@@ -1,41 +1,13 @@
 //! What a format's [`Descriptor`] may say: a well-formed id that no other
-//! format and none of the server's names takes, a mount the server leaves
-//! free (an images format's: the registry's, [`IMAGES_MOUNT`], and only one
-//! format's), its repository kinds once each, plain asset names and content
-//! types. A test over the server's built-in formats
+//! format and none of the server's names takes, its repository kinds once
+//! each, plain asset names and content types. A test over the server's built-in formats
 //! (`plugins::builtin`) checks them, so a bad descriptor fails `cargo test`.
 
-use forge_plugin_api::{Assets, Descriptor, Storage, IMAGES_MOUNT};
+use forge_plugin_api::{Assets, Descriptor, Storage};
 
 /// Format ids a plugin can never take: names the server routes or
 /// reserves.
-const RESERVED_IDS: &[&str] = &["v2", "v3", "admin", "browse", "auth", "repository"];
-
-/// Mounts a plugin can never take: the server's own routes, the web UI's
-/// pages (the first segment of every route in `web/src/routes.ts`) and the
-/// registry's, which only an images format takes ([`IMAGES_MOUNT`]).
-const RESERVED_MOUNTS: &[&str] = &[
-    "admin",
-    "api",
-    "assets",
-    "auth",
-    "browse",
-    "cli-login",
-    "healthz",
-    "images",
-    "invite",
-    "login",
-    "manage",
-    "packages",
-    "readyz",
-    "realms",
-    "repos",
-    "repositories",
-    "tokens",
-    "users",
-    "v2",
-    "version",
-];
+const RESERVED_IDS: &[&str] = &["v2", "admin", "browse", "auth", "repository"];
 
 /// Check the descriptors of the formats one server holds: each on its own
 /// ([`check_one`]), no two with the same id, and at most one images format
@@ -64,15 +36,6 @@ pub fn check_one(descriptor: &Descriptor) -> Result<(), String> {
     validate_id(id).map_err(|e| format!("format {id:?}: {e}"))?;
     if descriptor.name.trim().is_empty() {
         return Err(format!("format {id:?}: the name must not be empty"));
-    }
-    if descriptor.storage == Storage::Images {
-        if descriptor.mount != IMAGES_MOUNT {
-            return Err(format!(
-                "format {id:?}: an images format's mount is {IMAGES_MOUNT:?}"
-            ));
-        }
-    } else {
-        validate_mount(descriptor.mount).map_err(|e| format!("format {id:?}: {e}"))?;
     }
     let kinds = descriptor.kinds;
     if kinds.is_empty() {
@@ -103,27 +66,6 @@ pub fn validate_id(id: &str) -> Result<(), String> {
     }
     if RESERVED_IDS.contains(&id) {
         return Err(format!("id {id:?} is reserved"));
-    }
-    Ok(())
-}
-
-/// A mount: `/` and one path segment of 2–32 lowercase letters, digits and
-/// `-`, starting with a letter, and not one of the reserved names.
-pub fn validate_mount(mount: &str) -> Result<(), String> {
-    let name = mount.strip_prefix('/').unwrap_or("");
-    let well_formed = (2..=32).contains(&name.len())
-        && name.starts_with(|c: char| c.is_ascii_lowercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if !well_formed {
-        return Err(format!(
-            "mount {mount:?} must be '/' and 2-32 lowercase letters, digits or '-', \
-             starting with a letter"
-        ));
-    }
-    if RESERVED_MOUNTS.contains(&name) {
-        return Err(format!("mount {mount:?} is reserved"));
     }
     Ok(())
 }
@@ -167,7 +109,7 @@ fn validate_assets(assets: &Assets) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use forge_plugin_api::{RepositoryKind, Storage, UpstreamToken, DEFAULT_MOUNT};
+    use forge_plugin_api::{RepositoryKind, Storage, UpstreamToken};
 
     use super::*;
 
@@ -176,7 +118,6 @@ mod tests {
         name: "Helm charts",
         version: "0.1.0",
         description: "Charts.",
-        mount: DEFAULT_MOUNT,
         kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
         storage: Storage::Packages,
         assets: Assets::DEFAULT,
@@ -189,7 +130,6 @@ mod tests {
         let with_proxies = Descriptor {
             id: "npm",
             kinds: &[RepositoryKind::Hosted, RepositoryKind::Proxy],
-            mount: "/npm",
             storage: Storage::Files,
             ..GOOD
         };
@@ -206,7 +146,6 @@ mod tests {
             "1helm",
             "helm_charts",
             "v2",
-            "v3",
             "admin",
             "repository",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -222,7 +161,6 @@ mod tests {
     fn refuses_two_formats_with_one_id() {
         let twin = Descriptor {
             name: "Other charts",
-            mount: "/charts",
             ..GOOD
         };
         let err = check(&[&GOOD, &twin]).unwrap_err();
@@ -230,13 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_bad_mounts_and_kinds() {
-        for mount in [
-            "charts", "/", "/c", "/Charts", "/a/b", "/admin", "/v2", "/manage", "/images",
-        ] {
-            let bad = Descriptor { mount, ..GOOD };
-            assert!(check(&[&bad]).is_err(), "{mount:?} accepted");
-        }
+    fn refuses_bad_kinds() {
         for kinds in [
             &[][..],
             &[RepositoryKind::Hosted, RepositoryKind::Hosted][..],
@@ -247,20 +179,13 @@ mod tests {
     }
 
     #[test]
-    fn an_images_format_takes_the_registrys_mount_alone() {
+    fn only_one_images_format_is_allowed() {
         let images = Descriptor {
             id: "oci",
-            mount: IMAGES_MOUNT,
             storage: Storage::Images,
             ..GOOD
         };
         assert_eq!(check(&[&GOOD, &images]), Ok(()));
-        // Its mount is the registry's, and only its.
-        let elsewhere = Descriptor {
-            mount: "/oci",
-            ..images
-        };
-        assert!(check(&[&elsewhere]).is_err());
         let second = Descriptor {
             id: "oci-two",
             ..images
@@ -306,27 +231,5 @@ mod tests {
             ..Assets::DEFAULT
         };
         assert_eq!(check(&[&with(named)]), Ok(()));
-    }
-
-    /// Every top-level page of the web UI is reserved, so a plugin cannot
-    /// take a page's deep links from the SPA fallback.
-    #[test]
-    fn reserves_the_web_uis_pages() {
-        let tree = include_str!("../../../web/src/routeTree.gen.ts");
-        let mut pages: Vec<&str> = tree
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("fullPath: '/"))
-            .filter_map(|path| path.split(['/', '\'']).next())
-            .filter(|page| !page.is_empty())
-            .collect();
-        pages.sort_unstable();
-        pages.dedup();
-        assert!(pages.contains(&"images"), "no pages read: {pages:?}");
-        for page in pages {
-            assert!(
-                RESERVED_MOUNTS.contains(&page),
-                "the web UI's page /{page} is not in RESERVED_MOUNTS"
-            );
-        }
     }
 }

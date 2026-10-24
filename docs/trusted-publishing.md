@@ -233,7 +233,7 @@ steps:
     shell: bash
     run: >-
       dotnet nuget push "artifacts/*.nupkg"
-      --source https://forge.example.com/v3/releases/package
+      --source https://forge.example.com/repository/releases/package
       --no-service-endpoint
       --api-key "${{ steps.forge.outputs.NUGET_API_KEY }}"
 ```
@@ -276,7 +276,7 @@ steps:
       printf '%s\n' '<?xml version="1.0" encoding="utf-8"?><configuration><packageSources><clear /></packageSources></configuration>' > "${NUGET_CONFIG}"
       chmod 600 "${NUGET_CONFIG}"
       dotnet nuget add source \
-        https://forge.example.com/v3/releases/index.json \
+        https://forge.example.com/repository/releases/index.json \
         --name forge-oidc \
         --username oidc \
         --password "${FORGE_TOKEN}" \
@@ -353,7 +353,7 @@ publish:
     - dotnet pack -c Release -o artifacts --no-restore
     - >-
       dotnet nuget push "artifacts/*.nupkg"
-      --source https://forge.example.com/v3/releases/package
+      --source https://forge.example.com/repository/releases/package
       --no-service-endpoint
       --api-key "$NUGET_API_KEY"
 ```
@@ -372,7 +372,7 @@ publish:
     - chmod 600 "$NUGET_CONFIG"
     - >-
       dotnet nuget add source
-      https://forge.example.com/v3/releases/index.json
+      https://forge.example.com/repository/releases/index.json
       --name forge-oidc
       --username oidc
       --password "$FORGE_ID_TOKEN"

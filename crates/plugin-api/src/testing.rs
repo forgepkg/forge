@@ -30,12 +30,12 @@ pub const MAX_ROUNDS: usize = 4;
 pub const MAX_QUERIES: usize = 2048;
 
 /// A repository named `repo` of `kind`, served at
-/// `https://forge.example.com{mount}/repo`.
-pub fn repository(kind: RepositoryKind, mount: &str) -> Repository {
+/// `https://forge.example.com/repository/repo`.
+pub fn repository(kind: RepositoryKind) -> Repository {
     Repository {
         name: "repo".into(),
         kind,
-        base_url: format!("https://forge.example.com{mount}/repo"),
+        base_url: "https://forge.example.com/repository/repo".into(),
         inline: false,
         reserved_prefixes: Vec::new(),
     }

@@ -30,7 +30,7 @@
 //! (anything but GET/HEAD/OPTIONS/TRACE) must carry the session's
 //! double-submit token in `X-CSRF-Token`, or it is refused with **403** before
 //! any handler runs. This covers every router family (`/admin/**`,
-//! `/admin/me/tokens`, `/browse`, cookie-authenticated `/v3` mutations) in one
+//! `/admin/me/tokens`, `/browse`, cookie-authenticated `/repository` mutations) in one
 //! place. Requests authenticated by an explicit credential (API key, Basic,
 //! workload JWT) cannot be forged cross-site and are exempt, as are the
 //! pre-session login endpoints ([`CSRF_EXEMPT_PATHS`]).
@@ -38,7 +38,7 @@
 //! Independently of the credential, a state-changing request that a browser
 //! labels as cross-site (`Sec-Fetch-Site`, or a foreign `Origin`) is refused
 //! with **403** before authentication — this covers Basic credentials a
-//! browser cached from the `/v3` login prompt, which the token cannot.
+//! browser cached from the `/repository` login prompt, which the token cannot.
 //!
 //! ## Client IP and DNS rebinding
 //! The client IP is resolved from the socket peer and **every**
@@ -175,7 +175,7 @@ fn host_is_allowed<B>(req: &Request<B>, allowed: &[String]) -> bool {
 /// Refuse a state-changing request a **browser** marked as cross-site.
 ///
 /// The session-cookie CSRF token does not cover credentials a browser caches
-/// and replays on its own — HTTP Basic typed into the native prompt `/v3`
+/// and replays on its own — HTTP Basic typed into the native prompt `/repository`
 /// raises, in particular — so a cross-site `<form>` could otherwise drive a
 /// body-less admin POST with them. Browsers label every request with
 /// `Sec-Fetch-Site` (and send `Origin` on non-GET requests); NuGet clients and
@@ -627,7 +627,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_site_browser_mutations_are_refused_before_auth() {
-        // Basic credentials a browser cached from the `/v3` prompt are replayed
+        // Basic credentials a browser cached from the `/repository` prompt are replayed
         // on a cross-site form POST; the fetch-metadata / Origin check stops it
         // even though Basic is CSRF-token exempt.
         let sources: Vec<Box<dyn PrincipalSource>> = vec![Box::new(StubSource {

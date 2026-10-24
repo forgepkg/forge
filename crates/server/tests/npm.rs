@@ -1,4 +1,4 @@
-//! Integration tests of npm repositories (`/npm`): publishing and the
+//! Integration tests of npm repositories (`/repository`): publishing and the
 //! packument documents, the redeploy policy, dist-tags, deprecation and
 //! unpublishing, access levels and content selectors, Bearer tokens,
 //! `npm login` (legacy and web) and `npm logout`, proxies of a mock
@@ -129,7 +129,7 @@ fn escaped(name: &str) -> String {
 impl Npm {
     fn new(srv: &TestServer, repo: &str, token: Option<String>) -> Self {
         Npm {
-            base: format!("{}/npm/{repo}", srv.base_url),
+            base: format!("{}/repository/{repo}", srv.base_url),
             root: srv.base_url.clone(),
             client: srv.client(),
             token,
@@ -264,7 +264,7 @@ async fn publishes_and_serves_packuments_and_tarballs() {
     assert!(v.get("readme").is_none() && v.get("description").is_none());
     let tarball_url = v["dist"]["tarball"].as_str().unwrap();
     assert!(
-        tarball_url.ends_with(&format!("/npm/{repo}/@acme/ui/-/ui-1.0.0.tgz")),
+        tarball_url.ends_with(&format!("/repository/{repo}/@acme/ui/-/ui-1.0.0.tgz")),
         "{tarball_url}"
     );
     let bytes = npm.fetch(tarball_url).await.bytes().await.unwrap();
@@ -1262,7 +1262,7 @@ async fn a_proxy_caches_verifies_and_serves_stale() {
         .unwrap()
         .to_string();
     assert!(
-        url.contains(&format!("/npm/{repo}/left-pad/-/left-pad-1.3.0.tgz")),
+        url.contains(&format!("/repository/{repo}/left-pad/-/left-pad-1.3.0.tgz")),
         "{url}"
     );
     let full = npm.ok_packument("left-pad", false).await;
@@ -1541,7 +1541,7 @@ async fn a_group_merges_and_keeps_internal_scopes_internal() {
     assert_eq!(ui["dist-tags"], json!({"latest": "1.0.0"}));
     let url = ui["versions"]["1.0.0"]["dist"]["tarball"].as_str().unwrap();
     assert!(
-        url.contains(&format!("/npm/{group}/@acme/ui/-/ui-1.0.0.tgz")),
+        url.contains(&format!("/repository/{group}/@acme/ui/-/ui-1.0.0.tgz")),
         "{url}"
     );
     assert_eq!(
@@ -1574,7 +1574,10 @@ async fn a_group_merges_and_keeps_internal_scopes_internal() {
     let url = pad["versions"]["1.3.0"]["dist"]["tarball"]
         .as_str()
         .unwrap();
-    assert!(url.contains(&format!("/npm/{group}/left-pad/")), "{url}");
+    assert!(
+        url.contains(&format!("/repository/{group}/left-pad/")),
+        "{url}"
+    );
     assert_eq!(npm.fetch(url).await.status(), 200);
 
     // Publishing to the group lands in its writable member.
@@ -1726,7 +1729,7 @@ async fn routes_only_npm_repositories() {
             .status();
         assert!(status == 404 || status == 400, "{bad}: {status}");
     }
-    // The format is listed with its kinds and mount.
+    // The format is listed with its kinds and storage.
     let formats: Value = admin(&srv, reqwest::Method::GET, "/admin/formats", json!({}))
         .await
         .json()
@@ -1738,6 +1741,6 @@ async fn routes_only_npm_repositories() {
         .iter()
         .find(|f| f["id"] == "npm")
         .expect("npm listed");
-    assert_eq!(npm_format["mount"], "/npm");
+    assert!(npm_format.get("mount").is_none());
     assert_eq!(npm_format["kinds"], json!(["hosted", "proxy", "group"]));
 }

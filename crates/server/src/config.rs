@@ -1596,7 +1596,7 @@ fn default_nuget_max_nuspec_compression_ratio() -> u64 {
 ///
 /// When `enabled`, the server serves the built TanStack Start SPA from
 /// `assets_dir` (a directory containing `index.html` + `assets/*`), mounted as
-/// the router's fallback **after** the `/admin`, `/v3`, and `/browse` API
+/// the router's fallback **after** the `/admin`, `/repository`, and `/browse` API
 /// routers so API paths always win. Unknown paths fall back to `index.html` so
 /// client-side (TanStack Router) deep links resolve.
 ///
