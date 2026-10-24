@@ -14,9 +14,12 @@ import { authSourceLabel, type IssuedInvitation, type UserView } from '~/api/use
 import {
   useConvertUserToLocal,
   useInviteUser,
+  useReauthUser,
   useRevokeInvitation,
+  useSetUserActive,
   useUsers,
 } from '~/queries/useUsers'
+import { useMe } from '~/queries/useMe'
 import {
   useCreateToken,
   useRevokeToken,
@@ -67,7 +70,11 @@ import {
 } from '~/components/RbacLabels'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
 import { TokenCreateForm } from '~/components/TokenCreateForm'
-import { TokenScopeBadges, TokenStatusBadge } from '~/components/TokenBadges'
+import {
+  TokenScopeBadges,
+  TokenStatusBadge,
+  tokenStatus,
+} from '~/components/TokenBadges'
 import {
   draftFromScope,
   draftProblem,
@@ -101,7 +108,8 @@ const ADD_STRIP = 'grid gap-4 border-b border-line px-5 py-4'
  * kept its password hash can be switched to a local account with that
  * password from here. An invited account (its user has not chosen a password
  * yet) shows its invitation, which can be resent, copied as a link (shown
- * once) or revoked.
+ * once) or revoked. The account section on top deactivates, reactivates and
+ * signs the user out everywhere.
  */
 function UserPage() {
   const { userId } = Route.useParams()
@@ -131,6 +139,7 @@ function UserPage() {
         {user && <UserStatusBadge status={user.status} />}
       </PageHeader>
 
+      {user && <UserAccount user={user} />}
       {user && (user.status === 'invited' || user.status === 'invitation_expired') && (
         <UserInvitation user={user} />
       )}
@@ -139,7 +148,7 @@ function UserPage() {
       <Columns asideLabel="Access" aside={<UserAccess userId={id} />}>
         <UserRoles userId={id} legacyAdmin={user?.is_admin ?? false} />
         <EffectiveAccess userId={id} />
-        <UserTokens userId={id} />
+        <UserTokens userId={id} inactive={user?.active === false} />
       </Columns>
     </Page>
   )
@@ -437,9 +446,10 @@ function EffectiveAccess({ userId }: { userId: number }) {
 /**
  * The user's tokens: the New token panel (issue, with a scope), the scope
  * editor of the token being re-scoped, and the Tokens table (re-scope and
- * revoke, after a confirmation dialog).
+ * revoke, after a confirmation dialog). While the account is inactive its
+ * tokens are refused but not revoked, which the table says.
  */
-function UserTokens({ userId }: { userId: number }) {
+function UserTokens({ userId, inactive }: { userId: number; inactive: boolean }) {
   const tokens = useTokens(userId)
   const create = useCreateToken(userId)
   const revoke = useRevokeToken(userId)
@@ -516,6 +526,12 @@ function UserTokens({ userId }: { userId: number }) {
         description="API tokens authenticate this user against the registry. The secret is shown only at creation time."
         flush
       >
+        {inactive && (
+          <Notice tone="warn" role="status">
+            The account is inactive: its tokens are refused until it is
+            reactivated. Revoke a token to stop it for good.
+          </Notice>
+        )}
         {tokens.isError ? (
           <ErrorState
             title="Could not load tokens"
@@ -709,6 +725,174 @@ function UserInvitation({ user }: { user: UserView }) {
       )}
     </Panel>
   )
+}
+
+type AccountAction = 'deactivate' | 'reactivate' | 'reauth'
+
+/**
+ * The account's state and what changes it without deleting it, each after a
+ * confirmation that says what happens:
+ *
+ * - **Deactivate** (`PATCH {"active": false}`): every sign-in is refused, the
+ *   user's sessions end, an invitation is revoked, and their tokens are
+ *   refused but not revoked. The last active administrator's is refused
+ *   (409), and the server's reason shows here.
+ * - **Reactivate** (`{"active": true}`): only the flag; the user's unrevoked
+ *   tokens work again, so the confirmation counts them.
+ * - **Sign out everywhere** (`POST …/reauth`): ends the user's browser
+ *   sessions; for a credential-forwarding account the password is checked
+ *   against the upstream again, and the tokens minted from a forwarded
+ *   sign-in are revoked.
+ */
+function UserAccount({ user }: { user: UserView }) {
+  const me = useMe()
+  const tokens = useTokens(user.id)
+  const setActive = useSetUserActive()
+  const reauth = useReauthUser()
+  const [confirming, setConfirming] = useState<AccountAction | null>(null)
+  const [done, setDone] = useState<string | null>(null)
+  const self = me.data?.user.id === user.id
+  const invited = user.status === 'invited' || user.status === 'invitation_expired'
+  const forwarded = user.auth_source === 'upstream-basic'
+  const error = setActive.error ?? reauth.error
+  const pending = setActive.isPending || reauth.isPending
+  const liveTokens = tokens.data?.filter((t) => tokenStatus(t) === 'active').length
+  const ownAccount = self ? ' This is your own account: you are signed out too.' : ''
+
+  function ask(action: AccountAction) {
+    setActive.reset()
+    reauth.reset()
+    setDone(null)
+    setConfirming(action)
+  }
+
+  function confirm() {
+    const close = { onSettled: () => setConfirming(null) }
+    if (confirming === 'reauth') {
+      reauth.mutate(user.id, {
+        ...close,
+        onSuccess: () => setDone(`Signed ${user.username} out everywhere.`),
+      })
+    } else if (confirming) {
+      const active = confirming === 'reactivate'
+      setActive.mutate(
+        { id: user.id, active },
+        {
+          ...close,
+          onSuccess: () =>
+            setDone(
+              active
+                ? `Reactivated ${user.username}.`
+                : `Deactivated ${user.username}: their sessions have ended.`,
+            ),
+        },
+      )
+    }
+  }
+
+  return (
+    <Panel
+      title="Account"
+      description={
+        !user.active
+          ? `${user.username} is inactive: every sign-in is refused, and their tokens are suspended, not revoked.`
+          : invited
+            ? `${user.username} is active but has not chosen a password yet, so they cannot sign in.`
+            : `${user.username} is active and can sign in.`
+      }
+      footer={
+        user.active ? (
+          <>
+            {!invited && (
+              <Button icon="LogOut" disabled={pending} onClick={() => ask('reauth')}>
+                Sign out everywhere…
+              </Button>
+            )}
+            <Button
+              variant="danger"
+              icon="Lock"
+              disabled={pending}
+              onClick={() => ask('deactivate')}
+            >
+              Deactivate…
+            </Button>
+          </>
+        ) : (
+          <Button variant="primary" disabled={pending} onClick={() => ask('reactivate')}>
+            Reactivate…
+          </Button>
+        )
+      }
+    >
+      {error ? (
+        <InlineError>{error.body || error.message}</InlineError>
+      ) : done ? (
+        <Notice tone="ok">{done}</Notice>
+      ) : (
+        <p className="fg-text fg-text--small">
+          {!user.active
+            ? 'Reactivating lets the user sign in again, and their unrevoked tokens work again.'
+            : invited
+              ? 'Deactivating revokes the invitation and keeps the account and its roles; it can be undone.'
+              : "Deactivating refuses every sign-in but keeps the account, its roles and its tokens; it can be undone. Signing out everywhere ends the user's sessions and leaves the account active."}
+        </p>
+      )}
+
+      <Dialog
+        open={confirming === 'deactivate'}
+        onClose={() => setConfirming(null)}
+        icon="Lock"
+        tone="warn"
+        title={`Deactivate ${user.username}?`}
+        description={`Every sign-in is refused: password, browser, identity provider, credential forwarding and API tokens. Their browser sessions end now.${
+          invited ? ' Their invitation is revoked.' : ''
+        } Their tokens are suspended, not revoked: they work again if the account is reactivated.${ownAccount}`}
+        confirmLabel={setActive.isPending ? 'Deactivating…' : 'Deactivate user'}
+        confirmVariant="danger"
+        confirmDisabled={pending}
+        onConfirm={confirm}
+      />
+      <Dialog
+        open={confirming === 'reactivate'}
+        onClose={() => setConfirming(null)}
+        icon="Refresh"
+        title={`Reactivate ${user.username}?`}
+        description={reactivateConsequence(liveTokens)}
+        confirmLabel={setActive.isPending ? 'Reactivating…' : 'Reactivate user'}
+        confirmDisabled={pending}
+        onConfirm={confirm}
+      />
+      <Dialog
+        open={confirming === 'reauth'}
+        onClose={() => setConfirming(null)}
+        icon="LogOut"
+        title={`Sign ${user.username} out everywhere?`}
+        description={`Their browser sessions end, so they have to sign in again.${
+          forwarded
+            ? ' Their password is checked against the upstream again at the next sign-in or password request, and the tokens they minted from a forwarded sign-in are revoked; tokens an administrator issued keep working.'
+            : ' Their API tokens keep working: revoke them under Tokens to stop them.'
+        }${ownAccount}`}
+        confirmLabel={reauth.isPending ? 'Signing out…' : 'Sign out everywhere'}
+        confirmDisabled={pending}
+        onConfirm={confirm}
+      />
+    </Panel>
+  )
+}
+
+/**
+ * What reactivating does to the user's tokens: the ones neither revoked nor
+ * expired (`live`, unknown while the list loads) work again.
+ */
+function reactivateConsequence(live: number | undefined): string {
+  if (live === 0) return 'The user can sign in again. They have no token that would work again.'
+  const tokens =
+    live === undefined
+      ? 'their unrevoked tokens work'
+      : live === 1
+        ? 'their 1 unrevoked token works'
+        : `their ${live} unrevoked tokens work`
+  return `The user can sign in again, and ${tokens} again. Revoke any that should not under Tokens before you reactivate.`
 }
 
 /**

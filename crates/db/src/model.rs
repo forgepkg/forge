@@ -282,9 +282,6 @@ impl Repository {
     }
 }
 
-/// `repository.format` of raw (generic file) repositories.
-pub const RAW_FORMAT: &str = "raw";
-
 /// `repository.config` key of [`Repository::deployment_policy`].
 pub const DEPLOYMENT_POLICY_KEY: &str = "deployment_policy";
 
@@ -294,9 +291,9 @@ pub const CONTENT_DISPOSITION_KEY: &str = "content_disposition";
 /// `repository.config` key of [`Repository::max_age_seconds`].
 pub const MAX_AGE_SECONDS_KEY: &str = "max_age_seconds";
 
-/// How long a raw proxy serves a cached file before it asks its upstream
-/// whether the file changed, when the repository sets no `max_age_seconds`:
-/// a day.
+/// How long a proxy of files (raw) serves a cached file before it asks its
+/// upstream whether the file changed, when the repository sets no
+/// `max_age_seconds`: a day.
 pub const DEFAULT_RAW_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
 
 /// What a hosted raw repository does with an upload to a path it has
@@ -333,13 +330,11 @@ impl DeploymentPolicy {
     }
 }
 
+/// The options of a repository of a files format (raw): which repositories
+/// hold files is the format registry's to say (the server's
+/// `FormatRegistry::stores_files`).
 impl Repository {
-    /// Whether this is a raw (generic file) repository.
-    pub fn is_raw(&self) -> bool {
-        self.format == RAW_FORMAT
-    }
-
-    /// Hosted raw option (`config.deployment_policy`, default
+    /// Hosted files option (`config.deployment_policy`, default
     /// [`DeploymentPolicy::DisableRedeploy`]).
     pub fn deployment_policy(&self) -> DeploymentPolicy {
         self.config
@@ -349,7 +344,7 @@ impl Repository {
             .unwrap_or_default()
     }
 
-    /// Raw option (`config.content_disposition = "inline"`, default
+    /// Files option (`config.content_disposition = "inline"`, default
     /// `"attachment"`): files are served for display in the browser rather
     /// than as downloads.
     pub fn inline_content(&self) -> bool {
@@ -359,7 +354,7 @@ impl Repository {
             == Some("inline")
     }
 
-    /// Raw proxy option (`config.max_age_seconds`): how long a cached file
+    /// Files proxy option (`config.max_age_seconds`): how long a cached file
     /// is served before the upstream is asked whether it changed; `0` never
     /// asks (the upstream's files are immutable). Default
     /// [`DEFAULT_RAW_MAX_AGE_SECONDS`].

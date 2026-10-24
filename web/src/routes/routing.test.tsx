@@ -160,12 +160,9 @@ describe('app routing + admin gating', () => {
     expect(router.state.location.pathname).toBe('/manage')
     const main = within(screen.getByRole('main'))
     expect(await main.findByRole('heading', { level: 1, name: 'Administration' })).toBeInTheDocument()
-    // Only what the UI can manage; the rest is named as API-only, and RBAC
-    // is no longer part of that rest.
+    // Only what the UI can manage: nothing is named as API-only any more.
     expect(main.queryByText(/admin flags|with retention/)).toBeNull()
-    expect(
-      main.getByText(/User deactivation has no screen/),
-    ).toBeInTheDocument()
+    expect(main.queryByText(/has no screen|\/admin API/)).toBeNull()
     expect(main.queryByText(/RBAC/)).toBeNull()
     expect(main.getByRole('link', { name: /^Roles/ })).toHaveAttribute(
       'href',

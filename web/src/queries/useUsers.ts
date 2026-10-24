@@ -3,13 +3,16 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError } from '~/lib/httpClient'
 import { realmKeys } from '~/api/realms'
 import { roleKeys } from '~/api/rbac'
+import { tokenKeys } from '~/api/tokens'
 import {
   convertUserToLocal,
   createUser,
   deleteUser,
   fetchUsers,
   inviteUser,
+  reauthUser,
   revokeInvitation,
+  setUserActive,
   userKeys,
   type CreateUser,
   type CreatedUser,
@@ -73,6 +76,38 @@ export function useRevokeInvitation() {
     mutationFn: (id) => revokeInvitation(id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: userKeys.list() })
+    },
+  })
+}
+
+/**
+ * Deactivate or reactivate a user. The answer replaces the user in the
+ * cached list at once (the list and the user page show the new status), and
+ * the list is re-fetched.
+ */
+export function useSetUserActive() {
+  const queryClient = useQueryClient()
+  return useMutation<UserView, ApiError, { id: number; active: boolean }>({
+    mutationFn: ({ id, active }) => setUserActive(id, active),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<UserView[]>(userKeys.list(), (users) =>
+        users?.map((u) => (u.id === updated.id ? updated : u)),
+      )
+      void queryClient.invalidateQueries({ queryKey: userKeys.list() })
+    },
+  })
+}
+
+/**
+ * Sign a user out everywhere; invalidates their token list on success (the
+ * tokens they minted from a forwarded sign-in are revoked).
+ */
+export function useReauthUser() {
+  const queryClient = useQueryClient()
+  return useMutation<void, ApiError, number>({
+    mutationFn: (id) => reauthUser(id),
+    onSuccess: (_, id) => {
+      void queryClient.invalidateQueries({ queryKey: tokenKeys.list(id) })
     },
   })
 }

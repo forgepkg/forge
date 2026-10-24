@@ -15,13 +15,15 @@ import type { AccessLevel } from '~/api/rbac'
  *    sent by email, or (no email service, or a failed send) handed to the
  *    admin once in the answer's `invitation.link`. `role` gives the built-in
  *    access level; other roles are assigned on the user page.
- *  - The UI does not edit users: its only per-user writes beyond create are
- *    `DELETE /admin/users/{id}`, invitations (`POST`/`DELETE
- *    /admin/users/{id}/invitation`), switching a credential-forwarding
- *    account to a local one (`POST /admin/users/{id}/convert-to-local`),
- *    token management (see `tokens.ts`) and role assignment (see `rbac.ts`).
- *    The server's `PATCH /admin/users/{id}` (activate / deactivate) and
- *    `POST /admin/users/{id}/reauth` are not used here.
+ *  - `PATCH /admin/users/{id}` sets the account state alone
+ *    (`{"active": false}` deactivates, `true` reactivates); the server
+ *    refuses deactivating the last active administrator with 409.
+ *    `POST /admin/users/{id}/reauth` signs the user out everywhere. The
+ *    other per-user writes are `DELETE /admin/users/{id}`, invitations
+ *    (`POST`/`DELETE /admin/users/{id}/invitation`), switching a
+ *    credential-forwarding account to a local one (`POST
+ *    /admin/users/{id}/convert-to-local`), token management (see
+ *    `tokens.ts`) and role assignment (see `rbac.ts`).
  *
  * All endpoints are admin-gated by the server; the UI only reaches them after
  * the `_app/admin` route guard confirms `is_admin`.
@@ -207,6 +209,26 @@ export function revokeInvitation(id: number): Promise<void> {
  */
 export function convertUserToLocal(id: number): Promise<UserView> {
   return httpClient.post<UserView>(`/admin/users/${id}/convert-to-local`, {})
+}
+
+/**
+ * `PATCH /admin/users/{id}` — deactivate (`false`) or reactivate (`true`) a
+ * user; answers the updated view. Deactivating refuses every sign-in, ends
+ * the user's sessions and suspends their tokens without revoking them;
+ * reactivating changes only the flag.
+ */
+export function setUserActive(id: number, active: boolean): Promise<UserView> {
+  return httpClient.patch<UserView>(`/admin/users/${id}`, { active })
+}
+
+/**
+ * `POST /admin/users/{id}/reauth` — sign the user out everywhere (204): ends
+ * their browser sessions and drops their cached upstream verdicts, and
+ * revokes the tokens they minted from a session credential forwarding
+ * established.
+ */
+export function reauthUser(id: number): Promise<void> {
+  return httpClient.post<void>(`/admin/users/${id}/reauth`, {})
 }
 
 /** `DELETE /admin/users/{id}` — delete a user (204). */

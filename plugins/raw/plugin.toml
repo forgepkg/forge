@@ -1,0 +1,13 @@
+# A Forge format plugin: raw file repositories (see plugins/README.md).
+[plugin]
+id = "raw"
+name = "Raw files"
+version = "1.0.0"
+api = "0.4.0"
+description = "Arbitrary files under arbitrary paths, like Nexus' raw repositories: uploads with PUT or a form, downloads with ranges and checksum sidecars, directory listings; proxies of any HTTP(S) base URL."
+mount = "/raw"
+# Proxies cache the files under an HTTP(S) base URL through the plugin's
+# upstream side.
+kinds = ["hosted", "proxy", "group"]
+# Its repositories hold files under paths, in the host's file store.
+storage = "files"

@@ -26,8 +26,13 @@ import { searchOptions } from '~/lib/search'
  *    `userRoles.test.tsx`);
  *  - the user page of an invited account resends, copies (shown once) and
  *    revokes its invitation;
- *  - delete-user invalidates the list, and a refused delete (409 for the last
- *    active admin) shows the server's reason;
+ *  - the user page deactivates, reactivates and signs a user out everywhere,
+ *    each after a confirmation saying what happens, and the list and the page
+ *    show the new status at once; a refused deactivation (409 for the last
+ *    active admin) shows the server's reason and changes nothing;
+ *  - delete-user invalidates the list, its confirmation suggests deactivating
+ *    instead, and a refused delete (409 for the last active admin) shows the
+ *    server's reason;
  *  - the per-user token screen shows a freshly-created secret **once** and
  *    revoke (after a dialog) removes the token (list invalidation
  *    reflecting `revoked_at`);
@@ -88,6 +93,8 @@ interface ApiHandlers {
   onConvertUser?: (id: number) => Response
   onInvite?: (id: number, body: unknown) => Response
   onRevokeInvitation?: (id: number) => Response
+  onSetActive?: (id: number, body: unknown) => Response
+  onReauth?: (id: number) => Response
   email?: unknown
 }
 
@@ -167,12 +174,28 @@ function mockApi(h: ApiHandlers) {
         )
       }
 
-      // User delete.
+      // Sign out everywhere.
+      const reauthMatch = path.match(/\/admin\/users\/(\d+)\/reauth$/)
+      if (reauthMatch && method === 'POST') {
+        const id = Number(reauthMatch[1])
+        return Promise.resolve(
+          h.onReauth ? h.onReauth(id) : new Response(null, { status: 204 }),
+        )
+      }
+
+      // User delete, deactivate / reactivate.
       const userMatch = path.match(/\/admin\/users\/(\d+)$/)
       if (userMatch && method === 'DELETE') {
         const id = Number(userMatch[1])
         return Promise.resolve(
           h.onDeleteUser ? h.onDeleteUser(id) : new Response(null, { status: 204 }),
+        )
+      }
+      if (userMatch && method === 'PATCH') {
+        const id = Number(userMatch[1])
+        const body = init?.body ? JSON.parse(init.body as string) : {}
+        return Promise.resolve(
+          h.onSetActive ? h.onSetActive(id, body) : json(user({ id, ...body })),
         )
       }
 
@@ -487,6 +510,212 @@ describe('admin users', () => {
     await u.click(screen.getByRole('button', { name: 'Revoke invitation' }))
     await waitFor(() => expect(revoked).toBe(1))
     expect(screen.queryByText('https://forge.example.com/invite#copied')).toBeNull()
+  })
+
+  it('deactivates a user after a confirmation, and both screens show it at once', async () => {
+    const patches: unknown[] = []
+    let users = [user({ id: 2, username: 'alice' })]
+    mockApi({
+      get users() {
+        return users
+      },
+      tokens: [token({ id: 5, user_id: 2, name: 'ci' })],
+      onSetActive: (id, body) => {
+        patches.push(body)
+        users = [user({ id, username: 'alice', active: false, status: 'inactive' })]
+        return json(users[0])
+      },
+    })
+
+    const u = userEvent.setup()
+    const router = await renderAt('/manage/users/2')
+
+    const account = await screen.findByRole('region', { name: 'Account' })
+    expect(within(account).getByText('alice is active and can sign in.')).toBeInTheDocument()
+    await u.click(within(account).getByRole('button', { name: 'Deactivate…' }))
+    const dialog = screen.getByRole('dialog', { name: 'Deactivate alice?' })
+    expect(dialog).toHaveTextContent(/Every sign-in is refused/)
+    expect(dialog).toHaveTextContent(/browser sessions end now/)
+    expect(dialog).toHaveTextContent(/tokens are suspended, not revoked/)
+    expect(patches).toEqual([])
+    await u.click(within(dialog).getByRole('button', { name: 'Deactivate user' }))
+
+    await waitFor(() => expect(patches).toEqual([{ active: false }]))
+    expect(await within(account).findByText(/Deactivated alice/)).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(within(account).getByText(/alice is inactive/)).toBeInTheDocument()
+    expect(within(account).getByRole('button', { name: 'Reactivate…' })).toBeInTheDocument()
+    expect(within(account).queryByRole('button', { name: 'Deactivate…' })).toBeNull()
+    // The header's status and the tokens say so too.
+    expect(screen.getByText('inactive')).toBeInTheDocument()
+    expect(screen.getByText(/its tokens are refused until it is reactivated/)).toBeInTheDocument()
+
+    await router.navigate({ to: '/manage/users' })
+    const row = (await screen.findByRole('link', { name: 'alice' })).closest('tr')!
+    expect(within(row).getAllByRole('cell')[4]).toHaveTextContent('inactive')
+  })
+
+  it('reactivates a user, naming the tokens that work again', async () => {
+    const patches: unknown[] = []
+    let users = [user({ id: 2, username: 'alice', active: false, status: 'inactive' })]
+    mockApi({
+      get users() {
+        return users
+      },
+      tokens: [
+        token({ id: 5, user_id: 2, name: 'ci' }),
+        token({ id: 6, user_id: 2, name: 'old', revoked_at: '2026-02-02T00:00:00Z' }),
+      ],
+      onSetActive: (id, body) => {
+        patches.push(body)
+        users = [user({ id, username: 'alice' })]
+        return json(users[0])
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/2')
+
+    const account = await screen.findByRole('region', { name: 'Account' })
+    // Signing out an inactive user would change nothing.
+    expect(within(account).queryByRole('button', { name: /Sign out/ })).toBeNull()
+    await screen.findByText('ci')
+    await u.click(within(account).getByRole('button', { name: 'Reactivate…' }))
+    const dialog = screen.getByRole('dialog', { name: 'Reactivate alice?' })
+    expect(dialog).toHaveTextContent(/their 1 unrevoked token works again/)
+    expect(dialog).toHaveTextContent(/Revoke any that should not/)
+    await u.click(within(dialog).getByRole('button', { name: 'Reactivate user' }))
+
+    await waitFor(() => expect(patches).toEqual([{ active: true }]))
+    expect(await within(account).findByText('Reactivated alice.')).toBeInTheDocument()
+    expect(within(account).getByText('alice is active and can sign in.')).toBeInTheDocument()
+    expect(screen.queryByText(/its tokens are refused/)).toBeNull()
+  })
+
+  it('signs a credential-forwarding user out everywhere', async () => {
+    let reauthed: number | null = null
+    let tokenFetches = 0
+    mockApi({
+      users: [user({ id: 2, username: 'alice', auth_source: 'upstream-basic' })],
+      get tokens() {
+        tokenFetches += 1
+        return [token({ id: 5, user_id: 2, name: 'ci' })]
+      },
+      onReauth: (id) => {
+        reauthed = id
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/2')
+
+    const account = await screen.findByRole('region', { name: 'Account' })
+    await screen.findByText('ci')
+    const fetchesBefore = tokenFetches
+    await u.click(within(account).getByRole('button', { name: 'Sign out everywhere…' }))
+    const dialog = screen.getByRole('dialog', { name: 'Sign alice out everywhere?' })
+    expect(dialog).toHaveTextContent(/browser sessions end/)
+    expect(dialog).toHaveTextContent(/checked against the upstream again/)
+    expect(dialog).toHaveTextContent(/minted from a forwarded sign-in are revoked/)
+    expect(reauthed).toBeNull()
+    await u.click(within(dialog).getByRole('button', { name: 'Sign out everywhere' }))
+
+    await waitFor(() => expect(reauthed).toBe(2))
+    expect(await within(account).findByText('Signed alice out everywhere.')).toBeInTheDocument()
+    // The tokens are re-read: those minted from a forwarded sign-in are gone.
+    await waitFor(() => expect(tokenFetches).toBeGreaterThan(fetchesBefore))
+  })
+
+  it('explains that signing out keeps the tokens of an account that does not forward', async () => {
+    mockApi({ users: [user({ id: 2, username: 'alice' })], tokens: [] })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/2')
+
+    await u.click(await screen.findByRole('button', { name: 'Sign out everywhere…' }))
+    const dialog = screen.getByRole('dialog', { name: 'Sign alice out everywhere?' })
+    expect(dialog).toHaveTextContent(/API tokens keep working/)
+    expect(dialog).not.toHaveTextContent(/upstream/)
+  })
+
+  it('shows why deactivating the last administrator was refused and changes nothing', async () => {
+    mockApi({
+      users: [user({ id: 4, username: 'sole-admin', is_admin: true, roles: ['admin'] })],
+      tokens: [],
+      onSetActive: () =>
+        new Response(
+          'this would leave no active administrator; make another user an admin first',
+          { status: 409 },
+        ),
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/4')
+
+    const account = await screen.findByRole('region', { name: 'Account' })
+    await u.click(within(account).getByRole('button', { name: 'Deactivate…' }))
+    await u.click(
+      within(screen.getByRole('dialog', { name: 'Deactivate sole-admin?' })).getByRole(
+        'button',
+        { name: 'Deactivate user' },
+      ),
+    )
+
+    expect(await within(account).findByRole('alert')).toHaveTextContent(
+      'this would leave no active administrator',
+    )
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(within(account).getByText('sole-admin is active and can sign in.')).toBeInTheDocument()
+    expect(within(account).getByRole('button', { name: 'Deactivate…' })).toBeInTheDocument()
+  })
+
+  it('deactivating an invited user says its invitation is revoked', async () => {
+    mockApi({
+      users: [user({ id: 9, username: 'frank@example.com', status: 'invitation_expired' })],
+      tokens: [],
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/9')
+
+    const account = await screen.findByRole('region', { name: 'Account' })
+    expect(within(account).getByText(/has not chosen a password yet/)).toBeInTheDocument()
+    // Nothing to sign out of yet.
+    expect(within(account).queryByRole('button', { name: /Sign out/ })).toBeNull()
+    await u.click(within(account).getByRole('button', { name: 'Deactivate…' }))
+    expect(
+      screen.getByRole('dialog', { name: 'Deactivate frank@example.com?' }),
+    ).toHaveTextContent(/Their invitation is revoked/)
+  })
+
+  it('delete-user suggests deactivating an account that should be kept', async () => {
+    mockApi({
+      users: [
+        user({ id: 7, username: 'doomed' }),
+        user({ id: 8, username: 'gone', active: false, status: 'inactive' }),
+      ],
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users')
+
+    const row = (name: string) =>
+      screen.getByRole('link', { name }).closest('tr')!
+    await screen.findByText('doomed')
+    await u.click(within(row('doomed')).getByRole('button', { name: 'Delete' }))
+    let dialog = screen.getByRole('dialog', { name: 'Delete doomed?' })
+    expect(dialog).toHaveTextContent(/To keep the account, deactivate it/)
+    expect(within(dialog).getByRole('link', { name: 'its page' })).toHaveAttribute(
+      'href',
+      '/manage/users/7',
+    )
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+
+    // An inactive account is deactivated already.
+    await u.click(within(row('gone')).getByRole('button', { name: 'Delete' }))
+    dialog = screen.getByRole('dialog', { name: 'Delete gone?' })
+    expect(dialog).not.toHaveTextContent(/deactivate it/)
   })
 
   it('delete-user confirms then DELETEs and re-fetches', async () => {

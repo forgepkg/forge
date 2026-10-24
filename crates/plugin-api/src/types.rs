@@ -87,6 +87,11 @@ pub struct Repository {
     /// The absolute URL the repository is served at, without a trailing
     /// slash (e.g. `https://forge.example.com/repository/charts`).
     pub base_url: String,
+    /// Files formats: whether the repository's files are displayed by a
+    /// browser (its `inline` content disposition) rather than downloaded, as
+    /// [`Action::ServeFile`] serves them. Always `false` for a package
+    /// format.
+    pub inline: bool,
 }
 
 /// An HTTP request from a package client.
@@ -95,7 +100,8 @@ pub struct Request {
     /// The method, upper case.
     pub method: String,
     /// The path below `base_url`, starting with `/`, still percent-encoded
-    /// as the client sent it.
+    /// as the client sent it; empty when the URL ends with the repository's
+    /// name.
     pub path: String,
     /// The query string without its `?`, empty when there is none.
     pub query: String,
@@ -193,8 +199,8 @@ fn percent_decode(s: &str, plus_is_space: bool) -> Option<String> {
 }
 
 /// An HTTP response. The host keeps only the headers it allows (content
-/// type, caching and validators, content-disposition, location) and adds its
-/// own security headers.
+/// type, caching and validators, content-disposition, vary, and location and
+/// link within the repository) and adds its own security headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     pub status: u16,
@@ -206,6 +212,15 @@ impl Response {
     /// A plain-text response (`text/plain; charset=utf-8`).
     pub fn text(status: u16, body: &str) -> Self {
         Response::new(status, "text/plain; charset=utf-8", body)
+    }
+
+    /// A response without a body or headers (a 204, a redirect).
+    pub fn empty(status: u16) -> Self {
+        Response {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
     }
 
     /// A response with a body of `content_type`.
@@ -256,9 +271,145 @@ pub struct SearchQuery {
     pub upstream: bool,
 }
 
-/// Data a plugin can ask for. Package ids are canonical, versions
-/// normalized. Everything the caller may not read (package selectors, group
-/// members it cannot see) is left out, exactly as for an unknown package.
+/// A page of a directory of a files repository ([`Query::Directory`]).
+///
+/// A file path is a list of segments joined by `/`, without a leading or
+/// trailing `/` (see [`crate::files`]). A directory is `""` (the root) or a
+/// path ending in `/`. The host refuses any other path a plugin names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryQuery {
+    pub directory: String,
+    /// Start after this entry, a name in the directory (a subdirectory's ends
+    /// in `/`); `None` starts at the first.
+    pub after: Option<String>,
+    /// The page size: 0 means the default (100), more than 1000 is 1000.
+    pub limit: u32,
+}
+
+/// A file of a files repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    pub path: String,
+    pub size: u64,
+    /// What the upload declared, else what its name suggests.
+    pub content_type: String,
+    /// Lowercase hex.
+    pub sha256: String,
+    /// Base64.
+    pub sha512: String,
+    /// Lowercase hex.
+    pub sha1: String,
+    /// Lowercase hex.
+    pub md5: String,
+    /// When its content was last stored (uploaded, or fetched by a proxy):
+    /// RFC 3339 in UTC.
+    pub modified: String,
+    /// When it was last downloaded, to the hour: RFC 3339 in UTC.
+    pub last_downloaded: Option<String>,
+}
+
+/// One entry of a [`DirectoryPage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectoryEntry {
+    File(FileInfo),
+    /// A subdirectory: its path, ending in `/`.
+    Directory(String),
+}
+
+/// A page of a directory ([`Answer::Directory`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryPage {
+    /// In byte order of their names, a subdirectory's ending in `/`.
+    pub entries: Vec<DirectoryEntry>,
+    /// The `after` of the next page; `None` on the last.
+    pub next: Option<String>,
+}
+
+/// One part of a `multipart/form-data` body ([`Query::Form`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormPart {
+    /// The part's field name.
+    pub field: String,
+    pub content: FormContent,
+}
+
+/// What a [`FormPart`] holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormContent {
+    /// A file: received and staged by the host, stored with
+    /// [`FileSource::Part`] and its index among the form's parts.
+    File(FormFile),
+    /// Any other field: its value (UTF-8, at most 4 KiB).
+    Text(String),
+}
+
+/// A file part of a form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormFile {
+    /// The file name the part declares.
+    pub name: String,
+    /// The content type the part declares.
+    pub content_type: Option<String>,
+    pub size: u64,
+}
+
+/// Where a file to store comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileSource {
+    /// The request body.
+    Body,
+    /// A file part of the request's form, by its index ([`Query::Form`]).
+    Part(u32),
+}
+
+/// A file to store ([`Query::Store`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewFile {
+    pub path: String,
+    pub source: FileSource,
+    /// The content type the client declared. The host keeps it unless it
+    /// says no more than "bytes" (none, `application/octet-stream`, a form
+    /// encoding); then it takes the one the path's extension suggests.
+    pub content_type: Option<String>,
+}
+
+/// What storing a file did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreStatus {
+    /// The path was new.
+    Created,
+    /// The path held other content, which this replaced.
+    Replaced,
+    /// The path held this content already.
+    Unchanged,
+}
+
+/// A file stored ([`Answer::Stored`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    pub path: String,
+    pub size: u64,
+    /// Lowercase hex.
+    pub sha256: String,
+    pub status: StoreStatus,
+}
+
+/// What a plugin can ask of the host: data, and in a files repository
+/// changes to its files. Package ids are canonical, versions normalized.
+/// Everything the caller may not read (package selectors, group members it
+/// cannot see) is left out, exactly as for an unknown package or file.
+///
+/// A package format asks for packages ([`Query::Versions`] …
+/// [`Query::Search`]), a files format for files ([`Query::File`] …
+/// [`Query::Remove`]): a query of the other kind fails the request.
+/// [`Query::Form`], [`Query::Store`] and [`Query::Remove`] change the
+/// repository: each is asked alone in its round, at most once per request
+/// for `Form` and `Store`, and only by a request authorized for them (write
+/// for `Form` and `Store`, delete for `Remove`) in a hosted repository, with
+/// an API token or a workload identity. When one fails (403 not allowed, 405
+/// not hosted or read-only, 409 the path exists and the repository does not
+/// allow redeploying it, 413 too large) the host answers with its own
+/// status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     /// Every version of a package, ascending.
@@ -274,6 +425,49 @@ pub enum Query {
     Manifest(PackageRef),
     /// The packages matching a search.
     Search(SearchQuery),
+    /// The file stored at a path. A proxy answers with its cached copy,
+    /// re-validated with its upstream once it is due; a group with its first
+    /// member, by priority, that has the path.
+    File(String),
+    /// [`Query::File`], and a proxy (a group's proxy members too) that has
+    /// not cached the path asks its upstream for it ([`UpstreamOp::File`])
+    /// and caches what it gets.
+    FetchFile(String),
+    /// A page of a directory. A proxy lists the files it has cached, a group
+    /// the merged entries of its members (the first member's file of a
+    /// name). A subdirectory is listed when the caller may see a file in it.
+    Directory(DirectoryQuery),
+    /// Receive the request's `multipart/form-data` body: its file parts are
+    /// staged (each within the repository's upload limit, at most 100), its
+    /// other fields read.
+    Form,
+    /// Store files, all of them or none. A path that holds a file is replaced
+    /// only when the repository allows redeploying and the caller may delete;
+    /// the same content again is accepted as it is.
+    Store(Vec<NewFile>),
+    /// Delete the file at a path.
+    Remove(String),
+}
+
+impl Query {
+    /// Whether the query changes the repository (it is asked alone in its
+    /// round).
+    pub fn is_change(&self) -> bool {
+        matches!(self, Query::Form | Query::Store(_) | Query::Remove(_))
+    }
+
+    /// Whether the query is about files rather than packages.
+    pub fn is_files(&self) -> bool {
+        matches!(
+            self,
+            Query::File(_)
+                | Query::FetchFile(_)
+                | Query::Directory(_)
+                | Query::Form
+                | Query::Store(_)
+                | Query::Remove(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,6 +528,16 @@ pub enum Answer {
     Package(Option<PackageInfo>),
     Manifest(Option<Vec<u8>>),
     Search(SearchResult),
+    /// The answer to [`Query::File`] and to [`Query::FetchFile`].
+    File(Option<FileInfo>),
+    /// `None`: the directory does not exist (a directory other than the root
+    /// without an entry the caller may see, asked for without `after`).
+    Directory(Option<DirectoryPage>),
+    Form(Vec<FormPart>),
+    /// What became of each file, in the order of [`Query::Store`].
+    Stored(Vec<StoredFile>),
+    /// Whether there was a file to delete.
+    Removed(bool),
 }
 
 /// A query with its answer.
@@ -372,14 +576,17 @@ pub struct ChangeRequest {
     pub done: Response,
 }
 
-/// What a request is ([`FormatPlugin::handle`]).
+/// What a request is ([`FormatPlugin::handle`]), or what to do once the data
+/// it asked for is loaded ([`FormatPlugin::render`]).
 ///
 /// [`FormatPlugin::handle`]: crate::FormatPlugin::handle
+/// [`FormatPlugin::render`]: crate::FormatPlugin::render
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Answer with this response.
     Respond(Response),
-    /// Load this data, then call `render` with it.
+    /// Load this data, then call `render` with everything loaded so far (the
+    /// host bounds the rounds and the number of queries).
     Load(Vec<Query>),
     /// Serve the stored package of this version, or 404 when the caller
     /// cannot read it. The host streams it and counts the download.
@@ -393,18 +600,12 @@ pub enum Action {
     Relist(ChangeRequest),
     /// Remove a version and its bytes (delete permission).
     Delete(ChangeRequest),
-}
-
-/// What a round of [`FormatPlugin::render`] produced.
-///
-/// [`FormatPlugin::render`]: crate::FormatPlugin::render
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Rendered {
-    /// Answer with this response.
-    Respond(Response),
-    /// Load more data, then call `render` again with everything loaded so
-    /// far (the host bounds the rounds and the number of queries).
-    Load(Vec<Query>),
+    /// Serve the file at this path (read requests), found as
+    /// [`Query::FetchFile`] finds it, or 404. The host streams it with its
+    /// validators (`ETag`, its SHA-256; `Last-Modified`), answers conditional
+    /// requests and one range, sets its content type and the repository's
+    /// content disposition, and counts the download.
+    ServeFile(String),
 }
 
 /// The upstream a proxy repository mirrors ([`FormatPlugin::upstream`]).
@@ -446,6 +647,11 @@ pub enum UpstreamOp {
     Dating(PackageVersions),
     /// A page of the upstream's search results.
     Search(SearchQuery),
+    /// The URL of the file at a path (files formats). The host downloads it,
+    /// following redirects (its credentials go to the remote's origin only),
+    /// caches it as the file, and re-validates it with a conditional request
+    /// once the repository's maximum age has passed.
+    File(String),
 }
 
 /// How long the host may reuse a fetched document.
@@ -568,6 +774,9 @@ pub enum UpstreamAnswer {
     Metadata(PackageMetadata),
     /// `None`: the upstream offers no search.
     Search(Option<UpstreamSearch>),
+    /// The file's URL, on an origin a [`Fetch`] may reach; `None`: the
+    /// upstream cannot have the path.
+    File(Option<String>),
     /// The upstream answered something unusable: the host serves what it
     /// has cached.
     Failed(String),

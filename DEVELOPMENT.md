@@ -241,8 +241,9 @@ password: `docker login localhost:8421 -u admin@example.com`, then
 `docker push localhost:8421/docker-hosted/team/app:1`. See
 [docs/docker.md](docs/docker.md).
 
-Raw repositories (`"format":"raw"`) hold files under arbitrary paths, served
-under `/raw/`: `curl -u admin@example.com:<token> --upload-file x.tgz
+Raw repositories (`"format":"raw"`, the built-in plugin `plugins/raw`) hold
+files under arbitrary paths, served under `/raw/`: `curl -u
+admin@example.com:<token> --upload-file x.tgz
 localhost:8421/raw/binaries/tools/x.tgz`, a proxy of any HTTP(S) base URL
 (`"remote_url":"https://github.com/<owner>/<repo>/releases/download/"`), and
 groups. See [docs/raw.md](docs/raw.md).

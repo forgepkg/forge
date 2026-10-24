@@ -1,12 +1,14 @@
-//! Raw proxy repositories: files fetched from an HTTP(S) base URL on first
-//! request, cached content-addressed, and re-validated against the upstream
-//! once they are older than the repository's `max_age_seconds`.
+//! Proxy repositories of the file store: files fetched from the upstream on
+//! first request, cached content-addressed, and re-validated against the
+//! upstream once they are older than the repository's `max_age_seconds`.
 //!
-//! * A file `<path>` is `<remote_url>/<path>`, each segment
-//!   percent-encoded. Redirects are followed (GitHub release assets
-//!   redirect to `objects.githubusercontent.com`), every hop through the
-//!   upstream client's cloud-metadata guard; the upstream credentials go to
-//!   the origin of `remote_url` only.
+//! * The format's plugin names the upstream URL of a path (its upstream
+//!   side's `file` operation; raw's is `<remote_url>/<path>`, each segment
+//!   percent-encoded), on an origin the upstream points at. Redirects are
+//!   followed (GitHub release assets redirect to
+//!   `objects.githubusercontent.com`), every hop through the upstream
+//!   client's cloud-metadata guard; the upstream credentials go to the
+//!   origin of `remote_url` only.
 //! * Re-validation is a conditional GET (`If-None-Match` with the upstream's
 //!   `ETag`, `If-Modified-Since` with its `Last-Modified`): a `304` keeps
 //!   the copy, new content replaces it. A `max_age_seconds` of `0` never
@@ -31,8 +33,8 @@ use forge_db::raw_dao::{self, NewRawFile, RawFile, Redeploy};
 use futures_util::TryStreamExt;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 
-use super::upload::{content_type, ingest};
-use super::{Raw, RawError};
+use super::store::{content_type, ingest};
+use super::{FileError, Files};
 
 /// The gate of one file's upstream requests, by `(repository id, path)`.
 type Gates = HashMap<(i64, String), Weak<tokio::sync::Mutex<()>>>;
@@ -55,23 +57,6 @@ fn gate(repository_id: i64, path: &str) -> Arc<tokio::sync::Mutex<()>> {
     gate
 }
 
-/// The upstream URL of `path`: `remote_url` (as a directory) with the
-/// path's segments appended, each percent-encoded.
-pub fn upstream_url(remote_url: &str, path: &str) -> Result<String, RawError> {
-    let mut url = url::Url::parse(remote_url)
-        .map_err(|e| RawError::Internal(format!("proxy remote_url {remote_url:?}: {e}")))?;
-    {
-        let mut segments = url.path_segments_mut().map_err(|()| {
-            RawError::Internal(format!("proxy remote_url {remote_url:?} has no path"))
-        })?;
-        segments.pop_if_empty();
-        for segment in path.split('/') {
-            segments.push(segment);
-        }
-    }
-    Ok(url.into())
-}
-
 fn header_text(
     headers: &reqwest::header::HeaderMap,
     name: reqwest::header::HeaderName,
@@ -84,7 +69,7 @@ fn header_text(
         .map(str::to_string)
 }
 
-impl Raw<'_> {
+impl Files<'_> {
     /// Keyed by the repository's `updated_at` too, so an administrator's
     /// cache invalidation (which bumps it) forgets the misses on every
     /// instance.
@@ -97,9 +82,12 @@ impl Raw<'_> {
         let hit: Result<bool, ()> = self
             .state
             .cache
-            .get_or_try_insert_local("raw:upstream-nf", &key, Duration::from_secs(1), || async {
-                Err(())
-            })
+            .get_or_try_insert_local(
+                "files:upstream-nf",
+                &key,
+                Duration::from_secs(1),
+                || async { Err(()) },
+            )
             .await;
         hit.unwrap_or(false)
     }
@@ -118,7 +106,7 @@ impl Raw<'_> {
             .state
             .cache
             .get_or_try_insert_local(
-                "raw:upstream-nf",
+                "files:upstream-nf",
                 &key,
                 Duration::from_secs(ttl),
                 || async { Ok(true) },
@@ -126,24 +114,43 @@ impl Raw<'_> {
             .await;
     }
 
-    async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, RawError> {
+    async fn credentials(&self, repo: &Repository) -> Result<Option<Credentials>, FileError> {
         upstream_credentials(&self.state.pool, self.state.envelope.as_ref(), repo)
             .await
-            .map_err(|e| RawError::Internal(format!("proxy credentials: {e}")))
+            .map_err(|e| FileError::Internal(format!("proxy credentials: {e}")))
     }
 
-    /// GET `path` from the upstream, conditionally on `cached`'s validators.
+    /// The upstream URL of `path`, as the format's plugin names it; `None`
+    /// when the upstream cannot have it.
+    async fn upstream_url(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<Option<String>, FileError> {
+        let format = self
+            .state
+            .formats
+            .for_repository(repo)
+            .map_err(|e| FileError::Unavailable(e.to_string()))?;
+        self.state
+            .proxy_repo(format)
+            .file_url(repo, path)
+            .await
+            .map_err(|e| {
+                tracing::warn!(repo = %repo.name, %path, error = %e, "file proxy: the upstream URL could not be resolved");
+                FileError::BadGateway(format!("the upstream could not be reached: {e}"))
+            })
+    }
+
+    /// GET `url` (the upstream's `path`), conditionally on `cached`'s
+    /// validators.
     async fn upstream_get(
         &self,
         repo: &Repository,
         path: &str,
+        url: &str,
         cached: Option<&RawFile>,
-    ) -> Result<reqwest::Response, RawError> {
-        let remote = repo
-            .remote_url
-            .as_deref()
-            .ok_or_else(|| RawError::Internal("proxy repository without remote_url".into()))?;
-        let url = upstream_url(remote, path)?;
+    ) -> Result<reqwest::Response, FileError> {
         let credentials = self.credentials(repo).await?;
         let auth: Option<UpstreamAuth<'_>> = credentials.as_ref().map(Credentials::auth);
         let mut headers = reqwest::header::HeaderMap::new();
@@ -163,15 +170,15 @@ impl Raw<'_> {
             .upstream
             .send(
                 reqwest::Method::GET,
-                &url,
+                url,
                 RequestClass::Download,
                 headers,
                 auth.as_ref(),
             )
             .await
             .map_err(|e| {
-                tracing::warn!(repo = %repo.name, %path, error = %e, "raw proxy: upstream request failed");
-                RawError::BadGateway(format!("the upstream could not be reached: {e}"))
+                tracing::warn!(repo = %repo.name, %path, error = %e, "file proxy: upstream request failed");
+                FileError::BadGateway(format!("the upstream could not be reached: {e}"))
             })
     }
 
@@ -181,10 +188,10 @@ impl Raw<'_> {
         repo: &Repository,
         path: &str,
         response: reqwest::Response,
-    ) -> Result<RawFile, RawError> {
+    ) -> Result<RawFile, FileError> {
         let limit = self.state.upstream.config().max_package_bytes;
         if response.content_length().is_some_and(|len| len > limit) {
-            return Err(RawError::BadGateway(format!(
+            return Err(FileError::BadGateway(format!(
                 "the upstream file is larger than proxy.max_package_bytes ({limit} bytes)"
             )));
         }
@@ -194,11 +201,11 @@ impl Raw<'_> {
         let declared = header_text(&headers, CONTENT_TYPE);
         let body = response.bytes_stream().map_err(std::io::Error::other);
         let ingested = ingest(self, body, limit).await.map_err(|e| match e {
-            RawError::TooLarge(limit) => RawError::BadGateway(format!(
+            FileError::TooLarge(limit) => FileError::BadGateway(format!(
                 "the upstream file is larger than proxy.max_package_bytes ({limit} bytes)"
             )),
-            RawError::BadRequest(msg) => {
-                RawError::BadGateway(format!("the upstream download failed: {msg}"))
+            FileError::BadRequest(msg) => {
+                FileError::BadGateway(format!("the upstream download failed: {msg}"))
             }
             other => other,
         })?;
@@ -206,7 +213,7 @@ impl Raw<'_> {
         let content_type = content_type(declared.as_deref(), path);
         let mut tx = self.state.pool.begin().await?;
         if !oci_dao::lock_proxy_upstream(&mut tx, repo.id, repo.remote_url.as_deref()).await? {
-            return Err(RawError::Unavailable(
+            return Err(FileError::Unavailable(
                 "the proxy was pointed at another upstream while this was fetched; retry".into(),
             ));
         }
@@ -216,7 +223,7 @@ impl Raw<'_> {
             &NewRawFile {
                 path,
                 sha256: &stored.sha256,
-                size: i64::try_from(stored.size).map_err(|_| RawError::TooLarge(stored.size))?,
+                size: i64::try_from(stored.size).map_err(|_| FileError::TooLarge(stored.size))?,
                 content_type: &content_type,
                 sha512_base64: &stored.sha512_base64,
                 sha1: &ingested.sha1,
@@ -233,7 +240,7 @@ impl Raw<'_> {
         tx.commit().await?;
         raw_dao::find(&self.state.pool, repo.id, path)
             .await?
-            .ok_or(RawError::NotFound)
+            .ok_or(FileError::NotFound)
     }
 
     /// The cached `file` of proxy `repo`, re-validated first when it is due.
@@ -253,14 +260,21 @@ impl Raw<'_> {
         match self.revalidate(repo, &file).await {
             Ok(current) => current,
             Err(error) => {
-                tracing::warn!(repo = %repo.name, path = %file.path, error = %error.message(), "raw proxy: re-validation failed; serving the cached copy");
+                tracing::warn!(repo = %repo.name, path = %file.path, error = %error.message(), "file proxy: re-validation failed; serving the cached copy");
                 file
             }
         }
     }
 
-    async fn revalidate(&self, repo: &Repository, file: &RawFile) -> Result<RawFile, RawError> {
-        let response = self.upstream_get(repo, &file.path, Some(file)).await?;
+    async fn revalidate(&self, repo: &Repository, file: &RawFile) -> Result<RawFile, FileError> {
+        let Some(url) = self.upstream_url(repo, &file.path).await? else {
+            // The upstream cannot have it (any more): the cached copy stands.
+            raw_dao::mark_checked(&self.state.pool, file.id, None, None).await?;
+            return Ok(file.clone());
+        };
+        let response = self
+            .upstream_get(repo, &file.path, &url, Some(file))
+            .await?;
         let status = response.status();
         if status == StatusCode::NOT_MODIFIED {
             let headers = response.headers();
@@ -277,18 +291,18 @@ impl Raw<'_> {
             return self.store_response(repo, &file.path, response).await;
         }
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
-            tracing::warn!(repo = %repo.name, path = %file.path, "raw proxy: the upstream no longer has a cached file; serving the cached copy");
+            tracing::warn!(repo = %repo.name, path = %file.path, "file proxy: the upstream no longer has a cached file; serving the cached copy");
             raw_dao::mark_checked(&self.state.pool, file.id, None, None).await?;
             return Ok(file.clone());
         }
-        Err(RawError::BadGateway(format!(
+        Err(FileError::BadGateway(format!(
             "the upstream answered {status}"
         )))
     }
 
     /// Fetch `path` from the upstream of proxy `repo` and cache it. `None`
     /// when the upstream does not have it (or the proxy is offline).
-    pub async fn fetch(&self, repo: &Repository, path: &str) -> Result<Option<RawFile>, RawError> {
+    pub async fn fetch(&self, repo: &Repository, path: &str) -> Result<Option<RawFile>, FileError> {
         if !repo.online || self.negative_cached(repo, path).await {
             return Ok(None);
         }
@@ -300,15 +314,19 @@ impl Raw<'_> {
         if self.negative_cached(repo, path).await {
             return Ok(None);
         }
-        let response = self.upstream_get(repo, path, None).await?;
+        let Some(url) = self.upstream_url(repo, path).await? else {
+            self.remember_not_found(repo, path).await;
+            return Ok(None);
+        };
+        let response = self.upstream_get(repo, path, &url, None).await?;
         let status = response.status();
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
             self.remember_not_found(repo, path).await;
             return Ok(None);
         }
         if !status.is_success() {
-            tracing::warn!(repo = %repo.name, %path, %status, "raw proxy: upstream error");
-            return Err(RawError::BadGateway(format!(
+            tracing::warn!(repo = %repo.name, %path, %status, "file proxy: upstream error");
+            return Err(FileError::BadGateway(format!(
                 "the upstream answered {status}"
             )));
         }
@@ -321,27 +339,4 @@ fn is_due(file: &RawFile, max_age: u64) -> bool {
     let max_age = chrono::Duration::seconds(i64::try_from(max_age).unwrap_or(i64::MAX / 1000));
     file.checked_at
         .is_none_or(|checked| chrono::Utc::now() - checked >= max_age)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn upstream_urls_append_encoded_segments() {
-        let base = "https://github.com/bblanchon/pdfium-binaries/releases/download/";
-        assert_eq!(
-            upstream_url(base, "chromium/7350/pdfium-linux-x64.tgz").unwrap(),
-            "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7350/pdfium-linux-x64.tgz"
-        );
-        // Without a trailing slash the base is a directory all the same.
-        assert_eq!(
-            upstream_url("http://up.test/files", "a b/c?d#e.txt").unwrap(),
-            "http://up.test/files/a%20b/c%3Fd%23e.txt"
-        );
-        assert_eq!(
-            upstream_url("http://up.test", "x.bin").unwrap(),
-            "http://up.test/x.bin"
-        );
-    }
 }

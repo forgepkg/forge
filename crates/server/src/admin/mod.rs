@@ -192,7 +192,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/repositories/{name}/files",
-            axum::routing::delete(crate::raw::web::admin_delete),
+            axum::routing::delete(crate::files::web::admin_delete),
         )
         .route(
             "/repositories/{name}/proxy-cache/invalidate",

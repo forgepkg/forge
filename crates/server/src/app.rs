@@ -129,14 +129,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         .into_iter()
         .map(str::to_string)
         .collect();
-    // Raw repositories are feeds too, for the response policy.
-    let feeds: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
-        mounts
-            .iter()
-            .cloned()
-            .chain([crate::raw::MOUNT.to_string()])
-            .collect(),
-    );
+    // Every format's mount is a feed, for the response policy (raw's
+    // `/raw` among them).
+    let feeds: std::sync::Arc<Vec<String>> = std::sync::Arc::new(mounts.clone());
     let mut app = Router::new()
         // Liveness / readiness probes (unauthenticated, dependency-light).
         .merge(crate::health::health_router())
@@ -162,17 +157,16 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // the host) itself.
         .route("/v2", any(crate::registry::registry))
         .route("/v2/", any(crate::registry::registry))
-        .route("/v2/{*rest}", any(crate::registry::registry))
-        // Raw (generic file) repositories: `/raw/<repo>/<path>`.
-        .route("/raw/{repo}", any(crate::raw::handle))
-        .route("/raw/{repo}/", any(crate::raw::handle))
-        .route("/raw/{repo}/{*rest}", any(crate::raw::handle));
+        .route("/v2/{*rest}", any(crate::registry::registry));
     // Repositories, each served by its format's plugin under the format's
-    // mount (`crate::plugins`; NuGet at `/v3`). `any` covers
+    // mount (`crate::plugins`; NuGet at `/v3`, raw files at `/raw`). `any` covers
     // GET/HEAD/PUT/POST/DELETE; the dispatcher authorizes per method.
     for mount in mounts.iter() {
         app = app
             .route(&format!("{mount}/{{repo}}"), any(crate::plugins::dispatch))
+            // A wildcard matches no empty rest: the root of a repository
+            // (a files format's root listing) needs its own route.
+            .route(&format!("{mount}/{{repo}}/"), any(crate::plugins::dispatch))
             .route(
                 &format!("{mount}/{{repo}}/{{*rest}}"),
                 any(crate::plugins::dispatch),

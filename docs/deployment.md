@@ -371,6 +371,31 @@ false, "email": "…"}`) makes a new invitation and `DELETE` revokes it. The
 invited user's page calls `POST /auth/invitations/lookup` and
 `POST /auth/invitations/accept` (`{"token", "password"}`).
 
+### Deactivating users
+
+To cut a user off without deleting the account, deactivate it on the user's
+page (**Admin → Users → <user> → Deactivate**, or `PATCH /admin/users/{id}`
+with `{"active": false}`):
+
+- every sign-in is refused: the password, the browser, OIDC, credential
+  forwarding and API tokens, and no realm provisions the name back to life;
+- the user's browser sessions end, their cached upstream verdicts are
+  dropped, and a pending invitation is revoked;
+- their tokens are refused but **not** revoked: reactivating
+  (`{"active": true}`) lets the unrevoked ones work again, so revoke those
+  that should not before reactivating.
+
+Deactivate, rather than delete, an account to suspend during an incident or
+to keep after its user left: deleting cannot be undone and takes the
+account's tokens, roles and identity links along, and an OIDC realm that
+provisions accounts re-creates a deleted one at its next login.
+
+**Sign out everywhere** (`POST /admin/users/{id}/reauth`) ends the user's
+browser sessions without deactivating the account. For a
+credential-forwarding account the next password is checked against the
+upstream again, and the tokens the user minted from a forwarded sign-in are
+revoked; tokens an administrator issued keep working.
+
 ### Usernames
 
 Every account is named by a UPN, `local-part@domain` (`alice@example.com`):
