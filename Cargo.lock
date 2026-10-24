@@ -1545,6 +1545,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1629,6 +1639,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha2 0.11.1",
  "sqlx",
  "subtle",
@@ -1738,6 +1749,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-format-npm"
+version = "1.0.0"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "flate2",
+ "forge-plugin-api",
+ "hex",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.1",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
 name = "forge-format-nuget"
 version = "1.0.0"
 dependencies = [
@@ -1795,6 +1824,7 @@ dependencies = [
  "forge-crypto",
  "forge-db",
  "forge-format-docker",
+ "forge-format-npm",
  "forge-format-nuget",
  "forge-format-raw",
  "forge-plugin",
@@ -4550,6 +4580,16 @@ name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
 
 [[package]]
 name = "tempfile"

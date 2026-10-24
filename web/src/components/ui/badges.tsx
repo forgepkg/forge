@@ -35,6 +35,7 @@ const FORMATS: Record<string, { label: string; icon: IconName }> = {
   nuget: { label: 'NuGet', icon: 'Package' },
   docker: { label: 'Docker', icon: 'Layers' },
   raw: { label: 'Raw', icon: 'Folder' },
+  npm: { label: 'npm', icon: 'Package' },
 }
 
 /** Display name of a repository format (`NuGet`, `Docker`, a plugin's id). */

@@ -29,7 +29,7 @@ mod types;
 pub mod testing;
 
 use std::cmp::Ordering;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 pub use types::*;
@@ -113,12 +113,90 @@ pub trait FormatPlugin: Send + Sync + 'static {
         None
     }
 
+    /// The README a manifest carries, shown on the web UI's package page.
+    /// `None` by default.
+    fn readme(&self, manifest: &[u8]) -> Option<String> {
+        let _ = manifest;
+        None
+    }
+
+    /// A group's reserved prefix as the host stores it, from what an
+    /// administrator typed (trimmed, a trailing `*` dropped): refused when it
+    /// cannot start a package id. The default takes letters, digits, `.`,
+    /// `_` and `-`, lowercased.
+    fn reserved_prefix(&self, prefix: &str) -> Result<String, FormatError> {
+        let valid = !prefix.is_empty()
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if valid {
+            Ok(prefix.to_ascii_lowercase())
+        } else {
+            Err(FormatError::InvalidId(format!(
+                "{prefix:?} is not a package id prefix (letters, digits, '.', '_', '-')"
+            )))
+        }
+    }
+
+    /// An [`Upload::Document`]: read the request `body`, write the package it
+    /// carries to `package`, and return the rest of the document — or say
+    /// there is no package in it. Runs off the async workers; the host bounds
+    /// the package by the repository's upload limit, the plugin the document.
+    fn unpack_upload(
+        &self,
+        body: &mut dyn Read,
+        package: &mut dyn Write,
+    ) -> Result<Unpacked, FormatError> {
+        let _ = (body, package);
+        Err(FormatError::Internal(
+            "this format takes no document uploads".into(),
+        ))
+    }
+
+    /// [`Self::parse_package`] of a package [`Self::unpack_upload`] wrote,
+    /// with the document it came in: what the document says about the
+    /// package (its digests, its manifest) is checked here. The default
+    /// ignores the document.
+    fn parse_upload(
+        &self,
+        upload: &Uploaded<'_>,
+        package: &mut dyn PackageSource,
+    ) -> Result<ParsedPackage, FormatError> {
+        let _ = upload;
+        self.parse_package(package)
+    }
+
+    /// The changes to make once a document's package is stored as
+    /// `package` (npm: the dist-tags the document sets). None by default.
+    fn published(&self, document: &[u8], package: &PackageRef) -> Vec<Change> {
+        let _ = (document, package);
+        Vec::new()
+    }
+
+    /// The response to an [`Action::Auth`] that succeeded.
+    fn auth_response(&self, repo: &Repository, req: &Request, outcome: &AuthOutcome) -> Response {
+        let _ = (repo, req, outcome);
+        Response::text(500, "this format has no logins")
+    }
+
+    /// The body of an error the host answers with (a refusal, a conflict, a
+    /// missing package), for clients that read errors in a shape of their
+    /// own: npm prints `{"error": ...}`. The host keeps the status and its
+    /// own headers (`WWW-Authenticate`, `Retry-After`) and takes the
+    /// content type and the body. `None` (the default): plain text.
+    fn error_response(&self, status: u16, message: &str) -> Option<Response> {
+        let _ = (status, message);
+        None
+    }
+
     /// What a request is: a response right away, data to load first (then
     /// [`Self::render`]), or an action only the host can perform.
     ///
-    /// The host has authenticated the caller and checked that it may perform
-    /// the request's action on the repository (GET/HEAD read, PUT/POST
-    /// write, DELETE delete) before it asks.
+    /// The host has authenticated the caller before it asks, and checks
+    /// the answer against what the caller may do (GET/HEAD read, PUT/POST
+    /// write, DELETE delete) — loads, downloads, forwards and responses
+    /// need read, a publish or a change the permission it is for, a body
+    /// what [`BodyUse`] says, and a login nothing.
     fn handle(&self, repo: &Repository, req: &Request) -> Action;
 
     /// What to do once the data [`Self::handle`] (and earlier rounds of

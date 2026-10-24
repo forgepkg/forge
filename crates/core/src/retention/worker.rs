@@ -336,12 +336,22 @@ impl RetentionWorker {
         };
         // A panic there (e.g. a panicking `Format`) fails the run like a panic
         // anywhere else in `process`.
-        let (hosted_decisions, proxy_decisions) = evaluation.await.map_err(|e| {
+        let (mut hosted_decisions, proxy_decisions) = evaluation.await.map_err(|e| {
             WorkerError::Panicked(match e.try_into_panic() {
                 Ok(panic) => panic_message(&*panic),
                 Err(e) => e.to_string(), // cancelled: the runtime is shutting down
             })
         })?;
+        // A version a package tag names is never touched.
+        let spared = crate::retention::spare_protected(
+            &self.pool,
+            repo.repository_id,
+            &mut hosted_decisions,
+        )
+        .await?;
+        if spared > 0 {
+            tracing::info!(repo = %repo.name, spared, "retention spared tagged versions");
+        }
 
         // Affected package names (for cache invalidation after the run).
         let mut affected: BTreeSet<String> = BTreeSet::new();

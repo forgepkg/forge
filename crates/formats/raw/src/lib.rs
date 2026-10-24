@@ -31,7 +31,7 @@ use forge_plugin_api::files::{self, Target};
 use forge_plugin_api::{
     Action, Answer, Assets, Descriptor, DirectoryQuery, FetchResult, FileSource, FormatError,
     FormatPlugin, Loaded, NewFile, Query, Remote, Repository, RepositoryKind, Request, Response,
-    Storage, StoreStatus, UpstreamAnswer, UpstreamOp, UpstreamStep,
+    Storage, StoreStatus, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken,
 };
 
 /// What raw says about itself: its format id, name, version and mount.
@@ -53,6 +53,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // Its repositories hold files under paths, in the host's file store.
     storage: Storage::Files,
     assets: Assets::DEFAULT,
+    upstream_token: UpstreamToken::None,
 };
 
 /// The raw format.

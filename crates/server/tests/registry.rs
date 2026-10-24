@@ -2493,7 +2493,7 @@ async fn admin_validates_docker_repositories() {
         400
     );
     assert_eq!(
-        bad(json!({"name": format!("x{n}"), "kind": "hosted", "format": "npm"})).await,
+        bad(json!({"name": format!("x{n}"), "kind": "hosted", "format": "pypi"})).await,
         400
     );
     assert_eq!(

@@ -30,6 +30,7 @@ use std::cmp::Ordering;
 use forge_plugin_api::{
     Action, Assets, Descriptor, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource,
     ParsedPackage, Remote, Repository, RepositoryKind, Request, Storage, UpstreamOp, UpstreamStep,
+    UpstreamToken,
 };
 
 pub use model::NupkgLimits;
@@ -56,6 +57,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
         manifest: "package.nuspec",
         manifest_type: "application/xml",
     },
+    upstream_token: UpstreamToken::None,
 };
 
 /// The NuGet format, with the zip-bomb limits applied while parsing packages.

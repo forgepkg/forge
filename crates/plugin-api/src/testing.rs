@@ -37,6 +37,7 @@ pub fn repository(kind: RepositoryKind, mount: &str) -> Repository {
         kind,
         base_url: format!("https://forge.example.com{mount}/repo"),
         inline: false,
+        reserved_prefixes: Vec::new(),
     }
 }
 
@@ -80,11 +81,43 @@ pub fn serve(
     req: &Request,
     mut answer: impl FnMut(&Query) -> Answer,
 ) -> Served {
-    let mut queries = Vec::new();
-    let mut pending = match plugin.handle(repo, req) {
+    let queries = Vec::new();
+    let pending = match plugin.handle(repo, req) {
         Action::Load(pending) => pending,
         outcome => return Served { outcome, queries },
     };
+    serve_loads(plugin, repo, req, &mut answer, pending, queries)
+}
+
+/// [`serve`] for a request with a body ([`Action::ReadBody`]): the plugin is
+/// asked again with `body`, as the host does once it read it.
+pub fn serve_with_body(
+    plugin: &dyn FormatPlugin,
+    repo: &Repository,
+    req: &Request,
+    body: &[u8],
+    answer: impl FnMut(&Query) -> Answer,
+) -> Served {
+    match plugin.handle(repo, req) {
+        Action::ReadBody(_) => {}
+        outcome => {
+            return Served {
+                outcome,
+                queries: Vec::new(),
+            }
+        }
+    }
+    serve(plugin, repo, &req.clone().with_body(body.to_vec()), answer)
+}
+
+fn serve_loads(
+    plugin: &dyn FormatPlugin,
+    repo: &Repository,
+    req: &Request,
+    answer: &mut impl FnMut(&Query) -> Answer,
+    mut pending: Vec<Query>,
+    mut queries: Vec<Query>,
+) -> Served {
     let mut data: Vec<Loaded> = Vec::new();
     for _ in 0..MAX_ROUNDS {
         if data.len() + pending.len() > MAX_QUERIES {

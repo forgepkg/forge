@@ -430,13 +430,19 @@ pub async fn preview(
         )
     })
     .await;
-    let (decisions, proxy_decisions) = match evaluation {
+    let (mut decisions, proxy_decisions) = match evaluation {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(error = %e, repo = %repo.name, "retention preview evaluation failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
+    // As the worker does: a tagged version (npm's dist-tags) is never touched.
+    if let Err(e) =
+        forge_core::retention::spare_protected(&state.pool, repo.id, &mut decisions).await
+    {
+        return db_error(e);
+    }
 
     use forge_core::retention::model::Action;
     let unlisted = decisions

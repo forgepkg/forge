@@ -68,6 +68,13 @@ pub struct Config {
     /// and blob-link expiry.
     #[serde(default)]
     pub docker: DockerConfig,
+    /// npm registries (`/npm`): what the npm plugin reads of a request.
+    #[serde(default)]
+    pub npm: NpmConfig,
+    /// Logins of command-line clients (`npm login`): their tokens and the
+    /// logins approved in the browser.
+    #[serde(default)]
+    pub cli_login: CliLoginConfig,
     /// Static web UI (SPA) serving.
     #[serde(default)]
     pub web: WebConfig,
@@ -1456,6 +1463,106 @@ impl DockerConfig {
     }
 }
 
+/// `[npm]`: what the npm plugin reads of a request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NpmConfig {
+    /// The largest publish document, without its tarball (the tarball
+    /// follows the repository's upload limit), and the largest other
+    /// document a client sends (`npm deprecate`, `npm unpublish <version>`,
+    /// an audit), in bytes. Default 32 MiB.
+    #[serde(default = "default_npm_max_document_bytes")]
+    pub max_document_bytes: u64,
+    /// The most a tarball may unpack to, in bytes. Default 1 GiB.
+    #[serde(default = "default_npm_max_unpacked_bytes")]
+    pub max_unpacked_bytes: u64,
+}
+
+impl Default for NpmConfig {
+    fn default() -> Self {
+        NpmConfig {
+            max_document_bytes: default_npm_max_document_bytes(),
+            max_unpacked_bytes: default_npm_max_unpacked_bytes(),
+        }
+    }
+}
+
+impl NpmConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_document_bytes == 0 || self.max_unpacked_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "npm.max_document_bytes and npm.max_unpacked_bytes must be greater than 0".into(),
+            ));
+        }
+        if usize::try_from(self.max_document_bytes).is_err() {
+            return Err(ConfigError::Invalid(
+                "npm.max_document_bytes is too large".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The limits handed to [`forge_format_npm::Npm::with_limits`].
+    pub fn limits(&self) -> forge_format_npm::NpmLimits {
+        forge_format_npm::NpmLimits {
+            max_document_bytes: self.max_document_bytes,
+            max_unpacked_bytes: self.max_unpacked_bytes,
+        }
+    }
+}
+
+fn default_npm_max_document_bytes() -> u64 {
+    forge_format_npm::NpmLimits::default().max_document_bytes
+}
+fn default_npm_max_unpacked_bytes() -> u64 {
+    forge_format_npm::NpmLimits::default().max_unpacked_bytes
+}
+
+/// `[cli_login]`: logins of command-line clients (`npm login`), with a
+/// password or approved in the browser.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CliLoginConfig {
+    /// Lifetime, in days, of the token a login mints. `0`: the token does
+    /// not expire. Default 90.
+    #[serde(default = "default_cli_login_token_lifetime_days")]
+    pub token_lifetime_days: u32,
+    /// How long a login approved in the browser waits for the approval, in
+    /// seconds (60–3600). Default 600.
+    #[serde(default = "default_cli_login_web_login_ttl_seconds")]
+    pub web_login_ttl_seconds: u64,
+}
+
+impl Default for CliLoginConfig {
+    fn default() -> Self {
+        CliLoginConfig {
+            token_lifetime_days: default_cli_login_token_lifetime_days(),
+            web_login_ttl_seconds: default_cli_login_web_login_ttl_seconds(),
+        }
+    }
+}
+
+impl CliLoginConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(60..=3600).contains(&self.web_login_ttl_seconds) {
+            return Err(ConfigError::Invalid(
+                "cli_login.web_login_ttl_seconds must be between 60 and 3600".into(),
+            ));
+        }
+        if self.token_lifetime_days > 36_500 {
+            return Err(ConfigError::Invalid(
+                "cli_login.token_lifetime_days must be at most 36500 (0: no expiry)".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_cli_login_token_lifetime_days() -> u32 {
+    90
+}
+fn default_cli_login_web_login_ttl_seconds() -> u64 {
+    600
+}
+
 /// The largest blob a docker proxy downloads unless `docker.max_blob_bytes`
 /// says otherwise: 1 GiB.
 pub const DEFAULT_DOCKER_MAX_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
@@ -2189,6 +2296,8 @@ impl Config {
         self.proxy.validate()?;
         self.nuget.validate()?;
         self.docker.validate()?;
+        self.npm.validate()?;
+        self.cli_login.validate()?;
         self.validate_workers()?;
         self.validate_insecure_defaults()?;
         if self.server.removed_max_upload_bytes.is_some() {

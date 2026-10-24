@@ -35,6 +35,7 @@ use forge_plugin_api::images::{
 use forge_plugin_api::{
     Action, Assets, Descriptor, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource,
     Remote, Repository, RepositoryKind, Request, Response, Storage, UpstreamOp, UpstreamStep,
+    UpstreamToken,
 };
 
 use crate::manifest::{media, ManifestError, EMPTY_JSON, EMPTY_JSON_DIGEST};
@@ -61,6 +62,8 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // host's image store.
     storage: Storage::Images,
     assets: Assets::DEFAULT,
+    // The host's image store answers an upstream's Bearer challenge itself.
+    upstream_token: UpstreamToken::None,
 };
 
 /// The Docker / OCI format.
@@ -80,6 +83,22 @@ impl FormatPlugin for Docker {
         } else {
             Err(FormatError::InvalidId(format!(
                 "{id:?} is not an image name"
+            )))
+        }
+    }
+
+    /// An image-name prefix a group reserves: letters, digits, `.`, `_`,
+    /// `-` and `/` (a namespace such as `acme/`), lowercased.
+    fn reserved_prefix(&self, prefix: &str) -> Result<String, FormatError> {
+        let valid = !prefix.is_empty()
+            && prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'));
+        if valid {
+            Ok(prefix.to_ascii_lowercase())
+        } else {
+            Err(FormatError::InvalidId(format!(
+                "{prefix:?} is not an image name prefix (letters, digits, '.', '_', '-', '/')"
             )))
         }
     }

@@ -196,6 +196,7 @@ mod tests {
             kind: RepositoryKind::Hosted,
             base_url: "https://forge.example.com/raw/r".into(),
             inline: false,
+            reserved_prefixes: Vec::new(),
         };
         assert_eq!(
             content_disposition(&repo, "a/b.txt"),

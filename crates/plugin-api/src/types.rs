@@ -98,7 +98,7 @@ impl RepositoryKind {
 /// `'static` value next to its `impl FormatPlugin`.
 ///
 /// ```no_run
-/// use forge_plugin_api::{Assets, Descriptor, RepositoryKind, Storage};
+/// use forge_plugin_api::{Assets, Descriptor, RepositoryKind, Storage, UpstreamToken};
 ///
 /// pub const DESCRIPTOR: Descriptor = Descriptor {
 ///     id: "example",
@@ -109,6 +109,7 @@ impl RepositoryKind {
 ///     kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
 ///     storage: Storage::Packages,
 ///     assets: Assets::DEFAULT,
+///     upstream_token: UpstreamToken::None,
 /// };
 /// ```
 ///
@@ -138,6 +139,21 @@ pub struct Descriptor {
     pub storage: Storage,
     /// How a version's files are stored (a package format).
     pub assets: Assets,
+    /// What a proxy given a password and no username does with it.
+    pub upstream_token: UpstreamToken,
+}
+
+/// What a proxy given a password and no username sends its upstream
+/// ([`Descriptor::upstream_token`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpstreamToken {
+    /// Nothing: a proxy authenticates with a username and a password only
+    /// (Basic).
+    #[default]
+    None,
+    /// The password is a token, sent as `Authorization: Bearer` (npm's
+    /// `_authToken`).
+    Bearer,
 }
 
 /// Where a format's repositories are served unless it names another mount.
@@ -216,6 +232,10 @@ pub struct Repository {
     /// [`Action::ServeFile`] serves them. Always `false` for a package
     /// format.
     pub inline: bool,
+    /// A group's reserved prefixes ([`crate::FormatPlugin::reserved_prefix`]
+    /// forms): package ids that are never served from its proxy members.
+    /// Empty for any other repository.
+    pub reserved_prefixes: Vec<String>,
 }
 
 /// An HTTP request from a package client.
@@ -234,6 +254,9 @@ pub struct Request {
     /// if-none-match, user-agent, and to an images format content-range.
     /// Never credentials or cookies.
     pub headers: Vec<(String, String)>,
+    /// The request body, once the plugin asked for it ([`Action::ReadBody`]);
+    /// `None` before. A `Content-Encoding: gzip` body is inflated.
+    pub body: Option<Vec<u8>>,
     /// Images formats: the image the request is for, as the host resolved
     /// the name [`FormatPlugin::image_path`] split off the path; the path
     /// is then the endpoint. `None` for every other format.
@@ -252,8 +275,15 @@ impl Request {
             path: path.to_string(),
             query: query.to_string(),
             headers: Vec::new(),
+            body: None,
             image: None,
         }
+    }
+
+    /// The request with its body read ([`Action::ReadBody`]).
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = Some(body.into());
+        self
     }
 
     /// The request for `image` (images formats), the client having named
@@ -558,6 +588,11 @@ pub enum Query {
     Versions(String),
     /// Every version of a package with its metadata, ascending.
     Packages(String),
+    /// [`Query::Packages`] with every version's publish time
+    /// ([`PackageInfo::published`]), even where that costs more: a proxy
+    /// asks its upstream with [`UpstreamOp::Dating`] instead of
+    /// [`UpstreamOp::Metadata`].
+    DatedPackages(String),
     /// One version with its metadata.
     Package(PackageRef),
     /// Some versions of a package with their metadata, ascending; versions
@@ -567,6 +602,11 @@ pub enum Query {
     Manifest(PackageRef),
     /// The packages matching a search.
     Search(SearchQuery),
+    /// A package's tags ([`Tag`]). A hosted repository's are the ones set
+    /// with [`Change::Tag`], a proxy's its upstream's
+    /// ([`UpstreamOp::Tags`]), a group's those of its first member, by
+    /// priority, that serves the package and has tags for it.
+    Tags(String),
     /// The file stored at a path. A proxy answers with its cached copy,
     /// re-validated with its upstream once it is due; a group with its first
     /// member, by priority, that has the path.
@@ -623,6 +663,15 @@ impl Query {
     }
 }
 
+/// A name for one version of a package (npm's dist-tags: `latest`, `next`).
+/// A tag names one version; a version may have several tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tag {
+    pub name: String,
+    /// Normalized.
+    pub version: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionInfo {
     /// The id as the package writes it.
@@ -651,6 +700,9 @@ pub struct PackageInfo {
     ///
     /// [`FormatPlugin::manifest_summary`]: crate::FormatPlugin::manifest_summary
     pub summary: Option<String>,
+    /// Why the version should not be used any more, when it was deprecated
+    /// ([`Change::Deprecate`]).
+    pub deprecated: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -676,11 +728,14 @@ pub struct SearchResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
     Versions(Vec<VersionInfo>),
-    /// The answer to [`Query::Packages`] and to [`Query::PackagesOf`].
+    /// The answer to [`Query::Packages`], [`Query::DatedPackages`] and
+    /// [`Query::PackagesOf`].
     Packages(Vec<PackageInfo>),
     Package(Option<PackageInfo>),
     Manifest(Option<Vec<u8>>),
     Search(SearchResult),
+    /// The answer to [`Query::Tags`], by name.
+    Tags(Vec<Tag>),
     /// The answer to [`Query::File`] and to [`Query::FetchFile`].
     File(Option<FileInfo>),
     /// `None`: the directory does not exist (a directory other than the root
@@ -712,6 +767,16 @@ pub enum Upload {
     /// The package is the first part of a `multipart/form-data` body,
     /// whatever its name.
     FirstPart,
+    /// The body is a document carrying the package (npm's publish: a JSON
+    /// document with the tarball in base64): the host streams it through
+    /// [`FormatPlugin::unpack_upload`], parses the package with
+    /// [`FormatPlugin::parse_upload`] and, once it is stored, applies
+    /// [`FormatPlugin::published`]'s changes.
+    ///
+    /// [`FormatPlugin::unpack_upload`]: crate::FormatPlugin::unpack_upload
+    /// [`FormatPlugin::parse_upload`]: crate::FormatPlugin::parse_upload
+    /// [`FormatPlugin::published`]: crate::FormatPlugin::published
+    Document,
 }
 
 /// A publish, and the response when it succeeds. When it fails the host
@@ -720,7 +785,162 @@ pub enum Upload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRequest {
     pub upload: Upload,
+    /// The canonical id the package must have (the one its URL names):
+    /// another is refused with 400. `None`: any.
+    pub id: Option<String>,
     pub done: Response,
+}
+
+/// What [`FormatPlugin::unpack_upload`] found in an [`Upload::Document`].
+///
+/// [`FormatPlugin::unpack_upload`]: crate::FormatPlugin::unpack_upload
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unpacked {
+    /// A package, written out; `document` is the rest of the body, handed
+    /// to [`FormatPlugin::parse_upload`] and [`FormatPlugin::published`].
+    ///
+    /// [`FormatPlugin::parse_upload`]: crate::FormatPlugin::parse_upload
+    /// [`FormatPlugin::published`]: crate::FormatPlugin::published
+    Package { document: Vec<u8> },
+    /// No package: the body is a document of another kind (npm's
+    /// deprecations and dist-tag edits are the same request). The host
+    /// drops what was staged and asks [`FormatPlugin::handle`] again, with
+    /// the body as [`Request::body`].
+    ///
+    /// [`FormatPlugin::handle`]: crate::FormatPlugin::handle
+    Document(Vec<u8>),
+}
+
+/// What a request's body is for ([`BodyRequest`]): what the caller needs
+/// for the host to read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyUse {
+    /// A login's ([`AuthRequest::Password`], [`AuthRequest::StartWebLogin`]):
+    /// read for any caller, at most 64 KiB, and what the plugin answers then
+    /// must be [`Action::Auth`].
+    Login,
+    /// A query sent as a body (npm's audits): the caller needs read.
+    Read,
+    /// A change: the caller needs the permission the request's method takes
+    /// (PUT/POST write, DELETE delete).
+    Change,
+}
+
+/// A request whose body the plugin needs to decide what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyRequest {
+    /// The largest body accepted: a larger one is answered 413. The host
+    /// caps it at 64 MiB.
+    pub limit: u64,
+    pub used_for: BodyUse,
+}
+
+/// A package [`FormatPlugin::unpack_upload`] wrote, with what came with it.
+///
+/// [`FormatPlugin::unpack_upload`]: crate::FormatPlugin::unpack_upload
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Uploaded<'a> {
+    /// The rest of the document ([`Unpacked::Package`]).
+    pub document: &'a [u8],
+    /// The username of the account publishing, when it is a user's.
+    pub publisher: Option<&'a str>,
+}
+
+/// One change to a repository's packages ([`ChangeSet`]). Ids are
+/// canonical, versions normalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Hide a version from searches and "latest" (delete permission).
+    Unlist(PackageRef),
+    /// Show an unlisted version again (write permission).
+    Relist(PackageRef),
+    /// Remove a version, its bytes and its tags (delete permission).
+    Delete(PackageRef),
+    /// Mark a version deprecated with `message`, or (`None`) no longer
+    /// (write permission).
+    Deprecate {
+        target: PackageRef,
+        message: Option<String>,
+    },
+    /// Point tag `tag` of package `id` at `version`, which must exist
+    /// (write permission).
+    Tag {
+        id: String,
+        tag: String,
+        version: String,
+    },
+    /// Remove tag `tag` of package `id` (write permission).
+    Untag { id: String, tag: String },
+}
+
+/// Changes the host makes in order, and the response when every one
+/// succeeded. The first that fails answers instead (403, 404 for a version
+/// the caller cannot see, 400), and those before it stay made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub changes: Vec<Change>,
+    pub done: Response,
+}
+
+/// What only the host can do about who the caller is: log a client in,
+/// out, or tell it who it is. Its outcome comes back through
+/// [`FormatPlugin::auth_response`]; refusals the host answers itself (401,
+/// 429, 503).
+///
+/// [`FormatPlugin::auth_response`]: crate::FormatPlugin::auth_response
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthRequest {
+    /// Sign in with a password; the outcome is a new API token
+    /// ([`AuthOutcome::Token`]). Any caller may ask.
+    Password { username: String, password: String },
+    /// Start a login the user approves in the browser
+    /// ([`AuthOutcome::WebLoginStarted`]). Any caller may ask; 404 when the
+    /// server serves no web UI.
+    StartWebLogin { hostname: Option<String> },
+    /// Whether the web login `secret` was approved: [`AuthOutcome::Token`]
+    /// once, [`AuthOutcome::WebLoginPending`] before,
+    /// [`AuthOutcome::WebLoginUnknown`] when refused, expired or collected.
+    PollWebLogin { secret: String },
+    /// Revoke the caller's own API token `token` ([`AuthOutcome::LoggedOut`]).
+    Logout { token: String },
+    /// Who the caller is ([`AuthOutcome::Identity`]).
+    Whoami,
+}
+
+/// What came of an [`AuthRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// A new API token, for `username`.
+    Token {
+        token: String,
+        username: String,
+    },
+    /// The page the user approves the login on, and the login's secret
+    /// (what the client polls with).
+    WebLoginStarted {
+        login_url: String,
+        secret: String,
+    },
+    WebLoginPending,
+    WebLoginUnknown,
+    LoggedOut,
+    Identity {
+        username: String,
+    },
+}
+
+/// A request the host sends on to the upstream of the repository (a proxy)
+/// or of a group's first proxy member the caller may read: npm's audits.
+/// The upstream's status, content type and body are the response. A hosted
+/// repository has no upstream: 404.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    /// The path below the upstream's `remote_url`, starting with `/`
+    /// (with a query, if any).
+    pub path: String,
+    pub content_type: String,
+    /// Sent as a POST.
+    pub body: Vec<u8>,
 }
 
 /// An unlist, relist or delete, and the response when it succeeds (the host
@@ -755,6 +975,15 @@ pub enum Action {
     Relist(ChangeRequest),
     /// Remove a version and its bytes (delete permission).
     Delete(ChangeRequest),
+    /// Make these changes ([`ChangeSet`]): never for a GET or HEAD.
+    Change(ChangeSet),
+    /// Read the request body, then call `handle` again with it
+    /// ([`Request::body`]).
+    ReadBody(BodyRequest),
+    /// Log in, out, or say who the caller is ([`AuthRequest`]).
+    Auth(AuthRequest),
+    /// Send the request on to the upstream ([`Forward`]; read permission).
+    Forward(Forward),
     /// Serve the file at this path (read requests), found as
     /// [`Query::FetchFile`] finds it, or 404. The host streams it with its
     /// validators (`ETag`, its SHA-256; `Last-Modified`), answers conditional
@@ -812,6 +1041,8 @@ pub enum UpstreamOp {
     Dating(PackageVersions),
     /// A page of the upstream's search results.
     Search(SearchQuery),
+    /// The tags the upstream gives a package (canonical id).
+    Tags(String),
     /// The URL of the file at a path (files formats). The host downloads it,
     /// following redirects (its credentials go to the remote's origin only),
     /// caches it as the file, and re-validates it with a conditional request
@@ -878,7 +1109,8 @@ pub enum Freshness {
 pub struct Fetch {
     pub url: String,
     pub freshness: Freshness,
-    /// Images formats: the `Accept` header to send, if any.
+    /// The `Accept` header to send, if any (npm's abbreviated metadata, an
+    /// images format's manifest media types).
     pub accept: Option<String>,
     /// Images formats: the scope of the token to ask the upstream's token
     /// service for when it answers 401 with a Bearer challenge naming none.
@@ -886,14 +1118,20 @@ pub struct Fetch {
 }
 
 impl Fetch {
-    /// A plain GET of `url`.
-    pub fn get(url: impl Into<String>, freshness: Freshness) -> Self {
+    /// A fetch of `url` without an `Accept` header.
+    pub fn new(url: impl Into<String>, freshness: Freshness) -> Self {
         Fetch {
             url: url.into(),
             freshness,
             accept: None,
             scope: None,
         }
+    }
+
+    /// The fetch with an `Accept` header.
+    pub fn accepting(mut self, accept: &str) -> Self {
+        self.accept = Some(accept.to_string());
+        self
     }
 }
 
@@ -963,6 +1201,17 @@ pub struct UpstreamHit {
     pub total_downloads: Option<u64>,
 }
 
+/// Where an upstream keeps a version's package, and the digests it
+/// publishes for it: the host refuses a package that does not match them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageLocation {
+    pub url: String,
+    /// SHA-512, base64.
+    pub sha512: Option<String>,
+    /// SHA-1, lowercase hex.
+    pub sha1: Option<String>,
+}
+
 /// One page of an upstream's search results.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamSearch {
@@ -990,6 +1239,11 @@ pub enum UpstreamAnswer {
     Metadata(PackageMetadata),
     /// `None`: the upstream offers no search.
     Search(Option<UpstreamSearch>),
+    /// [`UpstreamAnswer::Package`] with the digests the upstream publishes.
+    Located(PackageLocation),
+    /// The answer to [`UpstreamOp::Tags`]; `None`: the upstream does not know
+    /// the package.
+    Tags(Option<Vec<Tag>>),
     /// The file's URL, on an origin a [`Fetch`] may reach; `None`: the
     /// upstream cannot have the path.
     File(Option<String>),

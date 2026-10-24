@@ -20,6 +20,7 @@ const RESERVED_MOUNTS: &[&str] = &[
     "assets",
     "auth",
     "browse",
+    "cli-login",
     "healthz",
     "images",
     "invite",
@@ -166,7 +167,7 @@ fn validate_assets(assets: &Assets) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use forge_plugin_api::{RepositoryKind, Storage, DEFAULT_MOUNT};
+    use forge_plugin_api::{RepositoryKind, Storage, UpstreamToken, DEFAULT_MOUNT};
 
     use super::*;
 
@@ -179,6 +180,7 @@ mod tests {
         kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
         storage: Storage::Packages,
         assets: Assets::DEFAULT,
+        upstream_token: UpstreamToken::None,
     };
 
     #[test]

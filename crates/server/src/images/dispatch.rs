@@ -190,6 +190,9 @@ impl Registry {
                     Some((name.to_string(), value.to_str().ok()?.to_string()))
                 })
                 .collect(),
+            // The format reads no bodies: the host streams uploads into the
+            // store.
+            body: None,
             image: Some(ImageName {
                 image: ctx.target.image.clone(),
                 name: ctx.target.name.clone(),
@@ -678,6 +681,9 @@ impl Conversation<'_> {
                 self.reg.plugin().descriptor().mount
             ),
             inline: false,
+            // A group's reserved prefixes are the host's to apply
+            // (`super::group`).
+            reserved_prefixes: Vec::new(),
         }
     }
 

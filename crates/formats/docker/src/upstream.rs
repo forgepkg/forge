@@ -113,7 +113,7 @@ fn get(url: String, image: &str, accept: Option<&str>) -> Fetch {
     Fetch {
         accept: accept.map(str::to_string),
         scope: Some(scope(image)),
-        ..Fetch::get(url, Freshness::Metadata)
+        ..Fetch::new(url, Freshness::Metadata)
     }
 }
 

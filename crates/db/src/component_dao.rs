@@ -388,6 +388,8 @@ pub struct RegistrationRow {
     pub package_sha256: Option<String>,
     /// Byte size of the package asset.
     pub package_size: Option<i64>,
+    /// Why the version is deprecated, if it is (migration 0047).
+    pub deprecation: Option<String>,
 }
 
 /// Every version of `name` with its registration data, in one query (the
@@ -404,7 +406,7 @@ pub async fn list_registration_rows(
         SELECT
             c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
             c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
-            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?", c.deprecation
         FROM component c
         LEFT JOIN asset a ON a.component_id = c.id AND a.path = $3
         WHERE c.repository_id = $1 AND c.name = $2
@@ -464,7 +466,7 @@ pub async fn list_registration_rows_for_versions(
         SELECT
             c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
             c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
-            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?", c.deprecation
         FROM component c
         LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4
         WHERE c.repository_id = $1 AND c.name = $2 AND c.version = ANY($3::text[])
@@ -493,7 +495,7 @@ pub async fn find_registration_row(
         SELECT
             c.id, c.original_id, c.version, c.version_original, c.listed, c.created_at,
             c.manifest_summary, a.sha512_base64 AS "package_hash_sha512_base64?",
-            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?"
+            a.blob_sha256 AS "package_sha256?", a.size AS "package_size?", c.deprecation
         FROM component c
         LEFT JOIN asset a ON a.component_id = c.id AND a.path = $4
         WHERE c.repository_id = $1 AND c.name = $2 AND c.version = $3
@@ -610,4 +612,31 @@ pub async fn set_imported_times(
         .await?;
     }
     Ok(())
+}
+
+/// Deprecate version `version` of `name` with `message`, or (`None`) no
+/// longer. Returns whether the version exists.
+pub async fn set_deprecation<'e, E>(
+    executor: E,
+    repository_id: i64,
+    name: &str,
+    version: &str,
+    message: Option<&str>,
+) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let res = sqlx::query!(
+        r#"
+        UPDATE component SET deprecation = $4, updated_at = now()
+        WHERE repository_id = $1 AND name = $2 AND version = $3
+        "#,
+        repository_id,
+        name,
+        version,
+        message,
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }

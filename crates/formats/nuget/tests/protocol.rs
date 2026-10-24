@@ -24,6 +24,7 @@ fn repo(kind: RepositoryKind) -> Repository {
         kind,
         base_url: format!("{BASE}/v3/main"),
         inline: false,
+        reserved_prefixes: Vec::new(),
     }
 }
 
@@ -46,7 +47,7 @@ impl MockRepo {
             Query::Versions(id) => {
                 Answer::Versions(self.versions.get(id).cloned().unwrap_or_default())
             }
-            Query::Packages(id) => {
+            Query::Packages(id) | Query::DatedPackages(id) => {
                 Answer::Packages(self.packages.get(id).cloned().unwrap_or_default())
             }
             Query::PackagesOf(set) => Answer::Packages(
@@ -66,6 +67,7 @@ impl MockRepo {
                     .find(|p| p.version == target.version)
                     .cloned(),
             ),
+            Query::Tags(_) => Answer::Tags(Vec::new()),
             Query::Manifest(target) => Answer::Manifest(
                 self.manifests
                     .get(&(target.id.clone(), target.version.clone()))
@@ -143,6 +145,7 @@ fn package(id: &str, v: &str, nuspec: Option<&[u8]>) -> PackageInfo {
         sha512: None,
         size: None,
         summary: nuspec.and_then(|n| Nuget::default().manifest_summary(n)),
+        deprecated: None,
     }
 }
 
