@@ -1,7 +1,7 @@
 # Trusted publishing with workload identity
 
 Forge can authenticate a CI job with its short-lived OIDC identity token instead
-of a stored NuGet API key. The token is validated against the configured
+of a stored API key. The token is validated against the configured
 issuer's discovery document and JWKS, matched against explicit claim rules, and
 mapped to an ordinary Forge RBAC role. No user or browser session is created.
 
@@ -11,7 +11,8 @@ A job uses its token in one of two ways:
   `POST /api/v2/token` and gets a short-lived workload API key back, exactly as
   nuget.org's trusted publishing works. It publishes with
   `dotnet nuget push --api-key <key>` and restores with the key as the Basic
-  password of the username `oidc`. Each token is redeemed once.
+  password of the username `oidc`. [npm](#npm) performs its own native
+  exchange automatically. Each token is redeemed once.
 - **Direct token.** The job presents the token itself on every request, as the
   Basic password (username `oidc`), the `X-NuGet-ApiKey` or a Bearer token.
 
@@ -301,6 +302,100 @@ steps:
 
 See GitHub's [OIDC reference](https://docs.github.com/en/actions/reference/security/oidc)
 for the current claim set and subject customization options.
+
+## npm
+
+npm 11.5.1 and later can exchange a CI identity token automatically during
+`npm publish`, without a stored `_authToken` or a curl step. npm 11.21 and
+later also supports the exchange for `npm dist-tag`. Use a current npm release
+with this support; pnpm, Yarn and Bun do not perform npm's exchange.
+
+Configure a `workload_identity` realm under **Admin → Authentication**, using
+the GitHub Actions or GitLab claim rules shown in this document, but set
+`allowed_audiences` to `["npm:forge.example.com"]`. The audience is
+`npm:<registry hostname>`, not the registry URL, port or repository path.
+If the realm also serves NuGet, add this audience alongside its existing one.
+
+Give the mapped role **write** on the hosted npm repository and, when
+publishing through a group, **read** on the group and **write** on its
+writable member. Package selectors on that role can restrict the package
+namespace.
+
+### GitHub Actions
+
+Use the GitHub issuer and immutable repository/owner IDs from the
+[GitHub Actions configuration](#github-actions) above, with the npm audience.
+Do not configure `NODE_AUTH_TOKEN` or `_authToken`:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+steps:
+  - uses: actions/checkout@v4
+  - uses: actions/setup-node@v4
+    with:
+      node-version: '26'
+  - run: npm ci
+  - run: npm publish --provenance=false --registry https://forge.example.com/npm/npm-all/
+```
+
+npm requests the GitHub job's ID token with the `npm:forge.example.com`
+audience, exchanges it at Forge and uses the resulting key for the command.
+For private dependencies, `npm ci` still needs separate read credentials;
+the automatic exchange is for publishing, not installing.
+
+### GitLab CI, including self-hosted GitLab
+
+Use the [GitLab realm configuration](#gitlab-ci) below with the npm audience.
+GitLab supplies the token through `NPM_ID_TOKEN`:
+
+```yaml
+publish:
+  image: mirror.gcr.io/library/node:26
+  timeout: 10m
+  id_tokens:
+    NPM_ID_TOKEN:
+      aud: npm:forge.example.com
+  script:
+    - npm ci
+    - npm publish --registry https://forge.example.com/npm/npm-all/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+```
+
+Self-hosted GitLab works the same way: set the realm's `issuer` to the exact
+`iss` in that instance's job tokens, for example `https://gitlab.example.com`,
+instead of `https://gitlab.com`. Pin numeric project and namespace IDs in the
+claim rules, plus protected-ref or environment restrictions. Older GitLab
+versions without `job_project_id` / `job_namespace_id` can use `project_id` /
+`namespace_id`. Forge must be able to reach that issuer's HTTPS discovery
+document and JWKS and trust its TLS certificate, including for a private
+instance. Do not enable `allow_http_issuer` for production. Set
+`max_token_age_seconds` to cover the job timeout, as described below.
+
+### Exchange and limitations
+
+npm calls `POST /-/npm/v1/oidc/token/exchange/package/<escaped-name>` at the
+**host root**, even when the registry is `/npm/npm-all/`. Reverse proxies must
+forward this root path to Forge, not only `/npm/`. The answer is
+`{"token":"forge_wif.…"}`; invalid requests or credentials receive a JSON
+`error` and 400 or 401 (temporary authentication failures receive 503).
+
+Both exchange endpoints share the same one-redemption-per-`(issuer, jti)`
+ledger, realm checks and `api_key_ttl_seconds`. The named package does not
+scope the issued key: the realm's role and package selectors authorize its
+use. The exchange has no repository, so a role without write permission can
+receive a key but its publish is refused with 403. Per-package trusted
+publishers are not implemented yet.
+
+npm silently falls back to configured credentials when the exchange fails;
+omit stored tokens in jobs intended to require trusted publishing. Forge
+does not serve npm's package-visibility endpoint. npm 11.5.1 can enable
+provenance automatically for public GitHub repositories without checking that
+endpoint, so pass `--provenance=false` to `npm publish` for those clients.
+Forge rejects provenance statements until attestations can be stored.
 
 ## GitLab CI
 
