@@ -2817,8 +2817,26 @@ impl forge_core::repo::group::MemberOpsFactory for ProxySearchFactory {
     }
 }
 
+/// The `take` of every upstream search for `q` the mock received.
+fn upstream_takes(mock: &MockUpstream, q: &str) -> Vec<String> {
+    mock.search_queries()
+        .into_iter()
+        .filter(|query| query.split('&').any(|part| part == format!("q={q}")))
+        .map(|query| {
+            assert!(query.split('&').any(|part| part == "skip=0"), "{query}");
+            query
+                .split('&')
+                .find_map(|part| part.strip_prefix("take="))
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// A group asks a proxy's upstream for the window of hits its page needs
+/// (#224), and pages through the upstream's hits in the upstream's order.
 #[tokio::test]
-async fn group_search_bounds_upstream_pages_and_preserves_totals() {
+async fn group_search_asks_upstreams_for_the_page_window() {
     use forge_core::auth::authz::Authz;
     use forge_core::auth::principal::Principal;
     use forge_core::authz::eval::PackageFilter;
@@ -2829,13 +2847,14 @@ async fn group_search_bounds_upstream_pages_and_preserves_totals() {
     let cas = common::cas(&pool).await;
     let first = start_mock(HashMap::new()).await;
     let second = start_mock(HashMap::new()).await;
+    let packages = |ids: &mut dyn Iterator<Item = String>| -> Vec<serde_json::Value> {
+        ids.map(|id| search_entry(&id, &["1.0.0"])).collect()
+    };
     for mock in [&first, &second] {
         mock.set_search(
             StatusCode::OK,
-            (0..60)
-                .map(|n| search_entry(&format!("Package{n:02}"), &["1.0.0"]))
-                .collect(),
-            100,
+            packages(&mut (0..60).map(|n| format!("Package{n:02}"))),
+            60,
         );
     }
     let group = repository_dao::insert_repository(
@@ -2898,8 +2917,28 @@ async fn group_search_bounds_upstream_pages_and_preserves_totals() {
         20,
     )
     .with_format(Arc::new(nuget()));
+    let search = |q: &str, skip: usize, take: usize| {
+        let (group_ops, group) = (&group_ops, &group);
+        let params = SearchParams {
+            q: q.into(),
+            skip,
+            take,
+            ..Default::default()
+        };
+        async move { group_ops.search(&group.name, &params).await.unwrap() }
+    };
+    let found = |result: &forge_core::repo::SearchResult| -> Vec<String> {
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.original_id.clone())
+            .collect()
+    };
+    let named = |range: std::ops::Range<usize>| -> Vec<String> {
+        range.map(|n| format!("Package{n:02}")).collect()
+    };
 
-    // A single member retains the upstream total, not just the fetched page.
+    // A single member keeps the upstream's total, not just the fetched page.
     let single = repository_dao::insert_repository(
         &pool,
         NewRepository::group(format!("single{}", common::unique())),
@@ -2916,106 +2955,77 @@ async fn group_search_bounds_upstream_pages_and_preserves_totals() {
         .search(&single.name, &SearchParams::default())
         .await
         .unwrap();
-    assert_eq!(result.hits.len(), 20);
-    assert_eq!(result.total_hits, 100);
+    assert_eq!(found(&result), named(0..20));
+    assert_eq!(result.total_hits, 60);
+    let takes: Vec<String> = [&first, &second]
+        .into_iter()
+        .flat_map(|mock| upstream_takes(mock, ""))
+        .collect();
+    assert_eq!(takes, ["32"]);
 
-    for (skip, take, window) in [
-        (0, 20, 20),
-        (5, 5, 10),
-        (0, 0, 20),
-        (0, usize::MAX, SearchParams::MAX_TAKE),
-        (usize::MAX, 20, SearchParams::MAX_TAKE),
+    // Two mirrors of one feed: the window, rounded up to a power of two, of
+    // each; their ids count once.
+    for (skip, take, window, total) in [
+        (0, 20, 32, 60),
+        (5, 5, 32, 60),
+        (0, 0, 32, 60),
+        (0, usize::MAX, SearchParams::MAX_TAKE, 60),
+        (usize::MAX, 20, SearchParams::MAX_TAKE, 60),
     ] {
-        let params = SearchParams {
-            q: format!("window-{skip}-{take}"),
-            skip,
-            take,
-            ..Default::default()
-        };
-        let result = group_ops.search(&group.name, &params).await.unwrap();
-        let fetched = window.min(60);
-        assert_eq!(
-            result.total_hits,
-            200 - fetched,
-            "retain both upstream totals, deduplicating fetched ids"
-        );
-        let expected: Vec<String> = (0..fetched)
-            .skip(skip)
-            .take(params.effective_take())
-            .map(|n| format!("Package{n:02}"))
-            .collect();
-        assert_eq!(
-            result
-                .hits
-                .iter()
-                .map(|hit| hit.original_id.clone())
-                .collect::<Vec<_>>(),
-            expected
-        );
+        let q = format!("window-{skip}-{take}");
+        let result = search(&q, skip, take).await;
+        assert_eq!(result.total_hits, total, "{q}");
+        let take = if take == 0 { 20 } else { take };
+        let expected: Vec<String> = named(0..60).into_iter().skip(skip).take(take).collect();
+        assert_eq!(found(&result), expected, "{q}");
         for mock in [&first, &second] {
-            let queries = mock.search_queries();
-            let query = queries.last().unwrap();
-            for part in ["skip=0".to_string(), format!("take={window}")] {
-                assert!(query.split('&').any(|p| p == part), "{part} in {query}");
-            }
+            assert_eq!(upstream_takes(mock, &q), [window.to_string()], "{q}");
         }
     }
 
-    // A restricted search fetches past the initial prefix so filtering cannot
-    // remove a matching package before group pagination.
+    // Upstreams rank by relevance: the pages follow the upstream's order,
+    // none repeated or skipped, and later pages are served from the windows
+    // the upstream already answered.
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            packages(&mut (0..60).rev().map(|n| format!("Package{n:02}"))),
+            60,
+        );
+    }
+    let mut pages = Vec::new();
+    for skip in [0, 20, 40] {
+        let result = search("relevance-order", skip, 20).await;
+        assert_eq!(result.total_hits, 60);
+        pages.extend(found(&result));
+    }
+    assert_eq!(pages, named(0..60).into_iter().rev().collect::<Vec<_>>());
+    for mock in [&first, &second] {
+        assert_eq!(upstream_takes(mock, "relevance-order"), ["32", "64"]);
+    }
+
+    // A restricted search is asked for all the upstream's hits at once, so
+    // filtering cannot remove a match before the group pages.
     let result = group_ops
         .search_with_package_filter(
             &group.name,
-            &SearchParams::default(),
+            &SearchParams {
+                q: "restricted".into(),
+                ..Default::default()
+            },
             &PackageFilter::Predicate(Arc::new(|id| id == "Package20")),
         )
         .await
         .unwrap();
-    assert_eq!(result.hits.len(), 1);
-    assert_eq!(result.hits[0].original_id, "Package20");
+    assert_eq!(found(&result), ["Package20"]);
     assert_eq!(result.total_hits, 1);
     for mock in [&first, &second] {
-        let query = mock.search_queries().last().unwrap().clone();
-        assert!(
-            query.split('&').any(|part| part == "take=1000"),
-            "restricted search must fetch the full bounded prefix: {query}"
-        );
+        assert_eq!(upstream_takes(mock, "restricted"), ["1000"]);
     }
 
-    // Upstreams may rank by relevance rather than id. Only the bounded
-    // candidates are alphabetized; this is not a full upstream corpus sort.
-    for mock in [&first, &second] {
-        mock.set_search(
-            StatusCode::OK,
-            (0..60)
-                .rev()
-                .map(|n| search_entry(&format!("Package{n:02}"), &["1.0.0"]))
-                .collect(),
-            100,
-        );
-    }
-    let result = group_ops
-        .search(
-            &single.name,
-            &SearchParams {
-                q: "relevance-order".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.total_hits, 100);
-    assert_eq!(
-        result
-            .hits
-            .iter()
-            .map(|hit| hit.original_id.clone())
-            .collect::<Vec<_>>(),
-        (40..60)
-            .map(|n| format!("Package{n:02}"))
-            .collect::<Vec<_>>()
-    );
-
+    // Hits a reserved prefix keeps off the proxies widen the window until
+    // the page is full; a window none of whose hits is shown, at once to
+    // all of them.
     sqlx::query(
         "UPDATE repository SET config = jsonb_build_object(\
          'prefer_hosted', true, 'reserved_prefixes', '[\"acme.\"]'::jsonb) WHERE id = $1",
@@ -3027,70 +3037,40 @@ async fn group_search_bounds_upstream_pages_and_preserves_totals() {
     for mock in [&first, &second] {
         mock.set_search(
             StatusCode::OK,
-            (0..60)
-                .map(|n| search_entry(&format!("Acme.Package{n:02}"), &["1.0.0"]))
-                .collect(),
-            100,
+            packages(&mut (0..60).map(|n| format!("Acme.Package{n:02}"))),
+            60,
         );
     }
-    let result = group_ops
-        .search(
-            &group.name,
-            &SearchParams {
-                q: "reserved-prefix".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let result = search("reserved-prefix", 0, 20).await;
     assert!(result.hits.is_empty());
-    assert_eq!(
-        result.total_hits, 0,
-        "reserved-prefix hits must not contribute opaque upstream totals"
-    );
+    assert_eq!(result.total_hits, 0);
+    for mock in [&first, &second] {
+        assert_eq!(upstream_takes(mock, "reserved-prefix"), ["32", "1000"]);
+    }
 
     for mock in [&first, &second] {
         mock.set_search(
             StatusCode::OK,
-            (0..60)
-                .map(|n| {
-                    let id = if n < 20 {
-                        format!("Acme.Package{n:02}")
-                    } else {
-                        format!("Package{n:02}")
-                    };
-                    search_entry(&id, &["1.0.0"])
-                })
-                .collect(),
-            100,
+            packages(&mut (0..60).map(|n| {
+                if n < 20 {
+                    format!("Acme.Package{n:02}")
+                } else {
+                    format!("Package{n:02}")
+                }
+            })),
+            60,
         );
     }
-    let result = group_ops
-        .search(
-            &group.name,
-            &SearchParams {
-                q: "mixed-reserved-public".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let result = search("mixed-reserved-public", 0, 20).await;
+    assert_eq!(found(&result), named(20..40));
     assert_eq!(result.total_hits, 40);
-    assert_eq!(
-        result
-            .hits
-            .iter()
-            .map(|hit| hit.original_id.clone())
-            .collect::<Vec<_>>(),
-        (20..40)
-            .map(|n| format!("Package{n:02}"))
-            .collect::<Vec<_>>()
-    );
+    let result = search("mixed-reserved-public", 20, 20).await;
+    assert_eq!(found(&result), named(40..60));
+    assert_eq!(result.total_hits, 40);
     for mock in [&first, &second] {
-        let query = mock.search_queries().last().unwrap().clone();
-        assert!(
-            query.split('&').any(|part| part == "take=1000"),
-            "guarded search must fetch beyond excluded prefix: {query}"
+        assert_eq!(
+            upstream_takes(mock, "mixed-reserved-public"),
+            ["32", "128", "64"]
         );
     }
 }
