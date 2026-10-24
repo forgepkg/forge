@@ -110,23 +110,19 @@ const hostedDetail: PackageDetail = {
 
 function mockApi(
   detail: (repo: string, id: string) => Response,
-<<<<<<< HEAD
   {
     me = anonMe,
     format = 'nuget',
     deleteVersion,
+    repos = [{ name: 'internal', format }],
   }: {
     me?: Me
     format?: string
     deleteVersion?: () => Response | Promise<Response>
+    repos?: { name: string; format: string }[]
   } = {},
 ) {
   fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-=======
-  repos: { name: string; format: string }[] = [],
-) {
-  fetchMock.mockImplementation((input: RequestInfo | URL) => {
->>>>>>> origin/main
     const raw = typeof input === 'string' ? input : input.toString()
     const url = new URL(raw, 'http://localhost')
     if (url.pathname.endsWith('/admin/me')) {
@@ -138,23 +134,15 @@ function mockApi(
       )
     }
     if (url.pathname.endsWith('/browse/repos')) {
-<<<<<<< HEAD
-      return Promise.resolve(jsonResponse([
-        { id: 1, name: 'internal', kind: 'hosted', online: true, format },
-      ]))
+      return Promise.resolve(
+        jsonResponse(repos.map((r, i) => ({ id: i + 1, kind: 'hosted', online: true, ...r }))),
+      )
     }
     if (init?.method === 'DELETE' && deleteVersion) {
       return Promise.resolve(deleteVersion())
     }
     if (url.pathname.endsWith('/browse/packages')) {
       return Promise.resolve(jsonResponse({ total: 0, items: [] }))
-=======
-      return Promise.resolve(
-        jsonResponse(
-          repos.map((r, i) => ({ id: i + 1, kind: 'hosted', online: true, ...r })),
-        ),
-      )
->>>>>>> origin/main
     }
     const m = url.pathname.match(/\/browse\/packages\/([^/]+)\/([^/]+)$/)
     if (m) return Promise.resolve(detail(m[1], m[2]))
@@ -483,7 +471,7 @@ describe('PackageDetail', () => {
   })
 
   it('shows an npm package\'s dist-tags, deprecations, README and install commands', async () => {
-    mockApi(() => jsonResponse(npmDetail), [{ name: 'npm-hosted', format: 'npm' }])
+    mockApi(() => jsonResponse(npmDetail), { repos: [{ name: 'npm-hosted', format: 'npm' }] })
 
     await renderDetail('/packages/npm-hosted/%40acme%2Fui')
 

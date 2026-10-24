@@ -31,27 +31,21 @@ export function VersionTable({
   versions,
   repoKind,
   caption,
-<<<<<<< HEAD
   onDelete,
   deletePending,
-=======
   distTags,
   deprecated,
->>>>>>> origin/main
 }: {
   versions: DetailVersion[]
   /** The package's repository kind: `hosted` | `proxy` | `group`. */
   repoKind: string
   caption?: string
-<<<<<<< HEAD
   onDelete?: (version: DetailVersion) => void
   deletePending?: boolean
-=======
   /** npm: tag → version. */
   distTags?: Record<string, string>
   /** npm: version → deprecation message. */
   deprecated?: Record<string, string>
->>>>>>> origin/main
 }) {
   const tagsOf = (version: string) =>
     Object.entries(distTags ?? {})

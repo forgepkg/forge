@@ -181,7 +181,6 @@ function PackageDetailPage() {
               versions={pkg.versions}
               repoKind={pkg.repo_kind}
               caption={`Versions of ${pkg.original_id}`}
-<<<<<<< HEAD
               onDelete={
                 me.data?.is_admin && pkg.repo_kind === 'hosted' && format !== 'docker'
                   ? (version) => {
@@ -191,10 +190,8 @@ function PackageDetailPage() {
                   : undefined
               }
               deletePending={del.isPending}
-=======
               distTags={pkg.tags}
               deprecated={pkg.deprecated}
->>>>>>> origin/main
             />
           )}
         </Panel>
@@ -308,16 +305,11 @@ function InstallPanel({
   /** npm: the version the `latest` dist-tag names. */
   latest?: string
 }) {
-<<<<<<< HEAD
-  const [version, setVersion] = useState(() => defaultVersion(versions))
+  const [version, setVersion] = useState(() => defaultVersion(versions, latest))
   const selectedVersion = versions.some((v) => v.version_original === version)
     ? version
-    : defaultVersion(versions)
-  if (format !== 'nuget') return null
-=======
-  const [version, setVersion] = useState(() => defaultVersion(versions, latest))
+    : defaultVersion(versions, latest)
   if (format !== 'nuget' && format !== 'npm') return null
->>>>>>> origin/main
   return (
     <Panel
       title="Install"
@@ -336,39 +328,25 @@ function InstallPanel({
           ))}
         </SelectField>
       )}
-<<<<<<< HEAD
-      <CommandSnippet
-        label="dotnet CLI"
-        command={`dotnet add package ${id} --version ${selectedVersion}`}
-        copyLabel="Copy add-package command"
-      />
-      <CodeBlock
-        title="PackageReference"
-        copyLabel="Copy PackageReference"
-        code={`<PackageReference\n  Include="${id}"\n  Version="${selectedVersion}" />`}
-        placeholders={[]}
-      />
-=======
       {format === 'npm' ? (
-        npmInstallCommands(id, version).map((snippet) => (
+        npmInstallCommands(id, selectedVersion).map((snippet) => (
           <CommandSnippet key={snippet.label} {...snippet} />
         ))
       ) : (
         <>
           <CommandSnippet
             label="dotnet CLI"
-            command={`dotnet add package ${id} --version ${version}`}
+            command={`dotnet add package ${id} --version ${selectedVersion}`}
             copyLabel="Copy add-package command"
           />
           <CodeBlock
             title="PackageReference"
             copyLabel="Copy PackageReference"
-            code={`<PackageReference\n  Include="${id}"\n  Version="${version}" />`}
+            code={`<PackageReference\n  Include="${id}"\n  Version="${selectedVersion}" />`}
             placeholders={[]}
           />
         </>
       )}
->>>>>>> origin/main
     </Panel>
   )
 }
