@@ -1,13 +1,12 @@
-//! Format plugins: the built-in ones, loading the WebAssembly ones at
-//! startup, and serving the repositories of their formats under each
-//! format's mount, `{mount}/{repo}/...` (`/repository` unless its
-//! `plugin.toml` names another; see `docs/format-plugins.md`).
+//! Format plugins: the built-in ones, and serving the repositories of their
+//! formats under each format's mount, `{mount}/{repo}/...` (`/repository`
+//! unless its `plugin.toml` names another; see `docs/format-plugins.md`).
 //!
 //! The dispatcher does what [`crate::dispatch`] does for the NuGet feed —
 //! resolve the repository, authorize the request's action (GET/HEAD read,
 //! PUT/POST write, DELETE delete), refuse an offline repository — and then
 //! lets the format's plugin decide what the request is
-//! ([`FormatPlugin::handle`]), whether it is built in or a component.
+//! ([`FormatPlugin::handle`]).
 //! Everything that touches data stays here:
 //!
 //! * **Queries** the plugin asks for run through the same read ops as every
@@ -30,7 +29,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::feed::{byte_range, ByteRange, PackageBytes};
-use anyhow::Context;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -49,11 +47,10 @@ use forge_plugin::api::{
     self as protocol, Action, Answer, ChangeRequest, FormatPlugin, Loaded, PackageInfo, PackageRef,
     PublishRequest, Query, Rendered, Upload,
 };
-use forge_plugin::{HostLimits, Plugin};
+use forge_plugin::Plugin;
 use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
 
-use crate::config::PluginsConfig;
 use crate::dispatch::{
     action_for_method, authz_denied, offline_response, offline_serves_nothing,
     principal_allows_protocol_mutations, HostedWriteAdapter,
@@ -106,39 +103,6 @@ pub fn builtin(nuget_limits: forge_format_nuget::NupkgLimits) -> Vec<Arc<Plugin>
         forge_format_nuget::Nuget::with_limits(nuget_limits),
     )
     .expect("plugins/nuget/plugin.toml is valid")]
-}
-
-/// Load the WebAssembly plugins `config` lists, each from `<dir>/<id>`,
-/// checked against its pinned digest. Any failure fails startup: a
-/// configured format that is silently missing would leave its repositories
-/// unavailable.
-pub fn load(config: &PluginsConfig) -> anyhow::Result<Vec<Arc<Plugin>>> {
-    let Some(dir) = &config.dir else {
-        return Ok(Vec::new());
-    };
-    let limits = HostLimits::default();
-    config
-        .formats
-        .iter()
-        .map(|(id, sha256)| {
-            let path = dir.join(id);
-            let plugin = Plugin::load(&path, sha256, &limits)
-                .with_context(|| format!("load format plugin {id:?} from {}", path.display()))?;
-            anyhow::ensure!(
-                plugin.id() == id,
-                "the plugin in {} declares format id {:?}, not {id:?}",
-                path.display(),
-                plugin.id()
-            );
-            tracing::info!(
-                format = id,
-                version = %plugin.manifest().version,
-                sha256 = plugin.sha256().unwrap_or_default(),
-                "format plugin loaded"
-            );
-            Ok(plugin)
-        })
-        .collect()
 }
 
 /// Axum handler mounted at `/repository/{repo}` (and everything under it).
@@ -308,8 +272,7 @@ struct Ctx<'a> {
 
 impl Ctx<'_> {
     /// Run a protocol call of the plugin off the async workers: rendering a
-    /// large index takes a while, and a component's call may run for as long
-    /// as its time limit. A plugin that panics answers 500.
+    /// large listing takes a while. A plugin that panics answers 500.
     async fn call<R: Send + 'static>(
         &self,
         f: impl FnOnce(&dyn FormatPlugin) -> R + Send + 'static,

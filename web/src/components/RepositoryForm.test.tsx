@@ -33,7 +33,6 @@ import {
 const example: FormatView = {
   id: 'example',
   name: 'Example packages',
-  builtin: false,
   kinds: ['hosted', 'group'],
   mount: '/repository',
   version: '0.1.0',

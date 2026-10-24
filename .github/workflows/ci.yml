@@ -231,29 +231,6 @@ jobs:
       - name: cargo audit
         run: cargo audit
 
-  # ── Format plugins as WebAssembly components (plugins/<id>/) ──────────────
-  # The plugins are workspace crates (fmt, clippy and their tests run with the
-  # workspace); this checks that each one also lints clean and builds as a
-  # component for wasm32-wasip2. The tests that load a component run in `test`.
-  plugins:
-    name: plugins
-    runs-on: ubuntu-latest
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust toolchain (rust-toolchain.toml) (with clippy, wasm32-wasip2)
-        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
-        with:
-          components: clippy
-          targets: wasm32-wasip2
-      - name: Cache cargo registry + dependency builds
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.event_name == 'push' }}
-      - name: cargo xtask plugins-check
-        run: cargo xtask plugins-check
-
   # ── Unit + integration tests ───────────────────────────────────────────────
   # The integration tests start their own Postgres, versitygw and Redis with
   # testcontainers (the runner has a Docker daemon). There is no separate
@@ -281,9 +258,6 @@ jobs:
           df -h /
       - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
-        with:
-          # The format-plugin tests build plugins/ as WebAssembly components.
-          targets: wasm32-wasip2
       - name: Cache cargo registry + dependency builds
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:

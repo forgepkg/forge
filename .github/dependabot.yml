@@ -12,12 +12,6 @@ updates:
       interval: weekly
     open-pull-requests-limit: 10
     groups:
-      # wasmtime-wasi of a major builds only against the wasmtime of the same
-      # major, so a major update of one alone fails to compile. Every update
-      # of the Wasmtime crates comes as one pull request; listed first, since
-      # a dependency joins the first group it matches.
-      wasmtime:
-        patterns: ["wasmtime", "wasmtime-*"]
       cargo-minor-and-patch:
         update-types: [minor, patch]
 

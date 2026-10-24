@@ -11,7 +11,6 @@ members = [
     "crates/format-oci",
     "crates/server",
     "crates/e2e",
-    "plugins/helm",
     "plugins/nuget",
     "xtask",
 ]
@@ -185,33 +184,6 @@ tempfile = { version = "3" }
 
 # Date/time (shared with forge-db's model types)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-
-# WebAssembly runtime for format plugins (forge-plugin). 49 is a regular
-# Wasmtime release: it gets security fixes for two months, an LTS release
-# (every 12th, like 48) for two years, so the next major is due within two
-# months. wasmtime-wasi of a major builds only against the wasmtime of the same
-# major: bump both together (Dependabot groups them). Only what the host uses:
-# the component model compiled by Cranelift, no WAT text parser, no GC
-# proposals, no profiling or debugging.
-wasmtime = { version = "49.0.4", default-features = false, features = [
-    "runtime",
-    "cranelift",
-    "component-model",
-    "std",
-    "parallel-compilation",
-] }
-# WASI 0.2 for plugin components (a Rust guest's std imports it); the host
-# grants no filesystem, network or environment.
-wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
-
-# Format plugins built as WebAssembly components (`cargo xtask plugins`):
-# small, self-contained `.wasm` files.
-[profile.plugin]
-inherits = "release"
-opt-level = "s"
-lto = true
-codegen-units = 1
-strip = true
 
 # Tests build unoptimized, yet the mock IdPs generate RSA keys and every test
 # server hashes its bootstrap admin password: ~30x (RSA-2048 keygen, ~3 s) and

@@ -17,9 +17,7 @@
 //! Ids are matched case-insensitively (`ToLowerInvariant`); versions are
 //! NuGet versions, normalized (`1.0` → `1.0.0`).
 //!
-//! Forge links this plugin in ([`Nuget`], [`PLUGIN_TOML`]). It is built in
-//! only for now: the `zip` reader it parses packages with does not build for
-//! `wasm32-wasip2` on stable Rust, so it has no component build yet.
+//! Forge links this plugin in ([`Nuget`], [`PLUGIN_TOML`]).
 
 pub mod model;
 pub mod nuspec;
@@ -115,8 +113,6 @@ mod tests {
         assert_eq!(value("version").as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert_eq!(value("api").as_deref(), Some(forge_plugin_api::API));
         assert_eq!(value("mount").as_deref(), Some("/v3"));
-        // Built in only (see the crate docs).
-        assert_eq!(value("component"), None);
     }
 
     #[test]

@@ -6,11 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[features]
-# `testing::example_plugin`: builds a plugin of `plugins/` as a component for
-# tests.
-testing = []
-
 [dependencies]
 forge-core = { path = "../core" }
 forge-plugin-api = { path = "../plugin-api" }
@@ -19,20 +14,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 toml = "1.1"
-# Spools a package handed over as a reader into a file the plugin can be lent.
-tempfile = { workspace = true }
-
-wasmtime = { workspace = true }
-wasmtime-wasi = { workspace = true }
-
-[dev-dependencies]
-forge-plugin = { path = ".", features = ["testing"] }
-# The Helm example plugin built in, to compare with its component.
-forge-format-helm = { path = "../../plugins/helm" }
-flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-# Hand-built components for the sandbox tests: the version Wasmtime itself
-# depends on, so bump it with `wasmtime`.
-wasm-encoder = "0.258.3"
