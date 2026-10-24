@@ -16,7 +16,7 @@ use forge_crypto::service::EnvelopeService;
 use forge_crypto::{ExposeSecret, PlaintextSecret};
 use forge_db::model::Repository;
 use forge_db::{authz_dao, secret_dao, workload_api_key_dao};
-use forge_oci::token::TokenKeys;
+use forge_format_docker::token::TokenKeys;
 use sha2::Digest;
 use sqlx::PgPool;
 
@@ -36,7 +36,7 @@ pub async fn registry(State(state): State<AppState>, req: Request<Body>) -> Resp
 /// Workload pushes go to the trusted-publishing ledger.
 pub(crate) struct LedgerRecorder;
 
-impl forge_oci::PublishRecorder for LedgerRecorder {
+impl forge_format_docker::PublishRecorder for LedgerRecorder {
     fn for_repository(&self, repository: &Repository) -> Arc<dyn PublishPolicy> {
         crate::dispatch::workload_ledger_policy(repository)
     }
@@ -50,7 +50,7 @@ pub(crate) struct WorkloadLiveness {
 }
 
 #[async_trait::async_trait]
-impl forge_oci::WorkloadCheck for WorkloadLiveness {
+impl forge_format_docker::WorkloadCheck for WorkloadLiveness {
     async fn still_valid(&self, principal: &Principal) -> Result<bool, String> {
         let Principal::Workload {
             realm_id,
@@ -91,7 +91,7 @@ pub(crate) fn amend_registry_rejection(public_base_url: &str, response: Response
     {
         return response;
     }
-    let (scheme, service) = forge_oci::registry_origin(public_base_url);
+    let (scheme, service) = forge_format_docker::registry_origin(public_base_url);
     let challenge = format!("Bearer realm=\"{scheme}://{service}/v2/token\",service=\"{service}\"");
     let body = serde_json::json!({
         "errors": [{ "code": "UNAUTHORIZED", "message": "invalid credentials" }]

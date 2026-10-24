@@ -485,7 +485,7 @@ with Bearer tokens, read layers with `Range` requests, and expect proxies of
 Docker Hub and other registries. Every one of those is on the roadmap above
 or outside the contract altogether.
 
-So Docker is a native format (`crates/format-oci`, served under `/v2`),
+So Docker is a native format (`crates/formats/docker`, served under `/v2`),
 registered next to the plugins: `GET /admin/formats` lists it with all three
 repository kinds, the admin API and the web UI create its repositories the
 same way, a group holds members of its format only, and repositories, RBAC,

@@ -804,7 +804,7 @@ async fn docker_options(
         }
         return Ok(config);
     }
-    if !forge_oci::reference::valid_name_component(name) {
+    if !forge_format_docker::reference::valid_name_component(name) {
         return Err(bad_request(format!(
             "invalid docker repository name {name:?}: image names start with it, so use \
              lowercase letters and digits, separated by '.', '_', '__' or '-'"

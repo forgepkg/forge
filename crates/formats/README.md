@@ -10,6 +10,10 @@ the design, the contract and how to write one.
 | [`nuget`](nuget) | `nuget` | NuGet V3 feeds at `/v3`: push, restore, search, unlist and relist; hosted, proxy and group repositories |
 | [`raw`](raw) | `raw` | Raw files at `/raw`: files under paths, uploads with `PUT` or a form, ranges, checksum sidecars, listings; hosted, proxy and group repositories ([docs/raw.md](../../docs/raw.md)) |
 
+[`docker`](docker) holds Docker / OCI (`forge-format-docker`), which is still
+native: the server's registry serves it under `/v2`, not through
+`FormatPlugin` ([docs/docker.md](../../docs/docker.md)).
+
 A plugin directory holds:
 
 - `Cargo.toml`: a member of the workspace; its `version` is the plugin's;
