@@ -10,7 +10,7 @@
 //! upstream is rejected before any fetch. The configured host is logged on save
 //! for operator visibility (the URL may point at internal addresses).
 //!
-//! Repository **names** are URL path segments (`/v3/{name}/…`, the SPA's
+//! Repository **names** are URL path segments (`/repository/{name}/…`, the SPA's
 //! `/repositories/{name}`), so they are validated on create and rename (see
 //! [`validate_repo_name`]).
 
@@ -301,7 +301,7 @@ const MAX_REPO_NAME_LEN: usize = 64;
 /// Validate a repository name: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, and not
 /// `new` (any case), which the SPA uses as its "create repository" route.
 ///
-/// The name is a URL path segment (`/v3/{name}/…`); a name with a space, `%`
+/// The name is a URL path segment (`/repository/{name}/…`); a name with a space, `%`
 /// or `/` is stored fine but can never be reached as a feed.
 fn validate_repo_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();

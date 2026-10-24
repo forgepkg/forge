@@ -61,7 +61,7 @@ async fn outbox_drained_once_across_two_instances() {
         .unwrap();
     let form = reqwest::multipart::Form::new().part("package", part);
     let resp = client
-        .put(format!("{}/v3/{repo}/package", a.base_url))
+        .put(format!("{}/repository/{repo}/package", a.base_url))
         .header("X-NuGet-ApiKey", &api_key)
         .multipart(form)
         .send()
@@ -71,7 +71,10 @@ async fn outbox_drained_once_across_two_instances() {
 
     // The package is visible on instance B (shared DB) — scale-out read.
     let resp = client
-        .get(format!("{}/v3/{repo}/flat/{lower}/index.json", b.base_url))
+        .get(format!(
+            "{}/repository/{repo}/flat/{lower}/index.json",
+            b.base_url
+        ))
         .basic_auth(&u, Some(&p))
         .send()
         .await

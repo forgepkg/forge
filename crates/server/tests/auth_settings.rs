@@ -80,7 +80,7 @@ async fn make_user(srv: &TestServer) -> (i64, String, String) {
 async fn read_index(srv: &TestServer, repo: &str, basic: Option<(&str, &str)>) -> u16 {
     let mut req = srv
         .client()
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url));
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url));
     if let Some((u, p)) = basic {
         req = req.basic_auth(u, Some(p));
     }

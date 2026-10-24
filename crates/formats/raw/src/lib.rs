@@ -1,7 +1,7 @@
 //! Raw file repositories for Forge: files under paths, like Nexus'
 //! raw-hosted, raw-proxy and raw-group repositories.
 //!
-//! Served under a Forge repository's base URL (`/raw/<repository>`):
+//! Served under a Forge repository's base URL (`/repository/<repository>`):
 //!
 //! * `GET` / `HEAD /<path>` — a file, which the host streams
 //!   ([`Action::ServeFile`]: one range, validators, conditional requests);
@@ -34,7 +34,7 @@ use forge_plugin_api::{
     Storage, StoreStatus, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken,
 };
 
-/// What raw says about itself: its format id, name, version and mount.
+/// What raw says about itself: its format id, name and version.
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "raw",
     name: "Raw files",
@@ -42,7 +42,6 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     description: "Arbitrary files under arbitrary paths, like Nexus' raw repositories: uploads \
                   with PUT or a form, downloads with ranges and checksum sidecars, directory \
                   listings; proxies of any HTTP(S) base URL.",
-    mount: "/raw",
     // Proxies cache the files under an HTTP(S) base URL through the
     // plugin's upstream side.
     kinds: &[
@@ -68,7 +67,7 @@ impl FormatPlugin for Raw {
     fn handle(&self, repo: &Repository, req: &Request) -> Action {
         let target = match target(req) {
             Ok(Some(target)) => target,
-            // `/raw/<repository>`: the root listing is `/raw/<repository>/`.
+            // `/repository/<repository>`: the root listing is `/repository/<repository>/`.
             Ok(None) if is_read(req) => {
                 return redirect(&format!("{}/", listing::base_path(&repo.base_url)))
             }

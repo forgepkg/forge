@@ -21,9 +21,6 @@ pub struct FormatView {
     /// What its repositories hold: `packages` (versions of packages),
     /// `files` (files under paths: raw) or `images` (Docker).
     pub storage: &'static str,
-    /// Where its repositories are served: `{mount}/{repository}` (for
-    /// Docker, `/v2/{repository}/{image}`, or a repository's own host).
-    pub mount: String,
     /// The plugin's version.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -50,7 +47,6 @@ pub async fn list(State(state): State<AppState>) -> Response {
             name: descriptor.name.to_string(),
             kinds: kinds(plugin.id()),
             storage: descriptor.storage.as_str(),
-            mount: descriptor.mount.to_string(),
             version: Some(descriptor.version.to_string()),
             description: Some(descriptor.description.to_string()),
             default_max_upload_bytes: state.config.default_upload_limit(descriptor.storage),

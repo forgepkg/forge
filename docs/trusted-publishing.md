@@ -234,7 +234,7 @@ steps:
     shell: bash
     run: >-
       dotnet nuget push "artifacts/*.nupkg"
-      --source https://forge.example.com/v3/releases/package
+      --source https://forge.example.com/repository/releases/package
       --no-service-endpoint
       --api-key "${{ steps.forge.outputs.NUGET_API_KEY }}"
 ```
@@ -277,7 +277,7 @@ steps:
       printf '%s\n' '<?xml version="1.0" encoding="utf-8"?><configuration><packageSources><clear /></packageSources></configuration>' > "${NUGET_CONFIG}"
       chmod 600 "${NUGET_CONFIG}"
       dotnet nuget add source \
-        https://forge.example.com/v3/releases/index.json \
+        https://forge.example.com/repository/releases/index.json \
         --name forge-oidc \
         --username oidc \
         --password "${FORGE_TOKEN}" \
@@ -338,7 +338,7 @@ steps:
     with:
       node-version: '26'
   - run: npm ci
-  - run: npm publish --provenance=false --registry https://forge.example.com/npm/npm-all/
+  - run: npm publish --provenance=false --registry https://forge.example.com/repository/npm-all/
 ```
 
 npm requests the GitHub job's ID token with the `npm:forge.example.com`
@@ -360,7 +360,7 @@ publish:
       aud: npm:forge.example.com
   script:
     - npm ci
-    - npm publish --registry https://forge.example.com/npm/npm-all/
+    - npm publish --registry https://forge.example.com/repository/npm-all/
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
 ```
@@ -378,8 +378,8 @@ instance. Do not enable `allow_http_issuer` for production. Set
 ### Exchange and limitations
 
 npm calls `POST /-/npm/v1/oidc/token/exchange/package/<escaped-name>` at the
-**host root**, even when the registry is `/npm/npm-all/`. Reverse proxies must
-forward this root path to Forge, not only `/npm/`. The answer is
+**host root**, even when the registry is `/repository/npm-all/`. Reverse proxies must
+forward this root path to Forge, not only `/repository/`. The answer is
 `{"token":"forge_wif.…"}`; invalid requests or credentials receive a JSON
 `error` and 400 or 401 (temporary authentication failures receive 503).
 
@@ -448,7 +448,7 @@ publish:
     - dotnet pack -c Release -o artifacts --no-restore
     - >-
       dotnet nuget push "artifacts/*.nupkg"
-      --source https://forge.example.com/v3/releases/package
+      --source https://forge.example.com/repository/releases/package
       --no-service-endpoint
       --api-key "$NUGET_API_KEY"
 ```
@@ -467,7 +467,7 @@ publish:
     - chmod 600 "$NUGET_CONFIG"
     - >-
       dotnet nuget add source
-      https://forge.example.com/v3/releases/index.json
+      https://forge.example.com/repository/releases/index.json
       --name forge-oidc
       --username oidc
       --password "$FORGE_ID_TOKEN"

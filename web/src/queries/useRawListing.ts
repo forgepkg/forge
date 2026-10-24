@@ -16,7 +16,7 @@ import {
 } from '~/api/raw'
 
 /**
- * A page of a raw repository's directory (`GET /raw/<repo>/<path>`). Keeps
+ * A page of a raw repository's directory (`GET /repository/<repo>/<path>`). Keeps
  * the previous page visible while the next loads, like the package search.
  * A directory that does not exist (404) is an answer, not retried.
  */

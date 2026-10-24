@@ -26,7 +26,7 @@ async fn make_user(srv: &common::TestServer) -> (i64, String, String) {
     (id, username, password)
 }
 
-/// Publish a `.nupkg` via the NuGet `PUT /v3/{repo}/package` multipart endpoint,
+/// Publish a `.nupkg` via the NuGet `PUT /repository/{repo}/package` multipart endpoint,
 /// authenticating with the given token (`X-NuGet-ApiKey`). Returns the HTTP
 /// status so a caller can assert allow (201) / deny (403).
 async fn publish_with_token(
@@ -43,7 +43,7 @@ async fn publish_with_token(
         .unwrap();
     let form = reqwest::multipart::Form::new().part("package", part);
     srv.client()
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", token)
         .multipart(form)
         .send()
@@ -201,7 +201,7 @@ async fn grant_changes_decision_and_invalidates_cache() {
 
     // Baseline: fresh-closed install ⇒ the user has no roles ⇒ read denied (403).
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .basic_auth(&username, Some(&password))
         .send()
         .await
@@ -271,7 +271,7 @@ async fn grant_changes_decision_and_invalidates_cache() {
 
     // The user can now read (the role-grant mutation invalidated the cache).
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .basic_auth(&username, Some(&password))
         .send()
         .await
@@ -301,7 +301,7 @@ async fn grant_changes_decision_and_invalidates_cache() {
     assert_eq!(resp.status(), 204);
 
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .basic_auth(&username, Some(&password))
         .send()
         .await
@@ -466,7 +466,7 @@ async fn unassign_role_denies() {
 
     // Allowed.
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .basic_auth(&username, Some(&password))
         .send()
         .await
@@ -502,7 +502,7 @@ async fn unassign_role_denies() {
     assert_eq!(resp.status(), 204);
 
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .basic_auth(&username, Some(&password))
         .send()
         .await
@@ -932,7 +932,7 @@ async fn the_writer_role_publishes_everywhere_but_deletes_and_administers_nothin
     );
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/flat/{}/index.json",
+            "{}/repository/{repo}/flat/{}/index.json",
             srv.base_url,
             id.to_lowercase()
         ))
@@ -942,7 +942,10 @@ async fn the_writer_role_publishes_everywhere_but_deletes_and_administers_nothin
         .unwrap();
     assert_eq!(resp.status(), 200, "and reads it back");
     let resp = client
-        .delete(format!("{}/v3/{repo}/package/{id}/1.0.0", srv.base_url))
+        .delete(format!(
+            "{}/repository/{repo}/package/{id}/1.0.0",
+            srv.base_url
+        ))
         .header("X-NuGet-ApiKey", &token)
         .send()
         .await
@@ -1054,7 +1057,7 @@ async fn token_scope_narrows_to_read_only() {
 
     // The scoped token can read.
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .header("X-NuGet-ApiKey", &token)
         .send()
         .await
@@ -1150,7 +1153,9 @@ async fn a_token_scoped_to_a_group_reads_only_the_members_it_lists() {
                 .await
                 .unwrap();
             client
-                .get(format!("{srv_url}/v3/{group}/flat/{lower}/index.json"))
+                .get(format!(
+                    "{srv_url}/repository/{group}/flat/{lower}/index.json"
+                ))
                 .header("X-NuGet-ApiKey", created["token"].as_str().unwrap())
                 .send()
                 .await
@@ -1285,14 +1290,14 @@ async fn signed_in_user_reads_anonymous_read_repo() {
         .id;
 
     let resp = client
-        .get(format!("{}/v3/{public}/index.json", srv.base_url))
+        .get(format!("{}/repository/{public}/index.json", srv.base_url))
         .basic_auth(&username, Some(&password))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "roleless user reads the public repo");
     let resp = client
-        .get(format!("{}/v3/{private}/index.json", srv.base_url))
+        .get(format!("{}/repository/{private}/index.json", srv.base_url))
         .basic_auth(&username, Some(&password))
         .send()
         .await
@@ -1326,7 +1331,7 @@ async fn signed_in_user_reads_anonymous_read_repo() {
         .await
         .unwrap();
     let resp = client
-        .get(format!("{}/v3/{public}/index.json", srv.base_url))
+        .get(format!("{}/repository/{public}/index.json", srv.base_url))
         .header("X-NuGet-ApiKey", scoped["token"].as_str().unwrap())
         .send()
         .await
@@ -1378,7 +1383,7 @@ async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role(
     assert_eq!(resp.status(), 204);
 
     let session = srv.login(&username, "pw-anon-role-1").await;
-    let index = format!("{}/v3/{repo}/index.json", srv.base_url);
+    let index = format!("{}/repository/{repo}/index.json", srv.base_url);
     let resp = session.apply(client.get(&index)).send().await.unwrap();
     assert_eq!(resp.status(), 200, "read through the anonymous role");
 

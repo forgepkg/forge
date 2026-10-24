@@ -106,9 +106,8 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 /// * `/admin/...` — admin REST API (admin-only).
 /// * `/browse/...` — read-side browse / search (signed-in users only; per-repo
 ///   read authz enforced inside the handlers).
-/// * `{mount}/{repo}/...` — repositories, under their format's mount (NuGet:
-///   `/v3`; other plugins: `/repository` unless their plugin names
-///   another), each served by its format's plugin ([`crate::plugins`]).
+/// * `/repository/{repo}/...` — repositories of every non-Docker format,
+///   each served by its format's plugin ([`crate::plugins`]).
 /// * everything else — the SPA (when `web.enabled`), whose admin screens live
 ///   under `/manage/*` (see [`crate::web_ui`]).
 ///
@@ -123,15 +122,7 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let admin = admin_router(state.clone());
 
-    let mounts: Vec<String> = state
-        .formats
-        .mounts()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    // Every format's mount is a feed, for the response policy (raw's
-    // `/raw` among them).
-    let feeds: std::sync::Arc<Vec<String>> = std::sync::Arc::new(mounts.clone());
+    let feeds = std::sync::Arc::new(vec!["/repository".to_string()]);
     let mut app = Router::new()
         // Liveness / readiness probes (unauthenticated, dependency-light).
         .merge(crate::health::health_router())
@@ -156,7 +147,8 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     // `/v2`: clients always talk to `/v2/` at the host root; the registry
     // resolves repositories from the name (or the host) itself.
     let images = state.formats.images_plugin();
-    if let Some(mount) = images.as_ref().map(|p| p.descriptor().mount) {
+    if images.is_some() {
+        let mount = forge_plugin::api::IMAGES_MOUNT;
         app = app
             .route(mount, any(crate::registry::registry))
             .route(&format!("{mount}/"), any(crate::registry::registry))
@@ -165,20 +157,14 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
                 any(crate::registry::registry),
             );
     }
-    // Repositories, each served by its format's plugin under the format's
-    // mount (`crate::plugins`; NuGet at `/v3`, raw files at `/raw`). `any` covers
+    // Every non-Docker repository shares this prefix. `any` covers
     // GET/HEAD/PUT/POST/DELETE; the dispatcher authorizes per method.
-    for mount in mounts.iter() {
-        app = app
-            .route(&format!("{mount}/{{repo}}"), any(crate::plugins::dispatch))
-            // A wildcard matches no empty rest: the root of a repository
-            // (a files format's root listing) needs its own route.
-            .route(&format!("{mount}/{{repo}}/"), any(crate::plugins::dispatch))
-            .route(
-                &format!("{mount}/{{repo}}/{{*rest}}"),
-                any(crate::plugins::dispatch),
-            );
-    }
+    app = app
+        .route("/repository/{repo}", any(crate::plugins::dispatch))
+        // A wildcard matches no empty rest: a files format's root listing
+        // needs its own route.
+        .route("/repository/{repo}/", any(crate::plugins::dispatch))
+        .route("/repository/{repo}/{*rest}", any(crate::plugins::dispatch));
 
     // Static SPA fallback, installed LAST so the API routers above always win
     // and only genuine UI paths fall through to `index.html`. Skipped for a
@@ -271,8 +257,7 @@ const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
 ///
 /// * API responses (`/admin`, `/auth`, `/browse`) are `Cache-Control:
 ///   private, no-store` — they carry user data, tokens and CSRF secrets;
-/// * feed responses (under the formats' mounts, `feeds`: `/v3/...`,
-///   `/repository/...`)
+/// * feed responses (under `/repository`)
 ///   carry [`FEED_VARY`], and are `private,
 ///   no-store` whenever the request presented credentials, so a package
 ///   fetched with credentials is never stored by a shared cache or served to
@@ -280,7 +265,7 @@ const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
 ///   [`REGISTRY_VARY`], and a 401 the authentication middleware answered
 ///   there gets the registry's Bearer challenge; Anonymous responses carry no `Cache-Control`; under
 ///   `anonymous_mode = "allowlist"` the deployment guide tells operators to
-///   keep shared caches off `/v3`, since the allowlist decision is keyed on
+///   keep shared caches off `/repository`, since the allowlist decision is keyed on
 ///   the client address, which no cache varies on;
 /// * with an `https` public URL every response carries HSTS.
 ///
@@ -299,7 +284,7 @@ async fn response_policy(
     let feed = feeds.iter().any(|mount| under(mount));
     let registry = images
         .as_ref()
-        .filter(|images| under(images.descriptor().mount));
+        .filter(|_| under(forge_plugin::api::IMAGES_MOUNT));
     let headers = req.headers();
     let credentials = headers.contains_key(header::AUTHORIZATION)
         || headers.contains_key("x-nuget-apikey")

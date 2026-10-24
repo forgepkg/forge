@@ -41,8 +41,7 @@ use forge_plugin_api::{
 use crate::manifest::{media, ManifestError, EMPTY_JSON, EMPTY_JSON_DIGEST};
 use crate::path::Endpoint;
 
-/// What Docker / OCI says about itself: its format id, name, version and
-/// mount.
+/// What Docker / OCI says about itself: its format id, name and version.
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "docker",
     name: "Docker / OCI",
@@ -50,9 +49,6 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     description: "Docker / OCI registries: push and pull images, indexes and artifacts (Helm \
                   charts, signatures, SBOMs) with docker, podman, containerd, crane, helm and \
                   cosign; proxies of Docker Hub and other registries.",
-    // Clients always talk to `/v2/` at the root of a host; the host keeps
-    // `/v2/`, `/v2/token` and `/v2/_catalog`.
-    mount: "/v2",
     kinds: &[
         RepositoryKind::Hosted,
         RepositoryKind::Proxy,

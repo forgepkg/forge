@@ -39,7 +39,7 @@ async fn download(
     range: Option<&str>,
 ) -> reqwest::Response {
     let url = format!(
-        "{}/v3/{repo}/flat/{id}/{version}/{id}.{version}.nupkg",
+        "{}/repository/{repo}/flat/{id}/{version}/{id}.{version}.nupkg",
         srv.base_url
     );
     let mut request = srv.client().get(url);
@@ -226,7 +226,7 @@ async fn cached_packages_keep_resolving_while_s3_is_down() {
     let nuspec = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/flat/cached.lib/1.0.0/cached.lib.nuspec",
+            "{}/repository/{repo}/flat/cached.lib/1.0.0/cached.lib.nuspec",
             srv.base_url
         ))
         .send()

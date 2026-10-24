@@ -37,11 +37,11 @@ async fn create_proxy_with_ttl(
     assert_eq!(resp.status(), 201, "create proxy repo");
 }
 
-/// GET `path` (below `/v3/{repo}`) as the admin.
+/// GET `path` (below `/repository/{repo}`) as the admin.
 async fn get_v3(srv: &TestServer, repo: &str, path: &str) -> reqwest::Response {
     let (u, p) = srv.admin_basic();
     srv.client()
-        .get(format!("{}/v3/{repo}/{path}", srv.base_url))
+        .get(format!("{}/repository/{repo}/{path}", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -52,7 +52,7 @@ async fn download(srv: &TestServer, repo: &str, lower: &str, version: &str) -> r
     let (u, p) = srv.admin_basic();
     srv.client()
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/{version}/{lower}.{version}.nupkg",
+            "{}/repository/{repo}/flat/{lower}/{version}/{lower}.{version}.nupkg",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -67,7 +67,7 @@ async fn list_versions(srv: &TestServer, repo: &str, lower: &str) -> Vec<String>
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/index.json",
+            "{}/repository/{repo}/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))

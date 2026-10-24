@@ -46,7 +46,7 @@ A plugin is a workspace crate that describes itself in Rust:
 ```
 crates/formats/nuget/
 ├── Cargo.toml     # the plugin's version
-├── src/lib.rs     # DESCRIPTOR (id, name, mount "/v3", kinds hosted/proxy/group)
+├── src/lib.rs     # DESCRIPTOR (id, name, kinds hosted/proxy/group)
 │                  # and impl FormatPlugin for Nuget
 ├── src/protocol.rs  # the V3 protocol: handle and render
 ├── src/upstream.rs  # proxies: reading another V3 feed (upstream)
@@ -54,7 +54,7 @@ crates/formats/nuget/
 
 crates/formats/raw/
 ├── Cargo.toml
-├── src/lib.rs     # DESCRIPTOR (mount "/raw", storage files, kinds hosted/proxy/group)
+├── src/lib.rs     # DESCRIPTOR (storage files, kinds hosted/proxy/group)
 │                  # and impl FormatPlugin for Raw: paths, methods, upstream URLs
 ├── src/listing.rs # directory listings as HTML or JSON
 ├── src/sidecar.rs # .sha256/.sha512/.sha1/.md5 from the stored digests
@@ -63,7 +63,7 @@ crates/formats/raw/
 
 crates/formats/npm/
 ├── Cargo.toml
-├── src/lib.rs     # DESCRIPTOR (mount "/npm", kinds hosted/proxy/group, Bearer
+├── src/lib.rs     # DESCRIPTOR (kinds hosted/proxy/group, Bearer
 │                  # upstream tokens) and impl FormatPlugin for Npm
 ├── src/protocol.rs  # the registry API: packuments, publishes, dist-tags, logins
 ├── src/publish.rs # the tarball inside a publish document, as it streams
@@ -72,7 +72,7 @@ crates/formats/npm/
 
 crates/formats/docker/
 ├── Cargo.toml
-├── src/lib.rs     # DESCRIPTOR (mount "/v2", storage images, kinds hosted/proxy/group)
+├── src/lib.rs     # DESCRIPTOR (storage images, kinds hosted/proxy/group)
 │                  # and impl FormatPlugin for Docker: paths, manifests, charts
 ├── src/protocol.rs  # the distribution-spec API: handle and render
 ├── src/upstream.rs  # proxies: URLs, tag pages and referrers of an upstream registry
@@ -87,7 +87,7 @@ The pieces:
 | [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, and, behind its `testing` feature, helpers that run a plugin's protocol against canned answers. Depends on nothing but `std`. |
 | [`crates/formats/<id>`](../crates/formats) | One crate per plugin, implementing `FormatPlugin`. |
 | [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin, which describes itself), `PluginFormat`, which adapts it to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
-| [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `{mount}/{repo}/...` dispatcher, the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)), and the image store and token service of images formats, under `/v2` ([`crates/server/src/images`](../crates/server/src/images)). |
+| [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `/repository/{repo}/...` dispatcher, the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)), and the image store and token service of images formats, under `/v2` ([`crates/server/src/images`](../crates/server/src/images)). |
 
 ## How it fits together
 
@@ -105,10 +105,9 @@ The pieces:
 | Retention | Evaluates policies, ordering versions with the plugin's `compare_versions` | Nothing more |
 | Files (a files format) | Keeps files under paths, content-addressed with their digests: serving, ranges and validators, uploads under the deployment policy, listings, proxies and groups, selectors on paths, retention by path ([Files formats](#files-formats)) | Which path a request names, which file or directory it needs, what the response looks like |
 
-A request to a plugin repository is served under its format's mount,
-`{mount}/{repo}/...`: `/repository` unless the plugin's descriptor names
-another (see [Writing a plugin](#writing-a-plugin)); NuGet's names `/v3`.
-A repository is served under its own format's mount only.
+A request to every non-Docker repository is served under
+`/repository/{repo}/...`; the repository name selects its format. Docker
+repositories are served only through the registry under `/v2`.
 The dispatcher
 ([`crates/server/src/plugins.rs`](../crates/server/src/plugins.rs)) handles it
 in this order:
@@ -231,7 +230,7 @@ hosted repository and a package-client credential, and when one fails (403,
 a request is for says whether its files are shown inline (`inline`), for
 responses the plugin renders itself.
 
-Raw maps its URLs onto these: `GET /raw/<repo>/<path>` is `file(path)`
+Raw maps its URLs onto these: `GET /repository/<repo>/<path>` is `file(path)`
 (and `file` of the file a checksum sidecar names), then `serve-file` or
 the sidecar rendered from the file's digests, else `fetch-file` in a proxy
 or group, else a `directory` probe for a redirect; `GET …/<dir>/` is a
@@ -427,8 +426,7 @@ web UI's *New repository* form offers them. Plugins serve **hosted** and
 side (all four do).
 
 A repository of a plugin's format is created like any other, with the
-plugin's format id, and served under the plugin's mount (`/repository`
-unless its descriptor names another):
+plugin's format id, and served under `/repository`:
 
 ```bash
 # Create a hosted repository of the plugin `example` (or use the web UI).
@@ -530,7 +528,6 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     name: "Example packages",
     version: env!("CARGO_PKG_VERSION"),
     description: "Example packages: push and pull with the example client.",
-    mount: forge_plugin_api::DEFAULT_MOUNT, // served at /repository/{repo}/…
     // The repository kinds it serves (`Proxy` too when it implements
     // `upstream`).
     kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
@@ -561,10 +558,9 @@ impl FormatPlugin for MyFormat {
 ```
 
 An id is 2–32 lowercase letters, digits and `-`, starting with a letter,
-and no other format's. A mount is `/` and one lowercase word; the server's
-own paths (`/admin`, `/auth`, `/browse`, `/v2`, the web UI's pages, …) are
-reserved, and plugins may share a mount. An images format's mount is `/v2`,
-and only one format of a server may store images. List `Proxy` among the kinds only
+and no other format's. Every non-images format is served under
+`/repository/{repo}/…`; only one format of a server may store images, which
+the registry serves at `/v2`. List `Proxy` among the kinds only
 when the plugin implements `upstream`. Asset names are plain file names, and
 their content types `type/subtype`.
 
@@ -626,9 +622,9 @@ to lift them:
 ### NuGet as a plugin
 
 NuGet is a built-in plugin: [`crates/formats/nuget`](../crates/formats/nuget)
-implements `FormatPlugin`, and the dispatcher serves it at `/v3/{repo}/...`
-with the same paths, status codes, messages and JSON as before. The pieces it
-needed from the contract are general ones: a mount, its own asset names,
+implements `FormatPlugin`, and the dispatcher serves it at
+`/repository/{repo}/...`. The pieces it needed from the contract are general
+ones: its own asset names,
 ranged downloads, paged registrations (`packages-of`), the search options of
 the V3 search service, and publishing the first file of a multipart body.
 
@@ -641,7 +637,7 @@ unlisted versions, and the search service.
 ### npm as a plugin
 
 npm is a built-in plugin too: [`crates/formats/npm`](../crates/formats/npm) serves
-registries at `/npm/{repo}/...` for npm, pnpm, Yarn and Bun ([npm.md](npm.md)).
+registries at `/repository/{repo}/...` for npm, pnpm, Yarn and Bun ([npm.md](npm.md)).
 Contract 0.4.0 grew for it too, and every piece is general:
 
 - **Bodies on demand** (`read body`): logins, audits, dist-tag changes and
@@ -664,4 +660,3 @@ Contract 0.4.0 grew for it too, and every piece is general:
 - **Groups**: a writable member, where publishes and changes through the
   group go, and reserved prefixes in the format's own words (`@acme` is the
   scope `@acme/`, `reserved_prefix`).
-

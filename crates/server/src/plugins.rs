@@ -1,6 +1,5 @@
 //! Format plugins: the built-in ones, and serving the repositories of their
-//! formats under each format's mount, `{mount}/{repo}/...` (`/repository`
-//! unless its descriptor names another; see `docs/format-plugins.md`).
+//! formats under `/repository/{repo}/...` (see `docs/format-plugins.md`).
 //!
 //! The dispatcher resolves the repository, authenticates the caller (an
 //! `Authorization: Bearer` API token too, as npm sends it), refuses an
@@ -70,16 +69,12 @@ use tokio_util::io::StreamReader;
 
 use crate::dispatch::{
     authz_denied, level_for_method, offline_response, offline_serves_nothing,
-    principal_allows_protocol_mutations, HostedWriteAdapter,
+    principal_allows_protocol_mutations, AuthzDenied, HostedWriteAdapter,
 };
 use crate::files::store::{Content, Ingested, Part, Via};
 use crate::files::{FileError, Files};
 use crate::middleware::principal_of;
 use crate::state::AppState;
-
-/// Where a plugin format's repositories are served unless its descriptor
-/// names another mount.
-pub const MOUNT: &str = forge_plugin::api::DEFAULT_MOUNT;
 
 /// The most rounds of queries one request may load.
 pub const MAX_ROUNDS: usize = 4;
@@ -141,26 +136,9 @@ pub fn builtin(
 
 /// Axum handler mounted at `/repository/{repo}` (and everything under it).
 pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Response {
-    // The plugin the mount serves, for errors answered before the
-    // repository (and its plugin) is known.
-    let mounted =
-        split_path(req.uri().path(), &state.formats.mounts()).and_then(|(mount, _, _)| {
-            let mut serving = state
-                .formats
-                .plugins()
-                .filter(|plugin| plugin.descriptor().mount == mount);
-            match (serving.next(), serving.next()) {
-                (Some(plugin), None) => Some(plugin.clone()),
-                _ => None,
-            }
-        });
     let head = req.method() == Method::HEAD;
     let mut response = dispatch_request(state, req).await;
-    let plugin = response
-        .extensions_mut()
-        .remove::<ServedBy>()
-        .map(|s| s.0)
-        .or(mounted);
+    let plugin = response.extensions_mut().remove::<ServedBy>().map(|s| s.0);
     if let Some(plugin) = plugin {
         if !head {
             response = in_format(&plugin, response).await;
@@ -187,6 +165,7 @@ async fn in_format(plugin: &Plugin, response: Response) -> Response {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error())
         || response.extensions().get::<PluginWritten>().is_some()
+        || response.extensions().get::<AuthzDenied>().is_some()
     {
         return response;
     }
@@ -217,18 +196,14 @@ async fn in_format(plugin: &Plugin, response: Response) -> Response {
     Response::from_parts(parts, Body::from(rendered.body))
 }
 
-/// `(mount, repository name, rest of the path)` of a `{mount}/{repo}/...`
-/// path, for one of `mounts`; the rest starts with `/`, or is empty when the
-/// path ends with the repository's name.
-fn split_path<'p>(path: &'p str, mounts: &[&str]) -> Option<(&'p str, &'p str, &'p str)> {
-    mounts.iter().find_map(|mount| {
-        let rest = path.strip_prefix(mount)?.strip_prefix('/')?;
-        let (name, rest) = match rest.find('/') {
-            Some(i) => rest.split_at(i),
-            None => (rest, ""),
-        };
-        (!name.is_empty()).then(|| (&path[..mount.len()], name, rest))
-    })
+/// `(repository name, rest of the path)` of a `/repository/{repo}/...` path.
+fn split_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/repository/")?;
+    let (name, rest) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    (!name.is_empty()).then_some((name, rest))
 }
 
 /// The caller, with an `Authorization: Bearer` API token resolved when the
@@ -279,8 +254,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    let mounts = state.formats.mounts();
-    let Some((mount, repo_name, rest)) = split_path(uri.path(), &mounts) else {
+    let Some((repo_name, rest)) = split_path(uri.path()) else {
         return (StatusCode::NOT_FOUND, "repository not found").into_response();
     };
 
@@ -300,8 +274,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
 
     let Some(plugin) = state.formats.plugin(&repo.format) else {
         return if state.formats.is_installed(&repo.format) {
-            // A format without a protocol (a test's own) is served under
-            // no mount.
+            // A format without a protocol (a test's own) is not served here.
             (StatusCode::NOT_FOUND, "repository is not served here").into_response()
         } else {
             (
@@ -311,11 +284,10 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
                 .into_response()
         };
     };
-    // Each format is served under its own mount only.
-    if plugin.descriptor().mount != mount {
+    if plugin.descriptor().storage == protocol::Storage::Images {
         return (StatusCode::NOT_FOUND, "repository is not served here").into_response();
     }
-    let mut response = serve(&state, req, principal, &repo, plugin.clone(), mount, rest).await;
+    let mut response = serve(&state, req, principal, &repo, plugin.clone(), rest).await;
     response.extensions_mut().insert(ServedBy(plugin));
     response
 }
@@ -327,7 +299,6 @@ async fn serve(
     principal: Principal,
     repo: &Repository,
     plugin: Arc<Plugin>,
-    mount: &str,
     rest: &str,
 ) -> Response {
     let method = req.method().clone();
@@ -376,7 +347,7 @@ async fn serve(
             RepoKind::Proxy => protocol::RepositoryKind::Proxy,
             RepoKind::Group => protocol::RepositoryKind::Group,
         },
-        base_url: repository_url(state, mount, &repo.name),
+        base_url: repository_url(state, &repo.name),
         inline: stores_files && repo.inline_content(),
         reserved_prefixes: if repo.kind() == RepoKind::Group {
             repo.reserved_prefixes()
@@ -405,7 +376,6 @@ async fn serve(
     let ctx = Ctx {
         state,
         repo,
-        mount,
         principal,
         method: method.clone(),
         client_ip: crate::auth::login_client_ip(state, peer, req.headers()),
@@ -448,8 +418,6 @@ async fn serve(
 struct Ctx<'a> {
     state: &'a AppState,
     repo: &'a Repository,
-    /// The format's mount (`/repository`).
-    mount: &'a str,
     principal: Principal,
     method: Method,
     /// Where the request came from, as the login lockout sees it.
@@ -1814,13 +1782,13 @@ impl Ctx<'_> {
     /// percent-encoded (URL parsers resolve `%2e%2e` like `..`), and no
     /// backslashes (which browsers read as `/`).
     fn within_repository(&self, location: &str) -> bool {
-        within(location, self.mount, &self.repo.name, &self.target.base_url)
+        within(location, &self.repo.name, &self.target.base_url)
     }
 
     /// Whether every target of a `Link` header (`<url>; rel=...`, comma
     /// separated) stays inside this repository.
     fn links_within_repository(&self, value: &str) -> bool {
-        links_within(value, self.mount, &self.repo.name, &self.target.base_url)
+        links_within(value, &self.repo.name, &self.target.base_url)
     }
 }
 
@@ -2024,20 +1992,18 @@ fn directory_page(page: crate::files::listing::Page) -> protocol::DirectoryPage 
     }
 }
 
-/// The absolute URL of repository `name` served under `mount`:
-/// `{public_base_url}{mount}/{name}`, the base its plugin builds URLs on and
-/// the address its clients are given.
-pub fn repository_url(state: &AppState, mount: &str, name: &str) -> String {
+/// The absolute URL of repository `name`, the base its plugin builds URLs on.
+pub fn repository_url(state: &AppState, name: &str) -> String {
     format!(
-        "{}{mount}/{name}",
+        "{}/repository/{name}",
         state.config.public_base_url().trim_end_matches('/')
     )
 }
 
 /// See [`Ctx::within_repository`]. A path may also start with the path of
 /// `base_url` (a public base URL with a path of its own).
-fn within(location: &str, mount: &str, repo: &str, base_url: &str) -> bool {
-    let path_prefix = format!("{mount}/{repo}/");
+fn within(location: &str, repo: &str, base_url: &str) -> bool {
+    let path_prefix = format!("/repository/{repo}/");
     let absolute_prefix = format!("{base_url}/");
     let base_path_prefix = url::Url::parse(base_url)
         .ok()
@@ -2057,7 +2023,7 @@ fn within(location: &str, mount: &str, repo: &str, base_url: &str) -> bool {
 
 /// See [`Ctx::links_within_repository`]: every `<…>` of `value` is
 /// [`within`] the repository, and there is one at least.
-fn links_within(value: &str, mount: &str, repo: &str, base_url: &str) -> bool {
+fn links_within(value: &str, repo: &str, base_url: &str) -> bool {
     let mut targets = 0;
     for link in value.split(',') {
         let Some(target) = link
@@ -2068,7 +2034,7 @@ fn links_within(value: &str, mount: &str, repo: &str, base_url: &str) -> bool {
         else {
             return false;
         };
-        if !within(target, mount, repo, base_url) {
+        if !within(target, repo, base_url) {
             return false;
         }
         targets += 1;
@@ -2167,8 +2133,8 @@ mod tests {
     use super::*;
 
     /// The built-in formats' descriptors are checked here, not at startup: a
-    /// well-formed id that is not reserved and no other format has, a free
-    /// mount, kinds, asset names.
+    /// well-formed id that is not reserved and no other format has, kinds,
+    /// asset names.
     #[test]
     fn the_builtin_formats_describe_themselves_well() {
         let plugins = builtin(Default::default(), Default::default());
@@ -2200,7 +2166,6 @@ mod tests {
         }
         let twin = forge_plugin::Descriptor {
             id: "nuget",
-            mount: "/twin",
             ..forge_format_raw::DESCRIPTOR
         };
         let mut with_twin = descriptors.clone();
@@ -2232,54 +2197,44 @@ mod tests {
 
     #[test]
     fn splits_repository_paths() {
-        let mounts = ["/repository", "/charts"];
-        let split = |path| split_path(path, &mounts);
+        let split = split_path;
         assert_eq!(
             split("/repository/charts/index.yaml"),
-            Some(("/repository", "charts", "/index.yaml"))
+            Some(("charts", "/index.yaml"))
         );
-        assert_eq!(
-            split("/repository/charts"),
-            Some(("/repository", "charts", ""))
-        );
-        assert_eq!(
-            split("/repository/charts/"),
-            Some(("/repository", "charts", "/"))
-        );
+        assert_eq!(split("/repository/charts"), Some(("charts", "")));
+        assert_eq!(split("/repository/charts/"), Some(("charts", "/")));
         assert_eq!(
             split("/repository/charts/api/charts/x/1.0.0"),
-            Some(("/repository", "charts", "/api/charts/x/1.0.0"))
-        );
-        assert_eq!(
-            split("/charts/stable/index.yaml"),
-            Some(("/charts", "stable", "/index.yaml"))
+            Some(("charts", "/api/charts/x/1.0.0"))
         );
         assert_eq!(split("/repository/"), None);
         assert_eq!(split("/repository"), None);
         assert_eq!(split("/repositoryx/a"), None);
-        assert_eq!(split("/chartsx/a"), None);
         assert_eq!(split("/v3/charts"), None);
+        assert_eq!(split("/raw/charts/file"), None);
+        assert_eq!(split("/npm/charts/file"), None);
+        assert_eq!(split("/v2/charts/file"), None);
     }
 
     #[test]
     fn links_stay_inside_the_repository() {
-        let base = "https://forge.example.com/raw/bin";
-        let ok = "<https://forge.example.com/raw/bin/a/?after=x>; rel=\"next\"";
-        assert!(links_within(ok, "/raw", "bin", base));
+        let base = "https://forge.example.com/repository/bin";
+        let ok = "<https://forge.example.com/repository/bin/a/?after=x>; rel=\"next\"";
+        assert!(links_within(ok, "bin", base));
         assert!(links_within(
-            "</raw/bin/a/?after=x>; rel=\"next\", </raw/bin/>; rel=\"up\"",
-            "/raw",
+            "</repository/bin/a/?after=x>; rel=\"next\", </repository/bin/>; rel=\"up\"",
             "bin",
             base
         ));
         for bad in [
             "<https://evil.example.com/>; rel=\"next\"",
-            "</raw/other/>; rel=\"next\"",
-            "</raw/bin/>; rel=\"next\", <https://evil.example.com/>; rel=\"preload\"",
+            "</repository/other/>; rel=\"next\"",
+            "</repository/bin/>; rel=\"next\", <https://evil.example.com/>; rel=\"preload\"",
             "rel=\"next\"",
             "",
         ] {
-            assert!(!links_within(bad, "/raw", "bin", base), "{bad}");
+            assert!(!links_within(bad, "bin", base), "{bad}");
         }
     }
 
@@ -2290,12 +2245,11 @@ mod tests {
             "/repository/charts/index.yaml",
             "https://forge.example.com/repository/charts/charts/x/1.0.0/x-1.0.0.tgz",
         ] {
-            assert!(within(ok, "/repository", "charts", base), "{ok}");
+            assert!(within(ok, "charts", base), "{ok}");
         }
         // Behind a public base URL with a path, the repository's path.
         assert!(within(
             "/forge/repository/charts/index.yaml",
-            "/repository",
             "charts",
             "https://forge.example.com/forge/repository/charts"
         ));
@@ -2309,7 +2263,7 @@ mod tests {
             "/repository/charts/x\\..\\..\\admin",
             "/admin",
         ] {
-            assert!(!within(bad, "/repository", "charts", base), "{bad}");
+            assert!(!within(bad, "charts", base), "{bad}");
         }
     }
 }

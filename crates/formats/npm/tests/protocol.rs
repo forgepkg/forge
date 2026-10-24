@@ -17,7 +17,7 @@ use forge_plugin_api::{
 };
 use serde_json::{json, Value};
 
-const BASE: &str = "https://forge.example.com/npm/main";
+const BASE: &str = "https://forge.example.com/repository/main";
 const ABBREVIATED: &str =
     "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
 

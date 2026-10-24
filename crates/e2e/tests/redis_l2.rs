@@ -191,7 +191,7 @@ async fn proxy_upstream_index_is_not_read_from_redis() {
     let resp = b
         .client()
         .get(format!(
-            "{}/v3/{name}/flat/contoso.lib/1.0.0/contoso.lib.1.0.0.nupkg",
+            "{}/repository/{name}/flat/contoso.lib/1.0.0/contoso.lib.1.0.0.nupkg",
             b.base_url
         ))
         .basic_auth(&u, Some(&p))

@@ -909,7 +909,7 @@ impl TestServer {
             .unwrap();
         let form = reqwest::multipart::Form::new().part("package", part);
         self.client()
-            .put(format!("{}/v3/{repo}/package", self.base_url))
+            .put(format!("{}/repository/{repo}/package", self.base_url))
             .header("X-NuGet-ApiKey", &self.admin_token)
             .multipart(form)
             .send()
@@ -1083,11 +1083,11 @@ impl TestServer {
         body["id"].as_i64().expect("created selector id")
     }
 
-    /// GET `/v3/{repo}/index.json` authenticating with an API token; returns the
+    /// GET `/repository/{repo}/index.json` authenticating with an API token; returns the
     /// HTTP status (the repo-level read gate's verdict).
     pub async fn read_index_with_token(&self, repo: &str, token: &str) -> reqwest::StatusCode {
         self.client()
-            .get(format!("{}/v3/{repo}/index.json", self.base_url))
+            .get(format!("{}/repository/{repo}/index.json", self.base_url))
             .header("X-NuGet-ApiKey", token)
             .send()
             .await
@@ -1110,7 +1110,7 @@ impl TestServer {
             .unwrap();
         let form = reqwest::multipart::Form::new().part("package", part);
         self.client()
-            .put(format!("{}/v3/{repo}/package", self.base_url))
+            .put(format!("{}/repository/{repo}/package", self.base_url))
             .header("X-NuGet-ApiKey", token)
             .multipart(form)
             .send()

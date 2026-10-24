@@ -164,7 +164,7 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
         .mime_str("application/octet-stream")
         .unwrap();
     let resp = client
-        .put(format!("{}/v3/{hosted}/package", srv.base_url))
+        .put(format!("{}/repository/{hosted}/package", srv.base_url))
         .header("X-NuGet-ApiKey", srv.admin_token().await)
         .multipart(reqwest::multipart::Form::new().part("package", part))
         .send()
@@ -175,7 +175,7 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
     let search = |repo: String| {
         let request = client
             .get(format!(
-                "{}/v3/{repo}/query?q=lib&semVerLevel=2.0.0",
+                "{}/repository/{repo}/query?q=lib&semVerLevel=2.0.0",
                 srv.base_url
             ))
             .basic_auth(&u, Some(&p));
@@ -192,12 +192,12 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
     assert_eq!(hits(&body).len(), 3, "{body}");
     let only = hit(&body, "Upstream.Only");
     let registration =
-        format!("http://test.local/v3/{proxy}/registration/upstream.only/index.json");
+        format!("http://test.local/repository/{proxy}/registration/upstream.only/index.json");
     assert_eq!(only["@id"], registration);
     assert_eq!(only["registration"], registration);
     assert_eq!(
         only["versions"][1]["@id"],
-        format!("http://test.local/v3/{proxy}/registration/upstream.only/1.1.0.json")
+        format!("http://test.local/repository/{proxy}/registration/upstream.only/1.1.0.json")
     );
     assert_eq!(only["description"], "Upstream.Only from upstream");
     assert_eq!(only["totalDownloads"], 42);
@@ -217,7 +217,7 @@ async fn proxy_and_group_search_find_packages_only_the_upstream_knows() {
     let only = hit(&body, "Upstream.Only");
     assert_eq!(
         only["@id"],
-        format!("http://test.local/v3/{group}/registration/upstream.only/index.json")
+        format!("http://test.local/repository/{group}/registration/upstream.only/index.json")
     );
     assert_eq!(only["description"], "Upstream.Only from upstream");
 

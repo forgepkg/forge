@@ -113,7 +113,7 @@ admin POST /admin/repositories/files/members '{"member":"releases","priority":5}
 step "hosted: upload with a token, download, ranges, resume"
 mkdir -p "$work/up" "$work/down"
 head -c 1048576 /dev/urandom > "$work/up/tool-linux-x64.tgz"
-url="$base/raw/binaries/tools/1.0/tool-linux-x64.tgz"
+url="$base/repository/binaries/tools/1.0/tool-linux-x64.tgz"
 expect_status 401 --upload-file "$work/up/tool-linux-x64.tgz" "$url"
 expect_status 201 "${auth[@]}" --upload-file "$work/up/tool-linux-x64.tgz" "$url"
 curl -fsS "${auth[@]}" -o "$work/down/tool-linux-x64.tgz" "$url"
@@ -138,7 +138,7 @@ step "checksum sidecars"
     curl -fsS "${auth[@]}" "$url.$sum" | "${sum}sum" -c - || fail "$sum sidecar"
   done
 )
-expect_status 404 "${auth[@]}" "$base/raw/binaries/tools/1.0/missing.tgz.sha256"
+expect_status 404 "${auth[@]}" "$base/repository/binaries/tools/1.0/missing.tgz.sha256"
 
 step "redeploy is refused by default; a form upload; listings"
 echo "other content" > "$work/up/other"
@@ -146,24 +146,24 @@ expect_status 409 "${auth[@]}" --upload-file "$work/up/other" "$url"
 expect_status 204 "${auth[@]}" --upload-file "$work/up/tool-linux-x64.tgz" "$url"
 echo "notes" > "$work/up/NOTES.txt"
 expect_status 201 "${auth[@]}" -F raw.directory=docs -F "raw.asset1=@$work/up/NOTES.txt" \
-  -F raw.asset1.filename=RELEASE-NOTES.txt "$base/raw/binaries/tools/1.0/"
-[ "$(curl -fsS "${auth[@]}" "$base/raw/binaries/tools/1.0/docs/RELEASE-NOTES.txt")" = notes ] \
+  -F raw.asset1.filename=RELEASE-NOTES.txt "$base/repository/binaries/tools/1.0/"
+[ "$(curl -fsS "${auth[@]}" "$base/repository/binaries/tools/1.0/docs/RELEASE-NOTES.txt")" = notes ] \
   || fail "form upload"
-names=$(curl -fsS "${auth[@]}" -H 'Accept: application/json' "$base/raw/binaries/tools/1.0/" \
+names=$(curl -fsS "${auth[@]}" -H 'Accept: application/json' "$base/repository/binaries/tools/1.0/" \
   | jq -r '[.entries[].name] | join(",")')
 [ "$names" = "docs/,tool-linux-x64.tgz" ] || fail "listing: $names"
-curl -fsS "${auth[@]}" "$base/raw/binaries/tools/" | grep -q '<a href="1.0/">1.0/</a>' \
+curl -fsS "${auth[@]}" "$base/repository/binaries/tools/" | grep -q '<a href="1.0/">1.0/</a>' \
   || fail "HTML listing"
 
 step "path traversal is refused"
 for path in '../x' 'tools/../tools/1.0/tool-linux-x64.tgz' '%2e%2e/x' '.%2e/x' \
   'tools/%2E%2E/x' 'tools//1.0' 'tools%2f1.0' 'tools%5c1.0' '..%5cx' 'tools/./1.0'; do
   for method in GET PUT DELETE; do
-    expect_status 400 "${auth[@]}" --path-as-is -X "$method" -d x "$base/raw/binaries/$path"
+    expect_status 400 "${auth[@]}" --path-as-is -X "$method" -d x "$base/repository/binaries/$path"
   done
 done
-code=$(curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" --path-as-is "$base/raw/../admin/repositories")
-[ "$code" != 200 ] || fail "/raw/../admin answered 200"
+code=$(curl -sS -o /dev/null -w '%{http_code}' "${auth[@]}" --path-as-is "$base/repository/../admin/repositories")
+[ "$code" != 200 ] || fail "/repository/../admin answered 200"
 
 step "proxy: a release host that redirects to an asset host on another origin"
 mkdir -p "$work/upstream/tool/2.0"
@@ -198,7 +198,7 @@ EOF
 python3 -u "$work/upstream.py" "$work/upstream" "$release_port" "$asset_port" > "$work/upstream.log" 2>&1 &
 upstream_pid=$!
 for _ in $(seq 1 30); do curl -fsS "http://127.0.0.1:$asset_port/" >/dev/null 2>&1 && break; sleep 0.5; done
-proxied="$base/raw/releases/tool/2.0/tool-linux-x64.tgz"
+proxied="$base/repository/releases/tool/2.0/tool-linux-x64.tgz"
 curl -fsS "${auth[@]}" -o "$work/down/proxied.tgz" "$proxied"
 cmp "$work/upstream/tool/2.0/tool-linux-x64.tgz" "$work/down/proxied.tgz" || fail "proxied file differs"
 grep -q '^release /releases/download/tool/2.0/tool-linux-x64.tgz auth=True' "$work/upstream.log" \
@@ -213,14 +213,14 @@ curl -fsS "${auth[@]}" -o "$work/down/proxied-again.tgz" "$proxied"
 cmp "$work/down/proxied.tgz" "$work/down/proxied-again.tgz" || fail "cached file differs"
 (cd "$work/down" && curl -fsS "${auth[@]}" "$proxied.sha256" | sed 's/tool-linux-x64.tgz$/proxied.tgz/' | sha256sum -c -) \
   || fail "proxied sidecar"
-expect_status 502 "${auth[@]}" "$base/raw/releases/tool/2.0/not-cached.tgz"
+expect_status 502 "${auth[@]}" "$base/repository/releases/tool/2.0/not-cached.tgz"
 
 step "group: the first member that has the path"
-[ "$(curl -fsS "${auth[@]}" "$base/raw/files/tools/1.0/docs/RELEASE-NOTES.txt")" = notes ] \
+[ "$(curl -fsS "${auth[@]}" "$base/repository/files/tools/1.0/docs/RELEASE-NOTES.txt")" = notes ] \
   || fail "group: hosted member"
-curl -fsS "${auth[@]}" -o "$work/down/via-group.tgz" "$base/raw/files/tool/2.0/tool-linux-x64.tgz"
+curl -fsS "${auth[@]}" -o "$work/down/via-group.tgz" "$base/repository/files/tool/2.0/tool-linux-x64.tgz"
 cmp "$work/down/proxied.tgz" "$work/down/via-group.tgz" || fail "group: proxy member"
-names=$(curl -fsS "${auth[@]}" -H 'Accept: application/json' "$base/raw/files/" \
+names=$(curl -fsS "${auth[@]}" -H 'Accept: application/json' "$base/repository/files/" \
   | jq -r '[.entries[].name] | join(",")')
 [ "$names" = "tool/,tools/" ] || fail "group listing: $names"
 
@@ -229,7 +229,7 @@ if [ "${FORGE_E2E_SKIP_GITHUB:-0}" != 1 ]; then
   admin POST /admin/repositories '{"name":"pdfium","kind":"proxy","format":"raw",
     "remote_url":"https://github.com/bblanchon/pdfium-binaries/releases/download/",
     "max_age_seconds":0}' >/dev/null
-  asset="$base/raw/pdfium/chromium/7350/pdfium-linux-x64.tgz"
+  asset="$base/repository/pdfium/chromium/7350/pdfium-linux-x64.tgz"
   (
     cd "$work/down"
     curl -fsS "${auth[@]}" -O "$asset"
@@ -241,7 +241,7 @@ if [ "${FORGE_E2E_SKIP_GITHUB:-0}" != 1 ]; then
     mkdir pdfium
     tar -xzf pdfium-linux-x64.tgz -C pdfium
     tar -czf repackaged.tgz -C pdfium lib include
-    hosted="$base/raw/binaries/pdfium/7350/pdfium-linux-x64.tgz"
+    hosted="$base/repository/binaries/pdfium/7350/pdfium-linux-x64.tgz"
     expect_status 201 "${auth[@]}" --upload-file repackaged.tgz "$hosted"
     mkdir check
     cd check

@@ -58,7 +58,7 @@ A Cargo workspace of small crates plus the web SPA:
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
 | `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
 | `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
-| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds (NuGet at `/v3`, npm at `/npm`, raw files at `/raw`, the Docker / OCI registry at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds under `/repository/{repo}` (except Docker at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
@@ -69,9 +69,8 @@ Docker / OCI is one too, an images format: the plugin speaks the protocol,
 and the server's image store (`crates/server/src/images`) keeps the
 images.
 
-**Single-origin serving.** `forge-server` mounts each format plugin's feed
-(NuGet at `/v3`, npm at `/npm`, others at `/repository`), the Docker / OCI registry (`/v2`),
-raw file repositories (`/raw`),
+**Single-origin serving.** `forge-server` serves every non-Docker format plugin
+at `/repository/{repo}`, the Docker / OCI registry at `/v2`,
 the admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
 from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
 the same origin with relative URLs; no routing proxy is required (production
@@ -98,15 +97,15 @@ the `changeme` password or `minioadmin` S3 keys). (Requires a running local Post
 role/db; use `--db docker` if you don't have one — see below.)
 
 - **UI:** http://localhost:8420
-- **NuGet feed:** `http://localhost:8421/v3/{repo}/index.json`
-- **npm registry:** `http://localhost:8421/npm/{repo}/`
+- **NuGet feed:** `http://localhost:8421/repository/{repo}/index.json`
+- **npm registry:** `http://localhost:8421/repository/{repo}/`
 
 Add demo data (anonymous-readable `nuget` repo + a pushed sample package) in a
 second terminal:
 
 ```bash
 cargo xtask seed
-# feed: http://localhost:8421/v3/nuget/index.json
+# feed: http://localhost:8421/repository/nuget/index.json
 ```
 
 ### Choosing where Postgres comes from
@@ -161,7 +160,7 @@ Settings** (see
 ### Point a `dotnet` client at it
 
 ```bash
-dotnet nuget add source http://localhost:8421/v3/nuget/index.json -n forge
+dotnet nuget add source http://localhost:8421/repository/nuget/index.json -n forge
 dotnet nuget push -s forge -k <TOKEN> your.1.0.0.nupkg
 dotnet add package <PackageId>          # in a project
 ```
@@ -188,9 +187,9 @@ Create a raw repository (`"format": "raw"`), then upload with an API token as
 the password and download with its checksum:
 
 ```bash
-curl -u admin@example.com:<TOKEN> --upload-file tool.tgz http://localhost:8421/raw/binaries/tools/1.0/tool.tgz
-curl -u admin@example.com:<TOKEN> -O http://localhost:8421/raw/binaries/tools/1.0/tool.tgz
-curl -u admin@example.com:<TOKEN> http://localhost:8421/raw/binaries/tools/1.0/tool.tgz.sha256 | sha256sum -c
+curl -u admin@example.com:<TOKEN> --upload-file tool.tgz http://localhost:8421/repository/binaries/tools/1.0/tool.tgz
+curl -u admin@example.com:<TOKEN> -O http://localhost:8421/repository/binaries/tools/1.0/tool.tgz
+curl -u admin@example.com:<TOKEN> http://localhost:8421/repository/binaries/tools/1.0/tool.tgz.sha256 | sha256sum -c
 ```
 
 ## Documentation

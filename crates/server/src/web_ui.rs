@@ -2,7 +2,7 @@
 //!
 //! The Rust `server` serves the **built TanStack Start SPA** so the UI and the
 //! API live on a **single origin** — no CORS, no Node proxy in front of the Rust
-//! API. The browser calls `/admin/*`, `/browse/*`, `/v3/*` directly.
+//! API. The browser calls `/admin/*`, `/browse/*`, `/repository/*` directly.
 //!
 //! The asset layer is a [`tower_http::services::ServeDir`] over the configured
 //! `web.assets_dir`, with `index.html` as the **SPA history fallback**: any path
@@ -30,8 +30,8 @@
 //!
 //! ## Route precedence (critical)
 //! This fallback is mounted **last** in [`crate::app::build_router`], after the
-//! `/admin`, `/browse`, and `/v3` routers. axum only routes to a `fallback`
-//! when no other route matches, so a request to `/admin/...` (or `/v3/...`,
+//! `/admin`, `/browse`, and `/repository` routers. axum only routes to a `fallback`
+//! when no other route matches, so a request to `/admin/...` (or `/repository/...`,
 //! `/browse/...`) is always handled by its API router and never shadowed by the
 //! SPA. Only genuine UI paths fall through to the SPA.
 //!
@@ -63,7 +63,7 @@ pub const UI_ADMIN_PREFIX: &str = "/manage";
 
 /// The API and feed prefixes. No SPA route lives under them, so a path there
 /// that no API route matched answers 404 instead of `index.html`.
-pub const API_PREFIXES: [&str; 7] = ["/admin", "/api", "/auth", "/browse", "/npm", "/raw", "/v3"];
+pub const API_PREFIXES: [&str; 5] = ["/admin", "/api", "/auth", "/browse", "/repository"];
 
 /// Whether `path` is `prefix` itself or lies under it (`/admin`, `/admin/x`;
 /// not `/administrator`).

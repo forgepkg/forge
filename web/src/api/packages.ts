@@ -39,8 +39,8 @@ export interface BrowseRepo {
    */
   format: string
   /**
-   * The address clients use for the repository (`<server><mount>/<name>`,
-   * e.g. `https://forge.example.com/v3/internal`), for the connect snippets.
+   * The address clients use for the repository (e.g.
+   * `https://forge.example.com/repository/internal`), for the connect snippets.
    * Absent for a docker repository (its registry comes with its images) and
    * for a format this server does not have installed.
    */

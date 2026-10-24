@@ -119,12 +119,12 @@ async fn password_login_session_round_trip() {
     assert_eq!(resp.status(), 200, "session cookie reaches the admin API");
 
     // Every cookie-authenticated mutation needs the CSRF token, whichever
-    // router family serves it (admin API, self-service tokens, /v3 dispatch).
+    // router family serves it (admin API, self-service tokens, repository dispatch).
     for (method, path) in [
         (reqwest::Method::POST, "/admin/roles"),
         (reqwest::Method::POST, "/admin/me/tokens"),
         (reqwest::Method::DELETE, "/admin/tokens/999999"),
-        (reqwest::Method::PUT, "/v3/no-such-repo/package"),
+        (reqwest::Method::PUT, "/repository/no-such-repo/package"),
     ] {
         let resp = client
             .request(method.clone(), format!("{}{path}", srv.base_url))

@@ -812,7 +812,7 @@ async fn upstream_demotion_drops_admin_and_ends_sessions_at_once() {
     );
     let read_locked = || async {
         srv.client()
-            .get(format!("{}/v3/locked/index.json", srv.base_url))
+            .get(format!("{}/repository/locked/index.json", srv.base_url))
             .basic_auth("up-admin@example.com", Some("apw"))
             .send()
             .await

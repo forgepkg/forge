@@ -149,7 +149,7 @@ async fn read_index(
 ) -> StatusCode {
     req(srv
         .client()
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url)))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url)))
     .send()
     .await
     .unwrap()
@@ -162,7 +162,7 @@ async fn push_with_api_key(srv: &TestServer, key: &str, id: &str, version: &str)
         .mime_str("application/octet-stream")
         .unwrap();
     srv.client()
-        .put(format!("{}/v3/ci-hosted/package", srv.base_url))
+        .put(format!("{}/repository/ci-hosted/package", srv.base_url))
         .header("X-NuGet-ApiKey", key)
         .multipart(reqwest::multipart::Form::new().part("package", part))
         .send()
@@ -282,7 +282,7 @@ async fn npm_publish(
     let file = format!("{}-{version}.tgz", name.rsplit('/').next().unwrap());
     srv.client()
         .put(format!(
-            "{}/npm/{repo}/{}",
+            "{}/repository/{repo}/{}",
             srv.base_url,
             name.replacen('/', "%2f", 1)
         ))
@@ -333,7 +333,7 @@ async fn npm_oidc_exchanged_bearer_publishes_hosted_and_writable_group() {
         );
         let response = srv
             .client()
-            .get(format!("{}/npm/npm-hosted/{escaped}", srv.base_url))
+            .get(format!("{}/repository/npm-hosted/{escaped}", srv.base_url))
             .bearer_auth(&key)
             .send()
             .await
@@ -515,7 +515,7 @@ async fn exchanged_key_publishes_restores_and_is_audited_as_the_token() {
     let versions: Value = srv
         .client()
         .get(format!(
-            "{}/v3/ci-group/flat/acme.exchanged/index.json",
+            "{}/repository/ci-group/flat/acme.exchanged/index.json",
             srv.base_url
         ))
         .basic_auth("OIDC", Some(&key))
@@ -898,7 +898,7 @@ async fn an_unreachable_issuer_answers_503_so_the_job_retries() {
     );
     unavailable(
         srv.client()
-            .get(format!("{}/v3/ci-hosted/index.json", srv.base_url))
+            .get(format!("{}/repository/ci-hosted/index.json", srv.base_url))
             .basic_auth("oidc", Some(&token))
             .send()
             .await
@@ -1292,12 +1292,12 @@ async fn native_dotnet_pushes_with_only_the_key_and_restores_through_a_group() {
     write_config(
         &publish_dir,
         "forge_publish",
-        format!("{}/v3/ci-hosted/package", srv.base_url),
+        format!("{}/repository/ci-hosted/package", srv.base_url),
     );
     write_config(
         &consumer_dir,
         "forge",
-        format!("{}/v3/ci-group/index.json", srv.base_url),
+        format!("{}/repository/ci-group/index.json", srv.base_url),
     );
     let package = publish_dir.join("Acme.Native.1.0.0.nupkg");
     std::fs::write(&package, nupkg_without_dependencies("Acme.Native", "1.0.0")).unwrap();

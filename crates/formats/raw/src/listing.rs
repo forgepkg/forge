@@ -1,4 +1,4 @@
-//! Directory listings: `GET /raw/<repo>/<dir>/`, as HTML for browsers or as
+//! Directory listings: `GET /repository/<repo>/<dir>/`, as HTML for browsers or as
 //! JSON (`Accept: application/json`, or `?format=json`), a page at a time.
 //!
 //! A page holds at most `limit` entries (default 100, at most 1000) after
@@ -198,7 +198,7 @@ fn next_link(repo: &Repository, page: &Page, query: &ListQuery) -> Option<String
     ))
 }
 
-/// The path of the repository's URL (`/raw/<repository>`), for links and
+/// The path of the repository's URL (`/repository/<repository>`), for links and
 /// redirects that keep the client on the host it asked.
 pub fn base_path(base_url: &str) -> &str {
     base_url
@@ -349,7 +349,7 @@ mod tests {
         Repository {
             name: "bin".into(),
             kind: RepositoryKind::Hosted,
-            base_url: "https://forge.example.com/raw/bin".into(),
+            base_url: "https://forge.example.com/repository/bin".into(),
             inline: false,
             reserved_prefixes: Vec::new(),
         }
@@ -416,12 +416,15 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains("<title>Index of /raw/bin/a/</title>"),
+            html.contains("<title>Index of /repository/bin/a/</title>"),
             "{html}"
         );
         assert!(html.contains("href=\"../\""));
         assert!(html.contains("2026-10-21 10:58:44 UTC"), "{html}");
-        assert!(html.contains("/raw/bin/a/?after=%3Cx%3E+y.txt"), "{html}");
+        assert!(
+            html.contains("/repository/bin/a/?after=%3Cx%3E+y.txt"),
+            "{html}"
+        );
         assert!(!html.contains("<x>"));
     }
 

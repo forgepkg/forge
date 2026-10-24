@@ -130,7 +130,7 @@ export async function pushNupkg(repo: string, bytes: Buffer): Promise<Response> 
   const view = new Uint8Array(bytes.byteLength)
   view.set(bytes)
   form.append('package', new Blob([view]), 'package.nupkg')
-  return fetch(`${f.baseUrl}/v3/${repo}/package`, {
+  return fetch(`${f.baseUrl}/repository/${repo}/package`, {
     method: 'PUT',
     headers: { 'X-NuGet-ApiKey': f.adminToken },
     body: form,

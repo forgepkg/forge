@@ -10,7 +10,7 @@ import { renderApp } from '~/test/renderApp'
 
 /**
  * The tree browser of a raw repository (`/repos/<repo>?path=<dir>/`): the
- * directory's entries from `GET /raw/<repo>/<dir>/` (JSON), opening
+ * directory's entries from `GET /repository/<repo>/<dir>/` (JSON), opening
  * directories (the path lives in the URL), a file's details with its URL and
  * `curl` commands, the upload into the directory and the delete of a file
  * through `/browse/raw/<repo>/files`, and, for administrators, the delete of
@@ -35,7 +35,7 @@ function repo(kind: string): BrowseRepo {
     kind,
     online: true,
     format: 'raw',
-    url: 'https://forge.example.com/raw/binaries',
+    url: 'https://forge.example.com/repository/binaries',
   } as BrowseRepo
 }
 
@@ -81,8 +81,8 @@ function mockApi(me: Me, kind: string, listings: Record<string, RawListing>) {
     calls.push({ method, url, body: init?.body })
     if (url.pathname === '/admin/me') return Promise.resolve(json(me))
     if (url.pathname === '/browse/repos') return Promise.resolve(json([repo(kind)]))
-    if (url.pathname.startsWith('/raw/binaries/')) {
-      const dir = decodeURIComponent(url.pathname.slice('/raw/binaries/'.length))
+    if (url.pathname.startsWith('/repository/binaries/')) {
+      const dir = decodeURIComponent(url.pathname.slice('/repository/binaries/'.length))
       const listing = listings[dir]
       return Promise.resolve(listing ? json(listing) : new Response('not found', { status: 404 }))
     }
@@ -129,7 +129,7 @@ describe('RawBrowse', () => {
     expect(within(dir).getByText('7350/')).toBeInTheDocument()
     expect(within(dir).getByText('2.0 KiB')).toBeInTheDocument()
     expect(
-      calls.some((c) => c.url.pathname === '/raw/binaries/pdfium/' && c.url.searchParams.get('format') === 'json'),
+      calls.some((c) => c.url.pathname === '/repository/binaries/pdfium/' && c.url.searchParams.get('format') === 'json'),
     ).toBe(true)
 
     // A page further, and back up through the path.
@@ -159,12 +159,12 @@ describe('RawBrowse', () => {
     expect(within(details).getByText('ab'.repeat(32))).toBeInTheDocument()
     expect(
       within(details).getByDisplayValue(
-        'https://forge.example.com/raw/binaries/pdfium/pdfium%20linux.tgz',
+        'https://forge.example.com/repository/binaries/pdfium/pdfium%20linux.tgz',
       ),
     ).toBeInTheDocument()
     expect(within(details).getByRole('link', { name: 'Download' })).toHaveAttribute(
       'href',
-      '/raw/binaries/pdfium/pdfium%20linux.tgz',
+      '/repository/binaries/pdfium/pdfium%20linux.tgz',
     )
 
     await user.click(within(details).getByRole('button', { name: 'Delete…' }))
