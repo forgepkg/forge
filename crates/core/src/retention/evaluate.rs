@@ -571,6 +571,7 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            size_budget: None,
             rules,
         }
     }

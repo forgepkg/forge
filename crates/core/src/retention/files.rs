@@ -25,7 +25,7 @@ use forge_db::retention_dao::{self, AuditRow, RunSummary};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use super::model::{MAX_MIN_RUN_INTERVAL_SECONDS, POLICY_VERSION};
+use super::model::{SizeBudget, MAX_MIN_RUN_INTERVAL_SECONDS, POLICY_VERSION};
 
 fn default_true() -> bool {
     true
@@ -45,6 +45,8 @@ pub struct FileRetentionPolicy {
     pub dry_run_only: bool,
     #[serde(default = "default_interval")]
     pub min_run_interval_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_budget: Option<SizeBudget>,
     pub rules: Vec<FileRule>,
 }
 
@@ -94,8 +96,15 @@ pub fn validate_file_policy(policy: &FileRetentionPolicy, kind: RepoKind) -> Res
             "min_run_interval_seconds must be at most {MAX_MIN_RUN_INTERVAL_SECONDS}"
         ));
     }
-    if policy.rules.is_empty() {
+    if policy.rules.is_empty() && policy.size_budget.is_none() {
         return Err("a policy needs at least one rule".into());
+    }
+    if let Some(budget) = policy.size_budget {
+        if budget.max_bytes == 0
+            || budget.target_bytes.is_some_and(|target| target > budget.max_bytes)
+        {
+            return Err("size_budget.max_bytes must be greater than zero and target_bytes must not exceed max_bytes".into());
+        }
     }
     let mut ids = HashSet::new();
     for rule in &policy.rules {
@@ -104,6 +113,9 @@ pub fn validate_file_policy(policy: &FileRetentionPolicy, kind: RepoKind) -> Res
         }
         if !ids.insert(rule.id.as_str()) {
             return Err(format!("duplicate rule id {:?}", rule.id));
+        }
+        if rule.id == "size_budget" {
+            return Err("rule id \"size_budget\" is reserved".into());
         }
         if rule.keep_newest_per_directory.is_none()
             && rule.older_than_days.is_none()
@@ -386,6 +398,7 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            size_budget: None,
             rules,
         }
     }
@@ -477,5 +490,17 @@ mod tests {
             serde_json::json!({"version": 1, "rules": [{"id": "x", "keep_last_n": 1}]}),
         );
         assert!(parsed.is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn budget_only_file_policy_is_valid_and_budget_is_validated() {
+        let mut p = policy(Vec::new());
+        p.size_budget = Some(SizeBudget {
+            max_bytes: 100,
+            target_bytes: Some(80),
+        });
+        assert!(validate_file_policy(&p, RepoKind::Hosted).is_ok());
+        p.size_budget.as_mut().unwrap().max_bytes = 0;
+        assert!(validate_file_policy(&p, RepoKind::Hosted).is_err());
     }
 }

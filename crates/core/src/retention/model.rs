@@ -45,8 +45,29 @@ pub struct RetentionPolicy {
     /// never schedules runs less than 60 s apart, whatever this says.
     #[serde(default = "default_min_run_interval")]
     pub min_run_interval_seconds: u64,
-    /// The ordered list of rules. Must be non-empty.
+    /// Optional repository-wide logical-size budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_budget: Option<SizeBudget>,
+    /// The ordered list of rules. May be empty when a size budget is set.
     pub rules: Vec<RetentionRule>,
+}
+
+/// A logical repository-size limit with a lower target to avoid repeated churn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SizeBudget {
+    pub max_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bytes: Option<u64>,
+}
+
+impl SizeBudget {
+    /// Target watermark, defaulting to 90% of the maximum.
+    pub fn target_bytes(self) -> u64 {
+        self.target_bytes.unwrap_or_else(|| {
+            (self.max_bytes / 10) * 9 + ((self.max_bytes % 10) * 9) / 10
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -206,6 +227,12 @@ pub enum PolicyError {
     /// The policy had no rules.
     #[error("policy must contain at least one rule")]
     EmptyRules,
+    /// The size budget is zero or has an invalid target.
+    #[error("size_budget.max_bytes must be greater than zero and target_bytes must not exceed max_bytes")]
+    InvalidSizeBudget,
+    /// A rule uses the reserved budget audit id.
+    #[error("rule id \"size_budget\" is reserved")]
+    ReservedRuleId,
     /// Two rules shared the same `id`.
     #[error("duplicate rule id {0:?}")]
     DuplicateRuleId(String),
@@ -289,8 +316,15 @@ pub fn validate_policy(policy: &RetentionPolicy, repo_kind: RepoKind) -> Result<
     if repo_kind == RepoKind::Group {
         return Err(PolicyError::GroupRepoUnsupported);
     }
-    if policy.rules.is_empty() {
+    if policy.rules.is_empty() && policy.size_budget.is_none() {
         return Err(PolicyError::EmptyRules);
+    }
+    if let Some(budget) = policy.size_budget {
+        if budget.max_bytes == 0
+            || budget.target_bytes.is_some_and(|target| target > budget.max_bytes)
+        {
+            return Err(PolicyError::InvalidSizeBudget);
+        }
     }
     if policy.min_run_interval_seconds > MAX_MIN_RUN_INTERVAL_SECONDS {
         return Err(PolicyError::RunIntervalTooLarge {
@@ -302,6 +336,9 @@ pub fn validate_policy(policy: &RetentionPolicy, repo_kind: RepoKind) -> Result<
     for rule in &policy.rules {
         if rule.id.trim().is_empty() {
             return Err(PolicyError::EmptyRuleId);
+        }
+        if rule.id == "size_budget" {
+            return Err(PolicyError::ReservedRuleId);
         }
         if seen_ids.contains(&rule.id.as_str()) {
             return Err(PolicyError::DuplicateRuleId(rule.id.clone()));
@@ -433,6 +470,7 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            size_budget: None,
             rules: vec![example_hosted_rule()],
         }
     }
@@ -444,6 +482,7 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            size_budget: None,
             rules: vec![example_hosted_rule(), example_proxy_rule()],
         };
         let json = serde_json::to_string(&policy).unwrap();
@@ -521,6 +560,49 @@ mod tests {
         assert_eq!(
             validate_policy(&p, RepoKind::Hosted),
             Err(PolicyError::EmptyRules)
+        );
+    }
+
+    #[test]
+    fn size_budget_can_be_the_only_policy_content() {
+        let mut p = minimal_valid();
+        p.rules.clear();
+        p.size_budget = Some(SizeBudget {
+            max_bytes: 100,
+            target_bytes: None,
+        });
+        validate_policy(&p, RepoKind::Hosted).unwrap();
+        assert_eq!(p.size_budget.unwrap().target_bytes(), 90);
+    }
+
+    #[test]
+    fn rejects_invalid_size_budgets() {
+        for budget in [
+            SizeBudget {
+                max_bytes: 0,
+                target_bytes: None,
+            },
+            SizeBudget {
+                max_bytes: 100,
+                target_bytes: Some(101),
+            },
+        ] {
+            let mut p = minimal_valid();
+            p.size_budget = Some(budget);
+            assert_eq!(
+                validate_policy(&p, RepoKind::Hosted),
+                Err(PolicyError::InvalidSizeBudget)
+            );
+        }
+    }
+
+    #[test]
+    fn reserves_the_size_budget_audit_rule_id() {
+        let mut p = minimal_valid();
+        p.rules[0].id = "size_budget".into();
+        assert_eq!(
+            validate_policy(&p, RepoKind::Hosted),
+            Err(PolicyError::ReservedRuleId)
         );
     }
 

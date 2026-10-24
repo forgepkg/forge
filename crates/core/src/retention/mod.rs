@@ -26,7 +26,7 @@ pub use evaluate::{
 };
 pub use model::{
     validate_policy, Action, Criteria, PolicyError, ReleaseType, RetentionPolicy, RetentionRule,
-    Scope, POLICY_VERSION,
+    Scope, SizeBudget, POLICY_VERSION,
 };
 pub use worker::{FormatResolver, RetentionConfig, RetentionWorker, WorkerError};
 
