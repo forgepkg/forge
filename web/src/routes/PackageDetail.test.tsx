@@ -231,6 +231,46 @@ describe('PackageDetail', () => {
     await waitFor(() => expect(router.state.location.pathname).toBe('/repos/internal'))
   })
 
+  it('clears a pending deletion when browser navigation changes packages', async () => {
+    const user = userEvent.setup()
+    mockApi(
+      (_repo, id) => {
+        const version = id === 'other' ? '42.0.0' : '13.0.3'
+        return jsonResponse({
+          ...hostedDetail,
+          id,
+          original_id: id === 'other' ? 'Other.Package' : 'Newtonsoft.Json',
+          versions: [{ ...hostedDetail.versions[0], version, version_original: version }],
+        })
+      },
+      { me: adminMe, deleteVersion: () => new Response(null, { status: 204 }) },
+    )
+    const router = await renderDetail('/packages/internal/newtonsoft.json')
+    await router.navigate({
+      to: '/packages/$repo/$id',
+      params: { repo: 'internal', id: 'other' },
+    })
+    await screen.findByRole('heading', { name: 'Other.Package' })
+    await user.click(await screen.findByRole('button', { name: 'Delete' }))
+    expect(screen.getByRole('dialog')).toHaveTextContent('42.0.0')
+
+    router.history.back()
+
+    await screen.findByRole('heading', { name: 'Newtonsoft.Json' })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await user.click(await screen.findByRole('button', { name: 'Delete' }))
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toHaveTextContent('13.0.3')
+    expect(dialog).not.toHaveTextContent('42.0.0')
+    await user.click(within(dialog).getByRole('button', { name: 'Delete version' }))
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/admin/repositories/internal/packages/newtonsoft.json/13.0.3',
+        expect.objectContaining({ method: 'DELETE' }),
+      ),
+    )
+  })
+
   it('keeps the version and reports a failed deletion, allowing a retry', async () => {
     const user = userEvent.setup()
     const deleteVersion = vi.fn()

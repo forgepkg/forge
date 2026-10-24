@@ -26,8 +26,13 @@ import {
 } from '~/components/ui'
 
 export const Route = createFileRoute('/_app/packages/$repo/$id')({
-  component: PackageDetailPage,
+  component: PackageDetailRoute,
 })
+
+function PackageDetailRoute() {
+  const { repo, id } = Route.useParams()
+  return <PackageDetailPage key={JSON.stringify([repo, id])} />
+}
 
 /**
  * Package-detail view: versions with per-version metadata + delay/retention
