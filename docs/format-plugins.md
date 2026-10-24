@@ -57,6 +57,15 @@ crates/formats/raw/
 ├── src/sidecar.rs # .sha256/.sha512/.sha1/.md5 from the stored digests
 ├── src/form.rs    # multipart uploads, Nexus' field names
 └── tests/         # the protocol against canned answers
+
+crates/formats/npm/
+├── Cargo.toml
+├── src/lib.rs     # DESCRIPTOR (mount "/npm", kinds hosted/proxy/group, Bearer
+│                  # upstream tokens) and impl FormatPlugin for Npm
+├── src/protocol.rs  # the registry API: packuments, publishes, dist-tags, logins
+├── src/publish.rs # the tarball inside a publish document, as it streams
+├── src/proxy.rs   # proxies: reading another registry (upstream)
+└── tests/         # the protocol against canned answers
 ```
 
 The pieces:

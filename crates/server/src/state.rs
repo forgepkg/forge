@@ -256,7 +256,7 @@ impl FormatRegistry {
 
     /// The repository kinds format `id` supports, `None` when it is not
     /// installed. Docker has every kind; a format plugin serves the kinds its
-    /// descriptor names (NuGet's and raw's all three).
+    /// descriptor names (NuGet's, npm's and raw's all three).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
         if Self::is_native(id) {
             return Some(vec!["hosted", "proxy", "group"]);
