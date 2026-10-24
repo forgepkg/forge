@@ -477,11 +477,11 @@ export function draftFromPolicy(
     sizeBudgetMaxGiB:
       policy.size_budget === undefined
         ? ''
-        : String(policy.size_budget.max_bytes / GIB),
+        : (policy.size_budget.max_bytes / GIB).toFixed(20).replace(/\.?0+$/, ''),
     sizeBudgetTargetGiB:
       policy.size_budget?.target_bytes === undefined
         ? ''
-        : String(policy.size_budget.target_bytes / GIB),
+        : (policy.size_budget.target_bytes / GIB).toFixed(20).replace(/\.?0+$/, ''),
     rules: rules.map((r) => ruleFromJson(shape, r as unknown as Record<string, unknown>)),
   }
 }
@@ -521,8 +521,8 @@ export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErro
     failed = true
   }
   if (targetGiB !== '') {
-    if (!/^\d+(\.\d+)?$/.test(targetGiB) || Number(targetGiB) <= 0) {
-      errors.sizeBudgetTargetGiB = 'Enter a positive size in GiB, or leave it empty.'
+    if (!/^\d+(\.\d+)?$/.test(targetGiB) || Number(targetGiB) < 0) {
+      errors.sizeBudgetTargetGiB = 'Enter a nonnegative size in GiB, or leave it empty.'
       failed = true
     } else if (!validMax) {
       errors.sizeBudgetTargetGiB = 'Set a maximum size first.'

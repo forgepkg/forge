@@ -470,6 +470,15 @@ pub async fn preview(
     };
 
     let evaluated = hosted.len() + proxy.len();
+    let has_size_budget = policy.size_budget.is_some();
+    let tagged_hosted_ids = if has_size_budget {
+        match forge_core::retention::tagged_candidate_ids(&state.pool, repo.id, &hosted).await {
+            Ok(tagged) => tagged,
+            Err(e) => return db_error(e),
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
     // The evaluator is CPU-bound and grows with the repository: run it on the
     // blocking pool so a large preview does not stall a runtime worker thread.
     let size_before = if policy.size_budget.is_some() {
@@ -481,7 +490,8 @@ pub async fn preview(
         0
     };
     let evaluation = tokio::task::spawn_blocking(move || {
-        let decisions = evaluate(format.as_ref(), now, &policy, &hosted);
+        let mut decisions = evaluate(format.as_ref(), now, &policy, &hosted);
+        decisions.retain(|decision| !tagged_hosted_ids.contains(&decision.component_id));
         let proxy_decisions = evaluate_proxy(format.as_ref(), now, &policy, &proxy);
         let budget = policy.size_budget.map(|_| {
             forge_core::retention::evaluate::evaluate_size_budget(
@@ -489,9 +499,12 @@ pub async fn preview(
                 &policy,
                 &hosted,
                 &proxy,
-                &decisions,
-                &proxy_decisions,
                 size_before,
+                forge_core::retention::evaluate::PackageBudgetInputs {
+                    hosted_decisions: &decisions,
+                    proxy_decisions: &proxy_decisions,
+                    tagged_hosted_ids: &tagged_hosted_ids,
+                },
             )
         });
         (decisions, proxy_decisions, budget)
@@ -504,11 +517,12 @@ pub async fn preview(
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
-    // As the worker does: a tagged version (npm's dist-tags) is never touched.
-    if let Err(e) =
-        forge_core::retention::spare_protected(&state.pool, repo.id, &mut decisions).await
-    {
-        return db_error(e);
+    if !has_size_budget {
+        if let Err(e) =
+            forge_core::retention::spare_protected(&state.pool, repo.id, &mut decisions).await
+        {
+            return db_error(e);
+        }
     }
     if let Some(plan) = &mut budget {
         let selected_bytes_before: u64 = plan
@@ -529,7 +543,7 @@ pub async fn preview(
         plan.size_after = plan
             .size_after
             .saturating_add(selected_bytes_before.saturating_sub(selected_bytes_after));
-        plan.target_reached = plan.size_after <= plan.target_bytes;
+        plan.target_reached = !plan.target_attempted || plan.size_after <= plan.target_bytes;
         let budget_deleted: std::collections::HashSet<i64> =
             plan.hosted.iter().map(|d| d.component_id).collect();
         decisions.retain(|d| {

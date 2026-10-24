@@ -96,6 +96,20 @@ describe('retention policy model', () => {
     expect(validateDraft('file', draft)?.sizeBudgetTargetGiB).toMatch(/must not exceed/)
     draft.sizeBudgetMaxGiB = '0'
     expect(validateDraft('file', draft)?.sizeBudgetMaxGiB).toMatch(/positive size/)
+
+    const smallStored = {
+      version: 1,
+      size_budget: { max_bytes: 100, target_bytes: 0 },
+      rules: [],
+    } as unknown as RetentionPolicy
+    const smallDraft = draftFromPolicy('file', smallStored)
+    expect(smallDraft.sizeBudgetMaxGiB).not.toMatch(/[eE]/)
+    expect(smallDraft.sizeBudgetTargetGiB).toBe('0')
+    expect(validateDraft('file', smallDraft)).toBeNull()
+    expect(buildPolicy('file', smallDraft).size_budget).toEqual({
+      max_bytes: 100,
+      target_bytes: 0,
+    })
   })
 
   it('refuses empty and duplicate ids, bad numbers and no rules', () => {

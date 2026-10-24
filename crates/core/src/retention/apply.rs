@@ -37,7 +37,7 @@
 //! we still record `dry_run = true` audit rows so an operator can inspect what
 //! *would* happen.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Duration;
 use serde_json::Value as JsonValue;
@@ -205,7 +205,7 @@ async fn decided_now(
     ctx: &ApplyContext<'_>,
     fence: &RunFence<'_>,
     package_name: &str,
-    size_budget: bool,
+    budget_ids: &HashSet<i64>,
 ) -> Result<HashMap<i64, Action>, sqlx::Error> {
     let candidates: Vec<CandidateComponent> = retention_dao::lock_package_candidates(
         tx,
@@ -226,16 +226,28 @@ async fn decided_now(
     })
     .collect();
     let now = ctx.evaluated_at.unwrap_or_else(chrono::Utc::now);
-    let mut decisions: HashMap<i64, Action> =
-        evaluate(fence.format, now, fence.policy, &candidates)
-            .into_iter()
-            .map(|again| (again.component_id, again.action))
-            .collect();
-    if size_budget && fence.policy.size_budget.is_some() {
+    let mut ordinary = evaluate(fence.format, now, fence.policy, &candidates);
+    if !budget_ids.is_empty() {
+        let tagged: HashSet<(String, String)> =
+            forge_db::tag_dao::tagged_versions(&mut *tx, ctx.repository_id)
+                .await?
+                .into_iter()
+                .collect();
+        ordinary.retain(|decision| {
+            !tagged.contains(&(decision.package_name.clone(), decision.version.clone()))
+        });
+    }
+    let mut decisions: HashMap<i64, Action> = ordinary
+        .iter()
+        .map(|again| (again.component_id, again.action))
+        .collect();
+    if !budget_ids.is_empty() && fence.policy.size_budget.is_some() {
         let (protected, _) =
-            size_budget_protected_ids(fence.format, fence.policy, &candidates, &[]);
+            size_budget_protected_ids(fence.format, fence.policy, &candidates, &[], &ordinary, &[]);
         for candidate in &candidates {
-            if !protected.contains(&candidate.component_id) {
+            if budget_ids.contains(&candidate.component_id)
+                && !protected.contains(&candidate.component_id)
+            {
                 decisions.insert(candidate.component_id, Action::HardDelete);
             }
         }
@@ -304,16 +316,12 @@ async fn apply_hosted_batch(
             {
                 return Ok(Step::Stop);
             }
-            Some(
-                decided_now(
-                    &mut tx,
-                    ctx,
-                    fence,
-                    &first.package_name,
-                    batch.iter().any(|d| d.rule_id == "size_budget"),
-                )
-                .await?,
-            )
+            let budget_ids: HashSet<i64> = batch
+                .iter()
+                .filter(|d| d.rule_id == "size_budget")
+                .map(|d| d.component_id)
+                .collect();
+            Some(decided_now(&mut tx, ctx, fence, &first.package_name, &budget_ids).await?)
         }
         None => None,
     };

@@ -330,13 +330,34 @@ impl RetentionWorker {
             None
         };
 
+        // Tagged versions stay in the snapshot as survivors, but their ordinary
+        // decisions and budget candidacy are excluded before planning.
+        let has_size_budget = budget_size_before.is_some();
+        let tagged_hosted_ids = if has_size_budget {
+            let tagged =
+                crate::retention::tagged_candidate_ids(&self.pool, repo.repository_id, &hosted)
+                    .await?;
+            if !tagged.is_empty() {
+                tracing::info!(
+                    repo = %repo.name,
+                    spared = tagged.len(),
+                    "retention spared tagged versions"
+                );
+            }
+            tagged
+        } else {
+            std::collections::HashSet::new()
+        };
+
         // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
         // with the repository, so it must not stall a runtime worker thread. ──
         let evaluation = {
             let format = Arc::clone(&format);
             let policy = policy.clone();
             tokio::task::spawn_blocking(move || {
-                let hosted_decisions = evaluate(format.as_ref(), now, &policy, &hosted);
+                let mut hosted_decisions = evaluate(format.as_ref(), now, &policy, &hosted);
+                hosted_decisions
+                    .retain(|decision| !tagged_hosted_ids.contains(&decision.component_id));
                 let proxy_decisions = evaluate_proxy(format.as_ref(), now, &policy, &proxy);
                 let budget = budget_size_before
                     .zip(policy.size_budget)
@@ -346,9 +367,12 @@ impl RetentionWorker {
                             &policy,
                             &hosted,
                             &proxy,
-                            &hosted_decisions,
-                            &proxy_decisions,
                             size_before,
+                            crate::retention::evaluate::PackageBudgetInputs {
+                                hosted_decisions: &hosted_decisions,
+                                proxy_decisions: &proxy_decisions,
+                                tagged_hosted_ids: &tagged_hosted_ids,
+                            },
                         )
                     });
                 (hosted_decisions, proxy_decisions, budget)
@@ -363,15 +387,16 @@ impl RetentionWorker {
                     Err(e) => e.to_string(), // cancelled: the runtime is shutting down
                 })
             })?;
-        // A version a package tag names is never touched.
-        let spared = crate::retention::spare_protected(
-            &self.pool,
-            repo.repository_id,
-            &mut hosted_decisions,
-        )
-        .await?;
-        if spared > 0 {
-            tracing::info!(repo = %repo.name, spared, "retention spared tagged versions");
+        if !has_size_budget {
+            let spared = crate::retention::spare_protected(
+                &self.pool,
+                repo.repository_id,
+                &mut hosted_decisions,
+            )
+            .await?;
+            if spared > 0 {
+                tracing::info!(repo = %repo.name, spared, "retention spared tagged versions");
+            }
         }
 
         if let Some(plan) = &mut budget_plan {
@@ -394,7 +419,7 @@ impl RetentionWorker {
             plan.size_after = plan
                 .size_after
                 .saturating_add(selected_bytes_before.saturating_sub(selected_bytes_after));
-            plan.target_reached = plan.size_after <= plan.target_bytes;
+            plan.target_reached = !plan.target_attempted || plan.size_after <= plan.target_bytes;
             let budget_deleted: std::collections::HashSet<i64> =
                 plan.hosted.iter().map(|d| d.component_id).collect();
             hosted_decisions.retain(|d| {
@@ -439,7 +464,8 @@ impl RetentionWorker {
             summary.size_before = Some(plan.size_before);
             summary.size_after = Some(size_after);
             summary.target_bytes = Some(plan.target_bytes);
-            summary.target_reached = Some(size_after <= plan.target_bytes);
+            summary.target_reached =
+                Some(!plan.target_attempted || size_after <= plan.target_bytes);
         }
 
         // ── Finish: record summary, advance schedule, clear lease. ──
@@ -519,7 +545,8 @@ impl RetentionWorker {
                 summary.size_before = Some(budget.size_before);
                 summary.size_after = Some(size_after);
                 summary.target_bytes = Some(budget.target_bytes);
-                summary.target_reached = Some(size_after <= budget.target_bytes);
+                summary.target_reached =
+                    Some(!budget.target_attempted || size_after <= budget.target_bytes);
             }
         }
         if !retention_dao::finish_run(
@@ -587,7 +614,8 @@ impl RetentionWorker {
                 summary.size_before = Some(budget.size_before);
                 summary.size_after = Some(size_after);
                 summary.target_bytes = Some(budget.target_bytes);
-                summary.target_reached = Some(size_after <= budget.target_bytes);
+                summary.target_reached =
+                    Some(!budget.target_attempted || size_after <= budget.target_bytes);
             }
         }
         if !retention_dao::finish_run(

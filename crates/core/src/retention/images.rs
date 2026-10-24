@@ -195,6 +195,7 @@ pub struct ImageBudgetSummary {
     pub size_before: u64,
     pub size_after: u64,
     pub target_bytes: u64,
+    pub target_attempted: bool,
     pub target_reached: bool,
 }
 
@@ -425,6 +426,7 @@ pub fn evaluate_image_size_budget(
                 size_before,
                 size_after,
                 target_bytes,
+                target_attempted: false,
                 target_reached: true,
             }),
         );
@@ -434,7 +436,7 @@ pub fn evaluate_image_size_budget(
         .iter()
         .map(|t| (t.image.as_str(), t.tag.as_str()))
         .collect();
-    let mut remaining_tags: Vec<&RetentionTag> = tags
+    let remaining_tags: Vec<&RetentionTag> = tags
         .iter()
         .filter(|t| {
             !deleted_rule_tags.contains(&(t.image.as_str(), t.tag.as_str()))
@@ -442,67 +444,19 @@ pub fn evaluate_image_size_budget(
         })
         .collect();
     let protected_tags = budget_protected_tags(policy, tags);
-    let manifest_by_id: HashMap<i64, &RetentionManifest> =
-        manifests.iter().map(|m| (m.id, m)).collect();
-    let manifest_by_digest: HashMap<(&str, &str), i64> = manifests
-        .iter()
-        .map(|m| ((m.image.as_str(), m.digest.as_str()), m.id))
-        .collect();
+    let mut evictor = ImageBudgetEvictor::new(manifests, remaining, &remaining_tags);
     let mut budget_decisions = ImageDecisions::default();
+    let mut budget_run = ImageBudgetRun {
+        size_after,
+        target_bytes,
+        max_bytes: budget.max_bytes,
+        manifest_blobs: &manifest_blobs,
+        object_sizes: &object_sizes,
+        references: &mut references,
+    };
+    evict_budget_manifests(&mut evictor, &mut budget_run, &mut budget_decisions);
 
-    let mut untagged: Vec<&RetentionManifest> = manifests
-        .iter()
-        .filter(|m| remaining.contains(&m.id))
-        .filter(|m| !remaining_tags.iter().any(|t| t.manifest_id == m.id))
-        .collect();
-    untagged.sort_by(|a, b| {
-        a.last_pulled_at
-            .unwrap_or(a.created_at)
-            .max(a.created_at)
-            .cmp(&b.last_pulled_at.unwrap_or(b.created_at).max(b.created_at))
-            .then_with(|| a.created_at.cmp(&b.created_at))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    while size_after > target_bytes {
-        let kept = protected_manifests(
-            &remaining,
-            &remaining_tags,
-            &manifest_by_id,
-            &manifest_by_digest,
-        );
-        let candidate = untagged.iter().copied().find(|m| {
-            remaining.contains(&m.id)
-                && !kept.contains(&m.id)
-                && !manifests.iter().any(|parent| {
-                    remaining.contains(&parent.id)
-                        && parent.id != m.id
-                        && parent.children.contains(&m.digest)
-                })
-        });
-        let Some(manifest) = candidate else {
-            break;
-        };
-        size_after = size_after.saturating_sub(remove_manifest_objects(
-            manifest.id,
-            &mut remaining,
-            &manifest_blobs,
-            &object_sizes,
-            &mut references,
-        ));
-        budget_decisions.manifests.push(ManifestDecision {
-            image: manifest.image.clone(),
-            manifest_id: manifest.id,
-            digest: manifest.digest.clone(),
-            rule_id: "size_budget".into(),
-            reason: serde_json::json!({
-                "size_budget": budget.max_bytes,
-                "target_bytes": target_bytes,
-                "last_used_at": manifest.last_pulled_at.unwrap_or(manifest.created_at).max(manifest.created_at),
-            }),
-        });
-    }
-
-    let mut tag_candidates: Vec<&RetentionTag> = remaining_tags.clone();
+    let mut tag_candidates: Vec<&RetentionTag> = remaining_tags;
     tag_candidates.sort_by(|a, b| {
         a.last_pulled_at
             .unwrap_or(a.updated_at)
@@ -512,20 +466,18 @@ pub fn evaluate_image_size_budget(
             .then_with(|| a.tag.cmp(&b.tag))
     });
     for tag in tag_candidates {
-        if size_after <= target_bytes {
+        if budget_run.size_after <= target_bytes {
             break;
         }
         if protected_tags.contains(&(tag.image.clone(), tag.tag.clone())) {
             continue;
         }
-        let image_tag_count = remaining_tags
-            .iter()
-            .filter(|t| t.image == tag.image)
-            .count();
-        if image_tag_count <= 1 {
+        if evictor.image_tag_count(&tag.image) <= 1 {
             continue;
         }
-        remaining_tags.retain(|t| !(t.image == tag.image && t.tag == tag.tag));
+        if !evictor.remove_tag(tag) {
+            continue;
+        }
         budget_decisions.tags.push(TagDecision {
             image: tag.image.clone(),
             tag: tag.tag.clone(),
@@ -533,61 +485,329 @@ pub fn evaluate_image_size_budget(
             digest: tag.digest.clone(),
             rule_id: "size_budget".into(),
             reason: serde_json::json!({
-                "size_budget": budget.max_bytes,
+                "size_budget": budget_run.max_bytes,
                 "target_bytes": target_bytes,
                 "last_used_at": tag.last_pulled_at.unwrap_or(tag.updated_at).max(tag.updated_at),
             }),
         });
-        if !remaining_tags
-            .iter()
-            .any(|t| t.manifest_id == tag.manifest_id)
-        {
-            let kept = protected_manifests(
-                &remaining,
-                &remaining_tags,
-                &manifest_by_id,
-                &manifest_by_digest,
-            );
-            let can_delete = remaining.contains(&tag.manifest_id)
-                && !kept.contains(&tag.manifest_id)
-                && !manifests.iter().any(|parent| {
-                    remaining.contains(&parent.id)
-                        && parent.id != tag.manifest_id
-                        && parent.children.contains(&tag.digest)
-                });
-            if can_delete {
-                let manifest = manifest_by_id[&tag.manifest_id];
-                size_after = size_after.saturating_sub(remove_manifest_objects(
-                    manifest.id,
-                    &mut remaining,
-                    &manifest_blobs,
-                    &object_sizes,
-                    &mut references,
-                ));
-                budget_decisions.manifests.push(ManifestDecision {
-                    image: manifest.image.clone(),
-                    manifest_id: manifest.id,
-                    digest: manifest.digest.clone(),
-                    rule_id: "size_budget".into(),
-                    reason: serde_json::json!({
-                        "size_budget": budget.max_bytes,
-                        "target_bytes": target_bytes,
-                        "last_used_at": manifest.last_pulled_at.unwrap_or(manifest.created_at).max(manifest.created_at),
-                    }),
-                });
-            }
-        }
+        evict_budget_manifests(&mut evictor, &mut budget_run, &mut budget_decisions);
     }
 
     (
         budget_decisions,
         Some(ImageBudgetSummary {
             size_before,
-            size_after,
+            size_after: budget_run.size_after,
             target_bytes,
-            target_reached: size_after <= target_bytes,
+            target_attempted: true,
+            target_reached: budget_run.size_after <= target_bytes,
         }),
     )
+}
+
+type ManifestCandidateKey = (DateTime<Utc>, DateTime<Utc>, i64);
+
+struct ImageBudgetEvictor<'a> {
+    remaining: HashSet<i64>,
+    manifests: HashMap<i64, &'a RetentionManifest>,
+    children: HashMap<i64, Vec<i64>>,
+    outgoing: HashMap<i64, Vec<i64>>,
+    referrers: HashMap<i64, Vec<i64>>,
+    referrer_subject: HashMap<i64, i64>,
+    parent_counts: HashMap<i64, usize>,
+    tags_by_manifest: HashMap<i64, usize>,
+    image_tag_counts: HashMap<String, usize>,
+    remaining_tags: HashSet<(String, String)>,
+    protection_roots: HashMap<i64, usize>,
+    protected_incoming: HashMap<i64, usize>,
+    protected: HashSet<i64>,
+    candidates: std::collections::BTreeSet<ManifestCandidateKey>,
+    candidate_keys: HashMap<i64, ManifestCandidateKey>,
+}
+
+struct ImageBudgetRun<'a, 'b> {
+    size_after: u64,
+    target_bytes: u64,
+    max_bytes: u64,
+    manifest_blobs: &'a HashMap<i64, HashSet<String>>,
+    object_sizes: &'a HashMap<&'b str, u64>,
+    references: &'a mut HashMap<String, usize>,
+}
+
+impl<'a> ImageBudgetEvictor<'a> {
+    fn new(
+        manifests: &'a [RetentionManifest],
+        remaining: HashSet<i64>,
+        tags: &[&RetentionTag],
+    ) -> Self {
+        let manifest_by_id: HashMap<i64, &RetentionManifest> = manifests
+            .iter()
+            .filter(|manifest| remaining.contains(&manifest.id))
+            .map(|manifest| (manifest.id, manifest))
+            .collect();
+        let manifest_by_digest: HashMap<(&str, &str), i64> = manifest_by_id
+            .values()
+            .map(|manifest| {
+                (
+                    (manifest.image.as_str(), manifest.digest.as_str()),
+                    manifest.id,
+                )
+            })
+            .collect();
+        let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut outgoing: HashMap<i64, HashSet<i64>> = HashMap::new();
+        let mut referrers: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut referrer_subject = HashMap::new();
+        let mut parent_counts = HashMap::new();
+        for manifest in manifest_by_id.values() {
+            for digest in &manifest.children {
+                if let Some(child_id) =
+                    manifest_by_digest.get(&(manifest.image.as_str(), digest.as_str()))
+                {
+                    children.entry(manifest.id).or_default().push(*child_id);
+                    *parent_counts.entry(*child_id).or_default() += 1;
+                    outgoing.entry(manifest.id).or_default().insert(*child_id);
+                }
+            }
+            if let Some(subject) = &manifest.subject_digest {
+                if let Some(subject_id) =
+                    manifest_by_digest.get(&(manifest.image.as_str(), subject.as_str()))
+                {
+                    referrers.entry(*subject_id).or_default().push(manifest.id);
+                    referrer_subject.insert(manifest.id, *subject_id);
+                    outgoing.entry(*subject_id).or_default().insert(manifest.id);
+                }
+            }
+        }
+        let mut tags_by_manifest = HashMap::new();
+        let mut image_tag_counts = HashMap::new();
+        let mut remaining_tags = HashSet::new();
+        let mut protection_roots = HashMap::new();
+        for tag in tags {
+            *tags_by_manifest.entry(tag.manifest_id).or_default() += 1;
+            *image_tag_counts.entry(tag.image.clone()).or_default() += 1;
+            remaining_tags.insert((tag.image.clone(), tag.tag.clone()));
+            *protection_roots.entry(tag.manifest_id).or_default() += 1;
+        }
+        let mut evictor = Self {
+            remaining,
+            manifests: manifest_by_id,
+            children,
+            outgoing: outgoing
+                .into_iter()
+                .map(|(id, targets)| (id, targets.into_iter().collect()))
+                .collect(),
+            referrers,
+            referrer_subject,
+            parent_counts,
+            tags_by_manifest,
+            image_tag_counts,
+            remaining_tags,
+            protection_roots,
+            protected_incoming: HashMap::new(),
+            protected: HashSet::new(),
+            candidates: std::collections::BTreeSet::new(),
+            candidate_keys: HashMap::new(),
+        };
+        let roots: Vec<i64> = evictor.protection_roots.keys().copied().collect();
+        for root in roots {
+            evictor.update_protection(root, true);
+        }
+        let ids: Vec<i64> = evictor.remaining.iter().copied().collect();
+        for id in ids {
+            evictor.refresh_candidate(id);
+        }
+        evictor
+    }
+
+    fn image_tag_count(&self, image: &str) -> usize {
+        self.image_tag_counts
+            .get(image)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn remove_tag(&mut self, tag: &RetentionTag) -> bool {
+        if !self
+            .remaining_tags
+            .remove(&(tag.image.clone(), tag.tag.clone()))
+        {
+            return false;
+        }
+        if let Some(count) = self.tags_by_manifest.get_mut(&tag.manifest_id) {
+            *count -= 1;
+        }
+        if let Some(count) = self.image_tag_counts.get_mut(&tag.image) {
+            *count -= 1;
+        }
+        let root_count = self
+            .protection_roots
+            .get_mut(&tag.manifest_id)
+            .expect("every active tag protects its manifest");
+        *root_count -= 1;
+        let should_unprotect = *root_count == 0
+            && self
+                .protected_incoming
+                .get(&tag.manifest_id)
+                .copied()
+                .unwrap_or_default()
+                == 0;
+        let changed = if should_unprotect {
+            self.update_protection(tag.manifest_id, false)
+        } else {
+            Vec::new()
+        };
+        self.refresh_candidate(tag.manifest_id);
+        for id in changed {
+            self.refresh_candidate(id);
+        }
+        true
+    }
+
+    fn pop_candidate(&mut self) -> Option<i64> {
+        let key = self.candidates.pop_first()?;
+        self.candidate_keys.remove(&key.2);
+        Some(key.2)
+    }
+
+    fn manifest_removed(&mut self, id: i64) {
+        if let Some(key) = self.candidate_keys.remove(&id) {
+            self.candidates.remove(&key);
+        }
+        let children = self.children.get(&id).cloned().unwrap_or_default();
+        for child in children {
+            if let Some(count) = self.parent_counts.get_mut(&child) {
+                *count -= 1;
+            }
+            self.refresh_candidate(child);
+        }
+        let referrers = self.referrers.get(&id).cloned().unwrap_or_default();
+        for referrer in referrers {
+            self.refresh_candidate(referrer);
+        }
+    }
+
+    fn refresh_candidate(&mut self, id: i64) {
+        if let Some(key) = self.candidate_keys.remove(&id) {
+            self.candidates.remove(&key);
+        }
+        let Some(manifest) = self.manifests.get(&id) else {
+            return;
+        };
+        let subject_remains = self
+            .referrer_subject
+            .get(&id)
+            .is_some_and(|subject| self.remaining.contains(subject));
+        if !self.remaining.contains(&id)
+            || self.tags_by_manifest.get(&id).copied().unwrap_or_default() > 0
+            || self.parent_counts.get(&id).copied().unwrap_or_default() > 0
+            || self.protected.contains(&id)
+            || subject_remains
+        {
+            return;
+        }
+        let key = (
+            manifest
+                .last_pulled_at
+                .unwrap_or(manifest.created_at)
+                .max(manifest.created_at),
+            manifest.created_at,
+            id,
+        );
+        self.candidates.insert(key);
+        self.candidate_keys.insert(id, key);
+    }
+
+    fn update_protection(&mut self, id: i64, protect: bool) -> Vec<i64> {
+        let mut changed = Vec::new();
+        let mut pending = vec![(id, protect)];
+        while let Some((current, add)) = pending.pop() {
+            if !self.remaining.contains(&current) {
+                continue;
+            }
+            if add {
+                if !self.protected.insert(current) {
+                    continue;
+                }
+                changed.push(current);
+                for target in self.outgoing.get(&current).into_iter().flatten() {
+                    let count = self.protected_incoming.entry(*target).or_default();
+                    *count += 1;
+                    if *count == 1
+                        && self
+                            .protection_roots
+                            .get(target)
+                            .copied()
+                            .unwrap_or_default()
+                            == 0
+                    {
+                        pending.push((*target, true));
+                    }
+                }
+            } else {
+                if !self.protected.remove(&current) {
+                    continue;
+                }
+                changed.push(current);
+                for target in self.outgoing.get(&current).into_iter().flatten() {
+                    if let Some(count) = self.protected_incoming.get_mut(target) {
+                        *count -= 1;
+                        if *count == 0
+                            && self
+                                .protection_roots
+                                .get(target)
+                                .copied()
+                                .unwrap_or_default()
+                                == 0
+                        {
+                            pending.push((*target, false));
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+}
+
+fn evict_budget_manifests(
+    evictor: &mut ImageBudgetEvictor<'_>,
+    budget: &mut ImageBudgetRun<'_, '_>,
+    decisions: &mut ImageDecisions,
+) {
+    while budget.size_after > budget.target_bytes {
+        let Some(id) = evictor.pop_candidate() else {
+            break;
+        };
+        let Some(manifest) = evictor.manifests.get(&id) else {
+            continue;
+        };
+        let image = manifest.image.clone();
+        let digest = manifest.digest.clone();
+        let last_used_at = manifest
+            .last_pulled_at
+            .unwrap_or(manifest.created_at)
+            .max(manifest.created_at);
+        budget.size_after = budget.size_after.saturating_sub(remove_manifest_objects(
+            id,
+            &mut evictor.remaining,
+            budget.manifest_blobs,
+            budget.object_sizes,
+            budget.references,
+        ));
+        evictor.manifest_removed(id);
+        decisions.manifests.push(ManifestDecision {
+            image,
+            manifest_id: id,
+            digest,
+            rule_id: "size_budget".into(),
+            reason: serde_json::json!({
+                "size_budget": budget.max_bytes,
+                "target_bytes": budget.target_bytes,
+                "last_used_at": last_used_at,
+            }),
+        });
+    }
 }
 
 fn remove_manifest_objects(
@@ -920,7 +1140,7 @@ async fn decided_now(
         selected_tags.insert((tag.tag.clone(), tag.manifest_id));
         remaining_tags.retain(|t| !(t.image == tag.image && t.tag == tag.tag));
     }
-    let remaining_manifests: HashSet<i64> = manifests
+    let mut remaining_manifests: HashSet<i64> = manifests
         .iter()
         .map(|m| m.id)
         .filter(|id| !selected_manifests.contains(id))
@@ -941,17 +1161,23 @@ async fn decided_now(
         let ImageDecision::Manifest(manifest) = decision else {
             continue;
         };
+        let Some(current) = manifest_by_id.get(&manifest.manifest_id) else {
+            continue;
+        };
+        let subject_remains = current
+            .subject_digest
+            .as_deref()
+            .and_then(|subject| manifest_by_digest.get(&(current.image.as_str(), subject)))
+            .is_some_and(|subject_id| remaining_manifests.contains(subject_id));
         if manifest.rule_id != "size_budget"
             || protected.contains(&manifest.manifest_id)
             || remaining_tags
                 .iter()
                 .any(|t| t.manifest_id == manifest.manifest_id)
+            || subject_remains
         {
             continue;
         }
-        let Some(current) = manifest_by_id.get(&manifest.manifest_id) else {
-            continue;
-        };
         if reason_time(&manifest.reason).is_some_and(|cutoff| {
             current
                 .last_pulled_at
@@ -962,6 +1188,7 @@ async fn decided_now(
             continue;
         }
         selected_manifests.insert(manifest.manifest_id);
+        remaining_manifests.remove(&manifest.manifest_id);
     }
     Ok(DecidedNow {
         tags: selected_tags,
@@ -1344,5 +1571,93 @@ mod tests {
         let summary = summary.unwrap();
         assert_eq!(summary.size_after, 40);
         assert!(!summary.target_reached);
+    }
+
+    #[test]
+    fn removing_a_tagged_index_reconsiders_its_newly_untagged_children() {
+        let tags = vec![tag("app", "old-index", 1, 20), tag("app", "new", 3, 1)];
+        let manifests = vec![
+            manifest("app", 1, None, &[2], None),
+            manifest("app", 2, Some(90), &[], None),
+            manifest("app", 3, None, &[], None),
+        ];
+        let objects = [1, 2, 3]
+            .into_iter()
+            .map(|manifest_id| oci_dao::RetentionManifestObject {
+                manifest_id,
+                blob_sha256: format!("manifest-{manifest_id}"),
+                size: if manifest_id == 1 { 10 } else { 40 },
+            })
+            .collect::<Vec<_>>();
+        let mut p = policy(Vec::new());
+        p.size_budget = Some(SizeBudget {
+            max_bytes: 80,
+            target_bytes: Some(50),
+        });
+        let (decisions, summary) = evaluate_image_size_budget(
+            &p,
+            &tags,
+            &manifests,
+            &objects,
+            &[],
+            &ImageDecisions::default(),
+            90,
+        );
+        assert_eq!(
+            decisions
+                .tags
+                .iter()
+                .map(|t| t.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-index"]
+        );
+        assert_eq!(
+            decisions
+                .manifests
+                .iter()
+                .map(|m| m.manifest_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(summary.unwrap().size_after, 40);
+    }
+
+    #[test]
+    fn size_budget_removes_an_untagged_subject_before_its_referrer() {
+        let manifests = vec![
+            manifest("app", 1, Some(90), &[], None),
+            manifest("app", 2, Some(90), &[], Some(1)),
+        ];
+        let objects = [1, 2]
+            .into_iter()
+            .map(|manifest_id| oci_dao::RetentionManifestObject {
+                manifest_id,
+                blob_sha256: format!("manifest-{manifest_id}"),
+                size: 30,
+            })
+            .collect::<Vec<_>>();
+        let mut p = policy(Vec::new());
+        p.size_budget = Some(SizeBudget {
+            max_bytes: 50,
+            target_bytes: Some(0),
+        });
+        let (decisions, summary) = evaluate_image_size_budget(
+            &p,
+            &[],
+            &manifests,
+            &objects,
+            &[],
+            &ImageDecisions::default(),
+            60,
+        );
+        assert_eq!(
+            decisions
+                .manifests
+                .iter()
+                .map(|m| m.manifest_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(summary.unwrap().size_after, 0);
     }
 }

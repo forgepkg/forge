@@ -42,12 +42,37 @@ pub async fn spare_protected(
     if decisions.is_empty() {
         return Ok(0);
     }
-    let tagged: std::collections::HashSet<(String, String)> =
-        forge_db::tag_dao::tagged_versions(pool, repository_id)
-            .await?
-            .into_iter()
-            .collect();
+    let tagged = tagged_versions(pool, repository_id).await?;
     let before = decisions.len();
     decisions.retain(|d| !tagged.contains(&(d.package_name.clone(), d.version.clone())));
     Ok(before - decisions.len())
+}
+
+/// Package-tagged versions must be excluded from hosted budget victims.
+pub async fn tagged_candidate_ids(
+    pool: &sqlx::PgPool,
+    repository_id: i64,
+    candidates: &[evaluate::CandidateComponent],
+) -> sqlx::Result<std::collections::HashSet<i64>> {
+    if candidates.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let tagged = tagged_versions(pool, repository_id).await?;
+    Ok(candidates
+        .iter()
+        .filter(|candidate| {
+            tagged.contains(&(candidate.package_name.clone(), candidate.version.clone()))
+        })
+        .map(|candidate| candidate.component_id)
+        .collect())
+}
+
+async fn tagged_versions(
+    pool: &sqlx::PgPool,
+    repository_id: i64,
+) -> sqlx::Result<std::collections::HashSet<(String, String)>> {
+    Ok(forge_db::tag_dao::tagged_versions(pool, repository_id)
+        .await?
+        .into_iter()
+        .collect())
 }

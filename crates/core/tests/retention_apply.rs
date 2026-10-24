@@ -28,6 +28,10 @@ fn reason() -> DecisionReason {
         older_than_days: Some(30),
         not_downloaded_for_days: None,
         not_pulled_for_days: None,
+        size_budget: None,
+        target_bytes: None,
+        size_bytes: None,
+        last_used_at: None,
     }
 }
 
@@ -423,6 +427,10 @@ fn evict(cached_version_id: i64) -> ProxyDecision {
             older_than_days: None,
             not_downloaded_for_days: None,
             not_pulled_for_days: Some(30),
+            size_budget: None,
+            target_bytes: None,
+            size_bytes: None,
+            last_used_at: None,
         },
     }
 }

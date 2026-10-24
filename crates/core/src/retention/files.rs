@@ -166,6 +166,7 @@ pub struct FileBudgetSummary {
     pub size_before: u64,
     pub size_after: u64,
     pub target_bytes: u64,
+    pub target_attempted: bool,
     pub target_reached: bool,
 }
 
@@ -327,6 +328,7 @@ fn evaluate_files_with_budget(
             size_before,
             size_after,
             target_bytes,
+            target_attempted: budget_triggered,
             target_reached: !budget_triggered || size_after <= target_bytes,
         }),
     )
