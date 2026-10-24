@@ -48,6 +48,7 @@ export default defineConfig({
       '/v3': { target: apiTarget, changeOrigin: false },
       '/v2': { target: apiTarget, changeOrigin: false },
       '/raw': { target: apiTarget, changeOrigin: false },
+      '/npm': { target: apiTarget, changeOrigin: false },
       '/auth': { target: apiTarget, changeOrigin: false },
     },
   },

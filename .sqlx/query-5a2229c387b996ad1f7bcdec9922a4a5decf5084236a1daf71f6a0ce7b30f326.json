@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE component SET deprecation = $4, updated_at = now()\n        WHERE repository_id = $1 AND name = $2 AND version = $3\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5a2229c387b996ad1f7bcdec9922a4a5decf5084236a1daf71f6a0ce7b30f326"
+}

@@ -14,7 +14,7 @@ use common::{start_with, unique, ServerOpts, TestServer};
 use forge_plugin::api::{
     Action, Answer, Assets, ChangeRequest, Descriptor, FormatError, FormatPlugin, Loaded,
     PackageInfo, PackageRef, PackageSource, PackageVersions, ParsedPackage, PublishRequest, Query,
-    Repository, RepositoryKind, Request, Response, SearchQuery, Storage, Upload,
+    Repository, RepositoryKind, Request, Response, SearchQuery, Storage, Upload, UpstreamToken,
 };
 use forge_plugin::Plugin;
 use reqwest::StatusCode;
@@ -34,6 +34,7 @@ const PROBE: Descriptor = Descriptor {
         manifest: "probe.txt",
         manifest_type: "text/plain",
     },
+    upstream_token: UpstreamToken::None,
 };
 
 /// A package is text whose first line is `<id> <version>`.
@@ -128,10 +129,12 @@ impl FormatPlugin for Probe {
         match (req.method.as_str(), segments.as_slice()) {
             ("PUT", ["upload"]) => Action::Publish(PublishRequest {
                 upload: Upload::FirstPart,
+                id: None,
                 done: Response::text(201, "saved"),
             }),
             ("POST", ["upload"]) => Action::Publish(PublishRequest {
                 upload: Upload::Body,
+                id: None,
                 done: Response::text(201, "saved"),
             }),
             (_, ["files", id, version]) if read => Action::Download(target(id, version)),

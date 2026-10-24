@@ -139,6 +139,8 @@ pub(crate) fn step(
         UpstreamOp::Search(query) => search(&resources, query, fetched),
         // A feed holds packages: it has no files to fetch.
         UpstreamOp::File(_) => done(UpstreamAnswer::File(None)),
+        // NuGet has no tags.
+        UpstreamOp::Tags(_) => done(UpstreamAnswer::Tags(None)),
     })
 }
 
@@ -151,10 +153,7 @@ fn failed(reason: impl Into<String>) -> UpstreamStep {
 }
 
 fn get(url: &str, freshness: Freshness) -> Fetch {
-    Fetch {
-        url: url.to_string(),
-        freshness,
-    }
+    Fetch::new(url, freshness)
 }
 
 /// How the fetch of `url` went, if it has been fetched.

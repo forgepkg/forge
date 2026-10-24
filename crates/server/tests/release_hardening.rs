@@ -690,7 +690,7 @@ async fn repository_formats_that_are_not_installed_are_rejected() {
         .client()
         .post(format!("{}/admin/repositories", srv.base_url))
         .basic_auth(&admin, Some(&password))
-        .json(&json!({ "name": format!("npm{}", common::unique()), "kind": "hosted", "format": "npm" }))
+        .json(&json!({ "name": format!("pypi{}", common::unique()), "kind": "hosted", "format": "pypi" }))
         .send()
         .await
         .unwrap();

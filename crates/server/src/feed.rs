@@ -1,13 +1,16 @@
 //! What every feed response and package transfer shares, whatever the
 //! format: the browser hardening of feed responses, byte ranges of
-//! downloads, and the bounds on a multipart upload's preamble.
+//! downloads, streaming a stored package, and the bounds on a multipart
+//! upload's preamble.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::http::{header, HeaderMap, HeaderValue};
+use axum::body::Body;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_core::repo::{NupkgLocation, RepoError};
 use futures_util::{Stream, StreamExt};
@@ -74,6 +77,65 @@ pub enum ByteRange {
     Partial(Range<u64>),
     /// A range starting past the end, `416`.
     Unsatisfiable,
+}
+
+/// A header value of ASCII digits and punctuation.
+pub(crate) fn numeric_header(value: String) -> HeaderValue {
+    HeaderValue::from_str(&value).expect("ASCII header value")
+}
+
+/// Stream the stored package at `location` as the answer to a download
+/// with `request`'s headers (`head`: a `HEAD`, answered from the metadata
+/// alone): its content type and length, and a single `Range` when the blob
+/// source serves ranges (with the local blob cache).
+pub async fn serve_package(
+    state: &crate::state::AppState,
+    location: &NupkgLocation,
+    request: &HeaderMap,
+    head: bool,
+) -> Response {
+    let size = u64::try_from(location.size).unwrap_or(0);
+    let blobs = state.blob_bytes();
+    let ranges = blobs.serves_ranges();
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&location.content_type) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    if ranges {
+        headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    }
+    let requested = if ranges && !head {
+        byte_range(request, size)
+    } else {
+        ByteRange::Full
+    };
+    let (status, range) = match requested {
+        ByteRange::Full => (StatusCode::OK, None),
+        ByteRange::Partial(range) => {
+            headers.insert(
+                header::CONTENT_RANGE,
+                numeric_header(format!("bytes {}-{}/{size}", range.start, range.end - 1)),
+            );
+            (StatusCode::PARTIAL_CONTENT, Some(range))
+        }
+        ByteRange::Unsatisfiable => {
+            headers.insert(
+                header::CONTENT_RANGE,
+                numeric_header(format!("bytes */{size}")),
+            );
+            return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
+        }
+    };
+    let length = range.as_ref().map_or(size, |r| r.end - r.start);
+    headers.insert(header::CONTENT_LENGTH, numeric_header(length.to_string()));
+    // A HEAD needs the headers only; don't open (or bill) a GET for it.
+    if head {
+        return (status, headers).into_response();
+    }
+    match blobs.open(location, range).await {
+        Ok(stream) => (status, headers, Body::from_stream(stream)).into_response(),
+        Err(e) => crate::plugins::repo_error(e),
+    }
 }
 
 /// The [`ByteRange`] a request asks of a `size`-byte body. Only one

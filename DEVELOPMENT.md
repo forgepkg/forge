@@ -119,7 +119,7 @@ cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8421
 cargo xtask web-dev                 # terminal 2: Vite on :8420
 ```
 
-The Vite dev server proxies `/admin`, `/browse`, `/v2`, `/v3`, `/raw`, `/auth`
+The Vite dev server proxies `/admin`, `/browse`, `/v2`, `/v3`, `/npm`, `/raw`, `/auth`
 to the Rust origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
@@ -252,15 +252,21 @@ groups. See [docs/raw.md](docs/raw.md).
 
 Every package format is a format plugin, a crate in
 [`crates/formats/`](./crates/formats) linked into the server (see
-[docs/format-plugins.md](./docs/format-plugins.md)): NuGet and raw. A new
-format goes in `crates/formats/<id>` too, never in a `crates/format-<id>`
+[docs/format-plugins.md](./docs/format-plugins.md)): NuGet, npm and raw. A
+new format goes in `crates/formats/<id>` too, never in a `crates/format-<id>`
 crate or the server. Docker / OCI (`crates/format-oci`) is not there yet and
 is to move to `crates/formats/docker`. A repository of a plugin format is
 created with `"format": "<id>"` (hosted, proxy or group; a plugin format has
 proxies when it implements the upstream side) and served under
 `/repository/<name>/` unless the plugin names another mount (NuGet's is
-`/v3`). Helm charts are pushed to docker repositories, see
+`/v3`, npm's `/npm`). Helm charts are pushed to docker repositories, see
 [docs/docker.md](docs/docker.md#helm-charts).
+
+npm repositories (`"format":"npm"`) are served under `/npm/`: `npm publish
+--registry http://localhost:8421/npm/<name>/` with an API token in
+`.npmrc` (`//localhost:8421/npm/<name>/:_authToken=<token>`), or after
+`npm login --registry …`, which opens the web UI's approval page. See
+[docs/npm.md](docs/npm.md).
 
 ## Configuration
 
@@ -633,6 +639,21 @@ cargo build -p forge-server
 .github/scripts/raw-e2e.sh target/debug/forge-server target/raw-e2e
 ```
 
+npm repositories have theirs, CI's `npm-e2e` job: the real clients against a
+live server and a mock upstream registry (npm's browser login, approved
+through the page's API, and Yarn's password login; logout; publishes with
+npm and pnpm, also through a group; installs with npm, pnpm and, when it is
+installed, Bun from a hosted repository, a proxy and a group; dist-tags,
+deprecation, unpublishing; the group's dependency-confusion guard and
+`npm audit`). It needs node with npm, pnpm, curl, jq, python3 and openssl
+(Yarn is fetched with `npm pack`, or given as `YARN_BERRY`), a Postgres and
+an S3 endpoint:
+
+```bash
+cargo build -p forge-server
+.github/scripts/npm-e2e.sh target/debug/forge-server target/npm-e2e
+```
+
 The container image has a smoke test, which CI's `docker` job runs on the
 image of each platform it built (#239). It starts the image the way the Kubernetes manifests
 and the Helm chart run it: read-only root filesystem, `/tmp` a tmpfs, user
@@ -833,7 +854,7 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 ## CI and the merge queue
 
 CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
-`test`, `docker`, `kubernetes`, `web`, `oci-e2e` and `raw-e2e`, and the slow
+`test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e` and `npm-e2e`, and the slow
 `e2e` and `web-e2e`, which pull requests skip: those two run in the merge
 queue and on every push to `main`. It runs on pull requests that target
 `main` only; a stacked one waits (see [Stacked pull
@@ -864,7 +885,7 @@ It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
-| Rust | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh` | `fmt`, `clippy`, `test`, `oci-e2e`, `raw-e2e`, `e2e`, `web-e2e` |
+| Rust | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh`, `npm-e2e.sh` | `fmt`, `clippy`, `test`, `oci-e2e`, `raw-e2e`, `npm-e2e`, `e2e`, `web-e2e` |
 | Changelog | `docs/changes/` | `fmt` |
 | Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
@@ -874,7 +895,7 @@ It sorts the change into groups of paths:
 
 A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
 counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
-`clippy`, `test`, `oci-e2e`, `raw-e2e` and `e2e` in Rust; `audit`
+`clippy`, `test`, `oci-e2e`, `raw-e2e`, `npm-e2e` and `e2e` in Rust; `audit`
 in Audit; `web` and `web-e2e` in Web; `docker` and `docker-platform` in
 Image and `kubernetes` in Kubernetes. A change outside the jobs (the triggers, the settings, the
 `changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
@@ -920,8 +941,8 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
 1. Enable **Require merge queue**. Keep its **status check timeout** above
    the run time of `e2e` and `web-e2e` (60 minutes by default).
 2. Under **Require status checks to pass**, require `fmt`, `clippy`, `audit`,
-   `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `e2e` and
-   `web-e2e` from GitHub Actions: every job of `ci.yml` but
+   `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `npm-e2e`,
+   `e2e` and `web-e2e` from GitHub Actions: every job of `ci.yml` but
    `changes`, the jobs the release workflow requires of the tagged commit
    (`REQUIRED_JOBS` in `.github/workflows/release.yml`). A job left out here
    can fail on a pull request that merges anyway, and the release then

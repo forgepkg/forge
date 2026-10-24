@@ -1024,7 +1024,7 @@ async fn forms_the_web_ui_and_the_admin_api() {
     assert_eq!(raw["kinds"], json!(["hosted", "proxy", "group"]));
     for (body, why) in [
         (
-            json!({"name": format!("x{}", unique()), "kind": "hosted", "deployment_policy": "read_only"}),
+            json!({"name": format!("x{}", unique()), "kind": "hosted", "content_disposition": "inline"}),
             "a raw option on nuget",
         ),
         (

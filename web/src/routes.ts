@@ -21,6 +21,8 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  *                                                the splat is the image name,
  *                                                which may contain `/`)
  *       /tokens         -> Tokens.tsx           (self-service registry tokens)
+ *       /cli-login/$secret -> CliLogin.tsx      (approve a command-line client's
+ *                                                web login: `npm login`)
  *       /manage         -> AdminLayout.tsx      (beforeLoad: require is_admin)
  *
  * The admin screens live under `/manage/*`, NOT `/admin/*`: `/admin/*` is the
@@ -38,6 +40,7 @@ export const routes = rootRoute('root.tsx', [
     route('/packages/$repo/$id', 'PackageDetail.tsx'),
     route('/images/$repo/$', 'ImageDetail.tsx'),
     route('/tokens', 'Tokens.tsx'),
+    route('/cli-login/$secret', 'CliLogin.tsx'),
     route('/manage', 'AdminLayout.tsx', [
       index('admin/AdminHome.tsx'),
       route('/repositories', 'admin/repositories/List.tsx'),
