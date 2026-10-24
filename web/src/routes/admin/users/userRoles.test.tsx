@@ -37,8 +37,8 @@ describe('admin user roles', () => {
     api.state.roles.push({ id: 7, name: 'ci-pushers', description: 'CI pushes', builtin: false })
     api.state.assignments.push([1, 1], [2, 7], [4, 4])
     api.state.grants.push(
-      { id: 30, role_id: 7, repository_id: 10, action: 'write', selector_id: null },
-      { id: 31, role_id: 7, repository_id: null, action: 'read', selector_id: 20 },
+      { id: 30, role_id: 7, repository_id: 10, level: 'write', selector_id: null },
+      { id: 31, role_id: 7, repository_id: null, level: 'read', selector_id: 20 },
     )
     vi.stubGlobal('fetch', vi.fn(api.fetch))
     setSession('admin-csrf')
@@ -214,12 +214,14 @@ describe('admin user roles', () => {
     await renderApp('/manage/users/2')
 
     await u.type(await screen.findByLabelText('Token name'), 'ci')
-    await u.click(screen.getByRole('radio', { name: 'Only these actions' }))
-    // read is chosen by default; add write.
-    await u.click(screen.getByRole('checkbox', { name: /^write/ }))
+    await u.click(screen.getByRole('checkbox', { name: /^Admin API/ }))
+    await u.click(screen.getByRole('radio', { name: 'At most this level' }))
+    // read is chosen by default; raise it to write.
+    await u.click(screen.getByRole('radio', { name: /^write/ }))
     await u.click(screen.getByRole('radio', { name: /^Only these repositories/ }))
     // Admin needs every repository.
-    expect(screen.getByRole('checkbox', { name: /^admin/ })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: /^Admin API/ })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: /^Admin API/ })).not.toBeChecked()
     expect(screen.getByRole('button', { name: 'Create token' })).toBeDisabled()
     expect(screen.getByText('Choose at least one repository.')).toBeInTheDocument()
     await u.click(await screen.findByRole('checkbox', { name: 'internal' }))
@@ -228,12 +230,12 @@ describe('admin user roles', () => {
     await waitFor(() =>
       expect(api.sent('POST', /^\/admin\/users\/2\/tokens$/)[0]?.body).toEqual({
         name: 'ci',
-        scope: { actions: ['read', 'write'], repositories: [10] },
+        scope: { level: 'write', repositories: [10] },
       }),
     )
     expect(await screen.findByText('plaintext-secret')).toBeInTheDocument()
     const row = (await screen.findByText('ci', { selector: 'td' })).closest('tr')!
-    expect(within(row).getByText('read, write')).toBeInTheDocument()
+    expect(within(row).getByText('write')).toBeInTheDocument()
     expect(within(row).getByText('1 repository')).toBeInTheDocument()
   })
 
@@ -250,7 +252,7 @@ describe('admin user roles', () => {
 
   it("changes a token's scope", async () => {
     api.state.tokens.push(
-      token({ id: 40, user_id: 2, name: 'deploy', scope: { actions: ['read'], repositories: [11] } }),
+      token({ id: 40, user_id: 2, name: 'deploy', scope: { level: 'read', repositories: [11] } }),
     )
     const u = userEvent.setup()
     await renderApp('/manage/users/2')
@@ -258,15 +260,16 @@ describe('admin user roles', () => {
     await u.click(await screen.findByRole('button', { name: 'Edit scope of deploy' }))
     const form = screen.getByRole('form', { name: 'Scope of deploy' })
     // Seeded from the stored scope.
-    expect(within(form).getByRole('radio', { name: 'Only these actions' })).toBeChecked()
+    expect(within(form).getByRole('radio', { name: 'At most this level' })).toBeChecked()
+    expect(within(form).getByRole('radio', { name: /^read/ })).toBeChecked()
     expect(await within(form).findByRole('checkbox', { name: 'public' })).toBeChecked()
     await u.click(within(form).getByRole('radio', { name: 'Every repository the owner can reach' }))
-    await u.click(within(form).getByRole('checkbox', { name: /^admin/ }))
+    await u.click(within(form).getByRole('checkbox', { name: /^Admin API/ }))
     await u.click(within(form).getByRole('button', { name: 'Save scope' }))
 
     await waitFor(() =>
       expect(api.sent('PATCH', /^\/admin\/tokens\/40\/scope$/)[0]?.body).toEqual({
-        scope: { actions: ['read', 'admin'] },
+        scope: { level: 'read', admin: true },
       }),
     )
     await waitFor(() =>
@@ -278,14 +281,14 @@ describe('admin user roles', () => {
 
   it("clears a token's scope", async () => {
     api.state.tokens.push(
-      token({ id: 41, user_id: 2, name: 'narrow', scope: { actions: ['read'] } }),
+      token({ id: 41, user_id: 2, name: 'narrow', scope: { level: 'read' } }),
     )
     const u = userEvent.setup()
     await renderApp('/manage/users/2')
 
     await u.click(await screen.findByRole('button', { name: 'Edit scope of narrow' }))
     const form = screen.getByRole('form', { name: 'Scope of narrow' })
-    await u.click(within(form).getByRole('radio', { name: /^The owner's read, write and delete/ }))
+    await u.click(within(form).getByRole('radio', { name: /^The owner's levels/ }))
     await u.click(within(form).getByRole('button', { name: 'Save scope' }))
     await waitFor(() =>
       expect(api.sent('PATCH', /^\/admin\/tokens\/41\/scope$/)[0]?.body).toEqual({

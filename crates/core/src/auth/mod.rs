@@ -6,8 +6,8 @@
 //! * [`client_ip`] — client-IP resolution behind trusted proxies and the
 //!   anonymous-access policy ([`AnonPolicy`]).
 //! * [`authz`] — the authorization seam: the [`Authz`] service whose
-//!   `can_read` / `can_write` / `can_admin` methods are the single decision
-//!   point every gate routes through.
+//!   `can_read` / `can_write` / `can_delete` / `is_global_admin` methods are
+//!   the single decision point every gate routes through.
 //! * [`provider`] / [`chain`] — the pluggable, ordered [`AuthProvider`] chain
 //!   for the password-style auth path. The local-password and
 //!   upstream-basic providers plug in here; OIDC stays its own interactive

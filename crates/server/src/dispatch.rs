@@ -5,16 +5,16 @@
 //! Resolution runs **before** a format sees the request:
 //! * Unknown repo → **404** to a global admin, otherwise answered like a
 //!   repository the caller may not read.
-//! * Read methods (`GET`/`HEAD`) require read; publish/relist methods
-//!   (`PUT`/`POST`) require `write`; package deletion (`DELETE`) requires the
-//!   distinct `delete` privilege. An unauthenticated caller → **401** (so a
+//! * Read methods (`GET`/`HEAD`) require the level `read`; publish/relist
+//!   methods (`PUT`/`POST`) require `write`; package deletion (`DELETE`)
+//!   requires `delete`, the highest level. An unauthenticated caller → **401** (so a
 //!   package client knows to send credentials), an authenticated-but-
 //!   disallowed caller → **403** ([`authz_denied`]).
 
 use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use forge_core::auth::principal::Principal;
-use forge_core::authz::{Action, PackageFilter};
+use forge_core::authz::{Level, PackageFilter};
 use forge_core::repo::RepoKind;
 use forge_db::model::Repository;
 use sha2::Digest;
@@ -43,12 +43,12 @@ pub(crate) fn offline_response() -> Response {
         .into_response()
 }
 
-/// RBAC action corresponding to one NuGet protocol request.
-pub(crate) fn action_for_method(method: &Method) -> Action {
+/// The access level one package protocol request requires.
+pub(crate) fn level_for_method(method: &Method) -> Level {
     match *method {
-        Method::PUT | Method::POST => Action::Write,
-        Method::DELETE => Action::Delete,
-        _ => Action::Read,
+        Method::PUT | Method::POST => Level::Write,
+        Method::DELETE => Level::Delete,
+        _ => Level::Read,
     }
 }
 
@@ -330,12 +330,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_methods_map_to_distinct_actions() {
-        assert_eq!(action_for_method(&Method::PUT), Action::Write);
-        assert_eq!(action_for_method(&Method::POST), Action::Write);
-        assert_eq!(action_for_method(&Method::DELETE), Action::Delete);
-        assert_eq!(action_for_method(&Method::GET), Action::Read);
-        assert_eq!(action_for_method(&Method::HEAD), Action::Read);
+    fn protocol_methods_map_to_levels() {
+        assert_eq!(level_for_method(&Method::PUT), Level::Write);
+        assert_eq!(level_for_method(&Method::POST), Level::Write);
+        assert_eq!(level_for_method(&Method::DELETE), Level::Delete);
+        assert_eq!(level_for_method(&Method::GET), Level::Read);
+        assert_eq!(level_for_method(&Method::HEAD), Level::Read);
     }
 
     #[test]

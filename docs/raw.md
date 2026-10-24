@@ -97,7 +97,7 @@ a file does:
 | `deployment_policy` | |
 | --- | --- |
 | `disable_redeploy` (default) | Refused with `409`. Uploading the same content again is accepted and changes nothing, so a retried upload succeeds. |
-| `allow_redeploy` | The file is replaced. Replacing needs the `delete` permission as well as `write`. |
+| `allow_redeploy` | The file is replaced. Replacing needs the `delete` level, which includes `write`. |
 | `read_only` | Every upload and delete is refused with `405`. |
 
 ```bash
@@ -262,10 +262,10 @@ A group takes no uploads; upload to a hosted member.
 
 ## Permissions
 
-`GET` and `HEAD` need `read` on the repository, `PUT` and `POST` need
-`write`, `DELETE` needs `delete` (and replacing a file with
-`allow_redeploy` needs both). Content selectors match file paths, so a role
-can be limited to part of a repository:
+`GET` and `HEAD` need the level `read` on the repository, `PUT` and `POST`
+need `write`, `DELETE` needs `delete` (and so does replacing a file with
+`allow_redeploy`); each level includes the ones below it. Content selectors
+match file paths, so a role can be limited to part of a repository:
 
 ```bash
 curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \

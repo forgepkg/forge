@@ -1,12 +1,13 @@
+import { LEVEL_COVERS, LEVELS, type Level } from '~/api/rbac'
 import type { TokenView } from '~/api/tokens'
 import { StatusBadge } from '~/components/ui'
 
 /**
  * Status and scope cells shared by the self-service and the admin token
  * tables. A token stops working once revoked or past `expires_at`; the scope
- * is the stored `{"actions": [...], "repositories": [...]}` document (or
- * `null` for an unscoped token), shown so a narrowed or admin token is
- * recognizable.
+ * is the stored `{"level": ..., "admin": true, "repositories": [...]}`
+ * document (or `null` for an unscoped token), shown so a narrowed or admin
+ * token is recognizable.
  */
 
 export type TokenStatus = 'active' | 'expired' | 'revoked'
@@ -32,26 +33,23 @@ export function TokenStatusBadge({ token }: { token: TokenView }) {
   }
 }
 
-const ACTIONS = new Set(['read', 'write', 'delete', 'admin'])
+const LEVEL_SET = new Set<string>(LEVELS)
 
 /**
  * The scope as the server reads it: `null` when unscoped (the owner's access
  * without `admin`), `'invalid'` when the stored document does not parse (the
- * server then denies the token everything), otherwise its parts.
+ * server then denies the token everything; a scope still listing `actions`
+ * is one), otherwise its parts.
  */
 export function parseTokenScope(
   scope: unknown,
-): { actions?: string[]; repositories?: number[] } | null | 'invalid' {
+): { level?: Level; admin?: boolean; repositories?: number[] } | null | 'invalid' {
   if (scope == null) return null
   if (typeof scope !== 'object' || Array.isArray(scope)) return 'invalid'
-  const { actions, repositories, ...rest } = scope as Record<string, unknown>
+  const { level, admin, repositories, ...rest } = scope as Record<string, unknown>
   if (Object.keys(rest).length > 0) return 'invalid'
-  if (
-    actions != null &&
-    !(Array.isArray(actions) && actions.every((a) => ACTIONS.has(a as string)))
-  ) {
-    return 'invalid'
-  }
+  if (level != null && !LEVEL_SET.has(level as string)) return 'invalid'
+  if (admin != null && typeof admin !== 'boolean') return 'invalid'
   if (
     repositories != null &&
     !(Array.isArray(repositories) && repositories.every(Number.isInteger))
@@ -59,7 +57,8 @@ export function parseTokenScope(
     return 'invalid'
   }
   return {
-    actions: (actions ?? undefined) as string[] | undefined,
+    level: (level ?? undefined) as Level | undefined,
+    admin: admin === true ? true : undefined,
     repositories: (repositories ?? undefined) as number[] | undefined,
   }
 }
@@ -76,31 +75,27 @@ export function TokenScopeBadges({ scope }: { scope: TokenView['scope'] }) {
       </StatusBadge>
     )
   }
-  const actions = parsed?.actions
+  const level = parsed?.level
+  const admin = parsed?.admin
   const repositories = parsed?.repositories
-  if (actions === undefined && repositories === undefined) {
+  if (level === undefined && !admin && repositories === undefined) {
     return (
-      <span
-        className="fg-muted"
-        title="The owner's read, write and delete access; never admin"
-      >
+      <span className="fg-muted" title="The owner's levels; never admin">
         unscoped
       </span>
     )
   }
-  const other = (actions ?? []).filter((a) => a !== 'admin')
   return (
     <span className="fg-cell-badges">
-      {actions?.includes('admin') && (
+      {admin && (
         <StatusBadge tone="heat" dot={false}>
           admin
         </StatusBadge>
       )}
-      {actions !== undefined && other.length > 0 && (
-        <StatusBadge dot={false}>{other.join(', ')}</StatusBadge>
-      )}
-      {actions !== undefined && actions.length === 0 && (
-        <StatusBadge dot={false}>no actions</StatusBadge>
+      {level !== undefined && (
+        <StatusBadge dot={false} title={`At most ${level}: ${LEVEL_COVERS[level]}`}>
+          {level}
+        </StatusBadge>
       )}
       {repositories !== undefined && (
         <StatusBadge icon="Repository">

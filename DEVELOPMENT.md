@@ -171,7 +171,7 @@ curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/rep
 curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/me/tokens \
   -H 'content-type: application/json' -d '{"name":"local"}'
 # -> {"token":"<SECRET>", ...}   (shown once)
-# For scripted administration, mint one with '{"name":"ops","scope":{"actions":["admin"]}}'
+# For scripted administration, mint one with '{"name":"ops","scope":{"admin":true}}'
 # and send it as the Basic password (curl -u admin@example.com:<SECRET>) or X-NuGet-ApiKey.
 
 # push a package, then read it back
@@ -231,7 +231,7 @@ password supplied to NuGet should be a **token**.
   the members it may read itself. The same holds for a token whose `scope`
   lists repositories: scoped to the group alone it sees an empty feed, so
   list the group **and** every member it should be served from, e.g.
-  `{"scope": {"actions": ["read"], "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
+  `{"scope": {"level": "read", "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
 
 The same three types exist for container images with `"format":"docker"`
 (`{"name":"docker-hosted","kind":"hosted","format":"docker"}`, a proxy with

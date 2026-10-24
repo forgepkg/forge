@@ -27,7 +27,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use forge_core::auth::Principal;
-use forge_core::authz::Action;
+use forge_core::authz::Level;
 use forge_core::net::upstream::RequestClass;
 use forge_core::repo::proxy::Credentials;
 use forge_db::model::{RepoKind, Repository};
@@ -353,10 +353,7 @@ impl Registry {
         if !reference::valid_name(image) {
             return Err(OciError::name_invalid(image));
         }
-        if !self
-            .rbac_allows(principal, repo, image, Action::Write)
-            .await
-        {
+        if !self.rbac_allows(principal, repo, image, Level::Write).await {
             return Err(OciError::denied(format!(
                 "the import may not push the image {image:?}"
             )));

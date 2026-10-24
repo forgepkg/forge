@@ -61,9 +61,9 @@ import { AccessLevelFields } from '~/components/AccessLevelFields'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import {
-  ActionBadge,
   byId,
   InlineError,
+  LevelBadge,
   RepositoryLabel,
   repoNames,
   SelectorLabel,
@@ -412,7 +412,7 @@ function EffectiveAccess({ userId }: { userId: number }) {
             <Table caption="Effective grants">
               <TableHead>
                 <TableHeader>Repository</TableHeader>
-                <TableHeader width="120px">Action</TableHeader>
+                <TableHeader width="120px">Level</TableHeader>
                 <TableHeader>Packages</TableHeader>
               </TableHead>
               <TableBody>
@@ -422,7 +422,7 @@ function EffectiveAccess({ userId }: { userId: number }) {
                       <RepositoryLabel id={g.repository_id} names={names} />
                     </TableCell>
                     <TableCell>
-                      <ActionBadge action={g.action} />
+                      <LevelBadge level={g.level} />
                     </TableCell>
                     <TableCell>
                       <SelectorLabel

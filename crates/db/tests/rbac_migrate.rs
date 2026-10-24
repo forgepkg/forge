@@ -19,6 +19,9 @@
 //! The upgrade case is exercised faithfully: migrations 0001..0006 are applied
 //! first, pre-RBAC rows are seeded, then 0007 runs — reproducing exactly what an
 //! upgrading deployment experiences (a non-empty `app_user` at 0007 time).
+//!
+//! Later migrations that reshape the RBAC data are tested the same way: 0042
+//! (the built-in `writer` role) and 0046 (ordered access levels).
 
 use forge_db::authz_dao::{self, ADMIN_ROLE, AUTHENTICATED_ROLE};
 use sqlx::migrate::Migrator;
@@ -186,15 +189,14 @@ async fn upgrade_preserves_pre_rbac_access() {
         let eff = authz_dao::load_user_effective(&pool, uid)
             .await
             .expect("effective");
-        // authenticated seeds (read, ANY) + (write, ANY): a grant with ANY repo
-        // covers both repos for both actions.
-        let has = |action: &str| {
+        // authenticated holds (write, ANY) since 0046: a grant with ANY repo
+        // covers both repos, to read and to write.
+        assert!(
             eff.grants
                 .iter()
-                .any(|g| g.action == action && g.repository_id.is_none())
-        };
-        assert!(has("read"), "user {uid} keeps read everywhere");
-        assert!(has("write"), "user {uid} keeps write everywhere");
+                .any(|g| g.level == "write" && g.repository_id.is_none()),
+            "user {uid} keeps read and write everywhere"
+        );
     }
 
     // The is_admin user additionally holds the admin role (still admin).
@@ -227,7 +229,7 @@ async fn upgrade_preserves_pre_rbac_access() {
     assert!(
         anon.grants
             .iter()
-            .any(|g| g.action == "read" && g.repository_id == Some(public_repo)),
+            .any(|g| g.level == "read" && g.repository_id == Some(public_repo)),
         "anonymous_read repo must get an anonymous read grant"
     );
     assert!(
@@ -284,12 +286,12 @@ async fn fresh_install_fails_closed() {
 /// `0042_writer_role.sql` carries version 42.
 const WRITER_ROLE_VERSION: i64 = 42;
 
-/// The `(action, ANY repository)` grants of the role named `name`, sorted.
+/// The levels of the unscoped ANY-repository grants of the role named `name`.
 async fn any_repo_grants(pool: &PgPool, name: &str) -> Vec<String> {
     sqlx::query_scalar(
-        "SELECT rp.action FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+        "SELECT rp.level FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
          WHERE r.name = $1 AND rp.repository_id IS NULL AND rp.selector_id IS NULL \
-         ORDER BY rp.action",
+         ORDER BY rp.level",
     )
     .bind(name)
     .fetch_all(pool)
@@ -297,8 +299,8 @@ async fn any_repo_grants(pool: &PgPool, name: &str) -> Vec<String> {
     .expect("read grants")
 }
 
-/// #318: every install gets the built-in `writer` role, with read and write on
-/// every repository and nothing else.
+/// #318: every install gets the built-in `writer` role, with `write` (which
+/// includes `read`) on every repository and nothing else.
 #[tokio::test]
 async fn writer_role_is_seeded_built_in() {
     let (pool, _container) = fresh_pool().await;
@@ -317,7 +319,7 @@ async fn writer_role_is_seeded_built_in() {
     );
     assert_eq!(
         any_repo_grants(&pool, authz_dao::WRITER_ROLE).await,
-        vec!["read".to_string(), "write".to_string()]
+        vec!["write".to_string()]
     );
     let grants: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
@@ -327,7 +329,7 @@ async fn writer_role_is_seeded_built_in() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(grants, 2, "no delete, no admin");
+    assert_eq!(grants, 1, "no delete, no admin");
 }
 
 /// #318: a custom role an install already named `writer` is renamed
@@ -402,7 +404,7 @@ async fn an_existing_writer_role_is_renamed() {
         .collect();
     assert_eq!(roles, vec![renamed.clone()], "the assignment stays with it");
     let kept: Vec<(Option<i64>, String)> =
-        sqlx::query_as("SELECT repository_id, action FROM repository_privilege WHERE role_id = $1")
+        sqlx::query_as("SELECT repository_id, level FROM repository_privilege WHERE role_id = $1")
             .bind(custom)
             .fetch_all(&pool)
             .await
@@ -416,7 +418,7 @@ async fn an_existing_writer_role_is_renamed() {
     // The built-in role takes the name.
     assert_eq!(
         any_repo_grants(&pool, authz_dao::WRITER_ROLE).await,
-        vec!["read".to_string(), "write".to_string()]
+        vec!["write".to_string()]
     );
     assert_ne!(
         authz_dao::role_id_by_name(&pool, authz_dao::WRITER_ROLE)
@@ -439,4 +441,193 @@ async fn an_existing_writer_role_is_renamed() {
         ])
     );
     assert_eq!(config["issuer"], "https://ci.example");
+}
+
+/// `0046_access_levels.sql` carries version 46.
+const ACCESS_LEVELS_VERSION: i64 = 46;
+
+/// #411: the verbs of one (role, repository | ANY, selector) become one grant
+/// when they are exactly a level; every other combination, and every `admin`
+/// grant, is dropped rather than widened. A token scope's `actions` becomes
+/// `level` (and `admin`) the same way; a token whose scope no level matches
+/// is revoked and reaches nothing.
+#[tokio::test]
+async fn access_levels_keep_what_a_level_matches_and_never_widen() {
+    let (pool, _container) = fresh_pool().await;
+    migrator_up_to(ACCESS_LEVELS_VERSION - 1)
+        .await
+        .run(&pool)
+        .await
+        .expect("migrate 0001..0045");
+
+    let role: i64 = sqlx::query_scalar("INSERT INTO role (name) VALUES ('ci') RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let selector: i64 =
+        sqlx::query_scalar("INSERT INTO content_selector (name) VALUES ('acme') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut repos = Vec::new();
+    for name in [
+        "read",
+        "write",
+        "delete",
+        "push-only",
+        "read-delete",
+        "scoped",
+    ] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO repository (name, format, kind) VALUES ($1, 'nuget', 'hosted') RETURNING id",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        repos.push(id);
+    }
+    let [read, write, delete, push_only, read_delete, scoped] = repos[..] else {
+        unreachable!()
+    };
+    for (repo, actions, selector) in [
+        (Some(read), &["read"][..], None),
+        (Some(write), &["read", "write"][..], None),
+        (Some(delete), &["read", "write", "delete"][..], None),
+        (Some(push_only), &["write"][..], None),
+        (Some(read_delete), &["read", "delete"][..], None),
+        (Some(scoped), &["read", "write"][..], Some(selector)),
+        (Some(scoped), &["delete"][..], None),
+        (None, &["admin"][..], None),
+    ] {
+        for action in actions {
+            sqlx::query(
+                "INSERT INTO repository_privilege (role_id, repository_id, action, selector_id) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(role)
+            .bind(repo)
+            .bind(action)
+            .bind(selector)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    let admin: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('a@example.com', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let admin_role = authz_dao::role_id_by_name(&pool, ADMIN_ROLE)
+        .await
+        .unwrap()
+        .unwrap();
+    authz_dao::assign_role(&pool, admin, admin_role)
+        .await
+        .unwrap();
+    let user: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, password_hash) VALUES ('u@example.com', 'x') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let tokens = [
+        (user, serde_json::json!({"actions": ["read"]})),
+        (
+            user,
+            serde_json::json!({"actions": ["write", "read", "admin"], "repositories": [read]}),
+        ),
+        (
+            user,
+            serde_json::json!({"actions": ["delete", "read", "write"]}),
+        ),
+        (
+            user,
+            serde_json::json!({"actions": null, "repositories": [write]}),
+        ),
+        (user, serde_json::json!({"repositories": [delete]})),
+        (admin, serde_json::json!({"actions": ["admin"]})),
+        (user, serde_json::json!({"actions": ["write"]})),
+        (user, serde_json::json!({"actions": ["admin"]})),
+        (
+            admin,
+            serde_json::json!({"actions": ["admin"], "repositories": [read]}),
+        ),
+        (user, serde_json::json!({"actions": []})),
+    ];
+    let mut ids = Vec::new();
+    for (n, (owner, scope)) in tokens.iter().enumerate() {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO token (user_id, name, token_hash, scope) VALUES ($1, $2, $2, $3) \
+             RETURNING id",
+        )
+        .bind(owner)
+        .bind(format!("t{n}"))
+        .bind(scope)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+
+    migrator().await.run(&pool).await.expect("migrate 0046");
+
+    let mut grants: Vec<(Option<i64>, Option<i64>, String)> = sqlx::query_as(
+        "SELECT repository_id, selector_id, level FROM repository_privilege WHERE role_id = $1",
+    )
+    .bind(role)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    grants.sort();
+    assert_eq!(
+        grants,
+        vec![
+            (Some(read), None, "read".to_string()),
+            (Some(write), None, "write".to_string()),
+            (Some(delete), None, "delete".to_string()),
+            (Some(scoped), Some(selector), "write".to_string()),
+        ],
+        "push-only, read+delete, delete-only and admin are dropped"
+    );
+    let admin_grants: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM repository_privilege WHERE role_id = $1")
+            .bind(admin_role)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(admin_grants, 0, "the admin role's sentinel is gone");
+
+    let mut after = Vec::new();
+    for id in ids {
+        let (scope, revoked): (serde_json::Value, bool) =
+            sqlx::query_as("SELECT scope, revoked_at IS NOT NULL FROM token WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        after.push((scope, revoked));
+    }
+    let nothing = serde_json::json!({"repositories": []});
+    assert_eq!(
+        after,
+        vec![
+            (serde_json::json!({"level": "read"}), false),
+            (
+                serde_json::json!({"level": "write", "admin": true, "repositories": [read]}),
+                false
+            ),
+            (serde_json::json!({"level": "delete"}), false),
+            (serde_json::json!({"repositories": [write]}), false),
+            (serde_json::json!({"repositories": [delete]}), false),
+            (serde_json::json!({"admin": true}), false),
+            (nothing.clone(), true),
+            (nothing.clone(), true),
+            (nothing.clone(), true),
+            (nothing, true),
+        ]
+    );
 }

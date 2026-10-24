@@ -635,8 +635,8 @@ pub struct TestServer {
     pub admin_user: Option<String>,
     /// Bootstrap admin password (if any).
     pub admin_pass: Option<String>,
-    /// An admin-scoped API token of the bootstrap admin (`{"actions":
-    /// ["admin"]}`), minted directly in the database. The admin API refuses a
+    /// An admin-scoped API token of the bootstrap admin (`{"admin":
+    /// true}`), minted directly in the database. The admin API refuses a
     /// password sent over Basic, so [`TestServer::admin_basic`] carries this.
     pub admin_scoped_token: Option<String>,
     /// A plaintext API token for the bootstrap admin (empty if no admin).
@@ -951,7 +951,8 @@ impl TestServer {
     }
 
     /// Issue an API token for `user_id`, optionally with a per-token `scope`
-    /// (`{"actions":[..],"repositories":[..]}`). Returns the plaintext secret.
+    /// (`{"level":"..","admin":true,"repositories":[..]}`). Returns the
+    /// plaintext secret.
     pub async fn issue_token(&self, user_id: i64, scope: Option<serde_json::Value>) -> String {
         let (u, p) = self.admin_basic();
         let mut body = serde_json::json!({"name": "e2e"});
@@ -989,18 +990,18 @@ impl TestServer {
         body["id"].as_i64().expect("created role id")
     }
 
-    /// Add a grant `(repository|ANY, action, selector?)` to a role. `repository`
+    /// Add a grant `(repository|ANY, level, selector?)` to a role. `repository`
     /// `None` ⇒ an ANY-repo (wildcard) grant. Returns the HTTP response so callers
     /// can assert on the status.
     pub async fn add_grant(
         &self,
         role_id: i64,
         repository: Option<&str>,
-        action: &str,
+        level: &str,
         selector_id: Option<i64>,
     ) -> reqwest::Response {
         let (u, p) = self.admin_basic();
-        let mut body = serde_json::json!({"action": action});
+        let mut body = serde_json::json!({"level": level});
         if let Some(r) = repository {
             body["repository"] = serde_json::json!(r);
         }
@@ -1162,7 +1163,7 @@ pub async fn mint_admin_scoped_token(pool: &PgPool, username: &str) -> Option<St
     forge_db::token_dao::set_token_scope(
         pool,
         token.id,
-        Some(&serde_json::json!({ "actions": ["admin"] })),
+        Some(&serde_json::json!({ "admin": true })),
     )
     .await
     .expect("scope admin token");

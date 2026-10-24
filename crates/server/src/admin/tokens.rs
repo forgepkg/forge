@@ -4,12 +4,13 @@
 //! once** in the create response and only its SHA-256 hash is persisted. Listing
 //! never returns the hash or plaintext, but does return each token's `scope`.
 //!
-//! A token without a scope carries its owner's `read` / `write` / `delete`
-//! reach but never `admin`: it cannot call `/admin/*`. A token meant for admin
-//! automation must be issued with `"scope": {"actions": ["admin"]}` (no
+//! A token without a scope carries its owner's levels (`read`, `write`,
+//! `delete`) but never `admin`: it cannot call `/admin/*`. A token meant for
+//! admin automation must be issued with `"scope": {"admin": true}` (no
 //! `repositories` restriction); for an admin account that is a full admin
 //! credential, including minting further tokens.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
@@ -21,7 +22,7 @@ use forge_db::user_dao;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use super::db_error;
+use super::{db_error, json_rejection};
 use crate::state::AppState;
 
 /// Metadata view of a token (no secret, no hash).
@@ -34,8 +35,8 @@ pub struct TokenView {
     pub revoked_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-    /// The token's privilege scope as stored (`{"actions": [...],
-    /// "repositories": [...]}`), or `null` for an unscoped token, so a
+    /// The token's privilege scope as stored (`{"level": "...", "admin":
+    /// true, "repositories": [...]}`), or `null` for an unscoped token, so a
     /// mistyped or missing scope is visible instead of silently unscoped.
     pub scope: Option<JsonValue>,
 }
@@ -65,8 +66,9 @@ pub struct CreateToken {
     pub expires_at: Option<DateTime<Utc>>,
     /// Optional per-token privilege scope: a subset that **narrows** the
     /// owner's effective set (it can never widen it). Omit / `null` ⇒ the token
-    /// inherits the owner's set **except `admin`**, which must be listed in
-    /// `actions` explicitly. Unknown keys are rejected (400/422).
+    /// inherits the owner's set **except `admin`**, which needs `"admin":
+    /// true`. Unknown keys are rejected with 400, `actions` with a message
+    /// naming `level`.
     #[serde(default)]
     pub scope: Option<forge_core::authz::TokenScope>,
 }
@@ -122,8 +124,12 @@ pub async fn list_for_user(State(state): State<AppState>, Path(user_id): Path<i6
 pub async fn create(
     State(state): State<AppState>,
     Path(user_id): Path<i64>,
-    Json(body): Json<CreateToken>,
+    body: Result<Json<CreateToken>, JsonRejection>,
 ) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return json_rejection(rejection),
+    };
     // Ensure the target user exists (FK would also catch it, but a clean 404 is
     // friendlier than a 500).
     match user_dao::find_user_by_id(&state.pool, user_id).await {
