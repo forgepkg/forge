@@ -226,3 +226,14 @@ export function fetchPackageDetail(
     { signal },
   )
 }
+
+/** Hard-delete a hosted package version (admin only). */
+export function deletePackageVersion(
+  repo: string,
+  id: string,
+  version: string,
+): Promise<void> {
+  return httpClient.delete<void>(
+    `/admin/repositories/${encodeURIComponent(repo)}/packages/${encodeURIComponent(id)}/${encodeURIComponent(version)}`,
+  )
+}

@@ -1,5 +1,6 @@
 import type { DetailVersion } from '~/api/packages'
 import {
+  Button,
   StatusBadge,
   Table,
   TableBody,
@@ -30,6 +31,8 @@ export function VersionTable({
   versions,
   repoKind,
   caption,
+  onDelete,
+  deletePending,
   distTags,
   deprecated,
 }: {
@@ -37,6 +40,8 @@ export function VersionTable({
   /** The package's repository kind: `hosted` | `proxy` | `group`. */
   repoKind: string
   caption?: string
+  onDelete?: (version: DetailVersion) => void
+  deletePending?: boolean
   /** npm: tag → version. */
   distTags?: Record<string, string>
   /** npm: version → deprecation message. */
@@ -61,6 +66,7 @@ export function VersionTable({
           Size
         </TableHeader>
         <TableHeader>Status</TableHeader>
+        {onDelete && <TableHeader align="right">Actions</TableHeader>}
       </TableHead>
       <TableBody>
         {versions.map((v) => (
@@ -89,6 +95,18 @@ export function VersionTable({
                 <RetentionBadge status={v.retention_status} />
               </span>
             </TableCell>
+            {onDelete && (
+              <TableCell align="right">
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled={deletePending}
+                  onClick={() => onDelete(v)}
+                >
+                  Delete
+                </Button>
+              </TableCell>
+            )}
           </TableRow>
         ))}
       </TableBody>

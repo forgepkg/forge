@@ -1,10 +1,11 @@
 import { useState } from 'react'
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
 import { isRepositoryOffline, type DetailVersion } from '~/api/packages'
 import { useBrowseRepos } from '~/queries/useBrowseRepos'
-import { usePackageDetail } from '~/queries/usePackageDetail'
+import { useDeletePackageVersion, usePackageDetail } from '~/queries/usePackageDetail'
+import { useMe } from '~/queries/useMe'
 import { VersionTable } from '~/components/VersionTable'
 import { DependencyGroups } from '~/components/DependencyGroups'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
@@ -14,6 +15,7 @@ import {
   CodeBlock,
   Columns,
   CommandSnippet,
+  Dialog,
   FactList,
   Page,
   PageHeader,
@@ -24,8 +26,13 @@ import {
 } from '~/components/ui'
 
 export const Route = createFileRoute('/_app/packages/$repo/$id')({
-  component: PackageDetailPage,
+  component: PackageDetailRoute,
 })
+
+function PackageDetailRoute() {
+  const { repo, id } = Route.useParams()
+  return <PackageDetailPage key={JSON.stringify([repo, id])} />
+}
 
 /**
  * Package-detail view: versions with per-version metadata + delay/retention
@@ -36,7 +43,11 @@ export const Route = createFileRoute('/_app/packages/$repo/$id')({
  */
 function PackageDetailPage() {
   const { repo, id } = Route.useParams()
+  const navigate = useNavigate()
+  const me = useMe()
   const detail = usePackageDetail(repo, id)
+  const del = useDeletePackageVersion(repo, id)
+  const [pendingDelete, setPendingDelete] = useState<DetailVersion | null>(null)
   // The repository's format, from the (cached) list the rail shows too.
   const repos = useBrowseRepos()
   const format = Array.isArray(repos.data)
@@ -170,6 +181,15 @@ function PackageDetailPage() {
               versions={pkg.versions}
               repoKind={pkg.repo_kind}
               caption={`Versions of ${pkg.original_id}`}
+              onDelete={
+                me.data?.is_admin && pkg.repo_kind === 'hosted' && format !== 'docker'
+                  ? (version) => {
+                      del.reset()
+                      setPendingDelete(version)
+                    }
+                  : undefined
+              }
+              deletePending={del.isPending}
               distTags={pkg.tags}
               deprecated={pkg.deprecated}
             />
@@ -213,6 +233,41 @@ function PackageDetailPage() {
           )}
         </Panel>
       </Columns>
+      <Dialog
+        open={pendingDelete !== null}
+        onClose={() => {
+          if (!del.isPending) setPendingDelete(null)
+        }}
+        title={`Delete ${pkg.original_id} ${pendingDelete?.version_original ?? ''}?`}
+        description={
+          <>
+            Permanently delete version <Code>{pendingDelete?.version_original}</Code> of{' '}
+            <Code>{pkg.original_id}</Code> from repository <Code>{pkg.repo}</Code>.
+            This cannot be undone. Clients that already downloaded this version keep their copy.
+          </>
+        }
+        icon="Trash"
+        tone="danger"
+        confirmLabel={del.isPending ? 'Deleting…' : 'Delete version'}
+        confirmVariant="danger-solid"
+        confirmDisabled={del.isPending}
+        onConfirm={() => pendingDelete && del.mutate(pendingDelete.version_original, {
+          onSuccess: async () => {
+            setPendingDelete(null)
+            const remaining = await detail.refetch({ cancelRefetch: false })
+            if (
+              remaining.data?.versions.length === 0 ||
+              (remaining.error instanceof ApiError && remaining.error.status === 404)
+            ) {
+              void navigate({ to: '/repos/$repo', params: { repo } })
+            }
+          },
+        })}
+      >
+        {del.isError && (
+          <ErrorState title="Could not delete version" message={del.error.body || del.error.message} />
+        )}
+      </Dialog>
     </Page>
   )
 }
@@ -251,6 +306,9 @@ function InstallPanel({
   latest?: string
 }) {
   const [version, setVersion] = useState(() => defaultVersion(versions, latest))
+  const selectedVersion = versions.some((v) => v.version_original === version)
+    ? version
+    : defaultVersion(versions, latest)
   if (format !== 'nuget' && format !== 'npm') return null
   return (
     <Panel
@@ -262,7 +320,7 @@ function InstallPanel({
       }
     >
       {versions.length > 1 && (
-        <SelectField label="Version" value={version} onChange={(e) => setVersion(e.target.value)}>
+        <SelectField label="Version" value={selectedVersion} onChange={(e) => setVersion(e.target.value)}>
           {versions.map((v) => (
             <option key={v.version} value={v.version_original}>
               {v.version_original}
@@ -271,20 +329,20 @@ function InstallPanel({
         </SelectField>
       )}
       {format === 'npm' ? (
-        npmInstallCommands(id, version).map((snippet) => (
+        npmInstallCommands(id, selectedVersion).map((snippet) => (
           <CommandSnippet key={snippet.label} {...snippet} />
         ))
       ) : (
         <>
           <CommandSnippet
             label="dotnet CLI"
-            command={`dotnet add package ${id} --version ${version}`}
+            command={`dotnet add package ${id} --version ${selectedVersion}`}
             copyLabel="Copy add-package command"
           />
           <CodeBlock
             title="PackageReference"
             copyLabel="Copy PackageReference"
-            code={`<PackageReference\n  Include="${id}"\n  Version="${version}" />`}
+            code={`<PackageReference\n  Include="${id}"\n  Version="${selectedVersion}" />`}
             placeholders={[]}
           />
         </>

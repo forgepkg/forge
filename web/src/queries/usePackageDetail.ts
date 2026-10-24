@@ -1,8 +1,9 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type { ApiError } from '~/lib/httpClient'
 import {
   fetchPackageDetail,
+  deletePackageVersion,
   pkgKeys,
   type PackageDetail,
 } from '~/api/packages'
@@ -16,5 +17,15 @@ export function usePackageDetail(repo: string, id: string) {
   return useQuery<PackageDetail, ApiError>({
     queryKey: pkgKeys.detail(repo, id),
     queryFn: ({ signal }) => fetchPackageDetail(repo, id, signal),
+  })
+}
+
+export function useDeletePackageVersion(repo: string, id: string) {
+  const queryClient = useQueryClient()
+  return useMutation<void, ApiError, string>({
+    mutationFn: (version) => deletePackageVersion(repo, id, version),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: pkgKeys.all() })
+    },
   })
 }
