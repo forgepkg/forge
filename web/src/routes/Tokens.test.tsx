@@ -145,7 +145,7 @@ describe('self-service tokens', () => {
       }
       expect(body.name).toBe(`choice-${index}`)
       if ('date' in choice) {
-        expect(body.expires_at).toBe(`${choice.date}T23:59:59.999Z`)
+        expect(body.expires_at).toBe(new Date(`${choice.date}T23:59:59.999`).toISOString())
       } else if ('days' in choice || 'years' in choice) {
         const expected = new Date(started)
         if ('years' in choice) expected.setUTCFullYear(expected.getUTCFullYear() + choice.years)
@@ -189,7 +189,7 @@ describe('self-service tokens', () => {
     await waitFor(() => expect(api.sent('POST', /^\/admin\/me\/tokens$/)).toHaveLength(1))
     expect(
       (api.sent('POST', /^\/admin\/me\/tokens$/)[0]!.body as { expires_at: string }).expires_at,
-    ).toBe(`${date.min}T23:59:59.999Z`)
+    ).toBe(new Date(`${date.min}T23:59:59.999`).toISOString())
   })
 
   it('keeps a custom expiry on the selected date in a non-UTC timezone', async () => {

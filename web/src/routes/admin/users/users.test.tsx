@@ -877,7 +877,7 @@ describe('admin tokens', () => {
       const body = bodies[index]!
       expect(body.name).toBe(`choice-${index}`)
       if ('date' in choice) {
-        expect(body.expires_at).toBe(`${choice.date}T23:59:59.999Z`)
+        expect(body.expires_at).toBe(new Date(`${choice.date}T23:59:59.999`).toISOString())
       } else if ('days' in choice || 'years' in choice) {
         const expected = new Date(started)
         if ('years' in choice) expected.setUTCFullYear(expected.getUTCFullYear() + choice.years)
@@ -934,7 +934,7 @@ describe('admin tokens', () => {
       init?.method === 'POST',
     )
     expect(JSON.parse(request![1]!.body as string).expires_at).toBe(
-      `${date.min}T23:59:59.999Z`,
+      new Date(`${date.min}T23:59:59.999`).toISOString(),
     )
   })
 
