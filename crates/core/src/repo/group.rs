@@ -861,14 +861,15 @@ impl GroupRepo {
             let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
             let bounded_proxy = params.include_upstream && leaf.kind() == RepoKind::Proxy;
             let unrestricted = matches!(&leaf_filter, PackageFilter::AllowAll);
-            member_params.take = if bounded_proxy && unrestricted {
-                params
-                    .skip
-                    .saturating_add(params.effective_take())
-                    .min(SearchParams::MAX_TAKE)
-            } else {
-                SearchParams::MAX_TAKE
-            };
+            member_params.take =
+                if bounded_proxy && unrestricted && !graph.may_exclude_leaf(leaf.id) {
+                    params
+                        .skip
+                        .saturating_add(params.effective_take())
+                        .min(SearchParams::MAX_TAKE)
+                } else {
+                    SearchParams::MAX_TAKE
+                };
             let result = match ops
                 .search_unenriched(&leaf.name, &member_params, &leaf_filter)
                 .await

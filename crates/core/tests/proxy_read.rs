@@ -3048,6 +3048,51 @@ async fn group_search_bounds_upstream_pages_and_preserves_totals() {
         result.total_hits, 0,
         "reserved-prefix hits must not contribute opaque upstream totals"
     );
+
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            (0..60)
+                .map(|n| {
+                    let id = if n < 20 {
+                        format!("Acme.Package{n:02}")
+                    } else {
+                        format!("Package{n:02}")
+                    };
+                    search_entry(&id, &["1.0.0"])
+                })
+                .collect(),
+            100,
+        );
+    }
+    let result = group_ops
+        .search(
+            &group.name,
+            &SearchParams {
+                q: "mixed-reserved-public".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.total_hits, 40);
+    assert_eq!(
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.original_id.clone())
+            .collect::<Vec<_>>(),
+        (20..40)
+            .map(|n| format!("Package{n:02}"))
+            .collect::<Vec<_>>()
+    );
+    for mock in [&first, &second] {
+        let query = mock.search_queries().last().unwrap().clone();
+        assert!(
+            query.split('&').any(|part| part == "take=1000"),
+            "guarded search must fetch beyond excluded prefix: {query}"
+        );
+    }
 }
 
 /// Record a `proxy_cached_version` row as the listing and download paths do.
