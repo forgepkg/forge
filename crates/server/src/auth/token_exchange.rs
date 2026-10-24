@@ -1,4 +1,4 @@
-//! The trusted-publishing token exchange: `POST /api/v2/token`.
+//! The native NuGet and npm trusted-publishing token exchanges.
 //!
 //! A CI job presents its OIDC token as `Authorization: Bearer` and receives a
 //! short-lived workload API key, the same exchange nuget.org's trusted
@@ -24,9 +24,13 @@
 //!   as a Bearer token, or as the Basic password of the username `oidc`.
 //! * `username` is optional and, when given, must be `oidc`: identity comes
 //!   only from the verified token, never from the request body.
+//!
+//! npm uses `POST /-/npm/v1/oidc/token/exchange/package/{name}` and receives
+//! `{"token":"forge_wif.…"}`. It shares NuGet's verifier and redemption ledger;
+//! the realm's role authorizes the key, not the package named in the URL.
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::post;
@@ -46,17 +50,58 @@ use crate::state::AppState;
 /// Where the exchange is served (nuget.org's path).
 pub const TOKEN_EXCHANGE_PATH: &str = "/api/v2/token";
 
+pub(crate) const NPM_TOKEN_EXCHANGE_PATH: &str = "/-/npm/v1/oidc/token/exchange/package/{name}";
+
 /// The only `tokenType` there is.
 const TOKEN_TYPE_API_KEY: &str = "ApiKey";
 
 /// A request body is a few dozen bytes; refuse anything much larger unread.
 const MAX_REQUEST_BYTES: usize = 4 * 1024;
 
-/// The `/api/v2/token` route.
+/// The NuGet and npm token-exchange routes.
 pub fn token_exchange_router() -> Router<AppState> {
     Router::new()
         .route(TOKEN_EXCHANGE_PATH, post(exchange))
+        .route(NPM_TOKEN_EXCHANGE_PATH, post(npm_exchange))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+}
+
+async fn npm_exchange(
+    State(state): State<AppState>,
+    name: Result<Path<String>, axum::extract::rejection::PathRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(Path(name)) = name else {
+        return npm_refused(StatusCode::BAD_REQUEST, "invalid npm package name");
+    };
+    if forge_format_npm::PackageName::parse(&name).is_err() {
+        return npm_refused(StatusCode::BAD_REQUEST, "invalid npm package name");
+    }
+    let Some(token) = bearer_token(&headers) else {
+        return npm_refused(
+            StatusCode::UNAUTHORIZED,
+            "present the CI job's OIDC token as `Authorization: Bearer`",
+        );
+    };
+    match issue_key(&state, token).await {
+        Ok(redeemed) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({"token": redeemed.api_key})),
+        )
+            .into_response(),
+        Err((status, message)) => npm_refused(status, message),
+    }
+}
+
+fn npm_refused(status: StatusCode, message: &'static str) -> Response {
+    let mut response = refused(status, message);
+    *response.body_mut() =
+        axum::body::Body::from(serde_json::json!({"error": message}).to_string());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 /// `POST /api/v2/token` request body (every field optional).
@@ -141,6 +186,26 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         }
     }
 
+    match issue_key(&state, token).await {
+        Ok(Redeemed {
+            api_key, expires, ..
+        }) => (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(ExchangeResponse { api_key, expires }),
+        )
+            .into_response(),
+        Err((status, message)) => refused(status, message),
+    }
+}
+
+async fn issue_key(state: &AppState, token: &str) -> Result<Redeemed, (StatusCode, &'static str)> {
+    if is_workload_key(token) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "an API key cannot be exchanged; present the CI job's OIDC token",
+        ));
+    }
     let source = WorkloadIdentitySource::new(state.realms.clone(), state.pool.clone());
     let redeemed = match redeem(&state.pool, &source, token, false).await {
         // The database holds another realm configuration than this
@@ -150,36 +215,25 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         Err(Refusal::RealmChanged) => redeem(&state.pool, &source, token, true).await,
         other => other,
     };
-    let Redeemed {
-        api_key,
-        expires,
-        realm_id,
-        role_id,
-        subject_sha256,
-    } = match redeemed {
+    let redeemed = match redeemed {
         Ok(redeemed) => redeemed,
         Err(Refusal::RealmChanged) => {
-            return refused(
+            return Err((
                 StatusCode::UNAUTHORIZED,
                 "the workload identity realm changed during the exchange; try again",
-            )
+            ))
         }
-        Err(Refusal::Answer(response)) => return response,
+        Err(Refusal::Answer(status, message)) => return Err((status, message)),
     };
     tracing::info!(
         target: "forge::audit",
-        realm_id,
-        role_id,
-        subject = %hex::encode(&subject_sha256[..8]),
-        %expires,
+        realm_id = redeemed.realm_id,
+        role_id = redeemed.role_id,
+        subject = %hex::encode(&redeemed.subject_sha256[..8]),
+        expires = %redeemed.expires,
         "workload token exchanged for an API key"
     );
-    (
-        StatusCode::OK,
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(ExchangeResponse { api_key, expires }),
-    )
-        .into_response()
+    Ok(redeemed)
 }
 
 /// A key [`redeem`] issued.
@@ -197,7 +251,7 @@ enum Refusal {
     /// verified against ([`Stored::RealmChanged`]).
     RealmChanged,
     /// Any other refusal, as the answer to send.
-    Answer(Response),
+    Answer(StatusCode, &'static str),
 }
 
 /// Verify `token` (against a rebuilt realm snapshot with `refresh`) and
@@ -208,7 +262,7 @@ async fn redeem(
     token: &str,
     refresh: bool,
 ) -> Result<Redeemed, Refusal> {
-    let refuse = |status, message| Err(Refusal::Answer(refused(status, message)));
+    let refuse = |status, message| Err(Refusal::Answer(status, message));
     let workload = match source.verify_for_exchange(token, refresh).await {
         Ok(workload) => workload,
         Err(ExchangeRefusal::NotWorkloadToken) => {
@@ -398,5 +452,26 @@ mod tests {
         .unwrap();
         assert_eq!(response["apiKey"], "k");
         assert!(response.get("expires").is_some());
+    }
+
+    #[tokio::test]
+    async fn npm_refusals_are_json_and_keep_authentication_headers() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::SERVICE_UNAVAILABLE] {
+            let response = npm_refused(status, "invalid credentials");
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            if status == StatusCode::UNAUTHORIZED {
+                assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+            } else {
+                assert!(response.headers().contains_key(header::RETRY_AFTER));
+            }
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({"error": "invalid credentials"})
+            );
+        }
     }
 }

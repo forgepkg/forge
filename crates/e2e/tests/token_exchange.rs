@@ -1,5 +1,6 @@
 //! E2E: the trusted-publishing token exchange (`POST /api/v2/token`) and the
-//! reserved workload Basic username `oidc` (issue #169).
+//! reserved workload Basic username `oidc` (issue #169), and npm's root OIDC
+//! token exchange (issue #467).
 //!
 //! Drives the real server against Postgres plus the in-process mock OIDC
 //! issuer, as `wif.rs` does:
@@ -21,6 +22,7 @@
 
 #![cfg(feature = "forge-e2e")]
 
+use base64::Engine as _;
 use forge_e2e::{make_nupkg, start_stack, MockBasicUpstream, MockOidc, StackBuilder, TestServer};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -28,6 +30,7 @@ use sha2::{Digest, Sha256};
 use std::process::Command;
 
 const AUD: &str = "forge-ci";
+const NPM_AUD: &str = "https://registry.npmjs.org";
 
 /// A GitLab-shaped job: the claims the `gitlab-ci` realm's rule matches.
 fn job_claims(idp: &MockOidc) -> Value {
@@ -170,6 +173,319 @@ async fn push_with_api_key(srv: &TestServer, key: &str, id: &str, version: &str)
 
 fn sha256(value: &str) -> Vec<u8> {
     Sha256::digest(value.as_bytes()).to_vec()
+}
+
+fn npm_job_claims(idp: &MockOidc) -> Value {
+    let mut claims = job_claims(idp);
+    claims["aud"] = json!(NPM_AUD);
+    claims
+}
+
+async fn setup_npm(srv: &TestServer, idp: &MockOidc, level: &str, ttl: i64) {
+    setup(
+        srv,
+        idp,
+        json!({"allowed_audiences": [NPM_AUD], "api_key_ttl_seconds": ttl}),
+    )
+    .await;
+    for (name, kind) in [("npm-hosted", "hosted"), ("npm-group", "group")] {
+        assert_eq!(
+            srv.create_repo(json!({
+                "name": name, "kind": kind, "format": "npm", "anonymous_read": false
+            }))
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+    }
+    assert!(srv
+        .add_member("npm-group", "npm-hosted", 10)
+        .await
+        .status()
+        .is_success());
+    let (u, p) = srv.admin_basic();
+    let response = srv
+        .client()
+        .put(format!("{}/admin/repositories/npm-group", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"writable_member": "npm-hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let role: i64 = sqlx::query_scalar("SELECT id FROM role WHERE name = 'ci-pub'")
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    for repo in ["npm-hosted", "npm-group"] {
+        assert_eq!(
+            srv.add_grant(role, Some(repo), level, None).await.status(),
+            StatusCode::CREATED
+        );
+    }
+}
+
+async fn npm_exchange(srv: &TestServer, token: &str, name: &str) -> reqwest::Response {
+    srv.client()
+        .post(format!(
+            "{}/-/npm/v1/oidc/token/exchange/package/{name}",
+            srv.base_url
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn npm_exchange_ok(srv: &TestServer, token: &str, name: &str) -> String {
+    let response = npm_exchange(srv, token, name).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, no-store")
+    );
+    let body: Value = response.json().await.unwrap();
+    let key = body["token"].as_str().expect("npm token response");
+    assert!(key.starts_with("forge_wif."), "{body}");
+    assert!(body.get("apiKey").is_none(), "npm uses token, not apiKey");
+    key.to_owned()
+}
+
+async fn npm_exchange_error(response: reqwest::Response, expected: StatusCode) {
+    assert_eq!(response.status(), expected);
+    assert!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"),
+        "npm errors are JSON"
+    );
+    let body: Value = response.json().await.unwrap();
+    assert!(body["error"].is_string(), "{body}");
+    assert!(body.get("token").is_none(), "{body}");
+}
+
+async fn npm_publish(
+    srv: &TestServer,
+    key: &str,
+    repo: &str,
+    name: &str,
+    version: &str,
+) -> reqwest::Response {
+    let package = json!({"name": name, "version": version}).to_string();
+    let tarball = forge_format_npm::tarball::build(&[("package/package.json", package.as_bytes())]);
+    let digests = forge_format_npm::integrity::Digests::of(&tarball).unwrap();
+    let file = format!("{}-{version}.tgz", name.rsplit('/').next().unwrap());
+    srv.client()
+        .put(format!(
+            "{}/npm/{repo}/{}",
+            srv.base_url,
+            name.replacen('/', "%2f", 1)
+        ))
+        .bearer_auth(key)
+        .json(&json!({
+            "_id": name,
+            "name": name,
+            "dist-tags": {"latest": version},
+            "versions": {version: {
+                "name": name, "version": version,
+                "dist": {
+                    "integrity": digests.integrity(),
+                    "shasum": digests.sha1_hex,
+                    "tarball": format!("http://localhost/{file}")
+                }
+            }},
+            "_attachments": {file: {
+                "content_type": "application/octet-stream",
+                "data": base64::engine::general_purpose::STANDARD.encode(&tarball),
+                "length": tarball.len()
+            }}
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn npm_oidc_exchanged_bearer_publishes_hosted_and_writable_group() {
+    let idp = MockOidc::start_workload_only("unused-npm-client").await;
+    let srv = start_stack().await;
+    setup_npm(&srv, &idp, "write", 600).await;
+
+    for (repo, name, escaped) in [
+        ("npm-hosted", "plain-pkg", "plain-pkg"),
+        ("npm-group", "@acme/ui", "@acme%2fui"),
+    ] {
+        let claims = npm_job_claims(&idp);
+        let token = idp.sign_token(claims.clone()).await;
+        let key = npm_exchange_ok(&srv, &token, escaped).await;
+        let response = npm_publish(&srv, &key, repo, name, "1.0.0").await;
+        let status = response.status();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "publish {name} to {repo}: {}",
+            response.text().await.unwrap()
+        );
+        let response = srv
+            .client()
+            .get(format!("{}/npm/npm-hosted/{escaped}", srv.base_url))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let packument: Value = response.json().await.unwrap();
+        assert_eq!(packument["versions"]["1.0.0"]["name"], name);
+
+        let (jti, lifetime): (Option<Vec<u8>>, i64) = sqlx::query_as(
+            "SELECT jti_sha256, extract(epoch FROM expires_at - created_at)::bigint \
+             FROM workload_api_key WHERE key_sha256 = $1",
+        )
+        .bind(sha256(&key))
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+        assert_eq!(jti, Some(sha256(claims["jti"].as_str().unwrap())));
+        assert_eq!(lifetime, 600, "npm exchange honors the realm's key TTL");
+    }
+}
+
+#[tokio::test]
+async fn npm_oidc_reader_exchanges_but_cannot_publish() {
+    let idp = MockOidc::start_workload_only("unused-npm-client").await;
+    let srv = start_stack().await;
+    setup_npm(&srv, &idp, "read", 600).await;
+    let token = idp.sign_token(npm_job_claims(&idp)).await;
+    let key = npm_exchange_ok(&srv, &token, "plain-pkg").await;
+    for repo in ["npm-hosted", "npm-group"] {
+        assert_eq!(
+            npm_publish(&srv, &key, repo, "plain-pkg", "1.0.0")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN,
+            "exchange does not elevate a reader on {repo}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn npm_oidc_rejects_replay_across_both_exchange_endpoints() {
+    let idp = MockOidc::start_workload_only("unused-npm-client").await;
+    let srv = start_stack().await;
+    setup(&srv, &idp, json!({"allowed_audiences": [NPM_AUD]})).await;
+    let token = idp.sign_token(npm_job_claims(&idp)).await;
+    let key = npm_exchange_ok(&srv, &token, "plain-pkg").await;
+    npm_exchange_error(
+        npm_exchange(&srv, &token, "@acme%2fui").await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    assert_eq!(
+        exchange(&srv, &token, json!({})).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "npm redemption also consumes the token for NuGet"
+    );
+    npm_exchange_error(
+        npm_exchange(&srv, &key, "plain-pkg").await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    let token = idp.sign_token(npm_job_claims(&idp)).await;
+    let nuget_key = exchange_ok(&srv, &token).await;
+    npm_exchange_error(
+        npm_exchange(&srv, &token, "plain-pkg").await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    npm_exchange_error(
+        npm_exchange(&srv, &nuget_key, "plain-pkg").await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn npm_oidc_rejects_invalid_credentials_and_package_names_as_json() {
+    let idp = MockOidc::start_workload_only("unused-npm-client").await;
+    let srv = start_stack().await;
+    setup(&srv, &idp, json!({"allowed_audiences": [NPM_AUD]})).await;
+    let missing = srv
+        .client()
+        .post(format!(
+            "{}/-/npm/v1/oidc/token/exchange/package/plain-pkg",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    npm_exchange_error(missing, StatusCode::UNAUTHORIZED).await;
+    let wrong_audience = idp.sign_token(job_claims(&idp)).await;
+    npm_exchange_error(
+        npm_exchange(&srv, &wrong_audience, "plain-pkg").await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    let stranger = MockOidc::start_workload_only("untrusted-npm-client").await;
+    let foreign = stranger.sign_token(npm_job_claims(&stranger)).await;
+    npm_exchange_error(
+        npm_exchange(&srv, &foreign, "plain-pkg").await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    let mut without_jti = npm_job_claims(&idp);
+    without_jti.as_object_mut().unwrap().remove("jti");
+    let token = idp.sign_token(without_jti).await;
+    npm_exchange_error(
+        npm_exchange(&srv, &token, "plain-pkg").await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    let token = idp.sign_token(npm_job_claims(&idp)).await;
+    npm_exchange_error(
+        npm_exchange(&srv, &token, "not%20a%20package").await,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // A malformed request must not consume an otherwise valid CI token.
+    npm_exchange_ok(&srv, &token, "%40acme%2Fui").await;
+}
+
+#[tokio::test]
+async fn npm_oidc_exchanged_key_stops_publishing_at_expiry() {
+    let idp = MockOidc::start_workload_only("unused-npm-client").await;
+    let srv = start_stack().await;
+    setup_npm(&srv, &idp, "write", 600).await;
+    let token = idp.sign_token(npm_job_claims(&idp)).await;
+    let key = npm_exchange_ok(&srv, &token, "plain-pkg").await;
+    assert_eq!(
+        npm_publish(&srv, &key, "npm-hosted", "plain-pkg", "1.0.0")
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    sqlx::query(
+        "UPDATE workload_api_key SET created_at = now() - interval '2 hours', \
+         expires_at = now() - interval '1 hour' WHERE key_sha256 = $1",
+    )
+    .bind(sha256(&key))
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        npm_publish(&srv, &key, "npm-hosted", "plain-pkg", "1.0.1")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
