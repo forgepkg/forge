@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, role_id, repository_id, action, selector_id\n        FROM repository_privilege\n        WHERE selector_id = $1\n        ORDER BY role_id, id\n        ",
+  "query": "\n        SELECT id, role_id, repository_id, level, selector_id\n        FROM repository_privilege\n        WHERE selector_id = $1\n        ORDER BY role_id, id\n        ",
   "describe": {
     "columns": [
       {
@@ -38,12 +38,12 @@
       },
       {
         "ordinal": 3,
-        "name": "action",
+        "name": "level",
         "type_info": "Text",
         "origin": {
           "Table": {
             "table": "repository_privilege",
-            "name": "action"
+            "name": "level"
           }
         }
       },
@@ -72,5 +72,5 @@
       true
     ]
   },
-  "hash": "e07faad99522882fa40c2893f64a8ff941c8e196e13b055d1caa2dd406e3b417"
+  "hash": "124b9e6828b1ec43804d8036c15bcc1e887db58a4693eafb2a53ef2dc45dac7b"
 }

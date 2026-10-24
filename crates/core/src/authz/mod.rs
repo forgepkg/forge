@@ -6,7 +6,7 @@
 //! [`EffectiveSet::package_filter`], [`EffectiveSet::intersect_scope`]).
 //!
 //! The *seam* that the rest of the codebase calls (`can_read` / `can_write` /
-//! `can_admin`) lives in [`crate::auth::authz`] (the [`Authz`] service). That
+//! `can_delete`) lives in [`crate::auth::authz`] (the [`Authz`] service). That
 //! service loads a [`RawEffectiveSet`] through the cached DB loader ([`cache`]),
 //! [`build`](EffectiveSet::build)s it, applies any token scope, and answers the
 //! seam predicates from the result. Keeping the evaluator pure here makes the
@@ -22,6 +22,6 @@ pub use cache::{
     load_role_effective, load_user_effective, LoadError, DEFAULT_TTL, NS_AUTHZ,
 };
 pub use eval::{
-    parse_token_scope, Action, CompiledSelector, EffectiveSet, Grant, PackageFilter,
+    parse_token_scope, CompiledSelector, EffectiveSet, Grant, Level, PackageFilter,
     RawEffectiveSet, RawGrant, SelectorCompileError, SelectorPatterns, TokenScope,
 };

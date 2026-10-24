@@ -33,7 +33,7 @@ pub struct EffectiveView {
 /// One grant in the effective view.
 #[derive(Debug, Serialize)]
 pub struct GrantView {
-    pub action: String,
+    pub level: String,
     pub repository_id: Option<i64>,
     pub selector_id: Option<i64>,
     pub includes: Option<JsonValue>,
@@ -47,7 +47,7 @@ impl From<EffectiveGrantRow> for GrantView {
             None => (None, None, None),
         };
         GrantView {
-            action: g.action,
+            level: g.level,
             repository_id: g.repository_id,
             selector_id,
             includes,

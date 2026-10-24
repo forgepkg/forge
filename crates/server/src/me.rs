@@ -13,7 +13,7 @@
 //! A token-scoped principal reports what that token may do.
 //! * every authenticated user can read (`repo.read`);
 //! * a principal that may publish to every repository (the built-in `writer`
-//!   role, or any unscoped `write` grant on every repository) gets
+//!   role, or any unscoped `write` or `delete` grant on every repository) gets
 //!   `repo.write`, so the SPA can show push instructions;
 //! * an admin additionally gets `repo.admin` / `user.admin` / `token.admin`
 //!   (and `repo.write`).

@@ -48,22 +48,26 @@ describe('token status', () => {
 describe('token scope', () => {
   it('reads the stored scope as the server does', () => {
     expect(parseTokenScope(null)).toBeNull()
-    expect(parseTokenScope({ actions: ['read'], repositories: [3] })).toEqual({
-      actions: ['read'],
+    expect(parseTokenScope({ level: 'read', repositories: [3] })).toEqual({
+      level: 'read',
       repositories: [3],
     })
+    expect(parseTokenScope({ admin: true, level: null })).toEqual({ admin: true })
     // Unknown keys and bad values do not parse; the server denies the token.
     expect(parseTokenScope({ repos: [3] })).toBe('invalid')
-    expect(parseTokenScope({ actions: ['push'] })).toBe('invalid')
+    expect(parseTokenScope({ level: 'admin' })).toBe('invalid')
+    expect(parseTokenScope({ admin: 'yes' })).toBe('invalid')
     expect(parseTokenScope('admin')).toBe('invalid')
+    // `actions`, which `level` and `admin` replaced, is refused too.
+    expect(parseTokenScope({ actions: ['read'] })).toBe('invalid')
   })
 
-  it('shows admin and the number of repositories', () => {
+  it('shows admin, the level and the number of repositories', () => {
     render(
-      <TokenScopeBadges scope={{ actions: ['read', 'admin'], repositories: [3, 4] }} />,
+      <TokenScopeBadges scope={{ level: 'read', admin: true, repositories: [3, 4] }} />,
     )
     expect(screen.getByText('admin')).toBeInTheDocument()
-    expect(screen.getByText('read')).toBeInTheDocument()
+    expect(screen.getByText('read')).toHaveAttribute('title', 'At most read: browse, read')
     expect(screen.getByText('2 repositories')).toBeInTheDocument()
   })
 
@@ -71,6 +75,9 @@ describe('token scope', () => {
     const { unmount } = render(<TokenScopeBadges scope={null} />)
     expect(screen.getByText('unscoped')).toBeInTheDocument()
     unmount()
+    const { unmount: unmountEmpty } = render(<TokenScopeBadges scope={{ admin: false }} />)
+    expect(screen.getByText('unscoped')).toBeInTheDocument()
+    unmountEmpty()
     render(<TokenScopeBadges scope={{ repos: [3] } as never} />)
     expect(screen.getByText('invalid scope')).toBeInTheDocument()
   })

@@ -9,9 +9,9 @@ import { httpClient } from '~/lib/httpClient'
  *  - `RoleView` (`roles.rs`) counts the role's grants and users. The built-in
  *    roles (`admin`, `writer`, `authenticated`, `anonymous`) cannot be
  *    deleted; only a role's description can change.
- *  - `GrantView` (`grants.rs`) is `(repository or every repository, action,
- *    selector?)`: `repository_id: null` means every repository. `admin` is
- *    accepted only on every repository (400 otherwise).
+ *  - `GrantView` (`grants.rs`) is `(repository or every repository, level,
+ *    selector?)`: `repository_id: null` means every repository. A role holds
+ *    one grant per repository and selector; adding one again sets its level.
  *  - `SelectorView` (`content_selectors.rs`): include and exclude globs on the
  *    lowercased package name. An empty include list matches every package.
  *    `PATCH` keeps an omitted field; deleting a selector deletes the grants
@@ -23,9 +23,28 @@ import { httpClient } from '~/lib/httpClient'
  * the `/manage` route guard confirms `is_admin`.
  */
 
-/** The action verbs a grant (and a token scope) names. */
-export const ACTIONS = ['read', 'write', 'delete', 'admin'] as const
-export type Action = (typeof ACTIONS)[number]
+/**
+ * The ordered access levels a grant (and a token scope) gives, lowest first:
+ * each includes the ones below it. Administration is no level: it is the
+ * built-in `admin` role.
+ */
+export const LEVELS = ['read', 'write', 'delete'] as const
+export type Level = (typeof LEVELS)[number]
+
+/**
+ * The Nexus actions each level covers: `read` covers browse and read, `write`
+ * adds add and edit, and `delete` adds delete.
+ */
+export const LEVEL_COVERS: Record<Level, string> = {
+  read: 'browse, read',
+  write: 'browse, read, add, edit',
+  delete: 'browse, read, add, edit, delete',
+}
+
+/** A level with what it covers, as the level pickers offer it. */
+export function levelLabel(level: Level): string {
+  return `${level} (${LEVEL_COVERS[level]})`
+}
 
 /** The built-in role names. */
 export const ADMIN_ROLE = 'admin'
@@ -88,17 +107,18 @@ export interface GrantView {
   id: number
   role_id: number
   repository_id: number | null
-  action: Action
+  level: Level
   selector_id: number | null
 }
 
 /**
  * `PUT /admin/roles/{id}/grants` body. Omit `repository_id` for every
- * repository; `admin` is refused together with a repository.
+ * repository. Sets the level of the role's grant on that repository and
+ * selector when it has one.
  */
 export interface AddGrant {
   repository_id?: number
-  action: Action
+  level: Level
   selector_id?: number
 }
 
@@ -135,7 +155,7 @@ export interface MatchSelector {
 
 /** One grant of an effective set (`effective.rs` `GrantView`). */
 export interface EffectiveGrant {
-  action: Action
+  level: Level
   repository_id: number | null
   selector_id: number | null
   includes: string[] | null

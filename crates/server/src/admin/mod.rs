@@ -32,10 +32,9 @@
 //!
 //! **API tokens and `/admin/*`.** A token is a feed credential, not an admin
 //! login: a token-authenticated caller passes [`require_admin`] only when the
-//! token's scope lists the `admin` action explicitly (and does not restrict
-//! repositories) — e.g. `{"actions": ["admin"]}` for automation. An unscoped
-//! token of an admin account gets 403 here (it keeps the owner's
-//! read/write/delete reach on the feed).
+//! token's scope opts in with `"admin": true` (and does not restrict
+//! repositories) — e.g. `{"admin": true}` for automation. An unscoped token of
+//! an admin account gets 403 here (it keeps the owner's levels on the feed).
 //!
 //! **Passwords and `/admin/*`.** A password sent over HTTP Basic is refused
 //! here (403) even for an administrator: NuGet clients store that password
@@ -86,7 +85,7 @@ use crate::state::AppState;
 ///
 /// **Tokens (B4).** For a token principal (`token_id: Some`) the verdict is the
 /// *token's* effective set, in which `admin` survives only when the token's
-/// scope names the `admin` action and does not restrict repositories (see
+/// scope sets `admin: true` and does not restrict repositories (see
 /// `EffectiveSet::intersect_scope`). An unscoped token of an admin is
 /// therefore refused with 403: otherwise a leaked feed token could create
 /// admins and mint replacement tokens, surviving its own revocation.
@@ -410,4 +409,25 @@ where
     T: serde::Deserialize<'de>,
 {
     <Option<T> as serde::Deserialize>::deserialize(de).map(Some)
+}
+
+/// Deserialize a field to `Some(())` whenever it is present, whatever its
+/// value: a field a request may no longer send, refused by name.
+pub(crate) fn present<'de, D>(de: D) -> Result<Option<()>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde::de::IgnoredAny as serde::Deserialize>::deserialize(de).map(|_| Some(()))
+}
+
+/// The answer to a JSON body that does not deserialize: 400 for one that
+/// parses but does not fit the request (axum answers 422), so a token scope
+/// still sending `actions` gets 400 with the message naming `level`; the
+/// rejection's own status otherwise.
+pub(crate) fn json_rejection(rejection: axum::extract::rejection::JsonRejection) -> Response {
+    let status = match &rejection {
+        axum::extract::rejection::JsonRejection::JsonDataError(_) => StatusCode::BAD_REQUEST,
+        other => other.status(),
+    };
+    (status, rejection.body_text()).into_response()
 }

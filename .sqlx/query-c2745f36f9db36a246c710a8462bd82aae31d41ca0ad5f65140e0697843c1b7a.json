@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            rp.action            AS action,\n            rp.repository_id     AS repository_id,\n            cs.id                AS \"selector_id?\",\n            cs.includes          AS \"includes?\",\n            cs.excludes          AS \"excludes?\"\n        FROM user_role ur\n        JOIN repository_privilege rp ON rp.role_id = ur.role_id\n        LEFT JOIN content_selector cs ON cs.id = rp.selector_id\n        WHERE ur.user_id = $1\n        ",
+  "query": "\n        SELECT\n            rp.level             AS level,\n            rp.repository_id     AS repository_id,\n            cs.id                AS \"selector_id?\",\n            cs.includes          AS \"includes?\",\n            cs.excludes          AS \"excludes?\"\n        FROM user_role ur\n        JOIN repository_privilege rp ON rp.role_id = ur.role_id\n        LEFT JOIN content_selector cs ON cs.id = rp.selector_id\n        WHERE ur.user_id = $1\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "action",
+        "name": "level",
         "type_info": "Text",
         "origin": {
           "Table": {
             "table": "repository_privilege",
-            "name": "action"
+            "name": "level"
           }
         }
       },
@@ -72,5 +72,5 @@
       true
     ]
   },
-  "hash": "fe4d2a1c3dc7be884063ae5062d71287be8ed15862c293ec4ce20ecb37027803"
+  "hash": "c2745f36f9db36a246c710a8462bd82aae31d41ca0ad5f65140e0697843c1b7a"
 }
