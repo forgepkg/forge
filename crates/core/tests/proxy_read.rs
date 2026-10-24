@@ -2806,6 +2806,174 @@ fn hit_versions(hit: &forge_core::repo::SearchHit) -> Vec<&str> {
     hit.versions.iter().map(|v| v.version.as_str()).collect()
 }
 
+struct ProxySearchFactory(Arc<ProxyRepo>);
+
+impl forge_core::repo::group::MemberOpsFactory for ProxySearchFactory {
+    fn ops_for(
+        &self,
+        _member: &forge_db::model::Repository,
+    ) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn group_search_bounds_upstream_pages_and_preserves_totals() {
+    use forge_core::auth::authz::Authz;
+    use forge_core::auth::principal::Principal;
+    use forge_core::authz::eval::PackageFilter;
+    use forge_core::repo::group::GroupRepo;
+    use forge_core::repo::SearchParams;
+
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let first = start_mock(HashMap::new()).await;
+    let second = start_mock(HashMap::new()).await;
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            (0..60)
+                .map(|n| search_entry(&format!("Package{n:02}"), &["1.0.0"]))
+                .collect(),
+            100,
+        );
+    }
+    let group = repository_dao::insert_repository(
+        &pool,
+        NewRepository::group(format!("group{}", common::unique())),
+    )
+    .await
+    .unwrap();
+    let nested = repository_dao::insert_repository(
+        &pool,
+        NewRepository::group(format!("nested{}", common::unique())),
+    )
+    .await
+    .unwrap();
+    repository_dao::add_group_member(&pool, group.id, nested.id, 0)
+        .await
+        .unwrap();
+    for (priority, mock) in [&first, &second].into_iter().enumerate() {
+        let name = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+        repository_dao::add_group_member(
+            &pool,
+            nested.id,
+            repo_id(&pool, &name).await,
+            priority as i32,
+        )
+        .await
+        .unwrap();
+    }
+    let authz = Authz::new(pool.clone(), Cache::l1_only(16));
+    let user = forge_db::user_dao::insert_user(
+        &pool,
+        forge_db::user_dao::NewUser::local(
+            format!("group-search-{}@example.com", common::unique()),
+            "x".into(),
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+    let role = forge_db::authz_dao::role_id_by_name(&pool, forge_db::authz_dao::AUTHENTICATED_ROLE)
+        .await
+        .unwrap()
+        .unwrap();
+    forge_db::authz_dao::assign_role(&pool, user.id, role)
+        .await
+        .unwrap();
+    let group_ops = GroupRepo::new(
+        pool.clone(),
+        Principal::User {
+            user_id: user.id,
+            token_id: None,
+            method: forge_core::auth::AuthMethod::Password,
+        },
+        Arc::new(ProxySearchFactory(Arc::new(proxy_repo(
+            &pool,
+            cas,
+            Cache::l1_only(128),
+        )))),
+        authz,
+        20,
+    )
+    .with_format(Arc::new(nuget()));
+
+    // A single member retains the upstream total, not just the fetched page.
+    let single = repository_dao::insert_repository(
+        &pool,
+        NewRepository::group(format!("single{}", common::unique())),
+    )
+    .await
+    .unwrap();
+    let members = repository_dao::group_members(&pool, nested.id)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, single.id, members[0].0.id, 0)
+        .await
+        .unwrap();
+    let result = group_ops
+        .search(&single.name, &SearchParams::default())
+        .await
+        .unwrap();
+    assert_eq!(result.hits.len(), 20);
+    assert_eq!(result.total_hits, 100);
+
+    for (skip, take, window) in [
+        (0, 20, 20),
+        (5, 5, 10),
+        (0, 0, 20),
+        (0, usize::MAX, SearchParams::MAX_TAKE),
+        (usize::MAX, 20, SearchParams::MAX_TAKE),
+    ] {
+        let params = SearchParams {
+            q: format!("window-{skip}-{take}"),
+            skip,
+            take,
+            ..Default::default()
+        };
+        let result = group_ops.search(&group.name, &params).await.unwrap();
+        let fetched = window.min(60);
+        assert_eq!(
+            result.total_hits,
+            200 - fetched,
+            "retain both upstream totals, deduplicating fetched ids"
+        );
+        let expected: Vec<String> = (0..fetched)
+            .skip(skip)
+            .take(params.effective_take())
+            .map(|n| format!("Package{n:02}"))
+            .collect();
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.original_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for mock in [&first, &second] {
+            let queries = mock.search_queries();
+            let query = queries.last().unwrap();
+            for part in ["skip=0".to_string(), format!("take={window}")] {
+                assert!(query.split('&').any(|p| p == part), "{part} in {query}");
+            }
+        }
+    }
+
+    // A restricted caller must not learn the upstream's unfiltered total.
+    let result = group_ops
+        .search_with_package_filter(
+            &group.name,
+            &SearchParams::default(),
+            &PackageFilter::Predicate(Arc::new(|id| id == "Package00")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.total_hits, 3, "one visible id plus paging sentinels");
+}
+
 /// Record a `proxy_cached_version` row as the listing and download paths do.
 async fn record_version(
     pool: &PgPool,

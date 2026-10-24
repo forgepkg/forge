@@ -436,6 +436,16 @@ impl GroupGraph {
     }
 
     fn filter_for_leaf(self: &Arc<Self>, leaf_id: i64) -> PackageFilter {
+        // With no selectors, every discovered leaf is visible for every id.
+        // Preserve AllowAll so proxies can retain their upstream hit counts.
+        if self
+            .groups
+            .values()
+            .flatten()
+            .all(|member| matches!(member.filter, PackageFilter::AllowAll))
+        {
+            return PackageFilter::AllowAll;
+        }
         let graph = self.clone();
         PackageFilter::Predicate(Arc::new(move |package_id| {
             graph
@@ -830,10 +840,20 @@ impl GroupRepo {
         // `member_ops[i]` reads `graph.leaves[i]`.
         let mut member_ops: Vec<Arc<dyn RepoReadOps>> = Vec::with_capacity(graph.leaves.len());
         let mut candidates: Vec<RankedHit> = Vec::new();
+        let mut unseen_hits = 0_usize;
         let mut failures = MemberFailures::default();
         for (member, leaf) in graph.leaves.iter().enumerate() {
             let ops = self.member_ops(leaf)?;
             member_ops.push(ops.clone());
+            let bounded_proxy = params.include_upstream && leaf.kind() == RepoKind::Proxy;
+            member_params.take = if bounded_proxy {
+                params
+                    .skip
+                    .saturating_add(params.effective_take())
+                    .min(SearchParams::MAX_TAKE)
+            } else {
+                SearchParams::MAX_TAKE
+            };
             let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
             let result = match ops
                 .search_unenriched(&leaf.name, &member_params, &leaf_filter)
@@ -848,6 +868,12 @@ impl GroupRepo {
                     continue;
                 }
             };
+            if bounded_proxy {
+                // Deduplicate the returned ids below. Unfetched upstream ids
+                // cannot be deduplicated, so their contribution is an estimate.
+                unseen_hits =
+                    unseen_hits.saturating_add(result.total_hits.saturating_sub(result.hits.len()));
+            }
             for hit in result.hits {
                 let Some(rank) = graph.leaf_rank(&hit.original_id, leaf.id) else {
                     continue;
@@ -893,7 +919,7 @@ impl GroupRepo {
             crate::format::lower_invariant(&a.hit.original_id)
                 .cmp(&crate::format::lower_invariant(&b.hit.original_id))
         });
-        let total_hits = ranked.len();
+        let total_hits = ranked.len().saturating_add(unseen_hits);
         let page: Vec<RankedHit> = ranked
             .into_iter()
             .skip(params.skip.min(total_hits))
