@@ -352,6 +352,6 @@ the other curl checks of this page.
 - **Ranges.** One range per request; a multi-range request is answered in
   full.
 - **No Nexus import.** Importing a Nexus raw repository is not supported yet
-  ([nexus-import.md](nexus-import.md) covers NuGet, Helm and Docker).
+  ([nexus-import.md](nexus-import.md) covers NuGet and Docker).
 - **No directory delete over `/raw`.** A directory is deleted through the
   admin API or the web UI (administrators).

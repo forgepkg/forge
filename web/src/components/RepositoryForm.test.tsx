@@ -30,14 +30,14 @@ import {
  *    diffs them (an emptied host / writable member clears it with `null`).
  */
 
-const helm: FormatView = {
-  id: 'helm',
-  name: 'Helm charts',
-  builtin: true,
+const example: FormatView = {
+  id: 'example',
+  name: 'Example packages',
+  builtin: false,
   kinds: ['hosted', 'group'],
   mount: '/repository',
   version: '0.1.0',
-  description: 'Helm chart repositories.',
+  description: 'Example package repositories.',
 }
 
 function lastValues(onSubmit: ReturnType<typeof vi.fn>): RepoFormValues {
@@ -83,7 +83,7 @@ describe('RepositoryForm', () => {
     render(
       <RepositoryForm
         mode="create"
-        formats={[NUGET_FORMAT, helm]}
+        formats={[NUGET_FORMAT, example]}
         submitting={false}
         onSubmit={onSubmit}
         onCancel={() => {}}
@@ -95,25 +95,25 @@ describe('RepositoryForm', () => {
     expect(screen.getByText('/v3/<name>/index.json')).toBeInTheDocument()
 
     await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
-    await user.selectOptions(screen.getByLabelText('Format'), 'helm')
+    await user.selectOptions(screen.getByLabelText('Format'), 'example')
     // A plugin format has no proxies; the kind falls back to hosted.
     expect(screen.queryByRole('option', { name: 'proxy' })).not.toBeInTheDocument()
     expect(screen.getByLabelText('Kind')).toHaveValue('hosted')
     expect(screen.getByText('/repository/<name>/')).toBeInTheDocument()
-    expect(screen.getByText(helm.description!)).toBeInTheDocument()
+    expect(screen.getByText(example.description!)).toBeInTheDocument()
 
-    await user.type(screen.getByLabelText('Name'), 'charts')
+    await user.type(screen.getByLabelText('Name'), 'pkgs')
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
     expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
-      name: 'charts',
+      name: 'pkgs',
       kind: 'hosted',
-      format: 'helm',
+      format: 'example',
     })
   })
 
   it('shows a stored format read-only on edit', () => {
-    renderEdit({ ...storedProxy, kind: 'hosted', format: 'helm' })
-    expect(screen.getByLabelText('Format')).toHaveValue('helm')
+    renderEdit({ ...storedProxy, kind: 'hosted', format: 'example' })
+    expect(screen.getByLabelText('Format')).toHaveValue('example')
     expect(screen.getByLabelText('Format')).toHaveAttribute('readonly')
     expect(screen.getByText('/repository/<name>/')).toBeInTheDocument()
   })

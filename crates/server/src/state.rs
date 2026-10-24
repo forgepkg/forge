@@ -55,7 +55,7 @@ pub struct AppState {
     /// through this.
     pub authz: Authz,
     /// Package-format registry, keyed by `Format::id()`: the built-in format
-    /// plugins (NuGet, Helm) and any loaded WebAssembly plugins.
+    /// plugin (NuGet) and any loaded WebAssembly plugins.
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
@@ -139,8 +139,8 @@ impl Instance {
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
-/// [`Format`] and its plugin. The built-in format plugins
-/// ([`crate::plugins::builtin`]: NuGet, Helm), Docker and raw are always
+/// [`Format`] and its plugin. The built-in format plugin
+/// ([`crate::plugins::builtin`]: NuGet), Docker and raw are always
 /// there; WebAssembly plugins are added at startup
 /// ([`FormatRegistry::with_plugin`]).
 ///
@@ -700,7 +700,7 @@ mod tests {
         assert!(registry.get(DOCKER_FORMAT).is_none());
         assert_eq!(
             registry.ids().collect::<Vec<_>>(),
-            ["docker", "helm", "nuget", "raw"]
+            ["docker", "nuget", "raw"]
         );
         assert!(registry.is_installed(RAW_FORMAT));
         assert!(registry.get(RAW_FORMAT).is_none());
@@ -716,10 +716,7 @@ mod tests {
             registry.kinds("nuget"),
             Some(vec!["hosted", "proxy", "group"])
         );
-        assert_eq!(
-            registry.kinds("helm"),
-            Some(vec!["hosted", "proxy", "group"])
-        );
+        assert_eq!(registry.kinds("helm"), None);
         assert_eq!(registry.kinds("npm"), None);
         assert!(!registry.is_installed("npm"));
     }

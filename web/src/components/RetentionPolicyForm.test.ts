@@ -16,7 +16,7 @@ import {
 describe('retention policy model', () => {
   it('picks the policy shape of a repository', () => {
     expect(policyShape({ format: 'nuget', kind: 'hosted' })).toBe('package')
-    expect(policyShape({ format: 'helm', kind: 'proxy' })).toBe('proxy')
+    expect(policyShape({ format: 'nuget', kind: 'proxy' })).toBe('proxy')
     expect(policyShape({ format: 'raw', kind: 'proxy' })).toBe('file')
     expect(policyShape({ format: 'docker', kind: 'hosted' })).toBe('image')
     expect(policyShape({ format: 'nuget', kind: 'group' })).toBeNull()

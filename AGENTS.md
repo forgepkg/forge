@@ -55,7 +55,7 @@ its pull request's description says why.
 A package format is a crate in `plugins/<id>/`, the directory named after its
 format id, whether it runs built in only, as a WebAssembly component, or
 both. Built in only is no reason to put it elsewhere: NuGet runs built in
-only and lives in `plugins/nuget`, like Helm. Never add a format as a crate
+only and lives in `plugins/nuget`. Never add a format as a crate
 under `crates/` (no `crates/format-<id>`) or as a module of the server: it
 implements `FormatPlugin` with the layout
 [plugins/README.md](plugins/README.md) describes, and has a `component`

@@ -56,7 +56,7 @@ pub struct InvalidateBody {
 /// What an invalidation removed.
 #[derive(Debug, Serialize)]
 pub struct Invalidated {
-    /// Not-found answers removed (NuGet and Helm proxies; a docker proxy
+    /// Not-found answers removed (NuGet and plugin proxies; a docker proxy
     /// keeps its own in memory, forgotten too but not counted).
     pub not_found_cleared: u64,
     /// Tags due for re-validation (docker proxies).

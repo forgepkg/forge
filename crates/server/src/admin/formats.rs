@@ -1,6 +1,6 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: the built-in format plugins (NuGet, Helm), Docker, raw
-//! files, and every loaded WebAssembly plugin.
+//! repositories of: the built-in format plugin (NuGet), Docker, raw files,
+//! and every loaded WebAssembly plugin.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};

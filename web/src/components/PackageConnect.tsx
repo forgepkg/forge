@@ -39,28 +39,6 @@ export function connectSnippets(
             ]
           : []),
       ]
-    case 'helm':
-      return [
-        {
-          label: 'Add the repository',
-          command: `helm repo add ${repo} ${url} --username <username> --password <token>`,
-          copyLabel: 'Copy repo-add command',
-        },
-        {
-          label: 'Install a chart',
-          command: `helm install <release> ${repo}/<chart>`,
-          copyLabel: 'Copy install command',
-        },
-        ...(canPush
-          ? [
-              {
-                label: 'Push a chart',
-                command: `curl -u <username>:<token> --data-binary @<chart>-<version>.tgz ${url}/api/charts`,
-                copyLabel: 'Copy push command',
-              },
-            ]
-          : []),
-      ]
     default:
       return [
         {
@@ -73,7 +51,7 @@ export function connectSnippets(
 }
 
 /**
- * "Connect" panel of a package repository (NuGet, Helm, or another format
+ * "Connect" panel of a package repository (NuGet, or another format
  * plugin's): the address to copy, the client commands for it, and where the
  * password comes from — clients authenticate with an API token (from the
  * Your tokens screen), not the UI sign-in. Docker repositories have

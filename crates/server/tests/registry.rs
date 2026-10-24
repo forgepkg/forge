@@ -1113,6 +1113,195 @@ async fn multi_arch_index_and_referrers() {
     assert_eq!(detail["pull_name"], format!("test.local/{repo}/multi"));
 }
 
+const HELM_CONFIG: &str = "application/vnd.cncf.helm.config.v1+json";
+const HELM_CHART: &str = "application/vnd.cncf.helm.chart.content.v1.tar+gzip";
+
+/// A gzipped ustar archive of `(path, contents)` entries.
+fn tgz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut tar = Vec::new();
+    for (path, data) in entries {
+        let mut h = [0u8; 512];
+        h[..path.len()].copy_from_slice(path.as_bytes());
+        h[100..108].copy_from_slice(b"0000644\0");
+        h[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+        h[156] = b'0';
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        h[148..156].fill(b' ');
+        let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        tar.extend_from_slice(&h);
+        tar.extend_from_slice(data);
+        tar.resize(tar.len().div_ceil(512) * 512, 0);
+    }
+    tar.extend_from_slice(&[0u8; 1024]);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&tar).unwrap();
+    gz.finish().unwrap()
+}
+
+/// A Helm chart as `helm push` stores it: its config blob, chart archive
+/// and manifest.
+fn helm_chart(name: &str, version: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let config = json!({
+        "apiVersion": "v2", "name": name, "version": version, "appVersion": "2.0",
+        "description": format!("The {name} chart"), "type": "application",
+    })
+    .to_string()
+    .into_bytes();
+    let chart_yaml =
+        format!("apiVersion: v2\nname: {name}\nversion: {version}\nappVersion: \"2.0\"\n");
+    let archive = tgz(&[
+        (&format!("{name}/Chart.yaml"), chart_yaml.as_bytes()),
+        (&format!("{name}/values.yaml"), b"replicas: 1\n"),
+        (
+            &format!("{name}/README.md"),
+            format!("# {name}\n").as_bytes(),
+        ),
+        (&format!("{name}/charts/sub/README.md"), b"# a subchart\n"),
+    ]);
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "config": {"mediaType": HELM_CONFIG, "digest": sha(&config), "size": config.len()},
+        "layers": [{"mediaType": HELM_CHART, "digest": sha(&archive), "size": archive.len()}],
+        "annotations": {"org.opencontainers.image.title": name, "org.opencontainers.image.version": version},
+    })
+    .to_string()
+    .into_bytes();
+    (config, archive, manifest)
+}
+
+/// Helm charts pushed as artifacts: the image page lists them by their
+/// config type, and `/browse/chart` reads their metadata, README and values
+/// from the blobs Forge holds, through a group too.
+#[tokio::test]
+async fn helm_charts_are_browsable() {
+    let srv = common::start().await;
+    let repo = repo_name("charts");
+    let group = repo_name("group");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker"}),
+    )
+    .await;
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{group}/members"),
+        json!({"member": repo, "priority": 10}),
+    )
+    .await;
+    assert_eq!(resp.status(), 201);
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/charts/demo");
+    let (config, archive, manifest) = helm_chart("demo", "1.2.3");
+    oci.push_blob(&name, &config).await;
+    oci.push_blob(&name, &archive).await;
+    let resp = oci
+        .put_manifest(&name, "1.2.3", OCI_MANIFEST, &manifest)
+        .await;
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    let digest = sha(&manifest);
+    let image_digest = oci
+        .push_image(&format!("{repo}/charts/app"), "1", "amd64", b"a layer")
+        .await;
+
+    let session = srv
+        .login(srv.admin_user.as_deref().unwrap(), "adminpw")
+        .await;
+    let get = |path: String| {
+        let request = session.apply(srv.client().get(format!("{}{path}", srv.base_url)));
+        async move { request.send().await.unwrap() }
+    };
+    let detail: Value = get(format!("/browse/images/{repo}/charts/demo"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["manifests"][0]["artifact_type"], HELM_CONFIG);
+    assert_eq!(detail["tags"][0]["tag"], "1.2.3");
+
+    for (r, source) in [(&repo, None), (&group, Some(repo.as_str()))] {
+        let resp = get(format!(
+            "/browse/chart?repo={r}&image=charts/demo&digest={digest}"
+        ))
+        .await;
+        assert_eq!(resp.status(), 200);
+        let chart: Value = resp.json().await.unwrap();
+        assert_eq!(chart["digest"], digest.as_str());
+        assert_eq!(chart["metadata"]["name"], "demo");
+        assert_eq!(chart["metadata"]["version"], "1.2.3");
+        assert_eq!(chart["metadata"]["appVersion"], "2.0");
+        assert_eq!(chart["metadata"]["description"], "The demo chart");
+        assert_eq!(chart["readme"]["name"], "README.md");
+        assert_eq!(chart["readme"]["text"], "# demo\n");
+        assert_eq!(chart["readme"]["truncated"], false);
+        assert_eq!(chart["values"]["text"], "replicas: 1\n");
+        assert_eq!(chart["archive_stored"], true);
+        assert_eq!(chart.get("source").and_then(Value::as_str), source);
+    }
+
+    // Not a chart, not there, not a digest.
+    for query in [
+        format!("repo={repo}&image=charts/app&digest={image_digest}"),
+        format!("repo={repo}&image=charts/demo&digest={image_digest}"),
+        format!("repo={repo}&image=charts/demo&digest=latest"),
+        format!("repo={repo}&image=..&digest={digest}"),
+    ] {
+        let resp = get(format!("/browse/chart?{query}")).await;
+        assert_eq!(resp.status(), 404, "{query}");
+    }
+    // Signed-in users only.
+    let resp = srv
+        .client()
+        .get(format!(
+            "{}/browse/chart?repo={repo}&image=charts/demo&digest={digest}",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // A proxy holds a chart's blobs once they are pulled: until then the
+    // chart shows neither metadata nor README.
+    let mock = MockRegistry::start().await;
+    mock.put("charts/demo", "1.2.3", OCI_MANIFEST, &manifest);
+    mock.put_blob(&config);
+    mock.put_blob(&archive);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let proxied = format!("{proxy}/charts/demo");
+    assert_eq!(oci.get(&proxied, "manifests/1.2.3").await.status(), 200);
+    let chart_url = format!("/browse/chart?repo={proxy}&image=charts/demo&digest={digest}");
+    let chart: Value = get(chart_url.clone()).await.json().await.unwrap();
+    assert_eq!(chart["metadata"], Value::Null);
+    assert_eq!(chart["readme"], Value::Null);
+    assert_eq!(chart["archive_stored"], false);
+    for blob in [&config, &archive] {
+        let resp = oci.get(&proxied, &format!("blobs/{}", sha(blob))).await;
+        assert_eq!(resp.status(), 200);
+        resp.bytes().await.unwrap();
+    }
+    let chart: Value = get(chart_url).await.json().await.unwrap();
+    assert_eq!(chart["metadata"]["appVersion"], "2.0");
+    assert_eq!(chart["values"]["text"], "replicas: 1\n");
+    assert_eq!(chart["archive_stored"], true);
+}
+
 #[tokio::test]
 async fn cross_repository_mount_needs_read_on_the_source() {
     let srv = common::start().await;

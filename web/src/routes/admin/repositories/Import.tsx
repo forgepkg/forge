@@ -126,7 +126,7 @@ function ImportRepository() {
 
       {!supported ? (
         <Notice tone="info">
-          Imports go to a hosted NuGet, Helm or Docker repository; this is a{' '}
+          Imports go to a hosted NuGet or Docker repository; this is a{' '}
           {repo.data.format} {repo.data.kind} repository.
         </Notice>
       ) : active ? (

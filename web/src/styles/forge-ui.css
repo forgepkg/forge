@@ -115,6 +115,9 @@
   .fg-codeblock-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: 6px 6px 6px 12px; border-bottom: 1px solid var(--code-line); background: var(--code-raised); }
   .fg-codeblock-title { color: var(--code-muted); font-family: var(--font-mono); font-size: 12px; line-height: 16px; }
   .fg-codeblock-pre { margin: 0; padding: 12px 14px; overflow-x: auto; color: var(--code-ink); font-family: var(--font-mono); font-size: 13px; line-height: 20px; font-weight: 450; }
+  /* A chart's README and default values: long files scroll inside the panel. */
+  .fg-readme { margin: 0; max-height: 640px; overflow: auto; color: var(--ink); font-family: var(--font-mono); font-size: 13px; line-height: 20px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .fg-chart-values .fg-codeblock-pre { max-height: 640px; overflow: auto; }
   .fg-copyfield { display: flex; min-width: 0; }
   .fg-copyfield-input { flex: 1; min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; background: var(--surface-sunken); }
   .fg-copyfield-btn { display: inline-flex; align-items: center; gap: 6px; flex: none; height: var(--control-md); padding: 0 12px; box-sizing: border-box; border: 1px solid var(--line-strong); border-left: 0; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; background: var(--surface); color: var(--ink); font-family: var(--font-sans); font-size: 13px; font-weight: 500; cursor: pointer; }

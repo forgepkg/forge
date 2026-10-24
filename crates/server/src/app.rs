@@ -107,7 +107,7 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 /// * `/browse/...` — read-side browse / search (signed-in users only; per-repo
 ///   read authz enforced inside the handlers).
 /// * `{mount}/{repo}/...` — repositories, under their format's mount (NuGet:
-///   `/v3`; Helm and other plugins: `/repository` unless their plugin names
+///   `/v3`; other plugins: `/repository` unless their plugin names
 ///   another), each served by its format's plugin ([`crate::plugins`]).
 /// * everything else — the SPA (when `web.enabled`), whose admin screens live
 ///   under `/manage/*` (see [`crate::web_ui`]).

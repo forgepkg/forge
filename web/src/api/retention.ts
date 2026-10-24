@@ -18,7 +18,7 @@ import { httpClient } from '~/lib/httpClient'
  *
  * A repository's policy takes one of three shapes, by its format
  * (`crates/core/src/retention/{model,files,images}.rs`): package rules for
- * NuGet, Helm and other package formats (hosted rules, or on a proxy
+ * NuGet and other package formats (hosted rules, or on a proxy
  * `scope: proxy_cached` eviction rules), file rules for raw repositories,
  * image rules for docker. Every shape has the same envelope. Unknown fields
  * are refused (422); an invalid rule is a 400 naming it.

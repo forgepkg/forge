@@ -21,9 +21,11 @@
 //! index lists the upstream's charts, each downloaded and cached on first
 //! use.
 //!
-//! Forge links this plugin in ([`Helm`], [`PLUGIN_TOML`]). With the
-//! `component` feature the same crate builds as a WebAssembly component of
-//! the `forge:format` world instead (`cargo xtask plugins`).
+//! This is the example plugin (`docs/format-plugins.md`): Forge does not
+//! build it in, and serves Helm charts from its OCI registry instead. The
+//! plugin tests install it as if built in ([`Helm`], [`PLUGIN_TOML`]); with
+//! the `component` feature the same crate builds as a WebAssembly component
+//! of the `forge:format` world (`cargo xtask plugins`).
 
 mod chart;
 mod semver;

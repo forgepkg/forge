@@ -65,8 +65,9 @@ function MyTokens() {
         description={
           <>
             Registry tokens authenticate NuGet clients (<Code>dotnet restore</Code>,{' '}
-            <Code>push</Code>), Helm and Docker clients as you: use one as the
-            password of <Code>docker login</Code> with your username. They
+            <Code>push</Code>), Docker and Helm clients as you: use one as the
+            password of <Code>docker login</Code> or{' '}
+            <Code>helm registry login</Code> with your username. They
             cannot be used to sign in here. The secret is shown only at
             creation time.
           </>

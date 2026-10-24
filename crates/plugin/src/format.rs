@@ -19,14 +19,14 @@ use crate::Plugin;
 /// larger than about 2,700 bytes: a plugin without a limit of its own let a
 /// multi-kilobyte version through to that insert, so a push answered 500
 /// instead of 400, and so did a proxy asked for such a version. 256 is above
-/// every built-in plugin's own limit (NuGet's 64 characters, Helm's 128) and,
+/// the plugins' own limits (NuGet's 64 characters, Helm's 128) and,
 /// with [`MAX_ID_LENGTH`], keeps an entry far below PostgreSQL's.
 const MAX_VERSION_LENGTH: usize = 256;
 
 /// The longest package id the host takes from a format plugin, in bytes:
 /// an id to validate, and a parsed package's id as written and canonical.
-/// Ids share the indexes of [`MAX_VERSION_LENGTH`]. 512 is above every
-/// built-in plugin's own limit (Helm's 250 ASCII characters, NuGet's 100
+/// Ids share the indexes of [`MAX_VERSION_LENGTH`]. 512 is above the
+/// plugins' own limits (Helm's 250 ASCII characters, NuGet's 100
 /// characters, at most 400 bytes in UTF-8).
 const MAX_ID_LENGTH: usize = 512;
 

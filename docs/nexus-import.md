@@ -9,7 +9,6 @@ a Nexus hosted repository of the same format, and Forge copies its content.
 | Format | What is copied |
 | --- | --- |
 | NuGet | the `.nupkg` of every version |
-| Helm | the chart `.tgz` of every version |
 | Docker | every tag with everything it references: config and layers, the child manifests of a multi-platform index; signatures and SBOMs (cosign's `sha256-<digest>.sig` tags, and referrers Nexus holds by digest) |
 
 apt follows once Forge serves apt repositories

@@ -12,16 +12,22 @@
 //!   registry, pull_prefix }`.
 //! * `GET /browse/images/{repo}/{*image}` → the image's tags and manifests,
 //!   with the `docker pull` name.
+//! * `GET /browse/chart?repo=<name>&image=<image>&digest=<manifest digest>`
+//!   → a Helm chart pushed as an artifact (`helm push`): its `Chart.yaml`
+//!   metadata, README and default values, read from the blobs Forge holds.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
 use forge_core::auth::principal::Principal;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
+use forge_oci::chart;
+use forge_oci::manifest::{self, ManifestKind, MAX_MANIFEST_BYTES};
+use forge_storage::BlobRef;
 use serde::{Deserialize, Serialize};
 
 use crate::admin::db_error;
@@ -383,4 +389,241 @@ fn platforms(summary: &serde_json::Value) -> Vec<String> {
         .and_then(|p| p.as_str())
         .map(|p| vec![p.to_string()])
         .unwrap_or_default()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChartQuery {
+    pub repo: String,
+    pub image: String,
+    /// The chart's manifest digest.
+    pub digest: String,
+}
+
+/// A text file of a chart (README, `values.yaml`).
+#[derive(Debug, Serialize)]
+pub struct ChartFileView {
+    pub name: String,
+    pub text: String,
+    /// Whether the text was cut at [`chart::MAX_FILE_TEXT`] bytes.
+    pub truncated: bool,
+}
+
+impl From<chart::ChartFile> for ChartFileView {
+    fn from(file: chart::ChartFile) -> Self {
+        Self {
+            name: file.name,
+            text: file.text,
+            truncated: file.truncated,
+        }
+    }
+}
+
+/// A Helm chart pushed as an OCI artifact.
+#[derive(Debug, Serialize)]
+pub struct ChartDetail {
+    pub digest: String,
+    /// The chart's `Chart.yaml` (name, version, appVersion, description,
+    /// …), from its config blob; `None` while the blob is not stored here.
+    pub metadata: Option<serde_json::Value>,
+    pub readme: Option<ChartFileView>,
+    pub values: Option<ChartFileView>,
+    /// Whether the chart archive is stored here. A proxy stores a chart's
+    /// blobs when it is first pulled, so until then it shows no README or
+    /// values.
+    pub archive_stored: bool,
+    /// The member repository it comes from (groups only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// The chart archive layer's media types: Helm's, and the plain one of the
+/// experimental OCI support of Helm before 3.8.
+fn is_chart_layer(media_type: &str) -> bool {
+    media_type == chart::media::CONTENT || media_type == "application/tar+gzip"
+}
+
+/// Why a stored blob could not be read.
+enum ReadFailure {
+    Missing,
+    Response(Response),
+}
+
+/// Read the blob `digest` linked into `image` of `repo`, if it is stored and
+/// at most `max` bytes.
+async fn read_linked(
+    state: &AppState,
+    repo: &Repository,
+    image: &str,
+    digest: &str,
+    max: i64,
+) -> Result<Vec<u8>, ReadFailure> {
+    let link = oci_dao::find_link(&state.pool, repo.id, image, digest)
+        .await
+        .map_err(|e| ReadFailure::Response(db_error(e)))?
+        .ok_or(ReadFailure::Missing)?;
+    if link.size > max {
+        return Err(ReadFailure::Missing);
+    }
+    read_blob(state, &link.blob_sha256, &link.s3_key, link.size)
+        .await
+        .map_err(ReadFailure::Response)
+}
+
+/// Read a stored blob into memory.
+async fn read_blob(
+    state: &AppState,
+    sha256: &str,
+    s3_key: &str,
+    size: i64,
+) -> Result<Vec<u8>, Response> {
+    let blob = BlobRef {
+        sha256,
+        s3_key,
+        size: size.max(0) as u64,
+    };
+    match state.blob_store.read_all(blob).await {
+        Ok(bytes) if bytes.len() as u64 == blob.size => Ok(bytes),
+        Ok(bytes) => {
+            tracing::error!(
+                s3_key,
+                read = bytes.len(),
+                expected = blob.size,
+                "browse: stored blob has the wrong size"
+            );
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
+        }
+        Err(error) if error.is_unavailable() => {
+            tracing::warn!(%error, "browse: object store unavailable");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "30")],
+                "object store unavailable",
+            )
+                .into_response())
+        }
+        Err(error) => {
+            tracing::error!(%error, s3_key, "browse: blob read failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
+        }
+    }
+}
+
+/// `GET /browse/chart?repo=…&image=…&digest=…`
+pub async fn chart_detail(
+    State(state): State<AppState>,
+    Query(query): Query<ChartQuery>,
+    req: axum::extract::Request,
+) -> Response {
+    let principal = principal_of(&req);
+    let repo = match readable_docker_repo(&state, &principal, &query.repo).await {
+        Ok(repo) => repo,
+        Err(resp) => return resp,
+    };
+    let not_found = || (StatusCode::NOT_FOUND, "chart not found").into_response();
+    let image = query.image;
+    if !forge_oci::reference::valid_name(&image)
+        || forge_oci::digest::Digest::parse(&query.digest).is_err()
+    {
+        return not_found();
+    }
+    let sources = match sources(&state, &principal, &repo).await {
+        Ok(s) => s,
+        Err(e) => return db_error(e),
+    };
+    // The manifest the highest-priority member holds, as a pull by digest
+    // resolves it.
+    let mut found = None;
+    for source in sources {
+        if !state
+            .authz
+            .package_filter(&principal, &source)
+            .await
+            .allows(&image)
+        {
+            continue;
+        }
+        match oci_dao::find_manifest(&state.pool, source.id, &image, &query.digest).await {
+            Ok(Some(row)) => {
+                found = Some((source, row));
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => return db_error(e),
+        }
+    }
+    let Some((source, row)) = found else {
+        return not_found();
+    };
+    if usize::try_from(row.size).map_or(true, |size| size > MAX_MANIFEST_BYTES) {
+        return not_found();
+    }
+    let bytes = match read_blob(&state, &row.blob_sha256, &row.s3_key, row.size).await {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    let Ok(parsed) = manifest::parse(&bytes, Some(&row.media_type)) else {
+        return not_found();
+    };
+    let config = parsed.config.as_ref();
+    let is_chart = parsed.kind == ManifestKind::Image
+        && (config.is_some_and(|c| c.media_type == chart::media::CONFIG)
+            || parsed.artifact_type.as_deref() == Some(chart::media::CONFIG));
+    if !is_chart {
+        return not_found();
+    }
+
+    let mut metadata = None;
+    if let Some(config) = config.filter(|c| c.media_type == chart::media::CONFIG) {
+        match read_linked(
+            &state,
+            &source,
+            &image,
+            config.digest.as_str(),
+            chart::MAX_CONFIG_BYTES,
+        )
+        .await
+        {
+            Ok(bytes) => metadata = chart::metadata(&bytes),
+            Err(ReadFailure::Missing) => {}
+            Err(ReadFailure::Response(resp)) => return resp,
+        }
+    }
+    let mut files = chart::ChartFiles::default();
+    let mut archive_stored = false;
+    if let Some(layer) = parsed.layers.iter().find(|l| is_chart_layer(&l.media_type)) {
+        match read_linked(
+            &state,
+            &source,
+            &image,
+            layer.digest.as_str(),
+            chart::MAX_ARCHIVE_BYTES,
+        )
+        .await
+        {
+            Ok(archive) => {
+                archive_stored = true;
+                files = match tokio::task::spawn_blocking(move || chart::read_files(&archive)).await
+                {
+                    Ok(files) => files,
+                    Err(e) => {
+                        tracing::error!(error = %e, "browse: reading a chart archive failed");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+                            .into_response();
+                    }
+                };
+            }
+            Err(ReadFailure::Missing) => {}
+            Err(ReadFailure::Response(resp)) => return resp,
+        }
+    }
+    let group = repo.kind() == RepoKind::Group;
+    Json(ChartDetail {
+        digest: row.digest,
+        metadata,
+        readme: files.readme.map(Into::into),
+        values: files.values.map(Into::into),
+        archive_stored,
+        source: group.then(|| source.name.clone()),
+    })
+    .into_response()
 }

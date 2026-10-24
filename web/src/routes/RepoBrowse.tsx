@@ -105,7 +105,7 @@ export const Route = createFileRoute('/_app/repos/$repo')({
 /**
  * One repository's contents: the second level of the folder view, with the
  * per-repo search box — packages (plus the client snippets of the format:
- * `dotnet nuget`, `helm repo add`, or the URL) for a package repository,
+ * `dotnet nuget`, or the URL) for a package repository,
  * images (plus the `docker login` / `pull` snippets) for a docker one. The query is debounced
  * into the URL search params (so it is shareable and survives reload) and fed
  * to `usePackageSearch` / `useImageSearch` scoped to this repository, which

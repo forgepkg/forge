@@ -10,7 +10,7 @@
 //! A plugin is a crate under `plugins/<id>/` implementing [`FormatPlugin`],
 //! with a `plugin.toml` naming it. The same crate runs either way:
 //!
-//! * **built in** — linked into the server and called directly (Helm);
+//! * **built in** — linked into the server and called directly (NuGet);
 //! * **as a WebAssembly component** — built for `wasm32-wasip2` with this
 //!   crate's `component` feature and `export_component!`, then loaded at
 //!   startup into a sandbox, from a digest the operator pinned.

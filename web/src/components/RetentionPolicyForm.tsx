@@ -18,7 +18,7 @@ import {
  * The retention policy editor and its model. A repository's policy takes one
  * of four shapes, by its format and kind (`crates/core/src/retention/`):
  *
- *  - `package`: hosted NuGet, Helm and plugin-format repositories. Rules
+ *  - `package`: hosted NuGet and plugin-format repositories. Rules
  *    unlist or delete versions, with filters, protections and triggers.
  *  - `proxy`: the same formats' proxies. Rules (`scope: proxy_cached`) evict
  *    cached versions nobody pulled for a while; they stay listed.

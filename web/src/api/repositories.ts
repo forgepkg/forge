@@ -183,7 +183,8 @@ export interface UpdateRepo {
 
 /**
  * An installed package format (`FormatView` of `GET /admin/formats`): the
- * built-in format plugins (NuGet, Helm) and every loaded WebAssembly plugin.
+ * built-in format plugin (NuGet), Docker, raw and every loaded WebAssembly
+ * plugin.
  */
 export interface FormatView {
   /** The format id (`RepoView.format`). */
@@ -219,7 +220,7 @@ export interface InvalidateProxyCache {
 
 /** What a proxy cache invalidation removed (`Invalidated`). */
 export interface ProxyCacheInvalidated {
-  /** Remembered upstream "not found" answers removed (NuGet, Helm). */
+  /** Remembered upstream "not found" answers removed (NuGet, plugins). */
   not_found_cleared: number
   /** Cached tags due for re-validation against the upstream (docker). */
   tags_expired: number

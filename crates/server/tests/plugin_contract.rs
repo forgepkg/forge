@@ -295,16 +295,16 @@ async fn a_format_is_served_under_its_own_mount_and_kinds() {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{url}");
         assert_ne!(resp.text().await.unwrap(), "nothing here", "{url}");
     }
-    let charts = format!("charts{}", unique());
+    let feed = format!("feed{}", unique());
     let resp = create_repo(
         &srv,
-        json!({ "name": charts, "kind": "hosted", "format": "helm" }),
+        json!({ "name": feed, "kind": "hosted", "format": "nuget" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let resp = srv
         .client()
-        .get(format!("{}/probe/{charts}/nothing", srv.base_url))
+        .get(format!("{}/probe/{feed}/nothing", srv.base_url))
         .basic_auth(&creds.0, Some(&creds.1))
         .send()
         .await
@@ -340,13 +340,13 @@ async fn a_format_is_served_under_its_own_mount_and_kinds() {
         .unwrap();
     assert_eq!(probe["mount"], "/probe");
     assert_eq!(probe["kinds"], json!(["hosted"]));
-    let helm = formats
+    let nuget = formats
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["id"] == "helm")
+        .find(|f| f["id"] == "nuget")
         .unwrap();
-    assert_eq!(helm["mount"], "/repository");
+    assert_eq!(nuget["mount"], "/v3");
 }
 
 #[tokio::test]

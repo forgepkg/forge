@@ -1,4 +1,5 @@
-# A Forge format plugin: Helm chart repositories (see plugins/README.md).
+# The example Forge format plugin: classic Helm chart repositories (see
+# plugins/README.md). Forge does not build it in.
 [plugin]
 id = "helm"
 name = "Helm charts"

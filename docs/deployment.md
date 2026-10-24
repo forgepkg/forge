@@ -891,8 +891,8 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   them on the outbound proxy or with network policy.
 - **Format plugins.** Every instance must load the same WebAssembly plugins
   (the same `[plugins]` section and component files): a repository whose
-  format is missing on an instance answers 503 there. Built-in plugins
-  (Helm) come with the image. See
+  format is missing on an instance answers 503 there. The built-in plugin
+  (NuGet) comes with the image. See
   [format-plugins.md](./format-plugins.md#loading-webassembly-plugins).
 
 ### Redis is a trust boundary

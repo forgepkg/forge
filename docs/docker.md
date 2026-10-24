@@ -142,6 +142,29 @@ with its annotations. cosign 3 stores signatures and attestations there by
 default; older cosign versions use tags (`sha256-<digest>.sig`), which work
 as well.
 
+### Helm charts
+
+Helm (3.8 and later) stores charts in OCI registries, and Forge serves them
+from docker repositories like any other artifact: a chart is a manifest
+whose config is the chart's `Chart.yaml` (`application/vnd.cncf.helm.config.v1+json`)
+and whose layer is the packaged chart. `helm push` tags it with the chart's
+version. Forge serves charts this way only; it has no classic chart
+repositories (`index.yaml`, `helm repo add`).
+
+```bash
+helm registry login forge.example.com --username <username>   # password: an API token
+helm push mychart-1.2.3.tgz oci://forge.example.com/docker-hosted/charts
+helm install myrelease oci://forge.example.com/docker-hosted/charts/mychart --version 1.2.3
+helm pull oci://forge.example.com/docker-group/charts/mychart --version '~1.2'
+```
+
+The chart's name is the last component of the image name
+(`docker-hosted/charts/mychart`); content selectors and retention match it
+like any image name. Proxies of a registry that serves charts (Docker Hub's
+`registry-1.docker.io/bitnamicharts`, GHCR) and groups work as for images.
+`helm registry login` keeps its own login, so log in with Helm even when
+`docker login` already did.
+
 ## Proxy repositories
 
 ```bash
@@ -224,6 +247,15 @@ ready-to-paste `docker login` / `docker pull` commands. The same data is in
 the browse API: `GET /browse/images?repo=<name>` and
 `GET /browse/images/<repo>/<image>`. An offline hosted or group repository
 answers 503 there, as it does to pulls and pushes.
+
+An image of Helm charts shows its charts instead: the versions, the
+`helm install` and `helm pull` commands of the selected one (the newest
+release by default), its `Chart.yaml` facts (version, appVersion,
+description, home, sources, maintainers, dependencies), its README and its
+default values. The browse API reads them from the chart's blobs:
+`GET /browse/chart?repo=<name>&image=<image>&digest=<manifest digest>`. A
+proxy stores a chart's blobs when it is first pulled, so until then it shows
+the versions and commands only. A README or `values.yaml` over 512 KiB is cut.
 
 The catalog API (`/v2/_catalog`) is not supported.
 

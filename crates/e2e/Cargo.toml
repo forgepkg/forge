@@ -60,8 +60,6 @@ aws-sigv4 = "1.6"
 aws-credential-types = { workspace = true }
 
 [dev-dependencies]
-# Builds the Helm chart archive the Nexus import scenario uploads to Nexus.
-flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true, features = ["multipart"] }

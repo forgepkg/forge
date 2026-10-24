@@ -1,6 +1,6 @@
 //! E2E: importing from a real Nexus Repository 3 OSS container
 //! (`sonatype/nexus3`) seeded with NuGet packages, a multi-platform image
-//! with a cosign signature and an SBOM, and a Helm chart. After the import,
+//! with a cosign signature and an SBOM. After the import,
 //! bytes and digests are Nexus' and so are the publish dates; a second run
 //! copies only what was added to Nexus since. (Resuming a killed import, the
 //! conflict policies and the dry run are covered against a mock Nexus in
@@ -9,7 +9,6 @@
 
 #![cfg(feature = "forge-e2e")]
 
-use std::io::Write;
 use std::time::Duration;
 
 use forge_e2e::{make_nupkg, StackBuilder, TestServer};
@@ -104,17 +103,6 @@ impl Nexus {
         let resp = self
             .api(reqwest::Method::POST, "repositories/docker/hosted")
             .json(&docker)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
-        let helm = json!({
-            "name": "helm-hosted", "online": true,
-            "storage": {"blobStoreName": "default", "strictContentTypeValidation": true, "writePolicy": "allow_once"},
-        });
-        let resp = self
-            .api(reqwest::Method::POST, "repositories/helm/hosted")
-            .json(&helm)
             .send()
             .await
             .unwrap();
@@ -220,40 +208,6 @@ impl Nexus {
     }
 }
 
-/// A gzipped Helm chart archive (a minimal ustar with a valid checksum).
-fn chart(name: &str, version: &str) -> Vec<u8> {
-    let files = [
-        (
-            format!("{name}/Chart.yaml"),
-            format!("apiVersion: v2\nname: {name}\nversion: {version}\ndescription: test chart\n"),
-        ),
-        (format!("{name}/values.yaml"), "replicas: 1\n".to_string()),
-    ];
-    let mut tar = Vec::new();
-    for (path, data) in &files {
-        let mut header = [0u8; 512];
-        header[..path.len()].copy_from_slice(path.as_bytes());
-        header[100..108].copy_from_slice(b"0000644\0");
-        header[108..116].copy_from_slice(b"0000000\0");
-        header[116..124].copy_from_slice(b"0000000\0");
-        header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
-        header[136..148].copy_from_slice(b"00000000000\0");
-        header[156] = b'0';
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-        header[148..156].copy_from_slice(b"        ");
-        let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
-        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-        tar.extend_from_slice(&header);
-        tar.extend_from_slice(data.as_bytes());
-        tar.resize(tar.len().div_ceil(512) * 512, 0);
-    }
-    tar.extend_from_slice(&[0u8; 1024]);
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    gz.write_all(&tar).unwrap();
-    gz.finish().unwrap()
-}
-
 async fn admin(
     srv: &TestServer,
     method: reqwest::Method,
@@ -347,12 +301,6 @@ async fn import_from_a_real_nexus() {
         .upload("nuget-hosted", "nuget", "acme.web.2.1.0.nupkg", web.clone())
         .await;
 
-    // Helm: a chart.
-    let mychart = chart("mychart", "0.1.0");
-    nexus
-        .upload("helm-hosted", "helm", "mychart-0.1.0.tgz", mychart.clone())
-        .await;
-
     // Docker: a two-platform image, its cosign signature (a tag) and an
     // SBOM pushed by digest (a referrer Nexus lists as an asset only).
     let image = "team/app";
@@ -412,11 +360,6 @@ async fn import_from_a_real_nexus() {
     create_repo(&srv, json!({"name": "nuget-internal", "kind": "hosted"})).await;
     create_repo(
         &srv,
-        json!({"name": "charts", "kind": "hosted", "format": "helm"}),
-    )
-    .await;
-    create_repo(
-        &srv,
         json!({"name": "images", "kind": "hosted", "format": "docker"}),
     )
     .await;
@@ -454,19 +397,6 @@ async fn import_from_a_real_nexus() {
     .await
     .unwrap();
     assert_eq!(created, published);
-
-    // Helm.
-    let done = import(&srv, &nexus, "charts", "helm-hosted").await;
-    assert_eq!(done["state"], "completed", "{done}");
-    assert_eq!(done["progress"]["imported"], 1, "{done}");
-    assert_eq!(
-        download(
-            &srv,
-            "/repository/charts/charts/mychart/0.1.0/mychart-0.1.0.tgz"
-        )
-        .await,
-        mychart
-    );
 
     // Docker: digests, the children, the signature tag and both referrers.
     let done = import(&srv, &nexus, "images", "docker-hosted").await;

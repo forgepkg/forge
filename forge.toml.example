@@ -160,7 +160,7 @@ max_nuspec_bytes             = 1048576      # (default: 1 MiB) also caps an upst
 max_nuspec_compression_ratio = 200          # (default: 200)
 
 # Optional: WebAssembly format plugins — further package formats loaded at
-# startup (docs/format-plugins.md). The built-in ones (Helm) need nothing here.
+# startup (docs/format-plugins.md). The built-in one (NuGet) needs nothing here.
 # Only the plugins listed under [plugins.formats] are loaded, each from
 # <dir>/<id>/ and pinned to its component's SHA-256; a mismatch, or an id a
 # built-in format holds, fails startup. `cargo xtask plugins` builds the

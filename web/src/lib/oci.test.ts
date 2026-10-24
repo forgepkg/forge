@@ -1,9 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  HELM_CHART_CONFIG,
+  chartVersion,
+  chartVersions,
+  defaultChartVersion,
   defaultPullTag,
   formatBytes,
   formatDateTime,
+  httpUrl,
+  isChartImage,
   isReferrerTag,
   manifestKind,
   referrerKind,
@@ -175,5 +181,67 @@ describe('formatDateTime', () => {
     expect(formatDateTime(null)).toBe('—')
     expect(formatDateTime('not a date')).toBe('—')
     expect(formatDateTime('2026-10-21T10:58:44Z')).not.toBe('—')
+  })
+})
+
+describe('Helm charts', () => {
+  const chart = (digest: string, extra: { subject_digest?: string; children?: string[] } = {}) => ({
+    digest,
+    artifact_type: HELM_CHART_CONFIG,
+    subject_digest: extra.subject_digest ?? null,
+    children: extra.children ?? [],
+  })
+  const image = (digest: string) => ({
+    ...chart(digest),
+    artifact_type: 'application/vnd.oci.image.config.v1+json',
+  })
+
+  it('an image of charts holds only charts at its top level', () => {
+    const sig = {
+      ...chart('sha256:sig', { subject_digest: 'sha256:a' }),
+      artifact_type: 'application/vnd.dev.cosign.artifact.sig.v1+json',
+    }
+    expect(isChartImage([chart('sha256:a'), chart('sha256:b'), sig])).toBe(true)
+    expect(isChartImage([chart('sha256:a'), image('sha256:b')])).toBe(false)
+    expect(isChartImage([sig])).toBe(false)
+    expect(isChartImage([])).toBe(false)
+  })
+
+  it('orders versions by SemVer precedence, newest first', () => {
+    const manifests = ['a', 'b', 'c', 'd', 'e', 'f'].map((d) => chart(`sha256:${d}`))
+    const tags = [
+      { tag: '1.10.0', digest: 'sha256:a' },
+      { tag: '1.9.0', digest: 'sha256:b' },
+      { tag: '2.0.0-rc.10', digest: 'sha256:c' },
+      { tag: '2.0.0-rc.9', digest: 'sha256:d' },
+      { tag: 'nightly', digest: 'sha256:e' },
+      { tag: '1.10.0_build.5', digest: 'sha256:f' },
+      // Not a chart's tag.
+      { tag: '9.9.9', digest: 'sha256:image' },
+    ]
+    const ordered = chartVersions(tags, [...manifests, image('sha256:image')])
+    expect(ordered.map((t) => t.tag)).toEqual([
+      '2.0.0-rc.10',
+      '2.0.0-rc.9',
+      '1.10.0',
+      '1.10.0_build.5',
+      '1.9.0',
+      'nightly',
+    ])
+    expect(defaultChartVersion(ordered)?.tag).toBe('1.10.0')
+    expect(defaultChartVersion(ordered.slice(0, 2))?.tag).toBe('2.0.0-rc.10')
+    expect(defaultChartVersion([])).toBeUndefined()
+  })
+
+  it('reads build metadata back from a tag', () => {
+    expect(chartVersion('1.0.0_build.5')).toBe('1.0.0+build.5')
+    expect(chartVersion('1.0.0')).toBe('1.0.0')
+  })
+
+  it('links only http(s) URLs', () => {
+    expect(httpUrl('https://example.com/chart')).toBe('https://example.com/chart')
+    expect(httpUrl('javascript:alert(1)')).toBeNull()
+    expect(httpUrl('not a url')).toBeNull()
+    expect(httpUrl(undefined)).toBeNull()
   })
 })

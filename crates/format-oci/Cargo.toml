@@ -34,6 +34,8 @@ reqwest = { workspace = true }
 # Registry Bearer tokens (HS256), the same crate the OIDC verifier uses.
 jsonwebtoken = { workspace = true }
 rand = { workspace = true }
+# Helm chart archives (.tgz), read for their README and values (`chart`).
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

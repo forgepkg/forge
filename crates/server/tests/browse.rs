@@ -363,7 +363,7 @@ async fn browse_repos_by_format_with_client_urls() {
     let suffix = common::unique();
     let created: Vec<(String, &str)> = vec![
         (format!("nu{suffix}"), "nuget"),
-        (format!("charts{suffix}"), "helm"),
+        (format!("files{suffix}"), "raw"),
         (format!("images{suffix}"), "docker"),
     ];
     for (name, format) in &created {
@@ -407,20 +407,20 @@ async fn browse_repos_by_format_with_client_urls() {
         nuget["url"],
         format!("http://test.local/v3/{}", created[0].0)
     );
-    let helm = entry(&created[1].0);
-    assert_eq!(helm["format"], "helm");
+    let raw = entry(&created[1].0);
+    assert_eq!(raw["format"], "raw");
     assert_eq!(
-        helm["url"],
-        format!("http://test.local/repository/{}", created[1].0)
+        raw["url"],
+        format!("http://test.local/raw/{}", created[1].0)
     );
     let docker = entry(&created[2].0);
     assert_eq!(docker["format"], "docker");
     assert!(docker.get("url").is_none(), "{docker}");
 
-    let charts = list("?format=helm").await;
-    let charts = charts.as_array().unwrap();
-    assert!(charts.iter().all(|r| r["format"] == "helm"), "{charts:?}");
-    assert!(charts.iter().any(|r| r["name"] == json!(created[1].0)));
+    let files = list("?format=raw").await;
+    let files = files.as_array().unwrap();
+    assert!(files.iter().all(|r| r["format"] == "raw"), "{files:?}");
+    assert!(files.iter().any(|r| r["name"] == json!(created[1].0)));
     assert!(list("?format=npm").await.as_array().unwrap().is_empty());
 }
 

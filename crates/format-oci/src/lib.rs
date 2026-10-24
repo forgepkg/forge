@@ -5,6 +5,8 @@
 //!   manifest parsing (Docker v2 schema 2 manifests and manifest lists, OCI
 //!   image manifests and indexes, artifacts with `artifactType`/`subject`);
 //! * [`token`] — the registry Bearer tokens of the Docker token protocol;
+//! * [`chart`] — Helm charts stored as artifacts: their metadata, README and
+//!   values, for the web UI;
 //! * [`Registry`] — the service answering every `/v2` request;
 //! * [`import`] — copying images from another registry (a Nexus hosted
 //!   repository) into a hosted repository.
@@ -12,6 +14,7 @@
 //! Repositories are addressed by path (`<host>/<forge-repo>/<image>`) or,
 //! with `config.host`, by host name (`<repo-host>/<image>`).
 
+pub mod chart;
 pub mod digest;
 pub mod error;
 pub mod gc;

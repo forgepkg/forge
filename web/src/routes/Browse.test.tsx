@@ -60,11 +60,11 @@ const repos: BrowseRepo[] = [
   { id: 4, name: 'docker-hosted', kind: 'hosted', online: true, format: 'docker' },
   {
     id: 5,
-    name: 'charts',
+    name: 'pkgs',
     kind: 'hosted',
     online: true,
-    format: 'helm',
-    url: 'https://forge.example.com/repository/charts',
+    format: 'acme',
+    url: 'https://forge.example.com/repository/pkgs',
   },
 ]
 
@@ -240,18 +240,18 @@ describe('Browse root (repository folders)', () => {
       within(filter)
         .getAllByRole('radio')
         .map((o) => o.textContent?.replace(/ \d+$/, '')),
-    ).toEqual(['All', 'Docker', 'Helm', 'NuGet'])
+    ).toEqual(['All', 'acme', 'Docker', 'NuGet'])
     expect(within(filter).getByRole('radio', { name: /^All/ })).toBeChecked()
 
-    await user.click(within(filter).getByRole('radio', { name: /^Helm/ }))
+    await user.click(within(filter).getByRole('radio', { name: /^acme/ }))
 
     await waitFor(() =>
-      expect(router.state.location.search).toEqual({ format: 'helm' }),
+      expect(router.state.location.search).toEqual({ format: 'acme' }),
     )
-    expect(await main().findByRole('link', { name: /charts/ })).toBeInTheDocument()
+    expect(await main().findByRole('link', { name: /pkgs/ })).toBeInTheDocument()
     expect(main().queryByRole('link', { name: /internal/ })).toBeNull()
     expect(main().queryByRole('link', { name: /docker-hosted/ })).toBeNull()
-    expect(within(filter).getByRole('radio', { name: /^Helm/ })).toBeChecked()
+    expect(within(filter).getByRole('radio', { name: /^acme/ })).toBeChecked()
 
     await user.click(within(filter).getByRole('radio', { name: /^All/ }))
 
@@ -544,24 +544,17 @@ describe('RepoBrowse connect snippets of package repositories', () => {
     expect(within(connect).queryByText(/dotnet nuget push/)).toBeNull()
   })
 
-  it('shows the helm commands of a Helm repository', async () => {
+  it('shows the URL of a plugin format repository', async () => {
     mockApi(() => jsonResponse(page(0, [])))
 
-    await renderBrowse('/repos/charts')
+    await renderBrowse('/repos/pkgs')
 
     const connect = await screen.findByRole('region', { name: 'Connect' })
     expect(
-      within(connect).getByText(
-        textContent('helm repo add charts https://forge.example.com/repository/charts --username <username> --password <token>'),
-      ),
+      within(connect).getByText(textContent('https://forge.example.com/repository/pkgs')),
     ).toBeInTheDocument()
     expect(
-      within(connect).getByText(textContent('helm install <release> charts/<chart>')),
-    ).toBeInTheDocument()
-    expect(
-      within(connect).getByText(
-        textContent('curl -u <username>:<token> --data-binary @<chart>-<version>.tgz https://forge.example.com/repository/charts/api/charts'),
-      ),
+      within(connect).getByRole('button', { name: 'Copy repository URL' }),
     ).toBeInTheDocument()
   })
 })
