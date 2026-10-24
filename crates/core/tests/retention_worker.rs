@@ -1166,3 +1166,56 @@ async fn proxy_eviction_keeps_the_newest_and_the_recently_pulled_versions() {
         );
     }
 }
+
+#[tokio::test]
+async fn size_budget_evicts_oldest_proxy_cache_versions_first() {
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::proxy(format!("rw-budget-proxy-{n}")))
+        .await
+        .unwrap();
+    for (i, (version, pulled_days_ago)) in
+        [("1.0.0", 30), ("2.0.0", 20), ("3.0.0", 10)]
+            .into_iter()
+            .enumerate()
+    {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, "lib", version, &sha, 100).await;
+        seed_cached_version(&pool, repo.id, version, true, Some(pulled_days_ago)).await;
+    }
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "size_budget": { "max_bytes": 250, "target_bytes": 100 },
+            "rules": []
+        }),
+    )
+    .await;
+
+    let summary = worker(&pool, config())
+        .tick_repo(repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(summary.deleted, 2);
+    assert_eq!(summary.size_before, Some(300));
+    assert_eq!(summary.size_after, Some(100));
+    assert_eq!(summary.target_reached, Some(true));
+    for (version, cached) in [
+        ("1.0.0", false),
+        ("2.0.0", false),
+        ("3.0.0", true),
+    ] {
+        assert_eq!(
+            cached_row(&pool, repo.id, version).await.unwrap().downloaded,
+            cached,
+            "{version}"
+        );
+    }
+    assert!(component_exists(&pool, repo.id, "lib", "3.0.0").await);
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert!(!component_exists(&pool, repo.id, "lib", "2.0.0").await);
+}

@@ -585,7 +585,7 @@ pub fn evaluate_image_size_budget(
             size_before,
             size_after,
             target_bytes,
-            target_reached: size_after <= target_bytes || size_after <= budget.max_bytes,
+            target_reached: size_after <= target_bytes,
         }),
     )
 }
@@ -1305,5 +1305,44 @@ mod tests {
         assert!(decisions.tags.is_empty());
         assert!(decisions.manifests.is_empty());
         assert!(!summary.unwrap().target_reached);
+    }
+
+    #[test]
+    fn image_size_budget_reports_unreached_target_after_reaching_maximum() {
+        let tags = vec![tag("app", "old", 1, 1), tag("app", "new", 2, 2)];
+        let manifests = vec![
+            manifest("app", 1, Some(90), &[], None),
+            manifest("app", 2, None, &[], None),
+        ];
+        let objects = vec![
+            oci_dao::RetentionManifestObject {
+                manifest_id: 1,
+                blob_sha256: "old".into(),
+                size: 40,
+            },
+            oci_dao::RetentionManifestObject {
+                manifest_id: 2,
+                blob_sha256: "new".into(),
+                size: 40,
+            },
+        ];
+        let mut p = policy(Vec::new());
+        p.size_budget = Some(SizeBudget {
+            max_bytes: 60,
+            target_bytes: Some(20),
+        });
+        let (decisions, summary) = evaluate_image_size_budget(
+            &p,
+            &tags,
+            &manifests,
+            &objects,
+            &[],
+            &ImageDecisions::default(),
+            80,
+        );
+        assert_eq!(decisions.tags.len(), 1);
+        let summary = summary.unwrap();
+        assert_eq!(summary.size_after, 40);
+        assert!(!summary.target_reached);
     }
 }

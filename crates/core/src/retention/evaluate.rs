@@ -557,9 +557,10 @@ pub fn evaluate_size_budget(
             )
             .fold(0u64, u64::saturating_add),
     );
+    let budget_triggered = size_after > budget.max_bytes;
     let mut hosted_out = Vec::new();
     let mut proxy_out = Vec::new();
-    if size_after > budget.max_bytes {
+    if budget_triggered {
         let hosted_deleted: HashSet<i64> = hosted_decisions
             .iter()
             .filter(|d| d.action == Action::HardDelete)
@@ -672,7 +673,7 @@ pub fn evaluate_size_budget(
         size_before,
         size_after,
         target_bytes,
-        target_reached: size_after <= target_bytes || size_after <= budget.max_bytes,
+        target_reached: !budget_triggered || size_after <= target_bytes,
     }
 }
 
@@ -1702,6 +1703,34 @@ mod tests {
         assert_eq!(plan.size_before, 120);
         assert_eq!(plan.size_after, 80);
         assert!(plan.target_reached);
+    }
+
+    #[test]
+    fn size_budget_reports_unreached_target_when_only_rule_protected_versions_remain() {
+        let mut candidates = vec![
+            comp(1, "lib", "1.0.0", 100, None),
+            comp(2, "lib", "2.0.0", 50, None),
+            comp(3, "lib", "3.0.0", 10, None),
+        ];
+        for candidate in &mut candidates {
+            candidate.size_bytes = 50;
+        }
+        let mut policy = policy_with(vec![rule(
+            "keep-two",
+            Action::HardDelete,
+            Criteria {
+                keep_last_n: Some(2),
+                ..Default::default()
+            },
+        )]);
+        policy.size_budget = Some(crate::retention::model::SizeBudget {
+            max_bytes: 100,
+            target_bytes: Some(80),
+        });
+        let plan = evaluate_size_budget(&fmt(), &policy, &candidates, &[], &[], &[], 150);
+        assert_eq!(plan.hosted.len(), 1);
+        assert_eq!(plan.size_after, 100);
+        assert!(!plan.target_reached);
     }
 
     #[test]

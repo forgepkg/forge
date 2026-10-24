@@ -280,7 +280,8 @@ fn evaluate_files_with_budget(
             .map(|f| u64::try_from(f.size).unwrap_or_default())
             .fold(0u64, u64::saturating_add),
     );
-    if size_after > budget.max_bytes {
+    let budget_triggered = size_after > budget.max_bytes;
+    if budget_triggered {
         let protected = protected_file_ids(policy, files);
         let mut eligible: Vec<&RetentionFile> = files
             .iter()
@@ -326,7 +327,7 @@ fn evaluate_files_with_budget(
             size_before,
             size_after,
             target_bytes,
-            target_reached: size_after <= target_bytes || size_after <= budget.max_bytes,
+            target_reached: !budget_triggered || size_after <= target_bytes,
         }),
     )
 }
@@ -648,5 +649,26 @@ mod tests {
             vec![1, 2]
         );
         assert!(decisions.iter().all(|d| d.rule_id == "size_budget"));
+    }
+
+    #[test]
+    fn size_budget_reports_unreached_target_when_directory_protection_remains() {
+        let mut files = vec![file(1, "dir/old", 100, None), file(2, "dir/new", 10, None)];
+        files[0].size = 3;
+        files[1].size = 2;
+        let mut policy = policy(vec![{
+            let mut keep = rule("keep");
+            keep.keep_newest_per_directory = Some(1);
+            keep.older_than_days = Some(1000);
+            keep
+        }]);
+        policy.size_budget = Some(SizeBudget {
+            max_bytes: 4,
+            target_bytes: Some(1),
+        });
+        let (_, budget) = evaluate_files_with_budget(at(0), &policy, &files);
+        let budget = budget.unwrap();
+        assert_eq!(budget.size_after, 2);
+        assert!(!budget.target_reached);
     }
 }

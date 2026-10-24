@@ -806,7 +806,7 @@ pub async fn lock_package_candidates(
             c.created_at    AS created_at,
             c.last_downloaded_at AS last_downloaded_at,
             COALESCE((SELECT SUM(a.size) FROM asset a WHERE a.component_id = c.id), 0)::bigint
-                AS size_bytes,
+                AS size_bytes
         FROM component c
         WHERE c.repository_id = $1 AND c.name = $2
           AND EXISTS (
