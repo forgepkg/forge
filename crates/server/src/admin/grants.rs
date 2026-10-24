@@ -1,20 +1,22 @@
 //! Admin grant management: the `repository_privilege` edges that give a role
-//! `<action>` on `<repo|ANY>`, optionally scoped by a content selector.
+//! `<level>` on `<repo|ANY>`, optionally scoped by a content selector.
 //!
 //! * `GET    /admin/roles/{id}/grants` — list a role's grants.
-//! * `PUT    /admin/roles/{id}/grants` — add a grant (idempotent).
+//! * `PUT    /admin/roles/{id}/grants` — give a level (idempotent; sets the
+//!   level of the role's grant on that repository and selector).
 //! * `DELETE /admin/roles/{id}/grants/{grant_id}` — remove a grant.
 //!
-//! A grant is `(repository|ANY, action, selector?)`:
+//! A grant is `(repository|ANY, level, selector?)`, one per repository and
+//! selector:
 //! * `repository` omitted/`null` ⇒ **ANY** repo (wildcard grant).
-//! * `action` is one of `read`/`write`/`delete`/`admin` (validated against the
-//!   pure [`Action`] parser so an unknown verb is a 400, never a silent widen).
-//!   `admin` is refused with a repository (400): administration is global
-//!   (every `/admin` operation needs the built-in `admin` role), so such a
-//!   grant would be stored and listed but delegate nothing.
+//! * `level` is one of `read`/`write`/`delete`, each including the ones below
+//!   it (validated against the pure [`Level`] parser so an unknown level is a
+//!   400, never a silent widen). Administration is no level: it is the
+//!   built-in `admin` role. A request still sending `action`, which `level`
+//!   replaced, is refused with 400 naming `level`.
 //! * `selector_id` optionally narrows the grant to packages matching a content
-//!   selector. The repo-level gate ignores the selector; it only filters which
-//!   packages are visible.
+//!   selector. The repo-level gate ignores the selector; it filters which
+//!   packages its level reaches.
 //!
 //! Every mutation blanket-invalidates the authz cache (epoch roll) after commit:
 //! a grant change can affect every principal holding the role.
@@ -22,7 +24,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use forge_core::authz::{invalidate_all, Action};
+use forge_core::authz::{invalidate_all, Level};
 use forge_db::authz_dao::{self, GrantRow};
 use forge_db::repository_dao;
 use serde::{Deserialize, Serialize};
@@ -36,7 +38,7 @@ pub struct GrantView {
     pub id: i64,
     pub role_id: i64,
     pub repository_id: Option<i64>,
-    pub action: String,
+    pub level: String,
     pub selector_id: Option<i64>,
 }
 
@@ -46,7 +48,7 @@ impl From<GrantRow> for GrantView {
             id: g.id,
             role_id: g.role_id,
             repository_id: g.repository_id,
-            action: g.action,
+            level: g.level,
             selector_id: g.selector_id,
         }
     }
@@ -65,11 +67,16 @@ pub struct AddGrant {
     /// `repository`; give at most one).
     #[serde(default)]
     pub repository_id: Option<i64>,
-    /// Action verb: `read` / `write` / `delete` / `admin`.
-    pub action: String,
+    /// Level: `read` / `write` / `delete`. Required; taken as a `String` so
+    /// an unknown or missing level answers 400 naming the levels.
+    #[serde(default)]
+    pub level: Option<String>,
     /// Optional content-selector id to scope the grant.
     #[serde(default)]
     pub selector_id: Option<i64>,
+    /// The verb `level` replaced: refused with 400 naming `level`.
+    #[serde(default, deserialize_with = "super::present")]
+    pub action: Option<()>,
 }
 
 /// `GET /admin/roles/{id}/grants`
@@ -96,28 +103,22 @@ pub async fn add(
     Path(role_id): Path<i64>,
     Json(body): Json<AddGrant>,
 ) -> Response {
-    // Validate the action verb up front (unknown ⇒ 400, never persisted).
-    let action = match Action::parse(&body.action) {
-        Some(a) => a,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "action must be one of read/write/delete/admin",
-            )
-                .into_response();
-        }
-    };
-
-    // Administration is global: an `admin` grant on one repository would be
-    // stored and listed but change nothing.
-    if action == Action::Admin && (body.repository.is_some() || body.repository_id.is_some()) {
+    if body.action.is_some() {
         return (
             StatusCode::BAD_REQUEST,
-            "repository admin is not supported: administration is global; \
-             assign the admin role instead",
+            "action is replaced by level: one of read, write or delete, \
+             each including the ones below it (administration is the admin role)",
         )
             .into_response();
     }
+    // Validate the level up front (unknown ⇒ 400, never persisted).
+    let Some(level) = body.level.as_deref().and_then(Level::parse) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "level must be one of read/write/delete",
+        )
+            .into_response();
+    };
 
     // The role must exist.
     match authz_dao::find_role_by_id(&state.pool, role_id).await {
@@ -165,7 +166,7 @@ pub async fn add(
         &state.pool,
         role_id,
         repository_id,
-        action.as_str(),
+        level.as_str(),
         body.selector_id,
     )
     .await

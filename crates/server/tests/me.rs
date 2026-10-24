@@ -220,7 +220,7 @@ async fn me_with_token() {
         .client()
         .post(format!("{}/admin/users/{admin_id}/tokens", srv.base_url))
         .basic_auth(&u, Some(&p))
-        .json(&json!({"name": "automation", "scope": {"actions": ["admin"]}}))
+        .json(&json!({"name": "automation", "scope": {"admin": true}}))
         .send()
         .await
         .unwrap()

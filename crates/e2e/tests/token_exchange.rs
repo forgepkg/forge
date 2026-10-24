@@ -60,13 +60,9 @@ async fn setup(srv: &TestServer, idp: &MockOidc, extra_config: Value) -> i64 {
         .status()
         .is_success());
     let role = srv.create_role("ci-pub").await;
-    for (repo, action) in [
-        ("ci-hosted", "read"),
-        ("ci-hosted", "write"),
-        ("ci-group", "read"),
-    ] {
+    for (repo, level) in [("ci-hosted", "write"), ("ci-group", "read")] {
         assert_eq!(
-            srv.add_grant(role, Some(repo), action, None).await.status(),
+            srv.add_grant(role, Some(repo), level, None).await.status(),
             StatusCode::CREATED
         );
     }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use forge_core::authz::{Action, EffectiveSet, RawEffectiveSet, RawGrant, SelectorPatterns};
+use forge_core::authz::{EffectiveSet, Level, RawEffectiveSet, RawGrant, SelectorPatterns};
 use forge_core::repo::{
     NupkgLocation, PackageFilteredReadOps, RegistrationEntry, RepoError, RepoReadOps, SearchHit,
     SearchParams, SearchResult, VersionEntry,
@@ -96,7 +96,7 @@ fn company_filter() -> forge_core::authz::PackageFilter {
     EffectiveSet::build(&RawEffectiveSet {
         is_admin: false,
         grants: vec![RawGrant {
-            action: Action::Read.as_str().to_string(),
+            level: Level::Read.as_str().to_string(),
             repo: Some(1),
             selector: Some(SelectorPatterns {
                 includes: vec!["company.*".to_string()],

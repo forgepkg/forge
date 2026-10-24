@@ -1,7 +1,7 @@
 //! The cached effective-set loader.
 //!
 //! The [`Authz`](crate::auth::authz::Authz) seam answers `can_read` /
-//! `can_write` / `can_admin` from a principal's resolved
+//! `can_write` / `can_delete` from a principal's resolved
 //! [`EffectiveSet`](super::EffectiveSet). Computing that set is a DB round trip
 //! (`user_role → repository_privilege`), far too costly to run on every
 //! download/restore request. This module sits in front of that load with
@@ -177,7 +177,7 @@ fn to_raw_set(rows: EffectiveRows) -> RawEffectiveSet {
                 Err(err) => {
                     tracing::error!(
                         error = %err,
-                        action = %g.action,
+                        level = %g.level,
                         "dropping grant with malformed content selector (fail-closed)"
                     );
                     // Drop the whole grant rather than keep it unscoped.
@@ -186,7 +186,7 @@ fn to_raw_set(rows: EffectiveRows) -> RawEffectiveSet {
             },
         };
         grants.push(RawGrant {
-            action: g.action,
+            level: g.level,
             repo: g.repository_id,
             selector,
         });
@@ -227,12 +227,12 @@ mod tests {
             is_admin: true,
             grants: vec![
                 EffectiveGrantRow {
-                    action: "read".into(),
+                    level: "read".into(),
                     repository_id: Some(1),
                     selector: None,
                 },
                 EffectiveGrantRow {
-                    action: "write".into(),
+                    level: "write".into(),
                     repository_id: None,
                     selector: Some(SelectorRow {
                         id: 5,
@@ -245,7 +245,7 @@ mod tests {
         let raw = to_raw_set(rows);
         assert!(raw.is_admin);
         assert_eq!(raw.grants.len(), 2);
-        assert_eq!(raw.grants[0].action, "read");
+        assert_eq!(raw.grants[0].level, "read");
         assert_eq!(raw.grants[0].repo, Some(1));
         assert!(raw.grants[0].selector.is_none());
         let sel = raw.grants[1].selector.as_ref().expect("selector");
@@ -260,7 +260,7 @@ mod tests {
         let rows = EffectiveRows {
             is_admin: false,
             grants: vec![EffectiveGrantRow {
-                action: "read".into(),
+                level: "read".into(),
                 repository_id: Some(1),
                 selector: Some(SelectorRow {
                     id: 9,

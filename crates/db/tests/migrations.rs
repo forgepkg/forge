@@ -37,8 +37,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "validated_credential_tag",
     // 0015_auth_success.sql
     "auth_success",
-    // 0005_rbac.sql
-    "privilege",
+    // 0005_rbac.sql (its `privilege` table is dropped by 0046)
     "role",
     "content_selector",
     "repository_privilege",
@@ -441,40 +440,34 @@ async fn migrations_create_all_expected_tables() {
     );
 
     // -----------------------------------------------------------------------
-    // 0005_rbac.sql: privilege vocabulary + seeded built-in roles + grants
+    // 0005_rbac.sql: seeded built-in roles + grants, as levels since 0046
     // -----------------------------------------------------------------------
 
-    // The privilege action set is seeded with exactly the four verbs.
-    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM privilege ORDER BY action")
-        .fetch_all(&pool)
+    // 0046 dropped the action vocabulary: a grant gives a level.
+    let privilege: Option<String> = sqlx::query_scalar("SELECT to_regclass('privilege')::text")
+        .fetch_one(&pool)
         .await
-        .expect("read privilege actions");
-    assert_eq!(
-        actions,
-        vec![
-            "admin".to_string(),
-            "delete".to_string(),
-            "read".to_string(),
-            "write".to_string()
-        ],
-        "privilege must seed exactly the four action verbs"
-    );
+        .expect("look up privilege");
+    assert_eq!(privilege, None, "the privilege table is dropped");
 
-    // The action column is an FK target: an unknown action on a grant is rejected.
+    // The level column holds the three levels only.
     let admin_role_id: i64 = sqlx::query_scalar("SELECT id FROM role WHERE name = 'admin'")
         .fetch_one(&pool)
         .await
         .expect("admin role exists");
-    let bad_action = sqlx::query(
-        "INSERT INTO repository_privilege (role_id, repository_id, action) VALUES ($1, NULL, 'frobnicate')",
-    )
-    .bind(admin_role_id)
-    .execute(&pool)
-    .await;
-    assert!(
-        bad_action.is_err(),
-        "repository_privilege.action must FK-reference the privilege table"
-    );
+    for level in ["frobnicate", "admin"] {
+        let bad_level = sqlx::query(
+            "INSERT INTO repository_privilege (role_id, repository_id, level) VALUES ($1, NULL, $2)",
+        )
+        .bind(admin_role_id)
+        .bind(level)
+        .execute(&pool)
+        .await;
+        assert!(
+            bad_level.is_err(),
+            "repository_privilege.level must refuse {level:?}"
+        );
+    }
 
     // The three built-in roles exist and are flagged builtin = true.
     for name in ["admin", "authenticated", "anonymous"] {
@@ -492,32 +485,29 @@ async fn migrations_create_all_expected_tables() {
         .await;
     assert!(dup_role.is_err(), "role.name must be UNIQUE");
 
-    // Seeded grants: admin has (ANY, admin); authenticated has (ANY, read) +
-    // (ANY, write); anonymous has none (the data migration adds its grants).
-    let admin_grants: Vec<String> = sqlx::query_scalar(
-        "SELECT rp.action FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
-         WHERE r.name = 'admin' AND rp.repository_id IS NULL ORDER BY rp.action",
+    // Seeded grants: admin has none (administration is the role itself);
+    // authenticated has (ANY, write); anonymous has none (the data migration
+    // adds its grants).
+    let admin_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+         WHERE r.name = 'admin'",
     )
-    .fetch_all(&pool)
+    .fetch_one(&pool)
     .await
-    .expect("read admin grants");
-    assert_eq!(
-        admin_grants,
-        vec!["admin".to_string()],
-        "admin role seeds a single (ANY, admin) sentinel grant"
-    );
+    .expect("count admin grants");
+    assert_eq!(admin_grants, 0, "the admin role holds no grant");
 
     let authenticated_grants: Vec<String> = sqlx::query_scalar(
-        "SELECT rp.action FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
-         WHERE r.name = 'authenticated' AND rp.repository_id IS NULL ORDER BY rp.action",
+        "SELECT rp.level FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+         WHERE r.name = 'authenticated' AND rp.repository_id IS NULL ORDER BY rp.level",
     )
     .fetch_all(&pool)
     .await
     .expect("read authenticated grants");
     assert_eq!(
         authenticated_grants,
-        vec!["read".to_string(), "write".to_string()],
-        "authenticated role seeds (ANY, read) + (ANY, write)"
+        vec!["write".to_string()],
+        "authenticated role holds (ANY, write)"
     );
 
     let anon_grant_count: i64 = sqlx::query_scalar(
@@ -532,17 +522,22 @@ async fn migrations_create_all_expected_tables() {
         "anonymous role seeds no grants in 0005_rbac.sql"
     );
 
-    // The COALESCE-based unique index collapses (role, ANY, action, no-selector)
-    // to a single row: a duplicate (admin, ANY, admin) insert must fail.
+    // The COALESCE-based unique index allows one grant per (role, ANY,
+    // no-selector), whatever its level: a second one must fail.
+    let authenticated_role_id: i64 =
+        sqlx::query_scalar("SELECT id FROM role WHERE name = 'authenticated'")
+            .fetch_one(&pool)
+            .await
+            .expect("authenticated role exists");
     let dup_grant = sqlx::query(
-        "INSERT INTO repository_privilege (role_id, repository_id, action) VALUES ($1, NULL, 'admin')",
+        "INSERT INTO repository_privilege (role_id, repository_id, level) VALUES ($1, NULL, 'read')",
     )
-    .bind(admin_role_id)
+    .bind(authenticated_role_id)
     .execute(&pool)
     .await;
     assert!(
         dup_grant.is_err(),
-        "repository_privilege_uq must collapse duplicate (role, ANY, action, no-selector) edges"
+        "repository_privilege_uq must allow one grant per (role, ANY, no-selector)"
     );
 
     // 0013: issuer routing is unambiguous among enabled WIF realms, including

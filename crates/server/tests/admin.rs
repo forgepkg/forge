@@ -458,7 +458,7 @@ async fn token_issue_use_and_revoke() {
     let resp = client
         .post(format!("{}/admin/users/{admin_id}/tokens", srv.base_url))
         .basic_auth(&u, Some(&p))
-        .json(&json!({"name": "ci", "scope": {"actions": ["admin"]}}))
+        .json(&json!({"name": "ci", "scope": {"admin": true}}))
         .send()
         .await
         .unwrap();
@@ -467,7 +467,7 @@ async fn token_issue_use_and_revoke() {
     let token = body["token"].as_str().unwrap().to_string();
     let token_id = body["id"].as_i64().unwrap();
     assert!(!token.is_empty());
-    assert_eq!(body["scope"], json!({"actions": ["admin"]}), "scope echoed");
+    assert_eq!(body["scope"], json!({"admin": true}), "scope echoed");
 
     // The token authenticates via the X-NuGet-ApiKey header on the admin API.
     let resp = client
@@ -555,7 +555,8 @@ async fn unscoped_admin_token_cannot_use_admin_api() {
     for scope in [
         None,
         Some(json!({})),
-        Some(json!({"actions": ["read", "write", "delete"]})),
+        Some(json!({"level": "delete"})),
+        Some(json!({"admin": false})),
     ] {
         let token = admin_token_with_scope(&srv, scope.clone()).await;
 
@@ -629,7 +630,7 @@ async fn unscoped_admin_token_cannot_use_admin_api() {
     assert_eq!(resp.status(), 201, "password admin mints tokens");
 }
 
-/// B4: a token whose scope explicitly lists `admin` (and does not restrict
+/// B4: a token whose scope opts in with `"admin": true` (and does not restrict
 /// repositories) may call the admin API, including minting tokens; a
 /// repo-restricted admin scope may not.
 #[tokio::test]
@@ -638,7 +639,7 @@ async fn admin_scoped_token_can_use_admin_api() {
     let client = srv.client();
     let id = admin_id(&srv).await;
 
-    let token = admin_token_with_scope(&srv, Some(json!({"actions": ["admin"]}))).await;
+    let token = admin_token_with_scope(&srv, Some(json!({"admin": true}))).await;
     let resp = client
         .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
         .header("X-NuGet-ApiKey", &token)
@@ -667,7 +668,7 @@ async fn admin_scoped_token_can_use_admin_api() {
     .id;
     let token = admin_token_with_scope(
         &srv,
-        Some(json!({"actions": ["admin"], "repositories": [repo_id]})),
+        Some(json!({"admin": true, "repositories": [repo_id]})),
     )
     .await;
     let resp = client
@@ -708,7 +709,7 @@ async fn token_scope_is_listed_and_unknown_keys_rejected() {
     let resp = client
         .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
         .basic_auth(&u, Some(&p))
-        .json(&json!({"name": "typo", "scop": {"actions": ["read"]}}))
+        .json(&json!({"name": "typo", "scop": {"level": "read"}}))
         .send()
         .await
         .unwrap();
@@ -722,7 +723,7 @@ async fn token_scope_is_listed_and_unknown_keys_rejected() {
     let created: Value = client
         .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
         .basic_auth(&u, Some(&p))
-        .json(&json!({"name": name, "scope": {"actions": ["read"]}}))
+        .json(&json!({"name": name, "scope": {"level": "read"}}))
         .send()
         .await
         .unwrap()
@@ -730,7 +731,7 @@ async fn token_scope_is_listed_and_unknown_keys_rejected() {
         .await
         .unwrap();
     let token_id = created["id"].as_i64().unwrap();
-    assert_eq!(created["scope"], json!({"actions": ["read"]}));
+    assert_eq!(created["scope"], json!({"level": "read"}));
 
     let list: Value = client
         .get(format!("{}/admin/users/{id}/tokens", srv.base_url))
@@ -747,7 +748,7 @@ async fn token_scope_is_listed_and_unknown_keys_rejected() {
         .iter()
         .find(|t| t["id"] == json!(token_id))
         .expect("token listed");
-    assert_eq!(listed["scope"], json!({"actions": ["read"]}));
+    assert_eq!(listed["scope"], json!({"level": "read"}));
     assert!(list
         .as_array()
         .unwrap()
@@ -757,7 +758,7 @@ async fn token_scope_is_listed_and_unknown_keys_rejected() {
     // PATCH with a mistyped key is rejected and leaves the scope in place.
     for body in [
         json!({"scope": {"repos": [1]}}),
-        json!({"scop": {"actions": ["write"]}}),
+        json!({"scop": {"level": "write"}}),
     ] {
         let resp = client
             .patch(format!("{}/admin/tokens/{token_id}/scope", srv.base_url))
@@ -773,11 +774,68 @@ async fn token_scope_is_listed_and_unknown_keys_rejected() {
         .unwrap()
         .unwrap()
         .scope;
-    assert_eq!(
-        stored,
-        Some(json!({"actions": ["read"]})),
-        "scope unchanged"
-    );
+    assert_eq!(stored, Some(json!({"level": "read"})), "scope unchanged");
+}
+
+/// #411: a token scope still sending `actions` answers 400 naming `level` and
+/// `admin`, which replaced it, on issue and on PATCH, and changes nothing.
+#[tokio::test]
+async fn token_scope_with_actions_answers_400_naming_level() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let id = admin_id(&srv).await;
+
+    for scope in [json!({"actions": ["read"]}), json!({"actions": ["admin"]})] {
+        let resp = client
+            .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({"name": "legacy", "scope": scope}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{scope}");
+        let message = resp.text().await.unwrap();
+        assert!(message.contains("`level`"), "{message}");
+        assert!(message.contains("`admin`"), "{message}");
+    }
+
+    let created: Value = client
+        .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": format!("lvl{}", common::unique()), "scope": {"level": "write"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token_id = created["id"].as_i64().unwrap();
+    let resp = client
+        .patch(format!("{}/admin/tokens/{token_id}/scope", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"scope": {"actions": ["read"]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("`level`"));
+    let stored = forge_db::token_dao::find_token_by_id(&srv.pool, token_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .scope;
+    assert_eq!(stored, Some(json!({"level": "write"})), "scope unchanged");
+
+    // `admin` is no level.
+    let resp = client
+        .patch(format!("{}/admin/tokens/{token_id}/scope", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"scope": {"level": "admin"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }
 
 /// L5: `PATCH /admin/tokens/{id}/scope` needs the `scope` key. `{}` (what
@@ -794,9 +852,7 @@ async fn token_scope_patch_clears_only_on_explicit_null() {
     let created: Value = client
         .post(format!("{}/admin/users/{id}/tokens", srv.base_url))
         .basic_auth(&u, Some(&p))
-        .json(
-            &json!({"name": format!("narrow{}", common::unique()), "scope": {"actions": ["read"]}}),
-        )
+        .json(&json!({"name": format!("narrow{}", common::unique()), "scope": {"level": "read"}}))
         .send()
         .await
         .unwrap()
@@ -821,13 +877,11 @@ async fn token_scope_patch_clears_only_on_explicit_null() {
 
     let resp = patch(json!({})).await.unwrap();
     assert_eq!(resp.status(), 400, "an empty body must not clear the scope");
-    assert_eq!(stored().await, Some(json!({"actions": ["read"]})));
+    assert_eq!(stored().await, Some(json!({"level": "read"})));
 
-    let resp = patch(json!({"scope": {"actions": ["read", "write"]}}))
-        .await
-        .unwrap();
+    let resp = patch(json!({"scope": {"level": "write"}})).await.unwrap();
     assert_eq!(resp.status(), 204);
-    assert_eq!(stored().await, Some(json!({"actions": ["read", "write"]})));
+    assert_eq!(stored().await, Some(json!({"level": "write"})));
 
     let resp = patch(json!({"scope": null})).await.unwrap();
     assert_eq!(resp.status(), 204);
@@ -1956,7 +2010,7 @@ async fn auth_tokens_refuses_a_scope_it_would_drop() {
         .post(format!("{}/auth/tokens", srv.base_url))
         .header("cookie", &cookie)
         .header("x-csrf-token", &csrf)
-        .json(&json!({"name": "ci", "scope": {"actions": ["read"]}}))
+        .json(&json!({"name": "ci", "scope": {"level": "read"}}))
         .send()
         .await
         .unwrap();
@@ -2781,7 +2835,7 @@ async fn anonymous_read_off_deletes_the_synthesized_grant() {
                 .await
                 .unwrap()
                 .iter()
-                .any(|g| g.repository_id == Some(repo_id) && g.action == "read")
+                .any(|g| g.repository_id == Some(repo_id) && g.level == "read")
         }
     };
 

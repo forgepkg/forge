@@ -1,3 +1,4 @@
+import type { Level } from '~/api/rbac'
 import { httpClient } from '~/lib/httpClient'
 
 /**
@@ -42,12 +43,14 @@ export interface TokenView {
 
 /**
  * Per-token scope (`forge_core::authz::TokenScope`): it only narrows the
- * owner's access. An absent `actions` means read/write/delete (never
- * `admin`); an absent `repositories` means every repository the owner can
- * reach.
+ * owner's access. An absent `level` keeps the owner's levels; `admin: true`
+ * keeps the owner's `admin` role (the admin API), only without
+ * `repositories`; an absent `repositories` means every repository the owner
+ * can reach.
  */
 export interface TokenScope {
-  actions?: Array<'read' | 'write' | 'delete' | 'admin'> | null
+  level?: Level | null
+  admin?: boolean | null
   repositories?: number[] | null
 }
 

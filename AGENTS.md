@@ -111,3 +111,10 @@ Never create an issue without a milestone; set it when you create the issue:
 Whatever merges to `main` ships in the next release. When an issue of a later
 milestone is fixed before then, move the issue to the next release's
 milestone, and its changelog fragment to that milestone's directory.
+
+## Issues: assign the issue when work on it starts
+
+When you start work on an issue, assign it to the person you work for, the
+GitHub account your GitHub access acts as (`get_me` names it), before the
+first commit: the issue then shows who is on it while the work is under way.
+Add the assignee and keep the ones already there.

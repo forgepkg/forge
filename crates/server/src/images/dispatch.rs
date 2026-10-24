@@ -27,7 +27,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use forge_core::auth::{AuthMethod, Principal};
-use forge_core::authz::Action as Rbac;
+use forge_core::authz::Level;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
 use forge_plugin::api::images::{
@@ -151,8 +151,8 @@ impl Registry {
                 return Err(self.refusal(&caller, &site, &name, permission, Decision::Deny));
             }
         };
-        let write_target = if action == Rbac::Read {
-            let decision = self.decide(&caller, &target, Rbac::Read).await;
+        let write_target = if action == Level::Read {
+            let decision = self.decide(&caller, &target, Level::Read).await;
             if decision != Decision::Allow {
                 return Err(self.refusal(&caller, &site, &name, permission, decision));
             }
@@ -206,7 +206,7 @@ impl Registry {
             blobs: Mutex::new(HashMap::new()),
         };
         let response = conversation.run(request).await;
-        if action != Rbac::Read {
+        if action != Level::Read {
             tracing::info!(
                 target: "forge::audit",
                 %method,
@@ -397,7 +397,7 @@ impl Registry {
     /// Whether the caller may `action` the target's image: the repository
     /// permission and its content selectors, then a registry token's scope
     /// (checked against the name the client used).
-    pub(crate) async fn decide(&self, caller: &Caller, target: &Target, action: Rbac) -> Decision {
+    pub(crate) async fn decide(&self, caller: &Caller, target: &Target, action: Level) -> Decision {
         if !self
             .rbac_allows(&caller.principal, &target.repo, &target.image, action)
             .await
@@ -416,14 +416,13 @@ impl Registry {
         principal: &Principal,
         repo: &Repository,
         image: &str,
-        action: Rbac,
+        action: Level,
     ) -> bool {
         let authz = &self.inner.authz;
         let allowed = match action {
-            Rbac::Read => authz.can_read(principal, repo).await,
-            Rbac::Write => authz.can_write(principal, repo).await,
-            Rbac::Delete => authz.can_delete(principal, repo).await,
-            Rbac::Admin => false,
+            Level::Read => authz.can_read(principal, repo).await,
+            Level::Write => authz.can_write(principal, repo).await,
+            Level::Delete => authz.can_delete(principal, repo).await,
         };
         allowed
             && authz
@@ -449,7 +448,7 @@ impl Registry {
         let landing = match target.repo.kind() {
             RepoKind::Hosted => target.clone(),
             RepoKind::Proxy | RepoKind::Group => {
-                let decision = self.decide(caller, target, Rbac::Read).await;
+                let decision = self.decide(caller, target, Level::Read).await;
                 if decision != Decision::Allow {
                     return Err(self.refusal(
                         caller,
@@ -1017,11 +1016,11 @@ pub(crate) fn mutation_credential(principal: &Principal) -> bool {
 }
 
 /// The RBAC action a permission is.
-pub(crate) fn rbac(permission: Permission) -> Rbac {
+pub(crate) fn rbac(permission: Permission) -> Level {
     match permission {
-        Permission::Read => Rbac::Read,
-        Permission::Write => Rbac::Write,
-        Permission::Delete => Rbac::Delete,
+        Permission::Read => Level::Read,
+        Permission::Write => Level::Write,
+        Permission::Delete => Level::Delete,
     }
 }
 
@@ -1034,12 +1033,11 @@ fn scope_actions(permission: Permission) -> &'static str {
     }
 }
 
-fn claims_allow(claims: &Claims, name: &str, action: Rbac) -> bool {
+fn claims_allow(claims: &Claims, name: &str, action: Level) -> bool {
     match action {
-        Rbac::Read => claims.grants(name, "pull"),
-        Rbac::Write => claims.grants(name, "push"),
-        Rbac::Delete => claims.grants(name, "delete"),
-        Rbac::Admin => false,
+        Level::Read => claims.grants(name, "pull"),
+        Level::Write => claims.grants(name, "push"),
+        Level::Delete => claims.grants(name, "delete"),
     }
 }
 

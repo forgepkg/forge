@@ -6,7 +6,7 @@ import type { AnonymousMode } from '~/api/settings'
 import { useRoleGrants, useRoles, useSelectors } from '~/queries/useRbac'
 import { useAuthSettings } from '~/queries/useSettings'
 import { FactList, Panel, Skeleton, StatusBadge } from '~/components/ui'
-import { ActionBadge, byId, SelectorLabel } from '~/components/RbacLabels'
+import { byId, LevelBadge, SelectorLabel } from '~/components/RbacLabels'
 
 const MODE_LABELS: Record<AnonymousMode, string> = {
   off: 'off',
@@ -95,7 +95,7 @@ export function AnonymousAccessPanel({ repo }: { repo: RepoView }) {
               <ul className="m-0 grid list-none gap-2 p-0 text-ink">
                 {covering.map((g) => (
                   <li key={g.id} className="flex flex-wrap items-center gap-2">
-                    <ActionBadge action={g.action} />
+                    <LevelBadge level={g.level} />
                     <span>
                       {g.repository_id == null
                         ? 'on all repositories'

@@ -19,7 +19,7 @@ use axum::extract::Request;
 use axum::http::header;
 use bytes::Bytes;
 use forge_core::auth::principal::{AuthMethod, Principal};
-use forge_core::authz::Action;
+use forge_core::authz::Level;
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::{DeploymentPolicy, RepoKind, Repository};
 use forge_db::raw_dao::{self, NewRawFile, Redeploy, StoreOutcome};
@@ -173,12 +173,12 @@ fn checked_path(path: &str) -> Result<&str, FileError> {
         .map_err(|e| FileError::Internal(format!("the format named path {path:?}: {e}")))
 }
 
-/// Why an upload or delete that needs `action` on `repo` may not happen;
+/// Why an upload or delete that needs `level` on `repo` may not happen;
 /// `None` when it may.
 pub async fn refusal(
     files: &Files<'_>,
     repo: &Repository,
-    action: Action,
+    level: Level,
     via: Via,
 ) -> Option<FileError> {
     if repo.kind() != RepoKind::Hosted {
@@ -198,8 +198,8 @@ pub async fn refusal(
     if !credential {
         return Some(FileError::CredentialRequired);
     }
-    let allowed = match action {
-        Action::Delete => files.state.authz.can_delete(&files.principal, repo).await,
+    let allowed = match level {
+        Level::Delete => files.state.authz.can_delete(&files.principal, repo).await,
         _ => files.state.authz.can_write(&files.principal, repo).await,
     };
     if !allowed {
@@ -271,7 +271,7 @@ async fn record_all(
     let replace = files
         .state
         .authz
-        .package_filter_for(&files.principal, repo, Action::Delete)
+        .package_filter_for(&files.principal, repo, Level::Delete)
         .await;
     let may_delete = files.state.authz.can_delete(&files.principal, repo).await;
     let grace = files.state.config.outbox.grace();
@@ -357,13 +357,13 @@ pub async fn store(
     uploads: Vec<Upload>,
     via: Via,
 ) -> Result<Vec<Stored>, FileError> {
-    if let Some(refused) = refusal(files, repo, Action::Write, via).await {
+    if let Some(refused) = refusal(files, repo, Level::Write, via).await {
         return Err(refused);
     }
     let write = files
         .state
         .authz
-        .package_filter_for(&files.principal, repo, Action::Write)
+        .package_filter_for(&files.principal, repo, Level::Write)
         .await;
     let mut seen = HashSet::new();
     for upload in &uploads {
@@ -415,7 +415,7 @@ pub async fn receive_form(
     req: Request<Body>,
     via: Via,
 ) -> Result<Vec<Part>, FileError> {
-    if let Some(refused) = refusal(files, repo, Action::Write, via).await {
+    if let Some(refused) = refusal(files, repo, Level::Write, via).await {
         return Err(refused);
     }
     let Some(boundary) = req
@@ -495,14 +495,14 @@ pub async fn remove(
     path: &str,
     via: Via,
 ) -> Result<bool, FileError> {
-    if let Some(refused) = refusal(files, repo, Action::Delete, via).await {
+    if let Some(refused) = refusal(files, repo, Level::Delete, via).await {
         return Err(refused);
     }
     let path = checked_path(path)?;
     let filter = files
         .state
         .authz
-        .package_filter_for(&files.principal, repo, Action::Delete)
+        .package_filter_for(&files.principal, repo, Level::Delete)
         .await;
     if !filter.allows(path) {
         return Ok(false);

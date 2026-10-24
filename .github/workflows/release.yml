@@ -5,27 +5,30 @@ name: Release
 #   :<major>.<minor> only for the newest release of that line and :latest only
 #   for the newest non-prerelease version overall (an older-line patch or a
 #   prerelease never moves them),
-# with a BuildKit SBOM + max-mode provenance attestation, a keyless cosign
-# signature, and a GitHub release whose notes come from the matching
-# CHANGELOG.md section. The Helm chart (deploy/helm/forge) is published next
-# to it as oci://ghcr.io/<owner>/charts/forge:<version>, pinned to the signed
-# image digest and signed the same way, once the dependency images it and the
+# one multi-platform image (an OCI index of linux/amd64 and linux/arm64, each
+# built natively on a runner of its platform) with a BuildKit SBOM +
+# max-mode provenance attestation per platform, keyless cosign signatures,
+# and a GitHub release whose notes come from the matching CHANGELOG.md
+# section. The Helm chart (deploy/helm/forge) is published next to it as
+# oci://ghcr.io/<owner>/charts/forge:<version>, pinned to the signed index
+# digest and signed the same way, once the dependency images it and the
 # Kubernetes manifests pin are on ghcr.io and public (mirror-images.yml).
 #
-# Order of operations: the image is pushed BY DIGEST (untagged), the digest is
-# signed and the signature verified, and only then are the tags attached
-# (`docker buildx imagetools create`), so no tag ever points at an unsigned
-# image. Every signature is checked, here and by the `cosign verify` commands
-# in the release notes, against this workflow at the release's tag AND the
-# tagged commit (and the push trigger): the identity alone names only the
-# tag, which a moved or re-created tag would share with another commit (so
-# protect refs/tags/v* with a ruleset; DEVELOPMENT.md, Releasing). The
-# floating tags are decided right before they are attached, against
-# the tags that exist by then, so an overlapping run for an older tag that
-# finishes last cannot move them back. Every third-party action is pinned to a
-# full commit SHA (the tag it was resolved from is in the trailing comment);
-# Dependabot keeps them current. The build's helpers (BuildKit, the SBOM
-# generator, the Dockerfile frontend) are pinned by digest as well.
+# Order of operations: each platform's image is pushed BY DIGEST (untagged),
+# the index of both is pushed by digest as well, the index and each
+# platform's image are signed and the signatures verified, and only then are
+# the tags attached (`docker buildx imagetools create`), so no tag ever points
+# at an unsigned image. Every signature is checked, here and by the `cosign
+# verify` commands in the release notes, against this workflow at the
+# release's tag AND the tagged commit (and the push trigger): the identity
+# alone names only the tag, which a moved or re-created tag would share with
+# another commit (so protect refs/tags/v* with a ruleset; DEVELOPMENT.md,
+# Releasing). The floating tags are decided right before they are attached,
+# against the tags that exist by then, so an overlapping run for an older tag
+# that finishes last cannot move them back. Every third-party action is
+# pinned to a full commit SHA (the tag it was resolved from is in the trailing
+# comment); Dependabot keeps them current. The build's helpers (BuildKit, the
+# SBOM generator, the Dockerfile frontend) are pinned by digest as well.
 #
 # Guard rails: the tag must point at a commit on the default branch whose CI
 # run (ci.yml) passed, e2e and web-e2e included (the `ci` job waits for it).
@@ -38,7 +41,10 @@ name: Release
 # would move the version's tags and overwrite its chart): a version whose
 # GitHub release exists is refused before anything is pushed, and the image
 # and chart that an earlier, failed run of the tag pushed are reused once
-# their signatures show a release run of this commit made them.
+# their signatures show a release run of this commit made them. Until the
+# index is tagged, a platform's image that an earlier attempt of the run
+# pushed is reused as well (its digest is an artifact of the run), so a
+# re-run builds only the platforms that are missing.
 on:
   push:
     tags: ["v*.*.*"]
@@ -55,6 +61,8 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  # The image's platforms, sorted; the build job's matrix builds each of them.
+  PLATFORMS: linux/amd64 linux/arm64
   CHART_DIR: deploy/helm/forge
   CHART_REPO: ghcr.io/${{ github.repository_owner }}/charts
   # Built from source by `go install`, so the Go checksum database verifies
@@ -154,19 +162,20 @@ jobs:
     with:
       release: true
 
-  image:
-    name: build, push, sign
-    needs: [ci, mirror]
+  # What can be checked before anything is built: the versions, the release
+  # notes, the chart. Also skips the builds when an earlier run of this
+  # release published the image already; the publish job decides whether it
+  # may reuse it.
+  check:
+    name: check the release
+    needs: [ci]
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the GitHub release
-      packages: write # push to ghcr.io
-      id-token: write # keyless cosign signing + provenance
-    env:
-      # The signer of this release's signatures: this workflow at the tag.
-      # Every `cosign verify` also pins the commit (GITHUB_SHA, the commit the
-      # tag points to) and the push trigger.
-      IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+      contents: read
+      packages: read # look the version up on ghcr.io
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image-published: ${{ steps.published.outputs.image-published }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -225,18 +234,76 @@ jobs:
             exit 1
           fi
 
+      # For the publish job, which creates the GitHub release.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          overwrite: true # a re-run of this job
+
       # Before anything is pushed, so a chart that does not lint stops the
       # release.
       - name: Install Helm and lint the chart
         run: |
           GOBIN="$RUNNER_TEMP/bin" GOTOOLCHAIN=auto GOFLAGS=-trimpath go install "helm.sh/helm/v4/cmd/helm@${HELM_VERSION}"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/bin/helm" lint --strict --with-subcharts "$CHART_DIR"
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only whether to build: when the lookup fails for another reason than
+      # a missing image, the platforms are built for nothing, and the publish
+      # job, which looks again, reuses what it finds.
+      - name: Is the image published already?
+        id: published
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" > /dev/null 2>&1; then
+            echo "${IMAGE}:${VERSION} exists: nothing to build"
+            echo "image-published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "${IMAGE}:${VERSION} is not published yet: building it"
+          fi
+
+  # Each platform's image, natively on a runner of that platform (under
+  # emulation a Rust release build takes several times as long), pushed BY
+  # DIGEST (untagged) with its own SBOM and provenance attestations. Its
+  # digest is an artifact of the run, for the publish job. Skipped when an
+  # earlier run of this release published the image.
+  build:
+    name: build (${{ matrix.arch }})
+    needs: [check]
+    if: needs.check.outputs.image-published != 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read # the digest an earlier attempt of this run recorded
+      packages: write # push to ghcr.io
+    strategy:
+      # The other platform's build goes on and keeps its image, so a re-run
+      # builds only the one that failed.
+      fail-fast: false
+      # One per platform in PLATFORMS.
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # BuildKit pinned by digest; the action's default is the floating
       # moby/buildkit:buildx-stable-1. Dependabot does not see it: bump tag and
-      # digest by hand, together with ci.yml's docker job. It pulls the
-      # Dockerfile's and the SBOM generator's Docker Hub images through
+      # digest by hand, together with ci.yml's docker-platform job. It pulls
+      # the Dockerfile's and the SBOM generator's Docker Hub images through
       # mirror.gcr.io.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
@@ -251,20 +318,150 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # A re-run of all jobs runs this one again although an earlier attempt
+      # may have pushed the platform's image already (re-running the failed
+      # jobs alone does not). Nothing to download on a first attempt.
+      - name: Download the digest an earlier attempt of this run recorded
+        if: github.run_attempt != '1'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/earlier
+          # Every attempt's artifacts, not only this attempt's.
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Reuse the image an earlier attempt of this run pushed
+        id: earlier
+        shell: bash # -eo pipefail: a failing lookup fails the step
+        run: |
+          file="$RUNNER_TEMP/earlier/$ARCH"
+          if [ ! -s "$file" ]; then
+            echo "no earlier attempt of this run pushed an image of linux/$ARCH"
+            exit 0
+          fi
+          digest=$(cat "$file")
+          if ! raw=$(docker buildx imagetools inspect --raw "${IMAGE}@${digest}"); then
+            echo "${IMAGE}@${digest}, which an earlier attempt pushed, cannot be found: building again"
+            exit 0
+          fi
+          platforms=$(jq -r '[.manifests[]? | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"] | join(" ")' <<< "$raw")
+          if [ "$platforms" != "linux/$ARCH" ]; then
+            echo "::error::${IMAGE}@${digest}, recorded as the image of linux/$ARCH, is an image of '$platforms'"
+            exit 1
+          fi
+          echo "${IMAGE}@${digest} was pushed by an earlier attempt of this run: reusing it"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata
+        id: meta
+        if: steps.earlier.outputs.digest == ''
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=forge
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+
+      # Push the image untagged (by digest only); the publish job adds it to
+      # the index, which is tagged once it is signed.
+      - name: Build and push by digest
+        id: build
+        if: steps.earlier.outputs.digest == ''
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FORGE_GIT_SHA=${{ github.sha }}
+            FORGE_VERSION=${{ needs.check.outputs.version }}
+          # Covers the crates and npm packages too: the Dockerfile has its web
+          # and builder stages scanned, and the binary embeds its crate list.
+          # The SBOM generator is pinned by digest (`sbom: true` would run the
+          # floating docker/buildkit-syft-scanner:stable-1); bump it by hand.
+          attests: type=sbom,generator=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
+          provenance: mode=max
+          # Built from scratch, no BuildKit cache: a tag reads the default
+          # branch's cache scope, which every CI job on main can write, so a
+          # cached layer would let code CI runs (test dependencies, tools)
+          # into the signed release image.
+          no-cache: true
+
+      - name: Record the digest
+        env:
+          DIGEST: ${{ steps.earlier.outputs.digest || steps.build.outputs.digest }}
+        run: |
+          if [ -z "$DIGEST" ]; then
+            echo "::error::the build of linux/$ARCH reported no digest"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/digest"
+          echo "$DIGEST" > "$RUNNER_TEMP/digest/$ARCH"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest/${{ matrix.arch }}
+          if-no-files-found: error
+          overwrite: true # a re-run of this job
+
+  # Combines the platforms' images into one index, signs it and them, tags it,
+  # and publishes the chart and the GitHub release. Also runs when the builds
+  # were skipped, to reuse the published image.
+  publish:
+    name: merge, sign, publish
+    needs: [check, mirror, build]
+    if: ${{ !cancelled() && needs.check.result == 'success' && needs.mirror.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release
+      actions: read # the build jobs' digests, of this and earlier attempts
+      packages: write # push to ghcr.io
+      id-token: write # keyless cosign signing
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      # The signer of this release's signatures: this workflow at the tag.
+      # Every `cosign verify` also pins the commit (GITHUB_SHA, the commit the
+      # tag points to) and the push trigger.
+      IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+    steps:
+      # The full history, for the floating tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Install Helm
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" GOTOOLCHAIN=auto GOFLAGS=-trimpath go install "helm.sh/helm/v4/cmd/helm@${HELM_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # A re-run must not build this version again: a new build gets another
-      # digest, and pushing it would move the version's tags and overwrite its
-      # chart. So a version that has a GitHub release is refused before
-      # anything is pushed, and an image or chart that an earlier, failed run
-      # of this tag pushed is reused as it is, once its signature shows that a
-      # release run of this commit made it.
+      # A re-run must not publish this version again: an index of other
+      # builds has another digest, and pushing it would move the version's
+      # tags and overwrite its chart. So a version that has a GitHub release
+      # is refused before anything is tagged, and an image or chart that an
+      # earlier, failed run of this tag published is reused as it is, once its
+      # signature shows that a release run of this commit made it.
       - name: Find what an earlier run of this release published
         id: published
         shell: bash # -eo pipefail: a failing command fails the step
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
           REGISTRY_USER: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -360,9 +557,14 @@ jobs:
             echo "chart-package=$package" >> "$GITHUB_OUTPUT"
           fi
 
+      # The fixed tags, and the annotations of the index: GHCR links a
+      # multi-platform image to the repository, and shows its description,
+      # from those (org.opencontainers.image.source, .description).
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE }}
           # Only the fixed tags: the floating ones (`<major>.<minor>`,
@@ -372,50 +574,112 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=sha,format=short
-          labels: |
+          annotations: |
             org.opencontainers.image.title=forge
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ env.VERSION }}
 
-      # Push the image untagged (by digest only); the tags are attached after
-      # the digest is signed. Skipped when an earlier run pushed it.
-      - name: Build and push by digest
-        id: build
+      # The platforms' images the build jobs pushed: in this attempt, or in an
+      # earlier one for a build a re-run of the failed jobs left alone.
+      - name: Download the platforms' digests
         if: steps.published.outputs.image-digest == ''
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          context: .
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            FORGE_GIT_SHA=${{ github.sha }}
-            FORGE_VERSION=${{ steps.version.outputs.version }}
-          # Covers the crates and npm packages too: the Dockerfile has its web
-          # and builder stages scanned, and the binary embeds its crate list.
-          # The SBOM generator is pinned by digest (`sbom: true` would run the
-          # floating docker/buildkit-syft-scanner:stable-1); bump it by hand.
-          attests: type=sbom,generator=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
-          provenance: mode=max
-          # Built from scratch, no BuildKit cache: a tag reads the default
-          # branch's cache scope, which every CI job on main can write, so a
-          # cached layer would let code CI runs (test dependencies, tools)
-          # into the signed release image.
-          no-cache: true
+          pattern: image-digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+          # Every attempt's artifacts, not only this attempt's.
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
 
-      # The image of this run, or the one an earlier run pushed and signed.
-      - name: Sign the image digest (keyless) and verify the signature
+      # One image for every platform: an index of the platforms' images, their
+      # attestations included, pushed BY DIGEST (untagged) like them. Skipped
+      # when an earlier run published it.
+      - name: Push the multi-platform index by digest
+        id: index
+        if: steps.published.outputs.image-digest == ''
+        shell: bash # -eo pipefail: a failing command fails the step
         env:
-          DIGEST: ${{ steps.published.outputs.image-digest || steps.build.outputs.digest }}
+          ANNOTATIONS: ${{ steps.meta.outputs.annotations }}
+        run: |
+          sources=()
+          for platform in $PLATFORMS; do
+            file="$RUNNER_TEMP/digests/${platform#linux/}"
+            if [ ! -s "$file" ]; then
+              echo "::error::${IMAGE}:${VERSION} is not published, and no build job of this run recorded an image of $platform: re-run all jobs"
+              exit 1
+            fi
+            sources+=("${IMAGE}@$(cat "$file")")
+          done
+          # Without the creation time, so a re-run of this job makes the same
+          # index of the same images.
+          annotations=()
+          while IFS= read -r annotation; do
+            case "$annotation" in
+              "" | index:org.opencontainers.image.created=*) ;;
+              *) annotations+=(--annotation "$annotation") ;;
+            esac
+          done <<< "$ANNOTATIONS"
+          # Given a reference by digest instead of a tag, imagetools pushes
+          # the index by its digest alone: the digest of what the dry run
+          # prints (followed by a newline).
+          docker buildx imagetools create --dry-run "${annotations[@]}" "${sources[@]}" > "$RUNNER_TEMP/index.json"
+          digest="sha256:$(head -c -1 "$RUNNER_TEMP/index.json" | sha256sum | cut -d' ' -f1)"
+          docker buildx imagetools create "${annotations[@]}" --tag "${IMAGE}@${digest}" "${sources[@]}"
+          if ! docker buildx imagetools inspect --raw "${IMAGE}@${digest}" | cmp -s - <(head -c -1 "$RUNNER_TEMP/index.json"); then
+            echo "::error::${IMAGE}@${digest} is not the index of ${sources[*]}"
+            exit 1
+          fi
+          echo "${IMAGE}@${digest}: the index of ${sources[*]}"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # The index of this run, or the one an earlier run pushed and signed:
+      # both platforms, each with its attestations. The index and each
+      # platform's image are signed, so `cosign verify` accepts the digest a
+      # tag names as well as the one `docker pull` resolves it to on a node.
+      - name: Sign the index and the platforms' images (keyless) and verify the signatures
+        id: sign
+        shell: bash # -eo pipefail: a failing command fails the step
+        env:
+          DIGEST: ${{ steps.published.outputs.image-digest || steps.index.outputs.digest }}
           REUSED: ${{ steps.published.outputs.image-digest != '' }}
         run: |
+          # "<platform> <digest>" of each platform's image.
+          images=$(docker buildx imagetools inspect --raw "${IMAGE}@${DIGEST}" \
+            | jq -r '.manifests[]? | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture) \(.digest)"' \
+            | sort)
+          platforms=$(cut -d' ' -f1 <<< "$images" | xargs)
+          if [ "$platforms" != "$PLATFORMS" ]; then
+            echo "::error::${IMAGE}@${DIGEST} has the platforms '$platforms', not '$PLATFORMS'"
+            exit 1
+          fi
+          for attestation in SBOM Provenance; do
+            attested=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format "{{json .${attestation}}}" \
+              | jq -r '. // {} | keys | sort | join(" ")')
+            if [ "$attested" != "$PLATFORMS" ]; then
+              echo "::error::${IMAGE}@${DIGEST} has a $attestation attestation for '$attested', not for each of '$PLATFORMS'"
+              exit 1
+            fi
+          done
+          refs=("${IMAGE}@${DIGEST}")
+          while read -r _ digest; do refs+=("${IMAGE}@${digest}"); done <<< "$images"
           if [ "$REUSED" != true ]; then
-            cosign sign --yes "${IMAGE}@${DIGEST}"
+            for ref in "${refs[@]}"; do
+              cosign sign --yes "$ref"
+            done
           fi
           # The exact command published in the release notes must succeed.
-          cosign verify "${IMAGE}@${DIGEST}" \
-            --certificate-identity "${IDENTITY}" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            --certificate-github-workflow-sha "${GITHUB_SHA}" \
-            --certificate-github-workflow-trigger push > /dev/null
+          for ref in "${refs[@]}"; do
+            cosign verify "$ref" \
+              --certificate-identity "${IDENTITY}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-sha "${GITHUB_SHA}" \
+              --certificate-github-workflow-trigger push > /dev/null
+          done
+          {
+            echo "images<<EOF"
+            echo "$images"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       # Which floating tags this release may move: `latest` only for the
       # highest non-prerelease version and `<major>.<minor>` only for the
@@ -427,7 +691,6 @@ jobs:
         id: channels
         shell: bash # -eo pipefail: a failing script fails the step
         env:
-          VERSION: ${{ steps.version.outputs.version }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           git fetch --force --tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
@@ -435,11 +698,10 @@ jobs:
 
       # Attaching them again to the digest they already name (a re-run) changes
       # nothing.
-      - name: Attach the tags to the signed digest
+      - name: Attach the tags to the signed index
         env:
-          DIGEST: ${{ steps.published.outputs.image-digest || steps.build.outputs.digest }}
+          DIGEST: ${{ steps.published.outputs.image-digest || steps.index.outputs.digest }}
           TAGS: ${{ steps.meta.outputs.tags }}
-          VERSION: ${{ steps.version.outputs.version }}
           LATEST: ${{ steps.channels.outputs.latest }}
           LINE_LATEST: ${{ steps.channels.outputs.line_latest }}
         run: |
@@ -460,16 +722,16 @@ jobs:
             exit 1
           fi
 
-      # The packaged chart records the signed digest (Chart.yaml annotation
-      # forge/image-digest), so it deploys exactly this image while
+      # The packaged chart records the signed index digest (Chart.yaml
+      # annotation forge/image-digest), so it deploys exactly this image, each
+      # node pulling its platform's, while
       # image.tag and image.digest are left unset. The checkout itself keeps
       # the annotation empty. A chart an earlier run pushed and signed is
       # used as pulled.
-      - name: Package the Helm chart, pinned to the signed image digest
+      - name: Package the Helm chart, pinned to the signed index digest
         id: chart
         env:
-          DIGEST: ${{ steps.published.outputs.image-digest || steps.build.outputs.digest }}
-          VERSION: ${{ steps.version.outputs.version }}
+          DIGEST: ${{ steps.published.outputs.image-digest || steps.index.outputs.digest }}
           PUBLISHED: ${{ steps.published.outputs.chart-package }}
         run: |
           if [ -n "$PUBLISHED" ]; then
@@ -516,7 +778,8 @@ jobs:
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          DIGEST: ${{ steps.published.outputs.image-digest || steps.build.outputs.digest }}
+          DIGEST: ${{ steps.published.outputs.image-digest || steps.index.outputs.digest }}
+          IMAGES: ${{ steps.sign.outputs.images }}
           CHART_DIGEST: ${{ steps.published.outputs.chart-digest || steps.chart-push.outputs.digest }}
           PACKAGE: ${{ steps.chart.outputs.package }}
         run: |
@@ -528,8 +791,13 @@ jobs:
             echo "  --certificate-github-workflow-trigger push"
           }
           # The packages' pages; both are linked to this repository through
-          # their org.opencontainers.image.source.
+          # their org.opencontainers.image.source (the image's index carries
+          # it as an annotation).
           packages="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pkgs/container"
+          platforms=""
+          for platform in $PLATFORMS; do
+            platforms="${platforms:+$platforms, }\`$platform\`"
+          done
           {
             cat release-notes.md
             echo
@@ -539,9 +807,14 @@ jobs:
             echo
             echo "Built from commit ${GITHUB_SHA}, which \`${GITHUB_REF_NAME}\` points to. The \`cosign verify\` commands below accept only a signature by this repository's release workflow for that tag and that commit."
             echo
+            echo "One image for ${platforms}: the digest below is that of the index of the platforms' images (listed under it), from which \`docker pull\` and Kubernetes take the node's platform. The index and each platform's image are signed: the \`cosign verify\` command passes for each of these digests."
+            echo
             echo '```'
-            echo "docker pull ${IMAGE}:${{ steps.version.outputs.version }}"
+            echo "docker pull ${IMAGE}:${VERSION}"
             echo "# digest: ${DIGEST}"
+            while read -r platform digest; do
+              echo "#   ${platform}: ${digest}"
+            done <<< "$IMAGES"
             verify "${IMAGE}@${DIGEST}"
             echo '```'
             echo
@@ -551,12 +824,12 @@ jobs:
             echo "Deploys exactly the image above (by digest)."
             echo
             echo '```'
-            echo "helm install forge oci://${CHART_REPO}/forge --version ${{ steps.version.outputs.version }}"
+            echo "helm install forge oci://${CHART_REPO}/forge --version ${VERSION}"
             echo "# digest: ${CHART_DIGEST}"
             verify "${CHART_REPO}/forge@${CHART_DIGEST}"
             echo '```'
           } > release-body.md
           prerelease=""
-          case "${{ steps.version.outputs.version }}" in *-*) prerelease="--prerelease";; esac
+          case "${VERSION}" in *-*) prerelease="--prerelease";; esac
           gh release create "$GITHUB_REF_NAME" "$PACKAGE" --title "$GITHUB_REF_NAME" \
             --notes-file release-body.md $prerelease --verify-tag

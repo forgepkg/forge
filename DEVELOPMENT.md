@@ -171,7 +171,7 @@ curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/rep
 curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/me/tokens \
   -H 'content-type: application/json' -d '{"name":"local"}'
 # -> {"token":"<SECRET>", ...}   (shown once)
-# For scripted administration, mint one with '{"name":"ops","scope":{"actions":["admin"]}}'
+# For scripted administration, mint one with '{"name":"ops","scope":{"admin":true}}'
 # and send it as the Basic password (curl -u admin@example.com:<SECRET>) or X-NuGet-ApiKey.
 
 # push a package, then read it back
@@ -231,7 +231,7 @@ password supplied to NuGet should be a **token**.
   the members it may read itself. The same holds for a token whose `scope`
   lists repositories: scoped to the group alone it sees an empty feed, so
   list the group **and** every member it should be served from, e.g.
-  `{"scope": {"actions": ["read"], "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
+  `{"scope": {"level": "read", "repositories": [<all>, <nuget>, <nuget-proxy>]}}`.
 
 The same three types exist for container images with `"format":"docker"`
 (`{"name":"docker-hosted","kind":"hosted","format":"docker"}`, a proxy with
@@ -556,8 +556,11 @@ When `admin_groups` is set, admin is **recomputed on every login** from the
 current claims: membership in the built-in `admin` role (a user
 removed from the admin role loses admin on next login; existing sessions are not
 downgraded mid-session). With an empty `admin_groups` OIDC never touches admin.
-OIDC users are identified by the `(issuer, sub)` link. With `auto_provision =
-true` (default) a first-time login creates an `app_user`;
+OIDC users are identified by the `(issuer, sub)` link. A first-time login
+creates an `app_user` while the realm's **Auto-provision users on first
+login** is on: it is set for each realm on its page under **Admin →
+Authentication** (`auto_provision` in the realm's config), never in the
+`[oidc]` block, and a realm the block seeds starts with it on.
 `link_existing_by_username` is **off by default** — when enabled it links a new
 identity to an existing user of the same name, but never to an account that has
 a local password or is an admin, and an email claim is only used as the
@@ -631,13 +634,14 @@ cargo build -p forge-server
 ```
 
 The container image has a smoke test, which CI's `docker` job runs on the
-image it built (#239). It starts the image the way the Kubernetes manifests
+image of each platform it built (#239). It starts the image the way the Kubernetes manifests
 and the Helm chart run it: read-only root filesystem, `/tmp` a tmpfs, user
 10001, every capability dropped, the baked `forge.toml` configured through
 `FORGE_*` only, and a blob cache in a volume prepared like a new persistent
 volume under `fsGroup`. PostgreSQL and versitygw run in containers of their
 own. The test waits for `/readyz`, checks `/version` and the web UI, pushes
-a NuGet package with an API token and downloads it. Then it restarts the
+a NuGet package with an API token and downloads it, and pushes a container
+image with `docker` to a docker repository and pulls it. Then it restarts the
 container and checks that the package still downloads, from the cache. It
 needs docker, curl and jq:
 
@@ -786,8 +790,17 @@ are bumped by hand (tag and digest, from the registry's index of the tag).
 
 ```bash
 cargo xtask docker-build       # docker build -t forge:latest .
+cargo xtask docker-build --platform linux/arm64   # another platform's image (docker buildx build)
 cargo xtask docker-run         # run the image against the compose db + s3 on :8421
 ```
+
+The release publishes the image for `linux/amd64` and `linux/arm64`, and
+nothing in the build is specific to either: every base image is a
+multi-platform index pinned by digest, and cargo builds natively for the
+platform it runs on. `--platform` builds the image of a platform other than
+the host's; that needs a builder of that platform or QEMU emulation
+(`docker run --privileged --rm mirror.gcr.io/tonistiigi/binfmt --install
+arm64`), under which the Rust build takes several times as long.
 
 `docker-run` composes `docker-compose.yml` (db + versitygw) with
 `docker-compose.app.yml` (the `app` service) and serves API + SPA on
@@ -826,6 +839,13 @@ queue and on every push to `main`. It runs on pull requests that target
 `main` only; a stacked one waits (see [Stacked pull
 requests](#stacked-pull-requests)).
 
+`docker` builds and smoke-tests the image of every platform the release
+publishes: the jobs `docker (amd64)` and `docker (arm64)` (`docker-platform`
+in `ci.yml`) each build one natively, on an `ubuntu-latest` and an
+`ubuntu-24.04-arm` runner, with a layer cache per platform, and `docker`
+passes once both did. Require `docker`, which keeps its name whatever the
+platforms are.
+
 A job runs only when the change touches what it checks (#353, #361, #363). The
 `changes` job (`.github/scripts/ci-changes.sh`) compares:
 
@@ -849,14 +869,14 @@ It sorts the change into groups of paths:
 | Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
 | Web | `web/` | `web`, `web-e2e` |
-| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc`; and what the smoke test reads: `image-smoke.sh`, `fixtures/nuget/sample.lib.1.0.0.nupkg` | `docker` |
+| Image | `Dockerfile`, `.dockerignore`, `docker/`, `LICENSE`, every `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `web/package.json`, `web/pnpm-lock.yaml`, `web/pnpm-workspace.yaml`, `web/.npmrc`; and what the smoke test reads: `image-smoke.sh`, `fixtures/nuget/sample.lib.1.0.0.nupkg` | `docker` (`docker-platform`) |
 | Kubernetes | `deploy/` (the manifests and the chart), and what the digest-pin check reads besides: every Dockerfile, `.github/workflows/`, and the job's scripts (`image-pin-check.sh`, `kustomize-check.sh`, `helm-check.sh`) | `kubernetes` |
 
 A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
 counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
 `clippy`, `test`, `oci-e2e`, `raw-e2e` and `e2e` in Rust; `audit`
-in Audit; `web` and `web-e2e` in Web; `docker` in Image and `kubernetes` in
-Kubernetes. A change outside the jobs (the triggers, the settings, the
+in Audit; `web` and `web-e2e` in Web; `docker` and `docker-platform` in
+Image and `kubernetes` in Kubernetes. A change outside the jobs (the triggers, the settings, the
 `changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
 counts for every group; blank and comment lines count for none. The
 Kubernetes group's digest-pin check reads every workflow, so any change to
@@ -1054,7 +1074,12 @@ and pushes `ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned
 to that image's digest, pushes and signs it as
 `oci://ghcr.io/forgepkg/charts/forge`
 (version `<version>`), and creates the GitHub release from the matching
-`CHANGELOG.md` section with the chart attached. It refuses a tag unless the
+`CHANGELOG.md` section with the chart attached. The image is one for
+`linux/amd64` and `linux/arm64`: the `build` job builds each platform's
+natively, on an `ubuntu-latest` and an `ubuntu-24.04-arm` runner, and pushes
+it by digest; the `publish` job pushes the index of both, by digest too,
+signs the index and each platform's image, and only then tags the index and
+pins the chart to its digest. It refuses a tag unless the
 workspace version (`Cargo.toml`), `web/package.json`, the image tag of the
 Kubernetes base (`deploy/kubernetes/base/kustomization.yaml`) and the chart's
 `version` and `appVersion` (`deploy/helm/forge/Chart.yaml`) all equal it, and
@@ -1128,7 +1153,11 @@ move them to `docs/changes/1.0.1/`.
 twice: a new build would have another digest, and pushing it would move the
 version's tags and overwrite its chart. The image and chart that the failed
 attempt already pushed are reused instead, once their signatures show that a
-release run of the tagged commit made them. Anything else it finds under the
+release run of the tagged commit made them. Until the image is tagged, the
+platforms' images an earlier attempt of the run pushed are reused too (the
+build jobs record their digests as artifacts of the run): **Re-run failed
+jobs** builds only a platform whose build failed, and a failure after the
+builds (in `publish`) builds nothing again. Anything else it finds under the
 version (an image or chart not signed that way, a chart without its image)
 stops the run with a message saying what to delete, and so does a version
 that already has a GitHub release: publish further changes as a new version.

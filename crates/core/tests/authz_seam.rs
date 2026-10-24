@@ -4,9 +4,9 @@
 //! testcontainer with the seeded built-in roles from migration 0005 plus
 //! per-test roles/grants/users. They prove:
 //!
-//! * the principal × repo × action **matrix** through the cached seam matches
-//!   the pure evaluator's contract (admin allow-all, ANY-repo, per-repo, deny by
-//!   default / fail-closed);
+//! * the principal × repo × level **matrix** through the cached seam matches
+//!   the pure evaluator's contract (admin allow-all, ANY-repo, per-repo, each
+//!   level including the ones below it, deny by default / fail-closed);
 //! * **caching** — a grant changed directly in the DB is *not* observed until
 //!   the relevant cache entry is invalidated (proving the seam read from cache,
 //!   not the DB), and invalidation (targeted user / anonymous / blanket) makes
@@ -23,7 +23,7 @@ mod common;
 use forge_cache::Cache;
 use forge_core::auth::authz::Authz;
 use forge_core::auth::principal::Principal;
-use forge_core::authz as core_authz;
+use forge_core::authz::{self as core_authz, Level};
 use forge_db::authz_dao::{add_grant, assign_role, insert_content_selector, ANONYMOUS_ROLE};
 use forge_db::model::Repository;
 use forge_db::repository_dao::{self, NewRepository};
@@ -93,11 +93,67 @@ async fn matrix_user_with_per_repo_read_grant() {
     assert!(az.can_read(&p, &repo_a).await, "read granted on A");
     assert!(!az.can_write(&p, &repo_a).await, "no write grant on A");
     assert!(!az.can_delete(&p, &repo_a).await, "no delete grant on A");
-    assert!(!az.can_admin(&p, &repo_a).await, "not admin");
+    assert!(!az.is_global_admin(&p).await, "not admin");
     assert!(
         !az.can_read(&p, &repo_b).await,
         "no grant on B (fail-closed)"
     );
+}
+
+/// Each level includes the ones below it, through the cached seam: a `write`
+/// grant reads and writes but does not delete, and its selector filters
+/// what it reads as well as what it writes.
+#[tokio::test]
+async fn matrix_levels_include_the_ones_below() {
+    let pool = pool().await;
+    let az = Authz::new(pool.clone(), Cache::l1_only(64));
+
+    let writable = make_repo(&pool, unique()).await;
+    let removable = make_repo(&pool, unique()).await;
+    let scoped = make_repo(&pool, unique()).await;
+    let role = make_role(&pool, unique()).await;
+    let uid = make_user(&pool, unique()).await;
+    let sel = insert_content_selector(
+        &pool,
+        &format!("sel-{}", unique()),
+        &["acme.*".to_string()],
+        &[],
+    )
+    .await
+    .expect("selector");
+    add_grant(&pool, role, Some(writable.id), "write", None)
+        .await
+        .expect("grant");
+    add_grant(&pool, role, Some(removable.id), "delete", None)
+        .await
+        .expect("grant");
+    add_grant(&pool, role, Some(scoped.id), "write", Some(sel))
+        .await
+        .expect("grant");
+    assign_role(&pool, uid, role).await.expect("assign");
+    let p = user(uid);
+
+    assert!(az.can_read(&p, &writable).await, "write includes read");
+    assert!(az.can_write(&p, &writable).await);
+    assert!(!az.can_delete(&p, &writable).await, "write excludes delete");
+    assert!(az.can_read(&p, &removable).await, "delete includes read");
+    assert!(az.can_write(&p, &removable).await, "delete includes write");
+    assert!(az.can_delete(&p, &removable).await);
+
+    assert!(az.can_read(&p, &scoped).await);
+    let read = az.package_filter(&p, &scoped).await;
+    assert!(read.allows("Acme.Lib"));
+    assert!(
+        !read.allows("Other.Lib"),
+        "the write grant's selector filters reads"
+    );
+    let write = az.package_filter_for(&p, &scoped, Level::Write).await;
+    assert!(write.allows("Acme.Lib"));
+    assert!(!write.allows("Other.Lib"));
+    assert!(!az
+        .package_filter_for(&p, &scoped, Level::Delete)
+        .await
+        .allows("Acme.Lib"));
 }
 
 #[tokio::test]
@@ -110,7 +166,7 @@ async fn matrix_user_with_no_roles_is_denied() {
     assert!(!az.can_read(&p, &repo).await);
     assert!(!az.can_write(&p, &repo).await);
     assert!(!az.can_delete(&p, &repo).await);
-    assert!(!az.can_admin(&p, &repo).await);
+    assert!(!az.is_global_admin(&p).await);
 }
 
 #[tokio::test]
@@ -122,7 +178,7 @@ async fn unauthenticated_is_always_denied() {
     assert!(!az.can_read(&p, &repo).await);
     assert!(!az.can_write(&p, &repo).await);
     assert!(!az.can_delete(&p, &repo).await);
-    assert!(!az.can_admin(&p, &repo).await);
+    assert!(!az.is_global_admin(&p).await);
 }
 
 #[tokio::test]
@@ -214,10 +270,10 @@ async fn anonymous_uses_anonymous_role_grants() {
 
 #[tokio::test]
 async fn anonymous_never_admin_even_with_admin_grant() {
-    // Defense in depth: an admin grant on the anonymous role can never make an
-    // anonymous caller admin. One on a single repository is refused outright
-    // (administration is global, #124), and the short-circuit is not
-    // triggered: an anonymous caller is not allow-all.
+    // Defense in depth: an `admin` grant can never make an anonymous caller
+    // admin. Administration is no level (#411), so the table refuses one, and
+    // the short-circuit is not triggered: an anonymous caller is not
+    // allow-all.
     let pool = pool().await;
     let cache = Cache::l1_only(64);
     let az = Authz::new(pool.clone(), cache.clone());
@@ -230,19 +286,22 @@ async fn anonymous_never_admin_even_with_admin_grant() {
         .expect("seeded");
     add_grant(&pool, anon_role, Some(repo.id), "admin", None)
         .await
-        .expect_err("an admin grant on one repository is refused");
+        .expect_err("an admin grant is refused");
+    add_grant(&pool, anon_role, None, "admin", None)
+        .await
+        .expect_err("on every repository too");
     core_authz::invalidate_anonymous(&cache).await;
 
     let p = anon();
-    assert!(!az.can_admin(&p, &repo).await, "anon is not admin");
+    assert!(!az.is_global_admin(&p).await, "anon is not admin");
     assert!(!az.can_read(&p, &repo).await, "anon is not allow-all");
     assert!(!az.can_read(&p, &other).await, "anon is not allow-all");
 }
 
 #[tokio::test]
-async fn token_scope_narrows_actions() {
-    // Owner has read+write on repo A; a token scoped to read-only may read but
-    // not write. The scope is applied after the cached owner-set lookup.
+async fn token_scope_caps_the_level() {
+    // Owner has write on repo A; a token scoped to `read` may read but not
+    // write. The scope is applied after the cached owner-set lookup.
     let pool = pool().await;
     let cache = Cache::l1_only(64);
     let az = Authz::new(pool.clone(), cache.clone());
@@ -250,9 +309,6 @@ async fn token_scope_narrows_actions() {
     let repo = make_repo(&pool, unique()).await;
     let role = make_role(&pool, unique()).await;
     let uid = make_user(&pool, unique()).await;
-    add_grant(&pool, role, Some(repo.id), "read", None)
-        .await
-        .expect("grant");
     add_grant(&pool, role, Some(repo.id), "write", None)
         .await
         .expect("grant");
@@ -275,7 +331,7 @@ async fn token_scope_narrows_actions() {
     sqlx::query!(
         r#"UPDATE token SET scope = $2 WHERE id = $1"#,
         token.id,
-        serde_json::json!({ "actions": ["read"] }),
+        serde_json::json!({ "level": "read" }),
     )
     .execute(&pool)
     .await
@@ -482,8 +538,8 @@ fn token_of(uid: i64, token_id: i64) -> Principal {
     }
 }
 
-/// B4: an admin's API token is not an admin credential unless its scope names
-/// `admin`. The unscoped token keeps the admin's read/write/delete reach on the
+/// B4: an admin's API token is not an admin credential unless its scope opts
+/// in with `admin: true`. The unscoped token keeps the admin's levels on the
 /// feed; the password/session principal stays a global admin.
 #[tokio::test]
 async fn unscoped_admin_token_is_not_global_admin() {
@@ -507,7 +563,6 @@ async fn unscoped_admin_token_is_not_global_admin() {
         !az.is_global_admin(&unscoped).await,
         "an unscoped token must not be a global admin"
     );
-    assert!(!az.can_admin(&unscoped, &repo).await);
     assert!(az.can_read(&unscoped, &repo).await, "feed reach kept");
     assert!(az.can_write(&unscoped, &repo).await, "feed reach kept");
     assert!(az.can_delete(&unscoped, &repo).await, "feed reach kept");
@@ -521,19 +576,41 @@ async fn unscoped_admin_token_is_not_global_admin() {
 
     let admin_scoped = token_of(
         uid,
-        make_token(&pool, uid, Some(serde_json::json!({"actions": ["admin"]}))).await,
+        make_token(&pool, uid, Some(serde_json::json!({"admin": true}))).await,
     );
     assert!(
         az.is_global_admin(&admin_scoped).await,
         "an explicitly admin-scoped token is a global admin"
     );
 
+    // The opt-in keeps the allow-all short-circuit, whatever the level.
+    let admin_read = token_of(
+        uid,
+        make_token(
+            &pool,
+            uid,
+            Some(serde_json::json!({"admin": true, "level": "read"})),
+        )
+        .await,
+    );
+    assert!(az.is_global_admin(&admin_read).await);
+    assert!(az.can_delete(&admin_read, &repo).await);
+
+    // Without it, a level-scoped token of the admin is capped at its level.
+    let read_only = token_of(
+        uid,
+        make_token(&pool, uid, Some(serde_json::json!({"level": "read"}))).await,
+    );
+    assert!(!az.is_global_admin(&read_only).await);
+    assert!(az.can_read(&read_only, &repo).await);
+    assert!(!az.can_write(&read_only, &repo).await, "capped at read");
+
     let repo_scoped_admin = token_of(
         uid,
         make_token(
             &pool,
             uid,
-            Some(serde_json::json!({"actions": ["admin"], "repositories": [repo.id]})),
+            Some(serde_json::json!({"admin": true, "repositories": [repo.id]})),
         )
         .await,
     );
@@ -564,10 +641,34 @@ async fn mistyped_token_scope_denies_everything() {
     assert!(!az.can_read(&p, &other).await, "and is not unscoped");
 }
 
+/// A stored scope that still lists `actions` (which `level` and `admin`
+/// replaced, #411) is fail-closed instead of an unscoped token.
+#[tokio::test]
+async fn token_scope_with_actions_denies_everything() {
+    let pool = pool().await;
+    let az = Authz::new(pool.clone(), Cache::l1_only(64));
+    let repo = make_repo(&pool, unique()).await;
+    let role = make_role(&pool, unique()).await;
+    let uid = make_user(&pool, unique()).await;
+    add_grant(&pool, role, None, "delete", None)
+        .await
+        .expect("grant");
+    assign_role(&pool, uid, role).await.expect("assign");
+
+    for scope in [
+        serde_json::json!({"actions": ["read"]}),
+        serde_json::json!({"actions": null}),
+    ] {
+        let p = token_of(uid, make_token(&pool, uid, Some(scope)).await);
+        assert!(!az.can_read(&p, &repo).await, "grants nothing");
+    }
+}
+
 /// L6: under `anonymous_mode = "all"` a signed-in principal without grants
 /// may read what an anonymous caller may (the `anonymous_read` flag and the
-/// anonymous role's read grants), still cut down to any token scope and never
-/// extended to writes. Without that switch it holds only its own grants.
+/// anonymous role's grants capped at `read`), still cut down to any token
+/// scope and never extended to writes. Without that switch it holds only its
+/// own grants.
 #[tokio::test]
 async fn signed_in_user_reads_what_anonymous_reads() {
     let pool = pool().await;
@@ -598,7 +699,9 @@ async fn signed_in_user_reads_what_anonymous_reads() {
     )
     .await
     .expect("selector");
-    add_grant(&pool, anon_role, Some(granted.id), "read", Some(sel))
+    // A higher level than `read` on the anonymous role reaches signed-in
+    // callers as `read` only.
+    add_grant(&pool, anon_role, Some(granted.id), "write", Some(sel))
         .await
         .expect("grant");
     core_authz::invalidate_anonymous(&cache).await;
@@ -623,6 +726,10 @@ async fn signed_in_user_reads_what_anonymous_reads() {
     assert!(
         !az.can_write(&p, &flagged).await,
         "public reach is read-only"
+    );
+    assert!(
+        !az.can_write(&p, &granted).await,
+        "the anonymous role's write is capped at read"
     );
 
     // An unscoped token of that user reads the same public repos.
@@ -649,12 +756,13 @@ async fn signed_in_user_reads_what_anonymous_reads() {
         "the package filter is scoped as well"
     );
 
-    // A write-only token gains no read at all.
-    let write_only = token_of(
+    // Nor does a level raise it.
+    let delete = token_of(
         uid,
-        make_token(&pool, uid, Some(serde_json::json!({"actions": ["write"]}))).await,
+        make_token(&pool, uid, Some(serde_json::json!({"level": "delete"}))).await,
     );
-    assert!(!az.can_read(&write_only, &flagged).await);
+    assert!(az.can_read(&delete, &flagged).await);
+    assert!(!az.can_write(&delete, &flagged).await);
 
     // Anonymous callers keep the same reach (the flag fast path).
     assert!(az.can_read(&anon(), &flagged).await);

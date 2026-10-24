@@ -13,7 +13,7 @@ use std::io::Cursor;
 use axum::body::Body;
 use bytes::Bytes;
 use forge_core::auth::Principal;
-use forge_core::authz::Action;
+use forge_core::authz::Level;
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, LinkOutcome, NewManifest, TagWrite, UploadRow};
@@ -169,7 +169,7 @@ impl Registry {
             RepoKind::Proxy => true,
             RepoKind::Group => false,
         };
-        if !serves || self.decide(&ctx.caller, &source, Action::Read).await != Decision::Allow {
+        if !serves || self.decide(&ctx.caller, &source, Level::Read).await != Decision::Allow {
             return Ok(None);
         }
         let Some(link) =

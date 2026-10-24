@@ -40,7 +40,7 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_core::auth::principal::Principal;
-use forge_core::authz::{Action as Permission, PackageFilter};
+use forge_core::authz::{Level, PackageFilter};
 use forge_core::format::Format;
 use forge_core::repo::{
     DeleteOutcome, RegistrationEntry, RepoError, RepoKind, RepoReadOps, RepoWriteOps, SearchParams,
@@ -58,7 +58,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
 
 use crate::dispatch::{
-    action_for_method, authz_denied, offline_response, offline_serves_nothing,
+    authz_denied, level_for_method, offline_response, offline_serves_nothing,
     principal_allows_protocol_mutations, HostedWriteAdapter,
 };
 use crate::files::store::{Content, Ingested, Part, Via};
@@ -160,12 +160,11 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         }
     };
 
-    let permission = action_for_method(&method);
-    let allowed = match permission {
-        Permission::Read => state.authz.can_read(&principal, &repo).await,
-        Permission::Write => state.authz.can_write(&principal, &repo).await,
-        Permission::Delete => state.authz.can_delete(&principal, &repo).await,
-        Permission::Admin => false,
+    let level = level_for_method(&method);
+    let allowed = match level {
+        Level::Read => state.authz.can_read(&principal, &repo).await,
+        Level::Write => state.authz.can_write(&principal, &repo).await,
+        Level::Delete => state.authz.can_delete(&principal, &repo).await,
     };
     if !allowed {
         return authz_denied(&principal);
@@ -197,7 +196,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     let stores_files = format.stores_files();
     let package_filter = state
         .authz
-        .package_filter_for(&principal, &repo, permission)
+        .package_filter_for(&principal, &repo, level)
         .await;
     // A files format reads the file store, never the package read ops.
     let ops = if stores_files {
@@ -237,7 +236,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         repo: &repo,
         mount,
         principal,
-        permission,
+        level,
         head: method == Method::HEAD,
         headers: req.headers().clone(),
         plugin: plugin.implementation().clone(),
@@ -259,7 +258,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         Ok(action) => ctx.perform(action, request).await,
         Err(response) => response,
     };
-    if permission != Permission::Read {
+    if level != Level::Read {
         // The same audit trail as the NuGet feed's package mutations.
         tracing::info!(
             target: "forge::audit",
@@ -281,8 +280,8 @@ struct Ctx<'a> {
     /// The format's mount (`/repository`).
     mount: &'a str,
     principal: Principal,
-    /// What the request's method was authorized for.
-    permission: Permission,
+    /// The level the request's method was authorized for.
+    level: Level,
     head: bool,
     /// The request's headers, for a download's `Range`.
     headers: axum::http::HeaderMap,
@@ -293,7 +292,7 @@ struct Ctx<'a> {
     stores_files: bool,
     /// The package read ops; `None` for a files format.
     ops: Option<Arc<dyn RepoReadOps>>,
-    /// The caller's package selector for [`Self::permission`].
+    /// The caller's package selector for [`Self::level`].
     package_filter: PackageFilter,
     target: protocol::Repository,
     /// The request, until a publish or a file query reads its body.
@@ -337,7 +336,7 @@ impl Ctx<'_> {
             Action::Respond(response) => self.respond(response),
             Action::Load(_) => self.plugin_misused("a load as an action"),
             Action::Download(target) => {
-                if self.permission != Permission::Read {
+                if self.level != Level::Read {
                     return refused("download");
                 }
                 self.download(&target).await
@@ -350,7 +349,7 @@ impl Ctx<'_> {
             Action::Relist(change) => self.change(change, Change::Relist).await,
             Action::Delete(change) => self.change(change, Change::Delete).await,
             Action::ServeFile(path) => {
-                if self.permission != Permission::Read {
+                if self.level != Level::Read {
                     return refused("serving a file");
                 }
                 self.serve_file(&path).await
@@ -515,7 +514,7 @@ impl Ctx<'_> {
                 Ok(Answer::Directory(page.map(directory_page)))
             }
             Query::Form => {
-                if self.permission != Permission::Write {
+                if self.level != Level::Write {
                     return Err(refused("receiving a form"));
                 }
                 let Some(req) = self.take_body() else {
@@ -558,7 +557,7 @@ impl Ctx<'_> {
                 Ok(Answer::Form(answer))
             }
             Query::Store(wanted) => {
-                if self.permission != Permission::Write {
+                if self.level != Level::Write {
                     return Err(refused("storing files"));
                 }
                 let mut uploads = Vec::with_capacity(wanted.len());
@@ -605,7 +604,7 @@ impl Ctx<'_> {
                 ))
             }
             Query::Remove(path) => {
-                if self.permission != Permission::Delete {
+                if self.level != Level::Delete {
                     return Err(refused("deleting a file"));
                 }
                 let removed = crate::files::store::remove(&files, self.repo, path, Via::Protocol)
@@ -872,8 +871,8 @@ impl Ctx<'_> {
 
     /// Whether this request may change packages: a hosted repository, a
     /// method authorized for `needed`, and a package-client credential.
-    fn may_change(&self, needed: Permission, what: &str) -> Result<(), Response> {
-        if self.permission != needed {
+    fn may_change(&self, needed: Level, what: &str) -> Result<(), Response> {
+        if self.level != needed {
             return Err(refused(what));
         }
         if self.repo.kind() != RepoKind::Hosted {
@@ -909,15 +908,15 @@ impl Ctx<'_> {
     }
 
     async fn publish(&self, publish: PublishRequest, req: Request<Body>) -> Response {
-        if let Err(response) = self.may_change(Permission::Write, "publish") {
+        if let Err(response) = self.may_change(Level::Write, "publish") {
             return response;
         }
-        // A redeploy replaces a version's bytes: it takes the delete
-        // permission's selector as well.
+        // A redeploy replaces a version's bytes: it takes the `delete`
+        // level's selector as well.
         let replace_filter = self
             .state
             .authz
-            .package_filter_for(&self.principal, self.repo, Permission::Delete)
+            .package_filter_for(&self.principal, self.repo, Level::Delete)
             .await;
         let writer = HostedWriteAdapter::new(
             self.state,
@@ -964,9 +963,9 @@ impl Ctx<'_> {
 
     async fn change(&self, change: ChangeRequest, kind: Change) -> Response {
         let (needed, what) = match kind {
-            Change::Unlist => (Permission::Delete, "unlist"),
-            Change::Relist => (Permission::Write, "relist"),
-            Change::Delete => (Permission::Delete, "delete"),
+            Change::Unlist => (Level::Delete, "unlist"),
+            Change::Relist => (Level::Write, "relist"),
+            Change::Delete => (Level::Delete, "delete"),
         };
         if let Err(response) = self.may_change(needed, what) {
             return response;

@@ -627,16 +627,14 @@ async fn mutations_outside_the_selector_are_unknown() {
     .await
     .unwrap();
     let role_id = role["id"].as_i64().unwrap();
-    for action in ["read", "delete"] {
-        let resp = admin(
-            reqwest::Method::PUT,
-            &format!("/admin/roles/{role_id}/grants"),
-            json!({ "repository": repo, "action": action, "selector_id": selector["id"] }),
-        )
-        .await
-        .unwrap();
-        assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
-    }
+    let resp = admin(
+        reqwest::Method::PUT,
+        &format!("/admin/roles/{role_id}/grants"),
+        json!({ "repository": repo, "level": "delete", "selector_id": selector["id"] }),
+    )
+    .await
+    .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
     let resp = admin(
         reqwest::Method::PUT,
         &format!("/admin/users/{user_id}/roles"),

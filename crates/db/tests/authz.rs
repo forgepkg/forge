@@ -87,11 +87,8 @@ async fn user_in_admin_role_is_admin() {
 
     let eff = load_user_effective(pool, user).await.expect("load");
     assert!(eff.is_admin, "admin-role member ⇒ is_admin");
-    // The seeded admin role carries a sentinel (ANY, admin) grant.
-    assert!(eff
-        .grants
-        .iter()
-        .any(|g| g.action == "admin" && g.repository_id.is_none()));
+    // Administration is the role itself, no grant: the admin role has none.
+    assert!(eff.grants.is_empty());
 }
 
 #[tokio::test]
@@ -118,7 +115,7 @@ async fn user_grants_are_loaded_with_repo_scope() {
     let read = eff
         .grants
         .iter()
-        .find(|g| g.action == "read")
+        .find(|g| g.level == "read")
         .expect("read grant");
     assert_eq!(read.repository_id, Some(repo));
     assert!(read.selector.is_none());
@@ -126,7 +123,7 @@ async fn user_grants_are_loaded_with_repo_scope() {
     let write = eff
         .grants
         .iter()
-        .find(|g| g.action == "write")
+        .find(|g| g.level == "write")
         .expect("write grant");
     assert_eq!(write.repository_id, None, "ANY-repo grant");
 }
@@ -158,7 +155,7 @@ async fn grant_with_selector_loads_raw_patterns() {
     let g = eff
         .grants
         .iter()
-        .find(|g| g.action == "read")
+        .find(|g| g.level == "read")
         .expect("grant");
     let selector = g.selector.as_ref().expect("selector loaded");
     assert_eq!(selector.id, sel);
@@ -215,7 +212,7 @@ async fn anonymous_effective_reflects_anonymous_role_grants() {
     assert!(
         eff.grants
             .iter()
-            .any(|g| g.action == "read" && g.repository_id == Some(repo)),
+            .any(|g| g.level == "read" && g.repository_id == Some(repo)),
         "anonymous role read grant must appear"
     );
 }
@@ -265,6 +262,76 @@ async fn add_grant_is_idempotent() {
         1,
         "duplicate grant collapses via unique index"
     );
+}
+
+/// A role holds one grant per repository and selector: giving another level
+/// there replaces the level, rather than adding a second grant.
+#[tokio::test]
+async fn add_grant_sets_the_level_of_its_target() {
+    let pool = pool().await;
+    let pool = &pool;
+    let n = unique();
+    let repo = make_repo(pool, n).await;
+    let role = make_role(pool, n).await;
+    let sel = insert_content_selector(pool, &format!("lvl-{n}"), &["a.*".to_string()], &[])
+        .await
+        .expect("selector");
+
+    add_grant(pool, role, Some(repo), "read", None)
+        .await
+        .expect("read");
+    add_grant(pool, role, Some(repo), "delete", None)
+        .await
+        .expect("raise to delete");
+    add_grant(pool, role, Some(repo), "write", Some(sel))
+        .await
+        .expect("a selector is another target");
+    add_grant(pool, role, None, "read", None)
+        .await
+        .expect("ANY is another target");
+
+    let mut grants: Vec<_> = authz_dao::list_grants_for_role(pool, role)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|g| (g.repository_id, g.selector_id, g.level))
+        .collect();
+    grants.sort();
+    assert_eq!(
+        grants,
+        vec![
+            (None, None, "read".to_string()),
+            (Some(repo), None, "delete".to_string()),
+            (Some(repo), Some(sel), "write".to_string()),
+        ]
+    );
+
+    add_grant(pool, role, Some(repo), "read", None)
+        .await
+        .expect("lower to read");
+    let levels: Vec<_> = authz_dao::list_grants_for_role(pool, role)
+        .await
+        .expect("list")
+        .into_iter()
+        .filter(|g| g.repository_id == Some(repo) && g.selector_id.is_none())
+        .map(|g| g.level)
+        .collect();
+    assert_eq!(levels, vec!["read".to_string()]);
+}
+
+/// The column holds the three levels only: `admin` and unknown values are
+/// refused by the table itself.
+#[tokio::test]
+async fn the_table_refuses_anything_but_a_level() {
+    let pool = pool().await;
+    let pool = &pool;
+    let role = make_role(pool, unique()).await;
+    for level in ["admin", "frobnicate", ""] {
+        assert!(
+            add_grant(pool, role, None, level, None).await.is_err(),
+            "{level:?} refused"
+        );
+    }
 }
 
 #[tokio::test]
@@ -350,13 +417,13 @@ async fn delete_anonymous_read_grant_removes_only_the_synthesized_grant() {
     )
     .await
     .expect("selector");
-    for (role, repo_id, action, selector) in [
+    for (role, repo_id, level, selector) in [
         (anon, repo, "read", None),
         (anon, repo, "read", Some(sel)),
         (anon, other_repo, "read", None),
         (custom, repo, "read", None),
     ] {
-        forge_db::authz_dao::add_grant(&pool, role, Some(repo_id), action, selector)
+        forge_db::authz_dao::add_grant(&pool, role, Some(repo_id), level, selector)
             .await
             .expect("grant");
     }
@@ -378,7 +445,7 @@ async fn delete_anonymous_read_grant_removes_only_the_synthesized_grant() {
         .expect("list");
     let on = |repo_id: i64, selector: Option<i64>| {
         anon_grants.iter().any(|g| {
-            g.repository_id == Some(repo_id) && g.action == "read" && g.selector_id == selector
+            g.repository_id == Some(repo_id) && g.level == "read" && g.selector_id == selector
         })
     };
     assert!(!on(repo, None), "the synthesized grant is gone");

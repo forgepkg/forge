@@ -10,7 +10,7 @@
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use forge_core::auth::Principal;
-use forge_core::authz::Action;
+use forge_core::authz::Level;
 use forge_db::model::RepoKind;
 use forge_plugin::api::images::ImageError;
 
@@ -146,7 +146,7 @@ impl Registry {
         let wants = |a: &str| requested.iter().any(|r| r == a || r == "*");
         let mut granted = Vec::new();
         let readable = self
-            .rbac_allows(principal, &target.repo, &target.image, Action::Read)
+            .rbac_allows(principal, &target.repo, &target.image, Level::Read)
             .await;
         if wants("pull") && readable {
             granted.push("pull".to_string());
@@ -162,14 +162,14 @@ impl Registry {
             if let Some(landing) = landing {
                 if wants("push")
                     && self
-                        .rbac_allows(principal, &landing, &target.image, Action::Write)
+                        .rbac_allows(principal, &landing, &target.image, Level::Write)
                         .await
                 {
                     granted.push("push".to_string());
                 }
                 if wants("delete")
                     && self
-                        .rbac_allows(principal, &landing, &target.image, Action::Delete)
+                        .rbac_allows(principal, &landing, &target.image, Level::Delete)
                         .await
                 {
                     granted.push("delete".to_string());
