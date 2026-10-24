@@ -1,5 +1,5 @@
 {
-  "name": "Stacked pull requests",
+  "name": "Merge into main only",
   "target": "branch",
   "enforcement": "active",
   "conditions": {
@@ -25,7 +25,7 @@
       "parameters": {
         "strict_required_status_checks_policy": false,
         "do_not_enforce_on_create": true,
-        "required_status_checks": [{ "context": "stack" }]
+        "required_status_checks": [{ "context": "merge into main only" }]
       }
     }
   ]
