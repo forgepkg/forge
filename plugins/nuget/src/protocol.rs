@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use forge_plugin_api::{
     Action, Answer, ChangeRequest, Loaded, PackageInfo, PackageRef, PackageVersions,
-    PublishRequest, Query, Rendered, Repository, RepositoryKind, Request, Response, SearchQuery,
+    PublishRequest, Query, Repository, RepositoryKind, Request, Response, SearchQuery,
     SearchResult, Upload, VersionInfo,
 };
 use serde_json::{json, Value};
@@ -263,9 +263,9 @@ pub(crate) fn handle(repo: &Repository, req: &Request) -> Action {
     }
 }
 
-pub(crate) fn render(repo: &Repository, req: &Request, data: &[Loaded]) -> Rendered {
-    let respond = Rendered::Respond;
-    let not_found = |text: &str| Rendered::Respond(Response::text(404, text));
+pub(crate) fn render(repo: &Repository, req: &Request, data: &[Loaded]) -> Action {
+    let respond = Action::Respond;
+    let not_found = |text: &str| Action::Respond(Response::text(404, text));
     let Ok(route) = route(req, repo.kind) else {
         return not_found("not found");
     };
@@ -319,7 +319,7 @@ pub(crate) fn render(repo: &Repository, req: &Request, data: &[Loaded]) -> Rende
                             base, &lower, &versions,
                         )))
                     } else {
-                        Rendered::Load(vec![Query::Packages(lower)])
+                        Action::Load(vec![Query::Packages(lower)])
                     }
                 }
                 Some([]) => not_found("registration not found"),
@@ -340,12 +340,10 @@ pub(crate) fn render(repo: &Repository, req: &Request, data: &[Loaded]) -> Rende
                     let versions = version_strings(versions().unwrap_or_default());
                     match registration_page_versions(&versions, &lower, upper) {
                         // Only the page's versions are loaded.
-                        Some(in_range) => {
-                            Rendered::Load(vec![Query::PackagesOf(PackageVersions {
-                                id: lower_id,
-                                versions: in_range.to_vec(),
-                            })])
-                        }
+                        Some(in_range) => Action::Load(vec![Query::PackagesOf(PackageVersions {
+                            id: lower_id,
+                            versions: in_range.to_vec(),
+                        })]),
                         None => not_found("registration page not found"),
                     }
                 }

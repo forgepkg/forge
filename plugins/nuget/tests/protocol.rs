@@ -23,6 +23,7 @@ fn repo(kind: RepositoryKind) -> Repository {
         name: "main".into(),
         kind,
         base_url: format!("{BASE}/v3/main"),
+        inline: false,
     }
 }
 
@@ -100,6 +101,7 @@ impl MockRepo {
                         .collect(),
                 })
             }
+            other => panic!("NuGet asked for files: {other:?}"),
         }
     }
 

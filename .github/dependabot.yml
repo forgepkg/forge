@@ -1,5 +1,5 @@
 # Dependency update PRs (review L12). Security updates are raised as soon as an
-# advisory lands; version updates are batched weekly and grouped per ecosystem
+# advisory lands; version updates are batched monthly and grouped per ecosystem
 # so the queue stays reviewable. CI's `audit` job (cargo-audit) is the gate for
 # Rust advisories, and the daily Audit workflow (audit.yml) reports one for an
 # unchanged lockfile; accepted ones are listed in .cargo/audit.toml.
@@ -9,7 +9,7 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     open-pull-requests-limit: 10
     groups:
       cargo-minor-and-patch:
@@ -21,7 +21,7 @@ updates:
   - package-ecosystem: npm
     directory: /web
     schedule:
-      interval: weekly
+      interval: monthly
     cooldown:
       default-days: 7
     open-pull-requests-limit: 10
@@ -33,7 +33,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     groups:
       actions:
         patterns: ["*"]
@@ -42,7 +42,7 @@ updates:
   - package-ecosystem: docker
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     ignore:
       # The Rust image must match rust-toolchain.toml, which Dependabot cannot
       # edit: bump both by hand. A newer image builds only because rustup
@@ -73,7 +73,7 @@ updates:
       - /deploy/helm/forge/charts/valkey
       - /deploy/helm/forge/charts/versitygw
     schedule:
-      interval: weekly
+      interval: monthly
     groups:
       deploy-images:
         patterns: ["*"]

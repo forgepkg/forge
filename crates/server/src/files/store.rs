@@ -1,35 +1,36 @@
-//! Changing files of a hosted raw repository: `PUT` of one file, a
-//! multipart form of several (the web UI's upload, and the form fields of
-//! Nexus' component upload), and `DELETE`.
+//! Changing the files of a hosted repository: receiving a multipart form
+//! (the `form` query), storing files from the request body or the form's
+//! parts (`store`), and deleting a file (`remove`), for the format's plugin
+//! and for the web UI.
 //!
 //! An upload is streamed to the staging directory under the repository's
 //! upload limit, hashed on the way (SHA-256 and SHA-512 by the CAS, SHA-1
-//! and MD5 here, for the checksum sidecars), stored content-addressed, and
+//! and MD5 here, for checksum sidecars), stored content-addressed, and
 //! recorded in one transaction with the deployment policy applied under the
 //! row lock: a path that exists is replaced only with `allow_redeploy` and
 //! the delete permission, and the same content again is accepted as is.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Json, Response};
+use axum::http::header;
 use bytes::Bytes;
 use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::authz::Action;
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::{DeploymentPolicy, RepoKind, Repository};
 use forge_db::raw_dao::{self, NewRawFile, Redeploy, StoreOutcome};
+use forge_plugin::api::files;
 use forge_storage::{CasError, StoredBlob};
 use futures_util::{Stream, TryStreamExt};
 use md5::Md5;
 use serde::Serialize;
 use sha1::{Digest as _, Sha1};
 
-use super::{path, Raw, RawError};
+use super::{FileError, Files};
 use crate::dispatch::principal_allows_protocol_mutations;
 
 /// Most files one multipart upload may carry.
@@ -41,7 +42,7 @@ const MAX_TEXT_FIELD_BYTES: usize = 4096;
 /// Who may change files through a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Via {
-    /// The `/raw` protocol: an API token or a workload identity, as for
+    /// The format's protocol: an API token or a workload identity, as for
     /// every package client (never a browser session).
     Protocol,
     /// The web UI's endpoints: a signed-in session (whose CSRF token the
@@ -63,8 +64,37 @@ struct Digests {
     md5: Md5,
 }
 
+/// One part of a received form.
+pub enum Part {
+    /// A file part: its declared name and content type, staged and stored.
+    File {
+        field: String,
+        name: String,
+        content_type: Option<String>,
+        ingested: Box<Ingested>,
+    },
+    /// Any other field.
+    Text { field: String, value: String },
+}
+
+/// A file to store, and where its content comes from.
+pub struct Upload {
+    pub path: String,
+    /// The content type the client declared.
+    pub declared: Option<String>,
+    pub content: Content,
+}
+
+/// The content of an [`Upload`].
+pub enum Content {
+    /// The request body, still to be read.
+    Body(Request<Body>),
+    /// Received already (a form's file part).
+    Staged(Ingested),
+}
+
 /// Stage `body` (at most `limit` bytes) and store it content-addressed.
-pub async fn ingest<S, E>(raw: &Raw<'_>, body: S, limit: u64) -> Result<Ingested, RawError>
+pub async fn ingest<S, E>(files: &Files<'_>, body: S, limit: u64) -> Result<Ingested, FileError>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + Unpin,
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -78,14 +108,14 @@ where
             d.sha1.update(chunk);
             d.md5.update(chunk);
         });
-    let staged = raw
+    let staged = files
         .state
         .cas
         .stage(tokio_util::io::StreamReader::new(body), limit)
         .await
         .map_err(cas_error)?;
     let digests = std::mem::take(&mut *digests.lock().unwrap_or_else(PoisonError::into_inner));
-    let stored = raw.state.cas.commit(staged).await.map_err(cas_error)?;
+    let stored = files.state.cas.commit(staged).await.map_err(cas_error)?;
     Ok(Ingested {
         stored,
         sha1: hex::encode(digests.sha1.finalize()),
@@ -94,15 +124,15 @@ where
 }
 
 /// An ingest failure as the answer to the request.
-pub fn cas_error(error: CasError) -> RawError {
+pub fn cas_error(error: CasError) -> FileError {
     match error {
-        CasError::TooLarge { limit } => RawError::TooLarge(limit),
+        CasError::TooLarge { limit } => FileError::TooLarge(limit),
         CasError::StagingFull { .. } => {
-            RawError::Unavailable("temporary staging space is exhausted; retry later".into())
+            FileError::Unavailable("temporary staging space is exhausted; retry later".into())
         }
-        e if e.is_unavailable() => RawError::Unavailable("object store unavailable".into()),
-        CasError::Io(e) => RawError::BadRequest(format!("the upload could not be read: {e}")),
-        e => RawError::Internal(format!("store upload: {e}")),
+        e if e.is_unavailable() => FileError::Unavailable("object store unavailable".into()),
+        CasError::Io(e) => FileError::BadRequest(format!("the upload could not be read: {e}")),
+        e => FileError::Internal(format!("store upload: {e}")),
     }
 }
 
@@ -136,35 +166,47 @@ pub fn content_type(declared: Option<&str>, path: &str) -> String {
     }
 }
 
-/// The answer to an upload or delete that needs `action` on `repo`, when it
-/// may not happen; `None` when it may.
-async fn refusal(raw: &Raw<'_>, repo: &Repository, action: Action, via: Via) -> Option<RawError> {
+/// A path the format named, checked against the store's rules.
+fn checked_path(path: &str) -> Result<&str, FileError> {
+    files::validate_path(path)
+        .map(|()| path)
+        .map_err(|e| FileError::Internal(format!("the format named path {path:?}: {e}")))
+}
+
+/// Why an upload or delete that needs `action` on `repo` may not happen;
+/// `None` when it may.
+pub async fn refusal(
+    files: &Files<'_>,
+    repo: &Repository,
+    action: Action,
+    via: Via,
+) -> Option<FileError> {
     if repo.kind() != RepoKind::Hosted {
-        return Some(RawError::MethodNotAllowed(
+        return Some(FileError::MethodNotAllowed(
             "files are uploaded to and deleted from hosted repositories",
         ));
     }
     let credential = match via {
-        Via::Protocol => principal_allows_protocol_mutations(&raw.principal),
+        Via::Protocol => principal_allows_protocol_mutations(&files.principal),
         Via::Browser => {
             matches!(
-                raw.principal,
+                files.principal,
                 Principal::User { method, .. } if method != AuthMethod::Password
-            ) || matches!(raw.principal, Principal::Workload { .. })
+            ) || matches!(files.principal, Principal::Workload { .. })
         }
     };
     if !credential {
-        return Some(RawError::CredentialRequired);
+        return Some(FileError::CredentialRequired);
     }
     let allowed = match action {
-        Action::Delete => raw.state.authz.can_delete(&raw.principal, repo).await,
-        _ => raw.state.authz.can_write(&raw.principal, repo).await,
+        Action::Delete => files.state.authz.can_delete(&files.principal, repo).await,
+        _ => files.state.authz.can_write(&files.principal, repo).await,
     };
     if !allowed {
-        return Some(RawError::Denied);
+        return Some(FileError::Denied);
     }
     if repo.deployment_policy() == DeploymentPolicy::ReadOnly {
-        return Some(RawError::MethodNotAllowed("the repository is read-only"));
+        return Some(FileError::MethodNotAllowed("the repository is read-only"));
     }
     None
 }
@@ -172,18 +214,18 @@ async fn refusal(raw: &Raw<'_>, repo: &Repository, action: Action, via: Via) -> 
 /// Record a workload's change in the trusted-publishing ledger, inside the
 /// transaction that makes it.
 async fn record(
-    raw: &Raw<'_>,
+    files: &Files<'_>,
     repo: &Repository,
     action: PackageMutation,
     path: &str,
     sha256: &str,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<(), RawError> {
-    if !matches!(raw.principal, Principal::Workload { .. }) {
+) -> Result<(), FileError> {
+    if !matches!(files.principal, Principal::Workload { .. }) {
         return Ok(());
     }
     let context = PublishAuthorizationContext {
-        principal: raw.principal,
+        principal: files.principal,
         action,
         package_id: path.to_string(),
         package_version: sha256.to_string(),
@@ -192,10 +234,10 @@ async fn record(
         .record_in_transaction(&context, tx)
         .await
         .map_err(|e| match e {
-            WriteError::ForbiddenPackage { .. } => RawError::Forbidden(
+            WriteError::ForbiddenPackage { .. } => FileError::Forbidden(
                 "the workload identity may no longer change this repository".into(),
             ),
-            other => RawError::Internal(format!("trusted-publishing record: {other}")),
+            other => FileError::Internal(format!("trusted-publishing record: {other}")),
         })
 }
 
@@ -221,37 +263,37 @@ pub struct Stored {
 /// are locked in the order every other writer takes them in; the answer
 /// lists them in the order given.
 async fn record_all(
-    raw: &Raw<'_>,
+    files: &Files<'_>,
     repo: &Repository,
-    files: Vec<Pending>,
-) -> Result<Vec<Stored>, RawError> {
+    pending: Vec<Pending>,
+) -> Result<Vec<Stored>, FileError> {
     let policy = repo.deployment_policy();
-    let replace = raw
+    let replace = files
         .state
         .authz
-        .package_filter_for(&raw.principal, repo, Action::Delete)
+        .package_filter_for(&files.principal, repo, Action::Delete)
         .await;
-    let may_delete = raw.state.authz.can_delete(&raw.principal, repo).await;
-    let grace = raw.state.config.outbox.grace();
-    let mut tx = raw.state.pool.begin().await?;
-    let mut order: Vec<usize> = (0..files.len()).collect();
+    let may_delete = files.state.authz.can_delete(&files.principal, repo).await;
+    let grace = files.state.config.outbox.grace();
+    let mut tx = files.state.pool.begin().await?;
+    let mut order: Vec<usize> = (0..pending.len()).collect();
     order.sort_by(|&a, &b| {
-        files[a]
+        pending[a]
             .ingested
             .stored
             .sha256
-            .cmp(&files[b].ingested.stored.sha256)
+            .cmp(&pending[b].ingested.stored.sha256)
     });
-    let mut out: Vec<Option<Stored>> = (0..files.len()).map(|_| None).collect();
+    let mut out: Vec<Option<Stored>> = (0..pending.len()).map(|_| None).collect();
     for index in order {
-        let file = &files[index];
+        let file = &pending[index];
         let stored = &file.ingested.stored;
         let replaceable =
             policy == DeploymentPolicy::AllowRedeploy && may_delete && replace.allows(&file.path);
         let new = NewRawFile {
             path: &file.path,
             sha256: &stored.sha256,
-            size: i64::try_from(stored.size).map_err(|_| RawError::TooLarge(stored.size))?,
+            size: i64::try_from(stored.size).map_err(|_| FileError::TooLarge(stored.size))?,
             content_type: &file.content_type,
             sha512_base64: &stored.sha512_base64,
             sha1: &file.ingested.sha1,
@@ -273,13 +315,13 @@ async fn record_all(
                 StoreOutcome::Replaced(_) => "replaced",
                 StoreOutcome::Unchanged(_) => "unchanged",
                 StoreOutcome::Exists if policy == DeploymentPolicy::AllowRedeploy => {
-                    return Err(RawError::Forbidden(format!(
+                    return Err(FileError::Forbidden(format!(
                         "{} exists; replacing a file needs the delete permission",
                         file.path
                     )));
                 }
                 StoreOutcome::Exists => {
-                    return Err(RawError::Conflict(format!(
+                    return Err(FileError::Conflict(format!(
                         "{} exists and the repository does not allow redeploying it",
                         file.path
                     )));
@@ -287,7 +329,7 @@ async fn record_all(
             };
         if status != "unchanged" {
             record(
-                raw,
+                files,
                 repo,
                 PackageMutation::Publish,
                 &file.path,
@@ -307,100 +349,73 @@ async fn record_all(
     Ok(out.into_iter().flatten().collect())
 }
 
-/// `PUT /raw/<repo>/<path>`: store the request body as the file.
-pub async fn put(raw: &Raw<'_>, repo: &Repository, path: &str, req: Request<Body>) -> Response {
-    match put_inner(raw, repo, path, req).await {
-        Ok(Stored {
-            status: "created", ..
-        }) => StatusCode::CREATED.into_response(),
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => e.into_response(),
-    }
-}
-
-async fn put_inner(
-    raw: &Raw<'_>,
+/// Store `uploads` in hosted `repo`, all of them or none, with the caller's
+/// write permission (and selector) on every path.
+pub async fn store(
+    files: &Files<'_>,
     repo: &Repository,
-    path: &str,
-    req: Request<Body>,
-) -> Result<Stored, RawError> {
-    if let Some(refused) = refusal(raw, repo, Action::Write, Via::Protocol).await {
+    uploads: Vec<Upload>,
+    via: Via,
+) -> Result<Vec<Stored>, FileError> {
+    if let Some(refused) = refusal(files, repo, Action::Write, via).await {
         return Err(refused);
     }
-    let write = raw
+    let write = files
         .state
         .authz
-        .package_filter_for(&raw.principal, repo, Action::Write)
+        .package_filter_for(&files.principal, repo, Action::Write)
         .await;
-    if !write.allows(path) {
-        return Err(RawError::Forbidden(format!("you may not upload to {path}")));
-    }
-    let limit = raw.state.upload_limit(repo);
-    let declared_length = req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if declared_length.is_some_and(|len| len > limit) {
-        return Err(RawError::TooLarge(limit));
-    }
-    let declared = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let ingested = ingest(raw, req.into_body().into_data_stream(), limit).await?;
-    let pending = Pending {
-        path: path.to_string(),
-        content_type: content_type(declared.as_deref(), path),
-        ingested,
-    };
-    let mut stored = record_all(raw, repo, vec![pending]).await?;
-    Ok(stored.remove(0))
-}
-
-/// `POST /raw/<repo>/<directory>/` (and the web UI's upload): a
-/// `multipart/form-data` body whose file parts are stored under
-/// `directory`, each at its part's file name. Nexus' field names work too:
-/// `raw.directory` (or `directory`) names a subdirectory, and
-/// `<field>.filename` (`raw.asset1.filename`) the name of the file part
-/// `<field>`. Every file is recorded, or none.
-pub async fn multipart(
-    raw: &Raw<'_>,
-    repo: &Repository,
-    directory: &str,
-    req: Request<Body>,
-    via: Via,
-) -> Response {
-    match multipart_inner(raw, repo, directory, req, via).await {
-        Ok(files) => {
-            let status = if files.iter().any(|f| f.status == "created") {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            };
-            (status, Json(serde_json::json!({ "files": files }))).into_response()
+    let mut seen = HashSet::new();
+    for upload in &uploads {
+        let path = checked_path(&upload.path)?;
+        if !seen.insert(path) {
+            return Err(FileError::BadRequest(format!(
+                "the upload holds {path} twice"
+            )));
         }
-        Err(e) => e.into_response(),
+        if !write.allows(path) {
+            return Err(FileError::Forbidden(format!(
+                "you may not upload to {path}"
+            )));
+        }
     }
+    let limit = files.state.upload_limit(repo);
+    let mut pending = Vec::with_capacity(uploads.len());
+    for upload in uploads {
+        let ingested = match upload.content {
+            Content::Staged(ingested) => ingested,
+            Content::Body(req) => {
+                let declared_length = req
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                if declared_length.is_some_and(|len| len > limit) {
+                    return Err(FileError::TooLarge(limit));
+                }
+                ingest(files, req.into_body().into_data_stream(), limit).await?
+            }
+        };
+        pending.push(Pending {
+            content_type: content_type(upload.declared.as_deref(), &upload.path),
+            path: upload.path,
+            ingested,
+        });
+    }
+    record_all(files, repo, pending).await
 }
 
-/// A file part, staged and stored, its name to be decided.
-struct FilePart {
-    field: String,
-    file_name: String,
-    declared: Option<String>,
-    ingested: Ingested,
-}
-
-async fn multipart_inner(
-    raw: &Raw<'_>,
+/// Receive the `multipart/form-data` body of `req` for hosted `repo`: every
+/// file part staged and stored (at most [`MAX_FILES_PER_UPLOAD`], each
+/// within the repository's upload limit), every other field read (at most
+/// [`MAX_TEXT_FIELD_BYTES`]), in the order of the form.
+pub async fn receive_form(
+    files: &Files<'_>,
     repo: &Repository,
-    directory: &str,
     req: Request<Body>,
     via: Via,
-) -> Result<Vec<Stored>, RawError> {
-    if let Some(refused) = refusal(raw, repo, Action::Write, via).await {
+) -> Result<Vec<Part>, FileError> {
+    if let Some(refused) = refusal(files, repo, Action::Write, via).await {
         return Err(refused);
     }
     let Some(boundary) = req
@@ -409,11 +424,11 @@ async fn multipart_inner(
         .and_then(|v| v.to_str().ok())
         .and_then(crate::feed::multipart_boundary)
     else {
-        return Err(RawError::BadRequest(
+        return Err(FileError::BadRequest(
             "upload files as multipart/form-data (or PUT a single file to its path)".into(),
         ));
     };
-    let limit = raw.state.upload_limit(repo);
+    let limit = files.state.upload_limit(repo);
     let overrun = Arc::new(AtomicBool::new(false));
     let guarded = crate::feed::preamble_guard(
         req.into_body().into_data_stream(),
@@ -424,31 +439,32 @@ async fn multipart_inner(
         .size_limit(multer::SizeLimit::new().per_field(limit.saturating_add(1)));
     let mut form = multer::Multipart::with_constraints(guarded, boundary, constraints);
     let form_error = |e: multer::Error| match e {
-        multer::Error::FieldSizeExceeded { .. } => RawError::TooLarge(limit),
+        multer::Error::FieldSizeExceeded { .. } => FileError::TooLarge(limit),
         _ if overrun.load(Ordering::Relaxed) => {
-            RawError::BadRequest("multipart body: no part within the first 64 KiB".into())
+            FileError::BadRequest("multipart body: no part within the first 64 KiB".into())
         }
-        e => RawError::BadRequest(format!("multipart body: {e}")),
+        e => FileError::BadRequest(format!("multipart body: {e}")),
     };
 
-    let mut parts: Vec<FilePart> = Vec::new();
-    let mut texts: BTreeMap<String, String> = BTreeMap::new();
+    let mut parts: Vec<Part> = Vec::new();
+    let mut file_parts = 0;
     while let Some(mut part) = form.next_field().await.map_err(form_error)? {
         let field = part.name().unwrap_or("").to_string();
         match part.file_name().map(str::to_string) {
-            Some(file_name) => {
-                if parts.len() == MAX_FILES_PER_UPLOAD {
-                    return Err(RawError::BadRequest(format!(
+            Some(name) => {
+                if file_parts == MAX_FILES_PER_UPLOAD {
+                    return Err(FileError::BadRequest(format!(
                         "at most {MAX_FILES_PER_UPLOAD} files per upload"
                     )));
                 }
-                let declared = part.content_type().map(|m| m.to_string());
-                let ingested = ingest(raw, part, limit).await?;
-                parts.push(FilePart {
+                file_parts += 1;
+                let content_type = part.content_type().map(|m| m.to_string());
+                let ingested = ingest(files, part, limit).await?;
+                parts.push(Part::File {
                     field,
-                    file_name,
-                    declared,
-                    ingested,
+                    name,
+                    content_type,
+                    ingested: Box::new(ingested),
                 });
             }
             None => {
@@ -456,110 +472,50 @@ async fn multipart_inner(
                 while let Some(chunk) = part.chunk().await.map_err(form_error)? {
                     text.extend_from_slice(&chunk);
                     if text.len() > MAX_TEXT_FIELD_BYTES {
-                        return Err(RawError::BadRequest(format!(
+                        return Err(FileError::BadRequest(format!(
                             "form field {field:?} is longer than {MAX_TEXT_FIELD_BYTES} bytes"
                         )));
                     }
                 }
-                let text = String::from_utf8(text).map_err(|_| {
-                    RawError::BadRequest(format!("form field {field:?} is not UTF-8"))
+                let value = String::from_utf8(text).map_err(|_| {
+                    FileError::BadRequest(format!("form field {field:?} is not UTF-8"))
                 })?;
-                texts.insert(field, text);
+                parts.push(Part::Text { field, value });
             }
         }
     }
-    if parts.is_empty() {
-        return Err(RawError::BadRequest("the form holds no file".into()));
-    }
-
-    // The fields: a subdirectory, and the names of file parts.
-    let mut subdirectory = String::new();
-    let fields: HashSet<&str> = parts.iter().map(|p| p.field.as_str()).collect();
-    for (name, value) in &texts {
-        match name.as_str() {
-            "directory" | "raw.directory" => subdirectory = value.clone(),
-            other
-                if other
-                    .strip_suffix(".filename")
-                    .is_some_and(|field| fields.contains(field)) => {}
-            other => {
-                return Err(RawError::BadRequest(format!(
-                    "unknown form field {other:?} (file parts, directory and <file field>.filename are accepted)"
-                )))
-            }
-        }
-    }
-    let base = path::normalize_directory(&subdirectory)
-        .map_err(|e| RawError::BadRequest(format!("directory: {e}")))?;
-    let directory = format!("{directory}{base}");
-
-    let write = raw
-        .state
-        .authz
-        .package_filter_for(&raw.principal, repo, Action::Write)
-        .await;
-    let mut seen = HashSet::new();
-    let mut pending = Vec::with_capacity(parts.len());
-    for part in parts {
-        let name = texts
-            .get(&format!("{}.filename", part.field))
-            .unwrap_or(&part.file_name);
-        let target = path::join(&directory, name)
-            .map_err(|e| RawError::BadRequest(format!("file name {name:?}: {e}")))?;
-        if !seen.insert(target.clone()) {
-            return Err(RawError::BadRequest(format!(
-                "the form holds {target} twice"
-            )));
-        }
-        if !write.allows(&target) {
-            return Err(RawError::Forbidden(format!(
-                "you may not upload to {target}"
-            )));
-        }
-        pending.push(Pending {
-            content_type: content_type(part.declared.as_deref(), &target),
-            path: target,
-            ingested: part.ingested,
-        });
-    }
-    record_all(raw, repo, pending).await
+    Ok(parts)
 }
 
-/// `DELETE /raw/<repo>/<path>` (and the web UI's delete).
-pub async fn delete(raw: &Raw<'_>, repo: &Repository, path: &str, via: Via) -> Response {
-    match delete_inner(raw, repo, path, via).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => e.into_response(),
-    }
-}
-
-async fn delete_inner(
-    raw: &Raw<'_>,
+/// Delete the file at `path` of hosted `repo`: `false` when there is none
+/// the caller may delete (one outside its selector is as unknown).
+pub async fn remove(
+    files: &Files<'_>,
     repo: &Repository,
     path: &str,
     via: Via,
-) -> Result<(), RawError> {
-    if let Some(refused) = refusal(raw, repo, Action::Delete, via).await {
+) -> Result<bool, FileError> {
+    if let Some(refused) = refusal(files, repo, Action::Delete, via).await {
         return Err(refused);
     }
-    let filter = raw
+    let path = checked_path(path)?;
+    let filter = files
         .state
         .authz
-        .package_filter_for(&raw.principal, repo, Action::Delete)
+        .package_filter_for(&files.principal, repo, Action::Delete)
         .await;
-    // Outside the caller's selector: as unknown.
     if !filter.allows(path) {
-        return Err(RawError::NotFound);
+        return Ok(false);
     }
-    let Some(file) = raw_dao::find(&raw.state.pool, repo.id, path).await? else {
-        return Err(RawError::NotFound);
+    let Some(file) = raw_dao::find(&files.state.pool, repo.id, path).await? else {
+        return Ok(false);
     };
-    let mut tx = raw.state.pool.begin().await?;
-    if !raw_dao::delete(&mut tx, repo.id, path, raw.state.config.outbox.grace()).await? {
-        return Err(RawError::NotFound);
+    let mut tx = files.state.pool.begin().await?;
+    if !raw_dao::delete(&mut tx, repo.id, path, files.state.config.outbox.grace()).await? {
+        return Ok(false);
     }
     record(
-        raw,
+        files,
         repo,
         PackageMutation::Delete,
         path,
@@ -568,7 +524,7 @@ async fn delete_inner(
     )
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

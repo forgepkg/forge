@@ -1,14 +1,20 @@
-//! Paths in raw repositories: what a request names, and how it is stored.
+//! Paths in files repositories: what a request names, and how a file is
+//! stored.
 //!
 //! A stored path is a list of segments joined by `/`, without a leading or
-//! trailing `/`: `pdfium/7350/pdfium-linux-x64.tgz`. A request names it
-//! percent-encoded after `/raw/<repo>/`, and is refused when any decoded
-//! segment is empty (`//`), `.` or `..` (also spelled `%2e%2e`), holds a `/`
-//! (`%2F`), a backslash or a control character, or the path is too long.
-//! Nothing is collapsed or resolved: a path that needs normalizing is
-//! refused, so there is exactly one spelling of every stored path.
+//! trailing `/`: `pdfium/7350/pdfium-linux-x64.tgz`. A directory is `""` (the
+//! root) or a path ending in `/`. A request names a path percent-encoded, and
+//! is refused when any decoded segment is empty (`//`), `.` or `..` (also
+//! spelled `%2e%2e`), holds a `/` (`%2F`), a backslash or a control
+//! character, or the path is too long. Nothing is collapsed or resolved: a
+//! path that needs normalizing is refused, so there is exactly one spelling
+//! of every stored path.
+//!
+//! The host refuses every path a plugin names that breaks these rules
+//! ([`validate_path`], [`validate_directory`]); a plugin parses its requests
+//! with [`parse_request`] to refuse them with the reason.
 
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+use std::fmt;
 
 /// Longest stored path, in bytes.
 pub const MAX_PATH_BYTES: usize = 1024;
@@ -26,25 +32,36 @@ pub enum Target {
 }
 
 /// Why a path is refused.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathError {
-    #[error("invalid path: empty segment (`//`)")]
     EmptySegment,
-    #[error("invalid path: `.` and `..` segments are not allowed")]
     DotSegment,
-    #[error("invalid path: backslashes are not allowed")]
     Backslash,
-    #[error("invalid path: an encoded `/` (%2F) is not allowed in a segment")]
     EncodedSlash,
-    #[error("invalid path: control characters are not allowed")]
     Control,
-    #[error("invalid path: not valid percent-encoded UTF-8")]
     Encoding,
-    #[error("invalid path: longer than {MAX_PATH_BYTES} bytes")]
     TooLong,
-    #[error("invalid path: a segment is longer than {MAX_SEGMENT_BYTES} bytes")]
     SegmentTooLong,
 }
+
+impl fmt::Display for PathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PathError::EmptySegment => "invalid path: empty segment (`//`)",
+            PathError::DotSegment => "invalid path: `.` and `..` segments are not allowed",
+            PathError::Backslash => "invalid path: backslashes are not allowed",
+            PathError::EncodedSlash => {
+                "invalid path: an encoded `/` (%2F) is not allowed in a segment"
+            }
+            PathError::Control => "invalid path: control characters are not allowed",
+            PathError::Encoding => "invalid path: not valid percent-encoded UTF-8",
+            PathError::TooLong => "invalid path: longer than 1024 bytes",
+            PathError::SegmentTooLong => "invalid path: a segment is longer than 255 bytes",
+        })
+    }
+}
+
+impl std::error::Error for PathError {}
 
 /// Check one decoded segment.
 pub fn validate_segment(segment: &str) -> Result<(), PathError> {
@@ -69,9 +86,55 @@ pub fn validate_segment(segment: &str) -> Result<(), PathError> {
     Ok(())
 }
 
-/// Parse the percent-encoded rest of a request path (what follows
-/// `/raw/<repo>/`): empty or ending in `/` names a directory, anything else
-/// a file.
+/// Check a stored file path: segments joined by `/`, no leading or trailing
+/// `/`.
+pub fn validate_path(path: &str) -> Result<(), PathError> {
+    if path.len() > MAX_PATH_BYTES {
+        return Err(PathError::TooLong);
+    }
+    path.split('/').try_for_each(validate_segment)
+}
+
+/// Check a directory: `""`, or a file path followed by `/`.
+pub fn validate_directory(directory: &str) -> Result<(), PathError> {
+    if directory.is_empty() {
+        return Ok(());
+    }
+    match directory.strip_suffix('/') {
+        Some(path) if directory.len() <= MAX_PATH_BYTES => validate_path(path),
+        Some(_) => Err(PathError::TooLong),
+        None => Err(PathError::EmptySegment),
+    }
+}
+
+/// `%XX`-decode a segment: an escape of two hex digits is decoded, a `%`
+/// before anything else stays as it is.
+fn decode_segment(segment: &str) -> Result<String, PathError> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'%')
+            .then(|| segment.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| PathError::Encoding)
+}
+
+/// Parse a percent-encoded request path below a repository (without its
+/// leading `/`): empty or ending in `/` names a directory, anything else a
+/// file.
 pub fn parse_request(encoded: &str) -> Result<Target, PathError> {
     if encoded.is_empty() {
         return Ok(Target::Directory(String::new()));
@@ -85,11 +148,9 @@ pub fn parse_request(encoded: &str) -> Result<Target, PathError> {
         if raw.contains('\\') {
             return Err(PathError::Backslash);
         }
-        let decoded = percent_decode_str(raw)
-            .decode_utf8()
-            .map_err(|_| PathError::Encoding)?;
+        let decoded = decode_segment(raw)?;
         validate_segment(&decoded)?;
-        segments.push(decoded.into_owned());
+        segments.push(decoded);
     }
     let path = segments.join("/");
     if path.len() + usize::from(directory) > MAX_PATH_BYTES {
@@ -102,9 +163,9 @@ pub fn parse_request(encoded: &str) -> Result<Target, PathError> {
     })
 }
 
-/// Normalize a path given unencoded (an upload's file name, a `directory`
-/// form field, an admin API parameter): segments separated by `/`, leading
-/// and trailing `/` ignored. Empty yields `""`.
+/// Normalize a path given unencoded (an upload's file name, a directory form
+/// field, an admin API parameter): segments separated by `/`, leading and
+/// trailing `/` ignored. Empty yields `""`.
 pub fn normalize(raw: &str) -> Result<String, PathError> {
     let trimmed = raw.trim_matches('/');
     if trimmed.is_empty() {
@@ -144,34 +205,30 @@ pub fn join(directory: &str, name: &str) -> Result<String, PathError> {
     Ok(path)
 }
 
-/// Characters percent-encoded in a URL path segment: everything but the
-/// unreserved characters and the sub-delimiters, `:` and `@` that a
+/// Whether `byte` is percent-encoded in a URL path segment: everything but
+/// the unreserved characters and the sub-delimiters, `:` and `@` that a
 /// segment may carry as they are.
-const SEGMENT: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'%')
-    .add(b'/')
-    .add(b'<')
-    .add(b'>')
-    .add(b'?')
-    .add(b'[')
-    .add(b'\\')
-    .add(b']')
-    .add(b'^')
-    .add(b'`')
-    .add(b'{')
-    .add(b'|')
-    .add(b'}');
+fn encoded_in_segment(byte: u8) -> bool {
+    !(0x20..0x7f).contains(&byte) || b" \"#%/<>?[\\]^`{|}".contains(&byte)
+}
 
 /// `path` percent-encoded for a URL, segment by segment (a trailing `/`
 /// kept).
 pub fn encode(path: &str) -> String {
-    path.split('/')
-        .map(|segment| utf8_percent_encode(segment, SEGMENT).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::with_capacity(path.len());
+    for (i, segment) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        for &byte in segment.as_bytes() {
+            if encoded_in_segment(byte) {
+                out.push_str(&format!("%{byte:02X}"));
+            } else {
+                out.push(char::from(byte));
+            }
+        }
+    }
+    out
 }
 
 /// The last segment of a path (a directory's without its `/`).
@@ -212,6 +269,9 @@ mod tests {
         assert_eq!(parse_request("%C3%A4/x"), Ok(Target::File("ä/x".into())));
         assert_eq!(parse_request("..."), Ok(Target::File("...".into())));
         assert_eq!(parse_request(".hidden"), Ok(Target::File(".hidden".into())));
+        // A `%` without two hex digits is a `%`.
+        assert_eq!(parse_request("a%zzb"), Ok(Target::File("a%zzb".into())));
+        assert_eq!(parse_request("a%2"), Ok(Target::File("a%2".into())));
     }
 
     #[test]
@@ -251,6 +311,21 @@ mod tests {
     }
 
     #[test]
+    fn stored_paths_and_directories_are_checked() {
+        assert_eq!(validate_path("a/b.txt"), Ok(()));
+        assert_eq!(validate_path(""), Err(PathError::EmptySegment));
+        assert_eq!(validate_path("/a"), Err(PathError::EmptySegment));
+        assert_eq!(validate_path("a/"), Err(PathError::EmptySegment));
+        assert_eq!(validate_path("a/../b"), Err(PathError::DotSegment));
+        assert_eq!(validate_path(&"a/".repeat(600)), Err(PathError::TooLong));
+        assert_eq!(validate_directory(""), Ok(()));
+        assert_eq!(validate_directory("a/b/"), Ok(()));
+        assert_eq!(validate_directory("a/b"), Err(PathError::EmptySegment));
+        assert_eq!(validate_directory("/"), Err(PathError::EmptySegment));
+        assert_eq!(validate_directory("a//"), Err(PathError::EmptySegment));
+    }
+
+    #[test]
     fn unencoded_names_normalize_their_slashes_only() {
         assert_eq!(normalize("/pdfium/7350/"), Ok("pdfium/7350".into()));
         assert_eq!(normalize(""), Ok(String::new()));
@@ -286,6 +361,8 @@ mod tests {
             assert_eq!(parse_request(&encoded), Ok(expected), "{encoded}");
         }
         assert_eq!(encode("a b/x?.txt"), "a%20b/x%3F.txt");
+        assert_eq!(encode("ä"), "%C3%A4");
+        assert_eq!(encode("a:b@c!$&'()*+,;=-._~"), "a:b@c!$&'()*+,;=-._~");
         assert_eq!(file_name("a/b/c.txt"), "c.txt");
         assert_eq!(file_name("a/b/"), "b");
         assert_eq!(file_name("c.txt"), "c.txt");
