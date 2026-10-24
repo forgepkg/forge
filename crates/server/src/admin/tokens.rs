@@ -73,6 +73,13 @@ pub struct CreateToken {
     pub scope: Option<forge_core::authz::TokenScope>,
 }
 
+pub(crate) fn validate_expiry(expires_at: Option<DateTime<Utc>>) -> Result<(), Response> {
+    if expires_at.is_some_and(|expires_at| expires_at <= Utc::now()) {
+        return Err((StatusCode::BAD_REQUEST, "expires_at must be in the future").into_response());
+    }
+    Ok(())
+}
+
 /// Persist an issue request's optional `scope` on the freshly inserted token
 /// and return the canonical jsonb that was stored (for the response view).
 ///
@@ -130,6 +137,9 @@ pub async fn create(
         Ok(body) => body,
         Err(rejection) => return json_rejection(rejection),
     };
+    if let Err(response) = validate_expiry(body.expires_at) {
+        return response;
+    }
     // Ensure the target user exists (FK would also catch it, but a clean 404 is
     // friendlier than a 500).
     match user_dao::find_user_by_id(&state.pool, user_id).await {

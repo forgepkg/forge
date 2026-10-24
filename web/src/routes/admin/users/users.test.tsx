@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -788,7 +788,12 @@ describe('admin tokens', () => {
       onCreateToken: (userId, body) =>
         json(
           {
-            ...token({ id: 9, user_id: userId, name: (body as { name: string }).name }),
+            ...token({
+              id: 9,
+              user_id: userId,
+              name: (body as { name: string }).name,
+              expires_at: (body as { expires_at: string }).expires_at,
+            }),
             token: 'super-secret-plaintext',
           },
           201,
@@ -813,6 +818,97 @@ describe('admin tokens', () => {
     // The plaintext is shown exactly once via ShowOnceSecret.
     expect(await screen.findByText('super-secret-plaintext')).toBeInTheDocument()
     expect(screen.getByText('Token created')).toBeInTheDocument()
+    expect(screen.getByText(/This token expires/)).toBeInTheDocument()
+    const request = fetchMock.mock.calls.find(([input, init]) => {
+      const path = new URL(String(input), 'http://localhost').pathname
+      return path === '/admin/users/2/tokens' && init?.method === 'POST'
+    })
+    const body = JSON.parse(request![1]!.body as string) as { expires_at: string }
+    expect(Date.parse(body.expires_at)).toBeGreaterThan(Date.now())
+  })
+
+  it('sends the selected expiry for each choice', async () => {
+    const bodies: Array<{ name: string; expires_at?: string }> = []
+    mockApi({
+      users: [user({ id: 2, username: 'alice' })],
+      tokens: [],
+      onCreateToken: (userId, body) => {
+        bodies.push(body as { name: string; expires_at?: string })
+        return json(
+          {
+            ...token({
+              id: bodies.length,
+              user_id: userId,
+              name: bodies.at(-1)!.name,
+              expires_at: bodies.at(-1)!.expires_at ?? null,
+            }),
+            token: 'plaintext-secret',
+          },
+          201,
+        )
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/2')
+    const expiry = await screen.findByLabelText('Token expiry')
+    const choices = [
+      { value: '90-days', days: 90 },
+      { value: '30-days', days: 30 },
+      { value: '1-year', years: 1 },
+      { value: 'custom', date: '2099-12-31' },
+      { value: 'never' },
+    ] as const
+
+    for (const [index, choice] of choices.entries()) {
+      if (choice.value !== '90-days') await u.selectOptions(expiry, choice.value)
+      if (choice.value === 'never') {
+        expect(screen.getByText('This token stays valid until it is revoked.')).toBeInTheDocument()
+      }
+      await u.type(await screen.findByLabelText('Token name'), `choice-${index}`)
+      if (choice.value === 'custom') {
+        fireEvent.change(screen.getByLabelText('Expiry date'), {
+          target: { value: choice.date },
+        })
+      }
+      const started = Date.now()
+      await u.click(screen.getByRole('button', { name: 'Create token' }))
+      await waitFor(() => expect(bodies).toHaveLength(index + 1))
+      const body = bodies[index]!
+      expect(body.name).toBe(`choice-${index}`)
+      if ('date' in choice) {
+        expect(body.expires_at).toBe(`${choice.date}T23:59:59.999Z`)
+      } else if ('days' in choice || 'years' in choice) {
+        const expected = new Date(started)
+        if ('years' in choice) expected.setUTCFullYear(expected.getUTCFullYear() + choice.years)
+        else expected.setUTCDate(expected.getUTCDate() + choice.days)
+        expect(Math.abs(Date.parse(body.expires_at!) - expected.getTime())).toBeLessThan(3000)
+      } else {
+        expect(body).not.toHaveProperty('expires_at')
+      }
+    }
+  })
+
+  it('refuses a custom expiry date that is not in the future', async () => {
+    mockApi({ users: [user({ id: 2, username: 'alice' })], tokens: [] })
+    const u = userEvent.setup()
+    await renderAt('/manage/users/2')
+    await u.type(await screen.findByLabelText('Token name'), 'invalid-date')
+    await u.selectOptions(screen.getByLabelText('Token expiry'), 'custom')
+    const submit = screen.getByRole('button', { name: 'Create token' })
+    expect(submit).toBeDisabled()
+
+    const past = new Date()
+    past.setUTCDate(past.getUTCDate() - 1)
+    fireEvent.change(screen.getByLabelText('Expiry date'), {
+      target: { value: past.toISOString().slice(0, 10) },
+    })
+    expect(screen.getByText('Choose a date in the future.')).toBeInTheDocument()
+    expect(submit).toBeDisabled()
+    expect(fetchMock.mock.calls.some(([input, init]) =>
+      new URL(String(input), 'http://localhost').pathname === '/admin/users/2/tokens' &&
+      init?.method === 'POST',
+    )).toBe(false)
   })
 
   it('switches a forwarded account with a kept password to a local one', async () => {
@@ -925,10 +1021,13 @@ describe('admin tokens', () => {
     const ops = await row('ops')
     expect(within(ops).getByText('admin')).toBeInTheDocument()
     expect(within(ops).getByText('active')).toBeInTheDocument()
+    expect(within(ops).getByText('never')).toBeInTheDocument()
 
     const push = await row('push')
     expect(within(push).getByText('write')).toBeInTheDocument()
     expect(within(push).getByText('2 repositories')).toBeInTheDocument()
     expect(within(push).getByText('active')).toBeInTheDocument()
+    expect(within(push).queryByText('never')).toBeNull()
+    expect(screen.getByRole('columnheader', { name: 'Expires' })).toBeInTheDocument()
   })
 })
