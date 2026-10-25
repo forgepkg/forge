@@ -10,10 +10,13 @@ use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde_json::{json, Value};
+use sha2::Digest as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BOUNDARY: &str = "TRUSTEDPUBLISHERBOUNDARY";
+const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const OCI_CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 
 struct TestSigner {
     private_pem: String,
@@ -115,6 +118,78 @@ async fn push(srv: &common::TestServer, repo: &str, api_key: &str, id: &str) -> 
             format!("multipart/form-data; boundary={BOUNDARY}"),
         )
         .body(package_body(&common::make_nupkg(id, "1.0.0")))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn oci_registry_token(srv: &common::TestServer, name: &str, api_key: &str) -> String {
+    let response = srv
+        .client()
+        .get(format!("{}/v2/token", srv.base_url))
+        .query(&[
+            ("service", "test.local"),
+            ("scope", &format!("repository:{name}:pull,push")),
+        ])
+        .basic_auth("oidc", Some(api_key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    response.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn exchange_workload_key(srv: &common::TestServer, token: String) -> String {
+    let response = srv
+        .client()
+        .post(format!("{}/api/v2/token", srv.base_url))
+        .bearer_auth(token)
+        .json(&json!({"username": "oidc", "tokenType": "ApiKey"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    response.json::<Value>().await.unwrap()["apiKey"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn push_oci_image(
+    srv: &common::TestServer,
+    name: &str,
+    token: &str,
+    tag: &str,
+    config: &[u8],
+) -> reqwest::Response {
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(config)));
+    let upload = srv
+        .client()
+        .post(format!("{}/v2/{name}/blobs/uploads/", srv.base_url))
+        .query(&[("digest", &digest)])
+        .bearer_auth(token)
+        .header("content-type", "application/octet-stream")
+        .body(config.to_vec())
+        .send()
+        .await
+        .unwrap();
+    if !upload.status().is_success() {
+        return upload;
+    }
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "config": {"mediaType": OCI_CONFIG, "digest": digest, "size": config.len()},
+        "layers": []
+    });
+    srv.client()
+        .put(format!("{}/v2/{name}/manifests/{tag}", srv.base_url))
+        .bearer_auth(token)
+        .header("content-type", OCI_MANIFEST)
+        .body(manifest.to_string())
         .send()
         .await
         .unwrap()
@@ -249,6 +324,208 @@ async fn trusted_publishers_are_validated_and_crud_is_repository_scoped() {
         .await
         .unwrap();
     assert_eq!(response.status(), 204);
+}
+
+#[tokio::test]
+async fn oci_registry_tokens_recheck_publisher_snapshots_and_keep_role_reads() {
+    let (issuer, signer) = issuer().await;
+    let srv = common::start().await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("trusted-oci-{}", common::unique());
+    let image = format!("{repo}/app");
+    let publishers = format!(
+        "{}/admin/repositories/{repo}/trusted-publishers",
+        srv.base_url
+    );
+
+    let response = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({"name": repo, "kind": "hosted", "format": "docker"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    let role_name = format!("trusted-oci-reader-{}", common::unique());
+    let role: Value = client
+        .post(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({"name": role_name}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let role_id = role["id"].as_i64().unwrap();
+    let response = client
+        .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({"repository": repo, "level": "read"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+
+    let realm_name = format!("trusted-oci-wif-{}", common::unique());
+    let response = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "kind": "workload_identity",
+            "name": realm_name.clone(),
+            "enabled": true,
+            "config": {
+                "issuer": issuer.uri(),
+                "allow_http_issuer": true,
+                "allowed_audiences": ["https://forge.example.com"],
+                "rules": [{
+                    "role": role_name,
+                    "conditions": [
+                        {"claim": "repository_id", "any_of": ["1001"]},
+                        {"claim": "repository_owner_id", "any_of": ["2001"]}
+                    ]
+                }]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+
+    let publisher_body = json!({
+        "name": "oci-release",
+        "realm": realm_name.clone(),
+        "packages": {"includes": ["app"], "excludes": []},
+        "conditions": [
+            {"claim": "repository_id", "any_of": ["1001"]},
+            {"claim": "repository_owner_id", "any_of": ["2001"]}
+        ],
+        "actions": ["write"]
+    });
+    let response = client
+        .post(&publishers)
+        .basic_auth(&admin, Some(&password))
+        .json(&publisher_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    let publisher: Value = response.json().await.unwrap();
+    let publisher_id = publisher["id"].as_i64().unwrap();
+
+    let api_key = exchange_workload_key(&srv, signer.sign(&claims(&issuer.uri(), "1001"))).await;
+    let registry_token = oci_registry_token(&srv, &image, &api_key).await;
+    let token_payload = registry_token.split('.').nth(1).unwrap();
+    let token_claims: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token_payload)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        token_claims["access"][0]["actions"],
+        json!(["pull", "push"]),
+        "{token_claims}"
+    );
+    assert_eq!(token_claims["fp"]["publishers"][0]["id"], publisher_id);
+    let config =
+        br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#;
+    let pushed = push_oci_image(&srv, &image, &registry_token, "release", config).await;
+    assert_eq!(pushed.status(), 201, "{}", pushed.text().await.unwrap());
+
+    let mut updated = publisher_body.clone();
+    updated["packages"]["includes"] = json!(["other"]);
+    let response = client
+        .put(format!("{publishers}/{publisher_id}"))
+        .basic_auth(&admin, Some(&password))
+        .json(&updated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let after_edit = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"variant":"after-edit"}"#;
+    assert_eq!(
+        push_oci_image(&srv, &image, &registry_token, "after-edit", after_edit)
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/v2/{image}/manifests/release", srv.base_url))
+            .bearer_auth(&registry_token)
+            .header("accept", OCI_MANIFEST)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the independent reader role remains effective"
+    );
+
+    let response = client
+        .post(&publishers)
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "name": "oci-release-2",
+            "realm": realm_name,
+            "packages": {"includes": ["app"], "excludes": []},
+            "conditions": publisher_body["conditions"],
+            "actions": ["write"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let second_publisher: Value = response.json().await.unwrap();
+    let api_key = exchange_workload_key(&srv, signer.sign(&claims(&issuer.uri(), "1001"))).await;
+    let registry_token = oci_registry_token(&srv, &image, &api_key).await;
+    let before_delete = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"variant":"before-delete"}"#;
+    assert_eq!(
+        push_oci_image(
+            &srv,
+            &image,
+            &registry_token,
+            "before-delete",
+            before_delete
+        )
+        .await
+        .status(),
+        201
+    );
+
+    let response = client
+        .delete(format!(
+            "{publishers}/{}",
+            second_publisher["id"].as_i64().unwrap()
+        ))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let after_delete = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"variant":"after-delete"}"#;
+    assert_eq!(
+        push_oci_image(&srv, &image, &registry_token, "after-delete", after_delete)
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/v2/{image}/manifests/release", srv.base_url))
+            .bearer_auth(&registry_token)
+            .header("accept", OCI_MANIFEST)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the independent reader role remains effective after deletion"
+    );
 }
 
 #[tokio::test]

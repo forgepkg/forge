@@ -1540,11 +1540,22 @@ impl Ctx<'_> {
         let not_found = || (StatusCode::NOT_FOUND, "package not found").into_response();
         let (needed, what) = needs(&change);
         let target = self.write_target(needed, what).await?;
-        let filter = self
-            .state
-            .authz
-            .package_filter_for(&self.principal, &target, needed)
-            .await;
+        let metadata_change = matches!(
+            &change,
+            Change::Deprecate { .. } | Change::Tag { .. } | Change::Untag { .. }
+        );
+        // These direct metadata writes do not use the publisher transaction fence.
+        let filter = if metadata_change && matches!(&self.principal, Principal::Workload { .. }) {
+            self.state
+                .authz
+                .role_package_filter_for(&self.principal, &target, needed)
+                .await
+        } else {
+            self.state
+                .authz
+                .package_filter_for(&self.principal, &target, needed)
+                .await
+        };
         // A package outside the caller's selector answers like an unknown
         // one, as for NuGet.
         let package = |r: &PackageRef| {

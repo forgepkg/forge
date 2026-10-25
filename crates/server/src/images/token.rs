@@ -510,7 +510,10 @@ mod tests {
             issued_at: 5,
             key_id: Some(6),
             expires_at: 7,
-            matched_publishers: vec![],
+            matched_publishers: vec![TrustedPublisherMatch {
+                id: 8,
+                definition_sha256: [9; 32],
+            }],
         };
         let tp = TokenPrincipal::of(&p);
         assert_eq!(tp.credential_ends(), Some(7));
