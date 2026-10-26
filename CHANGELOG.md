@@ -12,6 +12,8 @@ until the release folds them in.
 
 ## [Unreleased]
 
+## [2.0.0]
+
 A new major release, installed fresh: 2.0.0 does not upgrade 1.0 or 1.1.
 Install it on an empty PostgreSQL database and an object store of its own;
 [docs/deployment.md](https://github.com/forgepkg/forge/blob/main/docs/deployment.md)
@@ -1257,6 +1259,7 @@ lists the required settings.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/forgepkg/forge/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/forgepkg/forge/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/forgepkg/forge/releases/tag/v2.0.0
 [1.1.0]: https://github.com/forgepkg/forge/releases/tag/v1.1.0
 [1.0.0]: https://github.com/forgepkg/forge/releases/tag/v1.0.0
