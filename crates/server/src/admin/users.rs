@@ -31,8 +31,21 @@
 //! A credential-forwarding account whose realm keeps password hashes
 //! (`capture_password_hash`) can be switched to a local account with the last
 //! password its upstream accepted: `POST /admin/users/{id}/convert-to-local`.
+//!
+//! ## Service accounts (#508)
+//! `"kind": "service"` creates a service account instead: an account for a
+//! machine or a network (a CI pipeline, a build agent, a network the load
+//! balancer admits) that nobody signs in to. It has a description (what it
+//! is for, who owns it) and no password, invitation or email, and never holds
+//! the built-in `admin` role. It authenticates with the API tokens an
+//! administrator issues for it (`POST /admin/users/{id}/tokens`), or through
+//! the trusted-header realm named `realm`, which alone may name it. Roles,
+//! grants, tokens and deactivation work as for a user;
+//! `PATCH /admin/users/{id}` also sets its `description` and `realm`.
+//! Invitations, `reauth` and `convert-to-local` refuse it (**409**), and
+//! `GET /admin/users?kind=service` lists the service accounts alone.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::Extension;
@@ -41,10 +54,10 @@ use forge_core::auth::principal::Principal;
 use forge_db::authz_dao;
 use forge_db::invitation_dao::{self, Invitation, Onboarding};
 use forge_db::model::AppUser;
-use forge_db::user_dao::{self, ConvertedUser};
+use forge_db::user_dao::{self, AccountDetails, ConvertedUser};
 use serde::{Deserialize, Serialize};
 
-use super::{db_error, last_admin_conflict};
+use super::{db_error, double_option, last_admin_conflict};
 use crate::invitations::{self, Delivery};
 use crate::state::AppState;
 
@@ -53,15 +66,28 @@ use crate::state::AppState;
 pub struct UserView {
     pub id: i64,
     pub username: String,
+    /// `user` (a person) or `service` (a service account: a machine or a
+    /// network nobody signs in to).
+    pub kind: AccountKind,
+    /// What a service account is for and who owns it; `null` for a user.
+    pub description: Option<String>,
     /// Membership in the built-in `admin` role.
     pub is_admin: bool,
     pub active: bool,
     /// How the account signs in: `local` (a Forge password), `oidc` (an
-    /// identity provider), `upstream-basic` (a credential-forwarding realm)
-    /// or `trusted-header` (the headers of a trusted-header realm's proxy).
-    /// Two accounts can look alike by name (`bob`, `bob@entra`); this tells
-    /// them apart before a grant goes to the wrong one.
+    /// identity provider), `upstream-basic` (a credential-forwarding realm),
+    /// `trusted-header` (the headers of a trusted-header realm's proxy) or
+    /// `service` (a service account: its API tokens, or the headers of its
+    /// trusted-header realm). Two accounts can look alike by name (`bob`,
+    /// `bob@entra`); this tells them apart before a grant goes to the wrong
+    /// one.
     pub auth_source: String,
+    /// The name of the realm the account belongs to (a credential-forwarding
+    /// or trusted-header one); `null` for none, or when it was deleted.
+    pub realm: Option<String>,
+    /// When the account last authenticated: the latest use of one of its API
+    /// tokens, or the last request its trusted-header realm named it in.
+    pub last_used_at: Option<DateTime<Utc>>,
     /// When the account's realm last kept a hash of the password its upstream
     /// accepted (`capture_password_hash`); `null` when it keeps none. Such an
     /// account can be switched to a local one
@@ -99,6 +125,7 @@ impl UserView {
         roles: Vec<String>,
         onboarding: Option<&Onboarding>,
         invitation: Option<&Invitation>,
+        details: Option<&AccountDetails>,
     ) -> Self {
         let invited = onboarding.is_some_and(|o| o.invited);
         let live = invitation.is_some_and(|i| i.is_live(Utc::now()));
@@ -111,9 +138,13 @@ impl UserView {
         UserView {
             id: u.id,
             username: u.username.clone(),
+            kind: AccountKind::of(u),
+            description: details.and_then(|d| d.description.clone()),
             is_admin: roles.iter().any(|r| r == authz_dao::ADMIN_ROLE),
             active: u.active,
             auth_source: u.auth_source.clone(),
+            realm: details.and_then(|d| d.realm.clone()),
+            last_used_at: details.and_then(|d| d.last_used_at),
             captured_password_at: None,
             roles,
             email: onboarding.and_then(|o| o.email.clone()),
@@ -147,10 +178,83 @@ impl UserView {
         let invitation = invitation_dao::get(&state.pool, u.id)
             .await
             .map_err(db_error)?;
+        let details = user_dao::account_details(&state.pool, Some(u.id))
+            .await
+            .map_err(db_error)?;
         Ok(UserView {
             captured_password_at,
-            ..Self::new(u, roles, onboarding.as_ref(), invitation.as_ref())
+            ..Self::new(
+                u,
+                roles,
+                onboarding.as_ref(),
+                invitation.as_ref(),
+                details.first(),
+            )
         })
+    }
+}
+
+/// Whether an account stands for a person or for a machine or a network.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKind {
+    /// A person.
+    #[default]
+    User,
+    /// A service account: a machine or a network nobody signs in to.
+    Service,
+}
+
+impl AccountKind {
+    fn of(u: &AppUser) -> Self {
+        if u.is_service_account() {
+            AccountKind::Service
+        } else {
+            AccountKind::User
+        }
+    }
+}
+
+/// Longest accepted service-account description, in characters.
+const MAX_DESCRIPTION_CHARS: usize = 1000;
+
+/// A service account's description, trimmed (`None` when blank), or the
+/// **400** that refuses it.
+fn parse_description(description: Option<&str>) -> Result<Option<String>, Response> {
+    let Some(description) = description.map(str::trim).filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    if description.chars().count() > MAX_DESCRIPTION_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("description must be at most {MAX_DESCRIPTION_CHARS} characters"),
+        )
+            .into_response());
+    }
+    if description
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "description must not contain control characters",
+        )
+            .into_response());
+    }
+    Ok(Some(description.to_string()))
+}
+
+/// The id of the trusted-header realm named `name`, which a service account
+/// may belong to, or the **400** that refuses the name.
+async fn service_account_realm(state: &AppState, name: &str) -> Result<i64, Response> {
+    match forge_db::auth_realm_dao::find_realm_by_name(&state.pool, name.trim()).await {
+        Ok(Some(r)) if r.kind == crate::auth::KIND_TRUSTED_HEADER => Ok(r.id),
+        Ok(_) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("no trusted-header realm is named {name:?}"),
+        )
+            .into_response()),
+        Err(e) => Err(db_error(e)),
     }
 }
 
@@ -181,19 +285,36 @@ impl AccessRole {
 /// the password, or an account of the credential-forwarding realm named
 /// `realm` (it signs in with the upstream's password) or of the
 /// trusted-header realm named `realm` (the proxy's headers name it). No
-/// password is ever taken here.
+/// password is ever taken here. With `"kind": "service"`, a service account
+/// (module docs), of the trusted-header realm `realm` or of none.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUser {
     pub username: String,
-    /// Where the invitation goes; the username when absent.
+    #[serde(default)]
+    pub kind: AccountKind,
+    /// What a service account is for and who owns it.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Where the invitation goes; the username when absent. A service
+    /// account has none.
     #[serde(default)]
     pub email: Option<String>,
+    /// `admin` is refused for a service account.
     #[serde(default)]
     pub role: AccessRole,
-    /// The name of a `credential_forwarding` or `trusted_header` realm.
+    /// The name of a `credential_forwarding` or `trusted_header` realm; for
+    /// a service account, of a `trusted_header` one.
     #[serde(default)]
     pub realm: Option<String>,
+}
+
+/// `GET /admin/users` query.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListUsers {
+    /// Only the accounts of this kind.
+    #[serde(default)]
+    pub kind: Option<AccountKind>,
 }
 
 /// The create-user answer: the user and, for a local account, the
@@ -246,22 +367,39 @@ fn parse_email(email: &str) -> Result<String, Response> {
 }
 
 /// Update-user request (`PATCH /admin/users/{id}`). Only the account state is
-/// settable; unknown fields (e.g. an attempted `is_admin`) are rejected rather
-/// than silently ignored.
+/// settable, and a service account's description and realm; unknown fields
+/// (e.g. an attempted `is_admin`) are rejected rather than silently ignored.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateUser {
     /// `false` deactivates (and cuts off) the user, `true` reactivates it.
     #[serde(default)]
     pub active: Option<bool>,
+    /// A service account's description; `null` or blank clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub description: Option<Option<String>>,
+    /// The trusted-header realm a service account belongs to, by name;
+    /// `null` for none (only its tokens authenticate it then).
+    #[serde(default, deserialize_with = "double_option")]
+    pub realm: Option<Option<String>>,
 }
 
-/// `GET /admin/users`
-pub async fn list(State(state): State<AppState>) -> Response {
+/// `GET /admin/users`, or `?kind=user` / `?kind=service` for the accounts of
+/// that kind alone.
+pub async fn list(State(state): State<AppState>, Query(query): Query<ListUsers>) -> Response {
     let users = match user_dao::list_users(&state.pool).await {
         Ok(users) => users,
         Err(e) => return db_error(e),
     };
+    let users: Vec<AppUser> = users
+        .into_iter()
+        .filter(|u| query.kind.is_none_or(|kind| AccountKind::of(u) == kind))
+        .collect();
+    let details: std::collections::HashMap<i64, AccountDetails> =
+        match user_dao::account_details(&state.pool, None).await {
+            Ok(rows) => rows.into_iter().map(|d| (d.id, d)).collect(),
+            Err(e) => return db_error(e),
+        };
     let captured: std::collections::HashMap<i64, DateTime<Utc>> =
         match user_dao::captured_password_times(&state.pool).await {
             Ok(times) => times.into_iter().collect(),
@@ -295,6 +433,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
                 roles.remove(&u.id).unwrap_or_default(),
                 onboarding.get(&u.id),
                 invitations.get(&u.id),
+                details.get(&u.id),
             )
         })
         .collect();
@@ -302,9 +441,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
 }
 
 /// `POST /admin/users`: create an invited local account and invite its user
-/// (module docs), or an account of a credential-forwarding realm. **201**
-/// with the user and, for a local account, its invitation: whether the
-/// email went out, and the link when it did not.
+/// (module docs), an account of a credential-forwarding or trusted-header
+/// realm, or a service account. **201** with the user and, for a local
+/// account, its invitation: whether the email went out, and the link when it
+/// did not.
 pub async fn create(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -331,8 +471,42 @@ pub async fn create(
         },
         None => None,
     };
-    let account = match body.realm.as_deref() {
-        Some(realm) => {
+    let account = match (body.kind, body.realm.as_deref()) {
+        (AccountKind::Service, realm) => {
+            if email.is_some() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "a service account has no email address: nobody signs in to it",
+                )
+                    .into_response();
+            }
+            if body.role == AccessRole::Admin {
+                return service_account_admin_refused();
+            }
+            let description = match parse_description(body.description.as_deref()) {
+                Ok(description) => description,
+                Err(resp) => return resp,
+            };
+            let realm_id = match realm {
+                Some(realm) => match service_account_realm(&state, realm).await {
+                    Ok(id) => Some(id),
+                    Err(resp) => return resp,
+                },
+                None => None,
+            };
+            NewAccount::Service {
+                description,
+                realm_id,
+            }
+        }
+        (AccountKind::User, _) if body.description.is_some() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "only a service account has a description",
+            )
+                .into_response()
+        }
+        (AccountKind::User, Some(realm)) => {
             match forge_db::auth_realm_dao::find_realm_by_name(&state.pool, realm.trim()).await {
                 Ok(Some(r)) if r.kind == crate::auth::KIND_CRED_FORWARD => {
                     NewAccount::Forwarded { realm_id: r.id }
@@ -352,7 +526,7 @@ pub async fn create(
                 Err(e) => return db_error(e),
             }
         }
-        None => {
+        (AccountKind::User, None) => {
             // The invitation goes to the username unless told otherwise; a
             // UPN is not always a mailbox.
             let to = match &email {
@@ -394,7 +568,9 @@ pub async fn create(
                 Err(e) => return db_error(e),
             }
         }
-        NewAccount::Forwarded { .. } | NewAccount::TrustedHeader { .. } => None,
+        NewAccount::Forwarded { .. }
+        | NewAccount::TrustedHeader { .. }
+        | NewAccount::Service { .. } => None,
     };
     match UserView::load(&state, &u).await {
         Ok(user) => (
@@ -422,6 +598,21 @@ enum NewAccount {
     Forwarded { realm_id: i64 },
     /// An account of this trusted-header realm.
     TrustedHeader { realm_id: i64 },
+    /// A service account, of this trusted-header realm or of none.
+    Service {
+        description: Option<String>,
+        realm_id: Option<i64>,
+    },
+}
+
+/// The **400** to the `admin` role for a service account.
+pub(crate) fn service_account_admin_refused() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "a service account cannot hold the admin role; for admin automation, issue an \
+         administrator a token with the admin scope",
+    )
+        .into_response()
 }
 
 /// Insert the user (with `email` as its address) and assign it `role`'s
@@ -451,6 +642,13 @@ async fn insert_with_role(
                 invitation_dao::set_email(&mut *tx, user.id, email).await?;
             }
             user
+        }
+        NewAccount::Service {
+            description,
+            realm_id,
+        } => {
+            user_dao::insert_service_account(&mut *tx, username, description.as_deref(), *realm_id)
+                .await?
         }
     };
     if let Some(name) = role.role_name() {
@@ -572,17 +770,39 @@ pub async fn revoke_invitation(State(state): State<AppState>, Path(id): Path<i64
 /// only the flag.
 ///
 /// Deactivating the last active administrator is refused (**409**).
+///
+/// A service account's `description` and `realm` (the trusted-header realm
+/// that names it, or `null` for none) are set here too, before `active`; a
+/// user's are refused (**409**). A new realm names the account from the next
+/// request, and the one before stops naming it.
 pub async fn update(
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<UpdateUser>,
 ) -> Response {
-    let Some(active) = body.active else {
+    if body.active.is_none() && body.description.is_none() && body.realm.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            "nothing to update (expected {\"active\": true|false})",
+            "nothing to update (expected {\"active\": true|false}, or a service account's \
+             description or realm)",
         )
             .into_response();
+    }
+    if body.description.is_some() || body.realm.is_some() {
+        if let Err(resp) = update_service_account(&state, id, &body).await {
+            return resp;
+        }
+    }
+    let Some(active) = body.active else {
+        forge_core::authz::cache::invalidate_user(&state.cache, id).await;
+        return match user_dao::find_user_by_id(&state.pool, id).await {
+            Ok(Some(user)) => match UserView::load(&state, &user).await {
+                Ok(view) => Json(view).into_response(),
+                Err(resp) => resp,
+            },
+            Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
+            Err(e) => db_error(e),
+        };
     };
     let user = match set_active_guarded(&state, id, active).await {
         Ok(Some(u)) => u,
@@ -605,6 +825,56 @@ pub async fn update(
         Ok(view) => Json(view).into_response(),
         Err(resp) => resp,
     }
+}
+
+/// Set the `description` and `realm` a PATCH carries on the service account
+/// `id`, in one transaction: **404** for no account, **409** for a user's,
+/// **400** for a description or realm that is refused.
+async fn update_service_account(
+    state: &AppState,
+    id: i64,
+    body: &UpdateUser,
+) -> Result<(), Response> {
+    let user = match user_dao::find_user_by_id(&state.pool, id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "user not found").into_response()),
+        Err(e) => return Err(db_error(e)),
+    };
+    if !user.is_service_account() {
+        return Err((
+            StatusCode::CONFLICT,
+            "only a service account's description and realm are set here: a user's realm is \
+             how they sign in",
+        )
+            .into_response());
+    }
+    let description = match &body.description {
+        Some(description) => Some(parse_description(description.as_deref())?),
+        None => None,
+    };
+    let realm_id = match &body.realm {
+        Some(Some(realm)) => Some(Some(service_account_realm(state, realm).await?)),
+        Some(None) => Some(None),
+        None => None,
+    };
+    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    if let Some(description) = &description {
+        user_dao::set_service_account_description(&mut *tx, id, description.as_deref())
+            .await
+            .map_err(db_error)?;
+    }
+    if let Some(realm_id) = realm_id {
+        user_dao::set_service_account_realm(&mut *tx, id, realm_id)
+            .await
+            .map_err(db_error)?;
+    }
+    tx.commit().await.map_err(db_error)?;
+    tracing::info!(
+        user_id = id,
+        username = %user.username,
+        "service account updated"
+    );
+    Ok(())
 }
 
 /// `DELETE /admin/users/{id}` — delete the user (sessions, tokens, role
@@ -648,13 +918,22 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
 /// session that credential forwarding established are revoked as well (they
 /// rest on the same upstream verdict); tokens an administrator minted for the
 /// user are untouched. `204` on success (idempotent — a user with no cached
-/// verdicts, sessions or such tokens still returns `204`).
+/// verdicts, sessions or such tokens still returns `204`). **409** for a
+/// service account, which nobody signs in to: revoke its tokens or
+/// deactivate it instead.
 pub async fn reauth(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let user = match user_dao::find_user_by_id(&state.pool, id).await {
         Ok(Some(u)) => u,
         Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
         Err(e) => return db_error(e),
     };
+    if user.is_service_account() {
+        return (
+            StatusCode::CONFLICT,
+            "nobody signs in to a service account: revoke its tokens or deactivate it",
+        )
+            .into_response();
+    }
 
     if let Err(resp) = revoke_sessions_and_verdicts(&state, &user).await {
         return resp;

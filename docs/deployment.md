@@ -419,6 +419,62 @@ credential-forwarding account the next password is checked against the
 upstream again, and the tokens the user minted from a forwarded sign-in are
 revoked; tokens an administrator issued keep working.
 
+### Service accounts
+
+A CI pipeline, a build agent or a network the load balancer admits is no
+person, and should not have a person's account that someone could sign in
+to, invite or convert. Give it a **service account** (**Admin → Service
+accounts**, `/manage/service-accounts`): an account for a machine or a
+network that nobody signs in to.
+
+- **It has** a [username](#usernames) (a UPN, in the name space every
+  account shares, so a name always means one account), a description of
+  what it is for and who owns it, roles and grants like a user's, and an
+  access level of reader or writer.
+- **It never has** a password, an invitation or an email address, and
+  nobody signs in to it: the login screen, a password over HTTP Basic,
+  credential forwarding (its name is never forwarded upstream) and OIDC
+  (no identity is linked to it by name) all refuse it. **Sign out
+  everywhere**, invitations and the switch to a local account do not apply.
+- **It never holds the built-in `admin` role.** For admin automation, issue
+  an administrator a token with the `admin` scope instead.
+- **It authenticates** with the API tokens an administrator issues on its
+  page (each secret shown once; expiry, scope and revocation as for a
+  user's), and through the [trusted-header realm](#trusted-header-realms) it
+  belongs to, if any. A service account belongs to at most one such realm,
+  and only that realm may name it: another trusted-header realm, even one
+  that provisions accounts, gets a 401 for its name. No realm creates
+  service accounts.
+- **Deactivating it** (**Deactivate…** on its page) stops its tokens and its
+  realm from authenticating it; reactivating lets both work again. The list
+  shows when each service account was last used: its tokens' latest use, or
+  its realm's last request naming it.
+
+A CI pipeline that publishes packages: create `ci@example.com` as a writer
+(or with a role that grants `write` on its repositories), then issue it a
+token on its page, scoped to those repositories if you like, and store the
+token in the pipeline's secrets:
+
+```bash
+dotnet nuget push -s https://forge.example.com/repository/nuget/index.json \
+  -k "$FORGE_TOKEN" MyLib.1.2.3.nupkg
+```
+
+A network the load balancer admits, reading without credentials: create
+`office-lan@example.com` with the trusted-header realm of the load balancer
+as its realm, give it the grants the network should have, and let the load
+balancer name it for the network's clients (see the examples under
+[Trusted-header realms](#trusted-header-realms)).
+
+The admin API is the users API: `POST /admin/users` with `"kind":
+"service"`, the `username`, an optional `description` and `role` (`reader`
+or `writer`), and the optional `realm` (the name of a trusted-header realm).
+`GET /admin/users?kind=service` lists the service accounts; every user view
+carries `kind`, `description`, `realm` and `last_used_at`. `PATCH
+/admin/users/{id}` sets a service account's `description` and `realm`
+(`null` clears either) besides `active`. Tokens are
+`POST /admin/users/{id}/tokens`, roles `PUT /admin/users/{id}/roles`.
+
 ### Usernames
 
 Every account is named by a UPN, `local-part@domain` (`alice@example.com`):
@@ -458,6 +514,8 @@ The rule applies wherever an account is created:
   first request** (`auto_provision`) the realm creates a missing one;
   otherwise create each account under **Admin → Users** with the realm as its
   sign-in. A name that is no UPN is refused.
+- **[Service accounts](#service-accounts)**, under **Admin → Service
+  accounts**.
 
 ### Access and sign-in settings
 
@@ -848,20 +906,21 @@ balancer or reverse proxy in front of Forge names, in the style of
 `REMOTE_USER`. The proxy decides who gets which name:
 
 - an **SSO proxy** (oauth2-proxy, Authelia, …) names the person it signed in;
-- a **load balancer** names an account for a network or machines it admits
-  (`ci-runners@example.com`, `office-lan@example.com`), by source network,
-  mTLS or VPN. This is how a network reads without credentials: the load
-  balancer filters by network next to the rest of the network policy, and
-  Forge only checks the headers. Create the account under **Admin → Users**
-  with the realm as its sign-in and give it the grants the network should
-  have.
+- a **load balancer** names a [service account](#service-accounts) for a
+  network or machines it admits (`ci-runners@example.com`,
+  `office-lan@example.com`), by source network, mTLS or VPN. This is how a
+  network reads without credentials: the load balancer filters by network
+  next to the rest of the network policy, and Forge only checks the headers.
+  Create the service account under **Admin → Service accounts** with the
+  realm as its trusted-header realm, and give it the grants the network
+  should have. Only that realm may name it.
 
 | Config key | Meaning |
 | --- | --- |
 | `username_header` | The header naming the account, e.g. `X-Forwarded-User`. Its value is a UPN. |
 | `secret_header` | The header the proxy proves itself with, e.g. `X-Forge-Proxy-Secret`. |
 | `secret` | Its value, 16 to 1024 printable characters without spaces (`openssl rand -hex 32`, or **Generate a secret** in the form). Write-only and sealed at rest like the other realms' secrets; compared in constant time. |
-| `auto_provision` | Create a user's account on its first request when the realm has none of the name (off by default). |
+| `auto_provision` | Create a user's account on its first request when the realm has none of the name (off by default). It never creates a service account, nor takes over the name of one. |
 
 What Forge believes, and when:
 
@@ -878,7 +937,8 @@ What Forge believes, and when:
   with no, an empty, a repeated or an invalid name, a name of no account of
   the realm (without `auto_provision`), of a deactivated account, or of an
   account of another kind (local, OIDC, credential forwarding) or another
-  realm: the credentials are present but invalid, **401**, never anonymous.
+  realm, a service account of another realm or of none included: the
+  credentials are present but invalid, **401**, never anonymous.
   A realm never maps a name onto another source's account, and never
   creates or names the built-in `anonymous` principal.
 - The headers are an **ambient** credential: the proxy adds them to every
@@ -887,8 +947,11 @@ What Forge believes, and when:
   **never the `admin` role**: the admin API and minting tokens refuse it
   (403), and publishing packages or images takes an API token, which an
   administrator issues on the account's page (**Admin → Users → <user> →
-  Tokens**). State-changing requests a browser marks as cross-site are
-  refused (403) before authentication.
+  Tokens**, or **Admin → Service accounts → <account>**). State-changing
+  requests a browser marks as cross-site are refused (403) before
+  authentication.
+- When the realm last named each account is kept, written at most once a
+  minute: **Admin → Service accounts** shows it as the account's last use.
 - Forge answers every feed and registry request the headers authenticated
   with `Cache-Control: private, no-store`: no cache varies on the headers.
   Keep caches from overriding it, and do not let one between the proxy and
@@ -901,11 +964,11 @@ set them only for the clients it admits, the secret only together with a
 name. Most proxies replace a header they set; make sure they also drop the
 client's when they set none.
 
-nginx, admitting a network as an account (`proxy_set_header` replaces the
-client's header, and sends none for an empty value):
+nginx, admitting a network as a service account (`proxy_set_header`
+replaces the client's header, and sends none for an empty value):
 
 ```nginx
-# The networks admitted as an account, and the secret only with a name.
+# The networks admitted as a service account, and the secret only with a name.
 geo $forge_account {
     default         "";
     10.20.0.0/16    "ci-runners@example.com";

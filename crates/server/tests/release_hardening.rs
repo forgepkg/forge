@@ -541,6 +541,7 @@ async fn placeholder_bootstrap_password_is_detected() {
         active: true,
         auth_source: "local".into(),
         external_subject: None,
+        kind: "user".into(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

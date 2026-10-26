@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO app_user (username, password_hash, active, auth_source, realm_id)\n        VALUES ($1, NULL, true, 'trusted-header', $2)\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
+  "query": "\n        INSERT INTO app_user\n            (username, password_hash, active, auth_source, external_subject, realm_id)\n        VALUES ($1, NULL, $2, 'upstream-basic', $3, $4)\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, kind, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -95,6 +106,8 @@
     "parameters": {
       "Left": [
         "Text",
+        "Bool",
+        "Text",
         "Int8"
       ]
     },
@@ -106,8 +119,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "d7648f6e3d48835d1175e6a6c80d909afa2dc12e5dd0dd8da9d861861383c9ba"
+  "hash": "47d33c78d20475da145f14e201d96a74f0d2808751f975c7a8c9f416b345c3b2"
 }

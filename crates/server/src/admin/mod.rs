@@ -14,7 +14,8 @@
 //! * [`images`] — deleting a tag, a manifest or an image of a hosted
 //!   repository of images.
 //! * [`users`] — user CRUD: local accounts are invited to choose their
-//!   password ([`crate::invitations`]), never given one here.
+//!   password ([`crate::invitations`]), never given one here; service
+//!   accounts (#508) have none at all.
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
 //!   stored) + revoke + list.
 //! * [`members`] — group membership management.

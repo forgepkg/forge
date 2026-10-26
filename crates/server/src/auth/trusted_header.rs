@@ -26,13 +26,20 @@
 //!   (401), never anonymous.
 //!
 //! ## The accounts
-//! A realm names only its own accounts: `auth_source = 'trusted-header'` with
-//! the realm as `realm_id` ([`forge_db::user_dao::find_trusted_header_user`]).
-//! An account of another kind (local, OIDC, credential forwarding) or of
+//! A realm names only its own accounts, with the realm as `realm_id`
+//! ([`forge_db::user_dao::find_trusted_header_user`]): users
+//! (`auth_source = 'trusted-header'`), the people an SSO proxy signs in, and
+//! service accounts (#508), the networks or machines a load balancer admits.
+//! An account of another source (local, OIDC, credential forwarding) or of
 //! another realm is never mapped onto, whatever its name. With
-//! `auto_provision` the realm creates a missing account on its first request;
-//! otherwise an administrator creates it (`POST /admin/users` with the realm).
-//! The built-in `anonymous` principal is never one of them.
+//! `auto_provision` the realm creates a missing user's account on its first
+//! request; otherwise an administrator creates it (`POST /admin/users` with
+//! the realm). The realm never creates service accounts: an administrator
+//! creates each one with its realm (`"kind": "service"`). The built-in
+//! `anonymous` principal is never one of them. When the realm last
+//! authenticated an account is kept (`app_user.last_auth_source_at`, written
+//! at most once a minute), so the service accounts screen shows when each was
+//! last used.
 //!
 //! ## An ambient credential
 //! The proxy adds the headers to every request of a client it admits,
@@ -64,6 +71,10 @@ pub const MIN_SECRET_BYTES: usize = 16;
 
 /// Longest accepted `secret`, in bytes.
 const MAX_SECRET_BYTES: usize = 1024;
+
+/// An account's `last_auth_source_at` is written at most this often
+/// (seconds), so the requests of a busy account do not all write its row.
+const LAST_AUTHENTICATED_INTERVAL_SECS: i64 = 60;
 
 /// Headers that carry Forge's own credentials or routing: neither may be a
 /// realm's `username_header` or `secret_header`.
@@ -260,7 +271,7 @@ impl TrustedHeaderSource {
             _ => return refused("the username is empty, reserved or not valid", raw),
         };
         match user_dao::find_trusted_header_user(&self.pool, &username, realm.realm_id).await {
-            Ok(Some(user)) => self.signed_in(realm, &user),
+            Ok(Some(user)) => self.signed_in(realm, &user).await,
             Ok(None) if realm.auto_provision => self.provision(realm, &username).await,
             Ok(None) => refused("no account of the realm has this name", &username),
             Err(e) => {
@@ -291,14 +302,14 @@ impl TrustedHeaderSource {
                     username = %user.username,
                     "trusted-header realm created an account"
                 );
-                self.signed_in(realm, &user)
+                self.signed_in(realm, &user).await
             }
             // Not a UPN, which every account is named by.
             Err(sqlx::Error::InvalidArgument(_)) => refused("the username is no UPN"),
             Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
                 match user_dao::find_trusted_header_user(&self.pool, username, realm.realm_id).await
                 {
-                    Ok(Some(user)) => self.signed_in(realm, &user),
+                    Ok(Some(user)) => self.signed_in(realm, &user).await,
                     Ok(None) => refused("the name belongs to an account of another kind or realm"),
                     Err(e) => {
                         tracing::warn!(realm = %realm.name, error = %e, "trusted-header account lookup failed");
@@ -313,7 +324,7 @@ impl TrustedHeaderSource {
         }
     }
 
-    fn signed_in(&self, realm: &TrustedHeaderRealm, user: &AppUser) -> SourceOutcome {
+    async fn signed_in(&self, realm: &TrustedHeaderRealm, user: &AppUser) -> SourceOutcome {
         if !user.active {
             tracing::warn!(
                 realm = %realm.name,
@@ -321,6 +332,17 @@ impl TrustedHeaderSource {
                 "trusted-header credentials refused: the account is deactivated"
             );
             return SourceOutcome::Invalid;
+        }
+        // Best effort: when the account was last used is for the admin
+        // screens, and never fails the request.
+        if let Err(e) = user_dao::touch_last_authenticated(
+            &self.pool,
+            user.id,
+            LAST_AUTHENTICATED_INTERVAL_SECS,
+        )
+        .await
+        {
+            tracing::debug!(error = %e, user_id = user.id, "touch_last_authenticated failed");
         }
         SourceOutcome::Authenticated(Principal::User {
             user_id: user.id,

@@ -423,7 +423,11 @@ function Members({ role }: { role: RoleView }) {
                   <span className="fg-cell-user">
                     <Avatar name={m.username} decorative />
                     <Link
-                      to="/manage/users/$userId"
+                      to={
+                        m.auth_source === 'service'
+                          ? '/manage/service-accounts/$userId'
+                          : '/manage/users/$userId'
+                      }
                       params={{ userId: String(m.id) }}
                       className="fg-link-strong"
                     >

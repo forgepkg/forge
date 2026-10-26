@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        UPDATE app_user\n        SET active = $2,\n            updated_at = CASE WHEN active <> $2 THEN now() ELSE updated_at END\n        WHERE id = $1\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
+  "query": "\n        INSERT INTO app_user\n            (username, password_hash, active, auth_source, kind, description, realm_id)\n        VALUES ($1, NULL, true, 'service', 'service', $2, $3)\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, kind, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -94,8 +105,9 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Bool"
+        "Text",
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
@@ -106,8 +118,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "040f6e45a65af808db116285add373284dfa036b4e6b561a8f1076411cc6300d"
+  "hash": "4da6ae410e5c4930250a64a0f5c7462a95656980aca1d60f3562e2016037413a"
 }

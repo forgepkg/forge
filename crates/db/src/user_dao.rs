@@ -68,7 +68,7 @@ where
         VALUES ($1, $2, $3, $4, $5)
         RETURNING
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         "#,
         username,
         new.password_hash,
@@ -110,7 +110,7 @@ where
         VALUES ($1, NULL, $2, 'upstream-basic', $3, $4)
         RETURNING
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         "#,
         username,
         active,
@@ -139,7 +139,7 @@ pub async fn find_upstream_user(
         r#"
         SELECT
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         FROM app_user
         WHERE username = $1
           AND auth_source = 'upstream-basic'
@@ -176,7 +176,7 @@ where
         VALUES ($1, NULL, true, 'trusted-header', $2)
         RETURNING
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         "#,
         username,
         realm_id,
@@ -186,9 +186,10 @@ where
 }
 
 /// Find the account the trusted-header realm `realm_id` names `username`: a
-/// `'trusted-header'` account of exactly that realm that is not an orphan of a
-/// deleted realm. A same-named account of another kind or realm is never
-/// returned (`None` ⇒ deny).
+/// `'trusted-header'` account or a service account
+/// ([`insert_service_account`]) of exactly that realm, that is not an orphan
+/// of a deleted realm. A same-named account of another source or realm is
+/// never returned (`None` ⇒ deny).
 pub async fn find_trusted_header_user(
     pool: &PgPool,
     username: &str,
@@ -202,10 +203,10 @@ pub async fn find_trusted_header_user(
         r#"
         SELECT
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         FROM app_user
         WHERE username = $1
-          AND auth_source = 'trusted-header'
+          AND auth_source IN ('trusted-header', 'service')
           AND NOT realm_orphaned
           AND realm_id = $2
         "#,
@@ -214,6 +215,166 @@ pub async fn find_trusted_header_user(
     )
     .fetch_optional(pool)
     .await
+}
+
+/// `app_user.kind` of a service account: an account for a machine or a
+/// network rather than a person, which nobody signs in to.
+pub const SERVICE_ACCOUNT_KIND: &str = "service";
+
+/// Create a service account (#508): an account for a machine or a network
+/// (a CI pipeline, a build agent, a network the load balancer admits) that
+/// nobody signs in to. It has no password, invitation or email
+/// (`auth_source = 'service'`, DB CHECK `app_user_service_account_check`),
+/// and authenticates with the API tokens an administrator issues for it, or
+/// through the trusted-header realm `realm_id` when it belongs to one, which
+/// alone may name it ([`find_trusted_header_user`]). `description` says what
+/// it is for and who owns it.
+///
+/// The username is a UPN in the name space of every account, refused like
+/// [`insert_user`]'s otherwise; a name another account holds is a unique
+/// violation. A realm that is not a trusted-header one is a check violation.
+pub async fn insert_service_account<'e, E>(
+    executor: E,
+    username: &str,
+    description: Option<&str>,
+    realm_id: Option<i64>,
+) -> sqlx::Result<AppUser>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let username = canonical_account_username(username, false)
+        .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
+    sqlx::query_as!(
+        AppUser,
+        r#"
+        INSERT INTO app_user
+            (username, password_hash, active, auth_source, kind, description, realm_id)
+        VALUES ($1, NULL, true, 'service', 'service', $2, $3)
+        RETURNING
+            id, username, password_hash, active,
+            auth_source, external_subject, kind, created_at, updated_at
+        "#,
+        username,
+        description,
+        realm_id,
+    )
+    .fetch_one(executor)
+    .await
+}
+
+/// Set what the service account `user_id` is for; `None` clears it. Returns
+/// whether such a service account exists.
+pub async fn set_service_account_description<'e, E>(
+    executor: E,
+    user_id: i64,
+    description: Option<&str>,
+) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let res = sqlx::query!(
+        r#"
+        UPDATE app_user
+        SET description = $2,
+            updated_at = now()
+        WHERE id = $1 AND kind = 'service'
+        "#,
+        user_id,
+        description,
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Move the service account `user_id` to the trusted-header realm `realm_id`
+/// (`None`: to no realm, so only its tokens authenticate it). The realm it
+/// belonged to stops naming it at once; an orphan of a deleted realm is
+/// adopted. Returns whether such a service account exists; a realm that is
+/// not a trusted-header one is a check violation.
+pub async fn set_service_account_realm<'e, E>(
+    executor: E,
+    user_id: i64,
+    realm_id: Option<i64>,
+) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let res = sqlx::query!(
+        r#"
+        UPDATE app_user
+        SET realm_id = $2,
+            realm_orphaned = false,
+            updated_at = now()
+        WHERE id = $1 AND kind = 'service'
+        "#,
+        user_id,
+        realm_id,
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// What the admin views show of an account besides its [`AppUser`] row.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AccountDetails {
+    pub id: i64,
+    /// What a service account is for and who owns it.
+    pub description: Option<String>,
+    /// The realm the account belongs to, unless it was deleted.
+    pub realm_id: Option<i64>,
+    pub realm: Option<String>,
+    /// When the account last authenticated: the latest use of one of its
+    /// API tokens, or the last request a trusted-header realm named it in
+    /// ([`touch_last_authenticated`]).
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The [`AccountDetails`] of every account, or of `user_id` alone.
+pub async fn account_details(
+    pool: &PgPool,
+    user_id: Option<i64>,
+) -> sqlx::Result<Vec<AccountDetails>> {
+    sqlx::query_as(
+        r#"
+        SELECT u.id, u.description, r.id AS realm_id, r.name AS realm,
+               GREATEST(u.last_auth_source_at, max(t.last_used_at)) AS last_used_at
+        FROM app_user u
+        LEFT JOIN auth_realm r ON r.id = u.realm_id
+        LEFT JOIN token t ON t.user_id = u.id
+        WHERE $1::bigint IS NULL OR u.id = $1
+        GROUP BY u.id, r.id
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Record that a trusted-header realm just authenticated `user_id`
+/// (`app_user.last_auth_source_at`): written only when the last write is
+/// older than `min_age_secs`, so the requests of a busy account do not all
+/// write its row.
+pub async fn touch_last_authenticated(
+    pool: &PgPool,
+    user_id: i64,
+    min_age_secs: i64,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE app_user
+        SET last_auth_source_at = now()
+        WHERE id = $1
+          AND (last_auth_source_at IS NULL
+               OR last_auth_source_at < now() - make_interval(secs => $2))
+        "#,
+        user_id,
+        min_age_secs as f64,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Find a user by their unique username (compared in canonical form, so
@@ -227,7 +388,7 @@ pub async fn find_user_by_username(pool: &PgPool, username: &str) -> sqlx::Resul
         r#"
         SELECT
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         FROM app_user
         WHERE username = $1
         "#,
@@ -244,7 +405,7 @@ pub async fn find_user_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<AppU
         r#"
         SELECT
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         FROM app_user
         WHERE id = $1
         "#,
@@ -261,7 +422,7 @@ pub async fn list_users(pool: &PgPool) -> sqlx::Result<Vec<AppUser>> {
         r#"
         SELECT
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         FROM app_user
         ORDER BY username
         "#,
@@ -291,7 +452,7 @@ where
         WHERE id = $1
         RETURNING
             id, username, password_hash, active,
-            auth_source, external_subject, created_at, updated_at
+            auth_source, external_subject, kind, created_at, updated_at
         "#,
         id,
         active,
