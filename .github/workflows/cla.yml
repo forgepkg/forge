@@ -22,10 +22,10 @@ jobs:
   cla:
     name: cla
     runs-on: ubuntu-latest
-    # Pull requests opened by members of the forgepkg organization (including
-    # the commits Claude Code authors for them) or by Dependabot need no
-    # signature. On anyone else's pull request a commit authored by `claude`
-    # blocks the check: AI-agent commits must be re-authored by the
+    # Pull requests opened by members of the forgepkg organization or by
+    # Dependabot need no signature. On anyone else's pull request the commits
+    # of Copilot and Claude pass (see `allowlist`), while a commit by any
+    # other AI agent blocks the check: it must be re-authored by the
     # contributor (CONTRIBUTING.md). A member whose own commits land in such
     # a pull request signs once, like everyone else. Comments only trigger a
     # run when they sign or ask for a recheck.
@@ -48,8 +48,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Copilot cannot sign; human contributors still need to.
-          allowlist: 'Copilot,copilot-swe-agent[bot]'
+          # Copilot and Claude cannot sign; human contributors still need to.
+          # Claude Code commits as the user `claude`, the Claude GitHub App
+          # as `claude[bot]`.
+          allowlist: 'Copilot,copilot-swe-agent[bot],claude,claude[bot]'
           path-to-document: https://github.com/forgepkg/forge/blob/main/CLA.md
           # Bump the directory (version2, ...) when CLA.md changes materially,
           # so everyone signs the new text.
