@@ -123,7 +123,7 @@ export function ChartView({
       >
         <ManifestTable
           manifests={detail.manifests}
-          showSource={detail.repo_kind === 'group'}
+          repoKind={detail.repo_kind}
           onDelete={onDeleteManifest}
           deletePending={deletePending}
         />

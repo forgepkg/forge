@@ -231,7 +231,7 @@ function ImageDetailPage() {
       >
         <ManifestTable
           manifests={img.manifests}
-          showSource={img.repo_kind === 'group'}
+          repoKind={img.repo_kind}
           onDelete={askDelete && ((m) => askDelete({ kind: 'manifest', manifest: m }))}
           deletePending={del.isPending}
         />
