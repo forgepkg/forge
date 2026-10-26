@@ -30,7 +30,7 @@ use std::net::IpAddr;
 /// How a principal was authenticated / provisioned.
 ///
 /// The string forms match the `app_user.auth_source` column values
-/// (`'local'` | `'upstream-basic'` | `'oidc'`, see migration `0004`). Keeping
+/// (`'local'` | `'upstream-basic'` | `'oidc'`, see its CHECK constraint). Keeping
 /// the mapping here means the provider chain and the DB never disagree on the
 /// spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -119,7 +119,7 @@ pub struct ProvenIdentity {
     /// (`app_user.realm_id`). `None` for the built-in/static wiring.
     pub realm_id: Option<i64>,
     /// An argon2id hash of the presented password, set only when the vouching
-    /// realm keeps password hashes (`capture_password_hash`, migration 0035)
+    /// realm keeps password hashes (`capture_password_hash`)
     /// and this login asked the upstream, which accepted it (a cache hit
     /// carries none). The account keeps it
     /// ([`super::chain::provision_and_map`]). Always `None` for local.

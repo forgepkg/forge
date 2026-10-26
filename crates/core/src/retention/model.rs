@@ -1,6 +1,6 @@
 //! Retention policy model + validation (the `repository.retention_policy` jsonb).
 //!
-//! The shape mirrors the `0002_retention.sql` migration:
+//! The shape:
 //! a policy is a list of **rules**; a component is acted on if **any** rule
 //! selects it (union), but `keep_last_n` / `keep_n_most_downloaded` protections
 //! always win (a protected version is never deleted — see [`crate::retention::evaluate`]).

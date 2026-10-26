@@ -351,11 +351,6 @@ admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
 `repo.write` capability). A writer mints their own API tokens on the
 **Tokens** page; a token never carries more than its owner's rights.
 
-Migration 0042 adds `writer`. An install that already had a custom role named
-`writer` keeps it as `writer#<id>`, with its grants and members, and a
-workload-identity rule that named it names `writer#<id>` too; the migration
-logs a warning for each.
-
 ### Inviting users
 
 An administrator never sets another person's password. **Admin → Users →

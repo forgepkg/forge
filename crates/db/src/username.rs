@@ -10,7 +10,7 @@
 //! lowercased (and NFC again, since lowercasing can decompose). Empty names and
 //! names containing control characters are refused. Every DAO that stores or
 //! looks up a username canonicalizes it, and `app_user` carries a unique index
-//! on the canonical form (migration 0021), so no code path can create two
+//! on the canonical form, so no code path can create two
 //! accounts that differ only in case, spacing or Unicode composition.
 //!
 //! A name that signs in with a password must also fit in an HTTP Basic

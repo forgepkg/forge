@@ -2,7 +2,7 @@
 //! testcontainer.
 //!
 //! Covers what the realm runtime hinges on:
-//!   * migration 0010 seeds the built-in `local` realm;
+//!   * the schema seeds the built-in `local` realm;
 //!   * try-order is `priority` ascending and `reorder_realms` rewrites the
 //!     full order transactionally (the unique constraint is deferrable);
 //!   * `name` uniqueness and the slug CHECK surface as DB errors;
@@ -41,7 +41,7 @@ async fn migration_seeds_builtin_local_realm() {
     let local = auth_realm_dao::find_realm_by_name(&pool, "local")
         .await
         .expect("query")
-        .expect("local realm seeded by migration 0010");
+        .expect("local realm seeded by the schema");
     assert_eq!(local.kind, "local");
     assert!(local.enabled);
     assert!(auth_realm_dao::kind_exists(&pool, "local")

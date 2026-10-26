@@ -356,8 +356,6 @@ Unicode-NFC-normalized and lowercased, and names that are empty or contain
 control characters are refused. `Alice`, `alice` and ` alice ` are one
 account everywhere — login, the lockout, the credential cache, provisioning —
 and the database enforces it with a unique index on the canonical form.
-Migration 0021 canonicalizes existing accounts; where two collide, the oldest
-keeps the name and the others are renamed `<name>#<id>` (logged as a warning).
 A name that signs in with a password must not contain `:`: HTTP Basic splits
 at the first colon, so neither a feed client nor a forwarding realm's upstream
 could carry it. Form login answers such a name with 401, and admin user
@@ -408,7 +406,7 @@ cache keeps only a peppered HMAC that expires with the TTL. To be able to
 switch the upstream off later without asking every user for a new password,
 check **Keep a password hash of successful logins** on the realm
 (`"capture_password_hash": true`). Every login the upstream accepts then keeps
-an argon2id hash of that password on the user's account (migration 0035). It
+an argon2id hash of that password on the user's account. It
 is refreshed whenever a login actually asks the upstream (once per
 `positive_ttl_secs` per credential), never on a cache hit and never for a
 rejected password, so it is the last password the upstream accepted. The hash
@@ -751,6 +749,12 @@ server hashes its bootstrap admin password.
 
 - `cargo xtask down` stops the containers but **keeps** the Postgres volume. To
   wipe all state (start fresh): `docker compose down -v`.
+- **`the database was created by Forge 1.x or by a build before 2.0.0`** — the
+  schema started over at one migration in 2.0.0, and a database an earlier
+  build migrated is refused (`cargo xtask migrate` and `prepare`, which run
+  sqlx-cli, say "migration 1 was previously applied but has been modified").
+  Start fresh: `docker compose down -v` with `--db docker`, or drop and
+  recreate the `forge` database with `--db local`.
 - **Port 5432 already in use / `role "forge" does not exist`** — you have another
   Postgres on 5432. The dev DB is intentionally mapped to **5433** to avoid this;
   if the server still connects to the wrong one, check `forge.toml`'s

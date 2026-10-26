@@ -1247,7 +1247,7 @@ async fn a_reorder_waits_for_a_realm_change_instead_of_deadlocking() {
 }
 
 /// A credential-forwarding realm that keeps password hashes
-/// (`capture_password_hash`, migration 0035): an accepted login keeps one,
+/// (`capture_password_hash`): an accepted login keeps one,
 /// turning the option off deletes them, `captured_password_only` signs the
 /// accounts in with them while the upstream is never asked, and the accounts
 /// can then be switched to local ones that keep signing in with the same

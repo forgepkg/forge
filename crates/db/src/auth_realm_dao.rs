@@ -8,7 +8,7 @@
 //!
 //! `config` may contain secrets (OIDC `client_secret`, credential-forwarding
 //! `key_pepper`). This module moves the jsonb around opaquely; redaction is the
-//! API layer's job. Encryption at rest (`secrets_enc`, migration 0016) goes
+//! API layer's job. Encryption at rest (`secrets_enc`) goes
 //! through [`crate::secret_dao`]'s realm helpers, which call
 //! [`update_realm_and_secrets`] here.
 
@@ -115,7 +115,7 @@ pub async fn kind_exists(pool: &PgPool, kind: &str) -> sqlx::Result<bool> {
 
 /// The next free priority slot (max + 10, so manual inserts between rows stay
 /// possible). `10` on an empty table — though the table is never empty in
-/// practice (migration 0010 seeds the `local` row).
+/// practice (the schema seeds the `local` row).
 pub async fn next_priority(pool: &PgPool) -> sqlx::Result<i32> {
     let max: Option<i32> = sqlx::query_scalar!(r#"SELECT max(priority) FROM auth_realm"#)
         .fetch_one(pool)

@@ -1,4 +1,4 @@
-//! Short-lived workload API keys (migration 0034): the trusted-publishing
+//! Short-lived workload API keys (`workload_api_key`): the trusted-publishing
 //! token exchange stores one row per redeemed CI token.
 //!
 //! Only SHA-256 digests are stored. The unique `(issuer_sha256, jti_sha256)`

@@ -1,7 +1,7 @@
 //! Integration tests for the cached authorization seam.
 //!
 //! These drive the real [`Authz`] service (cache → DB) against a Postgres
-//! testcontainer with the seeded built-in roles from migration 0005 plus
+//! testcontainer with the built-in roles the schema seeds plus
 //! per-test roles/grants/users. They prove:
 //!
 //! * the principal × repo × level **matrix** through the cached seam matches

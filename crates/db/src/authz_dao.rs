@@ -29,7 +29,7 @@ pub const ANONYMOUS_ROLE: &str = "anonymous";
 /// The fixed slug of the built-in `authenticated` role (level `write` on
 /// every repository), for an administrator to assign.
 pub const AUTHENTICATED_ROLE: &str = "authenticated";
-/// The fixed slug of the built-in `writer` role (migration 0042): level
+/// The fixed slug of the built-in `writer` role: level
 /// `write` on every repository, to read and publish packages without deleting
 /// them or any right to administer the instance.
 pub const WRITER_ROLE: &str = "writer";
@@ -185,10 +185,10 @@ pub async fn load_user_effective(pool: &PgPool, user_id: i64) -> sqlx::Result<Ef
 /// Load the effective set applied to anonymous callers: exactly the grants of
 /// the built-in `anonymous` role. Anonymous principals are never admin.
 ///
-/// On a fresh / un-migrated install the `anonymous` role has no grants, so this
-/// returns an empty set (deny-all) — anonymous access is opened by granting the
-/// `anonymous` role `read` on specific repos (migration 0007 converted each
-/// repository's `anonymous_read` flag into exactly these grants).
+/// On a fresh install the `anonymous` role has no grants, so this returns an
+/// empty set (deny-all) — anonymous access is opened by granting the
+/// `anonymous` role `read` on specific repos (or by a repository's
+/// `anonymous_read` flag, which the seam honours next to these grants).
 pub async fn load_anonymous_effective(pool: &PgPool) -> sqlx::Result<EffectiveRows> {
     let rows = sqlx::query!(
         r#"
@@ -1041,16 +1041,14 @@ where
     Ok(result.rows_affected() > 0)
 }
 
-/// Delete the unscoped `(anonymous role, repository, read)` grant — the grant
-/// migration 0007 synthesized from `repository.anonymous_read` — for
+/// Delete the unscoped `(anonymous role, repository, read)` grant for
 /// `repository_id`. Returns whether a row was removed. A higher level the
 /// anonymous role was given there explicitly stays.
 ///
 /// Called in the same transaction that turns a repository's `anonymous_read`
-/// off: the seam honours the flag *and* the grant, so leaving the synthesized
-/// grant behind would keep the repository anonymously readable. Selector-scoped
-/// anonymous grants are not touched (migration 0007 never creates those; they
-/// can only come from an explicit RBAC edit).
+/// off: the seam honours the flag *and* the grant, so leaving the grant
+/// behind would keep the repository anonymously readable. Selector-scoped
+/// anonymous grants are not touched.
 pub async fn delete_anonymous_read_grant<'e, E>(
     executor: E,
     repository_id: i64,

@@ -70,9 +70,8 @@
 //!
 //! With `capture_password_hash` set, a login that asked the upstream and was
 //! accepted also carries an argon2id hash of the password on its
-//! [`ProvenIdentity`], which the account keeps (migration
-//! 0035) so an administrator can later switch the account to a local one and
-//! retire the upstream. A cache hit carries none: the hash is refreshed once
+//! [`ProvenIdentity`], which the account keeps so an administrator can later
+//! switch the account to a local one and retire the upstream. A cache hit carries none: the hash is refreshed once
 //! per positive-TTL window, like the verdict. Hashing never queues for an
 //! argon2 slot ([`PasswordHashLimiter::try_hash`]); when none is free the
 //! login goes ahead without a hash and a later one keeps it.

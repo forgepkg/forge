@@ -2950,8 +2950,8 @@ async fn repository_and_realm_bodies_reject_unknown_fields() {
 }
 
 /// M20: turning `anonymous_read` off also deletes the anonymous role's
-/// unscoped read grant on the repository (what migration 0007 synthesized),
-/// while an update that leaves the flag off does not touch explicit grants.
+/// unscoped read grant on the repository, while an update that leaves the
+/// flag off does not touch explicit grants.
 #[tokio::test]
 async fn anonymous_read_off_deletes_the_synthesized_grant() {
     let srv = common::start_with(
@@ -2984,7 +2984,7 @@ async fn anonymous_read_off_deletes_the_synthesized_grant() {
         }
     };
 
-    // An upgraded repository: the flag plus the grant 0007 synthesized from it.
+    // A repository both the flag and an anonymous read grant open.
     let public = format!("anonoff{}", common::unique());
     let resp = client
         .post(format!("{}/admin/repositories", srv.base_url))

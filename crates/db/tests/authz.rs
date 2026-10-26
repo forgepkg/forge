@@ -2,7 +2,7 @@
 //! Postgres testcontainer.
 //!
 //! These exercise the effective-set loader end-to-end against the seeded
-//! built-in roles from migration 0005 plus per-test users/roles/grants/selectors.
+//! built-in roles the schema seeds plus per-test users/roles/grants/selectors.
 //! Tests isolate themselves with `unique()` suffixes on every name so they run
 //! in parallel against the shared schema.
 

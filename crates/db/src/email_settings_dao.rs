@@ -1,4 +1,4 @@
-//! Data access for `email_settings` (migration 0043): the one row of the
+//! Data access for `email_settings`: the one row of the
 //! email service's settings, written in the admin UI only.
 //!
 //! `config` is the non-secret document. The transport's secrets are sealed

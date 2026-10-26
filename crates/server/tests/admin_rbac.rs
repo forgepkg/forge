@@ -1357,8 +1357,7 @@ async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role(
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
-    // The anonymous role's read grant on the repository (what migration 0007
-    // synthesized for repositories that were anonymous-readable).
+    // The anonymous role's read grant on the repository, next to the flag.
     let anon_role = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")
         .await
         .unwrap()

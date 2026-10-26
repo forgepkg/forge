@@ -1,17 +1,16 @@
 //! Integration test: spin up a real Postgres in a container, run the migrations,
-//! and assert every expected table exists.
+//! and assert every expected table exists; and refuse a database an earlier
+//! build created.
 //!
 //! Requires Docker to be available on the host running the test.
 
 use sqlx::Row;
 use testcontainers_modules::{
     postgres::Postgres,
-    testcontainers::{runners::AsyncRunner, ImageExt},
+    testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt},
 };
 
-/// Every table the migrations are expected to create. The unlabelled head of
-/// the list comes from `0001_init.sql`; every later group is labelled with the
-/// migration that creates it.
+/// Every table the migrations are expected to create, grouped by domain.
 const EXPECTED_TABLES: &[&str] = &[
     "repository",
     "group_member",
@@ -24,47 +23,43 @@ const EXPECTED_TABLES: &[&str] = &[
     "proxy_upstream_index",
     "app_user",
     "token",
-    // 0002_retention.sql
+    // retention
     "retention_run",
     "retention_audit",
-    // 0003_oidc.sql
+    // OIDC login
     "external_identity",
     "session",
     "oidc_flow",
-    // 0004_credforward.sql
+    // credential forwarding
     "validated_credential",
-    // 0014_validated_credential_tags.sql
     "validated_credential_tag",
-    // 0015_auth_success.sql
     "auth_success",
-    // 0005_rbac.sql (its `privilege` table is dropped by 0046)
+    // RBAC
     "role",
     "content_selector",
     "repository_privilege",
     "user_role",
-    // 0012_trusted_publish_audit.sql
+    // trusted publishing
     "trusted_publish_audit",
-    // 0049_trusted_publishers.sql
     "trusted_publisher",
     "workload_api_key_trusted_publisher",
 ];
 
-/// Columns `0004_credforward.sql` adds to `app_user` (provenance): (table, column).
+/// The credential-forwarding provenance columns of `app_user`: (table, column).
 const EXPECTED_CREDFORWARD_COLUMNS: &[(&str, &str)] = &[
     ("app_user", "auth_source"),
     ("app_user", "external_subject"),
     ("app_user", "last_auth_source_at"),
 ];
 
-/// Unique constraints `0003_oidc.sql` is expected to enforce: (table, columns).
+/// Unique constraints the OIDC login tables are expected to enforce: (table, columns).
 /// We assert these by attempting a duplicate insert below.
 const _OIDC_UNIQUE_DOC: &[(&str, &str)] = &[
     ("external_identity", "(issuer, subject)"),
     ("session", "(token_hash)"),
 ];
 
-/// Columns `0002_retention.sql` adds to the `0001_init.sql` tables:
-/// (table, column).
+/// The retention columns of the repository and content tables: (table, column).
 const EXPECTED_RETENTION_COLUMNS: &[(&str, &str)] = &[
     ("repository", "retention_policy"),
     ("repository", "retention_last_run_at"),
@@ -76,35 +71,8 @@ const EXPECTED_RETENTION_COLUMNS: &[(&str, &str)] = &[
 
 #[tokio::test]
 async fn migrations_create_all_expected_tables() {
-    // Start a throwaway Postgres 17 container matching docker-compose (db/user/pw = forge)
-    // — or, with FORGE_TEST_DATABASE_URL (no Docker), a fresh empty database
-    // on that server.
-    let (url, _container) = match std::env::var("FORGE_TEST_DATABASE_URL") {
-        Ok(admin_url) => (fresh_external_database(&admin_url).await, None),
-        Err(_) => {
-            let container = Postgres::default()
-                .with_db_name("forge")
-                .with_user("forge")
-                .with_password("forge")
-                .with_name("mirror.gcr.io/library/postgres")
-                .with_tag("17")
-                .start()
-                .await
-                .expect("failed to start postgres testcontainer (is Docker running?)");
-            let host = container
-                .get_host()
-                .await
-                .expect("failed to get container host");
-            let port = container
-                .get_host_port_ipv4(5432)
-                .await
-                .expect("failed to get mapped port");
-            (
-                format!("postgres://forge:forge@{host}:{port}/forge"),
-                Some(container),
-            )
-        }
-    };
+    let (server, _container) = server().await;
+    let url = fresh_database(&server, "migrations").await;
 
     let pool = forge_db::connect(&url).await.expect("failed to connect");
     forge_db::migrate(&pool).await.expect("migrations failed");
@@ -130,7 +98,7 @@ async fn migrations_create_all_expected_tables() {
         );
     }
 
-    // Assert the retention columns added to `0001_init.sql` tables exist.
+    // Assert the retention columns exist.
     for (table, column) in EXPECTED_RETENTION_COLUMNS {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (\
@@ -146,11 +114,11 @@ async fn migrations_create_all_expected_tables() {
 
         assert!(
             exists,
-            "expected column `{table}.{column}` to exist after the retention migration"
+            "expected column `{table}.{column}` to exist for retention"
         );
     }
 
-    // Assert the credential-forwarding provenance columns exist (0004).
+    // Assert the credential-forwarding provenance columns exist.
     for (table, column) in EXPECTED_CREDFORWARD_COLUMNS {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (\
@@ -166,11 +134,12 @@ async fn migrations_create_all_expected_tables() {
 
         assert!(
             exists,
-            "expected column `{table}.{column}` to exist after the credforward migration"
+            "expected column `{table}.{column}` to exist for credential forwarding"
         );
     }
 
-    // `app_user.password_hash` must now be NULLABLE (0004 dropped NOT NULL).
+    // `app_user.password_hash` is NULLABLE: an account of another realm has no
+    // local password.
     let password_hash_nullable: String = sqlx::query_scalar(
         "SELECT is_nullable FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = 'app_user' \
@@ -181,7 +150,7 @@ async fn migrations_create_all_expected_tables() {
     .expect("failed to query password_hash nullability");
     assert_eq!(
         password_hash_nullable, "YES",
-        "app_user.password_hash should be nullable after 0004"
+        "app_user.password_hash should be nullable"
     );
 
     // `repository.retention_policy` is jsonb and accepts a well-formed policy
@@ -238,7 +207,7 @@ async fn migrations_create_all_expected_tables() {
     .expect("retention_audit row should be insertable");
 
     // -----------------------------------------------------------------------
-    // 0003_oidc.sql: external_identity / session / oidc_flow round-trips
+    // OIDC login: external_identity / session / oidc_flow round-trips
     // -----------------------------------------------------------------------
 
     // A user to attach an external identity + session to.
@@ -337,18 +306,18 @@ async fn migrations_create_all_expected_tables() {
     );
 
     // -----------------------------------------------------------------------
-    // 0004_credforward.sql: app_user provenance + validated_credential
+    // Credential forwarding: app_user provenance + validated_credential
     // -----------------------------------------------------------------------
 
-    // Existing rows backfilled to auth_source = 'local' via the DEFAULT.
-    let backfilled: String =
+    // A row inserted without auth_source is 'local' (the DEFAULT).
+    let auth_source: String =
         sqlx::query_scalar("SELECT auth_source FROM app_user WHERE username = 'oidc-user'")
             .fetch_one(&pool)
             .await
-            .expect("read backfilled auth_source");
+            .expect("read default auth_source");
     assert_eq!(
-        backfilled, "local",
-        "existing app_user rows backfill to auth_source = 'local'"
+        auth_source, "local",
+        "app_user.auth_source defaults to 'local'"
     );
 
     // CHECK app_user_local_password_hash_check: a 'local' user with a NULL
@@ -443,10 +412,10 @@ async fn migrations_create_all_expected_tables() {
     );
 
     // -----------------------------------------------------------------------
-    // 0005_rbac.sql: seeded built-in roles + grants, as levels since 0046
+    // RBAC: the seeded built-in roles and their grants
     // -----------------------------------------------------------------------
 
-    // 0046 dropped the action vocabulary: a grant gives a level.
+    // A grant gives a level: there is no vocabulary of verbs.
     let privilege: Option<String> = sqlx::query_scalar("SELECT to_regclass('privilege')::text")
         .fetch_one(&pool)
         .await
@@ -472,8 +441,8 @@ async fn migrations_create_all_expected_tables() {
         );
     }
 
-    // The three built-in roles exist and are flagged builtin = true.
-    for name in ["admin", "authenticated", "anonymous"] {
+    // The four built-in roles exist and are flagged builtin = true.
+    for name in ["admin", "authenticated", "anonymous", "writer"] {
         let builtin: bool = sqlx::query_scalar("SELECT builtin FROM role WHERE name = $1")
             .bind(name)
             .fetch_one(&pool)
@@ -489,8 +458,7 @@ async fn migrations_create_all_expected_tables() {
     assert!(dup_role.is_err(), "role.name must be UNIQUE");
 
     // Seeded grants: admin has none (administration is the role itself);
-    // authenticated has (ANY, write); anonymous has none (the data migration
-    // adds its grants).
+    // authenticated and writer have (ANY, write); anonymous has none.
     let admin_grants: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
          WHERE r.name = 'admin'",
@@ -513,6 +481,22 @@ async fn migrations_create_all_expected_tables() {
         "authenticated role holds (ANY, write)"
     );
 
+    // writer (#318): `write` (which includes `read`) on every repository and
+    // nothing else: no delete, no admin.
+    let writer_grants: Vec<(Option<i64>, Option<i64>, String)> = sqlx::query_as(
+        "SELECT rp.repository_id, rp.selector_id, rp.level \
+         FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+         WHERE r.name = 'writer'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read writer grants");
+    assert_eq!(
+        writer_grants,
+        vec![(None, None, "write".to_string())],
+        "writer role holds (ANY, write) only"
+    );
+
     let anon_grant_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
          WHERE r.name = 'anonymous'",
@@ -522,7 +506,7 @@ async fn migrations_create_all_expected_tables() {
     .expect("count anonymous grants");
     assert_eq!(
         anon_grant_count, 0,
-        "anonymous role seeds no grants in 0005_rbac.sql"
+        "the anonymous role is seeded without grants"
     );
 
     // The COALESCE-based unique index allows one grant per (role, ANY,
@@ -543,7 +527,7 @@ async fn migrations_create_all_expected_tables() {
         "repository_privilege_uq must allow one grant per (role, ANY, no-selector)"
     );
 
-    // 0013: issuer routing is unambiguous among enabled WIF realms, including
+    // Issuer routing is unambiguous among enabled WIF realms, including
     // raw rows that differ only by a trailing slash.
     sqlx::query(
         r#"INSERT INTO auth_realm (kind, name, enabled, priority, config)
@@ -568,16 +552,110 @@ async fn migrations_create_all_expected_tables() {
             assert_eq!(
                 error.constraint(),
                 Some("auth_realm_enabled_wif_issuer_uq"),
-                "0013's DB index, not only the API pre-check, must reject the duplicate"
+                "the DB index, not only the API pre-check, must reject the duplicate"
             );
         }
         other => panic!("expected unique-constraint error, got {other:?}"),
     }
 }
 
+/// 2.0.0's baseline replaced the migrations of 1.x and of the builds before
+/// it: a database they created is refused with a message that names the
+/// cause (sqlx alone would say "migration 1 was previously applied but has
+/// been modified"), and nothing is migrated. An empty database migrates, and
+/// one this build migrated migrates again.
+#[tokio::test]
+async fn a_database_of_an_earlier_build_is_refused() {
+    let (server, _container) = server().await;
+
+    let url = fresh_database(&server, "empty").await;
+    let pool = forge_db::connect(&url).await.expect("connect");
+    forge_db::migrate(&pool)
+        .await
+        .expect("an empty database migrates");
+    forge_db::migrate(&pool)
+        .await
+        .expect("a database this build migrated migrates again");
+
+    // What an earlier build recorded: version 49 (the last of 1.x and the
+    // builds before 2.0.0), or a version 1 of another content.
+    for (label, version) in [("v49", 49_i64), ("v1", 1)] {
+        let url = fresh_database(&server, label).await;
+        let pool = forge_db::connect(&url).await.expect("connect");
+        // sqlx's table, as sqlx creates it.
+        sqlx::raw_sql(
+            "CREATE TABLE _sqlx_migrations (
+                 version BIGINT PRIMARY KEY,
+                 description TEXT NOT NULL,
+                 installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 success BOOLEAN NOT NULL,
+                 checksum BYTEA NOT NULL,
+                 execution_time BIGINT NOT NULL
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create _sqlx_migrations");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES ($1, 'from an earlier build', true, sha384('an earlier schema'), 1)",
+        )
+        .bind(version)
+        .execute(&pool)
+        .await
+        .expect("record a migration of an earlier build");
+
+        let err = forge_db::migrate(&pool)
+            .await
+            .expect_err("a database of an earlier build is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("created by Forge 1.x or by a build before 2.0.0")
+                && message.contains("needs an empty database"),
+            "{label}: {message}"
+        );
+        let migrated: Option<String> = sqlx::query_scalar("SELECT to_regclass('repository')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("look up repository");
+        assert_eq!(migrated, None, "{label}: nothing is migrated");
+    }
+}
+
+/// A Postgres server for one test: a throwaway Postgres 17 container matching
+/// docker-compose (db/user/pw = forge), or, with FORGE_TEST_DATABASE_URL (no
+/// Docker), that server. Returns the URL of a database on it, and the
+/// container to keep alive.
+async fn server() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("FORGE_TEST_DATABASE_URL") {
+        return (url, None);
+    }
+    let container = Postgres::default()
+        .with_db_name("forge")
+        .with_user("forge")
+        .with_password("forge")
+        .with_name("mirror.gcr.io/library/postgres")
+        .with_tag("17")
+        .start()
+        .await
+        .expect("failed to start postgres testcontainer (is Docker running?)");
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get mapped port");
+    (
+        format!("postgres://forge:forge@{host}:{port}/forge"),
+        Some(container),
+    )
+}
+
 /// Create an empty, uniquely named database next to `admin_url`; return its URL.
-async fn fresh_external_database(admin_url: &str) -> String {
-    let name = format!("migrations_{}", std::process::id());
+async fn fresh_database(admin_url: &str, label: &str) -> String {
+    let name = format!("{label}_{}", std::process::id());
     let admin = forge_db::connect(admin_url).await.expect("connect admin");
     // The name is generated here, never user input.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))

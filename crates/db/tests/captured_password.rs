@@ -1,4 +1,4 @@
-//! Kept password hashes of credential-forwarding accounts (migration 0035):
+//! Kept password hashes of credential-forwarding accounts:
 //! where they may be stored, how a realm drops them, and how an account is
 //! switched to a local one with its kept password.
 

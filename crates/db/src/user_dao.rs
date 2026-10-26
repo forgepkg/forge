@@ -1,7 +1,5 @@
 //! Data access for `app_user`.
 
-use std::collections::HashSet;
-
 use sqlx::PgPool;
 
 use crate::model::AppUser;
@@ -270,12 +268,12 @@ pub async fn set_user_realm(pool: &PgPool, user_id: i64, realm_id: i64) -> sqlx:
 }
 
 /// The `credential_forwarding` realm config key that opts the realm in to
-/// keeping a password hash of the logins its upstream accepts (migration 0035).
+/// keeping a password hash of the logins its upstream accepts.
 pub const CAPTURE_PASSWORD_HASH_KEY: &str = "capture_password_hash";
 
 /// Keep `hash` — the argon2id PHC string of a password the upstream of realm
 /// `realm_id` just accepted for `user_id` — as the account's captured password
-/// (migration 0035). Returns whether it was stored.
+/// (`app_user.captured_password_hash`). Returns whether it was stored.
 ///
 /// Stored only while the realm opts in (`capture_password_hash`) and the
 /// account is still that realm's upstream account, and the realm row is
@@ -508,206 +506,4 @@ where
     .bind(realm_id)
     .fetch_all(executor)
     .await
-}
-
-/// `forge_setting` key prefix of the bootstrap admin's "created once" markers
-/// (the server's `BOOTSTRAP_ADMIN_CREATED_KEY`, followed by `:` and the
-/// username).
-const BOOTSTRAP_MARKER_PREFIX: &str = "bootstrap_admin_created:";
-
-/// An account renamed by [`canonicalize_stored_usernames`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsernameRepair {
-    pub id: i64,
-    pub from: String,
-    pub to: String,
-}
-
-/// Bring every stored username, and the bootstrap admin's markers, into the
-/// canonical form ([`canonical_username`]) that every lookup uses. Runs after
-/// the migrations ([`crate::migrate`]); a read-only scan when nothing needs
-/// fixing.
-///
-/// Migration 0021 canonicalized existing names in SQL, where `lower()` follows
-/// the database's collation (under a `C` ctype it lowercases ASCII only, so
-/// `Jürgen` became `jürgen` but `JÜRGEN` became `jÜrgen`) and `btrim` trims
-/// only ASCII spaces. Lookups match the Rust form exactly, so such an account
-/// could no longer sign in.
-///
-/// An account whose name is already canonical keeps it. Among the others that
-/// map to the same canonical name the oldest takes it while it is free, and
-/// the rest become `<canonical>#<id>` (with a further `#<n>` if even that is
-/// taken), as in 0021. Names without a canonical form (control characters,
-/// oversized) are left alone: they cannot sign in either way.
-pub async fn canonicalize_stored_usernames(pool: &PgPool) -> sqlx::Result<Vec<UsernameRepair>> {
-    if !needs_canonicalizing(pool).await? {
-        return Ok(Vec::new());
-    }
-    let mut tx = pool.begin().await?;
-    // Keep concurrent writers (and another instance doing the same repair)
-    // out until the renames commit.
-    sqlx::query!("LOCK TABLE app_user IN SHARE ROW EXCLUSIVE MODE")
-        .execute(&mut *tx)
-        .await?;
-    let rows = sqlx::query!("SELECT id, username FROM app_user ORDER BY id")
-        .fetch_all(&mut *tx)
-        .await?;
-    let repairs = plan_username_repairs(rows.into_iter().map(|r| (r.id, r.username)).collect());
-    // Two passes so neither unique index sees a transient duplicate.
-    for r in &repairs {
-        sqlx::query!(
-            "UPDATE app_user SET username = '~canonicalizing~' || id WHERE id = $1",
-            r.id
-        )
-        .execute(&mut *tx)
-        .await?;
-    }
-    for r in &repairs {
-        sqlx::query!(
-            "UPDATE app_user SET username = $2, updated_at = now() WHERE id = $1",
-            r.id,
-            r.to
-        )
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    let markers = sqlx::query_scalar!(
-        "SELECT key FROM forge_setting WHERE starts_with(key, $1)",
-        BOOTSTRAP_MARKER_PREFIX
-    )
-    .fetch_all(&mut *tx)
-    .await?;
-    for key in markers {
-        let Some(canonical) = canonical_marker(&key) else {
-            continue;
-        };
-        sqlx::query!(
-            "INSERT INTO forge_setting (key, value)
-             SELECT $2, value FROM forge_setting WHERE key = $1
-             ON CONFLICT (key) DO NOTHING",
-            key,
-            canonical
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!("DELETE FROM forge_setting WHERE key = $1", key)
-            .execute(&mut *tx)
-            .await?;
-    }
-    tx.commit().await?;
-    Ok(repairs)
-}
-
-/// Whether any username or bootstrap marker is not in canonical form.
-async fn needs_canonicalizing(pool: &PgPool) -> sqlx::Result<bool> {
-    let usernames = sqlx::query_scalar!("SELECT username FROM app_user")
-        .fetch_all(pool)
-        .await?;
-    if usernames
-        .iter()
-        .any(|u| canonical_username(u).is_ok_and(|c| &c != u))
-    {
-        return Ok(true);
-    }
-    let markers = sqlx::query_scalar!(
-        "SELECT key FROM forge_setting WHERE starts_with(key, $1)",
-        BOOTSTRAP_MARKER_PREFIX
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(markers.iter().any(|k| canonical_marker(k).is_some()))
-}
-
-/// The canonical spelling of a bootstrap marker key, when it differs.
-fn canonical_marker(key: &str) -> Option<String> {
-    let name = key.strip_prefix(BOOTSTRAP_MARKER_PREFIX)?;
-    let canonical = canonical_username(name).ok()?;
-    (canonical != name).then(|| format!("{BOOTSTRAP_MARKER_PREFIX}{canonical}"))
-}
-
-/// The renames [`canonicalize_stored_usernames`] applies to `rows`
-/// (`(id, username)`, in id order).
-fn plan_username_repairs(rows: Vec<(i64, String)>) -> Vec<UsernameRepair> {
-    // Names that stay as they are: the canonical ones, and those that have no
-    // canonical form. A target is always canonical, so it never equals a name
-    // that is being vacated.
-    let mut taken: HashSet<String> = rows
-        .iter()
-        .filter(|(_, u)| canonical_username(u).map_or(true, |c| &c == u))
-        .map(|(_, u)| u.clone())
-        .collect();
-    let mut repairs = Vec::new();
-    for (id, username) in rows {
-        let Ok(canonical) = canonical_username(&username) else {
-            continue;
-        };
-        if canonical == username {
-            continue;
-        }
-        let mut to = canonical.clone();
-        let mut n = 1u32;
-        while taken.contains(&to) {
-            to = if n == 1 {
-                format!("{canonical}#{id}")
-            } else {
-                format!("{canonical}#{id}#{n}")
-            };
-            n += 1;
-        }
-        taken.insert(to.clone());
-        repairs.push(UsernameRepair {
-            id,
-            from: username,
-            to,
-        });
-    }
-    repairs
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn plan(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
-        plan_username_repairs(rows.iter().map(|(id, u)| (*id, u.to_string())).collect())
-            .into_iter()
-            .map(|r| (r.id, r.to))
-            .collect()
-    }
-
-    #[test]
-    fn repairs_what_a_c_collation_left_uppercase() {
-        // 0021 under a "C" ctype lowercased ASCII only.
-        assert_eq!(
-            plan(&[(1, "jÜrgen"), (2, "alice"), (3, "Ölaf")]),
-            vec![(1, "jürgen".into()), (3, "ölaf".into())]
-        );
-    }
-
-    #[test]
-    fn an_account_holding_the_canonical_name_keeps_it() {
-        assert_eq!(
-            plan(&[(1, "Özdemir"), (2, "özdemir")]),
-            vec![(1, "özdemir#1".into())]
-        );
-        // Among non-canonical ones the oldest wins.
-        assert_eq!(
-            plan(&[(4, "bob\u{a0}"), (7, "BOB")]),
-            vec![(4, "bob".into()), (7, "bob#7".into())]
-        );
-    }
-
-    #[test]
-    fn suffixes_never_collide_with_existing_names() {
-        assert_eq!(
-            plan(&[(2, "alice"), (3, "alice#5"), (5, "Alice")]),
-            vec![(5, "alice#5#2".into())]
-        );
-    }
-
-    #[test]
-    fn names_without_a_canonical_form_are_left_alone() {
-        assert!(plan(&[(1, "bad\nname"), (2, "ok")]).is_empty());
-    }
 }
