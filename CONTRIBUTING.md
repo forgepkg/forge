@@ -43,13 +43,13 @@ only at the person who opened it:
   with an address that is already there.
 - **Co-authors need to sign too.** Everyone whose commits are in the pull
   request has to sign before it can be merged.
-- **Commits by AI coding agents.** Some agents (for example, Claude Code on
-  the web) author commits under their own GitHub identity, which cannot sign
-  the CLA. GitHub Copilot's identities (`Copilot` and
-  `copilot-swe-agent[bot]`) are exempt from signing; human contributors to
-  those pull requests still need to sign. For other agents, you are
-  responsible for that code as your contribution, so make yourself the author
-  before you push:
+- **Commits by AI coding agents.** Some agents author commits under their
+  own GitHub identity, which cannot sign the CLA. The identities of GitHub
+  Copilot (`Copilot` and `copilot-swe-agent[bot]`) and of Claude (`claude`
+  and `claude[bot]`) are exempt from signing; human contributors to those
+  pull requests still need to sign. For other agents, you are responsible for
+  that code as your contribution, so make yourself the author before you
+  push:
 
   ```bash
   git rebase --exec 'git commit --amend --no-edit --reset-author' upstream/main
