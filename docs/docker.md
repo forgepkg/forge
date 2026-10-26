@@ -123,6 +123,9 @@ with any `artifactType`; Docker schema 1 is refused.
   (`{}`), which Forge stores itself when it is missing.
 - A blob a manifest of the image references cannot be deleted (`409`):
   delete the manifest first.
+- `DELETE /v2/<name>/manifests/<tag>` deletes the tag alone: the manifest
+  stays, under its other tags or untagged. A `DELETE` by digest deletes the
+  manifest and every tag that names it.
 - Uploads are limited per blob by the repository's upload limit (*Maximum
   upload size* in the web UI, `max_upload_bytes` in the admin API; 1 GiB
   when unset, or what an explicit `server.max_staging_bytes` below that
@@ -296,6 +299,15 @@ A docker repository's retention policy (`PUT
   `GET` or a `HEAD` of a tag's manifest counts as a pull, so a tag that
   containerd (Kubernetes, nerdctl, BuildKit) only resolves stays pulled. A
   rule with only `keep_last_n_tags` keeps N tags per image.
+- **Tags of one digest**: a tag rule deletes the tag alone. Its manifest
+  stays while another tag names it, and is untagged (for
+  `delete_untagged_after_days`) from when its last tag goes. A pull is
+  recorded per manifest, so pulling `latest` counts for every tag of its
+  digest: while `latest` is pulled, `tag_not_pulled_for_days` deletes no
+  other tag of that digest, whereas `tag_older_than_days` and
+  `keep_last_n_tags` judge each tag by its own push. Every tag takes a place
+  among the `keep_last_n_tags`; name aliases such as `latest` in
+  `protected_tags` so that they do not.
 - **Untagged rules** (`delete_untagged_after_days`) delete manifests without a
   tag for that long, except what something kept refers to: the platforms of
   a kept index, and the signatures, SBOMs and attestations (referrers) of a

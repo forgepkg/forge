@@ -3103,6 +3103,94 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     assert_eq!(audit, vec!["delete_tag", "delete_manifest"]);
 }
 
+/// A run that deletes one of a digest's tags leaves the manifest to the
+/// other: it is not untagged, so an untagged rule never takes it (#510).
+#[tokio::test]
+async fn retention_deletes_one_tag_of_a_digest_and_keeps_its_manifest() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("layer {}", unique()).into_bytes();
+    let digest = oci.push_image(&name, "1.0", "amd64", &layer).await;
+    let manifest = image(&config("amd64"), &[&layer]);
+    assert_eq!(
+        oci.put_manifest(&name, "1", OCI_MANIFEST, &manifest)
+            .await
+            .status(),
+        201
+    );
+    // `1.0` was pushed long ago, the alias `1` just now.
+    sqlx::query(
+        "UPDATE oci_tag SET updated_at = now() - interval '30 days' \
+         WHERE repository_id = $1 AND tag = '1.0'",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": {"version": 1, "rules": [
+            {"id": "old", "tag_older_than_days": 7},
+            {"id": "untagged", "delete_untagged_after_days": 1}
+        ]}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention/run"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), 202);
+    let worker = forge_core::retention::RetentionWorker::new(
+        srv.pool.clone(),
+        forge_server::state::RegistryResolver(srv.state.formats.clone()),
+        Arc::new(forge_core::repo::NoopCacheInvalidator),
+        forge_core::retention::RetentionConfig::default(),
+    );
+    let summary = worker.tick_repo(repo_id).await.unwrap().expect("a run");
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+    assert_eq!(oci.get(&name, "manifests/1.0").await.status(), 404);
+    for reference in ["1", digest.as_str()] {
+        assert_eq!(
+            oci.get(&name, &format!("manifests/{reference}"))
+                .await
+                .status(),
+            200
+        );
+    }
+    let untagged_since = "SELECT untagged_since IS NOT NULL FROM oci_manifest \
+                          WHERE repository_id = $1 AND digest = $2";
+    let untagged: bool = sqlx::query_scalar(untagged_since)
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert!(!untagged, "`1` still names the manifest");
+
+    // Its last tag gone, the manifest's untagged clock starts.
+    assert_eq!(oci.delete(&name, "manifests/1").await.status(), 202);
+    let untagged: bool = sqlx::query_scalar(untagged_since)
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert!(untagged);
+}
+
 #[tokio::test]
 async fn image_size_budget_worker_keeps_last_tag_when_target_is_unreachable() {
     let srv = common::start().await;
