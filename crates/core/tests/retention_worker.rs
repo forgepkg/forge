@@ -180,6 +180,10 @@ async fn size_budget_evicts_oldest_hosted_versions_and_keeps_newest() {
         .unwrap();
 
     assert_eq!(summary.deleted, 2);
+    assert_eq!(
+        summary.evaluated, 3,
+        "every candidate, not only the two decided on"
+    );
     assert_eq!(summary.size_before, Some(300));
     assert_eq!(summary.size_after, Some(100));
     assert_eq!(summary.target_reached, Some(true));
@@ -236,6 +240,9 @@ async fn tick_prunes_per_policy_and_drives_outbox() {
 
     assert_eq!(summary.deleted, 2, "two oldest hard-deleted");
     assert_eq!(summary.blobs_enqueued, 2);
+    // Every candidate version was inspected, not only the two decided on, as
+    // the preview counts them.
+    assert_eq!(summary.evaluated, 12);
 
     // 1.0.1 and 1.0.2 gone; 1.0.3..1.0.12 remain.
     assert!(!component_exists(&pool, repo.id, "lib", "1.0.1").await);
@@ -1203,6 +1210,10 @@ async fn size_budget_evicts_oldest_proxy_cache_versions_first() {
         .unwrap();
 
     assert_eq!(summary.deleted, 2);
+    assert_eq!(
+        summary.evaluated, 3,
+        "every candidate, not only the two decided on"
+    );
     assert_eq!(summary.size_before, Some(300));
     assert_eq!(summary.size_after, Some(100));
     assert_eq!(summary.target_reached, Some(true));
