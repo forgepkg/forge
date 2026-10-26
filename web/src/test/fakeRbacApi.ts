@@ -110,7 +110,6 @@ export interface FakeRequest {
 export const BUILTIN_ROLES: Role[] = [
   { id: 1, name: 'admin', description: 'Full administrative access.', builtin: true },
   { id: 2, name: 'anonymous', description: 'Unauthenticated callers.', builtin: true },
-  { id: 3, name: 'authenticated', description: 'Legacy open access.', builtin: true },
   {
     id: 4,
     name: 'writer',

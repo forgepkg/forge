@@ -2946,7 +2946,7 @@ async fn group_search_asks_upstreams_for_the_page_window() {
     )
     .await
     .unwrap();
-    let role = forge_db::authz_dao::role_id_by_name(&pool, forge_db::authz_dao::AUTHENTICATED_ROLE)
+    let role = forge_db::authz_dao::role_id_by_name(&pool, forge_db::authz_dao::WRITER_ROLE)
         .await
         .unwrap()
         .unwrap();

@@ -26,9 +26,6 @@ use sqlx::{PgExecutor, PgPool};
 pub const ADMIN_ROLE: &str = "admin";
 /// The fixed slug of the built-in anonymous role (applied to anonymous callers).
 pub const ANONYMOUS_ROLE: &str = "anonymous";
-/// The fixed slug of the built-in `authenticated` role (level `write` on
-/// every repository), for an administrator to assign.
-pub const AUTHENTICATED_ROLE: &str = "authenticated";
 /// The fixed slug of the built-in `writer` role: level
 /// `write` on every repository, to read and publish packages without deleting
 /// them or any right to administer the instance.

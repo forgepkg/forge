@@ -7,8 +7,8 @@ import { httpClient } from '~/lib/httpClient'
  * Types mirror the Rust DTOs in `crates/server/src/admin/`:
  *
  *  - `RoleView` (`roles.rs`) counts the role's grants and users. The built-in
- *    roles (`admin`, `writer`, `authenticated`, `anonymous`) cannot be
- *    deleted; only a role's description can change.
+ *    roles (`admin`, `writer`, `anonymous`) cannot be deleted; only a
+ *    role's description can change.
  *  - `GrantView` (`grants.rs`) is `(repository or every repository, level,
  *    selector?)`: `repository_id: null` means every repository. A role holds
  *    one grant per repository and selector; adding one again sets its level.

@@ -29,7 +29,7 @@ use forge_core::repo::{
     NupkgLocation, RepoError, RepoReadOps, SearchParams, NUPKG_ASSET_PATH, NUSPEC_ASSET_PATH,
 };
 use forge_db::asset_dao::{self, NewAsset};
-use forge_db::authz_dao::{self, AUTHENTICATED_ROLE};
+use forge_db::authz_dao::{self, WRITER_ROLE};
 use forge_db::blob_dao;
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::model::Repository;
@@ -120,8 +120,8 @@ fn group_repo_depth(
     GroupRepo::new(pool.clone(), principal, factory, authz, max_depth)
 }
 
-/// A real (non-admin) authenticated user holding the seeded `authenticated`
-/// role, which carries read/write on every repository. This is what makes the
+/// A real (non-admin) authenticated user holding the seeded `writer` role,
+/// which carries read/write on every repository. This is what makes the
 /// authenticated-sees-all assertions hold under fine-grained RBAC: visibility
 /// flows through `can_read`, so the user must actually be granted read.
 async fn user(pool: &PgPool) -> Principal {
@@ -135,13 +135,13 @@ async fn user(pool: &PgPool) -> Principal {
     )
     .await
     .expect("insert user");
-    let role = authz_dao::role_id_by_name(pool, AUTHENTICATED_ROLE)
+    let role = authz_dao::role_id_by_name(pool, WRITER_ROLE)
         .await
         .expect("query")
-        .expect("authenticated role seeded");
+        .expect("writer role seeded");
     authz_dao::assign_role(pool, u.id, role)
         .await
-        .expect("assign authenticated");
+        .expect("assign writer");
     Principal::User {
         user_id: u.id,
         token_id: None,

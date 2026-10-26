@@ -34,7 +34,10 @@ describe('admin user roles', () => {
         { id: 20, name: 'acme', description: '', includes: ['acme.*'], excludes: [] },
       ],
     })
-    api.state.roles.push({ id: 7, name: 'ci-pushers', description: 'CI pushes', builtin: false })
+    api.state.roles.push(
+      { id: 7, name: 'ci-pushers', description: 'CI pushes', builtin: false },
+      { id: 8, name: 'auditors', description: 'Read everything', builtin: false },
+    )
     api.state.assignments.push([1, 1], [2, 7], [4, 4])
     api.state.grants.push(
       { id: 30, role_id: 7, repository_id: 10, level: 'write', selector_id: null },
@@ -160,16 +163,16 @@ describe('admin user roles', () => {
     const form = screen.getByRole('form', { name: 'Assign role' })
     const picker = within(form).getByLabelText('Role')
     await waitFor(() =>
-      expect(within(picker).getByRole('option', { name: 'authenticated' })).toBeInTheDocument(),
+      expect(within(picker).getByRole('option', { name: 'auditors' })).toBeInTheDocument(),
     )
     // A role the user holds is not offered again.
     expect(within(picker).queryByRole('option', { name: 'ci-pushers' })).toBeNull()
-    await u.selectOptions(picker, 'authenticated')
+    await u.selectOptions(picker, 'auditors')
     await u.click(within(form).getByRole('button', { name: 'Assign role' }))
     await waitFor(() =>
-      expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)[0]?.body).toEqual({ role_id: 3 }),
+      expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)[0]?.body).toEqual({ role_id: 8 }),
     )
-    expect(await screen.findByRole('link', { name: 'authenticated' })).toBeInTheDocument()
+    expect(await screen.findByRole('link', { name: 'auditors' })).toBeInTheDocument()
 
     await u.click(screen.getByRole('button', { name: 'Remove role ci-pushers' }))
     await waitFor(() =>

@@ -1197,26 +1197,24 @@ CREATE INDEX user_role_role_idx ON user_role (role_id);
 -- The built-in roles. They exist on every install, and nobody holds one
 -- until it is assigned: a new install denies everything until an
 -- administrator grants (the server assigns `admin` to the bootstrap admin).
---   * admin         — allow-all: membership is the administration; no grants.
---   * authenticated — `write` on every repository.
---   * anonymous     — the role every anonymous principal is evaluated
---                     against; no grants until an administrator adds some.
---   * writer        — read and publish packages on every repository: `write`
---                     is the level every push checks, for a package or image
---                     name the repository does not have yet too. No `delete`
---                     (unlisting or deleting versions, deleting tags) and no
---                     administration, so a leaked CI token of a writer cannot
---                     remove published versions.
+--   * admin     — allow-all: membership is the administration; no grants.
+--   * anonymous — the role every anonymous principal is evaluated against;
+--                 no grants until an administrator adds some.
+--   * writer    — read and publish packages on every repository: `write` is
+--                 the level every push checks, for a package or image name
+--                 the repository does not have yet too. No `delete`
+--                 (unlisting or deleting versions, deleting tags) and no
+--                 administration, so a leaked CI token of a writer cannot
+--                 remove published versions.
 -- Like any role's, their grants can be edited.
 -- ---------------------------------------------------------------------------
 INSERT INTO role (name, description, builtin) VALUES
-    ('admin',         'Full administrative access to all repositories and privilege management.', true),
-    ('authenticated', 'Legacy convenience role: read/write on all repositories (slice-1 open access).', true),
-    ('anonymous',     'Grants applied to unauthenticated (anonymous) callers.', true),
-    ('writer',        'Read and publish packages on every repository; no administration.', true);
+    ('admin',     'Full administrative access to all repositories and privilege management.', true),
+    ('anonymous', 'Grants applied to unauthenticated (anonymous) callers.', true),
+    ('writer',    'Read and publish packages on every repository; no administration.', true);
 
 INSERT INTO repository_privilege (role_id, repository_id, level)
-SELECT id, NULL, 'write' FROM role WHERE name IN ('authenticated', 'writer') ORDER BY id;
+SELECT id, NULL, 'write' FROM role WHERE name = 'writer';
 
 
 -- ===========================================================================
