@@ -2845,6 +2845,212 @@ async fn group_guard_keeps_reserved_namespaces_off_proxies() {
     );
 }
 
+/// #241: a group's browse lists what a pull through it serves. Its guard
+/// keeps a proxy's image under a reserved prefix, or of a name a hosted
+/// member has, out of the listing and the image page, and a tag a higher
+/// priority member also has badges that member's manifest only.
+#[tokio::test]
+async fn group_browse_lists_what_its_pulls_serve() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let cfg = config("amd64");
+    let upstream = image(&cfg, &[b"public"]);
+    for name in ["acme/app", "public/app", "other/app"] {
+        mock.put(name, "1", OCI_MANIFEST, &upstream);
+    }
+    mock.put_blob(&cfg);
+    mock.put_blob(b"public");
+
+    let hosted = repo_name("dock");
+    let proxy = repo_name("proxy");
+    let guarded = repo_name("group");
+    let union = repo_name("union");
+    create_repo(
+        &srv,
+        json!({"name": hosted, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    create_repo(
+        &srv,
+        json!({"name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+               "upstream_username": "upstream", "upstream_password": "secret"}),
+    )
+    .await;
+    create_repo(
+        &srv,
+        json!({"name": guarded, "kind": "group", "format": "docker", "reserved_prefixes": ["acme/"]}),
+    )
+    .await;
+    create_repo(
+        &srv,
+        json!({"name": union, "kind": "group", "format": "docker", "prefer_hosted": false}),
+    )
+    .await;
+    for group in [&guarded, &union] {
+        for (member, priority) in [(&hosted, 10), (&proxy, 5)] {
+            admin_post(
+                &srv,
+                &format!("/admin/repositories/{group}/members"),
+                json!({"member": member, "priority": priority}),
+            )
+            .await;
+        }
+    }
+    let oci = admin_oci(&srv).await;
+    // Pulls straight through the proxy cache all three, the squatted
+    // `acme/app` included; `public/app` is also pushed to the hosted member.
+    for name in ["acme/app", "public/app", "other/app"] {
+        let resp = oci.get(&format!("{proxy}/{name}"), "manifests/1").await;
+        assert_eq!(resp.status(), 200, "{name}");
+    }
+    let ours_1 = oci
+        .push_image(&format!("{hosted}/public/app"), "1", "amd64", b"ours 1")
+        .await;
+    let ours_2 = oci
+        .push_image(&format!("{hosted}/public/app"), "2", "amd64", b"ours 2")
+        .await;
+
+    let session = srv
+        .login(srv.admin_user.as_deref().unwrap(), "adminpw")
+        .await;
+    let browse = |path: String| {
+        let (srv, session) = (&srv, &session);
+        async move {
+            session
+                .apply(srv.client().get(format!("{}{path}", srv.base_url)))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let listed = |body: Value| -> Vec<(String, i64)> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    i["image"].as_str().unwrap().to_string(),
+                    i["tag_count"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let tags = |body: &Value| -> Vec<(String, String)> {
+        body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["tag"].as_str().unwrap().to_string(),
+                    t["digest"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let pair = |tag: &str, digest: &str| (tag.to_string(), digest.to_string());
+
+    // The proxy holds all three.
+    let body: Value = browse(format!("/browse/images?repo={proxy}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 3, "{body}");
+
+    // The guarded group: no `acme/app`, and `public/app` is the hosted one.
+    let body: Value = browse(format!("/browse/images?repo={guarded}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed(body),
+        [("other/app".to_string(), 1), ("public/app".to_string(), 2)]
+    );
+    assert_eq!(
+        browse(format!("/browse/images/{guarded}/acme/app"))
+            .await
+            .status(),
+        404
+    );
+    let detail: Value = browse(format!("/browse/images/{guarded}/public/app"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        tags(&detail),
+        [pair("1", &ours_1), pair("2", &ours_2)],
+        "{detail}"
+    );
+    let manifests = detail["manifests"].as_array().unwrap();
+    assert_eq!(manifests.len(), 2, "{detail}");
+    assert!(manifests.iter().all(|m| m["source"] == hosted.as_str()));
+    let detail: Value = browse(format!("/browse/images/{guarded}/other/app"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tags(&detail), [pair("1", &sha(&upstream))]);
+    assert_eq!(detail["manifests"][0]["source"], proxy.as_str());
+
+    // Without the guard, both members serve: tag `1` is the hosted
+    // member's, and the proxy's manifest no longer wears it.
+    let body: Value = browse(format!("/browse/images?repo={union}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["total"], 3, "{body}");
+    let detail: Value = browse(format!("/browse/images/{union}/public/app"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tags(&detail), [pair("1", &ours_1), pair("2", &ours_2)]);
+    let badges: HashMap<&str, Vec<&str>> = detail["manifests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["digest"].as_str().unwrap(),
+                m["tags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.as_str().unwrap())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(badges[ours_1.as_str()], ["1"]);
+    assert_eq!(
+        badges[sha(&upstream).as_str()],
+        Vec::<&str>::new(),
+        "{detail}"
+    );
+
+    // A reader of the group and the proxy, not of the hosted member: still
+    // no proxy image a hosted member has, nor a reserved one.
+    let (user, token, uid) = user_with_token(&srv).await;
+    grant(&srv, uid, &guarded, "read").await;
+    grant(&srv, uid, &proxy, "read").await;
+    let reader: Value = srv
+        .client()
+        .get(format!("{}/browse/images?repo={guarded}", srv.base_url))
+        .basic_auth(user, Some(token))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed(reader), [("other/app".to_string(), 1)]);
+}
+
 // ── Admin API ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
