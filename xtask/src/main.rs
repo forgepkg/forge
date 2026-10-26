@@ -579,7 +579,7 @@ fn seed() -> Result<(), String> {
             "  push: HTTP %{http_code}\n",
             "-X",
             "PUT",
-            &format!("{forge_url}/v3/nuget/package"),
+            &format!("{forge_url}/repository/nuget/package"),
             "-H",
             &format!("X-NuGet-ApiKey: {token}"),
             "-F",
@@ -587,11 +587,11 @@ fn seed() -> Result<(), String> {
         ])
         .run()?;
 
-    println!("  feed:     {forge_url}/v3/nuget/index.json");
+    println!("  feed:     {forge_url}/repository/nuget/index.json");
     let versions = Cmd::new("curl")
         .args([
             "-fsS",
-            &format!("{forge_url}/v3/nuget/flat/sample.lib/index.json"),
+            &format!("{forge_url}/repository/nuget/flat/sample.lib/index.json"),
         ])
         .output_string()
         .unwrap_or_default();

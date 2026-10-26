@@ -237,7 +237,7 @@ async fn api_and_credentialed_feed_responses_are_not_cached() {
     };
 
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -255,7 +255,7 @@ async fn api_and_credentialed_feed_responses_are_not_cached() {
 
     // Without credentials the feed answer may be cached, but only per Vary.
     let resp = client
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .send()
         .await
         .unwrap();

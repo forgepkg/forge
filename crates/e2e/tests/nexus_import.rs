@@ -371,7 +371,7 @@ async fn import_from_a_real_nexus() {
     assert_eq!(
         download(
             &srv,
-            "/v3/nuget-internal/flat/acme.core/1.0.0/acme.core.1.0.0.nupkg"
+            "/repository/nuget-internal/flat/acme.core/1.0.0/acme.core.1.0.0.nupkg"
         )
         .await,
         core
@@ -379,7 +379,7 @@ async fn import_from_a_real_nexus() {
     assert_eq!(
         download(
             &srv,
-            "/v3/nuget-internal/flat/acme.web/2.1.0/acme.web.2.1.0.nupkg"
+            "/repository/nuget-internal/flat/acme.web/2.1.0/acme.web.2.1.0.nupkg"
         )
         .await,
         web
@@ -456,7 +456,7 @@ async fn import_from_a_real_nexus() {
     assert_eq!(
         download(
             &srv,
-            "/v3/nuget-internal/flat/acme.core/1.1.0/acme.core.1.1.0.nupkg"
+            "/repository/nuget-internal/flat/acme.core/1.1.0/acme.core.1.1.0.nupkg"
         )
         .await,
         next

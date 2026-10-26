@@ -63,7 +63,10 @@ async fn ordered_resolution_and_union_enumeration() {
 
     // Union enumeration via the group: both versions present.
     let resp = client
-        .get(format!("{}/v3/grp/flat/{lower}/index.json", srv.base_url))
+        .get(format!(
+            "{}/repository/grp/flat/{lower}/index.json",
+            srv.base_url
+        ))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -86,7 +89,7 @@ async fn ordered_resolution_and_union_enumeration() {
     // Ordered download: the high-priority member's bytes win for 1.0.0.
     let resp = client
         .get(format!(
-            "{}/v3/grp/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
+            "{}/repository/grp/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -165,7 +168,10 @@ async fn mixed_anon_group_filters_members() {
 
     // Anonymous caller: only the public member's version is visible.
     let resp = client
-        .get(format!("{}/v3/mgrp/flat/{lower}/index.json", srv.base_url))
+        .get(format!(
+            "{}/repository/mgrp/flat/{lower}/index.json",
+            srv.base_url
+        ))
         .send()
         .await
         .unwrap();
@@ -186,7 +192,7 @@ async fn mixed_anon_group_filters_members() {
     // The private member's version 2.0.0 is hidden from the anonymous caller.
     let resp = client
         .get(format!(
-            "{}/v3/mgrp/flat/{lower}/2.0.0/{lower}.2.0.0.nupkg",
+            "{}/repository/mgrp/flat/{lower}/2.0.0/{lower}.2.0.0.nupkg",
             srv.base_url
         ))
         .send()
@@ -200,7 +206,10 @@ async fn mixed_anon_group_filters_members() {
 
     // Authenticated caller sees the union of both members.
     let resp = client
-        .get(format!("{}/v3/mgrp/flat/{lower}/index.json", srv.base_url))
+        .get(format!(
+            "{}/repository/mgrp/flat/{lower}/index.json",
+            srv.base_url
+        ))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -297,7 +306,7 @@ async fn shadowed_internal_group(srv: &TestServer) -> MockUpstream {
         let body: Value = srv
             .client()
             .get(format!(
-                "{}/v3/dc-pub/flat/{lower}/index.json",
+                "{}/repository/dc-pub/flat/{lower}/index.json",
                 srv.base_url
             ))
             .basic_auth(&u, Some(&p))
@@ -326,11 +335,11 @@ async fn assert_shadow_not_served(
     let get = |path: String| auth(srv.client().get(format!("{}{path}", srv.base_url))).send();
 
     for path in [
-        format!("/v3/dc-grp/flat/{lower}/index.json"),
-        format!("/v3/dc-grp/flat/{lower}/{v}/{lower}.{v}.nupkg"),
-        format!("/v3/dc-grp/flat/{lower}/{v}/{lower}.nuspec"),
-        format!("/v3/dc-grp/registration/{lower}/index.json"),
-        format!("/v3/dc-grp/registration/{lower}/{v}.json"),
+        format!("/repository/dc-grp/flat/{lower}/index.json"),
+        format!("/repository/dc-grp/flat/{lower}/{v}/{lower}.{v}.nupkg"),
+        format!("/repository/dc-grp/flat/{lower}/{v}/{lower}.nuspec"),
+        format!("/repository/dc-grp/registration/{lower}/index.json"),
+        format!("/repository/dc-grp/registration/{lower}/{v}.json"),
     ] {
         assert_eq!(
             get(path.clone()).await.unwrap().status(),
@@ -340,7 +349,7 @@ async fn assert_shadow_not_served(
     }
 
     for q in ["contoso", ""] {
-        let search: Value = get(format!("/v3/dc-grp/query?q={q}&prerelease=true"))
+        let search: Value = get(format!("/repository/dc-grp/query?q={q}&prerelease=true"))
             .await
             .unwrap()
             .json()
@@ -363,7 +372,7 @@ async fn assert_shadow_not_served(
         );
     }
 
-    let resp = get("/v3/dc-grp/flat/public.lib/index.json".to_string())
+    let resp = get("/repository/dc-grp/flat/public.lib/index.json".to_string())
         .await
         .unwrap();
     assert_eq!(
@@ -389,7 +398,7 @@ async fn prefer_hosted_shields_internal_id_from_anonymous_callers() {
     let body: Value = srv
         .client()
         .get(format!(
-            "{}/v3/dc-grp/flat/{lower}/index.json",
+            "{}/repository/dc-grp/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -402,7 +411,10 @@ async fn prefer_hosted_shields_internal_id_from_anonymous_callers() {
     assert_eq!(body["versions"], serde_json::json!(["1.0.0"]));
     let search: Value = srv
         .client()
-        .get(format!("{}/v3/dc-grp/query?q=contoso", srv.base_url))
+        .get(format!(
+            "{}/repository/dc-grp/query?q=contoso",
+            srv.base_url
+        ))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -421,7 +433,7 @@ async fn prefer_hosted_shields_internal_id_from_anonymous_callers() {
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/dc-grp/flat/public.lib/1.0.0/public.lib.1.0.0.nupkg",
+            "{}/repository/dc-grp/flat/public.lib/1.0.0/public.lib.1.0.0.nupkg",
             srv.base_url
         ))
         .send()
@@ -430,7 +442,7 @@ async fn prefer_hosted_shields_internal_id_from_anonymous_callers() {
     assert_eq!(resp.status(), StatusCode::OK);
     let search: Value = srv
         .client()
-        .get(format!("{}/v3/dc-grp/query?q=public", srv.base_url))
+        .get(format!("{}/repository/dc-grp/query?q=public", srv.base_url))
         .send()
         .await
         .unwrap()

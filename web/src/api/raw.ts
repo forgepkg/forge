@@ -2,14 +2,14 @@ import { httpClient } from '~/lib/httpClient'
 
 /**
  * Raw (generic file) repositories: files under arbitrary paths, served at
- * `/raw/<repo>/<path>` (`crates/server/src/raw`).
+ * `/repository/<repo>/<path>` (`crates/formats/raw`).
  *
- *  - A directory's listing is `GET /raw/<repo>/<dir>/` as JSON, a page at a
+ *  - A directory's listing is `GET /repository/<repo>/<dir>/` as JSON, a page at a
  *    time (`after` names the entry a page starts after, `next` the next
  *    page's). The session reads it like any client; package selectors and
  *    group membership apply.
  *  - The web UI changes files through `/browse/raw/<repo>/files` with its
- *    session (`/raw` itself takes an API token): a multipart upload into a
+ *    session (the repository URL itself takes an API token): a multipart upload into a
  *    directory, a delete of a file. A directory is deleted through the admin
  *    API (`DELETE /admin/repositories/<repo>/files?path=<dir>/`).
  *
@@ -57,7 +57,7 @@ export function encodeRawPath(path: string): string {
 
 /** The address of `path` in repository `repo` (relative to the server). */
 export function rawFileUrl(repo: string, path: string): string {
-  return `/raw/${encodeURIComponent(repo)}/${encodeRawPath(path)}`
+  return `/repository/${encodeURIComponent(repo)}/${encodeRawPath(path)}`
 }
 
 export const rawKeys = {
@@ -67,7 +67,7 @@ export const rawKeys = {
     [...rawKeys.repo(repo), path, after ?? ''] as const,
 }
 
-/** `GET /raw/<repo>/<path>` as JSON. */
+/** `GET /repository/<repo>/<path>` as JSON. */
 export function fetchRawListing(
   repo: string,
   path: string,

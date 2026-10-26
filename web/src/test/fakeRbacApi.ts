@@ -205,7 +205,7 @@ export class FakeRbacApi {
     if (path === '/admin/me') return json(s.me)
     if (path === '/admin/formats') {
       return json([
-        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'] },
       ])
     }
 

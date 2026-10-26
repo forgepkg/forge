@@ -80,14 +80,14 @@ This turns anonymous reads and password Basic on (**Admin → Settings**),
 creates an anonymous-readable hosted repo `nuget`, mints a push token, and
 pushes the bundled sample package. It prints the feed URL and the available
 versions. The feed is then browsable without auth at
-`http://localhost:8421/v3/nuget/index.json`.
+`http://localhost:8421/repository/nuget/index.json`.
 
 ## Web UI (admin + browse SPA)
 
 The UI is a **TanStack Router SPA** in [`web/`](./web), built by Vite into
 `web/dist/`. There is **no Node server in production**: the Rust `forge-server`
 serves `web/dist/` directly (a `ServeDir` with an `index.html` SPA fallback,
-mounted *after* `/admin`, `/browse`, `/v3`), and the browser calls the Rust HTTP
+mounted *after* `/admin`, `/browse`, `/repository`), and the browser calls the Rust HTTP
 API on the **same origin** with relative URLs. `index.html` is served
 `Cache-Control: no-cache`, the content-hashed `/assets/*` files
 `public, max-age=31536000, immutable`, and a missing `/assets/*` file is a 404
@@ -125,7 +125,7 @@ cargo xtask up && cargo xtask run   # terminal 1: infra + API on :8421
 cargo xtask web-dev                 # terminal 2: Vite on :8420
 ```
 
-The Vite dev server proxies `/admin`, `/browse`, `/v2`, `/v3`, `/npm`, `/raw`, `/auth`
+The Vite dev server proxies `/admin`, `/browse`, `/repository`, `/v2`, `/auth`
 to the Rust origin (default `http://127.0.0.1:8421`, override with `FORGE_DEV_API_TARGET`)
 so the same relative API URLs work in dev — this is a dev-only static route, not
 a production API proxy.
@@ -183,16 +183,16 @@ curl -b /tmp/forge.jar -H "X-CSRF-Token: $CSRF" -X POST localhost:8421/admin/me/
 # and send it as the Basic password (curl -u admin@example.com:<SECRET>) or X-NuGet-ApiKey.
 
 # push a package, then read it back
-curl -X PUT localhost:8421/v3/nuget/package \
+curl -X PUT localhost:8421/repository/nuget/package \
   -H "X-NuGet-ApiKey: <SECRET>" -F package=@fixtures/nuget/sample.lib.1.0.0.nupkg   # 201
-curl localhost:8421/v3/nuget/index.json                          # service index
-curl localhost:8421/v3/nuget/flat/sample.lib/index.json          # {"versions":["1.2.3"]}
+curl localhost:8421/repository/nuget/index.json                          # service index
+curl localhost:8421/repository/nuget/flat/sample.lib/index.json          # {"versions":["1.2.3"]}
 ```
 
 ### Use it from the `dotnet` client
 
 ```bash
-dotnet nuget add source http://localhost:8421/v3/nuget/index.json -n forge
+dotnet nuget add source http://localhost:8421/repository/nuget/index.json -n forge
 dotnet nuget push -s forge -k <SECRET> your.1.0.0.nupkg
 # in a project:
 dotnet add package <PackageId>
@@ -250,9 +250,9 @@ password: `docker login localhost:8421 -u admin@example.com`, then
 [docs/docker.md](docs/docker.md).
 
 Raw repositories (`"format":"raw"`, the built-in plugin `crates/formats/raw`)
-hold files under arbitrary paths, served under `/raw/`: `curl -u
+hold files under arbitrary paths, served under `/repository/`: `curl -u
 admin@example.com:<token> --upload-file x.tgz
-localhost:8421/raw/binaries/tools/x.tgz`, a proxy of any HTTP(S) base URL
+localhost:8421/repository/binaries/tools/x.tgz`, a proxy of any HTTP(S) base URL
 (`"remote_url":"https://github.com/<owner>/<repo>/releases/download/"`), and
 groups. See [docs/raw.md](docs/raw.md).
 
@@ -266,13 +266,12 @@ and raw. A new format goes in `crates/formats/<id>` too, never in a
 served under `/v2` over the server's image store. A repository of a plugin
 format is created with `"format": "<id>"` (hosted, proxy or group; a plugin
 format has proxies when it implements the upstream side) and served under
-`/repository/<name>/` unless the plugin names another mount (NuGet's is
-`/v3`, npm's `/npm`). Helm charts are pushed to docker repositories, see
+`/repository/<name>/`. Helm charts are pushed to docker repositories, see
 [docs/docker.md](docs/docker.md#helm-charts).
 
-npm repositories (`"format":"npm"`) are served under `/npm/`: `npm publish
---registry http://localhost:8421/npm/<name>/` with an API token in
-`.npmrc` (`//localhost:8421/npm/<name>/:_authToken=<token>`), or after
+npm repositories (`"format":"npm"`) are served under `/repository/`: `npm publish
+--registry http://localhost:8421/repository/<name>/` with an API token in
+`.npmrc` (`//localhost:8421/repository/<name>/:_authToken=<token>`), or after
 `npm login --registry …`, which opens the web UI's approval page. See
 [docs/npm.md](docs/npm.md).
 

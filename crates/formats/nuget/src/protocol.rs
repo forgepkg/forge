@@ -2,7 +2,7 @@
 //! with.
 //!
 //! Every `@id` is absolute, built from the repository's base URL
-//! (`{public_base_url}/v3/{repo}`). The host has authorized the request
+//! (`{public_base_url}/repository/{repo}`). The host has authorized the request
 //! before [`handle`] sees it; publishing, unlisting and relisting are host
 //! actions, offered for hosted repositories only. Paths match literal
 //! segments as sent and percent-decode parameters; an unknown path answers

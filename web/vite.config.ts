@@ -45,10 +45,8 @@ export default defineConfig({
     proxy: {
       '/admin': { target: apiTarget, changeOrigin: false },
       '/browse': { target: apiTarget, changeOrigin: false },
-      '/v3': { target: apiTarget, changeOrigin: false },
+      '/repository': { target: apiTarget, changeOrigin: false },
       '/v2': { target: apiTarget, changeOrigin: false },
-      '/raw': { target: apiTarget, changeOrigin: false },
-      '/npm': { target: apiTarget, changeOrigin: false },
       '/auth': { target: apiTarget, changeOrigin: false },
     },
   },

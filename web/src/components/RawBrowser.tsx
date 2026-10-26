@@ -65,7 +65,7 @@ export function RawBrowser({
   const listing = useRawListing(repo, path, after)
   const [selected, setSelected] = useState<RawEntry | null>(null)
   const hosted = kind === 'hosted'
-  const base = url ?? `${window.location.origin}/raw/${repo}`
+  const base = url ?? `${window.location.origin}/repository/${repo}`
 
   function open(next: string, nextAfter?: string) {
     setSelected(null)

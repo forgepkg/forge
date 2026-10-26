@@ -63,7 +63,7 @@ async fn dotnet_push_and_restore_smoke() {
     // RBAC: anonymous read flows through an anonymous-role grant (what the RBAC
     // data migration converted the anonymous_read flag into).
     srv.grant_anonymous_read("dn-repo").await;
-    let source = format!("{}/v3/dn-repo/index.json", srv.base_url);
+    let source = format!("{}/repository/dn-repo/index.json", srv.base_url);
     let api_key = srv.admin_token.clone();
 
     let tmp = tempdir();

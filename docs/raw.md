@@ -9,7 +9,7 @@ example), installers, firmware images, test fixtures, tool downloads.
 Files live in repositories of `format: "raw"`, a format plugin built into
 Forge like NuGet ([`crates/formats/raw`](../crates/formats/raw);
 `GET /admin/formats` lists it), served at
-`https://<host>/raw/<repository>/<path>`. The plugin
+`https://<host>/repository/<repository>/<path>`. The plugin
 speaks the protocol below; the host's file store keeps the files
 ([format-plugins.md](format-plugins.md#files-formats)). They come in the
 usual three kinds:
@@ -50,7 +50,7 @@ a browser session):
 
 ```bash
 curl -u ci:<token> --upload-file pdfium-linux-x64.tgz \
-  https://forge.example.com/raw/binaries/pdfium/7350/pdfium-linux-x64.tgz
+  https://forge.example.com/repository/binaries/pdfium/7350/pdfium-linux-x64.tgz
 ```
 
 A new file answers `201`, a replaced one `204`. The `Content-Type` stored
@@ -70,14 +70,14 @@ whole form):
 curl -u ci:<token> -F raw.directory=7350 \
   -F raw.asset1=@pdfium-linux-x64.tgz -F raw.asset1.filename=pdfium-linux-x64.tgz \
   -F raw.asset2=@pdfium-win-x64.tgz -F raw.asset2.filename=pdfium-win-x64.tgz \
-  https://forge.example.com/raw/binaries/pdfium/
+  https://forge.example.com/repository/binaries/pdfium/
 ```
 
 At most 100 files per form; each one is limited by the repository's upload
 limit (*Maximum upload size*, `max_upload_bytes`; 512 MiB when unset) and
 staged on disk like every push (see `server.max_staging_bytes`).
 
-`DELETE /raw/<repository>/<path>` deletes a file (`204`). A directory, with
+`DELETE /repository/<repository>/<path>` deletes a file (`204`). A directory, with
 every file below it, is deleted through the admin API (or the web UI):
 
 ```bash
@@ -129,7 +129,7 @@ One `Range` is served (`206`, `416` past the end), and `If-Range` with the
 `ETag` or the date, so an interrupted download resumes where it stopped:
 
 ```bash
-curl -u me:<token> -C - -O https://forge.example.com/raw/binaries/pdfium/7350/pdfium-linux-x64.tgz
+curl -u me:<token> -C - -O https://forge.example.com/repository/binaries/pdfium/7350/pdfium-linux-x64.tgz
 ```
 
 ### Checksum sidecars
@@ -140,8 +140,8 @@ uploaded: the digest and the file name, the way `sha256sum` prints them, so
 the `-c` mode of the matching tool checks a download:
 
 ```bash
-curl -u me:<token> -O https://forge.example.com/raw/binaries/pdfium/7350/pdfium-linux-x64.tgz
-curl -u me:<token> https://forge.example.com/raw/binaries/pdfium/7350/pdfium-linux-x64.tgz.sha256 \
+curl -u me:<token> -O https://forge.example.com/repository/binaries/pdfium/7350/pdfium-linux-x64.tgz
+curl -u me:<token> https://forge.example.com/repository/binaries/pdfium/7350/pdfium-linux-x64.tgz.sha256 \
   | sha256sum -c
 # pdfium-linux-x64.tgz: OK
 ```
@@ -151,12 +151,12 @@ A file actually stored under such a name is served as it is.
 ## Listings
 
 `GET` of a directory (a path ending in `/`, or the repository's root
-`/raw/<repository>/`) lists it: as an HTML page for browsers, as JSON with
+`/repository/<repository>/`) lists it: as an HTML page for browsers, as JSON with
 `Accept: application/json` (or `?format=json`). A directory named without
 its `/` redirects to it.
 
 ```bash
-curl -u me:<token> -H 'Accept: application/json' https://forge.example.com/raw/binaries/pdfium/
+curl -u me:<token> -H 'Accept: application/json' https://forge.example.com/repository/binaries/pdfium/
 ```
 
 ```json
@@ -182,7 +182,7 @@ entries of the members the caller may read.
 The web UI's repository screen is a tree browser of the same listings: a
 file's size, type, SHA-256 and URL with the `curl` commands to download,
 check and upload it; an upload of files into the directory and the delete of
-a file (with the same permissions as `/raw`); and, for administrators, the
+a file (with the same permissions as the repository URL); and, for administrators, the
 delete of a directory.
 
 ## Paths
@@ -334,15 +334,15 @@ curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
 
 # A build downloads through it and checks the download.
 curl -u ci:<token> -O \
-  https://forge.example.com/raw/pdfium-releases/chromium/7350/pdfium-linux-x64.tgz
+  https://forge.example.com/repository/pdfium-releases/chromium/7350/pdfium-linux-x64.tgz
 curl -u ci:<token> \
-  https://forge.example.com/raw/pdfium-releases/chromium/7350/pdfium-linux-x64.tgz.sha256 | sha256sum -c
+  https://forge.example.com/repository/pdfium-releases/chromium/7350/pdfium-linux-x64.tgz.sha256 | sha256sum -c
 
 # A re-packaged copy (only the library and the headers) in a hosted repository.
 mkdir pdfium && tar -xzf pdfium-linux-x64.tgz -C pdfium
 tar -czf pdfium-linux-x64.tgz -C pdfium lib include
 curl -u ci:<token> --upload-file pdfium-linux-x64.tgz \
-  https://forge.example.com/raw/binaries/pdfium/7350/pdfium-linux-x64.tgz
+  https://forge.example.com/repository/binaries/pdfium/7350/pdfium-linux-x64.tgz
 ```
 
 CI runs this example against GitHub (`.github/scripts/raw-e2e.sh`), next to
@@ -357,5 +357,5 @@ the other curl checks of this page.
   full.
 - **No Nexus import.** Importing a Nexus raw repository is not supported yet
   ([nexus-import.md](nexus-import.md) covers NuGet and Docker).
-- **No directory delete over `/raw`.** A directory is deleted through the
+- **No directory delete through the repository URL.** A directory is deleted through the
   admin API or the web UI (administrators).

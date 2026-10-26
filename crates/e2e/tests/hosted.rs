@@ -32,7 +32,7 @@ async fn push_restore_registration_search_and_hash() {
     // ── Flat-container version list + byte round-trip ──
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/index.json",
+            "{}/repository/{repo}/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -45,7 +45,7 @@ async fn push_restore_registration_search_and_hash() {
 
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/1.2.3/{lower}.1.2.3.nupkg",
+            "{}/repository/{repo}/flat/{lower}/1.2.3/{lower}.1.2.3.nupkg",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -59,7 +59,7 @@ async fn push_restore_registration_search_and_hash() {
     // ── Registration index: SHA512 packageHash matches the uploaded bytes ──
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/registration/{lower}/index.json",
+            "{}/repository/{repo}/registration/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -81,7 +81,7 @@ async fn push_restore_registration_search_and_hash() {
 
     // ── Search returns the package ──
     let resp = client
-        .get(format!("{}/v3/{repo}/query?q={id}", srv.base_url))
+        .get(format!("{}/repository/{repo}/query?q={id}", srv.base_url))
         .basic_auth(&u, Some(&p))
         .send()
         .await
@@ -119,7 +119,7 @@ async fn unlist_hides_from_search_then_relist() {
 
     let search_hits = |srv_url: String, u: String, p: String, client: reqwest::Client| async move {
         let search: Value = client
-            .get(format!("{srv_url}/v3/{repo}/query?q={id}"))
+            .get(format!("{srv_url}/repository/{repo}/query?q={id}"))
             .basic_auth(&u, Some(&p))
             .send()
             .await
@@ -137,7 +137,10 @@ async fn unlist_hides_from_search_then_relist() {
 
     // Unlist (DELETE on the package version).
     let resp = client
-        .delete(format!("{}/v3/{repo}/package/{id}/2.0.0", srv.base_url))
+        .delete(format!(
+            "{}/repository/{repo}/package/{id}/2.0.0",
+            srv.base_url
+        ))
         .header("X-NuGet-ApiKey", &srv.admin_token)
         .send()
         .await
@@ -157,7 +160,7 @@ async fn unlist_hides_from_search_then_relist() {
     // Still downloadable by exact version.
     let resp = client
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/2.0.0/{lower}.2.0.0.nupkg",
+            "{}/repository/{repo}/flat/{lower}/2.0.0/{lower}.2.0.0.nupkg",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -169,7 +172,10 @@ async fn unlist_hides_from_search_then_relist() {
 
     // Relist (POST) restores search visibility.
     let resp = client
-        .post(format!("{}/v3/{repo}/package/{id}/2.0.0", srv.base_url))
+        .post(format!(
+            "{}/repository/{repo}/package/{id}/2.0.0",
+            srv.base_url
+        ))
         .header("X-NuGet-ApiKey", &srv.admin_token)
         .send()
         .await

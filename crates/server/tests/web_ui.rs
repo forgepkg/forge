@@ -1,7 +1,7 @@
 //! Integration tests for the static SPA serving layer.
 //!
 //! Verifies the correctness properties the serving model depends on:
-//! * the API routers (`/admin/*`, `/browse/*`, `/v3/*`) are **not** shadowed by
+//! * the API routers (`/admin/*`, `/browse/*`, `/repository/*`) are **not** shadowed by
 //!   the SPA fallback;
 //! * unknown (client-side) paths fall back to `index.html` so TanStack Router
 //!   can resolve deep links — including the admin UI under `/manage/*` — but a
@@ -125,8 +125,8 @@ async fn spa_serving_and_api_precedence() {
         "/admin/repositories/x/y/z/w",
         "/auth/does-not-exist",
         "/browse/does-not-exist",
-        "/v3",
-        "/v3/",
+        "/repository",
+        "/repository/",
     ] {
         for authed in [false, true] {
             let mut req = client.get(format!("{}{path}", server.base_url));
@@ -138,6 +138,20 @@ async fn spa_serving_and_api_precedence() {
             let body = res.text().await.expect("body");
             assert!(!body.contains("forge-spa"), "{path}: {body}");
         }
+    }
+    // Removed feed prefixes are no longer API routes: when the UI is enabled,
+    // they fall through to its SPA fallback rather than reaching a feed.
+    for path in ["/v3/nuget/index.json", "/raw/binaries/file"] {
+        let res = client
+            .get(format!("{}{path}", server.base_url))
+            .send()
+            .await
+            .expect("GET removed feed path");
+        assert_eq!(res.status(), reqwest::StatusCode::OK, "{path}");
+        assert!(
+            res.text().await.expect("SPA body").contains("forge-spa"),
+            "{path} should fall through to the SPA"
+        );
     }
     // A UI path that merely starts with the same letters is still the SPA.
     let res = client

@@ -502,7 +502,7 @@ async fn nupkg(srv: &TestServer, repo: &str, id: &str, version: &str) -> Option<
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/{version}/{lower}.{version}.nupkg",
+            "{}/repository/{repo}/flat/{lower}/{version}/{lower}.{version}.nupkg",
             srv.base_url
         ))
         .basic_auth(u, Some(p))
@@ -729,7 +729,7 @@ async fn conflict_policies_and_the_dry_run() {
     for pkg in [ours.clone(), make_nupkg("Acme.Same", "1.0.0")] {
         let resp = srv
             .client()
-            .put(format!("{}/v3/{repo}/package", srv.base_url))
+            .put(format!("{}/repository/{repo}/package", srv.base_url))
             .header("X-NuGet-ApiKey", &token)
             .multipart(reqwest::multipart::Form::new().part(
                 "package",

@@ -279,8 +279,8 @@ describe('admin repositories', () => {
     mockApi({
       repositories: [],
       formats: [
-        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
-        { id: 'acme', name: 'Acme packages', kinds: ['hosted', 'group'], mount: '/repository' },
+        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'] },
+        { id: 'acme', name: 'Acme packages', kinds: ['hosted', 'group'] },
       ],
       onCreate: (body) => {
         posted = body
@@ -324,8 +324,8 @@ describe('admin repositories', () => {
     mockApi({
       repositories: [],
       formats: [
-        { id: 'docker', name: 'Docker / OCI', kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
-        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+        { id: 'docker', name: 'Docker / OCI', kinds: ['hosted', 'proxy', 'group'] },
+        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'] },
       ],
       onCreate: (body) => {
         posted = body as Record<string, unknown>
@@ -364,8 +364,8 @@ describe('admin repositories', () => {
     mockApi({
       repositories: [],
       formats: [
-        { id: 'docker', name: 'Docker / OCI', kinds: ['hosted', 'proxy', 'group'], mount: '/v2' },
-        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'], mount: '/v3' },
+        { id: 'docker', name: 'Docker / OCI', kinds: ['hosted', 'proxy', 'group'] },
+        { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'] },
       ],
       onCreate: () =>
         new Response('another docker repository already answers on this host', {
@@ -420,7 +420,6 @@ describe('admin repositories', () => {
         id: format,
         name: format,
         kinds: ['hosted', 'proxy', 'group'],
-        mount: format === 'docker' ? '/v2' : '/v3',
         default_max_upload_bytes: defaultMib * 1024 * 1024,
         max_upload_bytes_limit: 2048 * 1024 * 1024,
       }],
@@ -450,14 +449,13 @@ describe('admin repositories', () => {
     )
   })
 
-  it('edit loads a plugin format name and custom feed mount', async () => {
+  it('edit loads a plugin format name and shared feed prefix', async () => {
     mockApi({
       repositories: [repo({ format: 'helm' })],
       formats: [{
         id: 'helm',
         name: 'Helm charts',
         kinds: ['hosted', 'proxy', 'group'],
-        mount: '/charts',
       }],
     })
 
@@ -465,7 +463,7 @@ describe('admin repositories', () => {
 
     expect(await screen.findByDisplayValue('Helm charts')).toHaveAttribute('readonly')
     expect(screen.getByLabelText('Name')).toHaveAccessibleDescription(
-      'Part of the feed URL (/charts/<name>/): letters, digits, ".", "_" and "-", up to 64 characters.',
+      'Part of the feed URL (/repository/<name>/): letters, digits, ".", "_" and "-", up to 64 characters.',
     )
   })
 

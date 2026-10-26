@@ -15,7 +15,7 @@ async fn versions_on(srv: &TestServer, repo: &str, lower: &str) -> Vec<String> {
     let resp = srv
         .client()
         .get(format!(
-            "{}/v3/{repo}/flat/{lower}/index.json",
+            "{}/repository/{repo}/flat/{lower}/index.json",
             srv.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -65,7 +65,7 @@ async fn push_on_a_visible_and_downloadable_on_b() {
     let resp = b
         .client()
         .get(format!(
-            "{}/v3/so-repo/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
+            "{}/repository/so-repo/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg",
             b.base_url
         ))
         .basic_auth(&u, Some(&p))
@@ -117,7 +117,7 @@ async fn concurrent_proxy_misses_across_instances_converge() {
         let st = srv
             .client()
             .get(format!(
-                "{}/v3/xo-proxy/flat/cross.lib/1.0.0/cross.lib.1.0.0.nupkg",
+                "{}/repository/xo-proxy/flat/cross.lib/1.0.0/cross.lib.1.0.0.nupkg",
                 srv.base_url
             ))
             .basic_auth(&u, Some(&p))
@@ -148,7 +148,7 @@ async fn concurrent_proxy_misses_across_instances_converge() {
     let st = a
         .client()
         .get(format!(
-            "{}/v3/xo-proxy/flat/cross.lib/1.0.0/cross.lib.1.0.0.nupkg",
+            "{}/repository/xo-proxy/flat/cross.lib/1.0.0/cross.lib.1.0.0.nupkg",
             a.base_url
         ))
         .basic_auth(&u, Some(&p))

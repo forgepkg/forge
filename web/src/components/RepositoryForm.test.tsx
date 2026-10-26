@@ -35,7 +35,6 @@ const example: FormatView = {
   id: 'example',
   name: 'Example packages',
   kinds: ['hosted', 'group'],
-  mount: '/repository',
   version: '0.1.0',
   description: 'Example package repositories.',
 }
@@ -89,9 +88,9 @@ describe('RepositoryForm', () => {
       />,
     )
 
-    // NuGet first: proxies are offered, the feed is a V3 index.
+    // NuGet first: proxies are offered, the feed is a service index.
     expect(screen.getByRole('option', { name: 'proxy' })).toBeInTheDocument()
-    expect(screen.getByText('/v3/<name>/index.json')).toBeInTheDocument()
+    expect(screen.getByText('/repository/<name>/index.json')).toBeInTheDocument()
 
     await user.selectOptions(screen.getByLabelText('Kind'), 'proxy')
     await user.selectOptions(screen.getByLabelText('Format'), 'example')

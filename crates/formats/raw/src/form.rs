@@ -1,4 +1,4 @@
-//! Uploads of several files: `POST /raw/<repo>/<directory>/` with a
+//! Uploads of several files: `POST /repository/<repo>/<directory>/` with a
 //! `multipart/form-data` body, whose file parts are stored under
 //! `directory`, each at its part's file name. Nexus' field names for its
 //! component upload work too: `raw.directory` (or `directory`) names a

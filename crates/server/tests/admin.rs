@@ -610,7 +610,7 @@ async fn unscoped_admin_token_cannot_use_admin_api() {
             .unwrap(),
     );
     let resp = client
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", &token)
         .multipart(form)
         .send()
@@ -2997,7 +2997,7 @@ async fn anonymous_read_off_deletes_the_synthesized_grant() {
     forge_db::authz_dao::add_grant(&srv.pool, anon_role, Some(public_id), "read", None)
         .await
         .unwrap();
-    let index = format!("{}/v3/{public}/index.json", srv.base_url);
+    let index = format!("{}/repository/{public}/index.json", srv.base_url);
     assert_eq!(client.get(&index).send().await.unwrap().status(), 200);
 
     let resp = put_repo(&srv, &public, json!({"anonymous_read": false})).await;

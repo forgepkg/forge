@@ -64,7 +64,7 @@ test('admin creates a hosted repo via the UI and it appears in the list', async 
   await expect(page.getByRole('main').getByRole('link', { name, exact: true })).toBeVisible()
 
   // And the V3 service index advertises PackagePublish (verified via the API).
-  const idx = await request.get(`${f.baseUrl}/v3/${name}/index.json`)
+  const idx = await request.get(`${f.baseUrl}/repository/${name}/index.json`)
   expect(idx.ok()).toBeTruthy()
   expect(JSON.stringify(await idx.json())).toContain('PackagePublish')
 })

@@ -111,7 +111,7 @@ fn package_body(package: &[u8]) -> Vec<u8> {
 
 async fn push(srv: &common::TestServer, repo: &str, api_key: &str, id: &str) -> reqwest::Response {
     srv.client()
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", api_key)
         .header(
             "content-type",
@@ -710,7 +710,7 @@ async fn reader_role_can_publish_only_live_publisher_packages() {
     );
     let unlist = client
         .delete(format!(
-            "{}/v3/{repo}/package/{allowed}/1.0.0",
+            "{}/repository/{repo}/package/{allowed}/1.0.0",
             srv.base_url
         ))
         .header("X-NuGet-ApiKey", &direct_token)
@@ -762,7 +762,7 @@ async fn reader_role_can_publish_only_live_publisher_packages() {
     assert_eq!(
         client
             .delete(format!(
-                "{}/v3/{repo}/package/{sibling_package}/1.0.0",
+                "{}/repository/{repo}/package/{sibling_package}/1.0.0",
                 srv.base_url
             ))
             .header("X-NuGet-ApiKey", sibling_api_key)

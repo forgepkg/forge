@@ -1,5 +1,5 @@
 //! Authorization and write plumbing shared by every format's feed, served by
-//! [`crate::plugins`] under each format's mount (NuGet: `/v3/{repo}`).
+//! [`crate::plugins`] under `/repository/{repo}`.
 //!
 //! ## Authorization
 //! Resolution runs **before** a format sees the request:
@@ -20,6 +20,9 @@ use forge_db::model::Repository;
 use sha2::Digest;
 
 use crate::state::AppState;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AuthzDenied;
 
 /// `Retry-After` (seconds) of an offline repository's 503.
 pub(crate) const OFFLINE_RETRY_AFTER_SECS: &str = "60";
@@ -70,7 +73,7 @@ pub(crate) fn principal_allows_protocol_mutations(principal: &Principal) -> bool
 /// Map an authorization denial to the right status: unauthenticated → 401 (send
 /// credentials), authenticated-but-forbidden → 403, anonymous-denied → 401.
 pub(crate) fn authz_denied(principal: &Principal) -> Response {
-    match principal {
+    let mut response = match principal {
         // An authenticated identity (user or WIF workload) that is nonetheless
         // denied by RBAC → 403.
         Principal::User { .. } | Principal::Workload { .. } => {
@@ -86,7 +89,9 @@ pub(crate) fn authz_denied(principal: &Principal) -> Response {
             "authentication required",
         )
             .into_response(),
-    }
+    };
+    response.extensions_mut().insert(AuthzDenied);
+    response
 }
 
 // ── Hosted write adapter ────────────────────────────────────────────────────

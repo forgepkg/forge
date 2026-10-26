@@ -2,7 +2,7 @@
 //!
 //! Exercises the full HTTP stack: publish a package, then browse + view detail;
 //! the signed-in-users-only rule (anonymous browse is 401 even for
-//! `anonymous_read` repos — those stay readable on the `/v3` feed only);
+//! `anonymous_read` repos — those stay readable on their repository feed only);
 //! the `/browse/repos` folder root; group-repo merge; dependency-group
 //! rendering; and that mounting `/browse` + `/admin/me` did not shadow the
 //! admin-only `/admin/*` API.
@@ -38,7 +38,7 @@ async fn publish_one(
     // Under RBAC, anonymous read flows through a grant on the built-in
     // `anonymous` role (what the RBAC data migration converted the
     // `anonymous_read` flag into), not the column. Seed that grant directly,
-    // mirroring the migration, so the `/v3` feed serves the repo anonymously.
+    // mirroring the migration, so the repository feed serves the repo anonymously.
     if anonymous_read {
         let repo_id = forge_db::repository_dao::find_repository_by_name(&srv.pool, repo)
             .await
@@ -62,7 +62,7 @@ async fn publish_one(
         .unwrap();
     let form = reqwest::multipart::Form::new().part("package", part);
     let resp = client
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", &api_key)
         .multipart(form)
         .send()
@@ -251,7 +251,7 @@ async fn browse_detail_unknown_repo_404() {
 
 /// Browsing is for signed-in users only: even with `anonymous_mode = all` and
 /// an `anonymous_read` repo, an anonymous caller gets 401 from every `/browse`
-/// endpoint, while the same repo stays anonymously readable on the `/v3` feed.
+/// endpoint, while the same repo stays anonymously readable on its repository feed.
 #[tokio::test]
 async fn browse_requires_login() {
     let srv = common::start_with(
@@ -287,11 +287,15 @@ async fn browse_requires_login() {
     // The same anonymous caller can still read the repo through the NuGet feed.
     let resp = srv
         .client()
-        .get(format!("{}/v3/{pub_repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{pub_repo}/index.json", srv.base_url))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "anonymous_read still applies to /v3");
+    assert_eq!(
+        resp.status(),
+        200,
+        "anonymous_read still applies to repository feeds"
+    );
 
     // A signed-in user browses normally.
     let resp = srv
@@ -354,8 +358,8 @@ async fn browse_repos_folder_root() {
     assert_eq!(names, sorted, "repo folder list is sorted by name");
 }
 
-/// `/browse/repos` names each repository's client URL under its format's
-/// mount, and `format` keeps one format's repositories.
+/// `/browse/repos` names each repository's client URL under the shared
+/// repository prefix, and `format` keeps one format's repositories.
 #[tokio::test]
 async fn browse_repos_by_format_with_client_urls() {
     let srv = common::start().await;
@@ -405,13 +409,13 @@ async fn browse_repos_by_format_with_client_urls() {
     assert_eq!(nuget["format"], "nuget");
     assert_eq!(
         nuget["url"],
-        format!("http://test.local/v3/{}", created[0].0)
+        format!("http://test.local/repository/{}", created[0].0)
     );
     let raw = entry(&created[1].0);
     assert_eq!(raw["format"], "raw");
     assert_eq!(
         raw["url"],
-        format!("http://test.local/raw/{}", created[1].0)
+        format!("http://test.local/repository/{}", created[1].0)
     );
     let docker = entry(&created[2].0);
     assert_eq!(docker["format"], "docker");

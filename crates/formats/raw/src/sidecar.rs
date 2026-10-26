@@ -194,7 +194,7 @@ mod tests {
         let mut repo = Repository {
             name: "r".into(),
             kind: RepositoryKind::Hosted,
-            base_url: "https://forge.example.com/raw/r".into(),
+            base_url: "https://forge.example.com/repository/r".into(),
             inline: false,
             reserved_prefixes: Vec::new(),
         };

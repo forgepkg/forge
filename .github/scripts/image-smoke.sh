@@ -156,11 +156,11 @@ admin POST /admin/repositories '{"name":"nuget","kind":"hosted"}' >/dev/null \
   || fail "creating a repository failed"
 token=$(admin POST /admin/me/tokens '{"name":"smoke"}' | jq -r .token)
 status=$(curl -sS -o "$work/push.txt" -w '%{http_code}' -X PUT -H "X-NuGet-ApiKey: $token" \
-  -F "package=@$package" "$base/v3/nuget/package")
+  -F "package=@$package" "$base/repository/nuget/package")
 [ "$status" = 201 ] || fail "push answered $status: $(cat "$work/push.txt")"
-version=$(curl -fsS -u "$admin_user:$token" "$base/v3/nuget/flat/sample.lib/index.json" \
+version=$(curl -fsS -u "$admin_user:$token" "$base/repository/nuget/flat/sample.lib/index.json" \
   | jq -r '.versions[0]')
-nupkg_url="$base/v3/nuget/flat/sample.lib/$version/sample.lib.$version.nupkg"
+nupkg_url="$base/repository/nuget/flat/sample.lib/$version/sample.lib.$version.nupkg"
 download
 [ "$(admin GET /admin/blob-cache | jq .entries)" -ge 1 ] || fail "the push left the cache empty"
 

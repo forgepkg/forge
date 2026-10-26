@@ -6,13 +6,13 @@
 //!
 //! * browsing requires a **signed-in user**: every `/browse/*` endpoint rejects
 //!   anonymous / unauthenticated callers with 401, regardless of any repo's
-//!   `anonymous_read` flag (which continues to apply to the `/v3` feed only);
+//!   `anonymous_read` flag (which continues to apply to repository feeds only);
 //! * authorization on top of that is the
 //!   [`Authz::can_read`](forge_core::auth::Authz::can_read) predicate,
 //!   evaluated against the request's [`Principal`];
 //! * version visibility, group member resolution, listed/prerelease filtering,
 //!   and proxy **package-delay** gating all come for free from
-//!   [`AppState::read_ops_for`] + [`RepoReadOps`] — the same ops the `/v3/*`
+//!   [`AppState::read_ops_for`] + [`RepoReadOps`] — the same ops the repository
 //!   dispatcher uses, so browse can never surface a version the protocol would
 //!   hide.
 //!
@@ -65,7 +65,7 @@ const DEFAULT_TAKE: usize = 20;
 /// Browsing is for signed-in users only: returns the 401 response to send when
 /// the principal is not an authenticated user, `None` when it is.
 ///
-/// Per-repo `anonymous_read` still governs the `/v3` feed; the web browse
+/// Per-repo `anonymous_read` still governs the repository feed; the web browse
 /// surface deliberately requires a login (token-authenticated API callers count
 /// — they are a user's credential).
 fn require_user(principal: &Principal) -> Option<Response> {
@@ -91,8 +91,8 @@ pub struct BrowseRepo {
     /// Repository format (`nuget`, `docker`, or a plugin format's id): docker repositories are
     /// browsed through `/browse/images`.
     pub format: String,
-    /// The address clients use for the repository (`{public_base_url}{mount}/{name}`,
-    /// for raw `{public_base_url}/raw/{name}`), for the UI's client
+    /// The address clients use for the repository (`{public_base_url}/repository/{name}`),
+    /// for the UI's client
     /// snippets. Absent for an images format's (Docker's) repositories, whose
     /// registry `/browse/images` names, and for a format not installed here.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,13 +147,7 @@ pub async fn list_repos(
                     .formats
                     .plugin(&repo.format)
                     .filter(|plugin| plugin.descriptor().storage != Storage::Images)
-                    .map(|plugin| {
-                        crate::plugins::repository_url(
-                            &state,
-                            plugin.descriptor().mount,
-                            &repo.name,
-                        )
-                    }),
+                    .map(|_| crate::plugins::repository_url(&state, &repo.name)),
                 storage: state.storage(&repo.format).as_str(),
             });
         }

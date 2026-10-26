@@ -105,7 +105,6 @@ impl RepositoryKind {
 ///     name: "Example packages",
 ///     version: env!("CARGO_PKG_VERSION"),
 ///     description: "Example packages: push and pull with the example client.",
-///     mount: "/repository",
 ///     kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
 ///     storage: Storage::Packages,
 ///     assets: Assets::DEFAULT,
@@ -125,11 +124,6 @@ pub struct Descriptor {
     pub version: &'static str,
     /// One line on what the format serves.
     pub description: &'static str,
-    /// Where its repositories are served, `{mount}/{repository}/…`:
-    /// [`DEFAULT_MOUNT`], or `/` and one lowercase word of its own. An
-    /// images format's is [`IMAGES_MOUNT`]: its clients name an image
-    /// `{host}/{repository}/{image}` and ask for it under `/v2`.
-    pub mount: &'static str,
     /// The repository kinds it supports, each once. `Proxy` only when the
     /// format implements [`FormatPlugin::upstream`].
     ///
@@ -155,9 +149,6 @@ pub enum UpstreamToken {
     /// `_authToken`).
     Bearer,
 }
-
-/// Where a format's repositories are served unless it names another mount.
-pub const DEFAULT_MOUNT: &str = "/repository";
 
 /// The mount of an images format ([`Storage::Images`]): the registry API's
 /// root, where every distribution-spec client asks.

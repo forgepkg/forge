@@ -67,7 +67,7 @@ export HOME="$work/home" NPM_CONFIG_USERCONFIG="$work/home/.npmrc"
 export npm_config_cache="$work/npm-cache" npm_config_update_notifier=false
 export npm_config_fund=false npm_config_audit=false
 mkdir -p "$HOME"
-reg() { echo "$base/npm/$1/"; }
+reg() { echo "$base/repository/$1/"; }
 # The versions `npm view` lists, as a JSON array (one version is printed
 # bare by some npm releases).
 versions() { # <package> <registry>
@@ -290,11 +290,11 @@ web_login() { # <userconfig> <output>
 web_login "$NPM_CONFIG_USERCONFIG" "$work/npm-login.out"
 grep -q "Logged in on $(reg npm-all)" "$work/npm-login.out" || fail "npm login: $(cat "$work/npm-login.out")"
 [ "$(npm whoami --registry "$(reg npm-all)")" = "$admin_user" ] || fail "npm whoami"
-token=$(sed -n 's#^//127.0.0.1:'"$port"'/npm/npm-all/:_authToken=##p' "$NPM_CONFIG_USERCONFIG")
+token=$(sed -n 's#^//127.0.0.1:'"$port"'/repository/npm-all/:_authToken=##p' "$NPM_CONFIG_USERCONFIG")
 [ -n "$token" ] || fail "npm login stored no token"
 # The token is the account's: the other repositories take it too.
 for repo in npm-hosted npm-proxy; do
-  echo "//127.0.0.1:$port/npm/$repo/:_authToken=$token" >> "$NPM_CONFIG_USERCONFIG"
+  echo "//127.0.0.1:$port/repository/$repo/:_authToken=$token" >> "$NPM_CONFIG_USERCONFIG"
 done
 [ "$(npm whoami --registry "$(reg npm-hosted)")" = "$admin_user" ] || fail "npm whoami (hosted)"
 
@@ -352,13 +352,13 @@ grep -q npmAuthToken "$HOME/.yarnrc.yml" || fail "yarn stored no token"
 # A wrong password is refused.
 code=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' \
   -d "{\"name\":\"$admin_user\",\"password\":\"wrong\"}" \
-  "$base/npm/npm-all/-/user/org.couchdb.user:$admin_user")
+  "$base/repository/npm-all/-/user/org.couchdb.user:$admin_user")
 [ "$code" = 401 ] || fail "a wrong password answered $code"
 # `npm logout` revokes the token it signed in with.
 web_login "$work/throwaway-npmrc" "$work/npm-login-2.out"
-throwaway=$(sed -n 's#^//127.0.0.1:'"$port"'/npm/npm-all/:_authToken=##p' "$work/throwaway-npmrc")
+throwaway=$(sed -n 's#^//127.0.0.1:'"$port"'/repository/npm-all/:_authToken=##p' "$work/throwaway-npmrc")
 npm logout --registry "$(reg npm-all)" --userconfig "$work/throwaway-npmrc" >/dev/null
-code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $throwaway" "$base/npm/npm-all/-/whoami")
+code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $throwaway" "$base/repository/npm-all/-/whoami")
 [ "$code" = 401 ] || fail "a logged-out token answered $code"
 
 step "the group keeps the internal scope internal"
@@ -492,7 +492,7 @@ project "$work/use-pnpm-proxy" "$(reg npm-proxy)"
 published=$(npm view e2e-public time --json --registry "$(reg npm-proxy)" | jq -r '.["1.1.0"]')
 [ "$published" = 2020-01-01T00:00:00.000Z ] || fail "the proxy's publish time of e2e-public 1.1.0: $published"
 curl -fsS -D "$work/corgi.headers" -o "$work/corgi.json" -H "Authorization: Bearer $token" \
-  -H 'Accept: application/vnd.npm.install-v1+json' "$base/npm/npm-proxy/e2e-public"
+  -H 'Accept: application/vnd.npm.install-v1+json' "$base/repository/npm-proxy/e2e-public"
 grep -qi '^content-type: application/vnd.npm.install-v1+json' "$work/corgi.headers" \
   || fail "the abbreviated packument: $(cat "$work/corgi.headers")"
 jq -e '(has("time") | not) and .versions["1.1.0"].dist.tarball != null' "$work/corgi.json" >/dev/null \

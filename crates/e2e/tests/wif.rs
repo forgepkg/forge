@@ -40,9 +40,9 @@ async fn create_wif_realm(srv: &TestServer, name: &str, config: Value) -> Status
         .status()
 }
 
-/// GET `/v3/{repo}/index.json` presenting `token` in the named transport.
+/// GET `/repository/{repo}/index.json` presenting `token` in the named transport.
 async fn read_index(srv: &TestServer, repo: &str, transport: Transport, token: &str) -> StatusCode {
-    let url = format!("{}/v3/{repo}/index.json", srv.base_url);
+    let url = format!("{}/repository/{repo}/index.json", srv.base_url);
     let req = srv.client().get(url);
     transport.apply(req, token).send().await.unwrap().status()
 }
@@ -62,7 +62,7 @@ async fn push(
     let form = reqwest::multipart::Form::new().part("package", part);
     let req = srv
         .client()
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .multipart(form);
     transport.apply(req, token).send().await.unwrap().status()
 }
@@ -359,7 +359,7 @@ async fn workload_unlist_and_relist_are_audited_and_fenced() {
     }
     let mutate = |method: reqwest::Method, version: &'static str| {
         let url = format!(
-            "{}/v3/ci-hosted/package/Acme.Mutations/{version}",
+            "{}/repository/ci-hosted/package/Acme.Mutations/{version}",
             srv.base_url
         );
         let req = srv.client().request(method, url).bearer_auth(&token);
@@ -557,7 +557,7 @@ async fn native_dotnet_push_uses_wif_for_private_index_and_package_put() {
     let package = temp.path().join("Native.Trusted.Core.1.0.0.nupkg");
     std::fs::write(&package, make_nupkg("Native.Trusted.Core", "1.0.0")).unwrap();
     let config = temp.path().join("nuget.config");
-    let source = format!("{}/v3/native-wif/index.json", srv.base_url);
+    let source = format!("{}/repository/native-wif/index.json", srv.base_url);
     std::fs::write(
         &config,
         format!(

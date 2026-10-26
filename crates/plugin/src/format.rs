@@ -365,7 +365,6 @@ mod tests {
         name: "Unlimited",
         version: "0.1.0",
         description: "Every id, every version.",
-        mount: api::DEFAULT_MOUNT,
         kinds: &[api::RepositoryKind::Hosted, api::RepositoryKind::Group],
         storage: Storage::Packages,
         assets: Assets::DEFAULT,

@@ -63,7 +63,7 @@ import {
 /**
  * The server's repository-name rule: 1–64 characters, letters, digits, `.`,
  * `_`, `-`, starting with a letter or digit (the name is a URL path segment of
- * the feed, `/v3/<name>/index.json`).
+ * the feed, `/repository/<name>/index.json`).
  */
 export const REPO_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
@@ -134,7 +134,6 @@ export const NUGET_FORMAT: FormatView = {
   id: 'nuget',
   name: 'NuGet',
   kinds: ['hosted', 'proxy', 'group'],
-  mount: '/v3',
 }
 
 /**
@@ -145,31 +144,28 @@ export const DOCKER_FORMAT: FormatView = {
   id: 'docker',
   name: 'Docker / OCI',
   kinds: ['hosted', 'proxy', 'group'],
-  mount: '/v2',
 }
 
 /**
  * Raw (generic file) repositories, built in: files under arbitrary paths,
- * served under `/raw`. They carry their own options (deployment policy,
- * content disposition, a proxy's maximum age).
+ * served under `/repository/<name>/`. They carry their own options (deployment
+ * policy, content disposition, a proxy's maximum age).
  */
 export const RAW_FORMAT: FormatView = {
   id: 'raw',
   name: 'Raw files',
   kinds: ['hosted', 'proxy', 'group'],
-  mount: '/raw',
 }
 
 /**
  * npm registries, built in: packages for npm, pnpm, Yarn and Bun, served
- * under `/npm`. Hosted ones have a deployment policy, groups a writable
- * member.
+ * under `/repository/<name>/`. Hosted ones have a deployment policy, groups a
+ * writable member.
  */
 export const NPM_FORMAT: FormatView = {
   id: 'npm',
   name: 'npm',
   kinds: ['hosted', 'proxy', 'group'],
-  mount: '/npm',
 }
 
 /** Default maximum age of a raw proxy's cached files: a day. */
@@ -178,8 +174,8 @@ export const DEFAULT_RAW_MAX_AGE_SECONDS = 86400
 /** Where a repository of `format` named `name` is served. */
 export function feedPath(format: FormatView, name: string): string {
   return format.id === NUGET_FORMAT.id
-    ? `${format.mount}/${name}/index.json`
-    : `${format.mount}/${name}/`
+    ? `/repository/${name}/index.json`
+    : `/repository/${name}/`
 }
 
 /** A draft mirrors the form fields; numbers are kept as strings while editing. */
@@ -423,7 +419,6 @@ export function RepositoryForm({
     id: values.format,
     name: values.format,
     kinds: ['hosted', 'group'],
-    mount: '/repository',
   }
 
   function setFormat(id: string) {

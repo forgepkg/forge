@@ -447,7 +447,7 @@ async fn session_minted_token_authenticates_nuget_endpoint() {
     assert!(resp.status().is_success(), "repo created");
 
     let push = no_redirect_client()
-        .put(format!("{}/v3/{repo}/package", srv.base_url))
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
         .header("X-NuGet-ApiKey", &api_key)
         .multipart(
             reqwest::multipart::Form::new().part(
@@ -469,7 +469,7 @@ async fn session_minted_token_authenticates_nuget_endpoint() {
 
     // And the same key reads the service index.
     let read = no_redirect_client()
-        .get(format!("{}/v3/{repo}/index.json", srv.base_url))
+        .get(format!("{}/repository/{repo}/index.json", srv.base_url))
         .header("X-NuGet-ApiKey", &api_key)
         .send()
         .await
