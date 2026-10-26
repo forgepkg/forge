@@ -327,6 +327,113 @@ async fn concurrent_first_pushes_yield_one_create_and_conflicts() {
     assert_eq!((created, conflicts), (1, 7));
 }
 
+/// With `allow_redeploy`, simultaneous first pushes of one (id, version) all
+/// succeed: one creates the version, the others replace it, as they would
+/// a moment later (#226).
+#[tokio::test]
+async fn concurrent_first_pushes_with_redeploy_create_then_replace() {
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, true).await;
+    let w = Arc::new(writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await);
+    let id = unique_id();
+    let bytes = make_nupkg(&id, "1.0.0");
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let (w, repo, bytes) = (w.clone(), repo.clone(), bytes.clone());
+            tokio::spawn(async move { w.store_upload(&repo, &bytes[..], MAX_UPLOAD).await })
+        })
+        .collect();
+    let (mut created, mut replaced) = (0, 0);
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(PublishOutcome::Created) => created += 1,
+            Ok(PublishOutcome::Replaced) => replaced += 1,
+            other => panic!("unexpected publish result: {other:?}"),
+        }
+    }
+    assert_eq!((created, replaced), (1, 7));
+}
+
+/// A first push that loses the race for the unique index to a concurrent
+/// first push of the same (id, version) is retried as a redeploy where the
+/// repository allows one, instead of failing with 409 (#226). The race is
+/// forced: the winner's row is inserted and held uncommitted until the push
+/// waits on it.
+#[tokio::test]
+async fn first_push_losing_the_insert_race_redeploys() {
+    let pool = common::pool().await;
+    let store = common::blob_store().await;
+    let cas = Cas::new(store.clone(), pool.clone());
+    let repo = seed_repo(&pool, true).await;
+    let repo_id = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let w = writer(&pool, cas, Arc::new(NoopCacheInvalidator)).await;
+    let id = unique_id();
+    let lower = id.to_lowercase();
+
+    // The winner: its version row, not committed yet.
+    let mut winner = pool.begin().await.unwrap();
+    let winner_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *winner)
+        .await
+        .unwrap();
+    forge_db::component_dao::insert_component(
+        &mut *winner,
+        forge_db::component_dao::NewComponent {
+            repository_id: repo_id,
+            name: lower.clone(),
+            original_id: id.clone(),
+            version: "1.0.0".into(),
+            version_original: "1.0.0".into(),
+            listed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    // The push finds no version and waits on the unique index.
+    let bytes = make_nupkg(&id, "1.0.0");
+    let pusher = {
+        let (repo, bytes) = (repo.clone(), bytes.clone());
+        tokio::spawn(async move { w.store_upload(&repo, &bytes[..], MAX_UPLOAD).await })
+    };
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(winner_pid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if blocked > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    winner.commit().await.unwrap();
+
+    let outcome = pusher
+        .await
+        .unwrap()
+        .expect("the losing first push redeploys");
+    assert_eq!(outcome, PublishOutcome::Replaced);
+    let comp = forge_db::component_dao::find_component(&pool, repo_id, &lower, "1.0.0")
+        .await
+        .unwrap()
+        .expect("the version exists");
+    let nupkg = forge_db::asset_dao::find_asset(&pool, comp.id, NUPKG_ASSET_PATH)
+        .await
+        .unwrap()
+        .expect("the redeploy stored the package");
+    assert_eq!(blob_ref_count(&pool, &nupkg.blob_sha256).await, Some(1));
+}
+
 #[tokio::test]
 async fn too_large_upload_is_rejected() {
     let pool = common::pool().await;

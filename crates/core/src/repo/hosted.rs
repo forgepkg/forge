@@ -625,6 +625,8 @@ impl HostedWrite {
     ///    `(id, version)` is rejected with [`WriteError::Conflict`] unless the
     ///    repository has `allow_redeploy`, in which case the assets are swapped
     ///    to the new blobs and the old blobs are dereferenced in the same tx.
+    ///    Of two concurrent first pushes, the one that loses the race for
+    ///    the unique index runs the transaction once more, as a duplicate.
     /// 5. Invalidate the `(repo, id)` cache namespace.
     pub async fn store_upload<R>(
         &self,
@@ -851,74 +853,77 @@ impl HostedWrite {
             .map_err(|_| RepoError::Storage("nuspec size overflow".into()))?;
 
         // 4. Commit references + component/asset rows in one transaction.
-        let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
-
-        // Read the duplicate-check *inside* the transaction so it serializes
-        // with the subsequent insert/redeploy write against concurrent pushes
-        // of the same (id, version).
-        let existing =
-            component_dao::find_component(&mut *tx, repo_row.id, &parsed.id, &parsed.version)
-                .await
-                .map_err(RepoError::from)?;
-
         let nupkg_hash512 = nupkg.sha512_base64.clone();
+        // Whether the transaction already lost the race for the unique index
+        // to a concurrent first push of this (id, version) once (see below).
+        let mut retried = false;
+        let (mut tx, component_id, replaced, outcome) = loop {
+            let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
 
-        let mut component_id = existing.as_ref().map(|c| c.id);
-        let replaced = match existing {
-            Some(comp) => {
-                match import {
-                    // Stored concurrently since the check above.
-                    Some(options) if !options.overwrite => {
-                        let stored = self.stored_package_sha256(&mut *tx, comp.id).await?;
-                        return done(if stored.as_deref() == Some(nupkg_sha.as_str()) {
-                            Published::Identical
-                        } else {
-                            Published::Conflict
-                        });
+            // Read the duplicate-check *inside* the transaction so it serializes
+            // with the subsequent insert/redeploy write against concurrent pushes
+            // of the same (id, version).
+            let existing =
+                component_dao::find_component(&mut *tx, repo_row.id, &parsed.id, &parsed.version)
+                    .await
+                    .map_err(RepoError::from)?;
+
+            let existing_id = existing.as_ref().map(|c| c.id);
+            let replaced = match existing {
+                Some(comp) => {
+                    match import {
+                        // Stored concurrently since the check above.
+                        Some(options) if !options.overwrite => {
+                            let stored = self.stored_package_sha256(&mut *tx, comp.id).await?;
+                            return done(if stored.as_deref() == Some(nupkg_sha.as_str()) {
+                                Published::Identical
+                            } else {
+                                Published::Conflict
+                            });
+                        }
+                        Some(_) => {}
+                        None if !repo_row.allow_redeploy => {
+                            // Duplicate and redeploy disabled → 409. Drop the tx; the
+                            // pending blobs become orphans the reconciler cleans up.
+                            return Err(WriteError::Conflict {
+                                id: parsed.original_id.clone(),
+                                version: parsed.version.clone(),
+                            });
+                        }
+                        None => {}
                     }
-                    Some(_) => {}
-                    None if !repo_row.allow_redeploy => {
-                        // Duplicate and redeploy disabled → 409. Drop the tx; the
-                        // pending blobs become orphans the reconciler cleans up.
-                        return Err(WriteError::Conflict {
-                            id: parsed.original_id.clone(),
-                            version: parsed.version.clone(),
-                        });
+                    // Replacing the bytes destroys the old ones: the caller must
+                    // also be allowed to delete this version (refusal drops the
+                    // tx like the 409 above).
+                    if let (Some((_, policy)), Some(context)) =
+                        (self.publish_policy.as_ref(), publish_context.as_ref())
+                    {
+                        let mut replace_context = context.clone();
+                        replace_context.requires_delete = true;
+                        policy.authorize_replace(&replace_context).await?;
                     }
-                    None => {}
+                    // `false`: a concurrent hard delete removed the version
+                    // before this push could lock it, so it is a fresh insert.
+                    self.redeploy_in_tx(
+                        &mut tx,
+                        &comp,
+                        &nupkg_sha,
+                        nupkg.ingest_token,
+                        nupkg_size,
+                        &nupkg_hash512,
+                        &nuspec_sha,
+                        nuspec.ingest_token,
+                        nuspec_size,
+                        &parsed,
+                    )
+                    .await?
                 }
-                // Replacing the bytes destroys the old ones: the caller must
-                // also be allowed to delete this version (refusal drops the
-                // tx like the 409 above).
-                if let (Some((_, policy)), Some(context)) =
-                    (self.publish_policy.as_ref(), publish_context.as_ref())
-                {
-                    let mut replace_context = context.clone();
-                    replace_context.requires_delete = true;
-                    policy.authorize_replace(&replace_context).await?;
-                }
-                // `false`: a concurrent hard delete removed the version
-                // before this push could lock it, so it is a fresh insert.
-                self.redeploy_in_tx(
-                    &mut tx,
-                    &comp,
-                    &nupkg_sha,
-                    nupkg.ingest_token,
-                    nupkg_size,
-                    &nupkg_hash512,
-                    &nuspec_sha,
-                    nuspec.ingest_token,
-                    nuspec_size,
-                    &parsed,
-                )
-                .await?
+                None => false,
+            };
+            if replaced {
+                break (tx, existing_id, true, Published::Replaced);
             }
-            None => false,
-        };
 
-        let outcome = if replaced {
-            Published::Replaced
-        } else {
             let inserted = self
                 .insert_new_in_tx(
                     &mut tx,
@@ -934,11 +939,21 @@ impl HostedWrite {
                 )
                 .await;
             match inserted {
-                Ok(id) => component_id = Some(id),
+                Ok(id) => break (tx, Some(id), false, Published::Created),
                 // A concurrent first push of the same (id, version) won the
                 // race: the duplicate check above could not lock a row that
-                // did not exist yet, so the unique index decides. Report it as
-                // the documented conflict, not an internal error.
+                // did not exist yet, so the unique index decided. Run the
+                // transaction once more (the rollback restores the blobs'
+                // ingest leases): it finds the winner's version and decides
+                // as this push would have a moment later, replacing it where
+                // the repository allows redeploys (or an import overwrites)
+                // and answering the documented conflict otherwise.
+                Err(WriteError::Repo(RepoError::Db(e))) if is_unique_violation(&e) && !retried => {
+                    tx.rollback().await.map_err(RepoError::from)?;
+                    retried = true;
+                }
+                // Lost again: report the documented conflict, not an
+                // internal error.
                 Err(WriteError::Repo(RepoError::Db(e))) if is_unique_violation(&e) => {
                     if import.is_some() {
                         return done(Published::Conflict);
@@ -950,7 +965,6 @@ impl HostedWrite {
                 }
                 Err(e) => return Err(e),
             }
-            Published::Created
         };
 
         if let (Some(id), Some(summary)) = (component_id, manifest_summary.as_ref()) {
