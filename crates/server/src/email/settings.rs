@@ -612,9 +612,10 @@ pub fn merge_secrets(stored: Option<&EmailConfig>, mut incoming: EmailConfig) ->
 
 /// Carry Forge's OAuth state over a save: the registered client while the
 /// issuer is the same (and the update names no other client), and the
-/// authorization while the client and the mailbox are the same too. What an
-/// update cannot set (the registration, the grant, the refresh token) is
-/// never taken from it.
+/// authorization while the client, the SMTP host and the mailbox are the
+/// same too: its access tokens go to that host, so another one gets none of
+/// them before the transport is authorized again. What an update cannot set
+/// (the registration, the grant, the refresh token) is never taken from it.
 fn merge_oauth_state(old: &SmtpOauthConfig, new: &mut SmtpOauthConfig) {
     let same_issuer =
         old.issuer.trim().trim_end_matches('/') == new.issuer.trim().trim_end_matches('/');
@@ -644,6 +645,9 @@ fn merge_oauth_state(old: &SmtpOauthConfig, new: &mut SmtpOauthConfig) {
     }
     new.registration_client_uri = old.registration_client_uri.clone();
     new.registration_access_token = old.registration_access_token.clone();
+    if !old.host.trim().eq_ignore_ascii_case(new.host.trim()) {
+        return;
+    }
     let same_mailbox = old.username.trim() == new.username.trim()
         && old.scope.as_deref().map(str::trim) == new.scope.as_deref().map(str::trim);
     if same_mailbox {
@@ -1088,17 +1092,32 @@ mod tests {
         assert_eq!(o.registration_access_token.as_deref(), Some("reg-token"));
         assert!(o.registered);
         assert!(o.authorized());
+        // The same host, spelled otherwise.
+        let merged = merge_secrets(
+            Some(&stored),
+            oauth(json!({"scope": "smtp", "host": " MAIL.example.com "})),
+        );
+        assert!(oauth_of(&merged).authorized());
 
-        // Another mailbox or scope: the client stays, the authorization goes.
+        // Another mailbox, scope or SMTP host (#489: its access tokens go
+        // there): the client stays, the authorization goes.
         for changed in [
             json!({"scope": "smtp", "username": "other@example.com"}),
             json!({"scope": "smtp submission"}),
+            json!({"scope": "smtp", "host": "smtp.evil.example"}),
         ] {
             let merged = merge_secrets(Some(&stored), oauth(changed.clone()));
             let o = oauth_of(&merged);
             assert_eq!(o.client_id.as_deref(), Some("forge-client"), "{changed}");
+            assert_eq!(
+                o.client_secret.as_deref(),
+                Some("client-s3cret"),
+                "{changed}"
+            );
+            assert!(o.registered, "{changed}");
             assert_eq!(o.refresh_token, None, "{changed}");
             assert_eq!(o.grant, None, "{changed}");
+            assert!(!o.authorized(), "{changed}");
         }
 
         // Another issuer, or another client named: nothing is kept.
@@ -1123,5 +1142,8 @@ mod tests {
         }));
         let merged = merge_secrets(Some(&cc), oauth(json!({"username": "other@example.com"})));
         assert_eq!(oauth_of(&merged).grant, Some(OauthGrant::ClientCredentials));
+        // But not across another SMTP host, which its tokens would go to.
+        let merged = merge_secrets(Some(&cc), oauth(json!({"host": "smtp.evil.example"})));
+        assert_eq!(oauth_of(&merged).grant, None);
     }
 }

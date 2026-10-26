@@ -1478,8 +1478,9 @@ async fn the_graph_client_secret_is_sealed_and_bound_to_the_app() {
 
 /// The `smtp_oauth` transport's secrets (#321), the client secret, the
 /// registration access token and the refresh token, are sealed, and bound to
-/// the issuer, the client and the mailbox; a compare-and-set update reseals
-/// them and refuses a row that changed meanwhile.
+/// the issuer, the client, the mailbox and the SMTP host its access tokens go
+/// to (#489); a compare-and-set update reseals them and refuses a row that
+/// changed meanwhile.
 #[tokio::test]
 async fn the_smtp_oauth_secrets_are_sealed_and_bound_to_the_authorization() {
     use forge_db::email_settings_dao;
@@ -1528,6 +1529,7 @@ async fn the_smtp_oauth_secrets_are_sealed_and_bound_to_the_authorization() {
         ("issuer", "https://evil.example"),
         ("client_id", "other-client"),
         ("username", "other@example.com"),
+        ("host", "smtp.evil.example"),
     ] {
         sqlx::query("UPDATE email_settings SET config = jsonb_set(config, $1, $2)")
             .bind(vec!["transport", field])
