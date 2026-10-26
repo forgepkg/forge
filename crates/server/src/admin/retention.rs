@@ -105,6 +105,20 @@ async fn runs_enabled(state: &AppState) -> Result<bool, Response> {
     }
 }
 
+/// The instant a preview evaluates at: the body's `at`, else the database's
+/// clock, which a run evaluates at too. The process's clock would put a
+/// version near an age boundary on the other side of it than the run does
+/// once the two clocks are apart.
+async fn preview_now(
+    state: &AppState,
+    at: Option<chrono::DateTime<Utc>>,
+) -> Result<chrono::DateTime<Utc>, Response> {
+    match at {
+        Some(at) => Ok(at),
+        None => forge_db::db_now(&state.pool).await.map_err(db_error),
+    }
+}
+
 /// `GET /admin/repositories/{name}/retention`
 pub async fn get(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let repo = match resolve_repo(&state, &name).await {
@@ -256,7 +270,8 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewBody {
-    /// Evaluate as-of this instant instead of `now()` (for staging/testing).
+    /// Evaluate as-of this instant instead of the database's `now()`, which a
+    /// run evaluates at (for staging/testing).
     #[serde(default)]
     pub at: Option<chrono::DateTime<Utc>>,
     /// A draft policy to evaluate in place of the stored one: parsed and
@@ -424,7 +439,10 @@ pub async fn preview(
         .into_response();
     }
 
-    let now = at.unwrap_or_else(Utc::now);
+    let now = match preview_now(&state, at).await {
+        Ok(now) => now,
+        Err(resp) => return resp,
+    };
     let kind = repo.kind();
     let format = match state.formats.for_repository(&repo) {
         Ok(format) => format,
@@ -576,12 +594,9 @@ async fn preview_images(
     if !source.enable(&mut policy.enabled) {
         return Json(empty(0)).into_response();
     }
-    let now = match at {
-        Some(at) => at,
-        None => match forge_db::db_now(&state.pool).await {
-            Ok(now) => now,
-            Err(e) => return db_error(e),
-        },
+    let now = match preview_now(state, at).await {
+        Ok(now) => now,
+        Err(resp) => return resp,
     };
     match forge_core::retention::images::evaluate_repository(&state.pool, repo.id, now, &policy)
         .await
@@ -635,12 +650,9 @@ async fn preview_files(
     if !source.enable(&mut policy.enabled) {
         return Json(view(Vec::new(), 0)).into_response();
     }
-    let now = match at {
-        Some(at) => at,
-        None => match forge_db::db_now(&state.pool).await {
-            Ok(now) => now,
-            Err(e) => return db_error(e),
-        },
+    let now = match preview_now(state, at).await {
+        Ok(now) => now,
+        Err(resp) => return resp,
     };
     match forge_core::retention::files::evaluate_repository(&state.pool, repo.id, now, &policy)
         .await
