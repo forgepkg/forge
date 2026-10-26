@@ -441,11 +441,11 @@ async fn store_key(pool: &PgPool, new: NewWorkloadApiKey<'_>) -> sqlx::Result<St
     match workload_api_key_dao::insert(&mut tx, new).await? {
         Redemption::Issued { expires_at, .. } => {
             tx.commit().await?;
-            return Ok(Stored::Issued { expires_at });
+            Ok(Stored::Issued { expires_at })
         }
-        Redemption::Replayed => return Ok(Stored::Replayed),
-        Redemption::TokenExpired => return Ok(Stored::TokenExpired),
-    };
+        Redemption::Replayed => Ok(Stored::Replayed),
+        Redemption::TokenExpired => Ok(Stored::TokenExpired),
+    }
 }
 
 #[cfg(test)]

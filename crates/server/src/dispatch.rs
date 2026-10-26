@@ -113,6 +113,7 @@ pub(crate) struct HostedWriteAdapter {
 }
 
 impl HostedWriteAdapter {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: &AppState,
         format: Arc<dyn Format>,
@@ -142,6 +143,7 @@ impl HostedWriteAdapter {
 /// The hosted write path of `principal` in a repository: publishes limited
 /// to `package_filter`, replacing a version to `replace_filter`, and the
 /// trusted-publishing ledger of a workload.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_write(
     state: &AppState,
     format: Arc<dyn Format>,
@@ -461,7 +463,7 @@ mod tests {
             issued_at: 1,
             key_id: None,
             expires_at: 2,
-            matched_publishers: vec![],
+            matched_publishers: Arc::from([]),
         }));
         assert!(!principal_allows_protocol_mutations(&Principal::User {
             user_id: 1,

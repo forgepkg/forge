@@ -2265,8 +2265,9 @@ async fn an_offline_nested_group_fails_instead_of_serving() {
     seed_version(&pool, &mut blobs, other.id, "Only.Other", "2.0.0", "o").await;
 
     let principal = user(&pool).await;
-    let read =
-        |blobs: StubBlobs| mixed_group_repo(&pool, blobs, principal, shadowing_proxy(&proxy));
+    let read = |blobs: StubBlobs| {
+        mixed_group_repo(&pool, blobs, principal.clone(), shadowing_proxy(&proxy))
+    };
     let g = read(blobs.clone());
     assert_eq!(
         sorted_versions(&g, &outer.name, "only.inner").await,

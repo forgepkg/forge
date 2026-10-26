@@ -154,7 +154,7 @@ impl TokenPrincipal {
                 iat: *issued_at,
                 key: *key_id,
                 ends: *expires_at,
-                publishers: matched_publishers.clone(),
+                publishers: matched_publishers.to_vec(),
             },
             _ => TokenPrincipal::Anonymous,
         }
@@ -204,7 +204,7 @@ impl TokenPrincipal {
                 issued_at: *iat,
                 key_id: *key,
                 expires_at: *ends,
-                matched_publishers: publishers.clone(),
+                matched_publishers: publishers.as_slice().into(),
             },
         })
     }
@@ -510,10 +510,10 @@ mod tests {
             issued_at: 5,
             key_id: Some(6),
             expires_at: 7,
-            matched_publishers: vec![TrustedPublisherMatch {
+            matched_publishers: Arc::from([TrustedPublisherMatch {
                 id: 8,
                 definition_sha256: [9; 32],
-            }],
+            }]),
         };
         let tp = TokenPrincipal::of(&p);
         assert_eq!(tp.credential_ends(), Some(7));
@@ -528,7 +528,7 @@ mod tests {
             issued_at: 5,
             key_id: None,
             expires_at: 7,
-            matched_publishers: vec![],
+            matched_publishers: Arc::from([]),
         };
         let tp = TokenPrincipal::of(&direct);
         assert!(!serde_json::to_string(&tp).unwrap().contains("\"key\""));

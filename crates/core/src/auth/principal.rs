@@ -1,6 +1,7 @@
 //! The authenticated (or not) caller of a request.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 /// Identity established for an authenticated user.
 ///
@@ -93,8 +94,8 @@ pub enum Principal {
         expires_at: i64,
         /// Trusted publishers that matched the verified token. Each digest
         /// binds the grant to the definition that was current at authentication.
-        #[allow(clippy::type_complexity)]
-        matched_publishers: Vec<TrustedPublisherMatch>,
+        /// A shared slice keeps the principal small and cheap to clone.
+        matched_publishers: Arc<[TrustedPublisherMatch]>,
     },
 }
 
@@ -190,7 +191,7 @@ mod tests {
             issued_at: 0,
             key_id: None,
             expires_at: 0,
-            matched_publishers: vec![],
+            matched_publishers: Arc::from([]),
         };
         assert_eq!(workload.audit_label(), "workload realm:3 role:7");
     }
