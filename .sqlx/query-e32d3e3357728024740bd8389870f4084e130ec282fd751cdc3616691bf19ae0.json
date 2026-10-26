@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE app_user\n        SET description = $2,\n            updated_at = now()\n        WHERE id = $1 AND kind = 'service'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e32d3e3357728024740bd8389870f4084e130ec282fd751cdc3616691bf19ae0"
+}

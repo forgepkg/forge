@@ -458,8 +458,19 @@ pub struct AppUser {
     pub active: bool,
     pub auth_source: String,
     pub external_subject: Option<String>,
+    /// `user` (a person) or `service` (a machine or a network nobody signs in
+    /// to, [`crate::user_dao::insert_service_account`]); never changes.
+    pub kind: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl AppUser {
+    /// Whether the account is a service account
+    /// ([`crate::user_dao::SERVICE_ACCOUNT_KIND`]).
+    pub fn is_service_account(&self) -> bool {
+        self.kind == crate::user_dao::SERVICE_ACCOUNT_KIND
+    }
 }
 
 /// A row of `token`.

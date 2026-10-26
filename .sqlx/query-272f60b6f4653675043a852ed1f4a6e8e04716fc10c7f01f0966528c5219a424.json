@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        ORDER BY username\n        ",
+  "query": "\n        SELECT\n            id, username, password_hash, active,\n            auth_source, external_subject, kind, created_at, updated_at\n        FROM app_user\n        WHERE username = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -93,7 +104,9 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Text"
+      ]
     },
     "nullable": [
       false,
@@ -103,8 +116,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "d8453a5d329c3e7ccd198d836bab8eaeb5c6354911977ea12b826bf4c799d902"
+  "hash": "272f60b6f4653675043a852ed1f4a6e8e04716fc10c7f01f0966528c5219a424"
 }

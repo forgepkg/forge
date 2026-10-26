@@ -786,6 +786,43 @@ async fn resolve_user_never_links_an_invited_account() {
     );
 }
 
+/// #508: a service account (no password, nobody signs in to it) is never
+/// linked by username, so an IdP account claiming its name cannot sign in
+/// as it.
+#[tokio::test]
+async fn resolve_user_never_links_a_service_account() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let name = format!("ci-{n}@example.com");
+    let service = forge_db::user_dao::insert_service_account(&pool, &name, None, None)
+        .await
+        .expect("service account");
+    let validated = run_login(&pool, &idp, &format!("sub-s-{n}"), &name, json!([])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    let user = oidc::resolve_user(
+        &pool,
+        &validated,
+        &mapped,
+        &ResolvePolicy {
+            auto_provision: true,
+            link_existing_by_username: true,
+        },
+    )
+    .await
+    .expect("provisioned separately");
+    assert_ne!(
+        user.id, service.id,
+        "a service account is never linked by name"
+    );
+    assert!(!user.is_service_account());
+    assert!(
+        !forge_db::external_identity_dao::user_has_identity(&pool, service.id)
+            .await
+            .unwrap()
+    );
+}
+
 /// Linking by username never takes over an account another credential owns:
 /// a credential-forwarding account, or an account already linked to an IdP
 /// identity (of another person, possibly at another issuer).

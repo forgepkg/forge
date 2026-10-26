@@ -15,9 +15,15 @@ import type { AccessLevel } from '~/api/rbac'
  *    sent by email, or (no email service, or a failed send) handed to the
  *    admin once in the answer's `invitation.link`. `role` gives the built-in
  *    access level; other roles are assigned on the user page.
- *  - `PATCH /admin/users/{id}` sets the account state alone
+ *  - `PATCH /admin/users/{id}` sets the account state
  *    (`{"active": false}` deactivates, `true` reactivates); the server
- *    refuses deactivating the last active administrator with 409.
+ *    refuses deactivating the last active administrator with 409. For a
+ *    service account it also sets the `description` and the trusted-header
+ *    `realm` that names it (`null`: none).
+ *  - A service account (`kind: 'service'`, #508) stands for a machine or a
+ *    network: nobody signs in to it. It has no password, invitation or
+ *    email, never holds `admin`, and authenticates with the tokens an
+ *    administrator issues for it, or through its trusted-header realm.
  *    `POST /admin/users/{id}/reauth` signs the user out everywhere. The
  *    other per-user writes are `DELETE /admin/users/{id}`, invitations
  *    (`POST`/`DELETE /admin/users/{id}/invitation`), switching a
@@ -29,18 +35,36 @@ import type { AccessLevel } from '~/api/rbac'
  * the `_app/admin` route guard confirms `is_admin`.
  */
 
+/**
+ * `user`: a person. `service`: a service account, a machine or a network
+ * nobody signs in to.
+ */
+export type AccountKind = 'user' | 'service'
+
 /** Password-free user view (`UserView`). */
 export interface UserView {
   id: number
   username: string
+  /** Absent from an older server: a user. */
+  kind?: AccountKind
+  /** What a service account is for and who owns it. */
+  description?: string | null
   is_admin: boolean
   active: boolean
   /**
    * How the account signs in: `local` (Forge password), `oidc` (identity
-   * provider), `upstream-basic` (credential-forwarding realm) or
-   * `trusted-header` (the headers of a trusted-header realm's proxy).
+   * provider), `upstream-basic` (credential-forwarding realm),
+   * `trusted-header` (the headers of a trusted-header realm's proxy) or
+   * `service` (a service account: its tokens, or its realm's headers).
    */
   auth_source: string
+  /** The realm the account belongs to; `null` for none (or a deleted one). */
+  realm?: string | null
+  /**
+   * When the account last authenticated: its tokens' latest use, or its
+   * trusted-header realm's last request naming it.
+   */
+  last_used_at?: string | null
   /**
    * When the account's credential-forwarding realm last kept a hash of the
    * password its upstream accepted; `null` when it keeps none. Such an
@@ -91,6 +115,12 @@ const AUTH_SOURCE_LABELS: Record<string, string> = {
   oidc: 'Identity provider',
   'upstream-basic': 'Credential forwarding',
   'trusted-header': 'Trusted header',
+  service: 'Service account',
+}
+
+/** Whether `user` is a service account. */
+export function isServiceAccount(user: Pick<UserView, 'kind'>): boolean {
+  return user.kind === 'service'
 }
 
 /**
@@ -157,11 +187,25 @@ export function upnError(raw: string): string | null {
  */
 export interface CreateUser {
   username: string
-  /** Where the invitation goes; the username when absent. */
+  /** `service` creates a service account; a user when absent. */
+  kind?: AccountKind
+  /** What a service account is for and who owns it. */
+  description?: string
+  /** Where the invitation goes; the username when absent. Never a service account's. */
   email?: string
-  /** The built-in access level; `reader` when absent. */
+  /** The built-in access level; `reader` when absent; never `admin` for a service account. */
   role?: AccessLevel
   realm?: string
+}
+
+/**
+ * A service account's `PATCH /admin/users/{id}` body: its description
+ * (`null` clears it) and the trusted-header realm that names it (`null`:
+ * none, so only its tokens authenticate it). Absent fields stay.
+ */
+export interface UpdateServiceAccount {
+  description?: string | null
+  realm?: string | null
 }
 
 /** `POST /admin/users` answer: the user and, for a local account, its invitation. */
@@ -222,6 +266,14 @@ export function convertUserToLocal(id: number): Promise<UserView> {
  */
 export function setUserActive(id: number, active: boolean): Promise<UserView> {
   return httpClient.patch<UserView>(`/admin/users/${id}`, { active })
+}
+
+/** `PATCH /admin/users/{id}` — a service account's description and realm. */
+export function updateServiceAccount(
+  id: number,
+  body: UpdateServiceAccount,
+): Promise<UserView> {
+  return httpClient.patch<UserView>(`/admin/users/${id}`, body)
 }
 
 /**

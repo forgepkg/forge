@@ -20,7 +20,8 @@ import type { UserView } from '~/api/users'
  * the server where the screens depend on it: 400 for a grant without a level
  * (or with `action`), one grant per repository and selector, 403 for
  * deleting a built-in role, 409 for taking `admin` from the last
- * administrator, cascading deletes, and the selector match.
+ * administrator, 400 for `admin` on a service account, cascading deletes,
+ * and the selector match.
  */
 
 export const adminMe: Me = {
@@ -98,6 +99,8 @@ export interface FakeState {
   tokens: TokenView[]
   myTokens: TokenView[]
   browseRepos: BrowseRepo[]
+  /** `GET /admin/realms`, as the server lists them. */
+  realms: unknown[]
 }
 
 export interface FakeRequest {
@@ -158,6 +161,7 @@ export class FakeRbacApi {
       tokens: [],
       myTokens: [],
       browseRepos: [],
+      realms: [],
       ...seed,
     }
   }
@@ -295,15 +299,23 @@ export class FakeRbacApi {
       return json(s.users.map((u) => this.userView(u)))
     }
     if (path === '/admin/users' && method === 'POST') {
+      const service = body.kind === 'service'
+      if (service && body.role === 'admin') {
+        return text('a service account cannot hold the admin role', 400)
+      }
       const u = {
         id: this.nextId++,
         username: body.username,
+        kind: service ? ('service' as const) : ('user' as const),
+        description: service ? (body.description ?? null) : null,
         is_admin: body.role === 'admin',
         active: true,
-        auth_source: 'local',
+        auth_source: service ? 'service' : 'local',
+        realm: body.realm ?? null,
+        last_used_at: null,
         captured_password_at: null,
-        email: body.email ?? body.username,
-        status: 'invited' as const,
+        email: service ? null : (body.email ?? body.username),
+        status: service ? ('active' as const) : ('invited' as const),
       }
       s.users.push(u)
       if (u.is_admin) s.assignments.push([u.id, this.roleNamed('admin')!.id])
@@ -322,6 +334,10 @@ export class FakeRbacApi {
       if (method === 'PUT') {
         const rid = body.role_id as number
         if (!s.roles.some((r) => r.id === rid)) return text('role not found', 404)
+        const service = s.users.find((u) => u.id === uid)?.kind === 'service'
+        if (service && rid === this.roleNamed('admin')!.id) {
+          return text('a service account cannot hold the admin role', 400)
+        }
         if (!s.assignments.some(([u, r]) => u === uid && r === rid)) {
           s.assignments.push([uid, rid])
         }
@@ -344,6 +360,18 @@ export class FakeRbacApi {
       s.assignments = s.assignments.filter(([u, r]) => !(u === uid && r === rid))
       return noContent()
     }
+    if ((m = path.match(/^\/admin\/users\/(\d+)$/)) && method === 'PATCH') {
+      const u = s.users.find((x) => x.id === Number(m![1]))
+      if (!u) return text('user not found', 404)
+      if (body.active !== undefined) {
+        u.active = body.active
+        u.status = body.active ? 'active' : 'inactive'
+      }
+      if (body.description !== undefined) u.description = body.description
+      if (body.realm !== undefined) u.realm = body.realm
+      return json(this.userView(u))
+    }
+    if (path === '/admin/realms' && method === 'GET') return json(s.realms)
     if ((m = path.match(/^\/admin\/users\/(\d+)\/effective$/))) {
       const uid = Number(m[1])
       const held = s.assignments.filter(([u]) => u === uid).map(([, r]) => r)

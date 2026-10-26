@@ -13,10 +13,12 @@ import {
   reauthUser,
   revokeInvitation,
   setUserActive,
+  updateServiceAccount,
   userKeys,
   type CreateUser,
   type CreatedUser,
   type IssuedInvitation,
+  type UpdateServiceAccount,
   type UserView,
 } from '~/api/users'
 
@@ -89,6 +91,23 @@ export function useSetUserActive() {
   const queryClient = useQueryClient()
   return useMutation<UserView, ApiError, { id: number; active: boolean }>({
     mutationFn: ({ id, active }) => setUserActive(id, active),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<UserView[]>(userKeys.list(), (users) =>
+        users?.map((u) => (u.id === updated.id ? updated : u)),
+      )
+      void queryClient.invalidateQueries({ queryKey: userKeys.list() })
+    },
+  })
+}
+
+/**
+ * Set a service account's description and realm. The answer replaces it in
+ * the cached list at once, and the list is re-fetched.
+ */
+export function useUpdateServiceAccount() {
+  const queryClient = useQueryClient()
+  return useMutation<UserView, ApiError, { id: number } & UpdateServiceAccount>({
+    mutationFn: ({ id, ...body }) => updateServiceAccount(id, body),
     onSuccess: (updated) => {
       queryClient.setQueryData<UserView[]>(userKeys.list(), (users) =>
         users?.map((u) => (u.id === updated.id ? updated : u)),

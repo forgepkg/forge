@@ -2,7 +2,12 @@ import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import { accessLevel, ADMIN_ROLE, WRITER_ROLE } from '~/api/rbac'
-import { authSourceLabel, type UserStatus, type UserView } from '~/api/users'
+import {
+  authSourceLabel,
+  isServiceAccount,
+  type UserStatus,
+  type UserView,
+} from '~/api/users'
 import { useDeleteUser, useUsers } from '~/queries/useUsers'
 import { useRoles } from '~/queries/useRbac'
 import { AccessBadge } from '~/components/AccessBadge'
@@ -42,15 +47,17 @@ export const Route = createFileRoute('/_app/manage/users')({
  * (`/manage/users/new`) and each user's page (where an account is
  * deactivated, reactivated or signed out everywhere), and deletes after a
  * confirmation dialog, which suggests deactivating an active account instead
- * when it should be kept. Every account is named by a UPN.
+ * when it should be kept. Every account is named by a UPN. Service accounts
+ * are listed on their own screen (`/manage/service-accounts`).
  */
 function UsersList() {
   const users = useUsers()
+  const people = users.data?.filter((u) => !isServiceAccount(u))
   const roles = useRoles()
   const roleIds = new Map((roles.data ?? []).map((r) => [r.name, r.id]))
   const del = useDeleteUser()
   const [pendingDelete, setPendingDelete] = useState<number | null>(null)
-  const doomed = users.data?.find((u) => u.id === pendingDelete)
+  const doomed = people?.find((u) => u.id === pendingDelete)
 
   function confirmDelete(id: number) {
     del.mutate(id, { onSettled: () => setPendingDelete(null) })
@@ -115,12 +122,12 @@ function UsersList() {
         />
       ) : users.isLoading ? (
         <Skeleton variant="table" rows={4} columns={5} label="Loading users…" />
-      ) : (users.data?.length ?? 0) === 0 ? (
+      ) : (people?.length ?? 0) === 0 ? (
         <EmptyState title="No users yet" icon="Users">
           Invite the first one with <strong>New user</strong>.
         </EmptyState>
       ) : (
-        <Panel title="All users" count={users.data!.length} flush>
+        <Panel title="All users" count={people!.length} flush>
           <Table caption="Users">
             <TableHead>
               <TableHeader>Username</TableHeader>
@@ -133,7 +140,7 @@ function UsersList() {
               </TableHeader>
             </TableHead>
             <TableBody>
-              {users.data!.map((user) => (
+              {people!.map((user) => (
                 <UserRow
                   key={user.id}
                   user={user}

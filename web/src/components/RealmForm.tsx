@@ -1394,7 +1394,10 @@ export function RealmForm({
                   The realm names only its own accounts, never a local, OIDC or other
                   realm&apos;s account of the same name, and never makes anyone an
                   administrator. Without provisioning, create the accounts under{' '}
-                  <strong>Admin → Users</strong> with this realm.
+                  <strong>Admin → Users</strong> with this realm. For a network or
+                  machines the load balancer admits, create a service account under{' '}
+                  <strong>Admin → Service accounts</strong> with this realm: only this
+                  realm may name it.
                 </>
               }
             >

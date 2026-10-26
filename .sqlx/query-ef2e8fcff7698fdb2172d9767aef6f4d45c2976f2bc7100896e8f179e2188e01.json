@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        WHERE username = $1\n          AND auth_source = 'trusted-header'\n          AND NOT realm_orphaned\n          AND realm_id = $2\n        ",
+  "query": "\n        SELECT\n            id, username, password_hash, active,\n            auth_source, external_subject, kind, created_at, updated_at\n        FROM app_user\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -94,7 +105,6 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
         "Int8"
       ]
     },
@@ -106,8 +116,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "e2d929bebcd5da04543bff2b9ca08e19ca7c421d0f4a9cd34654157c88d33cae"
+  "hash": "ef2e8fcff7698fdb2172d9767aef6f4d45c2976f2bc7100896e8f179e2188e01"
 }

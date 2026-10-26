@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            u.id, u.username, u.password_hash, u.active,\n            u.auth_source, u.external_subject, u.created_at, u.updated_at\n        FROM app_user u\n        JOIN external_identity ei ON ei.user_id = u.id\n        WHERE ei.issuer = $1 AND ei.subject = $2\n        ",
+  "query": "\n        UPDATE app_user\n        SET active = $2,\n            updated_at = CASE WHEN active <> $2 THEN now() ELSE updated_at END\n        WHERE id = $1\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, kind, created_at, updated_at\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -94,8 +105,8 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Text"
+        "Int8",
+        "Bool"
       ]
     },
     "nullable": [
@@ -106,8 +117,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "25ebe5e07218e8c623bd98fab22315002350b8d530a57becb6b981875cc75b25"
+  "hash": "147a4fa098a53dba3fd17f9a4867c7e127b79c5f847fab1f5ad3ec8cbee89ec8"
 }

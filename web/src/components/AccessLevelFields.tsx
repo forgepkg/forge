@@ -27,26 +27,35 @@ export const ACCESS_LEVEL_OPTIONS: ReadonlyArray<{
   },
 ]
 
+/** The levels a service account may have: it never holds `admin`. */
+export const SERVICE_ACCOUNT_LEVELS: readonly AccessLevel[] = ['reader', 'writer']
+
 /**
  * A radio group of the built-in access levels (`ACCESS_LEVEL_OPTIONS`): the
- * user page picks one with it.
+ * user page picks one with it. `levels` limits the choice (a service
+ * account's: `SERVICE_ACCOUNT_LEVELS`).
  */
 export function AccessLevelFields({
   value,
   onChange,
   disabled = false,
+  levels,
 }: {
   value: AccessLevel
   onChange: (level: AccessLevel) => void
   disabled?: boolean
+  levels?: readonly AccessLevel[]
 }) {
+  const options = levels
+    ? ACCESS_LEVEL_OPTIONS.filter((option) => levels.includes(option.level))
+    : ACCESS_LEVEL_OPTIONS
   return (
     <RadioGroup<AccessLevel>
       legend="Access level"
       value={value}
       onChange={onChange}
       disabled={disabled}
-      options={ACCESS_LEVEL_OPTIONS.map((option) => ({
+      options={options.map((option) => ({
         value: option.level,
         label: option.label,
         description: option.description,

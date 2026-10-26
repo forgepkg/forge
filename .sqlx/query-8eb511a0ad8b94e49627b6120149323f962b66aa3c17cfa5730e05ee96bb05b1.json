@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        FROM app_user\n        WHERE username = $1\n          AND auth_source = 'upstream-basic'\n          AND NOT realm_orphaned\n          AND realm_id IS NOT DISTINCT FROM $2::bigint\n        ",
+  "query": "\n        SELECT\n            u.id, u.username, u.password_hash, u.active,\n            u.auth_source, u.external_subject, u.kind, u.created_at, u.updated_at\n        FROM app_user u\n        JOIN external_identity ei ON ei.user_id = u.id\n        WHERE ei.issuer = $1 AND ei.subject = $2\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -95,7 +106,7 @@
     "parameters": {
       "Left": [
         "Text",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -106,8 +117,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "d776fbfa0048a272409c5f8288452fc0894504f5b9f2b43bc82e08dc35df522e"
+  "hash": "8eb511a0ad8b94e49627b6120149323f962b66aa3c17cfa5730e05ee96bb05b1"
 }

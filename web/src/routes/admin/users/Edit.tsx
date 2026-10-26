@@ -10,7 +10,12 @@ import {
   type AccessLevel,
 } from '~/api/rbac'
 import { ApiError } from '~/lib/httpClient'
-import { authSourceLabel, type IssuedInvitation, type UserView } from '~/api/users'
+import {
+  authSourceLabel,
+  isServiceAccount,
+  type IssuedInvitation,
+  type UserView,
+} from '~/api/users'
 import {
   useConvertUserToLocal,
   useInviteUser,
@@ -57,7 +62,7 @@ import {
 } from '~/components/ui'
 import { AccessBadge } from '~/components/AccessBadge'
 import { UserStatusBadge } from './List'
-import { AccessLevelFields } from '~/components/AccessLevelFields'
+import { AccessLevelFields, SERVICE_ACCOUNT_LEVELS } from '~/components/AccessLevelFields'
 import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import {
@@ -121,6 +126,28 @@ function UserPage() {
   const user = users.data?.find((u) => u.id === id)
   const name = user ? user.username : `User #${id}`
 
+  if (user && isServiceAccount(user)) {
+    return (
+      <Page>
+        <PageHeader
+          title={name}
+          crumbs={[{ label: 'Users', to: '/manage/users' }, { label: name }]}
+        />
+        <EmptyState title="A service account" icon="Terminal">
+          Nobody signs in to {user.username}: manage it under{' '}
+          <Link
+            to="/manage/service-accounts/$userId"
+            params={{ userId: String(user.id) }}
+            className="fg-link"
+          >
+            Service accounts
+          </Link>
+          .
+        </EmptyState>
+      </Page>
+    )
+  }
+
   return (
     <Page>
       <PageHeader
@@ -161,9 +188,16 @@ function UserPage() {
  * `/admin/users/{id}/roles`. A switch assigns the new level's role first and
  * then takes the other one, so a refused step (the last active
  * administrator keeps `admin`: 409, with the server's reason) never leaves
- * the user with less access than before.
+ * the user with less access than before. A service account
+ * (`serviceAccount`) is a reader or a writer, never an admin.
  */
-function UserAccess({ userId }: { userId: number }) {
+export function UserAccess({
+  userId,
+  serviceAccount = false,
+}: {
+  userId: number
+  serviceAccount?: boolean
+}) {
   const held = useUserRoles(userId)
   const roles = useRoles()
   const assign = useAssignRole()
@@ -206,7 +240,11 @@ function UserAccess({ userId }: { userId: number }) {
   return (
     <Panel
       title="Access"
-      description="The user's built-in role. Their other roles add to it."
+      description={
+        serviceAccount
+          ? 'The service account’s built-in role: a service account is never an admin. Its other roles add to it.'
+          : "The user's built-in role. Their other roles add to it."
+      }
       actions={
         loaded && (
           <span className="flex items-center gap-2 text-ink-muted">
@@ -235,7 +273,12 @@ function UserAccess({ userId }: { userId: number }) {
           }}
           className="grid gap-4"
         >
-          <AccessLevelFields value={chosen} onChange={setChoice} disabled={saving} />
+          <AccessLevelFields
+            value={chosen}
+            onChange={setChoice}
+            disabled={saving}
+            levels={serviceAccount ? SERVICE_ACCOUNT_LEVELS : undefined}
+          />
           {error && <InlineError>{error}</InlineError>}
           <div>
             <Button type="submit" disabled={saving || chosen === current}>
@@ -248,13 +291,18 @@ function UserAccess({ userId }: { userId: number }) {
   )
 }
 
-/** The roles the user holds; admins assign and remove them here. */
-function UserRoles({
+/**
+ * The roles the user holds; admins assign and remove them here. A service
+ * account (`serviceAccount`) is never offered `admin`.
+ */
+export function UserRoles({
   userId,
   legacyAdmin,
+  serviceAccount = false,
 }: {
   userId: number
   legacyAdmin: boolean
+  serviceAccount?: boolean
 }) {
   const held = useUserRoles(userId)
   const roles = useRoles()
@@ -263,14 +311,20 @@ function UserRoles({
   const [roleId, setRoleId] = useState('')
 
   const heldIds = new Set((held.data ?? []).map((r) => r.id))
-  const candidates = (roles.data ?? []).filter((r) => !heldIds.has(r.id))
+  const candidates = (roles.data ?? []).filter(
+    (r) => !heldIds.has(r.id) && !(serviceAccount && r.name === ADMIN_ROLE),
+  )
   const holdsAdmin = (held.data ?? []).some((r) => r.name === ADMIN_ROLE)
 
   return (
     <Panel
       title="Roles"
       count={held.data?.length}
-      description="What the user may do follows from the roles they hold."
+      description={
+        serviceAccount
+          ? 'What the service account may do follows from the roles it holds.'
+          : 'What the user may do follows from the roles they hold.'
+      }
       flush
     >
       <form
@@ -376,7 +430,7 @@ function UserRoles({
  * every role they hold, with repository and selector names. Reads of what
  * anonymous callers may read, and token scopes, are not part of it.
  */
-function EffectiveAccess({ userId }: { userId: number }) {
+export function EffectiveAccess({ userId }: { userId: number }) {
   const effective = useUserEffective(userId)
   const repos = useRepositories()
   const selectors = useSelectors()
@@ -450,7 +504,7 @@ function EffectiveAccess({ userId }: { userId: number }) {
  * revoke, after a confirmation dialog). While the account is inactive its
  * tokens are refused but not revoked, which the table says.
  */
-function UserTokens({ userId, inactive }: { userId: number; inactive: boolean }) {
+export function UserTokens({ userId, inactive }: { userId: number; inactive: boolean }) {
   const tokens = useTokens(userId)
   const create = useCreateToken(userId)
   const revoke = useRevokeToken(userId)
