@@ -330,13 +330,12 @@ narrow what its owner may do.
 
 ### Built-in roles
 
-Every install has four built-in roles, which cannot be deleted or renamed:
+Every install has three built-in roles, which cannot be deleted or renamed:
 
 | Role | Grants | For |
 | --- | --- | --- |
 | `admin` | Everything: every repository at every level, and administering the instance (repositories, users, roles, authentication, settings). It holds no grant; membership is the administration. | Administrators. |
 | `writer` | `write` on every repository, ones created later included. No `delete`, no administration. | People and CI that publish packages: a NuGet push, an npm publish, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
-| `authenticated` | `write` on every repository. | Legacy: what every user could do before roles existed, kept for upgraded installs. |
 | `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). Its grants reach signed-in users too, as `read`, under the anonymous mode `all`. | Anonymous access. |
 
 A user who holds neither `admin` nor `writer` is a **reader**: they read what

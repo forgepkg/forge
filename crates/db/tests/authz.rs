@@ -11,7 +11,7 @@ mod common;
 use forge_db::authz_dao::{
     self, add_grant, assign_role, insert_content_selector, load_anonymous_effective,
     load_user_effective, role_id_by_name, unassign_role, user_has_role, ADMIN_ROLE, ANONYMOUS_ROLE,
-    AUTHENTICATED_ROLE,
+    WRITER_ROLE,
 };
 use forge_db::repository_dao::{self, NewRepository};
 use forge_db::user_dao::{self, NewUser};
@@ -49,7 +49,7 @@ async fn make_repo(pool: &sqlx::PgPool, n: u64) -> i64 {
 #[tokio::test]
 async fn seeded_builtin_roles_exist() {
     let pool = pool().await;
-    for name in [ADMIN_ROLE, ANONYMOUS_ROLE, AUTHENTICATED_ROLE] {
+    for name in [ADMIN_ROLE, ANONYMOUS_ROLE, WRITER_ROLE] {
         let id = role_id_by_name(&pool, name)
             .await
             .expect("query")

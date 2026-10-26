@@ -7,7 +7,7 @@
 //! delete confirmation can say what a role carries.
 //!
 //! Built-in protections:
-//! * **DELETE** of a built-in role (`admin`/`authenticated`/`anonymous`) is
+//! * **DELETE** of a built-in role (`admin`/`writer`/`anonymous`) is
 //!   forbidden (**403**).
 //! * **PATCH** may edit a built-in role's `description` but never its identity
 //!   (`name`/`builtin` are immutable for every role).
