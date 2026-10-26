@@ -1594,7 +1594,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forge-cache"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "futures-util",
  "moka",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "forge-core"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "forge-crypto"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "forge-db"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "forge-e2e"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "aws-credential-types",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "forge-plugin"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "forge-core",
  "forge-plugin-api",
@@ -1805,11 +1805,11 @@ dependencies = [
 
 [[package]]
 name = "forge-plugin-api"
-version = "1.1.0"
+version = "2.0.0"
 
 [[package]]
 name = "forge-server"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "forge-storage"
-version = "1.1.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -5577,7 +5577,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 
 [[package]]
 name = "xtask"
-version = "1.1.0"
+version = "2.0.0"
 
 [[package]]
 name = "xxhash-rust"
