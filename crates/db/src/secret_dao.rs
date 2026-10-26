@@ -882,8 +882,9 @@ pub fn email_secret_binding_keys(kind: &str) -> &'static [&'static str] {
         // A client secret belongs to one app registration of one tenant.
         "microsoft_graph" => &["tenant_id", "client_id"],
         // The client's secrets belong to its authorization server, and the
-        // refresh token to the mailbox that authorized it.
-        "smtp_oauth" => &["issuer", "client_id", "username"],
+        // refresh token to the mailbox that authorized it, whose access
+        // tokens go to the SMTP host.
+        "smtp_oauth" => &["issuer", "client_id", "username", "host"],
         _ => &[],
     }
 }

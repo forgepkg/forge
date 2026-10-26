@@ -1165,6 +1165,58 @@ async fn a_failed_listing_serves_cached_ids_without_asking_again() {
     assert_eq!(mock.flat_index_hits(), asked + 2, "nothing cached: asked");
 }
 
+/// #488: a listing the upstream answers unusably for one id (here one
+/// without a versions array; a packument over `max_metadata_bytes` is the
+/// same) fails that id alone. What is cached of it is served, nothing cached
+/// answers 502, and the other ids' listings still ask the upstream: it is
+/// not the outage #223 backs off from.
+#[tokio::test]
+async fn an_unusable_listing_fails_its_id_alone() {
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mut corpus = corpus_of("Contoso.A", &["1.0.0"]);
+    corpus.extend(corpus_of("Contoso.B", &["2.0.0"]));
+    let mock = start_mock(corpus).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    // Every listing asks the upstream (no metadata TTL).
+    sqlx::query("UPDATE repository SET metadata_ttl_seconds = 0 WHERE name = $1")
+        .bind(&repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128));
+    let listed = |id: &'static str| {
+        let px = &px;
+        let repo = repo.clone();
+        async move { versions_of(&px.list_versions(&repo, id).await.unwrap()) }
+    };
+    assert_eq!(listed("Contoso.A").await, ["1.0.0"]);
+    assert_eq!(listed("Contoso.B").await, ["2.0.0"]);
+    let asked = mock.flat_index_hits();
+
+    let unusable = serde_json::json!({ "versions": "none" });
+    for id in ["contoso.a", "contoso.c"] {
+        mock.state
+            .flat_index_override
+            .lock()
+            .unwrap()
+            .insert(id.into(), unusable.clone());
+    }
+    assert_eq!(
+        listed("Contoso.A").await,
+        ["1.0.0"],
+        "served from the cache"
+    );
+    assert_eq!(mock.flat_index_hits(), asked + 1);
+    assert_eq!(listed("Contoso.B").await, ["2.0.0"]);
+    assert_eq!(mock.flat_index_hits(), asked + 2, "the others still ask");
+
+    let err = px.list_versions(&repo, "Contoso.C").await.unwrap_err();
+    assert!(matches!(err, RepoError::BadUpstream(_)), "{err:?}");
+    assert_eq!(listed("Contoso.B").await, ["2.0.0"]);
+    assert_eq!(mock.flat_index_hits(), asked + 4, "still asking");
+}
+
 /// #76: a service index without `PackageBaseAddress` (a captive portal, a
 /// gateway's error page) is an upstream failure. It never replaces the last
 /// good index, and without one the proxy errors instead of answering every id
