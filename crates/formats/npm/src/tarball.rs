@@ -4,7 +4,9 @@
 //! every path is dropped, whatever it is called (`package/` by convention),
 //! so the package's `package.json` is any entry at depth one. When several
 //! entries map to it, the last one wins on disk, so the last one is read.
-//! The whole archive is read, bounded in what it unpacks to.
+//! A file is any entry node-tar unpacks as one: a regular file (`0`, or NUL
+//! in the old form) or a contiguous file (`7`). The whole archive is read,
+//! bounded in what it unpacks to.
 
 use std::io::Read;
 
@@ -29,7 +31,7 @@ pub struct Tarball {
     pub name: String,
     /// Its `version`, as written.
     pub version: String,
-    /// Regular files in the archive (`dist.fileCount`).
+    /// Files in the archive (`dist.fileCount`).
     pub file_count: u64,
     /// Their unpacked size (`dist.unpackedSize`).
     pub unpacked_size: u64,
@@ -154,7 +156,7 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
         let path = next_path
             .take()
             .unwrap_or_else(|| entry.path_bytes().into_owned());
-        if !kind.is_file() {
+        if !(kind.is_file() || kind.is_contiguous()) {
             continue;
         }
         file_count += 1;
@@ -299,6 +301,27 @@ mod tests {
     }
 
     const PACKAGE_JSON: &[u8] = br#"{"name":"a","version":"1.0.0"}"#;
+
+    #[test]
+    fn reads_every_entry_npm_unpacks_as_a_file() {
+        // A regular file, in its current and its old form, and a contiguous
+        // file: the later one is the package.json npm installs.
+        let later = br#"{"name":"b","version":"2.0.0"}"#;
+        for kind in *b"0\x007" {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+            raw_entry(&mut tar, "package/package.json", kind, 30, later);
+            let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+            assert_eq!((t.name.as_str(), t.file_count), ("b", 2), "{kind}");
+        }
+
+        // What npm does not unpack as a file is neither read nor counted.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        raw_entry(&mut tar, "package/package.json", b'6', 30, later);
+        let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!((t.name.as_str(), t.file_count), ("a", 1));
+    }
 
     #[test]
     fn long_names_and_pax_headers_are_read_bounded() {
