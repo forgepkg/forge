@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::auth::WorkloadIdentitySource;
+use crate::auth::{TrustedHeaderSource, WorkloadIdentitySource};
 use anyhow::Context;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -49,7 +49,9 @@ use crate::web_ui::spa_service;
 /// ([`AnonSource::Settings`]). The session source is
 /// always mounted — local password logins mint sessions too — and every
 /// state-changing request it authenticates must carry the session's CSRF
-/// token (enforced by [`attach_principal`]).
+/// token (enforced by [`attach_principal`]). The trusted-header realms come
+/// after all of them, in place of the anonymous policy, and only for a
+/// request a trusted proxy forwarded ([`TrustedHeaderSource`]).
 pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
     let pool = &state.pool;
     let sources: Vec<Box<dyn PrincipalSource>> = vec![
@@ -81,13 +83,18 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         .context("trusted proxy CIDRs")?;
     Ok(PrincipalLayer {
         sources: Arc::new(sources),
+        trusted_header: Some(Arc::new(TrustedHeaderSource::new(
+            state.realms.clone(),
+            pool.clone(),
+        ))),
         trusted_proxies: Arc::new(trusted),
         anon: AnonSource::Settings(state.auth_settings.clone()),
         // Cookie-authenticated mutations must carry the session's CSRF token.
         sessions: Some(state.sessions.clone()),
         cookie_secure: state.cookie_secure,
         public_origin: crate::middleware::principal::origin_of(&state.config.public_base_url()),
-        // DNS-rebinding guard for the IP-allowlist anonymous grant.
+        // DNS-rebinding guard for the IP-allowlist anonymous grant and the
+        // trusted-header realms.
         allowed_hosts: Arc::new(
             crate::middleware::principal::allowed_hosts(
                 &state.config.public_base_url(),
@@ -261,7 +268,9 @@ const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
 ///   carry [`FEED_VARY`], and are `private,
 ///   no-store` whenever the request presented credentials, so a package
 ///   fetched with credentials is never stored by a shared cache or served to
-///   someone else; registry responses (`/v2/...`) likewise, with
+///   someone else (the headers of a trusted-header realm's proxy count as
+///   credentials: [`crate::middleware::principal::NamedByTrustedHeaders`]);
+///   registry responses (`/v2/...`) likewise, with
 ///   [`REGISTRY_VARY`], and a 401 the authentication middleware answered
 ///   there gets the registry's Bearer challenge; Anonymous responses carry no `Cache-Control`; under
 ///   `anonymous_mode = "allowlist"` the deployment guide tells operators to
@@ -290,6 +299,11 @@ async fn response_policy(
         || headers.contains_key("x-nuget-apikey")
         || headers.contains_key(header::COOKIE);
     let mut resp = next.run(req).await;
+    let credentials = credentials
+        || resp
+            .extensions()
+            .get::<crate::middleware::principal::NamedByTrustedHeaders>()
+            .is_some();
     if let Some(images) = registry {
         resp = crate::registry::amend_registry_rejection(&public_base_url, images.as_ref(), resp);
     }

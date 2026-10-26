@@ -6,8 +6,9 @@ import { httpClient } from '~/lib/httpClient'
  * Types mirror the Rust DTOs:
  *
  *  - `RealmView` is the redacted response shape: secret config fields
- *    (`client_secret`, `key_pepper`) are never returned; instead the config
- *    carries `client_secret_set` / `key_pepper_set` booleans.
+ *    (`client_secret`, `key_pepper`, `secret`) are never returned; instead the
+ *    config carries `client_secret_set` / `key_pepper_set` / `secret_set`
+ *    booleans.
  *  - `GET /admin/realms` returns a bare array ordered by `priority`
  *    (lower = tried/listed first).
  *  - `POST /admin/realms` appends at the end of the order; creating
@@ -19,7 +20,12 @@ import { httpClient } from '~/lib/httpClient'
  */
 
 /** Realm kinds. */
-export type RealmKind = 'local' | 'oidc' | 'credential_forwarding' | 'workload_identity'
+export type RealmKind =
+  | 'local'
+  | 'oidc'
+  | 'credential_forwarding'
+  | 'workload_identity'
+  | 'trusted_header'
 
 /**
  * How an OIDC realm authenticates at the IdP's token endpoint: its client
@@ -124,11 +130,28 @@ export interface WorkloadIdentityConfig {
   identity_claims?: string[]
 }
 
+/**
+ * Trusted-header realm config (redacted: `secret` -> `secret_set`): the
+ * proxy in front of Forge names the account in `username_header` and proves
+ * itself with `secret` in `secret_header`. Header names come back lowercase.
+ */
+export interface TrustedHeaderConfig {
+  username_header: string
+  secret_header: string
+  /** SECRET — write-only; required on create, omit to keep on update. */
+  secret?: string
+  /** Read-side redaction flag: a secret is stored. */
+  secret_set?: boolean
+  /** Create a user's account on its first request. */
+  auto_provision?: boolean
+}
+
 /** Kind-specific config; `local` has none. */
 export type RealmConfig =
   | OidcRealmConfig
   | CredentialForwardingConfig
   | WorkloadIdentityConfig
+  | TrustedHeaderConfig
   | Record<string, never>
 
 /**

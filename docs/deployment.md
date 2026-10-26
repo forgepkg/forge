@@ -400,7 +400,8 @@ page (**Admin → Users → <user> → Deactivate**, or `PATCH /admin/users/{id}
 with `{"active": false}`):
 
 - every sign-in is refused: the password, the browser, OIDC, credential
-  forwarding and API tokens, and no realm provisions the name back to life;
+  forwarding, the headers of a trusted-header realm and API tokens, and no
+  realm provisions the name back to life;
 - the user's browser sessions end, their cached upstream verdicts are
   dropped, and a pending invitation is revoked;
 - their tokens are refused but **not** revoked: reactivating
@@ -452,6 +453,11 @@ The rule applies wherever an account is created:
   `alice@example.com` signs in as the upstream's `alice`. A login the
   upstream accepts but that names no account of the realm is refused. A
   realm config that sets `auto_provision: true` is refused by the admin API.
+- **Trusted-header realms** ([below](#trusted-header-realms)) name an account
+  by the UPN in their username header. With **Create a user's account on its
+  first request** (`auto_provision`) the realm creates a missing one;
+  otherwise create each account under **Admin → Users** with the realm as its
+  sign-in. A name that is no UPN is refused.
 
 ### Access and sign-in settings
 
@@ -759,9 +765,10 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   Forward `X-Forwarded-For`, and list the proxy in
   `FORGE_AUTH__TRUSTED_PROXY_CIDRS`.
 - Let only the proxy reach Forge. Forge believes the `X-Forwarded-For` of
-  every peer in `trusted_proxy_cidrs`, so anything else that can connect from
-  those ranges can pick the client address the login lockout and the
-  anonymous-IP allowlist see. On Kubernetes the range is usually the whole
+  every peer in `trusted_proxy_cidrs`, and the headers of a
+  [trusted-header realm](#trusted-header-realms), so anything else that can
+  connect from those ranges can pick the client address the login lockout and
+  the anonymous-IP allowlist see. On Kubernetes the range is usually the whole
   pod network: admit only the ingress controller or gateway with a
   NetworkPolicy (the Helm chart's `networkPolicy.from`, the kustomize
   `network-policy` component; the CNI must enforce it).
@@ -831,6 +838,184 @@ server {
         proxy_set_header X-Forwarded-Proto https;
     }
 }
+```
+
+### Trusted-header realms
+
+A `trusted_header` realm (**Admin → Authentication → New realm → Trusted
+header**) authenticates a request as the account a header of the load
+balancer or reverse proxy in front of Forge names, in the style of
+`REMOTE_USER`. The proxy decides who gets which name:
+
+- an **SSO proxy** (oauth2-proxy, Authelia, …) names the person it signed in;
+- a **load balancer** names an account for a network or machines it admits
+  (`ci-runners@example.com`, `office-lan@example.com`), by source network,
+  mTLS or VPN. This is how a network reads without credentials: the load
+  balancer filters by network next to the rest of the network policy, and
+  Forge only checks the headers. Create the account under **Admin → Users**
+  with the realm as its sign-in and give it the grants the network should
+  have.
+
+| Config key | Meaning |
+| --- | --- |
+| `username_header` | The header naming the account, e.g. `X-Forwarded-User`. Its value is a UPN. |
+| `secret_header` | The header the proxy proves itself with, e.g. `X-Forge-Proxy-Secret`. |
+| `secret` | Its value, 16 to 1024 printable characters without spaces (`openssl rand -hex 32`, or **Generate a secret** in the form). Write-only and sealed at rest like the other realms' secrets; compared in constant time. |
+| `auto_provision` | Create a user's account on its first request when the realm has none of the name (off by default). |
+
+What Forge believes, and when:
+
+- The headers count only when the **socket peer** is in
+  `auth.trusted_proxy_cidrs` and the request's `Host` is one of Forge's own
+  names (the host of `public_base_url`, or one in `server.allowed_hosts`: a
+  DNS-rebinding page reaches the proxy under its own name). From any other
+  request they are ignored.
+- They name the caller only when the request has **no credential of its
+  own**: an API token, a password or a signed-in session is that
+  credential's, whatever the headers say, and one that is refused is a 401,
+  never the account the headers name.
+- The headers present but no realm's secret among them, the right secret
+  with no, an empty, a repeated or an invalid name, a name of no account of
+  the realm (without `auto_provision`), of a deactivated account, or of an
+  account of another kind (local, OIDC, credential forwarding) or another
+  realm: the credentials are present but invalid, **401**, never anonymous.
+  A realm never maps a name onto another source's account, and never
+  creates or names the built-in `anonymous` principal.
+- The headers are an **ambient** credential: the proxy adds them to every
+  request of a client it admits, the ones a browser sends for a foreign page
+  included. So a request they authenticate holds the account's grants but
+  **never the `admin` role**: the admin API and minting tokens refuse it
+  (403), and publishing packages or images takes an API token, which an
+  administrator issues on the account's page (**Admin → Users → <user> →
+  Tokens**). State-changing requests a browser marks as cross-site are
+  refused (403) before authentication.
+- Forge answers every feed and registry request the headers authenticated
+  with `Cache-Control: private, no-store`: no cache varies on the headers.
+  Keep caches from overriding it, and do not let one between the proxy and
+  Forge store `/repository` responses regardless of their caching headers.
+- In the web UI a user the SSO proxy signed in is signed in without a
+  session; they sign out at the proxy.
+
+The proxy must remove both headers from every request a client sends, and
+set them only for the clients it admits, the secret only together with a
+name. Most proxies replace a header they set; make sure they also drop the
+client's when they set none.
+
+nginx, admitting a network as an account (`proxy_set_header` replaces the
+client's header, and sends none for an empty value):
+
+```nginx
+# The networks admitted as an account, and the secret only with a name.
+geo $forge_account {
+    default         "";
+    10.20.0.0/16    "ci-runners@example.com";
+}
+map $forge_account $forge_proxy_secret {
+    ""       "";
+    default  "<the realm's secret>";
+}
+
+server {
+    # … as above …
+    location / {
+        proxy_pass http://forge:8421;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-User $forge_account;
+        proxy_set_header X-Forge-Proxy-Secret $forge_proxy_secret;
+    }
+}
+```
+
+nginx behind oauth2-proxy (`--set-xauthrequest`), naming the person it
+signed in; every request it lets through has a name:
+
+```nginx
+location /oauth2/ {
+    proxy_pass http://oauth2-proxy:4180;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+location = /oauth2/auth {
+    internal;
+    proxy_pass http://oauth2-proxy:4180;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+}
+location / {
+    auth_request /oauth2/auth;
+    error_page 401 = /oauth2/sign_in;
+    auth_request_set $forge_user $upstream_http_x_auth_request_email;
+
+    proxy_pass http://forge:8421;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-User $forge_user;
+    proxy_set_header X-Forge-Proxy-Secret "<the realm's secret>";
+}
+```
+
+NuGet, npm and docker clients cannot sign in to an SSO proxy: serve the
+feeds and `/v2` to them past it (another host name, or the proxy's own rule
+for requests with an `Authorization` or `X-NuGet-ApiKey` header), with
+their API tokens.
+
+ingress-nginx runs the same directives in a `configuration-snippet`
+annotation where the controller allows snippets. Without snippets, use
+`nginx.ingress.kubernetes.io/auth-url` and
+`nginx.ingress.kubernetes.io/auth-response-headers`: the controller copies
+the listed headers of the auth service's answer onto the request, in place
+of the client's, so let the auth service answer both the name and the
+secret.
+
+Traefik (v3), admitting a network: a router for the network's clients sets
+both headers, the other router removes them (an empty value removes a
+header):
+
+```yaml
+http:
+  routers:
+    forge-ci:
+      rule: "Host(`forge.example.com`) && ClientIP(`10.20.0.0/16`)"
+      priority: 100
+      service: forge
+      middlewares: [forge-ci-account]
+    forge:
+      rule: "Host(`forge.example.com`)"
+      service: forge
+      middlewares: [forge-no-account]
+  middlewares:
+    forge-ci-account:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-User: "ci-runners@example.com"
+          X-Forge-Proxy-Secret: "<the realm's secret>"
+    forge-no-account:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-User: ""
+          X-Forge-Proxy-Secret: ""
+```
+
+Behind an SSO proxy, Traefik's `forwardAuth` with
+`authResponseHeaders: [X-Auth-Request-Email]` replaces the client's header
+with the auth service's answer; add the secret with a `headers` middleware
+after it, and set `username_header` to `X-Auth-Request-Email`.
+
+HAProxy, admitting a network:
+
+```haproxy
+frontend fe_forge
+    bind :443 ssl crt /etc/haproxy/forge.pem
+    option forwardfor
+    http-request del-header X-Forwarded-User
+    http-request del-header X-Forge-Proxy-Secret
+    acl ci_network src 10.20.0.0/16
+    http-request set-header X-Forwarded-User ci-runners@example.com if ci_network
+    http-request set-header X-Forge-Proxy-Secret <the realm's secret> if ci_network
+    default_backend be_forge
 ```
 
 ## Health probes

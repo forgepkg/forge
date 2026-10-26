@@ -37,7 +37,8 @@ export interface UserView {
   active: boolean
   /**
    * How the account signs in: `local` (Forge password), `oidc` (identity
-   * provider) or `upstream-basic` (credential-forwarding realm).
+   * provider), `upstream-basic` (credential-forwarding realm) or
+   * `trusted-header` (the headers of a trusted-header realm's proxy).
    */
   auth_source: string
   /**
@@ -89,6 +90,7 @@ const AUTH_SOURCE_LABELS: Record<string, string> = {
   local: 'Password',
   oidc: 'Identity provider',
   'upstream-basic': 'Credential forwarding',
+  'trusted-header': 'Trusted header',
 }
 
 /**
@@ -150,7 +152,8 @@ export function upnError(raw: string): string | null {
 /**
  * `POST /admin/users` request body (`CreateUser`): an invited local
  * account, or an account of the credential-forwarding realm named `realm`
- * (it signs in with the upstream's password).
+ * (it signs in with the upstream's password) or of the trusted-header realm
+ * named `realm` (the headers of its proxy name it).
  */
 export interface CreateUser {
   username: string

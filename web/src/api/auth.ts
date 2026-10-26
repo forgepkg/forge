@@ -95,9 +95,15 @@ export function login(body: {
   })
 }
 
-/** `GET /auth/me` — the active cookie session (401 when none). */
-export function fetchAuthSession(signal?: AbortSignal): Promise<AuthSession> {
-  return httpClient.get<AuthSession>('/auth/me', { signal })
+/**
+ * `GET /auth/me` — the active cookie session (401 when none). With
+ * `skipUnauthorizedHandler`, a 401 is not reported as an expired session.
+ */
+export function fetchAuthSession(
+  signal?: AbortSignal,
+  skipUnauthorizedHandler?: boolean,
+): Promise<AuthSession> {
+  return httpClient.get<AuthSession>('/auth/me', { signal, skipUnauthorizedHandler })
 }
 
 /**
@@ -107,14 +113,16 @@ export function fetchAuthSession(signal?: AbortSignal): Promise<AuthSession> {
  * cookie, and a token stored by an earlier session can be stale, so the app
  * shell calls this once per load: without the current token every mutating
  * request (and logout) would be refused. Best-effort — any failure resolves
- * to `null` and leaves the stored token alone (a 401 already clears it and
- * reports the expired session in `httpClient`).
+ * to `null` and leaves the stored token alone (a 401 clears it). A 401 is
+ * not reported as an expired session: the app shell calls this only once
+ * `/admin/me` answered, and a user the proxy in front signs in (a
+ * trusted-header realm) has no cookie session at all.
  */
 export async function syncAuthSession(
   signal?: AbortSignal,
 ): Promise<AuthSession | null> {
   try {
-    const session = await fetchAuthSession(signal)
+    const session = await fetchAuthSession(signal, true)
     if (getCsrfToken() !== session.csrf_token) setSession(session.csrf_token)
     return session
   } catch {

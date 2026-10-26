@@ -67,6 +67,7 @@ mod realms;
 mod redirect;
 mod settings;
 mod token_exchange;
+mod trusted_header;
 mod wif;
 
 pub use issuer::{
@@ -77,7 +78,7 @@ pub(crate) use realms::normalize_endpoint_hosts;
 pub use realms::{
     federated_credential, forget_seed, merge_secrets, redact_config, secret_keys, seed_auth_realms,
     validate_config, FederatedCredential, OidcRealmRuntime, RealmAuth, RealmSnapshot,
-    KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_WORKLOAD_IDENTITY,
+    KIND_CRED_FORWARD, KIND_LOCAL, KIND_OIDC, KIND_TRUSTED_HEADER, KIND_WORKLOAD_IDENTITY,
 };
 pub use redirect::sanitize_redirect_to;
 pub use settings::{
@@ -86,6 +87,7 @@ pub use settings::{
 };
 pub(crate) use token_exchange::NPM_TOKEN_EXCHANGE_PATH;
 pub use token_exchange::{token_exchange_router, TOKEN_EXCHANGE_PATH};
+pub use trusted_header::{TrustedHeaderRealm, TrustedHeaderSource};
 pub(crate) use wif::{realm_current_now, workload_identity_config_sha256};
 pub use wif::{validate_trusted_publisher_conditions, ClaimCondition, WorkloadIdentitySource};
 

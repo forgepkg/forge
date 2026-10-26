@@ -43,8 +43,8 @@ pub use chain::{
     ChainUnavailable, StaticChainSource,
 };
 pub use client_ip::{
-    forwarded_for, resolve_client, resolve_client_ip, AllowlistParseError, AnonPolicy,
-    ResolvedClient,
+    forwarded_for, is_trusted_peer, resolve_client, resolve_client_ip, AllowlistParseError,
+    AnonPolicy, ResolvedClient,
 };
 pub use cred_cache::{
     cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, ForwardLimits,
@@ -66,8 +66,9 @@ pub use session_source::{
 };
 pub use token::{
     check_token, generate_token_secret, hash_token, resolve_principal,
-    resolve_principal_with_origin, verify_password, verify_token, AuthError, BasicAuthSource,
-    PrincipalSource, ResolvedPrincipal, SourceOutcome, TokenCheck, TokenHeaderSource,
+    resolve_principal_with_fallback, resolve_principal_with_origin, verify_password, verify_token,
+    AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal, SourceOutcome, TokenCheck,
+    TokenHeaderSource,
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};
 pub use workload_key::{

@@ -31,8 +31,10 @@ allow_insecure_defaults = true  # (default: false)
 # lowers the docker defaults (upload limit, docker.max_blob_bytes) to fit.
 # Host names (port ignored) clients reach this server under besides the host of
 # public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
-# the anonymous mode "allowlist" (Admin → Settings): a request naming any
-# other host is not served anonymously by IP (DNS-rebinding guard).
+# the anonymous mode "allowlist" (Admin → Settings) and the trusted-header
+# realms (Admin → Authentication): a request naming any other host is not
+# served anonymously by IP, nor named by the proxy's headers (DNS-rebinding
+# guard).
 allowed_hosts = []              # (default: [])
 # Connection and request time limits. A client that takes longer to send its
 # request headers, or whose request body stalls longer, is cut off; a handler
@@ -140,7 +142,8 @@ sweep_batch_size = 500            # (default: 500) rows per re-encrypt batch
 # login_failure_window_seconds). See docs/deployment.md, "Access and sign-in
 # settings".
 # CIDRs of reverse proxies whose X-Forwarded-For is trusted (the client address
-# behind them decides the anonymous allowlist and the login lockout).
+# behind them decides the anonymous allowlist and the login lockout), and whose
+# headers a trusted-header realm reads (from any other peer they are ignored).
 trusted_proxy_cidrs = []        # (default: [])
 # Most argon2 password verifications running at once (~19 MiB and a core each);
 # more queue for a few seconds, then fail as unavailable (not counted as a

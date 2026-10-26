@@ -153,6 +153,69 @@ pub async fn find_upstream_user(
     .await
 }
 
+/// Create an account of the trusted-header realm `realm_id`: no password
+/// (`auth_source = 'trusted-header'`), signed in by the realm when the header
+/// of the proxy in front names it. An administrator creates it, or the realm
+/// on the account's first request when it provisions accounts. The username
+/// is a UPN, refused like [`insert_user`]'s otherwise; a name another account
+/// holds is a unique violation.
+pub async fn insert_trusted_header_user<'e, E>(
+    executor: E,
+    username: &str,
+    realm_id: i64,
+) -> sqlx::Result<AppUser>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let username = canonical_account_username(username, false)
+        .map_err(|e| sqlx::Error::InvalidArgument(e.to_string()))?;
+    sqlx::query_as!(
+        AppUser,
+        r#"
+        INSERT INTO app_user (username, password_hash, active, auth_source, realm_id)
+        VALUES ($1, NULL, true, 'trusted-header', $2)
+        RETURNING
+            id, username, password_hash, active,
+            auth_source, external_subject, created_at, updated_at
+        "#,
+        username,
+        realm_id,
+    )
+    .fetch_one(executor)
+    .await
+}
+
+/// Find the account the trusted-header realm `realm_id` names `username`: a
+/// `'trusted-header'` account of exactly that realm that is not an orphan of a
+/// deleted realm. A same-named account of another kind or realm is never
+/// returned (`None` ⇒ deny).
+pub async fn find_trusted_header_user(
+    pool: &PgPool,
+    username: &str,
+    realm_id: i64,
+) -> sqlx::Result<Option<AppUser>> {
+    let Some(username) = lookup_key(username) else {
+        return Ok(None);
+    };
+    sqlx::query_as!(
+        AppUser,
+        r#"
+        SELECT
+            id, username, password_hash, active,
+            auth_source, external_subject, created_at, updated_at
+        FROM app_user
+        WHERE username = $1
+          AND auth_source = 'trusted-header'
+          AND NOT realm_orphaned
+          AND realm_id = $2
+        "#,
+        username,
+        realm_id,
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 /// Find a user by their unique username (compared in canonical form, so
 /// `Alice`, `alice` and ` alice ` find the same account).
 pub async fn find_user_by_username(pool: &PgPool, username: &str) -> sqlx::Result<Option<AppUser>> {

@@ -119,8 +119,11 @@ pub enum TokenPrincipal {
 }
 
 impl TokenPrincipal {
-    /// The token principal of a resolved request principal. A browser
-    /// session is not a registry credential and maps to anonymous.
+    /// The token principal of a resolved request principal. An ambient
+    /// credential (a browser session, the headers of a trusted-header realm's
+    /// proxy) is not a registry credential and maps to anonymous: a request
+    /// with such a token is the request's own principal again, the headers
+    /// the proxy adds to it included.
     pub fn of(principal: &Principal) -> Self {
         match principal {
             Principal::User {
@@ -128,7 +131,7 @@ impl TokenPrincipal {
                 token_id,
                 method,
                 ..
-            } if *method != AuthMethod::Session => TokenPrincipal::User {
+            } if !method.is_ambient() => TokenPrincipal::User {
                 uid: *user_id,
                 tid: *token_id,
                 pw: *method == AuthMethod::Password,
@@ -540,5 +543,16 @@ mod tests {
             method: AuthMethod::Session,
         };
         assert_eq!(TokenPrincipal::of(&session), TokenPrincipal::Anonymous);
+        let named = Principal::User {
+            user_id: 1,
+            token_id: None,
+            method: AuthMethod::TrustedHeader,
+        };
+        assert_eq!(TokenPrincipal::of(&named), TokenPrincipal::Anonymous);
+        // Read back on a request the proxy's headers name again.
+        assert_eq!(
+            TokenPrincipal::of(&named).to_principal(named.clone()),
+            Some(named)
+        );
     }
 }

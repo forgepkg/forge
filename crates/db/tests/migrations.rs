@@ -355,6 +355,35 @@ async fn migrations_create_all_expected_tables() {
         "an unknown auth_source value must violate the CHECK"
     );
 
+    // A trusted-header realm and its accounts (#506): an account has no
+    // local password.
+    let realm_id: i64 = sqlx::query_scalar(
+        "INSERT INTO auth_realm (kind, name, priority) \
+         VALUES ('trusted_header', 'sso-proxy', 90) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("a trusted_header realm is insertable");
+    sqlx::query(
+        "INSERT INTO app_user (username, password_hash, auth_source, realm_id) \
+         VALUES ('proxied@example.com', NULL, 'trusted-header', $1)",
+    )
+    .bind(realm_id)
+    .execute(&pool)
+    .await
+    .expect("a trusted-header account without a password is insertable");
+    let with_password = sqlx::query(
+        "INSERT INTO app_user (username, password_hash, auth_source, realm_id) \
+         VALUES ('proxied2@example.com', 'x', 'trusted-header', $1)",
+    )
+    .bind(realm_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        with_password.is_err(),
+        "a trusted-header account with a password must violate the CHECK"
+    );
+
     // validated_credential round-trips a verdict; the plaintext password is
     // never a column — only the HMAC.
     sqlx::query(

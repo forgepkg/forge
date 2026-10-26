@@ -44,6 +44,9 @@
 //!   scope sets `admin: true`; an unscoped token (`NULL` scope) is evaluated
 //!   as the default scope, i.e. the owner's set without `admin`. See
 //!   [`EffectiveSet::intersect_scope`].
+//! * **Trusted header** — a user the headers of the proxy in front named
+//!   ([`super::AuthMethod::TrustedHeader`]) holds its grants without the
+//!   `admin` role: the headers never make anyone an administrator.
 //! * **Unauthenticated** — always denied.
 //!
 //! ## Fail-closed
@@ -61,7 +64,7 @@ use forge_db::authz_dao;
 use forge_db::model::Repository;
 use sqlx::PgPool;
 
-use super::principal::Principal;
+use super::principal::{AuthMethod, Principal};
 use crate::authz::cache as authz_cache;
 use crate::authz::{
     parse_token_scope, EffectiveSet, Level, PackageFilter, SelectorPatterns, TokenScope,
@@ -402,11 +405,17 @@ impl Authz {
                 })
             }
             Principal::User {
-                user_id, token_id, ..
+                user_id,
+                token_id,
+                method,
             } => {
                 let mut owner = authz_cache::load_user_effective(&self.pool, &self.cache, *user_id)
                     .await
                     .map_err(|e| tracing::error!(error = %e, user_id, "authz user load failed"))?;
+                if *method == AuthMethod::TrustedHeader {
+                    // The proxy's headers never make anyone an administrator.
+                    owner = owner.without_admin();
+                }
                 if let Some(flag) =
                     public_read.filter(|_| self.public_read_for_signed_in.load(Ordering::Relaxed))
                 {

@@ -5,6 +5,15 @@
 //! and attaches the resulting [`Principal`] as a request extension for
 //! downstream handlers (repo dispatch, admin API).
 //!
+//! ## Trusted-header realms
+//! The headers a `trusted_header` realm reads ([`crate::auth::TrustedHeaderSource`])
+//! name the caller only for a request whose **socket peer** is a trusted
+//! proxy (`auth.trusted_proxy_cidrs`) and whose `Host` names this server (the
+//! DNS-rebinding guard below); from any other request they are ignored. Even
+//! then they are asked last, in place of the anonymous policy: a credential
+//! of the request's own wins, and one another source refused is a 401, never
+//! the account the headers name.
+//!
 //! Security rules (enforced by [`forge_core::auth::token::resolve_principal`]):
 //! * The first source that authenticates wins.
 //! * If any source reports credentials were **present but invalid**, the request
@@ -45,13 +54,14 @@
 //! `X-Forwarded-For` line behind the trusted proxies, with IPv4-mapped IPv6
 //! addresses canonicalized ([`forge_core::auth::client_ip`]). A client whose
 //! forwarded address is malformed is unknown and never allowlisted. The IP-allowlist
-//! anonymous grant (anonymous mode `allowlist`) additionally requires the
-//! request's `Host` to name this server (the host of `server.public_base_url`
-//! or an entry of `server.allowed_hosts`): a DNS-rebinding page in an internal
-//! user's browser reaches the server from an allowlisted IP but under its own
-//! host name, and such a request is treated as unauthenticated instead.
-//! Requests with credentials, and handlers that ignore the principal (health
-//! probes), do not depend on the host.
+//! anonymous grant (anonymous mode `allowlist`) and the trusted-header realms
+//! additionally require the request's `Host` to name this server (the host of
+//! `server.public_base_url` or an entry of `server.allowed_hosts`): a
+//! DNS-rebinding page in an internal user's browser reaches the server from an
+//! allowlisted IP, or through the proxy that adds the headers, but under its
+//! own host name, and such a request is treated as unauthenticated instead.
+//! Requests with credentials of their own, and handlers that ignore the
+//! principal (health probes), do not depend on the host.
 //!
 //! ## Stale session cookies
 //! A session cookie that no longer names a live session is treated as absent
@@ -65,10 +75,10 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use forge_core::auth::client_ip::{forwarded_for, resolve_client, AnonPolicy};
-use forge_core::auth::principal::Principal;
+use forge_core::auth::client_ip::{forwarded_for, is_trusted_peer, resolve_client, AnonPolicy};
+use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::auth::session_source::{session_cookie_name, unique_cookie_value};
-use forge_core::auth::token::{resolve_principal_with_origin, AuthError, PrincipalSource};
+use forge_core::auth::token::{resolve_principal_with_fallback, AuthError, PrincipalSource};
 use forge_core::session::{csrf_token_matches, SessionService};
 use ipnet::IpNet;
 
@@ -76,6 +86,13 @@ use crate::auth::AuthSettingsCache;
 
 /// The header carrying the per-session double-submit CSRF token.
 pub const CSRF_HEADER: &str = "x-csrf-token";
+
+/// Response extension: the request was authenticated by the headers of a
+/// trusted-header realm's proxy. They are credentials no cache varies on, so
+/// the response is kept out of shared caches like one to a request with
+/// `Authorization` (`crate::app`'s response policy).
+#[derive(Debug, Clone, Copy)]
+pub struct NamedByTrustedHeaders;
 
 /// Pre-session endpoints exempt from the CSRF layer: they authenticate a *new*
 /// login from the request body and never act on the presented session, so a
@@ -95,6 +112,9 @@ pub const CSRF_EXEMPT_PATHS: &[&str] = &[
 pub struct PrincipalLayer {
     /// Ordered credential sources (token header first, then Basic).
     pub sources: Arc<Vec<Box<dyn PrincipalSource>>>,
+    /// The trusted-header realms, asked after `sources` found no credentials
+    /// and only for a request from a trusted proxy that names this server.
+    pub trusted_header: Option<Arc<dyn PrincipalSource>>,
     /// Trusted proxy CIDRs for `X-Forwarded-For` resolution.
     pub trusted_proxies: Arc<Vec<IpNet>>,
     /// Anonymous-access policy.
@@ -109,7 +129,8 @@ pub struct PrincipalLayer {
     /// `server.public_base_url`), accepted as a same-origin `Origin` header.
     pub public_origin: Option<String>,
     /// Normalized host names ([`allowed_hosts`]) a request's `Host` must name
-    /// for the IP-allowlist anonymous grant to apply (DNS-rebinding guard).
+    /// for the IP-allowlist anonymous grant and the trusted-header realms to
+    /// apply (DNS-rebinding guard).
     pub allowed_hosts: Arc<Vec<String>>,
 }
 
@@ -137,7 +158,8 @@ fn normalize_host(authority: &str) -> Option<String> {
     (!host.is_empty()).then_some(host)
 }
 
-/// The host names a request may address for the IP-allowlist anonymous grant:
+/// The host names a request may address for the IP-allowlist anonymous grant
+/// and the trusted-header realms:
 /// the host of `public_base_url` plus each `extra` entry (`host` or
 /// `host:port`; the port is ignored — a rebinding page cannot present this
 /// server's host name, whatever the port). An unparsable entry is an error.
@@ -296,14 +318,27 @@ pub async fn attach_principal(
         policy => policy,
     };
 
-    let resolved =
-        match resolve_principal_with_origin(&layer.sources, req.headers(), client_ip, anon).await {
-            Ok(r) => r,
-            Err(AuthError::Unauthorized) => {
-                return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
-            }
-            Err(AuthError::Unavailable) => return auth_unavailable(),
-        };
+    // The trusted-header realms believe only a trusted proxy, and only for
+    // a request addressing this server by one of its own names.
+    let trusted_header = layer.trusted_header.as_deref().filter(|_| {
+        is_trusted_peer(peer, &layer.trusted_proxies) && host_is_allowed(&req, &layer.allowed_hosts)
+    });
+
+    let resolved = match resolve_principal_with_fallback(
+        &layer.sources,
+        trusted_header,
+        req.headers(),
+        client_ip,
+        anon,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(AuthError::Unauthorized) => {
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        Err(AuthError::Unavailable) => return auth_unavailable(),
+    };
 
     if resolved.ambient && !req.method().is_safe() && !CSRF_EXEMPT_PATHS.contains(&req.uri().path())
     {
@@ -314,8 +349,18 @@ pub async fn attach_principal(
         }
     }
 
+    let named_by_headers = matches!(
+        resolved.principal,
+        Principal::User {
+            method: AuthMethod::TrustedHeader,
+            ..
+        }
+    );
     req.extensions_mut().insert(resolved.principal);
     let mut resp = next.run(req).await;
+    if named_by_headers {
+        resp.extensions_mut().insert(NamedByTrustedHeaders);
+    }
     // A dead session cookie continues as anonymous/unauthenticated; drop it
     // from the browser so it stops riding along — unless the handler set the
     // cookie itself (a fresh login on this very request).
@@ -436,6 +481,7 @@ mod tests {
     fn layer(sources: Vec<Box<dyn PrincipalSource>>, anon: AnonPolicy) -> PrincipalLayer {
         PrincipalLayer {
             sources: Arc::new(sources),
+            trusted_header: None,
             trusted_proxies: Arc::new(vec![]),
             anon: anon.into(),
             sessions: None,
@@ -799,6 +845,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body_string(resp).await, "user:1");
+    }
+
+    /// A stub trusted-header source: names user 7 whenever `x-test-user` is
+    /// present.
+    struct HeaderStub;
+
+    #[async_trait::async_trait]
+    impl PrincipalSource for HeaderStub {
+        async fn resolve(&self, headers: &http::HeaderMap, _ip: IpAddr) -> SourceOutcome {
+            if headers.contains_key("x-test-user") {
+                SourceOutcome::Authenticated(Principal::User {
+                    user_id: 7,
+                    token_id: None,
+                    method: forge_core::auth::AuthMethod::TrustedHeader,
+                })
+            } else {
+                SourceOutcome::NoCredentials
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_headers_count_only_from_a_trusted_proxy_naming_this_server() {
+        let basic = StubSource {
+            outcome: SourceOutcome::Invalid,
+            require_header: true,
+        };
+        let mut l = layer(vec![Box::new(basic)], AnonPolicy::All);
+        l.trusted_header = Some(Arc::new(HeaderStub));
+        let send = |l: PrincipalLayer, req: http::request::Builder| async move {
+            let resp = app(l)
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            (resp.status(), body_string(resp).await)
+        };
+        let named = || {
+            Request::builder()
+                .uri("/")
+                .header(header::HOST, "forge.example")
+                .header("x-test-user", "alice@example.com")
+        };
+
+        // The peer (loopback here) is no trusted proxy: the headers are the
+        // client's own word and ignored.
+        assert_eq!(send(l.clone(), named()).await.1, "anonymous");
+
+        l.trusted_proxies = Arc::new(vec!["127.0.0.0/8".parse().unwrap()]);
+        assert_eq!(send(l.clone(), named()).await.1, "user:7");
+        assert_eq!(
+            send(
+                l.clone(),
+                Request::builder()
+                    .uri("/")
+                    .header(header::HOST, "forge.internal:8421")
+                    .header("x-test-user", "alice@example.com")
+            )
+            .await
+            .1,
+            "user:7"
+        );
+        // A DNS-rebinding page reaches the proxy under its own host name.
+        for host in [Some("rebind.attacker.example"), None] {
+            let mut req = Request::builder()
+                .uri("/")
+                .header("x-test-user", "alice@example.com");
+            if let Some(host) = host {
+                req = req.header(header::HOST, host);
+            }
+            assert_eq!(send(l.clone(), req).await.1, "anonymous", "{host:?}");
+        }
+        // A credential another source refused is a 401, not the named user.
+        assert_eq!(
+            send(l.clone(), named().header(AUTHORIZATION, "Basic bad"))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cross_site_mutation_is_refused_before_the_trusted_headers() {
+        let mut l = layer(vec![], AnonPolicy::Off);
+        l.trusted_header = Some(Arc::new(HeaderStub));
+        l.trusted_proxies = Arc::new(vec!["127.0.0.0/8".parse().unwrap()]);
+        let post = |site: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/admin/thing")
+                .header(header::HOST, "forge.example")
+                .header("x-test-user", "alice@example.com")
+                .header("sec-fetch-site", site)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = post_app(l.clone())
+            .oneshot(post("cross-site"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_string(resp).await, "cross-site request refused");
+        // The SPA's own request: no session token to check, the handler runs.
+        let resp = post_app(l).oneshot(post("same-origin")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// Echoes the resolved principal's IP (anonymous) for the XFF tests.

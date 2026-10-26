@@ -4,7 +4,8 @@
 //! interactive OIDC login are wired. This module owns:
 //!
 //! * the typed, serde-checked shapes of each realm `config` jsonb
-//!   ([`CredForwardRealmConfig`], [`OidcRealmConfig`]) plus their validation,
+//!   ([`CredForwardRealmConfig`], [`OidcRealmConfig`],
+//!   [`super::trusted_header::TrustedHeaderRealmConfig`]) plus their validation,
 //!   secret **redaction** (for API responses) and secret **merge** (write-only
 //!   updates keep the stored secret when the caller omits it);
 //! * [`RealmAuth`] — the per-instance snapshot cache that rebuilds the
@@ -30,6 +31,7 @@
 //! and OIDC routes report login unavailable. A malformed single realm is
 //! skipped with an error log so one bad row cannot take down the others.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,7 @@ pub const KIND_LOCAL: &str = "local";
 pub const KIND_OIDC: &str = "oidc";
 pub const KIND_CRED_FORWARD: &str = "credential_forwarding";
 pub const KIND_WORKLOAD_IDENTITY: &str = "workload_identity";
+pub const KIND_TRUSTED_HEADER: &str = "trusted_header";
 
 // ─── typed realm configs ─────────────────────────────────────────────────────
 
@@ -359,6 +362,7 @@ pub fn secret_keys(kind: &str) -> &'static [&'static str] {
     match kind {
         KIND_OIDC => &["client_secret"],
         KIND_CRED_FORWARD => &["key_pepper"],
+        KIND_TRUSTED_HEADER => &["secret"],
         _ => &[],
     }
 }
@@ -443,6 +447,7 @@ pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, Stri
             Ok(serde_json::to_value(&cfg).expect("serializable"))
         }
         KIND_WORKLOAD_IDENTITY => super::wif::validate_workload_identity_config(config),
+        KIND_TRUSTED_HEADER => super::trusted_header::validate_trusted_header_config(config),
         other => Err(format!("unknown realm kind {other:?}")),
     }
 }
@@ -597,6 +602,9 @@ pub struct RealmSnapshot {
     /// data can bypass the admin/DB uniqueness checks; routing such an issuer is
     /// ambiguous and must reject rather than depend on realm priority.
     pub workload_ambiguous_issuers: Vec<String>,
+    /// Enabled `trusted_header` realms, in try-order: the first whose secret
+    /// a request carries names its caller.
+    pub trusted_header: Vec<super::trusted_header::TrustedHeaderRealm>,
 }
 
 impl RealmSnapshot {
@@ -623,6 +631,8 @@ const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// the local instance converges immediately; peers converge within TTL).
 /// `refreshed()` rebuilds early for a credential issued under a realm
 /// configuration a peer already has and this instance does not yet.
+/// `current_or_stale()` serves a check every request makes without waiting
+/// on a rebuild.
 pub struct RealmAuth {
     pool: PgPool,
     cache: Cache,
@@ -634,6 +644,11 @@ pub struct RealmAuth {
     snapshot: tokio::sync::RwLock<Option<Arc<RealmSnapshot>>>,
     /// When [`RealmAuth::refreshed`] last rebuilt the snapshot.
     last_refresh: std::sync::Mutex<Option<Instant>>,
+    /// The snapshot built last, for [`RealmAuth::current_or_stale`]: read
+    /// without the lock a rebuild holds. Cleared by [`RealmAuth::invalidate`].
+    latest: std::sync::Mutex<Option<Arc<RealmSnapshot>>>,
+    /// Whether a rebuild [`RealmAuth::current_or_stale`] started still runs.
+    rebuilding: AtomicBool,
     /// Decrypts `auth_realm.secrets_enc`.
     envelope: Arc<EnvelopeService>,
     /// Per-provider bounds on concurrent upstream credential forwards
@@ -680,6 +695,8 @@ impl RealmAuth {
             ttl,
             snapshot: tokio::sync::RwLock::new(None),
             last_refresh: std::sync::Mutex::new(None),
+            latest: std::sync::Mutex::new(None),
+            rebuilding: AtomicBool::new(false),
             envelope,
             forward_limits,
             password_limiter,
@@ -711,7 +728,46 @@ impl RealmAuth {
         }
         let snap = Arc::new(self.build().await?);
         *slot = Some(snap.clone());
+        self.keep_latest(&snap);
         Ok(snap)
+    }
+
+    /// The snapshot for a check every request makes (the trusted-header
+    /// realms, asked for each request a trusted proxy forwards): the current
+    /// one, or, once it is due, the one at hand while a rebuild runs in the
+    /// background, so that a slow or unreachable database does not hold up
+    /// requests that carry no credentials at all (health probes among them).
+    /// Only without any snapshot (the first use, or right after an admin
+    /// write here) does it wait for one, as [`Self::snapshot`] does.
+    pub async fn current_or_stale(self: &Arc<Self>) -> anyhow::Result<Arc<RealmSnapshot>> {
+        let held = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match held {
+            Some(snap) if snap.built_at.elapsed() < self.ttl => Ok(snap),
+            Some(stale) => {
+                if !self.rebuilding.swap(true, Ordering::AcqRel) {
+                    let realms = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = realms.snapshot().await {
+                            tracing::error!(error = %e, "realm snapshot rebuild failed; the previous one stays in use");
+                        }
+                        realms.rebuilding.store(false, Ordering::Release);
+                    });
+                }
+                Ok(stale)
+            }
+            None => self.snapshot().await,
+        }
+    }
+
+    fn keep_latest(&self, snap: &Arc<RealmSnapshot>) {
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snap.clone());
     }
 
     /// A snapshot built after `seen`, for a caller holding a credential issued
@@ -744,12 +800,17 @@ impl RealmAuth {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
         *slot = Some(snap.clone());
+        self.keep_latest(&snap);
         Ok(snap)
     }
 
     /// Drop the cached snapshot (after an admin realm write).
     pub async fn invalidate(&self) {
         *self.snapshot.write().await = None;
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Rebuild the snapshot from the realm table.
@@ -761,6 +822,7 @@ impl RealmAuth {
         let mut oidc: Option<OidcRealmRuntime> = None;
         let mut workload: Vec<super::wif::WorkloadIdentityRealm> = Vec::new();
         let mut workload_configured_issuers: Vec<String> = Vec::new();
+        let mut trusted_header: Vec<super::trusted_header::TrustedHeaderRealm> = Vec::new();
 
         // Where the local provider goes, and whether a credential-forwarding
         // provider was built after it. Then names the local store does not own
@@ -830,6 +892,16 @@ impl RealmAuth {
                         }
                     }
                 }
+                KIND_TRUSTED_HEADER => {
+                    match super::trusted_header::TrustedHeaderRealm::build(realm, &config) {
+                        Ok(r) => trusted_header.push(r),
+                        // Its headers then name nobody: the requests carrying
+                        // them go on without its accounts.
+                        Err(e) => {
+                            tracing::error!(realm = %realm.name, error = %e, "trusted_header realm skipped");
+                        }
+                    }
+                }
                 other => {
                     tracing::error!(realm = %realm.name, kind = %other, "unknown realm kind skipped");
                 }
@@ -873,6 +945,7 @@ impl RealmAuth {
             workload,
             workload_configured_issuers,
             workload_ambiguous_issuers,
+            trusted_header,
         })
     }
 
@@ -1605,6 +1678,26 @@ mod tests {
         let red = redact_config(KIND_OIDC, &cfg);
         assert!(red.get("client_secret").is_none());
         assert_eq!(red["client_secret_set"], json!(false));
+    }
+
+    #[test]
+    fn a_trusted_header_secret_is_write_only() {
+        let stored = validate_config(
+            KIND_TRUSTED_HEADER,
+            &json!({
+                "username_header": "X-Forwarded-User",
+                "secret_header": "X-Forge-Proxy-Secret",
+                "secret": "0123456789abcdef0123456789abcdef",
+            }),
+        )
+        .expect("valid");
+        let redacted = redact_config(KIND_TRUSTED_HEADER, &stored);
+        assert!(redacted.get("secret").is_none());
+        assert_eq!(redacted["secret_set"], json!(true));
+        // The UI sends the redacted view back: the stored secret is kept.
+        let merged = merge_secrets(KIND_TRUSTED_HEADER, &stored, &redacted);
+        assert_eq!(merged["secret"], stored["secret"]);
+        assert_eq!(validate_config(KIND_TRUSTED_HEADER, &merged), Ok(stored));
     }
 
     #[test]

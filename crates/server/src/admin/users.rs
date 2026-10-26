@@ -17,8 +17,11 @@
 //! otherwise with a link the response carries once. With `realm` it creates
 //! an account of that credential-forwarding realm instead: such a realm
 //! creates no accounts on its own, and signs in only those created here
-//! (forwarding the local part of the name to its upstream). `role` makes the
-//! account a reader (the default), a writer or an administrator.
+//! (forwarding the local part of the name to its upstream). Or of that
+//! trusted-header realm: the headers of the proxy in front then name it (a
+//! realm without `auto_provision` names only the accounts created here).
+//! `role` makes the account a reader (the default), a writer or an
+//! administrator.
 //!
 //! An invited account signs in by no path until its user has chosen the
 //! password. `POST /admin/users/{id}/invitation` makes a new invitation
@@ -54,9 +57,10 @@ pub struct UserView {
     pub is_admin: bool,
     pub active: bool,
     /// How the account signs in: `local` (a Forge password), `oidc` (an
-    /// identity provider) or `upstream-basic` (a credential-forwarding
-    /// realm). Two accounts can look alike by name (`bob`, `bob@entra`); this
-    /// tells them apart before a grant goes to the wrong one.
+    /// identity provider), `upstream-basic` (a credential-forwarding realm)
+    /// or `trusted-header` (the headers of a trusted-header realm's proxy).
+    /// Two accounts can look alike by name (`bob`, `bob@entra`); this tells
+    /// them apart before a grant goes to the wrong one.
     pub auth_source: String,
     /// When the account's realm last kept a hash of the password its upstream
     /// accepted (`capture_password_hash`); `null` when it keeps none. Such an
@@ -175,8 +179,9 @@ impl AccessRole {
 
 /// Create-user request: a local account whose user is invited to choose
 /// the password, or an account of the credential-forwarding realm named
-/// `realm` (it signs in with the upstream's password). No password is ever
-/// taken here.
+/// `realm` (it signs in with the upstream's password) or of the
+/// trusted-header realm named `realm` (the proxy's headers name it). No
+/// password is ever taken here.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateUser {
@@ -186,7 +191,7 @@ pub struct CreateUser {
     pub email: Option<String>,
     #[serde(default)]
     pub role: AccessRole,
-    /// The name of a `credential_forwarding` realm.
+    /// The name of a `credential_forwarding` or `trusted_header` realm.
     #[serde(default)]
     pub realm: Option<String>,
 }
@@ -332,10 +337,15 @@ pub async fn create(
                 Ok(Some(r)) if r.kind == crate::auth::KIND_CRED_FORWARD => {
                     NewAccount::Forwarded { realm_id: r.id }
                 }
+                Ok(Some(r)) if r.kind == crate::auth::KIND_TRUSTED_HEADER => {
+                    NewAccount::TrustedHeader { realm_id: r.id }
+                }
                 Ok(_) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        format!("no credential-forwarding realm is named {realm:?}"),
+                        format!(
+                            "no credential-forwarding or trusted-header realm is named {realm:?}"
+                        ),
                     )
                         .into_response()
                 }
@@ -384,7 +394,7 @@ pub async fn create(
                 Err(e) => return db_error(e),
             }
         }
-        NewAccount::Forwarded { .. } => None,
+        NewAccount::Forwarded { .. } | NewAccount::TrustedHeader { .. } => None,
     };
     match UserView::load(&state, &u).await {
         Ok(user) => (
@@ -410,6 +420,8 @@ enum NewAccount {
     Invited { email: String },
     /// An account of this credential-forwarding realm.
     Forwarded { realm_id: i64 },
+    /// An account of this trusted-header realm.
+    TrustedHeader { realm_id: i64 },
 }
 
 /// Insert the user (with `email` as its address) and assign it `role`'s
@@ -428,6 +440,13 @@ async fn insert_with_role(
         }
         NewAccount::Forwarded { realm_id } => {
             let user = user_dao::insert_forwarded_user(&mut *tx, username, *realm_id, true).await?;
+            if email.is_some() {
+                invitation_dao::set_email(&mut *tx, user.id, email).await?;
+            }
+            user
+        }
+        NewAccount::TrustedHeader { realm_id } => {
+            let user = user_dao::insert_trusted_header_user(&mut *tx, username, *realm_id).await?;
             if email.is_some() {
                 invitation_dao::set_email(&mut *tx, user.id, email).await?;
             }
