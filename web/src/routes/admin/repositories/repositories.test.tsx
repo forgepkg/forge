@@ -32,7 +32,8 @@ import { searchOptions } from '~/lib/search'
  *    unflagging the last owner, explains a refused owner removal, and offers
  *    other groups (of the same format) as (nested) members;
  *  - a proxy's edit screen invalidates its cache, of one package or of all,
- *    and a hosted one offers no such thing.
+ *    and a hosted one offers no such thing;
+ *  - a repository change refreshes the repositories Browse lists.
  */
 
 const adminMe: Me = {
@@ -78,6 +79,8 @@ const fetchMock = vi.fn()
 
 interface ApiHandlers {
   repositories?: RepoView[]
+  /** `GET /browse/repos`: the repositories Browse lists. */
+  browseRepos?: () => unknown[]
   /** `GET /admin/formats`; unanswered (404) when absent. */
   formats?: unknown[]
   members?: MemberView[]
@@ -106,6 +109,9 @@ function mockApi(h: ApiHandlers) {
       const path = url.pathname
 
       if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
+      if (path.endsWith('/browse/repos') && method === 'GET') {
+        return Promise.resolve(json(h.browseRepos?.() ?? []))
+      }
 
       if (path.endsWith('/admin/realms') && method === 'GET') {
         return Promise.resolve(json(h.realms ?? []))
@@ -514,6 +520,44 @@ describe('admin repositories', () => {
       ).toBeNull(),
     )
     expect(screen.getByLabelText('Upstream username')).toBeEnabled()
+  })
+
+  it('a rename refreshes the repositories Browse lists (#244)', async () => {
+    let stored = repo({ id: 7, name: 'internal', kind: 'hosted' })
+    mockApi({
+      repositories: [stored],
+      browseRepos: () => [
+        { id: 7, name: stored.name, kind: 'hosted', online: true, format: 'nuget' },
+      ],
+      onUpdate: (_name, body) => {
+        stored = { ...stored, ...(body as Partial<RepoView>) }
+        return json(stored)
+      },
+    })
+
+    const user = userEvent.setup()
+    const router = await renderAt('/')
+    const main = () => within(screen.getByRole('main'))
+    expect(await main().findByRole('link', { name: /internal/ })).toHaveAttribute(
+      'href',
+      '/repos/internal',
+    )
+
+    // Renamed under Manage, well within the list's 30 s stale time.
+    await router.navigate({ to: '/manage/repositories/$repo', params: { repo: 'internal' } })
+    const name = await screen.findByLabelText('Name')
+    await user.clear(name)
+    await user.type(name, 'internal2')
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(stored.name).toBe('internal2'))
+
+    // Back in Browse, the list names the repository as it is now.
+    await router.navigate({ to: '/' })
+    expect(await main().findByRole('link', { name: /internal2/ })).toHaveAttribute(
+      'href',
+      '/repos/internal2',
+    )
+    expect(main().getAllByRole('link', { name: /internal/ })).toHaveLength(1)
   })
 
   it('invalidates a proxy cache, of one package or of the whole repository', async () => {
