@@ -2938,3 +2938,71 @@ async fn a_cache_answer_to_a_wider_search_keeps_the_first_hits() {
         assert!(totals[0] > 12, "the hits past them are still estimated");
     }
 }
+
+/// An upstream search whose hits all repeat ids the group already has, a
+/// mirror's first window say, may hold new ids past them: the total counts
+/// one past the merged ids while it does, so a client paging by the total
+/// asks for the page that shows them.
+#[tokio::test]
+async fn a_search_adding_no_id_keeps_the_total_past_the_merged_ids() {
+    let pool = common::pool().await;
+    let first = seed_proxy_member(&pool).await;
+    let second = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, first.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, second.id, 10)
+        .await
+        .unwrap();
+    let a = RankedUpstream::new(ids("Mirror", 0..32), 32);
+    let b = RankedUpstream::new([ids("Mirror", 0..32), ids("More", 0..40)].concat(), 72);
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&first, &a), (&second, &b)],
+    );
+    let (pages, totals) = search_pages(&g, &group.name, "", 16, 3).await;
+    assert_eq!(totals[..2], [33, 33], "one past the 32 merged ids");
+    assert_eq!(pages[2], ids("More", 0..16));
+}
+
+/// Local hits fill the page, and the proxy left out every hit of its
+/// upstream's first window: the total still counts one past the local ids.
+#[tokio::test]
+async fn an_upstream_window_the_proxy_emptied_keeps_the_total_past_the_page() {
+    let pool = common::pool().await;
+    let local = seed_proxy_member(&pool).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, local.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(local.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cached = RankedUpstream::new(ids("Local", 0..40), 40);
+    let delayed = ids("Delayed", 0..100);
+    let upstream = Arc::new(RankedUpstream {
+        ids: delayed.clone(),
+        total: 100,
+        dropped: delayed[..32].iter().cloned().collect(),
+        fallback: None,
+        takes: Default::default(),
+    });
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&local, &cached), (&proxy, &upstream)],
+    );
+    let (pages, totals) = search_pages(&g, &group.name, "", 20, 3).await;
+    assert_eq!(totals[0], 41, "one past the 40 local ids");
+    assert_eq!(pages[2], ids("Delayed", 32..52));
+}

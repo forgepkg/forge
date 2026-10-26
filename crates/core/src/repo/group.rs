@@ -120,10 +120,12 @@
 //! neither repeat nor skip an id. The count is exact when every member
 //! returned all its hits. Otherwise it adds, for each upstream search, the
 //! hits past those returned that it reports (up to `MAX_TAKE`), scaled by
-//! the share of its returned hits that added an id: an estimate. An id that
-//! a higher-priority member ranks past the hits it returned, but a
-//! lower-priority one returns, is shown from the lower-priority member's hit;
-//! every version that hit lists is served by the group.
+//! the share of its returned hits that added an id, and at least one while
+//! any upstream search has more hits than it returned, so that paging goes
+//! on: an estimate. An id that a higher-priority member ranks past the hits
+//! it returned, but a lower-priority one returns, is shown from the
+//! lower-priority member's hit; every version that hit lists is served by
+//! the group.
 //!
 //! ## Decoupling from concrete member kinds
 //! `forge-core` must not hard-wire how a hosted vs. proxy member is constructed
@@ -1104,6 +1106,14 @@ impl GroupRepo {
                 more.saturating_mul(credited) / search.hits.len()
             })
             .fold(0_usize, usize::saturating_add);
+        // A search with more hits than it returned may still add ids, though
+        // none of those it returned did: count one past the merged ids, so
+        // paging goes on until a larger window shows them.
+        let unseen = if upstream.iter().any(|&member| searches[member].incomplete()) {
+            unseen.max(1)
+        } else {
+            unseen
+        };
 
         MergedSearch {
             order: order
