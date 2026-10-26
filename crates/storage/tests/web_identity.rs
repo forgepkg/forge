@@ -411,10 +411,13 @@ async fn operations_keep_working_across_credential_expiry() {
 
 #[tokio::test]
 async fn a_multipart_upload_spanning_a_refresh_completes() {
-    let setup = setup("token-1", Duration::from_secs(1)).await;
+    // Keys live long enough to sign and send an 8 MiB part (the fake checks
+    // them once the whole part has arrived), even on a busy runner: hashing
+    // it takes a debug build a few hundred milliseconds.
+    let setup = setup("token-1", Duration::from_secs(3)).await;
     // Each part takes longer than the keys live: the keys the first part was
     // signed with have expired before the second part is sent.
-    *setup.fake.part_delay.lock().unwrap() = Duration::from_millis(1200);
+    *setup.fake.part_delay.lock().unwrap() = Duration::from_millis(3200);
     let store = store(
         &setup,
         S3Credentials::WebIdentity(web_identity(&setup, Some(ROLE))),
