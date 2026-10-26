@@ -183,6 +183,48 @@ describe('session expiry', () => {
   })
 })
 
+describe('signed in by the proxy in front', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockReset()
+    clearSession()
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    clearSession()
+  })
+
+  it('a page the proxy\'s headers sign in has no session, which is no expired one', async () => {
+    // A trusted-header realm names the user on every request: `/admin/me`
+    // answers, but there is no cookie session for `/auth/me` to find.
+    const server = fakeServer(readerMe)
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const raw = typeof input === 'string' ? input : input.toString()
+      const path = new URL(raw, 'http://localhost').pathname
+      server.calls.push(path)
+      if (path.endsWith('/auth/me')) {
+        return Promise.resolve(new Response('authentication required', { status: 401 }))
+      }
+      if (path.endsWith('/admin/me')) return Promise.resolve(json(readerMe))
+      if (path.endsWith('/browse/repos')) {
+        return Promise.resolve(json([{ name: 'nuget', kind: 'proxy' }]))
+      }
+      return Promise.resolve(new Response('not found', { status: 404 }))
+    })
+    const { router, queryClient } = await renderApp('/')
+    const header = await screen.findByRole('navigation', { name: 'Main' })
+    expect(await within(header).findByText('alice')).toBeInTheDocument()
+
+    // Loading the session again (as after a sign-in elsewhere) does not
+    // send the user to the login screen either.
+    await queryClient.refetchQueries({ queryKey: ['auth', 'session'] })
+    await sleep(100)
+    expect(server.calls.filter((p) => p.endsWith('/auth/me')).length).toBeGreaterThanOrEqual(2)
+    expect(router.state.location.pathname).toBe('/')
+    expect(screen.queryByText(/your session expired/i)).toBeNull()
+  })
+})
+
 describe('sign-out', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)

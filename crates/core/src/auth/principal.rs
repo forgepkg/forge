@@ -33,6 +33,20 @@ pub enum AuthMethod {
     Password,
     /// A browser session cookie, minted by an interactive login.
     Session,
+    /// The headers the load balancer or reverse proxy in front of Forge adds
+    /// to name the account (a `trusted_header` realm). Never an administrator
+    /// login: the account's `admin` role does not apply to such a request.
+    TrustedHeader,
+}
+
+impl AuthMethod {
+    /// Whether the request carries this credential without its client
+    /// presenting one: the session cookie a browser attaches, or the headers
+    /// the proxy in front adds. A foreign page can make a browser send a
+    /// request with either, so neither is a credential to publish with.
+    pub fn is_ambient(self) -> bool {
+        matches!(self, AuthMethod::Session | AuthMethod::TrustedHeader)
+    }
 }
 
 /// Who is making a request, after credential resolution.
@@ -108,7 +122,8 @@ pub struct TrustedPublisherMatch {
 
 impl Principal {
     /// Who this is, for audit log lines: ids only, never secrets
-    /// (`user:5 token:12`, `user:5 session`, `workload realm:3 role:7`).
+    /// (`user:5 token:12`, `user:5 session`, `user:5 trusted-header`,
+    /// `workload realm:3 role:7`).
     pub fn audit_label(&self) -> String {
         match self {
             Principal::Unauthenticated => "unauthenticated".into(),
@@ -121,6 +136,7 @@ impl Principal {
             } => match (token_id, method) {
                 (Some(token_id), _) => format!("user:{user_id} token:{token_id}"),
                 (None, AuthMethod::Session) => format!("user:{user_id} session"),
+                (None, AuthMethod::TrustedHeader) => format!("user:{user_id} trusted-header"),
                 (None, _) => format!("user:{user_id} password"),
             },
             Principal::Workload {
@@ -180,6 +196,10 @@ mod tests {
         assert_eq!(
             user(None, AuthMethod::Password).audit_label(),
             "user:5 password"
+        );
+        assert_eq!(
+            user(None, AuthMethod::TrustedHeader).audit_label(),
+            "user:5 trusted-header"
         );
         let workload = Principal::Workload {
             realm_id: 3,

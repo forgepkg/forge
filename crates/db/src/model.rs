@@ -568,7 +568,8 @@ pub struct ValidatedCredential {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuthRealm {
     pub id: i64,
-    /// `'local'` | `'oidc'` | `'credential_forwarding'` | `'workload_identity'`.
+    /// `'local'` | `'oidc'` | `'credential_forwarding'` | `'workload_identity'` |
+    /// `'trusted_header'`.
     pub kind: String,
     /// Unique display name + URL slug (lowercase, dns-label-ish; DB CHECK).
     pub name: String,

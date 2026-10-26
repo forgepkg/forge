@@ -266,6 +266,7 @@ describe('admin users', () => {
         user({ id: 3, username: 'alice@corp', auth_source: 'oidc' }),
         user({ id: 4, username: 'root', auth_source: 'local' }),
         user({ id: 5, username: 'svc', auth_source: 'scim' }),
+        user({ id: 6, username: 'office@corp', auth_source: 'trusted-header' }),
       ],
     })
 
@@ -280,6 +281,7 @@ describe('admin users', () => {
     expect(signIn('alice')).toHaveTextContent('Credential forwarding')
     expect(signIn('alice@corp')).toHaveTextContent('Identity provider')
     expect(signIn('root')).toHaveTextContent('Password')
+    expect(signIn('office@corp')).toHaveTextContent('Trusted header')
     // An unknown source is shown as sent.
     expect(signIn('svc')).toHaveTextContent('scim')
   })
@@ -327,6 +329,47 @@ describe('admin users', () => {
     })
     expect(
       await screen.findByText('Created dora@example.com: it signs in with its upstream password.'),
+    ).toBeInTheDocument()
+  })
+
+  it('creates an account of a trusted-header realm, without a password', async () => {
+    let posted: unknown = null
+    mockApi({
+      users: [],
+      realms: [
+        { id: 3, kind: 'credential_forwarding', name: 'nexus', enabled: true, priority: 20, config: {} },
+        { id: 5, kind: 'trusted_header', name: 'office-lan', enabled: true, priority: 40, config: {} },
+      ],
+      onCreateUser: (body) => {
+        posted = body
+        return json(
+          { ...user({ id: 2, username: 'ci@example.com', auth_source: 'trusted-header' }), invitation: null },
+          201,
+        )
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/new')
+
+    await u.type(await screen.findByLabelText('Username'), 'ci@example.com')
+    const signIn = await screen.findByLabelText('Sign-in')
+    expect(
+      within(signIn).getByRole('option', { name: 'Trusted header: office-lan' }),
+    ).toBeInTheDocument()
+    await u.selectOptions(signIn, 'office-lan')
+    expect(screen.getByText(/names the account in its header/)).toBeInTheDocument()
+    expect(screen.queryByText(/No email service is configured/)).toBeNull()
+    await u.click(screen.getByRole('button', { name: 'Create user' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toEqual({
+      username: 'ci@example.com',
+      role: 'reader',
+      realm: 'office-lan',
+    })
+    expect(
+      await screen.findByText("Created ci@example.com: the headers of its realm's proxy name it."),
     ).toBeInTheDocument()
   })
 

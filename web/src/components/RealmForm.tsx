@@ -7,6 +7,7 @@ import type {
   RealmConfig,
   RealmKind,
   RealmView,
+  TrustedHeaderConfig,
   WorkloadIdentityConfig,
 } from '~/api/realms'
 import { ADMIN_ROLE } from '~/api/rbac'
@@ -48,6 +49,10 @@ import {
  *  - **workload_identity** (WIF) → public OIDC issuer / allowed audiences /
  *    optional authorized parties / bounded token lifetime / ordered
  *    claim→role rules (no secrets, no redaction)
+ *  - **trusted_header** → the header naming the account, the header and
+ *    write-only secret the proxy proves itself with (a random one can be
+ *    generated and copied into the proxy's configuration before saving),
+ *    account provisioning; the side column says what the proxy must do
  *  - **local** → no config; only name + enabled are editable (built-in realm)
  *
  * On **create** the kind is chosen from cards (local is built-in and cannot
@@ -74,7 +79,7 @@ export interface RealmFormValues {
   kind: RealmKind
   name: string
   enabled: boolean
-  // Shared (oidc + credential_forwarding)
+  // oidc
   auto_provision: boolean
   // oidc
   issuer: string
@@ -143,6 +148,13 @@ export interface RealmFormValues {
     role: string
     conditions: Array<{ claim: string; anyOf: string }>
   }>
+  // trusted_header
+  username_header: string
+  secret_header: string
+  /** Newly-typed secret; blank ⇒ "leave unchanged" on edit / invalid on create. */
+  secret: string
+  /** Trusted header: create a user's account on its first request (off by default). */
+  header_auto_provision: boolean
 }
 
 export interface RealmFormProps {
@@ -177,6 +189,8 @@ export function disableRealmWarning(kind: RealmKind, name: string): string | nul
       return `Disabling ${name} stops the logins it checks against its upstream: NuGet clients sending those passwords over Basic, and browser sign-in with them. API tokens keep working.`
     case 'workload_identity':
       return `Disabling ${name} stops its token exchange and revokes every API key it issued: CI jobs using one fail with 401 until they exchange a new token. Enabling the realm again does not bring the keys back.`
+    case 'trusted_header':
+      return `Disabling ${name} stops its proxy's headers from naming anyone: the requests the proxy forwards without a credential of their own are anonymous. API tokens keep working.`
     default:
       return null
   }
@@ -227,6 +241,9 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
   const wif = (
     existing?.kind === 'workload_identity' ? existing.config : {}
   ) as WorkloadIdentityConfig
+  const header = (
+    existing?.kind === 'trusted_header' ? existing.config : {}
+  ) as TrustedHeaderConfig
   return {
     kind: existing?.kind ?? 'oidc',
     name: existing?.name ?? '',
@@ -293,6 +310,10 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
         anyOf: joinLines(c.any_of),
       })),
     })),
+    username_header: header.username_header ?? '',
+    secret_header: header.secret_header ?? '',
+    secret: '',
+    header_auto_provision: header.auto_provision ?? false,
   }
 }
 
@@ -324,11 +345,17 @@ export const REALM_KINDS: Record<
     description:
       'CI jobs, such as GitHub Actions or GitLab CI, authenticate with their OIDC token and get a role.',
   },
+  trusted_header: {
+    label: 'Trusted header',
+    icon: 'Shield',
+    description:
+      'The load balancer or SSO proxy in front of Forge names the account in a header, for the people or networks it admits.',
+  },
 }
 
 /** The kinds a realm can be created as (local is built in). */
 const KIND_CARDS: ChoiceCard<RealmKind>[] = (
-  ['oidc', 'credential_forwarding', 'workload_identity'] as const
+  ['oidc', 'credential_forwarding', 'workload_identity', 'trusted_header'] as const
 ).map((kind) => ({
   id: kind,
   title: REALM_KINDS[kind].label,
@@ -354,6 +381,8 @@ export function RealmForm({
   )
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [confirmSave, setConfirmSave] = useState(false)
+  // A secret generated in this form, shown to copy until it is replaced.
+  const [generatedSecret, setGeneratedSecret] = useState<string | null>(null)
   // Counts the submits that failed validation: each one moves focus to the
   // first field marked invalid, whose error is read with it (the field errors
   // are not live regions).
@@ -498,6 +527,30 @@ export function RealmForm({
         })
       })
     }
+    if (values.kind === 'trusted_header') {
+      for (const key of ['username_header', 'secret_header'] as const) {
+        if (values[key].trim() === '') {
+          next[key] = 'A header name is required.'
+        } else if (!HEADER_NAME.test(values[key].trim())) {
+          next[key] = 'A header name such as X-Forwarded-User, without spaces or colons.'
+        }
+      }
+      if (
+        !next.secret_header &&
+        values.secret_header.trim().toLowerCase() ===
+          values.username_header.trim().toLowerCase()
+      ) {
+        next.secret_header = 'The secret needs a header of its own.'
+      }
+      if (values.secret === '') {
+        if (mode === 'create' || !hasStoredSecret(existing, 'secret_set')) {
+          next.secret = 'A secret is required.'
+        }
+      } else {
+        const error = secretError(values.secret)
+        if (error) next.secret = error
+      }
+    }
     setErrors(next)
     return Object.keys(next).length === 0
   }
@@ -528,6 +581,7 @@ export function RealmForm({
   const isOidc = values.kind === 'oidc'
   const isForwarding = values.kind === 'credential_forwarding'
   const isWorkloadIdentity = values.kind === 'workload_identity'
+  const isTrustedHeader = values.kind === 'trusted_header'
 
   function setRule(
     index: number,
@@ -592,9 +646,12 @@ export function RealmForm({
     />
   )
 
-  // The side column: the caller's panels, then what to enter at the IdP.
+  // The side column: the caller's panels, then what to enter at the IdP or
+  // what the proxy must do.
   const registration = isOidc ? (
     <AppRegistration values={values} saved={existing?.federated_credential} />
+  ) : isTrustedHeader ? (
+    <ProxySetup values={values} />
   ) : null
   const side =
     aside || registration ? (
@@ -1260,6 +1317,100 @@ export function RealmForm({
           </>
         )}
 
+        {isTrustedHeader && (
+          <>
+            <Panel
+              title="Proxy"
+              description={
+                <>
+                  The headers the load balancer or reverse proxy in front of Forge sets
+                  for the clients it admits. Forge reads them only from a peer in{' '}
+                  <Code>auth.trusted_proxy_cidrs</Code>, for a request naming one of its
+                  own host names.
+                </>
+              }
+            >
+              <div className="fg-form">
+                <div className="fg-fieldrow items-start">
+                  <TextField
+                    label="Username header"
+                    mono
+                    autoComplete="off"
+                    value={values.username_header}
+                    onChange={(e) => set('username_header', e.target.value)}
+                    placeholder="X-Forwarded-User"
+                    description="Names the account: a UPN such as alice@example.com."
+                    error={errors.username_header}
+                  />
+                  <TextField
+                    label="Secret header"
+                    mono
+                    autoComplete="off"
+                    value={values.secret_header}
+                    onChange={(e) => set('secret_header', e.target.value)}
+                    placeholder="X-Forge-Proxy-Secret"
+                    description="Carries the secret that proves the request came through the proxy."
+                    error={errors.secret_header}
+                  />
+                </div>
+                <SecretField
+                  label="Secret"
+                  error={errors.secret}
+                  value={values.secret}
+                  onChange={(v) => {
+                    set('secret', v)
+                    setGeneratedSecret(null)
+                  }}
+                  stored={mode === 'edit' && hasStoredSecret(existing, 'secret_set')}
+                />
+                <div>
+                  <Button
+                    size="sm"
+                    icon="Refresh"
+                    onClick={() => {
+                      const secret = randomSecret()
+                      set('secret', secret)
+                      setGeneratedSecret(secret)
+                    }}
+                  >
+                    Generate a secret
+                  </Button>
+                </div>
+                {generatedSecret && (
+                  <CopyField
+                    label="Generated secret"
+                    value={generatedSecret}
+                    copyLabel="Copy the secret"
+                    description="Put it into the proxy's configuration: once saved, Forge never shows it again."
+                  />
+                )}
+              </div>
+            </Panel>
+
+            <Panel
+              title="Accounts"
+              description={
+                <>
+                  The realm names only its own accounts, never a local, OIDC or other
+                  realm&apos;s account of the same name, and never makes anyone an
+                  administrator. Without provisioning, create the accounts under{' '}
+                  <strong>Admin → Users</strong> with this realm.
+                </>
+              }
+            >
+              <div className="fg-form">
+                <Checkbox
+                  label="Create a user's account on its first request"
+                  aria-label="Create a user's account on its first request"
+                  description="For an SSO proxy whose users all may use Forge. The new accounts hold no role."
+                  checked={values.header_auto_provision}
+                  onChange={(c) => set('header_auto_provision', c)}
+                />
+              </div>
+            </Panel>
+          </>
+        )}
+
         {serverError && (
           <Notice
             tone="danger"
@@ -1392,9 +1543,68 @@ function AppRegistration({
   )
 }
 
+/**
+ * What the proxy in front of Forge must do for a trusted-header realm, for
+ * the side column: strip both headers from the requests it receives and set
+ * them for the clients it admits; Forge believes only a trusted peer.
+ */
+function ProxySetup({ values }: { values: RealmFormValues }) {
+  const user = values.username_header.trim() || 'X-Forwarded-User'
+  const secret = values.secret_header.trim() || 'X-Forge-Proxy-Secret'
+  return (
+    <Panel title="Proxy setup" description="What the load balancer or proxy in front of Forge must do.">
+      <ul className="fg-list fg-text--small">
+        <li>
+          Remove <Code>{user}</Code> and <Code>{secret}</Code> from every request a
+          client sends, then set them only for the clients it admits: the account&apos;s
+          name, and the secret.
+        </li>
+        <li>
+          Be listed in <Code>auth.trusted_proxy_cidrs</Code>. From any other peer, Forge
+          ignores the headers.
+        </li>
+        <li>
+          Forward Forge&apos;s own host name (the public base URL&apos;s, or one in{' '}
+          <Code>server.allowed_hosts</Code>).
+        </li>
+      </ul>
+      <p className="fg-text fg-text--small">
+        A request with a credential of its own (an API token, a password, a signed-in
+        session) is that credential&apos;s, whatever the headers say. Publishing takes an
+        API token; the deployment guide has examples for nginx, Traefik and HAProxy.
+      </p>
+    </Panel>
+  )
+}
+
+/** A header name the realm can read: an HTTP token (no spaces or `:`). */
+const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/
+
+/** The server's bounds on a trusted-header secret, in characters. */
+const MIN_SECRET = 16
+const MAX_SECRET = 1024
+
+/** Why `secret` cannot be a trusted-header realm's secret, or `null`. */
+export function secretError(secret: string): string | null {
+  if (secret.length < MIN_SECRET || secret.length > MAX_SECRET) {
+    return `Use ${MIN_SECRET} to ${MAX_SECRET} characters; generate one to be sure.`
+  }
+  if (!/^[\x21-\x7e]+$/.test(secret)) {
+    return 'Printable ASCII without spaces only: it is sent as a header value.'
+  }
+  return null
+}
+
+/** 32 random bytes as hex: a secret for the proxy to prove itself with. */
+export function randomSecret(): string {
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+}
+
 function hasStoredSecret(
   existing: RealmView | undefined,
-  flag: 'client_secret_set' | 'key_pepper_set',
+  flag: 'client_secret_set' | 'key_pepper_set' | 'secret_set',
 ): boolean {
   const config = existing?.config as Record<string, unknown> | undefined
   return config?.[flag] === true
@@ -1672,6 +1882,15 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (apiKeyTtl !== undefined) config.api_key_ttl_seconds = apiKeyTtl
     const identityClaims = parseLines(values.identity_claims)
     if (identityClaims.length > 0) config.identity_claims = identityClaims
+    return config
+  }
+  if (values.kind === 'trusted_header') {
+    const config: TrustedHeaderConfig = {
+      username_header: values.username_header.trim(),
+      secret_header: values.secret_header.trim(),
+      auto_provision: values.header_auto_provision,
+    }
+    if (values.secret !== '') config.secret = values.secret
     return config
   }
   // local (and reserved kinds): no config.

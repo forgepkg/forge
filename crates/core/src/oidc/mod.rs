@@ -114,10 +114,11 @@ impl Default for ResolvePolicy {
 /// 2. **No link, matching username** + `link_existing_by_username` (off by
 ///    default) → link the existing user, but **only** if no other credential
 ///    owns it: no local password, not an admin (`admin` role), not a
-///    credential-forwarding (`upstream-basic`) account, and not linked to any
-///    IdP identity yet (of this or another issuer). A colliding
-///    `preferred_username` must never take over a password account, an
-///    administrator, a directory account or another person's IdP account.
+///    credential-forwarding (`upstream-basic`) or trusted-header account, and
+///    not linked to any IdP identity yet (of this or another issuer). A
+///    colliding `preferred_username` must never take over a password account,
+///    an administrator, a directory account, an account a proxy's headers
+///    name or another person's IdP account.
 ///    Otherwise fall through (a fresh, suffixed user is provisioned
 ///    instead).
 /// 3. **No link, no linkable match** + `auto_provision` → create a no-password
@@ -173,6 +174,7 @@ pub async fn resolve_user(
             if user.password_hash.is_none()
                 && !is_admin_role
                 && user.auth_source != "upstream-basic"
+                && user.auth_source != "trusted-header"
                 && user.auth_source != "local"
                 && !already_linked
             {
@@ -181,7 +183,8 @@ pub async fn resolve_user(
             tracing::warn!(
                 username = %mapped.username,
                 "oidc login not linked by username: target has a password, is invited, is an \
-                 admin, is a credential-forwarding account or is already linked to an identity"
+                 admin, is a credential-forwarding or trusted-header account or is already linked \
+                 to an identity"
             );
         }
     }

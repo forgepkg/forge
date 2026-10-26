@@ -12,7 +12,10 @@
 //!   therefore requires a **browser session** ([`AuthMethod::Session`]):
 //!   token-authenticated callers get 403, and so does a password sent over
 //!   HTTP Basic — a password that NuGet clients store and replay on every feed
-//!   request must not be able to mint long-lived credentials.
+//!   request must not be able to mint long-lived credentials — and a request
+//!   the headers of a trusted-header realm's proxy authenticate: every client
+//!   the proxy admits sends them, and a token would outlive its admission (an
+//!   administrator issues the account's tokens).
 //! * Cookie-authenticated mutations are CSRF-checked by the principal
 //!   middleware (`X-CSRF-Token`); `POST` also requires a JSON content type.
 //! * Reuses the admin token DTOs: the plaintext secret is returned exactly once
@@ -63,6 +66,17 @@ fn session_user_of<B>(req: &axum::http::Request<B>) -> Result<i64, Box<Response>
             (
                 StatusCode::FORBIDDEN,
                 "tokens are managed from a signed-in session; a password sent over HTTP Basic cannot mint them",
+            )
+                .into_response(),
+        )),
+        Principal::User {
+            method: AuthMethod::TrustedHeader,
+            ..
+        } => Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                "tokens are managed from a signed-in session; the headers of the proxy in front \
+                 cannot mint them (an administrator issues this account's tokens)",
             )
                 .into_response(),
         )),

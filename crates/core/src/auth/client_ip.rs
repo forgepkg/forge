@@ -142,6 +142,14 @@ pub fn resolve_client(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> Res
     known(peer)
 }
 
+/// Whether the socket `peer` is one of the `trusted` proxies (canonicalized
+/// like every other check here). What such a proxy says about the client,
+/// its `X-Forwarded-For` or the headers a trusted-header realm reads, counts;
+/// from any other peer it is the client's own word and is ignored.
+pub fn is_trusted_peer(peer: IpAddr, trusted: &[IpNet]) -> bool {
+    ip_in_any(peer, trusted)
+}
+
 /// One `X-Forwarded-For` hop as a canonical address: a bare address, or one
 /// with a port (`a.b.c.d:port`, `[v6]:port`). `None` when it is neither.
 fn parse_hop(entry: &str) -> Option<IpAddr> {
@@ -307,6 +315,16 @@ mod tests {
 
     fn nets(list: &[&str]) -> Vec<IpNet> {
         list.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn trusted_peers_are_the_listed_proxies_mapped_ones_included() {
+        let trusted = nets(&["10.0.0.0/8", "2001:db8::/32"]);
+        assert!(is_trusted_peer(ip("10.1.2.3"), &trusted));
+        assert!(is_trusted_peer(ip("::ffff:10.1.2.3"), &trusted));
+        assert!(is_trusted_peer(ip("2001:db8::7"), &trusted));
+        assert!(!is_trusted_peer(ip("203.0.113.9"), &trusted));
+        assert!(!is_trusted_peer(ip("10.1.2.3"), &[]));
     }
 
     // ── resolve_client_ip ────────────────────────────────────────────────

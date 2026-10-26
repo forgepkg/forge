@@ -2,12 +2,14 @@ import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import type { AccessLevel } from '~/api/rbac'
+import type { RealmKind } from '~/api/realms'
 import { canonicalUsername, upnError, type CreatedUser } from '~/api/users'
 import { useCreateUser } from '~/queries/useUsers'
 import { useRealms } from '~/queries/useRealms'
 import { useEmailSettings } from '~/queries/useEmail'
 import { formatDateTime } from '~/lib/oci'
 import { AccessLevelFields } from '~/components/AccessLevelFields'
+import { REALM_KINDS } from '~/components/RealmForm'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
 import {
   Button,
@@ -28,26 +30,34 @@ export const Route = createFileRoute('/_app/manage/users/new')({
 /** A loose check of an address: something@something, without spaces. */
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+$/
 
+/** The realm kinds whose accounts an administrator creates here. */
+const ACCOUNT_REALM_KINDS: RealmKind[] = ['credential_forwarding', 'trusted_header']
+
 /**
  * Create a user (#322). A local account gets no password here: Forge emails
  * its user an invitation to choose one (to the username, or the address
  * entered), or, without an email service, shows the link once to pass on.
  * An account of a credential-forwarding realm signs in with the upstream's
- * password instead. Either way the admin picks the built-in access level.
+ * password instead, and one of a trusted-header realm is named by the
+ * headers of its proxy. Either way the admin picks the built-in access level.
  */
 function CreateUserPage() {
   const create = useCreateUser()
   const realms = useRealms()
   const email = useEmailSettings()
-  const forwarding = (realms.data ?? []).filter((r) => r.kind === 'credential_forwarding')
+  const accountRealms = (realms.data ?? []).filter((r) => ACCOUNT_REALM_KINDS.includes(r.kind))
   const [username, setUsername] = useState('')
   const [usernameTouched, setUsernameTouched] = useState(false)
   // Blank: the username.
   const [address, setAddress] = useState('')
-  // '' = invited (a Forge password); otherwise the forwarding realm's name.
+  // '' = invited (a Forge password); otherwise the account realm's name.
   const [realm, setRealm] = useState('')
+  const realmKind = accountRealms.find((r) => r.name === realm)?.kind
   const [level, setLevel] = useState<AccessLevel>('reader')
-  const [created, setCreated] = useState<CreatedUser | null>(null)
+  const [created, setCreated] = useState<{
+    user: CreatedUser
+    realmKind?: RealmKind
+  } | null>(null)
 
   const usernameError = username.trim() ? upnError(username) : null
   const showUsernameError = usernameTouched && usernameError !== null
@@ -71,7 +81,7 @@ function CreateUserPage() {
         role: level,
         realm: realm || undefined,
       },
-      { onSuccess: (user) => setCreated(user) },
+      { onSuccess: (user) => setCreated({ user, realmKind }) },
     )
   }
 
@@ -90,11 +100,11 @@ function CreateUserPage() {
       <PageHeader
         title="New user"
         crumbs={[{ label: 'Users', to: '/manage/users' }, { label: 'New user' }]}
-        description="A local account is invited to choose its own password; an account of a credential-forwarding realm signs in with the upstream's."
+        description="A local account is invited to choose its own password; an account of a credential-forwarding realm signs in with the upstream's, and one of a trusted-header realm is named by its proxy."
       />
 
       {created ? (
-        <Created user={created} onAnother={another} />
+        <Created user={created.user} realmKind={created.realmKind} onAnother={another} />
       ) : (
         <Columns
           aside={
@@ -137,21 +147,23 @@ function CreateUserPage() {
                   onBlur={() => setUsernameTouched(true)}
                   error={showUsernameError ? usernameError : undefined}
                 />
-                {forwarding.length > 0 && (
+                {accountRealms.length > 0 && (
                   <SelectField
                     label="Sign-in"
                     value={realm}
                     onChange={(e) => setRealm(e.target.value)}
                     description={
-                      realm
+                      realmKind === 'credential_forwarding'
                         ? 'Signs in with the upstream’s password, which gets the part of the username before the @.'
-                        : 'The user is invited to choose a password.'
+                        : realmKind === 'trusted_header'
+                          ? 'The proxy in front of Forge names the account in its header; it has no password. Its API tokens are issued on its user page.'
+                          : 'The user is invited to choose a password.'
                     }
                   >
                     <option value="">Forge password (invitation)</option>
-                    {forwarding.map((r) => (
+                    {accountRealms.map((r) => (
                       <option key={r.id} value={r.name}>
-                        Credential forwarding: {r.name}
+                        {REALM_KINDS[r.kind].label}: {r.name}
                       </option>
                     ))}
                   </SelectField>
@@ -201,7 +213,15 @@ function CreateUserPage() {
 }
 
 /** What the create did: the invitation sent, or its link to pass on. */
-function Created({ user, onAnother }: { user: CreatedUser; onAnother: () => void }) {
+function Created({
+  user,
+  realmKind,
+  onAnother,
+}: {
+  user: CreatedUser
+  realmKind?: RealmKind
+  onAnother: () => void
+}) {
   const invitation = user.invitation
   const until = invitation ? formatDateTime(invitation.expires_at) : ''
   return (
@@ -239,6 +259,10 @@ function Created({ user, onAnother }: { user: CreatedUser; onAnother: () => void
             <ShowOnceSecret secret={invitation.link} label="Invitation link" />
           )}
         </>
+      ) : realmKind === 'trusted_header' ? (
+        <Notice tone="ok">
+          Created {user.username}: the headers of its realm&apos;s proxy name it.
+        </Notice>
       ) : (
         <Notice tone="ok">
           Created {user.username}: it signs in with its upstream password.

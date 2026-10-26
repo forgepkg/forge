@@ -41,6 +41,11 @@
 //! and replay it on every feed request, and with credential forwarding it is
 //! the upstream directory's password. Administration takes a browser session
 //! (sign in through `/auth/login` or OIDC) or an admin-scoped token.
+//!
+//! **Trusted headers and `/admin/*`.** A request a trusted-header realm
+//! authenticated (the headers of the proxy in front name the account) is
+//! refused here too (403): the proxy adds them to every request of the
+//! clients it admits, and they never make anyone an administrator.
 
 pub mod blob_cache;
 pub mod content_selectors;
@@ -112,6 +117,19 @@ pub async fn require_admin(
                 StatusCode::FORBIDDEN,
                 "the admin API needs a signed-in session or an admin-scoped API token; \
                  a password sent over HTTP Basic is not accepted here",
+            )
+                .into_response();
+        }
+        // Nor are the headers of the proxy in front: they never make anyone
+        // an administrator.
+        Principal::User {
+            method: AuthMethod::TrustedHeader,
+            ..
+        } => {
+            return (
+                StatusCode::FORBIDDEN,
+                "the admin API needs a signed-in session or an admin-scoped API token; \
+                 a request the proxy's headers authenticate is not accepted here",
             )
                 .into_response();
         }

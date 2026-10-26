@@ -316,6 +316,14 @@ impl EffectiveSet {
         self.is_admin
     }
 
+    /// This set without the `admin` role's allow-all: only the grants remain.
+    /// What a request the trusted-header realm authenticated holds, so the
+    /// headers of the proxy in front never make anyone an administrator.
+    pub fn without_admin(mut self) -> EffectiveSet {
+        self.is_admin = false;
+        self
+    }
+
     /// **Repo-level gate.** Does this principal hold `required` (or a higher
     /// level) on repository `repo_id`?
     ///
@@ -761,6 +769,15 @@ mod tests {
             assert!(s.allows_repo(l, 999));
         }
         assert!(s.is_admin());
+    }
+
+    #[test]
+    fn without_admin_keeps_only_the_grants() {
+        let s = set(true, &[(Level::Read, Some(1), None)]).without_admin();
+        assert!(!s.is_admin());
+        assert!(s.allows_repo(Level::Read, 1), "the grant stays");
+        assert!(!s.allows_repo(Level::Write, 1), "no allow-all");
+        assert!(!s.allows_repo(Level::Read, 2));
     }
 
     #[test]

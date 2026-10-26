@@ -136,11 +136,12 @@ pub struct ServerConfig {
     /// Extra `Host` names (an optional `:port` is ignored) under which the
     /// server is legitimately reached, besides the host of
     /// [`Self::public_base_url`]. Only consulted for the anonymous mode
-    /// `allowlist` ([`crate::auth::AuthSettings`]): an unauthenticated request
-    /// whose `Host` matches neither is not served anonymously by IP (a
-    /// DNS-rebinding page in an internal user's browser presents its own host
-    /// name). Add the names a reverse proxy rewrites `Host` to, or that
-    /// internal clients use. Default empty.
+    /// `allowlist` ([`crate::auth::AuthSettings`]) and the trusted-header
+    /// realms: an unauthenticated request whose `Host` matches neither is not
+    /// served anonymously by IP, nor named by the headers of the proxy in
+    /// front (a DNS-rebinding page in an internal user's browser presents its
+    /// own host name). Add the names a reverse proxy rewrites `Host` to, or
+    /// that internal clients use. Default empty.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// Seconds a client may take to send a request's headers before the
@@ -541,7 +542,8 @@ impl S3WebIdentityConfig {
 /// ([`crate::auth::AuthSettings`]); its keys are refused ([`REMOVED_AUTH_KEYS`]).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
-    /// CIDRs of proxies whose `X-Forwarded-For` we trust.
+    /// CIDRs of proxies whose `X-Forwarded-For` we trust, and whose headers
+    /// a trusted-header realm reads (from any other peer they are ignored).
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
     /// First-run bootstrap admin credentials.
