@@ -23,6 +23,13 @@ const SECTIONS = [
       'Invite, deactivate and delete accounts; assign their roles; issue, scope and revoke their registry tokens.',
   },
   {
+    to: '/manage/service-accounts',
+    title: 'Service accounts',
+    icon: 'Terminal',
+    description:
+      'Accounts for CI pipelines, build agents and admitted networks that nobody signs in to; their roles and tokens.',
+  },
+  {
     to: '/manage/roles',
     title: 'Roles',
     icon: 'Lock',
@@ -76,7 +83,7 @@ const SECTIONS = [
 /**
  * Admin landing. Only reachable once the `AdminLayout` guard has confirmed
  * `is_admin`. A card per admin screen, with the rail's icon for it: the
- * repositories, users (incl. per-user tokens and roles), roles, content
+ * repositories, users (incl. per-user tokens and roles), service accounts, roles, content
  * selectors, authentication-realm, settings, email-service, retention and
  * system screens.
  */
@@ -88,10 +95,10 @@ function AdminHome() {
         description={
           <>
             Manage repositories and their retention policies, users and
-            their API tokens, roles and their grants, content selectors,
-            authentication realms, the sign-in and anonymous-access
-            settings, the email service, and the secret encryption and blob
-            cache.
+            service accounts and their API tokens, roles and their grants,
+            content selectors, authentication realms, the sign-in and
+            anonymous-access settings, the email service, and the secret
+            encryption and blob cache.
           </>
         }
       />

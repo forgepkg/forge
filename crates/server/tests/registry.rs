@@ -1111,6 +1111,184 @@ async fn multi_arch_index_and_referrers() {
     assert_eq!(detail["pull_name"], format!("test.local/{repo}/multi"));
 }
 
+/// `DELETE /admin/repositories/<name>/images` (the web UI's image page,
+/// #509): a tag, a manifest with the platform manifests and referrers only it
+/// kept, and a whole image of a hosted repository; once its images are gone,
+/// the repository can be deleted.
+#[tokio::test]
+async fn admins_delete_tags_manifests_and_images() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/team/app");
+    let path = format!("/admin/repositories/{repo}/images");
+    let delete = |query: Vec<(&'static str, String)>| {
+        let (srv, path) = (&srv, &path);
+        async move {
+            let (u, p) = srv.admin_basic();
+            srv.client()
+                .delete(format!("{}{path}", srv.base_url))
+                .basic_auth(u, Some(p))
+                .query(&query)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let image = || ("image", "team/app".to_string());
+
+    let amd = oci.push_image(&name, "amd64", "amd64", b"amd layer").await;
+    let arm = oci.push_image(&name, "arm64", "arm64", b"arm layer").await;
+    let index = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX,
+        "manifests": [
+            {"mediaType": OCI_MANIFEST, "digest": amd, "size": 1, "platform": {"architecture": "amd64", "os": "linux"}},
+            {"mediaType": OCI_MANIFEST, "digest": arm, "size": 1, "platform": {"architecture": "arm64", "os": "linux"}},
+        ]
+    })
+    .to_string()
+    .into_bytes();
+    assert_eq!(
+        oci.put_manifest(&name, "1.0", OCI_INDEX, &index)
+            .await
+            .status(),
+        201
+    );
+    assert_eq!(
+        oci.put_manifest(&name, "latest", OCI_INDEX, &index)
+            .await
+            .status(),
+        201
+    );
+    let index_digest = sha(&index);
+    let empty_cfg = b"{}";
+    let sig = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha(empty_cfg), "size": 2},
+        "layers": [],
+        "subject": {"mediaType": OCI_INDEX, "digest": index_digest, "size": index.len()},
+    })
+    .to_string()
+    .into_bytes();
+    let sig_digest = sha(&sig);
+    assert_eq!(
+        oci.put_manifest(&name, &sig_digest, OCI_MANIFEST, &sig)
+            .await
+            .status(),
+        201
+    );
+
+    // Refused: a repository of packages, an empty image name, a reference
+    // that is no digest; unknown tags and manifests are 404.
+    let nuget = repo_name("nu");
+    create_repo(&srv, json!({"name": nuget, "kind": "hosted"})).await;
+    let (u, p) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .delete(format!(
+            "{}/admin/repositories/{nuget}/images",
+            srv.base_url
+        ))
+        .basic_auth(u, Some(p))
+        .query(&[image()])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert_eq!(delete(vec![]).await.status(), 400);
+    assert_eq!(
+        delete(vec![image(), ("reference", "sha256:nothex".into())])
+            .await
+            .status(),
+        400
+    );
+    assert_eq!(
+        delete(vec![image(), ("reference", "2.0".into())])
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        delete(vec![image(), ("reference", sha(b"none"))])
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        delete(vec![("image", "team/other".into())]).await.status(),
+        404
+    );
+
+    // A tag goes alone: its manifest still pulls by digest.
+    let resp = delete(vec![image(), ("reference", "arm64".into())]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"manifests": 0, "tags": 1})
+    );
+    assert_eq!(oci.head(&name, "manifests/arm64").await.status(), 404);
+    assert_eq!(
+        oci.head(&name, &format!("manifests/{arm}")).await.status(),
+        200
+    );
+
+    // The index goes with its tags, its signature and the platform manifest
+    // only it listed; the one still tagged stays.
+    let resp = delete(vec![image(), ("reference", index_digest.clone())]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"manifests": 3, "tags": 2})
+    );
+    for gone in [&index_digest, &arm, &sig_digest] {
+        assert_eq!(
+            oci.head(&name, &format!("manifests/{gone}")).await.status(),
+            404
+        );
+    }
+    assert_eq!(oci.head(&name, "manifests/1.0").await.status(), 404);
+    assert_eq!(oci.head(&name, "manifests/amd64").await.status(), 200);
+
+    // A repository with images is not deleted; without, it is.
+    let repo_path = format!("{}/admin/repositories/{repo}", srv.base_url);
+    let (u, p) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .delete(&repo_path)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let resp = delete(vec![image()]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"manifests": 1, "tags": 1})
+    );
+    assert_eq!(
+        oci.head(&name, &format!("manifests/{amd}")).await.status(),
+        404
+    );
+    assert_eq!(delete(vec![image()]).await.status(), 404);
+    let resp = srv
+        .client()
+        .delete(&repo_path)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
 const HELM_CONFIG: &str = "application/vnd.cncf.helm.config.v1+json";
 const HELM_CHART: &str = "application/vnd.cncf.helm.chart.content.v1.tar+gzip";
 
@@ -3101,6 +3279,94 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     .await
     .unwrap();
     assert_eq!(audit, vec!["delete_tag", "delete_manifest"]);
+}
+
+/// A run that deletes one of a digest's tags leaves the manifest to the
+/// other: it is not untagged, so an untagged rule never takes it (#510).
+#[tokio::test]
+async fn retention_deletes_one_tag_of_a_digest_and_keeps_its_manifest() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("layer {}", unique()).into_bytes();
+    let digest = oci.push_image(&name, "1.0", "amd64", &layer).await;
+    let manifest = image(&config("amd64"), &[&layer]);
+    assert_eq!(
+        oci.put_manifest(&name, "1", OCI_MANIFEST, &manifest)
+            .await
+            .status(),
+        201
+    );
+    // `1.0` was pushed long ago, the alias `1` just now.
+    sqlx::query(
+        "UPDATE oci_tag SET updated_at = now() - interval '30 days' \
+         WHERE repository_id = $1 AND tag = '1.0'",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": {"version": 1, "rules": [
+            {"id": "old", "tag_older_than_days": 7},
+            {"id": "untagged", "delete_untagged_after_days": 1}
+        ]}}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention/run"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), 202);
+    let worker = forge_core::retention::RetentionWorker::new(
+        srv.pool.clone(),
+        forge_server::state::RegistryResolver(srv.state.formats.clone()),
+        Arc::new(forge_core::repo::NoopCacheInvalidator),
+        forge_core::retention::RetentionConfig::default(),
+    );
+    let summary = worker.tick_repo(repo_id).await.unwrap().expect("a run");
+    assert_eq!(summary.deleted, 1, "{summary:?}");
+    assert_eq!(oci.get(&name, "manifests/1.0").await.status(), 404);
+    for reference in ["1", digest.as_str()] {
+        assert_eq!(
+            oci.get(&name, &format!("manifests/{reference}"))
+                .await
+                .status(),
+            200
+        );
+    }
+    let untagged_since = "SELECT untagged_since IS NOT NULL FROM oci_manifest \
+                          WHERE repository_id = $1 AND digest = $2";
+    let untagged: bool = sqlx::query_scalar(untagged_since)
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert!(!untagged, "`1` still names the manifest");
+
+    // Its last tag gone, the manifest's untagged clock starts.
+    assert_eq!(oci.delete(&name, "manifests/1").await.status(), 202);
+    let untagged: bool = sqlx::query_scalar(untagged_since)
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert!(untagged);
 }
 
 #[tokio::test]

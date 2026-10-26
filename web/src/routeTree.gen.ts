@@ -21,6 +21,7 @@ import { Route as adminSelectorsListRouteImport } from './routes/admin/selectors
 import { Route as adminRealmsListRouteImport } from './routes/admin/realms/List'
 import { Route as adminRepositoriesListRouteImport } from './routes/admin/repositories/List'
 import { Route as adminRolesListRouteImport } from './routes/admin/roles/List'
+import { Route as adminServiceAccountsListRouteImport } from './routes/admin/service-accounts/List'
 import { Route as adminSettingsSettingsRouteImport } from './routes/admin/settings/Settings'
 import { Route as adminSystemSystemRouteImport } from './routes/admin/system/System'
 import { Route as adminUsersListRouteImport } from './routes/admin/users/List'
@@ -33,6 +34,8 @@ import { Route as adminRealmsCreateRouteImport } from './routes/admin/realms/Cre
 import { Route as adminRepositoriesEditRouteImport } from './routes/admin/repositories/Edit'
 import { Route as adminRepositoriesCreateRouteImport } from './routes/admin/repositories/Create'
 import { Route as adminRolesEditRouteImport } from './routes/admin/roles/Edit'
+import { Route as adminServiceAccountsEditRouteImport } from './routes/admin/service-accounts/Edit'
+import { Route as adminServiceAccountsCreateRouteImport } from './routes/admin/service-accounts/Create'
 import { Route as adminSettingsEmailRouteImport } from './routes/admin/settings/Email'
 import { Route as adminSettingsRetentionSettingsRouteImport } from './routes/admin/settings/RetentionSettings'
 import { Route as adminUsersEditRouteImport } from './routes/admin/users/Edit'
@@ -101,6 +104,12 @@ const adminRolesListRoute = adminRolesListRouteImport.update({
   path: '/roles',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
+const adminServiceAccountsListRoute =
+  adminServiceAccountsListRouteImport.update({
+    id: '/service-accounts',
+    path: '/service-accounts',
+    getParentRoute: () => AdminLayoutRoute,
+  } as any)
 const adminSettingsSettingsRoute = adminSettingsSettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
@@ -161,6 +170,18 @@ const adminRolesEditRoute = adminRolesEditRouteImport.update({
   path: '/roles/$roleId',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
+const adminServiceAccountsEditRoute =
+  adminServiceAccountsEditRouteImport.update({
+    id: '/service-accounts/$userId',
+    path: '/service-accounts/$userId',
+    getParentRoute: () => AdminLayoutRoute,
+  } as any)
+const adminServiceAccountsCreateRoute =
+  adminServiceAccountsCreateRouteImport.update({
+    id: '/service-accounts/new',
+    path: '/service-accounts/new',
+    getParentRoute: () => AdminLayoutRoute,
+  } as any)
 const adminSettingsEmailRoute = adminSettingsEmailRouteImport.update({
   id: '/settings/email',
   path: '/settings/email',
@@ -217,6 +238,7 @@ export interface FileRoutesByFullPath {
   '/manage/realms': typeof adminRealmsListRoute
   '/manage/repositories': typeof adminRepositoriesListRoute
   '/manage/roles': typeof adminRolesListRoute
+  '/manage/service-accounts': typeof adminServiceAccountsListRoute
   '/manage/settings': typeof adminSettingsSettingsRoute
   '/manage/system': typeof adminSystemSystemRoute
   '/manage/users': typeof adminUsersListRoute
@@ -229,6 +251,8 @@ export interface FileRoutesByFullPath {
   '/manage/repositories/$repo': typeof adminRepositoriesEditRoute
   '/manage/repositories/new': typeof adminRepositoriesCreateRoute
   '/manage/roles/$roleId': typeof adminRolesEditRoute
+  '/manage/service-accounts/$userId': typeof adminServiceAccountsEditRoute
+  '/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
   '/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
@@ -249,6 +273,7 @@ export interface FileRoutesByTo {
   '/manage/realms': typeof adminRealmsListRoute
   '/manage/repositories': typeof adminRepositoriesListRoute
   '/manage/roles': typeof adminRolesListRoute
+  '/manage/service-accounts': typeof adminServiceAccountsListRoute
   '/manage/settings': typeof adminSettingsSettingsRoute
   '/manage/system': typeof adminSystemSystemRoute
   '/manage/users': typeof adminUsersListRoute
@@ -261,6 +286,8 @@ export interface FileRoutesByTo {
   '/manage/repositories/$repo': typeof adminRepositoriesEditRoute
   '/manage/repositories/new': typeof adminRepositoriesCreateRoute
   '/manage/roles/$roleId': typeof adminRolesEditRoute
+  '/manage/service-accounts/$userId': typeof adminServiceAccountsEditRoute
+  '/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
   '/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
@@ -284,6 +311,7 @@ export interface FileRoutesById {
   '/_app/manage/realms': typeof adminRealmsListRoute
   '/_app/manage/repositories': typeof adminRepositoriesListRoute
   '/_app/manage/roles': typeof adminRolesListRoute
+  '/_app/manage/service-accounts': typeof adminServiceAccountsListRoute
   '/_app/manage/settings': typeof adminSettingsSettingsRoute
   '/_app/manage/system': typeof adminSystemSystemRoute
   '/_app/manage/users': typeof adminUsersListRoute
@@ -296,6 +324,8 @@ export interface FileRoutesById {
   '/_app/manage/repositories/$repo': typeof adminRepositoriesEditRoute
   '/_app/manage/repositories/new': typeof adminRepositoriesCreateRoute
   '/_app/manage/roles/$roleId': typeof adminRolesEditRoute
+  '/_app/manage/service-accounts/$userId': typeof adminServiceAccountsEditRoute
+  '/_app/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/_app/manage/settings/email': typeof adminSettingsEmailRoute
   '/_app/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
   '/_app/manage/users/$userId': typeof adminUsersEditRoute
@@ -319,6 +349,7 @@ export interface FileRouteTypes {
     | '/manage/realms'
     | '/manage/repositories'
     | '/manage/roles'
+    | '/manage/service-accounts'
     | '/manage/settings'
     | '/manage/system'
     | '/manage/users'
@@ -331,6 +362,8 @@ export interface FileRouteTypes {
     | '/manage/repositories/$repo'
     | '/manage/repositories/new'
     | '/manage/roles/$roleId'
+    | '/manage/service-accounts/$userId'
+    | '/manage/service-accounts/new'
     | '/manage/settings/email'
     | '/manage/settings/retention'
     | '/manage/users/$userId'
@@ -351,6 +384,7 @@ export interface FileRouteTypes {
     | '/manage/realms'
     | '/manage/repositories'
     | '/manage/roles'
+    | '/manage/service-accounts'
     | '/manage/settings'
     | '/manage/system'
     | '/manage/users'
@@ -363,6 +397,8 @@ export interface FileRouteTypes {
     | '/manage/repositories/$repo'
     | '/manage/repositories/new'
     | '/manage/roles/$roleId'
+    | '/manage/service-accounts/$userId'
+    | '/manage/service-accounts/new'
     | '/manage/settings/email'
     | '/manage/settings/retention'
     | '/manage/users/$userId'
@@ -385,6 +421,7 @@ export interface FileRouteTypes {
     | '/_app/manage/realms'
     | '/_app/manage/repositories'
     | '/_app/manage/roles'
+    | '/_app/manage/service-accounts'
     | '/_app/manage/settings'
     | '/_app/manage/system'
     | '/_app/manage/users'
@@ -397,6 +434,8 @@ export interface FileRouteTypes {
     | '/_app/manage/repositories/$repo'
     | '/_app/manage/repositories/new'
     | '/_app/manage/roles/$roleId'
+    | '/_app/manage/service-accounts/$userId'
+    | '/_app/manage/service-accounts/new'
     | '/_app/manage/settings/email'
     | '/_app/manage/settings/retention'
     | '/_app/manage/users/$userId'
@@ -499,6 +538,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminRolesListRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/manage/service-accounts': {
+      id: '/_app/manage/service-accounts'
+      path: '/service-accounts'
+      fullPath: '/manage/service-accounts'
+      preLoaderRoute: typeof adminServiceAccountsListRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
     '/_app/manage/settings': {
       id: '/_app/manage/settings'
       path: '/settings'
@@ -583,6 +629,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminRolesEditRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/manage/service-accounts/$userId': {
+      id: '/_app/manage/service-accounts/$userId'
+      path: '/service-accounts/$userId'
+      fullPath: '/manage/service-accounts/$userId'
+      preLoaderRoute: typeof adminServiceAccountsEditRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
+    '/_app/manage/service-accounts/new': {
+      id: '/_app/manage/service-accounts/new'
+      path: '/service-accounts/new'
+      fullPath: '/manage/service-accounts/new'
+      preLoaderRoute: typeof adminServiceAccountsCreateRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
     '/_app/manage/settings/email': {
       id: '/_app/manage/settings/email'
       path: '/settings/email'
@@ -648,6 +708,7 @@ interface AdminLayoutRouteChildren {
   adminRealmsListRoute: typeof adminRealmsListRoute
   adminRepositoriesListRoute: typeof adminRepositoriesListRoute
   adminRolesListRoute: typeof adminRolesListRoute
+  adminServiceAccountsListRoute: typeof adminServiceAccountsListRoute
   adminSettingsSettingsRoute: typeof adminSettingsSettingsRoute
   adminSystemSystemRoute: typeof adminSystemSystemRoute
   adminUsersListRoute: typeof adminUsersListRoute
@@ -658,6 +719,8 @@ interface AdminLayoutRouteChildren {
   adminRepositoriesEditRoute: typeof adminRepositoriesEditRoute
   adminRepositoriesCreateRoute: typeof adminRepositoriesCreateRoute
   adminRolesEditRoute: typeof adminRolesEditRoute
+  adminServiceAccountsEditRoute: typeof adminServiceAccountsEditRoute
+  adminServiceAccountsCreateRoute: typeof adminServiceAccountsCreateRoute
   adminSettingsEmailRoute: typeof adminSettingsEmailRoute
   adminSettingsRetentionSettingsRoute: typeof adminSettingsRetentionSettingsRoute
   adminUsersEditRoute: typeof adminUsersEditRoute
@@ -673,6 +736,7 @@ const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminRealmsListRoute: adminRealmsListRoute,
   adminRepositoriesListRoute: adminRepositoriesListRoute,
   adminRolesListRoute: adminRolesListRoute,
+  adminServiceAccountsListRoute: adminServiceAccountsListRoute,
   adminSettingsSettingsRoute: adminSettingsSettingsRoute,
   adminSystemSystemRoute: adminSystemSystemRoute,
   adminUsersListRoute: adminUsersListRoute,
@@ -683,6 +747,8 @@ const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminRepositoriesEditRoute: adminRepositoriesEditRoute,
   adminRepositoriesCreateRoute: adminRepositoriesCreateRoute,
   adminRolesEditRoute: adminRolesEditRoute,
+  adminServiceAccountsEditRoute: adminServiceAccountsEditRoute,
+  adminServiceAccountsCreateRoute: adminServiceAccountsCreateRoute,
   adminSettingsEmailRoute: adminSettingsEmailRoute,
   adminSettingsRetentionSettingsRoute: adminSettingsRetentionSettingsRoute,
   adminUsersEditRoute: adminUsersEditRoute,

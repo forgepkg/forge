@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE app_user\n        SET last_auth_source_at = now()\n        WHERE id = $1\n          AND (last_auth_source_at IS NULL\n               OR last_auth_source_at < now() - make_interval(secs => $2))\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6d16d1d9e37e05de97ccb28b827e1723018b27a64418f6142af7b09f3d0cd68"
+}

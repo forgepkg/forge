@@ -168,8 +168,7 @@ the STS, or for EKS Pod Identity the node's agent at `169.254.170.23:80`.
 Forge believes the `X-Forwarded-For` header of every peer in
 `trusted_proxy_cidrs`, which on Kubernetes is usually the whole pod network.
 Without a NetworkPolicy any pod in the cluster can call the Service with a
-forged client address and get past the login lockout and the anonymous-IP
-allowlist. List the pods that proxy to Forge (the namespace of your gateway's
+forged client address and get past the login lockout. List the pods that proxy to Forge (the namespace of your gateway's
 data plane or ingress controller) in `networkPolicy.from`, and the chart
 renders the policy (`networkPolicy.enabled` is null by default, which means
 "on as soon as `from` lists a peer"; `false` turns it off). The CNI must

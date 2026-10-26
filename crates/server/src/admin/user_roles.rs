@@ -1,7 +1,8 @@
 //! Admin user-role assignment.
 //!
 //! * `GET    /admin/users/{id}/roles` — list the roles a user holds.
-//! * `PUT    /admin/users/{id}/roles` — assign a role (idempotent).
+//! * `PUT    /admin/users/{id}/roles` — assign a role (idempotent). A service
+//!   account never holds the built-in `admin` role (**400**).
 //! * `DELETE /admin/users/{id}/roles/{role_id}` — unassign a role. Taking the
 //!   built-in `admin` role from the last active administrator is refused
 //!   (**409**, [`super::last_admin_conflict`]).
@@ -18,6 +19,7 @@ use forge_db::authz_dao::{self, Role};
 use forge_db::user_dao;
 use serde::{Deserialize, Serialize};
 
+use super::users::service_account_admin_refused;
 use super::{db_error, last_admin_conflict};
 use crate::state::AppState;
 
@@ -74,16 +76,23 @@ pub async fn assign(
     Path(user_id): Path<i64>,
     Json(body): Json<AssignRole>,
 ) -> Response {
-    match user_dao::find_user_by_id(&state.pool, user_id).await {
-        Ok(Some(_)) => {}
+    let user = match user_dao::find_user_by_id(&state.pool, user_id).await {
+        Ok(Some(user)) => user,
         Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
         Err(e) => return db_error(e),
-    }
+    };
 
     let role_id = match resolve_role_id(&state, &body.role, body.role_id).await {
         Ok(id) => id,
         Err(resp) => return resp,
     };
+    if user.is_service_account() {
+        match authz_dao::role_id_by_name(&state.pool, authz_dao::ADMIN_ROLE).await {
+            Ok(admin) if admin == Some(role_id) => return service_account_admin_refused(),
+            Ok(_) => {}
+            Err(e) => return db_error(e),
+        }
+    }
 
     let result = authz_dao::assign_role(&state.pool, user_id, role_id).await;
     invalidate_user(&state.cache, user_id).await;

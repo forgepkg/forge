@@ -320,8 +320,7 @@ to set them. See
 
 | Setting | Meaning |
 | --- | --- |
-| `anonymous_mode` | `off` (default) / `allowlist` / `all`. Makes unauthenticated requests an *anonymous principal*. |
-| `anonymous_ip_allowlist` | Under `allowlist`: `loopback`, `private`, `local`, networks, addresses. |
+| `anonymous_mode` | `off` (default) / `all`. Makes unauthenticated requests an *anonymous principal*. |
 | repo `anonymous_read` | **Also required** for anonymous reads — set it per repository. |
 | `login_mode` | `identifier_first` (default) or `combined`. |
 | `allow_password_basic` | Accept a user's password over HTTP Basic on the feeds (default off; the admin API never takes one). |

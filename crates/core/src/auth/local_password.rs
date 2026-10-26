@@ -14,7 +14,8 @@
 //!   password typed for it is ever forwarded to a later (upstream) provider.
 //! * So is an invited local account (`auth_source = 'local'`, no password
 //!   yet, #322): its user has not chosen the password, and no later provider
-//!   may take the name over.
+//!   may take the name over. And a service account (#508), which nobody
+//!   signs in to.
 //! * argon2id PHC verification runs on a blocking thread (CPU-bound), behind a
 //!   process-wide [`PasswordHashLimiter`]: at most N verifications run at once
 //!   (each holds ~19 MiB and a core for tens of milliseconds), and one that finds
@@ -312,9 +313,11 @@ impl AuthProvider for LocalPasswordProvider {
         // Users with no local password (auth_source upstream-basic / oidc) can
         // never authenticate via the local store — this username is not ours.
         // A local account without one is invited (its user has not chosen the
-        // password yet): ours, and refused like an inactive one.
+        // password yet): ours, and refused like an inactive one. So is a
+        // service account, which nobody signs in to: its name is Forge's own,
+        // and no upstream realm is asked about it.
         let Some(stored) = user.password_hash.clone() else {
-            if user.auth_source == "local" {
+            if user.auth_source == "local" || user.is_service_account() {
                 return self
                     .after_dummy_verify(cred.password, AuthOutcome::Rejected)
                     .await;

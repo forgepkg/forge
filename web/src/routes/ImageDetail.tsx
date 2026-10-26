@@ -1,16 +1,19 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 
 import type { ImageDetail } from '~/api/images'
 import { isRepositoryOffline } from '~/api/packages'
 import { ApiError } from '~/lib/httpClient'
-import { defaultPullTag, formatDateTime, isChartImage } from '~/lib/oci'
-import { useImageDetail } from '~/queries/useImageDetail'
+import { cappedNote, defaultPullTag, formatDateTime, isChartImage } from '~/lib/oci'
+import { useDeleteImage, useImageDetail } from '~/queries/useImageDetail'
+import { useMe } from '~/queries/useMe'
 import { ChartView } from '~/components/ChartView'
 import { ManifestTable, TagTable } from '~/components/ImageTables'
+import { ImageDeleteDialog, type ImageDeleteTarget } from '~/components/ImageDeleteDialog'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import {
+  Button,
   Code,
   CommandSnippet,
   Page,
@@ -34,8 +37,14 @@ export const Route = createFileRoute('/_app/images/$repo/$')({
     typeof search.tag === 'string' && search.tag.length > 0
       ? { tag: search.tag }
       : {},
-  component: ImageDetailPage,
+  component: ImageDetailRoute,
 })
+
+/** One page per image, so nothing (a pending delete) outlives a navigation. */
+function ImageDetailRoute() {
+  const { repo, _splat } = Route.useParams()
+  return <ImageDetailPage key={JSON.stringify([repo, _splat ?? ''])} />
+}
 
 /**
  * Image-detail view of a docker repository: the pull commands (by tag and by
@@ -43,7 +52,8 @@ export const Route = createFileRoute('/_app/images/$repo/$')({
  * and referrers such as signatures — with sizes, platforms and timestamps.
  * An image of Helm charts (`helm push`) shows its charts instead
  * ({@link ChartView}). Loading / not-found / error states mirror the
- * package-detail screen.
+ * package-detail screen. Administrators delete, in a hosted repository, the
+ * image, a tag, a manifest or a chart's version ({@link ImageDeleteDialog}).
  */
 function ImageDetailPage() {
   const { repo, _splat } = Route.useParams()
@@ -51,6 +61,9 @@ function ImageDetailPage() {
   const { tag } = Route.useSearch()
   const navigate = useNavigate({ from: Route.fullPath })
   const detail = useImageDetail(repo, image)
+  const me = useMe()
+  const del = useDeleteImage(repo, image)
+  const [pendingDelete, setPendingDelete] = useState<ImageDeleteTarget | null>(null)
 
   const crumbs = [
     { label: 'Repositories', to: '/' },
@@ -101,8 +114,36 @@ function ImageDetailPage() {
     .sort()
     .at(-1)
   const chart = isChartImage(img.manifests)
+  // The server lists at most 1,000 of each, and counts them all.
+  const tagCount = img.tags_total ?? img.tags.length
+  const manifestCount = img.manifests_total ?? img.manifests.length
   const selectTag = (next: string) =>
     void navigate({ search: { tag: next }, replace: true })
+  const canDelete = me.data?.is_admin === true && img.repo_kind === 'hosted'
+  const askDelete = canDelete
+    ? (target: ImageDeleteTarget) => {
+        del.reset()
+        setPendingDelete(target)
+      }
+    : undefined
+  const toRepository = () => void navigate({ to: '/repos/$repo', params: { repo } })
+  const deleteDialog = (
+    <ImageDeleteDialog
+      detail={img}
+      target={pendingDelete}
+      del={del}
+      onClose={() => setPendingDelete(null)}
+      onDeleted={async (target) => {
+        setPendingDelete(null)
+        if (target.kind === 'image') return toRepository()
+        // The last manifest gone, the image is too.
+        const remaining = await detail.refetch({ cancelRefetch: false })
+        if (remaining.error instanceof ApiError && remaining.error.status === 404) {
+          toRepository()
+        }
+      }}
+    />
+  )
   const header = (
     <PageHeader
       title={img.image}
@@ -117,16 +158,29 @@ function ImageDetailPage() {
       meta={[
         chart && 'Helm chart',
         chart
-          ? img.tags.length === 1
+          ? tagCount === 1
             ? '1 version'
-            : `${img.tags.length} versions`
-          : img.tags.length === 1
+            : `${tagCount.toLocaleString()} versions`
+          : tagCount === 1
             ? '1 tag'
-            : `${img.tags.length} tags`,
-        img.manifests.length === 1 ? '1 manifest' : `${img.manifests.length} manifests`,
+            : `${tagCount.toLocaleString()} tags`,
+        manifestCount === 1 ? '1 manifest' : `${manifestCount.toLocaleString()} manifests`,
         // A proxy's manifests carry their cache time, not a push (#248).
         img.repo_kind === 'hosted' && lastPushed && `Pushed ${formatDateTime(lastPushed)}`,
       ]}
+      actions={
+        askDelete && (
+          <Button
+            variant="danger"
+            size="sm"
+            icon="Trash"
+            disabled={del.isPending}
+            onClick={() => askDelete({ kind: 'image' })}
+          >
+            {chart ? 'Delete chart…' : 'Delete image…'}
+          </Button>
+        )
+      }
     />
   )
 
@@ -134,7 +188,15 @@ function ImageDetailPage() {
     return (
       <Page>
         {header}
-        <ChartView detail={img} selectedTag={tag} onSelectTag={selectTag} />
+        <ChartView
+          detail={img}
+          selectedTag={tag}
+          onSelectTag={selectTag}
+          onDeleteVersion={askDelete && ((t) => askDelete({ kind: 'version', tag: t }))}
+          onDeleteManifest={askDelete && ((m) => askDelete({ kind: 'manifest', manifest: m }))}
+          deletePending={del.isPending}
+        />
+        {deleteDialog}
       </Page>
     )
   }
@@ -147,27 +209,47 @@ function ImageDetailPage() {
 
       <Panel
         title="Tags"
-        count={img.tags.length}
+        count={tagCount}
         flush
-        description="A tag on an index pulls the platform that matches the client."
+        description={[
+          cappedNote(img.tags.length, img.tags_total, 'tags'),
+          'A tag on an index pulls the platform that matches the client.',
+        ]
+          .filter(Boolean)
+          .join(' ')}
       >
         {img.tags.length === 0 ? (
           <EmptyState title="No tags" icon="Layers" bordered={false}>
             This image has only untagged manifests; pull one by digest.
           </EmptyState>
         ) : (
-          <TagTable tags={img.tags} />
+          <TagTable
+            tags={img.tags}
+            onDelete={askDelete && ((t) => askDelete({ kind: 'tag', tag: t }))}
+            deletePending={del.isPending}
+          />
         )}
       </Panel>
 
       <Panel
         title="Manifests"
-        count={img.manifests.length}
+        count={manifestCount}
         flush
-        description="Indexes, the platform images they list, and referrers such as signatures and SBOMs."
+        description={[
+          cappedNote(img.manifests.length, img.manifests_total, 'manifests'),
+          'Indexes, the platform images they list, and referrers such as signatures and SBOMs.',
+        ]
+          .filter(Boolean)
+          .join(' ')}
       >
-        <ManifestTable manifests={img.manifests} showSource={img.repo_kind === 'group'} />
+        <ManifestTable
+          manifests={img.manifests}
+          repoKind={img.repo_kind}
+          onDelete={askDelete && ((m) => askDelete({ kind: 'manifest', manifest: m }))}
+          deletePending={del.isPending}
+        />
       </Panel>
+      {deleteDialog}
     </Page>
   )
 }

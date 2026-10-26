@@ -87,12 +87,15 @@ export const Route = createFileRoute('/_app/repos/$repo')({
   // The repository's format decides what this screen lists (NuGet packages or
   // docker images): have the (usually cached) repository list before the
   // first render instead of flashing the wrong screen, refreshed once when it
-  // predates this repository. Best effort — a failure is shown, with a retry,
-  // by the component's own query.
+  // predates this repository or a repository change invalidated it (which
+  // `ensureQueryData` alone would not refetch). Best effort — a failure is
+  // shown, with a retry, by the component's own query.
   loader: async ({ context: { queryClient }, params }) => {
     try {
       const repos = await queryClient.ensureQueryData(browseReposQueryOptions)
-      if (!repos.some((r) => r.name === params.repo)) {
+      const invalidated =
+        queryClient.getQueryState(browseReposQueryOptions.queryKey)?.isInvalidated === true
+      if (invalidated || !repos.some((r) => r.name === params.repo)) {
         await queryClient.fetchQuery({ ...browseReposQueryOptions, staleTime: 0 })
       }
     } catch {
@@ -235,6 +238,7 @@ function RepoBrowse() {
       ) : isDocker ? (
         <ImageBrowse
           repo={repo}
+          repoKind={info?.kind}
           canPush={info?.kind === 'hosted'}
           q={q}
           skip={skip}
@@ -427,6 +431,7 @@ function RepoBrowseResults({
  */
 function ImageBrowse({
   repo,
+  repoKind,
   canPush,
   q,
   skip,
@@ -434,6 +439,8 @@ function ImageBrowse({
   toolbar,
 }: {
   repo: string
+  /** `hosted` | `proxy` | `group`; unknown while the repository list loads. */
+  repoKind: string | undefined
   canPush: boolean
   q: string
   skip: number
@@ -468,6 +475,7 @@ function ImageBrowse({
         onRetry={() => void search.refetch()}
         result={search.data}
         repo={repo}
+        repoKind={repoKind}
         hasQuery={q.length > 0}
         skip={skip}
           onSkipChange={onSkipChange}
@@ -485,6 +493,7 @@ function ImageBrowseResults({
   onRetry,
   result,
   repo,
+  repoKind,
   hasQuery,
   skip,
   onSkipChange,
@@ -497,6 +506,7 @@ function ImageBrowseResults({
   onRetry: () => void
   result: ImagesResult | undefined
   repo: string
+  repoKind: string | undefined
   hasQuery: boolean
   skip: number
   onSkipChange: (next: number) => void
@@ -547,7 +557,17 @@ function ImageBrowseResults({
           <TableHeader align="right" width="110px">
             Manifests
           </TableHeader>
-          <TableHeader width="170px">Last pushed</TableHeader>
+          {/* A proxy's images carry their cache time, not a push (#248). */}
+          {repoKind === 'proxy' ? (
+            <TableHeader
+              width="170px"
+              hint="When Forge last cached a manifest of the image from the upstream"
+            >
+              Last cached
+            </TableHeader>
+          ) : (
+            <TableHeader width="170px">Last pushed</TableHeader>
+          )}
         </TableHead>
         <TableBody>
           {items.map((item) => (

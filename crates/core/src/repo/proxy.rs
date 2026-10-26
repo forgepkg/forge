@@ -107,6 +107,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -195,6 +196,11 @@ const IMMUTABLE_FETCH_TTL: std::time::Duration = std::time::Duration::from_secs(
 const MAX_UPSTREAM_ROUNDS: usize = 4;
 /// Fetches of one upstream conversation, all rounds together.
 const MAX_UPSTREAM_FETCHES: usize = 256;
+/// The bytes of the documents one upstream conversation keeps, all rounds
+/// together, in documents of `proxy.max_metadata_bytes` (its bound on one
+/// document): its fetches are bounded in number, but at that size each, 256
+/// of them would hold gigabytes.
+const CONVERSATION_BUDGET_DOCUMENTS: u64 = 4;
 /// Concurrent fetches of one round.
 const FETCH_CONCURRENCY: usize = 4;
 
@@ -563,6 +569,11 @@ impl ProxyRepo {
     /// and [`MAX_UPSTREAM_FETCHES`] fetches; the format runs off the async
     /// workers, as a format plugin may take its time.
     ///
+    /// The documents fetched are kept up to [`CONVERSATION_BUDGET_DOCUMENTS`]
+    /// × `proxy.max_metadata_bytes` in all: a document past that is dropped
+    /// (and the conversation's later fetches are not sent), and the format
+    /// is told so, as of any failed fetch ([`Self::over_budget`]).
+    ///
     /// Only the origins the upstream points at are reached
     /// ([`UpstreamOrigins`]): the `remote_url`'s, those `index` recorded, and
     /// those the documents fetched in earlier rounds name. A fetch anywhere
@@ -592,6 +603,15 @@ impl ProxyRepo {
         // format's failed answer is then the upstream's outage or refusal,
         // not a fault of the proxy.
         let mut trouble = Trouble::None;
+        let budget = self
+            .http
+            .config()
+            .max_metadata_bytes
+            .saturating_mul(CONVERSATION_BUDGET_DOCUMENTS);
+        // The bytes of the bodies in `fetched`, and whether one was dropped
+        // for the budget (then nothing more is sent).
+        let held = AtomicU64::new(0);
+        let exhausted = AtomicBool::new(false);
         for _ in 0..MAX_UPSTREAM_ROUNDS {
             let format = self.format.clone();
             let (asked, round) = (remote.clone(), op.clone());
@@ -664,11 +684,32 @@ impl ProxyRepo {
                 futures_util::stream::iter(wanted)
                     .map(|fetch| {
                         let permitted = origins.permits(&fetch.url);
+                        let (held, exhausted) = (&held, &exhausted);
                         async move {
-                            let (outcome, named, down) = if permitted {
-                                self.fetch(repo, &fetch).await
-                            } else {
+                            let (outcome, named, down) = if !permitted {
                                 (self.refuse(repo, &fetch.url), Vec::new(), Trouble::None)
+                            } else if exhausted.load(Ordering::Relaxed) {
+                                (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None)
+                            } else {
+                                match self.fetch(repo, &fetch).await {
+                                    (api::Fetched::Found(body), named, down) => {
+                                        let size = body.len() as u64;
+                                        let kept = held
+                                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |h| {
+                                                h.checked_add(size).filter(|total| *total <= budget)
+                                            })
+                                            .is_ok();
+                                        if kept {
+                                            (api::Fetched::Found(body), named, down)
+                                        } else {
+                                            if !exhausted.swap(true, Ordering::Relaxed) {
+                                                tracing::warn!(format = %self.format.id(), repo = %repo.name, url = %fetch.url, budget, "an upstream conversation's documents exceed its byte budget; the rest are not read");
+                                            }
+                                            (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None)
+                                        }
+                                    }
+                                    other => other,
+                                }
                             };
                             let result = api::FetchResult {
                                 fetch,
@@ -691,6 +732,16 @@ impl ProxyRepo {
         Err(RepoError::Storage(format!(
             "upstream protocol needed more than {MAX_UPSTREAM_ROUNDS} rounds"
         )))
+    }
+
+    /// The outcome of a fetch past the byte budget of its conversation
+    /// ([`Self::converse`]): its body is not kept, or it is not sent at all,
+    /// and the format is told so.
+    fn over_budget(url: &str, budget: u64) -> api::Fetched {
+        api::Fetched::Failed(format!(
+            "{url}: not read, the documents fetched for this operation would exceed \
+             {budget} bytes ({CONVERSATION_BUDGET_DOCUMENTS} x proxy.max_metadata_bytes)"
+        ))
     }
 
     /// The outcome of a fetch on an origin the conversation may not reach

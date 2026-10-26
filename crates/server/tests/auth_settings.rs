@@ -113,7 +113,6 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
         get_settings(&srv).await,
         json!({
             "anonymous_mode": "off",
-            "anonymous_ip_allowlist": [],
             "login_mode": "identifier_first",
             "allow_password_basic": true,
             "session_idle_ttl_seconds": 28800,
@@ -140,34 +139,22 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
     assert_eq!(resp.status(), 403);
 
     assert_eq!(login_mode(&srv).await, "identifier_first");
-    let resp = put_settings(
-        &srv,
-        json!({"login_mode": "combined", "anonymous_ip_allowlist": [" loopback ", "10.0.0.0/8"]}),
-    )
-    .await;
+    let resp = put_settings(&srv, json!({"login_mode": "combined"})).await;
     assert_eq!(resp.status(), 200);
     let saved: Value = resp.json().await.unwrap();
     assert_eq!(saved["login_mode"], "combined");
-    assert_eq!(
-        saved["anonymous_ip_allowlist"],
-        json!(["loopback", "10.0.0.0/8"])
-    );
     assert_eq!(saved["allow_password_basic"], true, "left out, kept");
     assert_eq!(get_settings(&srv).await, saved);
     assert_eq!(login_mode(&srv).await, "combined", "applied at once");
 
     for (body, message) in [
         (
-            json!({"anonymous_mode": "sometimes"}),
-            "unknown anonymous_mode \"sometimes\" (expected off|allowlist|all)",
+            json!({"anonymous_mode": "allowlist"}),
+            "unknown anonymous_mode \"allowlist\" (expected off|all)",
         ),
         (
             json!({"login_mode": "both"}),
             "unknown login_mode \"both\" (expected identifier_first|combined)",
-        ),
-        (
-            json!({"anonymous_ip_allowlist": ["10.0.0.0/33"]}),
-            "anonymous_ip_allowlist: invalid allowlist entry \"10.0.0.0/33\"",
         ),
         (
             json!({"session_idle_ttl_seconds": 0}),
@@ -187,8 +174,13 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
         assert_eq!(resp.text().await.unwrap(), message, "{body}");
     }
     // An unknown field is refused, not dropped.
-    let resp = put_settings(&srv, json!({"anonymous": "all"})).await;
-    assert_eq!(resp.status(), 422);
+    for body in [
+        json!({"anonymous": "all"}),
+        json!({"anonymous_ip_allowlist": ["10.0.0.0/8"]}),
+    ] {
+        let resp = put_settings(&srv, body.clone()).await;
+        assert_eq!(resp.status(), 422, "{body}");
+    }
     assert_eq!(
         get_settings(&srv).await,
         saved,
@@ -197,17 +189,11 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
 }
 
 /// The anonymous mode decides who reads an `anonymous_read` repository
-/// without credentials, at once: off, all (signed-in users then read it
-/// too), and an IP allowlist.
+/// without credentials, at once: off, and all (signed-in users then read it
+/// too).
 #[tokio::test]
 async fn anonymous_access_follows_the_setting_without_a_restart() {
-    // The allowlist only applies to requests naming the server's own host:
-    // the test client addresses it as 127.0.0.1.
-    let srv = start(ServerOpts {
-        public_base_url: Some("http://127.0.0.1".into()),
-        ..Default::default()
-    })
-    .await;
+    let srv = start(ServerOpts::default()).await;
     let public = create_repo(&srv, true).await;
     let private = create_repo(&srv, false).await;
     let (_, username, password) = make_user(&srv).await;
@@ -228,19 +214,10 @@ async fn anonymous_access_follows_the_setting_without_a_restart() {
     assert_eq!(read_index(&srv, &public, user).await, 200);
     assert_eq!(read_index(&srv, &private, user).await, 403);
 
-    put_settings(
-        &srv,
-        json!({"anonymous_mode": "allowlist", "anonymous_ip_allowlist": ["10.0.0.0/8"]}),
-    )
-    .await;
-    assert_eq!(read_index(&srv, &public, None).await, 401, "not listed");
-    // Under the allowlist the public reach is anonymous callers' alone.
-    assert_eq!(read_index(&srv, &public, user).await, 403);
-    put_settings(&srv, json!({"anonymous_ip_allowlist": ["loopback"]})).await;
-    assert_eq!(read_index(&srv, &public, None).await, 200, "listed");
-
     put_settings(&srv, json!({"anonymous_mode": "off"})).await;
     assert_eq!(read_index(&srv, &public, None).await, 401);
+    // Off again, the public reach is gone for signed-in users too.
+    assert_eq!(read_index(&srv, &public, user).await, 403);
 }
 
 /// Password Basic, the session lifetimes and the lockout apply to the next

@@ -164,7 +164,7 @@ secrecy = { version = "0.10" }
 # CSPRNG for token secrets
 rand = { version = "0.10" }
 
-# CIDR / IP network parsing (anon allowlist, SSRF guard)
+# CIDR / IP network parsing (trusted proxies, SSRF guard)
 ipnet = { version = "2.10" }
 
 # URL parsing (SSRF guard)

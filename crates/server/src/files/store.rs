@@ -191,7 +191,10 @@ pub async fn refusal(
         Via::Browser => {
             matches!(
                 files.principal,
-                Principal::User { method, .. } if method != AuthMethod::Password
+                Principal::User {
+                    method: AuthMethod::Session | AuthMethod::Token,
+                    ..
+                }
             ) || matches!(files.principal, Principal::Workload { .. })
         }
     };

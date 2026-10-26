@@ -387,6 +387,9 @@ impl RetentionWorker {
             None => None,
         };
 
+        // Every candidate is inspected, whether a rule decides on it or not.
+        let evaluated = (hosted.len() + proxy.len()) as u64;
+
         // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
         // with the repository, so it must not stall a runtime worker thread. ──
         let evaluation = {
@@ -446,6 +449,7 @@ impl RetentionWorker {
             }),
         };
         let mut summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
+        summary.evaluated = evaluated;
         if let Some(budget) = budget {
             let size_after = if policy.dry_run_only {
                 budget.size_after

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use forge_core::auth::{AuthMethod, Principal};
+use forge_core::auth::Principal;
 use forge_core::authz::Level;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
@@ -548,7 +548,7 @@ impl Registry {
         let signed_in = caller.claims.is_some()
             || matches!(
                 caller.principal,
-                Principal::User { method, .. } if method != AuthMethod::Session
+                Principal::User { method, .. } if !method.is_ambient()
             )
             || matches!(caller.principal, Principal::Workload { .. });
         if signed_in {
@@ -1014,10 +1014,11 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 /// Whether the principal is a credential a push may come from: an API
 /// token, a password (Basic or a token minted from one) or a workload — but
-/// never a browser session, which a cross-site page could ride.
+/// never an ambient one (a browser session, the headers of a trusted-header
+/// realm's proxy), which a cross-site page could ride.
 pub(crate) fn mutation_credential(principal: &Principal) -> bool {
     match principal {
-        Principal::User { method, .. } => *method != AuthMethod::Session,
+        Principal::User { method, .. } => !method.is_ambient(),
         Principal::Workload { .. } => true,
         _ => false,
     }
@@ -1138,6 +1139,7 @@ impl RequestCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_core::auth::AuthMethod;
 
     #[test]
     fn host_ports_are_stripped() {
@@ -1164,6 +1166,12 @@ mod tests {
             user_id: 1,
             token_id: None,
             method: AuthMethod::Session
+        }));
+        // Nor do the headers a trusted-header realm's proxy adds.
+        assert!(!mutation_credential(&Principal::User {
+            user_id: 1,
+            token_id: None,
+            method: AuthMethod::TrustedHeader
         }));
         assert!(mutation_credential(&Principal::User {
             user_id: 1,

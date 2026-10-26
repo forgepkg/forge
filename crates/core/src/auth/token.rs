@@ -516,7 +516,22 @@ impl PrincipalSource for BasicAuthSource {
     }
 }
 
-pub use crate::auth::client_ip::AnonPolicy;
+/// The anonymous-access policy: whether a request without credentials is
+/// served as [`Principal::Anonymous`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonPolicy {
+    /// No anonymous access at all.
+    Off,
+    /// Anonymous access for every client.
+    All,
+}
+
+impl AnonPolicy {
+    /// Whether a request without credentials may be served anonymously.
+    pub fn allows(self) -> bool {
+        self == AnonPolicy::All
+    }
+}
 
 /// Resolve a [`Principal`] from a chain of sources.
 ///
@@ -533,7 +548,7 @@ pub use crate::auth::client_ip::AnonPolicy;
 ///   return `Err(Unauthorized)`. Bad credentials are *never* downgraded to
 ///   anonymous.
 /// * If all sources report `NoCredentials`, apply the anonymous policy: become
-///   [`Principal::Anonymous`] if the client IP is allowed, else
+///   [`Principal::Anonymous`] if it allows anonymous access, else
 ///   [`Principal::Unauthenticated`].
 pub async fn resolve_principal(
     sources: &[Box<dyn PrincipalSource>],
@@ -567,6 +582,27 @@ pub async fn resolve_principal_with_origin(
     client_ip: IpAddr,
     anon: &AnonPolicy,
 ) -> Result<ResolvedPrincipal, AuthError> {
+    resolve_principal_with_fallback(sources, None, headers, client_ip, anon).await
+}
+
+/// [`resolve_principal_with_origin`] with a `fallback` source, asked in place
+/// of the anonymous policy: only when every source found no credentials (or
+/// a dead session cookie). A credential another source refused is never
+/// replaced by the fallback's principal, any more than by the anonymous one.
+/// What the fallback itself reports counts like any source's: `Invalid` and
+/// `Reject` are `Unauthorized`, `Unavailable` is `Unavailable`, and no
+/// credentials leaves the anonymous policy to decide.
+///
+/// The trusted-header realms are such a fallback: the headers the proxy in
+/// front adds to every request it admits name the caller only when the
+/// request presents no credential of its own.
+pub async fn resolve_principal_with_fallback(
+    sources: &[Box<dyn PrincipalSource>],
+    fallback: Option<&dyn PrincipalSource>,
+    headers: &HeaderMap,
+    client_ip: IpAddr,
+    anon: &AnonPolicy,
+) -> Result<ResolvedPrincipal, AuthError> {
     let mut saw_invalid = false;
     let mut saw_stale = false;
     for source in sources {
@@ -592,7 +628,23 @@ pub async fn resolve_principal_with_origin(
         return Err(AuthError::Unauthorized);
     }
 
-    let principal = if anon.allows(client_ip) {
+    if let Some(source) = fallback {
+        match source.resolve(headers, client_ip).await {
+            SourceOutcome::Authenticated(principal) => {
+                return Ok(ResolvedPrincipal {
+                    principal,
+                    ambient: source.is_ambient(),
+                    stale_ambient: saw_stale,
+                })
+            }
+            SourceOutcome::Invalid | SourceOutcome::Reject => return Err(AuthError::Unauthorized),
+            SourceOutcome::Unavailable => return Err(AuthError::Unavailable),
+            SourceOutcome::Stale => saw_stale = true,
+            SourceOutcome::NoCredentials => {}
+        }
+    }
+
+    let principal = if anon.allows() {
         Principal::Anonymous { ip: client_ip }
     } else {
         Principal::Unauthenticated
@@ -846,6 +898,90 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!res.ambient);
+    }
+
+    #[tokio::test]
+    async fn the_fallback_names_the_caller_only_without_other_credentials() {
+        let named = Principal::User {
+            user_id: 7,
+            token_id: None,
+            method: crate::auth::AuthMethod::TrustedHeader,
+        };
+        let token = Principal::User {
+            user_id: 1,
+            token_id: Some(2),
+            method: crate::auth::AuthMethod::Token,
+        };
+        let fallback = StubSource(SourceOutcome::Authenticated(named.clone()));
+        async fn resolve(
+            sources: Vec<Box<dyn PrincipalSource>>,
+            fallback: &StubSource,
+        ) -> Result<ResolvedPrincipal, AuthError> {
+            resolve_principal_with_fallback(
+                &sources,
+                Some(fallback),
+                &HeaderMap::new(),
+                ip(),
+                &AnonPolicy::All,
+            )
+            .await
+        }
+
+        // No credentials, or a dead session cookie: the fallback names the
+        // caller (and the dead cookie is still cleared), not the anonymous
+        // policy.
+        let res = resolve(
+            vec![Box::new(StubSource(SourceOutcome::NoCredentials))],
+            &fallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.principal, named);
+        assert!(!res.ambient && !res.stale_ambient);
+        let res = resolve(vec![Box::new(AmbientStub(SourceOutcome::Stale))], &fallback)
+            .await
+            .unwrap();
+        assert_eq!(res.principal, named);
+        assert!(res.stale_ambient);
+
+        // A credential of the request's own wins over it.
+        let res = resolve(
+            vec![Box::new(StubSource(SourceOutcome::Authenticated(
+                token.clone(),
+            )))],
+            &fallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.principal, token);
+
+        // A refused credential is never replaced by it.
+        for refused in [SourceOutcome::Invalid, SourceOutcome::Reject] {
+            assert_eq!(
+                resolve(vec![Box::new(StubSource(refused))], &fallback).await,
+                Err(AuthError::Unauthorized)
+            );
+        }
+
+        // Its own verdicts count like any source's; without credentials of
+        // its kind the anonymous policy decides.
+        for (outcome, want) in [
+            (SourceOutcome::Invalid, Err(AuthError::Unauthorized)),
+            (SourceOutcome::Reject, Err(AuthError::Unauthorized)),
+            (SourceOutcome::Unavailable, Err(AuthError::Unavailable)),
+            (
+                SourceOutcome::NoCredentials,
+                Ok(Principal::Anonymous { ip: ip() }),
+            ),
+        ] {
+            let res = resolve(
+                vec![Box::new(StubSource(SourceOutcome::NoCredentials))],
+                &StubSource(outcome.clone()),
+            )
+            .await
+            .map(|r| r.principal);
+            assert_eq!(res, want, "{outcome:?}");
+        }
     }
 
     #[tokio::test]

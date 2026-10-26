@@ -28,7 +28,6 @@ const adminMe: Me = {
 
 const stored: AuthSettings = {
   anonymous_mode: 'off',
-  anonymous_ip_allowlist: [],
   login_mode: 'identifier_first',
   allow_password_basic: false,
   session_idle_ttl_seconds: 28800,
@@ -183,24 +182,15 @@ describe('admin settings', () => {
     await renderApp('/manage/settings')
     const anonymous = await waitFor(() => section('Anonymous access'))
 
-    await u.selectOptions(within(anonymous).getByRole('combobox', { name: 'Mode' }), 'allowlist')
-    // An allowlist without entries is refused before any request.
+    const mode = within(anonymous).getByRole('combobox', { name: 'Mode' })
+    expect(
+      within(mode)
+        .getAllByRole('option')
+        .map((o) => o.getAttribute('value')),
+    ).toEqual(['off', 'all'])
+    await u.selectOptions(mode, 'all')
     await u.click(within(anonymous).getByRole('button', { name: 'Save anonymous access' }))
-    expect(await within(anonymous).findByRole('alert')).toHaveTextContent(
-      'List at least one address or network',
-    )
-    expect(puts()).toEqual([])
-
-    await u.type(
-      within(anonymous).getByRole('textbox', { name: 'IP allowlist' }),
-      ' loopback {enter}{enter}10.0.0.0/8',
-    )
-    await u.click(within(anonymous).getByRole('button', { name: 'Save anonymous access' }))
-    await waitFor(() =>
-      expect(puts()).toEqual([
-        { anonymous_mode: 'allowlist', anonymous_ip_allowlist: ['loopback', '10.0.0.0/8'] },
-      ]),
-    )
+    await waitFor(() => expect(puts()).toEqual([{ anonymous_mode: 'all' }]))
     expect(await within(anonymous).findByRole('status')).toHaveTextContent('Saved.')
   })
 

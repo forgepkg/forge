@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        INSERT INTO app_user\n            (username, password_hash, active, auth_source, external_subject)\n        VALUES ($1, $2, $3, $4, $5)\n        RETURNING\n            id, username, password_hash, active,\n            auth_source, external_subject, created_at, updated_at\n        ",
+  "query": "\n        SELECT\n            id, username, password_hash, active,\n            auth_source, external_subject, kind, created_at, updated_at\n        FROM app_user\n        WHERE username = $1\n          AND auth_source = 'upstream-basic'\n          AND NOT realm_orphaned\n          AND realm_id IS NOT DISTINCT FROM $2::bigint\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -95,10 +106,7 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text",
-        "Bool",
-        "Text",
-        "Text"
+        "Int8"
       ]
     },
     "nullable": [
@@ -109,8 +117,9 @@
       false,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "eeac769f80f6cc3f32f69f75e07db6acd9b6da431661c1f651be1602a4319931"
+  "hash": "1ce95a112377c2bcd46c8457a90c75ccc8730c9006053a45842e2d07ea99fdec"
 }

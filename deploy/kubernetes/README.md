@@ -142,9 +142,9 @@ Points that matter on Kubernetes:
 - **Who reaches Forge.** Forge believes the `X-Forwarded-For` of every peer
   in `FORGE_AUTH__TRUSTED_PROXY_CIDRS`, usually the whole pod network, so any
   other pod could call the Service with a forged client address and get past
-  the login lockout and the anonymous-IP allowlist. `components/network-policy`
-  admits only the ingress controller or gateway; use it whenever you set
-  trusted proxies (the CNI must enforce NetworkPolicy).
+  the login lockout. `components/network-policy` admits only the ingress
+  controller or gateway; use it whenever you set trusted proxies (the CNI must
+  enforce NetworkPolicy).
 - **Pod security.** Every workload here satisfies the `restricted` Pod
   Security Standard; the overlays' namespaces enforce it.
 

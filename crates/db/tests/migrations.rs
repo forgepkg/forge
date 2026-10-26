@@ -355,6 +355,146 @@ async fn migrations_create_all_expected_tables() {
         "an unknown auth_source value must violate the CHECK"
     );
 
+    // A trusted-header realm and its accounts (#506): an account has no
+    // local password.
+    let realm_id: i64 = sqlx::query_scalar(
+        "INSERT INTO auth_realm (kind, name, priority) \
+         VALUES ('trusted_header', 'sso-proxy', 90) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("a trusted_header realm is insertable");
+    sqlx::query(
+        "INSERT INTO app_user (username, password_hash, auth_source, realm_id) \
+         VALUES ('proxied@example.com', NULL, 'trusted-header', $1)",
+    )
+    .bind(realm_id)
+    .execute(&pool)
+    .await
+    .expect("a trusted-header account without a password is insertable");
+    let with_password = sqlx::query(
+        "INSERT INTO app_user (username, password_hash, auth_source, realm_id) \
+         VALUES ('proxied2@example.com', 'x', 'trusted-header', $1)",
+    )
+    .bind(realm_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        with_password.is_err(),
+        "a trusted-header account with a password must violate the CHECK"
+    );
+
+    // Service accounts (#508): the accounts that exist are users; a service
+    // account has the source 'service', no password, invitation or email,
+    // belongs to a trusted-header realm or to none, keeps its kind, never
+    // holds `admin` and is never linked to an identity.
+    let kind: String =
+        sqlx::query_scalar("SELECT kind FROM app_user WHERE username = 'proxied@example.com'")
+            .fetch_one(&pool)
+            .await
+            .expect("read the default kind");
+    assert_eq!(kind, "user", "app_user.kind defaults to 'user'");
+    let service_id: i64 = sqlx::query_scalar(
+        "INSERT INTO app_user (username, kind, auth_source, realm_id, description) \
+         VALUES ('ci@example.com', 'service', 'service', $1, 'CI') RETURNING id",
+    )
+    .bind(realm_id)
+    .fetch_one(&pool)
+    .await
+    .expect("a service account of a trusted-header realm is insertable");
+    sqlx::query(
+        "INSERT INTO app_user (username, kind, auth_source) \
+         VALUES ('build@example.com', 'service', 'service')",
+    )
+    .execute(&pool)
+    .await
+    .expect("a service account of no realm is insertable");
+    let oidc_realm: i64 = sqlx::query_scalar(
+        "INSERT INTO auth_realm (kind, name, priority) \
+         VALUES ('oidc', 'idp-for-service-accounts', 91) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("an oidc realm is insertable");
+    for (what, sql) in [
+        (
+            "a password",
+            "INSERT INTO app_user (username, kind, auth_source, password_hash) \
+             VALUES ('svc1@example.com', 'service', 'service', 'x')",
+        ),
+        (
+            "an email",
+            "INSERT INTO app_user (username, kind, auth_source, email) \
+             VALUES ('svc2@example.com', 'service', 'service', 'svc2@example.com')",
+        ),
+        (
+            "an invitation",
+            "INSERT INTO app_user (username, kind, auth_source, invited) \
+             VALUES ('svc3@example.com', 'service', 'service', true)",
+        ),
+        (
+            "another source",
+            "INSERT INTO app_user (username, kind, auth_source) \
+             VALUES ('svc4@example.com', 'service', 'trusted-header')",
+        ),
+        (
+            "a user of the source 'service'",
+            "INSERT INTO app_user (username, auth_source) \
+             VALUES ('svc5@example.com', 'service')",
+        ),
+    ] {
+        let refused = sqlx::query(sql).execute(&pool).await;
+        assert!(refused.is_err(), "a service account with {what} is refused");
+    }
+    let other_realm = sqlx::query(
+        "INSERT INTO app_user (username, kind, auth_source, realm_id) \
+         VALUES ('svc6@example.com', 'service', 'service', $1)",
+    )
+    .bind(oidc_realm)
+    .execute(&pool)
+    .await;
+    assert!(
+        other_realm.is_err(),
+        "a service account belongs to no realm of another kind"
+    );
+    let kind_change = sqlx::query(
+        "UPDATE app_user SET kind = 'user', auth_source = 'trusted-header' WHERE id = $1",
+    )
+    .bind(service_id)
+    .execute(&pool)
+    .await;
+    assert!(kind_change.is_err(), "a service account stays one");
+    let admin = sqlx::query(
+        "INSERT INTO user_role (user_id, role_id) \
+         SELECT $1, id FROM role WHERE name = 'admin'",
+    )
+    .bind(service_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        admin.is_err(),
+        "a service account cannot hold the admin role"
+    );
+    sqlx::query(
+        "INSERT INTO user_role (user_id, role_id) \
+         SELECT $1, id FROM role WHERE name = 'writer'",
+    )
+    .bind(service_id)
+    .execute(&pool)
+    .await
+    .expect("a service account holds other roles");
+    let linked = sqlx::query(
+        "INSERT INTO external_identity (user_id, issuer, subject) \
+         VALUES ($1, 'https://idp.example.com', 'ci')",
+    )
+    .bind(service_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        linked.is_err(),
+        "a service account is never linked to an identity"
+    );
+
     // validated_credential round-trips a verdict; the plaintext password is
     // never a column — only the HMAC.
     sqlx::query(

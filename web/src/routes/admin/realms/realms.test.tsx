@@ -633,6 +633,52 @@ describe('admin realms create', { timeout: 20_000 }, () => {
     })
   })
 
+  it('creates a trusted-header realm with a generated secret to copy', async () => {
+    let posted: { config: { secret: string } } | null = null
+    mockApi({
+      realms: [],
+      onCreate: (body) => {
+        posted = body as { config: { secret: string } }
+        return json(realm({ id: 9, kind: 'trusted_header' }), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/new')
+
+    await u.click(await screen.findByRole('radio', { name: /^Trusted header/ }))
+    await u.type(screen.getByLabelText('Name'), 'sso')
+    // The header names and a secret are required, the secret long enough.
+    await u.type(screen.getByLabelText('Secret'), 'short')
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+    expect(await screen.findAllByText('A header name is required.')).toHaveLength(2)
+    expect(screen.getByText(/Use 16 to 1024 characters/)).toBeInTheDocument()
+    expect(posted).toBeNull()
+
+    await u.type(screen.getByLabelText('Username header'), 'X-Forwarded-User')
+    await u.type(screen.getByLabelText('Secret header'), 'X-Forge-Proxy-Secret')
+    await u.clear(screen.getByLabelText('Secret'))
+    await u.click(screen.getByRole('button', { name: 'Generate a secret' }))
+    const generated = (screen.getByLabelText('Generated secret') as HTMLInputElement).value
+    expect(generated).toMatch(/^[0-9a-f]{64}$/)
+    // What the proxy must do, with the headers entered.
+    expect(screen.getAllByText('X-Forge-Proxy-Secret').length).toBeGreaterThan(0)
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toEqual({
+      kind: 'trusted_header',
+      name: 'sso',
+      enabled: true,
+      config: {
+        username_header: 'X-Forwarded-User',
+        secret_header: 'X-Forge-Proxy-Secret',
+        auto_provision: false,
+        secret: generated,
+      },
+    })
+  })
+
   it('switching to workload_identity builds the rules config', async () => {
     let posted: unknown = null
     mockApi({

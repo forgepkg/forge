@@ -5,6 +5,7 @@ import type {
   CredentialForwardingConfig,
   OidcRealmConfig,
   RealmView,
+  TrustedHeaderConfig,
   WorkloadIdentityConfig,
 } from '~/api/realms'
 import {
@@ -306,7 +307,8 @@ function RealmRow({
 
 /**
  * The line under a realm's name: what it connects to (the IdP's or CI
- * provider's issuer, the upstream URL), or what the built-in local realm is.
+ * provider's issuer, the upstream URL, the header the proxy names the account
+ * in), or what the built-in local realm is.
  */
 function realmSummary(realm: RealmView): string | undefined {
   switch (realm.kind) {
@@ -318,6 +320,10 @@ function realmSummary(realm: RealmView): string | undefined {
       return (realm.config as CredentialForwardingConfig).url || undefined
     case 'workload_identity':
       return (realm.config as WorkloadIdentityConfig).issuer || undefined
+    case 'trusted_header': {
+      const header = (realm.config as TrustedHeaderConfig).username_header
+      return header ? `Names the account in ${header}` : undefined
+    }
     default:
       return undefined
   }

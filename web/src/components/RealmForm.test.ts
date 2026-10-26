@@ -7,6 +7,8 @@ import {
   formatClaimRules,
   parseClaimRules,
   parseLines,
+  randomSecret,
+  secretError,
   seedRealmFormValues,
   toRealmConfig,
 } from './RealmForm'
@@ -110,6 +112,57 @@ describe('list fields', () => {
     ],
   ])('round-trips a %s config with commas in list values', (kind, config) => {
     expect(toRealmConfig(seedRealmFormValues(stored(kind, config)))).toEqual(config)
+  })
+})
+
+describe('trusted-header config', () => {
+  const stored: RealmView = {
+    id: 1,
+    kind: 'trusted_header',
+    name: 'sso',
+    enabled: true,
+    priority: 1,
+    config: {
+      username_header: 'x-forwarded-user',
+      secret_header: 'x-forge-proxy-secret',
+      secret_set: true,
+      auto_provision: true,
+    },
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+  }
+
+  it('keeps the stored secret when it is left blank', () => {
+    expect(toRealmConfig(seedRealmFormValues(stored))).toEqual({
+      username_header: 'x-forwarded-user',
+      secret_header: 'x-forge-proxy-secret',
+      auto_provision: true,
+    })
+  })
+
+  it('sends a typed secret, and creates no accounts by default', () => {
+    const values = {
+      ...seedRealmFormValues(),
+      kind: 'trusted_header' as const,
+      username_header: ' X-Forwarded-User ',
+      secret_header: 'X-Forge-Proxy-Secret',
+      secret: 'a'.repeat(32),
+    }
+    expect(toRealmConfig(values)).toEqual({
+      username_header: 'X-Forwarded-User',
+      secret_header: 'X-Forge-Proxy-Secret',
+      auto_provision: false,
+      secret: 'a'.repeat(32),
+    })
+  })
+
+  it('generates secrets the server accepts', () => {
+    const one = randomSecret()
+    expect(one).toMatch(/^[0-9a-f]{64}$/)
+    expect(secretError(one)).toBeNull()
+    expect(randomSecret()).not.toBe(one)
+    expect(secretError('short')).not.toBeNull()
+    expect(secretError('0123456789abcdef 0123456789abcdef')).not.toBeNull()
   })
 })
 

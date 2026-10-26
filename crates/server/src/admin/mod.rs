@@ -11,8 +11,11 @@
 //!   is write-only and REDACTED in responses; `remote_url` is SSRF-validated;
 //!   duplicate member priorities are rejected, nested groups only when they
 //!   would form a cycle or exceed the depth limit) and package hard-delete.
+//! * [`images`] — deleting a tag, a manifest or an image of a hosted
+//!   repository of images.
 //! * [`users`] — user CRUD: local accounts are invited to choose their
-//!   password ([`crate::invitations`]), never given one here.
+//!   password ([`crate::invitations`]), never given one here; service
+//!   accounts (#508) have none at all.
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
 //!   stored) + revoke + list.
 //! * [`members`] — group membership management.
@@ -41,6 +44,11 @@
 //! and replay it on every feed request, and with credential forwarding it is
 //! the upstream directory's password. Administration takes a browser session
 //! (sign in through `/auth/login` or OIDC) or an admin-scoped token.
+//!
+//! **Trusted headers and `/admin/*`.** A request a trusted-header realm
+//! authenticated (the headers of the proxy in front name the account) is
+//! refused here too (403): the proxy adds them to every request of the
+//! clients it admits, and they never make anyone an administrator.
 
 pub mod blob_cache;
 pub mod content_selectors;
@@ -50,6 +58,7 @@ pub mod email;
 pub mod email_oauth;
 pub mod formats;
 pub mod grants;
+pub mod images;
 pub mod imports;
 pub mod members;
 pub mod proxy_cache;
@@ -112,6 +121,19 @@ pub async fn require_admin(
                 StatusCode::FORBIDDEN,
                 "the admin API needs a signed-in session or an admin-scoped API token; \
                  a password sent over HTTP Basic is not accepted here",
+            )
+                .into_response();
+        }
+        // Nor are the headers of the proxy in front: they never make anyone
+        // an administrator.
+        Principal::User {
+            method: AuthMethod::TrustedHeader,
+            ..
+        } => {
+            return (
+                StatusCode::FORBIDDEN,
+                "the admin API needs a signed-in session or an admin-scoped API token; \
+                 a request the proxy's headers authenticate is not accepted here",
             )
                 .into_response();
         }
@@ -193,6 +215,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/repositories/{name}/files",
             axum::routing::delete(crate::files::web::admin_delete),
+        )
+        .route(
+            "/repositories/{name}/images",
+            axum::routing::delete(images::delete),
         )
         .route(
             "/repositories/{name}/proxy-cache/invalidate",

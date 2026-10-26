@@ -1,9 +1,21 @@
 import type { ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 
-import type { ChartDetail, ChartMetadata, ImageDetail } from '~/api/images'
+import type {
+  ChartDetail,
+  ChartMetadata,
+  ImageDetail,
+  ImageManifest,
+  ImageTag,
+} from '~/api/images'
 import { isRepositoryOffline } from '~/api/packages'
-import { chartVersion, chartVersions, defaultChartVersion, httpUrl } from '~/lib/oci'
+import {
+  cappedNote,
+  chartVersion,
+  chartVersions,
+  defaultChartVersion,
+  httpUrl,
+} from '~/lib/oci'
 import { useChart } from '~/queries/useChart'
 import { ManifestTable, TagTable } from '~/components/ImageTables'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
@@ -26,16 +38,24 @@ import {
  * The image page of a Helm chart pushed as an OCI artifact (`helm push`):
  * the `helm install` / `helm pull` commands of a version (the selected one,
  * else the newest release), the version's `Chart.yaml` facts, README and
- * default values, then the versions and manifests of the image.
+ * default values, then the versions and manifests of the image. With the
+ * delete callbacks (administrators, hosted repositories), each version and
+ * manifest has a Delete button.
  */
 export function ChartView({
   detail,
   selectedTag,
   onSelectTag,
+  onDeleteVersion,
+  onDeleteManifest,
+  deletePending,
 }: {
   detail: ImageDetail
   selectedTag: string | undefined
   onSelectTag: (tag: string) => void
+  onDeleteVersion?: (tag: ImageTag) => void
+  onDeleteManifest?: (manifest: ImageManifest) => void
+  deletePending?: boolean
 }) {
   const versions = chartVersions(detail.tags, detail.manifests)
   const current =
@@ -86,25 +106,42 @@ export function ChartView({
         </Notice>
       )}
       {body}
-      <Panel title="Versions" count={versions.length} flush>
+      <Panel
+        title="Versions"
+        count={versions.length}
+        flush
+        description={cappedNote(detail.tags.length, detail.tags_total, 'versions')}
+      >
         {detail.tags.length === 0 ? (
           <EmptyState title="No versions" icon="Wheel" bordered={false}>
             This chart has only untagged manifests; Helm installs charts by
             version.
           </EmptyState>
         ) : (
-          <TagTable tags={detail.tags} />
+          <TagTable
+            tags={detail.tags}
+            noun="version"
+            onDelete={onDeleteVersion}
+            deletePending={deletePending}
+          />
         )}
       </Panel>
       <Panel
         title="Manifests"
-        count={detail.manifests.length}
+        count={detail.manifests_total ?? detail.manifests.length}
         flush
-        description="The chart's manifests, and referrers such as signatures."
+        description={[
+          cappedNote(detail.manifests.length, detail.manifests_total, 'manifests'),
+          "The chart's manifests, and referrers such as signatures.",
+        ]
+          .filter(Boolean)
+          .join(' ')}
       >
         <ManifestTable
           manifests={detail.manifests}
-          showSource={detail.repo_kind === 'group'}
+          repoKind={detail.repo_kind}
+          onDelete={onDeleteManifest}
+          deletePending={deletePending}
         />
       </Panel>
     </Columns>

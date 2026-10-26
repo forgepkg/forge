@@ -10,7 +10,7 @@ import {
 
 import { clearSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
-import type { BrowseRepo, BrowseResult } from '~/api/packages'
+import { pkgKeys, type BrowseRepo, type BrowseResult } from '~/api/packages'
 import type { ImagesResult } from '~/api/images'
 import { routeTree } from '~/routeTree.gen'
 import { textContent } from '~/test/text'
@@ -592,6 +592,8 @@ describe('RepoBrowse of a docker repository (images)', () => {
       'Showing 1–2 of 2',
     )
     expect(screen.getByLabelText('Search images')).toBeInTheDocument()
+    // A hosted repository's images were pushed to it.
+    expect(screen.getByRole('columnheader', { name: 'Last pushed' })).toBeInTheDocument()
     // NuGet-only controls are absent, and no package search was made.
     expect(screen.queryByLabelText('Search packages')).toBeNull()
     expect(screen.queryByText('Include prerelease versions')).toBeNull()
@@ -689,6 +691,35 @@ describe('RepoBrowse of a docker repository (images)', () => {
     expect(screen.getByRole('region', { name: 'Connect' })).toBeInTheDocument()
   })
 
+  it('labels the image time column "Last cached" on a proxy (#248)', async () => {
+    mockApi(
+      () => jsonResponse(page(0, [])),
+      () => jsonResponse(imagePage(1, ['library/alpine'])),
+    )
+    const base = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname.endsWith('/browse/repos')) {
+        return Promise.resolve(
+          jsonResponse([
+            ...repos,
+            { id: 6, name: 'docker-hub', kind: 'proxy', online: true, format: 'docker' },
+          ]),
+        )
+      }
+      return base(input, init)
+    })
+
+    await renderBrowse('/repos/docker-hub')
+
+    await screen.findByRole('link', { name: /library\/alpine/ })
+    expect(screen.getByRole('columnheader', { name: 'Last cached' })).toHaveAttribute(
+      'title',
+      'When Forge last cached a manifest of the image from the upstream',
+    )
+    expect(screen.queryByRole('columnheader', { name: 'Last pushed' })).toBeNull()
+  })
+
   it('refreshes a cached repository list that predates the repository', async () => {
     mockApi(
       () => jsonResponse(page(1, ['ShouldNotShow'])),
@@ -711,6 +742,42 @@ describe('RepoBrowse of a docker repository (images)', () => {
     expect(await screen.findByRole('link', { name: /alpine/ })).toBeInTheDocument()
     expect(listCalls).toBeGreaterThanOrEqual(2)
     // The NuGet screen was never rendered for it, not even briefly.
+    expect(requestsTo('/browse/packages')).toHaveLength(0)
+  })
+
+  it('re-reads a cached repository list that a repository change invalidated (#244)', async () => {
+    mockApi(
+      () => jsonResponse(page(1, ['ShouldNotShow'])),
+      () => jsonResponse(imagePage(1, ['alpine'])),
+    )
+    // Until an admin replaced it, `docker-hosted` was a NuGet repository.
+    const base = fetchMock.getMockImplementation()!
+    let listCalls = 0
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname.endsWith('/browse/repos') && listCalls++ === 0) {
+        return Promise.resolve(
+          jsonResponse(
+            repos.map((r) => (r.name === 'docker-hosted' ? { ...r, format: 'nuget' } : r)),
+          ),
+        )
+      }
+      return base(input, init)
+    })
+
+    const router = await renderBrowse('/')
+    await waitFor(() => main().getByRole('link', { name: /docker-hosted/ }))
+    // The admin screens invalidate the list on a repository change; the
+    // navigation below comes before any refetch.
+    await router.options.context.queryClient.invalidateQueries({
+      queryKey: pkgKeys.repos(),
+      refetchType: 'none',
+    })
+    await router.navigate({ to: '/repos/$repo', params: { repo: 'docker-hosted' } })
+
+    expect(await screen.findByRole('link', { name: /alpine/ })).toBeInTheDocument()
+    expect(listCalls).toBeGreaterThanOrEqual(2)
+    // The NuGet screen of the stale list was never rendered, not even briefly.
     expect(requestsTo('/browse/packages')).toHaveLength(0)
   })
 

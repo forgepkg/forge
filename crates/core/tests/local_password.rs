@@ -194,6 +194,67 @@ async fn local_provider_rejects_an_invited_account() {
 }
 
 #[tokio::test]
+async fn a_service_account_signs_in_with_no_password_but_its_tokens_work() {
+    // #508: nobody signs in to a service account. Its name is Forge's own:
+    // Rejected whatever the password, never a Skip that would forward the
+    // password to a later (upstream) provider. The tokens an administrator
+    // issued for it authenticate it, until it is deactivated.
+    let pool = common::pool().await;
+    let username = format!("ci-{}@example.com", common::unique());
+    let account = user_dao::insert_service_account(&pool, &username, Some("CI"), None)
+        .await
+        .expect("insert service account");
+    assert!(account.is_service_account());
+    assert_eq!(account.auth_source, "service");
+    for forwarding_follows in [false, true] {
+        let provider =
+            LocalPasswordProvider::new(pool.clone()).forwarding_follows(forwarding_follows);
+        for password in ["", "a-guess"] {
+            assert_eq!(
+                provider.authenticate(&cred(&username, password)).await,
+                AuthOutcome::Rejected,
+                "{password:?} (forwarding follows: {forwarding_follows})"
+            );
+        }
+    }
+
+    let secret = generate_token_secret();
+    token_dao::insert_token(
+        &pool,
+        NewToken {
+            user_id: account.id,
+            name: "ci".into(),
+            token_hash: hash_token(&secret),
+            expires_at: None,
+            minted_with_forwarded_credential: false,
+        },
+    )
+    .await
+    .expect("insert token");
+    let source = basic_source(&pool, true);
+    let basic = |password: &str| basic_header(&username, password);
+    match source.resolve(&basic(&secret), ip()).await {
+        SourceOutcome::Authenticated(Principal::User { user_id, .. }) => {
+            assert_eq!(user_id, account.id)
+        }
+        other => panic!("the token authenticates the service account: {other:?}"),
+    }
+    assert_eq!(
+        source.resolve(&basic("a-guess"), ip()).await,
+        SourceOutcome::Invalid
+    );
+
+    user_dao::set_active(&pool, account.id, false)
+        .await
+        .expect("deactivate");
+    assert_eq!(
+        source.resolve(&basic(&secret), ip()).await,
+        SourceOutcome::Invalid,
+        "a deactivated service account's tokens are refused"
+    );
+}
+
+#[tokio::test]
 async fn local_provider_skips_user_without_local_password() {
     // An upstream-basic / oidc provisioned user has no local password_hash and
     // must never be acceptable by the local provider — it's not ours.

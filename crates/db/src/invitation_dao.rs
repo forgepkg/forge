@@ -69,7 +69,7 @@ where
         "INSERT INTO app_user (username, password_hash, active, auth_source, email, invited) \
          VALUES ($1, NULL, true, 'local', $2, true) \
          RETURNING id, username, password_hash, active, auth_source, external_subject, \
-                   created_at, updated_at",
+                   kind, created_at, updated_at",
     )
     .bind(username)
     .bind(email)
@@ -237,7 +237,7 @@ pub async fn accept(
         "UPDATE app_user SET password_hash = $2, invited = false, updated_at = now() \
          WHERE id = $1 AND invited AND active \
          RETURNING id, username, password_hash, active, auth_source, external_subject, \
-                   created_at, updated_at",
+                   kind, created_at, updated_at",
     )
     .bind(user_id)
     .bind(password_hash)

@@ -3861,6 +3861,82 @@ async fn a_format_cannot_reach_an_origin_its_upstream_does_not_name() {
     assert_eq!(mock.nupkg_hits(), 0);
 }
 
+/// #230: one upstream conversation keeps at most 4 × `max_metadata_bytes` of
+/// documents, all rounds together. The documents past that are not kept, and
+/// the format is told so as of a failed fetch, so it can answer with what it
+/// read (as NuGet's dating leaves an unread registration page to the
+/// listing).
+#[tokio::test]
+async fn an_upstream_conversation_keeps_at_most_its_byte_budget() {
+    use forge_core::net::upstream::{UpstreamHttp, UpstreamHttpConfig};
+
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path_regex(r"^/doc/\d+\.json$"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("x".repeat(90)))
+        .mount(&upstream)
+        .await;
+    let docs: Vec<String> = (0..8)
+        .map(|i| format!("{}/doc/{i}.json", upstream.uri()))
+        .collect();
+    let seen: Arc<Mutex<Vec<Fetched>>> = Arc::default();
+    let px = {
+        let (docs, seen) = (docs.clone(), seen.clone());
+        scripted_proxy(&pool, cas, move |nuget, remote, op, fetched| match op {
+            UpstreamOp::Index => Ok(UpstreamStep::Done(UpstreamAnswer::Index("{}".into()))),
+            // Eight documents of 90 bytes, against a budget of 4 × 100.
+            UpstreamOp::Versions(_) if fetched.is_empty() => Ok(UpstreamStep::Fetch(
+                docs.iter()
+                    .map(|url| Fetch::new(url.clone(), Freshness::Metadata))
+                    .collect(),
+            )),
+            UpstreamOp::Versions(_) => {
+                *seen.lock().unwrap() = fetched.iter().map(|f| f.outcome.clone()).collect();
+                Ok(UpstreamStep::Done(UpstreamAnswer::Versions(Some(vec![
+                    "1.0.0".into(),
+                ]))))
+            }
+            _ => nuget.upstream(remote, op, fetched),
+        })
+    }
+    .with_http(
+        UpstreamHttp::new(UpstreamHttpConfig {
+            max_metadata_bytes: 100,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let repo = make_proxy(&pool, &format!("{}/index.json", upstream.uri()), 0, true).await;
+
+    assert_eq!(
+        versions_of(&px.list_versions(&repo, "Sample.Lib").await.unwrap()),
+        ["1.0.0"],
+        "the format answers with what it read"
+    );
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 8, "every fetch has an outcome");
+    let kept = seen
+        .iter()
+        .filter(|outcome| matches!(outcome, Fetched::Found(body) if body.len() == 90))
+        .count();
+    assert_eq!(
+        kept, 4,
+        "360 of the 400 bytes; a fifth document would exceed them"
+    );
+    for outcome in seen
+        .iter()
+        .filter(|outcome| !matches!(outcome, Fetched::Found(_)))
+    {
+        match outcome {
+            Fetched::Failed(reason) => {
+                assert!(reason.contains("would exceed 400 bytes"), "{reason}")
+            }
+            other => panic!("a document past the budget reached the format: {other:?}"),
+        }
+    }
+}
+
 /// #233: a format's index is its own making, so a URL in it names no origin.
 /// A plugin cannot point its index at an internal service, nor write the
 /// origins the host records beside it.

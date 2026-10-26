@@ -36,8 +36,9 @@ repository in the image name:
   (`"host": "docker.example.com"`) also answers at the root of that host, so
   its images keep short names: `docker.example.com/team/app:1.2`. Point the
   host name at Forge, include it in the TLS certificate, keep `Host` intact
-  in the reverse proxy, and add it to `server.allowed_hosts` if you use the
-  anonymous mode `allowlist` (Admin → Settings).
+  in the reverse proxy, and add it to `server.allowed_hosts` if a
+  [trusted-header realm](deployment.md#trusted-header-realms) names its
+  clients.
 
 A docker repository's name is part of every image name, so it follows the
 spec's name grammar: lowercase letters and digits, separated by `.`, `_`,
@@ -123,6 +124,9 @@ with any `artifactType`; Docker schema 1 is refused.
   (`{}`), which Forge stores itself when it is missing.
 - A blob a manifest of the image references cannot be deleted (`409`):
   delete the manifest first.
+- `DELETE /v2/<name>/manifests/<tag>` deletes the tag alone: the manifest
+  stays, under its other tags or untagged. A `DELETE` by digest deletes the
+  manifest and every tag that names it.
 - Uploads are limited per blob by the repository's upload limit (*Maximum
   upload size* in the web UI, `max_upload_bytes` in the admin API; 1 GiB
   when unset, or what an explicit `server.max_staging_bytes` below that
@@ -258,6 +262,29 @@ default values. The browse API reads them from the chart's blobs:
 proxy stores a chart's blobs when it is first pulled, so until then it shows
 the versions and commands only. A README or `values.yaml` over 512 KiB is cut.
 
+### Deleting from the web UI
+
+In a hosted repository, an administrator deletes from the image page: the
+whole image (*Delete image…*), a tag, a manifest, or a chart's version (its
+manifest). The admin API does the same with a session or an admin-scoped
+token:
+
+```bash
+# A tag: its manifest stays, pullable by digest.
+curl -u admin@example.com:<admin-token> -X DELETE \
+  'https://forge.example.com/admin/repositories/docker-hosted/images?image=team/app&reference=1.0'
+# {"manifests": 0, "tags": 1}
+# A manifest, with its tags: reference=sha256:<hex>. The whole image: no reference.
+```
+
+A manifest goes with its tags and with what only it kept: the manifests an
+index lists and the referrers (signatures, SBOMs, attestations) of it, unless
+a tag or another manifest of the image still needs them, as image retention
+decides. A manifest an index lists is deleted when asked for, even though
+pulling that platform through the index then fails. The answer counts the
+manifests and tags deleted (404 when nothing matched). A hosted repository is
+deleted only once it holds no image, so emptying one is deleting its images.
+
 The catalog API (`/v2/_catalog`) is not supported.
 
 ## Retention and garbage collection
@@ -296,6 +323,15 @@ A docker repository's retention policy (`PUT
   `GET` or a `HEAD` of a tag's manifest counts as a pull, so a tag that
   containerd (Kubernetes, nerdctl, BuildKit) only resolves stays pulled. A
   rule with only `keep_last_n_tags` keeps N tags per image.
+- **Tags of one digest**: a tag rule deletes the tag alone. Its manifest
+  stays while another tag names it, and is untagged (for
+  `delete_untagged_after_days`) from when its last tag goes. A pull is
+  recorded per manifest, so pulling `latest` counts for every tag of its
+  digest: while `latest` is pulled, `tag_not_pulled_for_days` deletes no
+  other tag of that digest, whereas `tag_older_than_days` and
+  `keep_last_n_tags` judge each tag by its own push. Every tag takes a place
+  among the `keep_last_n_tags`; name aliases such as `latest` in
+  `protected_tags` so that they do not.
 - **Untagged rules** (`delete_untagged_after_days`) delete manifests without a
   tag for that long, except what something kept refers to: the platforms of
   a kept index, and the signatures, SBOMs and attestations (referrers) of a

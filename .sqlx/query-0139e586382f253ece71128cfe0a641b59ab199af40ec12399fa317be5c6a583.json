@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE app_user\n        SET realm_id = $2,\n            realm_orphaned = false,\n            updated_at = now()\n        WHERE id = $1 AND kind = 'service'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0139e586382f253ece71128cfe0a641b59ab199af40ec12399fa317be5c6a583"
+}
