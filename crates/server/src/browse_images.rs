@@ -5,9 +5,11 @@
 //!
 //! The same rules as the package browse apply: a signed-in user, per-repo
 //! read authorization, the caller's content selectors on image names, and a
-//! 503 for an offline hosted or group repository. A group lists what its
-//! online members the caller may read hold, the highest priority member
-//! first, like a pull through it.
+//! 503 for an offline hosted or group repository. A group lists what a pull
+//! through it serves the caller: its own content selector applies, and its
+//! guard (`reserved_prefixes`, `prefer_hosted`, owners) decides per image
+//! which members serve it, as in the registry (its `GroupMembers`); the
+//! highest priority member serving an image is listed first.
 //!
 //! ## Endpoints
 //! * `GET /browse/images?repo=<name>&q=&skip=&take=` → `{ total, items,
@@ -39,6 +41,8 @@ use serde::{Deserialize, Serialize};
 use crate::admin::db_error;
 use crate::dispatch::{offline_response, offline_serves_nothing};
 use crate::images::digest::ContentDigest;
+use crate::images::dispatch::Caller;
+use crate::images::Failure;
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -181,48 +185,43 @@ async fn readable_images_repo(
     Ok((repo, format))
 }
 
-/// The repositories whose images `repo` shows the caller, in priority order:
-/// itself, or a group's readable members (nested groups expanded).
-async fn sources(
+/// The repositories whose `image` the caller sees through `repo`, highest
+/// priority first, as a pull resolves it: `repo` itself, or the members of a
+/// group that serve the image to the caller, its guard applied
+/// ([`crate::images::Registry::serving_members`]). None when `repo`'s own
+/// content selector hides the image.
+async fn image_sources(
     state: &AppState,
     principal: &Principal,
     repo: &Repository,
-) -> sqlx::Result<Vec<Repository>> {
+    image: &str,
+) -> Result<Vec<Repository>, Response> {
+    if !state
+        .authz
+        .package_filter(principal, repo)
+        .await
+        .allows(image)
+    {
+        return Ok(Vec::new());
+    }
     if repo.kind() != RepoKind::Group {
         return Ok(vec![repo.clone()]);
     }
-    let mut out = Vec::new();
-    let mut seen = HashSet::from([repo.id]);
-    let mut stack = vec![(repo.clone(), 0i32)];
-    let max_depth = state.config.groups.max_nesting_depth.max(1);
-    while let Some((group, depth)) = stack.pop() {
-        if depth >= max_depth {
-            continue;
-        }
-        let members = repository_dao::group_members(&state.pool, group.id).await?;
-        // Depth-first in priority order: push the lowest priority first.
-        let mut nested = Vec::new();
-        for (member, _) in members {
-            // An offline hosted or group member serves nothing through the
-            // group; an offline proxy still serves its cache.
-            if member.format != repo.format
-                || offline_serves_nothing(&member)
-                || !seen.insert(member.id)
-            {
-                continue;
-            }
-            if !state.authz.can_read(principal, &member).await {
-                continue;
-            }
-            if member.kind() == RepoKind::Group {
-                nested.push((member, depth + 1));
-            } else {
-                out.push(member);
-            }
-        }
-        stack.extend(nested.into_iter().rev());
-    }
-    Ok(out)
+    let caller = Caller {
+        principal: principal.clone(),
+        claims: None,
+    };
+    state
+        .registry()
+        .serving_members(&caller, repo, image, 0)
+        .await
+        .map_err(failure_response)
+}
+
+/// The answer to a failure of the registry's group walk.
+fn failure_response(failure: Failure) -> Response {
+    tracing::error!(error = %failure.message(), "browse: resolving a group's members failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
 /// `GET /browse/images?repo=…`
@@ -236,18 +235,21 @@ pub async fn list_images(
         Ok(found) => found,
         Err(resp) => return resp,
     };
-    let sources = match sources(&state, &principal, &repo).await {
-        Ok(s) => s,
-        Err(e) => return db_error(e),
-    };
     let take = if query.take == 0 {
         DEFAULT_TAKE
     } else {
         query.take.min(MAX_TAKE)
     };
-    let (total, images) = match image_page(&state, &principal, &sources, &query, take).await {
+    let page = if repo.kind() == RepoKind::Group {
+        group_image_page(&state, &principal, &repo, &query, take).await
+    } else {
+        image_page(&state, &principal, &repo, &query, take)
+            .await
+            .map_err(db_error)
+    };
+    let (total, images) = match page {
         Ok(page) => page,
-        Err(e) => return db_error(e),
+        Err(resp) => return resp,
     };
     let items = images
         .into_iter()
@@ -268,51 +270,116 @@ pub async fn list_images(
     .into_response()
 }
 
+/// A page of the images of a hosted or proxy repository the caller may see.
 async fn image_page(
     state: &AppState,
     principal: &Principal,
-    sources: &[Repository],
+    repo: &Repository,
     query: &ImagesQuery,
     take: usize,
 ) -> sqlx::Result<(usize, Vec<oci_dao::ImageSummary>)> {
-    let mut merged = BTreeMap::new();
-    for source in sources {
-        let filter = state.authz.package_filter(principal, source).await;
-        if sources.len() == 1 && matches!(filter, PackageFilter::AllowAll) {
-            let total = oci_dao::count_images(&state.pool, source.id, &query.q).await?;
+    let filter = state.authz.package_filter(principal, repo).await;
+    match filter {
+        PackageFilter::AllowAll => {
+            let total = oci_dao::count_images(&state.pool, repo.id, &query.q).await?;
             let images = oci_dao::list_images(
                 &state.pool,
-                source.id,
+                repo.id,
                 &query.q,
                 i64::try_from(query.skip).unwrap_or(i64::MAX),
                 take as i64,
             )
             .await?;
-            return Ok((total as usize, images));
+            Ok((total as usize, images))
         }
-        if matches!(filter, PackageFilter::DenyAll) {
-            continue;
-        }
-        let mut offset = 0;
-        loop {
-            let images =
-                oci_dao::list_images(&state.pool, source.id, &query.q, offset, IMAGE_BATCH_SIZE)
-                    .await?;
-            let count = images.len() as i64;
-            for image in images {
+        PackageFilter::DenyAll => Ok((0, Vec::new())),
+        filter => {
+            let mut images = Vec::new();
+            for_each_image(state, repo.id, &query.q, |image| {
                 if filter.allows(&image.image) {
-                    merged.entry(image.image.clone()).or_insert(image);
+                    images.push(image);
                 }
-            }
-            if count < IMAGE_BATCH_SIZE {
-                break;
-            }
-            offset += count;
+            })
+            .await?;
+            let total = images.len();
+            Ok((
+                total,
+                images.into_iter().skip(query.skip).take(take).collect(),
+            ))
         }
+    }
+}
+
+/// A page of the images a pull through `group` serves the caller: the
+/// group's content selector applies, and its guard decides per image which
+/// members serve it (the registry's `GroupMembers`). An image is listed
+/// with the counts of the highest priority member serving it.
+async fn group_image_page(
+    state: &AppState,
+    principal: &Principal,
+    group: &Repository,
+    query: &ImagesQuery,
+    take: usize,
+) -> Result<(usize, Vec<oci_dao::ImageSummary>), Response> {
+    let group_filter = state.authz.package_filter(principal, group).await;
+    if matches!(group_filter, PackageFilter::DenyAll) {
+        return Ok((0, Vec::new()));
+    }
+    let members = state
+        .registry()
+        .group_members(principal, group, 0)
+        .await
+        .map_err(failure_response)?;
+    // The images an owner has, whatever the caller may read: with
+    // `prefer_hosted`, only owners serve them.
+    let mut owned: HashSet<String> = HashSet::new();
+    if members.asks_owners() {
+        for owner in members.owner_ids() {
+            for_each_image(state, owner, &query.q, |image| {
+                owned.insert(image.image);
+            })
+            .await
+            .map_err(db_error)?;
+        }
+    }
+    let mut merged: BTreeMap<String, oci_dao::ImageSummary> = BTreeMap::new();
+    for (position, leaf) in members.leaves() {
+        for_each_image(state, leaf.id, &query.q, |image| {
+            if merged.contains_key(&image.image) || !group_filter.allows(&image.image) {
+                return;
+            }
+            let owners_only = members.owners_only(&image.image, owned.contains(&image.image));
+            if members.serves(position, &image.image, owners_only) {
+                merged.insert(image.image.clone(), image);
+            }
+        })
+        .await
+        .map_err(db_error)?;
     }
     let total = merged.len();
     let images = merged.into_values().skip(query.skip).take(take).collect();
     Ok((total, images))
+}
+
+/// Call `each` with every image of repository `repository_id` matching
+/// `q`, read [`IMAGE_BATCH_SIZE`] at a time.
+async fn for_each_image(
+    state: &AppState,
+    repository_id: i64,
+    q: &str,
+    mut each: impl FnMut(oci_dao::ImageSummary),
+) -> sqlx::Result<()> {
+    let mut offset = 0;
+    loop {
+        let images =
+            oci_dao::list_images(&state.pool, repository_id, q, offset, IMAGE_BATCH_SIZE).await?;
+        let count = images.len() as i64;
+        images.into_iter().for_each(&mut each);
+        if count < IMAGE_BATCH_SIZE {
+            return Ok(());
+        }
+        offset += count;
+    }
 }
 
 /// `GET /browse/images/{repo}/{*image}`
@@ -329,23 +396,15 @@ pub async fn image_detail(
     if format.validate_id(&image).is_err() {
         return (StatusCode::NOT_FOUND, "image not found").into_response();
     }
-    let sources = match sources(&state, &principal, &repo).await {
+    let sources = match image_sources(&state, &principal, &repo, &image).await {
         Ok(s) => s,
-        Err(e) => return db_error(e),
+        Err(resp) => return resp,
     };
     let group = repo.kind() == RepoKind::Group;
     let mut manifests: Vec<ManifestItem> = Vec::new();
     let mut seen_digests = HashSet::new();
     let mut tags: BTreeMap<String, String> = BTreeMap::new();
     for source in &sources {
-        if !state
-            .authz
-            .package_filter(&principal, source)
-            .await
-            .allows(&image)
-        {
-            continue;
-        }
         let rows = match oci_dao::image_manifests(&state.pool, source.id, &image).await {
             Ok(rows) => rows,
             Err(e) => return db_error(e),
@@ -367,7 +426,9 @@ pub async fn image_detail(
                 manifest_size: row.size,
                 size: row.summary.get("layers_size").and_then(|v| v.as_i64()),
                 platforms: platforms(&row.summary),
-                tags: row.tags,
+                // The tags pulls resolve to it, below: a lower priority
+                // member's tag that a higher one also has is not its.
+                tags: Vec::new(),
                 children: row.children,
                 created_at: row.created_at,
                 last_pulled_at: row.last_pulled_at,
@@ -578,22 +639,14 @@ pub async fn chart_detail(
     if format.validate_id(&image).is_err() || ContentDigest::parse(&query.digest).is_none() {
         return not_found();
     }
-    let sources = match sources(&state, &principal, &repo).await {
+    let sources = match image_sources(&state, &principal, &repo, &image).await {
         Ok(s) => s,
-        Err(e) => return db_error(e),
+        Err(resp) => return resp,
     };
     // The manifest the highest-priority member holds, as a pull by digest
     // resolves it.
     let mut found = None;
     for source in sources {
-        if !state
-            .authz
-            .package_filter(&principal, &source)
-            .await
-            .allows(&image)
-        {
-            continue;
-        }
         match oci_dao::find_manifest(&state.pool, source.id, &image, &query.digest).await {
             Ok(Some(row)) => {
                 found = Some((source, row));
