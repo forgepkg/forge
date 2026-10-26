@@ -1117,23 +1117,33 @@ impl ProxyRepo {
             Ok(true) => self.cached_rows(repo.id, lower_id).await,
             Ok(false) => Ok(Vec::new()),
             Err(e) => {
-                // Upstream unreachable: degrade to what is already cached
-                // locally rather than failing a restore that could be served,
-                // and keep doing so for a while without asking it.
-                let _ = self
-                    .cache
-                    .get_or_try_insert_local(
-                        NS_UPSTREAM_LISTING_FAILED,
-                        &Self::upstream_scope(repo),
-                        UPSTREAM_LISTING_BACKOFF,
-                        || async { Ok::<_, ()>(true) },
-                    )
-                    .await;
+                // Degrade to what is already cached locally rather than
+                // failing a restore that could be served. An outage keeps
+                // doing so for a while without asking the upstream; a
+                // listing that failed for this id alone (an unusable
+                // document) is no reason to stop asking for the others.
+                let e = RepoError::from(e);
+                let outage = matches!(e, RepoError::Upstream(_));
+                if outage {
+                    let _ = self
+                        .cache
+                        .get_or_try_insert_local(
+                            NS_UPSTREAM_LISTING_FAILED,
+                            &Self::upstream_scope(repo),
+                            UPSTREAM_LISTING_BACKOFF,
+                            || async { Ok::<_, ()>(true) },
+                        )
+                        .await;
+                }
                 let rows = self.cached_rows(repo.id, lower_id).await?;
                 if rows.is_empty() {
-                    return Err(e.into());
+                    return Err(e);
                 }
-                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream version listing failed; serving cached versions for a minute");
+                if outage {
+                    tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream version listing failed; serving cached versions for a minute");
+                } else {
+                    tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream version listing failed; serving cached versions");
+                }
                 Ok(rows)
             }
         }
@@ -1225,8 +1235,9 @@ impl ProxyRepo {
                 Ok(false)
             }
             // An unusable listing is an upstream failure (what is cached is
-            // served), never "no versions", which would retire them all.
-            api::UpstreamAnswer::Failed(reason) => Err(RepoError::Storage(reason)),
+            // served), never "no versions", which would retire them all:
+            // the upstream answered, but not usably (502).
+            api::UpstreamAnswer::Failed(reason) => Err(RepoError::BadUpstream(reason)),
             _ => Err(RepoError::Storage(
                 "upstream protocol answered versions with something else".into(),
             )),

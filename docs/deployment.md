@@ -336,7 +336,7 @@ Every install has four built-in roles, which cannot be deleted or renamed:
 | --- | --- | --- |
 | `admin` | Everything: every repository at every level, and administering the instance (repositories, users, roles, authentication, settings). It holds no grant; membership is the administration. | Administrators. |
 | `writer` | `write` on every repository, ones created later included. No `delete`, no administration. | People and CI that publish packages: a NuGet push, an npm publish, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
-| `authenticated` | `write` on every repository. | Legacy: what every user could do before roles existed, kept for upgraded installs. |
+| `authenticated` | `write` on every repository. | Legacy: what every user could do before roles existed. Nobody holds it unless assigned. |
 | `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). Its grants reach signed-in users too, as `read`, under the anonymous mode `all`. | Anonymous access. |
 
 A user who holds neither `admin` nor `writer` is a **reader**: they read what
@@ -709,9 +709,7 @@ issuer keys. Packages and metadata are unaffected. AWS KMS is not supported
 yet.
 
 There is no plaintext mode: every instance needs the same root key, and a
-secret is never written unencrypted. An install upgraded from 1.x that ran
-without `[crypto]` enables it on 1.x first (the 1.x startup encrypts the
-stored secrets); see the 2.0.0 upgrade notes in the changelog.
+secret is never written unencrypted.
 
 Each encrypted secret is bound to its row and to where it is sent: a proxy
 password to the origin (scheme, host and port) of the repository's
@@ -1170,6 +1168,8 @@ Then sign in as a local administrator and fix or disable the broken realm.
 
 ## Upgrades
 
+- 2.0.0 does not upgrade a 1.x install: it is installed fresh, with an empty
+  database, as the 2.0.0 upgrade notes say. Upgrades are from 2.0.0 on.
 - Read the [changelog](../CHANGELOG.md) for each version you skip over. A
   release that needs something other than a rolling restart says so there.
 - Migrations run automatically on the first start of a new version and only
