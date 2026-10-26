@@ -258,6 +258,29 @@ default values. The browse API reads them from the chart's blobs:
 proxy stores a chart's blobs when it is first pulled, so until then it shows
 the versions and commands only. A README or `values.yaml` over 512 KiB is cut.
 
+### Deleting from the web UI
+
+In a hosted repository, an administrator deletes from the image page: the
+whole image (*Delete image…*), a tag, a manifest, or a chart's version (its
+manifest). The admin API does the same with a session or an admin-scoped
+token:
+
+```bash
+# A tag: its manifest stays, pullable by digest.
+curl -u admin@example.com:<admin-token> -X DELETE \
+  'https://forge.example.com/admin/repositories/docker-hosted/images?image=team/app&reference=1.0'
+# {"manifests": 0, "tags": 1}
+# A manifest, with its tags: reference=sha256:<hex>. The whole image: no reference.
+```
+
+A manifest goes with its tags and with what only it kept: the manifests an
+index lists and the referrers (signatures, SBOMs, attestations) of it, unless
+a tag or another manifest of the image still needs them, as image retention
+decides. A manifest an index lists is deleted when asked for, even though
+pulling that platform through the index then fails. The answer counts the
+manifests and tags deleted (404 when nothing matched). A hosted repository is
+deleted only once it holds no image, so emptying one is deleting its images.
+
 The catalog API (`/v2/_catalog`) is not supported.
 
 ## Retention and garbage collection

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -26,6 +26,11 @@ import { searchOptions } from '~/lib/search'
 const readerMe: Me = {
   user: { id: 2, username: 'alice', is_admin: false, active: true },
   is_admin: false,
+  capabilities: ['repo.read'],
+}
+const adminMe: Me = {
+  user: { id: 1, username: 'admin', is_admin: true, active: true },
+  is_admin: true,
   capabilities: ['repo.read'],
 }
 
@@ -115,18 +120,30 @@ const hostedDetail: ImageDetail = {
 const fetchMock = vi.fn()
 
 /**
- * Route the mock: `/admin/me` -> identity, `/browse/images/{repo}/{image…}`,
- * and `/browse/chart` -> `chart` (404 without one).
+ * Route the mock: `/admin/me` -> identity (`me`, a reader by default),
+ * `/browse/images/{repo}/{image…}`, `/browse/chart` -> `chart` (404 without
+ * one), and a `DELETE /admin/repositories/{repo}/images` -> `deleteImage`.
  */
 function mockApi(
   detail: (repo: string, image: string) => Response,
   chart?: (query: URLSearchParams) => Response,
+  {
+    me = readerMe,
+    deleteImage,
+  }: {
+    me?: Me
+    deleteImage?: (repo: string, query: URLSearchParams) => Response | Promise<Response>
+  } = {},
 ) {
-  fetchMock.mockImplementation((input: RequestInfo | URL) => {
+  fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
     const raw = typeof input === 'string' ? input : input.toString()
     const url = new URL(raw, 'http://localhost')
     if (url.pathname.endsWith('/admin/me')) {
-      return Promise.resolve(jsonResponse(readerMe))
+      return Promise.resolve(jsonResponse(me))
+    }
+    const del = url.pathname.match(/^\/admin\/repositories\/([^/]+)\/images$/)
+    if (del && init?.method === 'DELETE' && deleteImage) {
+      return Promise.resolve(deleteImage(decodeURIComponent(del[1]), url.searchParams))
     }
     if (url.pathname.endsWith('/browse/chart')) {
       return Promise.resolve(
@@ -580,6 +597,48 @@ describe('ImageDetail', () => {
       expect(screen.queryByRole('region', { name: 'Chart' })).toBeNull()
     })
 
+    it('lets an administrator delete a version: its manifest', async () => {
+      const asked: string[] = []
+      let current = chartDetail
+      mockApi(
+        () => jsonResponse(current),
+        (q) => jsonResponse(stored(q.get('digest') ?? '')),
+        {
+          me: adminMe,
+          deleteImage: (repo, q) => {
+            asked.push(`${repo}|${q.get('image')}|${q.get('reference')}`)
+            current = {
+              ...chartDetail,
+              tags: chartDetail.tags.filter((t) => t.digest !== CHART_OLD),
+              manifests: chartDetail.manifests.filter((m) => m.digest !== CHART_OLD),
+            }
+            return jsonResponse({ manifests: 1, tags: 1 })
+          },
+        },
+      )
+
+      const user = userEvent.setup()
+      await renderDetail('/images/charts/stable/web')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete chart…' }))
+      expect(screen.getByRole('dialog')).toHaveTextContent(
+        'Permanently delete chart stable/web from repository charts: 2 versions and 2 manifests.',
+      )
+      await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }))
+      await user.click(screen.getByRole('button', { name: 'Delete version 1.9.0' }))
+      const dialog = screen.getByRole('dialog')
+      expect(dialog).toHaveTextContent('Delete stable/web 1.9.0?')
+      expect(dialog).toHaveTextContent('This cannot be undone')
+      await user.click(within(dialog).getByRole('button', { name: 'Delete version' }))
+
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: 'Delete version 1.9.0' })).toBeNull(),
+      )
+      expect(asked).toEqual([`charts|stable/web|${CHART_OLD}`])
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(screen.getByRole('button', { name: 'Delete version 1.10.0' })).toBeInTheDocument()
+    })
+
     it('renders an error state when the chart cannot be read', async () => {
       mockApi(
         () => jsonResponse(chartDetail),
@@ -590,6 +649,165 @@ describe('ImageDetail', () => {
 
       const alert = await screen.findByRole('alert')
       expect(within(alert).getByText('Could not load the chart')).toBeInTheDocument()
+    })
+  })
+
+  describe('deleting (administrators)', () => {
+    /** The detail after deleting `digests` (and the tags on them) or `tag`. */
+    function without(digests: string[], tag?: string): ImageDetail {
+      return {
+        ...hostedDetail,
+        tags: hostedDetail.tags.filter((t) => t.tag !== tag && !digests.includes(t.digest)),
+        manifests: hostedDetail.manifests
+          .filter((m) => !digests.includes(m.digest))
+          .map((m) => ({ ...m, tags: m.tags.filter((t) => t !== tag) })),
+      }
+    }
+
+    /** An admin's page whose deletes answer `answer` and leave `after`. */
+    function mockDelete(after: ImageDetail | null, answer = jsonResponse({ manifests: 1, tags: 0 })) {
+      const asked: { repo: string; image: string | null; reference: string | null }[] = []
+      let current: ImageDetail | null = hostedDetail
+      mockApi(
+        () => (current ? jsonResponse(current) : new Response('image not found', { status: 404 })),
+        undefined,
+        {
+          me: adminMe,
+          deleteImage: (repo, q) => {
+            asked.push({ repo, image: q.get('image'), reference: q.get('reference') })
+            if (answer.ok) current = after
+            return answer
+          },
+        },
+      )
+      return asked
+    }
+
+    it('offers no delete to a reader, nor in a proxy or a group', async () => {
+      mockApi(() => jsonResponse(hostedDetail))
+      await renderDetail('/images/docker-hosted/team/app')
+      await screen.findByRole('table', { name: 'Tags' })
+      expect(screen.queryByRole('button', { name: /^Delete/ })).toBeNull()
+      cleanup()
+
+      for (const repo_kind of ['proxy', 'group']) {
+        mockApi(() => jsonResponse({ ...hostedDetail, repo_kind }), undefined, { me: adminMe })
+        await renderDetail('/images/docker-hosted/team/app')
+        await screen.findByRole('table', { name: 'Tags' })
+        expect(screen.queryByRole('button', { name: /^Delete/ })).toBeNull()
+        cleanup()
+      }
+    })
+
+    it('removes a tag after confirming; its manifest stays', async () => {
+      const asked = mockDelete(without([], '1.36'), jsonResponse({ manifests: 0, tags: 1 }))
+      const user = userEvent.setup()
+      await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete tag 1.36' }))
+      const dialog = screen.getByRole('dialog')
+      expect(dialog).toHaveTextContent('Delete tag 1.36?')
+      expect(dialog).toHaveTextContent('can still be pulled by digest')
+      await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+      expect(asked).toEqual([])
+
+      await user.click(screen.getByRole('button', { name: 'Delete tag 1.36' }))
+      await user.click(
+        within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete tag' }),
+      )
+
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: 'Delete tag 1.36' })).toBeNull(),
+      )
+      expect(asked).toEqual([{ repo: 'docker-hosted', image: 'team/app', reference: '1.36' }])
+      expect(screen.queryByRole('dialog')).toBeNull()
+      // The index stays, untagged.
+      const manifests = screen.getByRole('table', { name: 'Manifests' })
+      expect(within(manifests).getAllByRole('button', { name: /^Delete manifest/ })).toHaveLength(4)
+    })
+
+    it('deletes an index with what only it keeps, saying so first', async () => {
+      const asked = mockDelete(without([INDEX, ARM64, SIG]), jsonResponse({ manifests: 3, tags: 1 }))
+      const user = userEvent.setup()
+      await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete manifest 1111111111aa' }))
+      const dialog = screen.getByRole('dialog')
+      expect(dialog).toHaveTextContent('Delete manifest 1111111111aa?')
+      expect(dialog).toHaveTextContent('with its tag 1.36')
+      expect(dialog).toHaveTextContent(
+        'With it go the 2 manifests it lists and the 1 referrer (signatures, SBOMs, attestations) of it, unless a tag or another manifest still needs them.',
+      )
+      expect(within(dialog).queryByRole('alert')).toBeNull()
+      await user.click(within(dialog).getByRole('button', { name: 'Delete manifest' }))
+
+      await waitFor(() =>
+        expect(screen.queryByRole('button', { name: 'Delete manifest 1111111111aa' })).toBeNull(),
+      )
+      expect(asked).toEqual([{ repo: 'docker-hosted', image: 'team/app', reference: INDEX }])
+      expect(screen.getByRole('button', { name: 'Delete manifest 2222222222bb' })).toBeInTheDocument()
+    })
+
+    it('warns that an index lists the manifest, and shows a refusal', async () => {
+      const asked = mockDelete(null, new Response('internal error', { status: 500 }))
+      const user = userEvent.setup()
+      await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete manifest 3333333333cc' }))
+      const dialog = screen.getByRole('dialog')
+      expect(within(dialog).getByRole('alert')).toHaveTextContent(
+        'Index 1111111111aa lists this manifest: pulling linux/arm64/v8 through it fails once the manifest is gone.',
+      )
+      await user.click(within(dialog).getByRole('button', { name: 'Delete manifest' }))
+
+      expect(await within(dialog).findByText('Could not delete')).toBeInTheDocument()
+      expect(dialog).toHaveTextContent('internal error')
+      expect(asked).toEqual([{ repo: 'docker-hosted', image: 'team/app', reference: ARM64 }])
+      expect(screen.getByRole('dialog')).toBeInTheDocument()
+    })
+
+    it('deletes the whole image and returns to the repository', async () => {
+      const asked = mockDelete(null, jsonResponse({ manifests: 4, tags: 2 }))
+      const user = userEvent.setup()
+      const router = await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete image…' }))
+      const dialog = screen.getByRole('dialog')
+      expect(dialog).toHaveTextContent('Delete team/app?')
+      expect(dialog).toHaveTextContent('2 tags and 4 manifests')
+      await user.click(within(dialog).getByRole('button', { name: 'Delete image' }))
+
+      await waitFor(() => expect(router.state.location.pathname).toBe('/repos/docker-hosted'))
+      expect(asked).toEqual([{ repo: 'docker-hosted', image: 'team/app', reference: null }])
+    })
+
+    it('returns to the repository when the last manifest is gone', async () => {
+      const only: ImageDetail = {
+        ...hostedDetail,
+        tags: [hostedDetail.tags[1]],
+        manifests: [hostedDetail.manifests[1]],
+      }
+      let gone = false
+      mockApi(
+        () => (gone ? new Response('image not found', { status: 404 }) : jsonResponse(only)),
+        undefined,
+        {
+          me: adminMe,
+          deleteImage: () => {
+            gone = true
+            return jsonResponse({ manifests: 1, tags: 1 })
+          },
+        },
+      )
+      const user = userEvent.setup()
+      const router = await renderDetail('/images/docker-hosted/team/app')
+
+      await user.click(await screen.findByRole('button', { name: 'Delete manifest 2222222222bb' }))
+      await user.click(
+        within(screen.getByRole('dialog')).getByRole('button', { name: 'Delete manifest' }),
+      )
+
+      await waitFor(() => expect(router.state.location.pathname).toBe('/repos/docker-hosted'))
     })
   })
 })

@@ -8,6 +8,7 @@ import {
   type ManifestKind,
 } from '~/lib/oci'
 import {
+  Button,
   Chip,
   CopyButton,
   StatusBadge,
@@ -27,6 +28,10 @@ import {
  * refer to another manifest). Digests are shown Docker-style (12 hex chars)
  * with the full digest in a tooltip and a copy button. Sizes are the
  * compressed layer sizes the server reports ("—" when unknown).
+ *
+ * With `onDelete` (administrators, hosted repositories), each row ends in a
+ * Delete button that asks the page to confirm the delete of its tag or
+ * manifest.
  */
 
 /** A short digest with its full value as tooltip, plus a copy button. */
@@ -55,7 +60,37 @@ function Chips({ values }: { values: string[] }) {
   )
 }
 
-export function TagTable({ tags }: { tags: ImageTag[] }) {
+/** A row's Delete button. */
+function DeleteCell({
+  label,
+  disabled,
+  onClick,
+}: {
+  label: string
+  disabled?: boolean
+  onClick: () => void
+}) {
+  return (
+    <TableCell align="right">
+      <Button size="sm" variant="danger" aria-label={label} disabled={disabled} onClick={onClick}>
+        Delete
+      </Button>
+    </TableCell>
+  )
+}
+
+export function TagTable({
+  tags,
+  noun = 'tag',
+  onDelete,
+  deletePending,
+}: {
+  tags: ImageTag[]
+  /** What a tag is to the reader: a `tag`, or a chart's `version`. */
+  noun?: string
+  onDelete?: (tag: ImageTag) => void
+  deletePending?: boolean
+}) {
   return (
     <Table caption="Tags">
       <TableHead>
@@ -65,6 +100,7 @@ export function TagTable({ tags }: { tags: ImageTag[] }) {
           Size
         </TableHeader>
         <TableHeader>Platforms</TableHeader>
+        {onDelete && <TableHeader align="right">Actions</TableHeader>}
       </TableHead>
       <TableBody>
         {tags.map((t) => (
@@ -81,6 +117,13 @@ export function TagTable({ tags }: { tags: ImageTag[] }) {
             <TableCell>
               <Chips values={t.platforms} />
             </TableCell>
+            {onDelete && (
+              <DeleteCell
+                label={`Delete ${noun} ${t.tag}`}
+                disabled={deletePending}
+                onClick={() => onDelete(t)}
+              />
+            )}
           </TableRow>
         ))}
       </TableBody>
@@ -97,10 +140,14 @@ const KIND_ICONS: Record<ManifestKind, IconName> = {
 export function ManifestTable({
   manifests,
   showSource,
+  onDelete,
+  deletePending,
 }: {
   manifests: ImageManifest[]
   /** Group repositories: show which member each manifest comes from. */
   showSource: boolean
+  onDelete?: (manifest: ImageManifest) => void
+  deletePending?: boolean
 }) {
   // Referrers name their subject by digest; show the subject's tags too.
   const tagsByDigest = new Map(manifests.map((m) => [m.digest, m.tags]))
@@ -116,6 +163,7 @@ export function ManifestTable({
         <TableHeader>Pushed</TableHeader>
         <TableHeader>Last pulled</TableHeader>
         {showSource && <TableHeader>Source</TableHeader>}
+        {onDelete && <TableHeader align="right">Actions</TableHeader>}
       </TableHead>
       <TableBody>
         {manifests.map((m) => (
@@ -145,6 +193,13 @@ export function ManifestTable({
               <TableCell>
                 <span className="fg-mono">{m.source ?? '—'}</span>
               </TableCell>
+            )}
+            {onDelete && (
+              <DeleteCell
+                label={`Delete manifest ${shortDigest(m.digest)}`}
+                disabled={deletePending}
+                onClick={() => onDelete(m)}
+              />
             )}
           </TableRow>
         ))}

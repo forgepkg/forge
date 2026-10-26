@@ -237,3 +237,28 @@ export function fetchChart(
     signal,
   })
 }
+
+/** What an image delete removed (`admin::images::Deleted`). */
+export interface ImageDeleted {
+  manifests: number
+  tags: number
+}
+
+/**
+ * `DELETE /admin/repositories/<repo>/images?image=<image>&reference=<…>`
+ * (administrators, hosted repositories): with `reference` a tag, the tag
+ * alone (its manifest stays, pullable by digest); a digest, the manifest with
+ * its tags, the platform manifests it lists and its referrers (signatures,
+ * SBOMs) unless a tag or another manifest still needs them; none, the whole
+ * image.
+ */
+export function deleteImage(
+  repo: string,
+  image: string,
+  reference?: string,
+): Promise<ImageDeleted> {
+  return httpClient.delete<ImageDeleted>(
+    `/admin/repositories/${encodeURIComponent(repo)}/images`,
+    { query: { image, reference } },
+  )
+}

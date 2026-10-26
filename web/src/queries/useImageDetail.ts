@@ -1,7 +1,13 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type { ApiError } from '~/lib/httpClient'
-import { fetchImageDetail, imageKeys, type ImageDetail } from '~/api/images'
+import {
+  deleteImage,
+  fetchImageDetail,
+  imageKeys,
+  type ImageDeleted,
+  type ImageDetail,
+} from '~/api/images'
 
 /**
  * Image detail (`GET /browse/images/{repo}/{image…}`): the image's tags and
@@ -14,5 +20,19 @@ export function useImageDetail(repo: string, image: string) {
     queryKey: imageKeys.detail(repo, image),
     queryFn: ({ signal }) => fetchImageDetail(repo, image, signal),
     enabled: image !== '',
+  })
+}
+
+/**
+ * Delete a tag or a manifest (the reference) of a hosted repository's image,
+ * or (no reference) the whole image; refreshes every image query after.
+ */
+export function useDeleteImage(repo: string, image: string) {
+  const queryClient = useQueryClient()
+  return useMutation<ImageDeleted, ApiError, string | undefined>({
+    mutationFn: (reference) => deleteImage(repo, image, reference),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: imageKeys.all() })
+    },
   })
 }

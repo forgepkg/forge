@@ -1449,7 +1449,7 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
         Ok(RepoDelete::NotFound) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Ok(RepoDelete::HasPackages) if state.formats.stores_images(&existing.format) => (
             StatusCode::CONFLICT,
-            "repository still has images; delete their manifests first",
+            "repository still has images; delete them first (DELETE /admin/repositories/<name>/images?image=<image>)",
         )
             .into_response(),
         Ok(RepoDelete::HasPackages) if state.formats.stores_files(&existing.format) => (
@@ -1586,7 +1586,7 @@ pub async fn hard_delete_package(
     if state.formats.stores_images(&repo.format) {
         return (
             StatusCode::BAD_REQUEST,
-            "delete image manifests and tags through the registry API (DELETE /v2/<name>/manifests/<reference>)",
+            "delete images, manifests and tags through DELETE /admin/repositories/<name>/images?image=<image>&reference=<tag|digest>",
         )
             .into_response();
     }
