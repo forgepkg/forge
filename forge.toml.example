@@ -182,6 +182,8 @@ connect_timeout_seconds  = 15          # (default: 15)
 read_timeout_seconds     = 60          # (default: 60) max silence between two reads
 metadata_timeout_seconds = 60          # (default: 60) total, per metadata request
 download_timeout_seconds = 1800        # (default: 1800) total, per .nupkg or layer download
+# The largest metadata document. One upstream operation (a version listing,
+# dating the package delay) keeps at most 4 x this of the documents it reads.
 max_metadata_bytes       = 33554432    # (default: 32 MiB)
 max_package_bytes        = 1073741824  # (default: 1 GiB)
 # Metadata bodies up to this size stay in memory; larger ones spill to a
