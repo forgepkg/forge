@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to envisia-forge are documented here. The format follows
+All notable changes to Forge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/): breaking changes come only in a
 major release, and each one is called out under **Upgrade notes**.
@@ -12,11 +12,28 @@ until the release folds them in.
 
 ## [Unreleased]
 
+A new major release, installed fresh: 2.0.0 does not upgrade 1.0 or 1.1.
+Install it on an empty PostgreSQL database and an object store of its own;
+[docs/deployment.md](https://github.com/forgepkg/forge/blob/main/docs/deployment.md)
+lists the required settings. It adds npm and raw (generic file)
+repositories, serves every package repository at `/repository/<name>/`,
+keeps Helm charts as OCI artifacts in docker repositories, invites users by
+email, and manages roles, access levels and retention in the web UI. Every
+format is built in: Docker / OCI, NuGet, npm and raw. Forge is licensed
+under the MIT License (up to 1.1.0: the GNU AGPL v3 or a commercial
+license), and is published as `ghcr.io/forgepkg/forge` for `linux/amd64`
+and `linux/arm64`, with the Helm chart `oci://ghcr.io/forgepkg/charts/forge`.
+
 ### Upgrade notes
 
-- Migration 0036 adds the `nexus_import` and `nexus_import_item` tables for
-  imports from Nexus; it changes no existing data.
-  ([#183](https://github.com/schmitch/forge/issues/183))
+- **2.0.0 does not upgrade 1.0 or 1.1.** There is no upgrade path: 2.0.0 is
+  installed fresh, with an empty PostgreSQL database and an object-store
+  bucket (or prefix) of its own. Startup refuses a database created by 1.x or
+  by a build before 2.0.0 ("the database was created by Forge 1.x or by a
+  build before 2.0.0, and 2.0.0 does not upgrade it"). Upgrades are from 2.0.0
+  on.
+  ([#490](https://github.com/forgepkg/forge/issues/490),
+  [#498](https://github.com/forgepkg/forge/issues/498))
 
 ### Features
 
@@ -39,18 +56,18 @@ until the release folds them in.
   through the database (sealed with `[crypto]`), and rotated every 30 days,
   each new key published two days before it signs. The realm shows the
   issuer, subject (`<client id>@<realm issuer>`) and audience to register.
-  See [DEVELOPMENT.md](https://github.com/schmitch/forge/blob/main/DEVELOPMENT.md#without-a-client-secret-a-federated-credential).
-  ([#302](https://github.com/schmitch/forge/pull/302))
+  See [DEVELOPMENT.md](https://github.com/forgepkg/forge/blob/main/DEVELOPMENT.md#without-a-client-secret-a-federated-credential).
+  ([#302](https://github.com/forgepkg/forge/pull/302))
 - Helm: `extraObjects` can also be a map, whose keys only name its entries.
   Helm merges a map across values files, so each file can add its own
   objects, and a later one replaces an entry by its key or drops it with
   `null`; a list in a later file replaces the whole list. Lists keep
   working.
-  ([#288](https://github.com/schmitch/forge/pull/288))
+  ([#288](https://github.com/forgepkg/forge/pull/288))
 - **Import from Nexus**: copy a Nexus 3 hosted repository into a Forge hosted
   repository of the same format, one repository at a time: NuGet packages,
-  Helm charts, and Docker images with their digests, multi-platform
-  indexes, signatures and SBOMs. In the web UI (a hosted repository's
+  and Docker images with their digests, multi-platform indexes, signatures
+  and SBOMs. In the web UI (a hosted repository's
   **Import from Nexus**) or the admin API
   (`/admin/repositories/{name}/imports`). The source is checked before an
   import starts; a dry run reports the counts, the size and the conflicts
@@ -63,68 +80,329 @@ until the release folds them in.
   copies only what is new. The Nexus password is sealed with the secret
   encryption and deleted when the import completes. See
   [docs/nexus-import.md](docs/nexus-import.md).
-  ([#183](https://github.com/schmitch/forge/issues/183))
+  ([#183](https://github.com/forgepkg/forge/issues/183))
+- npm registries: repositories of `"format": "npm"`, served at
+  `/repository/<repository>/` for npm, pnpm, Yarn and Bun. Hosted ones take
+  `npm publish` (the tarball checked against the integrity the client claims
+  and the version it names, under the repository's deployment policy),
+  dist-tags and `npm deprecate` with the level `write`, and `npm unpublish`
+  with `delete`. Proxies cache `registry.npmjs.org` or any registry, with
+  Basic credentials or a token sent as `Authorization: Bearer` to its own
+  origin only, and serve the upstream's dist-tags, deprecations and publish
+  times, verified tarballs and the publication delay. Groups merge their
+  members, take publishes into a writable member, keep reserved scopes
+  (`@acme`) away from proxy members and pass `npm audit` on to their proxy
+  without the reserved names. `npm login` is approved in the browser on a
+  page of the web UI, or checks a password (`yarn npm login`), and mints an
+  API token that `npm logout` revokes; npm clients send API tokens as
+  `Authorization: Bearer`, which every format plugin's repositories now
+  accept. Retention never deletes a version a dist-tag names. The web UI
+  shows a package's dist-tags, deprecated versions and README, and a
+  repository's `.npmrc` and `.yarnrc.yml` lines and install commands. npm is
+  a built-in format plugin (`crates/formats/npm`). See
+  [docs/npm.md](docs/npm.md).
+  ([#41](https://github.com/forgepkg/forge/issues/41))
+- Hosted NuGet repositories have a deployment policy, like raw and npm ones:
+  allow redeploys, refuse them (the default), or read-only, which refuses
+  every push, unlist and delete. `allow_redeploy` says the same and follows
+  it. A NuGet group may have a writable member, a hosted member that pushes,
+  unlists and deletes through the group go to. The web UI's repository form
+  offers both.
+  ([#41](https://github.com/forgepkg/forge/issues/41))
+- Raw (generic file) repositories, like Nexus' raw-hosted, raw-proxy and
+  raw-group: `"format": "raw"` repositories serve arbitrary files under
+  arbitrary paths at `/repository/<repository>/<path>`. Uploads are a `PUT` with an
+  API token or a multipart form (Nexus' `raw.directory` / `raw.assetN` fields
+  work); downloads answer one `Range`, conditional requests, an `ETag` (the
+  SHA-256) and `Last-Modified`, and `<file>.sha256`, `.sha512`, `.sha1` and
+  `.md5` from the stored digests, so `sha256sum -c` checks a download.
+  Directories list as HTML or JSON, a page at a time. A hosted repository's
+  deployment policy allows redeploys, refuses them (the default) or makes it
+  read-only; files download unless the repository displays them `inline`, and
+  are sandboxed either way. Paths with `..`, `.`, empty segments, backslashes
+  or encoded slashes are refused. A proxy fetches from any HTTP(S) base URL,
+  following redirects (GitHub release assets) with its credentials sent to
+  its own origin only, re-validates cached files after `max_age_seconds` (`0`:
+  never), remembers misses, and serves its cached copy while the upstream is
+  down; a group serves a path from its first member that has it. Content
+  selectors match paths, retention deletes files by path prefix, age and
+  downloads or keeps the newest per directory, and the web UI browses a
+  repository's tree, uploads and deletes files and shows each file's URL and
+  `curl` commands. See [docs/raw.md](docs/raw.md).
+  ([#42](https://github.com/forgepkg/forge/issues/42))
+- Helm charts pushed to a docker repository (`helm push`) have a page of their
+  own in the web UI: the chart's versions, the `helm install` and `helm pull`
+  commands of the selected one (the newest release by default) with the
+  `helm registry login` to run first, its `Chart.yaml` facts (appVersion,
+  description, home, sources, maintainers, dependencies), its README and its
+  default values. The browse API serves them at
+  `GET /browse/chart?repo=<name>&image=<image>&digest=<manifest digest>`; a
+  proxy shows them once the chart has been pulled through it. See
+  [docs/docker.md](docs/docker.md#helm-charts).
+  ([#43](https://github.com/forgepkg/forge/issues/43))
+- A proxy's retention rules (`scope: proxy_cached`) can keep a working set of
+  each package: `keep_last_n` keeps the newest N cached versions the upstream
+  lists, and `keep_n_most_downloaded` the N cached versions pulled most
+  recently (by when they were last pulled, not how often). A version any proxy
+  rule keeps is never evicted, however long nobody pulls it, so a quiet package
+  no longer loses every cached version and stays restorable while the upstream
+  is unreachable. The Retention screen offers both on proxy rules, and a new
+  proxy policy starts by keeping the newest three versions of each package.
+  ([#59](https://github.com/forgepkg/forge/issues/59))
+- Forge runs on arm64: each release publishes `ghcr.io/forgepkg/forge` for
+  `linux/amd64` and `linux/arm64` as one multi-platform image under the same
+  tags, so arm64 nodes (AWS Graviton, Azure Cobalt, Ampere, Raspberry Pi) and
+  Apple Silicon machines pull an image of their own platform, without
+  emulation. Each platform's image carries its own SBOM and provenance
+  attestations. The release signs the multi-platform index and each platform's
+  image, so the release notes' `cosign verify` command passes for each of their
+  digests, and the Helm chart pins the index digest. `cargo xtask docker-build
+  --platform linux/arm64` builds the arm64 image from a checkout.
+  ([#186](https://github.com/forgepkg/forge/issues/186))
+- **Admin → Settings** (`/manage/settings`) sets who may read without signing
+  in (the anonymous mode and its IP allowlist, next to the repositories that
+  allow anonymous reads) and how people sign in (the login screen, password
+  Basic on the feeds, the session lifetimes and the lockout), for every
+  instance and without a restart: the instance that takes a change applies it
+  at once, the others within `auth.realm_cache_ttl_seconds`. The admin API
+  offers the same as `GET`/`PUT /admin/settings/auth`; a `PUT` changes the
+  fields it names and refuses a wrong value with 400 and what is wrong. A
+  repository's page shows the server-wide anonymous mode next to its own
+  anonymous access.
+  ([#294](https://github.com/forgepkg/forge/issues/294))
+- Hosted repositories can grant package-scoped write and delete access to
+  workload identities through trusted publishers, independently of their realm
+  reader role. Manage trusted publishers through the admin API or the repository
+  admin page; publisher changes revoke their rights from outstanding workload
+  keys and registry tokens without revoking the realm's other keys.
+  ([#306](https://github.com/forgepkg/forge/issues/306))
+- A built-in `writer` role: `read` and `write` on every repository, no
+  `delete` and no `admin`. A writer publishes NuGet packages, container images,
+  Helm charts and raw files (new ones too) to every repository but cannot
+  unlist or delete versions, delete tags, delete or replace raw files, or reach
+  the admin API; `/admin/me` reports the
+  `repo.write` capability. **Admin → Users** shows each user's access level
+  (admin, writer or reader) from their roles, and the user's page switches it.
+  `docs/deployment.md` describes the built-in roles.
+  ([#318](https://github.com/forgepkg/forge/issues/318))
+- Forge can send email: **Admin → Email** (`/manage/settings/email`) sets up
+  the email service, starting with an SMTP server (STARTTLS or implicit TLS,
+  with a username and password or as a relay), with a test send and the last
+  failed send on the page. The settings live in the database only, with no
+  `forge.toml` section or environment variable, apply on every instance
+  without a restart, and the password is sealed at rest with secret
+  encryption and never returned. The admin API is `/admin/settings/email`
+  (`GET`, `PUT`, `DELETE`) and `POST /admin/settings/email/test`.
+  ([#319](https://github.com/forgepkg/forge/issues/319))
+- The email service can send through Microsoft 365: a **Microsoft 365 (Graph)**
+  transport on **Admin → Email** signs in as an Entra app registration with
+  the client credentials grant and sends with Graph's `sendMail`, so no mailbox
+  password is stored and SMTP AUTH can stay off. The app authenticates with a
+  client secret (sealed at rest, bound to the tenant and app) or with a
+  federated credential: Forge signs the client assertion with the issuer keys
+  federated OIDC realms use, and the page shows the issuer, subject and
+  audience to register. `docs/deployment.md` walks through the setup, including
+  limiting the app to the sender mailbox with RBAC for Applications.
+  ([#320](https://github.com/forgepkg/forge/issues/320))
+- The email service can send through an SMTP server that takes OAuth tokens
+  (SASL `OAUTHBEARER`, or `XOAUTH2`), such as Stalwart: the **SMTP server with
+  OAuth** transport on **Admin → Email** stores no mailbox password. Forge
+  registers itself with the mail server's authorization server (RFC 7591,
+  authenticated by an initial access token or an account, which are never
+  stored) or uses a client entered by hand, and the mailbox authorizes it once,
+  in the browser (the code flow with PKCE) or with a code on another device (RFC
+  8628); the client credentials grant works too. Forge refreshes its access
+  token, stores a rotated refresh token sealed at rest, and asks for a new
+  authorization on the page when a refresh is refused. `docs/deployment.md`
+  walks through the setup with Stalwart.
+  ([#321](https://github.com/forgepkg/forge/issues/321))
+- Users are invited instead of given a password: **Admin → Users → New user**
+  creates the account with its email address and access level (reader, writer
+  or admin), and Forge emails its user a single-use link,
+  `/invite#<token>`, with which they choose their own password before signing
+  in. The user's page resends the invitation, copies a new link (shown once,
+  for an install without email) or revokes it, and the users list shows who is
+  still invited. Only the token's hash is stored; the link expires after the
+  lifetime set on the email settings page (72 hours by default), and
+  deactivating or deleting the account revokes it. Until the password is
+  chosen the account signs in by no path, and no credential-forwarding or OIDC
+  realm can take its name.
+  ([#322](https://github.com/forgepkg/forge/issues/322))
+- The web UI manages RBAC without the `/admin` API: roles with their grants
+  and members (deleting a role first names the users and grants it takes
+  along), content selectors (with a box that tests a package name against the
+  patterns, and a delete that first names the grants it removes), each user's
+  roles and effective access, and token scopes, which a token gets when it is
+  created and an administrator can change later. The user list shows each
+  user's roles instead of `admin` or `reader`, a repository's page shows the
+  anonymous role's grants on it next to its anonymous-read flag, and a
+  workload-identity rule picks its role from a list. For these screens,
+  `GET /admin/roles` counts each role's grants and users,
+  `GET /admin/roles/{id}/users` lists its members,
+  `GET /admin/content-selectors/{id}/grants` lists the grants a selector
+  scopes, `POST /admin/content-selectors/match` tests a package name, a user
+  lists its `roles`, and `GET /browse/repos` gives each repository's `id`.
+  ([#369](https://github.com/forgepkg/forge/issues/369))
+- Tokens created in the web UI now expire after 90 days by default, with 30-day,
+  one-year, custom-date and no-expiry choices. Expiry is shown when the secret is
+  created and in token lists; the API rejects an expiry that is not in the future.
+  ([#371](https://github.com/forgepkg/forge/issues/371))
+- A user's page (**Admin → Users → <user>**) deactivates, reactivates and signs
+  the user out everywhere, each after a confirmation that says what happens,
+  without the `/admin` API. Deactivating refuses every sign-in, ends the
+  user's sessions and revokes a pending invitation; their tokens are refused
+  but not revoked, so reactivating lets them work again, and the confirmation
+  counts them. Deactivating the last active administrator is refused with the
+  server's reason. Signing out everywhere ends the user's browser sessions;
+  for a credential-forwarding account it also checks the password against the
+  upstream again and revokes the tokens minted from a forwarded sign-in. The
+  delete confirmation suggests deactivating an account that should be kept.
+  ([#372](https://github.com/forgepkg/forge/issues/372))
+- Each hosted or proxy repository has a Retention screen (**Repositories →
+  <name> → Retention**): it edits the repository's policy rule by rule (package,
+  proxy eviction, raw file or image rules, by the repository's format), previews
+  what the policy in the form would remove before it is saved, asks before
+  saving a policy whose runs delete and before removing one, starts a run, shows
+  the last run, and lists the audit log, filtered to one run and paged back.
+  `POST /admin/repositories/{name}/retention/preview` takes a draft `policy` to
+  evaluate in place of the stored one: it is checked like a `PUT` of it,
+  evaluated even when disabled, and never stored. Until now retention was
+  managed through the admin API only.
+  ([#373](https://github.com/forgepkg/forge/issues/373))
+- Administrators can permanently delete a hosted package version from its package page after confirming the repository, package and version.
+  ([#374](https://github.com/forgepkg/forge/issues/374))
+- The web UI has a design of its own: Forge's design system replaces the
+  Catalyst kit on every screen. A navigation rail takes the place of the top
+  bar, with the places, the administration screens and the repositories you
+  can read, each with its kind and format; on phones it opens as a drawer.
+  Screens open with a header of breadcrumbs, title, badges and actions, lists
+  are tables, and detail screens show their connect and install commands next
+  to the content. The interface uses IBM Plex Sans and JetBrains Mono, served
+  by Forge itself, and offers three themes (Light, Light with dark rail and
+  Dark; System follows the operating system). Deleting files and revoking
+  tokens ask for confirmation in a dialog.
+  ([#397](https://github.com/forgepkg/forge/issues/397))
+- Administration has a System screen: it lists the keys of the secret
+  encryption at rest, rotates the data key or the key-encryption key and re-wraps the
+  keys under the current root key after asking first, and shows the local blob
+  cache of the instance that answered: its hit ratio, what it served, its size
+  against the limit, its evictions and whether S3 is reachable. Until now these
+  were `GET /admin/crypto/keys`, `POST /admin/crypto/rotate/{dek,kek,root}` and
+  `GET /admin/blob-cache` only.
+  ([#404](https://github.com/forgepkg/forge/issues/404))
+- Grants and token scopes give ordered access levels, `read` < `write` <
+  `delete`, each including the ones below it: one grant gives full access to a
+  repository, a role can no longer push to a repository it cannot pull from,
+  and a content selector on a `write` grant filters what its holder reads as
+  well as what it publishes. A role holds one grant per repository and
+  selector. The role page and the token dialogs pick one level, labelled with
+  the Nexus actions it covers (`read`: browse, read; `write`: add, edit;
+  `delete`: delete), and a token's admin opt-in is a checkbox of its own.
+  `docs/deployment.md` describes the levels.
+  ([#411](https://github.com/forgepkg/forge/issues/411))
+- Retention policies can set a per-repository logical size budget. When a
+  repository exceeds its maximum, retention evicts least-recently used eligible
+  content toward a configurable target, while preserving rule protections. The
+  Retention screen shows the current repository size and budget status.
+  ([#417](https://github.com/forgepkg/forge/issues/417))
+- **Admin → Retention** switches retention runs off and on for every repository
+  and instance, and sets how long the retention audit log is kept. While runs
+  are off no run starts, a run in progress stops before its next batch, Run now
+  answers 409, and each repository's Retention screen says so; policies can still
+  be edited and previewed. A failed run is retried after its policy's interval
+  rather than the old global default.
+  ([#429](https://github.com/forgepkg/forge/issues/429))
+- Raw file repositories are a format plugin, `crates/formats/raw`, like
+  NuGet: the plugin speaks the raw protocol (paths, checksum sidecars,
+  listings, Nexus' form fields, a proxy's upstream URLs) and the server's new
+  file store keeps the files. The plugin contract gains a second storage
+  model for this: a format whose descriptor says `Storage::Files` asks the
+  host for files and directories, stores and deletes files, and serves a file
+  with `Action::ServeFile`; `render` may now answer with any action `handle`
+  can. `GET /admin/formats`
+  and the repositories API report what a repository holds (`storage`:
+  `packages`, `files` or `images`). See
+  [docs/format-plugins.md](docs/format-plugins.md#files-formats).
+  ([#431](https://github.com/forgepkg/forge/issues/431))
+- Docker / OCI is a format plugin, `crates/formats/docker`, like NuGet and
+  raw: the plugin speaks the distribution-spec protocol (paths, names,
+  manifests, error answers, Helm charts, an upstream registry's URLs), and the
+  server's image store keeps the images, the registry tokens and the
+  authorization. `/v2` answers as before. The plugin contract gains a third
+  storage model for this, images: a plugin whose descriptor says
+  `Storage::Images` asks the host for manifests, blobs, tags and referrers,
+  runs upload sessions and stores manifests through it, and serves a blob or
+  a manifest with `serve-blob` and `serve-manifest`; a proxy's plugin names
+  the upstream's URLs and the host fetches them, exchanging the upstream's
+  Bearer tokens. `GET /admin/formats` lists Docker from its descriptor, with
+  its version and description. See
+  [docs/format-plugins.md](docs/format-plugins.md#images-formats).
+  ([#447](https://github.com/forgepkg/forge/issues/447))
+- npm can publish from GitHub Actions and GitLab CI, including self-hosted
+  GitLab, without a stored token through its native OIDC token exchange.
+  Exchanged keys use the workload realm's lifetime, claim rules and repository
+  permissions, including a group's writable member.
+  ([#467](https://github.com/forgepkg/forge/issues/467))
 
 ### Fixed
 
 - A database failure while checking a browser session or its CSRF token
   answered 500; it answers 503 with `Retry-After`, like the token and
   password checks, which now send `Retry-After` too.
-  ([#205](https://github.com/schmitch/forge/issues/205))
+  ([#205](https://github.com/forgepkg/forge/issues/205))
 - Trusted publishing: a workload token answered 401 "invalid credentials"
   while its issuer's discovery document or keys could not be fetched and
   were not cached yet (after a restart, on a new replica, at the hourly key
   refresh), so CI jobs failed instead of retrying. It answers 503 with
   `Retry-After`, at the token exchange too.
-  ([#202](https://github.com/schmitch/forge/issues/202))
+  ([#202](https://github.com/forgepkg/forge/issues/202))
 - Trusted publishing: after a realm edit, the other instances refused the
   workload keys the editing instance issued under the new configuration
   for up to `auth.realm_cache_ttl_seconds`, and could refuse an exchange
   with 401 "realm changed during the exchange". An instance now reloads
   the realms when a key names a configuration it does not have yet.
-  ([#203](https://github.com/schmitch/forge/issues/203))
+  ([#203](https://github.com/forgepkg/forge/issues/203))
 - Trusted publishing: an instance whose clock ran behind the database's
   could exchange a CI token a second time just after the record of its
   first exchange was cleaned up. Whether a token has expired is decided on
   the database's clock, and the record is kept 15 minutes past the token's
-  expiry. ([#204](https://github.com/schmitch/forge/issues/204))
+  expiry. ([#204](https://github.com/forgepkg/forge/issues/204))
 - Docker registry: a registry token got with a workload key
   (`docker login -u oidc`) worked again once the key's record was cleaned
   up, and one got with a CI token directly stopped working when a key
   exchanged from that CI token ended. A registry token stands and falls
   with the credential it was got with, and expires no later than it.
-  Registry tokens issued before the upgrade are refused once, and clients
-  ask for a new one. ([#201](https://github.com/schmitch/forge/issues/201))
+  ([#201](https://github.com/forgepkg/forge/issues/201))
 - S3 `default_chain` credentials: an STS or container credentials endpoint
   that could not be reached counted as a refusal, so requests answered 500
   instead of 503, and with the blob cache an instance restarted during the
   outage failed to start instead of starting degraded.
-  ([#208](https://github.com/schmitch/forge/issues/208))
+  ([#208](https://github.com/forgepkg/forge/issues/208))
 - Blob cache: making room deleted the evicted files while every cache hit
   on the instance waited, on the threads that serve requests, and each
   miss read the disk's free space. Evicted files are deleted in the
   background, and the free space is read once a minute.
-  ([#212](https://github.com/schmitch/forge/issues/212))
+  ([#212](https://github.com/forgepkg/forge/issues/212))
 - Blob cache: after a restart, concurrent downloads of a cached blob each
   read and hashed the whole file before serving it; each file is checked
-  once. ([#210](https://github.com/schmitch/forge/issues/210))
+  once. ([#210](https://github.com/forgepkg/forge/issues/210))
 - Blob cache: a blob garbage collection deleted stayed in the other
   instances' caches until it was evicted. Every instance drops such blobs
   at startup and every 10 minutes.
-  ([#211](https://github.com/schmitch/forge/issues/211))
+  ([#211](https://github.com/forgepkg/forge/issues/211))
 - Docker registry: while S3 was unavailable, uncached pulls, pushes and the
   finish of a chunked upload answered 500 instead of 503 with
   `Retry-After`, and an upload whose body the client aborted answered 500
-  instead of 400. ([#209](https://github.com/schmitch/forge/issues/209))
+  instead of 400. ([#209](https://github.com/forgepkg/forge/issues/209))
 - Blob cache: a docker blob pushed in several chunks was cached about twice:
   every chunk was written through to the cache next to the assembled blob,
   and evicted as much content that is downloaded. Only the blob is cached.
-  ([#213](https://github.com/schmitch/forge/issues/213))
+  ([#213](https://github.com/forgepkg/forge/issues/213))
 - Blob cache: with several replicas, `GET /admin/blob-cache` answered with
   the statistics of whichever replica served the request, without saying
   which one. The response names it in `instance` (host name and start
   time), and the deployment guide says the numbers are per instance.
-  ([#214](https://github.com/schmitch/forge/issues/214))
+  ([#214](https://github.com/forgepkg/forge/issues/214))
 - Docker image retention kept deleting what a run had decided after its
   policy was disabled, switched to dry run or changed, after the run lost
   its lease, and when the image changed meanwhile: it deleted a tag pulled
@@ -132,7 +410,7 @@ until the release folds them in.
   image tagged again. Like package retention, a run now stops when its
   policy or lease changes, and applies an image's decisions only after
   evaluating its current state again.
-  ([#215](https://github.com/schmitch/forge/issues/215))
+  ([#215](https://github.com/forgepkg/forge/issues/215))
 - Docker proxies: a tag list was cut short, without a link to the next
   page, when the upstream paged its tags (`Link: rel="next"`, as Quay
   does) or refused a large `n` (then only the cached tags were listed), so
@@ -140,28 +418,170 @@ until the release folds them in.
   proxy follows the upstream's pages, asks again without `n` when one is
   refused, and links to its next page when the upstream has more. A group
   ends its page where a member left tags out.
-  ([#216](https://github.com/schmitch/forge/issues/216))
+  ([#216](https://github.com/forgepkg/forge/issues/216))
 - Docker proxies: a fetch from the previous upstream that was still running
   when the proxy was pointed at another `remote_url` cached its tag,
   manifest or layer after the repoint had emptied the cache, so the
   previous upstream's tag was served for `metadata_ttl_seconds`. Such a
   fetch caches nothing; its client is asked to retry (503).
-  ([#217](https://github.com/schmitch/forge/issues/217))
+  ([#217](https://github.com/forgepkg/forge/issues/217))
 - Docker registry: the sweeper could release a layer a client had just
   confirmed, so the manifest push answered `MANIFEST_BLOB_UNKNOWN`: a pull
   or `HEAD` of a blob recorded its use at most hourly, which with
   `docker.unreferenced_blob_ttl_seconds = 3600` left no time, and pushing
   or mounting a blob the image already had recorded none. Pushes and
   mounts record the use, and pulls record it every tenth of the TTL.
-  ([#218](https://github.com/schmitch/forge/issues/218))
+  ([#218](https://github.com/forgepkg/forge/issues/218))
 - Docker groups named their `writable_member` by name: renaming that
   repository broke group pushes, and a repository created later under the
-  old name silently became the push target. The member is stored by id
-  (migration 0037 converts existing groups; a name no hosted docker
-  repository has any more is dropped), and the admin API and web UI show
-  its current name. Downgrading to 1.1.0 leaves docker groups without a
-  writable member until it is set again.
-  ([#219](https://github.com/schmitch/forge/issues/219))
+  old name silently became the push target. The member is stored by id, and
+  the admin API and web UI show its current name.
+  ([#219](https://github.com/forgepkg/forge/issues/219))
+- Proxies of a format plugin (NuGet, npm): an upstream that refuses the
+  proxy's credentials (401, 403), or serves a package the proxy does not take
+  (too large, unreadable, not the version asked for, not matching the digest
+  the upstream publishes), with nothing cached for the request, answered 500.
+  It answers 502: the upstream or the proxy's settings need fixing, retrying
+  does not help.
+  ([#41](https://github.com/forgepkg/forge/issues/41))
+- Proxies: `server.request_timeout_seconds` (900 s) cut off a first download
+  long before `proxy.download_timeout_seconds` (1800 s), since a proxy stores
+  the whole package or layer before it answers; a large layer from a slow
+  upstream answered 408 and could never be cached. A download from the
+  upstream extends its request's deadline to its own, and the request has
+  `request_timeout_seconds` again after it.
+  ([#220](https://github.com/forgepkg/forge/issues/220))
+- NuGet proxies: a package id the upstream answered 404 for stayed hidden for
+  `metadata_ttl_seconds`, whatever `not_found_ttl_seconds` said (0 included):
+  the "unknown id" listing was cached for the metadata TTL on every instance.
+  With a shorter not-found TTL, a package published upstream meanwhile
+  answered 404 to restores, and with a package delay its downloads failed
+  too. The cached answer now stands only while the id's not-found marker
+  does.
+  ([#222](https://github.com/forgepkg/forge/issues/222))
+- Proxies: a failed upstream version listing was not remembered, so during an
+  upstream outage every listing, registration or package-delay check waited
+  for the upstream to time out (15–60 s) before serving the cached versions;
+  a restore of hundreds of cached packages took many minutes or timed out.
+  For a minute after the upstream was unavailable for a listing (no answer, a
+  timeout, a 5xx or a 429), ids with cached versions are answered from the
+  cache without asking the upstream; ids without still ask it. A listing that
+  failed for one id alone (an unusable document) does not hold back the
+  others.
+  ([#223](https://github.com/forgepkg/forge/issues/223))
+- A search through a group asked each proxy member's upstream for 1,000 hits,
+  even for a page of 20: every search through a group that fronts nuget.org was
+  as slow as a 1,000-hit one, and an answer over `proxy.max_metadata_bytes` sent
+  the proxy's searches to its cache for a minute. The group asks an upstream for
+  the hits its page needs (32 for a page of 20), and for more only while the
+  proxy or the group's guards leave hits out. A group search lists its hosted
+  members' packages first, then the upstreams' in the upstreams' own (relevance)
+  order rather than by id, and its total is an estimate while an upstream has
+  more hits than it returned.
+  ([#224](https://github.com/forgepkg/forge/issues/224))
+- Format plugins: a version several kilobytes long passed validation and
+  failed its database insert, so a push answered 500 instead of 400, and so
+  did a proxy asked for such a version. Every format plugin's ids are now at
+  most 512 bytes and its versions at most 256: a longer one is refused with
+  400 on push, answers 404 in a URL, and is left out of a proxy's upstream
+  version listings.
+  ([#231](https://github.com/forgepkg/forge/issues/231))
+- Helm chart: `strategy.type: Recreate`, which a blob cache on a ReadWriteOnce
+  volume needs, kept the default's `rollingUpdate`, so the API server refused
+  the Deployment and `helm install` / `helm upgrade` failed. The chart leaves
+  `rollingUpdate` out of a Recreate strategy.
+  ([#235](https://github.com/forgepkg/forge/issues/235))
+- Image listings now show accurate totals and allow paging through every image,
+  including in repository groups and with content selectors, instead of stopping
+  at 5,000 images per member. Image search is now case-insensitive.
+  ([#242](https://github.com/forgepkg/forge/issues/242))
+- The repository edit screen loads format metadata, restoring upload-size defaults
+  and client-side staging-ceiling validation, and showing plugin format names and
+  feed paths correctly.
+  ([#243](https://github.com/forgepkg/forge/issues/243))
+- The image page's pull commands started with the first tag by name: for a
+  signed image a cosign `sha256-….sig` signature, otherwise often the oldest
+  version. They start with `latest`, else the most recently pushed image tag,
+  and skip signature, attestation and SBOM tags.
+  ([#245](https://github.com/forgepkg/forge/issues/245))
+- **Admin → Authentication**: one click on a workload-identity realm's
+  *Enabled* switch disabled it at once, which revokes every API key its token
+  exchange issued, for good. Disabling one now asks first, and so does saving
+  an enabled one on its edit page, which revokes the keys too.
+  ([#247](https://github.com/forgepkg/forge/issues/247))
+- Proxies of a format plugin (NuGet): an upstream that could not be
+  reached (connection refused, a name that does not resolve, a timeout) or
+  answered a 5xx or 429, with nothing cached for the request, answered 500
+  and logged an error, as if Forge were broken. It answers 503 with
+  `Retry-After`, like the docker registry's proxy, and logs a warning naming
+  the upstream. A group whose member failed this way answers the same.
+  Credentials the upstream refuses answer 502.
+  ([#283](https://github.com/forgepkg/forge/issues/283))
+- Web UI: a link whose query value looked like a number or a boolean lost
+  it, because the router read the value as JSON: `?tag=1.36` on an image page
+  showed the pull commands of the default tag, `?tag=1.10` was even read as
+  `1.1`, `?q=1.0` on a repository page searched for `1`, and `?path=2026`
+  missed the directory `2026/` of a raw repository. Every query value is now
+  read as the text it is. Links the web UI wrote before, such as
+  `?tag=%221.36%22`, still work, and the links it writes are plain
+  (`?tag=1.36`).
+  ([#403](https://github.com/forgepkg/forge/issues/403))
+- Widen the L1 cache TTL tests' timing windows to avoid spurious failures on busy CI runners while preserving their cache reuse and expiry checks.
+  ([#471](https://github.com/forgepkg/forge/issues/471))
+- Proxies: a version listing the upstream answered unusably (a document over
+  `proxy.max_metadata_bytes`, or one without the versions) answered 500 when
+  nothing was cached; it answers 502, like an upstream that refuses the proxy.
+  ([#488](https://github.com/forgepkg/forge/issues/488))
+
+### Security
+
+- Proxy search no longer lets rejected search parameters disable upstream search
+  for other callers for a minute. Only upstream outages trigger search backoff;
+  NuGet search offsets above 3,000 use locally cached packages instead.
+  ([#225](https://github.com/forgepkg/forge/issues/225))
+- A proxy repository's format plugin could make Forge send a GET to any
+  address Forge reaches, a loopback or private service included, and read the
+  answer back into what the proxy serves. Forge now sends the requests a
+  format asks for, and downloads its packages, only from the origin of the
+  repository's `remote_url` and from origins that documents fetched from that
+  upstream name (a NuGet service index's resources on other hosts); any other
+  request is refused and logged as a warning.
+  The documents an upstream serves still decide which hosts become reachable,
+  so confine Forge's egress with network policy where internal services must
+  stay out of reach.
+  ([#233](https://github.com/forgepkg/forge/issues/233))
+- The S3 client no longer compiles in SigV4a signing, and with it
+  `crypto-bigint` 0.5.5 (RUSTSEC-2026-0387): several of its operations meant
+  to run in constant time did not. The AWS SDK used it only to derive SigV4a
+  signing keys, which sign requests to AWS S3 Multi-Region Access Points (a
+  bucket given as an `arn:aws:s3::…:accesspoint/….mrap` ARN), a setup Forge
+  never documented or tested; requests to such a bucket now fail.
+- The `ctutils` crate moves from 0.4.2 to 0.4.5 (RUSTSEC-2026-0385): 0.4.2
+  generated its masks and compared `u128` values in non-constant time. Forge
+  uses it through the AES-GCM encryption of stored secrets and the hash crates.
+
+### Documentation
+
+- `forge.toml.example` suggested `blob_cache.path = "/var/cache/forge"`, where
+  the Kubernetes manifests mount the cache volume. A volume's mount root
+  belongs to root, and startup refuses a cache directory Forge's user does not
+  own. The example suggests `/var/cache/forge/blobs`, a directory Forge
+  creates in the volume, like the deployment docs.
+  ([#236](https://github.com/forgepkg/forge/issues/236))
+- Contributions from outside the forgepkg organization now require signing the
+  Contributor License Agreement (`CLA.md`) once, which grants forgepkg the
+  rights to distribute them under the MIT License or other terms.
+  `CONTRIBUTING.md` explains how to sign.
+
+### Known limitations
+
+- npm's password login (`npm login --auth-type=legacy`) refuses a username
+  with an `@`, which every Forge account has: log in in the browser
+  (`npm login`), with `yarn npm login`, or with an API token from the web UI.
+  A publish with a provenance statement (`npm publish --provenance`) is
+  refused, and `npm access`, `npm owner`, `npm team`, `npm org`, `npm star`
+  and `npm token` are not served.
+  ([#41](https://github.com/forgepkg/forge/issues/41))
 
 ## [1.1.0]
 
@@ -837,6 +1257,6 @@ lists the required settings.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/schmitch/forge/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/schmitch/forge/releases/tag/v1.1.0
-[1.0.0]: https://github.com/schmitch/forge/releases/tag/v1.0.0
+[Unreleased]: https://github.com/forgepkg/forge/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/forgepkg/forge/releases/tag/v1.1.0
+[1.0.0]: https://github.com/forgepkg/forge/releases/tag/v1.0.0
