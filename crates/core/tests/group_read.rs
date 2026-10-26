@@ -2394,3 +2394,615 @@ async fn a_diamond_serves_what_its_unguarded_path_admits() {
         "A's guard keeps it from its non-owner"
     );
 }
+
+// ── upstream search windows (#224) ──────────────────────────────────────────
+
+/// A proxy member searching its upstream, which ranks `ids` in that order and
+/// reports `total` hits: a search returns the first `take` ids but those in
+/// `dropped`, which it takes off its total too, as a proxy leaves out a
+/// version inside its package delay. It records every `take` asked. With a
+/// `fallback`, a search for more than its `take` fails upstream and the
+/// proxy answers from its cache: those ids.
+struct RankedUpstream {
+    ids: Vec<String>,
+    total: usize,
+    dropped: std::collections::HashSet<String>,
+    fallback: Option<(usize, Vec<String>)>,
+    takes: std::sync::Mutex<Vec<usize>>,
+}
+
+impl RankedUpstream {
+    fn new(ids: Vec<String>, total: usize) -> Arc<Self> {
+        Arc::new(RankedUpstream {
+            ids,
+            total,
+            dropped: Default::default(),
+            fallback: None,
+            takes: Default::default(),
+        })
+    }
+
+    fn takes(&self) -> Vec<usize> {
+        self.takes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl RepoReadOps for RankedUpstream {
+    async fn list_versions(
+        &self,
+        _repo: &str,
+        _id: &str,
+    ) -> Result<Vec<forge_core::repo::VersionEntry>, RepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn resolve_nupkg(
+        &self,
+        _repo: &str,
+        _id: &str,
+        _version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        Ok(None)
+    }
+
+    async fn resolve_nuspec(
+        &self,
+        _repo: &str,
+        _id: &str,
+        _version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        Ok(None)
+    }
+
+    async fn registration(
+        &self,
+        _repo: &str,
+        _id: &str,
+    ) -> Result<Vec<forge_core::repo::RegistrationEntry>, RepoError> {
+        Ok(Vec::new())
+    }
+
+    async fn search(
+        &self,
+        _repo: &str,
+        params: &SearchParams,
+    ) -> Result<forge_core::repo::SearchResult, RepoError> {
+        self.takes.lock().unwrap().push(params.take);
+        if let Some((_, cached)) = self
+            .fallback
+            .as_ref()
+            .filter(|(take, _)| params.take > *take)
+        {
+            return Ok(forge_core::repo::SearchResult {
+                total_hits: cached.len(),
+                hits: cached
+                    .iter()
+                    .map(|id| forge_core::repo::SearchHit {
+                        original_id: id.clone(),
+                        latest_version: "1.0.0".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            });
+        }
+        let returned: Vec<&String> = self
+            .ids
+            .iter()
+            .skip(params.skip)
+            .take(params.effective_take())
+            .collect();
+        let hits: Vec<forge_core::repo::SearchHit> = returned
+            .iter()
+            .filter(|id| !self.dropped.contains(id.as_str()))
+            .map(|id| forge_core::repo::SearchHit {
+                original_id: (*id).clone(),
+                latest_version: "9.9.9".into(),
+                versions: vec![forge_core::repo::VersionEntry {
+                    original_id: (*id).clone(),
+                    version: "9.9.9".into(),
+                    version_original: "9.9.9".into(),
+                    listed: true,
+                }],
+                ..Default::default()
+            })
+            .collect();
+        Ok(forge_core::repo::SearchResult {
+            total_hits: self.total - (returned.len() - hits.len()),
+            hits,
+        })
+    }
+}
+
+/// Hosted members are real; the proxy-kind members are [`RankedUpstream`]s.
+struct UpstreamFactory {
+    hosted: HostedFactory,
+    upstreams: HashMap<i64, Arc<RankedUpstream>>,
+}
+
+impl MemberOpsFactory for UpstreamFactory {
+    fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        match self.upstreams.get(&member.id) {
+            Some(upstream) => Ok(upstream.clone()),
+            None => self.hosted.ops_for(member),
+        }
+    }
+}
+
+fn upstream_group_repo(
+    pool: &PgPool,
+    blobs: StubBlobs,
+    principal: Principal,
+    upstreams: &[(&Repository, &Arc<RankedUpstream>)],
+) -> GroupRepo {
+    let factory = Arc::new(UpstreamFactory {
+        hosted: HostedFactory {
+            pool: pool.clone(),
+            blobs,
+        },
+        upstreams: upstreams
+            .iter()
+            .map(|(proxy, upstream)| (proxy.id, Arc::clone(upstream)))
+            .collect(),
+    });
+    let authz = Authz::new(pool.clone(), Cache::l1_only(16));
+    GroupRepo::new(pool.clone(), principal, factory, authz, TEST_MAX_DEPTH)
+        .with_format(Arc::new(nuget()))
+}
+
+/// The ids of every page of `take` of a search for `q`, page by page, and
+/// the total each page reported.
+async fn search_pages(
+    g: &GroupRepo,
+    group: &str,
+    q: &str,
+    take: usize,
+    count: usize,
+) -> (Vec<Vec<String>>, Vec<usize>) {
+    let mut pages = Vec::new();
+    let mut totals = Vec::new();
+    for page in 0..count {
+        let result = g
+            .search(
+                group,
+                &SearchParams {
+                    q: q.into(),
+                    skip: page * take,
+                    take,
+                    ..SearchParams::default()
+                },
+            )
+            .await
+            .unwrap();
+        pages.push(result.hits.into_iter().map(|hit| hit.original_id).collect());
+        totals.push(result.total_hits);
+    }
+    (pages, totals)
+}
+
+fn ids(prefix: &str, range: std::ops::Range<usize>) -> Vec<String> {
+    range.map(|n| format!("{prefix}.{n:02}")).collect()
+}
+
+/// A prefer-hosted group (the default) with a hosted member asks its proxy's
+/// upstream for the window the page needs, not for 1,000 hits. The hosted
+/// ids come first; the upstream's follow in its own order, page after page,
+/// none repeated or skipped, and the hosted copy of an id both have wins.
+#[tokio::test]
+async fn a_prefer_hosted_group_asks_its_upstream_for_the_page_window() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    let p = format!("Win{}", common::unique());
+    seed_version(
+        &pool,
+        &mut blobs,
+        hosted.id,
+        &format!("{p}.Internal"),
+        "1.0.0",
+        "h",
+    )
+    .await;
+    seed_version(
+        &pool,
+        &mut blobs,
+        hosted.id,
+        &format!("{p}.Shared"),
+        "1.0.0",
+        "h",
+    )
+    .await;
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    // The upstream ranks its public ids last to first, the shared one first.
+    let mut ranked = vec![format!("{p}.Shared")];
+    ranked.extend(ids(&format!("{p}.Public"), 0..60).into_iter().rev());
+    let upstream = RankedUpstream::new(ranked, 61);
+    let g = upstream_group_repo(&pool, blobs, user(&pool).await, &[(&proxy, &upstream)]);
+
+    let (pages, totals) = search_pages(&g, &group.name, &p, 20, 4).await;
+    let mut expected = vec![format!("{p}.Internal"), format!("{p}.Shared")];
+    expected.extend(ids(&format!("{p}.Public"), 0..60).into_iter().rev());
+    assert_eq!(pages.concat(), expected);
+    assert_eq!(
+        upstream.takes(),
+        [32, 64, 64, 128],
+        "each page asks the upstream for its window, rounded up"
+    );
+    assert_eq!(totals[3], 62, "exact once the upstream returned every hit");
+
+    let result = g
+        .search(
+            &group.name,
+            &SearchParams {
+                q: p.clone(),
+                take: 2,
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.hits[1].original_id, format!("{p}.Shared"));
+    assert_eq!(
+        result.hits[1].latest_version, "1.0.0",
+        "the hosted copy wins"
+    );
+}
+
+/// An anonymous caller who cannot read the hosted member does not get the
+/// proxy's hits for the ids the member owns. The group asks the upstream for
+/// more hits until the page is full, rather than answering it short.
+#[tokio::test]
+async fn hits_a_guard_drops_widen_the_upstream_window() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    let p = format!("Shield{}", common::unique());
+    let internal = ids(&format!("{p}.Internal"), 0..20);
+    for id in &internal {
+        seed_version(&pool, &mut blobs, hosted.id, id, "1.0.0", "h").await;
+    }
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    grant_anon_read(&pool, &group).await;
+    grant_anon_read(&pool, &proxy).await;
+    // The upstream ranks the internal ids' public shadows first.
+    let public = ids(&format!("{p}.Public"), 0..40);
+    let upstream = RankedUpstream::new([internal.clone(), public.clone()].concat(), 60);
+    let g = upstream_group_repo(&pool, blobs, anon(), &[(&proxy, &upstream)]);
+
+    let (pages, totals) = search_pages(&g, &group.name, &p, 20, 2).await;
+    assert_eq!(pages.concat(), public);
+    assert_eq!(totals, [40, 40]);
+    assert_eq!(
+        upstream.takes(),
+        [32, 128, 64],
+        "12 of the first 32 hits are shown: four times the window"
+    );
+
+    // A window the group shows none of, here under a reserved prefix, is
+    // followed by all the hits at once.
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object(\
+         'reserved_prefixes', jsonb_build_array($2::text)) WHERE id = $1",
+    )
+    .bind(group.id)
+    .bind(format!("{p}.reserved.").to_lowercase())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let reserved = ids(&format!("{p}.Reserved"), 0..40);
+    let upstream = RankedUpstream::new([reserved, public.clone()].concat(), 80);
+    let g = upstream_group_repo(&pool, StubBlobs::default(), anon(), &[(&proxy, &upstream)]);
+    let (pages, totals) = search_pages(&g, &group.name, &p, 20, 1).await;
+    assert_eq!(pages[0], public[..20]);
+    assert_eq!(totals, [40]);
+    assert_eq!(upstream.takes(), [32, SearchParams::MAX_TAKE]);
+}
+
+/// A proxy leaves out hits (a package delay, a not-found marker) after its
+/// upstream returned them: the group asks for more to fill the page.
+#[tokio::test]
+async fn hits_a_proxy_drops_widen_the_upstream_window() {
+    let pool = common::pool().await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    let all = ids("Delayed", 0..100);
+    let upstream = Arc::new(RankedUpstream {
+        ids: all.clone(),
+        total: 100,
+        dropped: all.iter().skip(1).step_by(2).cloned().collect(),
+        fallback: None,
+        takes: Default::default(),
+    });
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&proxy, &upstream)],
+    );
+
+    let (pages, totals) = search_pages(&g, &group.name, "Delayed", 20, 1).await;
+    let shown: Vec<String> = all.iter().step_by(2).take(20).cloned().collect();
+    assert_eq!(pages[0], shown);
+    assert_eq!(totals[0], 50);
+    assert_eq!(upstream.takes(), [32, 128]);
+}
+
+/// The total of an upstream search the group bounds is an estimate, never more
+/// than the hits the group can page through: it reaches no further than the
+/// upstream's first 1,000.
+#[tokio::test]
+async fn upstream_totals_stop_at_what_the_group_can_page() {
+    let pool = common::pool().await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    let all: Vec<String> = (0..1500).map(|n| format!("Many.{n:04}")).collect();
+    let upstream = RankedUpstream::new(all.clone(), 400_000);
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&proxy, &upstream)],
+    );
+
+    for (skip, hits, first) in [(0, 20, 0), (980, 20, 980), (1000, 0, 0)] {
+        let result = g
+            .search(
+                &group.name,
+                &SearchParams {
+                    q: "Many".into(),
+                    skip,
+                    take: 20,
+                    ..SearchParams::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.total_hits, SearchParams::MAX_TAKE, "skip={skip}");
+        assert_eq!(result.hits.len(), hits, "skip={skip}");
+        if hits > 0 {
+            assert_eq!(result.hits[0].original_id, all[first]);
+        }
+    }
+}
+
+/// Two upstream searches are merged one hit of each in turn, in their own
+/// order, and an id both return is counted once, also among the hits past
+/// those returned.
+#[tokio::test]
+async fn upstream_searches_are_merged_in_turn() {
+    let pool = common::pool().await;
+    let first = seed_proxy_member(&pool).await;
+    let second = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, first.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, second.id, 10)
+        .await
+        .unwrap();
+    let a = RankedUpstream::new(ids("A", 0..100), 100);
+    let b = RankedUpstream::new(ids("B", 0..100), 100);
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&first, &a), (&second, &b)],
+    );
+    let (pages, totals) = search_pages(&g, &group.name, "", 4, 1).await;
+    assert_eq!(pages[0], ["A.00", "B.00", "A.01", "B.01"]);
+    assert_eq!(totals[0], 200);
+
+    // Two mirrors of one feed: their ids count once.
+    let mirror = RankedUpstream::new(ids("A", 0..100), 100);
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&first, &a), (&second, &mirror)],
+    );
+    let (pages, totals) = search_pages(&g, &group.name, "", 4, 1).await;
+    assert_eq!(pages[0], ["A.00", "A.01", "A.02", "A.03"]);
+    assert_eq!(totals[0], 100);
+}
+
+/// An offline proxy searches its cache: the group asks it for all its hits
+/// and counts them exactly, as it does a hosted member's.
+#[tokio::test]
+async fn an_offline_proxy_is_searched_like_a_local_member() {
+    let pool = common::pool().await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(proxy.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let upstream = RankedUpstream::new(ids("Cached", 0..60), 60);
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&proxy, &upstream)],
+    );
+    let (pages, totals) = search_pages(&g, &group.name, "Cached", 20, 1).await;
+    assert_eq!(pages[0], ids("Cached", 0..20));
+    assert_eq!(totals[0], 60);
+    assert_eq!(upstream.takes(), [SearchParams::MAX_TAKE]);
+}
+
+/// Only the upstream search whose hits hold the page back is widened: one
+/// that shows a hit in 64 is asked for more, another whose first window
+/// fills its share is not.
+#[tokio::test]
+async fn only_the_search_holding_the_page_back_is_widened() {
+    let pool = common::pool().await;
+    let sparse = seed_proxy_member(&pool).await;
+    let full = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, sparse.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, full.id, 10)
+        .await
+        .unwrap();
+    let delayed: Vec<String> = (0..1000).map(|n| format!("Sparse.{n:03}")).collect();
+    let a = Arc::new(RankedUpstream {
+        ids: delayed.clone(),
+        total: 1000,
+        dropped: delayed
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| n % 64 != 0)
+            .map(|(_, id)| id.clone())
+            .collect(),
+        fallback: None,
+        takes: Default::default(),
+    });
+    let b = RankedUpstream::new(ids("Full", 0..100), 100);
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&sparse, &a), (&full, &b)],
+    );
+
+    let (pages, _) = search_pages(&g, &group.name, "", 20, 1).await;
+    assert_eq!(
+        pages[0][..4],
+        ["Sparse.000", "Full.00", "Sparse.064", "Full.01"]
+    );
+    assert_eq!(pages[0].len(), 20);
+    assert_eq!(a.takes(), [32, 128, 512, SearchParams::MAX_TAKE]);
+    assert_eq!(b.takes(), [32], "its first 32 hits fill its share");
+}
+
+/// A wider search whose upstream fails is answered from the proxy's cache,
+/// with other hits: the group keeps the hits the upstream returned first.
+#[tokio::test]
+async fn a_cache_answer_to_a_wider_search_keeps_the_first_hits() {
+    let pool = common::pool().await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object(\
+         'reserved_prefixes', jsonb_build_array('fallback.reserved.')) WHERE id = $1",
+    )
+    .bind(group.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let public = ids("Fallback.Public", 0..40);
+    for cached in [Vec::new(), ids("Fallback.Cached", 0..3)] {
+        let upstream = Arc::new(RankedUpstream {
+            ids: [ids("Fallback.Reserved", 0..20), public.clone()].concat(),
+            total: 60,
+            dropped: Default::default(),
+            fallback: Some((32, cached)),
+            takes: Default::default(),
+        });
+        let g = upstream_group_repo(
+            &pool,
+            StubBlobs::default(),
+            user(&pool).await,
+            &[(&proxy, &upstream)],
+        );
+        let (pages, totals) = search_pages(&g, &group.name, "Fallback", 20, 1).await;
+        assert_eq!(pages[0], public[..12], "the 12 public hits of the first 32");
+        assert_eq!(upstream.takes(), [32, 128]);
+        assert!(totals[0] > 12, "the hits past them are still estimated");
+    }
+}
+
+/// An upstream search whose hits all repeat ids the group already has, a
+/// mirror's first window say, may hold new ids past them: the total counts
+/// one past the merged ids while it does, so a client paging by the total
+/// asks for the page that shows them.
+#[tokio::test]
+async fn a_search_adding_no_id_keeps_the_total_past_the_merged_ids() {
+    let pool = common::pool().await;
+    let first = seed_proxy_member(&pool).await;
+    let second = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, first.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, second.id, 10)
+        .await
+        .unwrap();
+    let a = RankedUpstream::new(ids("Mirror", 0..32), 32);
+    let b = RankedUpstream::new([ids("Mirror", 0..32), ids("More", 0..40)].concat(), 72);
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&first, &a), (&second, &b)],
+    );
+    let (pages, totals) = search_pages(&g, &group.name, "", 16, 3).await;
+    assert_eq!(totals[..2], [33, 33], "one past the 32 merged ids");
+    assert_eq!(pages[2], ids("More", 0..16));
+}
+
+/// Local hits fill the page, and the proxy left out every hit of its
+/// upstream's first window: the total still counts one past the local ids.
+#[tokio::test]
+async fn an_upstream_window_the_proxy_emptied_keeps_the_total_past_the_page() {
+    let pool = common::pool().await;
+    let local = seed_proxy_member(&pool).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, local.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(local.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cached = RankedUpstream::new(ids("Local", 0..40), 40);
+    let delayed = ids("Delayed", 0..100);
+    let upstream = Arc::new(RankedUpstream {
+        ids: delayed.clone(),
+        total: 100,
+        dropped: delayed[..32].iter().cloned().collect(),
+        fallback: None,
+        takes: Default::default(),
+    });
+    let g = upstream_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&local, &cached), (&proxy, &upstream)],
+    );
+    let (pages, totals) = search_pages(&g, &group.name, "", 20, 3).await;
+    assert_eq!(totals[0], 41, "one past the 40 local ids");
+    assert_eq!(pages[2], ids("Delayed", 32..52));
+}

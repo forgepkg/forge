@@ -2806,6 +2806,275 @@ fn hit_versions(hit: &forge_core::repo::SearchHit) -> Vec<&str> {
     hit.versions.iter().map(|v| v.version.as_str()).collect()
 }
 
+struct ProxySearchFactory(Arc<ProxyRepo>);
+
+impl forge_core::repo::group::MemberOpsFactory for ProxySearchFactory {
+    fn ops_for(
+        &self,
+        _member: &forge_db::model::Repository,
+    ) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// The `take` of every upstream search for `q` the mock received.
+fn upstream_takes(mock: &MockUpstream, q: &str) -> Vec<String> {
+    mock.search_queries()
+        .into_iter()
+        .filter(|query| query.split('&').any(|part| part == format!("q={q}")))
+        .map(|query| {
+            assert!(query.split('&').any(|part| part == "skip=0"), "{query}");
+            query
+                .split('&')
+                .find_map(|part| part.strip_prefix("take="))
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// A group asks a proxy's upstream for the window of hits its page needs
+/// (#224), and pages through the upstream's hits in the upstream's order.
+#[tokio::test]
+async fn group_search_asks_upstreams_for_the_page_window() {
+    use forge_core::auth::authz::Authz;
+    use forge_core::auth::principal::Principal;
+    use forge_core::authz::eval::PackageFilter;
+    use forge_core::repo::group::GroupRepo;
+    use forge_core::repo::SearchParams;
+
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let first = start_mock(HashMap::new()).await;
+    let second = start_mock(HashMap::new()).await;
+    let packages = |ids: &mut dyn Iterator<Item = String>| -> Vec<serde_json::Value> {
+        ids.map(|id| search_entry(&id, &["1.0.0"])).collect()
+    };
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            packages(&mut (0..60).map(|n| format!("Package{n:02}"))),
+            60,
+        );
+    }
+    let group = repository_dao::insert_repository(
+        &pool,
+        NewRepository::group(format!("group{}", common::unique())),
+    )
+    .await
+    .unwrap();
+    let nested = repository_dao::insert_repository(
+        &pool,
+        NewRepository::group(format!("nested{}", common::unique())),
+    )
+    .await
+    .unwrap();
+    repository_dao::add_group_member(&pool, group.id, nested.id, 0)
+        .await
+        .unwrap();
+    for (priority, mock) in [&first, &second].into_iter().enumerate() {
+        let name = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+        repository_dao::add_group_member(
+            &pool,
+            nested.id,
+            repo_id(&pool, &name).await,
+            priority as i32,
+        )
+        .await
+        .unwrap();
+    }
+    let authz = Authz::new(pool.clone(), Cache::l1_only(16));
+    let user = forge_db::user_dao::insert_user(
+        &pool,
+        forge_db::user_dao::NewUser::local(
+            format!("group-search-{}@example.com", common::unique()),
+            "x".into(),
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+    let role = forge_db::authz_dao::role_id_by_name(&pool, forge_db::authz_dao::AUTHENTICATED_ROLE)
+        .await
+        .unwrap()
+        .unwrap();
+    forge_db::authz_dao::assign_role(&pool, user.id, role)
+        .await
+        .unwrap();
+    let group_ops = GroupRepo::new(
+        pool.clone(),
+        Principal::User {
+            user_id: user.id,
+            token_id: None,
+            method: forge_core::auth::AuthMethod::Password,
+        },
+        Arc::new(ProxySearchFactory(Arc::new(proxy_repo(
+            &pool,
+            cas,
+            Cache::l1_only(128),
+        )))),
+        authz,
+        20,
+    )
+    .with_format(Arc::new(nuget()));
+    let search = |q: &str, skip: usize, take: usize| {
+        let (group_ops, group) = (&group_ops, &group);
+        let params = SearchParams {
+            q: q.into(),
+            skip,
+            take,
+            ..Default::default()
+        };
+        async move { group_ops.search(&group.name, &params).await.unwrap() }
+    };
+    let found = |result: &forge_core::repo::SearchResult| -> Vec<String> {
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.original_id.clone())
+            .collect()
+    };
+    let named = |range: std::ops::Range<usize>| -> Vec<String> {
+        range.map(|n| format!("Package{n:02}")).collect()
+    };
+
+    // A single member keeps the upstream's total, not just the fetched page.
+    let single = repository_dao::insert_repository(
+        &pool,
+        NewRepository::group(format!("single{}", common::unique())),
+    )
+    .await
+    .unwrap();
+    let members = repository_dao::group_members(&pool, nested.id)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, single.id, members[0].0.id, 0)
+        .await
+        .unwrap();
+    let result = group_ops
+        .search(&single.name, &SearchParams::default())
+        .await
+        .unwrap();
+    assert_eq!(found(&result), named(0..20));
+    assert_eq!(result.total_hits, 60);
+    let takes: Vec<String> = [&first, &second]
+        .into_iter()
+        .flat_map(|mock| upstream_takes(mock, ""))
+        .collect();
+    assert_eq!(takes, ["32"]);
+
+    // Two mirrors of one feed: the window, rounded up to a power of two, of
+    // each; their ids count once.
+    for (skip, take, window, total) in [
+        (0, 20, 32, 60),
+        (5, 5, 32, 60),
+        (0, 0, 32, 60),
+        (0, usize::MAX, SearchParams::MAX_TAKE, 60),
+        (usize::MAX, 20, SearchParams::MAX_TAKE, 60),
+    ] {
+        let q = format!("window-{skip}-{take}");
+        let result = search(&q, skip, take).await;
+        assert_eq!(result.total_hits, total, "{q}");
+        let take = if take == 0 { 20 } else { take };
+        let expected: Vec<String> = named(0..60).into_iter().skip(skip).take(take).collect();
+        assert_eq!(found(&result), expected, "{q}");
+        for mock in [&first, &second] {
+            assert_eq!(upstream_takes(mock, &q), [window.to_string()], "{q}");
+        }
+    }
+
+    // Upstreams rank by relevance: the pages follow the upstream's order,
+    // none repeated or skipped, and later pages are served from the windows
+    // the upstream already answered.
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            packages(&mut (0..60).rev().map(|n| format!("Package{n:02}"))),
+            60,
+        );
+    }
+    let mut pages = Vec::new();
+    for skip in [0, 20, 40] {
+        let result = search("relevance-order", skip, 20).await;
+        assert_eq!(result.total_hits, 60);
+        pages.extend(found(&result));
+    }
+    assert_eq!(pages, named(0..60).into_iter().rev().collect::<Vec<_>>());
+    for mock in [&first, &second] {
+        assert_eq!(upstream_takes(mock, "relevance-order"), ["32", "64"]);
+    }
+
+    // A restricted search is asked for all the upstream's hits at once, so
+    // filtering cannot remove a match before the group pages.
+    let result = group_ops
+        .search_with_package_filter(
+            &group.name,
+            &SearchParams {
+                q: "restricted".into(),
+                ..Default::default()
+            },
+            &PackageFilter::Predicate(Arc::new(|id| id == "Package20")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(found(&result), ["Package20"]);
+    assert_eq!(result.total_hits, 1);
+    for mock in [&first, &second] {
+        assert_eq!(upstream_takes(mock, "restricted"), ["1000"]);
+    }
+
+    // Hits a reserved prefix keeps off the proxies widen the window until
+    // the page is full; a window none of whose hits is shown, at once to
+    // all of them.
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object(\
+         'prefer_hosted', true, 'reserved_prefixes', '[\"acme.\"]'::jsonb) WHERE id = $1",
+    )
+    .bind(group.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            packages(&mut (0..60).map(|n| format!("Acme.Package{n:02}"))),
+            60,
+        );
+    }
+    let result = search("reserved-prefix", 0, 20).await;
+    assert!(result.hits.is_empty());
+    assert_eq!(result.total_hits, 0);
+    for mock in [&first, &second] {
+        assert_eq!(upstream_takes(mock, "reserved-prefix"), ["32", "1000"]);
+    }
+
+    for mock in [&first, &second] {
+        mock.set_search(
+            StatusCode::OK,
+            packages(&mut (0..60).map(|n| {
+                if n < 20 {
+                    format!("Acme.Package{n:02}")
+                } else {
+                    format!("Package{n:02}")
+                }
+            })),
+            60,
+        );
+    }
+    let result = search("mixed-reserved-public", 0, 20).await;
+    assert_eq!(found(&result), named(20..40));
+    assert_eq!(result.total_hits, 40);
+    let result = search("mixed-reserved-public", 20, 20).await;
+    assert_eq!(found(&result), named(40..60));
+    assert_eq!(result.total_hits, 40);
+    for mock in [&first, &second] {
+        assert_eq!(
+            upstream_takes(mock, "mixed-reserved-public"),
+            ["32", "128", "64"]
+        );
+    }
+}
+
 /// Record a `proxy_cached_version` row as the listing and download paths do.
 async fn record_version(
     pool: &PgPool,

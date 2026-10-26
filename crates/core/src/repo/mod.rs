@@ -690,8 +690,10 @@ pub trait RepoReadOps: Send + Sync {
     /// the hits carry ids and versions, but [`SearchHit::nuspec_bytes`] and
     /// [`SearchHit::total_downloads`] may be left unset.
     ///
-    /// A group asks every member for a full (up to [`SearchParams::MAX_TAKE`])
-    /// result to merge, dedup and count, but renders only the client's page.
+    /// A group asks its local members for up to [`SearchParams::MAX_TAKE`]
+    /// hits, and a proxy that searches its upstream for the leading window of
+    /// its hits the client's page needs; it merges and counts them, and
+    /// renders only the client's page (see [`group`]).
     /// It therefore searches its members through this method and enriches just
     /// the final page via [`Self::enrich_search_hits`], so manifest reads (S3)
     /// are bounded by the client's `take` rather than by every member's corpus.
