@@ -9,7 +9,13 @@ import type {
   ImageTag,
 } from '~/api/images'
 import { isRepositoryOffline } from '~/api/packages'
-import { chartVersion, chartVersions, defaultChartVersion, httpUrl } from '~/lib/oci'
+import {
+  cappedNote,
+  chartVersion,
+  chartVersions,
+  defaultChartVersion,
+  httpUrl,
+} from '~/lib/oci'
 import { useChart } from '~/queries/useChart'
 import { ManifestTable, TagTable } from '~/components/ImageTables'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
@@ -100,7 +106,12 @@ export function ChartView({
         </Notice>
       )}
       {body}
-      <Panel title="Versions" count={versions.length} flush>
+      <Panel
+        title="Versions"
+        count={versions.length}
+        flush
+        description={cappedNote(detail.tags.length, detail.tags_total, 'versions')}
+      >
         {detail.tags.length === 0 ? (
           <EmptyState title="No versions" icon="Wheel" bordered={false}>
             This chart has only untagged manifests; Helm installs charts by
@@ -117,9 +128,14 @@ export function ChartView({
       </Panel>
       <Panel
         title="Manifests"
-        count={detail.manifests.length}
+        count={detail.manifests_total ?? detail.manifests.length}
         flush
-        description="The chart's manifests, and referrers such as signatures."
+        description={[
+          cappedNote(detail.manifests.length, detail.manifests_total, 'manifests'),
+          "The chart's manifests, and referrers such as signatures.",
+        ]
+          .filter(Boolean)
+          .join(' ')}
       >
         <ManifestTable
           manifests={detail.manifests}

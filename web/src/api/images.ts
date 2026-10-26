@@ -90,8 +90,17 @@ export interface ImageDetail {
   registry: string
   /** `docker pull <pull_name>:<tag>` / `docker pull <pull_name>@<digest>`. */
   pull_name: string
+  /** At most 1,000 tags, the newest ({@link ImageDetail.tags_total} counts all). */
   tags: ImageTag[]
+  /** How many tags the image has; `tags.length` when absent. */
+  tags_total?: number
+  /**
+   * At most 1,000 manifests: the listed tags', then the newest others
+   * ({@link ImageDetail.manifests_total} counts all).
+   */
   manifests: ImageManifest[]
+  /** How many manifests the image has; `manifests.length` when absent. */
+  manifests_total?: number
 }
 
 /** A person named by a chart (`maintainers` of its `Chart.yaml`). */

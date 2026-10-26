@@ -409,6 +409,34 @@ describe('ImageDetail', () => {
     expect(within(manifests).queryByRole('columnheader', { name: 'Source' })).toBeNull()
   })
 
+  it('says when the server listed only the newest tags and manifests (#240)', async () => {
+    mockApi(() =>
+      jsonResponse({ ...hostedDetail, tags_total: 20_000, manifests_total: 30_000 }),
+    )
+
+    await renderDetail('/images/docker-hosted/team/app')
+
+    const tags = await screen.findByRole('region', { name: 'Tags' })
+    expect(within(tags).getByText(/^Showing the newest 2 of 20,000 tags\./)).toBeInTheDocument()
+    const manifests = screen.getByRole('region', { name: 'Manifests' })
+    expect(
+      within(manifests).getByText(/^Showing the newest 4 of 30,000 manifests\./),
+    ).toBeInTheDocument()
+    // The header counts them all.
+    expect(screen.getByText('20,000 tags')).toBeInTheDocument()
+    expect(screen.getByText('30,000 manifests')).toBeInTheDocument()
+  })
+
+  it('lists every tag and manifest without a note when the server listed them all', async () => {
+    mockApi(() => jsonResponse({ ...hostedDetail, tags_total: 2, manifests_total: 4 }))
+
+    await renderDetail('/images/docker-hosted/team/app')
+
+    await screen.findByRole('region', { name: 'Tags' })
+    expect(screen.queryByText(/Showing the newest/)).toBeNull()
+    expect(screen.getByText('2 tags')).toBeInTheDocument()
+  })
+
   it('shows the member each manifest comes from in a group', async () => {
     mockApi(() =>
       jsonResponse({

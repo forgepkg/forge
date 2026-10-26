@@ -4,7 +4,7 @@ import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import type { ImageDetail } from '~/api/images'
 import { isRepositoryOffline } from '~/api/packages'
 import { ApiError } from '~/lib/httpClient'
-import { defaultPullTag, formatDateTime, isChartImage } from '~/lib/oci'
+import { cappedNote, defaultPullTag, formatDateTime, isChartImage } from '~/lib/oci'
 import { useDeleteImage, useImageDetail } from '~/queries/useImageDetail'
 import { useMe } from '~/queries/useMe'
 import { ChartView } from '~/components/ChartView'
@@ -114,6 +114,9 @@ function ImageDetailPage() {
     .sort()
     .at(-1)
   const chart = isChartImage(img.manifests)
+  // The server lists at most 1,000 of each, and counts them all.
+  const tagCount = img.tags_total ?? img.tags.length
+  const manifestCount = img.manifests_total ?? img.manifests.length
   const selectTag = (next: string) =>
     void navigate({ search: { tag: next }, replace: true })
   const canDelete = me.data?.is_admin === true && img.repo_kind === 'hosted'
@@ -155,13 +158,13 @@ function ImageDetailPage() {
       meta={[
         chart && 'Helm chart',
         chart
-          ? img.tags.length === 1
+          ? tagCount === 1
             ? '1 version'
-            : `${img.tags.length} versions`
-          : img.tags.length === 1
+            : `${tagCount.toLocaleString()} versions`
+          : tagCount === 1
             ? '1 tag'
-            : `${img.tags.length} tags`,
-        img.manifests.length === 1 ? '1 manifest' : `${img.manifests.length} manifests`,
+            : `${tagCount.toLocaleString()} tags`,
+        manifestCount === 1 ? '1 manifest' : `${manifestCount.toLocaleString()} manifests`,
         // A proxy's manifests carry their cache time, not a push (#248).
         img.repo_kind === 'hosted' && lastPushed && `Pushed ${formatDateTime(lastPushed)}`,
       ]}
@@ -206,9 +209,14 @@ function ImageDetailPage() {
 
       <Panel
         title="Tags"
-        count={img.tags.length}
+        count={tagCount}
         flush
-        description="A tag on an index pulls the platform that matches the client."
+        description={[
+          cappedNote(img.tags.length, img.tags_total, 'tags'),
+          'A tag on an index pulls the platform that matches the client.',
+        ]
+          .filter(Boolean)
+          .join(' ')}
       >
         {img.tags.length === 0 ? (
           <EmptyState title="No tags" icon="Layers" bordered={false}>
@@ -225,9 +233,14 @@ function ImageDetailPage() {
 
       <Panel
         title="Manifests"
-        count={img.manifests.length}
+        count={manifestCount}
         flush
-        description="Indexes, the platform images they list, and referrers such as signatures and SBOMs."
+        description={[
+          cappedNote(img.manifests.length, img.manifests_total, 'manifests'),
+          'Indexes, the platform images they list, and referrers such as signatures and SBOMs.',
+        ]
+          .filter(Boolean)
+          .join(' ')}
       >
         <ManifestTable
           manifests={img.manifests}

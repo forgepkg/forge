@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   HELM_CHART_CONFIG,
+  cappedNote,
   chartVersion,
   chartVersions,
   defaultChartVersion,
@@ -149,6 +150,14 @@ describe('defaultPullTag', () => {
       defaultPullTag([tag('a', 'sha256:new'), tag('b', 'sha256:new')], manifests)?.tag,
     ).toBe('a')
     expect(defaultPullTag([], manifests)).toBeUndefined()
+  })
+})
+
+describe('cappedNote', () => {
+  it('says how many of how many the server listed, only when it bounded the list', () => {
+    expect(cappedNote(1000, 20_000, 'tags')).toBe('Showing the newest 1,000 of 20,000 tags.')
+    expect(cappedNote(4, 4, 'manifests')).toBeUndefined()
+    expect(cappedNote(4, undefined, 'manifests')).toBeUndefined()
   })
 })
 

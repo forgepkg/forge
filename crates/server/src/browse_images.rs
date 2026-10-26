@@ -53,6 +53,14 @@ const CHART_KEY: &str = "chart";
 const IMAGE_BATCH_SIZE: i64 = 1000;
 const DEFAULT_TAKE: usize = 50;
 const MAX_TAKE: usize = 200;
+/// The most tags an image's page lists: the newest (by their manifest's
+/// push). A CI that tags each build, or a proxy of an image with thousands
+/// of tags upstream, makes images with tens of thousands; the page counts
+/// them all ([`ImageDetail::tags_total`]).
+const MAX_DETAIL_TAGS: usize = 1000;
+/// The most manifests an image's page lists: those of the tags it lists,
+/// then the newest others ([`ImageDetail::manifests_total`]).
+const MAX_DETAIL_MANIFESTS: usize = 1000;
 
 #[derive(Debug, Deserialize)]
 pub struct ImagesQuery {
@@ -127,8 +135,15 @@ pub struct ImageDetail {
     pub registry: String,
     /// `docker pull <pull_name>:<tag>`.
     pub pull_name: String,
+    /// At most [`MAX_DETAIL_TAGS`] of the image's tags, by name.
     pub tags: Vec<TagItem>,
+    /// How many tags the image has.
+    pub tags_total: usize,
+    /// At most [`MAX_DETAIL_MANIFESTS`] of the image's manifests (more only
+    /// when the listed tags point at more).
     pub manifests: Vec<ManifestItem>,
+    /// How many manifests the image has.
+    pub manifests_total: usize,
 }
 
 /// The registry host of the server (`host[:port]` of `public_base_url`).
@@ -400,29 +415,7 @@ pub async fn image_detail(
             m.platforms = platforms;
         }
     }
-    // Tags point at a manifest of this listing (the one pulls resolve).
-    for (tag, digest) in &tags {
-        if let Some(m) = manifests.iter_mut().find(|m| &m.digest == digest) {
-            if !m.tags.contains(tag) {
-                m.tags.push(tag.clone());
-            }
-        }
-    }
-    let tag_items = tags
-        .into_iter()
-        .filter_map(|(tag, digest)| {
-            manifests
-                .iter()
-                .find(|m| m.digest == digest)
-                .map(|m| TagItem {
-                    tag,
-                    digest,
-                    media_type: m.media_type.clone(),
-                    size: m.size,
-                    platforms: m.platforms.clone(),
-                })
-        })
-        .collect();
+    let (tags, tags_total, manifests, manifests_total) = list_tags(tags, manifests);
     let (registry, prefix) = pull_prefix(&state, &repo);
     Json(ImageDetail {
         repo: repo.name.clone(),
@@ -430,10 +423,97 @@ pub async fn image_detail(
         pull_name: format!("{prefix}/{image}"),
         image,
         registry,
-        tags: tag_items,
+        tags,
+        tags_total,
         manifests,
+        manifests_total,
     })
     .into_response()
+}
+
+/// The tags (tag → the digest pulls resolve) and manifests of an image's
+/// page, each manifest badged with the tags pointing at it, with the totals
+/// of both. The lists are bounded ([`MAX_DETAIL_TAGS`],
+/// [`MAX_DETAIL_MANIFESTS`]; past the tag bound, a manifest is badged with
+/// the listed tags only), and every lookup goes through an index by digest:
+/// comparing every tag with every manifest took seconds per request for an
+/// image with tens of thousands of each, on a runtime worker (#240).
+fn list_tags(
+    tags: BTreeMap<String, String>,
+    mut manifests: Vec<ManifestItem>,
+) -> (Vec<TagItem>, usize, Vec<ManifestItem>, usize) {
+    let index: HashMap<&str, usize> = manifests
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.digest.as_str(), i))
+        .collect();
+    // Tags point at a manifest of this listing (the one pulls resolve).
+    let mut tagged: Vec<(String, usize)> = tags
+        .into_iter()
+        .filter_map(|(tag, digest)| index.get(digest.as_str()).map(|&i| (tag, i)))
+        .collect();
+    drop(index);
+    let tags_total = tagged.len();
+    if tags_total > MAX_DETAIL_TAGS {
+        // The newest, listed by name like the others.
+        tagged.sort_by(|(a, i), (b, j)| {
+            manifests[*j]
+                .created_at
+                .cmp(&manifests[*i].created_at)
+                .then_with(|| a.cmp(b))
+        });
+        tagged.truncate(MAX_DETAIL_TAGS);
+        tagged.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let listed: HashSet<&str> = tagged.iter().map(|(tag, _)| tag.as_str()).collect();
+        for m in &mut manifests {
+            m.tags.retain(|tag| listed.contains(tag.as_str()));
+        }
+    }
+    let mut badges: HashSet<(usize, String)> = manifests
+        .iter()
+        .enumerate()
+        .flat_map(|(i, m)| m.tags.iter().map(move |tag| (i, tag.clone())))
+        .collect();
+    for (tag, i) in &tagged {
+        if badges.insert((*i, tag.clone())) {
+            manifests[*i].tags.push(tag.clone());
+        }
+    }
+    let tag_items: Vec<TagItem> = tagged
+        .iter()
+        .map(|(tag, i)| {
+            let m = &manifests[*i];
+            TagItem {
+                tag: tag.clone(),
+                digest: m.digest.clone(),
+                media_type: m.media_type.clone(),
+                size: m.size,
+                platforms: m.platforms.clone(),
+            }
+        })
+        .collect();
+
+    let manifests_total = manifests.len();
+    if manifests_total > MAX_DETAIL_MANIFESTS {
+        // The listed tags' manifests, then the others in order (the highest
+        // priority member's first, each newest first) up to the bound.
+        let listed: HashSet<usize> = tagged.iter().map(|(_, i)| *i).collect();
+        let mut room = MAX_DETAIL_MANIFESTS.saturating_sub(listed.len());
+        let mut position = 0;
+        manifests.retain(|_| {
+            let i = position;
+            position += 1;
+            if listed.contains(&i) {
+                return true;
+            }
+            if room == 0 {
+                return false;
+            }
+            room -= 1;
+            true
+        });
+    }
+    (tag_items, tags_total, manifests, manifests_total)
 }
 
 /// The platforms a manifest summary names.
@@ -664,4 +744,132 @@ pub async fn chart_detail(
         source: group.then(|| source.name.clone()),
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(n: usize, tags: &[&str]) -> ManifestItem {
+        ManifestItem {
+            digest: format!("sha256:{n:064x}"),
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            artifact_type: None,
+            subject_digest: None,
+            manifest_size: 100,
+            size: Some(n as i64),
+            platforms: vec!["linux/amd64".into()],
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            children: Vec::new(),
+            created_at: DateTime::from_timestamp(1_700_000_000 + n as i64, 0).unwrap(),
+            last_pulled_at: None,
+            source: None,
+        }
+    }
+
+    /// An image with `n` manifests (manifest `i` pushed `i` seconds after
+    /// the first), each tagged `t<i>`, newest first as the store lists them.
+    fn image(n: usize) -> (BTreeMap<String, String>, Vec<ManifestItem>) {
+        let manifests: Vec<ManifestItem> = (0..n)
+            .rev()
+            .map(|i| manifest(i, &[&format!("t{i}")]))
+            .collect();
+        let tags = manifests
+            .iter()
+            .map(|m| (m.tags[0].clone(), m.digest.clone()))
+            .collect();
+        (tags, manifests)
+    }
+
+    #[test]
+    fn tags_are_badged_and_listed_with_their_manifest() {
+        // `latest` is the newest manifest's, as a pull resolves it; a tag of
+        // a manifest the listing lacks is left out.
+        let mut tags: BTreeMap<String, String> = BTreeMap::new();
+        tags.insert("1.0".into(), manifest(1, &[]).digest);
+        tags.insert("latest".into(), manifest(2, &[]).digest);
+        tags.insert("gone".into(), manifest(9, &[]).digest);
+        let manifests = vec![manifest(2, &[]), manifest(1, &["1.0"])];
+
+        let (tags, tags_total, manifests, manifests_total) = list_tags(tags, manifests);
+
+        let listed: Vec<(&str, &str)> = tags
+            .iter()
+            .map(|t| (t.tag.as_str(), t.digest.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("1.0", manifests[1].digest.as_str()),
+                ("latest", manifests[0].digest.as_str())
+            ]
+        );
+        assert_eq!(tags[1].size, Some(2));
+        assert_eq!((tags_total, manifests_total), (2, 2));
+        assert_eq!(manifests[0].tags, ["latest"]);
+        assert_eq!(manifests[1].tags, ["1.0"], "not badged twice");
+    }
+
+    #[test]
+    fn the_newest_tags_and_their_manifests_are_listed_up_to_the_bounds() {
+        let n = MAX_DETAIL_TAGS + 500;
+        let (tags, mut manifests) = image(n);
+        // Untagged manifests, older than every tagged one.
+        manifests.extend((0..MAX_DETAIL_MANIFESTS).map(|i| ManifestItem {
+            created_at: DateTime::from_timestamp(1_600_000_000 + i as i64, 0).unwrap(),
+            digest: format!("sha256:{:064x}", n + i),
+            ..manifest(0, &[])
+        }));
+
+        let (tags, tags_total, manifests, manifests_total) = list_tags(tags, manifests);
+
+        assert_eq!(tags_total, n);
+        assert_eq!(manifests_total, n + MAX_DETAIL_MANIFESTS);
+        assert_eq!(tags.len(), MAX_DETAIL_TAGS);
+        // The newest tags (t500 … t1499), by name.
+        let mut names: Vec<&str> = tags.iter().map(|t| t.tag.as_str()).collect();
+        assert!(names.is_sorted());
+        names.sort_by_key(|name| name[1..].parse::<usize>().unwrap());
+        assert_eq!(names.first(), Some(&"t500"));
+        assert_eq!(names.last(), Some(&format!("t{}", n - 1).as_str()));
+        // Their manifests, and no other: the bound is reached.
+        assert_eq!(manifests.len(), MAX_DETAIL_MANIFESTS);
+        let digests: HashSet<&str> = manifests.iter().map(|m| m.digest.as_str()).collect();
+        assert!(tags.iter().all(|t| digests.contains(t.digest.as_str())));
+        assert!(manifests.iter().all(|m| m.tags.len() == 1));
+    }
+
+    #[test]
+    fn untagged_manifests_fill_the_listing_after_the_tagged_ones() {
+        let (tags, mut manifests) = image(10);
+        manifests.extend((0..MAX_DETAIL_MANIFESTS).map(|i| ManifestItem {
+            digest: format!("sha256:{:064x}", 10 + i),
+            ..manifest(0, &[])
+        }));
+
+        let (tags, _, manifests, manifests_total) = list_tags(tags, manifests);
+
+        assert_eq!(tags.len(), 10);
+        assert_eq!(manifests_total, 10 + MAX_DETAIL_MANIFESTS);
+        assert_eq!(manifests.len(), MAX_DETAIL_MANIFESTS);
+        assert!(manifests[..10].iter().all(|m| m.tags.len() == 1));
+    }
+
+    /// The issue's 50,000 tagged manifests took 24 s with nested scans.
+    #[test]
+    fn a_large_image_is_listed_in_linear_time() {
+        let (tags, manifests) = image(50_000);
+        let started = std::time::Instant::now();
+        let (tags, tags_total, manifests, manifests_total) = list_tags(tags, manifests);
+        assert_eq!((tags_total, manifests_total), (50_000, 50_000));
+        assert_eq!(
+            (tags.len(), manifests.len()),
+            (MAX_DETAIL_TAGS, MAX_DETAIL_MANIFESTS)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 }
