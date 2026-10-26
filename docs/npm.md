@@ -217,7 +217,12 @@ any registry that speaks npm's protocol:
   full one. A package the upstream does not know is remembered for the
   not-found TTL. A tarball is downloaded once, checked against the
   `integrity` (or `shasum`) the upstream publishes and against its version,
-  and kept; one that does not hold up is refused (502) and not stored.
+  and kept; one that does not hold up is refused (502) and not stored. A
+  packument larger than `proxy.max_metadata_bytes` (32 MiB by default) is
+  not read: until the setting is raised, its package is served from what is
+  cached of it, or answers 502 when nothing is. A few
+  packages publish that many versions (`renovate`'s abbreviated packument
+  is about 36 MB, its full one about 73 MB).
 - **The upstream's dist-tags and deprecations** are served as it gives
   them, and the last dist-tags read are kept for when it is down.
 - **Publication delay.** `package_delay_seconds` holds back versions
