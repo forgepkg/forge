@@ -910,6 +910,72 @@ async fn preview_evaluates_a_draft_without_storing_it() {
     assert_eq!(resp.status(), 422, "{}", resp.text().await.unwrap());
 }
 
+/// A preview without `at` evaluates at the database's clock, as a run does
+/// (#227): with the database an hour ahead, a version 30 days old by the
+/// database and not yet by this process is one the preview deletes, as the
+/// run would. An explicit `at` is still evaluated as given.
+#[tokio::test]
+async fn preview_evaluates_at_the_database_clock() {
+    let srv = common::start_with(
+        common::pool_with_clock_ahead().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let name = format!("retc{}", common::unique());
+    let repo_id = seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+    // Half an hour short of 30 days by this process's clock, half an hour
+    // past them by the database's.
+    let process_now = chrono::Utc::now();
+    sqlx::query("UPDATE component SET created_at = $1 WHERE repository_id = $2")
+        .bind(process_now - chrono::Duration::days(30) + chrono::Duration::minutes(30))
+        .bind(repo_id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    let policy = json!({
+        "version": 1,
+        "enabled": true,
+        "dry_run_only": false,
+        "min_run_interval_seconds": 3600,
+        "rules": [
+            {
+                "id": "old",
+                "action": "hard_delete",
+                "release_type": "any",
+                "criteria": { "older_than_days": 30 }
+            }
+        ]
+    });
+    let url = format!(
+        "{}/admin/repositories/{name}/retention/preview",
+        srv.base_url
+    );
+    let preview = |body: Value| {
+        let request = client.post(&url).basic_auth(&u, Some(&p)).json(&body);
+        async move {
+            let resp = request.send().await.unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+
+    let body = preview(json!({ "policy": policy })).await;
+    assert_eq!(body["counts"]["deleted"], json!(1), "{body}");
+    assert_eq!(body["decisions"][0]["version"], json!("1.0.0"), "{body}");
+
+    let body = preview(json!({ "policy": policy, "at": process_now })).await;
+    assert_eq!(body["counts"]["evaluated"], json!(1), "{body}");
+    assert_eq!(body["counts"]["deleted"], json!(0), "{body}");
+}
+
 /// Whether retention runs and how long its audit log is kept are settings of
 /// every instance (`/admin/settings/retention`, #429), on a database of its
 /// own since they are install-wide. Switched off, no run is claimed, a run in
