@@ -313,7 +313,7 @@ async fn oidc_callback(
 /// to the login page ([`login_failed`]) refused the sign-in, any other one
 /// completed it, a `5xx` failed it. A `404` (no OIDC realm) is no sign-in.
 fn record_oidc_sign_in(resp: &Response) {
-    use forge_metrics::auth::{sign_in, RealmType, SignInOutcome};
+    use forge_telemetry::auth::{sign_in, RealmType, SignInOutcome};
     let status = resp.status();
     let outcome = if status == StatusCode::FOUND {
         let refused = resp

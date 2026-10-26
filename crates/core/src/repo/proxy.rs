@@ -125,8 +125,9 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use forge_metrics::proxy::{Kind as LookupKind, Lookup, Outcome};
 use forge_plugin_api as api;
+use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
+use tracing::Instrument;
 
 use crate::authz::PackageFilter;
 use crate::format::Format;
@@ -1102,7 +1103,11 @@ impl ProxyRepo {
         lower_id: &str,
     ) -> Result<Vec<forge_db::model::ProxyCachedVersion>, RepoError> {
         let mut lookup = Lookup::start(&repo.name, LookupKind::Metadata);
-        let result = self.discover(repo, lower_id, &mut lookup).await;
+        let span = lookup.span();
+        let result = self
+            .discover(repo, lower_id, &mut lookup)
+            .instrument(span)
+            .await;
         let outcome = match &result {
             Ok(_) => lookup.marked().unwrap_or(Outcome::Hit),
             Err(e) => error_outcome(e, lookup.marked()),
@@ -1379,7 +1384,11 @@ impl ProxyRepo {
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
         let mut lookup = Lookup::start(&repo.name, LookupKind::Package);
-        let result = self.download(repo, lower_id, version, &mut lookup).await;
+        let span = lookup.span();
+        let result = self
+            .download(repo, lower_id, version, &mut lookup)
+            .instrument(span)
+            .await;
         let outcome = match &result {
             Ok(Some(_)) => lookup.marked().unwrap_or(Outcome::Hit),
             Ok(None) => lookup.marked().unwrap_or(Outcome::NotFound),
@@ -1606,7 +1615,7 @@ impl ProxyRepo {
         let reader = tokio_util::io::StreamReader::new(body);
         let staged = match self.cas.stage(reader, max_bytes).await {
             Ok(staged) => {
-                forge_metrics::proxy::upstream_bytes(&repo.name, staged.size);
+                forge_telemetry::proxy::upstream_bytes(&repo.name, staged.size);
                 lookup.mark(Outcome::Fetched);
                 staged
             }

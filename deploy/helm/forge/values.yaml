@@ -78,6 +78,32 @@ config:
 # RUST_LOG (tracing filter), e.g. "info,forge::audit=info,sqlx=warn".
 logLevel: info
 
+# OpenTelemetry (docs/deployment.md → Telemetry): Forge exports metrics,
+# traces and logs over OTLP/HTTP, each once enabled here, to an
+# OpenTelemetry Collector (or any OTLP/HTTP endpoint), which sends them on to
+# your backends. The resource attributes name the pod, its namespace, node
+# and Deployment. With networkPolicy.egress set, allow the Collector's port.
+telemetry:
+  metrics: false
+  traces: false
+  logs: false
+  # The OTLP/HTTP endpoint (OTEL_EXPORTER_OTLP_ENDPOINT, port 4318; Forge
+  # does not speak OTLP/gRPC), e.g. http://otel-collector.observability:4318,
+  # or http://$(HOST_IP):4318 for a Collector on every node. Empty: the
+  # default, http://localhost:4318 (a sidecar).
+  endpoint: ""
+  # Headers sent with every export (OTEL_EXPORTER_OTLP_HEADERS, e.g. a
+  # vendor's API key as `api-key=...`), from a Secret: a SecretKeySelector,
+  # e.g. { name: otlp-auth, key: headers }.
+  headersSecret: {}
+  # Further resource attributes (OTEL_RESOURCE_ATTRIBUTES), e.g.
+  #   deployment.environment.name: production
+  resourceAttributes: {}
+  # The trace sampler (OTEL_TRACES_SAMPLER / _ARG), e.g.
+  # parentbased_traceidratio with "0.1"; empty: every trace (parentbased_always_on).
+  sampler: ""
+  samplerArg: ""
+
 # Secret settings as environment variables, stored in a Secret the chart
 # creates (<fullname>-secret-env) and loaded with envFrom: FORGE_DATABASE__URL,
 # FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY, FORGE_REDIS__URL,
@@ -214,41 +240,6 @@ securityContext:
 # The port Forge listens on (server.bind); the API, the feeds, the registry
 # and the web UI share it.
 containerPort: 8421
-
-# Prometheus metrics (docs/deployment.md → Metrics): GET /metrics on a
-# listener of their own (server.metrics_bind), never on the http port, so
-# the HTTPRoute never exposes them. The Service carries the port as
-# `metrics`. To require a bearer token (server.metrics_token, at least 16
-# characters) set FORGE_SERVER__METRICS_TOKEN in secretEnv or
-# existingSecret, and give the monitors its Secret (bearerTokenSecret).
-# Repository names are labels unless config.metrics.per_repository is false.
-metrics:
-  enabled: true
-  port: 9421
-  # A prometheus-operator ServiceMonitor (monitoring.coreos.com/v1) for the
-  # Service's metrics port.
-  serviceMonitor:
-    enabled: false
-    annotations: {}
-    # E.g. the label your Prometheus selects monitors by (release: ...).
-    labels: {}
-    interval: 30s
-    scrapeTimeout: ""
-    # The token, when Forge requires one: a SecretKeySelector, e.g.
-    #   { name: forge-metrics, key: token }
-    bearerTokenSecret: {}
-    relabelings: []
-    metricRelabelings: []
-  # A PodMonitor for the pods' metrics port instead (or as well).
-  podMonitor:
-    enabled: false
-    annotations: {}
-    labels: {}
-    interval: 30s
-    scrapeTimeout: ""
-    bearerTokenSecret: {}
-    relabelings: []
-    metricRelabelings: []
 
 # On SIGTERM Forge stops accepting connections and drains in-flight requests;
 # this bounds the drain (the largest download you expect).
@@ -442,13 +433,7 @@ autoscaling:
   maxReplicas: 4
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: null
-  # Further metrics (MetricSpec objects) and scaling behavior. With Forge's
-  # metrics in Prometheus and an adapter serving them as custom metrics
-  # (prometheus-adapter, KEDA), scale on the requests in flight:
-  #   - type: Pods
-  #     pods:
-  #       metric: { name: forge_http_requests_in_flight }
-  #       target: { type: AverageValue, averageValue: "20" }
+  # Further metrics (MetricSpec objects) and scaling behavior.
   metrics: []
   behavior: {}
 
@@ -468,13 +453,6 @@ networkPolicy:
   #         kubernetes.io/metadata.name: gateway-system
   # Empty allows every source.
   from: []
-  # Peers allowed to reach the metrics port (metrics.port), e.g. the
-  # namespace of your Prometheus:
-  #   - namespaceSelector:
-  #       matchLabels:
-  #         kubernetes.io/metadata.name: monitoring
-  # Empty allows every source.
-  metricsFrom: []
   # Further ingress rules.
   extraIngress: []
   # Egress rules. Empty leaves egress unrestricted; once set, allow DNS,

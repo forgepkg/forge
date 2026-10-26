@@ -10,6 +10,7 @@ use forge_server::app::{
 };
 use forge_server::config::Config;
 use forge_server::state::AppState;
+use forge_server::telemetry::{self, Telemetry};
 use forge_server::workers;
 
 #[tokio::main]
@@ -17,20 +18,43 @@ async fn main() -> anyhow::Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
-    // The log, filtered by RUST_LOG (default `info`), and the connection
-    // pool's acquire events, which the metrics read whatever RUST_LOG says.
-    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let log_level = log_filter.max_level_hint();
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(log_filter))
-        .with(
-            forge_server::metrics::AcquireTimes.with_filter(
+    // Config: optional path from FORGE_CONFIG, else `forge.toml` if present.
+    // Loaded with the console log only: `[telemetry]` says what else the
+    // process's log is.
+    let config_path = std::env::var_os("FORGE_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let default = PathBuf::from("forge.toml");
+            default.exists().then_some(default)
+        });
+    let config = tracing::subscriber::with_default(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(telemetry::console_log_filter())),
+        || Config::load(config_path.as_deref()),
+    )
+    .context("load configuration")?;
+
+    // OpenTelemetry: the signals `[telemetry]` turns on, exported over OTLP.
+    let telemetry = Telemetry::new(&config.telemetry).context("set up OpenTelemetry")?;
+    telemetry.install();
+    forge_telemetry::set_per_repository(config.telemetry.per_repository);
+
+    // The console log, filtered by RUST_LOG (default `info`); the connection
+    // pool's acquire events, which the metrics read whatever RUST_LOG says;
+    // and the trace and log export.
+    let console_filter = telemetry::console_log_filter();
+    let log_level = console_filter.max_level_hint();
+    let mut layers: Vec<telemetry::BoxedLayer> = vec![
+        Box::new(tracing_subscriber::fmt::layer().with_filter(console_filter)),
+        Box::new(
+            telemetry::AcquireTimes.with_filter(
                 tracing_subscriber::filter::Targets::new()
-                    .with_target(forge_server::metrics::ACQUIRE_TARGET, tracing::Level::TRACE),
+                    .with_target(telemetry::ACQUIRE_TARGET, tracing::Level::TRACE),
             ),
-        )
-        .init();
+        ),
+    ];
+    layers.extend(telemetry.layers());
+    tracing_subscriber::registry().with(layers).init();
     // Those TRACE events raise the subscriber's level, and `init` gives it to
     // the `log` bridge too: keep dependencies' `log` records at the level
     // the log prints, so they are skipped as cheaply as before.
@@ -45,22 +69,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Config: optional path from FORGE_CONFIG, else `forge.toml` if present.
-    let config_path = std::env::var_os("FORGE_CONFIG")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let default = PathBuf::from("forge.toml");
-            default.exists().then_some(default)
-        });
-    let config = Config::load(config_path.as_deref()).context("load configuration")?;
-    let revision = option_env!("FORGE_GIT_SHA").unwrap_or("unknown");
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        revision,
+        revision = option_env!("FORGE_GIT_SHA").unwrap_or("unknown"),
+        metrics = config.telemetry.metrics,
+        traces = config.telemetry.traces,
+        logs = config.telemetry.logs,
         "starting forge-server"
     );
-    forge_metrics::set_build_info(env!("CARGO_PKG_VERSION"), revision);
-    forge_metrics::set_per_repository(config.metrics.per_repository);
     for warning in config.deployment_warnings() {
         tracing::warn!("{warning}");
     }
@@ -141,10 +157,6 @@ async fn main() -> anyhow::Result<()> {
         .context("ensure auth realms")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
-    let metrics_addr = config
-        .server
-        .metrics_addr()
-        .context("parse server.metrics_bind")?;
     // Registry (`/v2`) tokens are signed with one key shared by every
     // instance: docker.token_secret, or the install's generated key.
     let registry_keys = forge_server::registry::load_token_keys(&config, &pool, &envelope)
@@ -153,30 +165,12 @@ async fn main() -> anyhow::Result<()> {
     let state =
         AppState::new(pool, blob_store, cache, config, envelope).with_registry_keys(registry_keys);
     let layer = principal_layer(&state)?;
+    telemetry::install_live_source(&state);
     let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);
 
     // Background workers (outbox / reconciler / proxy refresh / …), each
     // supervised: a panicking loop is logged and restarted.
     let workers = workers::spawn_all(&state);
-
-    // The metrics listener, served until the process ends (scrapes see the
-    // drain): never on the main listener, so never behind the ingress.
-    let metrics = match metrics_addr {
-        Some(addr) => {
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("bind the metrics listener {addr}"))?;
-            tracing::info!(%addr, "metrics listening on /metrics");
-            let router = forge_server::metrics::router(state.clone());
-            Some(tokio::spawn(forge_server::serve::serve(
-                listener,
-                router,
-                serve_options,
-                std::future::pending(),
-            )))
-        }
-        None => None,
-    };
 
     let downloads = state.downloads.clone();
     let app = build_router(state, layer);
@@ -187,9 +181,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%bind_addr, "forge-server listening");
 
     forge_server::serve::serve(listener, app, serve_options, shutdown_signal()).await;
-    if let Some(metrics) = metrics {
-        metrics.abort();
-    }
 
     // In-flight requests have drained; stop the background loops. Every worker
     // step is idempotent / lease-fenced, so an interrupted pass is resumed by
@@ -198,6 +189,10 @@ async fn main() -> anyhow::Result<()> {
     // Download counts not written yet would be lost with the process.
     downloads.write_pending().await;
     tracing::info!("forge-server stopped");
+    // Export what the telemetry still buffers.
+    tokio::task::spawn_blocking(move || telemetry.shutdown())
+        .await
+        .context("flush the telemetry")?;
     Ok(())
 }
 

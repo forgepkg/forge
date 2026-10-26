@@ -18,8 +18,6 @@ public_base_url = "http://localhost:8421"
 # (bootstrap admin@example.com/changeme, minioadmin S3 keys). Without this
 # opt-in the server refuses to start with them. Never set it in production.
 allow_insecure_defaults = true
-# Prometheus metrics at http://localhost:9421/metrics (off by default).
-# metrics_bind = "0.0.0.0:9421"
 
 [database]
 # docker-compose maps the dev Postgres to host port 5433 (see docker-compose.yml).

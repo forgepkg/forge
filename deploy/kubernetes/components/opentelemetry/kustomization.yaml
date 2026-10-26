@@ -1,0 +1,19 @@
+# OpenTelemetry (docs/deployment.md → Telemetry): Forge exports its metrics,
+# traces and logs over OTLP/HTTP to an OpenTelemetry Collector, which sends
+# them on to your backends (Prometheus, Tempo, Loki, a vendor's).
+#
+# The Collector's address, `otel-collector.observability.svc:4318`, is a
+# placeholder: patch OTEL_EXPORTER_OTLP_ENDPOINT to yours (port 4318, OTLP
+# over HTTP; Forge does not speak OTLP/gRPC). For a Collector running as a
+# DaemonSet, use the node's address: http://$(HOST_IP):4318. Drop a
+# FORGE_TELEMETRY__* variable to leave that signal off. The resource
+# attributes name the pod, its namespace and node, and make the pod's name
+# the instance's id (Prometheus' `instance` label); add yours (e.g.
+# deployment.environment.name=production) to OTEL_RESOURCE_ATTRIBUTES. With
+# components/network-policy and your own egress rules, allow the Collector's
+# port.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+patches:
+  - path: deployment-patch.yaml

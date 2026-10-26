@@ -31,11 +31,6 @@ configMapGenerator:
       # Secret encryption at rest, required: the root key is FORGE_ROOT_KEY in
       # the forge-env Secret.
       - FORGE_CRYPTO__ROOT__PROVIDER=env
-      # Prometheus metrics (GET /metrics) on a port of their own, `metrics`,
-      # which the Service carries but no Ingress or HTTPRoute routes.
-      # ../components/metrics adds a ServiceMonitor. For a bearer token put
-      # FORGE_SERVER__METRICS_TOKEN in the forge-env Secret.
-      - FORGE_SERVER__METRICS_BIND=0.0.0.0:9421
 
 # The release this commit belongs to. `cargo xtask release <version>` rewrites
 # newTag before it creates the tag, and the release workflow refuses a tag

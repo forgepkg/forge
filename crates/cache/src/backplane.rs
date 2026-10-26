@@ -334,7 +334,7 @@ async fn apply_message(l2: &RedisL2, tag_versions: &TagVersions, node_id: u64, p
             // advances the barrier by one (see
             // `TagVersions::observe_invalidation`).
             tag_versions.observe_invalidation(tag, generation);
-            forge_metrics::cache::invalidation_received();
+            forge_telemetry::cache::invalidation_received();
         }
         "k" | "n" => {
             let (ns, tag) = if kind == "k" {

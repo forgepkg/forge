@@ -1,7 +1,7 @@
 {
   "title": "Forge",
   "uid": "forge-overview",
-  "description": "Forge's Prometheus metrics (docs/deployment.md \u2192 Metrics).",
+  "description": "Forge's OpenTelemetry metrics in Prometheus (docs/deployment.md \u2192 Telemetry).",
   "tags": [
     "forge"
   ],
@@ -41,10 +41,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(forge_http_requests_total, job)",
+          "query": "label_values(http_server_request_duration_seconds_count, job)",
           "refId": "job-var"
         },
-        "definition": "label_values(forge_http_requests_total, job)",
+        "definition": "label_values(http_server_request_duration_seconds_count, job)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -71,10 +71,10 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(forge_http_requests_total{job=~\"$job\"}, instance)",
+          "query": "label_values(http_server_request_duration_seconds_count{job=~\"$job\"}, instance)",
           "refId": "instance-var"
         },
-        "definition": "label_values(forge_http_requests_total{job=~\"$job\"}, instance)",
+        "definition": "label_values(http_server_request_duration_seconds_count{job=~\"$job\"}, instance)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -93,18 +93,18 @@
         "hide": 0
       },
       {
-        "name": "repo",
-        "label": "Proxy / repository",
+        "name": "repository",
+        "label": "Repository",
         "type": "query",
         "datasource": {
           "type": "prometheus",
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(forge_proxy_lookups_total{job=~\"$job\"}, repo)",
-          "refId": "repo-var"
+          "query": "label_values(forge_repository_versions{job=~\"$job\"}, forge_repository)",
+          "refId": "repository-var"
         },
-        "definition": "label_values(forge_proxy_lookups_total{job=~\"$job\"}, repo)",
+        "definition": "label_values(forge_repository_versions{job=~\"$job\"}, forge_repository)",
         "refresh": 2,
         "multi": true,
         "includeAll": true,
@@ -193,7 +193,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(forge_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(http_server_request_duration_seconds_count{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "",
           "refId": "A",
           "range": true
@@ -264,7 +264,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(forge_http_requests_total{job=~\"$job\",instance=~\"$instance\",status=\"5xx\"}[$__rate_interval])) / sum(rate(forge_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(rate(http_server_request_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",http_response_status_code=~\"5..\"}[$__rate_interval])) / sum(rate(http_server_request_duration_seconds_count{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "",
           "refId": "A",
           "range": true
@@ -421,8 +421,8 @@
     },
     {
       "type": "table",
-      "title": "Running builds",
-      "description": "The version each instance runs.",
+      "title": "Running versions",
+      "description": "The version each instance runs (service.version and the revision of its resource).",
       "id": 6,
       "datasource": {
         "type": "prometheus",
@@ -475,7 +475,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "count by (instance, version, commit) (forge_build_info{job=~\"$job\",instance=~\"$instance\"})",
+          "expr": "count by (instance, service_version, vcs_ref_head_revision) (target_info{job=~\"$job\",instance=~\"$instance\"})",
           "legendFormat": "",
           "refId": "A",
           "range": false,
@@ -539,7 +539,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(forge_http_requests_in_flight{job=~\"$job\",instance=~\"$instance\"})",
+          "expr": "sum(http_server_active_requests{job=~\"$job\",instance=~\"$instance\"})",
           "legendFormat": "",
           "refId": "A",
           "range": true
@@ -601,7 +601,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(max by (format, kind) (forge_repositories{job=~\"$job\",instance=~\"$instance\"}))",
+          "expr": "sum(max by (forge_repository_format, forge_repository_kind) (forge_repositories{job=~\"$job\",instance=~\"$instance\"}))",
           "legendFormat": "",
           "refId": "A",
           "range": true
@@ -674,8 +674,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (surface) (rate(forge_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{surface}}",
+          "expr": "sum by (forge_surface) (rate(http_server_request_duration_seconds_count{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_surface}}",
           "refId": "A",
           "range": true
         }
@@ -683,8 +683,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Requests by status class",
-      "description": "Requests per second by status class.",
+      "title": "Requests by status",
+      "description": "Requests per second by response status.",
       "id": 11,
       "datasource": {
         "type": "prometheus",
@@ -734,8 +734,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (status) (rate(forge_http_requests_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{status}}",
+          "expr": "sum by (http_response_status_code) (rate(http_server_request_duration_seconds_count{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{http_response_status_code}}",
           "refId": "A",
           "range": true
         }
@@ -794,8 +794,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, surface) (rate(forge_http_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "{{surface}}",
+          "expr": "histogram_quantile(0.95, sum by (le, forge_surface) (rate(http_server_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{forge_surface}}",
           "refId": "A",
           "range": true
         }
@@ -854,8 +854,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (surface) (rate(forge_http_response_bytes_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{surface}}",
+          "expr": "sum by (forge_surface) (rate(http_server_response_body_size_bytes_sum{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_surface}}",
           "refId": "A",
           "range": true
         }
@@ -927,8 +927,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (outcome) (rate(forge_proxy_lookups_total{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\"}[$__rate_interval]))",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum by (forge_proxy_outcome) (rate(forge_proxy_lookups_total{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_proxy_outcome}}",
           "refId": "A",
           "range": true
         }
@@ -987,8 +987,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (repo) (rate(forge_proxy_lookups_total{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\",outcome=\"hit\"}[$__rate_interval])) / sum by (repo) (rate(forge_proxy_lookups_total{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\"}[$__rate_interval]))",
-          "legendFormat": "{{repo}}",
+          "expr": "sum by (forge_repository) (rate(forge_proxy_lookups_total{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\",forge_proxy_outcome=\"hit\"}[$__rate_interval])) / sum by (forge_repository) (rate(forge_proxy_lookups_total{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_repository}}",
           "refId": "A",
           "range": true
         }
@@ -1047,8 +1047,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (repo) (rate(forge_proxy_lookups_total{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\",outcome=\"upstream_error\"}[$__rate_interval]))",
-          "legendFormat": "{{repo}}",
+          "expr": "sum by (forge_repository) (rate(forge_proxy_lookups_total{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\",forge_proxy_outcome=\"upstream_error\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_repository}}",
           "refId": "A",
           "range": true
         }
@@ -1107,8 +1107,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (repo) (increase(forge_proxy_upstream_rate_limited_total{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\"}[$__rate_interval]))",
-          "legendFormat": "{{repo}}",
+          "expr": "sum by (forge_repository) (increase(http_client_request_duration_seconds_count{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\",http_response_status_code=\"429\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_repository}}",
           "refId": "A",
           "range": true
         }
@@ -1167,8 +1167,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, repo) (rate(forge_proxy_upstream_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\"}[$__rate_interval])))",
-          "legendFormat": "{{repo}}",
+          "expr": "histogram_quantile(0.95, sum by (le, forge_repository) (rate(http_client_request_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\"}[$__rate_interval])))",
+          "legendFormat": "{{forge_repository}}",
           "refId": "A",
           "range": true
         }
@@ -1227,8 +1227,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (repo) (rate(forge_proxy_upstream_bytes_total{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\"}[$__rate_interval]))",
-          "legendFormat": "{{repo}}",
+          "expr": "sum by (forge_repository) (rate(forge_proxy_upstream_fetched_bytes_total{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_repository}}",
           "refId": "A",
           "range": true
         }
@@ -1300,8 +1300,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (outcome) (rate(forge_s3_operations_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum by (forge_s3_outcome) (rate(forge_s3_operation_duration_seconds_count{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_s3_outcome}}",
           "refId": "A",
           "range": true
         }
@@ -1360,8 +1360,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(forge_s3_operation_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "{{op}}",
+          "expr": "histogram_quantile(0.95, sum by (le, forge_s3_operation) (rate(forge_s3_operation_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{forge_s3_operation}}",
           "refId": "A",
           "range": true
         }
@@ -1480,7 +1480,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (instance) (forge_blob_cache_size_bytes{job=~\"$job\",instance=~\"$instance\"})",
+          "expr": "sum by (instance) (forge_blob_cache_usage_bytes{job=~\"$job\",instance=~\"$instance\"})",
           "legendFormat": "{{instance}}",
           "refId": "A",
           "range": true
@@ -1540,7 +1540,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (instance) (forge_staging_bytes{job=~\"$job\",instance=~\"$instance\"}) / sum by (instance) (forge_staging_limit_bytes{job=~\"$job\",instance=~\"$instance\"})",
+          "expr": "sum by (instance) (forge_staging_usage_bytes{job=~\"$job\",instance=~\"$instance\"}) / sum by (instance) (forge_staging_limit_bytes{job=~\"$job\",instance=~\"$instance\"})",
           "legendFormat": "{{instance}}",
           "refId": "A",
           "range": true
@@ -1670,8 +1670,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (source) (increase(forge_gc_blobs_deleted_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{source}}",
+          "expr": "sum by (forge_gc_source) (increase(forge_gc_deleted_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_gc_source}}",
           "refId": "A",
           "range": true
         }
@@ -1693,7 +1693,7 @@
     {
       "type": "timeseries",
       "title": "Cache hit ratio by tier",
-      "description": "In-process (L1) and Redis (L2) cache lookups that hit.",
+      "description": "In-process (l1) and Redis (l2) cache lookups that hit.",
       "id": 30,
       "datasource": {
         "type": "prometheus",
@@ -1743,8 +1743,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (tier) (rate(forge_cache_lookups_total{job=~\"$job\",instance=~\"$instance\",result=\"hit\"}[$__rate_interval])) / sum by (tier) (rate(forge_cache_lookups_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{tier}}",
+          "expr": "sum by (forge_cache_tier) (rate(forge_cache_lookups_total{job=~\"$job\",instance=~\"$instance\",forge_cache_result=\"hit\"}[$__rate_interval])) / sum by (forge_cache_tier) (rate(forge_cache_lookups_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_cache_tier}}",
           "refId": "A",
           "range": true
         }
@@ -1803,19 +1803,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(forge_cache_invalidations_sent_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "sent",
+          "expr": "sum by (forge_cache_direction) (rate(forge_cache_invalidations_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_cache_direction}}",
           "refId": "A",
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(forge_cache_invalidations_received_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "received",
-          "refId": "B",
           "range": true
         }
       ]
@@ -1823,7 +1813,7 @@
     {
       "type": "timeseries",
       "title": "Database connections",
-      "description": "Pooled connections in use and idle, against the pools' maximum (all instances).",
+      "description": "Pooled connections used and idle, against the pools' maximum (all instances).",
       "id": 32,
       "datasource": {
         "type": "prometheus",
@@ -1873,8 +1863,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (state) (forge_db_pool_connections{job=~\"$job\",instance=~\"$instance\"})",
-          "legendFormat": "{{state}}",
+          "expr": "sum by (db_client_connection_state) (db_client_connection_count{job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{db_client_connection_state}}",
           "refId": "A",
           "range": true
         },
@@ -1883,7 +1873,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(forge_db_pool_max_connections{job=~\"$job\",instance=~\"$instance\"})",
+          "expr": "sum(db_client_connection_max{job=~\"$job\",instance=~\"$instance\"})",
           "legendFormat": "max",
           "refId": "B",
           "range": true
@@ -1892,7 +1882,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Connection acquire p95",
+      "title": "Connection wait p95",
       "description": "95th percentile wait for a pooled database connection.",
       "id": 33,
       "datasource": {
@@ -1943,7 +1933,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(forge_db_pool_acquire_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(db_client_connection_wait_time_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "A",
           "range": true
@@ -2016,8 +2006,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "time() - max by (worker) (forge_worker_last_success_timestamp_seconds{job=~\"$job\",instance=~\"$instance\"})",
-          "legendFormat": "{{worker}}",
+          "expr": "time() - max by (forge_worker) (forge_worker_last_success_time_seconds{job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{forge_worker}}",
           "refId": "A",
           "range": true
         }
@@ -2076,8 +2066,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (worker) (increase(forge_worker_runs_total{job=~\"$job\",instance=~\"$instance\",outcome=\"failure\"}[$__rate_interval]))",
-          "legendFormat": "{{worker}}",
+          "expr": "sum by (forge_worker) (increase(forge_worker_runs_total{job=~\"$job\",instance=~\"$instance\",forge_worker_outcome=\"failure\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_worker}}",
           "refId": "A",
           "range": true
         }
@@ -2136,8 +2126,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, worker) (rate(forge_worker_run_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "{{worker}}",
+          "expr": "histogram_quantile(0.95, sum by (le, forge_worker) (rate(forge_worker_run_duration_seconds_bucket{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{forge_worker}}",
           "refId": "A",
           "range": true
         }
@@ -2196,8 +2186,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (worker) (increase(forge_worker_restarts_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{worker}}",
+          "expr": "sum by (forge_worker) (increase(forge_worker_restarts_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_worker}}",
           "refId": "A",
           "range": true
         }
@@ -2269,8 +2259,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (action) (increase(forge_retention_versions_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{action}}",
+          "expr": "sum by (forge_retention_action) (increase(forge_retention_versions_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_retention_action}}",
           "refId": "A",
           "range": true
         }
@@ -2329,8 +2319,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (repo) (increase(forge_retention_freed_bytes_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{repo}}",
+          "expr": "sum by (forge_repository) (increase(forge_retention_freed_bytes_total{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_repository}}",
           "refId": "A",
           "range": true
         }
@@ -2402,8 +2392,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (realm_type, outcome) (rate(forge_auth_sign_ins_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{realm_type}} {{outcome}}",
+          "expr": "sum by (forge_auth_realm_type, forge_auth_outcome) (rate(forge_auth_sign_ins_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_auth_realm_type}} {{forge_auth_outcome}}",
           "refId": "A",
           "range": true
         }
@@ -2462,8 +2452,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (reason) (rate(forge_auth_throttled_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{reason}}",
+          "expr": "sum by (forge_auth_throttle_reason) (rate(forge_auth_throttled_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_auth_throttle_reason}}",
           "refId": "A",
           "range": true
         }
@@ -2522,8 +2512,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (outcome) (rate(forge_auth_token_exchanges_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum by (forge_auth_exchange_outcome) (rate(forge_auth_token_exchanges_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{forge_auth_exchange_outcome}}",
           "refId": "A",
           "range": true
         }
@@ -2592,7 +2582,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(forge_auth_credential_forwarding_errors_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum(increase(forge_auth_forwarding_errors_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "credential-forwarding errors",
           "refId": "B",
           "range": true
@@ -2668,7 +2658,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (format, kind) (forge_repositories{job=~\"$job\",instance=~\"$instance\"})",
+          "expr": "max by (forge_repository_format, forge_repository_kind) (forge_repositories{job=~\"$job\",instance=~\"$instance\"})",
           "legendFormat": "",
           "refId": "A",
           "range": false,
@@ -2747,7 +2737,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(20, max by (repo) (forge_repository_stored_bytes{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\"}))",
+          "expr": "topk(20, max by (forge_repository) (forge_repository_size_bytes{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\"}))",
           "legendFormat": "",
           "refId": "A",
           "range": false,
@@ -2759,7 +2749,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (repo) (forge_repository_versions{job=~\"$job\",instance=~\"$instance\",repo=~\"$repo\"})",
+          "expr": "max by (forge_repository) (forge_repository_versions{job=~\"$job\",instance=~\"$instance\",forge_repository=~\"$repository\"})",
           "legendFormat": "",
           "refId": "B",
           "range": false,

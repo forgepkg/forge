@@ -104,7 +104,7 @@ use serde::{Deserialize, Serialize};
 use crate::backplane::Backplane;
 use crate::l1::L1;
 use crate::l2_redis::RedisL2;
-use forge_metrics::cache::Tier;
+use forge_telemetry::cache::Tier;
 
 /// Errors raised by the cache infrastructure itself (construction / L2 setup).
 ///
@@ -742,7 +742,7 @@ impl Cache {
                                                 && serde_json::from_slice::<T>(&candidate.value)
                                                     .is_ok()
                                             {
-                                                forge_metrics::cache::lookup(Tier::L2, true);
+                                                forge_telemetry::cache::lookup(Tier::L2, true);
                                                 return Ok(Arc::new(candidate));
                                             }
                                             if candidate.tags == current {
@@ -786,7 +786,7 @@ impl Cache {
                             tracing::warn!(error = %err, key = %key_for_l2, "L2 get failed; falling through to factory");
                         }
                     }
-                    forge_metrics::cache::lookup(Tier::L2, false);
+                    forge_telemetry::cache::lookup(Tier::L2, false);
                 }
 
                 let (stamps, redis_generations_available) = if let Some(l2) = &l2 {
@@ -863,7 +863,7 @@ impl Cache {
             .await;
         // A caller coalesced onto another's fill counts as a hit: it did not
         // fill.
-        forge_metrics::cache::lookup(Tier::L1, !missed.load(Ordering::Relaxed));
+        forge_telemetry::cache::lookup(Tier::L1, !missed.load(Ordering::Relaxed));
         result
     }
 
@@ -892,7 +892,7 @@ impl Cache {
     }
 
     async fn invalidate_internal_tag(&self, ns: &str, tag: &str) {
-        forge_metrics::cache::invalidation_sent();
+        forge_telemetry::cache::invalidation_sent();
         // Raise the local barrier first: from here on this instance hides
         // every entry stamped before it, whatever Redis does next. No lock is
         // held across the Redis round-trips below (see the crate docs).

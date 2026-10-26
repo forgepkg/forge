@@ -175,7 +175,7 @@ impl Chain {
 /// Count a password sign-in in the metrics, under the kind of realm that
 /// decided it.
 fn record_sign_in(outcome: &ChainOutcome, decided_by: Option<AuthSource>) {
-    use forge_metrics::auth::{sign_in, RealmType, SignInOutcome};
+    use forge_telemetry::auth::{sign_in, RealmType, SignInOutcome};
     let realm = match decided_by {
         Some(AuthSource::Local) => RealmType::Local,
         Some(AuthSource::UpstreamBasic) => RealmType::CredentialForwarding,

@@ -143,10 +143,10 @@ pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Resp
         if !head {
             response = in_format(&plugin, response).await;
         }
-        // Counted under the repository's format ([`crate::metrics::track`]).
+        // Counted under the repository's format ([`crate::telemetry::track`]).
         response
             .extensions_mut()
-            .insert(forge_metrics::http::plugin_surface(plugin.id()));
+            .insert(forge_telemetry::http::plugin_surface(plugin.id()));
     }
     crate::feed::harden_response_headers(response.headers_mut());
     response

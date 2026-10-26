@@ -16,7 +16,7 @@ forge-crypto = { path = "../crypto" }
 # The format-plugin contract: the upstream conversation of proxy repositories
 # (`Format::upstream`) speaks its types. Nothing but std.
 forge-plugin-api = { path = "../plugin-api" }
-forge-metrics = { path = "../metrics" }
+forge-telemetry = { path = "../telemetry" }
 
 tokio = { workspace = true }
 sqlx = { workspace = true }

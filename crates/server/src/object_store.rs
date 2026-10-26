@@ -21,6 +21,7 @@ use anyhow::Context;
 use forge_storage::{BlobCache, BlobCacheStats, BlobStore};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tracing::Instrument;
 
 use crate::config::Config;
 use crate::state::Instance;
@@ -109,10 +110,10 @@ pub fn spawn_maintenance(
         loop {
             ticker.tick().await;
             runs += 1;
-            let run = forge_metrics::workers::Run::start(WORKER);
+            let run = forge_telemetry::workers::Run::start(WORKER);
             let mut ok = true;
             if runs % DROP_DELETED_EVERY == 1 {
-                match drop_deleted(&cache, &pool).await {
+                match drop_deleted(&cache, &pool).instrument(run.span()).await {
                     Ok(0) => {}
                     Ok(dropped) => tracing::info!(
                         dropped,

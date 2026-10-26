@@ -92,9 +92,10 @@ pub struct Config {
     /// download reads S3.
     #[serde(default)]
     pub blob_cache: BlobCacheConfig,
-    /// What the metrics listener (`server.metrics_bind`) reports.
+    /// OpenTelemetry: which signals Forge exports over OTLP, and what its
+    /// metrics report.
     #[serde(default)]
-    pub metrics: MetricsConfig,
+    pub telemetry: TelemetryConfig,
 }
 
 /// `server.*`
@@ -168,36 +169,6 @@ pub struct ServerConfig {
     /// disables. Default 900.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
-    /// Socket address of the metrics listener, e.g. `0.0.0.0:9421`:
-    /// Prometheus metrics at `GET /metrics` ([`crate::metrics`]), on a
-    /// listener of their own. The main listener never serves them, so they
-    /// stay off the ingress. Unset (the default): no metrics listener.
-    #[serde(default)]
-    pub metrics_bind: Option<String>,
-    /// A bearer token the metrics listener requires (`Authorization: Bearer
-    /// <token>`, at least 16 characters), for scrapers outside the cluster
-    /// network. Unset: whoever reaches the listener may scrape it.
-    #[serde(default)]
-    pub metrics_token: Option<MetricsToken>,
-}
-
-/// The bearer token of the metrics listener. `Debug` never shows it.
-#[derive(Clone, Deserialize)]
-#[serde(transparent)]
-pub struct MetricsToken(String);
-
-impl MetricsToken {
-    /// Whether `presented` is the token (compared in constant time).
-    pub fn matches(&self, presented: &str) -> bool {
-        use subtle::ConstantTimeEq;
-        bool::from(self.0.as_bytes().ct_eq(presented.as_bytes()))
-    }
-}
-
-impl std::fmt::Debug for MetricsToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MetricsToken(<redacted>)")
-    }
 }
 
 /// The upload limit of a package repository without one of its own: 512 MiB.
@@ -225,37 +196,6 @@ impl ServerConfig {
         self.bind
             .parse()
             .map_err(|_| ConfigError::Invalid(format!("invalid server.bind {:?}", self.bind)))
-    }
-
-    /// Parse [`Self::metrics_bind`]: `None` without a metrics listener.
-    pub fn metrics_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
-        if self
-            .metrics_token
-            .as_ref()
-            .is_some_and(|token| token.0.chars().count() < 16)
-        {
-            return Err(ConfigError::Invalid(
-                "server.metrics_token must be at least 16 characters (or unset for none)".into(),
-            ));
-        }
-        let Some(bind) = &self.metrics_bind else {
-            return Ok(None);
-        };
-        let addr: SocketAddr = bind
-            .parse()
-            .map_err(|_| ConfigError::Invalid(format!("invalid server.metrics_bind {bind:?}")))?;
-        let main = self.bind_addr()?;
-        // Port 0 picks a free port: two of them never collide.
-        let overlaps = addr.port() != 0
-            && addr.port() == main.port()
-            && (addr.ip() == main.ip() || addr.ip().is_unspecified() || main.ip().is_unspecified());
-        if overlaps {
-            return Err(ConfigError::Invalid(format!(
-                "server.metrics_bind ({addr}) must be another port than server.bind ({main}): \
-                 the metrics are served on a listener of their own"
-            )));
-        }
-        Ok(Some(addr))
     }
 }
 
@@ -1428,40 +1368,65 @@ impl NugetConfig {
     }
 }
 
-/// `[metrics]`: what the metrics listener (`server.metrics_bind`) reports.
+/// `[telemetry]`: OpenTelemetry ([`crate::telemetry`]). Each signal is
+/// exported over OTLP/HTTP to where the standard `OTEL_EXPORTER_OTLP_*`
+/// variables say (by default `http://localhost:4318`, an OpenTelemetry
+/// Collector beside Forge); `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`,
+/// `OTEL_TRACES_SAMPLER` and `OTEL_METRIC_EXPORT_INTERVAL` apply as usual.
 #[derive(Debug, Clone, Deserialize)]
-pub struct MetricsConfig {
-    /// Label metrics with the repository name (`repo`): administrators
-    /// create repositories, so their number stays small. Turn it off for an
-    /// install with very many; the metrics then add up all repositories.
-    /// Default `true`.
+pub struct TelemetryConfig {
+    /// Export metrics. Default `false`.
+    #[serde(default)]
+    pub metrics: bool,
+    /// Export traces: a span per request (joining the caller's trace from
+    /// its `traceparent`), proxy lookup, upstream request, S3 operation and
+    /// worker pass. Default `false`.
+    #[serde(default)]
+    pub traces: bool,
+    /// Export what the log prints (`RUST_LOG`) as log records, with the
+    /// trace and span they happened in. Default `false`.
+    #[serde(default)]
+    pub logs: bool,
+    /// Give the metrics the repository's name (`forge.repository`):
+    /// administrators create repositories, so their number stays small.
+    /// Turn it off for an install with very many; the metrics then add up
+    /// all repositories. Default `true`.
     #[serde(default = "default_true")]
     pub per_repository: bool,
     /// Seconds between two counts of what the instance holds (repositories,
     /// their versions and stored bytes) and of the outbox backlog: database
-    /// queries a worker runs, never a scrape. Default 300, at least 10.
-    #[serde(default = "default_metrics_inventory_interval_seconds")]
+    /// queries a worker runs with the metrics on, never an export. Default
+    /// 300, at least 10.
+    #[serde(default = "default_telemetry_inventory_interval_seconds")]
     pub inventory_interval_seconds: u64,
 }
 
-impl Default for MetricsConfig {
+impl Default for TelemetryConfig {
     fn default() -> Self {
-        MetricsConfig {
+        TelemetryConfig {
+            metrics: false,
+            traces: false,
+            logs: false,
             per_repository: true,
-            inventory_interval_seconds: default_metrics_inventory_interval_seconds(),
+            inventory_interval_seconds: default_telemetry_inventory_interval_seconds(),
         }
     }
 }
 
-fn default_metrics_inventory_interval_seconds() -> u64 {
+fn default_telemetry_inventory_interval_seconds() -> u64 {
     300
 }
 
-impl MetricsConfig {
+impl TelemetryConfig {
+    /// Whether any signal is exported.
+    pub fn any(&self) -> bool {
+        self.metrics || self.traces || self.logs
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.inventory_interval_seconds < 10 {
             return Err(ConfigError::Invalid(
-                "metrics.inventory_interval_seconds must be at least 10".into(),
+                "telemetry.inventory_interval_seconds must be at least 10".into(),
             ));
         }
         Ok(())
@@ -2159,7 +2124,6 @@ pub const SECRET_KEYS: &[&str] = &[
     "auth.upstream_basic.cache.key_pepper",
     "oidc.client_secret",
     "docker.token_secret",
-    "server.metrics_token",
 ];
 
 /// Whether an error at config key `path` must not echo its value: one of
@@ -2373,24 +2337,6 @@ impl Config {
         {
             self.redis.url = None;
         }
-        // `FORGE_SERVER__METRICS_BIND=` turns the metrics listener off, and
-        // a blank token is none.
-        if self
-            .server
-            .metrics_bind
-            .as_deref()
-            .is_some_and(|b| b.trim().is_empty())
-        {
-            self.server.metrics_bind = None;
-        }
-        if self
-            .server
-            .metrics_token
-            .as_ref()
-            .is_some_and(|t| t.0.trim().is_empty())
-        {
-            self.server.metrics_token = None;
-        }
         // `FORGE_BLOB_CACHE__PATH=` turns the blob cache off.
         if self
             .blob_cache
@@ -2405,8 +2351,7 @@ impl Config {
     /// Validate cross-cutting invariants that serde cannot express.
     fn validate(&self) -> Result<(), ConfigError> {
         self.server.bind_addr()?;
-        self.server.metrics_addr()?;
-        self.metrics.validate()?;
+        self.telemetry.validate()?;
         self.validate_public_base_url()?;
         // The DNS-rebinding guard's host list, checked before migrations run
         // rather than when the router is built.
@@ -3334,77 +3279,34 @@ mod tests {
     }
 
     #[test]
-    fn the_metrics_listener_is_off_by_default_and_needs_a_port_of_its_own() {
+    fn telemetry_is_off_by_default() {
         let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
-        assert_eq!(cfg.server.metrics_addr().unwrap(), None);
-        assert!(cfg.metrics.per_repository);
-        assert_eq!(cfg.metrics.inventory_interval_seconds, 300);
+        assert!(!cfg.telemetry.any());
+        assert!(cfg.telemetry.per_repository);
+        assert_eq!(cfg.telemetry.inventory_interval_seconds, 300);
 
-        let with = |server: &str, extra: &str| {
-            let toml = MINIMAL.replace(
-                "public_base_url = \"https://forge.example.com/\"",
-                &format!("public_base_url = \"https://forge.example.com/\"\n{server}"),
-            ) + extra;
-            Config::from_figment(fig_from_toml(&toml))
-        };
-        let cfg = with("metrics_bind = \"0.0.0.0:9421\"", "").expect("valid");
-        assert_eq!(
-            cfg.server.metrics_addr().unwrap(),
-            Some("0.0.0.0:9421".parse().unwrap())
-        );
-        for clash in ["0.0.0.0:8080", "127.0.0.1:8080"] {
-            let err = with(&format!("metrics_bind = \"{clash}\""), "").unwrap_err();
-            assert!(err.to_string().contains("server.metrics_bind"), "{err}");
-        }
-        let err = with("metrics_bind = \"nope\"", "").unwrap_err();
+        let with = |extra: &str| Config::from_figment(fig_from_toml(&format!("{MINIMAL}{extra}")));
+        let cfg = with("\n[telemetry]\ntraces = true\nper_repository = false\n").expect("valid");
+        assert!(cfg.telemetry.any());
+        assert!(cfg.telemetry.traces && !cfg.telemetry.metrics && !cfg.telemetry.logs);
+        assert!(!cfg.telemetry.per_repository);
+        let err = with("\n[telemetry]\ninventory_interval_seconds = 5\n").unwrap_err();
         assert!(
-            err.to_string().contains("invalid server.metrics_bind"),
-            "{err}"
-        );
-
-        let token = "metrics_bind = \"0.0.0.0:9421\"\nmetrics_token = \"short\"";
-        let err = with(token, "").unwrap_err();
-        assert!(err.to_string().contains("server.metrics_token"), "{err}");
-        assert!(
-            !err.to_string().contains("short"),
-            "never echoes the token: {err}"
-        );
-        let token = "metrics_bind = \"0.0.0.0:9421\"\nmetrics_token = \"0123456789abcdef\"";
-        let cfg = with(token, "").expect("valid");
-        let configured = cfg.server.metrics_token.as_ref().expect("a token");
-        assert!(configured.matches("0123456789abcdef"));
-        assert!(!configured.matches("0123456789abcdeX"));
-        assert!(!format!("{cfg:?}").contains("0123456789abcdef"));
-
-        let cfg = with("", "\n[metrics]\nper_repository = false\n").expect("valid");
-        assert!(!cfg.metrics.per_repository);
-        let err = with("", "\n[metrics]\ninventory_interval_seconds = 5\n").unwrap_err();
-        assert!(
-            err.to_string().contains("inventory_interval_seconds"),
+            err.to_string()
+                .contains("telemetry.inventory_interval_seconds"),
             "{err}"
         );
     }
 
     #[test]
     #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
-    fn a_blank_metrics_bind_turns_the_listener_off() {
+    fn telemetry_signals_are_turned_on_by_env() {
         figment::Jail::expect_with(|jail| {
             jail.create_file("forge.toml", MINIMAL)?;
-            jail.set_env("FORGE_SERVER__METRICS_BIND", "");
-            jail.set_env("FORGE_SERVER__METRICS_TOKEN", " ");
+            jail.set_env("FORGE_TELEMETRY__METRICS", "true");
+            jail.set_env("FORGE_TELEMETRY__LOGS", "true");
             let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
-            assert!(cfg.server.metrics_bind.is_none());
-            assert!(cfg.server.metrics_token.is_none());
-            jail.set_env("FORGE_SERVER__METRICS_BIND", "0.0.0.0:9421");
-            jail.set_env("FORGE_SERVER__METRICS_TOKEN", "1234567890123456");
-            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
-            assert_eq!(cfg.server.metrics_bind.as_deref(), Some("0.0.0.0:9421"));
-            // Read verbatim: a numeric token stays a string.
-            assert!(cfg
-                .server
-                .metrics_token
-                .as_ref()
-                .is_some_and(|t| t.matches("1234567890123456")));
+            assert!(cfg.telemetry.metrics && cfg.telemetry.logs && !cfg.telemetry.traces);
             Ok(())
         });
     }

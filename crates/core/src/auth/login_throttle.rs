@@ -630,9 +630,9 @@ impl LoginThrottle {
     ) -> Result<LoginAttempt<'_>, AttemptRefused> {
         let reserved = self.reserve(ip, username).await;
         if let Err(refused) = &reserved {
-            forge_metrics::auth::throttled(match refused {
-                AttemptRefused::Locked => forge_metrics::auth::Throttle::Locked,
-                AttemptRefused::Busy => forge_metrics::auth::Throttle::Busy,
+            forge_telemetry::auth::throttled(match refused {
+                AttemptRefused::Locked => forge_telemetry::auth::Throttle::Locked,
+                AttemptRefused::Busy => forge_telemetry::auth::Throttle::Busy,
             });
         }
         reserved

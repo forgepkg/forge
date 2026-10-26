@@ -6,7 +6,7 @@ members = [
     "crates/cache",
     "crates/core",
     "crates/crypto",
-    "crates/metrics",
+    "crates/telemetry",
     "crates/plugin-api",
     "crates/plugin",
     "crates/server",
@@ -120,8 +120,15 @@ thiserror = { version = "2" }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-# Prometheus metrics (`GET /metrics` on its own listener, `forge-metrics`).
-prometheus-client = { version = "0.25" }
+# OpenTelemetry: metrics, traces and logs, exported over OTLP. Every crate
+# records through the API (forge-telemetry); only forge-server sets up the
+# SDK, the OTLP/HTTP exporter and the bridges from `tracing`. The SDK's
+# `internal-logs` reports export failures in Forge's log.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics", "trace", "logs", "internal-logs"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "trace", "logs", "internal-logs"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "metrics", "trace", "logs", "internal-logs", "gzip-http"] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+opentelemetry-appender-tracing = { version = "0.33", default-features = false }
 
 # Hashing
 sha2 = { version = "0.11" }

@@ -10,7 +10,7 @@ publish.workspace = true
 # Secret encryption at rest: the Postgres KeyStore over
 # `encryption_key` and the encrypted-column helpers go through forge-crypto.
 forge-crypto = { path = "../crypto" }
-forge-metrics = { path = "../metrics" }
+forge-telemetry = { path = "../telemetry" }
 # sqlx takes the level of its pool-acquire events as a `log` level.
 log = "0.4"
 

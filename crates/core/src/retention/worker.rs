@@ -29,6 +29,7 @@ use std::time::Duration as StdDuration;
 use chrono::{Duration, Utc};
 use futures_util::FutureExt;
 use sqlx::PgPool;
+use tracing::Instrument;
 
 use forge_db::model::RepoKind;
 use forge_db::retention_dao::{self, RunSummary};
@@ -205,7 +206,7 @@ impl RetentionWorker {
                 Ok(Some(summary))
             }
             Err(e) => {
-                forge_metrics::retention::run(&repo.name, false, 0, 0, 0);
+                forge_telemetry::retention::run(&repo.name, false, 0, 0, 0);
                 tracing::error!(error = %e, repo = %repo.name, %run_id, "retention run failed");
                 // Release the lease, record the error, reschedule.
                 let now = forge_db::db_now(&self.pool)
@@ -255,7 +256,7 @@ impl RetentionWorker {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         if dry_run {
-            forge_metrics::retention::run(&repo.name, true, 0, 0, 0);
+            forge_telemetry::retention::run(&repo.name, true, 0, 0, 0);
             return;
         }
         let freed = match (size_before, summary.deleted > 0) {
@@ -266,7 +267,7 @@ impl RetentionWorker {
                 .unwrap_or(0),
             _ => 0,
         };
-        forge_metrics::retention::run(&repo.name, true, summary.unlisted, summary.deleted, freed);
+        forge_telemetry::retention::run(&repo.name, true, summary.unlisted, summary.deleted, freed);
     }
 
     /// Evaluate + apply one claimed repository, then finish the run + invalidate
@@ -653,24 +654,26 @@ impl RetentionWorker {
             let mut ticker = tokio::time::interval(self.config.poll_interval);
             loop {
                 ticker.tick().await;
-                let run = forge_metrics::workers::Run::start(WORKER);
-                let mut ok = true;
+                let run = forge_telemetry::workers::Run::start(WORKER);
                 // Drain all currently-due repos this cycle (bounded by the lease
                 // / SKIP LOCKED so other instances share the work).
-                loop {
-                    match self.tick().await {
-                        Ok(Some(summary)) => {
-                            tracing::debug!(?summary, "retention run completed");
-                        }
-                        Ok(None) => break, // nothing due
-                        Err(e) => {
-                            ok = false;
-                            tracing::error!(error = %e, "retention tick failed");
-                            break;
+                let drained = async {
+                    loop {
+                        match self.tick().await {
+                            Ok(Some(summary)) => {
+                                tracing::debug!(?summary, "retention run completed");
+                            }
+                            Ok(None) => return true, // nothing due
+                            Err(e) => {
+                                tracing::error!(error = %e, "retention tick failed");
+                                return false;
+                            }
                         }
                     }
                 }
-                run.finish(ok);
+                .instrument(run.span())
+                .await;
+                run.finish(drained);
             }
         })
     }

@@ -32,7 +32,7 @@ pub async fn connect_with(
 /// request paths turn a `sqlx::Error` into their own.
 pub fn observe_error(error: &sqlx::Error) {
     if matches!(error, sqlx::Error::PoolTimedOut) {
-        forge_metrics::db::acquire_timeout();
+        forge_telemetry::db::acquire_timeout();
     }
 }
 

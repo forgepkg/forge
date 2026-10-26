@@ -1,7 +1,9 @@
-# Example Prometheus alerting rules for Forge's metrics (docs/deployment.md →
-# Metrics). Load the file with `rule_files`, or wrap its `groups` into a
-# prometheus-operator PrometheusRule (spec.groups). The thresholds are
-# starting points: tune them to your traffic. Check with
+# Example Prometheus alerting rules for Forge's OpenTelemetry metrics
+# (docs/deployment.md → Telemetry), under the names the OTLP translation
+# gives them (the Collector's prometheus exporter, otel-collector.yaml, or
+# Prometheus' own OTLP receiver). Load the file with `rule_files`, or wrap its
+# `groups` into a prometheus-operator PrometheusRule (spec.groups). The
+# thresholds are starting points: tune them to your traffic. Check with
 # `promtool check rules deploy/monitoring/alerts.yaml`.
 groups:
   - name: forge
@@ -10,15 +12,15 @@ groups:
       # has had no successful pass for three of its intervals.
       - alert: ForgeWorkerStalled
         expr: |
-          time() - forge_worker_last_success_timestamp_seconds
+          time() - forge_worker_last_success_time_seconds
             > 3 * forge_worker_interval_seconds
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Forge worker {{ $labels.worker }} has not completed a pass on {{ $labels.instance }}"
+          summary: "Forge worker {{ $labels.forge_worker }} has not completed a pass on {{ $labels.instance }}"
           description: >-
-            The {{ $labels.worker }} worker's last successful pass was
+            The {{ $labels.forge_worker }} worker's last successful pass was
             {{ $value | humanizeDuration }} ago, more than three of its
             intervals. Its errors are in the instance's log.
 
@@ -26,15 +28,15 @@ groups:
       # never succeeded since the instance started).
       - alert: ForgeWorkerFailing
         expr: |
-          increase(forge_worker_runs_total{outcome="failure"}[30m]) > 0
-          unless on (job, instance, worker)
-            increase(forge_worker_runs_total{outcome="success"}[30m]) > 0
+          increase(forge_worker_runs_total{forge_worker_outcome="failure"}[30m]) > 0
+          unless on (job, instance, forge_worker)
+            increase(forge_worker_runs_total{forge_worker_outcome="success"}[30m]) > 0
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Forge worker {{ $labels.worker }} keeps failing on {{ $labels.instance }}"
-          description: "No pass of the {{ $labels.worker }} worker succeeded in 30 minutes; see the instance's log."
+          summary: "Forge worker {{ $labels.forge_worker }} keeps failing on {{ $labels.instance }}"
+          description: "No pass of the {{ $labels.forge_worker }} worker succeeded in 30 minutes; see the instance's log."
 
       # A worker loop panicked or exited and was restarted.
       - alert: ForgeWorkerRestarting
@@ -42,8 +44,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Forge worker {{ $labels.worker }} restarted on {{ $labels.instance }}"
-          description: "The {{ $labels.worker }} worker loop panicked or exited and was restarted; the log has the panic."
+          summary: "Forge worker {{ $labels.forge_worker }} restarted on {{ $labels.instance }}"
+          description: "The {{ $labels.forge_worker }} worker loop panicked or exited and was restarted; the log has the panic."
 
       # S3 is considered down: the circuit breaker in front of it (with the
       # local blob cache) is open. Cached blobs are still served; pushes and
@@ -60,15 +62,15 @@ groups:
       # More than 5 % of the requests are answered with a server error.
       - alert: ForgeHighErrorRate
         expr: |
-          sum by (job) (rate(forge_http_requests_total{status="5xx"}[5m]))
-            / sum by (job) (rate(forge_http_requests_total[5m]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5.."}[5m]))
+            / sum by (job) (rate(http_server_request_duration_seconds_count[5m]))
           > 0.05
         for: 10m
         labels:
           severity: critical
         annotations:
           summary: "Forge answers {{ $value | humanizePercentage }} of its requests with a 5xx"
-          description: "forge_http_requests_total by surface shows which part of Forge fails."
+          description: "http_server_request_duration_seconds_count by forge_surface shows which part of Forge fails."
 
       # Due S3 deletes wait: the outbox worker is failing or cannot keep up.
       # Every instance reports the same (shared) backlog.
@@ -87,34 +89,37 @@ groups:
           description: >-
             The outbox has due deletes it does not process (the oldest has
             waited over 30 minutes, or more than 1000 and growing). Check the
-            outbox worker (forge_worker_runs_total{worker="outbox"}) and the
+            outbox worker (forge_worker_runs_total{forge_worker="outbox"}) and the
             S3 delete permissions.
 
       # A proxy's upstream fails more than 10 % of its lookups.
       - alert: ForgeProxyUpstreamErrors
         expr: |
-          sum by (job, repo) (rate(forge_proxy_lookups_total{outcome="upstream_error"}[10m]))
-            / sum by (job, repo) (rate(forge_proxy_lookups_total[10m]))
+          sum by (job, forge_repository) (rate(forge_proxy_lookups_total{forge_proxy_outcome="upstream_error"}[10m]))
+            / sum by (job, forge_repository) (rate(forge_proxy_lookups_total[10m]))
           > 0.1
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "The upstream of proxy {{ $labels.repo }} fails {{ $value | humanizePercentage }} of the lookups"
-          description: "Cached content is still served; what is not cached fails. forge_proxy_upstream_requests_total shows the upstream's answers."
+          summary: "The upstream of proxy {{ $labels.forge_repository }} fails {{ $value | humanizePercentage }} of the lookups"
+          description: "Cached content is still served; what is not cached fails. http_client_request_duration_seconds_count shows the upstream's answers."
 
       # A proxy's upstream rate-limits it (Docker Hub's pull limit).
       - alert: ForgeProxyRateLimited
-        expr: sum by (job, repo) (increase(forge_proxy_upstream_rate_limited_total[1h])) > 10
+        expr: |
+          sum by (job, forge_repository) (
+            increase(http_client_request_duration_seconds_count{http_response_status_code="429"}[1h])
+          ) > 10
         labels:
           severity: warning
         annotations:
-          summary: "The upstream of proxy {{ $labels.repo }} answered 429 Too Many Requests {{ $value }} times in an hour"
+          summary: "The upstream of proxy {{ $labels.forge_repository }} answered 429 Too Many Requests {{ $value }} times in an hour"
           description: "Give the proxy upstream credentials with a higher limit, or raise its metadata TTL."
 
       # Requests time out waiting for a database connection.
       - alert: ForgeDatabasePoolExhausted
-        expr: increase(forge_db_pool_acquire_timeouts_total[10m]) > 0
+        expr: increase(db_client_connection_timeouts_total[10m]) > 0
         labels:
           severity: warning
         annotations:
@@ -124,7 +129,7 @@ groups:
       # The Redis invalidation backplane is down: other instances' changes
       # reach this one only when its cache entries expire.
       - alert: ForgeRedisBackplaneDown
-        expr: forge_cache_redis_backplane_connected == 0
+        expr: forge_cache_backplane_connected == 0
         for: 5m
         labels:
           severity: warning
@@ -135,7 +140,7 @@ groups:
       # Staged pushes and proxy downloads use most of server.max_staging_bytes;
       # beyond it they are refused with 503.
       - alert: ForgeStagingNearlyFull
-        expr: forge_staging_bytes / forge_staging_limit_bytes > 0.9
+        expr: forge_staging_usage_bytes / forge_staging_limit_bytes > 0.9
         for: 10m
         labels:
           severity: warning

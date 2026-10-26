@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-forge-metrics = { path = "../metrics" }
+forge-telemetry = { path = "../telemetry" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 moka = { workspace = true }
 redis = { workspace = true }

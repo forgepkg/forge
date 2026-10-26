@@ -1,0 +1,22 @@
+# CI: every OpenTelemetry signal exported to a Collector on the node, with a
+# vendor's headers from a Secret, extra resource attributes and a sampler.
+host: forge.example.com
+secretEnv:
+  FORGE_ROOT_KEY: check-only
+config:
+  telemetry:
+    per_repository: false
+    inventory_interval_seconds: 600
+telemetry:
+  metrics: true
+  traces: true
+  logs: true
+  endpoint: http://$(HOST_IP):4318
+  headersSecret:
+    name: otlp-auth
+    key: headers
+  resourceAttributes:
+    deployment.environment.name: production
+    service.namespace: packages
+  sampler: parentbased_traceidratio
+  samplerArg: "0.25"

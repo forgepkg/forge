@@ -44,6 +44,7 @@ use forge_db::encryption_key_dao::PgKeyStore;
 use forge_db::secret_dao;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::config::{Config, CryptoConfig};
 
@@ -254,8 +255,10 @@ pub fn spawn_worker(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            let run = forge_metrics::workers::Run::start(WORKER);
-            let pass = locked_rotation_pass(&pool, &envelope, &cfg).await;
+            let run = forge_telemetry::workers::Run::start(WORKER);
+            let pass = locked_rotation_pass(&pool, &envelope, &cfg)
+                .instrument(run.span())
+                .await;
             run.finish(pass.is_ok());
             if let Err(e) = pass {
                 tracing::error!(error = %e, "crypto rotation pass failed");

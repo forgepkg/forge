@@ -873,63 +873,97 @@ On SIGTERM, Forge stops accepting connections and lets in-flight requests
 finish before exiting. Give it a termination grace period long enough for your
 largest package download.
 
-## Metrics
+## Telemetry
 
-Forge serves Prometheus metrics at `GET /metrics` on a **listener of its
-own**, `server.metrics_bind` (`FORGE_SERVER__METRICS_BIND`), for example
-`0.0.0.0:9421`. The main listener never serves them, so no ingress or
-HTTPRoute exposes them by accident. The listener is off unless set; the
-Helm chart (`metrics.enabled`, port 9421) and the kustomize base turn it on.
+Forge exports **OpenTelemetry** metrics, traces and logs over OTLP/HTTP,
+with the official OpenTelemetry SDK. Each signal is off until `[telemetry]`
+turns it on:
 
-| Setting | Meaning |
+```toml
+[telemetry]
+metrics = true        # FORGE_TELEMETRY__METRICS=true
+traces = true         # FORGE_TELEMETRY__TRACES=true
+logs = true           # FORGE_TELEMETRY__LOGS=true
+# per_repository = true          # the repository's name on the metrics
+# inventory_interval_seconds = 300
+```
+
+Where the signals go, and how, is set by the standard OpenTelemetry
+variables, read by the SDK:
+
+| Variable | Meaning |
 | --- | --- |
-| `server.metrics_bind` | Address of the metrics listener. Unset: no metrics. Must be another port than `server.bind`. |
-| `server.metrics_token` | A bearer token every scrape must send (`Authorization: Bearer <token>`, at least 16 characters), for scrapers outside the cluster network. Set it as `FORGE_SERVER__METRICS_TOKEN`; unset, whoever reaches the port may scrape. |
-| `metrics.per_repository` | Label metrics with repository names (default `true`). Off, every repository's series add up into one. |
-| `metrics.inventory_interval_seconds` | How often each instance counts the inventory and the outbox backlog (default 300). |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | The OTLP/HTTP endpoint, usually an [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) beside Forge; default `http://localhost:4318`. Forge appends `/v1/metrics`, `/v1/traces` and `/v1/logs`; the `OTEL_EXPORTER_OTLP_{METRICS,TRACES,LOGS}_ENDPOINT` variables set one signal's full URL. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Headers sent with every export (`api-key=...` for a vendor's backend). Keep it in a secret. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf`, the only protocol Forge speaks: Forge refuses to start with `grpc`. |
+| `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TIMEOUT` | `gzip`; the export timeout in milliseconds (default 10 000). |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | The resource. Forge sets `service.name=forge`, `service.version`, `vcs.ref.head.revision`, `host.name` and a random `service.instance.id`; what these variables say wins. |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Milliseconds between two metric exports (default 60 000). |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Which traces are kept (default `parentbased_always_on`: all, and a caller's decision); e.g. `parentbased_traceidratio` and `0.1`. |
+| `OTEL_SDK_DISABLED` | `true` turns every signal off, whatever `[telemetry]` says. |
 
-The text is OpenMetrics (`application/openmetrics-text`), which Prometheus
-scrapes like its own format. Each instance reports its own numbers: scrape
-every pod, not the Service's load-balanced address (a `ServiceMonitor` or
-`PodMonitor` does).
+An export that fails is logged and never fails a request: metrics are
+cumulative, so the next export carries what a failed one held, while a
+failed batch of spans or log records is dropped. Each instance exports its
+own telemetry.
 
-**Labels stay bounded.** No label carries a package id, a version, an image
-name or tag, a username, a token or a path: a request is counted under its
-*surface* (`nuget`, `oci`, `plugin_npm`, `plugin_raw`, `admin`, `browse`,
-`auth`, `health`, `ui`; `repository` for a `/repository/…` request that named
-no repository), never its URL. The repository name is the one label an
-administrator chooses (`repo`); with very many repositories turn
-`metrics.per_repository` off. Counters end in `_total`, durations are
-histograms in seconds.
+**Metrics.** The names follow the OpenTelemetry semantic conventions where
+one exists (`http.server.request.duration`, `db.client.connection.count`),
+and are `forge.*` otherwise. Durations are histograms in seconds, sizes in
+bytes (`By`). **Attributes stay bounded**: none carries a package id, a
+version, an image or tag, a username, a token or a path. A request is
+counted under the *surface* of the route it matched (`forge.surface`:
+`nuget`, `oci`, `plugin_npm`, `plugin_raw`, `plugin_other`, `admin`,
+`browse`, `auth`, `health`, `ui`; `repository` for a `/repository/…` request
+that named no repository), never its URL. The repository's name
+(`forge.repository`) is the one attribute an administrator chooses; with
+very many repositories turn `telemetry.per_repository` off and the
+repositories add up.
 
-| Area | Metrics |
+| Area | Instruments (attributes) |
 | --- | --- |
-| Build | `forge_build_info{version, commit}` |
-| HTTP | `forge_http_requests_total{surface, method, status}` (status class), `forge_http_request_duration_seconds` (to the response headers), `forge_http_requests_in_flight`, `forge_http_response_bytes_total{surface}` |
-| Proxies | `forge_proxy_lookups_total{repo, kind, outcome}`: `kind` is `metadata`, `package`, `manifest`, `blob` or `file`; `outcome` is `hit`, `fetched`, `stale_served`, `negative_cached`, `delay_gated`, `not_found`, `offline`, `upstream_error` or `error`. `forge_proxy_upstream_requests_total{repo, status}` (`2xx` … `5xx`, `429`, `error`), `forge_proxy_upstream_request_duration_seconds{repo}`, `forge_proxy_upstream_bytes_total{repo}`, `forge_proxy_upstream_rate_limited_total{repo}` (Docker Hub's pull limit) |
-| Storage | `forge_s3_operations_total{op, outcome}` and `forge_s3_operation_duration_seconds{op}`; `forge_s3_circuit_breaker_open` (with the local blob cache); the counters of `GET /admin/blob-cache` as `forge_blob_cache_*` (hits, hit bytes, hits while S3 was down, misses, fills, fill failures, corrupt entries, evictions, bypassed reads, size, limit); `forge_staging_bytes` against `forge_staging_limit_bytes` (`server.max_staging_bytes`); `forge_outbox_pending`, `forge_outbox_due`, `forge_outbox_oldest_due_age_seconds`; `forge_gc_blobs_deleted_total{source}` |
-| Cache | `forge_cache_lookups_total{tier, result}` (L1 in process, L2 Redis), `forge_cache_redis_backplane_connected` (with Redis), `forge_cache_invalidations_sent_total`, `forge_cache_invalidations_received_total` |
-| Database | `forge_db_pool_connections{state}` (`in_use`, `idle`), `forge_db_pool_max_connections`, `forge_db_pool_acquire_duration_seconds`, `forge_db_pool_acquire_timeouts_total` |
-| Workers | `forge_worker_runs_total{worker, outcome}`, `forge_worker_last_success_timestamp_seconds{worker}`, `forge_worker_interval_seconds{worker}`, `forge_worker_run_duration_seconds{worker}`, `forge_worker_restarts_total{worker}`, for the `outbox`, `reconciler`, `proxy-refresh`, `retention`, `auth-reaper`, `cred-reaper`, `registry-sweeper`, `crypto-rotation`, `blob-cache` and `metrics-inventory` workers (restarts for every worker) |
-| Retention | `forge_retention_runs_total{repo, outcome}`, `forge_retention_versions_total{repo, action}` (`unlisted`, `deleted`), `forge_retention_freed_bytes_total{repo}` (the repository's size before a run less its size after) |
-| Auth | `forge_auth_sign_ins_total{realm_type, outcome}` (a password through the realms, on the login form or over HTTP Basic, and OIDC logins), `forge_auth_throttled_total{reason}`, `forge_auth_token_exchanges_total{outcome}`, `forge_auth_jwks_refresh_failures_total`, `forge_auth_credential_forwarding_errors_total` |
-| Inventory | `forge_repositories{format, kind}`, `forge_repository_versions{repo}` (package versions, image tags, files), `forge_repository_stored_bytes{repo}`, counted by a worker every `metrics.inventory_interval_seconds`, never per scrape |
+| HTTP | `http.server.request.duration` (`forge.surface`, `http.request.method`, `http.response.status_code`), to the response headers; `http.server.active_requests` (`http.request.method`); `http.server.response.body.size` |
+| Proxies | `forge.proxy.lookups` (`forge.repository`, `forge.proxy.kind`: `metadata`, `package`, `manifest`, `blob`, `file`; `forge.proxy.outcome`: `hit`, `fetched`, `stale_served`, `negative_cached`, `delay_gated`, `not_found`, `offline`, `upstream_error`, `error`); `http.client.request.duration` of the requests to the upstreams (`forge.repository`, `http.request.method`, `http.response.status_code`, or `error.type` when none came); `forge.proxy.upstream.fetched` (bytes) |
+| Storage | `forge.s3.operation.duration` (`forge.s3.operation`, `forge.s3.outcome`: `ok`, `not_found`, `precondition_failed`, `unreachable`, `breaker_open`, `error`); `forge.s3.circuit_breaker.open` (with the local blob cache); the counters of `GET /admin/blob-cache` as `forge.blob_cache.*` (`hits`, `served`, `hits_while_store_down`, `misses`, `fills`, `fill_failures`, `corrupt`, `evictions`, `evicted`, `bypassed`, `verifications`, and `entries`, `usage`, `reserved`, `limit`); `forge.staging.usage` against `forge.staging.limit` (`server.max_staging_bytes`); `forge.outbox.pending`, `forge.outbox.due`, `forge.outbox.oldest_due.age`; `forge.gc.deleted` (`forge.gc.source`) |
+| Cache | `forge.cache.lookups` (`forge.cache.tier`: `l1` in process, `l2` Redis; `forge.cache.result`); `forge.cache.backplane.connected` (with Redis); `forge.cache.invalidations` (`forge.cache.direction`: `sent`, `received`) |
+| Database | `db.client.connection.count` (`db.client.connection.state`: `idle`, `used`), `db.client.connection.max`, `db.client.connection.wait_time`, `db.client.connection.timeouts` |
+| Workers | `forge.worker.runs` (`forge.worker`, `forge.worker.outcome`), `forge.worker.run.duration`, `forge.worker.last_success.time` (Unix seconds), `forge.worker.interval`, `forge.worker.restarts`, for the `outbox`, `reconciler`, `proxy-refresh`, `retention`, `auth-reaper`, `cred-reaper`, `registry-sweeper`, `crypto-rotation`, `blob-cache` and `metrics-inventory` workers (restarts for every worker) |
+| Retention | `forge.retention.runs` (`forge.repository`, `forge.retention.outcome`), `forge.retention.versions` (`forge.retention.action`: `unlisted`, `deleted`), `forge.retention.freed` (the repository's size before a run less its size after) |
+| Auth | `forge.auth.sign_ins` (`forge.auth.realm_type`, `forge.auth.outcome`): a password through the realms, on the login form or over HTTP Basic, and OIDC logins; `forge.auth.throttled` (`forge.auth.throttle.reason`), `forge.auth.token_exchanges` (`forge.auth.exchange.outcome`), `forge.auth.jwks.refresh_failures`, `forge.auth.forwarding.errors` |
+| Inventory | `forge.repositories` (`forge.repository.format`, `forge.repository.kind`), `forge.repository.versions` (package versions, image tags, files) and `forge.repository.size` (`forge.repository`), counted by a worker every `telemetry.inventory_interval_seconds`, never per export |
 
 The inventory and the outbox backlog are database-wide: every instance
 reports the same numbers, so aggregate them with `max`, not `sum`. The pool's
-acquire times come from sqlx's pool events, which `forge-server` reads
-whatever `RUST_LOG` says.
+wait times come from sqlx's pool events, which `forge-server` reads whatever
+`RUST_LOG` says.
 
-[deploy/monitoring](../deploy/monitoring/README.md) has a Grafana dashboard
-and example alerting rules: a worker without a successful pass for three of
-its intervals, the S3 circuit breaker open, a high 5xx rate, a growing outbox
-backlog, upstream errors and rate limits per proxy, an exhausted connection
-pool, a lost Redis backplane and nearly full staging space.
+In Prometheus (the Collector's `prometheus` or `prometheusremotewrite`
+exporter, or Prometheus' own OTLP receiver), the names become
+`http_server_request_duration_seconds`, `forge_proxy_lookups_total`,
+`forge_repository_size_bytes` and so on, the attributes `forge_surface`,
+`forge_repository`, …, and `job` and `instance` come from `service.name` and
+`service.instance.id`. [deploy/monitoring](../deploy/monitoring/README.md)
+has an example Collector configuration, a Grafana dashboard and alerting
+rules written against those names: a worker without a successful pass for
+three of its intervals, the S3 circuit breaker open, a high 5xx rate, a
+growing outbox backlog, upstream errors and rate limits per proxy, an
+exhausted connection pool, a lost Redis backplane and nearly full staging
+space.
 
-The Helm chart's HorizontalPodAutoscaler scales on CPU and memory; with the
-metrics in Prometheus and an adapter that serves them as custom metrics
-(prometheus-adapter, KEDA), `autoscaling.metrics` can add, for example,
-`forge_http_requests_in_flight` per pod.
+**Traces.** Each request is a server span (`GET /repository/{repo}/{*rest}`:
+the route, never the URL, names it), a child of the caller's trace when the
+request carries a W3C `traceparent`. Beneath it are the spans of a proxy's
+lookup (`proxy package`, with its outcome), its requests to the upstream
+(client spans, which send the trace on in their own `traceparent`, so a
+Forge proxying another Forge continues the trace), and the S3 operations
+(`S3.GetObject`, …). Each pass of a background worker is a trace of its own
+(`outbox pass`, …). Health probes make no spans. A span's URL never holds a
+query string or credentials.
+
+**Logs.** With `logs` on, what Forge logs (filtered by `RUST_LOG`, as the
+console log is) is exported too, each record with the trace and span it was
+written in, so a backend links a request's log lines to its trace. The
+console log stays as it is.
 
 ## Running more than one instance
 

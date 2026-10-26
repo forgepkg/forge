@@ -50,6 +50,7 @@ use futures_util::future::BoxFuture;
 use hyper_util::client::proxy::matcher::Matcher as ProxyMatcher;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use tracing::Instrument;
 use url::Url;
 
 /// Tuning for outbound proxy traffic. Built from the server's `[proxy]` config
@@ -301,6 +302,17 @@ fn redirect_target(from: &Url, resp: &reqwest::Response) -> Option<Url> {
     matches!(next.scheme(), "http" | "https").then_some(next)
 }
 
+/// `url` as a span records it: without credentials, query or fragment (a
+/// redirect to an object store carries its signature in the query).
+fn span_url(url: &Url) -> String {
+    let mut url = url.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 /// Request class, selecting the total deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestClass {
@@ -475,7 +487,7 @@ impl UpstreamHttp {
     /// repository's ([`Self::for_repository`]).
     pub fn count_bytes(&self, bytes: u64) {
         if let Some(repository) = &self.repository {
-            forge_metrics::proxy::upstream_bytes(repository, bytes);
+            forge_telemetry::proxy::upstream_bytes(repository, bytes);
         }
     }
 
@@ -529,24 +541,60 @@ impl UpstreamHttp {
         method: reqwest::Method,
         url: &str,
         class: RequestClass,
-        headers: reqwest::header::HeaderMap,
+        mut headers: reqwest::header::HeaderMap,
         auth: Option<&UpstreamAuth<'_>>,
         body: Option<Vec<u8>>,
     ) -> Result<reqwest::Response, UpstreamError> {
-        let Some(repository) = &self.repository else {
-            return self
-                .send_hops(method, url, class, headers, auth, body)
-                .await;
-        };
+        let parsed = Url::parse(url).ok();
+        let span = tracing::info_span!(
+            target: forge_telemetry::TARGET,
+            "upstream request",
+            otel.name = %method,
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            "http.request.method" = %method,
+            "url.full" = parsed.as_ref().map(span_url).as_deref(),
+            "server.address" = parsed.as_ref().and_then(Url::host_str),
+            "forge.repository" = self.repository.as_deref(),
+            "http.response.status_code" = tracing::field::Empty,
+            "error.type" = tracing::field::Empty,
+        );
+        // The upstream continues the trace (a Forge proxying another).
+        for (name, value) in span.in_scope(forge_telemetry::trace_headers) {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
         let started = std::time::Instant::now();
+        let request_method = method.clone();
         let result = self
             .send_hops(method, url, class, headers, auth, body)
+            .instrument(span.clone())
             .await;
-        forge_metrics::proxy::upstream_request(
-            repository,
-            result.as_ref().ok().map(|resp| resp.status().as_u16()),
-            started.elapsed(),
-        );
+        let status = result.as_ref().ok().map(|resp| resp.status().as_u16());
+        match status {
+            Some(status) => {
+                span.record("http.response.status_code", status);
+                if status >= 500 {
+                    span.record("otel.status_code", "ERROR");
+                }
+            }
+            None => {
+                span.record("error.type", "transport");
+                span.record("otel.status_code", "ERROR");
+            }
+        }
+        if let Some(repository) = &self.repository {
+            forge_telemetry::proxy::upstream_request(
+                repository,
+                request_method.as_str(),
+                status,
+                started.elapsed(),
+            );
+        }
         result
     }
 

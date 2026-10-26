@@ -13,7 +13,6 @@ deploy/kubernetes/
 │   ├── ingress/             Ingress with TLS (ingress-nginx annotations for large, slow pushes)
 │   ├── httproute/           Gateway API HTTPRoute instead of an Ingress
 │   ├── network-policy/      only the ingress controller / gateway reaches Forge
-│   ├── metrics/             a ServiceMonitor for the metrics port (prometheus-operator)
 │   ├── valkey/              in-cluster Valkey (shared cache), password-protected
 │   ├── high-availability/   two replicas, spread over nodes, PodDisruptionBudget
 │   ├── local-cache/         local blob cache on an emptyDir (faster downloads, serves through an S3 outage)
@@ -21,6 +20,7 @@ deploy/kubernetes/
 │   ├── postgres/            in-cluster PostgreSQL 17 (evaluation / small installs)
 │   ├── s3-versitygw/        in-cluster S3 gateway on a PersistentVolume (evaluation / small installs)
 │   ├── s3-workload-identity/  short-lived S3 credentials from a projected service-account token (no S3 keys)
+│   ├── opentelemetry/       metrics, traces and logs over OTLP to an OpenTelemetry Collector
 │   └── image-latest/        run :latest instead of the pinned release
 └── overlays/
     ├── production/          external PostgreSQL + S3, Valkey, two replicas, Ingress, NetworkPolicy
@@ -147,13 +147,6 @@ Points that matter on Kubernetes:
   trusted proxies (the CNI must enforce NetworkPolicy).
 - **Pod security.** Every workload here satisfies the `restricted` Pod
   Security Standard; the overlays' namespaces enforce it.
-- **Metrics.** The base serves Prometheus metrics on port 9421
-  (`FORGE_SERVER__METRICS_BIND`), the Service's `metrics` port, which no
-  Ingress or HTTPRoute routes. `components/metrics` adds a ServiceMonitor;
-  with `components/network-policy`, patch its second rule
-  (`spec.ingress[1].from`) to your Prometheus's namespace. A bearer token:
-  `FORGE_SERVER__METRICS_TOKEN` in `forge.env`. The dashboard and alert rules
-  are in [deploy/monitoring](../monitoring/README.md).
 
 ## Short-lived S3 credentials
 
@@ -249,6 +242,44 @@ patches:
                       storageClassName: local-nvme
                       resources: { requests: { storage: 50Gi } }
 ```
+
+## Telemetry
+
+`components/opentelemetry` turns on Forge's OpenTelemetry export: metrics,
+traces and logs over OTLP/HTTP to an OpenTelemetry Collector (see
+[docs/deployment.md](../../docs/deployment.md#telemetry) for what is
+exported). It sets `FORGE_TELEMETRY__METRICS`, `__TRACES` and `__LOGS`, the
+Collector's address in `OTEL_EXPORTER_OTLP_ENDPOINT`, and resource attributes
+naming the pod, its namespace and its node. The address,
+`http://otel-collector.observability.svc:4318`, is a placeholder: patch it to
+your Collector's OTLP/HTTP endpoint, or to `http://$(HOST_IP):4318` for one
+running on every node. Any other `OTEL_*` variable (`OTEL_TRACES_SAMPLER`,
+`OTEL_EXPORTER_OTLP_HEADERS` from a Secret for a vendor's API key) goes in
+the same way.
+
+```yaml
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: forge
+      spec:
+        template:
+          spec:
+            containers:
+              - name: forge
+                env:
+                  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+                    value: http://otel-collector.monitoring.svc:4318
+                  - name: OTEL_TRACES_SAMPLER
+                    value: parentbased_traceidratio
+                  - name: OTEL_TRACES_SAMPLER_ARG
+                    value: "0.1"
+```
+
+With `components/network-policy` and your own egress rules, allow the
+Collector's port.
 
 ## Checking changes
 

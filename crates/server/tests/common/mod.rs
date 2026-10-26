@@ -274,9 +274,6 @@ poll_interval_seconds = 1
 /// A running test server.
 pub struct TestServer {
     pub base_url: String,
-    /// The metrics listener (`GET /metrics`), served next to the main one
-    /// as `main` serves it with `server.metrics_bind`.
-    pub metrics_url: String,
     pub pool: PgPool,
     pub state: AppState,
     pub admin_user: Option<String>,
@@ -286,7 +283,6 @@ pub struct TestServer {
     /// [`TestServer::admin_basic`] carries this in the password field.
     pub admin_scoped_token: Option<String>,
     handle: tokio::task::JoinHandle<()>,
-    metrics_handle: tokio::task::JoinHandle<()>,
     workers: Option<WorkerHandles>,
 }
 
@@ -296,7 +292,6 @@ impl Drop for TestServer {
             w.abort();
         }
         self.handle.abort();
-        self.metrics_handle.abort();
     }
 }
 
@@ -475,20 +470,6 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
     let handle = tokio::spawn(async move {
         forge_server::serve::serve(listener, app, serve_options, std::future::pending()).await;
     });
-    let metrics_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral metrics listener");
-    let metrics_addr = metrics_listener.local_addr().expect("local addr");
-    let metrics_app = forge_server::metrics::router(state.clone());
-    let metrics_handle = tokio::spawn(async move {
-        forge_server::serve::serve(
-            metrics_listener,
-            metrics_app,
-            serve_options,
-            std::future::pending(),
-        )
-        .await;
-    });
 
     let admin_scoped_token = match &opts.bootstrap_admin {
         Some((username, _)) => mint_admin_scoped_token(&pool, username).await,
@@ -497,14 +478,12 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
 
     TestServer {
         base_url: format!("http://{addr}"),
-        metrics_url: format!("http://{metrics_addr}/metrics"),
         pool,
         state,
         admin_user: opts.bootstrap_admin.as_ref().map(|(u, _)| u.clone()),
         admin_pass: opts.bootstrap_admin.as_ref().map(|(_, p)| p.clone()),
         admin_scoped_token,
         handle,
-        metrics_handle,
         workers,
     }
 }

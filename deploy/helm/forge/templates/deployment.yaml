@@ -117,11 +117,6 @@ spec:
             - name: http
               containerPort: {{ .Values.containerPort }}
               protocol: TCP
-            {{- if .Values.metrics.enabled }}
-            - name: metrics
-              containerPort: {{ .Values.metrics.port }}
-              protocol: TCP
-            {{- end }}
           env:
             {{- include "forge.env" . | nindent 12 }}
           {{- if or .Values.secretEnv .Values.existingSecret .Values.envFrom }}

@@ -20,7 +20,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::{
@@ -33,7 +33,8 @@ use aws_sdk_s3::types::{
     BucketLocationConstraint, CompletedMultipartUpload, CompletedPart, CreateBucketConfiguration,
 };
 use aws_sdk_s3::Client;
-use forge_metrics::storage::{self as metrics, S3Op, S3Outcome};
+use forge_telemetry::storage::{self as metrics, S3Call, S3Op, S3Outcome};
+use tracing::Instrument;
 
 use crate::blob_cache::BlobCache;
 use crate::breaker::CircuitBreaker;
@@ -214,13 +215,8 @@ impl BlobStore {
 
     /// Report a call's outcome to the breaker, and the call, `op` sent at
     /// `started`, to the metrics.
-    fn observe<T, E>(
-        &self,
-        op: S3Op,
-        started: Instant,
-        result: &Result<T, SdkError<E, HttpResponse>>,
-    ) {
-        metrics::s3_operation(op, s3_outcome(result), started.elapsed());
+    fn observe<T, E>(&self, call: S3Call, result: &Result<T, SdkError<E, HttpResponse>>) {
+        call.finish(s3_outcome(result));
         if let Some(breaker) = &self.breaker {
             match result {
                 Err(e) if is_unreachable(e) => breaker.record_failure(),
@@ -254,9 +250,9 @@ impl BlobStore {
         op: S3Op,
         call: impl std::future::Future<Output = Result<T, SdkError<E, HttpResponse>>>,
     ) -> Result<T, S3Error> {
-        let started = Instant::now();
-        let result = call.await;
-        self.observe(op, started, &result);
+        let s3_call = S3Call::start(op, &self.bucket);
+        let result = call.instrument(s3_call.span()).await;
+        self.observe(s3_call, &result);
         result.map_err(|e| self.error(e))
     }
 
@@ -285,9 +281,15 @@ impl BlobStore {
     pub async fn ensure_bucket(&self) -> Result<(), S3Error> {
         self.admit(S3Op::HeadBucket)?;
         // Fast path: bucket already there.
-        let started = Instant::now();
-        let head = self.client.head_bucket().bucket(&self.bucket).send().await;
-        self.observe(S3Op::HeadBucket, started, &head);
+        let call = S3Call::start(S3Op::HeadBucket, &self.bucket);
+        let head = self
+            .client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .instrument(call.span())
+            .await;
+        self.observe(call, &head);
         match head {
             Ok(_) => return Ok(()),
             // Without credentials a create cannot succeed either.
@@ -298,9 +300,9 @@ impl BlobStore {
         if let Some(config) = create_bucket_configuration(&self.region) {
             create = create.create_bucket_configuration(config);
         }
-        let started = Instant::now();
-        let created = create.send().await;
-        self.observe(S3Op::CreateBucket, started, &created);
+        let call = S3Call::start(S3Op::CreateBucket, &self.bucket);
+        let created = create.send().instrument(call.span()).await;
+        self.observe(call, &created);
         let err = match created {
             Ok(_) => return Ok(()),
             Err(e) => e,
@@ -311,9 +313,15 @@ impl BlobStore {
             // Taken, by another account unless these credentials can reach
             // it now (some backends answer this to a concurrent create).
             Some(CreateBucketError::BucketAlreadyExists(_)) => {
-                let started = Instant::now();
-                let reachable = self.client.head_bucket().bucket(&self.bucket).send().await;
-                self.observe(S3Op::HeadBucket, started, &reachable);
+                let call = S3Call::start(S3Op::HeadBucket, &self.bucket);
+                let reachable = self
+                    .client
+                    .head_bucket()
+                    .bucket(&self.bucket)
+                    .send()
+                    .instrument(call.span())
+                    .await;
+                self.observe(call, &reachable);
                 if reachable.is_ok() {
                     Ok(())
                 } else {
@@ -336,15 +344,16 @@ impl BlobStore {
     /// [`Self::head`] without the breaker's admission (the caller's
     /// operation was admitted already).
     async fn head_object(&self, key: &str) -> Result<bool, S3Error> {
-        let started = Instant::now();
+        let call = S3Call::start(S3Op::Head, &self.bucket);
         let result = self
             .client
             .head_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
+            .instrument(call.span())
             .await;
-        self.observe(S3Op::Head, started, &result);
+        self.observe(call, &result);
         match result {
             Ok(_) => Ok(true),
             Err(e) => {
@@ -438,7 +447,7 @@ impl BlobStore {
     /// a real error.
     async fn put_conditional(&self, key: &str, path: &Path) -> Result<ConditionalPut, S3Error> {
         let body = body_from_path(path).await?;
-        let started = Instant::now();
+        let call = S3Call::start(S3Op::PutConditional, &self.bucket);
         let result = self
             .client
             .put_object()
@@ -447,8 +456,9 @@ impl BlobStore {
             .if_none_match("*")
             .body(body)
             .send()
+            .instrument(call.span())
             .await;
-        self.observe(S3Op::PutConditional, started, &result);
+        self.observe(call, &result);
         match result {
             Ok(_) => Ok(ConditionalPut::Uploaded),
             Err(e) if credentials::failure(&e).is_some() => Err(self.error(e)),
@@ -617,15 +627,16 @@ impl BlobStore {
     /// Delete the object at `key`. Idempotent: a missing object is `Ok(())`.
     pub async fn delete(&self, key: &str) -> Result<(), S3Error> {
         self.admit(S3Op::Delete)?;
-        let started = Instant::now();
+        let call = S3Call::start(S3Op::Delete, &self.bucket);
         let result = self
             .client
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
+            .instrument(call.span())
             .await;
-        self.observe(S3Op::Delete, started, &result);
+        self.observe(call, &result);
         match result {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -720,15 +731,16 @@ impl Drop for MultipartAbortGuard {
 /// Best-effort `AbortMultipartUpload`; failures are logged, never returned (the
 /// caller is already on an error or cancellation path).
 async fn abort_multipart(client: &Client, bucket: &str, key: &str, upload_id: &str) {
-    let started = Instant::now();
+    let call = S3Call::start(S3Op::AbortMultipart, bucket);
     let result = client
         .abort_multipart_upload()
         .bucket(bucket)
         .key(key)
         .upload_id(upload_id)
         .send()
+        .instrument(call.span())
         .await;
-    metrics::s3_operation(S3Op::AbortMultipart, s3_outcome(&result), started.elapsed());
+    call.finish(s3_outcome(&result));
     if let Err(error) = result {
         tracing::warn!(
             key,

@@ -29,16 +29,17 @@ use forge_core::net::upstream::{Origin, RequestClass, UpstreamHttp};
 use forge_core::repo::proxy::{upstream_credentials, Credentials};
 use forge_db::model::Repository;
 use forge_db::oci_dao::{self, LinkOutcome};
-use forge_metrics::proxy::{Kind as LookupKind, Lookup, Outcome};
 use forge_plugin::api::images::ImageError;
 use forge_plugin::api::images::{ImageUrl, ManifestInfo, Reference, TagPage, MAX_MANIFEST_BYTES};
 use forge_plugin::api::{
     FetchResult, Fetched, FormatError, Remote, UpstreamAnswer, UpstreamOp, UpstreamStep,
 };
 use forge_storage::BlobRef;
+use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 use reqwest::Method;
+use tracing::Instrument;
 
 use super::digest::ContentDigest;
 use super::dispatch::Target;
@@ -642,8 +643,10 @@ impl Registry {
         reference: &Reference,
     ) -> ImgResult<Option<ManifestHit>> {
         let mut lookup = Lookup::start(&repo.name, LookupKind::Manifest);
+        let span = lookup.span();
         let result = self
             .proxied_manifest(repo, image, reference, &mut lookup)
+            .instrument(span)
             .await;
         finish(lookup, &result);
         result
@@ -855,7 +858,11 @@ impl Registry {
         digest: &ContentDigest,
     ) -> ImgResult<Option<BlobHit>> {
         let mut lookup = Lookup::start(&repo.name, LookupKind::Blob);
-        let result = self.proxied_blob(repo, image, digest, &mut lookup).await;
+        let span = lookup.span();
+        let result = self
+            .proxied_blob(repo, image, digest, &mut lookup)
+            .instrument(span)
+            .await;
         finish(lookup, &result);
         result
     }

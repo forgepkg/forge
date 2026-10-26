@@ -261,7 +261,7 @@ impl UpstreamBasicProvider {
     async fn forward(&self, username: &str, password: &str) -> ForwardResult {
         let result = self.forward_once(username, password).await;
         if matches!(result.verdict, UpstreamVerdict::Unavailable) {
-            forge_metrics::auth::forwarding_error();
+            forge_telemetry::auth::forwarding_error();
         }
         result
     }

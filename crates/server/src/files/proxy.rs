@@ -30,9 +30,10 @@ use forge_core::repo::proxy::{upstream_credentials, Credentials, DEFAULT_NOT_FOU
 use forge_db::model::Repository;
 use forge_db::oci_dao;
 use forge_db::raw_dao::{self, NewRawFile, RawFile, Redeploy};
-use forge_metrics::proxy::{Kind as LookupKind, Lookup, Outcome};
+use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
 use futures_util::TryStreamExt;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use tracing::Instrument;
 
 use super::store::{content_type, ingest};
 use super::{FileError, Files};
@@ -212,7 +213,7 @@ impl Files<'_> {
             other => other,
         })?;
         let stored = &ingested.stored;
-        forge_metrics::proxy::upstream_bytes(&repo.name, stored.size);
+        forge_telemetry::proxy::upstream_bytes(&repo.name, stored.size);
         let content_type = content_type(declared.as_deref(), path);
         let mut tx = self.state.pool.begin().await?;
         if !oci_dao::lock_proxy_upstream(&mut tx, repo.id, repo.remote_url.as_deref()).await? {
@@ -249,7 +250,11 @@ impl Files<'_> {
     /// The cached `file` of proxy `repo`, re-validated first when it is due.
     pub async fn fresh(&self, repo: &Repository, file: RawFile) -> RawFile {
         let mut lookup = Lookup::start(&repo.name, LookupKind::File);
-        let file = self.fresh_file(repo, file, &mut lookup).await;
+        let span = lookup.span();
+        let file = self
+            .fresh_file(repo, file, &mut lookup)
+            .instrument(span)
+            .await;
         let outcome = lookup.marked().unwrap_or(Outcome::Hit);
         lookup.finish(outcome);
         file
@@ -324,7 +329,11 @@ impl Files<'_> {
     /// when the upstream does not have it (or the proxy is offline).
     pub async fn fetch(&self, repo: &Repository, path: &str) -> Result<Option<RawFile>, FileError> {
         let mut lookup = Lookup::start(&repo.name, LookupKind::File);
-        let result = self.fetch_file(repo, path, &mut lookup).await;
+        let span = lookup.span();
+        let result = self
+            .fetch_file(repo, path, &mut lookup)
+            .instrument(span)
+            .await;
         let marked = lookup.marked();
         let outcome = match &result {
             Ok(Some(_)) => marked.unwrap_or(Outcome::Hit),

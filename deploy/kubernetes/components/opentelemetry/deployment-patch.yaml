@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forge
+spec:
+  template:
+    spec:
+      containers:
+        - name: forge
+          env:
+            - name: FORGE_TELEMETRY__METRICS
+              value: "true"
+            - name: FORGE_TELEMETRY__TRACES
+              value: "true"
+            - name: FORGE_TELEMETRY__LOGS
+              value: "true"
+            # Defined before the variables that expand them.
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: K8S_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_NAMESPACE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Placeholder: your Collector's OTLP/HTTP endpoint.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability.svc:4318
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.instance.id=$(K8S_NAMESPACE_NAME).$(K8S_POD_NAME).forge,k8s.namespace.name=$(K8S_NAMESPACE_NAME),k8s.pod.name=$(K8S_POD_NAME),k8s.container.name=forge,k8s.node.name=$(K8S_NODE_NAME),k8s.deployment.name=forge

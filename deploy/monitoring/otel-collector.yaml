@@ -1,0 +1,46 @@
+# An example OpenTelemetry Collector configuration for Forge's telemetry
+# (docs/deployment.md → Telemetry): Forge exports to the Collector over
+# OTLP/HTTP (port 4318), which serves the metrics to Prometheus and sends the
+# traces and logs on over OTLP. The trace and log endpoints are placeholders:
+# Grafana Tempo, Jaeger and most vendors take OTLP traces; Grafana Loki takes
+# OTLP logs at /otlp. Check edits with
+# `otelcol-contrib validate --config deploy/monitoring/otel-collector.yaml`.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch: {}
+
+exporters:
+  # Metrics for Prometheus to scrape, named as the dashboard and the alerts
+  # expect (http_server_request_duration_seconds, forge_proxy_lookups_total,
+  # …), with `job` and `instance` from service.name and service.instance.id.
+  # Scrape it with `honor_labels: true`, so those labels stay Forge's.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+  otlphttp/traces:
+    endpoint: http://tempo.observability:4318
+  otlphttp/logs:
+    endpoint: http://loki.observability:3100/otlp
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/traces]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/logs]
