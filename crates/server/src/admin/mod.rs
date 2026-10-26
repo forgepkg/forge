@@ -11,6 +11,8 @@
 //!   is write-only and REDACTED in responses; `remote_url` is SSRF-validated;
 //!   duplicate member priorities are rejected, nested groups only when they
 //!   would form a cycle or exceed the depth limit) and package hard-delete.
+//! * [`images`] — deleting a tag, a manifest or an image of a hosted
+//!   repository of images.
 //! * [`users`] — user CRUD: local accounts are invited to choose their
 //!   password ([`crate::invitations`]), never given one here.
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
@@ -55,6 +57,7 @@ pub mod email;
 pub mod email_oauth;
 pub mod formats;
 pub mod grants;
+pub mod images;
 pub mod imports;
 pub mod members;
 pub mod proxy_cache;
@@ -211,6 +214,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/repositories/{name}/files",
             axum::routing::delete(crate::files::web::admin_delete),
+        )
+        .route(
+            "/repositories/{name}/images",
+            axum::routing::delete(images::delete),
         )
         .route(
             "/repositories/{name}/proxy-cache/invalidate",

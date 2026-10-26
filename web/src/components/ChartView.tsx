@@ -1,7 +1,13 @@
 import type { ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 
-import type { ChartDetail, ChartMetadata, ImageDetail } from '~/api/images'
+import type {
+  ChartDetail,
+  ChartMetadata,
+  ImageDetail,
+  ImageManifest,
+  ImageTag,
+} from '~/api/images'
 import { isRepositoryOffline } from '~/api/packages'
 import { chartVersion, chartVersions, defaultChartVersion, httpUrl } from '~/lib/oci'
 import { useChart } from '~/queries/useChart'
@@ -26,16 +32,24 @@ import {
  * The image page of a Helm chart pushed as an OCI artifact (`helm push`):
  * the `helm install` / `helm pull` commands of a version (the selected one,
  * else the newest release), the version's `Chart.yaml` facts, README and
- * default values, then the versions and manifests of the image.
+ * default values, then the versions and manifests of the image. With the
+ * delete callbacks (administrators, hosted repositories), each version and
+ * manifest has a Delete button.
  */
 export function ChartView({
   detail,
   selectedTag,
   onSelectTag,
+  onDeleteVersion,
+  onDeleteManifest,
+  deletePending,
 }: {
   detail: ImageDetail
   selectedTag: string | undefined
   onSelectTag: (tag: string) => void
+  onDeleteVersion?: (tag: ImageTag) => void
+  onDeleteManifest?: (manifest: ImageManifest) => void
+  deletePending?: boolean
 }) {
   const versions = chartVersions(detail.tags, detail.manifests)
   const current =
@@ -93,7 +107,12 @@ export function ChartView({
             version.
           </EmptyState>
         ) : (
-          <TagTable tags={detail.tags} />
+          <TagTable
+            tags={detail.tags}
+            noun="version"
+            onDelete={onDeleteVersion}
+            deletePending={deletePending}
+          />
         )}
       </Panel>
       <Panel
@@ -105,6 +124,8 @@ export function ChartView({
         <ManifestTable
           manifests={detail.manifests}
           showSource={detail.repo_kind === 'group'}
+          onDelete={onDeleteManifest}
+          deletePending={deletePending}
         />
       </Panel>
     </Columns>
