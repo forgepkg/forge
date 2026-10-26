@@ -1028,9 +1028,8 @@ async fn signed_in_user_reads_anonymous_readable_repos() {
     );
 }
 
-/// The public reach follows `anonymous_mode`: with anonymous access off (or
-/// limited to an allowlist the server cannot judge per principal) a signed-in
-/// user without grants does not inherit the `anonymous_read` flag.
+/// The public reach follows `anonymous_mode`: with anonymous access off a
+/// signed-in user without grants does not inherit the `anonymous_read` flag.
 #[tokio::test]
 async fn signed_in_user_gets_no_public_reach_when_anonymous_access_is_off() {
     let srv = start_stack().await;

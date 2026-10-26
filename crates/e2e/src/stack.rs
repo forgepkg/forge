@@ -186,8 +186,6 @@ async fn blob_store() -> BlobStore {
 pub enum AnonMode {
     /// `off` — every read requires authentication.
     Off,
-    /// `allowlist` with the given allowlist tokens.
-    Allowlist(Vec<String>),
     /// `all` — anonymous reads of `anonymous_read` repos.
     All,
 }
@@ -197,10 +195,6 @@ impl AnonMode {
     fn settings(&self) -> serde_json::Value {
         match self {
             AnonMode::Off => serde_json::json!({"anonymous_mode": "off"}),
-            AnonMode::Allowlist(tokens) => serde_json::json!({
-                "anonymous_mode": "allowlist",
-                "anonymous_ip_allowlist": tokens,
-            }),
             AnonMode::All => serde_json::json!({"anonymous_mode": "all"}),
         }
     }
@@ -344,8 +338,8 @@ impl Default for StackBuilder {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
             spawn_workers: false,
             use_redis: false,
-            // Trust loopback so XFF-driven anon-allowlist tests can spoof the
-            // client IP from the in-process client.
+            // Trust loopback so tests can set the client IP from the
+            // in-process client with `X-Forwarded-For`.
             trusted_proxies: vec!["127.0.0.1/32".into(), "::1/128".into()],
             cache_ttl_seconds: 5,
             oidc_block_fn: None,

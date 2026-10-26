@@ -10,7 +10,6 @@ import { byId, LevelBadge, SelectorLabel } from '~/components/RbacLabels'
 
 const MODE_LABELS: Record<AnonymousMode, string> = {
   off: 'off',
-  allowlist: 'IP allowlist',
   all: 'everyone',
 }
 

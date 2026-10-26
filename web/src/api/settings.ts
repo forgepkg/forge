@@ -12,7 +12,7 @@ import { httpClient } from '~/lib/httpClient'
  */
 
 /** Who is served without credentials. */
-export type AnonymousMode = 'off' | 'allowlist' | 'all'
+export type AnonymousMode = 'off' | 'all'
 
 /** What the login screen asks for first. */
 export type LoginMode = 'identifier_first' | 'combined'
@@ -20,8 +20,6 @@ export type LoginMode = 'identifier_first' | 'combined'
 /** The settings (`GET /admin/settings/auth`). */
 export interface AuthSettings {
   anonymous_mode: AnonymousMode
-  /** `loopback`, `private`, `local`, CIDRs and single addresses. */
-  anonymous_ip_allowlist: string[]
   login_mode: LoginMode
   /** Accept a user's password over HTTP Basic on the feeds. */
   allow_password_basic: boolean

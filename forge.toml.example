@@ -31,10 +31,8 @@ allow_insecure_defaults = true  # (default: false)
 # lowers the docker defaults (upload limit, docker.max_blob_bytes) to fit.
 # Host names (port ignored) clients reach this server under besides the host of
 # public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
-# the anonymous mode "allowlist" (Admin → Settings) and the trusted-header
-# realms (Admin → Authentication): a request naming any other host is not
-# served anonymously by IP, nor named by the proxy's headers (DNS-rebinding
-# guard).
+# the trusted-header realms (Admin → Authentication): a request naming any
+# other host is not named by the proxy's headers (DNS-rebinding guard).
 allowed_hosts = []              # (default: [])
 # Connection and request time limits. A client that takes longer to send its
 # request headers, or whose request body stalls longer, is cut off; a handler
@@ -132,9 +130,9 @@ kek_max_age_days = 365            # (default: 365; 0 disables)
 sweep_batch_size = 500            # (default: 500) rows per re-encrypt batch
 
 [auth]
-# Anonymous access (mode and IP allowlist), the login screen, passwords over
-# HTTP Basic, the session lifetimes and the login lockout are not configured
-# here: they are auth settings, set in the web UI (Admin → Settings) or through
+# Anonymous access, the login screen, passwords over HTTP Basic, the session
+# lifetimes and the login lockout are not configured here: they are auth
+# settings, set in the web UI (Admin → Settings) or through
 # /admin/settings/auth, and every instance applies them without a restart.
 # Startup refuses the keys that used to set them (anonymous_mode,
 # anonymous_ip_allowlist, login_mode, allow_password_basic,
@@ -142,8 +140,8 @@ sweep_batch_size = 500            # (default: 500) rows per re-encrypt batch
 # login_failure_window_seconds). See docs/deployment.md, "Access and sign-in
 # settings".
 # CIDRs of reverse proxies whose X-Forwarded-For is trusted (the client address
-# behind them decides the anonymous allowlist and the login lockout), and whose
-# headers a trusted-header realm reads (from any other peer they are ignored).
+# behind them keys the login lockout), and whose headers a trusted-header realm
+# reads (from any other peer they are ignored).
 trusted_proxy_cidrs = []        # (default: [])
 # Most argon2 password verifications running at once (~19 MiB and a core each);
 # more queue for a few seconds, then fail as unavailable (not counted as a

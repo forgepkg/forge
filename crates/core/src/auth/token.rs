@@ -516,7 +516,22 @@ impl PrincipalSource for BasicAuthSource {
     }
 }
 
-pub use crate::auth::client_ip::AnonPolicy;
+/// The anonymous-access policy: whether a request without credentials is
+/// served as [`Principal::Anonymous`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonPolicy {
+    /// No anonymous access at all.
+    Off,
+    /// Anonymous access for every client.
+    All,
+}
+
+impl AnonPolicy {
+    /// Whether a request without credentials may be served anonymously.
+    pub fn allows(self) -> bool {
+        self == AnonPolicy::All
+    }
+}
 
 /// Resolve a [`Principal`] from a chain of sources.
 ///
@@ -533,7 +548,7 @@ pub use crate::auth::client_ip::AnonPolicy;
 ///   return `Err(Unauthorized)`. Bad credentials are *never* downgraded to
 ///   anonymous.
 /// * If all sources report `NoCredentials`, apply the anonymous policy: become
-///   [`Principal::Anonymous`] if the client IP is allowed, else
+///   [`Principal::Anonymous`] if it allows anonymous access, else
 ///   [`Principal::Unauthenticated`].
 pub async fn resolve_principal(
     sources: &[Box<dyn PrincipalSource>],
@@ -629,7 +644,7 @@ pub async fn resolve_principal_with_fallback(
         }
     }
 
-    let principal = if anon.allows(client_ip) {
+    let principal = if anon.allows() {
         Principal::Anonymous { ip: client_ip }
     } else {
         Principal::Unauthenticated

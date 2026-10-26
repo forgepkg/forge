@@ -4,9 +4,8 @@
 # Forge believes the X-Forwarded-For header of every peer in
 # FORGE_AUTH__TRUSTED_PROXY_CIDRS. That range is usually the whole pod
 # network, so without this policy any pod in the cluster can call the forge
-# Service with a forged client address, past the login lockout and the
-# anonymous-IP allowlist. Use it whenever an overlay sets
-# FORGE_AUTH__TRUSTED_PROXY_CIDRS.
+# Service with a forged client address, past the login lockout. Use it
+# whenever an overlay sets FORGE_AUTH__TRUSTED_PROXY_CIDRS.
 #
 # The namespace it admits, `ingress-nginx`, is a placeholder: patch
 # spec.ingress[0].from to the pods that proxy to Forge (the ingress

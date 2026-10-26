@@ -93,8 +93,7 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         sessions: Some(state.sessions.clone()),
         cookie_secure: state.cookie_secure,
         public_origin: crate::middleware::principal::origin_of(&state.config.public_base_url()),
-        // DNS-rebinding guard for the IP-allowlist anonymous grant and the
-        // trusted-header realms.
+        // DNS-rebinding guard for the trusted-header realms.
         allowed_hosts: Arc::new(
             crate::middleware::principal::allowed_hosts(
                 &state.config.public_base_url(),
@@ -272,10 +271,7 @@ const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
 ///   credentials: [`crate::middleware::principal::NamedByTrustedHeaders`]);
 ///   registry responses (`/v2/...`) likewise, with
 ///   [`REGISTRY_VARY`], and a 401 the authentication middleware answered
-///   there gets the registry's Bearer challenge; Anonymous responses carry no `Cache-Control`; under
-///   `anonymous_mode = "allowlist"` the deployment guide tells operators to
-///   keep shared caches off `/repository`, since the allowlist decision is keyed on
-///   the client address, which no cache varies on;
+///   there gets the registry's Bearer challenge; Anonymous responses carry no `Cache-Control`;
 /// * with an `https` public URL every response carries HSTS.
 ///
 /// The SPA keeps its own cache headers (hashed assets are immutable).
