@@ -172,7 +172,8 @@ pub async fn write_settings(pool: &PgPool, settings: &RetentionSettings) -> sqlx
 /// A summary of a completed run, persisted on `retention_run.last_run_summary`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RunSummary {
-    /// Components/proxy entries inspected.
+    /// Candidates inspected, decided on or not: hosted components or cached
+    /// proxy versions, image tags and manifests, or files.
     pub evaluated: u64,
     /// Versions unlisted.
     pub unlisted: u64,

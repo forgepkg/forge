@@ -128,6 +128,9 @@ const PROXY_BATCH: usize = 100;
 
 /// Apply a set of hosted + proxy decisions, returning the run summary.
 ///
+/// The summary's `evaluated` is left at zero: it counts the candidates the
+/// decisions were evaluated from, which only the caller knows.
+///
 /// Hosted decisions are applied per package in batches of up to
 /// [`HOSTED_BATCH`], proxy evictions one by one; each batch or eviction is one
 /// transaction. An error aborts that transaction (rolling back its effects
@@ -139,10 +142,7 @@ pub async fn apply(
     proxy: &[ProxyDecision],
 ) -> Result<RunSummary, sqlx::Error> {
     let total = hosted.len() + proxy.len();
-    let mut summary = RunSummary {
-        evaluated: total as u64,
-        ..Default::default()
-    };
+    let mut summary = RunSummary::default();
 
     let mut done = 0;
     if ctx.dry_run {
