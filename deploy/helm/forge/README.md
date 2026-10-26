@@ -302,6 +302,36 @@ kubectl -n forge-eval port-forward svc/forge 8421
 Open http://localhost:8421 and sign in as `admin@example.com` with that
 password. The bootstrap admin is named by a UPN and has no default name.
 
+## Metrics
+
+Forge serves Prometheus metrics at `GET /metrics` on a port of their own,
+`metrics.port` (9421), which the chart turns on (`metrics.enabled`, written
+into `server.metrics_bind`). The Service carries it as `metrics`; the
+HTTPRoute never routes it. For the prometheus-operator:
+
+```yaml
+metrics:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack   # what your Prometheus selects monitors by
+networkPolicy:
+  # Who may scrape, once the NetworkPolicy is rendered (empty: everyone).
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+```
+
+`metrics.podMonitor` scrapes the pods directly instead. To require a bearer
+token, set `FORGE_SERVER__METRICS_TOKEN` (at least 16 characters) in
+`secretEnv` or `existingSecret`, and point the monitor's `bearerTokenSecret`
+at it (`{name: <fullname>-secret-env, key: FORGE_SERVER__METRICS_TOKEN}`).
+`config.metrics.per_repository: false` drops the repository labels.
+[deploy/monitoring](../../monitoring/README.md) has a Grafana dashboard and
+example alerting rules; `autoscaling.metrics` can scale on Forge's metrics
+through a custom-metrics adapter.
+
 ## Checking changes
 
 CI lints the chart and renders it with the default values and each file in

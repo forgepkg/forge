@@ -22,3 +22,11 @@ spec:
       ports:
         - port: http
           protocol: TCP
+    - from:
+        # PLACEHOLDER: the namespace of your Prometheus (or other scraper).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: metrics
+          protocol: TCP

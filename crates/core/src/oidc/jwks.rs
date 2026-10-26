@@ -335,7 +335,11 @@ impl OidcMetadataClient {
         let url = jwks_uri.to_string();
         self.cache
             .get_or_try_insert_local(NS_JWKS, &self.issuer, self.jwks_ttl, || async move {
-                fetch_json::<JwkSet>(&http, &url, "jwks").await
+                let fetched = fetch_json::<JwkSet>(&http, &url, "jwks").await;
+                if fetched.is_err() {
+                    forge_metrics::auth::jwks_refresh_failed();
+                }
+                fetched
             })
             .await
     }
@@ -358,6 +362,7 @@ impl OidcMetadataClient {
         let fresh = match fetch_json::<JwkSet>(&self.http, jwks_uri, "jwks").await {
             Ok(fresh) => fresh,
             Err(e) => {
+                forge_metrics::auth::jwks_refresh_failed();
                 tracing::warn!(
                     issuer = %self.issuer,
                     error = %e,

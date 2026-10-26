@@ -81,6 +81,7 @@ pub struct LoadError(String);
 
 impl From<sqlx::Error> for LoadError {
     fn from(e: sqlx::Error) -> Self {
+        forge_db::observe_error(&e);
         LoadError(e.to_string())
     }
 }

@@ -243,6 +243,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // Request spans (method, path, status, latency) for every route; emitted
         // at DEBUG, so `RUST_LOG=tower_http=debug` turns on an access log.
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Request metrics, outermost so they time and count every answer,
+        // the ones the layers above give themselves (a timeout) included.
+        .layer(axum::middleware::from_fn(crate::metrics::track))
         .with_state(state)
 }
 

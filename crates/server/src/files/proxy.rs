@@ -30,6 +30,7 @@ use forge_core::repo::proxy::{upstream_credentials, Credentials, DEFAULT_NOT_FOU
 use forge_db::model::Repository;
 use forge_db::oci_dao;
 use forge_db::raw_dao::{self, NewRawFile, RawFile, Redeploy};
+use forge_metrics::proxy::{Kind as LookupKind, Lookup, Outcome};
 use futures_util::TryStreamExt;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 
@@ -168,6 +169,7 @@ impl Files<'_> {
         }
         self.state
             .upstream
+            .for_repository(&repo.name)
             .send(
                 reqwest::Method::GET,
                 url,
@@ -210,6 +212,7 @@ impl Files<'_> {
             other => other,
         })?;
         let stored = &ingested.stored;
+        forge_metrics::proxy::upstream_bytes(&repo.name, stored.size);
         let content_type = content_type(declared.as_deref(), path);
         let mut tx = self.state.pool.begin().await?;
         if !oci_dao::lock_proxy_upstream(&mut tx, repo.id, repo.remote_url.as_deref()).await? {
@@ -245,6 +248,15 @@ impl Files<'_> {
 
     /// The cached `file` of proxy `repo`, re-validated first when it is due.
     pub async fn fresh(&self, repo: &Repository, file: RawFile) -> RawFile {
+        let mut lookup = Lookup::start(&repo.name, LookupKind::File);
+        let file = self.fresh_file(repo, file, &mut lookup).await;
+        let outcome = lookup.marked().unwrap_or(Outcome::Hit);
+        lookup.finish(outcome);
+        file
+    }
+
+    /// [`Self::fresh`], marking what it does on `lookup`.
+    async fn fresh_file(&self, repo: &Repository, file: RawFile, lookup: &mut Lookup) -> RawFile {
         let max_age = repo.max_age_seconds();
         if max_age == 0 || !repo.online || !is_due(&file, max_age) {
             return file;
@@ -257,16 +269,22 @@ impl Files<'_> {
             Ok(Some(current)) => current,
             _ => file,
         };
-        match self.revalidate(repo, &file).await {
+        match self.revalidate(repo, &file, lookup).await {
             Ok(current) => current,
             Err(error) => {
+                lookup.mark(Outcome::StaleServed);
                 tracing::warn!(repo = %repo.name, path = %file.path, error = %error.message(), "file proxy: re-validation failed; serving the cached copy");
                 file
             }
         }
     }
 
-    async fn revalidate(&self, repo: &Repository, file: &RawFile) -> Result<RawFile, FileError> {
+    async fn revalidate(
+        &self,
+        repo: &Repository,
+        file: &RawFile,
+        lookup: &mut Lookup,
+    ) -> Result<RawFile, FileError> {
         let Some(url) = self.upstream_url(repo, &file.path).await? else {
             // The upstream cannot have it (any more): the cached copy stands.
             raw_dao::mark_checked(&self.state.pool, file.id, None, None).await?;
@@ -288,9 +306,11 @@ impl Files<'_> {
             return Ok(file.clone());
         }
         if status.is_success() {
+            lookup.mark(Outcome::Fetched);
             return self.store_response(repo, &file.path, response).await;
         }
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
+            lookup.mark(Outcome::StaleServed);
             tracing::warn!(repo = %repo.name, path = %file.path, "file proxy: the upstream no longer has a cached file; serving the cached copy");
             raw_dao::mark_checked(&self.state.pool, file.id, None, None).await?;
             return Ok(file.clone());
@@ -303,7 +323,32 @@ impl Files<'_> {
     /// Fetch `path` from the upstream of proxy `repo` and cache it. `None`
     /// when the upstream does not have it (or the proxy is offline).
     pub async fn fetch(&self, repo: &Repository, path: &str) -> Result<Option<RawFile>, FileError> {
-        if !repo.online || self.negative_cached(repo, path).await {
+        let mut lookup = Lookup::start(&repo.name, LookupKind::File);
+        let result = self.fetch_file(repo, path, &mut lookup).await;
+        let marked = lookup.marked();
+        let outcome = match &result {
+            Ok(Some(_)) => marked.unwrap_or(Outcome::Hit),
+            Ok(None) => marked.unwrap_or(Outcome::NotFound),
+            Err(FileError::BadGateway(_)) => Outcome::UpstreamError,
+            Err(_) => Outcome::Error,
+        };
+        lookup.finish(outcome);
+        result
+    }
+
+    /// [`Self::fetch`], marking what it finds on `lookup`.
+    async fn fetch_file(
+        &self,
+        repo: &Repository,
+        path: &str,
+        lookup: &mut Lookup,
+    ) -> Result<Option<RawFile>, FileError> {
+        if !repo.online {
+            lookup.mark(Outcome::Offline);
+            return Ok(None);
+        }
+        if self.negative_cached(repo, path).await {
+            lookup.mark(Outcome::NegativeCached);
             return Ok(None);
         }
         let gate = gate(repo.id, path);
@@ -312,6 +357,7 @@ impl Files<'_> {
             return Ok(Some(file));
         }
         if self.negative_cached(repo, path).await {
+            lookup.mark(Outcome::NegativeCached);
             return Ok(None);
         }
         let Some(url) = self.upstream_url(repo, path).await? else {
@@ -330,6 +376,7 @@ impl Files<'_> {
                 "the upstream answered {status}"
             )));
         }
+        lookup.mark(Outcome::Fetched);
         self.store_response(repo, path, response).await.map(Some)
     }
 }

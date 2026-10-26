@@ -295,6 +295,7 @@ with `FORGE_*` env vars using **double-underscore** nesting, e.g.
 | `server.max_staging_bytes` | Temp space all staged pushes and proxy downloads may use at once (default 4 × the largest item, 4 GiB; `0` = no limit); 503 + `Retry-After` above it, and the ceiling of a repository's upload limit. `server.staging_dir` picks the directory. |
 | `database.max_connections` / `database.acquire_timeout_seconds` | Pool size (default 20) and how long a request waits for a connection (default 10 s). |
 | `[proxy]` | Upstream connect/read/metadata/download timeouts (15 s / 60 s / 60 s / 30 min), size caps (32 MiB metadata, 1 GiB packages) and the 2 MiB in-memory spool threshold — see `forge.toml.example`. |
+| `server.metrics_bind` / `server.metrics_token` | Prometheus metrics at `GET /metrics` on a listener of their own (off unless set; `forge.toml` has a commented `0.0.0.0:9421`), optionally behind a bearer token. See [docs/deployment.md](./docs/deployment.md#metrics). |
 
 ### Health probes
 

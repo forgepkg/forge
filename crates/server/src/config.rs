@@ -92,6 +92,9 @@ pub struct Config {
     /// download reads S3.
     #[serde(default)]
     pub blob_cache: BlobCacheConfig,
+    /// What the metrics listener (`server.metrics_bind`) reports.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 /// `server.*`
@@ -165,6 +168,36 @@ pub struct ServerConfig {
     /// disables. Default 900.
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: u64,
+    /// Socket address of the metrics listener, e.g. `0.0.0.0:9421`:
+    /// Prometheus metrics at `GET /metrics` ([`crate::metrics`]), on a
+    /// listener of their own. The main listener never serves them, so they
+    /// stay off the ingress. Unset (the default): no metrics listener.
+    #[serde(default)]
+    pub metrics_bind: Option<String>,
+    /// A bearer token the metrics listener requires (`Authorization: Bearer
+    /// <token>`, at least 16 characters), for scrapers outside the cluster
+    /// network. Unset: whoever reaches the listener may scrape it.
+    #[serde(default)]
+    pub metrics_token: Option<MetricsToken>,
+}
+
+/// The bearer token of the metrics listener. `Debug` never shows it.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct MetricsToken(String);
+
+impl MetricsToken {
+    /// Whether `presented` is the token (compared in constant time).
+    pub fn matches(&self, presented: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        bool::from(self.0.as_bytes().ct_eq(presented.as_bytes()))
+    }
+}
+
+impl std::fmt::Debug for MetricsToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MetricsToken(<redacted>)")
+    }
 }
 
 /// The upload limit of a package repository without one of its own: 512 MiB.
@@ -192,6 +225,37 @@ impl ServerConfig {
         self.bind
             .parse()
             .map_err(|_| ConfigError::Invalid(format!("invalid server.bind {:?}", self.bind)))
+    }
+
+    /// Parse [`Self::metrics_bind`]: `None` without a metrics listener.
+    pub fn metrics_addr(&self) -> Result<Option<SocketAddr>, ConfigError> {
+        if self
+            .metrics_token
+            .as_ref()
+            .is_some_and(|token| token.0.chars().count() < 16)
+        {
+            return Err(ConfigError::Invalid(
+                "server.metrics_token must be at least 16 characters (or unset for none)".into(),
+            ));
+        }
+        let Some(bind) = &self.metrics_bind else {
+            return Ok(None);
+        };
+        let addr: SocketAddr = bind
+            .parse()
+            .map_err(|_| ConfigError::Invalid(format!("invalid server.metrics_bind {bind:?}")))?;
+        let main = self.bind_addr()?;
+        // Port 0 picks a free port: two of them never collide.
+        let overlaps = addr.port() != 0
+            && addr.port() == main.port()
+            && (addr.ip() == main.ip() || addr.ip().is_unspecified() || main.ip().is_unspecified());
+        if overlaps {
+            return Err(ConfigError::Invalid(format!(
+                "server.metrics_bind ({addr}) must be another port than server.bind ({main}): \
+                 the metrics are served on a listener of their own"
+            )));
+        }
+        Ok(Some(addr))
     }
 }
 
@@ -1364,6 +1428,51 @@ impl NugetConfig {
     }
 }
 
+/// `[metrics]`: what the metrics listener (`server.metrics_bind`) reports.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetricsConfig {
+    /// Label metrics with the repository name (`repo`): administrators
+    /// create repositories, so their number stays small. Turn it off for an
+    /// install with very many; the metrics then add up all repositories.
+    /// Default `true`.
+    #[serde(default = "default_true")]
+    pub per_repository: bool,
+    /// Seconds between two counts of what the instance holds (repositories,
+    /// their versions and stored bytes) and of the outbox backlog: database
+    /// queries a worker runs, never a scrape. Default 300, at least 10.
+    #[serde(default = "default_metrics_inventory_interval_seconds")]
+    pub inventory_interval_seconds: u64,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            per_repository: true,
+            inventory_interval_seconds: default_metrics_inventory_interval_seconds(),
+        }
+    }
+}
+
+fn default_metrics_inventory_interval_seconds() -> u64 {
+    300
+}
+
+impl MetricsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.inventory_interval_seconds < 10 {
+            return Err(ConfigError::Invalid(
+                "metrics.inventory_interval_seconds must be at least 10".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::inventory_interval_seconds`] as a [`Duration`].
+    pub fn inventory_interval(&self) -> Duration {
+        Duration::from_secs(self.inventory_interval_seconds)
+    }
+}
+
 /// `[docker]`: the Docker / OCI registry served under `/v2`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DockerConfig {
@@ -2050,6 +2159,7 @@ pub const SECRET_KEYS: &[&str] = &[
     "auth.upstream_basic.cache.key_pepper",
     "oidc.client_secret",
     "docker.token_secret",
+    "server.metrics_token",
 ];
 
 /// Whether an error at config key `path` must not echo its value: one of
@@ -2263,6 +2373,24 @@ impl Config {
         {
             self.redis.url = None;
         }
+        // `FORGE_SERVER__METRICS_BIND=` turns the metrics listener off, and
+        // a blank token is none.
+        if self
+            .server
+            .metrics_bind
+            .as_deref()
+            .is_some_and(|b| b.trim().is_empty())
+        {
+            self.server.metrics_bind = None;
+        }
+        if self
+            .server
+            .metrics_token
+            .as_ref()
+            .is_some_and(|t| t.0.trim().is_empty())
+        {
+            self.server.metrics_token = None;
+        }
         // `FORGE_BLOB_CACHE__PATH=` turns the blob cache off.
         if self
             .blob_cache
@@ -2277,6 +2405,8 @@ impl Config {
     /// Validate cross-cutting invariants that serde cannot express.
     fn validate(&self) -> Result<(), ConfigError> {
         self.server.bind_addr()?;
+        self.server.metrics_addr()?;
+        self.metrics.validate()?;
         self.validate_public_base_url()?;
         // The DNS-rebinding guard's host list, checked before migrations run
         // rather than when the router is built.
@@ -3201,6 +3331,82 @@ mod tests {
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
         assert!(!cfg.web.enabled);
         assert_eq!(cfg.web.assets_dir, "/srv/ui");
+    }
+
+    #[test]
+    fn the_metrics_listener_is_off_by_default_and_needs_a_port_of_its_own() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert_eq!(cfg.server.metrics_addr().unwrap(), None);
+        assert!(cfg.metrics.per_repository);
+        assert_eq!(cfg.metrics.inventory_interval_seconds, 300);
+
+        let with = |server: &str, extra: &str| {
+            let toml = MINIMAL.replace(
+                "public_base_url = \"https://forge.example.com/\"",
+                &format!("public_base_url = \"https://forge.example.com/\"\n{server}"),
+            ) + extra;
+            Config::from_figment(fig_from_toml(&toml))
+        };
+        let cfg = with("metrics_bind = \"0.0.0.0:9421\"", "").expect("valid");
+        assert_eq!(
+            cfg.server.metrics_addr().unwrap(),
+            Some("0.0.0.0:9421".parse().unwrap())
+        );
+        for clash in ["0.0.0.0:8080", "127.0.0.1:8080"] {
+            let err = with(&format!("metrics_bind = \"{clash}\""), "").unwrap_err();
+            assert!(err.to_string().contains("server.metrics_bind"), "{err}");
+        }
+        let err = with("metrics_bind = \"nope\"", "").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid server.metrics_bind"),
+            "{err}"
+        );
+
+        let token = "metrics_bind = \"0.0.0.0:9421\"\nmetrics_token = \"short\"";
+        let err = with(token, "").unwrap_err();
+        assert!(err.to_string().contains("server.metrics_token"), "{err}");
+        assert!(
+            !err.to_string().contains("short"),
+            "never echoes the token: {err}"
+        );
+        let token = "metrics_bind = \"0.0.0.0:9421\"\nmetrics_token = \"0123456789abcdef\"";
+        let cfg = with(token, "").expect("valid");
+        let configured = cfg.server.metrics_token.as_ref().expect("a token");
+        assert!(configured.matches("0123456789abcdef"));
+        assert!(!configured.matches("0123456789abcdeX"));
+        assert!(!format!("{cfg:?}").contains("0123456789abcdef"));
+
+        let cfg = with("", "\n[metrics]\nper_repository = false\n").expect("valid");
+        assert!(!cfg.metrics.per_repository);
+        let err = with("", "\n[metrics]\ninventory_interval_seconds = 5\n").unwrap_err();
+        assert!(
+            err.to_string().contains("inventory_interval_seconds"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn a_blank_metrics_bind_turns_the_listener_off() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_SERVER__METRICS_BIND", "");
+            jail.set_env("FORGE_SERVER__METRICS_TOKEN", " ");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert!(cfg.server.metrics_bind.is_none());
+            assert!(cfg.server.metrics_token.is_none());
+            jail.set_env("FORGE_SERVER__METRICS_BIND", "0.0.0.0:9421");
+            jail.set_env("FORGE_SERVER__METRICS_TOKEN", "1234567890123456");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(cfg.server.metrics_bind.as_deref(), Some("0.0.0.0:9421"));
+            // Read verbatim: a numeric token stays a string.
+            assert!(cfg
+                .server
+                .metrics_token
+                .as_ref()
+                .is_some_and(|t| t.matches("1234567890123456")));
+            Ok(())
+        });
     }
 
     #[test]

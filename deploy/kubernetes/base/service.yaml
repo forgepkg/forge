@@ -16,3 +16,8 @@ spec:
       port: 8421
       targetPort: http
       protocol: TCP
+    # Prometheus metrics, for a scraper (../components/metrics); never routed.
+    - name: metrics
+      port: 9421
+      targetPort: metrics
+      protocol: TCP

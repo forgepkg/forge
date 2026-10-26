@@ -215,6 +215,41 @@ securityContext:
 # and the web UI share it.
 containerPort: 8421
 
+# Prometheus metrics (docs/deployment.md → Metrics): GET /metrics on a
+# listener of their own (server.metrics_bind), never on the http port, so
+# the HTTPRoute never exposes them. The Service carries the port as
+# `metrics`. To require a bearer token (server.metrics_token, at least 16
+# characters) set FORGE_SERVER__METRICS_TOKEN in secretEnv or
+# existingSecret, and give the monitors its Secret (bearerTokenSecret).
+# Repository names are labels unless config.metrics.per_repository is false.
+metrics:
+  enabled: true
+  port: 9421
+  # A prometheus-operator ServiceMonitor (monitoring.coreos.com/v1) for the
+  # Service's metrics port.
+  serviceMonitor:
+    enabled: false
+    annotations: {}
+    # E.g. the label your Prometheus selects monitors by (release: ...).
+    labels: {}
+    interval: 30s
+    scrapeTimeout: ""
+    # The token, when Forge requires one: a SecretKeySelector, e.g.
+    #   { name: forge-metrics, key: token }
+    bearerTokenSecret: {}
+    relabelings: []
+    metricRelabelings: []
+  # A PodMonitor for the pods' metrics port instead (or as well).
+  podMonitor:
+    enabled: false
+    annotations: {}
+    labels: {}
+    interval: 30s
+    scrapeTimeout: ""
+    bearerTokenSecret: {}
+    relabelings: []
+    metricRelabelings: []
+
 # On SIGTERM Forge stops accepting connections and drains in-flight requests;
 # this bounds the drain (the largest download you expect).
 terminationGracePeriodSeconds: 300
@@ -407,7 +442,13 @@ autoscaling:
   maxReplicas: 4
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: null
-  # Further metrics (MetricSpec objects) and scaling behavior.
+  # Further metrics (MetricSpec objects) and scaling behavior. With Forge's
+  # metrics in Prometheus and an adapter serving them as custom metrics
+  # (prometheus-adapter, KEDA), scale on the requests in flight:
+  #   - type: Pods
+  #     pods:
+  #       metric: { name: forge_http_requests_in_flight }
+  #       target: { type: AverageValue, averageValue: "20" }
   metrics: []
   behavior: {}
 
@@ -427,6 +468,13 @@ networkPolicy:
   #         kubernetes.io/metadata.name: gateway-system
   # Empty allows every source.
   from: []
+  # Peers allowed to reach the metrics port (metrics.port), e.g. the
+  # namespace of your Prometheus:
+  #   - namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: monitoring
+  # Empty allows every source.
+  metricsFrom: []
   # Further ingress rules.
   extraIngress: []
   # Egress rules. Empty leaves egress unrestricted; once set, allow DNS,

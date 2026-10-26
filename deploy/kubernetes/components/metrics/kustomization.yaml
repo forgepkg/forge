@@ -1,0 +1,19 @@
+# A prometheus-operator ServiceMonitor (monitoring.coreos.com/v1) that scrapes
+# the forge Service's `metrics` port (the base serves the metrics there, on a
+# port of their own that no Ingress or HTTPRoute routes). Needs the operator's
+# CRDs; your Prometheus may select monitors by a label (kube-prometheus-stack:
+# `release: <its release>`): add it with a patch.
+#
+# With a bearer token (FORGE_SERVER__METRICS_TOKEN in the forge-env Secret),
+# uncomment the endpoint's `authorization`: it reads the token from that
+# Secret. With components/network-policy, the metrics port admits the
+# `monitoring` namespace (see there). docs/deployment.md lists the metrics.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: forge
+
+resources:
+  - servicemonitor.yaml

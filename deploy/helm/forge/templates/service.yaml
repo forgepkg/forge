@@ -55,6 +55,13 @@ spec:
       {{- if and (has $svc.type (list "NodePort" "LoadBalancer")) $svc.nodePort }}
       nodePort: {{ $svc.nodePort }}
       {{- end }}
+    {{- if .Values.metrics.enabled }}
+    # Prometheus metrics, for the ServiceMonitor (never routed).
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- end }}
     {{- with $svc.extraPorts }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

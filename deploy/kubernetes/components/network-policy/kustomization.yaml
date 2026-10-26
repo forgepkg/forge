@@ -12,7 +12,9 @@
 # spec.ingress[0].from to the pods that proxy to Forge (the ingress
 # controller's namespace, or your Gateway implementation's data plane, e.g.
 # envoy-gateway-system for Envoy Gateway), as overlays/production does, and
-# add any other peer that needs direct access (a metrics scraper).
+# add any other peer that needs direct access. The metrics port admits the
+# placeholder namespace `monitoring`: patch spec.ingress[1].from to where
+# your Prometheus runs.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 

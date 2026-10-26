@@ -185,6 +185,9 @@ impl RetentionWorker {
             run_id,
             self.config.lease,
         ));
+        // The size before the run, for the bytes it frees (metrics only: a
+        // failed read records none).
+        let size_before = self.repository_size(&repo).await.ok();
         // A panic in `process` (a bug, or a panicking `Format`) is recorded
         // like any other failed run instead of unwinding past `fail_run` and
         // leaving the ledger row `running` until its lease expires. Nothing is
@@ -197,8 +200,12 @@ impl RetentionWorker {
         drop(heartbeat);
 
         match result {
-            Ok(summary) => Ok(Some(summary)),
+            Ok(summary) => {
+                self.record_metrics(&repo, &summary, size_before).await;
+                Ok(Some(summary))
+            }
             Err(e) => {
+                forge_metrics::retention::run(&repo.name, false, 0, 0, 0);
                 tracing::error!(error = %e, repo = %repo.name, %run_id, "retention run failed");
                 // Release the lease, record the error, reschedule.
                 let now = forge_db::db_now(&self.pool)
@@ -219,6 +226,47 @@ impl RetentionWorker {
                 Err(e)
             }
         }
+    }
+
+    /// The logical size of a claimed repository, as its format stores it.
+    async fn repository_size(&self, repo: &retention_dao::ClaimedRepo) -> sqlx::Result<u64> {
+        let format = self.formats.resolve(&repo.format);
+        if format.as_ref().is_some_and(|f| f.stores_images()) {
+            forge_db::oci_dao::repository_size(&self.pool, repo.repository_id).await
+        } else if format.as_ref().is_some_and(|f| f.stores_files()) {
+            forge_db::raw_dao::repository_size(&self.pool, repo.repository_id).await
+        } else {
+            retention_dao::package_repository_size(&self.pool, repo.repository_id).await
+        }
+    }
+
+    /// Record a finished run in the metrics: the versions it unlisted and
+    /// deleted and the bytes it freed. A dry run changed nothing (its summary
+    /// counts what it would have done) and records zeros.
+    async fn record_metrics(
+        &self,
+        repo: &retention_dao::ClaimedRepo,
+        summary: &RunSummary,
+        size_before: Option<u64>,
+    ) {
+        let dry_run = repo
+            .policy
+            .get("dry_run_only")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if dry_run {
+            forge_metrics::retention::run(&repo.name, true, 0, 0, 0);
+            return;
+        }
+        let freed = match (size_before, summary.deleted > 0) {
+            (Some(before), true) => self
+                .repository_size(repo)
+                .await
+                .map(|after| before.saturating_sub(after))
+                .unwrap_or(0),
+            _ => 0,
+        };
+        forge_metrics::retention::run(&repo.name, true, summary.unlisted, summary.deleted, freed);
     }
 
     /// Evaluate + apply one claimed repository, then finish the run + invalidate
@@ -605,6 +653,8 @@ impl RetentionWorker {
             let mut ticker = tokio::time::interval(self.config.poll_interval);
             loop {
                 ticker.tick().await;
+                let run = forge_metrics::workers::Run::start(WORKER);
+                let mut ok = true;
                 // Drain all currently-due repos this cycle (bounded by the lease
                 // / SKIP LOCKED so other instances share the work).
                 loop {
@@ -614,15 +664,20 @@ impl RetentionWorker {
                         }
                         Ok(None) => break, // nothing due
                         Err(e) => {
+                            ok = false;
                             tracing::error!(error = %e, "retention tick failed");
                             break;
                         }
                     }
                 }
+                run.finish(ok);
             }
         })
     }
 }
+
+/// The retention worker's name (logs, `forge_worker_*`).
+pub const WORKER: &str = "retention";
 
 /// Aborts the wrapped task when dropped (a [`tokio::task::JoinHandle`] only
 /// detaches on drop).

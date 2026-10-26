@@ -21,6 +21,7 @@ forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
+forge-metrics = { path = "../metrics" }
 # The built-in format plugins (crates/formats/docker, crates/formats/nuget,
 # crates/formats/npm, crates/formats/raw), linked in.
 forge-format-docker = { path = "../formats/docker" }
@@ -35,6 +36,8 @@ tower-http = { workspace = true }
 # The HTTP server loop (`serve`): hyper's header-read timeout needs a timer,
 # which `axum::serve` does not configure.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
+# The metrics middleware counts the bytes of response bodies.
+http-body = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio", "http1", "http2"] }
 sqlx = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
@@ -42,6 +45,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The `log` bridge's level (main.rs), which the metrics' TRACE events raise.
+log = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 http = { workspace = true }

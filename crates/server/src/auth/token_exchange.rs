@@ -201,6 +201,18 @@ async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes
 }
 
 async fn issue_key(state: &AppState, token: &str) -> Result<Redeemed, (StatusCode, &'static str)> {
+    use forge_metrics::auth::ExchangeOutcome;
+    let issued = issue(state, token).await;
+    forge_metrics::auth::token_exchange(match &issued {
+        Ok(_) => ExchangeOutcome::Issued,
+        Err((status, _)) if status.is_server_error() => ExchangeOutcome::Error,
+        Err(_) => ExchangeOutcome::Rejected,
+    });
+    issued
+}
+
+/// [`issue_key`] proper.
+async fn issue(state: &AppState, token: &str) -> Result<Redeemed, (StatusCode, &'static str)> {
     if is_workload_key(token) {
         return Err((
             StatusCode::UNAUTHORIZED,

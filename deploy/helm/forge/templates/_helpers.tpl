@@ -150,6 +150,9 @@ public URL, the in-cluster S3 gateway); a value set in .Values.config wins. */}}
 {{- define "forge.config" -}}
 {{- include "forge.requireRootKey" . }}
 {{- $server := dict "bind" (printf "0.0.0.0:%d" (int .Values.containerPort)) "public_base_url" (include "forge.publicBaseUrl" .) }}
+{{- if .Values.metrics.enabled }}
+{{- $_ := set $server "metrics_bind" (printf "0.0.0.0:%d" (int .Values.metrics.port)) }}
+{{- end }}
 {{- $derived := dict "server" $server }}
 {{- if .Values.versitygw.enabled }}
 {{- $_ := set $derived "s3" (dict
@@ -365,4 +368,31 @@ wins without a duplicate entry. */}}
 {{- if not (has .name $userNames) }}{{ $merged = append $merged . }}{{ end }}
 {{- end }}
 {{- toYaml (concat $merged .Values.env) }}
+{{- end }}
+
+{{/* The scrape settings of a ServiceMonitor endpoint or a PodMonitor's
+podMetricsEndpoint, from metrics.serviceMonitor / metrics.podMonitor. */}}
+{{- define "forge.metricsEndpoint" -}}
+path: /metrics
+scheme: http
+{{- with .interval }}
+interval: {{ . }}
+{{- end }}
+{{- with .scrapeTimeout }}
+scrapeTimeout: {{ . }}
+{{- end }}
+{{- with .bearerTokenSecret }}
+authorization:
+  type: Bearer
+  credentials:
+    {{- toYaml . | nindent 4 }}
+{{- end }}
+{{- with .relabelings }}
+relabelings:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .metricRelabelings }}
+metricRelabelings:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
 {{- end }}

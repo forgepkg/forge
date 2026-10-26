@@ -6,6 +6,7 @@ members = [
     "crates/cache",
     "crates/core",
     "crates/crypto",
+    "crates/metrics",
     "crates/plugin-api",
     "crates/plugin",
     "crates/server",
@@ -118,6 +119,9 @@ thiserror = { version = "2" }
 # Tracing / logging
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Prometheus metrics (`GET /metrics` on its own listener, `forge-metrics`).
+prometheus-client = { version = "0.25" }
 
 # Hashing
 sha2 = { version = "0.11" }

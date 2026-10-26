@@ -1414,6 +1414,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dtoa"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1596,6 +1602,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 name = "forge-cache"
 version = "2.0.0"
 dependencies = [
+ "forge-metrics",
  "futures-util",
  "moka",
  "redis",
@@ -1623,6 +1630,7 @@ dependencies = [
  "forge-crypto",
  "forge-db",
  "forge-format-nuget",
+ "forge-metrics",
  "forge-plugin",
  "forge-plugin-api",
  "forge-storage",
@@ -1685,6 +1693,8 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "forge-crypto",
+ "forge-metrics",
+ "log",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -1794,6 +1804,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-metrics"
+version = "2.0.0"
+dependencies = [
+ "prometheus-client",
+]
+
+[[package]]
 name = "forge-plugin"
 version = "2.0.0"
 dependencies = [
@@ -1829,11 +1846,13 @@ dependencies = [
  "forge-format-npm",
  "forge-format-nuget",
  "forge-format-raw",
+ "forge-metrics",
  "forge-plugin",
  "forge-storage",
  "futures-util",
  "hex",
  "http",
+ "http-body",
  "http-body-util",
  "httpdate",
  "hyper",
@@ -1841,6 +1860,7 @@ dependencies = [
  "ipnet",
  "jsonwebtoken",
  "lettre",
+ "log",
  "md-5",
  "mime_guess",
  "multer",
@@ -1885,6 +1905,7 @@ dependencies = [
  "bytes",
  "chrono",
  "forge-db",
+ "forge-metrics",
  "futures-util",
  "rustix",
  "sha2 0.11.1",
@@ -3378,6 +3399,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus-client"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1784dc11a05f5a8f57c4a62915686be140f24f70301290b997e317241fa9ffc2"
+dependencies = [
+ "dtoa",
+ "itoa",
+ "parking_lot",
+ "prometheus-client-derive-encode",
+]
+
+[[package]]
+name = "prometheus-client-derive-encode"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01e34894696ff94f64a20c2c373a6440903e9c2789a303d68ec6e6f953f890e4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4600,7 +4644,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

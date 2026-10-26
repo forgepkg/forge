@@ -1,0 +1,12 @@
+[package]
+name = "forge-metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Prometheus / OpenMetrics exposition: typed label sets, so a metric's labels
+# are fixed by its type and never carry a value nobody chose.
+prometheus-client = { workspace = true }

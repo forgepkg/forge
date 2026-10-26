@@ -383,6 +383,9 @@ pub struct UpstreamHttp {
     proxies: Arc<ProxyMatcher>,
     /// Resolves proxied host names for the metadata guard.
     lookup: Lookup,
+    /// The proxy repository the requests are for, which the metrics count
+    /// them under ([`Self::for_repository`]); `None` counts nothing.
+    repository: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for UpstreamHttp {
@@ -429,6 +432,7 @@ impl UpstreamHttp {
             config: Arc::new(config),
             proxies: Arc::new(proxies),
             lookup,
+            repository: None,
         })
     }
 
@@ -455,6 +459,24 @@ impl UpstreamHttp {
     /// The active tuning.
     pub fn config(&self) -> &UpstreamHttpConfig {
         &self.config
+    }
+
+    /// This client (sharing its connections) for the upstream of proxy
+    /// repository `name`: the metrics count its requests, their latency
+    /// and the metadata bytes it reads under that repository.
+    pub fn for_repository(&self, name: &str) -> Self {
+        UpstreamHttp {
+            repository: Some(Arc::from(name)),
+            ..self.clone()
+        }
+    }
+
+    /// Count `bytes` fetched from the upstream, when this client is a
+    /// repository's ([`Self::for_repository`]).
+    pub fn count_bytes(&self, bytes: u64) {
+        if let Some(repository) = &self.repository {
+            forge_metrics::proxy::upstream_bytes(repository, bytes);
+        }
     }
 
     /// Issue a GET for `url`, attaching `auth` to every hop that shares the
@@ -503,6 +525,33 @@ impl UpstreamHttp {
     /// registry). A redirect keeps it, except a `303`, which is followed
     /// with a GET.
     pub async fn send_with_body(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        class: RequestClass,
+        headers: reqwest::header::HeaderMap,
+        auth: Option<&UpstreamAuth<'_>>,
+        body: Option<Vec<u8>>,
+    ) -> Result<reqwest::Response, UpstreamError> {
+        let Some(repository) = &self.repository else {
+            return self
+                .send_hops(method, url, class, headers, auth, body)
+                .await;
+        };
+        let started = std::time::Instant::now();
+        let result = self
+            .send_hops(method, url, class, headers, auth, body)
+            .await;
+        forge_metrics::proxy::upstream_request(
+            repository,
+            result.as_ref().ok().map(|resp| resp.status().as_u16()),
+            started.elapsed(),
+        );
+        result
+    }
+
+    /// [`Self::send_with_body`]: the request and the redirects it follows.
+    async fn send_hops(
         &self,
         mut method: reqwest::Method,
         url: &str,
@@ -710,6 +759,7 @@ impl UpstreamHttp {
         let limit = self.config.max_metadata_bytes;
         let threshold = self.config.spool_memory_bytes;
         let body = SpooledBody::read(resp, url, limit, threshold).await?;
+        self.count_bytes(body.len());
         if !gzip {
             return Ok(Some(body));
         }

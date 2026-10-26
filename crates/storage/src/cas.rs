@@ -78,7 +78,14 @@ pub enum CasError {
     #[error("s3 error: {0}")]
     S3(#[from] S3Error),
     #[error("database error: {0}")]
-    Db(#[from] sqlx::Error),
+    Db(#[source] sqlx::Error),
+}
+
+impl From<sqlx::Error> for CasError {
+    fn from(e: sqlx::Error) -> Self {
+        forge_db::observe_error(&e);
+        CasError::Db(e)
+    }
 }
 
 impl CasError {
@@ -465,6 +472,17 @@ impl Staging {
         &self.dir
     }
 
+    /// The bytes staged now and the budget they count against, `None`
+    /// without a budget (nothing counts them then).
+    pub fn usage(&self) -> Option<(u64, u64)> {
+        let budget = self.budget.as_ref()?;
+        let permits = usize::try_from(self.limit)
+            .unwrap_or(usize::MAX)
+            .min(Semaphore::MAX_PERMITS);
+        let in_use = permits.saturating_sub(budget.available_permits());
+        Some((in_use as u64, self.limit))
+    }
+
     /// This process's own subdirectory, and the handle that keeps it alive
     /// while a staged file is in it (`None`: stage in `dir` itself). One that
     /// has disappeared is replaced by a new one: a sweep on another host,
@@ -637,6 +655,11 @@ impl Cas {
     pub fn with_staging(mut self, staging: Staging) -> Self {
         self.staging = staging;
         self
+    }
+
+    /// Where this store stages.
+    pub fn staging(&self) -> &Staging {
+        &self.staging
     }
 
     /// Compute the stable prefix for a content hash:

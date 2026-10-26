@@ -259,6 +259,15 @@ impl UpstreamBasicProvider {
     /// body (for the vouched identity). A network error / timeout /
     /// unexpected status is `Unavailable` (fail-closed).
     async fn forward(&self, username: &str, password: &str) -> ForwardResult {
+        let result = self.forward_once(username, password).await;
+        if matches!(result.verdict, UpstreamVerdict::Unavailable) {
+            forge_metrics::auth::forwarding_error();
+        }
+        result
+    }
+
+    /// [`Self::forward`] proper.
+    async fn forward_once(&self, username: &str, password: &str) -> ForwardResult {
         let method = match reqwest::Method::from_bytes(self.config.method.as_bytes()) {
             Ok(m) => m,
             Err(_) => {

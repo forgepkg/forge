@@ -25,7 +25,8 @@
 //! subscription like a closed stream: L1 is flushed and the supervisor
 //! resubscribes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use redis::AsyncCommands;
 
@@ -65,6 +66,8 @@ fn tag_message(node_id: u64, ns: &str, tag: &str, generation: u64) -> String {
 pub struct Backplane {
     conn: redis::aio::ConnectionManager,
     node_id: u64,
+    /// Whether the subscription is live (the metrics' view).
+    subscribed: Arc<AtomicBool>,
 }
 
 impl Backplane {
@@ -89,6 +92,7 @@ impl Backplane {
         )?;
 
         let (subscribed_tx, subscribed_rx) = tokio::sync::oneshot::channel();
+        let subscribed = Arc::new(AtomicBool::new(false));
         tokio::spawn(subscriber_supervisor(
             client,
             l2,
@@ -96,7 +100,10 @@ impl Backplane {
             tag_versions,
             node_id,
             timeouts,
-            subscribed_tx,
+            Signals {
+                first: subscribed_tx,
+                live: subscribed.clone(),
+            },
         ));
         let wait = initial_subscribe_wait(timeouts);
         if tokio::time::timeout(wait, subscribed_rx).await.is_err() {
@@ -106,7 +113,16 @@ impl Backplane {
             );
         }
 
-        Ok(Backplane { conn, node_id })
+        Ok(Backplane {
+            conn,
+            node_id,
+            subscribed,
+        })
+    }
+
+    /// Whether the subscription is live: peers' invalidations are heard.
+    pub fn is_subscribed(&self) -> bool {
+        self.subscribed.load(Ordering::Relaxed)
     }
 
     /// Broadcast one tag-generation barrier, then the re-sync message for the
@@ -132,6 +148,14 @@ impl Backplane {
     }
 }
 
+/// What the subscriber supervisor tells about its subscription.
+struct Signals {
+    /// Sent once the first subscription is live.
+    first: tokio::sync::oneshot::Sender<()>,
+    /// Whether a subscription is live now.
+    live: Arc<AtomicBool>,
+}
+
 /// How long [`Backplane::start`] waits for the first subscription: one full
 /// [`subscribe`] attempt (connect + `SUBSCRIBE`, each bounded by the connect
 /// plus response deadline) and a retry.
@@ -145,7 +169,7 @@ fn initial_subscribe_wait(timeouts: RedisTimeouts) -> std::time::Duration {
 /// entry filled before it may already be stale (with a slow Redis at boot that
 /// window can be long). When the subscription drops (Redis restart, network
 /// partition) it is re-established with capped exponential backoff and L1 is
-/// flushed again, so no stale entry outlives the outage. `subscribed` is
+/// flushed again, so no stale entry outlives the outage. `signals.first` is
 /// signalled after the first subscription is live and L1 flushed.
 async fn subscriber_supervisor(
     client: redis::Client,
@@ -154,14 +178,16 @@ async fn subscriber_supervisor(
     tag_versions: TagVersions,
     node_id: u64,
     timeouts: RedisTimeouts,
-    subscribed: tokio::sync::oneshot::Sender<()>,
+    signals: Signals,
 ) {
     const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_millis(250);
-    let mut subscribed = Some(subscribed);
+    let Signals { first, live } = signals;
+    let mut subscribed = Some(first);
     loop {
         match subscribe(&client, timeouts).await {
             Ok(pubsub) => {
+                live.store(true, Ordering::Relaxed);
                 l1.invalidate_all();
                 match subscribed.take() {
                     // Nobody may have filled L1 yet (construction is still
@@ -176,6 +202,7 @@ async fn subscriber_supervisor(
                 }
                 backoff = std::time::Duration::from_millis(250);
                 subscriber_loop(pubsub, &l2, &tag_versions, node_id, timeouts).await;
+                live.store(false, Ordering::Relaxed);
                 // The stream ended: from here until resubscribed, peers'
                 // invalidations are not seen — flush eagerly too.
                 l1.invalidate_all();
@@ -307,6 +334,7 @@ async fn apply_message(l2: &RedisL2, tag_versions: &TagVersions, node_id: u64, p
             // advances the barrier by one (see
             // `TagVersions::observe_invalidation`).
             tag_versions.observe_invalidation(tag, generation);
+            forge_metrics::cache::invalidation_received();
         }
         "k" | "n" => {
             let (ns, tag) = if kind == "k" {

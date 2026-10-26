@@ -87,6 +87,7 @@ impl FileError {
 
 impl From<sqlx::Error> for FileError {
     fn from(e: sqlx::Error) -> Self {
+        forge_db::observe_error(&e);
         match e {
             sqlx::Error::PoolTimedOut => FileError::Unavailable("database busy".into()),
             e => FileError::Internal(format!("database: {e}")),

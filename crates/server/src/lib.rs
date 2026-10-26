@@ -30,6 +30,7 @@ pub mod images;
 pub mod invitations;
 pub mod me;
 pub mod me_tokens;
+pub mod metrics;
 pub mod middleware;
 pub mod nexus_import;
 pub mod object_store;

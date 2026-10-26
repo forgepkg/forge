@@ -47,6 +47,12 @@ allowed_hosts = []              # (default: [])
 header_read_timeout_seconds = 150 # (default: 150)
 body_idle_timeout_seconds = 60   # (default: 60)
 request_timeout_seconds = 900    # (default: 900)
+# Prometheus metrics at GET /metrics, on a listener of their own: never on
+# `bind`, so they stay off the ingress (docs/deployment.md → Metrics). With a
+# token (at least 16 characters; better FORGE_SERVER__METRICS_TOKEN in the
+# environment) a scrape must send `Authorization: Bearer <token>`.
+# metrics_bind = "0.0.0.0:9421"  # (default: unset, no metrics listener)
+# metrics_token = "<secret>"     # (default: unset, no token)
 
 [database]
 url = "postgres://forge:forge@localhost:5432/forge"
@@ -246,6 +252,15 @@ batch_size = 100                # (default: 100)
 grace_seconds = 3600            # (default: 3600) grace before a dereferenced blob is deleted
 poll_interval_seconds = 10      # (default: 10)
 processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processed outbox rows this long; 0 = never prune
+
+[metrics]
+# What the metrics listener (server.metrics_bind) reports.
+# Label metrics with repository names (repo="…"). Off, every repository's
+# series add up into one: for an install with very many repositories.
+per_repository = true           # (default: true)
+# How often an instance counts its repositories, their versions and stored
+# bytes, and the outbox backlog (database queries, never run per scrape).
+inventory_interval_seconds = 300 # (default: 300, at least 10)
 
 [retention]
 # Retention is set in the web UI, for every instance: each repository's policy

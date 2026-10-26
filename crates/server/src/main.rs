@@ -14,12 +14,36 @@ use forge_server::workers;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    // The log, filtered by RUST_LOG (default `info`), and the connection
+    // pool's acquire events, which the metrics read whatever RUST_LOG says.
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let log_level = log_filter.max_level_hint();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(log_filter))
+        .with(
+            forge_server::metrics::AcquireTimes.with_filter(
+                tracing_subscriber::filter::Targets::new()
+                    .with_target(forge_server::metrics::ACQUIRE_TARGET, tracing::Level::TRACE),
+            ),
         )
         .init();
+    // Those TRACE events raise the subscriber's level, and `init` gives it to
+    // the `log` bridge too: keep dependencies' `log` records at the level
+    // the log prints, so they are skipped as cheaply as before.
+    if let Some(level) = log_level {
+        log::set_max_level(match level.into_level() {
+            None => log::LevelFilter::Off,
+            Some(tracing::Level::ERROR) => log::LevelFilter::Error,
+            Some(tracing::Level::WARN) => log::LevelFilter::Warn,
+            Some(tracing::Level::INFO) => log::LevelFilter::Info,
+            Some(tracing::Level::DEBUG) => log::LevelFilter::Debug,
+            Some(tracing::Level::TRACE) => log::LevelFilter::Trace,
+        });
+    }
 
     // Config: optional path from FORGE_CONFIG, else `forge.toml` if present.
     let config_path = std::env::var_os("FORGE_CONFIG")
@@ -29,11 +53,14 @@ async fn main() -> anyhow::Result<()> {
             default.exists().then_some(default)
         });
     let config = Config::load(config_path.as_deref()).context("load configuration")?;
+    let revision = option_env!("FORGE_GIT_SHA").unwrap_or("unknown");
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        revision = option_env!("FORGE_GIT_SHA").unwrap_or("unknown"),
+        revision,
         "starting forge-server"
     );
+    forge_metrics::set_build_info(env!("CARGO_PKG_VERSION"), revision);
+    forge_metrics::set_per_repository(config.metrics.per_repository);
     for warning in config.deployment_warnings() {
         tracing::warn!("{warning}");
     }
@@ -114,6 +141,10 @@ async fn main() -> anyhow::Result<()> {
         .context("ensure auth realms")?;
 
     let bind_addr = config.server.bind_addr().context("parse server.bind")?;
+    let metrics_addr = config
+        .server
+        .metrics_addr()
+        .context("parse server.metrics_bind")?;
     // Registry (`/v2`) tokens are signed with one key shared by every
     // instance: docker.token_secret, or the install's generated key.
     let registry_keys = forge_server::registry::load_token_keys(&config, &pool, &envelope)
@@ -128,6 +159,25 @@ async fn main() -> anyhow::Result<()> {
     // supervised: a panicking loop is logged and restarted.
     let workers = workers::spawn_all(&state);
 
+    // The metrics listener, served until the process ends (scrapes see the
+    // drain): never on the main listener, so never behind the ingress.
+    let metrics = match metrics_addr {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind the metrics listener {addr}"))?;
+            tracing::info!(%addr, "metrics listening on /metrics");
+            let router = forge_server::metrics::router(state.clone());
+            Some(tokio::spawn(forge_server::serve::serve(
+                listener,
+                router,
+                serve_options,
+                std::future::pending(),
+            )))
+        }
+        None => None,
+    };
+
     let downloads = state.downloads.clone();
     let app = build_router(state, layer);
 
@@ -137,6 +187,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%bind_addr, "forge-server listening");
 
     forge_server::serve::serve(listener, app, serve_options, shutdown_signal()).await;
+    if let Some(metrics) = metrics {
+        metrics.abort();
+    }
 
     // In-flight requests have drained; stop the background loops. Every worker
     // step is idempotent / lease-fenced, so an interrupted pass is resumed by

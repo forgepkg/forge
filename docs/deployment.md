@@ -873,6 +873,64 @@ On SIGTERM, Forge stops accepting connections and lets in-flight requests
 finish before exiting. Give it a termination grace period long enough for your
 largest package download.
 
+## Metrics
+
+Forge serves Prometheus metrics at `GET /metrics` on a **listener of its
+own**, `server.metrics_bind` (`FORGE_SERVER__METRICS_BIND`), for example
+`0.0.0.0:9421`. The main listener never serves them, so no ingress or
+HTTPRoute exposes them by accident. The listener is off unless set; the
+Helm chart (`metrics.enabled`, port 9421) and the kustomize base turn it on.
+
+| Setting | Meaning |
+| --- | --- |
+| `server.metrics_bind` | Address of the metrics listener. Unset: no metrics. Must be another port than `server.bind`. |
+| `server.metrics_token` | A bearer token every scrape must send (`Authorization: Bearer <token>`, at least 16 characters), for scrapers outside the cluster network. Set it as `FORGE_SERVER__METRICS_TOKEN`; unset, whoever reaches the port may scrape. |
+| `metrics.per_repository` | Label metrics with repository names (default `true`). Off, every repository's series add up into one. |
+| `metrics.inventory_interval_seconds` | How often each instance counts the inventory and the outbox backlog (default 300). |
+
+The text is OpenMetrics (`application/openmetrics-text`), which Prometheus
+scrapes like its own format. Each instance reports its own numbers: scrape
+every pod, not the Service's load-balanced address (a `ServiceMonitor` or
+`PodMonitor` does).
+
+**Labels stay bounded.** No label carries a package id, a version, an image
+name or tag, a username, a token or a path: a request is counted under its
+*surface* (`nuget`, `oci`, `plugin_npm`, `plugin_raw`, `admin`, `browse`,
+`auth`, `health`, `ui`; `repository` for a `/repository/…` request that named
+no repository), never its URL. The repository name is the one label an
+administrator chooses (`repo`); with very many repositories turn
+`metrics.per_repository` off. Counters end in `_total`, durations are
+histograms in seconds.
+
+| Area | Metrics |
+| --- | --- |
+| Build | `forge_build_info{version, commit}` |
+| HTTP | `forge_http_requests_total{surface, method, status}` (status class), `forge_http_request_duration_seconds` (to the response headers), `forge_http_requests_in_flight`, `forge_http_response_bytes_total{surface}` |
+| Proxies | `forge_proxy_lookups_total{repo, kind, outcome}`: `kind` is `metadata`, `package`, `manifest`, `blob` or `file`; `outcome` is `hit`, `fetched`, `stale_served`, `negative_cached`, `delay_gated`, `not_found`, `offline`, `upstream_error` or `error`. `forge_proxy_upstream_requests_total{repo, status}` (`2xx` … `5xx`, `429`, `error`), `forge_proxy_upstream_request_duration_seconds{repo}`, `forge_proxy_upstream_bytes_total{repo}`, `forge_proxy_upstream_rate_limited_total{repo}` (Docker Hub's pull limit) |
+| Storage | `forge_s3_operations_total{op, outcome}` and `forge_s3_operation_duration_seconds{op}`; `forge_s3_circuit_breaker_open` (with the local blob cache); the counters of `GET /admin/blob-cache` as `forge_blob_cache_*` (hits, hit bytes, hits while S3 was down, misses, fills, fill failures, corrupt entries, evictions, bypassed reads, size, limit); `forge_staging_bytes` against `forge_staging_limit_bytes` (`server.max_staging_bytes`); `forge_outbox_pending`, `forge_outbox_due`, `forge_outbox_oldest_due_age_seconds`; `forge_gc_blobs_deleted_total{source}` |
+| Cache | `forge_cache_lookups_total{tier, result}` (L1 in process, L2 Redis), `forge_cache_redis_backplane_connected` (with Redis), `forge_cache_invalidations_sent_total`, `forge_cache_invalidations_received_total` |
+| Database | `forge_db_pool_connections{state}` (`in_use`, `idle`), `forge_db_pool_max_connections`, `forge_db_pool_acquire_duration_seconds`, `forge_db_pool_acquire_timeouts_total` |
+| Workers | `forge_worker_runs_total{worker, outcome}`, `forge_worker_last_success_timestamp_seconds{worker}`, `forge_worker_interval_seconds{worker}`, `forge_worker_run_duration_seconds{worker}`, `forge_worker_restarts_total{worker}`, for the `outbox`, `reconciler`, `proxy-refresh`, `retention`, `auth-reaper`, `cred-reaper`, `registry-sweeper`, `crypto-rotation`, `blob-cache` and `metrics-inventory` workers (restarts for every worker) |
+| Retention | `forge_retention_runs_total{repo, outcome}`, `forge_retention_versions_total{repo, action}` (`unlisted`, `deleted`), `forge_retention_freed_bytes_total{repo}` (the repository's size before a run less its size after) |
+| Auth | `forge_auth_sign_ins_total{realm_type, outcome}` (a password through the realms, on the login form or over HTTP Basic, and OIDC logins), `forge_auth_throttled_total{reason}`, `forge_auth_token_exchanges_total{outcome}`, `forge_auth_jwks_refresh_failures_total`, `forge_auth_credential_forwarding_errors_total` |
+| Inventory | `forge_repositories{format, kind}`, `forge_repository_versions{repo}` (package versions, image tags, files), `forge_repository_stored_bytes{repo}`, counted by a worker every `metrics.inventory_interval_seconds`, never per scrape |
+
+The inventory and the outbox backlog are database-wide: every instance
+reports the same numbers, so aggregate them with `max`, not `sum`. The pool's
+acquire times come from sqlx's pool events, which `forge-server` reads
+whatever `RUST_LOG` says.
+
+[deploy/monitoring](../deploy/monitoring/README.md) has a Grafana dashboard
+and example alerting rules: a worker without a successful pass for three of
+its intervals, the S3 circuit breaker open, a high 5xx rate, a growing outbox
+backlog, upstream errors and rate limits per proxy, an exhausted connection
+pool, a lost Redis backplane and nearly full staging space.
+
+The Helm chart's HorizontalPodAutoscaler scales on CPU and memory; with the
+metrics in Prometheus and an adapter that serves them as custom metrics
+(prometheus-adapter, KEDA), `autoscaling.metrics` can add, for example,
+`forge_http_requests_in_flight` per pod.
+
 ## Running more than one instance
 
 Instances coordinate through PostgreSQL (row locks and leases), so any number

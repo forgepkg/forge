@@ -1,0 +1,28 @@
+{{- $sm := .Values.metrics.serviceMonitor }}
+{{- if and .Values.metrics.enabled $sm.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "forge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with include "forge.annotations" (dict "ctx" . "annotations" $sm.annotations) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "forge.selectorLabels" . | nindent 6 }}
+  endpoints:
+    # The Service's metrics port (metrics.port), never routed.
+    - port: metrics
+      {{- include "forge.metricsEndpoint" $sm | nindent 6 }}
+{{- end }}

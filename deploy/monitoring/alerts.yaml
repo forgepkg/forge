@@ -1,0 +1,144 @@
+# Example Prometheus alerting rules for Forge's metrics (docs/deployment.md →
+# Metrics). Load the file with `rule_files`, or wrap its `groups` into a
+# prometheus-operator PrometheusRule (spec.groups). The thresholds are
+# starting points: tune them to your traffic. Check with
+# `promtool check rules deploy/monitoring/alerts.yaml`.
+groups:
+  - name: forge
+    rules:
+      # A background worker (outbox, reconciler, retention, the reapers, …)
+      # has had no successful pass for three of its intervals.
+      - alert: ForgeWorkerStalled
+        expr: |
+          time() - forge_worker_last_success_timestamp_seconds
+            > 3 * forge_worker_interval_seconds
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forge worker {{ $labels.worker }} has not completed a pass on {{ $labels.instance }}"
+          description: >-
+            The {{ $labels.worker }} worker's last successful pass was
+            {{ $value | humanizeDuration }} ago, more than three of its
+            intervals. Its errors are in the instance's log.
+
+      # Every pass of a worker failed for half an hour (also a worker that
+      # never succeeded since the instance started).
+      - alert: ForgeWorkerFailing
+        expr: |
+          increase(forge_worker_runs_total{outcome="failure"}[30m]) > 0
+          unless on (job, instance, worker)
+            increase(forge_worker_runs_total{outcome="success"}[30m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forge worker {{ $labels.worker }} keeps failing on {{ $labels.instance }}"
+          description: "No pass of the {{ $labels.worker }} worker succeeded in 30 minutes; see the instance's log."
+
+      # A worker loop panicked or exited and was restarted.
+      - alert: ForgeWorkerRestarting
+        expr: increase(forge_worker_restarts_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forge worker {{ $labels.worker }} restarted on {{ $labels.instance }}"
+          description: "The {{ $labels.worker }} worker loop panicked or exited and was restarted; the log has the panic."
+
+      # S3 is considered down: the circuit breaker in front of it (with the
+      # local blob cache) is open. Cached blobs are still served; pushes and
+      # cache misses fail with 503.
+      - alert: ForgeObjectStoreDown
+        expr: max by (job, instance) (forge_s3_circuit_breaker_open) == 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Forge on {{ $labels.instance }} cannot reach S3"
+          description: "The S3 circuit breaker has been open for 2 minutes: pushes and blobs that are not cached fail."
+
+      # More than 5 % of the requests are answered with a server error.
+      - alert: ForgeHighErrorRate
+        expr: |
+          sum by (job) (rate(forge_http_requests_total{status="5xx"}[5m]))
+            / sum by (job) (rate(forge_http_requests_total[5m]))
+          > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Forge answers {{ $value | humanizePercentage }} of its requests with a 5xx"
+          description: "forge_http_requests_total by surface shows which part of Forge fails."
+
+      # Due S3 deletes wait: the outbox worker is failing or cannot keep up.
+      # Every instance reports the same (shared) backlog.
+      - alert: ForgeOutboxBacklogGrowing
+        expr: |
+          max by (job) (forge_outbox_oldest_due_age_seconds) > 1800
+          or (
+            max by (job) (forge_outbox_due) > 1000
+            and max by (job) (delta(forge_outbox_due[1h])) > 0
+          )
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forge's deferred S3 deletes are piling up"
+          description: >-
+            The outbox has due deletes it does not process (the oldest has
+            waited over 30 minutes, or more than 1000 and growing). Check the
+            outbox worker (forge_worker_runs_total{worker="outbox"}) and the
+            S3 delete permissions.
+
+      # A proxy's upstream fails more than 10 % of its lookups.
+      - alert: ForgeProxyUpstreamErrors
+        expr: |
+          sum by (job, repo) (rate(forge_proxy_lookups_total{outcome="upstream_error"}[10m]))
+            / sum by (job, repo) (rate(forge_proxy_lookups_total[10m]))
+          > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The upstream of proxy {{ $labels.repo }} fails {{ $value | humanizePercentage }} of the lookups"
+          description: "Cached content is still served; what is not cached fails. forge_proxy_upstream_requests_total shows the upstream's answers."
+
+      # A proxy's upstream rate-limits it (Docker Hub's pull limit).
+      - alert: ForgeProxyRateLimited
+        expr: sum by (job, repo) (increase(forge_proxy_upstream_rate_limited_total[1h])) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "The upstream of proxy {{ $labels.repo }} answered 429 Too Many Requests {{ $value }} times in an hour"
+          description: "Give the proxy upstream credentials with a higher limit, or raise its metadata TTL."
+
+      # Requests time out waiting for a database connection.
+      - alert: ForgeDatabasePoolExhausted
+        expr: increase(forge_db_pool_acquire_timeouts_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forge on {{ $labels.instance }} ran out of database connections"
+          description: "Requests waited longer than database.acquire_timeout_seconds for a connection: raise database.max_connections (within PostgreSQL's max_connections) or look for slow queries."
+
+      # The Redis invalidation backplane is down: other instances' changes
+      # reach this one only when its cache entries expire.
+      - alert: ForgeRedisBackplaneDown
+        expr: forge_cache_redis_backplane_connected == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forge on {{ $labels.instance }} lost its Redis invalidation backplane"
+          description: "The instance does not hear other instances' cache invalidations until it resubscribes."
+
+      # Staged pushes and proxy downloads use most of server.max_staging_bytes;
+      # beyond it they are refused with 503.
+      - alert: ForgeStagingNearlyFull
+        expr: forge_staging_bytes / forge_staging_limit_bytes > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Forge on {{ $labels.instance }} uses {{ $value | humanizePercentage }} of its staging space"
+          description: "Raise server.max_staging_bytes (and the staging volume) or expect 503s for pushes and proxy downloads."

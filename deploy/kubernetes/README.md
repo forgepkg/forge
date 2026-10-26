@@ -13,6 +13,7 @@ deploy/kubernetes/
 │   ├── ingress/             Ingress with TLS (ingress-nginx annotations for large, slow pushes)
 │   ├── httproute/           Gateway API HTTPRoute instead of an Ingress
 │   ├── network-policy/      only the ingress controller / gateway reaches Forge
+│   ├── metrics/             a ServiceMonitor for the metrics port (prometheus-operator)
 │   ├── valkey/              in-cluster Valkey (shared cache), password-protected
 │   ├── high-availability/   two replicas, spread over nodes, PodDisruptionBudget
 │   ├── local-cache/         local blob cache on an emptyDir (faster downloads, serves through an S3 outage)
@@ -146,6 +147,13 @@ Points that matter on Kubernetes:
   trusted proxies (the CNI must enforce NetworkPolicy).
 - **Pod security.** Every workload here satisfies the `restricted` Pod
   Security Standard; the overlays' namespaces enforce it.
+- **Metrics.** The base serves Prometheus metrics on port 9421
+  (`FORGE_SERVER__METRICS_BIND`), the Service's `metrics` port, which no
+  Ingress or HTTPRoute routes. `components/metrics` adds a ServiceMonitor;
+  with `components/network-policy`, patch its second rule
+  (`spec.ingress[1].from`) to your Prometheus's namespace. A bearer token:
+  `FORGE_SERVER__METRICS_TOKEN` in `forge.env`. The dashboard and alert rules
+  are in [deploy/monitoring](../monitoring/README.md).
 
 ## Short-lived S3 credentials
 

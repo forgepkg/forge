@@ -1,0 +1,28 @@
+{{- $pm := .Values.metrics.podMonitor }}
+{{- if and .Values.metrics.enabled $pm.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "forge.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "forge.labels" . | nindent 4 }}
+    {{- with $pm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with include "forge.annotations" (dict "ctx" . "annotations" $pm.annotations) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "forge.selectorLabels" . | nindent 6 }}
+  podMetricsEndpoints:
+    # The pods' metrics port (metrics.port).
+    - port: metrics
+      {{- include "forge.metricsEndpoint" $pm | nindent 6 }}
+{{- end }}

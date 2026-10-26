@@ -53,6 +53,10 @@ spec:
             - name: http
               containerPort: 8421
               protocol: TCP
+            # Prometheus metrics (FORGE_SERVER__METRICS_BIND).
+            - name: metrics
+              containerPort: 9421
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: forge-config

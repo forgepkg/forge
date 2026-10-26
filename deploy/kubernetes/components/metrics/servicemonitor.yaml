@@ -1,0 +1,23 @@
+# Scrapes /metrics on the forge Service's `metrics` port; see
+# kustomization.yaml.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: forge
+  labels:
+    app.kubernetes.io/name: forge
+    app.kubernetes.io/component: server
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: forge
+      app.kubernetes.io/component: server
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      # authorization:
+      #   type: Bearer
+      #   credentials:
+      #     name: forge-env
+      #     key: FORGE_SERVER__METRICS_TOKEN
