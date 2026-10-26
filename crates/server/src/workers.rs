@@ -55,6 +55,16 @@
 //!    runs on one instance at a time; every instance runs the loop
 //!    ([`crate::nexus_import`]).
 //!
+//! 9. **Metrics inventory** — only with the metrics exported
+//!    (`telemetry.metrics`): counts repositories, their versions and stored
+//!    bytes, and the outbox backlog for the metrics
+//!    ([`crate::telemetry::spawn_inventory`]). Read-only, per instance.
+//!
+//! Every loop reports to the metrics (`forge.worker.*`): its restarts, and
+//! for the periodic ones each pass's outcome and duration, the time of the
+//! last successful one and the interval it runs at. Each pass is a trace of
+//! its own.
+//!
 //! [`spawn_all`] launches all of these and returns their join handles (so a caller
 //! can abort them on shutdown). Each loop logs and continues on error rather
 //! than terminating the process, and runs under [`supervise`]: a loop that
@@ -69,6 +79,7 @@ use forge_db::repository_dao;
 use forge_storage::{outbox_worker, reconciler, BlobStore};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::state::AppState;
 
@@ -107,6 +118,9 @@ pub struct WorkerHandles {
     pub blob_cache: Option<JoinHandle<()>>,
     /// Runs imports from Nexus, one at a time per instance.
     pub nexus_import: JoinHandle<()>,
+    /// Counts the inventory for the metrics. Present only with the metrics
+    /// exported (`telemetry.metrics`).
+    pub metrics_inventory: Option<JoinHandle<()>>,
 }
 
 impl WorkerHandles {
@@ -130,6 +144,9 @@ impl WorkerHandles {
             h.abort();
         }
         self.nexus_import.abort();
+        if let Some(h) = &self.metrics_inventory {
+            h.abort();
+        }
     }
 }
 
@@ -142,7 +159,8 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
 
     let outbox = {
         let (pool, store) = (state.pool.clone(), state.blob_store.clone());
-        supervise("outbox", move || {
+        forge_telemetry::workers::set_interval(outbox_worker::WORKER, poll);
+        supervise(outbox_worker::WORKER, move || {
             outbox_worker::spawn_loop(pool.clone(), store.clone(), batch, poll)
         })
     };
@@ -152,6 +170,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         // Reconcile less often than the outbox polls; it is only a safety net.
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
         let prune_outbox = state.config.outbox.processed_retention();
+        forge_telemetry::workers::set_interval("reconciler", interval);
         supervise("reconciler", move || {
             spawn_reconciler(pool.clone(), store.clone(), grace, prune_outbox, interval)
         })
@@ -162,6 +181,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         // Refresh upstream metadata on a modest cadence; the per-proxy TTL +
         // the shared cache bound actual upstream traffic.
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
+        forge_telemetry::workers::set_interval("proxy-refresh", interval);
         supervise("proxy-refresh", move || {
             spawn_proxy_refresh(state.clone(), interval)
         })
@@ -176,7 +196,11 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     // its next batch; the admin REST surface stays intact.
     let retention = {
         let state = state.clone();
-        supervise("retention", move || {
+        forge_telemetry::workers::set_interval(
+            forge_core::retention::worker::WORKER,
+            state.config.retention.poll_interval(),
+        );
+        supervise(forge_core::retention::worker::WORKER, move || {
             RetentionWorker::new(
                 state.pool.clone(),
                 crate::state::RegistryResolver(state.formats.clone()),
@@ -206,6 +230,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     let auth_reaper = {
         let pool = state.pool.clone();
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
+        forge_telemetry::workers::set_interval("auth-reaper", interval);
         Some(supervise("auth-reaper", move || {
             spawn_auth_reaper(pool.clone(), interval)
         }))
@@ -218,6 +243,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     let cred_reaper = {
         let pool = state.pool.clone();
         let interval = poll.saturating_mul(6).max(Duration::from_secs(60));
+        forge_telemetry::workers::set_interval("cred-reaper", interval);
         supervise("cred-reaper", move || {
             spawn_cred_reaper(pool.clone(), interval)
         })
@@ -228,6 +254,10 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     let registry_sweeper = {
         let pool = state.pool.clone();
         let docker = state.config.docker.clone();
+        forge_telemetry::workers::set_interval(
+            "registry-sweeper",
+            Duration::from_secs(docker.sweep_interval_seconds.max(1)),
+        );
         supervise("registry-sweeper", move || {
             spawn_registry_sweeper(pool.clone(), docker.clone(), grace)
         })
@@ -261,7 +291,8 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
             state.envelope.clone(),
             state.config.crypto.clone(),
         );
-        Some(supervise("crypto-rotation", move || {
+        forge_telemetry::workers::set_interval(crate::crypto::WORKER, crypto_cfg.poll_interval());
+        Some(supervise(crate::crypto::WORKER, move || {
             crate::crypto::spawn_worker(pool.clone(), envelope.clone(), &crypto_cfg)
                 .unwrap_or_else(|| tokio::spawn(std::future::pending()))
         }))
@@ -275,7 +306,11 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
     // instance, and log the cache's statistics now and then.
     let blob_cache = state.blob_store.cache().cloned().map(|cache| {
         let pool = state.pool.clone();
-        supervise("blob-cache", move || {
+        forge_telemetry::workers::set_interval(
+            crate::object_store::WORKER,
+            crate::object_store::MAINTENANCE_INTERVAL,
+        );
+        supervise(crate::object_store::WORKER, move || {
             crate::object_store::spawn_maintenance(
                 cache.clone(),
                 pool.clone(),
@@ -292,6 +327,16 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     };
 
+    // The metrics' inventory: only counted where the metrics are exported.
+    let metrics_inventory = forge_telemetry::enabled().then(|| {
+        let state = state.clone();
+        let interval = state.config.telemetry.inventory_interval();
+        forge_telemetry::workers::set_interval(crate::telemetry::INVENTORY_WORKER, interval);
+        supervise(crate::telemetry::INVENTORY_WORKER, move || {
+            crate::telemetry::spawn_inventory(state.clone(), interval)
+        })
+    });
+
     WorkerHandles {
         outbox,
         reconciler,
@@ -305,6 +350,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         crypto_rotation,
         blob_cache,
         nexus_import,
+        metrics_inventory,
     }
 }
 
@@ -321,14 +367,17 @@ fn spawn_registry_sweeper(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            match crate::images::gc::sweep_once(
+            let run = forge_telemetry::workers::Run::start("registry-sweeper");
+            let swept = crate::images::gc::sweep_once(
                 &pool,
                 chrono::Duration::seconds(docker.upload_ttl_seconds as i64),
                 chrono::Duration::seconds(docker.unreferenced_blob_ttl_seconds as i64),
                 grace,
             )
-            .await
-            {
+            .instrument(run.span())
+            .await;
+            run.finish(swept.is_ok());
+            match swept {
                 Ok(s) if s.uploads == 0 && s.links == 0 => {}
                 Ok(s) => tracing::info!(
                     uploads = s.uploads,
@@ -368,6 +417,7 @@ where
                     tracing::error!(worker = name, error = %e, "worker loop panicked; restarting")
                 }
             }
+            forge_telemetry::workers::restarted(name);
             tokio::time::sleep(RESTART_DELAY).await;
         }
     })
@@ -382,26 +432,40 @@ fn spawn_cred_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            match forge_db::validated_credential_dao::sweep_expired(&pool).await {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::debug!(
-                        reaped = n,
-                        "cred reaper deleted expired credential verdicts"
-                    )
+            let run = forge_telemetry::workers::Run::start("cred-reaper");
+            let ok = async {
+                let mut ok = true;
+                match forge_db::validated_credential_dao::sweep_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!(
+                            reaped = n,
+                            "cred reaper deleted expired credential verdicts"
+                        )
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "validated_credential sweep failed")
+                    }
                 }
-                Err(e) => tracing::error!(error = %e, "validated_credential sweep failed"),
-            }
-            match forge_db::validated_credential_dao::sweep_orphaned_tags(&pool).await {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::debug!(
-                        reaped = n,
-                        "cred reaper deleted orphaned user-tag fence rows"
-                    )
+                match forge_db::validated_credential_dao::sweep_orphaned_tags(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!(
+                            reaped = n,
+                            "cred reaper deleted orphaned user-tag fence rows"
+                        )
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "validated_credential_tag sweep failed")
+                    }
                 }
-                Err(e) => tracing::error!(error = %e, "validated_credential_tag sweep failed"),
+                ok
             }
+            .instrument(run.span())
+            .await;
+            run.finish(ok);
         }
     })
 }
@@ -414,51 +478,83 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            match forge_db::oidc_flow_dao::reap_expired(&pool).await {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted expired oidc_flow rows"),
-                Err(e) => tracing::error!(error = %e, "oidc_flow reap failed"),
-            }
-            // The email service's OAuth authorizations left unfinished.
-            match forge_db::email_oauth_flow_dao::sweep_expired(&pool).await {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::debug!(reaped = n, "auth reaper deleted expired email OAuth flows")
+            let run = forge_telemetry::workers::Run::start("auth-reaper");
+            let ok = async {
+                let mut ok = true;
+                match forge_db::oidc_flow_dao::reap_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!(reaped = n, "auth reaper deleted expired oidc_flow rows")
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "oidc_flow reap failed")
+                    }
                 }
-                Err(e) => tracing::error!(error = %e, "email OAuth flow reap failed"),
-            }
-            match forge_db::session_dao::reap_expired(&pool).await {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted dead session rows"),
-                Err(e) => tracing::error!(error = %e, "session reap failed"),
-            }
-            // Command-line logins (`npm login`) nobody finished in the
-            // browser.
-            match forge_db::cli_login_dao::delete_expired(&pool).await {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted expired cli logins"),
-                Err(e) => tracing::error!(error = %e, "cli login reap failed"),
-            }
-            // Exchanged workload keys whose CI token has expired as well,
-            // well past any clock skew a realm accepts (until then the row
-            // records the token's redemption).
-            match forge_db::workload_api_key_dao::reap_expired(&pool).await {
-                Ok(0) => {}
-                Ok(n) => {
-                    tracing::debug!(reaped = n, "auth reaper deleted expired workload API keys")
+                // The email service's OAuth authorizations left unfinished.
+                match forge_db::email_oauth_flow_dao::sweep_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!(reaped = n, "auth reaper deleted expired email OAuth flows")
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "email OAuth flow reap failed")
+                    }
                 }
-                Err(e) => tracing::error!(error = %e, "workload API key reap failed"),
-            }
-            // Networks no sign-in came from for longer than the login
-            // throttle remembers them.
-            let forgotten = chrono::Utc::now()
-                - chrono::Duration::from_std(forge_core::auth::login_throttle::KNOWN_NETWORK_TTL)
+                match forge_db::session_dao::reap_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted dead session rows"),
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "session reap failed")
+                    }
+                }
+                // Command-line logins (`npm login`) nobody finished in the
+                // browser.
+                match forge_db::cli_login_dao::delete_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted expired cli logins"),
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "cli login reap failed")
+                    }
+                }
+                // Exchanged workload keys whose CI token has expired as well,
+                // well past any clock skew a realm accepts (until then the row
+                // records the token's redemption).
+                match forge_db::workload_api_key_dao::reap_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!(reaped = n, "auth reaper deleted expired workload API keys")
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "workload API key reap failed")
+                    }
+                }
+                // Networks no sign-in came from for longer than the login
+                // throttle remembers them.
+                let forgotten = chrono::Utc::now()
+                    - chrono::Duration::from_std(
+                        forge_core::auth::login_throttle::KNOWN_NETWORK_TTL,
+                    )
                     .expect("a 30-day TTL fits");
-            match forge_db::login_network_dao::prune(&pool, forgotten, 1000).await {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(reaped = n, "auth reaper deleted stale login networks"),
-                Err(e) => tracing::error!(error = %e, "login network reap failed"),
+                match forge_db::login_network_dao::prune(&pool, forgotten, 1000).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!(reaped = n, "auth reaper deleted stale login networks")
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "login network reap failed")
+                    }
+                }
+                ok
             }
+            .instrument(run.span())
+            .await;
+            run.finish(ok);
         }
     })
 }
@@ -477,48 +573,77 @@ fn spawn_reconciler(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            match reconciler::reconcile_orphans(&pool, &store, grace).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(reclaimed = n, "reconciler reclaimed orphan blobs"),
-                Err(e) => tracing::error!(error = %e, "reconciler pass failed"),
-            }
-            if let Some(retention) = prune_outbox {
-                match outbox_worker::prune_processed(&pool, retention).await {
+            let run = forge_telemetry::workers::Run::start("reconciler");
+            let ok = async {
+                let mut ok = true;
+                match reconciler::reconcile_orphans(&pool, &store, grace).await {
                     Ok(0) => {}
-                    Ok(n) => tracing::debug!(pruned = n, "pruned processed blob_outbox rows"),
-                    Err(e) => tracing::error!(error = %e, "blob_outbox prune failed"),
+                    Ok(n) => {
+                        forge_telemetry::storage::gc_deleted(
+                            forge_telemetry::storage::GcSource::Reconciler,
+                            n as u64,
+                        );
+                        tracing::info!(reclaimed = n, "reconciler reclaimed orphan blobs")
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "reconciler pass failed")
+                    }
                 }
-            }
-            // Read on every tick, so a change in Admin → Retention applies
-            // within one; settings that cannot be read prune nothing.
-            match forge_db::retention_dao::read_settings(&pool).await {
-                Ok(settings) => {
-                    if let Some(keep) = settings.audit_retention() {
-                        match forge_core::retention::worker::prune_audit(&pool, keep).await {
-                            Ok(0) => {}
-                            Ok(n) => tracing::debug!(pruned = n, "pruned retention_audit rows"),
-                            Err(e) => tracing::error!(error = %e, "retention_audit prune failed"),
+                if let Some(retention) = prune_outbox {
+                    match outbox_worker::prune_processed(&pool, retention).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::debug!(pruned = n, "pruned processed blob_outbox rows"),
+                        Err(e) => {
+                            ok = false;
+                            tracing::error!(error = %e, "blob_outbox prune failed")
                         }
                     }
                 }
-                Err(e) => tracing::error!(
-                    error = %e,
-                    "cannot read the retention settings; retention_audit not pruned"
-                ),
+                // Read on every tick, so a change in Admin → Retention applies
+                // within one; settings that cannot be read prune nothing.
+                match forge_db::retention_dao::read_settings(&pool).await {
+                    Ok(settings) => {
+                        if let Some(keep) = settings.audit_retention() {
+                            match forge_core::retention::worker::prune_audit(&pool, keep).await {
+                                Ok(0) => {}
+                                Ok(n) => tracing::debug!(pruned = n, "pruned retention_audit rows"),
+                                Err(e) => {
+                                    ok = false;
+                                    tracing::error!(error = %e, "retention_audit prune failed")
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(
+                            error = %e,
+                            "cannot read the retention settings; retention_audit not pruned"
+                        )
+                    }
+                }
+                // Proxy versions only ever requested, never listed or served
+                // upstream, once their negative-cache window has lapsed.
+                match forge_db::proxy_dao::prune_unconfirmed(
+                    &pool,
+                    forge_core::repo::proxy::DEFAULT_NOT_FOUND_TTL_SECONDS,
+                    1000,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(pruned = n, "pruned unconfirmed proxy versions"),
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "proxy version prune failed")
+                    }
+                }
+                ok
             }
-            // Proxy versions only ever requested, never listed or served
-            // upstream, once their negative-cache window has lapsed.
-            match forge_db::proxy_dao::prune_unconfirmed(
-                &pool,
-                forge_core::repo::proxy::DEFAULT_NOT_FOUND_TTL_SECONDS,
-                1000,
-            )
-            .await
-            {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(pruned = n, "pruned unconfirmed proxy versions"),
-                Err(e) => tracing::error!(error = %e, "proxy version prune failed"),
-            }
+            .instrument(run.span())
+            .await;
+            run.finish(ok);
         }
     })
 }
@@ -532,7 +657,10 @@ fn spawn_proxy_refresh(state: AppState, interval: Duration) -> JoinHandle<()> {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(e) = refresh_proxies_once(&state).await {
+            let run = forge_telemetry::workers::Run::start("proxy-refresh");
+            let refreshed = refresh_proxies_once(&state).instrument(run.span()).await;
+            run.finish(refreshed.is_ok());
+            if let Err(e) = refreshed {
                 tracing::error!(error = %e, "proxy metadata refresh pass failed");
             }
         }

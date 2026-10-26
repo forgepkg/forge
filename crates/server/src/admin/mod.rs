@@ -406,6 +406,7 @@ pub(crate) async fn hash_password(password: String) -> Result<String, Response> 
 
 /// Helper used by handlers to turn a `sqlx::Error` into a 500 response.
 pub(crate) fn db_error(e: sqlx::Error) -> Response {
+    forge_db::observe_error(&e);
     tracing::error!(error = %e, "admin db error");
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }

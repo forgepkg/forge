@@ -151,6 +151,10 @@ public URL, the in-cluster S3 gateway); a value set in .Values.config wins. */}}
 {{- include "forge.requireRootKey" . }}
 {{- $server := dict "bind" (printf "0.0.0.0:%d" (int .Values.containerPort)) "public_base_url" (include "forge.publicBaseUrl" .) }}
 {{- $derived := dict "server" $server }}
+{{- $telemetry := .Values.telemetry }}
+{{- if or $telemetry.metrics $telemetry.traces $telemetry.logs }}
+{{- $_ := set $derived "telemetry" (dict "metrics" $telemetry.metrics "traces" $telemetry.traces "logs" $telemetry.logs) }}
+{{- end }}
 {{- if .Values.versitygw.enabled }}
 {{- $_ := set $derived "s3" (dict
       "endpoint" (printf "http://%s:%d" (include "forge.versitygw.fullname" .) (int .Values.versitygw.service.port))
@@ -357,6 +361,35 @@ wins without a duplicate entry. */}}
 {{- $secret := default (include "forge.versitygw.fullname" .) $s3.auth.existingSecret }}
 {{- $env = append $env (dict "name" "FORGE_S3__ACCESS_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" $secret "key" $s3.auth.accessKeyKey))) }}
 {{- $env = append $env (dict "name" "FORGE_S3__SECRET_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" $secret "key" $s3.auth.secretKeyKey))) }}
+{{- end }}
+{{- $telemetry := .Values.telemetry }}
+{{- if or $telemetry.metrics $telemetry.traces $telemetry.logs }}
+{{- /* The pod's identity, for the resource attributes, and the node's address,
+for an endpoint on the node ($(HOST_IP)): defined before what expands them. */}}
+{{- range $name, $path := dict "HOST_IP" "status.hostIP" "K8S_POD_NAME" "metadata.name" "K8S_NAMESPACE_NAME" "metadata.namespace" "K8S_NODE_NAME" "spec.nodeName" }}
+{{- $env = append $env (dict "name" $name "valueFrom" (dict "fieldRef" (dict "fieldPath" $path))) }}
+{{- end }}
+{{- /* service.instance.id as the Kubernetes conventions build it: <namespace>.<pod>.<container>. */}}
+{{- $attributes := list "service.instance.id=$(K8S_NAMESPACE_NAME).$(K8S_POD_NAME).forge" "k8s.namespace.name=$(K8S_NAMESPACE_NAME)" "k8s.pod.name=$(K8S_POD_NAME)" "k8s.container.name=forge" "k8s.node.name=$(K8S_NODE_NAME)" (printf "k8s.deployment.name=%s" (include "forge.fullname" .)) }}
+{{- range $key, $value := $telemetry.resourceAttributes }}
+{{- if or (contains "," $key) (contains "=" $key) (contains "," (toString $value)) }}
+{{- fail (printf "telemetry.resourceAttributes: %q may not contain a comma (nor its key an equals sign)" $key) }}
+{{- end }}
+{{- $attributes = append $attributes (printf "%s=%s" $key (toString $value)) }}
+{{- end }}
+{{- $env = append $env (dict "name" "OTEL_RESOURCE_ATTRIBUTES" "value" (join "," $attributes)) }}
+{{- with $telemetry.endpoint }}
+{{- $env = append $env (dict "name" "OTEL_EXPORTER_OTLP_ENDPOINT" "value" .) }}
+{{- end }}
+{{- with $telemetry.headersSecret }}
+{{- $env = append $env (dict "name" "OTEL_EXPORTER_OTLP_HEADERS" "valueFrom" (dict "secretKeyRef" (dict "name" .name "key" .key))) }}
+{{- end }}
+{{- with $telemetry.sampler }}
+{{- $env = append $env (dict "name" "OTEL_TRACES_SAMPLER" "value" .) }}
+{{- end }}
+{{- with $telemetry.samplerArg }}
+{{- $env = append $env (dict "name" "OTEL_TRACES_SAMPLER_ARG" "value" .) }}
+{{- end }}
 {{- end }}
 {{- $userNames := list }}
 {{- range .Values.env }}{{ $userNames = append $userNames .name }}{{ end }}

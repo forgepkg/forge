@@ -301,6 +301,39 @@ kubectl -n forge-eval port-forward svc/forge 8421
 Open http://localhost:8421 and sign in as `admin@example.com` with that
 password. The bootstrap admin is named by a UPN and has no default name.
 
+## Telemetry
+
+Forge exports OpenTelemetry metrics, traces and logs over OTLP/HTTP (see
+[docs/deployment.md](../../../docs/deployment.md#telemetry) for what each
+holds). Turn on the signals you want and point them at your OpenTelemetry
+Collector's OTLP/HTTP port; Forge does not speak OTLP/gRPC:
+
+```yaml
+telemetry:
+  metrics: true
+  traces: true
+  logs: true
+  endpoint: http://otel-collector.observability:4318
+  resourceAttributes:
+    deployment.environment.name: production
+  # Keep one trace in ten (a caller's sampling decision is kept).
+  sampler: parentbased_traceidratio
+  samplerArg: "0.1"
+```
+
+The chart writes the signals into `[telemetry]` and sets the standard
+`OTEL_*` variables: `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_SAMPLER`, and
+`OTEL_RESOURCE_ATTRIBUTES` with the pod, its namespace, node and Deployment
+besides yours; the instance's id (`service.instance.id`, Prometheus'
+`instance` label) is `<namespace>.<pod>.forge`. For a Collector on every node (a DaemonSet), use
+`http://$(HOST_IP):4318`: the chart defines `HOST_IP` from the downward API.
+A backend that wants an API key on every export gets it from a Secret
+holding the `OTEL_EXPORTER_OTLP_HEADERS` value (`api-key=...`):
+`telemetry.headersSecret: {name: otlp-auth, key: headers}`. Any other
+`OTEL_*` variable goes in `env`. With `networkPolicy.egress` set, allow the
+Collector's port. `config.telemetry.per_repository: false` takes the
+repository names off the metrics.
+
 ## Checking changes
 
 CI lints the chart and renders it with the default values and each file in

@@ -257,6 +257,22 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # poll_interval_seconds = 30             # (default: 30) how often this instance looks for a due repository
 # lease_seconds = 300                    # (default: 300) lease a run holds, renewed while it works
 
+[telemetry]
+# OpenTelemetry metrics, traces and logs over OTLP/HTTP (docs/deployment.md →
+# Telemetry), each off unless turned on. Where they go is set by the standard
+# OTEL_* variables: OTEL_EXPORTER_OTLP_ENDPOINT (default
+# http://localhost:4318, a Collector beside Forge), OTEL_EXPORTER_OTLP_HEADERS,
+# OTEL_RESOURCE_ATTRIBUTES, OTEL_TRACES_SAMPLER, …
+# metrics = true                 # (default: false)
+# traces = true                  # (default: false)
+# logs = true                    # (default: false) what RUST_LOG prints, with its trace
+# The repository's name on the metrics (forge.repository). Off, the
+# repositories add up: for an install with very many.
+# per_repository = true          # (default: true)
+# How often an instance counts its repositories, their versions and stored
+# bytes, and the outbox backlog for the metrics (database queries).
+# inventory_interval_seconds = 300 # (default: 300, at least 10)
+
 # Optional: OpenID Connect / Microsoft Entra interactive login.
 # This block is a one-shot SEED — on first boot it is imported into an
 # `auth_realm` row and authentication is managed in the admin UI from then on

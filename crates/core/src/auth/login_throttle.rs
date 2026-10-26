@@ -628,6 +628,22 @@ impl LoginThrottle {
         ip: IpAddr,
         username: &str,
     ) -> Result<LoginAttempt<'_>, AttemptRefused> {
+        let reserved = self.reserve(ip, username).await;
+        if let Err(refused) = &reserved {
+            forge_telemetry::auth::throttled(match refused {
+                AttemptRefused::Locked => forge_telemetry::auth::Throttle::Locked,
+                AttemptRefused::Busy => forge_telemetry::auth::Throttle::Busy,
+            });
+        }
+        reserved
+    }
+
+    /// [`Self::begin`] proper.
+    async fn reserve(
+        &self,
+        ip: IpAddr,
+        username: &str,
+    ) -> Result<LoginAttempt<'_>, AttemptRefused> {
         if self.limits().max_failures == 0 {
             return Ok(LoginAttempt {
                 throttle: self,

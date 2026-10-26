@@ -307,6 +307,7 @@ impl From<ImageError> for Failure {
 
 impl From<sqlx::Error> for Failure {
     fn from(e: sqlx::Error) -> Self {
+        forge_db::observe_error(&e);
         Failure::internal("database error", e)
     }
 }

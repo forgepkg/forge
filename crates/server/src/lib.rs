@@ -37,5 +37,6 @@ pub mod plugins;
 pub mod registry;
 pub mod serve;
 pub mod state;
+pub mod telemetry;
 pub mod web_ui;
 pub mod workers;

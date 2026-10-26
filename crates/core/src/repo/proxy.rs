@@ -127,6 +127,8 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use forge_plugin_api as api;
+use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
+use tracing::Instrument;
 
 use crate::authz::PackageFilter;
 use crate::format::Format;
@@ -245,6 +247,16 @@ impl PersistedIndex {
 enum CachedFetch {
     Found { body: String, named: Vec<Origin> },
     NotFound,
+}
+
+/// The outcome of a proxy lookup that failed with `e`: the upstream's fault
+/// when the error says so or the path marked it, else Forge's.
+fn error_outcome(e: &RepoError, marked: Option<Outcome>) -> Outcome {
+    match e {
+        RepoError::Upstream(_) | RepoError::BadUpstream(_) => Outcome::UpstreamError,
+        _ if marked == Some(Outcome::UpstreamError) => Outcome::UpstreamError,
+        _ => Outcome::Error,
+    }
 }
 
 /// Map an upstream transport/size/parse failure onto the read-path error:
@@ -778,6 +790,7 @@ impl ProxyRepo {
                 let auth = creds.as_ref().map(Credentials::auth);
                 match self
                     .http
+                    .for_repository(&repo.name)
                     .get_bytes_accepting(&fetch.url, auth.as_ref(), fetch.accept.as_deref())
                     .await
                 {
@@ -1140,8 +1153,30 @@ impl ProxyRepo {
         repo: &Repository,
         lower_id: &str,
     ) -> Result<Vec<forge_db::model::ProxyCachedVersion>, RepoError> {
+        let mut lookup = Lookup::start(&repo.name, LookupKind::Metadata);
+        let span = lookup.span();
+        let result = self
+            .discover(repo, lower_id, &mut lookup)
+            .instrument(span)
+            .await;
+        let outcome = match &result {
+            Ok(_) => lookup.marked().unwrap_or(Outcome::Hit),
+            Err(e) => error_outcome(e, lookup.marked()),
+        };
+        lookup.finish(outcome);
+        result
+    }
+
+    /// [`Self::discover_versions`], marking what it finds on `lookup`.
+    async fn discover(
+        &self,
+        repo: &Repository,
+        lower_id: &str,
+        lookup: &mut Lookup,
+    ) -> Result<Vec<forge_db::model::ProxyCachedVersion>, RepoError> {
         // Offline: only what we already cached.
         if !repo.online {
+            lookup.mark(Outcome::Offline);
             return self.cached_rows(repo.id, lower_id).await;
         }
         // The upstream failed a listing moments ago: what is cached is
@@ -1149,11 +1184,13 @@ impl ProxyRepo {
         if self.upstream_listing_failed(repo).await {
             let rows = self.cached_rows(repo.id, lower_id).await?;
             if !rows.is_empty() {
+                lookup.mark(Outcome::StaleServed);
                 return Ok(rows);
             }
         }
 
-        let mut refreshed = self.listing_refreshed(repo, lower_id).await;
+        let fetched = std::sync::atomic::AtomicBool::new(false);
+        let mut refreshed = self.listing_refreshed(repo, lower_id, &fetched).await;
         // "The upstream does not know the id" is cached for the metadata
         // TTL, but stands only while the id's not-found marker does
         // (`not_found_ttl_seconds`, which may be shorter, or 0): past it,
@@ -1162,11 +1199,26 @@ impl ProxyRepo {
             self.cache
                 .invalidate(NS_UPSTREAM_VERSIONS, &Self::versions_key(repo, lower_id))
                 .await;
-            refreshed = self.listing_refreshed(repo, lower_id).await;
+            refreshed = self.listing_refreshed(repo, lower_id, &fetched).await;
         }
+        let fetched = fetched.load(std::sync::atomic::Ordering::Relaxed);
         match refreshed {
-            Ok(true) => self.cached_rows(repo.id, lower_id).await,
-            Ok(false) => Ok(Vec::new()),
+            Ok(true) => {
+                lookup.mark(if fetched {
+                    Outcome::Fetched
+                } else {
+                    Outcome::Hit
+                });
+                self.cached_rows(repo.id, lower_id).await
+            }
+            Ok(false) => {
+                lookup.mark(if fetched {
+                    Outcome::NotFound
+                } else {
+                    Outcome::NegativeCached
+                });
+                Ok(Vec::new())
+            }
             Err(e) => {
                 // Degrade to what is already cached locally rather than
                 // failing a restore that could be served. An outage keeps
@@ -1190,6 +1242,7 @@ impl ProxyRepo {
                 if rows.is_empty() {
                     return Err(e);
                 }
+                lookup.mark(Outcome::StaleServed);
                 if outage {
                     tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream version listing failed; serving cached versions for a minute");
                 } else {
@@ -1220,10 +1273,13 @@ impl ProxyRepo {
     /// was refreshed within the metadata TTL (the cache coalesces concurrent
     /// refreshes, across instances too). `Ok(false)`: the upstream does not
     /// know the id.
+    ///
+    /// `fetched` is set when this call asked the upstream itself.
     async fn listing_refreshed(
         &self,
         repo: &Repository,
         lower_id: &str,
+        fetched: &std::sync::atomic::AtomicBool,
     ) -> Result<bool, SharedRepoError> {
         let ttl = Self::metadata_ttl(repo).to_std().unwrap_or_default();
         self.cache
@@ -1232,6 +1288,7 @@ impl ProxyRepo {
                 &Self::versions_key(repo, lower_id),
                 ttl,
                 || async {
+                    fetched.store(true, std::sync::atomic::Ordering::Relaxed);
                     Box::pin(self.refresh_versions(repo, lower_id))
                         .await
                         .map_err(SharedRepoError::from)
@@ -1377,6 +1434,29 @@ impl ProxyRepo {
         lower_id: &str,
         version: &str,
     ) -> Result<Option<NupkgLocation>, RepoError> {
+        let mut lookup = Lookup::start(&repo.name, LookupKind::Package);
+        let span = lookup.span();
+        let result = self
+            .download(repo, lower_id, version, &mut lookup)
+            .instrument(span)
+            .await;
+        let outcome = match &result {
+            Ok(Some(_)) => lookup.marked().unwrap_or(Outcome::Hit),
+            Ok(None) => lookup.marked().unwrap_or(Outcome::NotFound),
+            Err(e) => error_outcome(e, lookup.marked()),
+        };
+        lookup.finish(outcome);
+        result
+    }
+
+    /// [`Self::ensure_downloaded`], marking what it finds on `lookup`.
+    async fn download(
+        &self,
+        repo: &Repository,
+        lower_id: &str,
+        version: &str,
+        lookup: &mut Lookup,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
         // Already cached + downloaded + delay-cleared? Serve immediately.
         if let Some(row) =
             proxy_dao::get_cached_version(&self.pool, repo.id, lower_id, version).await?
@@ -1384,6 +1464,7 @@ impl ProxyRepo {
             let now = self.db_now().await?;
             if row.downloaded {
                 if !Self::delay_cleared(repo, row.first_seen_at, now) {
+                    lookup.mark(Outcome::DelayGated);
                     return Ok(None);
                 }
                 if let Some(loc) = self.local_nupkg(repo.id, lower_id, version).await? {
@@ -1392,12 +1473,14 @@ impl ProxyRepo {
                 // Marked downloaded but the local copy is gone: re-fetch below.
             } else if Self::not_found_live(repo, &row, now) {
                 // A still-valid genuine-404 marker short-circuits (no upstream call).
+                lookup.mark(Outcome::NegativeCached);
                 return Ok(None);
             }
         }
 
         // Offline and not (or no longer) cached locally ⇒ nothing to serve.
         if !repo.online {
+            lookup.mark(Outcome::Offline);
             return Ok(None);
         }
 
@@ -1410,6 +1493,7 @@ impl ProxyRepo {
         if repo.package_delay_seconds > 0
             && !self.delay_cleared_upstream(repo, lower_id, version).await?
         {
+            lookup.mark(Outcome::DelayGated);
             return Ok(None);
         }
 
@@ -1450,6 +1534,7 @@ impl ProxyRepo {
             tx.commit().await?;
             if locked.downloaded {
                 if !Self::delay_cleared(repo, locked.first_seen_at, now) {
+                    lookup.mark(Outcome::DelayGated);
                     return Ok(None);
                 }
                 // A racing caller already finished the fetch.
@@ -1463,6 +1548,7 @@ impl ProxyRepo {
                 proxy_dao::mark_not_downloaded(&self.pool, locked.id).await?;
             } else if Self::not_found_live(repo, &locked, now) {
                 // A still-valid genuine-404 marker short-circuits (no upstream call).
+                lookup.mark(Outcome::NegativeCached);
                 return Ok(None);
             }
             // This caller performs the fetch.
@@ -1511,6 +1597,7 @@ impl ProxyRepo {
             let creds = self.credentials(repo).await?;
             let auth = creds.as_ref().map(Credentials::auth);
             self.http
+                .for_repository(&repo.name)
                 .get(&url, RequestClass::Download, auth.as_ref())
                 .await
                 .map_err(upstream_err)?
@@ -1548,6 +1635,7 @@ impl ProxyRepo {
             return Ok(None);
         }
         if !resp.status().is_success() {
+            lookup.mark(Outcome::UpstreamError);
             let reason = format!("upstream package fetch {url} returned {}", resp.status());
             return Err(if status_is_unavailable(resp.status()) {
                 RepoError::Upstream(reason)
@@ -1577,7 +1665,11 @@ impl ProxyRepo {
         let body = futures_util::TryStreamExt::map_err(resp.bytes_stream(), std::io::Error::other);
         let reader = tokio_util::io::StreamReader::new(body);
         let staged = match self.cas.stage(reader, max_bytes).await {
-            Ok(staged) => staged,
+            Ok(staged) => {
+                forge_telemetry::proxy::upstream_bytes(&repo.name, staged.size);
+                lookup.mark(Outcome::Fetched);
+                staged
+            }
             Err(CasError::TooLarge { limit }) => {
                 return Err(self
                     .reject(
@@ -1718,6 +1810,7 @@ impl ProxyRepo {
             let now = forge_db::db_now(&mut *tx).await?;
             tx.rollback().await?;
             if !Self::delay_cleared(repo, locked.first_seen_at, now) {
+                lookup.mark(Outcome::DelayGated);
                 return Ok(None);
             }
             return self.local_nupkg(repo.id, lower_id, version).await;

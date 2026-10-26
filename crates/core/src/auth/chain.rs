@@ -103,45 +103,57 @@ impl Chain {
     /// See the module-level docs for the exact ordering / fail-closed
     /// semantics.
     pub async fn authenticate(&self, cred: &PasswordCredential<'_>) -> ChainOutcome {
+        let (outcome, decided_by) = self.fold(cred).await;
+        record_sign_in(&outcome, decided_by);
+        outcome
+    }
+
+    /// [`Self::authenticate`], with the source of the provider that decided
+    /// (`None` when none did).
+    async fn fold(&self, cred: &PasswordCredential<'_>) -> (ChainOutcome, Option<AuthSource>) {
         let Ok(username) = forge_db::username::canonical_username(cred.username) else {
-            return ChainOutcome::Rejected;
+            return (ChainOutcome::Rejected, None);
         };
         // A reserved name (the workload-identity `oidc`) is no account's
         // login: no provider is asked, so it is never forwarded upstream.
         if forge_db::username::is_reserved_username(&username) {
-            return ChainOutcome::Rejected;
+            return (ChainOutcome::Rejected, None);
         }
         let cred = &PasswordCredential {
             username: &username,
             password: cred.password,
             client_ip: cred.client_ip,
         };
-        let mut saw_rejected = false;
-        let mut saw_unavailable = false;
+        let mut saw_rejected = None;
+        let mut saw_unavailable = None;
 
         for provider in &self.providers {
+            let source = Some(provider.source());
             match provider.authenticate(cred).await {
                 AuthOutcome::Authenticated(identity) => {
                     // First acceptance wins; later providers are not consulted.
-                    return ChainOutcome::Authenticated {
-                        identity,
-                        provider_id: provider.id().to_string(),
-                    };
+                    return (
+                        ChainOutcome::Authenticated {
+                            identity,
+                            provider_id: provider.id().to_string(),
+                        },
+                        source,
+                    );
                 }
                 // A local account owns this username: a wrong password is final
                 // (never forwarded upstream, see module docs rule 3).
                 AuthOutcome::Rejected if provider.source() == AuthSource::Local => {
-                    return ChainOutcome::Rejected;
+                    return (ChainOutcome::Rejected, source);
                 }
                 // The local store could not decide (DB error, argon2 overload):
                 // it may still own this username, so do not forward (rule 4).
                 AuthOutcome::Unavailable if provider.source() == AuthSource::Local => {
-                    return ChainOutcome::Unavailable;
+                    return (ChainOutcome::Unavailable, source);
                 }
                 // The database failed: no later provider can decide either.
-                AuthOutcome::Failed => return ChainOutcome::Failed,
-                AuthOutcome::Rejected => saw_rejected = true,
-                AuthOutcome::Unavailable => saw_unavailable = true,
+                AuthOutcome::Failed => return (ChainOutcome::Failed, source),
+                AuthOutcome::Rejected => saw_rejected = saw_rejected.or(source),
+                AuthOutcome::Unavailable => saw_unavailable = saw_unavailable.or(source),
                 AuthOutcome::Skip => {}
             }
         }
@@ -150,14 +162,33 @@ impl Chain {
         // infrastructure outage for the wire verdict (both deny), but an
         // outage that produced *no* rejection must still fail closed — never
         // fall through to NoCredentials (which would let the anon policy grant).
-        if saw_rejected {
-            ChainOutcome::Rejected
-        } else if saw_unavailable {
-            ChainOutcome::Unavailable
+        if saw_rejected.is_some() {
+            (ChainOutcome::Rejected, saw_rejected)
+        } else if saw_unavailable.is_some() {
+            (ChainOutcome::Unavailable, saw_unavailable)
         } else {
-            ChainOutcome::NoCredentials
+            (ChainOutcome::NoCredentials, None)
         }
     }
+}
+
+/// Count a password sign-in in the metrics, under the kind of realm that
+/// decided it.
+fn record_sign_in(outcome: &ChainOutcome, decided_by: Option<AuthSource>) {
+    use forge_telemetry::auth::{sign_in, RealmType, SignInOutcome};
+    let realm = match decided_by {
+        Some(AuthSource::Local) => RealmType::Local,
+        Some(AuthSource::UpstreamBasic) => RealmType::CredentialForwarding,
+        Some(AuthSource::Oidc) => RealmType::Oidc,
+        None => RealmType::None,
+    };
+    let outcome = match outcome {
+        ChainOutcome::Authenticated { .. } => SignInOutcome::Success,
+        ChainOutcome::Rejected | ChainOutcome::NoCredentials => SignInOutcome::Rejected,
+        ChainOutcome::Unavailable => SignInOutcome::Unavailable,
+        ChainOutcome::Failed => SignInOutcome::Error,
+    };
+    sign_in(realm, outcome);
 }
 
 /// Supplies the *current* password-auth [`Chain`] to the Basic source.

@@ -70,9 +70,9 @@ impl ImportSource {
         }
     }
 
-    fn upstream<'a>(&self, registry: &'a Registry) -> Upstream<'a> {
+    fn upstream(&self, registry: &Registry) -> Upstream {
         Upstream {
-            http: &registry.inner.http,
+            http: registry.inner.http.clone(),
             owner: self.owner.clone(),
             remote: self.base.clone(),
             creds: self.credentials.clone(),
@@ -390,7 +390,7 @@ impl Registry {
     async fn copy_references(
         &self,
         t: &Target,
-        upstream: &Upstream<'_>,
+        upstream: &Upstream,
         fetched: &Fetched,
         options: &ImageImportOptions,
         depth: usize,
@@ -459,7 +459,7 @@ impl Registry {
     async fn copy_blob(
         &self,
         t: &Target,
-        upstream: &Upstream<'_>,
+        upstream: &Upstream,
         blob: &ManifestBlob,
     ) -> ImgResult<u64> {
         let pool = &self.inner.pool;
@@ -549,7 +549,7 @@ impl Registry {
     /// its SHA-256 digest.
     async fn fetch_manifest(
         &self,
-        upstream: &Upstream<'_>,
+        upstream: &Upstream,
         image: &str,
         reference: &Reference,
         expected: Option<&ContentDigest>,

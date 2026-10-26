@@ -78,6 +78,32 @@ config:
 # RUST_LOG (tracing filter), e.g. "info,forge::audit=info,sqlx=warn".
 logLevel: info
 
+# OpenTelemetry (docs/deployment.md → Telemetry): Forge exports metrics,
+# traces and logs over OTLP/HTTP, each once enabled here, to an
+# OpenTelemetry Collector (or any OTLP/HTTP endpoint), which sends them on to
+# your backends. The resource attributes name the pod, its namespace, node
+# and Deployment. With networkPolicy.egress set, allow the Collector's port.
+telemetry:
+  metrics: false
+  traces: false
+  logs: false
+  # The OTLP/HTTP endpoint (OTEL_EXPORTER_OTLP_ENDPOINT, port 4318; Forge
+  # does not speak OTLP/gRPC), e.g. http://otel-collector.observability:4318,
+  # or http://$(HOST_IP):4318 for a Collector on every node. Empty: the
+  # default, http://localhost:4318 (a sidecar).
+  endpoint: ""
+  # Headers sent with every export (OTEL_EXPORTER_OTLP_HEADERS, e.g. a
+  # vendor's API key as `api-key=...`), from a Secret: a SecretKeySelector,
+  # e.g. { name: otlp-auth, key: headers }.
+  headersSecret: {}
+  # Further resource attributes (OTEL_RESOURCE_ATTRIBUTES), e.g.
+  #   deployment.environment.name: production
+  resourceAttributes: {}
+  # The trace sampler (OTEL_TRACES_SAMPLER / _ARG), e.g.
+  # parentbased_traceidratio with "0.1"; empty: every trace (parentbased_always_on).
+  sampler: ""
+  samplerArg: ""
+
 # Secret settings as environment variables, stored in a Secret the chart
 # creates (<fullname>-secret-env) and loaded with envFrom: FORGE_DATABASE__URL,
 # FORGE_S3__ACCESS_KEY / FORGE_S3__SECRET_KEY, FORGE_REDIS__URL,

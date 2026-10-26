@@ -21,12 +21,16 @@ use anyhow::Context;
 use forge_storage::{BlobCache, BlobCacheStats, BlobStore};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tracing::Instrument;
 
 use crate::config::Config;
 use crate::state::Instance;
 
 /// How often the cache re-reads its filesystem and evicts down to its limit.
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The maintenance worker's name (logs, `forge_worker_*`).
+pub const WORKER: &str = "blob-cache";
 
 /// Every this many maintenance runs, the cache's statistics are logged.
 const LOG_EVERY: u64 = 10;
@@ -106,14 +110,17 @@ pub fn spawn_maintenance(
         loop {
             ticker.tick().await;
             runs += 1;
+            let run = forge_telemetry::workers::Run::start(WORKER);
+            let mut ok = true;
             if runs % DROP_DELETED_EVERY == 1 {
-                match drop_deleted(&cache, &pool).await {
+                match drop_deleted(&cache, &pool).instrument(run.span()).await {
                     Ok(0) => {}
                     Ok(dropped) => tracing::info!(
                         dropped,
                         "dropped cached blobs that garbage collection deleted"
                     ),
                     Err(error) => {
+                        ok = false;
                         tracing::warn!(%error, "checking the blob cache against the database failed")
                     }
                 }
@@ -123,9 +130,11 @@ pub fn spawn_maintenance(
                 Ok(stats) => stats,
                 Err(error) => {
                     tracing::warn!(%error, "blob cache maintenance failed");
+                    run.finish(false);
                     continue;
                 }
             };
+            run.finish(ok);
             if runs % LOG_EVERY == 1 {
                 log_stats(&stats);
             }

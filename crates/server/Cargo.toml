@@ -21,6 +21,7 @@ forge-cache = { path = "../cache" }
 forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
+forge-telemetry = { path = "../telemetry" }
 # The built-in format plugins (crates/formats/docker, crates/formats/nuget,
 # crates/formats/npm, crates/formats/raw), linked in.
 forge-format-docker = { path = "../formats/docker" }
@@ -35,6 +36,8 @@ tower-http = { workspace = true }
 # The HTTP server loop (`serve`): hyper's header-read timeout needs a timer,
 # which `axum::serve` does not configure.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
+# The metrics middleware counts the bytes of response bodies.
+http-body = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio", "http1", "http2"] }
 sqlx = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
@@ -42,6 +45,15 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The `log` bridge's level (main.rs), which the pool's TRACE events raise.
+log = "0.4"
+# OpenTelemetry export (crate::telemetry): the SDK, OTLP over HTTP, and the
+# bridges of `tracing` spans and events to traces and logs.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry-appender-tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 http = { workspace = true }
@@ -112,6 +124,11 @@ jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
 sqlx = { workspace = true }
+# The OpenTelemetry tests: in-memory exporters (tests/telemetry.rs), and a
+# mock OTLP/HTTP receiver decoding what is exported (tests/otlp_export.rs).
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "metrics", "trace", "logs"] }
+prost = "0.14"
 # A throwaway CA and server certificate for the SMTP-over-TLS tests (mailpit),
 # made per run instead of a key kept in the repository.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

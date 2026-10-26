@@ -94,6 +94,7 @@ mod l2_redis;
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -103,6 +104,7 @@ use serde::{Deserialize, Serialize};
 use crate::backplane::Backplane;
 use crate::l1::L1;
 use crate::l2_redis::RedisL2;
+use forge_telemetry::cache::Tier;
 
 /// Errors raised by the cache infrastructure itself (construction / L2 setup).
 ///
@@ -706,7 +708,11 @@ impl Cache {
         // moka in an `Arc`). L2 infrastructure errors never become `E`: they are
         // logged inside the future and we fall through to the factory.
         let key_for_l2 = full_key.to_string();
-        self.inner
+        // Set by the init, which runs on an L1 miss only.
+        let missed = Arc::new(AtomicBool::new(false));
+        let init_missed = missed.clone();
+        let result = self
+            .inner
             .l1
             .try_get_entry_with(
                 full_key.to_string(),
@@ -714,6 +720,7 @@ impl Cache {
                 entry_tags.clone(),
                 tag_versions.clone(),
                 move || async move {
+                init_missed.store(true, Ordering::Relaxed);
                 let factory = take_factory()
                     .expect("a caller's factory is taken only by its own, single init");
                 // L2 read (graceful degradation on infra error → None → factory).
@@ -735,6 +742,7 @@ impl Cache {
                                                 && serde_json::from_slice::<T>(&candidate.value)
                                                     .is_ok()
                                             {
+                                                forge_telemetry::cache::lookup(Tier::L2, true);
                                                 return Ok(Arc::new(candidate));
                                             }
                                             if candidate.tags == current {
@@ -778,6 +786,7 @@ impl Cache {
                             tracing::warn!(error = %err, key = %key_for_l2, "L2 get failed; falling through to factory");
                         }
                     }
+                    forge_telemetry::cache::lookup(Tier::L2, false);
                 }
 
                 let (stamps, redis_generations_available) = if let Some(l2) = &l2 {
@@ -851,7 +860,17 @@ impl Cache {
                 Ok(entry)
             },
             )
-            .await
+            .await;
+        // A caller coalesced onto another's fill counts as a hit: it did not
+        // fill.
+        forge_telemetry::cache::lookup(Tier::L1, !missed.load(Ordering::Relaxed));
+        result
+    }
+
+    /// Whether the Redis invalidation backplane is subscribed: `None`
+    /// without Redis.
+    pub fn backplane_subscribed(&self) -> Option<bool> {
+        self.inner.backplane.as_ref().map(Backplane::is_subscribed)
     }
 
     /// Invalidate a single `(ns, key)` by advancing its synthetic key tag and
@@ -873,6 +892,7 @@ impl Cache {
     }
 
     async fn invalidate_internal_tag(&self, ns: &str, tag: &str) {
+        forge_telemetry::cache::invalidation_sent();
         // Raise the local barrier first: from here on this instance hides
         // every entry stamped before it, whatever Redis does next. No lock is
         // held across the Redis round-trips below (see the crate docs).

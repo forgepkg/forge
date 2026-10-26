@@ -35,15 +35,31 @@ use forge_plugin::api::{
     FetchResult, Fetched, FormatError, Remote, UpstreamAnswer, UpstreamOp, UpstreamStep,
 };
 use forge_storage::BlobRef;
+use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 use reqwest::Method;
+use tracing::Instrument;
 
 use super::digest::ContentDigest;
 use super::dispatch::Target;
 use super::pull::{BlobHit, ManifestHit};
 use super::push::{merge, require_linked};
 use super::{Failure, ImgResult, Registry};
+
+/// Record a proxy `lookup` that answered `result`: what its path marked,
+/// else a hit for something found and "not found" for nothing. A failure is
+/// the upstream's when the path was talking to it, else Forge's.
+fn finish<T>(lookup: Lookup, result: &ImgResult<Option<T>>) {
+    let marked = lookup.marked();
+    let outcome = match result {
+        Ok(Some(_)) => marked.unwrap_or(Outcome::Hit),
+        Ok(None) => marked.unwrap_or(Outcome::NotFound),
+        Err(_) if marked == Some(Outcome::UpstreamError) => Outcome::UpstreamError,
+        Err(_) => Outcome::Error,
+    };
+    lookup.finish(outcome);
+}
 
 /// How long a tag is served without asking the upstream, unless the
 /// repository sets `metadata_ttl_seconds`.
@@ -228,8 +244,8 @@ fn upstream_status(status: reqwest::StatusCode) -> Failure {
 
 /// An upstream registry (a proxy repository's, or an import's source), for
 /// one request.
-pub(crate) struct Upstream<'a> {
-    pub(crate) http: &'a UpstreamHttp,
+pub(crate) struct Upstream {
+    pub(crate) http: UpstreamHttp,
     /// Who the cached tokens belong to: a proxy repository's id, an import.
     pub(crate) owner: String,
     /// The upstream's URL, as configured: requests go to its origin only.
@@ -237,7 +253,7 @@ pub(crate) struct Upstream<'a> {
     pub(crate) creds: Option<Arc<Credentials>>,
 }
 
-impl Upstream<'_> {
+impl Upstream {
     fn token_key(&self, scope: &str) -> String {
         format!("{}:{}:{scope}", self.owner, self.remote)
     }
@@ -517,7 +533,7 @@ fn format_failure(context: &str, e: FormatError) -> Failure {
 }
 
 impl Registry {
-    pub(crate) async fn upstream<'a>(&'a self, repo: &Repository) -> ImgResult<Upstream<'a>> {
+    pub(crate) async fn upstream(&self, repo: &Repository) -> ImgResult<Upstream> {
         let remote = repo
             .remote_url
             .as_deref()
@@ -526,7 +542,7 @@ impl Registry {
             .await
             .map_err(|e| Failure::internal("proxy credentials", e))?;
         Ok(Upstream {
-            http: &self.inner.http,
+            http: self.inner.http.for_repository(&repo.name),
             owner: repo.id.to_string(),
             remote: remote.to_string(),
             creds: creds.map(Arc::new),
@@ -626,6 +642,24 @@ impl Registry {
         image: &str,
         reference: &Reference,
     ) -> ImgResult<Option<ManifestHit>> {
+        let mut lookup = Lookup::start(&repo.name, LookupKind::Manifest);
+        let span = lookup.span();
+        let result = self
+            .proxied_manifest(repo, image, reference, &mut lookup)
+            .instrument(span)
+            .await;
+        finish(lookup, &result);
+        result
+    }
+
+    /// [`Self::proxy_manifest`], marking what it finds on `lookup`.
+    async fn proxied_manifest(
+        &self,
+        repo: &Repository,
+        image: &str,
+        reference: &Reference,
+        lookup: &mut Lookup,
+    ) -> ImgResult<Option<ManifestHit>> {
         let local = self.proxied_image(repo, image);
         let target = Target {
             repo: repo.clone(),
@@ -638,7 +672,12 @@ impl Registry {
                 if let Some(row) = oci_dao::find_manifest(pool, repo.id, &local, digest).await? {
                     return Ok(Some(ManifestHit::from_row(row)));
                 }
-                if !repo.online || self.negative_cached(repo, &local, digest).await {
+                if !repo.online {
+                    lookup.mark(Outcome::Offline);
+                    return Ok(None);
+                }
+                if self.negative_cached(repo, &local, digest).await {
+                    lookup.mark(Outcome::NegativeCached);
                     return Ok(None);
                 }
                 let digest = ContentDigest::named(digest)?;
@@ -650,10 +689,12 @@ impl Registry {
                         reference: reference.clone(),
                     },
                 )?;
+                lookup.mark(Outcome::UpstreamError);
                 let response = upstream
                     .send_url(Method::GET, &url, RequestClass::Metadata)
                     .await?;
                 if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    lookup.mark(Outcome::NotFound);
                     self.remember_not_found(repo, &local, digest.as_str()).await;
                     return Ok(None);
                 }
@@ -662,6 +703,7 @@ impl Registry {
                 }
                 let content_type = content_type(&response);
                 let body = read_limited(response, MAX_MANIFEST_BYTES).await?;
+                upstream.http.count_bytes(body.len() as u64);
                 if !digest.matches_bytes(&body) {
                     tracing::warn!(repo = %repo.name, image = %local, %digest, "registry proxy: upstream manifest does not match its digest");
                     return Err(Failure::unavailable(
@@ -671,6 +713,7 @@ impl Registry {
                 let parsed = self
                     .parse_manifest(&body, content_type.as_deref())
                     .map_err(|_| Failure::unavailable("the upstream served an invalid manifest"))?;
+                lookup.mark(Outcome::Fetched);
                 let row = self
                     .store_proxied_manifest(&target, &digest, &parsed, &body, None)
                     .await?;
@@ -681,6 +724,9 @@ impl Registry {
             Reference::Tag(tag) => {
                 let cached = oci_dao::find_tag(pool, repo.id, &local, tag).await?;
                 if !repo.online {
+                    if cached.is_none() {
+                        lookup.mark(Outcome::Offline);
+                    }
                     return Ok(cached.map(|c| ManifestHit::from_row(c.manifest)));
                 }
                 let ttl = repo
@@ -693,15 +739,17 @@ impl Registry {
                         return Ok(Some(ManifestHit::from_row(c.manifest.clone())));
                     }
                 } else if self.negative_cached(repo, &local, tag).await {
+                    lookup.mark(Outcome::NegativeCached);
                     return Ok(None);
                 }
                 match self
-                    .revalidate_tag(repo, &target, reference, tag, cached.as_ref())
+                    .revalidate_tag(repo, &target, reference, tag, cached.as_ref(), lookup)
                     .await
                 {
                     Ok(found) => Ok(found),
                     Err(e) => match cached {
                         Some(c) => {
+                            lookup.mark(Outcome::StaleServed);
                             tracing::warn!(
                                 repo = %repo.name, image = %local, %tag, error = %e.message(),
                                 "registry proxy: upstream unavailable; serving the cached tag"
@@ -723,9 +771,11 @@ impl Registry {
         reference: &Reference,
         tag: &str,
         cached: Option<&oci_dao::TaggedManifest>,
+        lookup: &mut Lookup,
     ) -> ImgResult<Option<ManifestHit>> {
         let local = &target.image;
         let upstream = self.upstream(repo).await?;
+        lookup.mark(Outcome::UpstreamError);
         let url = self.image_url(
             &upstream.remote,
             &UpstreamOp::ImageManifest {
@@ -738,6 +788,7 @@ impl Registry {
                 .send_url(Method::HEAD, &url, RequestClass::Metadata)
                 .await?;
             if head.status() == reqwest::StatusCode::NOT_FOUND {
+                lookup.mark(Outcome::NotFound);
                 self.remember_not_found(repo, local, tag).await;
                 return Ok(None);
             }
@@ -748,6 +799,7 @@ impl Registry {
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|d| d == c.manifest.digest);
                 if same {
+                    lookup.mark(Outcome::Hit);
                     oci_dao::mark_tag_checked(&self.inner.pool, repo.id, local, tag).await?;
                     return Ok(Some(ManifestHit::from_row(c.manifest.clone())));
                 }
@@ -763,6 +815,7 @@ impl Registry {
             .send_url(Method::GET, &url, RequestClass::Metadata)
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
+            lookup.mark(Outcome::NotFound);
             self.remember_not_found(repo, local, tag).await;
             return Ok(None);
         }
@@ -776,6 +829,7 @@ impl Registry {
             .and_then(ContentDigest::parse);
         let content_type = content_type(&response);
         let body = read_limited(response, MAX_MANIFEST_BYTES).await?;
+        upstream.http.count_bytes(body.len() as u64);
         if let Some(declared) = &declared {
             if !declared.matches_bytes(&body) {
                 tracing::warn!(repo = %repo.name, image = %local, %tag, "registry proxy: upstream manifest does not match its Docker-Content-Digest");
@@ -788,6 +842,7 @@ impl Registry {
         let parsed = self
             .parse_manifest(&body, content_type.as_deref())
             .map_err(|_| Failure::unavailable("the upstream served an invalid manifest"))?;
+        lookup.mark(Outcome::Fetched);
         let row = self
             .store_proxied_manifest(target, &digest, &parsed, &body, Some(tag))
             .await?;
@@ -802,11 +857,34 @@ impl Registry {
         image: &str,
         digest: &ContentDigest,
     ) -> ImgResult<Option<BlobHit>> {
+        let mut lookup = Lookup::start(&repo.name, LookupKind::Blob);
+        let span = lookup.span();
+        let result = self
+            .proxied_blob(repo, image, digest, &mut lookup)
+            .instrument(span)
+            .await;
+        finish(lookup, &result);
+        result
+    }
+
+    /// [`Self::proxy_blob`], marking what it finds on `lookup`.
+    async fn proxied_blob(
+        &self,
+        repo: &Repository,
+        image: &str,
+        digest: &ContentDigest,
+        lookup: &mut Lookup,
+    ) -> ImgResult<Option<BlobHit>> {
         let local = self.proxied_image(repo, image);
         if let Some(hit) = self.hosted_blob(repo, &local, digest).await? {
             return Ok(Some(hit));
         }
-        if !repo.online || self.negative_cached(repo, &local, digest.as_str()).await {
+        if !repo.online {
+            lookup.mark(Outcome::Offline);
+            return Ok(None);
+        }
+        if self.negative_cached(repo, &local, digest.as_str()).await {
+            lookup.mark(Outcome::NegativeCached);
             return Ok(None);
         }
         let gate = gate(format!("{}:{local}:{digest}", repo.id));
@@ -833,9 +911,12 @@ impl Registry {
             if let Some((_, size)) =
                 oci_dao::blob_linked_in_repository(pool, repo.id, sha256).await?
             {
+                lookup.mark(Outcome::UpstreamError);
                 let head = upstream
                     .send_url(Method::HEAD, &url, RequestClass::Metadata)
                     .await?;
+                // Linked from the cache once the upstream confirms it.
+                lookup.mark(Outcome::Hit);
                 if head.status().is_success() {
                     let mut tx = pool.begin().await?;
                     still_upstream(&mut tx, repo).await?;
@@ -868,16 +949,19 @@ impl Registry {
                         }
                     }
                 } else if head.status() == reqwest::StatusCode::NOT_FOUND {
+                    lookup.mark(Outcome::NotFound);
                     self.remember_not_found(repo, &local, digest.as_str()).await;
                     return Ok(None);
                 }
             }
         }
 
+        lookup.mark(Outcome::UpstreamError);
         let response = upstream
             .send_url(Method::GET, &url, RequestClass::Download)
             .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
+            lookup.mark(Outcome::NotFound);
             self.remember_not_found(repo, &local, digest.as_str()).await;
             return Ok(None);
         }
@@ -894,12 +978,14 @@ impl Registry {
             .cas
             .stage(tokio_util::io::StreamReader::new(body), max)
             .await?;
+        upstream.http.count_bytes(staged.size);
         if !digest.matches(&staged.sha256, &staged.sha512_base64) {
             tracing::warn!(repo = %repo.name, image = %local, %digest, "registry proxy: upstream blob does not match its digest");
             return Err(Failure::unavailable(
                 "the upstream served a blob that does not match its digest",
             ));
         }
+        lookup.mark(Outcome::Fetched);
         // A small blob may be a config (read while it is at hand).
         let small = if staged.size <= MAX_CONFIG_BYTES as u64 {
             tokio::fs::read(&staged.temp_path).await.ok()

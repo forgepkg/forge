@@ -230,6 +230,7 @@ pub enum CredCacheError {
 
 impl From<sqlx::Error> for CredCacheError {
     fn from(e: sqlx::Error) -> Self {
+        forge_db::observe_error(&e);
         CredCacheError::Db(e.to_string())
     }
 }

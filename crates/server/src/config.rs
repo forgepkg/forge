@@ -92,6 +92,10 @@ pub struct Config {
     /// download reads S3.
     #[serde(default)]
     pub blob_cache: BlobCacheConfig,
+    /// OpenTelemetry: which signals Forge exports over OTLP, and what its
+    /// metrics report.
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 /// `server.*`
@@ -1364,6 +1368,76 @@ impl NugetConfig {
     }
 }
 
+/// `[telemetry]`: OpenTelemetry ([`crate::telemetry`]). Each signal is
+/// exported over OTLP/HTTP to where the standard `OTEL_EXPORTER_OTLP_*`
+/// variables say (by default `http://localhost:4318`, an OpenTelemetry
+/// Collector beside Forge); `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`,
+/// `OTEL_TRACES_SAMPLER` and `OTEL_METRIC_EXPORT_INTERVAL` apply as usual.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelemetryConfig {
+    /// Export metrics. Default `false`.
+    #[serde(default)]
+    pub metrics: bool,
+    /// Export traces: a span per request (joining the caller's trace from
+    /// its `traceparent`), proxy lookup, upstream request, S3 operation and
+    /// worker pass. Default `false`.
+    #[serde(default)]
+    pub traces: bool,
+    /// Export what the log prints (`RUST_LOG`) as log records, with the
+    /// trace and span they happened in. Default `false`.
+    #[serde(default)]
+    pub logs: bool,
+    /// Give the metrics the repository's name (`forge.repository`):
+    /// administrators create repositories, so their number stays small.
+    /// Turn it off for an install with very many; the metrics then add up
+    /// all repositories. Default `true`.
+    #[serde(default = "default_true")]
+    pub per_repository: bool,
+    /// Seconds between two counts of what the instance holds (repositories,
+    /// their versions and stored bytes) and of the outbox backlog: database
+    /// queries a worker runs with the metrics on, never an export. Default
+    /// 300, at least 10.
+    #[serde(default = "default_telemetry_inventory_interval_seconds")]
+    pub inventory_interval_seconds: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        TelemetryConfig {
+            metrics: false,
+            traces: false,
+            logs: false,
+            per_repository: true,
+            inventory_interval_seconds: default_telemetry_inventory_interval_seconds(),
+        }
+    }
+}
+
+fn default_telemetry_inventory_interval_seconds() -> u64 {
+    300
+}
+
+impl TelemetryConfig {
+    /// Whether any signal is exported.
+    pub fn any(&self) -> bool {
+        self.metrics || self.traces || self.logs
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.inventory_interval_seconds < 10 {
+            return Err(ConfigError::Invalid(
+                "telemetry.inventory_interval_seconds must be at least 10".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// [`Self::inventory_interval_seconds`] as a [`Duration`].
+    pub fn inventory_interval(&self) -> Duration {
+        Duration::from_secs(self.inventory_interval_seconds)
+    }
+}
+
 /// `[docker]`: the Docker / OCI registry served under `/v2`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DockerConfig {
@@ -2277,6 +2351,7 @@ impl Config {
     /// Validate cross-cutting invariants that serde cannot express.
     fn validate(&self) -> Result<(), ConfigError> {
         self.server.bind_addr()?;
+        self.telemetry.validate()?;
         self.validate_public_base_url()?;
         // The DNS-rebinding guard's host list, checked before migrations run
         // rather than when the router is built.
@@ -3201,6 +3276,39 @@ mod tests {
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
         assert!(!cfg.web.enabled);
         assert_eq!(cfg.web.assets_dir, "/srv/ui");
+    }
+
+    #[test]
+    fn telemetry_is_off_by_default() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert!(!cfg.telemetry.any());
+        assert!(cfg.telemetry.per_repository);
+        assert_eq!(cfg.telemetry.inventory_interval_seconds, 300);
+
+        let with = |extra: &str| Config::from_figment(fig_from_toml(&format!("{MINIMAL}{extra}")));
+        let cfg = with("\n[telemetry]\ntraces = true\nper_repository = false\n").expect("valid");
+        assert!(cfg.telemetry.any());
+        assert!(cfg.telemetry.traces && !cfg.telemetry.metrics && !cfg.telemetry.logs);
+        assert!(!cfg.telemetry.per_repository);
+        let err = with("\n[telemetry]\ninventory_interval_seconds = 5\n").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("telemetry.inventory_interval_seconds"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn telemetry_signals_are_turned_on_by_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_TELEMETRY__METRICS", "true");
+            jail.set_env("FORGE_TELEMETRY__LOGS", "true");
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert!(cfg.telemetry.metrics && cfg.telemetry.logs && !cfg.telemetry.traces);
+            Ok(())
+        });
     }
 
     #[test]

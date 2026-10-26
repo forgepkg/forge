@@ -301,6 +301,7 @@ async fn oidc_callback(
         .flatten()
         .filter(|v| !v.is_empty());
     let mut resp = oidc_callback_inner(&state, q, flow_cookie.clone()).await;
+    record_oidc_sign_in(&resp);
     if flow_cookie.is_some() {
         // Single-use: drop the pre-auth cookie whatever the outcome.
         if let Ok(v) = clear_flow_cookie_value(state.cookie_secure).parse() {
@@ -308,6 +309,33 @@ async fn oidc_callback(
         }
     }
     resp
+}
+
+/// Count an OIDC callback in the sign-in metrics by its answer: a redirect
+/// to the login page ([`login_failed`]) refused the sign-in, any other one
+/// completed it, a `5xx` failed it. A `404` (no OIDC realm) is no sign-in.
+fn record_oidc_sign_in(resp: &Response) {
+    use forge_telemetry::auth::{sign_in, RealmType, SignInOutcome};
+    let status = resp.status();
+    let outcome = if status == StatusCode::FOUND {
+        let refused = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|location| location.starts_with("/login?"));
+        if refused {
+            SignInOutcome::Rejected
+        } else {
+            SignInOutcome::Success
+        }
+    } else if status.is_server_error() {
+        SignInOutcome::Error
+    } else if status == StatusCode::NOT_FOUND {
+        return;
+    } else {
+        SignInOutcome::Rejected
+    };
+    sign_in(RealmType::Oidc, outcome);
 }
 
 /// Why an OIDC sign-in was refused, as the SPA's login page names it.

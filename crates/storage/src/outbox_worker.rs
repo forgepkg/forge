@@ -20,6 +20,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::Utc;
 use sqlx::PgPool;
+use tracing::Instrument;
 
 use crate::s3::BlobStore;
 
@@ -146,6 +147,7 @@ async fn process_row(
             }
             forge_db::outbox_dao::mark_processed(&mut *tx, row.id).await?;
             tx.commit().await?;
+            forge_telemetry::storage::gc_deleted(forge_telemetry::storage::GcSource::Outbox, 1);
 
             Ok(true)
         }
@@ -208,9 +210,15 @@ pub fn spawn_loop(
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            if let Err(e) = run_once(&pool, &store, batch).await {
+            let run = forge_telemetry::workers::Run::start(WORKER);
+            let pass = run_once(&pool, &store, batch).instrument(run.span()).await;
+            run.finish(pass.is_ok());
+            if let Err(e) = pass {
                 tracing::error!(error = %e, "outbox worker run_once failed");
             }
         }
     })
 }
+
+/// The worker's name (logs, `forge_worker_*`).
+pub const WORKER: &str = "outbox";

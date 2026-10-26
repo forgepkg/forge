@@ -10,6 +10,10 @@ pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
 /// Connect with an explicit pool size and acquire deadline: a request that
 /// cannot get a connection within `acquire_timeout` fails instead of queueing
 /// indefinitely behind a saturated pool.
+///
+/// Every acquire emits a `TRACE` event (target `sqlx::pool::acquire`, field
+/// `acquired_after_secs`), which the server's metrics read; a slow one (2 s)
+/// is a `WARN`, as by default.
 pub async fn connect_with(
     url: &str,
     max_connections: u32,
@@ -18,8 +22,18 @@ pub async fn connect_with(
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(acquire_timeout)
+        .acquire_time_level(log::LevelFilter::Trace)
         .connect(url)
         .await
+}
+
+/// Note a database error in the metrics: a pool acquire that timed out
+/// counts in `forge_db_pool_acquire_timeouts_total`. Called where the
+/// request paths turn a `sqlx::Error` into their own.
+pub fn observe_error(error: &sqlx::Error) {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        forge_telemetry::db::acquire_timeout();
+    }
 }
 
 /// The migrations, embedded at compile time from the workspace-level

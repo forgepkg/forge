@@ -64,6 +64,63 @@
     "logLevel": {
       "type": "string"
     },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "metrics": {
+          "type": "boolean"
+        },
+        "traces": {
+          "type": "boolean"
+        },
+        "logs": {
+          "type": "boolean"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "headersSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "dependencies": {
+            "name": ["key"],
+            "key": ["name"]
+          }
+        },
+        "resourceAttributes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "sampler": {
+          "type": "string",
+          "enum": [
+            "",
+            "always_on",
+            "always_off",
+            "traceidratio",
+            "parentbased_always_on",
+            "parentbased_always_off",
+            "parentbased_traceidratio"
+          ]
+        },
+        "samplerArg": {
+          "type": "string"
+        }
+      }
+    },
     "secretEnv": {
       "type": "object",
       "description": "FORGE_* secrets, stored in the Secret <fullname>-secret-env that the chart creates",

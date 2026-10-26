@@ -53,7 +53,7 @@ pub enum RepoError {
     },
     /// A database error bubbled up from the DAO layer.
     #[error("database error: {0}")]
-    Db(#[from] sqlx::Error),
+    Db(#[source] sqlx::Error),
     /// A storage/I-O error while fetching blob bytes (e.g. an S3 failure).
     /// The concrete blob fetcher surfaces transport errors here
     /// rather than overloading [`RepoError::RepoNotFound`].
@@ -84,6 +84,13 @@ pub enum RepoError {
     /// until the format is back, and it is never read as another format.
     #[error("format {0:?} is not installed")]
     FormatUnavailable(String),
+}
+
+impl From<sqlx::Error> for RepoError {
+    fn from(e: sqlx::Error) -> Self {
+        forge_db::observe_error(&e);
+        RepoError::Db(e)
+    }
 }
 
 /// A [`RepoError`] that a cache shares between the requests it coalesces,
