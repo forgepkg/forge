@@ -1071,26 +1071,28 @@ async fn secret_settings_follow_dek_rotation() {
         async move { secret_dao::open_secret_setting(envelope, key, &value).await }
     };
 
-    let stored = secret_dao::store_secret_setting(&pool, &envelope, key, &secret("k1"), None)
+    // `-` is not base64, so the plaintext never turns up in the envelope by
+    // chance (a two-letter one did, now and then).
+    let stored = secret_dao::store_secret_setting(&pool, &envelope, key, &secret("key-1"), None)
         .await
         .unwrap()
         .expect("stored");
-    assert!(stored.starts_with("sealed:") && !stored.contains("k1"));
+    assert!(stored.starts_with("sealed:") && !stored.contains("key-1"));
     assert!(
-        secret_dao::store_secret_setting(&pool, &envelope, key, &secret("k9"), None)
+        secret_dao::store_secret_setting(&pool, &envelope, key, &secret("key-9"), None)
             .await
             .unwrap()
             .is_none(),
         "stored only while unset"
     );
-    assert_eq!(open(stored.clone()).await.unwrap().expose_secret(), "k1");
+    assert_eq!(open(stored.clone()).await.unwrap().expose_secret(), "key-1");
 
     // Its DEK stays while the key is sealed under it.
     envelope.rotate_dek().await.unwrap();
     secret_dao::revoke_unreferenced_deks(&pool, &envelope)
         .await
         .unwrap();
-    assert_eq!(open(stored.clone()).await.unwrap().expose_secret(), "k1");
+    assert_eq!(open(stored.clone()).await.unwrap().expose_secret(), "key-1");
 
     // The sweep re-seals it under the active DEK; then the old one goes.
     assert_eq!(
@@ -1114,7 +1116,10 @@ async fn secret_settings_follow_dek_rotation() {
             .unwrap()
             >= 1
     );
-    assert_eq!(open(resealed.clone()).await.unwrap().expose_secret(), "k1");
+    assert_eq!(
+        open(resealed.clone()).await.unwrap().expose_secret(),
+        "key-1"
+    );
     let err = open(stored).await.unwrap_err();
     assert!(secret_dao::is_unreadable_setting(&err), "{err}");
     for malformed in ["sealed:***", "sealed:AAAA", "bogus", "plain:k2"] {
