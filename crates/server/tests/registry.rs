@@ -3359,6 +3359,167 @@ async fn image_budget_keeps_a_child_and_its_referrer_when_a_new_index_uses_it() 
     }
 }
 
+/// A subject the budget planned to delete is tagged again before the run
+/// applies, by a tag the rules would delete on a later run: the subject keeps
+/// that tag, so neither it nor its signature goes.
+#[tokio::test]
+async fn image_budget_keeps_a_referrer_whose_subject_was_tagged_again() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("retention subject {}", unique()).into_bytes();
+    let subject = oci.push_image(&name, "subject", "amd64", &layer).await;
+    let subject_manifest = image(&config("amd64"), &[&layer]);
+    let sig = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha(b"{}"), "size": 2},
+        "layers": [],
+        "subject": {"mediaType": OCI_MANIFEST, "digest": subject, "size": subject_manifest.len()},
+    })
+    .to_string()
+    .into_bytes();
+    let sig_digest = sha(&sig);
+    assert_eq!(
+        oci.put_manifest(&name, &sig_digest, OCI_MANIFEST, &sig)
+            .await
+            .status(),
+        201
+    );
+    assert_eq!(oci.delete(&name, "manifests/subject").await.status(), 202);
+
+    // `keep_last_n_tags: 0` deletes every tag, the one added below included,
+    // but not in this run: it was not there when the run evaluated.
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 1, "target_bytes": 0 },
+        "rules": [{ "id": "no-tags", "keep_last_n_tags": 0 }]
+    });
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": policy}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+    let decided: Vec<_> = decisions
+        .manifests
+        .iter()
+        .map(|manifest| manifest.digest.as_str())
+        .collect();
+    assert_eq!(decided, vec![subject.as_str(), sig_digest.as_str()]);
+
+    let response = oci
+        .put_manifest(&name, "again", OCI_MANIFEST, &subject_manifest)
+        .await;
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+
+    let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+    assert_eq!((summary.deleted, summary.skipped), (0, 2));
+    for digest in [&subject, &sig_digest] {
+        assert_eq!(
+            oci.get(&name, &format!("manifests/{digest}"))
+                .await
+                .status(),
+            200,
+            "{digest}"
+        );
+    }
+}
+
+/// The budget deletes a manifest's tags together, and only when the
+/// manifest goes with them: an alias whose manifest keeps the image's last
+/// tag is not deleted for nothing.
+#[tokio::test]
+async fn image_budget_deletes_all_tags_of_a_manifest_or_none() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let app = format!("{repo}/app");
+    let old_layer = format!("old {}", unique()).into_bytes();
+    let old = oci.push_image(&app, "1.0", "amd64", &old_layer).await;
+    let old_manifest = image(&config("amd64"), &[&old_layer]);
+    assert_eq!(
+        oci.put_manifest(&app, "1", OCI_MANIFEST, &old_manifest)
+            .await
+            .status(),
+        201
+    );
+    oci.push_image(&app, "2.0", "amd64", format!("new {}", unique()).as_bytes())
+        .await;
+    let tool = format!("{repo}/tool");
+    let tool_layer = format!("tool {}", unique()).into_bytes();
+    oci.push_image(&tool, "1.0", "amd64", &tool_layer).await;
+    let tool_manifest = image(&config("amd64"), &[&tool_layer]);
+    assert_eq!(
+        oci.put_manifest(&tool, "latest", OCI_MANIFEST, &tool_manifest)
+            .await
+            .status(),
+        201
+    );
+    // `app`'s old release and both tags of `tool` are the least recently used.
+    sqlx::query(
+        "UPDATE oci_tag SET updated_at = now() - interval '60 days' \
+         WHERE repository_id = $1 AND (image = 'tool' OR tag IN ('1.0', '1'))",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": {
+            "version": 1,
+            "size_budget": { "max_bytes": 1, "target_bytes": 0 },
+            "rules": []
+        }}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+    let mut tags: Vec<_> = decisions
+        .tags
+        .iter()
+        .map(|t| format!("{}:{}", t.image, t.tag))
+        .collect();
+    tags.sort_unstable();
+    assert_eq!(tags, vec!["app:1", "app:1.0"]);
+    let manifests: Vec<_> = decisions
+        .manifests
+        .iter()
+        .map(|m| m.digest.as_str())
+        .collect();
+    assert_eq!(manifests, vec![old.as_str()]);
+
+    let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+    assert_eq!((summary.deleted, summary.skipped), (3, 0));
+    assert_eq!(oci.get(&app, "manifests/1.0").await.status(), 404);
+    assert_eq!(oci.get(&app, "manifests/2.0").await.status(), 200);
+    for tag in ["1.0", "latest"] {
+        assert_eq!(
+            oci.get(&tool, &format!("manifests/{tag}")).await.status(),
+            200
+        );
+    }
+}
+
 /// A tag that clients only resolve with a HEAD, as containerd does while it
 /// holds the digest, counts as pulled for `tag_not_pulled_for_days` (#197).
 #[tokio::test]

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            c.id            AS component_id,\n            c.name          AS name,\n            c.version       AS version,\n            c.listed        AS listed,\n            c.created_at    AS created_at,\n            c.last_downloaded_at AS last_downloaded_at,\n            (\n                SELECT a.blob_sha256\n                FROM asset a\n                WHERE a.component_id = c.id AND (a.path = $2 OR a.path LIKE '%.nupkg')\n                ORDER BY a.path\n                LIMIT 1\n            ) AS \"blob_sha256?: String\"\n        FROM component c\n        WHERE c.repository_id = $1\n        ORDER BY c.name, c.id\n        ",
+  "query": "\n        SELECT\n            c.id            AS component_id,\n            c.name          AS name,\n            c.version       AS version,\n            c.listed        AS listed,\n            c.created_at    AS created_at,\n            c.last_downloaded_at AS last_downloaded_at,\n            COALESCE((SELECT SUM(a.size) FROM asset a WHERE a.component_id = c.id), 0)::bigint\n                AS \"size_bytes!\",\n            (\n                SELECT a.blob_sha256\n                FROM asset a\n                WHERE a.component_id = c.id AND (a.path = $2 OR a.path LIKE '%.nupkg')\n                ORDER BY a.path\n                LIMIT 1\n            ) AS \"blob_sha256?: String\"\n        FROM component c\n        WHERE c.repository_id = $1\n        ORDER BY c.name, c.id\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,12 @@
       },
       {
         "ordinal": 6,
+        "name": "size_bytes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
         "name": "blob_sha256?: String",
         "type_info": "Text",
         "origin": "Expression"
@@ -89,8 +95,9 @@
       false,
       false,
       true,
+      null,
       null
     ]
   },
-  "hash": "05aabc2f0be3c4bf20ce00388903ee6ce2a967593c2be5c28aa3efbfb050a999"
+  "hash": "f87de28a0a8dbc58f3e231d8a84b037970cee3202a4d0d5a680f733ffa01c18d"
 }

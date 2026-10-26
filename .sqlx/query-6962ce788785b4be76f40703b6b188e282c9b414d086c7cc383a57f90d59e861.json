@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT r.manifest_id, l.blob_sha256, l.size\n        FROM oci_manifest_ref r\n        JOIN oci_manifest m ON m.id = r.manifest_id\n        JOIN oci_blob_link l\n          ON l.repository_id = m.repository_id AND l.image = m.image AND l.digest = r.digest\n        WHERE m.repository_id = $1 AND r.kind = 'blob'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "manifest_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest_ref",
+            "name": "manifest_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "blob_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_blob_link",
+            "name": "blob_sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "oci_blob_link",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "6962ce788785b4be76f40703b6b188e282c9b414d086c7cc383a57f90d59e861"
+}

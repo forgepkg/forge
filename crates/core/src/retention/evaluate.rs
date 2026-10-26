@@ -47,7 +47,7 @@ use chrono::{DateTime, Utc};
 
 use crate::format::Format;
 use crate::retention::model::{
-    Action, Criteria, ReleaseType, RetentionPolicy, RetentionRule, Scope,
+    Action, Criteria, ReleaseType, RetentionPolicy, RetentionRule, Scope, SizeBudgetSummary,
 };
 
 /// One hosted component in the evaluation snapshot. All fields come straight
@@ -134,12 +134,86 @@ pub struct PackageSizeBudgetPlan {
     pub target_reached: bool,
 }
 
+impl PackageSizeBudgetPlan {
+    /// The plan's effect on the repository's size.
+    pub fn summary(&self) -> SizeBudgetSummary {
+        SizeBudgetSummary {
+            size_before: self.size_before,
+            size_after: self.size_after,
+            target_bytes: self.target_bytes,
+            target_attempted: self.target_attempted,
+            target_reached: self.target_reached,
+        }
+    }
+}
+
 /// Decisions and protections from package tags that constrain budget planning.
 #[derive(Debug, Clone, Copy)]
 pub struct PackageBudgetInputs<'a> {
     pub hosted_decisions: &'a [Decision],
     pub proxy_decisions: &'a [ProxyDecision],
     pub tagged_hosted_ids: &'a HashSet<i64>,
+}
+
+/// Everything a package repository's run decides: see [`plan_package_run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagePlan {
+    pub hosted: Vec<Decision>,
+    pub proxy: Vec<ProxyDecision>,
+    /// Rule decisions left out because a package tag names their version.
+    pub spared: usize,
+    /// The size budget's effect, when the policy has one.
+    pub budget: Option<SizeBudgetSummary>,
+}
+
+/// What one run of `policy` decides for a package repository as of `now`:
+/// the rules' decisions, less those on versions a package tag names
+/// (`tagged_hosted_ids`, which retention never touches), then the size
+/// budget's on top of them when the policy has one (`repository_size_bytes`
+/// is the repository's size then). A version the budget deletes is not also
+/// unlisted. The worker and the preview both plan with this.
+pub fn plan_package_run(
+    format: &dyn Format,
+    now: DateTime<Utc>,
+    policy: &RetentionPolicy,
+    hosted: &[CandidateComponent],
+    proxy: &[ProxyCandidate],
+    tagged_hosted_ids: &HashSet<i64>,
+    repository_size_bytes: Option<u64>,
+) -> PackagePlan {
+    let mut hosted_decisions = evaluate(format, now, policy, hosted);
+    let before = hosted_decisions.len();
+    hosted_decisions.retain(|d| !tagged_hosted_ids.contains(&d.component_id));
+    let spared = before - hosted_decisions.len();
+    let mut proxy_decisions = evaluate_proxy(format, now, policy, proxy);
+
+    let mut budget = None;
+    if let (Some(_), Some(size)) = (policy.size_budget, repository_size_bytes) {
+        let mut plan = evaluate_size_budget(
+            format,
+            policy,
+            hosted,
+            proxy,
+            size,
+            PackageBudgetInputs {
+                hosted_decisions: &hosted_decisions,
+                proxy_decisions: &proxy_decisions,
+                tagged_hosted_ids,
+            },
+        );
+        let deleted: HashSet<i64> = plan.hosted.iter().map(|d| d.component_id).collect();
+        hosted_decisions
+            .retain(|d| d.action != Action::Unlist || !deleted.contains(&d.component_id));
+        hosted_decisions.append(&mut plan.hosted);
+        proxy_decisions.append(&mut plan.proxy);
+        budget = Some(plan.summary());
+    }
+    PackagePlan {
+        hosted: hosted_decisions,
+        proxy: proxy_decisions,
+        spared,
+        budget,
+    }
 }
 
 /// Structured explanation of why a version was selected, recorded on the audit

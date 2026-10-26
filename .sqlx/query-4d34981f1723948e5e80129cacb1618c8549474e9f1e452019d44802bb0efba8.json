@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, path, blob_sha256, updated_at, last_downloaded_at\n        FROM raw_file\n        WHERE repository_id = $1\n        ORDER BY path\n        ",
+  "query": "\n        SELECT id, path, blob_sha256, size, updated_at, last_downloaded_at\n        FROM raw_file\n        WHERE repository_id = $1 AND path >= $2 AND ($3::text IS NULL OR path < $3)\n          AND strpos(substr(path, $4), '/') = 0\n        ORDER BY path\n        FOR UPDATE\n        ",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,17 @@
       },
       {
         "ordinal": 3,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -48,7 +59,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "last_downloaded_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -61,7 +72,10 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Int8",
+        "Text",
+        "Text",
+        "Int4"
       ]
     },
     "nullable": [
@@ -69,8 +83,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "b4b4b0a04792e0b0287582b2f2ce2b07394a447ffd17f6bbd0e75dc8650fe68f"
+  "hash": "4d34981f1723948e5e80129cacb1618c8549474e9f1e452019d44802bb0efba8"
 }

@@ -69,6 +69,27 @@ impl SizeBudget {
     }
 }
 
+/// What a size budget does to a repository's logical size, as evaluated:
+/// the size before, the size projected once the run's decisions apply, and
+/// whether that reaches the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeBudgetSummary {
+    pub size_before: u64,
+    pub size_after: u64,
+    pub target_bytes: u64,
+    /// Whether the repository was over its maximum, so the budget deletes.
+    pub target_attempted: bool,
+    pub target_reached: bool,
+}
+
+impl SizeBudgetSummary {
+    /// Whether `size_after` is within the target: always, when the
+    /// repository was not over its maximum and the budget deleted nothing.
+    pub fn reached(&self, size_after: u64) -> bool {
+        !self.target_attempted || size_after <= self.target_bytes
+    }
+}
+
 fn default_true() -> bool {
     true
 }

@@ -375,6 +375,37 @@ export function intervalFromSeconds(seconds: number): {
   return { value: String(seconds), unit: 'seconds' }
 }
 
+/** The units a size budget is entered in. */
+export type SizeUnit = 'GB' | 'GiB'
+
+const UNIT_BYTES: Record<SizeUnit, number> = {
+  GB: 1000 ** 3,
+  GiB: 1024 ** 3,
+}
+
+/** `bytes` in `unit`, as the shortest decimal that reads back to it. */
+function amountIn(bytes: number, unit: SizeUnit): string {
+  const amount = bytes / UNIT_BYTES[unit]
+  const short = String(amount)
+  // Tiny amounts print as `2e-9`, which the form does not take.
+  return short.includes('e') ? amount.toFixed(30).replace(/\.?0+$/, '') : short
+}
+
+/** The unit that shows stored sizes in the fewest digits, GiB on a tie. */
+function unitOf(sizes: number[]): SizeUnit {
+  const digits = (unit: SizeUnit) =>
+    sizes.reduce((n, bytes) => n + amountIn(bytes, unit).length, 0)
+  return digits('GB') < digits('GiB') ? 'GB' : 'GiB'
+}
+
+/** `bytes` in `unit`, for reading: at most two decimals. */
+export function formatBytes(bytes: number, unit: SizeUnit): string {
+  const amount = (bytes / UNIT_BYTES[unit]).toLocaleString(undefined, {
+    maximumFractionDigits: 2,
+  })
+  return `${amount} ${unit}`
+}
+
 /** One rule as the form holds it. */
 export interface RuleDraft {
   /** Stable React key; not part of the policy. */
@@ -392,8 +423,10 @@ export interface PolicyDraft {
   dryRunOnly: boolean
   interval: string
   intervalUnit: IntervalUnit
-  sizeBudgetMaxGiB: string
-  sizeBudgetTargetGiB: string
+  /** The size budget's maximum and target, in `sizeBudgetUnit`. */
+  sizeBudgetMax: string
+  sizeBudgetTarget: string
+  sizeBudgetUnit: SizeUnit
   rules: RuleDraft[]
 }
 
@@ -461,27 +494,27 @@ export function draftFromPolicy(
       dryRunOnly: true,
       interval: '1',
       intervalUnit: 'hours',
-      sizeBudgetMaxGiB: '',
-      sizeBudgetTargetGiB: '',
+      sizeBudgetMax: '',
+      sizeBudgetTarget: '',
+      sizeBudgetUnit: 'GiB',
       rules: [example],
     }
   }
   const { rules, ...base } = policy as RetentionPolicy & Record<string, unknown>
   const interval = intervalFromSeconds(policy.min_run_interval_seconds ?? 3600)
+  const budget = policy.size_budget
+  const sizes = budget ? [budget.max_bytes, budget.target_bytes ?? 0] : []
+  const unit = unitOf(sizes)
   return {
     base: structuredClone(base),
     enabled: policy.enabled ?? true,
     dryRunOnly: policy.dry_run_only ?? false,
     interval: interval.value,
     intervalUnit: interval.unit,
-    sizeBudgetMaxGiB:
-      policy.size_budget === undefined
-        ? ''
-        : (policy.size_budget.max_bytes / GIB).toFixed(30).replace(/\.?0+$/, ''),
-    sizeBudgetTargetGiB:
-      policy.size_budget?.target_bytes === undefined
-        ? ''
-        : (policy.size_budget.target_bytes / GIB).toFixed(30).replace(/\.?0+$/, ''),
+    sizeBudgetMax: budget ? amountIn(budget.max_bytes, unit) : '',
+    sizeBudgetTarget:
+      budget?.target_bytes === undefined ? '' : amountIn(budget.target_bytes, unit),
+    sizeBudgetUnit: unit,
     rules: rules.map((r) => ruleFromJson(shape, r as unknown as Record<string, unknown>)),
   }
 }
@@ -489,8 +522,8 @@ export function draftFromPolicy(
 /** What is wrong with the form, field by field. */
 export interface DraftErrors {
   interval?: string
-  sizeBudgetMaxGiB?: string
-  sizeBudgetTargetGiB?: string
+  sizeBudgetMax?: string
+  sizeBudgetTarget?: string
   /** A message for the rules as a whole. */
   rules?: string
   /** Per rule key, per field key. */
@@ -498,7 +531,7 @@ export interface DraftErrors {
 }
 
 const WHOLE = /^\d+$/
-const GIB = 1024 ** 3
+const DECIMAL = /^\d+(\.\d+)?$/
 
 /** The browser's checks; `null` when the form can be sent. */
 export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErrors | null {
@@ -509,26 +542,25 @@ export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErro
     errors.interval = 'Enter a whole number of at least 1.'
     failed = true
   }
-  const maxGiB = draft.sizeBudgetMaxGiB.trim()
-  const targetGiB = draft.sizeBudgetTargetGiB.trim()
-  const validMax = maxGiB !== '' && /^\d+(\.\d+)?$/.test(maxGiB) && Number(maxGiB) > 0
-  if (maxGiB !== '' && !validMax) {
-    errors.sizeBudgetMaxGiB = 'Enter a positive size in GiB, or leave it empty.'
+  const max = draft.sizeBudgetMax.trim()
+  const target = draft.sizeBudgetTarget.trim()
+  const validMax = DECIMAL.test(max) && Number(max) > 0
+  if (max !== '' && !validMax) {
+    errors.sizeBudgetMax = 'Enter a positive size, or leave it empty.'
+    failed = true
+  } else if (validMax && toBytes(max, draft.sizeBudgetUnit) > Number.MAX_SAFE_INTEGER) {
+    errors.sizeBudgetMax = 'The maximum exceeds the supported byte range.'
     failed = true
   }
-  if (validMax && Number(maxGiB) * GIB > Number.MAX_SAFE_INTEGER) {
-    errors.sizeBudgetMaxGiB = 'The maximum exceeds the supported byte range.'
-    failed = true
-  }
-  if (targetGiB !== '') {
-    if (!/^\d+(\.\d+)?$/.test(targetGiB) || Number(targetGiB) < 0) {
-      errors.sizeBudgetTargetGiB = 'Enter a nonnegative size in GiB, or leave it empty.'
+  if (target !== '') {
+    if (!DECIMAL.test(target)) {
+      errors.sizeBudgetTarget = 'Enter a size, or leave it empty.'
       failed = true
     } else if (!validMax) {
-      errors.sizeBudgetTargetGiB = 'Set a maximum size first.'
+      errors.sizeBudgetTarget = 'Set a maximum size first.'
       failed = true
-    } else if (Number(targetGiB) > Number(maxGiB)) {
-      errors.sizeBudgetTargetGiB = 'The target must not exceed the maximum.'
+    } else if (Number(target) > Number(max)) {
+      errors.sizeBudgetTarget = 'The target must not exceed the maximum.'
       failed = true
     }
   }
@@ -558,6 +590,11 @@ export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErro
   return failed ? errors : null
 }
 
+/** `amount` of `unit` in whole bytes. */
+function toBytes(amount: string, unit: SizeUnit): number {
+  return Math.round(Number(amount) * UNIT_BYTES[unit])
+}
+
 /** The policy the form says, for a form `validateDraft` accepted. */
 export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPolicy {
   const rules = draft.rules.map((rule) => {
@@ -580,14 +617,14 @@ export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPo
     return json as unknown as RetentionRule
   })
   const base = structuredClone(draft.base)
-  if (draft.sizeBudgetMaxGiB.trim() === '') {
+  const max = draft.sizeBudgetMax.trim()
+  const target = draft.sizeBudgetTarget.trim()
+  if (max === '') {
     delete base.size_budget
   } else {
     base.size_budget = {
-      max_bytes: Math.floor(Number(draft.sizeBudgetMaxGiB) * GIB),
-      ...(draft.sizeBudgetTargetGiB.trim() === ''
-        ? {}
-        : { target_bytes: Math.floor(Number(draft.sizeBudgetTargetGiB) * GIB) }),
+      max_bytes: toBytes(max, draft.sizeBudgetUnit),
+      ...(target === '' ? {} : { target_bytes: toBytes(target, draft.sizeBudgetUnit) }),
     }
   }
   return {
@@ -659,8 +696,7 @@ const REASONS: Record<string, (n: number) => string> = {
 }
 
 function formatSize(bytes: number): string {
-  const gib = bytes / (1024 ** 3)
-  return `${gib.toLocaleString(undefined, { maximumFractionDigits: 2 })} GiB`
+  return formatBytes(bytes, 'GiB')
 }
 
 /** Why a rule selected something, from a decision's or audit row's `reason`. */
@@ -691,6 +727,9 @@ export function RetentionPolicyForm({
   onChange: (draft: PolicyDraft) => void
 }) {
   const spec = SHAPES[shape]
+  const max = draft.sizeBudgetMax.trim()
+  const maxBytes =
+    DECIMAL.test(max) && Number(max) > 0 ? toBytes(max, draft.sizeBudgetUnit) : null
 
   function setRule(key: number, values: Record<string, string>) {
     onChange({
@@ -751,32 +790,38 @@ export function RetentionPolicyForm({
         description="After the rules run, delete least-recently used content until the repository reaches the target. This counts logical repository content, not deduplicated object-store usage."
       >
         <p className="fg-text">
-          Current logical size: {(currentSizeBytes / GIB).toLocaleString(undefined, {
-            maximumFractionDigits: 2,
-          })}{' '}
-          GiB
+          Current logical size: {formatBytes(currentSizeBytes, draft.sizeBudgetUnit)}
+          {maxBytes !== null && ` of ${formatBytes(maxBytes, draft.sizeBudgetUnit)}`}
         </p>
         <div className="fg-fieldrow">
           <TextField
-            label="Maximum size (GiB)"
+            label="Maximum size"
             optional
             mono
             inputMode="decimal"
-            value={draft.sizeBudgetMaxGiB}
-            onChange={(e) => onChange({ ...draft, sizeBudgetMaxGiB: e.target.value })}
-            error={errors?.sizeBudgetMaxGiB}
+            value={draft.sizeBudgetMax}
+            onChange={(e) => onChange({ ...draft, sizeBudgetMax: e.target.value })}
+            error={errors?.sizeBudgetMax}
             description="Eviction starts when the repository grows past this size."
           />
           <TextField
-            label="Target size (GiB)"
+            label="Target size"
             optional
             mono
             inputMode="decimal"
-            value={draft.sizeBudgetTargetGiB}
-            onChange={(e) => onChange({ ...draft, sizeBudgetTargetGiB: e.target.value })}
-            error={errors?.sizeBudgetTargetGiB}
+            value={draft.sizeBudgetTarget}
+            onChange={(e) => onChange({ ...draft, sizeBudgetTarget: e.target.value })}
+            error={errors?.sizeBudgetTarget}
             description="Defaults to 90% of the maximum to avoid deleting content on every run."
           />
+          <SelectField
+            label="Size unit"
+            value={draft.sizeBudgetUnit}
+            onChange={(e) => onChange({ ...draft, sizeBudgetUnit: e.target.value as SizeUnit })}
+          >
+            <option value="GB">GB</option>
+            <option value="GiB">GiB</option>
+          </SelectField>
         </div>
       </Fieldset>
 
