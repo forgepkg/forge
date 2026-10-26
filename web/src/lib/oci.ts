@@ -141,6 +141,20 @@ export function formatDateTime(iso: string | null | undefined): string {
     : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
 
+/**
+ * What an image's page says above a list the server bounded (it lists at
+ * most 1,000 tags and 1,000 manifests of an image, the newest): `undefined`
+ * when it listed all `total`.
+ */
+export function cappedNote(
+  shown: number,
+  total: number | undefined,
+  noun: string,
+): string | undefined {
+  if (total === undefined || total <= shown) return undefined
+  return `Showing the newest ${shown.toLocaleString()} of ${total.toLocaleString()} ${noun}.`
+}
+
 /** The config media type of a Helm chart pushed as an artifact (`helm push`). */
 export const HELM_CHART_CONFIG = 'application/vnd.cncf.helm.config.v1+json'
 
