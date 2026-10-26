@@ -52,16 +52,14 @@
 //! ## Client IP and DNS rebinding
 //! The client IP is resolved from the socket peer and **every**
 //! `X-Forwarded-For` line behind the trusted proxies, with IPv4-mapped IPv6
-//! addresses canonicalized ([`forge_core::auth::client_ip`]). A client whose
-//! forwarded address is malformed is unknown and never allowlisted. The IP-allowlist
-//! anonymous grant (anonymous mode `allowlist`) and the trusted-header realms
-//! additionally require the request's `Host` to name this server (the host of
-//! `server.public_base_url` or an entry of `server.allowed_hosts`): a
-//! DNS-rebinding page in an internal user's browser reaches the server from an
-//! allowlisted IP, or through the proxy that adds the headers, but under its
-//! own host name, and such a request is treated as unauthenticated instead.
-//! Requests with credentials of their own, and handlers that ignore the
-//! principal (health probes), do not depend on the host.
+//! addresses canonicalized ([`forge_core::auth::client_ip`]). The
+//! trusted-header realms additionally require the request's `Host` to name
+//! this server (the host of `server.public_base_url` or an entry of
+//! `server.allowed_hosts`): a DNS-rebinding page in an internal user's browser
+//! reaches the server through the proxy that adds the headers, but under its
+//! own host name, and the headers of such a request are ignored. Requests with
+//! credentials of their own, the anonymous policy, and handlers that ignore
+//! the principal (health probes), do not depend on the host.
 //!
 //! ## Stale session cookies
 //! A session cookie that no longer names a live session is treated as absent
@@ -75,10 +73,12 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use forge_core::auth::client_ip::{forwarded_for, is_trusted_peer, resolve_client, AnonPolicy};
+use forge_core::auth::client_ip::{forwarded_for, is_trusted_peer, resolve_client_ip};
 use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::auth::session_source::{session_cookie_name, unique_cookie_value};
-use forge_core::auth::token::{resolve_principal_with_fallback, AuthError, PrincipalSource};
+use forge_core::auth::token::{
+    resolve_principal_with_fallback, AnonPolicy, AuthError, PrincipalSource,
+};
 use forge_core::session::{csrf_token_matches, SessionService};
 use ipnet::IpNet;
 
@@ -129,8 +129,7 @@ pub struct PrincipalLayer {
     /// `server.public_base_url`), accepted as a same-origin `Origin` header.
     pub public_origin: Option<String>,
     /// Normalized host names ([`allowed_hosts`]) a request's `Host` must name
-    /// for the IP-allowlist anonymous grant and the trusted-header realms to
-    /// apply (DNS-rebinding guard).
+    /// for the trusted-header realms to apply (DNS-rebinding guard).
     pub allowed_hosts: Arc<Vec<String>>,
 }
 
@@ -138,15 +137,15 @@ pub struct PrincipalLayer {
 #[derive(Clone)]
 pub enum AnonSource {
     /// This policy, always.
-    Fixed(Arc<AnonPolicy>),
-    /// The auth settings' anonymous mode and allowlist, as this instance has
-    /// them; asking re-reads them once they are due.
+    Fixed(AnonPolicy),
+    /// The auth settings' anonymous mode, as this instance has them; asking
+    /// re-reads them once they are due.
     Settings(Arc<AuthSettingsCache>),
 }
 
 impl From<AnonPolicy> for AnonSource {
     fn from(policy: AnonPolicy) -> Self {
-        AnonSource::Fixed(Arc::new(policy))
+        AnonSource::Fixed(policy)
     }
 }
 
@@ -158,8 +157,7 @@ fn normalize_host(authority: &str) -> Option<String> {
     (!host.is_empty()).then_some(host)
 }
 
-/// The host names a request may address for the IP-allowlist anonymous grant
-/// and the trusted-header realms:
+/// The host names a request may address for the trusted-header realms:
 /// the host of `public_base_url` plus each `extra` entry (`host` or
 /// `host:port`; the port is ignored — a rebinding page cannot present this
 /// server's host name, whatever the port). An unparsable entry is an error.
@@ -296,26 +294,11 @@ pub async fn attach_principal(
     }
 
     let xff = forwarded_for(req.headers());
-    let client = resolve_client(peer, xff.as_deref(), &layer.trusted_proxies);
-    let client_ip = client.ip;
+    let client_ip = resolve_client_ip(peer, xff.as_deref(), &layer.trusted_proxies);
 
-    let settings;
-    let policy = match &layer.anon {
-        AnonSource::Fixed(policy) => policy.as_ref(),
-        AnonSource::Settings(cache) => {
-            settings = cache.current().await;
-            &settings.anon
-        }
-    };
-    // DNS-rebinding guard: the IP-allowlist grant applies only to requests
-    // addressing this server by one of its own host names. It never applies to
-    // a client whose address a malformed `X-Forwarded-For` hid: its `ip` is
-    // the proxy's own.
-    let anon = match policy.for_client(client) {
-        AnonPolicy::Allowlist(_) if !host_is_allowed(&req, &layer.allowed_hosts) => {
-            &AnonPolicy::Off
-        }
-        policy => policy,
+    let anon = match &layer.anon {
+        AnonSource::Fixed(policy) => *policy,
+        AnonSource::Settings(cache) => cache.current().await.anon,
     };
 
     // The trusted-header realms believe only a trusted proxy, and only for
@@ -329,7 +312,7 @@ pub async fn attach_principal(
         trusted_header,
         req.headers(),
         client_ip,
-        anon,
+        &anon,
     )
     .await
     {
@@ -767,41 +750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ip_allowlist_anonymous_requires_a_known_host() {
-        // L7 (DNS rebinding): an allowlisted peer (loopback here) that names a
-        // foreign host is not served anonymously; this server's own names are.
-        let anon = AnonPolicy::allowlist_from_tokens(["loopback"]).unwrap();
-        let app = app(layer(
-            vec![Box::new(StubSource {
-                outcome: SourceOutcome::NoCredentials,
-                require_header: true,
-            })],
-            anon,
-        ));
-        let principal_for = |host: Option<&'static str>| {
-            let app = app.clone();
-            async move {
-                let mut b = Request::builder().uri("/");
-                if let Some(host) = host {
-                    b = b.header(header::HOST, host);
-                }
-                body_string(app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap()).await
-            }
-        };
-        for host in ["forge.example", "FORGE.example:443", "forge.internal:8421"] {
-            assert_eq!(principal_for(Some(host)).await, "anonymous", "{host}");
-        }
-        for host in [
-            Some("rebind.attacker.example"),
-            Some("forge.example.evil"),
-            None,
-        ] {
-            assert_eq!(principal_for(host).await, "unauthenticated", "{host:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn foreign_host_does_not_affect_other_policies_or_credentials() {
+    async fn foreign_host_does_not_affect_the_anonymous_policy_or_credentials() {
         // `all` grants regardless of host; credentials never depend on it.
         let anon_all = app(layer(
             vec![Box::new(StubSource {
@@ -831,7 +780,7 @@ mod tests {
                 }),
                 require_header: true,
             })],
-            AnonPolicy::allowlist_from_tokens(["loopback"]).unwrap(),
+            AnonPolicy::Off,
         ));
         let resp = authed
             .oneshot(

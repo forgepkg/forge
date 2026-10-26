@@ -1,21 +1,13 @@
-//! Client-IP resolution and the anonymous-access policy.
-//!
-//! Two concerns live here:
-//!
-//! 1. [`resolve_client_ip`] — derive the *real* client IP from the socket peer
-//!    and a possibly-spoofed `X-Forwarded-For` header, honoring a configured
-//!    list of trusted proxy CIDRs.
-//! 2. [`AnonPolicy`] — decide whether an unauthenticated request from a given
-//!    client IP may be served anonymously (`off` / `allowlist` / `all`).
+//! Client-IP resolution: [`resolve_client_ip`] derives the *real* client IP
+//! from the socket peer and a possibly-spoofed `X-Forwarded-For` header,
+//! honoring a configured list of trusted proxy CIDRs.
 //!
 //! ## XFF trust model
 //! The client IP is the **socket peer** unless the peer is itself a trusted
 //! proxy. When the peer is trusted, we walk `X-Forwarded-For` **right-to-left**,
 //! dropping trusted hops, and take the first untrusted address. A malformed XFF
-//! (an empty or unparsable entry we reach) leaves the client **unknown**: its
-//! key is the peer's address, but it never matches the anonymous allowlist,
-//! because the peer is the proxy and its address says nothing about the
-//! client. We never trust XFF from an untrusted peer.
+//! (an empty or unparsable entry we reach) falls back to the peer's address.
+//! We never trust XFF from an untrusted peer.
 //!
 //! A request may carry several `X-Forwarded-For` header lines (a proxy may add
 //! its hop as a new line rather than extending the one the client sent);
@@ -28,8 +20,7 @@
 //!
 //! IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`, as a dual-stack listener
 //! reports IPv4 peers) are canonicalized to plain IPv4 before every CIDR check
-//! — the peer, each parsed hop, and the anonymous allowlist — so they match
-//! IPv4 CIDRs.
+//! — the peer and each parsed hop — so they match IPv4 CIDRs.
 
 use std::net::IpAddr;
 
@@ -62,19 +53,6 @@ pub fn forwarded_for(headers: &HeaderMap) -> Option<String> {
     )
 }
 
-/// The effective client of a request ([`resolve_client`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResolvedClient {
-    /// The address to key the client by (lockout, rate limits, audit). For an
-    /// unknown client this is the socket peer.
-    pub ip: IpAddr,
-    /// `false` when a trusted peer forwarded a malformed `X-Forwarded-For`
-    /// (an empty or unparsable hop reached by the walk): the client's address
-    /// is unknown, and `ip` is the proxy's. Such a client must not be granted
-    /// anything by address ([`AnonPolicy::allows_client`]).
-    pub known: bool,
-}
-
 /// Resolve the effective client IP.
 ///
 /// * `peer` — the socket peer address (always trustworthy as *a* hop).
@@ -90,9 +68,7 @@ pub struct ResolvedClient {
 ///   parseable address wins.
 /// * If we exhaust XFF (all hops trusted, or it is absent) → `peer`.
 /// * If we encounter an empty or **unparseable** hop before finding an
-///   untrusted address → treat as malformed → `peer`, but see
-///   [`resolve_client`]: such a client is unknown and must never be granted
-///   anything by address.
+///   untrusted address → treat as malformed → `peer`.
 ///
 /// A hop may carry a port (`198.51.100.5:4711`, `[2001:db8::1]:4711`), as
 /// some proxies (Azure Application Gateway) write it.
@@ -100,20 +76,13 @@ pub struct ResolvedClient {
 /// The peer and every hop are canonicalized (IPv4-mapped IPv6 → IPv4) before
 /// the CIDR checks, and the returned address is canonical too.
 pub fn resolve_client_ip(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> IpAddr {
-    resolve_client(peer, xff, trusted).ip
-}
-
-/// [`resolve_client_ip`], also reporting whether the client's address could
-/// be determined ([`ResolvedClient::known`]).
-pub fn resolve_client(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> ResolvedClient {
     let peer = peer.to_canonical();
-    let known = |ip| ResolvedClient { ip, known: true };
     if !ip_in_any(peer, trusted) {
-        return known(peer);
+        return peer;
     }
 
     let Some(xff) = xff else {
-        return known(peer);
+        return peer;
     };
 
     // Walk right-to-left. The right-most entry is the hop closest to us.
@@ -125,21 +94,15 @@ pub fn resolve_client(peer: IpAddr, xff: Option<&str>, trusted: &[IpNet]) -> Res
                     continue;
                 }
                 // First untrusted, parseable address: this is the client.
-                return known(ip);
+                return ip;
             }
-            None => {
-                // Empty or malformed hop → the whole XFF is untrustworthy, and
-                // the peer (a proxy) is not the client either.
-                return ResolvedClient {
-                    ip: peer,
-                    known: false,
-                };
-            }
+            // Empty or malformed hop → the whole XFF is untrustworthy.
+            None => return peer,
         }
     }
 
     // All hops were trusted → the peer is the client.
-    known(peer)
+    peer
 }
 
 /// Whether the socket `peer` is one of the `trusted` proxies (canonicalized
@@ -165,87 +128,6 @@ fn ip_in_any(ip: IpAddr, nets: &[IpNet]) -> bool {
     nets.iter().any(|n| n.contains(&ip))
 }
 
-/// The configured anonymous-access policy (`auth.anonymous_mode`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AnonPolicy {
-    /// No anonymous access at all.
-    Off,
-    /// Anonymous access only for client IPs inside the allowlist.
-    Allowlist(Vec<IpNet>),
-    /// Anonymous access for every client IP.
-    All,
-}
-
-impl AnonPolicy {
-    /// Whether an unauthenticated request from `ip` may be served anonymously.
-    pub fn allows(&self, ip: IpAddr) -> bool {
-        match self {
-            AnonPolicy::Off => false,
-            AnonPolicy::All => true,
-            AnonPolicy::Allowlist(nets) => ip_in_any(ip, nets),
-        }
-    }
-
-    /// The policy for a request from `client`: an unknown client
-    /// ([`ResolvedClient::known`] `false`) gets no allowlist grant, whatever
-    /// the proxy's own address is.
-    pub fn for_client(&self, client: ResolvedClient) -> &AnonPolicy {
-        match self {
-            AnonPolicy::Allowlist(_) if !client.known => &AnonPolicy::Off,
-            policy => policy,
-        }
-    }
-
-    /// Whether an unauthenticated request from `client` may be served
-    /// anonymously ([`Self::for_client`]).
-    pub fn allows_client(&self, client: ResolvedClient) -> bool {
-        self.for_client(client).allows(client.ip)
-    }
-
-    /// Build an [`AnonPolicy::Allowlist`] from configuration tokens.
-    ///
-    /// Recognised tokens (case-insensitive):
-    /// * `loopback` → `127.0.0.0/8`, `::1/128`
-    /// * `private`  → RFC1918 + link-local v4 + ULA + link-local v6
-    ///   (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`,
-    ///   `fc00::/7`, `fe80::/10`)
-    /// * `local`    → loopback **+** private
-    ///
-    /// Any other token is parsed as a CIDR; a bare IP is accepted as a
-    /// single-host CIDR (`/32` or `/128`).
-    pub fn allowlist_from_tokens<I, S>(tokens: I) -> Result<Self, AllowlistParseError>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let mut nets: Vec<IpNet> = Vec::new();
-        for tok in tokens {
-            let tok = tok.as_ref().trim();
-            if tok.is_empty() {
-                continue;
-            }
-            match tok.to_ascii_lowercase().as_str() {
-                "loopback" => nets.extend(loopback_nets()),
-                "private" => nets.extend(private_nets()),
-                "local" => {
-                    nets.extend(loopback_nets());
-                    nets.extend(private_nets());
-                }
-                _ => nets.push(parse_cidr_or_host(tok)?),
-            }
-        }
-        Ok(AnonPolicy::Allowlist(nets))
-    }
-}
-
-/// Failure to parse an allowlist token as a CIDR / host.
-#[derive(Debug, thiserror::Error)]
-#[error("invalid allowlist entry {entry:?}")]
-pub struct AllowlistParseError {
-    /// The offending token.
-    pub entry: String,
-}
-
 /// An IPv4-mapped IPv6 network (`::ffff:a.b.c.d/(96+n)`) as the IPv4 network
 /// `a.b.c.d/n`; any other network unchanged. Peer and forwarded addresses are
 /// canonicalized (`to_canonical`) before they are matched, so a configured
@@ -260,49 +142,6 @@ pub fn canonical_net(net: IpNet) -> IpNet {
         }
     }
     net
-}
-
-fn parse_cidr_or_host(tok: &str) -> Result<IpNet, AllowlistParseError> {
-    if let Ok(net) = tok.parse::<IpNet>() {
-        return Ok(canonical_net(net));
-    }
-    if let Ok(ip) = tok.parse::<IpAddr>() {
-        // Single host: full-length prefix.
-        let prefix = match ip {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
-        };
-        // `new` only fails on an out-of-range prefix, which 32/128 never are.
-        return IpNet::new(ip, prefix)
-            .map(canonical_net)
-            .map_err(|_| AllowlistParseError {
-                entry: tok.to_string(),
-            });
-    }
-    Err(AllowlistParseError {
-        entry: tok.to_string(),
-    })
-}
-
-fn loopback_nets() -> Vec<IpNet> {
-    ["127.0.0.0/8", "::1/128"]
-        .into_iter()
-        .map(|s| s.parse().expect("static CIDR"))
-        .collect()
-}
-
-fn private_nets() -> Vec<IpNet> {
-    [
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "169.254.0.0/16",
-        "fc00::/7",
-        "fe80::/10",
-    ]
-    .into_iter()
-    .map(|s| s.parse().expect("static CIDR"))
-    .collect()
 }
 
 #[cfg(test)]
@@ -364,43 +203,17 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_empty_hop_leaves_the_client_unknown() {
+    fn malformed_or_empty_hop_falls_back_to_peer() {
         let trusted = nets(&["10.0.0.0/8"]);
         for xff in ["not-an-ip", "198.51.100.5, ", ",10.0.0.9", ""] {
-            let got = resolve_client(ip("10.0.0.1"), Some(xff), &trusted);
-            assert_eq!(
-                got,
-                ResolvedClient {
-                    ip: ip("10.0.0.1"),
-                    known: false
-                },
-                "{xff:?}"
-            );
+            let got = resolve_client_ip(ip("10.0.0.1"), Some(xff), &trusted);
+            assert_eq!(got, ip("10.0.0.1"), "{xff:?}");
         }
-        // Absent, or every hop trusted: the trusted peer itself is the client.
-        assert!(resolve_client(ip("10.0.0.1"), None, &trusted).known);
-        assert!(resolve_client(ip("10.0.0.1"), Some("10.0.0.2"), &trusted).known);
-        // An untrusted peer is always known.
-        assert!(resolve_client(ip("203.0.113.9"), Some("junk"), &trusted).known);
-    }
-
-    #[test]
-    fn unknown_client_is_never_allowlisted() {
-        let allow = AnonPolicy::allowlist_from_tokens(["private"]).unwrap();
-        let unknown = ResolvedClient {
-            ip: ip("10.0.0.1"),
-            known: false,
-        };
-        assert!(allow.allows(unknown.ip));
-        assert!(!allow.allows_client(unknown));
-        assert_eq!(allow.for_client(unknown), &AnonPolicy::Off);
-        assert!(allow.allows_client(ResolvedClient {
-            known: true,
-            ..unknown
-        }));
-        // `off` and `all` do not depend on the address at all.
-        assert!(AnonPolicy::All.allows_client(unknown));
-        assert!(!AnonPolicy::Off.allows_client(unknown));
+        // An untrusted peer's XFF is never read, malformed or not.
+        assert_eq!(
+            resolve_client_ip(ip("203.0.113.9"), Some("junk"), &trusted),
+            ip("203.0.113.9")
+        );
     }
 
     #[test]
@@ -432,27 +245,21 @@ mod tests {
         );
         let xff = forwarded_for(&headers);
         assert_eq!(xff.as_deref(), Some("_, 198.51.100.5"));
-        let got = resolve_client(ip("10.0.0.1"), xff.as_deref(), &trusted);
         assert_eq!(
-            got,
-            ResolvedClient {
-                ip: ip("198.51.100.5"),
-                known: true
-            }
+            resolve_client_ip(ip("10.0.0.1"), xff.as_deref(), &trusted),
+            ip("198.51.100.5")
         );
-        let allow = AnonPolicy::allowlist_from_tokens(["private"]).unwrap();
-        assert!(!allow.allows_client(got));
 
-        // The proxy's own hop unreadable: the client is unknown, never the
-        // (allowlisted) proxy.
+        // The proxy's own hop unreadable: malformed → the peer.
         let mut headers = HeaderMap::new();
         headers.append(
             "x-forwarded-for",
             http::HeaderValue::from_bytes(b"198.51.100.5, \xfe").unwrap(),
         );
-        let got = resolve_client(ip("10.0.0.1"), forwarded_for(&headers).as_deref(), &trusted);
-        assert!(!got.known);
-        assert!(!allow.allows_client(got));
+        assert_eq!(
+            resolve_client_ip(ip("10.0.0.1"), forwarded_for(&headers).as_deref(), &trusted),
+            ip("10.0.0.1")
+        );
     }
 
     #[test]
@@ -531,11 +338,6 @@ mod tests {
             resolve_client_ip(ip("::ffff:203.0.113.9"), Some("1.2.3.4"), &trusted),
             ip("203.0.113.9")
         );
-        // The anonymous allowlist matches mapped addresses too.
-        let p = AnonPolicy::allowlist_from_tokens(["loopback", "192.168.0.0/16"]).unwrap();
-        assert!(p.allows(ip("::ffff:127.0.0.1")));
-        assert!(p.allows(ip("::ffff:192.168.1.1")));
-        assert!(!p.allows(ip("::ffff:8.8.8.8")));
     }
 
     #[test]
@@ -550,79 +352,9 @@ mod tests {
             canonical_net("2001:db8::/32".parse().unwrap()),
             "2001:db8::/32".parse::<IpNet>().unwrap()
         );
-        let p = AnonPolicy::allowlist_from_tokens(["::ffff:172.17.0.1"]).unwrap();
-        assert!(p.allows(ip("172.17.0.1")));
-        assert!(p.allows(ip("::ffff:172.17.0.1")));
-        assert!(!p.allows(ip("172.17.0.2")));
-    }
-
-    // ── AnonPolicy ───────────────────────────────────────────────────────
-
-    #[test]
-    fn off_allows_nothing() {
-        assert!(!AnonPolicy::Off.allows(ip("127.0.0.1")));
-    }
-
-    #[test]
-    fn all_allows_everything() {
-        assert!(AnonPolicy::All.allows(ip("203.0.113.1")));
-        assert!(AnonPolicy::All.allows(ip("::1")));
-    }
-
-    #[test]
-    fn loopback_token_expands_v4_and_v6() {
-        let p = AnonPolicy::allowlist_from_tokens(["loopback"]).unwrap();
-        assert!(p.allows(ip("127.0.0.1")));
-        assert!(p.allows(ip("127.5.5.5")));
-        assert!(p.allows(ip("::1")));
-        assert!(!p.allows(ip("10.0.0.1")));
-        assert!(!p.allows(ip("203.0.113.1")));
-    }
-
-    #[test]
-    fn private_token_expands_rfc1918_and_v6_ula_linklocal() {
-        let p = AnonPolicy::allowlist_from_tokens(["private"]).unwrap();
-        assert!(p.allows(ip("10.1.2.3")));
-        assert!(p.allows(ip("172.16.0.1")));
-        assert!(p.allows(ip("192.168.1.1")));
-        assert!(p.allows(ip("169.254.1.1")));
-        assert!(p.allows(ip("fc00::1")));
-        assert!(p.allows(ip("fe80::1")));
-        // loopback is NOT private
-        assert!(!p.allows(ip("127.0.0.1")));
-        assert!(!p.allows(ip("::1")));
-        assert!(!p.allows(ip("8.8.8.8")));
-    }
-
-    #[test]
-    fn local_token_is_loopback_plus_private() {
-        let p = AnonPolicy::allowlist_from_tokens(["local"]).unwrap();
-        assert!(p.allows(ip("127.0.0.1")));
-        assert!(p.allows(ip("::1")));
-        assert!(p.allows(ip("10.0.0.1")));
-        assert!(!p.allows(ip("8.8.8.8")));
-    }
-
-    #[test]
-    fn explicit_cidr_and_host_tokens() {
-        let p = AnonPolicy::allowlist_from_tokens(["203.0.113.0/24", "2001:db8::1"]).unwrap();
-        assert!(p.allows(ip("203.0.113.50")));
-        assert!(p.allows(ip("2001:db8::1")));
-        assert!(!p.allows(ip("203.0.114.1")));
-        assert!(!p.allows(ip("2001:db8::2")));
-    }
-
-    #[test]
-    fn mixed_tokens_combine() {
-        let p = AnonPolicy::allowlist_from_tokens(["loopback", "203.0.113.0/24"]).unwrap();
-        assert!(p.allows(ip("127.0.0.1")));
-        assert!(p.allows(ip("203.0.113.7")));
-        assert!(!p.allows(ip("10.0.0.1")));
-    }
-
-    #[test]
-    fn invalid_token_errors() {
-        let err = AnonPolicy::allowlist_from_tokens(["nope"]).unwrap_err();
-        assert_eq!(err.entry, "nope");
+        let trusted = vec![canonical_net("::ffff:172.17.0.1/128".parse().unwrap())];
+        assert!(is_trusted_peer(ip("172.17.0.1"), &trusted));
+        assert!(is_trusted_peer(ip("::ffff:172.17.0.1"), &trusted));
+        assert!(!is_trusted_peer(ip("172.17.0.2"), &trusted));
     }
 }

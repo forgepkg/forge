@@ -22,7 +22,6 @@ import {
   Panel,
   SelectField,
   Skeleton,
-  TextareaField,
   TextField,
 } from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
@@ -38,9 +37,8 @@ const DESCRIPTION =
  * Settings screen (`/admin/settings/auth`): the sign-in and anonymous-access
  * policy, which every instance applies without a restart.
  *
- *  - **Anonymous access**: the mode and its IP allowlist; the side column
- *    lists the repositories that allow anonymous reads (the other half of
- *    the switch).
+ *  - **Anonymous access**: the mode; the side column lists the
+ *    repositories that allow anonymous reads (the other half of the switch).
  *  - **Sign-in**: the login screen's mode, password Basic on the feeds, the
  *    session lifetimes and the password lockout.
  *
@@ -125,30 +123,17 @@ function SaveButton({ pending, children }: { pending: boolean; children: string 
 
 const MODE_HINTS: Record<AnonymousMode, string> = {
   off: 'Every request needs credentials.',
-  allowlist:
-    'Clients whose address is in the allowlist read without credentials; everyone else signs in.',
   all: 'Everyone reads without credentials; signed-in users also read what anonymous callers may.',
 }
 
-/** The anonymous-access mode and its IP allowlist. */
+/** The anonymous-access mode. */
 function AnonymousAccessForm({ settings }: { settings: AuthSettings }) {
   const update = useUpdateAuthSettings()
   const [mode, setMode] = useState<AnonymousMode>(settings.anonymous_mode)
-  const [allowlist, setAllowlist] = useState(settings.anonymous_ip_allowlist.join('\n'))
-  const [error, setError] = useState<string | null>(null)
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault()
-    const entries = allowlist
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line !== '')
-    if (mode === 'allowlist' && entries.length === 0) {
-      setError('List at least one address or network for the allowlist.')
-      return
-    }
-    setError(null)
-    update.mutate({ anonymous_mode: mode, anonymous_ip_allowlist: entries })
+    update.mutate({ anonymous_mode: mode })
   }
 
   const serverError = update.isError ? update.error.body || update.error.message : null
@@ -162,7 +147,13 @@ function AnonymousAccessForm({ settings }: { settings: AuthSettings }) {
           A repository is read without credentials only when both this mode
           and the repository allow it: the repository&apos;s{' '}
           <strong>Allow anonymous read</strong>, or a grant of the{' '}
-          <Code>anonymous</Code> role. Writing always needs a grant.
+          <Code>anonymous</Code> role. Writing always needs a grant. To let
+          a network in without credentials, have the load balancer name a
+          service account through a trusted-header realm (
+          <Link to="/manage/realms" className="fg-link">
+            Authentication
+          </Link>
+          ).
         </>
       }
       footer={<SaveButton pending={update.isPending}>Save anonymous access</SaveButton>}
@@ -171,42 +162,12 @@ function AnonymousAccessForm({ settings }: { settings: AuthSettings }) {
         <SelectField
           label="Mode"
           value={mode}
-          onChange={(e) => {
-            setMode(e.target.value as AnonymousMode)
-            setError(null)
-          }}
+          onChange={(e) => setMode(e.target.value as AnonymousMode)}
           description={MODE_HINTS[mode]}
         >
           <option value="off">Off</option>
-          <option value="allowlist">IP allowlist</option>
           <option value="all">Everyone</option>
         </SelectField>
-        <TextareaField
-          label="IP allowlist"
-          mono
-          rows={4}
-          disabled={mode !== 'allowlist'}
-          value={allowlist}
-          onChange={(e) => {
-            setAllowlist(e.target.value)
-            setError(null)
-          }}
-          placeholder={'loopback\nprivate\n10.20.0.0/16'}
-          error={fieldError(error)}
-          description={
-            <>
-              One entry per line: <Code>loopback</Code>, <Code>private</Code>{' '}
-              (RFC 1918, link-local and ULA networks), <Code>local</Code> (both),
-              a network (<Code>10.20.0.0/16</Code>) or an address. Behind a
-              reverse proxy a client&apos;s address is known only when the
-              proxy is listed in <Code>auth.trusted_proxy_cidrs</Code>, and a
-              request must name the server by its own host (
-              <Code>server.public_base_url</Code> or{' '}
-              <Code>server.allowed_hosts</Code>); both stay in the
-              configuration file.
-            </>
-          }
-        />
       </div>
       <SaveOutcome saved={update.isSuccess} error={serverError} />
     </Panel>
@@ -223,7 +184,7 @@ function AnonymousRepositories() {
   return (
     <Panel
       title="Repositories allowing anonymous reads"
-      description="Read without credentials when the anonymous access mode also allows the client."
+      description="Read without credentials when the anonymous access mode also allows it."
     >
       {repos.isError ? (
         <Notice tone="danger">Could not load the repositories.</Notice>

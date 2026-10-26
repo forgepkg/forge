@@ -3,8 +3,7 @@
 //! * [`principal`] — the [`Principal`] enum and its `User` payload.
 //! * [`token`] — credential verification (API tokens, passwords) and the
 //!   [`PrincipalSource`] chain that turns request headers into a principal.
-//! * [`client_ip`] — client-IP resolution behind trusted proxies and the
-//!   anonymous-access policy ([`AnonPolicy`]).
+//! * [`client_ip`] — client-IP resolution behind trusted proxies.
 //! * [`authz`] — the authorization seam: the [`Authz`] service whose
 //!   `can_read` / `can_write` / `can_delete` / `is_global_admin` methods are
 //!   the single decision point every gate routes through.
@@ -42,10 +41,7 @@ pub use chain::{
     map_identity_to_principal, provision_and_map, Chain, ChainOutcome, ChainSource,
     ChainUnavailable, StaticChainSource,
 };
-pub use client_ip::{
-    forwarded_for, is_trusted_peer, resolve_client, resolve_client_ip, AllowlistParseError,
-    AnonPolicy, ResolvedClient,
-};
+pub use client_ip::{forwarded_for, is_trusted_peer, resolve_client_ip};
 pub use cred_cache::{
     cred_key, revoke_credentials_for_user, CredCacheError, CredKeyPepper, ForwardLimits,
     UpstreamVerdict, ValidatedCredentialCache, DEFAULT_FORWARD_TIMEOUT,
@@ -67,8 +63,8 @@ pub use session_source::{
 pub use token::{
     check_token, generate_token_secret, hash_token, resolve_principal,
     resolve_principal_with_fallback, resolve_principal_with_origin, verify_password, verify_token,
-    AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal, SourceOutcome, TokenCheck,
-    TokenHeaderSource,
+    AnonPolicy, AuthError, BasicAuthSource, PrincipalSource, ResolvedPrincipal, SourceOutcome,
+    TokenCheck, TokenHeaderSource,
 };
 pub use upstream_basic::{UpstreamBasicConfig, UpstreamBasicProvider, UPSTREAM_BASIC_ID};
 pub use workload_key::{

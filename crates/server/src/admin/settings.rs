@@ -7,9 +7,8 @@
 //!
 //! `GET /admin/settings/auth` answers the sign-in and anonymous-access policy
 //! ([`AuthSettings`]); `PUT` changes it, for every instance: the fields a body
-//! names, the others keep their value. A value out of range, a mode that does
-//! not exist or an allowlist entry that does not parse is refused with 400 and
-//! what is wrong. This instance applies a change at once; the others within
+//! names, the others keep their value. A value out of range or a mode that
+//! does not exist is refused with 400 and what is wrong. This instance applies a change at once; the others within
 //! `auth.realm_cache_ttl_seconds` ([`crate::auth::AuthSettingsCache`]).
 //!
 //! Both read the stored row rather than this instance's copy, so a change

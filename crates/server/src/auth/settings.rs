@@ -1,8 +1,8 @@
 //! Sign-in and anonymous-access policy, set at runtime (#294).
 //!
-//! The anonymous mode and its IP allowlist, the login screen's mode, password
-//! Basic authentication, the session lifetimes and the password lockout are
-//! policy an administrator changes while Forge runs, and every instance must
+//! The anonymous mode, the login screen's mode, password Basic
+//! authentication, the session lifetimes and the password lockout are policy
+//! an administrator changes while Forge runs, and every instance must
 //! apply the same values. They are kept in `forge_setting` under
 //! [`AUTH_SETTINGS_KEY`] as one JSON document ([`AuthSettings`]), changed
 //! through `GET`/`PUT /admin/settings/auth` (the web UI's **Admin →
@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use forge_core::auth::authz::Authz;
-use forge_core::auth::client_ip::AnonPolicy;
+use forge_core::auth::AnonPolicy;
 use forge_core::auth::LoginThrottle;
 use forge_core::session::SessionService;
 use forge_db::authz_dao;
@@ -48,16 +48,18 @@ pub const MAX_LOGIN_FAILURE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 
 /// Who is served anonymously (without credentials). A repository is read
 /// anonymously only when it allows anonymous reads too.
+///
+/// A stored mode this version does not know (the removed `allowlist`, or one
+/// a later version added) reads as [`AnonymousMode::Off`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnonymousMode {
-    /// Nobody: every request needs credentials.
-    #[default]
-    Off,
-    /// Clients whose address is in [`AuthSettings::anonymous_ip_allowlist`].
-    Allowlist,
     /// Everyone. Signed-in callers then also read what anonymous ones may.
     All,
+    /// Nobody: every request needs credentials.
+    #[default]
+    #[serde(other)]
+    Off,
 }
 
 impl std::str::FromStr for AnonymousMode {
@@ -66,11 +68,8 @@ impl std::str::FromStr for AnonymousMode {
     fn from_str(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" => Ok(AnonymousMode::Off),
-            "allowlist" => Ok(AnonymousMode::Allowlist),
             "all" => Ok(AnonymousMode::All),
-            _ => Err(format!(
-                "unknown anonymous_mode {s:?} (expected off|allowlist|all)"
-            )),
+            _ => Err(format!("unknown anonymous_mode {s:?} (expected off|all)")),
         }
     }
 }
@@ -121,12 +120,6 @@ impl std::str::FromStr for LoginMode {
 pub struct AuthSettings {
     /// Who is served anonymously.
     pub anonymous_mode: AnonymousMode,
-    /// The addresses served anonymously under [`AnonymousMode::Allowlist`]:
-    /// `loopback`, `private`, `local`, CIDRs and single addresses. Behind a
-    /// reverse proxy a client's address is only known when the proxy is in
-    /// `auth.trusted_proxy_cidrs`, and the request must name one of the
-    /// server's own hosts (`server.public_base_url`, `server.allowed_hosts`).
-    pub anonymous_ip_allowlist: Vec<String>,
     /// What the login screen asks for first.
     pub login_mode: LoginMode,
     /// Accept a user's password over HTTP Basic on the feeds (an API token
@@ -150,7 +143,6 @@ impl Default for AuthSettings {
     fn default() -> Self {
         AuthSettings {
             anonymous_mode: AnonymousMode::Off,
-            anonymous_ip_allowlist: Vec::new(),
             login_mode: LoginMode::IdentifierFirst,
             allow_password_basic: false,
             session_idle_ttl_seconds: 8 * 60 * 60,
@@ -185,13 +177,8 @@ impl AuthSettings {
                  {MAX_LOGIN_FAILURE_WINDOW_SECONDS} (a day), got {window}"
             ));
         }
-        // The allowlist is checked whatever the mode, so switching to
-        // `allowlist` later never meets a list that does not parse.
-        let allowlist = AnonPolicy::allowlist_from_tokens(&self.anonymous_ip_allowlist)
-            .map_err(|e| format!("anonymous_ip_allowlist: {e}"))?;
         Ok(match self.anonymous_mode {
             AnonymousMode::Off => AnonPolicy::Off,
-            AnonymousMode::Allowlist => allowlist,
             AnonymousMode::All => AnonPolicy::All,
         })
     }
@@ -207,10 +194,6 @@ impl AuthSettings {
         diff(
             "anonymous_mode",
             self.anonymous_mode != other.anonymous_mode,
-        );
-        diff(
-            "anonymous_ip_allowlist",
-            self.anonymous_ip_allowlist != other.anonymous_ip_allowlist,
         );
         diff("login_mode", self.login_mode != other.login_mode);
         diff(
@@ -244,7 +227,6 @@ impl AuthSettings {
 #[serde(deny_unknown_fields)]
 pub struct AuthSettingsUpdate {
     pub anonymous_mode: Option<String>,
-    pub anonymous_ip_allowlist: Option<Vec<String>>,
     pub login_mode: Option<String>,
     pub allow_password_basic: Option<bool>,
     pub session_idle_ttl_seconds: Option<u64>,
@@ -259,13 +241,6 @@ impl AuthSettingsUpdate {
         let mut next = current.clone();
         if let Some(mode) = self.anonymous_mode {
             next.anonymous_mode = mode.parse()?;
-        }
-        if let Some(allowlist) = self.anonymous_ip_allowlist {
-            next.anonymous_ip_allowlist = allowlist
-                .iter()
-                .map(|entry| entry.trim().to_string())
-                .filter(|entry| !entry.is_empty())
-                .collect();
         }
         if let Some(mode) = self.login_mode {
             next.login_mode = mode.parse()?;
@@ -311,7 +286,7 @@ pub async fn load(pool: &PgPool) -> anyhow::Result<AuthSettings> {
 pub struct CurrentAuthSettings {
     /// The settings.
     pub settings: AuthSettings,
-    /// [`AuthSettings::anonymous_mode`] with its allowlist, parsed.
+    /// [`AuthSettings::anonymous_mode`] as the policy the middleware applies.
     pub anon: AnonPolicy,
     /// When the copy was read (or written) here.
     read_at: Instant,
@@ -529,23 +504,40 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_mode_this_version_does_not_know_reads_as_off() {
+        // A row an earlier version saved under the removed `allowlist` mode
+        // still loads, with its other settings, and serves nobody anonymously.
+        let stored: AuthSettings = serde_json::from_str(
+            r#"{"anonymous_mode":"allowlist","anonymous_ip_allowlist":["10.0.0.0/8"],"allow_password_basic":true}"#,
+        )
+        .unwrap();
+        assert_eq!(stored.anonymous_mode, AnonymousMode::Off);
+        assert!(stored.allow_password_basic);
+        assert_eq!(stored.validate().unwrap(), AnonPolicy::Off);
+        let off: AuthSettings = serde_json::from_str(r#"{"anonymous_mode":"off"}"#).unwrap();
+        assert_eq!(off.anonymous_mode, AnonymousMode::Off);
+        assert_eq!(
+            serde_json::to_value(AuthSettings::default()).unwrap()["anonymous_mode"],
+            "off"
+        );
+    }
+
+    #[test]
     fn an_update_keeps_what_it_leaves_out() {
         let current = AuthSettings {
             allow_password_basic: true,
             ..AuthSettings::default()
         };
         let update: AuthSettingsUpdate = serde_json::from_value(serde_json::json!({
-            "anonymous_mode": "Allowlist",
-            "anonymous_ip_allowlist": [" loopback ", "", "10.0.0.0/8"],
+            "anonymous_mode": " All",
             "login_mode": "combined",
         }))
         .unwrap();
         let next = update.apply_to(&current).unwrap();
-        assert_eq!(next.anonymous_mode, AnonymousMode::Allowlist);
-        assert_eq!(next.anonymous_ip_allowlist, ["loopback", "10.0.0.0/8"]);
+        assert_eq!(next.anonymous_mode, AnonymousMode::All);
         assert_eq!(next.login_mode, LoginMode::Combined);
         assert!(next.allow_password_basic, "left out, kept");
-        assert!(matches!(next.validate().unwrap(), AnonPolicy::Allowlist(nets) if nets.len() == 3));
+        assert_eq!(next.validate().unwrap(), AnonPolicy::All);
     }
 
     #[test]
@@ -557,16 +549,12 @@ mod tests {
                 .unwrap_err()
         };
         assert_eq!(
-            refused(serde_json::json!({"anonymous_mode": "sometimes"})),
-            "unknown anonymous_mode \"sometimes\" (expected off|allowlist|all)"
+            refused(serde_json::json!({"anonymous_mode": "allowlist"})),
+            "unknown anonymous_mode \"allowlist\" (expected off|all)"
         );
         assert_eq!(
             refused(serde_json::json!({"login_mode": "both"})),
             "unknown login_mode \"both\" (expected identifier_first|combined)"
-        );
-        assert_eq!(
-            refused(serde_json::json!({"anonymous_ip_allowlist": ["10.0.0.0/33"]})),
-            "anonymous_ip_allowlist: invalid allowlist entry \"10.0.0.0/33\""
         );
         assert!(refused(serde_json::json!({"session_idle_ttl_seconds": 0}))
             .starts_with("session_idle_ttl_seconds must be between 1 and"));
@@ -579,9 +567,11 @@ mod tests {
                 .starts_with("login_failure_window_seconds must be between 1 and")
         );
         // An unknown field is refused, not dropped.
-        assert!(serde_json::from_value::<AuthSettingsUpdate>(
-            serde_json::json!({"anonymous": "all"})
-        )
-        .is_err());
+        for body in [
+            serde_json::json!({"anonymous": "all"}),
+            serde_json::json!({"anonymous_ip_allowlist": ["10.0.0.0/8"]}),
+        ] {
+            assert!(serde_json::from_value::<AuthSettingsUpdate>(body).is_err());
+        }
     }
 }

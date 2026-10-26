@@ -1,16 +1,10 @@
-//! E2E: authentication / authorization — anonymous modes (off / allowlist /
-//! all), allowed vs denied client IP, admin gating + bootstrap, and the
-//! scheme-only outbound guard on a proxy upstream URL. Gated behind
-//! `forge-e2e`.
+//! E2E: authentication / authorization — anonymous modes (off / all), admin
+//! gating + bootstrap, and the scheme-only outbound guard on a proxy upstream
+//! URL. Gated behind `forge-e2e`.
 
 #![cfg(feature = "forge-e2e")]
 
 use forge_e2e::{start_stack, AnonMode, StackBuilder};
-
-/// An IP not in the allowlist (used to prove denial).
-const DENIED_IP: &str = "198.51.100.7";
-/// An IP inside the configured allowlist CIDR.
-const ALLOWED_IP: &str = "203.0.113.7";
 
 /// `anonymous_mode = off`: every read of a (even anonymous_read) repo without
 /// credentials is 401; with credentials it succeeds.
@@ -75,96 +69,6 @@ async fn anon_mode_all_allows_anonymous_read_repos() {
         401,
         "non-anonymous_read repo still requires auth even with mode=all"
     );
-}
-
-/// `anonymous_mode = allowlist`: an anonymous read of an `anonymous_read` repo
-/// is permitted from an allowed IP and denied from any other IP. The client IP
-/// is taken from `X-Forwarded-For` because the harness trusts loopback.
-#[tokio::test]
-async fn anon_mode_allowlist_gates_by_ip() {
-    let srv = StackBuilder::default()
-        .anon(AnonMode::Allowlist(vec!["203.0.113.0/24".into()]))
-        .start()
-        .await;
-    let client = srv.client();
-
-    srv.create_repo(
-        serde_json::json!({"name": "al-repo", "kind": "hosted", "anonymous_read": true}),
-    )
-    .await;
-    srv.grant_anonymous_read("al-repo").await;
-
-    // Allowed IP → 200.
-    let resp = client
-        .get(format!("{}/repository/al-repo/index.json", srv.base_url))
-        .header("X-Forwarded-For", ALLOWED_IP)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "anon read from allowlisted IP");
-
-    // Denied IP → 401.
-    let resp = client
-        .get(format!("{}/repository/al-repo/index.json", srv.base_url))
-        .header("X-Forwarded-For", DENIED_IP)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        401,
-        "anon read from non-allowlisted IP denied"
-    );
-}
-
-/// A malformed `X-Forwarded-For` never makes a client look like the trusted
-/// proxy. The harness's peer (loopback) is a trusted proxy and is itself on
-/// the allowlist, as an nginx in a private network on an allowlist of
-/// `[private]` is. nginx appends the real client to the line the client sent,
-/// so an unreadable byte in the client's part must not hide it, and a hop the
-/// walk cannot read must not fall back to the proxy's address.
-#[tokio::test]
-async fn malformed_forwarded_for_is_never_allowlisted_as_the_proxy() {
-    let srv = StackBuilder::default()
-        .anon(AnonMode::Allowlist(vec!["loopback".into()]))
-        .start()
-        .await;
-    let client = srv.client();
-    srv.create_repo(
-        serde_json::json!({"name": "xff-repo", "kind": "hosted", "anonymous_read": true}),
-    )
-    .await;
-    srv.grant_anonymous_read("xff-repo").await;
-    let url = format!("{}/repository/xff-repo/index.json", srv.base_url);
-
-    // The proxy host itself (no forwarded hop) is allowlisted.
-    let resp = client.get(&url).send().await.unwrap();
-    assert_eq!(
-        resp.status(),
-        200,
-        "request from the allowlisted proxy itself"
-    );
-
-    let denied = DENIED_IP.as_bytes();
-    for (value, why) in [
-        (
-            [&b"\xff, "[..], denied].concat(),
-            "nginx: unreadable client part",
-        ),
-        ([denied, &b", \xff"[..]].concat(), "unreadable hop reached"),
-        ([denied, &b", "[..]].concat(), "empty hop reached"),
-    ] {
-        let resp = client
-            .get(&url)
-            .header(
-                "X-Forwarded-For",
-                reqwest::header::HeaderValue::from_bytes(&value).unwrap(),
-            )
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401, "{why}: {value:?}");
-    }
 }
 
 /// The admin API requires an admin principal; the bootstrap admin works, and a

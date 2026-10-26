@@ -100,11 +100,7 @@ impl Authz {
 
     /// Give authenticated principals the public read reach as well. The server
     /// enables this only for anonymous mode `all`, where anyone may read
-    /// those repositories anyway. Under `off` the reach is inert for everyone,
-    /// and under `allowlist` it depends on the caller's address and `Host`,
-    /// which authorization does not see — granting it there would let a
-    /// signed-in user (or their token, or a workload) read from anywhere what
-    /// only allowlisted networks may read anonymously.
+    /// those repositories anyway. Under `off` the reach is inert for everyone.
     pub fn with_public_read_for_signed_in(self, enabled: bool) -> Self {
         self.set_public_read_for_signed_in(enabled);
         self

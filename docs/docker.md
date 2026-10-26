@@ -36,8 +36,9 @@ repository in the image name:
   (`"host": "docker.example.com"`) also answers at the root of that host, so
   its images keep short names: `docker.example.com/team/app:1.2`. Point the
   host name at Forge, include it in the TLS certificate, keep `Host` intact
-  in the reverse proxy, and add it to `server.allowed_hosts` if you use the
-  anonymous mode `allowlist` (Admin → Settings).
+  in the reverse proxy, and add it to `server.allowed_hosts` if a
+  [trusted-header realm](deployment.md#trusted-header-realms) names its
+  clients.
 
 A docker repository's name is part of every image name, so it follows the
 spec's name grammar: lowercase letters and digits, separated by `.`, `_`,

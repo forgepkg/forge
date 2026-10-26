@@ -41,8 +41,8 @@ to secretEnv (FORGE_{{ . | upper | replace "." "__" }}) or existingSecret.
 
 WARNING: Forge believes X-Forwarded-For from every peer in
 auth.trusted_proxy_cidrs, but no NetworkPolicy restricts who reaches it: any
-pod in those ranges can claim any client address, past the login lockout and
-the anonymous-IP allowlist. List the pods that proxy to Forge (your gateway's
+pod in those ranges can claim any client address, past the login lockout.
+List the pods that proxy to Forge (your gateway's
 data plane or ingress controller) in networkPolicy.from.
 {{- end }}
 {{- if and (gt (int .Values.replicaCount) 1) (not .Values.valkey.enabled) }}

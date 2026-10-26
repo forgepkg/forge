@@ -269,7 +269,7 @@ no quoting, and configuration errors never print their values.
 | `FORGE_S3__FORCE_PATH_STYLE` | `true` for MinIO and most self-hosted stores, `false` for AWS. |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` / `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | First start only: the initial admin, named by a [UPN](#usernames) (default `admin@example.com`), and its password. Without the password no bootstrap admin is created. |
 | `FORGE_CRYPTO__ROOT__PROVIDER` + root key | **Required**: the root key of the [secret encryption](#secret-encryption-at-rest), e.g. `FORGE_CRYPTO__ROOT__PROVIDER=env` with `FORGE_ROOT_KEY=<openssl rand -base64 32>`. |
-| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and an anonymous-IP allowlist that contains the proxy's address admits every client. A request whose `X-Forwarded-For` is malformed where the walk reaches it is never allowlisted. Every address in these ranges chooses the client IP Forge sees: a whole pod network trusts every pod in the cluster, which can then get around the login lockout and the anonymous allowlist. Keep the ranges as narrow as the proxies allow, and let only the proxies reach Forge (see [Reverse proxy](#reverse-proxy): on Kubernetes the Helm chart's `networkPolicy.from`, the kustomize `network-policy` component). |
+| `FORGE_AUTH__TRUSTED_PROXY_CIDRS` | The CIDRs of your reverse proxies, e.g. `[10.0.0.0/8]`. Without it, every request appears to come from the proxy's IP, so the login lockout sees one client, and the headers of a [trusted-header realm](#trusted-header-realms) are ignored. Every address in these ranges chooses the client IP Forge sees: a whole pod network trusts every pod in the cluster, which can then get around the login lockout. Keep the ranges as narrow as the proxies allow, and let only the proxies reach Forge (see [Reverse proxy](#reverse-proxy): on Kubernetes the Helm chart's `networkPolicy.from`, the kustomize `network-policy` component). |
 
 Startup refuses the known placeholder credentials (a `changeme` bootstrap
 password, `minioadmin` S3 keys, and a secret still holding a `<…>` placeholder
@@ -530,8 +530,7 @@ wrong.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `anonymous_mode` | `off` | `off`, `allowlist` or `all`: who is served without credentials. A repository is read anonymously only when it also allows it (**Allow anonymous read**, or a grant of the `anonymous` role). Under `all`, signed-in users also read what anonymous callers may. |
-| `anonymous_ip_allowlist` | `[]` | Under `allowlist`: `loopback`, `private`, `local`, networks and addresses. It depends on `auth.trusted_proxy_cidrs` and `server.allowed_hosts`, which stay in the configuration file. |
+| `anonymous_mode` | `off` | `off` or `all`: who is served without credentials. A repository is read anonymously only when it also allows it (**Allow anonymous read**, or a grant of the `anonymous` role). Under `all`, signed-in users also read what anonymous callers may. To let a network read without credentials, have the load balancer name a service account through a [trusted-header realm](#trusted-header-realms). |
 | `login_mode` | `identifier_first` | The login screen: the username first (then a password prompt or the identity provider whose login domains match), or `combined` (username and password, plus the OIDC button). |
 | `allow_password_basic` | `false` | Accept a user's password over HTTP Basic on the feeds (see below). |
 | `session_idle_ttl_seconds` | `28800` (8 h) | A browser session ends this long after its last use. |
@@ -825,11 +824,11 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
 - Let only the proxy reach Forge. Forge believes the `X-Forwarded-For` of
   every peer in `trusted_proxy_cidrs`, and the headers of a
   [trusted-header realm](#trusted-header-realms), so anything else that can
-  connect from those ranges can pick the client address the login lockout and
-  the anonymous-IP allowlist see. On Kubernetes the range is usually the whole
-  pod network: admit only the ingress controller or gateway with a
-  NetworkPolicy (the Helm chart's `networkPolicy.from`, the kustomize
-  `network-policy` component; the CNI must enforce it).
+  connect from those ranges can pick the client address the login lockout
+  sees. On Kubernetes the range is usually the whole pod network: admit only
+  the ingress controller or gateway with a NetworkPolicy (the Helm chart's
+  `networkPolicy.from`, the kustomize `network-policy` component; the CNI
+  must enforce it).
 - Allow large request bodies for `PUT /repository/{repo}/package` (package pushes),
   for image pushes under `/v2`, where docker sends a whole layer in one
   request, and for file uploads under `/repository` (and the web UI's
@@ -854,12 +853,6 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   `Vary: Authorization, Cookie, X-NuGet-ApiKey` and registry responses
   `Vary: Authorization, Cookie, Accept`: keep a caching proxy from
   overriding either.
-- With the anonymous mode `allowlist`, do not let a shared cache store
-  `/repository` responses at all. Anonymous feed responses carry no `Cache-Control`, and
-  whether Forge serves one depends on the client's address, which the cache
-  does not key on: a cache that stores responses without caching headers
-  (Varnish's default does) would serve what an allowlisted client fetched to
-  a client outside the allowlist.
 - Forge bounds slow clients itself (`server.header_read_timeout_seconds`,
   `body_idle_timeout_seconds`, `request_timeout_seconds`); keep the proxy's
   own timeouts at least as long for package pushes. A proxy repository's
