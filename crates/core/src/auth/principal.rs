@@ -1,6 +1,7 @@
 //! The authenticated (or not) caller of a request.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 /// Identity established for an authenticated user.
 ///
@@ -35,7 +36,7 @@ pub enum AuthMethod {
 }
 
 /// Who is making a request, after credential resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Principal {
     /// No credentials and anonymous access is not permitted.
     Unauthenticated,
@@ -91,7 +92,18 @@ pub enum Principal {
         /// expiry, or the CI token's `exp`. Nothing derived from it (a
         /// registry token) may outlive it.
         expires_at: i64,
+        /// Trusted publishers that matched the verified token. Each digest
+        /// binds the grant to the definition that was current at authentication.
+        /// A shared slice keeps the principal small and cheap to clone.
+        matched_publishers: Arc<[TrustedPublisherMatch]>,
     },
+}
+
+/// Snapshot reference to a trusted-publisher definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrustedPublisherMatch {
+    pub id: i64,
+    pub definition_sha256: [u8; 32],
 }
 
 impl Principal {
@@ -179,6 +191,7 @@ mod tests {
             issued_at: 0,
             key_id: None,
             expires_at: 0,
+            matched_publishers: Arc::from([]),
         };
         assert_eq!(workload.audit_label(), "workload realm:3 role:7");
     }

@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use forge_cache::Cache;
 use forge_core::auth::token::{PrincipalSource, SourceOutcome};
-use forge_core::auth::Principal;
 use forge_core::auth::{is_workload_key, WORKLOAD_USERNAME};
+use forge_core::auth::{Principal, TrustedPublisherMatch};
 use forge_core::net::ssrf;
 use forge_core::oidc::{IdTokenClaims, OidcError, OidcMetadataClient, Verified};
 use forge_db::authz_dao;
@@ -190,6 +190,64 @@ pub struct ClaimCondition {
     /// Accepted values; the claim matches when any equals one of these.
     #[serde(default)]
     pub any_of: Vec<String>,
+}
+
+/// Validate claim conditions with the same rules and error messages as a realm
+/// rule, including issuer-specific stable identity requirements.
+pub fn validate_trusted_publisher_conditions(
+    issuer: &str,
+    identity_claims: &[String],
+    conditions: Vec<ClaimCondition>,
+) -> Result<Vec<ClaimCondition>, String> {
+    let cfg = serde_json::json!({
+        "issuer": issuer,
+        "allowed_audiences": ["trusted-publisher-validation"],
+        "allow_http_issuer": issuer.starts_with("http://"),
+        "identity_claims": identity_claims,
+        "rules": [{
+            "role": "trusted-publisher-validation",
+            "conditions": conditions,
+        }],
+    });
+    let normalized = validate_workload_identity_config(&cfg)?;
+    let parsed: WorkloadIdentityRealmConfig =
+        serde_json::from_value(normalized).map_err(|e| format!("invalid config: {e}"))?;
+    let normalized = parsed
+        .rules
+        .into_iter()
+        .next()
+        .expect("one rule")
+        .conditions;
+    if normalize_issuer(issuer) == GITLAB_COM_ISSUER
+        && !(normalized
+            .iter()
+            .any(|condition| condition.claim == "job_project_id")
+            && normalized
+                .iter()
+                .any(|condition| condition.claim == "job_namespace_id"))
+    {
+        return Err(
+            "GitLab.com trusted publishers must include job_project_id and job_namespace_id".into(),
+        );
+    }
+    Ok(normalized)
+}
+
+/// Whether a trusted publisher's validated conditions match these claims.
+pub fn trusted_publisher_conditions_match(
+    claims: &IdTokenClaims,
+    issuer: &str,
+    identity_claims: &[String],
+    conditions: &[ClaimCondition],
+) -> bool {
+    rule_matches(
+        claims,
+        &ClaimRule {
+            role: "trusted-publisher".into(),
+            conditions: conditions.to_vec(),
+        },
+        identity_claims,
+    ) && normalize_issuer(&claims.iss) == normalize_issuer(issuer)
 }
 
 /// Validate + normalize a `workload_identity` realm `config` document.
@@ -658,6 +716,36 @@ impl WorkloadIdentitySource {
                     role = %role_name,
                     "WIF workload authenticated"
                 );
+                let publishers = match forge_db::trusted_publisher_dao::list_for_realm(
+                    &self.pool,
+                    realm.realm_id,
+                )
+                .await
+                {
+                    Ok(publishers) => publishers,
+                    Err(error) => {
+                        tracing::error!(error = %error, realm_id = realm.realm_id, "trusted publisher lookup failed");
+                        return Err(SourceOutcome::Unavailable);
+                    }
+                };
+                let matched_publishers = publishers
+                    .into_iter()
+                    .filter_map(|publisher| {
+                        let conditions =
+                            serde_json::from_value::<Vec<ClaimCondition>>(publisher.conditions)
+                                .ok()?;
+                        trusted_publisher_conditions_match(
+                            &verified.claims,
+                            &realm.config.issuer,
+                            &realm.config.identity_claims,
+                            &conditions,
+                        )
+                        .then_some(TrustedPublisherMatch {
+                            id: publisher.id,
+                            definition_sha256: publisher.definition_sha256,
+                        })
+                    })
+                    .collect();
                 Ok(VerifiedWorkload {
                     principal: Principal::Workload {
                         realm_id: realm.realm_id,
@@ -669,6 +757,7 @@ impl WorkloadIdentitySource {
                         issued_at: verified.claims.iat.expect("workload verifier requires iat"),
                         key_id: None,
                         expires_at: verified.claims.exp.expect("workload verifier requires exp"),
+                        matched_publishers,
                     },
                     jti: verified.claims.jti.clone(),
                     api_key_ttl_seconds: realm.config.api_key_ttl_seconds(),
@@ -741,6 +830,14 @@ impl WorkloadIdentitySource {
             key_id = row.id,
             "workload API key authenticated"
         );
+        let matched_publishers = row
+            .matched_publishers
+            .into_iter()
+            .map(|matched| TrustedPublisherMatch {
+                id: matched.id,
+                definition_sha256: matched.definition_sha256,
+            })
+            .collect();
         SourceOutcome::Authenticated(Principal::Workload {
             realm_id: row.realm_id,
             role_id: row.role_id,
@@ -751,6 +848,7 @@ impl WorkloadIdentitySource {
             issued_at: row.token_issued_at.timestamp(),
             key_id: Some(row.id),
             expires_at: row.expires_at.timestamp(),
+            matched_publishers,
         })
     }
 
@@ -1351,6 +1449,101 @@ mod tests {
             },
         ];
         assert_eq!(matched_role(&claims, &rules, &[]), Some("publisher"));
+    }
+
+    #[test]
+    fn trusted_publishers_require_stable_issuer_identity_claims() {
+        let github = vec![
+            ClaimCondition {
+                claim: "repository_id".into(),
+                any_of: vec!["123".into()],
+            },
+            ClaimCondition {
+                claim: "repository_owner_id".into(),
+                any_of: vec!["456".into()],
+            },
+        ];
+        assert!(
+            validate_trusted_publisher_conditions(GITHUB_ACTIONS_ISSUER, &[], github.clone(),)
+                .is_ok()
+        );
+        assert!(validate_trusted_publisher_conditions(
+            GITHUB_ACTIONS_ISSUER,
+            &[],
+            github[..1].to_vec(),
+        )
+        .is_err());
+
+        let gitlab = vec![
+            ClaimCondition {
+                claim: "job_project_id".into(),
+                any_of: vec!["1001".into()],
+            },
+            ClaimCondition {
+                claim: "job_namespace_id".into(),
+                any_of: vec!["2001".into()],
+            },
+        ];
+        assert!(validate_trusted_publisher_conditions(GITLAB_COM_ISSUER, &[], gitlab,).is_ok());
+        assert!(validate_trusted_publisher_conditions(
+            GITLAB_COM_ISSUER,
+            &[],
+            vec![
+                ClaimCondition {
+                    claim: "project_id".into(),
+                    any_of: vec!["1001".into()],
+                },
+                ClaimCondition {
+                    claim: "namespace_id".into(),
+                    any_of: vec!["2001".into()],
+                },
+            ],
+        )
+        .is_err());
+        assert!(validate_trusted_publisher_conditions(
+            "https://issuer.example",
+            &[],
+            vec![ClaimCondition {
+                claim: "environment".into(),
+                any_of: vec!["release".into()],
+            }],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn trusted_publisher_conditions_are_and_combined_and_issuer_bound() {
+        let mut additional = Map::new();
+        additional.insert("job_project_id".into(), json!("1001"));
+        additional.insert("job_namespace_id".into(), json!("2001"));
+        additional.insert("environment".into(), json!("release"));
+        let claims = claims_with(additional);
+        let conditions = vec![
+            ClaimCondition {
+                claim: "job_project_id".into(),
+                any_of: vec!["1001".into()],
+            },
+            ClaimCondition {
+                claim: "job_namespace_id".into(),
+                any_of: vec!["2001".into()],
+            },
+            ClaimCondition {
+                claim: "environment".into(),
+                any_of: vec!["release".into()],
+            },
+        ];
+        assert!(trusted_publisher_conditions_match(
+            &claims,
+            "https://gitlab.example",
+            &[],
+            &conditions,
+        ));
+        assert!(!trusted_publisher_conditions_match(
+            &claims,
+            "https://other.example",
+            &[],
+            &conditions,
+        ));
     }
 
     #[test]

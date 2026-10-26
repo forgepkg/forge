@@ -7,18 +7,22 @@ import {
 import type { ApiError } from '~/lib/httpClient'
 import {
   addMember,
+  createTrustedPublisher,
   createRepository,
+  deleteTrustedPublisher,
   deleteRepository,
   fetchFormats,
   fetchMembers,
   fetchRepositories,
   fetchRepository,
+  fetchTrustedPublishers,
   formatKeys,
   invalidateProxyCache,
   removeMember,
   repoKeys,
   updateMember,
   updateRepository,
+  updateTrustedPublisher,
   type AddMember,
   type CreateRepo,
   type FormatView,
@@ -27,6 +31,8 @@ import {
   type ProxyCacheInvalidated,
   type RepoView,
   type UpdateRepo,
+  type TrustedPublisherBody,
+  type TrustedPublisherView,
 } from '~/api/repositories'
 
 /**
@@ -153,4 +159,46 @@ export function useUpdateMember(name: string) {
       void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
     },
   })
+}
+
+export function useTrustedPublishers(name: string) {
+  return useQuery<TrustedPublisherView[], ApiError>({
+    queryKey: repoKeys.trustedPublishers(name),
+    queryFn: ({ signal }) => fetchTrustedPublishers(name, signal),
+  })
+}
+
+function useTrustedPublisherMutation<TVariables>(
+  name: string,
+  mutationFn: (variables: TVariables) => Promise<unknown>,
+) {
+  const queryClient = useQueryClient()
+  return useMutation<unknown, ApiError, TVariables>({
+    mutationFn,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: repoKeys.trustedPublishers(name),
+      })
+    },
+  })
+}
+
+export function useCreateTrustedPublisher(name: string) {
+  return useTrustedPublisherMutation(name, (body: TrustedPublisherBody) =>
+    createTrustedPublisher(name, body),
+  )
+}
+
+export function useUpdateTrustedPublisher(name: string) {
+  return useTrustedPublisherMutation(
+    name,
+    ({ id, body }: { id: number; body: TrustedPublisherBody }) =>
+      updateTrustedPublisher(name, id, body),
+  )
+}
+
+export function useDeleteTrustedPublisher(name: string) {
+  return useTrustedPublisherMutation(name, (id: number) =>
+    deleteTrustedPublisher(name, id),
+  )
 }

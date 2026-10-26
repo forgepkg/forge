@@ -38,6 +38,7 @@ use axum::http::{HeaderName, HeaderValue};
 use forge_cache::Cache;
 use forge_core::auth::authz::Authz;
 use forge_core::auth::Principal;
+use forge_core::authz::PackageFilter;
 use forge_core::net::upstream::UpstreamHttp;
 use forge_core::repo::PublishPolicy;
 use forge_db::model::Repository;
@@ -84,7 +85,12 @@ impl RegistryConfig {
 /// Builds the request-scoped policy that records a workload's publishes
 /// (the trusted-publishing ledger) in the manifest transaction.
 pub trait PublishRecorder: Send + Sync {
-    fn for_repository(&self, repository: &Repository) -> Arc<dyn PublishPolicy>;
+    fn for_repository(
+        &self,
+        repository: &Repository,
+        role_filter: PackageFilter,
+        role_replace_filter: PackageFilter,
+    ) -> Arc<dyn PublishPolicy>;
 }
 
 /// Whether the workload principal of a registry token still stands. The

@@ -219,18 +219,37 @@ async fn record(
     action: PackageMutation,
     path: &str,
     sha256: &str,
+    requires_delete: bool,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), FileError> {
     if !matches!(files.principal, Principal::Workload { .. }) {
         return Ok(());
     }
     let context = PublishAuthorizationContext {
-        principal: files.principal,
+        principal: files.principal.clone(),
         action,
         package_id: path.to_string(),
         package_version: sha256.to_string(),
+        requires_delete,
     };
-    crate::dispatch::workload_ledger_policy(repo)
+    let role_filter = files
+        .state
+        .authz
+        .role_package_filter_for(
+            &files.principal,
+            repo,
+            match action {
+                PackageMutation::Unlist | PackageMutation::Delete => Level::Delete,
+                PackageMutation::Publish | PackageMutation::Relist => Level::Write,
+            },
+        )
+        .await;
+    let role_replace_filter = files
+        .state
+        .authz
+        .role_package_filter_for(&files.principal, repo, Level::Delete)
+        .await;
+    crate::dispatch::workload_ledger_policy(repo, role_filter, role_replace_filter)
         .record_in_transaction(&context, tx)
         .await
         .map_err(|e| match e {
@@ -334,6 +353,7 @@ async fn record_all(
                 PackageMutation::Publish,
                 &file.path,
                 &stored.sha256,
+                status == "replaced",
                 &mut tx,
             )
             .await?;
@@ -520,6 +540,7 @@ pub async fn remove(
         PackageMutation::Delete,
         path,
         &file.blob_sha256,
+        false,
         &mut tx,
     )
     .await?;

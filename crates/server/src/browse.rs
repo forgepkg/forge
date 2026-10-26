@@ -285,7 +285,7 @@ pub async fn search_packages(
         let Ok(format) = state.formats.for_repository(repo) else {
             continue;
         };
-        let ops = match state.read_ops_for(repo, principal).await {
+        let ops = match state.read_ops_for(repo, principal.clone()).await {
             Ok(o) => o,
             Err(_) => continue,
         };

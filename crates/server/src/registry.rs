@@ -40,8 +40,13 @@ pub async fn registry(State(state): State<AppState>, req: Request<Body>) -> Resp
 pub(crate) struct LedgerRecorder;
 
 impl crate::images::PublishRecorder for LedgerRecorder {
-    fn for_repository(&self, repository: &Repository) -> Arc<dyn PublishPolicy> {
-        crate::dispatch::workload_ledger_policy(repository)
+    fn for_repository(
+        &self,
+        repository: &Repository,
+        role_filter: forge_core::authz::PackageFilter,
+        role_replace_filter: forge_core::authz::PackageFilter,
+    ) -> Arc<dyn PublishPolicy> {
+        crate::dispatch::workload_ledger_policy(repository, role_filter, role_replace_filter)
     }
 }
 
@@ -60,13 +65,13 @@ impl crate::images::WorkloadCheck for WorkloadLiveness {
             config_sha256,
             key_id,
             ..
-        } = *principal
+        } = principal
         else {
             return Ok(true);
         };
         let snapshot = self.realms.snapshot().await.map_err(|e| e.to_string())?;
         let current =
-            crate::auth::realm_current_now(&self.realms, &snapshot, realm_id, &config_sha256)
+            crate::auth::realm_current_now(&self.realms, &snapshot, *realm_id, config_sha256)
                 .await
                 .map_err(|e| e.to_string())?;
         if !current {
@@ -79,7 +84,7 @@ impl crate::images::WorkloadCheck for WorkloadLiveness {
         };
         // Minted with an exchanged key: it stands while that key does. A key
         // the reaper deleted has ended too.
-        workload_api_key_dao::is_live(&self.pool, key_id)
+        workload_api_key_dao::is_live(&self.pool, *key_id)
             .await
             .map_err(|e| e.to_string())
     }

@@ -28,6 +28,7 @@ import { ErrorState } from '~/components/ErrorState'
 import { ProxyCachePanel } from '~/components/ProxyCachePanel'
 import { AnonymousAccessPanel } from '~/components/AnonymousAccessPanel'
 import { IMPORT_FORMATS } from '~/api/imports'
+import { TrustedPublishers } from './TrustedPublishers'
 
 export const Route = createFileRoute('/_app/manage/repositories/$repo')({
   component: EditRepository,
@@ -177,6 +178,9 @@ function EditRepository() {
           onSubmit={handleSubmit}
           onCancel={() => void navigate({ to: '/manage/repositories' })}
         />
+        {current.kind === 'hosted' && (
+          <TrustedPublishers key={current.name} repository={current.name} />
+        )}
       </Columns>
     </Page>
   )

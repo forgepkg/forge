@@ -915,6 +915,9 @@ pub struct PublishAuthorizationContext {
     pub package_id: String,
     /// Canonical normalized package version extracted by the format parser.
     pub package_version: String,
+    /// Whether this publish replaces existing content and therefore also
+    /// requires delete authorization.
+    pub requires_delete: bool,
 }
 
 /// A package mutation a [`PublishPolicy`] is consulted about.

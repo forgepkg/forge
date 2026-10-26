@@ -772,14 +772,15 @@ impl HostedWrite {
             ))
         };
 
-        let publish_context =
+        let mut publish_context =
             self.publish_policy
                 .as_ref()
                 .map(|(principal, _)| PublishAuthorizationContext {
-                    principal: *principal,
+                    principal: principal.clone(),
                     action: PackageMutation::Publish,
                     package_id: parsed.id.clone(),
                     package_version: parsed.version.clone(),
+                    requires_delete: false,
                 });
         if let (Some((_, policy)), Some(context)) =
             (self.publish_policy.as_ref(), publish_context.as_ref())
@@ -892,7 +893,9 @@ impl HostedWrite {
                 if let (Some((_, policy)), Some(context)) =
                     (self.publish_policy.as_ref(), publish_context.as_ref())
                 {
-                    policy.authorize_replace(context).await?;
+                    let mut replace_context = context.clone();
+                    replace_context.requires_delete = true;
+                    policy.authorize_replace(&replace_context).await?;
                 }
                 // `false`: a concurrent hard delete removed the version
                 // before this push could lock it, so it is a fresh insert.
@@ -968,8 +971,9 @@ impl HostedWrite {
         }
 
         if let (Some((_, policy)), Some(context)) =
-            (self.publish_policy.as_ref(), publish_context.as_ref())
+            (self.publish_policy.as_ref(), publish_context.as_mut())
         {
+            context.requires_delete = replaced;
             policy.record_in_transaction(context, &mut tx).await?;
         }
 
@@ -1370,10 +1374,11 @@ impl HostedWrite {
             return Ok(());
         };
         let context = PublishAuthorizationContext {
-            principal: *principal,
+            principal: principal.clone(),
             action,
             package_id: lower.to_string(),
             package_version: version.to_string(),
+            requires_delete: false,
         };
         policy.record_in_transaction(&context, tx).await
     }

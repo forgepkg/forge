@@ -103,6 +103,7 @@ use forge_core::repo::{
     RepoWriteOps, UploadReader, WriteError,
 };
 use forge_db::trusted_publish_audit_dao::{self, NewTrustedPublishAudit};
+use forge_db::trusted_publisher_dao;
 use std::sync::Arc;
 
 /// Bridges the object-safe [`RepoWriteOps`] trait (which takes a boxed
@@ -112,6 +113,7 @@ pub(crate) struct HostedWriteAdapter {
 }
 
 impl HostedWriteAdapter {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: &AppState,
         format: Arc<dyn Format>,
@@ -120,6 +122,8 @@ impl HostedWriteAdapter {
         principal: Principal,
         package_filter: PackageFilter,
         replace_filter: PackageFilter,
+        role_filter: PackageFilter,
+        role_replace_filter: PackageFilter,
     ) -> Self {
         let inner = hosted_write(
             state,
@@ -129,6 +133,8 @@ impl HostedWriteAdapter {
             principal,
             package_filter,
             replace_filter,
+            role_filter,
+            role_replace_filter,
         );
         HostedWriteAdapter { inner }
     }
@@ -137,6 +143,7 @@ impl HostedWriteAdapter {
 /// The hosted write path of `principal` in a repository: publishes limited
 /// to `package_filter`, replacing a version to `replace_filter`, and the
 /// trusted-publishing ledger of a workload.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hosted_write(
     state: &AppState,
     format: Arc<dyn Format>,
@@ -145,10 +152,14 @@ pub(crate) fn hosted_write(
     principal: Principal,
     package_filter: PackageFilter,
     replace_filter: PackageFilter,
+    role_filter: PackageFilter,
+    role_replace_filter: PackageFilter,
 ) -> HostedWrite {
     let policy: Arc<dyn PublishPolicy> = Arc::new(SelectorPublishPolicy {
         filter: package_filter.clone(),
         replace_filter,
+        role_filter,
+        role_replace_filter,
         repository_id,
         repository_name,
     });
@@ -167,10 +178,16 @@ pub(crate) fn hosted_write(
 /// a workload's manifest push is recorded (and re-validated against the
 /// current realm) like a package publish. Selectors are checked by the
 /// registry itself, so this policy allows every image.
-pub(crate) fn workload_ledger_policy(repository: &Repository) -> Arc<dyn PublishPolicy> {
+pub(crate) fn workload_ledger_policy(
+    repository: &Repository,
+    role_filter: PackageFilter,
+    role_replace_filter: PackageFilter,
+) -> Arc<dyn PublishPolicy> {
     Arc::new(SelectorPublishPolicy {
         filter: PackageFilter::AllowAll,
         replace_filter: PackageFilter::AllowAll,
+        role_filter,
+        role_replace_filter,
         repository_id: repository.id,
         repository_name: repository.name.clone(),
     })
@@ -183,6 +200,8 @@ struct SelectorPublishPolicy {
     filter: PackageFilter,
     /// The caller's delete predicate, required to replace an existing version.
     replace_filter: PackageFilter,
+    role_filter: PackageFilter,
+    role_replace_filter: PackageFilter,
     repository_id: i64,
     repository_name: String,
 }
@@ -225,17 +244,18 @@ impl PublishPolicy for SelectorPublishPolicy {
             subject_sha256,
             jti_sha256,
             issued_at,
+            matched_publishers,
             ..
-        } = context.principal
+        } = &context.principal
         else {
             // This ledger is specifically the federated trusted-publishing
             // provenance record. Existing user/token publication behavior is
             // unchanged and is not mislabeled as workload identity.
             return Ok(());
         };
-        let token_issued_at = chrono::DateTime::<chrono::Utc>::from_timestamp(issued_at, 0)
+        let token_issued_at = chrono::DateTime::<chrono::Utc>::from_timestamp(*issued_at, 0)
             .ok_or_else(|| RepoError::Storage("validated workload iat is out of range".into()))?;
-        let identity = trusted_publish_audit_dao::lock_identity_snapshot(tx, realm_id, role_id)
+        let identity = trusted_publish_audit_dao::lock_identity_snapshot(tx, *realm_id, *role_id)
             .await
             .map_err(RepoError::from)?
             .ok_or_else(|| WriteError::ForbiddenPackage {
@@ -243,7 +263,7 @@ impl PublishPolicy for SelectorPublishPolicy {
             })?;
         let current_issuer_hash: [u8; 32] =
             sha2::Sha256::digest(identity.issuer.trim_end_matches('/').as_bytes()).into();
-        if current_issuer_hash != issuer_sha256 {
+        if current_issuer_hash != *issuer_sha256 {
             // A stale in-memory realm snapshot authenticated against an issuer
             // that has since been replaced. The row locks above make this check
             // authoritative for the rest of the package transaction.
@@ -256,7 +276,7 @@ impl PublishPolicy for SelectorPublishPolicy {
         )
         .map_err(|error| {
             tracing::warn!(
-                realm_id,
+                realm_id = *realm_id,
                 error = %error,
                 "current WIF realm config is invalid; publish denied"
             );
@@ -264,7 +284,7 @@ impl PublishPolicy for SelectorPublishPolicy {
                 id: context.package_id.clone(),
             }
         })?;
-        if current_config_hash != config_sha256 {
+        if current_config_hash != *config_sha256 {
             // Audience, lifetime, authorized-party, or claim-rule policy changed
             // after this peer built its realm snapshot. Do not let the stale
             // principal publish under the new configuration's identity.
@@ -273,6 +293,87 @@ impl PublishPolicy for SelectorPublishPolicy {
             });
         }
 
+        let publisher_matches: Vec<_> = matched_publishers
+            .iter()
+            .map(
+                |matched| forge_db::trusted_publisher_dao::TrustedPublisherMatch {
+                    id: matched.id,
+                    definition_sha256: matched.definition_sha256,
+                },
+            )
+            .collect();
+        let (current_publishers, _) =
+            trusted_publisher_dao::lock_matches_with_rows(tx, &publisher_matches)
+                .await
+                .map_err(RepoError::from)?;
+        let required_action = match context.action {
+            forge_core::repo::PackageMutation::Unlist
+            | forge_core::repo::PackageMutation::Delete => "delete",
+            forge_core::repo::PackageMutation::Publish
+            | forge_core::repo::PackageMutation::Relist => "write",
+        };
+        let role_action_filter = if required_action == "delete" {
+            &self.role_replace_filter
+        } else {
+            &self.role_filter
+        };
+        let role_allows_action = role_action_filter.allows(&context.package_id);
+        let role_allows_delete =
+            !context.requires_delete || self.role_replace_filter.allows(&context.package_id);
+        let role_authorized = role_allows_action && role_allows_delete;
+        let needs_publisher_action = !role_allows_action;
+        let needs_publisher_delete =
+            context.requires_delete && !self.role_replace_filter.allows(&context.package_id);
+        let mut publisher_action = None;
+        let mut publisher_delete = None;
+        for publisher in current_publishers
+            .iter()
+            .filter(|publisher| publisher.repository_id == self.repository_id)
+        {
+            if (!needs_publisher_action || publisher_action.is_some())
+                && (!needs_publisher_delete || publisher_delete.is_some())
+            {
+                break;
+            }
+            let patterns = match (
+                serde_json::from_value::<Vec<String>>(publisher.includes.clone()),
+                serde_json::from_value::<Vec<String>>(publisher.excludes.clone()),
+            ) {
+                (Ok(includes), Ok(excludes)) => {
+                    forge_core::authz::SelectorPatterns { includes, excludes }
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    tracing::error!(error = %error, publisher_id = publisher.id, "malformed trusted-publisher selector");
+                    continue;
+                }
+            };
+            if !patterns.matches(&context.package_id).unwrap_or(false) {
+                continue;
+            }
+            if needs_publisher_action
+                && publisher
+                    .actions
+                    .iter()
+                    .any(|action| action == required_action)
+            {
+                publisher_action = Some((publisher.id, publisher.name.as_str()));
+            }
+            if needs_publisher_delete && publisher.actions.iter().any(|action| action == "delete") {
+                publisher_delete = Some((publisher.id, publisher.name.as_str()));
+            }
+        }
+        if (needs_publisher_action && publisher_action.is_none())
+            || (needs_publisher_delete && publisher_delete.is_none())
+        {
+            return Err(WriteError::ForbiddenPackage {
+                id: context.package_id.clone(),
+            });
+        }
+        let trusted_publisher = if role_authorized {
+            None
+        } else {
+            publisher_action.or(publisher_delete)
+        };
         trusted_publish_audit_dao::insert(
             tx,
             NewTrustedPublishAudit {
@@ -280,15 +381,17 @@ impl PublishPolicy for SelectorPublishPolicy {
                 repository_name: &self.repository_name,
                 package_name: &context.package_id,
                 package_version: &context.package_version,
-                realm_id,
+                realm_id: *realm_id,
                 realm_name: &identity.realm_name,
                 issuer: &identity.issuer,
-                role_id,
+                role_id: *role_id,
                 role_name: &identity.role_name,
-                subject_sha256: &subject_sha256,
+                subject_sha256,
                 jti_sha256: jti_sha256.as_ref(),
                 token_issued_at,
                 action: context.action.as_str(),
+                trusted_publisher_id: trusted_publisher.map(|(id, _)| id),
+                trusted_publisher_name: trusted_publisher.map(|(_, name)| name),
             },
         )
         .await
@@ -360,6 +463,7 @@ mod tests {
             issued_at: 1,
             key_id: None,
             expires_at: 2,
+            matched_publishers: Arc::from([]),
         }));
         assert!(!principal_allows_protocol_mutations(&Principal::User {
             user_id: 1,

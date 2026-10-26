@@ -249,6 +249,26 @@ export interface UpdateMember {
   owner: boolean
 }
 
+export interface TrustedPublisherCondition {
+  claim: string
+  any_of: string[]
+}
+
+export interface TrustedPublisherBody {
+  name: string
+  description: string
+  realm: string
+  packages: { includes: string[]; excludes: string[] }
+  conditions: TrustedPublisherCondition[]
+  actions: ('write' | 'delete')[]
+}
+
+export interface TrustedPublisherView extends TrustedPublisherBody {
+  id: number
+  realm_id: number
+  issuer: string
+}
+
 /**
  * Query-key factory for the repository resource. Arrays from one factory so
  * list / detail / members invalidation share stable, structured keys.
@@ -258,6 +278,8 @@ export const repoKeys = {
   list: () => ['repositories', 'list'] as const,
   detail: (name: string) => ['repositories', 'detail', name] as const,
   members: (name: string) => ['repositories', 'members', name] as const,
+  trustedPublishers: (name: string) =>
+    ['repositories', 'trusted-publishers', name] as const,
 }
 
 /** Query key of the installed formats. */
@@ -360,5 +382,42 @@ export function updateMember(
   return httpClient.patch<void>(
     `/admin/repositories/${encodeURIComponent(name)}/members/${encodeURIComponent(member)}`,
     body,
+  )
+}
+
+export function fetchTrustedPublishers(
+  name: string,
+  signal?: AbortSignal,
+): Promise<TrustedPublisherView[]> {
+  return httpClient.get<TrustedPublisherView[]>(
+    `/admin/repositories/${encodeURIComponent(name)}/trusted-publishers`,
+    { signal },
+  )
+}
+
+export function createTrustedPublisher(
+  name: string,
+  body: TrustedPublisherBody,
+): Promise<TrustedPublisherView> {
+  return httpClient.post<TrustedPublisherView>(
+    `/admin/repositories/${encodeURIComponent(name)}/trusted-publishers`,
+    body,
+  )
+}
+
+export function updateTrustedPublisher(
+  name: string,
+  id: number,
+  body: TrustedPublisherBody,
+): Promise<TrustedPublisherView> {
+  return httpClient.put<TrustedPublisherView>(
+    `/admin/repositories/${encodeURIComponent(name)}/trusted-publishers/${id}`,
+    body,
+  )
+}
+
+export function deleteTrustedPublisher(name: string, id: number): Promise<void> {
+  return httpClient.delete<void>(
+    `/admin/repositories/${encodeURIComponent(name)}/trusted-publishers/${id}`,
   )
 }

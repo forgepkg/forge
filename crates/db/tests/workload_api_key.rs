@@ -44,6 +44,7 @@ async fn redeem(
             token_issued_at: token_expires_at - Duration::minutes(5),
             token_expires_at,
             token_leeway_seconds,
+            matched_publishers: &[],
             ttl_seconds: 3600,
         },
     )
@@ -66,7 +67,7 @@ async fn a_token_is_redeemed_once() {
     let exp = db_now(&pool).await + Duration::minutes(5);
     assert!(matches!(
         redeem(&pool, n, 10, exp, 60).await,
-        Redemption::Issued(_)
+        Redemption::Issued { .. }
     ));
     assert_eq!(redeem(&pool, n, 11, exp, 60).await, Redemption::Replayed);
 }
@@ -86,7 +87,7 @@ async fn a_token_past_its_leeway_on_the_database_clock_is_not_redeemed() {
     let n = unique();
     assert!(matches!(
         redeem(&pool, n, 10, now - Duration::seconds(30), 60).await,
-        Redemption::Issued(_)
+        Redemption::Issued { .. }
     ));
     // The leeway is capped at the most any realm accepts.
     let n = unique();
@@ -110,7 +111,7 @@ async fn a_record_outlives_its_token_by_the_leeway_and_a_margin() {
     let exp = db_now(&pool).await + Duration::minutes(5);
     assert!(matches!(
         redeem(&pool, n, 10, exp, 60).await,
-        Redemption::Issued(_)
+        Redemption::Issued { .. }
     ));
     let key = digest(n, 10);
     let age = |token_expired_seconds_ago: i64| {

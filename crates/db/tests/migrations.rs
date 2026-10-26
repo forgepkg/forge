@@ -44,6 +44,9 @@ const EXPECTED_TABLES: &[&str] = &[
     "user_role",
     // 0012_trusted_publish_audit.sql
     "trusted_publish_audit",
+    // 0049_trusted_publishers.sql
+    "trusted_publisher",
+    "workload_api_key_trusted_publisher",
 ];
 
 /// Columns `0004_credforward.sql` adds to `app_user` (provenance): (table, column).

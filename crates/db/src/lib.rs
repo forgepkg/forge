@@ -35,6 +35,7 @@ pub mod session_dao;
 pub mod tag_dao;
 pub mod token_dao;
 pub mod trusted_publish_audit_dao;
+pub mod trusted_publisher_dao;
 pub mod user_dao;
 pub mod username;
 pub mod validated_credential_dao;

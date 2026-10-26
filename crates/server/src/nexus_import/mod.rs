@@ -368,14 +368,22 @@ impl Run<'_> {
             let replace = authz
                 .package_filter_for(&principal, &repo, Level::Delete)
                 .await;
+            let role_filter = authz
+                .role_package_filter_for(&principal, &repo, Level::Write)
+                .await;
+            let role_replace = authz
+                .role_package_filter_for(&principal, &repo, Level::Delete)
+                .await;
             Target::Packages(Box::new(crate::dispatch::hosted_write(
                 self.state,
                 format,
                 repo.id,
                 repo.name.clone(),
-                principal,
+                principal.clone(),
                 filter,
                 replace,
+                role_filter,
+                role_replace,
             )))
         };
         Ok(Ctx {
@@ -717,7 +725,7 @@ impl Run<'_> {
             .find(|a| a.path.contains("/manifests/"))
             .or(source.assets.first());
         let options = ImageImportOptions {
-            principal: ctx.principal,
+            principal: ctx.principal.clone(),
             overwrite: self.import.on_conflict == "overwrite",
             dry_run: self.import.dry_run,
             published_at: asset.and_then(|a| published_at(ctx.images(), a)),
