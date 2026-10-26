@@ -647,8 +647,9 @@ never spend the same refresh token. When the server refuses a refresh
 (`invalid_grant`: the authorization was revoked or expired), sending stops
 and the page asks for a new authorization. A token the mail server refuses
 is dropped and the next send gets a new one. Saving the settings keeps the
-client and the authorization while the issuer and the mailbox stay the
-same. Forge deletes a client it registered (RFC 7592) when the settings stop
+client while the issuer stays the same, and the authorization while the
+SMTP host and the mailbox stay the same too: another host gets no token
+before the transport is authorized again. Forge deletes a client it registered (RFC 7592) when the settings stop
 using it, or names it so that it can be removed on the server when the
 server offers no way to.
 
@@ -709,7 +710,8 @@ Each encrypted secret is bound to its row and to where it is sent: a proxy
 password to the origin (scheme, host and port) of the repository's
 `remote_url`, an OIDC client secret to the realm's `issuer` and `client_id`,
 the email password to the SMTP host and username, the Graph client secret to
-the tenant and app.
+the tenant and app, the OAuth mailbox's secrets to the issuer, client,
+mailbox and SMTP host.
 Changing those through the admin API asks for the secret again. Changing
 them directly in the database makes the secret undecryptable (the proxy
 then fails instead of sending the password to the new host), and it has to
