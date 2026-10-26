@@ -592,6 +592,8 @@ describe('RepoBrowse of a docker repository (images)', () => {
       'Showing 1–2 of 2',
     )
     expect(screen.getByLabelText('Search images')).toBeInTheDocument()
+    // A hosted repository's images were pushed to it.
+    expect(screen.getByRole('columnheader', { name: 'Last pushed' })).toBeInTheDocument()
     // NuGet-only controls are absent, and no package search was made.
     expect(screen.queryByLabelText('Search packages')).toBeNull()
     expect(screen.queryByText('Include prerelease versions')).toBeNull()
@@ -687,6 +689,35 @@ describe('RepoBrowse of a docker repository (images)', () => {
       screen.getByText('This repository does not contain any images yet.'),
     ).toBeInTheDocument()
     expect(screen.getByRole('region', { name: 'Connect' })).toBeInTheDocument()
+  })
+
+  it('labels the image time column "Last cached" on a proxy (#248)', async () => {
+    mockApi(
+      () => jsonResponse(page(0, [])),
+      () => jsonResponse(imagePage(1, ['library/alpine'])),
+    )
+    const base = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname.endsWith('/browse/repos')) {
+        return Promise.resolve(
+          jsonResponse([
+            ...repos,
+            { id: 6, name: 'docker-hub', kind: 'proxy', online: true, format: 'docker' },
+          ]),
+        )
+      }
+      return base(input, init)
+    })
+
+    await renderBrowse('/repos/docker-hub')
+
+    await screen.findByRole('link', { name: /library\/alpine/ })
+    expect(screen.getByRole('columnheader', { name: 'Last cached' })).toHaveAttribute(
+      'title',
+      'When Forge last cached a manifest of the image from the upstream',
+    )
+    expect(screen.queryByRole('columnheader', { name: 'Last pushed' })).toBeNull()
   })
 
   it('refreshes a cached repository list that predates the repository', async () => {

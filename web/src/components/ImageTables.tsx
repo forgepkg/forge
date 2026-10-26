@@ -32,6 +32,11 @@ import {
  * With `onDelete` (administrators, hosted repositories), each row ends in a
  * Delete button that asks the page to confirm the delete of its tag or
  * manifest.
+ *
+ * A manifest's `created_at` is when it reached Forge. On a proxy that is when
+ * Forge first cached it from the upstream, not when it was pushed there, so
+ * the column is labelled "Cached" for a proxy repository (as package
+ * versions are, #110).
  */
 
 /** A short digest with its full value as tooltip, plus a copy button. */
@@ -139,18 +144,22 @@ const KIND_ICONS: Record<ManifestKind, IconName> = {
 
 export function ManifestTable({
   manifests,
-  showSource,
+  repoKind,
   onDelete,
   deletePending,
 }: {
   manifests: ImageManifest[]
-  /** Group repositories: show which member each manifest comes from. */
-  showSource: boolean
+  /**
+   * The image's repository kind: `hosted` | `proxy` | `group`. A group shows
+   * which member each manifest comes from.
+   */
+  repoKind: string
   onDelete?: (manifest: ImageManifest) => void
   deletePending?: boolean
 }) {
   // Referrers name their subject by digest; show the subject's tags too.
   const tagsByDigest = new Map(manifests.map((m) => [m.digest, m.tags]))
+  const showSource = repoKind === 'group'
 
   return (
     <Table caption="Manifests">
@@ -160,7 +169,13 @@ export function ManifestTable({
         <TableHeader align="right">Size</TableHeader>
         <TableHeader>Platforms</TableHeader>
         <TableHeader>Tags</TableHeader>
-        <TableHeader>Pushed</TableHeader>
+        {repoKind === 'proxy' ? (
+          <TableHeader hint="When Forge first cached this manifest from the upstream">
+            Cached
+          </TableHeader>
+        ) : (
+          <TableHeader>Pushed</TableHeader>
+        )}
         <TableHeader>Last pulled</TableHeader>
         {showSource && <TableHeader>Source</TableHeader>}
         {onDelete && <TableHeader align="right">Actions</TableHeader>}

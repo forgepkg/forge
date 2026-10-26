@@ -407,6 +407,29 @@ describe('ImageDetail', () => {
 
     // Not a group: no Source column.
     expect(within(manifests).queryByRole('columnheader', { name: 'Source' })).toBeNull()
+    // A hosted repository's manifests were pushed to it.
+    expect(within(manifests).getByRole('columnheader', { name: 'Pushed' })).toBeInTheDocument()
+    expect(within(manifests).queryByRole('columnheader', { name: 'Cached' })).toBeNull()
+  })
+
+  it('labels the manifest time column "Cached" on a proxy (#248)', async () => {
+    mockApi(() =>
+      jsonResponse({
+        ...hostedDetail,
+        repo: 'docker-hub',
+        repo_kind: 'proxy',
+        pull_name: 'forge.example.com/docker-hub/team/app',
+      }),
+    )
+
+    await renderDetail('/images/docker-hub/team/app')
+
+    const manifests = await screen.findByRole('region', { name: 'Manifests' })
+    expect(within(manifests).getByRole('columnheader', { name: 'Cached' })).toHaveAttribute(
+      'title',
+      'When Forge first cached this manifest from the upstream',
+    )
+    expect(within(manifests).queryByRole('columnheader', { name: 'Pushed' })).toBeNull()
   })
 
   it('shows the member each manifest comes from in a group', async () => {
