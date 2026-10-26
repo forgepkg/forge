@@ -263,11 +263,34 @@ describe('retention screen', () => {
     clearSession()
   })
 
-  it('shows the current repository size and an unreached target warning', async () => {
+  it('shows the size against the budget and when a run missed its target', async () => {
     mockApi({
       repositories: [repo({})],
       view: {
-        policy: null,
+        policy: { ...storedPolicy, size_budget: { max_bytes: 500 * 1000 ** 3 } },
+        last_run: {
+          ...ledger,
+          last_run_summary: { target_reached: false, target_bytes: 450 * 1000 ** 3 },
+        },
+        runs_enabled: true,
+        current_size_bytes: 312 * 1000 ** 3,
+      },
+    })
+    await renderAt('/manage/repositories/nuget-internal/retention')
+    expect(
+      await screen.findByText(/Current logical size: 312 GB of 500 GB/),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: /Maximum size/ })).toHaveValue('500')
+    expect(screen.getByRole('textbox', { name: /Target size/ })).toHaveValue('')
+    expect(screen.getByRole('combobox', { name: 'Size unit' })).toHaveValue('GB')
+    expect(screen.getByText(/Size budget target not reached/)).toBeInTheDocument()
+  })
+
+  it('warns of a missed target only while the policy has a size budget', async () => {
+    mockApi({
+      repositories: [repo({})],
+      view: {
+        policy: storedPolicy,
         last_run: {
           ...ledger,
           last_run_summary: { target_reached: false, target_bytes: 1024 },
@@ -277,10 +300,8 @@ describe('retention screen', () => {
       },
     })
     await renderAt('/manage/repositories/nuget-internal/retention')
-    expect(await screen.findByText(/Current logical size: 1.5 GiB/)).toBeInTheDocument()
-    expect(screen.getByRole('textbox', { name: /Maximum size \(GiB\)/ })).toBeInTheDocument()
-    expect(screen.getByRole('textbox', { name: /Target size \(GiB\)/ })).toBeInTheDocument()
-    expect(screen.getByText(/Size budget target not reached/)).toBeInTheDocument()
+    expect(await screen.findByText(/Current logical size: 1.5 GiB$/)).toBeInTheDocument()
+    expect(screen.queryByText(/Size budget target not reached/)).not.toBeInTheDocument()
   })
 
   it('is linked from hosted and proxy repositories, not from a group', async () => {

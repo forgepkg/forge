@@ -26,29 +26,13 @@ pub use evaluate::{
 };
 pub use model::{
     validate_policy, Action, Criteria, PolicyError, ReleaseType, RetentionPolicy, RetentionRule,
-    Scope, SizeBudget, POLICY_VERSION,
+    Scope, SizeBudget, SizeBudgetSummary, POLICY_VERSION,
 };
 pub use worker::{FormatResolver, RetentionConfig, RetentionWorker, WorkerError};
 
-/// Leave out of `decisions` the versions retention never touches: every
-/// version a package tag names (npm's dist-tags, `latest` included).
-/// Returns how many decisions were dropped. The apply path checks again,
-/// with the version locked.
-pub async fn spare_protected(
-    pool: &sqlx::PgPool,
-    repository_id: i64,
-    decisions: &mut Vec<Decision>,
-) -> sqlx::Result<usize> {
-    if decisions.is_empty() {
-        return Ok(0);
-    }
-    let tagged = tagged_versions(pool, repository_id).await?;
-    let before = decisions.len();
-    decisions.retain(|d| !tagged.contains(&(d.package_name.clone(), d.version.clone())));
-    Ok(before - decisions.len())
-}
-
-/// Package-tagged versions must be excluded from hosted budget victims.
+/// The hosted `candidates` a package tag names (npm's dist-tags, `latest`
+/// included): retention never touches them, whatever a rule or the size
+/// budget decides. The apply path checks again, with the version locked.
 pub async fn tagged_candidate_ids(
     pool: &sqlx::PgPool,
     repository_id: i64,
@@ -57,22 +41,16 @@ pub async fn tagged_candidate_ids(
     if candidates.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    let tagged = tagged_versions(pool, repository_id).await?;
+    let tagged: std::collections::HashSet<(String, String)> =
+        forge_db::tag_dao::tagged_versions(pool, repository_id)
+            .await?
+            .into_iter()
+            .collect();
     Ok(candidates
         .iter()
         .filter(|candidate| {
             tagged.contains(&(candidate.package_name.clone(), candidate.version.clone()))
         })
         .map(|candidate| candidate.component_id)
-        .collect())
-}
-
-async fn tagged_versions(
-    pool: &sqlx::PgPool,
-    repository_id: i64,
-) -> sqlx::Result<std::collections::HashSet<(String, String)>> {
-    Ok(forge_db::tag_dao::tagged_versions(pool, repository_id)
-        .await?
-        .into_iter()
         .collect())
 }

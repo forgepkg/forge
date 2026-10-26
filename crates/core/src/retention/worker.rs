@@ -36,8 +36,10 @@ use forge_db::retention_dao::{self, RunSummary};
 use crate::format::Format;
 use crate::repo::CacheInvalidator;
 use crate::retention::apply::{apply, ApplyContext, RunFence};
-use crate::retention::evaluate::{evaluate, evaluate_proxy, CandidateComponent, ProxyCandidate};
-use crate::retention::model::{validate_policy, RetentionPolicy};
+use crate::retention::evaluate::{
+    plan_package_run, CandidateComponent, PackagePlan, ProxyCandidate,
+};
+use crate::retention::model::{validate_policy, RetentionPolicy, SizeBudgetSummary};
 
 /// The shortest interval the worker ever schedules between two automatic runs
 /// of a repository, whatever the config and the policy say (both accept 0).
@@ -324,29 +326,16 @@ impl RetentionWorker {
             Vec::new()
         };
 
-        let budget_size_before = if policy.size_budget.is_some() {
-            Some(retention_dao::package_repository_size(&self.pool, repo.repository_id).await?)
-        } else {
-            None
-        };
-
-        // Tagged versions stay in the snapshot as survivors, but their ordinary
-        // decisions and budget candidacy are excluded before planning.
-        let has_size_budget = budget_size_before.is_some();
-        let tagged_hosted_ids = if has_size_budget {
-            let tagged =
-                crate::retention::tagged_candidate_ids(&self.pool, repo.repository_id, &hosted)
-                    .await?;
-            if !tagged.is_empty() {
-                tracing::info!(
-                    repo = %repo.name,
-                    spared = tagged.len(),
-                    "retention spared tagged versions"
-                );
+        // A version a package tag names is never touched: it stays in the
+        // snapshot (it counts as a newer version), but neither a rule nor the
+        // size budget selects it.
+        let tagged_hosted_ids =
+            crate::retention::tagged_candidate_ids(&self.pool, repo.repository_id, &hosted).await?;
+        let size_before = match policy.size_budget {
+            Some(_) => {
+                Some(retention_dao::package_repository_size(&self.pool, repo.repository_id).await?)
             }
-            tagged
-        } else {
-            std::collections::HashSet::new()
+            None => None,
         };
 
         // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
@@ -355,79 +344,32 @@ impl RetentionWorker {
             let format = Arc::clone(&format);
             let policy = policy.clone();
             tokio::task::spawn_blocking(move || {
-                let mut hosted_decisions = evaluate(format.as_ref(), now, &policy, &hosted);
-                hosted_decisions
-                    .retain(|decision| !tagged_hosted_ids.contains(&decision.component_id));
-                let proxy_decisions = evaluate_proxy(format.as_ref(), now, &policy, &proxy);
-                let budget = budget_size_before
-                    .zip(policy.size_budget)
-                    .map(|(size_before, _)| {
-                        crate::retention::evaluate::evaluate_size_budget(
-                            format.as_ref(),
-                            &policy,
-                            &hosted,
-                            &proxy,
-                            size_before,
-                            crate::retention::evaluate::PackageBudgetInputs {
-                                hosted_decisions: &hosted_decisions,
-                                proxy_decisions: &proxy_decisions,
-                                tagged_hosted_ids: &tagged_hosted_ids,
-                            },
-                        )
-                    });
-                (hosted_decisions, proxy_decisions, budget)
+                plan_package_run(
+                    format.as_ref(),
+                    now,
+                    &policy,
+                    &hosted,
+                    &proxy,
+                    &tagged_hosted_ids,
+                    size_before,
+                )
             })
         };
         // A panic there (e.g. a panicking `Format`) fails the run like a panic
         // anywhere else in `process`.
-        let (mut hosted_decisions, mut proxy_decisions, mut budget_plan) =
-            evaluation.await.map_err(|e| {
-                WorkerError::Panicked(match e.try_into_panic() {
-                    Ok(panic) => panic_message(&*panic),
-                    Err(e) => e.to_string(), // cancelled: the runtime is shutting down
-                })
-            })?;
-        if !has_size_budget {
-            let spared = crate::retention::spare_protected(
-                &self.pool,
-                repo.repository_id,
-                &mut hosted_decisions,
-            )
-            .await?;
-            if spared > 0 {
-                tracing::info!(repo = %repo.name, spared, "retention spared tagged versions");
-            }
-        }
-
-        if let Some(plan) = &mut budget_plan {
-            let selected_bytes_before: u64 = plan
-                .hosted
-                .iter()
-                .filter_map(|d| d.reason.size_bytes)
-                .fold(0u64, u64::saturating_add);
-            let spared =
-                crate::retention::spare_protected(&self.pool, repo.repository_id, &mut plan.hosted)
-                    .await?;
-            if spared > 0 {
-                tracing::info!(repo = %repo.name, spared, "size budget spared tagged versions");
-            }
-            let selected_bytes_after: u64 = plan
-                .hosted
-                .iter()
-                .filter_map(|d| d.reason.size_bytes)
-                .fold(0u64, u64::saturating_add);
-            plan.size_after = plan
-                .size_after
-                .saturating_add(selected_bytes_before.saturating_sub(selected_bytes_after));
-            plan.target_reached = !plan.target_attempted || plan.size_after <= plan.target_bytes;
-            let budget_deleted: std::collections::HashSet<i64> =
-                plan.hosted.iter().map(|d| d.component_id).collect();
-            hosted_decisions.retain(|d| {
-                d.action != crate::retention::model::Action::Unlist
-                    || !budget_deleted.contains(&d.component_id)
-            });
-            hosted_decisions.append(&mut plan.hosted);
-            proxy_decisions.append(&mut plan.proxy);
+        let PackagePlan {
+            hosted: hosted_decisions,
+            proxy: proxy_decisions,
+            spared,
+            budget,
+        } = evaluation.await.map_err(|e| {
+            WorkerError::Panicked(match e.try_into_panic() {
+                Ok(panic) => panic_message(&*panic),
+                Err(e) => e.to_string(), // cancelled: the runtime is shutting down
+            })
+        })?;
+        if spared > 0 {
+            tracing::info!(repo = %repo.name, spared, "retention spared tagged versions");
         }
 
         // Affected package names (for cache invalidation after the run).
@@ -455,17 +397,13 @@ impl RetentionWorker {
             }),
         };
         let mut summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
-        if let Some(plan) = budget_plan {
+        if let Some(budget) = budget {
             let size_after = if policy.dry_run_only {
-                plan.size_after
+                budget.size_after
             } else {
                 retention_dao::package_repository_size(&self.pool, repo.repository_id).await?
             };
-            summary.size_before = Some(plan.size_before);
-            summary.size_after = Some(size_after);
-            summary.target_bytes = Some(plan.target_bytes);
-            summary.target_reached =
-                Some(!plan.target_attempted || size_after <= plan.target_bytes);
+            record_budget(&mut summary, budget, size_after);
         }
 
         // ── Finish: record summary, advance schedule, clear lease. ──
@@ -542,11 +480,7 @@ impl RetentionWorker {
                 } else {
                     forge_db::oci_dao::repository_size(&self.pool, repo.repository_id).await?
                 };
-                summary.size_before = Some(budget.size_before);
-                summary.size_after = Some(size_after);
-                summary.target_bytes = Some(budget.target_bytes);
-                summary.target_reached =
-                    Some(!budget.target_attempted || size_after <= budget.target_bytes);
+                record_budget(&mut summary, budget, size_after);
             }
         }
         if !retention_dao::finish_run(
@@ -611,11 +545,7 @@ impl RetentionWorker {
                 } else {
                     forge_db::raw_dao::repository_size(&self.pool, repo.repository_id).await?
                 };
-                summary.size_before = Some(budget.size_before);
-                summary.size_after = Some(size_after);
-                summary.target_bytes = Some(budget.target_bytes);
-                summary.target_reached =
-                    Some(!budget.target_attempted || size_after <= budget.target_bytes);
+                record_budget(&mut summary, budget, size_after);
             }
         }
         if !retention_dao::finish_run(
@@ -706,6 +636,15 @@ impl Drop for AbortOnDrop {
 
 /// Best-effort text of a caught panic payload (`panic!` with a literal yields
 /// `&str`, with format arguments `String`).
+/// Record a size budget's outcome on a run's summary: `size_after` is the
+/// size measured once the run applied, or, for a dry run, the projected one.
+fn record_budget(summary: &mut RunSummary, budget: SizeBudgetSummary, size_after: u64) {
+    summary.size_before = Some(budget.size_before);
+    summary.size_after = Some(size_after);
+    summary.target_bytes = Some(budget.target_bytes);
+    summary.target_reached = Some(budget.reached(size_after));
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()

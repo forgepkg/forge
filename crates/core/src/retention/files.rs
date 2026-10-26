@@ -25,7 +25,7 @@ use forge_db::retention_dao::{self, AuditRow, RunSummary};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use super::model::{SizeBudget, MAX_MIN_RUN_INTERVAL_SECONDS, POLICY_VERSION};
+use super::model::{SizeBudget, SizeBudgetSummary, MAX_MIN_RUN_INTERVAL_SECONDS, POLICY_VERSION};
 
 fn default_true() -> bool {
     true
@@ -161,15 +161,6 @@ pub struct FileDecision {
     pub reason: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileBudgetSummary {
-    pub size_before: u64,
-    pub size_after: u64,
-    pub target_bytes: u64,
-    pub target_attempted: bool,
-    pub target_reached: bool,
-}
-
 /// The directory a path is in (`""`, or ending in `/`).
 fn directory_of(path: &str) -> &str {
     match path.rfind('/') {
@@ -211,7 +202,7 @@ fn evaluate_files_with_budget(
     now: DateTime<Utc>,
     policy: &FileRetentionPolicy,
     files: &[RetentionFile],
-) -> (Vec<FileDecision>, Option<FileBudgetSummary>) {
+) -> (Vec<FileDecision>, Option<SizeBudgetSummary>) {
     let days = |d: u32| Duration::days(i64::from(d));
     let mut by_directory: BTreeMap<&str, Vec<&RetentionFile>> = BTreeMap::new();
     for f in files {
@@ -324,7 +315,7 @@ fn evaluate_files_with_budget(
     }
     (
         out,
-        Some(FileBudgetSummary {
+        Some(SizeBudgetSummary {
             size_before,
             size_after,
             target_bytes,
@@ -341,7 +332,7 @@ pub async fn evaluate_repository(
     repository_id: i64,
     now: DateTime<Utc>,
     policy: &FileRetentionPolicy,
-) -> sqlx::Result<(Vec<FileDecision>, u64, Option<FileBudgetSummary>)> {
+) -> sqlx::Result<(Vec<FileDecision>, u64, Option<SizeBudgetSummary>)> {
     let files = raw_dao::retention_files(pool, repository_id).await?;
     let evaluated = files.len() as u64;
     let policy = policy.clone();

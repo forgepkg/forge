@@ -37,7 +37,7 @@ pub struct ClaimedRepo {
 /// `blob_sha256` of its primary `.nupkg` asset (used by the apply path to
 /// decref the right blob). A component with no `.nupkg` asset is skipped by the
 /// loader (it has nothing to GC).
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct CandidateRow {
     /// `component.id`.
     pub component_id: i64,
@@ -55,22 +55,10 @@ pub struct CandidateRow {
     pub size_bytes: i64,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct CandidateWithShaRow {
-    component_id: i64,
-    name: String,
-    version: String,
-    listed: bool,
-    created_at: DateTime<Utc>,
-    last_downloaded_at: Option<DateTime<Utc>>,
-    size_bytes: i64,
-    blob_sha256: Option<String>,
-}
-
 /// One proxy cached-version candidate row loaded for eviction evaluation.
 /// Only versions whose bytes are cached locally (`downloaded = true`) are
 /// candidates; see [`load_proxy_candidates`].
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct ProxyCandidateRow {
     /// `proxy_cached_version.id`.
     pub cached_version_id: i64,
@@ -483,7 +471,7 @@ pub async fn load_candidate_components<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query_as::<_, CandidateWithShaRow>(
+    let rows = sqlx::query!(
         r#"
         SELECT
             c.id            AS component_id,
@@ -493,21 +481,21 @@ where
             c.created_at    AS created_at,
             c.last_downloaded_at AS last_downloaded_at,
             COALESCE((SELECT SUM(a.size) FROM asset a WHERE a.component_id = c.id), 0)::bigint
-                AS size_bytes,
+                AS "size_bytes!",
             (
                 SELECT a.blob_sha256
                 FROM asset a
                 WHERE a.component_id = c.id AND (a.path = $2 OR a.path LIKE '%.nupkg')
                 ORDER BY a.path
                 LIMIT 1
-            ) AS blob_sha256
+            ) AS "blob_sha256?: String"
         FROM component c
         WHERE c.repository_id = $1
         ORDER BY c.name, c.id
         "#,
+        repository_id,
+        package_path,
     )
-    .bind(repository_id)
-    .bind(package_path)
     .fetch_all(executor)
     .await?;
 
@@ -548,7 +536,8 @@ pub async fn load_proxy_candidates<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query_as::<_, ProxyCandidateRow>(
+    sqlx::query_as!(
+        ProxyCandidateRow,
         r#"
         SELECT p.id AS cached_version_id, p.name, p.version, p.listed, p.first_seen_at,
                p.last_downloaded_at,
@@ -557,17 +546,15 @@ where
                    FROM component c JOIN asset a ON a.component_id = c.id
                    WHERE c.repository_id = p.repository_id
                      AND c.name = p.name AND c.version = p.version
-               ), 0)::bigint AS size_bytes
+               ), 0)::bigint AS "size_bytes!"
         FROM proxy_cached_version p
         WHERE p.repository_id = $1 AND p.downloaded AND p.not_found = false
         ORDER BY p.name, p.version
         "#,
+        repository_id,
     )
-    .bind(repository_id)
     .fetch_all(executor)
-    .await?;
-
-    Ok(rows.into_iter().collect())
+    .await
 }
 
 /// Lock and load the cached versions of one proxy package for retention
@@ -579,30 +566,69 @@ pub async fn lock_proxy_package_candidates(
     name: &str,
 ) -> sqlx::Result<Vec<ProxyCandidateRow>> {
     crate::proxy_dao::lock_cached_package(conn, repository_id, name).await?;
-    sqlx::query_as::<_, ProxyCandidateRow>(
+    sqlx::query_as!(
+        ProxyCandidateRow,
         r#"
         SELECT p.id AS cached_version_id, p.name, p.version, p.listed, p.first_seen_at,
-               p.last_downloaded_at, 0::bigint AS size_bytes
+               p.last_downloaded_at, 0::bigint AS "size_bytes!"
         FROM proxy_cached_version p
         WHERE p.repository_id = $1 AND p.name = $2
           AND p.downloaded AND p.not_found = false
         ORDER BY p.id
         FOR UPDATE OF p
         "#,
+        repository_id,
+        name,
     )
-    .bind(repository_id)
-    .bind(name)
     .fetch_all(conn)
     .await
+}
+
+/// Lock (`FOR UPDATE`, in hash order) the blob rows the assets of `versions`
+/// of package `name` reference: a retention batch that releases several
+/// versions takes them before it decrements any, in the order every writer
+/// that touches two blobs takes them, so that two batches sharing blobs never
+/// wait for each other.
+pub async fn lock_package_version_blobs(
+    conn: &mut sqlx::PgConnection,
+    repository_id: i64,
+    name: &str,
+    versions: &[String],
+) -> sqlx::Result<()> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT b.sha256
+        FROM blob b
+        WHERE b.sha256 IN (
+            SELECT a.blob_sha256
+            FROM component c
+            JOIN asset a ON a.component_id = c.id
+            WHERE c.repository_id = $1 AND c.name = $2 AND c.version = ANY($3)
+        )
+        ORDER BY b.sha256
+        FOR UPDATE OF b
+        "#,
+        repository_id,
+        name,
+        versions,
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(())
 }
 
 /// The logical size of a hosted or proxy package repository, counting its
 /// assets (including assets shared by multiple versions).
 pub async fn package_repository_size(pool: &PgPool, repository_id: i64) -> sqlx::Result<u64> {
-    let bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(a.size), 0)::bigint FROM asset a JOIN component c ON c.id = a.component_id WHERE c.repository_id = $1",
+    let bytes = sqlx::query_scalar!(
+        r#"
+        SELECT COALESCE(SUM(a.size), 0)::bigint AS "bytes!"
+        FROM asset a
+        JOIN component c ON c.id = a.component_id
+        WHERE c.repository_id = $1
+        "#,
+        repository_id,
     )
-    .bind(repository_id)
     .fetch_one(pool)
     .await?;
     u64::try_from(bytes).map_err(|e| sqlx::Error::Protocol(e.to_string()))
@@ -822,7 +848,7 @@ pub async fn lock_package_candidates(
     name: &str,
     package_path: &str,
 ) -> sqlx::Result<Vec<CandidateRow>> {
-    let rows = sqlx::query_as::<_, CandidateRow>(
+    let rows = sqlx::query!(
         r#"
         SELECT
             c.id            AS component_id,
@@ -831,24 +857,36 @@ pub async fn lock_package_candidates(
             c.listed        AS listed,
             c.created_at    AS created_at,
             c.last_downloaded_at AS last_downloaded_at,
+            EXISTS (
+                SELECT 1 FROM asset a
+                WHERE a.component_id = c.id AND (a.path = $3 OR a.path LIKE '%.nupkg')
+            ) AS "has_nupkg!",
             COALESCE((SELECT SUM(a.size) FROM asset a WHERE a.component_id = c.id), 0)::bigint
-                AS size_bytes
+                AS "size_bytes!"
         FROM component c
         WHERE c.repository_id = $1 AND c.name = $2
-          AND EXISTS (
-              SELECT 1 FROM asset a
-              WHERE a.component_id = c.id AND (a.path = $3 OR a.path LIKE '%.nupkg')
-          )
         ORDER BY c.id
         FOR UPDATE OF c
         "#,
+        repository_id,
+        name,
+        package_path,
     )
-    .bind(repository_id)
-    .bind(name)
-    .bind(package_path)
     .fetch_all(conn)
     .await?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .filter(|r| r.has_nupkg)
+        .map(|r| CandidateRow {
+            component_id: r.component_id,
+            name: r.name,
+            version: r.version,
+            listed: r.listed,
+            created_at: r.created_at,
+            last_downloaded_at: r.last_downloaded_at,
+            size_bytes: r.size_bytes,
+        })
+        .collect())
 }
 
 /// Read recent audit rows for a repository, newest first. Optionally filter by

@@ -727,6 +727,7 @@ async fn apply_proxy_budget_batch(
         .map(|candidate| (candidate.cached_version_id, candidate))
         .collect();
 
+    let mut evict = Vec::new();
     for d in decisions {
         let Some(candidate) = candidates_by_id.get(&d.cached_version_id) else {
             audit_skipped_proxy(&mut tx, ctx, d).await?;
@@ -743,6 +744,19 @@ async fn apply_proxy_budget_batch(
             summary.skipped += 1;
             continue;
         }
+        evict.push((d, candidate));
+    }
+    // The batch releases several versions' blobs: lock them all in hash
+    // order first, as every other writer takes them.
+    let versions: Vec<String> = evict.iter().map(|(_, c)| c.version.clone()).collect();
+    retention_dao::lock_package_version_blobs(
+        &mut tx,
+        ctx.repository_id,
+        &first.package_name,
+        &versions,
+    )
+    .await?;
+    for (d, candidate) in evict {
         evict_proxy_cached_tx(
             &mut tx,
             ctx,

@@ -40,11 +40,17 @@ evicts unprotected content in least-recently-used order until it reaches
   time if never downloaded. Hosted repositories retain each package's newest
   listed version; proxy versions are evicted from the cache and can be fetched
   again.
-- Raw files: ordered by last download, or deployment time if never downloaded.
-- Docker: untagged manifests are considered before tags; manifests are ordered
-  by last pull, or push time if never pulled. The last tag of an image is
-  retained. Freed size counts only blobs no remaining manifest in the
-  repository links.
+- Raw files: ordered by the later of their last download and their
+  deployment, so a file deployed again counts as used then.
+- Docker: untagged manifests go first, ordered by last pull, or push time if
+  never pulled. Then tagged manifests, ordered by the later of their last pull
+  and their newest tag's push (as `tag_not_pulled_for_days` judges a tag): the
+  budget deletes all of a manifest's tags together, and the manifest with
+  them. It never deletes a tag whose manifest would stay, since that frees
+  nothing: not an alias of a manifest a protected tag also names, and not the
+  tags of a manifest that holds its image's last tags. An image always keeps
+  a tag. Freed size counts only blobs no remaining manifest in the repository
+  links.
 
 The protections of ordinary rules also apply to budget eviction, including
 keep-N rules, protected tags, and Docker index children and referrers. If
@@ -55,5 +61,6 @@ Retention preview reports budget decisions with reason `size_budget` and
 includes the size before and projected size after. The retention API reports
 the repository's current logical size, and the run summary records the
 before/after sizes, target, and whether it was reached. The **Retention**
-screen displays the current size against the configured maximum and warns when
-a run could not reach its target.
+screen edits the maximum and the target in GB or GiB, displays the current size
+against the configured maximum, and warns when the last run could not reach
+its target.

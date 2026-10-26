@@ -204,7 +204,8 @@ function RetentionScreen({ repo, shape }: { repo: RepoView; shape: PolicyShape }
         />
       }
     >
-      {view.data.last_run?.last_run_summary?.target_reached === false && (
+      {view.data.policy?.size_budget &&
+        view.data.last_run?.last_run_summary?.target_reached === false && (
         <Notice tone="warn" title="Size budget target not reached">
           The content protected by this policy still exceeds the target size.
         </Notice>

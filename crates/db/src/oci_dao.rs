@@ -1599,14 +1599,14 @@ pub struct RetentionManifest {
     pub children: Vec<String>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct RetentionManifestObject {
     pub manifest_id: i64,
     pub blob_sha256: String,
     pub size: i64,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct RetentionBlobRef {
     pub manifest_id: i64,
     pub blob_sha256: String,
@@ -1618,13 +1618,19 @@ pub async fn retention_manifest_objects(
     pool: &PgPool,
     repository_id: i64,
 ) -> sqlx::Result<(Vec<RetentionManifestObject>, Vec<RetentionBlobRef>)> {
-    let manifests = sqlx::query_as::<_, RetentionManifestObject>(
-        "SELECT id AS manifest_id, blob_sha256, size FROM oci_manifest WHERE repository_id = $1",
+    let manifests = sqlx::query_as!(
+        RetentionManifestObject,
+        r#"
+        SELECT id AS manifest_id, blob_sha256, size
+        FROM oci_manifest
+        WHERE repository_id = $1
+        "#,
+        repository_id,
     )
-    .bind(repository_id)
     .fetch_all(pool)
     .await?;
-    let blobs = sqlx::query_as::<_, RetentionBlobRef>(
+    let blobs = sqlx::query_as!(
+        RetentionBlobRef,
         r#"
         SELECT r.manifest_id, l.blob_sha256, l.size
         FROM oci_manifest_ref r
@@ -1633,8 +1639,8 @@ pub async fn retention_manifest_objects(
           ON l.repository_id = m.repository_id AND l.image = m.image AND l.digest = r.digest
         WHERE m.repository_id = $1 AND r.kind = 'blob'
         "#,
+        repository_id,
     )
-    .bind(repository_id)
     .fetch_all(pool)
     .await?;
     Ok((manifests, blobs))
@@ -1666,9 +1672,9 @@ pub async fn retention_manifests(
 /// The logical size of a Docker repository: distinct manifest and linked blob
 /// objects, regardless of how many manifests or images refer to each blob.
 pub async fn repository_size(pool: &PgPool, repository_id: i64) -> sqlx::Result<u64> {
-    let bytes: i64 = sqlx::query_scalar(
+    let bytes = sqlx::query_scalar!(
         r#"
-        SELECT COALESCE(SUM(size), 0)::bigint
+        SELECT COALESCE(SUM(size), 0)::bigint AS "bytes!"
         FROM (
             SELECT blob_sha256, MAX(size) AS size
             FROM (
@@ -1691,8 +1697,8 @@ pub async fn repository_size(pool: &PgPool, repository_id: i64) -> sqlx::Result<
             GROUP BY blob_sha256
         ) distinct_objects
         "#,
+        repository_id,
     )
-    .bind(repository_id)
     .fetch_one(pool)
     .await?;
     u64::try_from(bytes).map_err(|e| sqlx::Error::Protocol(e.to_string()))

@@ -24,11 +24,13 @@ pub async fn lock_cached_package(
     repository_id: i64,
     name: &str,
 ) -> sqlx::Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($2, $1))")
-        .bind(repository_id)
-        .bind(name)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock(hashtextextended('forge.proxy_cached_package.' || $2, $1))",
+        repository_id,
+        name,
+    )
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

@@ -80,22 +80,35 @@ describe('retention policy model', () => {
     expect(newRule('file', ['rule-2', 'keep-recent']).values.id).toBe('rule-3')
   })
 
-  it('builds a budget-only policy in GiB and validates its low watermark', () => {
+  it('builds a budget-only policy and validates its low watermark', () => {
     const draft = draftFromPolicy('file', null)
     draft.rules = []
-    draft.sizeBudgetMaxGiB = '2'
-    draft.sizeBudgetTargetGiB = '1.5'
+    draft.sizeBudgetMax = '2'
+    draft.sizeBudgetTarget = '1.5'
+    expect(draft.sizeBudgetUnit).toBe('GiB')
     expect(validateDraft('file', draft)).toBeNull()
     expect(buildPolicy('file', draft).size_budget).toEqual({
       max_bytes: 2 * 1024 ** 3,
       target_bytes: 1.5 * 1024 ** 3,
     })
-    expect(draftFromPolicy('file', buildPolicy('file', draft)).sizeBudgetMaxGiB).toBe('2')
+    expect(draftFromPolicy('file', buildPolicy('file', draft)).sizeBudgetMax).toBe('2')
 
-    draft.sizeBudgetTargetGiB = '2.5'
-    expect(validateDraft('file', draft)?.sizeBudgetTargetGiB).toMatch(/must not exceed/)
-    draft.sizeBudgetMaxGiB = '0'
-    expect(validateDraft('file', draft)?.sizeBudgetMaxGiB).toMatch(/positive size/)
+    draft.sizeBudgetUnit = 'GB'
+    expect(buildPolicy('file', draft).size_budget).toEqual({
+      max_bytes: 2_000_000_000,
+      target_bytes: 1_500_000_000,
+    })
+    const reloaded = draftFromPolicy('file', buildPolicy('file', draft))
+    expect([reloaded.sizeBudgetMax, reloaded.sizeBudgetTarget, reloaded.sizeBudgetUnit]).toEqual([
+      '2',
+      '1.5',
+      'GB',
+    ])
+
+    draft.sizeBudgetTarget = '2.5'
+    expect(validateDraft('file', draft)?.sizeBudgetTarget).toMatch(/must not exceed/)
+    draft.sizeBudgetMax = '0'
+    expect(validateDraft('file', draft)?.sizeBudgetMax).toMatch(/positive size/)
 
     const smallStored = {
       version: 1,
@@ -103,22 +116,30 @@ describe('retention policy model', () => {
       rules: [],
     } as unknown as RetentionPolicy
     const smallDraft = draftFromPolicy('file', smallStored)
-    expect(smallDraft.sizeBudgetMaxGiB).not.toMatch(/[eE]/)
-    expect(smallDraft.sizeBudgetTargetGiB).toBe('0')
+    expect(smallDraft.sizeBudgetMax).not.toMatch(/[eE]/)
+    expect(smallDraft.sizeBudgetTarget).toBe('0')
     expect(validateDraft('file', smallDraft)).toBeNull()
     expect(buildPolicy('file', smallDraft).size_budget).toEqual({
       max_bytes: 100,
       target_bytes: 0,
     })
 
-    for (const bytes of [2, 10]) {
+    // A stored size reads back unchanged, in the unit that shows it shortest.
+    for (const [bytes, unit] of [
+      [2, 'GiB'],
+      [10, 'GiB'],
+      [123_456_789, 'GB'],
+      [500 * 1000 ** 3, 'GB'],
+      [500 * 1024 ** 3, 'GiB'],
+    ] as const) {
       const stored = {
         version: 1,
         size_budget: { max_bytes: bytes, target_bytes: bytes },
         rules: [],
       } as unknown as RetentionPolicy
-      const draft = draftFromPolicy('file', stored)
-      expect(buildPolicy('file', draft).size_budget).toEqual({
+      const shown = draftFromPolicy('file', stored)
+      expect(shown.sizeBudgetUnit).toBe(unit)
+      expect(buildPolicy('file', shown).size_budget).toEqual({
         max_bytes: bytes,
         target_bytes: bytes,
       })
