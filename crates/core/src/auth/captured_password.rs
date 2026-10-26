@@ -1,6 +1,5 @@
 //! A credential-forwarding realm that no longer forwards: its accounts sign
-//! in with the password hashes the realm kept (`captured_password_only`,
-//! migration 0035).
+//! in with the password hashes the realm kept (`captured_password_only`).
 //!
 //! A realm that keeps password hashes (`capture_password_hash`, see
 //! [`super::upstream_basic`]) stores the last password its upstream accepted

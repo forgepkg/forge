@@ -388,7 +388,7 @@ pub struct RegistrationRow {
     pub package_sha256: Option<String>,
     /// Byte size of the package asset.
     pub package_size: Option<i64>,
-    /// Why the version is deprecated, if it is (migration 0047).
+    /// Why the version is deprecated, if it is.
     pub deprecation: Option<String>,
 }
 

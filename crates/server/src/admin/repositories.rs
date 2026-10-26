@@ -227,8 +227,7 @@ pub struct CreateRepo {
 ///   the same request is still applied.) The response then carries
 ///   `"upstream_credentials_dropped": true` and a warning is logged.
 /// * Turning `anonymous_read` off also deletes the anonymous role's unscoped
-///   `read` grant on the repository (the grant migration 0007 synthesized from
-///   the flag), so anonymous access really ends.
+///   `read` grant on the repository, so anonymous access really ends.
 /// * Docker options (`host`, `immutable_tags`, `latest_mutable`) follow the
 ///   same rules (`host`: `null` clears) and are refused on other formats; a
 ///   docker or package group's `writable_member` too (`null` clears).
@@ -1349,8 +1348,8 @@ pub async fn update(
     }
 
     // M20: the seam honours `anonymous_read` *and* the anonymous role's grants,
-    // so switching the flag off must also remove the grant migration 0007
-    // synthesized from it, or the repository stays anonymously readable.
+    // so switching the flag off must also remove the anonymous role's read
+    // grant on the repository, or the repository stays anonymously readable.
     let anonymous_revoked = if existing.anonymous_read && !updated.anonymous_read {
         match forge_db::authz_dao::delete_anonymous_read_grant(&mut *tx, updated.id).await {
             Ok(removed) => removed,

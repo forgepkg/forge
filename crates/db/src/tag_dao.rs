@@ -1,4 +1,4 @@
-//! Package tags (migration 0047): names for versions of a package, such as
+//! Package tags (`package_tag`): names for versions of a package, such as
 //! npm's dist-tags (`latest`, `next`). A hosted repository's are set by its
 //! clients (a format plugin's tag changes); a proxy's are its upstream's
 //! as last read ([`replace_tags`]).

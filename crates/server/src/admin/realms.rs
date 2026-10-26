@@ -173,7 +173,7 @@ fn normalized_wif_issuer(config: &JsonValue) -> Option<&str> {
         .filter(|issuer| !issuer.is_empty())
 }
 
-/// Friendly pre-check for enabled WIF issuer ownership. Migration 0013's
+/// Friendly pre-check for enabled WIF issuer ownership. The schema's
 /// partial unique index is the authoritative race-safe enforcement.
 async fn assert_unique_enabled_wif_issuer(
     state: &AppState,

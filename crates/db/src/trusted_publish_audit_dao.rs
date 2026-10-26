@@ -1,7 +1,7 @@
 //! Append-only trusted-publishing provenance.
 //!
 //! Rows are inserted in the same transaction as the component/assets they
-//! describe. Migration 0012 rejects UPDATE and DELETE at the database boundary;
+//! describe. A trigger rejects UPDATE and DELETE at the database boundary;
 //! this module deliberately exposes no mutation API other than insert.
 
 use chrono::{DateTime, Utc};

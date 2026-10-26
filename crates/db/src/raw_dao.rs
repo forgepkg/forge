@@ -1,7 +1,7 @@
 //! Raw (generic file) repositories: the `raw_file` table.
 //!
 //! A file is a path in a repository naming one CAS blob, and each row holds
-//! exactly one `blob.ref_count` reference (see migration 0040): [`store`]
+//! exactly one `blob.ref_count` reference (see the schema): [`store`]
 //! takes it with the ingest lease of the uploaded content, in the
 //! transaction that inserts the row or points it at new content, and every
 //! delete releases it in the transaction that removes the row.

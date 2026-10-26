@@ -1,4 +1,4 @@
-//! Command-line logins approved in the browser (migration 0047): a client
+//! Command-line logins approved in the browser (`cli_login`): a client
 //! such as `npm login` is given a login URL to open and a done URL to poll.
 
 use chrono::{DateTime, Utc};

@@ -123,13 +123,12 @@ pub struct CredForwardRealmConfig {
     pub allow_http: bool,
     /// Gone in 2.0: a credential-forwarding realm creates no accounts (an
     /// administrator creates each one, `POST /admin/users` with the realm).
-    /// Accepted only as `false`, and never stored (migration 0041 removed it
-    /// from stored rows).
+    /// Accepted only as `false`, and never stored.
     #[serde(default, skip_serializing)]
     pub auto_provision: Option<bool>,
     /// Keep an argon2id hash of every password the upstream accepts on the
-    /// account (migration 0035), so an administrator can later switch the
-    /// realm's accounts to local ones and retire the upstream. Off by default;
+    /// account, so an administrator can later switch the realm's accounts to
+    /// local ones and retire the upstream. Off by default;
     /// turning it off deletes the kept hashes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub capture_password_hash: bool,
@@ -1143,7 +1142,7 @@ pub async fn seed_auth_realms(
     let provider_idx = |id: &str| config.auth.providers.iter().position(|p| p == id);
 
     if first_import {
-        // The built-in local row was created by migration 0010 at priority 10;
+        // The schema seeds the built-in local row at priority 10;
         // move it to its configured slot when the order says otherwise.
         if let Some(local) = auth_realm_dao::find_realm_by_name(pool, "local").await? {
             let desired = provider_idx("local-password").map(slot).unwrap_or(10);

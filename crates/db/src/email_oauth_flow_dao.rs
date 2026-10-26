@@ -1,4 +1,4 @@
-//! Data access for `email_oauth_flow` (migration 0044): the OAuth
+//! Data access for `email_oauth_flow`: the OAuth
 //! authorizations of the email service's `smtp_oauth` transport in progress
 //! (#321), by the authorization code flow with PKCE or the device
 //! authorization grant. Rows are short-lived and taken (deleted) when the

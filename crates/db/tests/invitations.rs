@@ -1,4 +1,4 @@
-//! Invitations (#322, migration 0045): an invited local account has no
+//! Invitations (#322): an invited local account has no
 //! password only while it is invited, its invitation is replaced by a new
 //! one, and a token is accepted once, live, for an active account.
 

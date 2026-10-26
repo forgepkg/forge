@@ -1,4 +1,4 @@
-//! Data access for invitations (#322, migration 0045): a local account an
+//! Data access for invitations (#322): a local account an
 //! administrator created without a password (`app_user.invited`), and the
 //! one live `user_invitation` with which its user sets the password.
 //!

@@ -1,7 +1,7 @@
 //! Keeping a password hash of credential-forwarding logins
 //! (`capture_password_hash`) and signing in with it once the realm stops
 //! forwarding (`captured_password_only`), against an in-process mock upstream
-//! (`wiremock`) and a real Postgres (migration 0035).
+//! (`wiremock`) and a real Postgres.
 
 mod common;
 

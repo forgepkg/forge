@@ -882,7 +882,7 @@ async fn github_actions_minimal_discovery_and_stable_claims_authenticate() {
     // Historical provenance must outlive every mutable authorization/config
     // row it snapshots. Delete the live realm, mapped role, and repository and
     // prove the immutable ledger remains independently readable with the names
-    // captured at publish time (0012 intentionally has no cascading FKs).
+    // captured at publish time (the ledger intentionally has no cascading FKs).
     sqlx::query("DELETE FROM auth_realm WHERE name = 'github-actions'")
         .execute(&srv.pool)
         .await
