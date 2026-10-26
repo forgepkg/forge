@@ -1503,6 +1503,69 @@ mod tests {
     }
 
     #[test]
+    fn deleting_one_tag_of_a_digest_leaves_its_other_tags_and_manifest() {
+        // `1.0` and `1` name manifest 1; `1` was moved onto it recently.
+        let tags = vec![
+            tag("app", "1.0", 1, 30),
+            tag("app", "1", 1, 2),
+            tag("app", "2.0", 2, 1),
+        ];
+        let manifests = vec![
+            manifest("app", 1, None, &[], None),
+            manifest("app", 2, None, &[], None),
+        ];
+        let mut r = rule("r");
+        r.tag_older_than_days = Some(7);
+        r.delete_untagged_after_days = Some(1);
+        let d = evaluate_images(now(), &policy(vec![r]), &tags, &manifests);
+        let deleted: Vec<&str> = d.tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(deleted, vec!["1.0"]);
+        assert!(d.manifests.is_empty(), "`1` keeps manifest 1");
+    }
+
+    #[test]
+    fn the_same_digest_in_two_images_is_judged_per_image() {
+        // `a` and `b` each hold a manifest of the same digest.
+        let mut a = tag("a", "x", 1, 30);
+        let mut b = tag("b", "x", 2, 30);
+        let mut ma = manifest("a", 1, None, &[], None);
+        let mut mb = manifest("b", 2, None, &[], None);
+        for digest in [&mut a.digest, &mut b.digest, &mut ma.digest, &mut mb.digest] {
+            *digest = "sha256:same".into();
+        }
+        let mut r = rule("r");
+        r.image_prefix = Some("a".into());
+        r.tag_older_than_days = Some(7);
+        r.delete_untagged_after_days = Some(7);
+        let d = evaluate_images(now(), &policy(vec![r]), &[a, b], &[ma, mb]);
+        let deleted: Vec<(&str, i64)> = d
+            .tags
+            .iter()
+            .map(|t| (t.image.as_str(), t.manifest_id))
+            .collect();
+        assert_eq!(deleted, vec![("a", 1)]);
+        assert!(d.manifests.is_empty(), "the rule does not match `b`");
+    }
+
+    #[test]
+    fn a_pull_of_one_tag_counts_for_every_tag_of_its_digest() {
+        // `1` and `latest` name manifest 1, pulled (through `latest`)
+        // yesterday; `0.9`'s manifest was never pulled.
+        let mut tags = vec![
+            tag("app", "0.9", 0, 60),
+            tag("app", "1", 1, 60),
+            tag("app", "latest", 1, 60),
+        ];
+        tags[1].last_pulled_at = Some(at(1));
+        tags[2].last_pulled_at = Some(at(1));
+        let mut r = rule("stale");
+        r.tag_not_pulled_for_days = Some(30);
+        let d = evaluate_images(now(), &policy(vec![r]), &tags, &[]);
+        let deleted: Vec<&str> = d.tags.iter().map(|t| t.tag.as_str()).collect();
+        assert_eq!(deleted, vec!["0.9"]);
+    }
+
+    #[test]
     fn index_deleted_before_its_children() {
         let manifests = vec![
             manifest("app", 2, Some(30), &[], None),
