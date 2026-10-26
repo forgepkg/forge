@@ -87,12 +87,15 @@ export const Route = createFileRoute('/_app/repos/$repo')({
   // The repository's format decides what this screen lists (NuGet packages or
   // docker images): have the (usually cached) repository list before the
   // first render instead of flashing the wrong screen, refreshed once when it
-  // predates this repository. Best effort — a failure is shown, with a retry,
-  // by the component's own query.
+  // predates this repository or a repository change invalidated it (which
+  // `ensureQueryData` alone would not refetch). Best effort — a failure is
+  // shown, with a retry, by the component's own query.
   loader: async ({ context: { queryClient }, params }) => {
     try {
       const repos = await queryClient.ensureQueryData(browseReposQueryOptions)
-      if (!repos.some((r) => r.name === params.repo)) {
+      const invalidated =
+        queryClient.getQueryState(browseReposQueryOptions.queryKey)?.isInvalidated === true
+      if (invalidated || !repos.some((r) => r.name === params.repo)) {
         await queryClient.fetchQuery({ ...browseReposQueryOptions, staleTime: 0 })
       }
     } catch {

@@ -2,9 +2,13 @@ import {
   useMutation,
   useQuery,
   useQueryClient,
+  type QueryClient,
 } from '@tanstack/react-query'
 
 import type { ApiError } from '~/lib/httpClient'
+import { imageKeys } from '~/api/images'
+import { pkgKeys } from '~/api/packages'
+import { rawKeys } from '~/api/raw'
 import {
   addMember,
   createTrustedPublisher,
@@ -41,7 +45,22 @@ import {
  * the UI re-fetches the authoritative server state (rather than optimistically
  * mutating a redacted view). Auth failures are not retried by the shared
  * query-client policy.
+ *
+ * A change to a repository or a group's members also invalidates what the
+ * Browse screens cached ({@link invalidateBrowse}).
  */
+
+/**
+ * Mark everything the Browse screens show as stale: the repository list
+ * (`GET /browse/repos`), package and image searches and details, and raw
+ * listings. Creating, renaming, deleting or taking a repository offline, and
+ * changing a group's members, change what they list.
+ */
+function invalidateBrowse(queryClient: QueryClient) {
+  void queryClient.invalidateQueries({ queryKey: pkgKeys.all() })
+  void queryClient.invalidateQueries({ queryKey: imageKeys.all() })
+  void queryClient.invalidateQueries({ queryKey: rawKeys.all })
+}
 
 /** List all repositories (`GET /admin/repositories`). */
 export function useRepositories() {
@@ -69,18 +88,22 @@ export function useRepository(name: string) {
   })
 }
 
-/** Create a repository; invalidates the list on success. */
+/** Create a repository; invalidates the list and Browse on success. */
 export function useCreateRepository() {
   const queryClient = useQueryClient()
   return useMutation<RepoView, ApiError, CreateRepo>({
     mutationFn: (body) => createRepository(body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: repoKeys.list() })
+      invalidateBrowse(queryClient)
     },
   })
 }
 
-/** Update a repository; invalidates the list + that repo's detail on success. */
+/**
+ * Update a repository; invalidates the list, that repo's detail and Browse on
+ * success.
+ */
 export function useUpdateRepository(name: string) {
   const queryClient = useQueryClient()
   return useMutation<RepoView, ApiError, UpdateRepo>({
@@ -94,11 +117,12 @@ export function useUpdateRepository(name: string) {
           queryKey: repoKeys.detail(updated.name),
         })
       }
+      invalidateBrowse(queryClient)
     },
   })
 }
 
-/** Delete a repository; invalidates the list on success. */
+/** Delete a repository; invalidates the list and Browse on success. */
 export function useDeleteRepository() {
   const queryClient = useQueryClient()
   return useMutation<void, ApiError, string>({
@@ -106,6 +130,7 @@ export function useDeleteRepository() {
     onSuccess: (_void, name) => {
       void queryClient.invalidateQueries({ queryKey: repoKeys.list() })
       void queryClient.removeQueries({ queryKey: repoKeys.detail(name) })
+      invalidateBrowse(queryClient)
     },
   })
 }
@@ -128,35 +153,44 @@ export function useMembers(name: string) {
   })
 }
 
-/** Add a member to a group; invalidates that group's member list on success. */
+/**
+ * Add a member to a group; invalidates that group's member list and Browse on
+ * success.
+ */
 export function useAddMember(name: string) {
   const queryClient = useQueryClient()
   return useMutation<void, ApiError, AddMember>({
     mutationFn: (body) => addMember(name, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
+      invalidateBrowse(queryClient)
     },
   })
 }
 
-/** Remove a member from a group; invalidates that group's member list. */
+/** Remove a member from a group; invalidates its member list and Browse. */
 export function useRemoveMember(name: string) {
   const queryClient = useQueryClient()
   return useMutation<void, ApiError, string>({
     mutationFn: (member) => removeMember(name, member),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
+      invalidateBrowse(queryClient)
     },
   })
 }
 
-/** Flag or unflag a member as owner; invalidates that group's member list. */
+/**
+ * Flag or unflag a member as owner (which decides what the group serves);
+ * invalidates that group's member list and Browse.
+ */
 export function useUpdateMember(name: string) {
   const queryClient = useQueryClient()
   return useMutation<void, ApiError, { member: string; owner: boolean }>({
     mutationFn: ({ member, owner }) => updateMember(name, member, { owner }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
+      invalidateBrowse(queryClient)
     },
   })
 }
