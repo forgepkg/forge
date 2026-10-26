@@ -204,11 +204,18 @@ function RetentionScreen({ repo, shape }: { repo: RepoView; shape: PolicyShape }
         />
       }
     >
+      {view.data.policy?.size_budget &&
+        view.data.last_run?.last_run_summary?.target_reached === false && (
+        <Notice tone="warn" title="Size budget target not reached">
+          The content protected by this policy still exceeds the target size.
+        </Notice>
+      )}
       <PolicyPanel
         key={seed}
         repo={name}
         shape={shape}
         stored={view.data.policy}
+        currentSizeBytes={view.data.current_size_bytes}
         onReset={() => setSeed((n) => n + 1)}
       />
       <AuditPanel repo={name} />
@@ -224,11 +231,13 @@ function PolicyPanel({
   repo,
   shape,
   stored,
+  currentSizeBytes,
   onReset,
 }: {
   repo: string
   shape: PolicyShape
   stored: RetentionPolicy | null
+  currentSizeBytes: number
   onReset: () => void
 }) {
   const toast = useToast()
@@ -358,6 +367,7 @@ function PolicyPanel({
           shape={shape}
           draft={draft}
           errors={errors}
+          currentSizeBytes={currentSizeBytes}
           onChange={change}
         />
         {errors && (

@@ -160,6 +160,78 @@ async fn put_validates_then_get_round_trips() {
         .unwrap();
     assert_eq!(resp.status(), 400, "empty-rules policy must be rejected");
 
+    // A valid size budget can be the policy's only content.
+    let budget_only = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 100, "target_bytes": 80 },
+        "rules": []
+    });
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": budget_only}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "budget-only policy must be accepted");
+    let stored: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(stored["policy"]["size_budget"]["max_bytes"], 100);
+    assert!(stored["current_size_bytes"].is_number());
+
+    let preview = client
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/preview",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), 200);
+    let preview: serde_json::Value = preview.json().await.unwrap();
+    assert_eq!(preview["size_before"], 10);
+    assert_eq!(preview["size_after"], 10);
+    assert_eq!(preview["target_bytes"], 80);
+    assert_eq!(preview["target_reached"], true);
+
+    let invalid_budget = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 100, "target_bytes": 101 },
+        "rules": []
+    });
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": invalid_budget}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "target above maximum must be rejected");
+
+    let zero_max = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 0 },
+        "rules": []
+    });
+    let resp = client
+        .put(format!(
+            "{}/admin/repositories/{name}/retention",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"policy": zero_max}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "zero maximum must be rejected");
+
     // Invalid: a proxy-cached rule on a hosted repo is rejected → 400.
     let proxy_on_hosted = json!({
         "version": 1, "enabled": true, "dry_run_only": false,
@@ -510,6 +582,81 @@ async fn preview_returns_decisions_without_mutating() {
             .await
             .unwrap();
     assert_eq!(audited, 0, "preview must not write audit rows");
+}
+
+/// A preview over the size budget lists the budget's deletions next to the
+/// rules' decisions, as a run would apply them: a tagged version is left
+/// alone, a version the budget deletes is not also unlisted, and the
+/// projected size says the target is out of reach.
+#[tokio::test]
+async fn preview_shows_the_size_budget_as_a_run_applies_it() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("ret{s}");
+    // Four versions of 10 bytes each: 40 bytes.
+    let repo_id = seed_hosted_with_versions(
+        &srv,
+        &name,
+        "Sample.Lib",
+        &["1.0.0", "1.1.0", "1.2.0", "2.0.0"],
+    )
+    .await;
+    forge_db::tag_dao::set_tag(&srv.pool, repo_id, "sample.lib", "legacy", "1.0.0")
+        .await
+        .unwrap();
+
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 25, "target_bytes": 15 },
+        "rules": [{
+            "id": "unlist-cold",
+            "action": "unlist",
+            "release_type": "any",
+            "criteria": { "keep_last_n": 1, "not_downloaded_for_days": 1 }
+        }]
+    });
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{name}/retention/preview",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": policy }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    // 1.0.0 is tagged and 2.0.0 the newest listed version: the budget
+    // deletes the other two instead of the rule unlisting them.
+    let decisions: Vec<(&str, &str, &str)> = body["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["version"].as_str().unwrap(),
+                d["action"].as_str().unwrap(),
+                d["rule_id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![
+            ("1.1.0", "hard_delete", "size_budget"),
+            ("1.2.0", "hard_delete", "size_budget"),
+        ]
+    );
+    assert_eq!(body["counts"]["deleted"], 2);
+    assert_eq!(body["counts"]["unlisted"], 0);
+    assert_eq!(body["size_before"], 40);
+    assert_eq!(body["size_after"], 20);
+    assert_eq!(body["target_bytes"], 15);
+    assert_eq!(body["target_reached"], false);
 }
 
 /// Preview with no policy returns an empty decision set (not an error).

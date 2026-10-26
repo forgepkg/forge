@@ -1,15 +1,15 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            c.id            AS component_id,\n            c.name          AS name,\n            c.version       AS version,\n            c.listed        AS listed,\n            c.created_at    AS created_at,\n            c.last_downloaded_at AS last_downloaded_at,\n            EXISTS (\n                SELECT 1 FROM asset a\n                WHERE a.component_id = c.id AND (a.path = $3 OR a.path LIKE '%.nupkg')\n            ) AS \"has_nupkg!\"\n        FROM component c\n        WHERE c.repository_id = $1 AND c.name = $2\n        ORDER BY c.id\n        FOR UPDATE OF c\n        ",
+  "query": "\n        SELECT p.id AS cached_version_id, p.name, p.version, p.listed, p.first_seen_at,\n               p.last_downloaded_at, 0::bigint AS \"size_bytes!\"\n        FROM proxy_cached_version p\n        WHERE p.repository_id = $1 AND p.name = $2\n          AND p.downloaded AND p.not_found = false\n        ORDER BY p.id\n        FOR UPDATE OF p\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "component_id",
+        "name": "cached_version_id",
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "component",
+            "table": "proxy_cached_version",
             "name": "id"
           }
         }
@@ -20,7 +20,7 @@
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "component",
+            "table": "proxy_cached_version",
             "name": "name"
           }
         }
@@ -31,7 +31,7 @@
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "component",
+            "table": "proxy_cached_version",
             "name": "version"
           }
         }
@@ -42,19 +42,19 @@
         "type_info": "Bool",
         "origin": {
           "Table": {
-            "table": "component",
+            "table": "proxy_cached_version",
             "name": "listed"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "created_at",
+        "name": "first_seen_at",
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "component",
-            "name": "created_at"
+            "table": "proxy_cached_version",
+            "name": "first_seen_at"
           }
         }
       },
@@ -64,22 +64,21 @@
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "component",
+            "table": "proxy_cached_version",
             "name": "last_downloaded_at"
           }
         }
       },
       {
         "ordinal": 6,
-        "name": "has_nupkg!",
-        "type_info": "Bool",
+        "name": "size_bytes!",
+        "type_info": "Int8",
         "origin": "Expression"
       }
     ],
     "parameters": {
       "Left": [
         "Int8",
-        "Text",
         "Text"
       ]
     },
@@ -93,5 +92,5 @@
       null
     ]
   },
-  "hash": "bf35532a9387bd2cd0d4cd2fb29a69907e0ac61291df8190250afbe0afebfb2d"
+  "hash": "3c6ecbbb33344e1c80f52681fc2d11675eeb69a4066c3359f20f2a43638feb8a"
 }

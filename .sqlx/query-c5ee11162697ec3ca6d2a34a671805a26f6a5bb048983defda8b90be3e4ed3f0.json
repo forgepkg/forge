@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COALESCE(SUM(size), 0)::bigint AS \"bytes!\"\n        FROM (\n            SELECT blob_sha256, MAX(size) AS size\n            FROM (\n                SELECT blob_sha256, size\n                FROM oci_blob_link\n                WHERE repository_id = $1\n                  AND EXISTS (\n                      SELECT 1\n                      FROM oci_manifest m\n                      JOIN oci_manifest_ref r ON r.manifest_id = m.id AND r.kind = 'blob'\n                      WHERE m.repository_id = oci_blob_link.repository_id\n                        AND m.image = oci_blob_link.image\n                        AND r.digest = oci_blob_link.digest\n                  )\n                UNION ALL\n                SELECT blob_sha256, size\n                FROM oci_manifest\n                WHERE repository_id = $1\n            ) objects\n            GROUP BY blob_sha256\n        ) distinct_objects\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "bytes!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c5ee11162697ec3ca6d2a34a671805a26f6a5bb048983defda8b90be3e4ed3f0"
+}

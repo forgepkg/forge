@@ -582,6 +582,7 @@ pub struct RetentionFile {
     pub id: i64,
     pub path: String,
     pub blob_sha256: String,
+    pub size: i64,
     pub updated_at: DateTime<Utc>,
     pub last_downloaded_at: Option<DateTime<Utc>>,
 }
@@ -594,7 +595,7 @@ pub async fn retention_files(
     sqlx::query_as!(
         RetentionFile,
         r#"
-        SELECT id, path, blob_sha256, updated_at, last_downloaded_at
+        SELECT id, path, blob_sha256, size, updated_at, last_downloaded_at
         FROM raw_file
         WHERE repository_id = $1
         ORDER BY path
@@ -603,6 +604,17 @@ pub async fn retention_files(
     )
     .fetch_all(pool)
     .await
+}
+
+/// The logical size of a raw repository, counting every file entry.
+pub async fn repository_size(pool: &PgPool, repository_id: i64) -> sqlx::Result<u64> {
+    let bytes = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(size), 0)::bigint AS "bytes!" FROM raw_file WHERE repository_id = $1"#,
+        repository_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    u64::try_from(bytes).map_err(|e| sqlx::Error::Protocol(e.to_string()))
 }
 
 /// The files directly in directory `prefix` (not in its subdirectories),
@@ -618,7 +630,7 @@ pub async fn lock_directory_for_retention(
     sqlx::query_as!(
         RetentionFile,
         r#"
-        SELECT id, path, blob_sha256, updated_at, last_downloaded_at
+        SELECT id, path, blob_sha256, size, updated_at, last_downloaded_at
         FROM raw_file
         WHERE repository_id = $1 AND path >= $2 AND ($3::text IS NULL OR path < $3)
           AND strpos(substr(path, $4), '/') = 0

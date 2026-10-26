@@ -152,6 +152,51 @@ async fn component_exists(pool: &PgPool, repo_id: i64, name: &str, version: &str
 }
 
 #[tokio::test]
+async fn size_budget_evicts_oldest_hosted_versions_and_keeps_newest() {
+    let pool = pool().await;
+    let n = unique();
+    let repo =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw-budget-{n}")))
+            .await
+            .unwrap();
+    for (i, (version, days)) in [("1.0.0", 30), ("2.0.0", 20), ("3.0.0", 10)]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, "lib", version, &sha, days).await;
+    }
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 250, "target_bytes": 100 },
+        "rules": []
+    });
+    arm(&pool, repo.id, &policy).await;
+
+    let summary = worker(&pool, config())
+        .tick_repo(repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(summary.deleted, 2);
+    assert_eq!(summary.size_before, Some(300));
+    assert_eq!(summary.size_after, Some(100));
+    assert_eq!(summary.target_reached, Some(true));
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert!(!component_exists(&pool, repo.id, "lib", "2.0.0").await);
+    assert!(component_exists(&pool, repo.id, "lib", "3.0.0").await);
+    let audit_reason: String = sqlx::query_scalar(
+        "SELECT rule_id FROM retention_audit WHERE repository_id = $1 ORDER BY id LIMIT 1",
+    )
+    .bind(repo.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_reason, "size_budget");
+}
+
+#[tokio::test]
 async fn tick_prunes_per_policy_and_drives_outbox() {
     let pool = pool().await;
     let n = unique();
@@ -829,6 +874,7 @@ async fn claim_and_evaluate(
                     listed: r.listed,
                     created_at: r.created_at,
                     last_downloaded_at: r.last_downloaded_at,
+                    size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
                 },
             )
             .collect();
@@ -1119,4 +1165,194 @@ async fn proxy_eviction_keeps_the_newest_and_the_recently_pulled_versions() {
             "{version}"
         );
     }
+}
+
+#[tokio::test]
+async fn size_budget_evicts_oldest_proxy_cache_versions_first() {
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(
+        &pool,
+        NewRepository::proxy(format!("rw-budget-proxy-{n}")),
+    )
+    .await
+    .unwrap();
+    for (i, (version, pulled_days_ago)) in [("1.0.0", 30), ("2.0.0", 20), ("3.0.0", 10)]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, "lib", version, &sha, 100).await;
+        seed_cached_version(&pool, repo.id, version, true, Some(pulled_days_ago)).await;
+    }
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "size_budget": { "max_bytes": 250, "target_bytes": 100 },
+            "rules": []
+        }),
+    )
+    .await;
+
+    let summary = worker(&pool, config())
+        .tick_repo(repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(summary.deleted, 2);
+    assert_eq!(summary.size_before, Some(300));
+    assert_eq!(summary.size_after, Some(100));
+    assert_eq!(summary.target_reached, Some(true));
+    for (version, cached) in [("1.0.0", false), ("2.0.0", false), ("3.0.0", true)] {
+        assert_eq!(
+            cached_row(&pool, repo.id, version)
+                .await
+                .unwrap()
+                .downloaded,
+            cached,
+            "{version}"
+        );
+    }
+    assert!(component_exists(&pool, repo.id, "lib", "3.0.0").await);
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert!(!component_exists(&pool, repo.id, "lib", "2.0.0").await);
+}
+
+#[tokio::test]
+async fn proxy_size_budget_rechecks_keep_last_n_after_a_newer_version_is_unlisted() {
+    let pool = pool().await;
+    let n = unique();
+    let repo = repository_dao::insert_repository(
+        &pool,
+        NewRepository::proxy(format!("rw-budget-proxy-protection-{n}")),
+    )
+    .await
+    .unwrap();
+    for (i, (version, pulled_days_ago)) in [("1.0.0", 60), ("2.0.0", 20), ("3.0.0", 1)]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, "lib", version, &sha, 100).await;
+        seed_cached_version(&pool, repo.id, version, true, Some(pulled_days_ago)).await;
+    }
+    let policy_json = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 250, "target_bytes": 100 },
+        "rules": [{
+            "id": "keep-latest",
+            "action": "hard_delete",
+            "scope": "proxy_cached",
+            "criteria": { "keep_last_n": 1, "not_pulled_for_days": 90 }
+        }]
+    });
+    arm(&pool, repo.id, &policy_json).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let (claimed, run_id) = retention_dao::claim_next_due_repo(
+        &mut tx,
+        Utc::now(),
+        Duration::seconds(60),
+        Some(repo.id),
+    )
+    .await
+    .unwrap()
+    .expect("due");
+    tx.commit().await.unwrap();
+    let policy: forge_core::retention::model::RetentionPolicy =
+        serde_json::from_value(claimed.policy.clone()).unwrap();
+    let now = forge_db::db_now(&pool).await.unwrap();
+    let format = nuget();
+    let candidates: Vec<_> = retention_dao::load_proxy_candidates(&pool, repo.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| forge_core::retention::evaluate::ProxyCandidate {
+            cached_version_id: r.cached_version_id,
+            package_name: r.name,
+            version: r.version,
+            listed: r.listed,
+            first_seen_at: r.first_seen_at,
+            last_downloaded_at: r.last_downloaded_at,
+            size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
+        })
+        .collect();
+    let ordinary =
+        forge_core::retention::evaluate::evaluate_proxy(&format, now, &policy, &candidates);
+    let size_before = retention_dao::package_repository_size(&pool, repo.id)
+        .await
+        .unwrap();
+    let mut plan = forge_core::retention::evaluate::evaluate_size_budget(
+        &format,
+        &policy,
+        &[],
+        &candidates,
+        size_before,
+        forge_core::retention::evaluate::PackageBudgetInputs {
+            hosted_decisions: &[],
+            proxy_decisions: &ordinary,
+            tagged_hosted_ids: &std::collections::HashSet::new(),
+        },
+    );
+    assert_eq!(
+        plan.proxy
+            .iter()
+            .map(|decision| decision.version.as_str())
+            .collect::<Vec<_>>(),
+        vec!["1.0.0", "2.0.0"]
+    );
+    let mut decisions = ordinary;
+    decisions.append(&mut plan.proxy);
+
+    sqlx::query(
+        "UPDATE proxy_cached_version SET listed = false \
+         WHERE repository_id = $1 AND name = 'lib' AND version = '3.0.0'",
+    )
+    .bind(repo.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ctx = forge_core::retention::apply::ApplyContext {
+        pool: &pool,
+        repository_id: repo.id,
+        repository_name: &claimed.name,
+        run_id,
+        delete_grace: Duration::seconds(60),
+        dry_run: false,
+        evaluated_at: Some(now),
+        fence: Some(forge_core::retention::apply::RunFence {
+            stored_policy: &claimed.policy,
+            policy: &policy,
+            format: &format,
+        }),
+    };
+    let summary = forge_core::retention::apply::apply(&ctx, &[], &decisions)
+        .await
+        .unwrap();
+    assert_eq!((summary.deleted, summary.skipped), (1, 1));
+    assert!(
+        !cached_row(&pool, repo.id, "1.0.0")
+            .await
+            .unwrap()
+            .downloaded
+    );
+    assert!(
+        cached_row(&pool, repo.id, "2.0.0")
+            .await
+            .unwrap()
+            .downloaded
+    );
+    assert!(
+        cached_row(&pool, repo.id, "3.0.0")
+            .await
+            .unwrap()
+            .downloaded
+    );
+    assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
+    assert!(component_exists(&pool, repo.id, "lib", "2.0.0").await);
+    assert!(component_exists(&pool, repo.id, "lib", "3.0.0").await);
 }

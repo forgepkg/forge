@@ -3103,6 +3103,84 @@ async fn retention_keeps_newest_tags_and_drops_old_untagged_manifests() {
     assert_eq!(audit, vec!["delete_tag", "delete_manifest"]);
 }
 
+#[tokio::test]
+async fn image_size_budget_worker_keeps_last_tag_when_target_is_unreachable() {
+    let srv = common::start().await;
+    let repo = repo_name("dock-budget");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    for i in 0..3 {
+        oci.push_image(
+            &name,
+            &format!("v{i}"),
+            "amd64",
+            format!("budget layer {i}").as_bytes(),
+        )
+        .await;
+    }
+    for (i, tag) in ["v0", "v1", "v2"].iter().enumerate() {
+        sqlx::query("UPDATE oci_tag SET updated_at = now() - make_interval(days => $1) WHERE repository_id = $2 AND tag = $3")
+            .bind(10 - i as i32)
+            .bind(repo_id)
+            .bind(tag)
+            .execute(&srv.pool)
+            .await
+            .unwrap();
+    }
+    let size_before = forge_db::oci_dao::repository_size(&srv.pool, repo_id)
+        .await
+        .unwrap();
+    assert!(size_before > 1);
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": size_before - 1, "target_bytes": 1 },
+        "rules": []
+    });
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": policy}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let resp = admin_post(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention/run"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status(), 202);
+
+    let worker = forge_core::retention::RetentionWorker::new(
+        srv.pool.clone(),
+        forge_server::state::RegistryResolver(srv.state.formats.clone()),
+        Arc::new(forge_core::repo::NoopCacheInvalidator),
+        forge_core::retention::RetentionConfig::default(),
+    );
+    let summary = worker.tick_repo(repo_id).await.unwrap().unwrap();
+    assert!(summary.deleted > 0);
+    assert_eq!(summary.size_before, Some(size_before));
+    assert_eq!(summary.target_bytes, Some(1));
+    assert_eq!(summary.target_reached, Some(false));
+    assert!(summary.size_after.unwrap() > 1);
+    assert_eq!(oci.get(&name, "manifests/v0").await.status(), 404);
+    assert_eq!(oci.get(&name, "manifests/v1").await.status(), 404);
+    assert_eq!(oci.get(&name, "manifests/v2").await.status(), 200);
+    let audit: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT rule_id FROM retention_audit WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_all(&srv.pool)
+            .await
+            .unwrap();
+    assert_eq!(audit, vec!["size_budget"]);
+}
+
 /// Claim `repo_id`'s retention run and evaluate its image policy as the
 /// worker does, stopping before the apply step so a test can change state
 /// in between.
@@ -3138,7 +3216,7 @@ async fn claim_image_run(
     let policy: forge_core::retention::images::ImageRetentionPolicy =
         serde_json::from_value(claimed.policy.clone()).unwrap();
     let now = forge_db::db_now(&srv.pool).await.unwrap();
-    let (decisions, _) =
+    let (decisions, _, _) =
         forge_core::retention::images::evaluate_repository(&srv.pool, repo_id, now, &policy)
             .await
             .unwrap();
@@ -3369,6 +3447,264 @@ async fn image_retention_re_evaluates_each_image_under_its_lock() {
                 .status(),
             200,
             "{digest}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn image_budget_keeps_a_child_and_its_referrer_when_a_new_index_uses_it() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("retention child {}", unique()).into_bytes();
+    let child = oci.push_image(&name, "child", "amd64", &layer).await;
+    let child_manifest = image(&config("amd64"), &[&layer]);
+    let sig = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha(b"{}"), "size": 2},
+        "layers": [],
+        "subject": {"mediaType": OCI_MANIFEST, "digest": child, "size": child_manifest.len()},
+    })
+    .to_string()
+    .into_bytes();
+    assert_eq!(
+        oci.put_manifest(&name, &sha(&sig), OCI_MANIFEST, &sig)
+            .await
+            .status(),
+        201
+    );
+    assert_eq!(oci.delete(&name, "manifests/child").await.status(), 202);
+    let sig_digest = sha(&sig);
+    sqlx::query(
+        "UPDATE oci_manifest SET untagged_since = now() - interval '30 days' \
+         WHERE repository_id = $1 AND image = 'app' AND digest = ANY($2)",
+    )
+    .bind(repo_id)
+    .bind(vec![child.clone(), sig_digest.clone()])
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 1, "target_bytes": 0 },
+        "rules": []
+    });
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": policy}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+    let mut decided: Vec<_> = decisions
+        .manifests
+        .iter()
+        .map(|manifest| manifest.digest.as_str())
+        .collect();
+    decided.sort_unstable();
+    let mut expected = vec![child.as_str(), sig_digest.as_str()];
+    expected.sort_unstable();
+    assert_eq!(decided, expected);
+
+    let index = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX,
+        "manifests": [{
+            "mediaType": OCI_MANIFEST,
+            "digest": child,
+            "size": child_manifest.len(),
+            "platform": {"architecture": "amd64", "os": "linux"}
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    let index_digest = sha(&index);
+    let response = oci
+        .put_manifest(&name, &index_digest, OCI_INDEX, &index)
+        .await;
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+
+    let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+    assert_eq!((summary.deleted, summary.skipped), (0, 2));
+    for digest in [&child, &sig_digest] {
+        assert_eq!(
+            oci.get(&name, &format!("manifests/{digest}"))
+                .await
+                .status(),
+            200,
+            "{digest}"
+        );
+    }
+}
+
+/// A subject the budget planned to delete is tagged again before the run
+/// applies, by a tag the rules would delete on a later run: the subject keeps
+/// that tag, so neither it nor its signature goes.
+#[tokio::test]
+async fn image_budget_keeps_a_referrer_whose_subject_was_tagged_again() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/app");
+    let layer = format!("retention subject {}", unique()).into_bytes();
+    let subject = oci.push_image(&name, "subject", "amd64", &layer).await;
+    let subject_manifest = image(&config("amd64"), &[&layer]);
+    let sig = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST,
+        "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+        "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha(b"{}"), "size": 2},
+        "layers": [],
+        "subject": {"mediaType": OCI_MANIFEST, "digest": subject, "size": subject_manifest.len()},
+    })
+    .to_string()
+    .into_bytes();
+    let sig_digest = sha(&sig);
+    assert_eq!(
+        oci.put_manifest(&name, &sig_digest, OCI_MANIFEST, &sig)
+            .await
+            .status(),
+        201
+    );
+    assert_eq!(oci.delete(&name, "manifests/subject").await.status(), 202);
+
+    // `keep_last_n_tags: 0` deletes every tag, the one added below included,
+    // but not in this run: it was not there when the run evaluated.
+    let policy = json!({
+        "version": 1,
+        "size_budget": { "max_bytes": 1, "target_bytes": 0 },
+        "rules": [{ "id": "no-tags", "keep_last_n_tags": 0 }]
+    });
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": policy}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+    let decided: Vec<_> = decisions
+        .manifests
+        .iter()
+        .map(|manifest| manifest.digest.as_str())
+        .collect();
+    assert_eq!(decided, vec![subject.as_str(), sig_digest.as_str()]);
+
+    let response = oci
+        .put_manifest(&name, "again", OCI_MANIFEST, &subject_manifest)
+        .await;
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+
+    let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+    assert_eq!((summary.deleted, summary.skipped), (0, 2));
+    for digest in [&subject, &sig_digest] {
+        assert_eq!(
+            oci.get(&name, &format!("manifests/{digest}"))
+                .await
+                .status(),
+            200,
+            "{digest}"
+        );
+    }
+}
+
+/// The budget deletes a manifest's tags together, and only when the
+/// manifest goes with them: an alias whose manifest keeps the image's last
+/// tag is not deleted for nothing.
+#[tokio::test]
+async fn image_budget_deletes_all_tags_of_a_manifest_or_none() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let app = format!("{repo}/app");
+    let old_layer = format!("old {}", unique()).into_bytes();
+    let old = oci.push_image(&app, "1.0", "amd64", &old_layer).await;
+    let old_manifest = image(&config("amd64"), &[&old_layer]);
+    assert_eq!(
+        oci.put_manifest(&app, "1", OCI_MANIFEST, &old_manifest)
+            .await
+            .status(),
+        201
+    );
+    oci.push_image(&app, "2.0", "amd64", format!("new {}", unique()).as_bytes())
+        .await;
+    let tool = format!("{repo}/tool");
+    let tool_layer = format!("tool {}", unique()).into_bytes();
+    oci.push_image(&tool, "1.0", "amd64", &tool_layer).await;
+    let tool_manifest = image(&config("amd64"), &[&tool_layer]);
+    assert_eq!(
+        oci.put_manifest(&tool, "latest", OCI_MANIFEST, &tool_manifest)
+            .await
+            .status(),
+        201
+    );
+    // `app`'s old release and both tags of `tool` are the least recently used.
+    sqlx::query(
+        "UPDATE oci_tag SET updated_at = now() - interval '60 days' \
+         WHERE repository_id = $1 AND (image = 'tool' OR tag IN ('1.0', '1'))",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let resp = admin_put(
+        &srv,
+        &format!("/admin/repositories/{repo}/retention"),
+        json!({"policy": {
+            "version": 1,
+            "size_budget": { "max_bytes": 1, "target_bytes": 0 },
+            "rules": []
+        }}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let (claimed, run_id, parsed, decisions, now) = claim_image_run(&srv, &repo, repo_id).await;
+    let mut tags: Vec<_> = decisions
+        .tags
+        .iter()
+        .map(|t| format!("{}:{}", t.image, t.tag))
+        .collect();
+    tags.sort_unstable();
+    assert_eq!(tags, vec!["app:1", "app:1.0"]);
+    let manifests: Vec<_> = decisions
+        .manifests
+        .iter()
+        .map(|m| m.digest.as_str())
+        .collect();
+    assert_eq!(manifests, vec![old.as_str()]);
+
+    let summary = apply_image_run(&srv, &claimed, run_id, &parsed, &decisions, now).await;
+    assert_eq!((summary.deleted, summary.skipped), (3, 0));
+    assert_eq!(oci.get(&app, "manifests/1.0").await.status(), 404);
+    assert_eq!(oci.get(&app, "manifests/2.0").await.status(), 200);
+    for tag in ["1.0", "latest"] {
+        assert_eq!(
+            oci.get(&tool, &format!("manifests/{tag}")).await.status(),
+            200
         );
     }
 }

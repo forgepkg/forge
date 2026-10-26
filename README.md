@@ -217,6 +217,9 @@ curl -u admin@example.com:<TOKEN> http://localhost:8421/repository/binaries/tool
   (hosted, proxy, group): uploads with curl, ranges and checksum sidecars,
   listings, the deployment policy, proxies of release downloads (the pdfium
   example) and retention.
+- **[Retention size budgets](./docs/retention.md)** — keep a repository
+  under a logical size: the budget in the retention policy, how size is
+  counted, and what goes first.
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers,
   and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`).

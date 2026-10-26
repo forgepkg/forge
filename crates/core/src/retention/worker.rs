@@ -36,8 +36,10 @@ use forge_db::retention_dao::{self, RunSummary};
 use crate::format::Format;
 use crate::repo::CacheInvalidator;
 use crate::retention::apply::{apply, ApplyContext, RunFence};
-use crate::retention::evaluate::{evaluate, evaluate_proxy, CandidateComponent, ProxyCandidate};
-use crate::retention::model::{validate_policy, RetentionPolicy};
+use crate::retention::evaluate::{
+    plan_package_run, CandidateComponent, PackagePlan, ProxyCandidate,
+};
+use crate::retention::model::{validate_policy, RetentionPolicy, SizeBudgetSummary};
 
 /// The shortest interval the worker ever schedules between two automatic runs
 /// of a repository, whatever the config and the policy say (both accept 0).
@@ -301,6 +303,7 @@ impl RetentionWorker {
                 listed: r.listed,
                 created_at: r.created_at,
                 last_downloaded_at: r.last_downloaded_at,
+                size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
             })
             .collect()
         };
@@ -316,10 +319,23 @@ impl RetentionWorker {
                     listed: r.listed,
                     first_seen_at: r.first_seen_at,
                     last_downloaded_at: r.last_downloaded_at,
+                    size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
                 })
                 .collect()
         } else {
             Vec::new()
+        };
+
+        // A version a package tag names is never touched: it stays in the
+        // snapshot (it counts as a newer version), but neither a rule nor the
+        // size budget selects it.
+        let tagged_hosted_ids =
+            crate::retention::tagged_candidate_ids(&self.pool, repo.repository_id, &hosted).await?;
+        let size_before = match policy.size_budget {
+            Some(_) => {
+                Some(retention_dao::package_repository_size(&self.pool, repo.repository_id).await?)
+            }
+            None => None,
         };
 
         // ── Pure evaluation, on the blocking pool: it is CPU-bound and grows
@@ -328,27 +344,30 @@ impl RetentionWorker {
             let format = Arc::clone(&format);
             let policy = policy.clone();
             tokio::task::spawn_blocking(move || {
-                (
-                    evaluate(format.as_ref(), now, &policy, &hosted),
-                    evaluate_proxy(format.as_ref(), now, &policy, &proxy),
+                plan_package_run(
+                    format.as_ref(),
+                    now,
+                    &policy,
+                    &hosted,
+                    &proxy,
+                    &tagged_hosted_ids,
+                    size_before,
                 )
             })
         };
         // A panic there (e.g. a panicking `Format`) fails the run like a panic
         // anywhere else in `process`.
-        let (mut hosted_decisions, proxy_decisions) = evaluation.await.map_err(|e| {
+        let PackagePlan {
+            hosted: hosted_decisions,
+            proxy: proxy_decisions,
+            spared,
+            budget,
+        } = evaluation.await.map_err(|e| {
             WorkerError::Panicked(match e.try_into_panic() {
                 Ok(panic) => panic_message(&*panic),
                 Err(e) => e.to_string(), // cancelled: the runtime is shutting down
             })
         })?;
-        // A version a package tag names is never touched.
-        let spared = crate::retention::spare_protected(
-            &self.pool,
-            repo.repository_id,
-            &mut hosted_decisions,
-        )
-        .await?;
         if spared > 0 {
             tracing::info!(repo = %repo.name, spared, "retention spared tagged versions");
         }
@@ -377,7 +396,15 @@ impl RetentionWorker {
                 format: format.as_ref(),
             }),
         };
-        let summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
+        let mut summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
+        if let Some(budget) = budget {
+            let size_after = if policy.dry_run_only {
+                budget.size_after
+            } else {
+                retention_dao::package_repository_size(&self.pool, repo.repository_id).await?
+            };
+            record_budget(&mut summary, budget, size_after);
+        }
 
         // ── Finish: record summary, advance schedule, clear lease. ──
         if !retention_dao::finish_run(
@@ -429,7 +456,7 @@ impl RetentionWorker {
                 .max(self.config.default_run_interval);
         let mut summary = RunSummary::default();
         if policy.enabled {
-            let (decisions, evaluated) =
+            let (decisions, evaluated, budget) =
                 images::evaluate_repository(&self.pool, repo.repository_id, now, &policy).await?;
             let fence = images::ImageRunFence {
                 stored_policy: &repo.policy,
@@ -447,6 +474,14 @@ impl RetentionWorker {
             )
             .await?;
             summary.evaluated = evaluated;
+            if let Some(budget) = budget {
+                let size_after = if policy.dry_run_only {
+                    budget.size_after
+                } else {
+                    forge_db::oci_dao::repository_size(&self.pool, repo.repository_id).await?
+                };
+                record_budget(&mut summary, budget, size_after);
+            }
         }
         if !retention_dao::finish_run(
             &self.pool,
@@ -486,7 +521,7 @@ impl RetentionWorker {
                 .max(self.config.default_run_interval);
         let mut summary = RunSummary::default();
         if policy.enabled {
-            let (decisions, evaluated) =
+            let (decisions, evaluated, budget) =
                 files::evaluate_repository(&self.pool, repo.repository_id, now, &policy).await?;
             let fence = files::FileRunFence {
                 stored_policy: &repo.policy,
@@ -504,6 +539,14 @@ impl RetentionWorker {
             )
             .await?;
             summary.evaluated = evaluated;
+            if let Some(budget) = budget {
+                let size_after = if policy.dry_run_only {
+                    budget.size_after
+                } else {
+                    forge_db::raw_dao::repository_size(&self.pool, repo.repository_id).await?
+                };
+                record_budget(&mut summary, budget, size_after);
+            }
         }
         if !retention_dao::finish_run(
             &self.pool,
@@ -593,6 +636,15 @@ impl Drop for AbortOnDrop {
 
 /// Best-effort text of a caught panic payload (`panic!` with a literal yields
 /// `&str`, with format arguments `String`).
+/// Record a size budget's outcome on a run's summary: `size_after` is the
+/// size measured once the run applied, or, for a dry run, the projected one.
+fn record_budget(summary: &mut RunSummary, budget: SizeBudgetSummary, size_after: u64) {
+    summary.size_before = Some(budget.size_before);
+    summary.size_after = Some(size_after);
+    summary.target_bytes = Some(budget.target_bytes);
+    summary.target_reached = Some(budget.reached(size_after));
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()

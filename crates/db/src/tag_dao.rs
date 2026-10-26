@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
+use sqlx::{PgExecutor, Postgres, Transaction};
 
 /// The tags of `package` in repository `repository_id`, tag → version.
 pub async fn tags<'e, E>(
@@ -104,15 +104,18 @@ where
 
 /// Every `(package, version)` a tag of repository `repository_id`
 /// names: what retention never deletes.
-pub async fn tagged_versions(
-    pool: &PgPool,
+pub async fn tagged_versions<'e, E>(
+    executor: E,
     repository_id: i64,
-) -> sqlx::Result<Vec<(String, String)>> {
+) -> sqlx::Result<Vec<(String, String)>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let rows = sqlx::query!(
         r#"SELECT DISTINCT package, version FROM package_tag WHERE repository_id = $1"#,
         repository_id,
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
     Ok(rows.into_iter().map(|r| (r.package, r.version)).collect())
 }

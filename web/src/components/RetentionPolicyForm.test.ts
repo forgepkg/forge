@@ -80,6 +80,72 @@ describe('retention policy model', () => {
     expect(newRule('file', ['rule-2', 'keep-recent']).values.id).toBe('rule-3')
   })
 
+  it('builds a budget-only policy and validates its low watermark', () => {
+    const draft = draftFromPolicy('file', null)
+    draft.rules = []
+    draft.sizeBudgetMax = '2'
+    draft.sizeBudgetTarget = '1.5'
+    expect(draft.sizeBudgetUnit).toBe('GiB')
+    expect(validateDraft('file', draft)).toBeNull()
+    expect(buildPolicy('file', draft).size_budget).toEqual({
+      max_bytes: 2 * 1024 ** 3,
+      target_bytes: 1.5 * 1024 ** 3,
+    })
+    expect(draftFromPolicy('file', buildPolicy('file', draft)).sizeBudgetMax).toBe('2')
+
+    draft.sizeBudgetUnit = 'GB'
+    expect(buildPolicy('file', draft).size_budget).toEqual({
+      max_bytes: 2_000_000_000,
+      target_bytes: 1_500_000_000,
+    })
+    const reloaded = draftFromPolicy('file', buildPolicy('file', draft))
+    expect([reloaded.sizeBudgetMax, reloaded.sizeBudgetTarget, reloaded.sizeBudgetUnit]).toEqual([
+      '2',
+      '1.5',
+      'GB',
+    ])
+
+    draft.sizeBudgetTarget = '2.5'
+    expect(validateDraft('file', draft)?.sizeBudgetTarget).toMatch(/must not exceed/)
+    draft.sizeBudgetMax = '0'
+    expect(validateDraft('file', draft)?.sizeBudgetMax).toMatch(/positive size/)
+
+    const smallStored = {
+      version: 1,
+      size_budget: { max_bytes: 100, target_bytes: 0 },
+      rules: [],
+    } as unknown as RetentionPolicy
+    const smallDraft = draftFromPolicy('file', smallStored)
+    expect(smallDraft.sizeBudgetMax).not.toMatch(/[eE]/)
+    expect(smallDraft.sizeBudgetTarget).toBe('0')
+    expect(validateDraft('file', smallDraft)).toBeNull()
+    expect(buildPolicy('file', smallDraft).size_budget).toEqual({
+      max_bytes: 100,
+      target_bytes: 0,
+    })
+
+    // A stored size reads back unchanged, in the unit that shows it shortest.
+    for (const [bytes, unit] of [
+      [2, 'GiB'],
+      [10, 'GiB'],
+      [123_456_789, 'GB'],
+      [500 * 1000 ** 3, 'GB'],
+      [500 * 1024 ** 3, 'GiB'],
+    ] as const) {
+      const stored = {
+        version: 1,
+        size_budget: { max_bytes: bytes, target_bytes: bytes },
+        rules: [],
+      } as unknown as RetentionPolicy
+      const shown = draftFromPolicy('file', stored)
+      expect(shown.sizeBudgetUnit).toBe(unit)
+      expect(buildPolicy('file', shown).size_budget).toEqual({
+        max_bytes: bytes,
+        target_bytes: bytes,
+      })
+    }
+  })
+
   it('refuses empty and duplicate ids, bad numbers and no rules', () => {
     const draft = draftFromPolicy('image', null)
     const second = newRule('image', [])
@@ -123,5 +189,8 @@ describe('retention policy model', () => {
     ).toBe('not among the 3 newest in its directory')
     expect(describeReason({})).toBe('')
     expect(describeReason(null)).toBe('')
+    expect(describeReason({ size_budget: 1024 ** 3, target_bytes: 512 * 1024 ** 2 })).toBe(
+      'repository exceeds 1 GiB, target 0.5 GiB',
+    )
   })
 })

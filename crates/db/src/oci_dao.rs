@@ -1601,6 +1601,53 @@ pub struct RetentionManifest {
     pub children: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RetentionManifestObject {
+    pub manifest_id: i64,
+    pub blob_sha256: String,
+    pub size: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetentionBlobRef {
+    pub manifest_id: i64,
+    pub blob_sha256: String,
+    pub size: i64,
+}
+
+/// The content-addressed objects held by each manifest.
+pub async fn retention_manifest_objects(
+    pool: &PgPool,
+    repository_id: i64,
+) -> sqlx::Result<(Vec<RetentionManifestObject>, Vec<RetentionBlobRef>)> {
+    let manifests = sqlx::query_as!(
+        RetentionManifestObject,
+        r#"
+        SELECT id AS manifest_id, blob_sha256, size
+        FROM oci_manifest
+        WHERE repository_id = $1
+        "#,
+        repository_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    let blobs = sqlx::query_as!(
+        RetentionBlobRef,
+        r#"
+        SELECT r.manifest_id, l.blob_sha256, l.size
+        FROM oci_manifest_ref r
+        JOIN oci_manifest m ON m.id = r.manifest_id
+        JOIN oci_blob_link l
+          ON l.repository_id = m.repository_id AND l.image = m.image AND l.digest = r.digest
+        WHERE m.repository_id = $1 AND r.kind = 'blob'
+        "#,
+        repository_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok((manifests, blobs))
+}
+
 /// Every manifest of a repository.
 pub async fn retention_manifests(
     pool: &PgPool,
@@ -1622,6 +1669,41 @@ pub async fn retention_manifests(
     )
     .fetch_all(pool)
     .await
+}
+
+/// The logical size of a Docker repository: distinct manifest and linked blob
+/// objects, regardless of how many manifests or images refer to each blob.
+pub async fn repository_size(pool: &PgPool, repository_id: i64) -> sqlx::Result<u64> {
+    let bytes = sqlx::query_scalar!(
+        r#"
+        SELECT COALESCE(SUM(size), 0)::bigint AS "bytes!"
+        FROM (
+            SELECT blob_sha256, MAX(size) AS size
+            FROM (
+                SELECT blob_sha256, size
+                FROM oci_blob_link
+                WHERE repository_id = $1
+                  AND EXISTS (
+                      SELECT 1
+                      FROM oci_manifest m
+                      JOIN oci_manifest_ref r ON r.manifest_id = m.id AND r.kind = 'blob'
+                      WHERE m.repository_id = oci_blob_link.repository_id
+                        AND m.image = oci_blob_link.image
+                        AND r.digest = oci_blob_link.digest
+                  )
+                UNION ALL
+                SELECT blob_sha256, size
+                FROM oci_manifest
+                WHERE repository_id = $1
+            ) objects
+            GROUP BY blob_sha256
+        ) distinct_objects
+        "#,
+        repository_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    u64::try_from(bytes).map_err(|e| sqlx::Error::Protocol(e.to_string()))
 }
 
 /// Lock (`FOR UPDATE`) and load one image's manifests and tags, as

@@ -41,13 +41,13 @@
 //! deletes the cached bytes (the version stays listed and re-caches on the
 //! next pull).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
 use crate::format::Format;
 use crate::retention::model::{
-    Action, Criteria, ReleaseType, RetentionPolicy, RetentionRule, Scope,
+    Action, Criteria, ReleaseType, RetentionPolicy, RetentionRule, Scope, SizeBudgetSummary,
 };
 
 /// One hosted component in the evaluation snapshot. All fields come straight
@@ -66,6 +66,8 @@ pub struct CandidateComponent {
     pub created_at: DateTime<Utc>,
     /// Last download timestamp, or `None` if never downloaded.
     pub last_downloaded_at: Option<DateTime<Utc>>,
+    /// Sum of this version's asset sizes, in bytes.
+    pub size_bytes: u64,
 }
 
 /// One proxy cached version in the evaluation snapshot.
@@ -84,6 +86,8 @@ pub struct ProxyCandidate {
     pub first_seen_at: DateTime<Utc>,
     /// Last pull timestamp, or `None` if never pulled since caching.
     pub last_downloaded_at: Option<DateTime<Utc>>,
+    /// Size of the locally cached version, in bytes.
+    pub size_bytes: u64,
 }
 
 /// The action plus provenance the apply path / audit needs.
@@ -118,6 +122,100 @@ pub struct ProxyDecision {
     pub reason: DecisionReason,
 }
 
+/// A package-repository size-budget plan after ordinary rules have run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageSizeBudgetPlan {
+    pub hosted: Vec<Decision>,
+    pub proxy: Vec<ProxyDecision>,
+    pub size_before: u64,
+    pub size_after: u64,
+    pub target_bytes: u64,
+    pub target_attempted: bool,
+    pub target_reached: bool,
+}
+
+impl PackageSizeBudgetPlan {
+    /// The plan's effect on the repository's size.
+    pub fn summary(&self) -> SizeBudgetSummary {
+        SizeBudgetSummary {
+            size_before: self.size_before,
+            size_after: self.size_after,
+            target_bytes: self.target_bytes,
+            target_attempted: self.target_attempted,
+            target_reached: self.target_reached,
+        }
+    }
+}
+
+/// Decisions and protections from package tags that constrain budget planning.
+#[derive(Debug, Clone, Copy)]
+pub struct PackageBudgetInputs<'a> {
+    pub hosted_decisions: &'a [Decision],
+    pub proxy_decisions: &'a [ProxyDecision],
+    pub tagged_hosted_ids: &'a HashSet<i64>,
+}
+
+/// Everything a package repository's run decides: see [`plan_package_run`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagePlan {
+    pub hosted: Vec<Decision>,
+    pub proxy: Vec<ProxyDecision>,
+    /// Rule decisions left out because a package tag names their version.
+    pub spared: usize,
+    /// The size budget's effect, when the policy has one.
+    pub budget: Option<SizeBudgetSummary>,
+}
+
+/// What one run of `policy` decides for a package repository as of `now`:
+/// the rules' decisions, less those on versions a package tag names
+/// (`tagged_hosted_ids`, which retention never touches), then the size
+/// budget's on top of them when the policy has one (`repository_size_bytes`
+/// is the repository's size then). A version the budget deletes is not also
+/// unlisted. The worker and the preview both plan with this.
+pub fn plan_package_run(
+    format: &dyn Format,
+    now: DateTime<Utc>,
+    policy: &RetentionPolicy,
+    hosted: &[CandidateComponent],
+    proxy: &[ProxyCandidate],
+    tagged_hosted_ids: &HashSet<i64>,
+    repository_size_bytes: Option<u64>,
+) -> PackagePlan {
+    let mut hosted_decisions = evaluate(format, now, policy, hosted);
+    let before = hosted_decisions.len();
+    hosted_decisions.retain(|d| !tagged_hosted_ids.contains(&d.component_id));
+    let spared = before - hosted_decisions.len();
+    let mut proxy_decisions = evaluate_proxy(format, now, policy, proxy);
+
+    let mut budget = None;
+    if let (Some(_), Some(size)) = (policy.size_budget, repository_size_bytes) {
+        let mut plan = evaluate_size_budget(
+            format,
+            policy,
+            hosted,
+            proxy,
+            size,
+            PackageBudgetInputs {
+                hosted_decisions: &hosted_decisions,
+                proxy_decisions: &proxy_decisions,
+                tagged_hosted_ids,
+            },
+        );
+        let deleted: HashSet<i64> = plan.hosted.iter().map(|d| d.component_id).collect();
+        hosted_decisions
+            .retain(|d| d.action != Action::Unlist || !deleted.contains(&d.component_id));
+        hosted_decisions.append(&mut plan.hosted);
+        proxy_decisions.append(&mut plan.proxy);
+        budget = Some(plan.summary());
+    }
+    PackagePlan {
+        hosted: hosted_decisions,
+        proxy: proxy_decisions,
+        spared,
+        budget,
+    }
+}
+
 /// Structured explanation of why a version was selected, recorded on the audit
 /// row's `reason` jsonb.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -131,6 +229,14 @@ pub struct DecisionReason {
     /// Whether `not_pulled_for_days` was a matched trigger (proxy).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_pulled_for_days: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_budget: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime<Utc>>,
 }
 
 /// Whether a **normalized** version string denotes a prerelease.
@@ -187,6 +293,10 @@ fn triggers_match(
         older_than_days: None,
         not_downloaded_for_days: None,
         not_pulled_for_days: None,
+        size_budget: None,
+        target_bytes: None,
+        size_bytes: None,
+        last_used_at: None,
     };
 
     if let Some(days) = c.older_than_days {
@@ -476,6 +586,10 @@ pub fn evaluate_proxy(
                         older_than_days: None,
                         not_downloaded_for_days: None,
                         not_pulled_for_days: Some(days),
+                        size_budget: None,
+                        target_bytes: None,
+                        size_bytes: None,
+                        last_used_at: None,
                     },
                 });
             }
@@ -483,6 +597,262 @@ pub fn evaluate_proxy(
     }
 
     decisions
+}
+
+/// Add least-recently-used hard-delete decisions after package rules. The
+/// newest listed hosted version and all rule protections remain protected.
+pub fn evaluate_size_budget(
+    format: &dyn Format,
+    policy: &RetentionPolicy,
+    hosted: &[CandidateComponent],
+    proxy: &[ProxyCandidate],
+    repository_size_bytes: u64,
+    inputs: PackageBudgetInputs<'_>,
+) -> PackageSizeBudgetPlan {
+    let Some(budget) = policy.size_budget else {
+        return PackageSizeBudgetPlan {
+            hosted: Vec::new(),
+            proxy: Vec::new(),
+            size_before: 0,
+            size_after: 0,
+            target_bytes: 0,
+            target_attempted: false,
+            target_reached: true,
+        };
+    };
+    let hosted_decisions = inputs.hosted_decisions;
+    let proxy_decisions = inputs.proxy_decisions;
+    let tagged_hosted_ids = inputs.tagged_hosted_ids;
+    let target_bytes = budget.target_bytes();
+    let size_before = repository_size_bytes;
+    let hosted_sizes: HashMap<i64, u64> = hosted
+        .iter()
+        .map(|candidate| (candidate.component_id, candidate.size_bytes))
+        .collect();
+    let proxy_sizes: HashMap<i64, u64> = proxy
+        .iter()
+        .map(|candidate| (candidate.cached_version_id, candidate.size_bytes))
+        .collect();
+    let mut size_after = size_before.saturating_sub(
+        hosted_decisions
+            .iter()
+            .filter(|d| d.action == Action::HardDelete)
+            .filter_map(|d| hosted_sizes.get(&d.component_id))
+            .copied()
+            .chain(
+                proxy_decisions
+                    .iter()
+                    .filter_map(|d| proxy_sizes.get(&d.cached_version_id))
+                    .copied(),
+            )
+            .fold(0u64, u64::saturating_add),
+    );
+    let budget_triggered = size_after > budget.max_bytes;
+    let mut hosted_out = Vec::new();
+    let mut proxy_out = Vec::new();
+    if budget_triggered {
+        let hosted_deleted: HashSet<i64> = hosted_decisions
+            .iter()
+            .filter(|d| d.action == Action::HardDelete)
+            .map(|d| d.component_id)
+            .collect();
+        let proxy_deleted: HashSet<i64> = proxy_decisions
+            .iter()
+            .map(|d| d.cached_version_id)
+            .collect();
+        let hosted_unlisted: HashSet<i64> = hosted_decisions
+            .iter()
+            .filter(|d| d.action == Action::Unlist)
+            .map(|d| d.component_id)
+            .collect();
+        let mut eligible_hosted = Vec::new();
+        for mut group in group_by_package(hosted) {
+            group.sort_by(|a, b| format.compare_versions(&b.version, &a.version));
+            let mut survivors: Vec<CandidateComponent> = group
+                .into_iter()
+                .filter(|candidate| !hosted_deleted.contains(&candidate.component_id))
+                .cloned()
+                .collect();
+            for candidate in &mut survivors {
+                if hosted_unlisted.contains(&candidate.component_id) {
+                    candidate.listed = false;
+                }
+            }
+            let ordered: Vec<&CandidateComponent> = survivors.iter().collect();
+            let protected = protected_indices(policy, Scope::Hosted, &ordered);
+            let newest_listed = survivors.iter().find(|c| c.listed).map(|c| c.component_id);
+            for (idx, candidate) in survivors.into_iter().enumerate() {
+                if !protected[idx]
+                    && newest_listed != Some(candidate.component_id)
+                    && !tagged_hosted_ids.contains(&candidate.component_id)
+                {
+                    eligible_hosted.push(candidate);
+                }
+            }
+        }
+        eligible_hosted.sort_by(|a, b| {
+            a.last_downloaded_at
+                .unwrap_or(a.created_at)
+                .cmp(&b.last_downloaded_at.unwrap_or(b.created_at))
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| format.compare_versions(&a.version, &b.version))
+                .then_with(|| a.component_id.cmp(&b.component_id))
+        });
+        for candidate in eligible_hosted {
+            if size_after <= target_bytes {
+                break;
+            }
+            hosted_out.push(Decision {
+                component_id: candidate.component_id,
+                package_name: candidate.package_name.clone(),
+                version: candidate.version.clone(),
+                action: Action::HardDelete,
+                rule_id: "size_budget".into(),
+                reason: DecisionReason {
+                    older_than_days: None,
+                    not_downloaded_for_days: None,
+                    not_pulled_for_days: None,
+                    size_budget: Some(budget.max_bytes),
+                    target_bytes: Some(target_bytes),
+                    size_bytes: Some(candidate.size_bytes),
+                    last_used_at: Some(
+                        candidate.last_downloaded_at.unwrap_or(candidate.created_at),
+                    ),
+                },
+            });
+            size_after = size_after.saturating_sub(candidate.size_bytes);
+        }
+        let mut proxy_protected = HashSet::new();
+        for mut group in group_by_package(proxy) {
+            group.sort_by(|a, b| format.compare_versions(&b.version, &a.version));
+            let survivors: Vec<ProxyCandidate> = group
+                .into_iter()
+                .filter(|candidate| !proxy_deleted.contains(&candidate.cached_version_id))
+                .cloned()
+                .collect();
+            let ordered: Vec<&ProxyCandidate> = survivors.iter().collect();
+            let protected = protected_indices(policy, Scope::ProxyCached, &ordered);
+            proxy_protected.extend(survivors.iter().zip(protected).filter_map(
+                |(candidate, protected)| protected.then_some(candidate.cached_version_id),
+            ));
+        }
+        let mut eligible_proxy: Vec<&ProxyCandidate> = proxy
+            .iter()
+            .filter(|c| !proxy_deleted.contains(&c.cached_version_id))
+            .filter(|c| !proxy_protected.contains(&c.cached_version_id))
+            .collect();
+        eligible_proxy.sort_by(|a, b| {
+            a.last_downloaded_at
+                .unwrap_or(a.first_seen_at)
+                .cmp(&b.last_downloaded_at.unwrap_or(b.first_seen_at))
+                .then_with(|| a.first_seen_at.cmp(&b.first_seen_at))
+                .then_with(|| format.compare_versions(&a.version, &b.version))
+                .then_with(|| a.cached_version_id.cmp(&b.cached_version_id))
+        });
+        for candidate in eligible_proxy {
+            if size_after <= target_bytes {
+                break;
+            }
+            proxy_out.push(ProxyDecision {
+                cached_version_id: candidate.cached_version_id,
+                package_name: candidate.package_name.clone(),
+                version: candidate.version.clone(),
+                rule_id: "size_budget".into(),
+                reason: DecisionReason {
+                    older_than_days: None,
+                    not_downloaded_for_days: None,
+                    not_pulled_for_days: None,
+                    size_budget: Some(budget.max_bytes),
+                    target_bytes: Some(target_bytes),
+                    size_bytes: Some(candidate.size_bytes),
+                    last_used_at: Some(
+                        candidate
+                            .last_downloaded_at
+                            .unwrap_or(candidate.first_seen_at),
+                    ),
+                },
+            });
+            size_after = size_after.saturating_sub(candidate.size_bytes);
+        }
+    }
+    PackageSizeBudgetPlan {
+        hosted: hosted_out,
+        proxy: proxy_out,
+        size_before,
+        size_after,
+        target_bytes,
+        target_attempted: budget_triggered,
+        target_reached: !budget_triggered || size_after <= target_bytes,
+    }
+}
+
+/// IDs a size-budget pass must never remove because of existing package
+/// protections or because they are the newest listed hosted versions.
+pub fn size_budget_protected_ids(
+    format: &dyn Format,
+    policy: &RetentionPolicy,
+    hosted: &[CandidateComponent],
+    proxy: &[ProxyCandidate],
+    hosted_decisions: &[Decision],
+    proxy_decisions: &[ProxyDecision],
+) -> (HashSet<i64>, HashSet<i64>) {
+    let hosted_hard_deleted: HashSet<i64> = hosted_decisions
+        .iter()
+        .filter(|decision| decision.action == Action::HardDelete)
+        .map(|decision| decision.component_id)
+        .collect();
+    let hosted_unlisted: HashSet<i64> = hosted_decisions
+        .iter()
+        .filter(|decision| decision.action == Action::Unlist)
+        .map(|decision| decision.component_id)
+        .collect();
+    let proxy_deleted: HashSet<i64> = proxy_decisions
+        .iter()
+        .map(|decision| decision.cached_version_id)
+        .collect();
+    let mut hosted_ids = HashSet::new();
+    for mut group in group_by_package(hosted) {
+        group.sort_by(|a, b| format.compare_versions(&b.version, &a.version));
+        let mut survivors: Vec<CandidateComponent> = group
+            .into_iter()
+            .filter(|candidate| !hosted_hard_deleted.contains(&candidate.component_id))
+            .cloned()
+            .collect();
+        for candidate in &mut survivors {
+            if hosted_unlisted.contains(&candidate.component_id) {
+                candidate.listed = false;
+            }
+        }
+        let ordered: Vec<&CandidateComponent> = survivors.iter().collect();
+        let protected = protected_indices(policy, Scope::Hosted, &ordered);
+        let newest_listed = survivors.iter().find(|c| c.listed).map(|c| c.component_id);
+        hosted_ids.extend(
+            survivors
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| protected[*i] || newest_listed == Some(c.component_id))
+                .map(|(_, c)| c.component_id),
+        );
+    }
+    let mut proxy_ids = HashSet::new();
+    for mut group in group_by_package(proxy) {
+        group.sort_by(|a, b| format.compare_versions(&b.version, &a.version));
+        let survivors: Vec<ProxyCandidate> = group
+            .into_iter()
+            .filter(|candidate| !proxy_deleted.contains(&candidate.cached_version_id))
+            .cloned()
+            .collect();
+        let ordered: Vec<&ProxyCandidate> = survivors.iter().collect();
+        let protected = protected_indices(policy, Scope::ProxyCached, &ordered);
+        proxy_ids.extend(
+            survivors
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| protected[*i])
+                .map(|(_, c)| c.cached_version_id),
+        );
+    }
+    (hosted_ids, proxy_ids)
 }
 
 #[cfg(test)]
@@ -562,6 +932,7 @@ mod tests {
             listed: true,
             created_at: days_ago(created_days_ago),
             last_downloaded_at: last_dl_days_ago.map(days_ago),
+            size_bytes: 1,
         }
     }
 
@@ -571,6 +942,7 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            size_budget: None,
             rules,
         }
     }
@@ -1279,6 +1651,7 @@ mod tests {
             listed: true,
             first_seen_at: days_ago(first_seen_days),
             last_downloaded_at: last_dl_days.map(days_ago),
+            size_bytes: 1,
         }
     }
 
@@ -1437,5 +1810,238 @@ mod tests {
         ];
         let p = policy_with(vec![proxy_keep_rule("evict", Some(1), None)]);
         assert_eq!(evicted(&p, &cands), vec![2]);
+    }
+
+    #[test]
+    fn size_budget_deletes_least_recently_used_and_keeps_newest_version() {
+        let mut candidates = vec![
+            comp(1, "lib", "1.0.0", 100, Some(90)),
+            comp(2, "lib", "2.0.0", 50, Some(20)),
+            comp(3, "lib", "3.0.0", 10, Some(1)),
+        ];
+        for candidate in &mut candidates {
+            candidate.size_bytes = 40;
+        }
+        let mut policy = policy_with(vec![rule(
+            "keep",
+            Action::HardDelete,
+            Criteria {
+                keep_last_n: Some(1),
+                ..Default::default()
+            },
+        )]);
+        policy.size_budget = Some(crate::retention::model::SizeBudget {
+            max_bytes: 100,
+            target_bytes: Some(80),
+        });
+        let plan = evaluate_size_budget(
+            &fmt(),
+            &policy,
+            &candidates,
+            &[],
+            120,
+            PackageBudgetInputs {
+                hosted_decisions: &[],
+                proxy_decisions: &[],
+                tagged_hosted_ids: &HashSet::new(),
+            },
+        );
+        assert_eq!(
+            plan.hosted
+                .iter()
+                .map(|d| d.component_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(plan.size_before, 120);
+        assert_eq!(plan.size_after, 80);
+        assert!(plan.target_reached);
+    }
+
+    #[test]
+    fn size_budget_reports_unreached_target_when_only_rule_protected_versions_remain() {
+        let mut candidates = vec![
+            comp(1, "lib", "1.0.0", 100, None),
+            comp(2, "lib", "2.0.0", 50, None),
+            comp(3, "lib", "3.0.0", 10, None),
+        ];
+        for candidate in &mut candidates {
+            candidate.size_bytes = 50;
+        }
+        let mut policy = policy_with(vec![rule(
+            "keep-two",
+            Action::HardDelete,
+            Criteria {
+                keep_last_n: Some(2),
+                ..Default::default()
+            },
+        )]);
+        policy.size_budget = Some(crate::retention::model::SizeBudget {
+            max_bytes: 100,
+            target_bytes: Some(80),
+        });
+        let plan = evaluate_size_budget(
+            &fmt(),
+            &policy,
+            &candidates,
+            &[],
+            150,
+            PackageBudgetInputs {
+                hosted_decisions: &[],
+                proxy_decisions: &[],
+                tagged_hosted_ids: &HashSet::new(),
+            },
+        );
+        assert_eq!(plan.hosted.len(), 1);
+        assert_eq!(plan.size_after, 100);
+        assert!(!plan.target_reached);
+    }
+
+    #[test]
+    fn size_budget_preserves_newest_listed_survivor_after_rule_deletions() {
+        let mut candidates = vec![
+            comp(1, "lib", "1.0.0", 30, None),
+            comp(2, "lib", "2.0.0-beta.1", 20, None),
+            comp(3, "lib", "0.9.0", 40, None),
+        ];
+        for candidate in &mut candidates {
+            candidate.size_bytes = 50;
+        }
+        let ordinary = vec![Decision {
+            component_id: 2,
+            package_name: "lib".into(),
+            version: "2.0.0-beta.1".into(),
+            action: Action::HardDelete,
+            rule_id: "prerelease".into(),
+            reason: DecisionReason {
+                older_than_days: Some(1),
+                not_downloaded_for_days: None,
+                not_pulled_for_days: None,
+                size_budget: None,
+                target_bytes: None,
+                size_bytes: None,
+                last_used_at: None,
+            },
+        }];
+        let mut policy = policy_with(Vec::new());
+        policy.size_budget = Some(crate::retention::model::SizeBudget {
+            max_bytes: 100,
+            target_bytes: Some(50),
+        });
+        let plan = evaluate_size_budget(
+            &fmt(),
+            &policy,
+            &candidates,
+            &[],
+            200,
+            PackageBudgetInputs {
+                hosted_decisions: &ordinary,
+                proxy_decisions: &[],
+                tagged_hosted_ids: &HashSet::new(),
+            },
+        );
+        assert_eq!(
+            plan.hosted
+                .iter()
+                .map(|decision| decision.component_id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(plan.size_after, 100);
+    }
+
+    #[test]
+    fn size_budget_reports_when_it_did_not_attempt_eviction() {
+        let mut policy = policy_with(Vec::new());
+        policy.size_budget = Some(crate::retention::model::SizeBudget {
+            max_bytes: 100,
+            target_bytes: Some(80),
+        });
+        let plan = evaluate_size_budget(
+            &fmt(),
+            &policy,
+            &[],
+            &[],
+            95,
+            PackageBudgetInputs {
+                hosted_decisions: &[],
+                proxy_decisions: &[],
+                tagged_hosted_ids: &HashSet::new(),
+            },
+        );
+        assert!(!plan.target_attempted);
+        assert!(plan.target_reached);
+    }
+
+    #[test]
+    fn tagged_newest_version_stays_the_newest_budget_survivor() {
+        let mut candidates = vec![
+            comp(1, "lib", "1.0.0", 30, None),
+            comp(2, "lib", "2.0.0", 20, None),
+            comp(3, "lib", "3.0.0", 10, None),
+        ];
+        for candidate in &mut candidates {
+            candidate.size_bytes = 50;
+        }
+        let mut policy = policy_with(Vec::new());
+        policy.size_budget = Some(crate::retention::model::SizeBudget {
+            max_bytes: 100,
+            target_bytes: Some(50),
+        });
+        let plan = evaluate_size_budget(
+            &fmt(),
+            &policy,
+            &candidates,
+            &[],
+            150,
+            PackageBudgetInputs {
+                hosted_decisions: &[],
+                proxy_decisions: &[],
+                tagged_hosted_ids: &HashSet::from([3]),
+            },
+        );
+        assert_eq!(
+            plan.hosted
+                .iter()
+                .map(|decision| decision.component_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(plan.size_after, 50);
+    }
+
+    #[test]
+    fn proxy_size_budget_honors_rule_protections() {
+        let mut candidates = cold_versions();
+        for candidate in &mut candidates {
+            candidate.size_bytes = 30;
+        }
+        let mut policy = policy_with(vec![proxy_keep_rule("keep", Some(1), None)]);
+        policy.size_budget = Some(crate::retention::model::SizeBudget {
+            max_bytes: 100,
+            target_bytes: Some(80),
+        });
+        let plan = evaluate_size_budget(
+            &fmt(),
+            &policy,
+            &[],
+            &candidates,
+            150,
+            PackageBudgetInputs {
+                hosted_decisions: &[],
+                proxy_decisions: &[],
+                tagged_hosted_ids: &HashSet::new(),
+            },
+        );
+        assert_eq!(
+            plan.proxy
+                .iter()
+                .map(|d| d.cached_version_id)
+                .collect::<Vec<_>>(),
+            vec![4, 3, 2]
+        );
+        assert_eq!(plan.size_after, 60);
+        assert!(plan.target_reached);
+        assert!(plan.proxy.iter().all(|d| d.rule_id == "size_budget"));
     }
 }

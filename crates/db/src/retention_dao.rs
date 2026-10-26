@@ -51,6 +51,8 @@ pub struct CandidateRow {
     pub created_at: DateTime<Utc>,
     /// Denormalized last-download timestamp (`component.last_downloaded_at`).
     pub last_downloaded_at: Option<DateTime<Utc>>,
+    /// Sum of the component's asset sizes, in bytes.
+    pub size_bytes: i64,
 }
 
 /// One proxy cached-version candidate row loaded for eviction evaluation.
@@ -70,6 +72,8 @@ pub struct ProxyCandidateRow {
     pub first_seen_at: DateTime<Utc>,
     /// Last pull timestamp, or `None` if never pulled.
     pub last_downloaded_at: Option<DateTime<Utc>>,
+    /// Sum of the cached component's asset sizes, in bytes.
+    pub size_bytes: i64,
 }
 
 /// An append-only audit row to persist after a decision is applied (or previewed).
@@ -178,6 +182,18 @@ pub struct RunSummary {
     pub blobs_enqueued: u64,
     /// Decisions skipped at apply time (row changed under us).
     pub skipped: u64,
+    /// Logical size before a size-budget run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_before: Option<u64>,
+    /// Logical size after the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_after: Option<u64>,
+    /// The low watermark used by the size budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bytes: Option<u64>,
+    /// Whether the run reached its target watermark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_reached: Option<bool>,
 }
 
 /// Ensure a `retention_run` ledger row exists for `repository_id` (idempotent).
@@ -464,6 +480,8 @@ where
             c.listed        AS listed,
             c.created_at    AS created_at,
             c.last_downloaded_at AS last_downloaded_at,
+            COALESCE((SELECT SUM(a.size) FROM asset a WHERE a.component_id = c.id), 0)::bigint
+                AS "size_bytes!",
             (
                 SELECT a.blob_sha256
                 FROM asset a
@@ -493,6 +511,7 @@ where
                         listed: r.listed,
                         created_at: r.created_at,
                         last_downloaded_at: r.last_downloaded_at,
+                        size_bytes: r.size_bytes,
                     },
                     sha,
                 )
@@ -517,29 +536,102 @@ pub async fn load_proxy_candidates<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query!(
+    sqlx::query_as!(
+        ProxyCandidateRow,
         r#"
-        SELECT id, name, version, listed, first_seen_at, last_downloaded_at
-        FROM proxy_cached_version
-        WHERE repository_id = $1 AND downloaded AND not_found = false
-        ORDER BY name, version
+        SELECT p.id AS cached_version_id, p.name, p.version, p.listed, p.first_seen_at,
+               p.last_downloaded_at,
+               COALESCE((
+                   SELECT SUM(a.size)
+                   FROM component c JOIN asset a ON a.component_id = c.id
+                   WHERE c.repository_id = p.repository_id
+                     AND c.name = p.name AND c.version = p.version
+               ), 0)::bigint AS "size_bytes!"
+        FROM proxy_cached_version p
+        WHERE p.repository_id = $1 AND p.downloaded AND p.not_found = false
+        ORDER BY p.name, p.version
         "#,
         repository_id,
     )
     .fetch_all(executor)
-    .await?;
+    .await
+}
 
-    Ok(rows
-        .into_iter()
-        .map(|r| ProxyCandidateRow {
-            cached_version_id: r.id,
-            name: r.name,
-            version: r.version,
-            listed: r.listed,
-            first_seen_at: r.first_seen_at,
-            last_downloaded_at: r.last_downloaded_at,
-        })
-        .collect())
+/// Lock and load the cached versions of one proxy package for retention
+/// revalidation. Like [`load_proxy_candidates`], only cached, found versions
+/// are candidates.
+pub async fn lock_proxy_package_candidates(
+    conn: &mut sqlx::PgConnection,
+    repository_id: i64,
+    name: &str,
+) -> sqlx::Result<Vec<ProxyCandidateRow>> {
+    crate::proxy_dao::lock_cached_package(conn, repository_id, name).await?;
+    sqlx::query_as!(
+        ProxyCandidateRow,
+        r#"
+        SELECT p.id AS cached_version_id, p.name, p.version, p.listed, p.first_seen_at,
+               p.last_downloaded_at, 0::bigint AS "size_bytes!"
+        FROM proxy_cached_version p
+        WHERE p.repository_id = $1 AND p.name = $2
+          AND p.downloaded AND p.not_found = false
+        ORDER BY p.id
+        FOR UPDATE OF p
+        "#,
+        repository_id,
+        name,
+    )
+    .fetch_all(conn)
+    .await
+}
+
+/// Lock (`FOR UPDATE`, in hash order) the blob rows the assets of `versions`
+/// of package `name` reference: a retention batch that releases several
+/// versions takes them before it decrements any, in the order every writer
+/// that touches two blobs takes them, so that two batches sharing blobs never
+/// wait for each other.
+pub async fn lock_package_version_blobs(
+    conn: &mut sqlx::PgConnection,
+    repository_id: i64,
+    name: &str,
+    versions: &[String],
+) -> sqlx::Result<()> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT b.sha256
+        FROM blob b
+        WHERE b.sha256 IN (
+            SELECT a.blob_sha256
+            FROM component c
+            JOIN asset a ON a.component_id = c.id
+            WHERE c.repository_id = $1 AND c.name = $2 AND c.version = ANY($3)
+        )
+        ORDER BY b.sha256
+        FOR UPDATE OF b
+        "#,
+        repository_id,
+        name,
+        versions,
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(())
+}
+
+/// The logical size of a hosted or proxy package repository, counting its
+/// assets (including assets shared by multiple versions).
+pub async fn package_repository_size(pool: &PgPool, repository_id: i64) -> sqlx::Result<u64> {
+    let bytes = sqlx::query_scalar!(
+        r#"
+        SELECT COALESCE(SUM(a.size), 0)::bigint AS "bytes!"
+        FROM asset a
+        JOIN component c ON c.id = a.component_id
+        WHERE c.repository_id = $1
+        "#,
+        repository_id,
+    )
+    .fetch_one(pool)
+    .await?;
+    u64::try_from(bytes).map_err(|e| sqlx::Error::Protocol(e.to_string()))
 }
 
 /// Insert one audit row. Accepts any executor so it composes inside the same
@@ -768,7 +860,9 @@ pub async fn lock_package_candidates(
             EXISTS (
                 SELECT 1 FROM asset a
                 WHERE a.component_id = c.id AND (a.path = $3 OR a.path LIKE '%.nupkg')
-            ) AS "has_nupkg!"
+            ) AS "has_nupkg!",
+            COALESCE((SELECT SUM(a.size) FROM asset a WHERE a.component_id = c.id), 0)::bigint
+                AS "size_bytes!"
         FROM component c
         WHERE c.repository_id = $1 AND c.name = $2
         ORDER BY c.id
@@ -790,6 +884,7 @@ pub async fn lock_package_candidates(
             listed: r.listed,
             created_at: r.created_at,
             last_downloaded_at: r.last_downloaded_at,
+            size_bytes: r.size_bytes,
         })
         .collect())
 }
