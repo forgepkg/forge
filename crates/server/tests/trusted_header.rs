@@ -457,6 +457,83 @@ async fn the_headers_never_make_an_administrator_and_own_credentials_win() {
     );
 }
 
+/// npm's `_authToken`, a Bearer API token, is the request's own credential
+/// (#555): it wins over the headers on `/repository`, and one that is
+/// refused is a 401, never the account the headers name.
+#[tokio::test]
+async fn a_bearer_token_of_the_requests_own_wins_over_the_headers() {
+    let srv = proxied().await;
+    let realm = create_realm(&srv, false).await;
+    let n = common::unique();
+    let office = format!("office{n}@example.com");
+    create_account(&srv, &realm, &office, "reader").await;
+    let ci = format!("ci{n}@example.com");
+    let ci_id = create_account(&srv, &realm, &ci, "writer").await;
+    let (u, p) = srv.admin_basic();
+    let repo = format!("npm{n}");
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": repo, "kind": "hosted", "format": "npm"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let token: Value = srv
+        .client()
+        .post(format!("{}/admin/users/{ci_id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "ci"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = token["token"].as_str().unwrap();
+    let whoami = || {
+        realm.named(
+            srv.client()
+                .get(format!("{}/repository/{repo}/-/whoami", srv.base_url)),
+            &office,
+        )
+    };
+
+    // The headers alone name the network's account…
+    let (status, body) = me(whoami()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["username"], json!(office));
+    // …a Bearer token of the request's own wins…
+    let (status, body) = me(whoami().bearer_auth(token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["username"], json!(ci));
+    // …and one that is refused, unknown or revoked, is a 401.
+    let (status, _) = me(whoami().bearer_auth("not-a-token")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let tokens: Value = srv
+        .client()
+        .get(format!("{}/admin/users/{ci_id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token_id = tokens[0]["id"].as_i64().unwrap();
+    let resp = srv
+        .client()
+        .delete(format!("{}/admin/tokens/{token_id}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let (status, _) = me(whoami().bearer_auth(token)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn an_update_keeps_the_stored_secret() {
     let srv = proxied().await;

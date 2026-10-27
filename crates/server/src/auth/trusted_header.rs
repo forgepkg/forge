@@ -19,7 +19,12 @@
 //! * The realm names the caller only when the request presents no credential
 //!   of its own ([`forge_core::auth::resolve_principal_with_fallback`]): an
 //!   API token, a password or a session cookie wins, and one that is refused
-//!   is never replaced by the account the headers name.
+//!   is never replaced by the account the headers name. That includes an API
+//!   token sent as `Authorization: Bearer` to `/repository`, as npm sends
+//!   its `_authToken`, which the feed resolves after the middleware
+//!   (`plugins::with_bearer`, #555). A registry token on `/v2` is the
+//!   registry's: an anonymous one stands for the request's principal, the
+//!   account the headers name included.
 //! * The headers present but no realm's secret among them, or the right
 //!   secret with a missing, empty, repeated or invalid name, or a name that
 //!   is not an account of the realm: the credentials are present but invalid

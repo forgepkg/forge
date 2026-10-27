@@ -46,7 +46,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use forge_core::auth::principal::Principal;
+use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::auth::token::{check_token, TokenCheck};
 use forge_core::authz::Level;
 use forge_core::format::Format;
@@ -211,8 +211,11 @@ fn split_path(path: &str) -> Option<(&str, &str)> {
 }
 
 /// The caller, with an `Authorization: Bearer` API token resolved when the
-/// principal middleware left it anonymous (npm sends its `_authToken` so).
-/// An unknown or unusable token is refused, never read as anonymous.
+/// principal middleware left it anonymous (npm sends its `_authToken` so),
+/// or named it by the headers of a trusted-header realm's proxy: the token
+/// is the request's own credential, which wins over the headers (#555). An
+/// unknown or unusable token is refused, never read as anonymous or as the
+/// account the headers name.
 async fn with_bearer(
     state: &AppState,
     headers: &HeaderMap,
@@ -220,7 +223,12 @@ async fn with_bearer(
 ) -> Result<Principal, Response> {
     if !matches!(
         principal,
-        Principal::Anonymous { .. } | Principal::Unauthenticated
+        Principal::Anonymous { .. }
+            | Principal::Unauthenticated
+            | Principal::User {
+                method: AuthMethod::TrustedHeader,
+                ..
+            }
     ) {
         return Ok(principal);
     }
