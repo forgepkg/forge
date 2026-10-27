@@ -1,16 +1,25 @@
 //! Reading a package tarball the way npm installs it.
 //!
-//! npm (pacote) unpacks a tarball with `strip: 1`: the first component of
-//! every path is dropped, whatever it is called (`package/` by convention),
-//! so the package's `package.json` is any entry at depth one. When several
-//! entries map to it, the last one wins on disk, so the last one is read.
-//! A file is any entry node-tar unpacks as one: a regular file (`0`, or NUL
-//! in the old form) or a contiguous file (`7`). A directory is one of type
-//! `5`, or of type `0` whose path ends in `/`, as old tars wrote them; it has
-//! no body to node-tar. The whole archive is read, bounded in what it unpacks
-//! to.
+//! npm (pacote) unpacks a tarball with node-tar and `strip: 1`: the first
+//! component of every path is dropped, whatever it is called (`package/` by
+//! convention), so the package's `package.json` is the entry
+//! `<first>/package.json`. When several entries map to it, the last one wins
+//! on disk, so the last one is read. A file is any entry node-tar unpacks as
+//! one: a regular file (`0`, or NUL in the old form) or a contiguous file
+//! (`7`). A directory is one of type `5`, or of type `0` whose path ends in
+//! `/`, as old tars wrote them; it has no body to node-tar. The whole archive
+//! is read, every gzip member of it, bounded in what it unpacks to.
+//!
+//! Where node-tar would read the archive otherwise than its headers lay it
+//! out, the tarball is refused rather than read one way (#554): a header
+//! node-tar rejects (it then reads the block after it as the next header, so
+//! the body `tar` skips holds entries only npm sees), a PAX record it would
+//! skip or read otherwise, data after the end of the archive (node-tar reads
+//! on after one zero block), and a file some client could unpack to
+//! `package.json` otherwise than by node-tar's strip on Linux (`\`, `.` or
+//! empty components, another case). `npm pack` writes none of these.
 
-use std::io::Read;
+use std::io::{self, BufRead, Read};
 
 use serde_json::{Map, Value};
 
@@ -39,13 +48,102 @@ pub struct Tarball {
     pub unpacked_size: u64,
 }
 
-/// The path an entry named `raw` unpacks to with `strip: 1`, as components.
-fn stripped(raw: &[u8]) -> Vec<&[u8]> {
-    let mut parts = raw
-        .split(|b| *b == b'/' || *b == b'\\')
-        .filter(|part| !part.is_empty() && *part != b".");
-    parts.next();
-    parts.collect()
+/// A gzip stream inflated as npm inflates it (minizlib, on Node's zlib):
+/// member after member, until the input ends or a member is followed by a
+/// zero byte, the padding old tarballs carry (`npm` once padded them to
+/// 10 KiB). Node's zlib ignores what follows that byte; here it must be zeros
+/// to the end.
+struct Gunzip<R: BufRead> {
+    member: Option<flate2::bufread::GzDecoder<R>>,
+}
+
+impl<R: BufRead> Read for Gunzip<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let Some(member) = self.member.as_mut() else {
+                return Ok(0);
+            };
+            let n = member.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            let mut input = self.member.take().expect("a member").into_inner();
+            match input.fill_buf()?.first() {
+                None => return Ok(0),
+                Some(0) => loop {
+                    let padding = input.fill_buf()?;
+                    if padding.is_empty() {
+                        return Ok(0);
+                    }
+                    if padding.iter().any(|b| *b != 0) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "data after the gzip stream's padding",
+                        ));
+                    }
+                    let len = padding.len();
+                    input.consume(len);
+                },
+                Some(_) => self.member = Some(flate2::bufread::GzDecoder::new(input)),
+            }
+        }
+    }
+}
+
+/// `path` without a leading Windows drive (`c:`), which node-tar strips as a
+/// root of the path before the first component is (`strip-absolute-path.js`
+/// parses with Windows' rules, also on Linux).
+fn without_drive(path: &[u8]) -> Option<&[u8]> {
+    match path {
+        [letter, b':', rest @ ..] if letter.is_ascii_alphabetic() => Some(rest),
+        _ => None,
+    }
+}
+
+/// Whether npm unpacks the file `path` to the package's `package.json`:
+/// `<first>/package.json`, as node-tar strips the first component
+/// (`strip: 1`) and resolves the rest (a trailing `/` included) on Linux and
+/// macOS. The first component is a plain name: not empty, `.` or `..`, no
+/// `\` and no drive, which node-tar or Windows read otherwise.
+fn is_manifest(path: &[u8]) -> bool {
+    let Some(slash) = path.iter().position(|b| *b == b'/') else {
+        return false;
+    };
+    let (first, rest) = (&path[..slash], &path[slash + 1..]);
+    let plain = !first.is_empty()
+        && first != b"."
+        && first != b".."
+        && !first.contains(&b'\\')
+        && without_drive(first).is_none();
+    let end = rest.iter().rposition(|b| *b != b'/').map_or(0, |i| i + 1);
+    plain && &rest[..end] == b"package.json"
+}
+
+/// Whether some client could unpack the file `path` to `package.json`
+/// although [`is_manifest`] says no: node-tar resolves `.` and empty
+/// components after the strip, takes `..` and a drive or a leading `/` for a
+/// root before it, Windows also splits at `\` and drops trailing dots and
+/// spaces, and macOS and Windows ignore case.
+fn may_be_manifest(path: &[u8]) -> bool {
+    let named = |part: &[u8]| {
+        let end = part
+            .iter()
+            .rposition(|b| *b != b'.' && !b.is_ascii_whitespace())
+            .map_or(0, |i| i + 1);
+        part[..end].eq_ignore_ascii_case(b"package.json")
+    };
+    [Some(path), without_drive(path)]
+        .into_iter()
+        .flatten()
+        .any(|path| {
+            [&b"/"[..], b"/\\"].into_iter().any(|separators| {
+                let parts: Vec<&[u8]> = path
+                    .split(|b| separators.contains(b))
+                    .filter(|part| !part.is_empty() && *part != b".")
+                    .collect();
+                parts.len() <= 2 && parts.last().is_some_and(|last| named(last))
+            })
+        })
 }
 
 /// The name field of `header` alone, up to its first NUL: without the ustar
@@ -54,6 +152,142 @@ fn stripped(raw: &[u8]) -> Vec<&[u8]> {
 fn name_field(header: &tar::Header) -> &[u8] {
     let name = &header.as_old().name;
     &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())]
+}
+
+/// Whether `bytes` hold a line break as JavaScript's `.` sees one (`\n`,
+/// `\r`, U+2028, U+2029).
+fn has_line_break(bytes: &[u8]) -> bool {
+    bytes.iter().any(|b| *b == b'\n' || *b == b'\r')
+        || bytes
+            .windows(3)
+            .any(|w| w == [0xE2, 0x80, 0xA8] || w == [0xE2, 0x80, 0xA9])
+}
+
+/// Whether node-tar reads the string `field` as `tar` does, up to its first
+/// NUL: node-tar's `replace(/\0.*/, '')` keeps what follows a line break
+/// after that NUL.
+fn reads_to_nul(field: &[u8]) -> bool {
+    field
+        .iter()
+        .position(|b| *b == 0)
+        .is_none_or(|nul| !has_line_break(&field[nul..]))
+}
+
+/// The base-256 number `field` holds as node-tar reads it
+/// (`lib/large-numbers.js`): positive after `0x80`, two's complement after
+/// `0xff`. `None` where node-tar throws: another first byte, or a number
+/// past JavaScript's safe integers.
+fn base256(field: &[u8]) -> Option<i128> {
+    const SAFE: i128 = (1 << 53) - 1;
+    let unsigned = |bytes: &[u8]| bytes.iter().fold(0i128, |n, b| n << 8 | i128::from(*b));
+    let value = match field.first()? {
+        0x80 => unsigned(&field[1..]),
+        0xff => unsigned(field) - (1i128 << (8 * field.len())),
+        _ => return None,
+    };
+    (-SAFE..=SAFE).contains(&value).then_some(value)
+}
+
+/// The octal number `field` holds as node-tar reads it (`decSmallNumber`,
+/// `parseInt(_, 8)`): the leading octal digits after whitespace and a sign.
+/// `None` for no digits, where node-tar reads `null`.
+fn octal(field: &[u8]) -> Option<i128> {
+    let text = field.trim_ascii_start();
+    let (sign, text) = match text.first() {
+        Some(b'-') => (-1, &text[1..]),
+        Some(b'+') => (1, &text[1..]),
+        _ => (1, text),
+    };
+    let digits = text
+        .iter()
+        .take_while(|b| (b'0'..=b'7').contains(b))
+        .count();
+    (digits > 0).then(|| {
+        sign * text[..digits]
+            .iter()
+            .fold(0i128, |n, d| n * 8 + i128::from(d - b'0'))
+    })
+}
+
+/// A number field as node-tar reads it: base-256 when its first byte has the
+/// high bit, else octal.
+fn number(field: &[u8]) -> Option<i128> {
+    if field[0] & 0x80 != 0 {
+        base256(field)
+    } else {
+        octal(field)
+    }
+}
+
+/// Refuse the header `header` of an entry of `size` bytes where node-tar
+/// reads it otherwise than `tar` (`lib/header.js`, `lib/parse.js`): node-tar
+/// rejects a header with a warning, skips its 512 bytes alone and reads the
+/// next block as a header, so a body `tar` skips would hold entries only npm
+/// sees. `extended_path`: a GNU long name or PAX header names the entry.
+fn check_header(header: &tar::Header, size: u64, extended_path: bool) -> Result<(), String> {
+    let b = header.as_bytes();
+    let refuse = |why: &str| {
+        Err(format!(
+            "the tarball has a header npm reads otherwise: {why}"
+        ))
+    };
+    let ustar = &b[257..265] == b"ustar\x0000";
+    // What node-tar decodes besides the size: mode, uid, gid and mtime; a
+    // ustar header's device numbers, and its atime and ctime where the
+    // prefix leaves them room. A base-256 number it cannot read throws.
+    let mut fields = vec![(100, 8), (108, 8), (116, 8), (136, 12)];
+    if ustar {
+        fields.extend([(329, 8), (337, 8)]);
+        if b[475] == 0 {
+            fields.extend([(476, 12), (488, 12)]);
+        }
+    }
+    if fields
+        .into_iter()
+        .any(|(at, len)| b[at] & 0x80 != 0 && base256(&b[at..at + len]).is_none())
+    {
+        return refuse("a base-256 number");
+    }
+    if number(&b[124..136]) != Some(i128::from(size)) {
+        return refuse("its size");
+    }
+    // node-tar reads the checksum field over 12 bytes, into the type and the
+    // link name, and sums the header unsigned as `tar` does.
+    let sum = 8 * 0x20
+        + b[..148]
+            .iter()
+            .chain(&b[156..])
+            .map(|byte| i128::from(*byte))
+            .sum::<i128>();
+    if number(&b[148..160]) != Some(sum) {
+        return refuse("its checksum");
+    }
+    let prefix = if ustar {
+        Some(&b[345..if b[475] == 0 { 475 } else { 500 }])
+    } else {
+        None
+    };
+    let name = &b[..100];
+    let link = &b[157..257];
+    if !reads_to_nul(name) || !reads_to_nul(link) || prefix.is_some_and(|p| !reads_to_nul(p)) {
+        return refuse("a string with a line break after its end");
+    }
+    // A prefix node-tar joins with `/` although `tar` reads it empty.
+    if ustar && b[475] != 0 && b[345] == 0 {
+        return refuse("an empty prefix");
+    }
+    if !extended_path && header.path_bytes().is_empty() {
+        return refuse("an empty path");
+    }
+    let is_link = matches!(b[156], b'1' | b'2');
+    if is_link == (link[0] == 0) {
+        return refuse(if is_link {
+            "a link without a target"
+        } else {
+            "a link target on an entry that is no link"
+        });
+    }
+    Ok(())
 }
 
 /// Read the data of `entry`, a GNU long name or a PAX extended header of
@@ -71,19 +305,45 @@ fn header_entry(entry: &mut impl Read, size: u64, what: &str) -> Result<Vec<u8>,
     Ok(data)
 }
 
-/// The `path` and `size` records of the PAX header `data` (the last of each,
-/// as node-tar reads them).
+/// The `path` and `size` records of the PAX header `data` (the last of each),
+/// as node-tar reads them (`lib/pax.js`): it splits the data at line breaks
+/// and reads each line as `<length> <key>=<value>`, skipping a line whose
+/// length is not its own, as a record whose value holds a line break is. A
+/// record node-tar would skip or read otherwise is refused: one not in that
+/// form with its length in plain decimal, data that is not UTF-8, and a path
+/// node-tar ignores (empty) or reads as a number (digits alone).
 fn pax(data: &[u8]) -> Result<(Option<Vec<u8>>, Option<u64>), String> {
+    let refuse = |why: &str| format!("the tarball's PAX header has {why}");
+    let text = std::str::from_utf8(data).map_err(|_| refuse("a record that is not UTF-8"))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
     let (mut path, mut size) = (None, None);
-    for record in tar::PaxExtensions::new(data).flatten() {
-        match record.key_bytes() {
-            b"path" => path = Some(record.value_bytes().to_vec()),
-            b"size" => {
-                let value = std::str::from_utf8(record.value_bytes()).ok();
+    if text.is_empty() {
+        return Ok((path, size));
+    }
+    for line in text.split('\n') {
+        let (length, record) = line
+            .split_once(' ')
+            .ok_or_else(|| refuse("a record without a length"))?;
+        let plain = !length.starts_with('0') && length.bytes().all(|b| b.is_ascii_digit());
+        if !plain || length.parse::<usize>().ok() != Some(line.len() + 1) {
+            return Err(refuse("a record whose length is not its own"));
+        }
+        let (key, value) = record
+            .split_once('=')
+            .ok_or_else(|| refuse("a record without a value"))?;
+        let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+        match key {
+            "path" if value.is_empty() || digits || value.contains('\0') => {
+                return Err(refuse("a path npm reads otherwise"));
+            }
+            "path" => path = Some(value.as_bytes().to_vec()),
+            "size" => {
                 size = Some(
                     value
-                        .and_then(|v| v.parse().ok())
-                        .ok_or("the tarball's PAX header has an unreadable size")?,
+                        .parse()
+                        .ok()
+                        .filter(|_| digits)
+                        .ok_or_else(|| refuse("an unreadable size"))?,
                 );
             }
             _ => {}
@@ -100,13 +360,18 @@ fn pax(data: &[u8]) -> Result<(Option<Vec<u8>>, Option<u64>), String> {
 /// names. They are read here instead, bounded ([`header_entry`]) and counted
 /// against `max_unpacked` like any entry, and the path they give the next
 /// entry is applied as npm (node-tar) applies it: the later one wins, old
-/// forms included. A PAX `size` that is not the next entry's own is
-/// refused (an npm tarball is far below the 8 GiB a header holds, so the
-/// record only ever disagrees), as are a global one, a GNU sparse entry and
-/// a directory whose header gives it a body: each would lay the archive out
+/// forms included. A PAX `size` that is not the size of every header it
+/// applies to (node-tar applies it up to the next entry that is no GNU long
+/// name or PAX header) is refused (an npm tarball is far below the 8 GiB a
+/// header holds, so the record only ever disagrees), as are a global one, a
+/// GNU sparse entry, a directory whose header gives it a body, and the
+/// headers [`check_header`] refuses: each would lay the archive out
 /// otherwise than its headers do.
 pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
-    let gz = flate2::read::GzDecoder::new(tgz);
+    // npm (minizlib) reads every gzip member.
+    let gz = Gunzip {
+        member: Some(flate2::bufread::GzDecoder::new(io::BufReader::new(tgz))),
+    };
     let mut archive = tar::Archive::new(gz);
     let entries = archive
         .entries()
@@ -127,13 +392,23 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
                 "the tarball unpacks to more than {max_unpacked} bytes"
             ));
         }
+        check_header(entry.header(), size, next_path.is_some())?;
+        if next_size.is_some_and(|pax| pax != size) {
+            return Err("the tarball's PAX header gives an entry another size than its own".into());
+        }
         let kind = entry.header().entry_type();
         // The entries node-tar reads as describing the next one.
         match kind.as_byte() {
             // A GNU long name (`N` in its old form) names the next entry.
             b'L' | b'N' => {
                 let mut name = header_entry(&mut entry, size, "GNU long name")?;
+                if !reads_to_nul(&name) {
+                    return Err("the tarball has a GNU long name npm reads otherwise".into());
+                }
                 name.truncate(name.iter().position(|b| *b == 0).unwrap_or(name.len()));
+                if name.is_empty() {
+                    return Err("the tarball has an empty GNU long name".into());
+                }
                 next_path = Some(name);
                 continue;
             }
@@ -161,9 +436,7 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
             b'S' => return Err("the tarball holds a GNU sparse entry".into()),
             _ => {}
         }
-        if next_size.take().is_some_and(|pax| pax != size) {
-            return Err("the tarball's PAX header gives an entry another size than its own".into());
-        }
+        next_size = None;
         let named = next_path.take();
         // node-tar takes a `0` entry whose path ends in `/` for a directory:
         // the path a GNU long name or a PAX header gives, else the header's
@@ -185,7 +458,7 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
             continue;
         }
         file_count += 1;
-        if stripped(&path) == [b"package.json".as_slice()] {
+        if is_manifest(&path) {
             if size > MAX_PACKAGE_JSON_BYTES {
                 return Err(format!(
                     "package.json is larger than {MAX_PACKAGE_JSON_BYTES} bytes"
@@ -197,9 +470,37 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
                 .read_to_end(&mut data)
                 .map_err(|e| format!("unreadable package.json: {e}"))?;
             package_json = Some(data);
+        } else if may_be_manifest(&path) {
+            return Err(format!(
+                "the tarball holds {:?}, which a client may unpack to package.json",
+                String::from_utf8_lossy(&path)
+            ));
         }
         // The rest of the entry's data is skipped by the archive reader,
         // which still inflates it: what the size bound above is for.
+    }
+    // `tar` ends the archive at its first zero block, node-tar only at two
+    // in a row: what follows must be zeros alone, inflated within the bound
+    // (but no part of `dist.unpackedSize`).
+    let mut rest = archive.into_inner();
+    let mut block = [0u8; 8192];
+    let mut trailing = 0u64;
+    loop {
+        let n = rest
+            .read(&mut block)
+            .map_err(|e| format!("unreadable tarball: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        trailing = trailing.saturating_add(n as u64);
+        if unpacked.saturating_add(trailing) > max_unpacked {
+            return Err(format!(
+                "the tarball unpacks to more than {max_unpacked} bytes"
+            ));
+        }
+        if block[..n].iter().any(|b| *b != 0) {
+            return Err("the tarball holds data after the end of its archive".into());
+        }
     }
     let data = package_json.ok_or("the tarball holds no package/package.json")?;
     let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data);
@@ -524,5 +825,295 @@ mod tests {
             let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
             assert!(err.contains(why), "{name}: {err}");
         }
+    }
+
+    /// Append an entry like [`raw_entry`] with all of `data`, its header
+    /// changed by `change` before its checksum is set.
+    fn changed_entry(
+        tar: &mut Vec<u8>,
+        name: &[u8],
+        kind: u8,
+        data: &[u8],
+        change: impl FnOnce(&mut [u8; 512]),
+    ) {
+        let mut header = tar::Header::new_ustar();
+        header.as_old_mut().name[..name.len()].copy_from_slice(name);
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::new(kind));
+        change(header.as_mut_bytes());
+        header.set_cksum();
+        tar.extend_from_slice(header.as_bytes());
+        tar.extend_from_slice(data);
+        tar.resize(tar.len().next_multiple_of(512), 0);
+    }
+
+    #[test]
+    fn refuses_a_header_npm_rejects() {
+        // node-tar rejects these headers and reads the block after each as
+        // the next header, so the body `tar` skips could hold a package.json
+        // only npm installs (#554).
+        let size_past_8_bytes = |b: &mut [u8; 512]| {
+            let mut field = [0u8; 12];
+            field[0] = 0x80;
+            field[3] = 1;
+            field[11] = 30;
+            b[124..136].copy_from_slice(&field);
+        };
+        type Change = Box<dyn FnOnce(&mut [u8; 512])>;
+        let refused: [(&[u8], u8, Change, &str); 7] = [
+            (
+                b"package/x",
+                b'0',
+                Box::new(|b| b[157..163].copy_from_slice(b"target")),
+                "a link target on an entry that is no link",
+            ),
+            (
+                b"package/x",
+                b'2',
+                Box::new(|_| {}),
+                "a link without a target",
+            ),
+            (b"", b'0', Box::new(|_| {}), "an empty path"),
+            (
+                b"package/x",
+                b'0',
+                Box::new(|b| b[100] = 0x81),
+                "a base-256 number",
+            ),
+            // `tar` reads the last 8 bytes of a base-256 size, node-tar all.
+            (b"package/x", b'0', Box::new(size_past_8_bytes), "its size"),
+            // node-tar reads `package/x\n/`, a directory.
+            (
+                b"package/x\0x\n/",
+                b'0',
+                Box::new(|_| {}),
+                "a string with a line break after its end",
+            ),
+            // node-tar joins an empty prefix: `/package/x`.
+            (
+                b"package/x",
+                b'0',
+                Box::new(|b| b[475] = b'A'),
+                "an empty prefix",
+            ),
+        ];
+        for (name, kind, change, why) in refused {
+            let mut tar = Vec::new();
+            changed_entry(&mut tar, name, kind, PACKAGE_JSON, change);
+            raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+            let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        }
+
+        // A checksum of 8 digits with no end runs into the type flag, which
+        // node-tar reads with it.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        let sum = tar::Header::from_byte_slice(&tar[..512]).cksum().unwrap();
+        tar[148..156].copy_from_slice(format!("{sum:08o}").as_bytes());
+        let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+        assert!(err.contains("its checksum"), "{err}");
+
+        // A base-256 size both read alike is read.
+        let mut tar = Vec::new();
+        changed_entry(&mut tar, b"package/package.json", b'0', PACKAGE_JSON, |b| {
+            let mut field = [0u8; 12];
+            field[0] = 0x80;
+            field[11] = 30;
+            b[124..136].copy_from_slice(&field);
+        });
+        let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!(t.name, "a");
+    }
+
+    #[test]
+    fn refuses_data_after_the_end_of_the_archive() {
+        // `tar` ends the archive at a zero block, node-tar reads on after one.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        tar.extend_from_slice(&[0; 512]);
+        raw_entry(
+            &mut tar,
+            "package/package.json",
+            b'0',
+            30,
+            br#"{"name":"b","version":"2.0.0"}"#,
+        );
+        let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+        assert!(err.contains("data after the end"), "{err}");
+
+        // Zeros after it are counted against the bound, not in the size.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        tar.extend_from_slice(&[0; 4096]);
+        let tgz = finish(tar);
+        assert_eq!(
+            read(&tgz[..], DEFAULT_MAX_UNPACKED_BYTES)
+                .unwrap()
+                .unpacked_size,
+            30
+        );
+        let err = read(&tgz[..], 1024).unwrap_err();
+        assert!(err.contains("unpacks to more than"), "{err}");
+    }
+
+    #[test]
+    fn reads_every_gzip_member() {
+        // npm inflates every member of the gzip stream; the later package.json
+        // is the one it installs.
+        let gz = |tar: &[u8]| {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut gz, tar).expect("gzip");
+            gz.finish().expect("finish gzip")
+        };
+        let mut first = Vec::new();
+        raw_entry(&mut first, "package/package.json", b'0', 30, PACKAGE_JSON);
+        let mut second = Vec::new();
+        raw_entry(
+            &mut second,
+            "package/package.json",
+            b'0',
+            30,
+            br#"{"name":"b","version":"2.0.0"}"#,
+        );
+        second.extend_from_slice(&[0; 1024]);
+        let tgz = [gz(&first), gz(&second)].concat();
+        let t = read(&tgz[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!((t.name.as_str(), t.file_count), ("b", 2));
+
+        // Zeros after the stream are padding, as old npm wrote it (grunt
+        // 0.1.0); anything else after the padding is refused.
+        let whole = [first, vec![0; 1024]].concat();
+        let padded = [gz(&whole), vec![0; 3000]].concat();
+        let t = read(&padded[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!(t.name, "a");
+        let err = read(&[padded, vec![1]].concat()[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+        assert!(err.contains("after the gzip stream's padding"), "{err}");
+    }
+
+    #[test]
+    fn pax_records_are_read_as_npm_reads_them() {
+        let path = pax_record("path", "package/package.json");
+        let refused: [(Vec<u8>, &str); 7] = [
+            // node-tar reads the key ` path` after a length with a sign or a
+            // leading zero.
+            (format!("+{path}").into_bytes(), "length is not its own"),
+            (format!("0{path}").into_bytes(), "length is not its own"),
+            (
+                b"99 path=package/package.json\n".to_vec(),
+                "length is not its own",
+            ),
+            // node-tar skips an empty line, where `tar` stops.
+            (format!("\n{path}").into_bytes(), "without a length"),
+            (b"9 a=\xff\xfe\n".to_vec(), "not UTF-8"),
+            // An empty path node-tar ignores, digits alone it reads as a number.
+            (
+                pax_record("path", "").into_bytes(),
+                "a path npm reads otherwise",
+            ),
+            (
+                pax_record("path", "123").into_bytes(),
+                "a path npm reads otherwise",
+            ),
+        ];
+        for (data, why) in refused {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "PaxHeaders/x", b'x', data.len() as u64, &data);
+            raw_entry(&mut tar, "package/x", b'0', 30, PACKAGE_JSON);
+            let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        }
+
+        // Other records, as GNU tar and bsdtar write them, pass by.
+        let data = format!("{}{path}", pax_record("mtime", "1700000000.5"));
+        let mut tar = Vec::new();
+        raw_entry(
+            &mut tar,
+            "PaxHeaders/x",
+            b'x',
+            data.len() as u64,
+            data.as_bytes(),
+        );
+        raw_entry(&mut tar, "package/x", b'0', 30, PACKAGE_JSON);
+        let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!(t.name, "a");
+    }
+
+    #[test]
+    fn a_pax_size_applies_up_to_the_next_entry() {
+        // node-tar gives a GNU long name after a PAX header that header's size.
+        let size = pax_record("size", "30");
+        let mut tar = Vec::new();
+        raw_entry(
+            &mut tar,
+            "PaxHeaders/x",
+            b'x',
+            size.len() as u64,
+            size.as_bytes(),
+        );
+        raw_entry(
+            &mut tar,
+            "././@LongLink",
+            b'L',
+            21,
+            b"package/package.json\0",
+        );
+        raw_entry(&mut tar, "package/x", b'0', 30, PACKAGE_JSON);
+        let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+        assert!(err.contains("another size"), "{err}");
+    }
+
+    #[test]
+    fn refuses_a_gnu_long_name_npm_reads_otherwise() {
+        for (name, why) in [
+            (
+                &b"package/package.json\0x\ny"[..],
+                "GNU long name npm reads otherwise",
+            ),
+            (b"\0", "empty GNU long name"),
+        ] {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "././@LongLink", b'L', name.len() as u64, name);
+            raw_entry(&mut tar, "package/x", b'0', 30, PACKAGE_JSON);
+            let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+            assert!(err.contains(why), "{why}: {err}");
+        }
+    }
+
+    #[test]
+    fn takes_the_manifest_only_where_npm_does() {
+        // node-tar strips exactly the first component and resolves the rest;
+        // a path some client unpacks to package.json otherwise is refused.
+        for path in [
+            "./package.json",
+            "/package.json",
+            "../package.json",
+            "package.json",
+            "./package/package.json",
+            "package//package.json",
+            "package/./package.json",
+            "package\\package.json",
+            "pa\\ck/package.json",
+            "package/PACKAGE.JSON",
+            "package/package.json.",
+            "package/package.json ",
+            "c:package.json",
+            "c:x/package.json",
+        ] {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+            raw_entry(&mut tar, path, b'0', 30, PACKAGE_JSON);
+            let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+            assert!(err.contains("may unpack to package.json"), "{path}: {err}");
+        }
+
+        // The first component is any plain name; a deeper package.json is
+        // just a file.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "pkg/package.json", b'0', 30, PACKAGE_JSON);
+        raw_entry(&mut tar, "pkg/lib/package.json", b'0', 9, br#"{"a":"b"}"#);
+        let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!((t.name.as_str(), t.file_count), ("a", 2));
     }
 }
