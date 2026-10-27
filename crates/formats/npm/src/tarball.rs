@@ -336,51 +336,146 @@ fn header_entry(entry: &mut impl Read, size: u64, what: &str) -> Result<Vec<u8>,
     Ok(data)
 }
 
-/// The `path` and `size` records of the PAX header `data` (the last of each),
-/// as node-tar reads them (`lib/pax.js`): it splits the data at line breaks
-/// and reads each line as `<length> <key>=<value>`, skipping a line whose
-/// length is not its own, as a record whose value holds a line break is. A
-/// record node-tar would skip or read otherwise is refused: one not in that
-/// form with its length in plain decimal, data that is not UTF-8, and a path
-/// node-tar ignores (empty) or reads as a number (digits alone).
+/// The `path` and `size` records of the PAX header `data` (the last of each).
+///
+/// The records are read as the format defines them, each `<length>
+/// <key>=<value>\n` of the length it states in plain decimal, and also as
+/// node-tar reads them ([`node_tar_pax`]). A header is refused when the
+/// records are not of the lengths they state, when a path is one node-tar
+/// ignores (empty) or reads as a number (digits alone), when a size is not
+/// plain digits, and when node-tar finds another path or size in it: a value
+/// holding a line break or bytes that are not UTF-8 node-tar reads otherwise.
+/// Other records may hold anything (GNU tar and bsdtar write a file's
+/// extended attributes raw, `SCHILY.xattr.<name>`), as npm installs them.
 fn pax(data: &[u8]) -> Result<(Option<Vec<u8>>, Option<u64>), String> {
     let refuse = |why: &str| format!("the tarball's PAX header has {why}");
-    let text = std::str::from_utf8(data).map_err(|_| refuse("a record that is not UTF-8"))?;
-    let text = text.strip_suffix('\n').unwrap_or(text);
     let (mut path, mut size) = (None, None);
-    if text.is_empty() {
-        return Ok((path, size));
-    }
-    for line in text.split('\n') {
-        let (length, record) = line
-            .split_once(' ')
+    let mut rest = data;
+    while !rest.is_empty() {
+        let space = rest
+            .iter()
+            .position(|b| *b == b' ' || *b == b'\n')
+            .filter(|at| rest[*at] == b' ')
             .ok_or_else(|| refuse("a record without a length"))?;
-        let plain = !length.starts_with('0') && length.bytes().all(|b| b.is_ascii_digit());
-        if !plain || length.parse::<usize>().ok() != Some(line.len() + 1) {
-            return Err(refuse("a record whose length is not its own"));
-        }
-        let (key, value) = record
-            .split_once('=')
+        let length = &rest[..space];
+        let plain =
+            !length.is_empty() && length[0] != b'0' && length.iter().all(|b| b.is_ascii_digit());
+        let length = std::str::from_utf8(length)
+            .ok()
+            .filter(|_| plain)
+            .and_then(|l| l.parse::<usize>().ok())
+            .filter(|l| *l > space + 1 && *l <= rest.len() && rest[*l - 1] == b'\n')
+            .ok_or_else(|| refuse("a record whose length is not its own"))?;
+        let record = &rest[space + 1..length - 1];
+        rest = &rest[length..];
+        let eq = record
+            .iter()
+            .position(|b| *b == b'=')
             .ok_or_else(|| refuse("a record without a value"))?;
-        let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+        let (key, value) = (&record[..eq], &record[eq + 1..]);
+        let digits = !value.is_empty() && value.iter().all(|b| b.is_ascii_digit());
         match key {
-            "path" if value.is_empty() || digits || value.contains('\0') => {
+            b"path" if value.is_empty() || digits || value.contains(&0) => {
                 return Err(refuse("a path npm reads otherwise"));
             }
-            "path" => path = Some(value.as_bytes().to_vec()),
-            "size" => {
+            b"path" => path = Some(value.to_vec()),
+            b"size" => {
                 size = Some(
-                    value
-                        .parse()
+                    std::str::from_utf8(value)
                         .ok()
                         .filter(|_| digits)
+                        .and_then(|v| v.parse().ok())
                         .ok_or_else(|| refuse("an unreadable size"))?,
                 );
             }
             _ => {}
         }
     }
+    let (npm_path, npm_size) = node_tar_pax(data);
+    if npm_path.as_ref().map(String::as_bytes) != path.as_deref() || npm_size != size.map(Ok) {
+        return Err(refuse("a record npm reads otherwise"));
+    }
     Ok((path, size))
+}
+
+/// The `path` and `size` node-tar takes from the PAX header `data`
+/// (`lib/parse.js`, `lib/pax.js`): it decodes the data as UTF-8 with
+/// replacement characters, splits it at line breaks, and reads a line as a
+/// record when `parseInt` finds the line's own length plus one at its start;
+/// the key is what follows as many characters as that number and a space
+/// take, up to the first `=`. A size that is not plain digits is `Err` (no
+/// size node-tar is sure to read alike).
+fn node_tar_pax(data: &[u8]) -> (Option<String>, Option<Result<u64, ()>>) {
+    // JavaScript's white space and line terminators, which `parseInt` skips.
+    let js_space = |c: char| {
+        matches!(
+            c,
+            '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200a}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{202f}'
+                    | '\u{205f}'
+                    | '\u{3000}'
+                    | '\u{feff}'
+        )
+    };
+    let text = String::from_utf8_lossy(data);
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    let (mut path, mut size) = (None, None);
+    for line in text.split('\n') {
+        // `parseInt(line, 10)`.
+        let number = line.trim_start_matches(js_space);
+        let (negative, number) = match number.as_bytes().first() {
+            Some(b'-') => (true, &number[1..]),
+            Some(b'+') => (false, &number[1..]),
+            _ => (false, number),
+        };
+        let digits = number.bytes().take_while(u8::is_ascii_digit).count();
+        let Some(n) = number[..digits].parse::<u128>().ok().filter(|_| !negative) else {
+            continue;
+        };
+        if n != line.len() as u128 + 1 {
+            continue;
+        }
+        // `line.slice((n + ' ').length)`, in UTF-16 code units: a slice
+        // that splits a character leaves no key node-tar reads.
+        let skip = n.to_string().len() + 1;
+        let (mut units, mut at) = (0, None);
+        for (i, c) in line.char_indices() {
+            if units >= skip {
+                at = (units == skip).then_some(i);
+                break;
+            }
+            units += c.len_utf16();
+        }
+        let Some(at) = at else {
+            continue;
+        };
+        let Some((key, value)) = line[at..].split_once('=') else {
+            continue;
+        };
+        // `.replace(/\0.*/, '')`: `.` stops at a line terminator.
+        let value = match value.find('\0') {
+            Some(nul) => {
+                let after = &value[nul + 1..];
+                let kept = after
+                    .find(['\r', '\u{2028}', '\u{2029}'])
+                    .map_or("", |end| &after[end..]);
+                format!("{}{kept}", &value[..nul])
+            }
+            None => value.to_owned(),
+        };
+        match key {
+            "path" => path = Some(value),
+            "size" => {
+                let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+                size = Some(value.parse().ok().filter(|_| digits).ok_or(()));
+            }
+            _ => {}
+        }
+    }
+    (path, size)
 }
 
 /// Read the gzip-compressed tarball in `tgz`, refusing one that unpacks to
@@ -656,6 +751,16 @@ mod tests {
             len = rest.len() + len.to_string().len();
         }
         format!("{len}{rest}")
+    }
+
+    /// A PAX record whose value is `value`, any bytes.
+    fn pax_bytes(key: &str, value: &[u8]) -> Vec<u8> {
+        let rest = [format!(" {key}=").as_bytes(), value, b"\n"].concat();
+        let mut len = rest.len();
+        while rest.len() + len.to_string().len() != len {
+            len = rest.len() + len.to_string().len();
+        }
+        [len.to_string().into_bytes(), rest].concat()
     }
 
     const PACKAGE_JSON: &[u8] = br#"{"name":"a","version":"1.0.0"}"#;
@@ -1026,7 +1131,8 @@ mod tests {
     #[test]
     fn pax_records_are_read_as_npm_reads_them() {
         let path = pax_record("path", "package/package.json");
-        let refused: [(Vec<u8>, &str); 7] = [
+        let hidden = |line: &str| [b"x\n", line.as_bytes()].concat();
+        let refused: [(Vec<u8>, &str); 11] = [
             // node-tar reads the key ` path` after a length with a sign or a
             // leading zero.
             (format!("+{path}").into_bytes(), "length is not its own"),
@@ -1037,7 +1143,31 @@ mod tests {
             ),
             // node-tar skips an empty line, where `tar` stops.
             (format!("\n{path}").into_bytes(), "without a length"),
-            (b"9 a=\xff\xfe\n".to_vec(), "not UTF-8"),
+            (b"9 a=\xff\xfe\n".to_vec(), "length is not its own"),
+            // node-tar decodes a path that is not UTF-8 with replacement
+            // characters, so its length is no longer its own, and splits one
+            // holding a line break: it skips both.
+            (
+                pax_bytes("path", b"package/\xffpackage.json"),
+                "npm reads otherwise",
+            ),
+            (
+                pax_bytes("path", b"package/a\nb.json"),
+                "npm reads otherwise",
+            ),
+            // A line break in another record's value starts a line node-tar
+            // reads as a record of its own, `parseInt` skipping a sign.
+            (
+                pax_bytes("SCHILY.xattr.user.a", &hidden(path.trim_end())),
+                "npm reads otherwise",
+            ),
+            (
+                pax_bytes(
+                    "SCHILY.xattr.user.a",
+                    &hidden("+29path=package/package.json"),
+                ),
+                "npm reads otherwise",
+            ),
             // An empty path node-tar ignores, digits alone it reads as a number.
             (
                 pax_record("path", "").into_bytes(),
@@ -1056,19 +1186,23 @@ mod tests {
             assert!(err.contains(why), "{why}: {err}");
         }
 
-        // Other records, as GNU tar and bsdtar write them, pass by.
-        let data = format!("{}{path}", pax_record("mtime", "1700000000.5"));
-        let mut tar = Vec::new();
-        raw_entry(
-            &mut tar,
-            "PaxHeaders/x",
-            b'x',
-            data.len() as u64,
-            data.as_bytes(),
-        );
-        raw_entry(&mut tar, "package/x", b'0', 30, PACKAGE_JSON);
-        let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
-        assert_eq!(t.name, "a");
+        // Other records, as GNU tar and bsdtar write them, pass by: a time,
+        // and extended attributes raw, bytes that are not UTF-8 and line
+        // breaks included, which node-tar skips.
+        for other in [
+            pax_record("mtime", "1700000000.5").into_bytes(),
+            pax_bytes("SCHILY.xattr.com.apple.provenance", b"\x01\x02\x00\xff"),
+            pax_bytes("SCHILY.xattr.user.b", b"\xf0\x90\x80A"),
+            pax_bytes("SCHILY.xattr.user.c", b"\x00\n\xfe\n12 x=y\n"),
+        ] {
+            let data = [other, path.clone().into_bytes()].concat();
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "PaxHeaders/x", b'x', data.len() as u64, &data);
+            raw_entry(&mut tar, "package/x", b'0', 30, PACKAGE_JSON);
+            let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES)
+                .unwrap_or_else(|e| panic!("{:?}: {e}", String::from_utf8_lossy(&data)));
+            assert_eq!(t.name, "a");
+        }
     }
 
     #[test]
