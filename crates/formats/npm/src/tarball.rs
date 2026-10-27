@@ -5,8 +5,10 @@
 //! so the package's `package.json` is any entry at depth one. When several
 //! entries map to it, the last one wins on disk, so the last one is read.
 //! A file is any entry node-tar unpacks as one: a regular file (`0`, or NUL
-//! in the old form) or a contiguous file (`7`). The whole archive is read,
-//! bounded in what it unpacks to.
+//! in the old form) or a contiguous file (`7`). A directory is one of type
+//! `5`, or of type `0` whose path ends in `/`, as old tars wrote them; it has
+//! no body to node-tar. The whole archive is read, bounded in what it unpacks
+//! to.
 
 use std::io::Read;
 
@@ -44,6 +46,14 @@ fn stripped(raw: &[u8]) -> Vec<&[u8]> {
         .filter(|part| !part.is_empty() && *part != b".");
     parts.next();
     parts.collect()
+}
+
+/// The name field of `header` alone, up to its first NUL: without the ustar
+/// prefix, as node-tar reads it when it decides whether a `0` entry is a
+/// directory.
+fn name_field(header: &tar::Header) -> &[u8] {
+    let name = &header.as_old().name;
+    &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())]
 }
 
 /// Read the data of `entry`, a GNU long name or a PAX extended header of
@@ -92,8 +102,9 @@ fn pax(data: &[u8]) -> Result<(Option<Vec<u8>>, Option<u64>), String> {
 /// entry is applied as npm (node-tar) applies it: the later one wins, old
 /// forms included. A PAX `size` that is not the next entry's own is
 /// refused (an npm tarball is far below the 8 GiB a header holds, so the
-/// record only ever disagrees), as are a global one and a GNU sparse entry:
-/// each would lay the archive out otherwise than its headers do.
+/// record only ever disagrees), as are a global one, a GNU sparse entry and
+/// a directory whose header gives it a body: each would lay the archive out
+/// otherwise than its headers do.
 pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
     let gz = flate2::read::GzDecoder::new(tgz);
     let mut archive = tar::Archive::new(gz);
@@ -153,9 +164,23 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
         if next_size.take().is_some_and(|pax| pax != size) {
             return Err("the tarball's PAX header gives an entry another size than its own".into());
         }
-        let path = next_path
-            .take()
-            .unwrap_or_else(|| entry.path_bytes().into_owned());
+        let named = next_path.take();
+        // node-tar takes a `0` entry whose path ends in `/` for a directory:
+        // the path a GNU long name or a PAX header gives, else the header's
+        // name field alone. A directory has no body to node-tar, whatever its
+        // header says, so the next header follows its own; `tar` skips the
+        // size the header says, and would read other entries than npm does.
+        let slash = named
+            .as_deref()
+            .unwrap_or_else(|| name_field(entry.header()))
+            .ends_with(b"/");
+        if kind.is_dir() || (kind.is_file() && slash) {
+            if size != 0 {
+                return Err("the tarball holds a directory entry with a body".into());
+            }
+            continue;
+        }
+        let path = named.unwrap_or_else(|| entry.path_bytes().into_owned());
         if !(kind.is_file() || kind.is_contiguous()) {
             continue;
         }
@@ -268,11 +293,12 @@ mod tests {
         assert!(err.contains("unpacks to more than"), "{err}");
     }
 
-    /// Append an entry of `kind` named `name` to the uncompressed `tar`: a
-    /// header that says `size`, then `data` (which may be shorter).
+    /// Append an entry of `kind` named `name` (its name field, as is) to the
+    /// uncompressed `tar`: a header that says `size`, then `data` (which may
+    /// be shorter).
     fn raw_entry(tar: &mut Vec<u8>, name: &str, kind: u8, size: u64, data: &[u8]) {
         let mut header = tar::Header::new_ustar();
-        header.set_path(name).expect("short name");
+        header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
         header.set_size(size);
         header.set_mode(0o644);
         header.set_entry_type(tar::EntryType::new(kind));
@@ -321,6 +347,77 @@ mod tests {
         raw_entry(&mut tar, "package/package.json", b'6', 30, later);
         let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
         assert_eq!((t.name.as_str(), t.file_count), ("a", 1));
+    }
+
+    #[test]
+    fn directories_are_read_as_npm_reads_them() {
+        // A directory is neither read nor counted: of type `5`, or of type
+        // `0` (or NUL) whose path ends in `/`, the path its name field, a
+        // GNU long name or a PAX header gives. `package/package.json/` is
+        // then no manifest.
+        let pax_dir = pax_record("path", "package/package.json/");
+        let dirs: [&[(&str, u8, &[u8])]; 5] = [
+            &[("package/package.json", b'5', b"")],
+            &[("package/package.json/", b'0', b"")],
+            &[("package/package.json/", b'\0', b"")],
+            &[
+                ("././@LongLink", b'L', b"package/package.json/\0"),
+                ("package/x", b'0', b""),
+            ],
+            &[
+                ("PaxHeaders/x", b'x', pax_dir.as_bytes()),
+                ("package/x", b'0', b""),
+            ],
+        ];
+        for entries in dirs {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+            for (name, kind, data) in entries {
+                raw_entry(&mut tar, name, *kind, data.len() as u64, data);
+            }
+            let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES)
+                .unwrap_or_else(|e| panic!("{entries:?}: {e}"));
+            assert_eq!((t.name.as_str(), t.file_count), ("a", 1), "{entries:?}");
+        }
+
+        // A contiguous file stays a file, its path ending in `/` or not: npm
+        // unpacks it to `package.json`.
+        let mut tar = Vec::new();
+        let later = br#"{"name":"b","version":"2.0.0"}"#;
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        raw_entry(&mut tar, "package/package.json/", b'7', 30, later);
+        let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!((t.name.as_str(), t.file_count), ("b", 2));
+    }
+
+    #[test]
+    fn refuses_a_directory_with_a_body() {
+        // node-tar reads a directory as having no body and the header after
+        // its own as the next entry, where `tar` skips the size the header
+        // says. A directory's body can so hold a package.json with an
+        // install script, and an entry npm skips over the package.json
+        // `tar` reads next: npm and Forge would read different manifests.
+        let evil = br#"{"name":"a","version":"1.0.0","scripts":{"install":"x"}}"#;
+        let mut body = Vec::new();
+        raw_entry(
+            &mut body,
+            "package/package.json",
+            b'0',
+            evil.len() as u64,
+            evil,
+        );
+        raw_entry(&mut body, "package/skip", b'V', 1024, &[]);
+        for (name, kind) in [
+            ("package/lib", b'5'),
+            ("package/lib/", b'0'),
+            ("package/lib/", b'\0'),
+        ] {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, name, kind, body.len() as u64, &body);
+            raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+            let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+            assert!(err.contains("directory entry with a body"), "{name}: {err}");
+        }
     }
 
     #[test]
