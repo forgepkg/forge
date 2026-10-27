@@ -119,11 +119,26 @@ fn is_manifest(path: &[u8]) -> bool {
     plain && &rest[..end] == b"package.json"
 }
 
+/// Whether `path` starts with what node-tar's `stripAbsolutePath` takes for
+/// a root and strips (Windows' rules, also on Linux): a `/` or `\`, which
+/// begins a UNC (`\\server\share\`) or device (`\\?\C:\`) root too, or a
+/// drive (`c:`).
+fn rooted(path: &[u8]) -> bool {
+    matches!(path, [b'/' | b'\\', ..]) || without_drive(path).is_some()
+}
+
 /// Whether some client could unpack the file `path` to `package.json`
 /// although [`is_manifest`] says no: node-tar resolves `.` and empty
 /// components after the strip, takes `..` and a drive or a leading `/` for a
 /// root before it, Windows also splits at `\` and drops trailing dots and
 /// spaces, and macOS and Windows ignore case.
+///
+/// node-tar also strips every root it finds at the start of the path, before
+/// the first component is stripped (node-tar 6 and 7.4, npm 10) or after it
+/// (7.5, npm 11.20 and later): `\\srv\share\package.json`, `C:C:package.json`
+/// and `package/c:package.json` are all unpacked to `package.json`. Such a
+/// rooted path naming a `package.json` (with drives before the name, as in
+/// `c:c:package.json`) is taken for one whatever the root holds.
 fn may_be_manifest(path: &[u8]) -> bool {
     let named = |part: &[u8]| {
         let end = part
@@ -132,6 +147,22 @@ fn may_be_manifest(path: &[u8]) -> bool {
             .map_or(0, |i| i + 1);
         part[..end].eq_ignore_ascii_case(b"package.json")
     };
+    let after_first = path
+        .iter()
+        .position(|b| *b == b'/')
+        .map(|slash| &path[slash + 1..]);
+    if [Some(path), after_first].into_iter().flatten().any(rooted) {
+        let mut last = path
+            .split(|b| *b == b'/' || *b == b'\\')
+            .rfind(|part| !part.is_empty() && *part != b".")
+            .unwrap_or_default();
+        while let Some(rest) = without_drive(last) {
+            last = rest;
+        }
+        if named(last) {
+            return true;
+        }
+    }
     [Some(path), without_drive(path)]
         .into_iter()
         .flatten()
@@ -1107,6 +1138,49 @@ mod tests {
             let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
             assert!(err.contains("may unpack to package.json"), "{path}: {err}");
         }
+
+        // node-tar strips Windows roots (drives, UNC and device roots) at the
+        // start of the path, before the first component is stripped (6, 7.4)
+        // or after it (7.5): each is the package.json npm installs.
+        for path in [
+            "package/c:package.json",
+            "package/C:/package.json",
+            "package/C:\\package.json",
+            "package/c:c:package.json",
+            "package/c:./package.json",
+            "package/\\\\srv\\share\\package.json",
+            "package/\\/srv/share/package.json",
+            "package/\\\\?\\C:\\package.json",
+            "./c:package.json",
+            "\\\\srv\\share\\package.json",
+            "\\/srv/share/package.json",
+            "/\\\\srv\\share\\package.json",
+            "C:C:package.json",
+            "\\\\?\\C:\\package.json",
+            "//?/C:/package.json",
+            "package/c:PACKAGE.JSON.",
+        ] {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+            raw_entry(&mut tar, path, b'0', 30, PACKAGE_JSON);
+            let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+            assert!(err.contains("may unpack to package.json"), "{path}: {err}");
+        }
+
+        // A drive or a backslash elsewhere names a file of its own, as does a
+        // rooted path to another file.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        for path in [
+            "package/lib/c:package.json",
+            "package/lib\\package.json",
+            "package/c:index.js",
+            "package/c:package.json.js",
+        ] {
+            raw_entry(&mut tar, path, b'0', 9, br#"{"a":"b"}"#);
+        }
+        let t = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+        assert_eq!((t.name.as_str(), t.file_count), ("a", 5));
 
         // The first component is any plain name; a deeper package.json is
         // just a file.
