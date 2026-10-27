@@ -2,7 +2,8 @@
 # Lint and render the Helm chart (deploy/helm/forge) and validate the output
 # (used by ci.yml): `helm template` refusing the default values, which have no
 # root key; `helm lint --strict` and `helm template` with the default values
-# plus a root key and with each file in the chart's ci/ directory; kubeconform
+# plus a root key and with each file in the chart's ci/ directory; `helm
+# template` with the values of a 2.0.0 release (`--reuse-values`); kubeconform
 # against the Kubernetes schemas (plus the Gateway API and cert-manager CRDs), every
 # rendered forge.toml parsed as TOML, a Recreate strategy rendered without
 # rollingUpdate, and the pod annotations that roll the pods on a secret change
@@ -46,6 +47,37 @@ done
 render set-flags --set config.server.max_staging_bytes=8589934592 --set replicaCount=2 \
   "${root_key[@]}"
 rm -f "$work/lint.log"
+
+# `helm upgrade --reuse-values` renders the new chart with the values of the
+# release it upgrades instead of the chart's defaults, so a value block added
+# after that release is absent (#548). Render a copy of the chart whose
+# values.yaml lacks the blocks added since 2.0.0, as such an upgrade of a
+# 2.0.0 release does. Add a new top-level block of values.yaml here.
+added_since_2_0_0=(telemetry)
+cp -r "$chart" "$work/chart-2.0.0"
+python3 - "$work/chart-2.0.0/values.yaml" "${added_since_2_0_0[@]}" <<'EOF'
+import re
+import sys
+
+path, blocks = sys.argv[1], set(sys.argv[2:])
+kept, skipping, found = [], False, set()
+for line in open(path, encoding="utf-8").read().split("\n"):
+    top = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):", line)
+    if top:
+        skipping = top.group(1) in blocks
+        if skipping:
+            found.add(top.group(1))
+    if not skipping:
+        kept.append(line)
+if found != blocks:
+    print(f"values.yaml has no top-level {sorted(blocks - found)}")
+    sys.exit(1)
+open(path, "w", encoding="utf-8").write("\n".join(kept))
+EOF
+echo "helm template: --reuse-values from 2.0.0" >&2
+helm template forge "$work/chart-2.0.0" --namespace forge --kube-version "$k8s_version" \
+  "${root_key[@]}" > "$work/reuse-values-2.0.0.yaml"
+rm -rf "$work/chart-2.0.0"
 
 kubeconform -strict -summary -kubernetes-version "$k8s_version" \
   -schema-location default \
