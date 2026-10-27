@@ -925,7 +925,10 @@ What Forge believes, and when:
 - They name the caller only when the request has **no credential of its
   own**: an API token, a password or a signed-in session is that
   credential's, whatever the headers say, and one that is refused is a 401,
-  never the account the headers name.
+  never the account the headers name. A feed request the named account may
+  not make is challenged like an anonymous one (401 with
+  `WWW-Authenticate: Basic`), so a client with credentials of its own, such
+  as NuGet, sends them.
 - The headers present but no realm's secret among them, the right secret
   with no, an empty, a repeated or an invalid name, a name of no account of
   the realm (without `auto_provision`), of a deactivated account, or of an
