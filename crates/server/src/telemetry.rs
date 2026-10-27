@@ -378,24 +378,28 @@ fn surface_of(path: &str) -> Surface {
     }
 }
 
-/// The secret path segment of a command-line client's web login, as a span
-/// records it.
+/// The secret path segment of a command-line client's login or logout, as a
+/// span records it.
 const SECRET_SEGMENT: &str = "{secret}";
 
-/// `path` as a request's span records it (`url.path`): the secret of a web
-/// login, and whatever follows it, replaced by [`SECRET_SEGMENT`]. The page
-/// that approves a login (`/cli-login/<secret>`) and the API behind it
-/// (`/auth/cli-login/<secret>`) carry the secret that approves it; the URL
-/// npm polls (its `doneUrl`, `/repository/<repo>/-/v1/login/done/<secret>`)
-/// carries the one that collects the user's new token, once.
-fn span_path(path: &str) -> Cow<'_, str> {
+/// `path` as a request's span (`url.path`) and the audit line of a package
+/// mutation record it: a secret in the path, and whatever follows it,
+/// replaced by [`SECRET_SEGMENT`]. The page that approves a web login
+/// (`/cli-login/<secret>`) and the API behind it (`/auth/cli-login/<secret>`)
+/// carry the secret that approves it; the URL npm polls (its `doneUrl`,
+/// `/repository/<repo>/-/v1/login/done/<secret>`) carries the one that
+/// collects the user's new token, once; `npm logout`
+/// (`/repository/<repo>/-/user/token/<token>`) carries the API token it
+/// revokes, which stays valid when the logout fails.
+pub(crate) fn recorded_path(path: &str) -> Cow<'_, str> {
     let secret_at = ["/cli-login/", "/auth/cli-login/"]
         .into_iter()
         .find(|prefix| path.starts_with(prefix))
         .map(str::len)
         .or_else(|| {
-            const DONE: &str = "/-/v1/login/done/";
-            path.find(DONE).map(|at| at + DONE.len())
+            ["/-/v1/login/done/", "/-/user/token/"]
+                .into_iter()
+                .find_map(|segment| path.find(segment).map(|at| at + segment.len()))
         });
     match secret_at {
         Some(at) => Cow::Owned(format!("{}{SECRET_SEGMENT}", &path[..at])),
@@ -417,7 +421,7 @@ impl Extractor for HeaderExtractor<'_> {
 }
 
 /// The server span of `req`, a child of the trace its `traceparent` names,
-/// with its path as [`span_path`] records it.
+/// with its path as [`recorded_path`] records it.
 /// A health probe's is never exported, nor is what it does (the readiness
 /// checks): they would bury the traces worth reading.
 fn request_span(req: &Request, surface: Surface, route: Option<&str>) -> tracing::Span {
@@ -428,7 +432,7 @@ fn request_span(req: &Request, surface: Surface, route: Option<&str>) -> tracing
         return span;
     }
     let method = forge_telemetry::http::method(req.method().as_str());
-    let path = span_path(req.uri().path());
+    let path = recorded_path(req.uri().path());
     let span = tracing::info_span!(
         target: forge_telemetry::TARGET,
         "HTTP request",
@@ -706,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn a_span_path_never_holds_a_web_logins_secret() {
+    fn a_recorded_path_never_holds_a_cli_logins_secret() {
         for (path, recorded) in [
             ("/cli-login/s3cret", "/cli-login/{secret}"),
             ("/auth/cli-login/s3cret", "/auth/cli-login/{secret}"),
@@ -714,6 +718,13 @@ mod tests {
                 "/repository/npm/-/v1/login/done/s3cret",
                 "/repository/npm/-/v1/login/done/{secret}",
             ),
+            // `npm logout`'s token, in the request's path and in the part
+            // of it after the repository that the audit line records.
+            (
+                "/repository/npm/-/user/token/s3cret",
+                "/repository/npm/-/user/token/{secret}",
+            ),
+            ("/-/user/token/s3cret", "/-/user/token/{secret}"),
             // Whatever follows the secret goes with it.
             ("/cli-login/s3cret/x", "/cli-login/{secret}"),
             (
@@ -721,16 +732,17 @@ mod tests {
                 "/repository/npm/-/v1/login/done/{secret}",
             ),
         ] {
-            assert_eq!(span_path(path), recorded, "{path}");
+            assert_eq!(recorded_path(path), recorded, "{path}");
         }
         for path in [
             "/repository/nuget/flat/a/1.0.0/a.1.0.0.nupkg",
             "/repository/npm/-/v1/login",
+            "/repository/npm/-/user/org.couchdb.user:alice",
             "/auth/cli-login",
             "/manage/repositories",
         ] {
             assert!(
-                matches!(span_path(path), Cow::Borrowed(p) if p == path),
+                matches!(recorded_path(path), Cow::Borrowed(p) if p == path),
                 "{path}"
             );
         }

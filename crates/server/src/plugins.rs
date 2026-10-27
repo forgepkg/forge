@@ -417,7 +417,7 @@ async fn serve(
             target: "forge::audit",
             %method,
             repo = %repo.name,
-            path = %rest,
+            path = %crate::telemetry::recorded_path(rest),
             status = response.status().as_u16(),
             principal = %principal.audit_label(),
             "package mutation"
