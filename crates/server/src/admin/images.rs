@@ -13,6 +13,8 @@
 //!   attestations), as image retention would take them along.
 //! * no `reference`: deletes the image, every manifest and tag of it.
 //!
+//! An empty `reference` (`reference=`, as a script with an unset variable
+//! sends it) is refused (**400**): only its absence deletes the whole image.
 //! Answers `{"manifests": <n>, "tags": <n>}`, what was deleted; **404** when
 //! nothing matched. Each delete is in the audit log (`forge::audit`, "image
 //! delete") with the image and reference, which the admin change log's path
@@ -39,7 +41,7 @@ use crate::state::AppState;
 pub struct DeleteQuery {
     #[serde(default)]
     image: String,
-    /// A tag or a digest; absent (or empty): the whole image.
+    /// A tag or a digest; absent: the whole image. Empty is refused.
     #[serde(default)]
     reference: Option<String>,
 }
@@ -80,8 +82,15 @@ pub async fn delete(
     if query.image.is_empty() {
         return (StatusCode::BAD_REQUEST, "image is required").into_response();
     }
+    if query.reference.as_deref() == Some("") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "reference is empty; leave it out to delete the whole image",
+        )
+            .into_response();
+    }
     let grace = state.config.outbox.grace();
-    let (result, what) = match query.reference.as_deref().filter(|r| !r.is_empty()) {
+    let (result, what) = match query.reference.as_deref() {
         // A tag never holds a `:`, a digest always does.
         Some(reference) if reference.contains(':') => {
             let Some(digest) = ContentDigest::parse(reference) else {
