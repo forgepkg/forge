@@ -649,3 +649,41 @@ async fn past_its_ttl_the_snapshot_at_hand_serves_while_the_database_is_gone() {
         "with nothing at hand it waits for a rebuild"
     );
 }
+
+/// A feed request the headers name but RBAC denies is challenged like an
+/// anonymous one (#556): it carried no credential of its own, and NuGet
+/// sends the credentials of its `nuget.config` only after a 401 challenge.
+#[tokio::test]
+async fn a_denied_request_the_headers_name_is_challenged() {
+    let srv = proxied().await;
+    let realm = create_realm(&srv, false).await;
+    let n = common::unique();
+    let office = format!("office{n}@example.com");
+    create_account(&srv, &realm, &office, "reader").await;
+    let (u, p) = srv.admin_basic();
+    let feed = format!("private{n}");
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": feed, "kind": "hosted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let index = || {
+        realm.named(
+            srv.client()
+                .get(format!("{}/repository/{feed}/index.json", srv.base_url)),
+            &office,
+        )
+    };
+
+    let resp = index().send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.headers()["www-authenticate"], "Basic realm=\"Forge\"");
+    // The client's own credentials (an API token), sent after the
+    // challenge, win.
+    let resp = index().basic_auth(&u, Some(&p)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

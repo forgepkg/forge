@@ -948,6 +948,9 @@ What Forge believes, and when:
   authentication. An account of the realm never holds the `admin` role
   either (creating or making it an admin is a 400): it would count as an
   administrator nobody can act as, and the last real one could go.
+- A feed request the named account may not make is challenged like an
+  anonymous one (401 with `WWW-Authenticate: Basic`), so a client with
+  credentials of its own, such as NuGet, sends them.
 - When the realm last named each account is kept, written at most once a
   minute: **Admin → Service accounts** shows it as the account's last use.
 - Forge answers every feed and registry request the headers authenticated
