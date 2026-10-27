@@ -747,7 +747,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
 
     // The row and its sealed secret commit together: a failed seal must not
     // leave a half-created repository whose retry then answers 409.
-    let mut tx = match state.pool.begin().await {
+    let mut tx = match forge_db::begin(&state.pool).await {
         Ok(tx) => tx,
         Err(e) => return db_error(e),
     };
@@ -1285,7 +1285,7 @@ pub async fn update(
     // The metadata and a replacement secret commit together: otherwise a
     // failed seal after a committed `remote_url` change would leave the new
     // host paired with the previous host's credentials.
-    let mut tx = match state.pool.begin().await {
+    let mut tx = match forge_db::begin(&state.pool).await {
         Ok(tx) => tx,
         Err(e) => return db_error(e),
     };
@@ -1519,7 +1519,7 @@ async fn delete_repository_once(
     kind: RepoKind,
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     if kind != RepoKind::Hosted {
         // Before the repository row: an in-flight first download holds its
         // cached version and then needs the repository row.
@@ -1629,7 +1629,7 @@ async fn hard_delete(
     version: &str,
     grace: chrono::Duration,
 ) -> sqlx::Result<bool> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     let deleted =
         component_dao::hard_delete_component(&mut tx, repo_id, lower_id, version, grace).await?;
     tx.commit().await?;

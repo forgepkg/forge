@@ -239,7 +239,7 @@ async fn delete_file(
     path: &str,
     grace: chrono::Duration,
 ) -> sqlx::Result<u64> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     let deleted = raw_dao::delete(&mut tx, repository_id, path, grace).await?;
     tx.commit().await?;
     Ok(u64::from(deleted))
@@ -254,7 +254,7 @@ async fn delete_directory(
 ) -> sqlx::Result<u64> {
     let mut deleted = 0;
     loop {
-        let mut tx = state.pool.begin().await?;
+        let mut tx = forge_db::begin(&state.pool).await?;
         let n = raw_dao::delete_under(&mut tx, repository_id, prefix, DELETE_BATCH, grace).await?;
         tx.commit().await?;
         deleted += n;

@@ -134,7 +134,7 @@ async fn check_dek_parent(
 #[async_trait]
 impl KeyStore for PgKeyStore {
     async fn insert_active(&self, new: NewKeyRecord) -> Result<KeyRecord, CryptoError> {
-        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        let mut tx = crate::begin(&self.pool).await.map_err(store_err)?;
         lock_scope(&mut tx, &new.scope).await?;
         check_dek_parent(&mut tx, &new).await?;
 
@@ -183,7 +183,7 @@ impl KeyStore for PgKeyStore {
     }
 
     async fn insert_active_if_absent(&self, new: NewKeyRecord) -> Result<KeyRecord, CryptoError> {
-        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        let mut tx = crate::begin(&self.pool).await.map_err(store_err)?;
         lock_scope(&mut tx, &new.scope).await?;
 
         // Under the lock, the check-then-insert is race-free.
@@ -317,7 +317,7 @@ impl KeyStore for PgKeyStore {
         root_key_version: Option<&str>,
         wrapping_kek_version: Option<i32>,
     ) -> Result<bool, CryptoError> {
-        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        let mut tx = crate::begin(&self.pool).await.map_err(store_err)?;
         lock_scope(&mut tx, &current.scope).await?;
         // Compare-and-swap on the row as the caller read it (wrapped bytes +
         // parent reference), never onto a revoked row, and — for a DEK — only
@@ -354,7 +354,7 @@ impl KeyStore for PgKeyStore {
     }
 
     async fn revoke_kek_if_unreferenced(&self, kek: &KeyRecord) -> Result<bool, CryptoError> {
-        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        let mut tx = crate::begin(&self.pool).await.map_err(store_err)?;
         lock_scope(&mut tx, &kek.scope).await?;
         // Reference check and state flip in one statement under the scope
         // lock: every re-wrap/insert that names this KEK either committed

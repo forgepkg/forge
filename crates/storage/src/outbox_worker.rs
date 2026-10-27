@@ -38,7 +38,7 @@ pub async fn run_once(pool: &PgPool, store: &BlobStore, batch: i64) -> anyhow::R
     // 1. Claim a batch in a short transaction, then commit to release the tx
     //    (the rows stay leased via `locked_until`).
     let claimed = {
-        let mut tx = pool.begin().await?;
+        let mut tx = forge_db::begin(pool).await?;
         // Due-ness on the database clock, which set `available_at`
         // (`now() + grace`): an instance whose clock runs ahead would
         // otherwise delete objects before the grace period that backups and
@@ -138,7 +138,7 @@ async fn process_row(
             // Short tx: finalize only our exact fencing token and mark the
             // outbox row processed atomically. A stale owner cannot delete a
             // newer row or close work now owned by another process.
-            let mut tx = pool.begin().await?;
+            let mut tx = forge_db::begin(pool).await?;
             let finalized =
                 forge_db::blob_dao::finalize_delete_reservation(&mut *tx, &reservation).await?;
             if !finalized {

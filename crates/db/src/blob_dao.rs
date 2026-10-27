@@ -142,7 +142,7 @@ async fn begin_ingest_attempt(
     lease_expires_at: DateTime<Utc>,
     stale_deletion_before: DateTime<Utc>,
 ) -> sqlx::Result<Option<BeginIngestOutcome>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let inserted = sqlx::query(
         r#"
         INSERT INTO blob (sha256, size, s3_key, ref_count, state)
@@ -546,7 +546,7 @@ async fn reserve_delete(
     kind: DeleteKind,
     stale_deletion_before: DateTime<Utc>,
 ) -> sqlx::Result<ReserveDeleteOutcome> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let Some(row) = sqlx::query(
         r#"
         SELECT

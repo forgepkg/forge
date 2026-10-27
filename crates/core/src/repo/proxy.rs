@@ -1523,7 +1523,7 @@ impl ProxyRepo {
         //   3. a second short tx that re-locks the row, re-checks (a racing
         //      caller may have finished in the meantime), and finalizes.
         {
-            let mut tx = self.pool.begin().await?;
+            let mut tx = forge_db::begin(&self.pool).await?;
             let locked =
                 proxy_dao::lock_or_insert_cached_version(&mut tx, repo.id, lower_id, version)
                     .await?;
@@ -1607,7 +1607,7 @@ impl ProxyRepo {
             // Genuine upstream 404 → negative cache on this exact version row.
             // Short tx; re-lock and only set the marker if no racing caller has
             // since downloaded it.
-            let mut tx = self.pool.begin().await?;
+            let mut tx = forge_db::begin(&self.pool).await?;
             if let Some(row) =
                 proxy_dao::lock_cached_version_for_update(&mut tx, repo.id, lower_id, version)
                     .await?
@@ -1800,7 +1800,7 @@ impl ProxyRepo {
 
         // ── Finalize (short tx) — re-lock, re-check, attach, mark downloaded. ─
         // An unconfirmed row pruned during the fetch is created again here.
-        let mut tx = self.pool.begin().await?;
+        let mut tx = forge_db::begin(&self.pool).await?;
         let locked =
             proxy_dao::lock_or_insert_cached_version(&mut tx, repo.id, lower_id, version).await?;
 
@@ -2589,7 +2589,7 @@ impl RepoReadOps for ProxyRepo {
                             Some((tag.name, version))
                         })
                         .collect();
-                    let mut tx = self.pool.begin().await?;
+                    let mut tx = forge_db::begin(&self.pool).await?;
                     forge_db::tag_dao::replace_tags(&mut tx, repo_row.id, &lower, &tags).await?;
                     tx.commit().await?;
                     return Ok(tags);

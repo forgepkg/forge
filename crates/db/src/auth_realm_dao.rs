@@ -313,7 +313,7 @@ pub enum ReorderOutcome {
 /// concurrent change either finishes first (and then shows up as
 /// [`ReorderOutcome::Changed`]) or waits for this one.
 pub async fn reorder_realms(pool: &PgPool, order: &[i64]) -> sqlx::Result<ReorderOutcome> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     sqlx::query!(r#"LOCK TABLE auth_realm IN EXCLUSIVE MODE"#)
         .execute(&mut *tx)
         .await?;

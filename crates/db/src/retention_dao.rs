@@ -688,7 +688,7 @@ pub async fn write_policy(
     repository_id: i64,
     policy: Option<&JsonValue>,
 ) -> sqlx::Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let res = sqlx::query!(
         r#"
         UPDATE repository
@@ -962,7 +962,7 @@ pub async fn schedule_now(pool: &PgPool, repository_id: i64) -> sqlx::Result<boo
         return Ok(false);
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     upsert_retention_run(&mut *tx, repository_id).await?;
     sqlx::query!(
         r#"

@@ -420,7 +420,7 @@ pub async fn create(
     }
 
     let created = async {
-        let mut tx = state.pool.begin().await?;
+        let mut tx = forge_db::begin(&state.pool).await?;
         let id = import_dao::insert(
             &mut *tx,
             NewImport {
@@ -571,7 +571,7 @@ pub async fn resume(
         );
     }
     let resumed = async {
-        let mut tx = state.pool.begin().await?;
+        let mut tx = forge_db::begin(&state.pool).await?;
         let retried = import_dao::requeue(&mut tx, import.id, retry, body.items.as_deref()).await?;
         if retried.is_some() {
             if let Some(password) = &password {

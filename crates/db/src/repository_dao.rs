@@ -350,7 +350,7 @@ pub async fn add_group_member_checked(
     owner: bool,
     max_depth: i32,
 ) -> sqlx::Result<AddMemberOutcome> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let conn = tx.acquire().await?;
 
     // Serialize every group-graph mutation across instances (see above): the

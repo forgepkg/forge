@@ -122,7 +122,7 @@ pub async fn unassign(
 /// Unassign the role in one transaction. Taking the built-in `admin` role
 /// away runs under the last-admin guard.
 async fn unassign_guarded(state: &AppState, user_id: i64, role_id: i64) -> Result<(), Response> {
-    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    let mut tx = forge_db::begin(&state.pool).await.map_err(db_error)?;
     let admin_role = authz_dao::role_id_by_name(&mut *tx, authz_dao::ADMIN_ROLE)
         .await
         .map_err(db_error)?;

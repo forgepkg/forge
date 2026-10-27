@@ -177,7 +177,7 @@ impl Registry {
         else {
             return Ok(None);
         };
-        let mut tx = pool.begin().await?;
+        let mut tx = forge_db::begin(pool).await?;
         match oci_dao::insert_link_existing(
             &mut tx,
             t.repo.id,
@@ -212,7 +212,7 @@ impl Registry {
 
     pub(crate) async fn cancel_upload(&self, t: &Target, id: &str) -> ImgResult<()> {
         let upload = self.upload_of(t, id).await?;
-        let mut tx = self.inner.pool.begin().await?;
+        let mut tx = forge_db::begin(&self.inner.pool).await?;
         let deleted = oci_dao::delete_upload(&mut tx, upload.id, self.grace()).await?;
         tx.commit().await?;
         if !deleted {
@@ -272,7 +272,7 @@ impl Registry {
         } else {
             self.inner.cas.commit_uncached(staged).await?
         };
-        let mut tx = self.inner.pool.begin().await?;
+        let mut tx = forge_db::begin(&self.inner.pool).await?;
         let Some(locked) =
             oci_dao::lock_upload(&mut tx, upload.id, upload.repository_id, &upload.image).await?
         else {
@@ -341,7 +341,7 @@ impl Registry {
                     self.drop_upload(upload.id).await;
                     return Err(mismatch());
                 }
-                tx = pool.begin().await?;
+                tx = forge_db::begin(pool).await?;
                 if oci_dao::lock_upload(&mut tx, upload.id, t.repo.id, &t.image)
                     .await?
                     .is_none_or(|u| u.size != upload.size)
@@ -402,7 +402,7 @@ impl Registry {
                     return Err(mismatch());
                 }
                 let stored = self.inner.cas.commit(staged).await?;
-                tx = pool.begin().await?;
+                tx = forge_db::begin(pool).await?;
                 if oci_dao::lock_upload(&mut tx, upload.id, t.repo.id, &t.image)
                     .await?
                     .is_none_or(|u| u.size != upload.size)
@@ -431,7 +431,7 @@ impl Registry {
     /// End a failed upload session (best effort).
     async fn drop_upload(&self, id: Uuid) {
         let result = async {
-            let mut tx = self.inner.pool.begin().await?;
+            let mut tx = forge_db::begin(&self.inner.pool).await?;
             oci_dao::delete_upload(&mut tx, id, self.grace()).await?;
             tx.commit().await
         }
@@ -531,7 +531,7 @@ impl Registry {
         let role_filters = self
             .role_filters_for_mutation(principal, &t.repo, PackageMutation::Publish)
             .await;
-        let mut tx = self.inner.pool.begin().await?;
+        let mut tx = forge_db::begin(&self.inner.pool).await?;
         let linked: HashSet<String> =
             oci_dao::lock_links(&mut tx, t.repo.id, &t.image, &required_blobs)
                 .await?
@@ -630,7 +630,7 @@ impl Registry {
             .cas
             .store(Cursor::new(content.to_vec()), content.len() as u64)
             .await?;
-        let mut tx = pool.begin().await?;
+        let mut tx = forge_db::begin(pool).await?;
         oci_dao::insert_link_ingested(
             &mut tx,
             t.repo.id,
@@ -723,7 +723,7 @@ impl Registry {
         let role_filters = self
             .role_filters_for_mutation(principal, &t.repo, PackageMutation::Delete)
             .await;
-        let mut tx = self.inner.pool.begin().await?;
+        let mut tx = forge_db::begin(&self.inner.pool).await?;
         let deleted = match reference {
             Reference::Tag(tag) => oci_dao::delete_tag(&mut tx, t.repo.id, &t.image, tag).await?,
             Reference::Digest(digest) => {
@@ -763,7 +763,7 @@ impl Registry {
         let role_filters = self
             .role_filters_for_mutation(principal, &t.repo, PackageMutation::Delete)
             .await;
-        let mut tx = self.inner.pool.begin().await?;
+        let mut tx = forge_db::begin(&self.inner.pool).await?;
         // Lock first, check after: a manifest naming the blob that commits
         // while this waits for the lock is seen by the check.
         if !oci_dao::lock_link(&mut tx, t.repo.id, &t.image, digest.as_str()).await? {
@@ -876,7 +876,7 @@ impl Registry {
             .stage(Cursor::new(body.to_vec()), MAX_MANIFEST_BYTES as u64)
             .await?;
         let stored = self.inner.cas.commit(staged).await?;
-        let mut tx = self.inner.pool.begin().await?;
+        let mut tx = forge_db::begin(&self.inner.pool).await?;
         super::proxy::still_upstream(&mut tx, &t.repo).await?;
         let (manifest_id, _) = oci_dao::insert_manifest(
             &mut tx,

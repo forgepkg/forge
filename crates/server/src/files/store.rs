@@ -297,7 +297,7 @@ async fn record_all(
         .await;
     let may_delete = files.state.authz.can_delete(&files.principal, repo).await;
     let grace = files.state.config.outbox.grace();
-    let mut tx = files.state.pool.begin().await?;
+    let mut tx = forge_db::begin(&files.state.pool).await?;
     let mut order: Vec<usize> = (0..pending.len()).collect();
     order.sort_by(|&a, &b| {
         pending[a]
@@ -533,7 +533,7 @@ pub async fn remove(
     let Some(file) = raw_dao::find(&files.state.pool, repo.id, path).await? else {
         return Ok(false);
     };
-    let mut tx = files.state.pool.begin().await?;
+    let mut tx = forge_db::begin(&files.state.pool).await?;
     if !raw_dao::delete(&mut tx, repo.id, path, files.state.config.outbox.grace()).await? {
         return Ok(false);
     }

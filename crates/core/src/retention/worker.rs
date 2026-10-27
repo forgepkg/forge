@@ -160,7 +160,7 @@ impl RetentionWorker {
         // work below happens with NO transaction held (the same rule as the
         // proxy fetch).
         let claimed = {
-            let mut tx = self.pool.begin().await?;
+            let mut tx = forge_db::begin(&self.pool).await?;
             // Due-ness and the lease (checked by the run fence against
             // `now()`) run on the database's clock.
             let now = forge_db::db_now(&mut *tx).await?;

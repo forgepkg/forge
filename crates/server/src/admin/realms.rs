@@ -631,7 +631,7 @@ async fn write_realm_update(
 ) -> Result<Option<AuthRealm>, RealmWriteError> {
     let drops_captured_passwords = existing.kind == KIND_CRED_FORWARD
         && upd.config.get(user_dao::CAPTURE_PASSWORD_HASH_KEY) != Some(&JsonValue::Bool(true));
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     if !upd.enabled {
         guard_last_interactive_realm(&mut tx, existing).await?;
     }
@@ -673,7 +673,7 @@ async fn delete_realm_guarded(
     realm: &AuthRealm,
     state: &AppState,
 ) -> Result<bool, RealmWriteError> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     guard_last_interactive_realm(&mut tx, realm).await?;
     let deleted = auth_realm_dao::delete_realm(&mut *tx, realm.id).await?;
     if deleted && realm.kind == KIND_WORKLOAD_IDENTITY {

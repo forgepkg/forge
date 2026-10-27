@@ -435,7 +435,7 @@ enum Stored {
 /// issued: a key never outlives the change, whatever the realm later
 /// becomes.
 async fn store_key(pool: &PgPool, new: NewWorkloadApiKey<'_>) -> sqlx::Result<Stored> {
-    let mut tx = pool.begin().await?;
+    let mut tx = forge_db::begin(pool).await?;
     let Some(identity) =
         trusted_publish_audit_dao::lock_identity_snapshot(&mut tx, new.realm_id, new.role_id)
             .await?

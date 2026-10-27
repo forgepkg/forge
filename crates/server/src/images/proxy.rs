@@ -918,7 +918,7 @@ impl Registry {
                 // Linked from the cache once the upstream confirms it.
                 lookup.mark(Outcome::Hit);
                 if head.status().is_success() {
-                    let mut tx = pool.begin().await?;
+                    let mut tx = forge_db::begin(pool).await?;
                     still_upstream(&mut tx, repo).await?;
                     match oci_dao::insert_link_existing(
                         &mut tx,
@@ -993,7 +993,7 @@ impl Registry {
             None
         };
         let stored = self.inner.cas.commit(staged).await?;
-        let mut tx = pool.begin().await?;
+        let mut tx = forge_db::begin(pool).await?;
         still_upstream(&mut tx, repo).await?;
         oci_dao::insert_link_ingested(
             &mut tx,
