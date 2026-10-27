@@ -496,9 +496,11 @@ struct Directory {
 /// and central-directory limits **before** `zip::ZipArchive::new` parses (and
 /// allocates for) the central directory they describe.
 ///
-/// Mirrors the zip reader's choice: it searches backwards and uses the last
-/// EOCD signature whose record and comment fit in the file (plus, for ZIP64,
-/// the record its locator names). Earlier signature matches — which ordinary
+/// Takes the record NuGet and the zip reader both read: the last EOCD
+/// signature with a whole record after it (plus, for ZIP64, the record its
+/// locator names), refusing one whose comment runs past the end of the file,
+/// which the zip reader passes over and NuGet does not, and one whose ZIP64
+/// marker the two read differently. Earlier signature matches — which ordinary
 /// compressed data or a package signature contains by chance — are never
 /// vetted: the reader consults them only when that record fails a later
 /// consistency check, and whatever it reads then stays inside the returned
@@ -509,26 +511,26 @@ fn check_archive_directory(
 ) -> Result<VettedDirectory, NupkgError> {
     let len = file.seek(SeekFrom::End(0))?;
     let trailer = ZIP_TRAILER_WINDOW.min(len);
-    let mut chosen = None;
-    for pos in find_signatures(file, len - trailer, len, &EOCD_SIG)?
+    // NuGet (.NET's `ZipArchive`) reads the last signature with a whole
+    // record after it, whatever its comment says: .NET 8 and .NET Framework
+    // read what comment there is, .NET 9 and later refuse the archive. The
+    // zip reader passes over a record whose comment runs past the end of the
+    // file for an earlier one, so such an archive is refused.
+    let Some(pos) = find_signatures(file, len - trailer, len, &EOCD_SIG)?
         .into_iter()
         .rev()
-    {
-        if pos + EOCD_LEN > len {
-            continue;
-        }
-        let rec = read_at(file, pos, EOCD_LEN as usize)?;
-        let comment = u64::from(le_u16(&rec, 20));
-        if pos + EOCD_LEN + comment <= len {
-            chosen = Some(pos);
-            break;
-        }
-    }
-    let Some(pos) = chosen else {
+        .find(|pos| pos + EOCD_LEN <= len)
+    else {
         return Err(NupkgError::InvalidZip(
             "no end-of-central-directory record near the end of the archive".into(),
         ));
     };
+    let rec = read_at(file, pos, EOCD_LEN as usize)?;
+    if pos + EOCD_LEN + u64::from(le_u16(&rec, 20)) > len {
+        return Err(NupkgError::InvalidZip(
+            "the end-of-central-directory record's comment runs past the end of the archive".into(),
+        ));
+    }
     let directory = check_eocd_candidate(file, pos, len, limits)?;
     let read_budget = trailer
         .saturating_add(directory.size)
@@ -557,9 +559,21 @@ fn check_eocd_candidate(
         return Ok(Directory::default());
     }
     let rec = read_at(file, pos, EOCD_LEN as usize)?;
+    let disk = le_u16(&rec, 4);
     let (on_disk, total) = (le_u16(&rec, 8), le_u16(&rec, 10));
     let (directory, offset) = (le_u32(&rec, 12), le_u32(&rec, 16));
     let zip64_marker = total == u16::MAX || directory == u32::MAX || offset == u32::MAX;
+    // NuGet (.NET's `ZipArchive`) looks for the ZIP64 records when the disk
+    // number, the offset or the entry count holds the marker, the zip reader
+    // when the entry count, the size or the offset does: with the marker in
+    // the size or the disk number alone, the two read different central
+    // directories.
+    if zip64_marker != (disk == u16::MAX || offset == u32::MAX || total == u16::MAX) {
+        return Err(NupkgError::InvalidZip(
+            "the end-of-central-directory record marks ZIP64 in a field NuGet reads otherwise"
+                .into(),
+        ));
+    }
 
     // A ZIP64 locator sits immediately before the EOCD. The record it names
     // must be exactly there: the zip reader is opened at archive offset 0
@@ -2153,6 +2167,124 @@ mod tests {
         assert!(zip.windows(4).filter(|w| *w == EOCD_SIG).count() >= 2);
         let parsed = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap();
         assert_eq!(parsed.id, "a.b");
+    }
+
+    /// An archive of a `Good.Package` and an `Evil.Package` manifest of the
+    /// same name, stored, with a central directory of its own each (the evil
+    /// one first, ended by four zero bytes, where .NET stops reading headers),
+    /// and no end record yet. Returns it with the good and the evil
+    /// directory's offset and size.
+    fn two_directories() -> (Vec<u8>, (u32, u32), (u32, u32)) {
+        const NAME: &[u8] = b"Pkg.nuspec";
+        fn put16(zip: &mut Vec<u8>, v: u16) {
+            zip.extend_from_slice(&v.to_le_bytes());
+        }
+        fn put32(zip: &mut Vec<u8>, v: u32) {
+            zip.extend_from_slice(&v.to_le_bytes());
+        }
+        let local = |zip: &mut Vec<u8>, data: &[u8]| {
+            let at = zip.len() as u32;
+            put32(zip, 0x0403_4b50);
+            for v in [20, 0, 0, 0, 0x21] {
+                put16(zip, v);
+            }
+            put32(zip, crc32(data));
+            put32(zip, data.len() as u32);
+            put32(zip, data.len() as u32);
+            put16(zip, NAME.len() as u16);
+            put16(zip, 0);
+            zip.extend_from_slice(NAME);
+            zip.extend_from_slice(data);
+            at
+        };
+        let central = |zip: &mut Vec<u8>, data: &[u8], local_at: u32| {
+            let at = zip.len() as u32;
+            put32(zip, 0x0201_4b50);
+            for v in [20, 20, 0, 0, 0, 0x21] {
+                put16(zip, v);
+            }
+            put32(zip, crc32(data));
+            put32(zip, data.len() as u32);
+            put32(zip, data.len() as u32);
+            for v in [NAME.len() as u16, 0, 0, 0, 0] {
+                put16(zip, v);
+            }
+            put32(zip, 0);
+            put32(zip, local_at);
+            zip.extend_from_slice(NAME);
+            (at, zip.len() as u32 - at)
+        };
+        let (good, evil) = (nuspec_of("Good.Package"), nuspec_of("Evil.Package"));
+        let mut zip = Vec::new();
+        let good_at = local(&mut zip, &good);
+        let evil_at = local(&mut zip, &evil);
+        let evil_directory = central(&mut zip, &evil, evil_at);
+        put32(&mut zip, 0);
+        let good_directory = central(&mut zip, &good, good_at);
+        (zip, good_directory, evil_directory)
+    }
+
+    /// An end-of-central-directory record of one entry.
+    fn end_record(zip: &mut Vec<u8>, disk: u16, (offset, size): (u32, u32), comment: u16) {
+        zip.extend_from_slice(&EOCD_SIG);
+        for v in [disk, disk, 1, 1] {
+            zip.extend_from_slice(&v.to_le_bytes());
+        }
+        zip.extend_from_slice(&size.to_le_bytes());
+        zip.extend_from_slice(&offset.to_le_bytes());
+        zip.extend_from_slice(&comment.to_le_bytes());
+    }
+
+    /// A ZIP64 end record of one entry naming `(offset, size)`, and its
+    /// locator.
+    fn zip64_trailer(zip: &mut Vec<u8>, (offset, size): (u32, u32)) {
+        let record = zip.len() as u64;
+        zip.extend_from_slice(&ZIP64_EOCD_SIG);
+        zip.extend_from_slice(&44u64.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&45u16.to_le_bytes());
+        zip.extend_from_slice(&[0; 8]);
+        zip.extend_from_slice(&1u64.to_le_bytes());
+        zip.extend_from_slice(&1u64.to_le_bytes());
+        zip.extend_from_slice(&u64::from(size).to_le_bytes());
+        zip.extend_from_slice(&u64::from(offset).to_le_bytes());
+        zip.extend_from_slice(&ZIP64_LOCATOR_SIG);
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&record.to_le_bytes());
+        zip.extend_from_slice(&1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn the_end_record_is_the_one_nuget_reads() {
+        // The baseline: one end record, a comment that fits.
+        let (mut zip, good, _) = two_directories();
+        end_record(&mut zip, 0, good, 3);
+        zip.extend_from_slice(b"abc");
+        assert_eq!(manifest_id(zip).unwrap(), "Good.Package");
+
+        let refused = |zip: Vec<u8>, why: &str| {
+            let err = manifest_id(zip).unwrap_err();
+            assert!(err.to_string().contains(why), "{why}: {err}");
+        };
+        // The ZIP64 marker in the directory size alone: the zip reader reads
+        // the ZIP64 record's directory, NuGet the 32-bit offset's.
+        let (mut zip, good, evil) = two_directories();
+        zip64_trailer(&mut zip, good);
+        end_record(&mut zip, 0, (evil.0, u32::MAX), 0);
+        refused(zip, "marks ZIP64");
+        // The marker in the disk numbers alone (both equal, as NuGet asks):
+        // NuGet reads the ZIP64 record's directory, the zip reader the
+        // 32-bit one.
+        let (mut zip, good, evil) = two_directories();
+        zip64_trailer(&mut zip, evil);
+        end_record(&mut zip, u16::MAX, good, 0);
+        refused(zip, "marks ZIP64");
+        // A last record whose comment overruns the file: the zip reader
+        // takes the one before, .NET 8 and .NET Framework this one.
+        let (mut zip, good, evil) = two_directories();
+        end_record(&mut zip, 0, good, 0);
+        end_record(&mut zip, 0, evil, 100);
+        refused(zip, "comment runs past the end");
     }
 
     #[test]
