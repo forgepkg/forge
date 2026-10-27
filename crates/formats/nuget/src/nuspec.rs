@@ -707,6 +707,7 @@ fn find_manifest(
             )));
         }
         let mut size = u64::from(declared);
+        let mut zip64 = false;
         let mut fields = &directory[name_end..extra_end];
         while let [a, b, c, d, rest @ ..] = fields {
             let id = u16::from_le_bytes([*a, *b]);
@@ -722,10 +723,22 @@ fn find_manifest(
                     "entry {name:?} carries an Info-ZIP Unicode Path field"
                 )));
             }
-            // A size that does not fit the header's 32 bits is the first
-            // value of the ZIP64 field.
-            if id == ZIP64_EXTRA_ID && declared == u32::MAX && data.len() >= 8 {
-                size = le_u64(data, 0);
+            if id == ZIP64_EXTRA_ID {
+                // .NET reads the first ZIP64 field of a header, the zip
+                // reader applies each in turn, so the last wins: with two,
+                // they would find the entry's data (its local header, its
+                // sizes) in different places, and could read different
+                // manifests. Neither NuGet nor .NET writes a second one.
+                if std::mem::replace(&mut zip64, true) {
+                    return Err(NupkgError::UnsupportedEntry(format!(
+                        "entry {name:?} carries more than one ZIP64 extra field"
+                    )));
+                }
+                // A size that does not fit the header's 32 bits is the
+                // field's first value.
+                if declared == u32::MAX && data.len() >= 8 {
+                    size = le_u64(data, 0);
+                }
             }
             fields = &rest[data.len()..];
         }
@@ -1740,6 +1753,79 @@ mod tests {
         assert!(err.to_string().contains("total uncompressed"), "{err}");
         let parsed = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap();
         assert_eq!(parsed.id, "a.b");
+    }
+
+    #[test]
+    fn two_zip64_fields_in_a_header_are_refused() {
+        // One central header whose local header offset is in its ZIP64
+        // field, twice: .NET (and so NuGet) reads the first field and the
+        // manifest of `Good.Package`, the zip reader the last and that of
+        // `Evil.Package`.
+        fn put16(zip: &mut Vec<u8>, v: u16) {
+            zip.extend_from_slice(&v.to_le_bytes());
+        }
+        fn put32(zip: &mut Vec<u8>, v: u32) {
+            zip.extend_from_slice(&v.to_le_bytes());
+        }
+        let (good, evil) = (nuspec_of("Good.Package"), nuspec_of("Evil.Package"));
+        let name = b"Pkg.nuspec";
+        let len = u32::try_from(good.len()).unwrap();
+        assert_eq!(evil.len(), good.len());
+        let mut zip = Vec::new();
+        let mut locals = Vec::new();
+        for data in [&good, &evil] {
+            locals.push(zip.len() as u64);
+            put32(&mut zip, 0x0403_4b50);
+            // Version, flags, stored, time, date.
+            for v in [20, 0, 0, 0, 0x21] {
+                put16(&mut zip, v);
+            }
+            put32(&mut zip, crc32(data));
+            put32(&mut zip, len);
+            put32(&mut zip, len);
+            put16(&mut zip, name.len() as u16);
+            put16(&mut zip, 0);
+            zip.extend_from_slice(name);
+            zip.extend_from_slice(data);
+        }
+        let directory = zip.len();
+        put32(&mut zip, 0x0201_4b50);
+        // Made by, needed, flags, stored, time, date.
+        for v in [45, 45, 0, 0, 0, 0x21] {
+            put16(&mut zip, v);
+        }
+        put32(&mut zip, crc32(&evil));
+        put32(&mut zip, len);
+        put32(&mut zip, len);
+        // Name, extra fields, comment, disk, internal attributes.
+        for v in [name.len() as u16, 24, 0, 0, 0] {
+            put16(&mut zip, v);
+        }
+        put32(&mut zip, 0);
+        // The local header's offset is in the ZIP64 field.
+        put32(&mut zip, u32::MAX);
+        zip.extend_from_slice(name);
+        for local in locals {
+            put16(&mut zip, 0x0001);
+            put16(&mut zip, 8);
+            zip.extend_from_slice(&local.to_le_bytes());
+        }
+        let directory_size = zip.len() - directory;
+        put32(&mut zip, 0x0605_4b50);
+        for v in [0, 0, 1, 1] {
+            put16(&mut zip, v);
+        }
+        put32(&mut zip, directory_size as u32);
+        put32(&mut zip, directory as u32);
+        put16(&mut zip, 0);
+
+        // The zip reader really does read the last field's manifest.
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
+        let mut read = Vec::new();
+        archive.by_index(0).unwrap().read_to_end(&mut read).unwrap();
+        assert_eq!(read, evil);
+        let err = manifest_id(zip).unwrap_err();
+        assert!(err.to_string().contains("more than one ZIP64"), "{err}");
     }
 
     /// CRC-32 (IEEE), as the Info-ZIP Unicode Path field stores it.
