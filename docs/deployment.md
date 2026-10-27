@@ -1215,7 +1215,8 @@ Forge proxying another Forge continues the trace), and the S3 operations
 (`outbox pass`, …). Health probes make no spans. A span's URL never holds a
 query string or credentials, and the secret in the path of an npm web login
 (the URL the client polls for its token, the page that approves the login
-and the API behind it) is recorded as `{secret}`.
+and the API behind it) and the token in the path of `npm logout` are
+recorded as `{secret}`, there and in the audit line of the request.
 
 **Logs.** With `logs` on, what Forge logs (filtered by `RUST_LOG`, as the
 console log is) is exported too, each record with the trace and span it was
