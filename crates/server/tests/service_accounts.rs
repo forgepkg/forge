@@ -22,6 +22,10 @@ const SECRET: &str = "the-proxys-secret-0123456789abcdef";
 /// The 401 body of credentials that are present but invalid.
 const INVALID: &str = "invalid credentials";
 
+/// The 401 body of a request without credentials, as headers a realm refuses
+/// leave it (#573).
+const UNAUTHENTICATED: &str = "authentication required";
+
 /// A server with a database of its own (its auth settings change), behind
 /// the test client as its trusted proxy, addressed as `127.0.0.1`.
 async fn server() -> TestServer {
@@ -387,15 +391,15 @@ async fn only_its_own_trusted_header_realm_names_a_service_account() {
     // account of no realm.
     assert_eq!(
         answer(other.named(me_request(&srv), &lan)).await,
-        (StatusCode::UNAUTHORIZED, json!(INVALID))
+        (StatusCode::UNAUTHORIZED, json!(UNAUTHENTICATED))
     );
     assert_eq!(
         answer(own.named(me_request(&srv), &tokens_only)).await,
-        (StatusCode::UNAUTHORIZED, json!(INVALID))
+        (StatusCode::UNAUTHORIZED, json!(UNAUTHENTICATED))
     );
     assert_eq!(
         answer(other.named(me_request(&srv), &tokens_only)).await,
-        (StatusCode::UNAUTHORIZED, json!(INVALID))
+        (StatusCode::UNAUTHORIZED, json!(UNAUTHENTICATED))
     );
 
     // Moved to the other realm, that one names it, and its former one no
@@ -407,7 +411,7 @@ async fn only_its_own_trusted_header_realm_names_a_service_account() {
     assert_eq!(body["user"]["id"], json!(id));
     assert_eq!(
         answer(own.named(me_request(&srv), &lan)).await,
-        (StatusCode::UNAUTHORIZED, json!(INVALID))
+        (StatusCode::UNAUTHORIZED, json!(UNAUTHENTICATED))
     );
 
     // Deactivated, no realm names it.
@@ -415,6 +419,6 @@ async fn only_its_own_trusted_header_realm_names_a_service_account() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         answer(other.named(me_request(&srv), &lan)).await,
-        (StatusCode::UNAUTHORIZED, json!(INVALID))
+        (StatusCode::UNAUTHORIZED, json!(UNAUTHENTICATED))
     );
 }

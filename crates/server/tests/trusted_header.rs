@@ -162,11 +162,12 @@ async fn the_headers_authenticate_an_account_of_the_realm() {
     let resp = srv.client().get(&feed).send().await.unwrap();
     assert!(resp.headers().get("cache-control").is_none());
 
-    // Without `auto_provision` the realm names only the accounts created for it.
+    // Without `auto_provision` the realm names only the accounts created for
+    // it: the headers of another name name nobody (#573).
     let bob = format!("bob{}@example.com", common::unique());
     assert_eq!(
         me(realm.named(me_request(&srv), &bob)).await,
-        (StatusCode::UNAUTHORIZED, json!(INVALID))
+        (StatusCode::UNAUTHORIZED, json!(ANONYMOUS))
     );
 
     // A deactivated account is refused.
@@ -182,7 +183,7 @@ async fn the_headers_authenticate_an_account_of_the_realm() {
     assert_eq!(resp.status(), 200);
     assert_eq!(
         me(realm.named(me_request(&srv), &alice)).await,
-        (StatusCode::UNAUTHORIZED, json!(INVALID))
+        (StatusCode::UNAUTHORIZED, json!(ANONYMOUS))
     );
 }
 
@@ -218,12 +219,12 @@ async fn auto_provision_creates_a_users_account() {
     // Every account is named by a UPN; so is every account a realm creates.
     assert_eq!(
         me(realm.named(me_request(&srv), "not-a-upn")).await,
-        (StatusCode::UNAUTHORIZED, json!(INVALID))
+        (StatusCode::UNAUTHORIZED, json!(ANONYMOUS))
     );
 }
 
 #[tokio::test]
-async fn refused_headers_are_a_401_never_anonymous() {
+async fn refused_headers_name_nobody_never_anonymous() {
     let srv = proxied().await;
     // It creates accounts: a refused name is refused for whose it is, not
     // for being unknown.
@@ -291,10 +292,12 @@ async fn refused_headers_are_a_401_never_anonymous() {
         // The reserved workload-identity name.
         ("a reserved name", realm.named(me_request(&srv), "oidc")),
     ];
+    // Refused headers name nobody: the request goes on unauthenticated, as
+    // one without credentials (never anonymous, #573).
     for (case, rb) in cases {
         assert_eq!(
             me(rb).await,
-            (StatusCode::UNAUTHORIZED, json!(INVALID)),
+            (StatusCode::UNAUTHORIZED, json!(ANONYMOUS)),
             "{case}"
         );
     }
@@ -532,6 +535,91 @@ async fn a_bearer_token_of_the_requests_own_wins_over_the_headers() {
     assert!(resp.status().is_success(), "{}", resp.status());
     let (status, _) = me(whoami().bearer_auth(token)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Headers the realm refuses name nobody (#573), here those of a
+/// deactivated network account, the way an administrator cuts a network
+/// off: the request's own credentials that only their handler reads — npm's
+/// Bearer token on a feed, a registry token — still count, and its sender
+/// can sign in.
+#[tokio::test]
+async fn refused_headers_leave_the_requests_own_credentials_and_sign_in() {
+    let srv = proxied().await;
+    let realm = create_realm(&srv, false).await;
+    let n = common::unique();
+    let office = format!("office{n}@example.com");
+    let office_id = create_account(&srv, &realm, &office, "reader").await;
+    let ci = format!("ci{n}@example.com");
+    let ci_id = create_account(&srv, &realm, &ci, "reader").await;
+    let (u, p) = srv.admin_basic();
+    let repo = format!("npm{n}");
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": repo, "kind": "hosted", "format": "npm"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let token: Value = srv
+        .client()
+        .post(format!("{}/admin/users/{ci_id}/tokens", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": "ci"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = token["token"].as_str().unwrap();
+    let resp = srv
+        .client()
+        .patch(format!("{}/admin/users/{office_id}", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"active": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let office_says = |rb: RequestBuilder| realm.named(rb, &office);
+
+    // The headers alone name nobody: a 401, as without them.
+    let whoami = format!("{}/repository/{repo}/-/whoami", srv.base_url);
+    let (status, _) = me(office_says(srv.client().get(&whoami))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // npm's own token is read…
+    let (status, body) = me(office_says(srv.client().get(&whoami)).bearer_auth(token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["username"], json!(ci));
+
+    // …so is a registry token: `docker login`, then the token.
+    let resp = office_says(srv.client().get(format!("{}/v2/token", srv.base_url)))
+        .query(&[("service", "test.local")])
+        .basic_auth(&ci, Some(token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let registry: Value = resp.json().await.unwrap();
+    let registry = registry["token"].as_str().unwrap();
+    let resp = office_says(srv.client().get(format!("{}/v2/", srv.base_url)))
+        .bearer_auth(registry)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // And someone behind the proxy signs in with a password of their own.
+    let (admin, password) = srv.admin_password_basic();
+    let resp = office_says(srv.client().post(format!("{}/auth/login", srv.base_url)))
+        .json(&json!({"username": admin, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().contains_key("set-cookie"));
 }
 
 #[tokio::test]

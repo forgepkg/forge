@@ -934,7 +934,13 @@ What Forge believes, and when:
   the realm (without `auto_provision`), of a deactivated account, or of an
   account of another kind (local, OIDC, credential forwarding) or another
   realm, a service account of another realm or of none included: the
-  credentials are present but invalid, **401**, never anonymous.
+  headers **name nobody**. The request goes on as one without credentials,
+  never anonymous whatever the anonymous mode: what needs a principal
+  answers 401, while a credential of its own still counts (an API token sent
+  as `Authorization: Bearer`, a registry token) and its sender can sign in.
+  Deactivating the service account a load balancer names for a network so
+  cuts the network's access, not the access of the people on it. The
+  refusal is logged (`trusted-header credentials refused`).
   A realm never maps a name onto another source's account, and never
   creates or names the built-in `anonymous` principal.
 - The headers are an **ambient** credential: the proxy adds them to every

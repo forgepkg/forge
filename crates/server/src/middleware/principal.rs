@@ -12,7 +12,10 @@
 //! DNS-rebinding guard below); from any other request they are ignored. Even
 //! then they are asked last, in place of the anonymous policy: a credential
 //! of the request's own wins, and one another source refused is a 401, never
-//! the account the headers name.
+//! the account the headers name. Headers the realm itself refuses name
+//! nobody: the request goes on [`Principal::Unauthenticated`], never
+//! anonymous, so a credential its handler reads (a Bearer API token on a
+//! feed, a registry token) still counts, and its sender can sign in (#573).
 //!
 //! Security rules (enforced by [`forge_core::auth::token::resolve_principal`]):
 //! * The first source that authenticates wins.
@@ -803,7 +806,9 @@ mod tests {
     #[async_trait::async_trait]
     impl PrincipalSource for HeaderStub {
         async fn resolve(&self, headers: &http::HeaderMap, _ip: IpAddr) -> SourceOutcome {
-            if headers.contains_key("x-test-user") {
+            if headers.get("x-test-user").is_some_and(|v| v == "refused") {
+                SourceOutcome::Invalid
+            } else if headers.contains_key("x-test-user") {
                 SourceOutcome::Authenticated(Principal::User {
                     user_id: 7,
                     token_id: None,
@@ -871,6 +876,16 @@ mod tests {
                 .await
                 .0,
             StatusCode::UNAUTHORIZED
+        );
+        // Headers the realm refuses name nobody: the request reaches its
+        // handler unauthenticated, though anonymous access is on.
+        let refused = Request::builder()
+            .uri("/")
+            .header(header::HOST, "forge.example")
+            .header("x-test-user", "refused");
+        assert_eq!(
+            send(l.clone(), refused).await,
+            (StatusCode::OK, "unauthenticated".to_string())
         );
     }
 
