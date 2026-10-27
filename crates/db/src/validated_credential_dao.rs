@@ -280,7 +280,7 @@ pub async fn claim_state(
 /// commits first and its delete removes the claim row this write is
 /// conditioned on. A stale validation can never resurrect a revoked verdict.
 pub async fn finalize_claim(pool: &PgPool, new: NewVerdict, token: Uuid) -> sqlx::Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     lock_user_tag(&mut tx, &new.username).await?;
     let written = sqlx::query!(
         r#"
@@ -487,7 +487,7 @@ pub async fn revoke_by_username(
     username: &str,
     provider_id: Option<&str>,
 ) -> sqlx::Result<u64> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
 
     // The upsert is the revocation's linearization point. It takes an exclusive
     // row lock and therefore waits for every in-progress verdict write holding

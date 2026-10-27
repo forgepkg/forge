@@ -82,7 +82,7 @@ pub async fn upsert_cached_versions(
     if versions.is_empty() {
         return Ok(0);
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     lock_cached_package(&mut tx, repository_id, name).await?;
     let res = sqlx::query!(
         r#"
@@ -137,7 +137,7 @@ pub async fn reconcile_listing(
     versions: &[String],
     confirm_after_secs: i64,
 ) -> sqlx::Result<u64> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     lock_cached_package(&mut tx, repository_id, name).await?;
     let flagged = sqlx::query!(
         r#"
@@ -526,7 +526,7 @@ pub async fn set_listed(
     if versions.is_empty() {
         return Ok(0);
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     lock_cached_package(&mut tx, repository_id, name).await?;
     let res = sqlx::query!(
         r#"

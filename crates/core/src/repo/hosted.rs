@@ -858,7 +858,7 @@ impl HostedWrite {
         // to a concurrent first push of this (id, version) once (see below).
         let mut retried = false;
         let (mut tx, component_id, replaced, outcome) = loop {
-            let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
+            let mut tx = forge_db::begin(&self.pool).await.map_err(RepoError::from)?;
 
             // Read the duplicate-check *inside* the transaction so it serializes
             // with the subsequent insert/redeploy write against concurrent pushes
@@ -1290,7 +1290,7 @@ impl HostedWrite {
         // concurrent redeploy could swap the asset blob references between the
         // read and the decref, leaking the redeployed blob and over-decrefing
         // the old one.
-        let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
+        let mut tx = forge_db::begin(&self.pool).await.map_err(RepoError::from)?;
 
         let Some(comp) = component_dao::find_component(&mut *tx, repo_row.id, &lower, &norm_ver)
             .await
@@ -1355,7 +1355,7 @@ impl HostedWrite {
         version: &str,
         listed: bool,
     ) -> Result<bool, WriteError> {
-        let mut tx = self.pool.begin().await.map_err(RepoError::from)?;
+        let mut tx = forge_db::begin(&self.pool).await.map_err(RepoError::from)?;
         let updated = component_dao::set_listed(&mut *tx, repo_id, lower, version, listed)
             .await
             .map_err(RepoError::from)?;

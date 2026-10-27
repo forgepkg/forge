@@ -157,7 +157,7 @@ async fn forget(
     stores_files: bool,
     package: Option<&str>,
 ) -> sqlx::Result<Option<Invalidated>> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     let mut invalidated = Invalidated {
         not_found_cleared: 0,
         tags_expired: 0,

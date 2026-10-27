@@ -219,7 +219,7 @@ pub async fn accept(
     token_hash: &str,
     password_hash: &str,
 ) -> sqlx::Result<Option<AppUser>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let user_id: Option<i64> = sqlx::query_scalar(
         "UPDATE user_invitation i SET accepted_at = now() \
          FROM app_user u \

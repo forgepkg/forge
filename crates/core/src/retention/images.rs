@@ -1070,7 +1070,7 @@ pub async fn apply_images(
     let batches = image_batches(decisions);
     let mut remaining = decisions.tags.len() + decisions.manifests.len();
     for (image, batch) in &batches {
-        let mut tx = pool.begin().await?;
+        let mut tx = forge_db::begin(pool).await?;
         let mut decided = None;
         if let Some(fence) = fence.filter(|_| !dry_run) {
             if !retention_dao::lock_run_fence(&mut tx, repository_id, run_id, fence.stored_policy)

@@ -133,7 +133,7 @@ impl ImportWorker {
     pub async fn tick(&self) -> sqlx::Result<Option<i64>> {
         let pool = &self.state.pool;
         let claimed = {
-            let mut tx = pool.begin().await?;
+            let mut tx = forge_db::begin(pool).await?;
             let now = forge_db::db_now(&mut *tx).await?;
             let claimed =
                 import_dao::claim_next(&mut tx, now, chrono::Duration::seconds(LEASE_SECONDS))
@@ -446,7 +446,7 @@ impl Run<'_> {
                 })
                 .collect();
             let pool = &self.state.pool;
-            let mut tx = pool.begin().await.map_err(db_failed)?;
+            let mut tx = forge_db::begin(pool).await.map_err(db_failed)?;
             import_dao::insert_items(&mut tx, self.import.id, &new_items)
                 .await
                 .map_err(db_failed)?;

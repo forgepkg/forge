@@ -476,7 +476,7 @@ impl Registry {
             if let Some((_, size)) =
                 oci_dao::blob_linked_in_repository(pool, t.repo.id, sha256).await?
             {
-                let mut tx = pool.begin().await?;
+                let mut tx = forge_db::begin(pool).await?;
                 match oci_dao::insert_link_existing(
                     &mut tx,
                     t.repo.id,
@@ -526,7 +526,7 @@ impl Registry {
         }
         let size = staged.size;
         let stored = self.inner.cas.commit(staged).await?;
-        let mut tx = pool.begin().await?;
+        let mut tx = forge_db::begin(pool).await?;
         oci_dao::insert_link_ingested(
             &mut tx,
             t.repo.id,

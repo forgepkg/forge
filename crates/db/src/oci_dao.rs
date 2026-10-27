@@ -516,7 +516,7 @@ pub async fn sweep_link(
     cutoff: DateTime<Utc>,
     grace: chrono::Duration,
 ) -> sqlx::Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let locked = sqlx::query_scalar!(
         r#"
         SELECT 1 AS "one!"
@@ -696,7 +696,7 @@ pub async fn set_imported_times(
     published_at: Option<DateTime<Utc>>,
     downloaded_at: Option<DateTime<Utc>>,
 ) -> sqlx::Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     sqlx::query!(
         r#"
         UPDATE oci_manifest
@@ -1508,7 +1508,7 @@ pub async fn expire_upload(
     cutoff: DateTime<Utc>,
     grace: chrono::Duration,
 ) -> sqlx::Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let idle = sqlx::query_scalar!(
         r#"
         SELECT 1 AS "one!" FROM oci_upload

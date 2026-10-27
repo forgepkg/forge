@@ -215,7 +215,7 @@ impl Files<'_> {
         let stored = &ingested.stored;
         forge_telemetry::proxy::upstream_bytes(&repo.name, stored.size);
         let content_type = content_type(declared.as_deref(), path);
-        let mut tx = self.state.pool.begin().await?;
+        let mut tx = forge_db::begin(&self.state.pool).await?;
         if !oci_dao::lock_proxy_upstream(&mut tx, repo.id, repo.remote_url.as_deref()).await? {
             return Err(FileError::Unavailable(
                 "the proxy was pointed at another upstream while this was fetched; retry".into(),

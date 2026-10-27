@@ -390,7 +390,7 @@ pub async fn apply_files(
     let mut remaining = decisions.len();
     for (dir, all) in &directories {
         for batch in all.chunks(FILE_BATCH) {
-            let mut tx = pool.begin().await?;
+            let mut tx = forge_db::begin(pool).await?;
             let mut decided_now: Option<HashSet<i64>> = None;
             if let Some(fence) = fence.filter(|_| !dry_run) {
                 if !retention_dao::lock_run_fence(

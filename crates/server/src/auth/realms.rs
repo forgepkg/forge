@@ -1398,7 +1398,7 @@ async fn apply_seed(
             let fingerprint = seed_fingerprint(kind, &config);
             // The row is written only while it is still the one compared
             // above, and the marker only while it is still `marker`.
-            let mut tx = pool.begin().await?;
+            let mut tx = forge_db::begin(pool).await?;
             let applied = secret_dao::update_realm_with_secrets_if_unchanged(
                 &mut tx,
                 envelope,

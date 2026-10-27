@@ -139,7 +139,7 @@ async fn delete_tag(
     image: &str,
     tag: &str,
 ) -> sqlx::Result<Deleted> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     let deleted = oci_dao::delete_tag(&mut tx, repo_id, image, tag).await?;
     tx.commit().await?;
     Ok(Deleted {
@@ -159,7 +159,7 @@ async fn delete_manifests(
     digest: Option<&str>,
     grace: chrono::Duration,
 ) -> sqlx::Result<Deleted> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     let (tags, manifests) = oci_dao::lock_image_for_retention(&mut tx, repo_id, image).await?;
     let doomed = match digest {
         None => manifests.iter().map(|m| m.id).collect(),

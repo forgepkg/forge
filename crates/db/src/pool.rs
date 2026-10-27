@@ -27,6 +27,35 @@ pub async fn connect_with(
         .await
 }
 
+/// Begin a transaction on a connection of `pool`. Use this, never
+/// `Pool::begin`: it is safe against cancellation.
+///
+/// sqlx (0.9) counts a transaction only once Postgres has answered its
+/// `BEGIN`. A `pool.begin()` dropped while that answer is in flight (an
+/// aborted task, a request whose client went away or whose deadline passed,
+/// a `select!`) therefore queues no `ROLLBACK`, and the connection goes back
+/// to the pool inside an open transaction that sqlx does not know of. Every
+/// statement run on it afterwards joins that transaction: its writes are not
+/// committed and other connections do not see them, its row locks are held,
+/// `now()` stands still; until a transaction later begun on the connection
+/// commits it all, or rolls it all back, or the pool closes the idle
+/// connection (10 to 20 minutes later) and Postgres rolls it back.
+///
+/// The `BEGIN` therefore runs in a task of its own, which finishes even when
+/// the caller is dropped; the transaction nobody took is then dropped, and
+/// rolled back, like any other.
+pub async fn begin(pool: &PgPool) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    use tracing::Instrument as _;
+    let pool = pool.clone();
+    let begin = async move { pool.begin().await };
+    match tokio::spawn(begin.in_current_span()).await {
+        Ok(begun) => begun,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // The runtime is shutting down.
+        Err(_) => Err(sqlx::Error::PoolClosed),
+    }
+}
+
 /// Note a database error in the metrics: a pool acquire that timed out
 /// counts in `forge_db_pool_acquire_timeouts_total`. Called where the
 /// request paths turn a `sqlx::Error` into their own.

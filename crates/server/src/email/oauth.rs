@@ -762,7 +762,7 @@ impl OauthTokens {
     /// authorization.
     async fn refresh_stored(&self, oauth: &SmtpOauthConfig) -> Result<TokenSet, AccessError> {
         let db = |e: sqlx::Error| AccessError::Failed(format!("database error: {e}"));
-        let mut lock = self.pool.begin().await.map_err(db)?;
+        let mut lock = forge_db::begin(&self.pool).await.map_err(db)?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(REFRESH_LOCK_KEY)
             .execute(&mut *lock)

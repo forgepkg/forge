@@ -314,7 +314,7 @@ async fn record_hosted_dry_run(
 ) -> Result<(), sqlx::Error> {
     let reason = reason_json(&d.reason);
 
-    let mut tx = ctx.pool.begin().await?;
+    let mut tx = forge_db::begin(ctx.pool).await?;
     retention_dao::insert_audit(
         &mut *tx,
         &AuditRow {
@@ -354,7 +354,7 @@ async fn apply_hosted_batch(
     let Some(first) = batch.first() else {
         return Ok(Step::Continue);
     };
-    let mut tx = ctx.pool.begin().await?;
+    let mut tx = forge_db::begin(ctx.pool).await?;
     let decided = match &ctx.fence {
         Some(fence) => {
             if !retention_dao::lock_run_fence(
@@ -573,7 +573,7 @@ async fn apply_proxy(
     let reason = reason_json(&d.reason);
 
     if ctx.dry_run {
-        let mut tx = ctx.pool.begin().await?;
+        let mut tx = forge_db::begin(ctx.pool).await?;
         retention_dao::insert_audit(
             &mut *tx,
             &AuditRow {
@@ -598,7 +598,7 @@ async fn apply_proxy(
         return Ok(Step::Continue);
     }
 
-    let mut tx = ctx.pool.begin().await?;
+    let mut tx = forge_db::begin(ctx.pool).await?;
 
     if let Some(fence) = &ctx.fence {
         if !retention_dao::lock_run_fence(
@@ -690,7 +690,7 @@ async fn apply_proxy_budget_batch(
         return Ok(Step::Continue);
     };
 
-    let mut tx = ctx.pool.begin().await?;
+    let mut tx = forge_db::begin(ctx.pool).await?;
     if !retention_dao::lock_run_fence(&mut tx, ctx.repository_id, ctx.run_id, fence.stored_policy)
         .await?
     {

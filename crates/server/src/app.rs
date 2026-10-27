@@ -407,7 +407,9 @@ pub async fn ensure_bootstrap_admin(config: &Config, pool: &PgPool) -> anyhow::R
 
     // The account and its `admin` role in one transaction: an account left
     // without the role would not be an administrator.
-    let mut tx = pool.begin().await.context("begin bootstrap admin")?;
+    let mut tx = forge_db::begin(pool)
+        .await
+        .context("begin bootstrap admin")?;
     let user = match user_dao::insert_user(
         &mut *tx,
         NewUser::local(ba.username.clone(), password_hash, true),

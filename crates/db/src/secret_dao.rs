@@ -554,7 +554,7 @@ pub async fn revoke_unreferenced_deks(
     pool: &PgPool,
     envelope: &EnvelopeService,
 ) -> Result<usize, SecretDbError> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let retiring = sqlx::query!(
         r#"
         SELECT id, version
@@ -711,7 +711,7 @@ pub async fn insert_realm_with_secrets(
         return Ok(auth_realm_dao::insert_realm(pool, new).await?);
     }
     new.config = stripped;
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     let row = auth_realm_dao::insert_realm(&mut *tx, new).await?;
     let blob = seal_realm_secrets(envelope, row.id, &row.kind, &row.config, &secrets).await?;
     lock_sealing_dek(&mut tx, envelope, &blob).await?;
@@ -761,7 +761,7 @@ pub async fn update_realm_with_secrets(
     };
     let sealed = seal_realm_secrets(envelope, id, &kind, &upd.config, &secrets).await?;
     // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     lock_sealing_dek(&mut tx, envelope, &sealed).await?;
     let row = auth_realm_dao::update_realm_and_secrets(&mut *tx, id, upd, Some(&sealed)).await?;
     tx.commit().await?;
@@ -990,7 +990,7 @@ pub async fn store_email_settings(
     }
     let blob = seal_email_secrets(envelope, &stripped, &secrets).await?;
     // Ciphertext write: hold the sealing DEK `FOR SHARE` until commit.
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     lock_sealing_dek(&mut tx, envelope, &blob).await?;
     let row = email_settings_dao::put(&mut *tx, enabled, &stripped, Some(&blob)).await?;
     tx.commit().await?;
@@ -1013,7 +1013,7 @@ pub async fn update_email_settings(
         return Ok(email_settings_dao::put_if_unchanged(pool, expected, &stripped, None).await?);
     }
     let blob = seal_email_secrets(envelope, &stripped, &secrets).await?;
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     lock_sealing_dek(&mut tx, envelope, &blob).await?;
     let row =
         email_settings_dao::put_if_unchanged(&mut *tx, expected, &stripped, Some(&blob)).await?;
@@ -1166,7 +1166,7 @@ async fn write_sealed_setting(
         "{SEALED_SETTING}{}",
         base64::engine::general_purpose::STANDARD.encode(blob)
     );
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::begin(pool).await?;
     lock_sealing_dek(&mut tx, envelope, blob).await?;
     let written = write_setting(&mut tx, key, &value, expected).await?;
     tx.commit().await?;

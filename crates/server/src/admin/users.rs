@@ -640,7 +640,7 @@ async fn insert_with_role(
     email: Option<&str>,
     role: AccessRole,
 ) -> sqlx::Result<AppUser> {
-    let mut tx = state.pool.begin().await?;
+    let mut tx = forge_db::begin(&state.pool).await?;
     let user = match account {
         NewAccount::Invited { email } => {
             invitation_dao::insert_invited_user(&mut *tx, username, email).await?
@@ -873,7 +873,7 @@ async fn update_service_account(
         Some(None) => Some(None),
         None => None,
     };
-    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    let mut tx = forge_db::begin(&state.pool).await.map_err(db_error)?;
     if let Some(description) = &description {
         user_dao::set_service_account_description(&mut *tx, id, description.as_deref())
             .await
@@ -1041,7 +1041,7 @@ async fn set_active_guarded(
     id: i64,
     active: bool,
 ) -> Result<Option<AppUser>, Response> {
-    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    let mut tx = forge_db::begin(&state.pool).await.map_err(db_error)?;
     if !active
         && authz_dao::would_leave_no_admin(&mut tx, id)
             .await
@@ -1059,7 +1059,7 @@ async fn set_active_guarded(
 /// Delete the user in a transaction under the last-admin guard. `Ok(false)`
 /// when no such user exists.
 async fn delete_guarded(state: &AppState, id: i64) -> Result<bool, Response> {
-    let mut tx = state.pool.begin().await.map_err(db_error)?;
+    let mut tx = forge_db::begin(&state.pool).await.map_err(db_error)?;
     if authz_dao::would_leave_no_admin(&mut tx, id)
         .await
         .map_err(db_error)?
