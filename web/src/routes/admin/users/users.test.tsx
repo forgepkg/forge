@@ -353,12 +353,18 @@ describe('admin users', () => {
     await renderAt('/manage/users/new')
 
     await u.type(await screen.findByLabelText('Username'), 'ci@example.com')
+    // Admin is offered for an invited account, but an account of a
+    // trusted-header realm is never an admin (#547): choosing the realm
+    // takes the choice back to Reader.
+    await u.click(screen.getByRole('radio', { name: /^Admin/ }))
     const signIn = await screen.findByLabelText('Sign-in')
     expect(
       within(signIn).getByRole('option', { name: 'Trusted header: office-lan' }),
     ).toBeInTheDocument()
     await u.selectOptions(signIn, 'office-lan')
     expect(screen.getByText(/names the account in its header/)).toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: /^Admin/ })).toBeNull()
+    expect(screen.getByRole('radio', { name: /^Reader/ })).toBeChecked()
     expect(screen.queryByText(/No email service is configured/)).toBeNull()
     await u.click(screen.getByRole('button', { name: 'Create user' }))
 

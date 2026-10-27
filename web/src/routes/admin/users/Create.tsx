@@ -8,7 +8,7 @@ import { useCreateUser } from '~/queries/useUsers'
 import { useRealms } from '~/queries/useRealms'
 import { useEmailSettings } from '~/queries/useEmail'
 import { formatDateTime } from '~/lib/oci'
-import { AccessLevelFields } from '~/components/AccessLevelFields'
+import { AccessLevelFields, SERVICE_ACCOUNT_LEVELS } from '~/components/AccessLevelFields'
 import { REALM_KINDS } from '~/components/RealmForm'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
 import {
@@ -39,7 +39,8 @@ const ACCOUNT_REALM_KINDS: RealmKind[] = ['credential_forwarding', 'trusted_head
  * entered), or, without an email service, shows the link once to pass on.
  * An account of a credential-forwarding realm signs in with the upstream's
  * password instead, and one of a trusted-header realm is named by the
- * headers of its proxy. Either way the admin picks the built-in access level.
+ * headers of its proxy. Either way the admin picks the built-in access level;
+ * an account of a trusted-header realm is never an admin (#547).
  */
 function CreateUserPage() {
   const create = useCreateUser()
@@ -151,7 +152,12 @@ function CreateUserPage() {
                   <SelectField
                     label="Sign-in"
                     value={realm}
-                    onChange={(e) => setRealm(e.target.value)}
+                    onChange={(e) => {
+                      const next = e.target.value
+                      setRealm(next)
+                      const kind = accountRealms.find((r) => r.name === next)?.kind
+                      if (kind === 'trusted_header' && level === 'admin') setLevel('reader')
+                    }}
                     description={
                       realmKind === 'credential_forwarding'
                         ? 'Signs in with the upstream’s password, which gets the part of the username before the @.'
@@ -185,7 +191,11 @@ function CreateUserPage() {
               </div>
             </Panel>
             <Panel title="Access">
-              <AccessLevelFields value={level} onChange={setLevel} />
+              <AccessLevelFields
+                value={level}
+                onChange={setLevel}
+                levels={realmKind === 'trusted_header' ? SERVICE_ACCOUNT_LEVELS : undefined}
+              />
             </Panel>
             {create.isError && (
               <Notice tone="danger">{create.error.body || create.error.message}</Notice>

@@ -495,6 +495,33 @@ async fn migrations_create_all_expected_tables() {
         "a service account is never linked to an identity"
     );
 
+    // Nor does an account of a trusted-header realm hold `admin` (#547); it
+    // holds other roles.
+    let proxied_id: i64 =
+        sqlx::query_scalar("SELECT id FROM app_user WHERE username = 'proxied@example.com'")
+            .fetch_one(&pool)
+            .await
+            .expect("read the trusted-header account");
+    let admin = sqlx::query(
+        "INSERT INTO user_role (user_id, role_id) \
+         SELECT $1, id FROM role WHERE name = 'admin'",
+    )
+    .bind(proxied_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        admin.is_err(),
+        "an account of a trusted-header realm cannot hold the admin role"
+    );
+    sqlx::query(
+        "INSERT INTO user_role (user_id, role_id) \
+         SELECT $1, id FROM role WHERE name = 'writer'",
+    )
+    .bind(proxied_id)
+    .execute(&pool)
+    .await
+    .expect("an account of a trusted-header realm holds other roles");
+
     // validated_credential round-trips a verdict; the plaintext password is
     // never a column — only the HMAC.
     sqlx::query(
