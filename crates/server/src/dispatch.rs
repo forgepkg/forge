@@ -9,11 +9,13 @@
 //!   methods (`PUT`/`POST`) require `write`; package deletion (`DELETE`)
 //!   requires `delete`, the highest level. An unauthenticated caller → **401** (so a
 //!   package client knows to send credentials), an authenticated-but-
-//!   disallowed caller → **403** ([`authz_denied`]).
+//!   disallowed caller → **403** ([`authz_denied`]). The account a
+//!   trusted-header realm's proxy named counts as unauthenticated here: the
+//!   request carried no credential of its own.
 
 use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use forge_core::auth::principal::Principal;
+use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::authz::{Level, PackageFilter};
 use forge_core::repo::RepoKind;
 use forge_db::model::Repository;
@@ -72,15 +74,20 @@ pub(crate) fn principal_allows_protocol_mutations(principal: &Principal) -> bool
 
 /// Map an authorization denial to the right status: unauthenticated → 401 (send
 /// credentials), authenticated-but-forbidden → 403, anonymous-denied → 401.
+/// The account a trusted-header realm's proxy named is denied like an
+/// anonymous caller: the request carried no credential of its own, and a
+/// client with credentials of its own sends them only after a challenge
+/// (NuGet) (#556).
 pub(crate) fn authz_denied(principal: &Principal) -> Response {
     let mut response = match principal {
         // An authenticated identity (user or WIF workload) that is nonetheless
         // denied by RBAC → 403.
-        Principal::User { .. } | Principal::Workload { .. } => {
+        Principal::User { method, .. } if *method != AuthMethod::TrustedHeader => {
             (StatusCode::FORBIDDEN, "forbidden").into_response()
         }
+        Principal::Workload { .. } => (StatusCode::FORBIDDEN, "forbidden").into_response(),
         // No/insufficient identity → 401 so the client knows to authenticate.
-        Principal::Anonymous { .. } | Principal::Unauthenticated => (
+        Principal::User { .. } | Principal::Anonymous { .. } | Principal::Unauthenticated => (
             StatusCode::UNAUTHORIZED,
             [(
                 axum::http::header::WWW_AUTHENTICATE,
@@ -444,6 +451,29 @@ mod tests {
         assert_eq!(level_for_method(&Method::DELETE), Level::Delete);
         assert_eq!(level_for_method(&Method::GET), Level::Read);
         assert_eq!(level_for_method(&Method::HEAD), Level::Read);
+    }
+
+    #[test]
+    fn a_denial_challenges_callers_without_a_credential_of_their_own() {
+        let user = |method| Principal::User {
+            user_id: 1,
+            token_id: None,
+            method,
+        };
+        let anonymous = Principal::Anonymous {
+            ip: std::net::Ipv4Addr::LOCALHOST.into(),
+        };
+        for principal in [anonymous, user(AuthMethod::TrustedHeader)] {
+            let denied = authz_denied(&principal);
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED, "{principal:?}");
+            assert_eq!(
+                denied.headers()[header::WWW_AUTHENTICATE],
+                "Basic realm=\"Forge\""
+            );
+        }
+        for method in [AuthMethod::Token, AuthMethod::Password, AuthMethod::Session] {
+            assert_eq!(authz_denied(&user(method)).status(), StatusCode::FORBIDDEN);
+        }
     }
 
     #[test]
