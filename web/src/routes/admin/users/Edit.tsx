@@ -13,6 +13,7 @@ import { ApiError } from '~/lib/httpClient'
 import {
   authSourceLabel,
   isServiceAccount,
+  isTrustedHeaderAccount,
   type IssuedInvitation,
   type UserView,
 } from '~/api/users'
@@ -125,6 +126,7 @@ function UserPage() {
   const users = useUsers()
   const user = users.data?.find((u) => u.id === id)
   const name = user ? user.username : `User #${id}`
+  const trustedHeader = user ? isTrustedHeaderAccount(user) : false
 
   if (user && isServiceAccount(user)) {
     return (
@@ -173,8 +175,15 @@ function UserPage() {
       )}
       {user?.captured_password_at && <KeptPassword user={user} />}
 
-      <Columns asideLabel="Access" aside={<UserAccess userId={id} />}>
-        <UserRoles userId={id} legacyAdmin={user?.is_admin ?? false} />
+      <Columns
+        asideLabel="Access"
+        aside={<UserAccess userId={id} trustedHeader={trustedHeader} />}
+      >
+        <UserRoles
+          userId={id}
+          legacyAdmin={user?.is_admin ?? false}
+          trustedHeader={trustedHeader}
+        />
         <EffectiveAccess userId={id} />
         <UserTokens userId={id} inactive={user?.active === false} />
       </Columns>
@@ -189,14 +198,17 @@ function UserPage() {
  * then takes the other one, so a refused step (the last active
  * administrator keeps `admin`: 409, with the server's reason) never leaves
  * the user with less access than before. A service account
- * (`serviceAccount`) is a reader or a writer, never an admin.
+ * (`serviceAccount`) or an account of a trusted-header realm
+ * (`trustedHeader`) is a reader or a writer, never an admin.
  */
 export function UserAccess({
   userId,
   serviceAccount = false,
+  trustedHeader = false,
 }: {
   userId: number
   serviceAccount?: boolean
+  trustedHeader?: boolean
 }) {
   const held = useUserRoles(userId)
   const roles = useRoles()
@@ -243,7 +255,9 @@ export function UserAccess({
       description={
         serviceAccount
           ? 'The service account’s built-in role: a service account is never an admin. Its other roles add to it.'
-          : "The user's built-in role. Their other roles add to it."
+          : trustedHeader
+            ? "The user's built-in role: the headers of a trusted-header realm never make anyone an admin. Their other roles add to it."
+            : "The user's built-in role. Their other roles add to it."
       }
       actions={
         loaded && (
@@ -277,7 +291,7 @@ export function UserAccess({
             value={chosen}
             onChange={setChoice}
             disabled={saving}
-            levels={serviceAccount ? SERVICE_ACCOUNT_LEVELS : undefined}
+            levels={serviceAccount || trustedHeader ? SERVICE_ACCOUNT_LEVELS : undefined}
           />
           {error && <InlineError>{error}</InlineError>}
           <div>
@@ -293,16 +307,19 @@ export function UserAccess({
 
 /**
  * The roles the user holds; admins assign and remove them here. A service
- * account (`serviceAccount`) is never offered `admin`.
+ * account (`serviceAccount`) or an account of a trusted-header realm
+ * (`trustedHeader`) is never offered `admin`.
  */
 export function UserRoles({
   userId,
   legacyAdmin,
   serviceAccount = false,
+  trustedHeader = false,
 }: {
   userId: number
   legacyAdmin: boolean
   serviceAccount?: boolean
+  trustedHeader?: boolean
 }) {
   const held = useUserRoles(userId)
   const roles = useRoles()
@@ -312,7 +329,7 @@ export function UserRoles({
 
   const heldIds = new Set((held.data ?? []).map((r) => r.id))
   const candidates = (roles.data ?? []).filter(
-    (r) => !heldIds.has(r.id) && !(serviceAccount && r.name === ADMIN_ROLE),
+    (r) => !heldIds.has(r.id) && !((serviceAccount || trustedHeader) && r.name === ADMIN_ROLE),
   )
   const holdsAdmin = (held.data ?? []).some((r) => r.name === ADMIN_ROLE)
 

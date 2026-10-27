@@ -2,7 +2,8 @@
 //!
 //! * `GET    /admin/users/{id}/roles` — list the roles a user holds.
 //! * `PUT    /admin/users/{id}/roles` — assign a role (idempotent). A service
-//!   account never holds the built-in `admin` role (**400**).
+//!   account or an account of a trusted-header realm never holds the built-in
+//!   `admin` role (**400**).
 //! * `DELETE /admin/users/{id}/roles/{role_id}` — unassign a role. Taking the
 //!   built-in `admin` role from the last active administrator is refused
 //!   (**409**, [`super::last_admin_conflict`]).
@@ -19,7 +20,7 @@ use forge_db::authz_dao::{self, Role};
 use forge_db::user_dao;
 use serde::{Deserialize, Serialize};
 
-use super::users::service_account_admin_refused;
+use super::users::{service_account_admin_refused, trusted_header_admin_refused};
 use super::{db_error, last_admin_conflict};
 use crate::state::AppState;
 
@@ -86,9 +87,12 @@ pub async fn assign(
         Ok(id) => id,
         Err(resp) => return resp,
     };
-    if user.is_service_account() {
+    if !user.may_hold_admin() {
         match authz_dao::role_id_by_name(&state.pool, authz_dao::ADMIN_ROLE).await {
-            Ok(admin) if admin == Some(role_id) => return service_account_admin_refused(),
+            Ok(admin) if admin == Some(role_id) && user.is_service_account() => {
+                return service_account_admin_refused()
+            }
+            Ok(admin) if admin == Some(role_id) => return trusted_header_admin_refused(),
             Ok(_) => {}
             Err(e) => return db_error(e),
         }

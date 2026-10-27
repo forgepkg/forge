@@ -123,6 +123,11 @@ export function isServiceAccount(user: Pick<UserView, 'kind'>): boolean {
   return user.kind === 'service'
 }
 
+/** Whether `user` is an account of a trusted-header realm. */
+export function isTrustedHeaderAccount(user: Pick<UserView, 'auth_source'>): boolean {
+  return user.auth_source === 'trusted-header'
+}
+
 /**
  * A user's `auth_source` for display. Look-alike usernames from different
  * sources are different accounts; an unknown value is shown as sent.
