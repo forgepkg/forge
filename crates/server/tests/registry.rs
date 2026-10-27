@@ -1186,8 +1186,9 @@ async fn admins_delete_tags_manifests_and_images() {
         201
     );
 
-    // Refused: a repository of packages, an empty image name, a reference
-    // that is no digest; unknown tags and manifests are 404.
+    // Refused: a repository of packages, an empty image name, an empty
+    // reference (a script's unset variable: never the whole image, #545), a
+    // reference that is no digest; unknown tags and manifests are 404.
     let nuget = repo_name("nu");
     create_repo(&srv, json!({"name": nuget, "kind": "hosted"})).await;
     let (u, p) = srv.admin_basic();
@@ -1204,6 +1205,13 @@ async fn admins_delete_tags_manifests_and_images() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     assert_eq!(delete(vec![]).await.status(), 400);
+    assert_eq!(
+        delete(vec![image(), ("reference", String::new())])
+            .await
+            .status(),
+        400
+    );
+    assert_eq!(oci.head(&name, "manifests/1.0").await.status(), 200);
     assert_eq!(
         delete(vec![image(), ("reference", "sha256:nothex".into())])
             .await
