@@ -147,7 +147,12 @@ Forge checks what it stores:
   claims match the tarball;
 - the name is a valid npm name (scoped or not; at most 214 characters,
   lowercase for new names) and the version valid SemVer;
-- the tarball is a gzip'd tar that unpacks to at most `npm.max_unpacked_bytes`;
+- the tarball is a gzip'd tar that unpacks to at most `npm.max_unpacked_bytes`,
+  read as npm unpacks it: one that npm would read otherwise than its headers
+  say (a header npm rejects, data after the end of the archive, a PAX record
+  npm reads otherwise, a file some client may unpack to `package.json` other
+  than `<first>/package.json`) is refused, whether published or fetched
+  through a proxy. `npm pack` writes none of these;
 - the tarball fits the repository's upload limit (*Maximum upload size*,
   512 MiB by default), and the rest of the document `npm.max_document_bytes`.
 
