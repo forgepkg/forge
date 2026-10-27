@@ -25,6 +25,7 @@
 //! * [`AcquireTimes`], the tracing layer that turns the connection pool's
 //!   acquire events into `db.client.connection.wait_time`.
 
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -377,6 +378,31 @@ fn surface_of(path: &str) -> Surface {
     }
 }
 
+/// The secret path segment of a command-line client's web login, as a span
+/// records it.
+const SECRET_SEGMENT: &str = "{secret}";
+
+/// `path` as a request's span records it (`url.path`): the secret of a web
+/// login, and whatever follows it, replaced by [`SECRET_SEGMENT`]. The page
+/// that approves a login (`/cli-login/<secret>`) and the API behind it
+/// (`/auth/cli-login/<secret>`) carry the secret that approves it; the URL
+/// npm polls (its `doneUrl`, `/repository/<repo>/-/v1/login/done/<secret>`)
+/// carries the one that collects the user's new token, once.
+fn span_path(path: &str) -> Cow<'_, str> {
+    let secret_at = ["/cli-login/", "/auth/cli-login/"]
+        .into_iter()
+        .find(|prefix| path.starts_with(prefix))
+        .map(str::len)
+        .or_else(|| {
+            const DONE: &str = "/-/v1/login/done/";
+            path.find(DONE).map(|at| at + DONE.len())
+        });
+    match secret_at {
+        Some(at) => Cow::Owned(format!("{}{SECRET_SEGMENT}", &path[..at])),
+        None => Cow::Borrowed(path),
+    }
+}
+
 /// The request headers, as the propagator reads them.
 struct HeaderExtractor<'a>(&'a HeaderMap);
 
@@ -390,7 +416,8 @@ impl Extractor for HeaderExtractor<'_> {
     }
 }
 
-/// The server span of `req`, a child of the trace its `traceparent` names.
+/// The server span of `req`, a child of the trace its `traceparent` names,
+/// with its path as [`span_path`] records it.
 /// A health probe's is never exported, nor is what it does (the readiness
 /// checks): they would bury the traces worth reading.
 fn request_span(req: &Request, surface: Surface, route: Option<&str>) -> tracing::Span {
@@ -401,6 +428,7 @@ fn request_span(req: &Request, surface: Surface, route: Option<&str>) -> tracing
         return span;
     }
     let method = forge_telemetry::http::method(req.method().as_str());
+    let path = span_path(req.uri().path());
     let span = tracing::info_span!(
         target: forge_telemetry::TARGET,
         "HTTP request",
@@ -412,7 +440,7 @@ fn request_span(req: &Request, surface: Surface, route: Option<&str>) -> tracing
         otel.status_code = tracing::field::Empty,
         "http.request.method" = method,
         "http.route" = route,
-        "url.path" = req.uri().path(),
+        "url.path" = path.as_ref(),
         "user_agent.original" = req
             .headers()
             .get(header::USER_AGENT)
@@ -675,6 +703,37 @@ mod tests {
         assert_eq!(surface_of("/manage/repositories"), Surface::Ui);
         assert_eq!(surface_of("/v2x"), Surface::Ui);
         assert_eq!(surface_of("/"), Surface::Ui);
+    }
+
+    #[test]
+    fn a_span_path_never_holds_a_web_logins_secret() {
+        for (path, recorded) in [
+            ("/cli-login/s3cret", "/cli-login/{secret}"),
+            ("/auth/cli-login/s3cret", "/auth/cli-login/{secret}"),
+            (
+                "/repository/npm/-/v1/login/done/s3cret",
+                "/repository/npm/-/v1/login/done/{secret}",
+            ),
+            // Whatever follows the secret goes with it.
+            ("/cli-login/s3cret/x", "/cli-login/{secret}"),
+            (
+                "/repository/npm/-/v1/login/done/s3cret/",
+                "/repository/npm/-/v1/login/done/{secret}",
+            ),
+        ] {
+            assert_eq!(span_path(path), recorded, "{path}");
+        }
+        for path in [
+            "/repository/nuget/flat/a/1.0.0/a.1.0.0.nupkg",
+            "/repository/npm/-/v1/login",
+            "/auth/cli-login",
+            "/manage/repositories",
+        ] {
+            assert!(
+                matches!(span_path(path), Cow::Borrowed(p) if p == path),
+                "{path}"
+            );
+        }
     }
 
     #[test]

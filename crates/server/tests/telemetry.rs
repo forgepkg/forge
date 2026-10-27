@@ -4,8 +4,9 @@
 //! proxy's miss then hit, and no attribute carries a package id, a version,
 //! an image, a tag, a username or a path; a request joins the trace its
 //! `traceparent` names, with the proxy lookup, the upstream request (which
-//! carries the trace on) and the S3 operations beneath it; and a log record
-//! written while handling a request carries its trace. Requires Docker
+//! carries the trace on) and the S3 operations beneath it; no span holds the
+//! secrets of an npm web login; and a log record written while handling a
+//! request carries its trace. Requires Docker
 //! (Postgres + versitygw via the shared harness), or
 //! `FORGE_TEST_DATABASE_URL` / `FORGE_TEST_S3_ENDPOINT`.
 //!
@@ -17,7 +18,7 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -97,10 +98,25 @@ fn export() -> &'static Export {
     })
 }
 
+/// Server starts. Each checks its bucket, an `S3.HeadBucket` span, so a test
+/// counting those spans holds this exclusively.
+static STARTS: LazyLock<tokio::sync::RwLock<()>> = LazyLock::new(Default::default);
+
 /// Start a test server whose state the metrics read.
 async fn start() -> TestServer {
+    let admin = format!("admin{}@example.com", unique());
+    start_with(common::ServerOpts {
+        bootstrap_admin: Some((admin, "adminpw".into())),
+        ..Default::default()
+    })
+    .await
+}
+
+/// [`start`] a server with `opts`.
+async fn start_with(opts: common::ServerOpts) -> TestServer {
     export();
-    let srv = common::start().await;
+    let _starting = STARTS.read().await;
+    let srv = common::start_with(common::pool().await, opts).await;
     forge_server::telemetry::install_live_source(&srv.state);
     srv
 }
@@ -788,6 +804,8 @@ async fn a_request_joins_the_callers_trace_down_to_the_upstream_and_s3() {
             .filter(|s| s.name == "S3.HeadBucket")
             .count()
     };
+    // No server starts (and checks its bucket) while they are counted.
+    let no_starts = STARTS.write().await;
     let before = head_buckets();
     for probe in ["healthz", "readyz"] {
         let resp = srv
@@ -802,6 +820,7 @@ async fn a_request_joins_the_callers_trace_down_to_the_upstream_and_s3() {
     }
     // The readiness check's S3 call made no span either.
     assert_eq!(head_buckets(), before);
+    drop(no_starts);
 
     let spans = eventually("the requests' spans", || {
         let spans = spans_of(trace);
@@ -897,6 +916,91 @@ async fn a_request_joins_the_callers_trace_down_to_the_upstream_and_s3() {
         })
         .count();
     assert_eq!(probes, 0);
+}
+
+/// An npm web login's secrets travel in paths: the login's page and the API
+/// behind it carry the one that approves it, the URL the client polls the
+/// one that collects the user's token. No span holds either.
+#[tokio::test]
+async fn no_span_holds_the_secrets_of_a_web_login() {
+    // A web login is approved in the web UI: without it, none starts.
+    let assets = tempfile::tempdir().unwrap();
+    std::fs::write(assets.path().join("index.html"), "<html></html>").unwrap();
+    let srv = start_with(common::ServerOpts {
+        bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
+        web_assets_dir: Some(assets.path().display().to_string()),
+        ..Default::default()
+    })
+    .await;
+    let repo = format!("tnpm{}", unique());
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+
+    let (traceparent, trace, _) = traceparent();
+    let started: Value = srv
+        .client()
+        .post(format!("{}/repository/{repo}/-/v1/login", srv.base_url))
+        .header("traceparent", &traceparent)
+        .json(&json!({"hostname": "laptop"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let secret_of = |url: &Value| url.as_str().unwrap().rsplit('/').next().unwrap().to_owned();
+    let login = secret_of(&started["loginUrl"]);
+    let done = secret_of(&started["doneUrl"]);
+    for path in [
+        format!("/repository/{repo}/-/v1/login/done/{done}"),
+        format!("/auth/cli-login/{login}"),
+        format!("/cli-login/{login}"),
+    ] {
+        let resp = srv
+            .client()
+            .get(format!("{}{path}", srv.base_url))
+            .header("traceparent", &traceparent)
+            .send()
+            .await
+            .unwrap();
+        resp.bytes().await.unwrap();
+    }
+
+    let spans = eventually("the login's spans", || {
+        let spans = spans_of(trace);
+        let servers = spans
+            .iter()
+            .filter(|s| s.span_kind == SpanKind::Server)
+            .count();
+        (servers >= 4).then_some(spans)
+    })
+    .await;
+    for span in &spans {
+        let holds = |text: &str| text.contains(&login) || text.contains(&done);
+        assert!(!holds(&span.name), "{span:#?}");
+        assert!(
+            !span
+                .attributes
+                .iter()
+                .any(|kv| holds(&kv.value.to_string())),
+            "{span:#?}"
+        );
+    }
+    let paths: BTreeSet<String> = spans
+        .iter()
+        .filter_map(|s| attribute(s, "url.path"))
+        .collect();
+    let expected: BTreeSet<String> = [
+        format!("/repository/{repo}/-/v1/login"),
+        format!("/repository/{repo}/-/v1/login/done/{{secret}}"),
+        "/auth/cli-login/{secret}".to_owned(),
+        "/cli-login/{secret}".to_owned(),
+    ]
+    .into();
+    assert_eq!(paths, expected);
 }
 
 /// A log record written while a request is handled carries its trace and
