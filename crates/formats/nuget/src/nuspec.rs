@@ -650,6 +650,10 @@ const CENTRAL_HEADER_LEN: usize = 46;
 /// Extra-field ids: ZIP64 extended information, and the Info-ZIP Unicode Path.
 const ZIP64_EXTRA_ID: u16 = 0x0001;
 const UNICODE_PATH_EXTRA_ID: u16 = 0x7075;
+/// The ZIP64 field's length from which .NET reads each of its values at its
+/// fixed place (the two sizes and the local header offset, 8 bytes each, and
+/// the disk, 4), skipping those the header does not mark.
+const ZIP64_FIXED_PLACES_LEN: usize = 28;
 
 /// Check every entry of the central directory [`check_archive_directory`]
 /// vetted, as .NET's zip reader (and so NuGet) lists them, and return where
@@ -752,6 +756,22 @@ fn find_manifest(
                 // field's first value.
                 if declared == u32::MAX && data.len() >= 8 {
                     size = le_u64(data, 0);
+                }
+                // The zip reader takes the values the header marks one after
+                // the other from the field's start, .NET (from 28 bytes on)
+                // each at its fixed place: a marked value after one that is
+                // not then sits at two places, so the two would find the
+                // entry's local header (or its compressed size) apart, and
+                // could read different manifests. Neither NuGet nor .NET
+                // writes such a field.
+                let marked =
+                    [declared, le_u32(header, 20), le_u32(header, 42)].map(|v| v == u32::MAX);
+                if data.len() >= ZIP64_FIXED_PLACES_LEN
+                    && marked.windows(2).any(|pair| !pair[0] && pair[1])
+                {
+                    return Err(NupkgError::UnsupportedEntry(format!(
+                        "entry {name:?} carries a ZIP64 extra field whose values NuGet reads from other places"
+                    )));
                 }
             }
             fields = &rest[data.len()..];
@@ -1775,19 +1795,92 @@ mod tests {
         // field, twice: .NET (and so NuGet) reads the first field and the
         // manifest of `Good.Package`, the zip reader the last and that of
         // `Evil.Package`.
+        let (good, evil) = (nuspec_of("Good.Package"), nuspec_of("Evil.Package"));
+        let zip = zip64_manifest(&[&good, &evil], crc32(&evil), false, |locals| {
+            locals
+                .iter()
+                .flat_map(|local| zip64_field(&local.to_le_bytes()))
+                .collect()
+        });
+
+        // The zip reader really does read the last field's manifest.
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
+        let mut read = Vec::new();
+        archive.by_index(0).unwrap().read_to_end(&mut read).unwrap();
+        assert_eq!(read, evil);
+        let err = manifest_id(zip).unwrap_err();
+        assert!(err.to_string().contains("more than one ZIP64"), "{err}");
+    }
+
+    #[test]
+    fn a_zip64_field_read_at_other_places_by_net_is_refused() {
+        // One ZIP64 field of 28 bytes, the header marking only the local
+        // header offset: the zip reader takes the offset from the field's
+        // first 8 bytes and the manifest of `Good.Package`, .NET 8 and later
+        // (and so NuGet in `dotnet restore`) from its third 8 and that of
+        // `Evil.Package`.
+        let (good, evil) = (nuspec_of("Good.Package"), nuspec_of("Evil.Package"));
+        let zip = zip64_manifest(&[&good, &evil], crc32(&good), false, |locals| {
+            let mut values = Vec::new();
+            for value in [locals[0], 0, locals[1]] {
+                values.extend_from_slice(&value.to_le_bytes());
+            }
+            values.extend_from_slice(&0u32.to_le_bytes());
+            zip64_field(&values)
+        });
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
+        let mut read = Vec::new();
+        archive.by_index(0).unwrap().read_to_end(&mut read).unwrap();
+        assert_eq!(read, good);
+        let err = manifest_id(zip).unwrap_err();
+        assert!(err.to_string().contains("other places"), "{err}");
+
+        // Every value marked: both read each one at its fixed place.
+        let len = good.len() as u64;
+        let zip = zip64_manifest(&[&good], crc32(&good), true, |locals| {
+            let mut values = Vec::new();
+            for value in [len, len, locals[0]] {
+                values.extend_from_slice(&value.to_le_bytes());
+            }
+            values.extend_from_slice(&0u32.to_le_bytes());
+            zip64_field(&values)
+        });
+        assert_eq!(manifest_id(zip).unwrap(), "Good.Package");
+    }
+
+    /// A ZIP64 extended information field holding `values`.
+    fn zip64_field(values: &[u8]) -> Vec<u8> {
+        let mut field = 0x0001u16.to_le_bytes().to_vec();
+        field.extend_from_slice(&u16::try_from(values.len()).unwrap().to_le_bytes());
+        field.extend_from_slice(values);
+        field
+    }
+
+    /// A package of stored local headers, one for each of `manifests` (all of
+    /// one length), and one central header of `Pkg.nuspec` with `crc`, whose
+    /// local header offset (and with `sizes_marked` its sizes) is
+    /// `0xFFFFFFFF`, and whose extra fields `extra` writes from the local
+    /// headers' offsets.
+    fn zip64_manifest(
+        manifests: &[&[u8]],
+        crc: u32,
+        sizes_marked: bool,
+        extra: impl FnOnce(&[u64]) -> Vec<u8>,
+    ) -> Vec<u8> {
         fn put16(zip: &mut Vec<u8>, v: u16) {
             zip.extend_from_slice(&v.to_le_bytes());
         }
         fn put32(zip: &mut Vec<u8>, v: u32) {
             zip.extend_from_slice(&v.to_le_bytes());
         }
-        let (good, evil) = (nuspec_of("Good.Package"), nuspec_of("Evil.Package"));
         let name = b"Pkg.nuspec";
-        let len = u32::try_from(good.len()).unwrap();
-        assert_eq!(evil.len(), good.len());
+        let len = u32::try_from(manifests[0].len()).unwrap();
+        assert!(manifests
+            .iter()
+            .all(|data| data.len() == manifests[0].len()));
         let mut zip = Vec::new();
         let mut locals = Vec::new();
-        for data in [&good, &evil] {
+        for data in manifests {
             locals.push(zip.len() as u64);
             put32(&mut zip, 0x0403_4b50);
             // Version, flags, stored, time, date.
@@ -1808,22 +1901,20 @@ mod tests {
         for v in [45, 45, 0, 0, 0, 0x21] {
             put16(&mut zip, v);
         }
-        put32(&mut zip, crc32(&evil));
-        put32(&mut zip, len);
-        put32(&mut zip, len);
+        put32(&mut zip, crc);
+        let size = if sizes_marked { u32::MAX } else { len };
+        put32(&mut zip, size);
+        put32(&mut zip, size);
+        let extra = extra(&locals);
         // Name, extra fields, comment, disk, internal attributes.
-        for v in [name.len() as u16, 24, 0, 0, 0] {
+        for v in [name.len() as u16, extra.len() as u16, 0, 0, 0] {
             put16(&mut zip, v);
         }
         put32(&mut zip, 0);
         // The local header's offset is in the ZIP64 field.
         put32(&mut zip, u32::MAX);
         zip.extend_from_slice(name);
-        for local in locals {
-            put16(&mut zip, 0x0001);
-            put16(&mut zip, 8);
-            zip.extend_from_slice(&local.to_le_bytes());
-        }
+        zip.extend_from_slice(&extra);
         let directory_size = zip.len() - directory;
         put32(&mut zip, 0x0605_4b50);
         for v in [0, 0, 1, 1] {
@@ -1832,14 +1923,7 @@ mod tests {
         put32(&mut zip, directory_size as u32);
         put32(&mut zip, directory as u32);
         put16(&mut zip, 0);
-
-        // The zip reader really does read the last field's manifest.
-        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
-        let mut read = Vec::new();
-        archive.by_index(0).unwrap().read_to_end(&mut read).unwrap();
-        assert_eq!(read, evil);
-        let err = manifest_id(zip).unwrap_err();
-        assert!(err.to_string().contains("more than one ZIP64"), "{err}");
+        zip
     }
 
     /// CRC-32 (IEEE), as the Info-ZIP Unicode Path field stores it.
