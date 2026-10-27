@@ -27,8 +27,13 @@
 //!   account the headers name included.
 //! * The headers present but no realm's secret among them, or the right
 //!   secret with a missing, empty, repeated or invalid name, or a name that
-//!   is not an account of the realm: the credentials are present but invalid
-//!   (401), never anonymous.
+//!   is not a usable account of the realm (a deactivated one included): the
+//!   realm names nobody, and the request goes on unauthenticated, never
+//!   anonymous ([`forge_core::auth::resolve_principal_with_fallback`], #573).
+//!   A credential of its own that its handler reads (a Bearer API token on a
+//!   feed, a registry token on `/v2`) still counts, and its sender can sign
+//!   in: deactivating the account a load balancer names for a network cuts
+//!   the network's access, not everyone's on it. The refusal is logged.
 //!
 //! ## The accounts
 //! A realm names only its own accounts, with the realm as `realm_id`

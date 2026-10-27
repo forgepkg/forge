@@ -589,13 +589,18 @@ pub async fn resolve_principal_with_origin(
 /// of the anonymous policy: only when every source found no credentials (or
 /// a dead session cookie). A credential another source refused is never
 /// replaced by the fallback's principal, any more than by the anonymous one.
-/// What the fallback itself reports counts like any source's: `Invalid` and
-/// `Reject` are `Unauthorized`, `Unavailable` is `Unavailable`, and no
-/// credentials leaves the anonymous policy to decide.
+/// `Unavailable` from the fallback is `Unavailable`, and no credentials
+/// leaves the anonymous policy to decide. A fallback that refuses what it
+/// was shown (`Invalid`, `Reject`) names nobody: the request goes on
+/// [`Principal::Unauthenticated`], whatever the anonymous policy, not with a
+/// 401 here. It may still carry a credential only its handler reads (a
+/// Bearer API token on a feed, a registry token), or be a sign-in.
 ///
 /// The trusted-header realms are such a fallback: the headers the proxy in
 /// front adds to every request it admits name the caller only when the
-/// request presents no credential of its own.
+/// request presents no credential of its own, and headers the realm refuses
+/// (a deactivated account, a wrong secret) must not keep the request's own
+/// credential from being read, nor its sender from signing in.
 pub async fn resolve_principal_with_fallback(
     sources: &[Box<dyn PrincipalSource>],
     fallback: Option<&dyn PrincipalSource>,
@@ -637,7 +642,13 @@ pub async fn resolve_principal_with_fallback(
                     stale_ambient: saw_stale,
                 })
             }
-            SourceOutcome::Invalid | SourceOutcome::Reject => return Err(AuthError::Unauthorized),
+            SourceOutcome::Invalid | SourceOutcome::Reject => {
+                return Ok(ResolvedPrincipal {
+                    principal: Principal::Unauthenticated,
+                    ambient: false,
+                    stale_ambient: saw_stale,
+                })
+            }
             SourceOutcome::Unavailable => return Err(AuthError::Unavailable),
             SourceOutcome::Stale => saw_stale = true,
             SourceOutcome::NoCredentials => {}
@@ -963,11 +974,13 @@ mod tests {
             );
         }
 
-        // Its own verdicts count like any source's; without credentials of
-        // its kind the anonymous policy decides.
+        // What it refuses names nobody: the request goes on unauthenticated
+        // (never anonymous, though the policy allows it), for a credential
+        // only its handler reads, or a sign-in. It cannot be read, or without
+        // credentials of its kind the anonymous policy decides.
         for (outcome, want) in [
-            (SourceOutcome::Invalid, Err(AuthError::Unauthorized)),
-            (SourceOutcome::Reject, Err(AuthError::Unauthorized)),
+            (SourceOutcome::Invalid, Ok(Principal::Unauthenticated)),
+            (SourceOutcome::Reject, Ok(Principal::Unauthenticated)),
             (SourceOutcome::Unavailable, Err(AuthError::Unavailable)),
             (
                 SourceOutcome::NoCredentials,
@@ -982,6 +995,15 @@ mod tests {
             .map(|r| r.principal);
             assert_eq!(res, want, "{outcome:?}");
         }
+        // A dead session cookie is still cleared.
+        let res = resolve(
+            vec![Box::new(AmbientStub(SourceOutcome::Stale))],
+            &StubSource(SourceOutcome::Invalid),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.principal, Principal::Unauthenticated);
+        assert!(res.stale_ambient);
     }
 
     #[tokio::test]
