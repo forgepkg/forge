@@ -471,6 +471,14 @@ impl AppUser {
     pub fn is_service_account(&self) -> bool {
         self.kind == crate::user_dao::SERVICE_ACCOUNT_KIND
     }
+
+    /// Whether the account may hold the built-in `admin` role: neither a
+    /// service account nor an account of a trusted-header realm, whose
+    /// headers never make anyone an administrator (DB triggers
+    /// `user_role_service_admin_check`, `user_role_trusted_header_admin_check`).
+    pub fn may_hold_admin(&self) -> bool {
+        !self.is_service_account() && self.auth_source != "trusted-header"
+    }
 }
 
 /// A row of `token`.

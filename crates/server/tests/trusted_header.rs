@@ -384,9 +384,32 @@ async fn the_headers_never_make_an_administrator_and_own_credentials_win() {
     let realm = create_realm(&srv, false).await;
     let n = common::unique();
     let root = format!("root{n}@example.com");
-    let root_id = create_account(&srv, &realm, &root, "admin").await;
+    let (u, p) = srv.admin_basic();
 
-    // An account holding the admin role is no administrator by the headers.
+    // An account of the realm never holds the admin role (#547), neither
+    // created as an administrator nor made one later: holding it, it would
+    // count as an administrator the headers never make it.
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/users", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"username": root, "realm": realm.name, "role": "admin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let root_id = create_account(&srv, &realm, &root, "writer").await;
+    let resp = srv
+        .client()
+        .put(format!("{}/admin/users/{root_id}/roles", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"role": "admin"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The headers make no administrator either.
     let (status, body) = me(realm.named(me_request(&srv), &root)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["is_admin"], json!(false));
@@ -401,7 +424,6 @@ async fn the_headers_never_make_an_administrator_and_own_credentials_win() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // A token of the request's own wins over the headers…
-    let (u, p) = srv.admin_basic();
     let other = format!("frank{n}@example.com");
     let other_id = create_account(&srv, &realm, &other, "reader").await;
     let token: Value = srv

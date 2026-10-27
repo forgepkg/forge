@@ -27,13 +27,17 @@ export const ACCESS_LEVEL_OPTIONS: ReadonlyArray<{
   },
 ]
 
-/** The levels a service account may have: it never holds `admin`. */
+/**
+ * The levels a service account may have: it never holds `admin`. Nor does an
+ * account of a trusted-header realm, whose headers never make anyone an
+ * administrator (#547).
+ */
 export const SERVICE_ACCOUNT_LEVELS: readonly AccessLevel[] = ['reader', 'writer']
 
 /**
  * A radio group of the built-in access levels (`ACCESS_LEVEL_OPTIONS`): the
  * user page picks one with it. `levels` limits the choice (a service
- * account's: `SERVICE_ACCOUNT_LEVELS`).
+ * account's or a trusted-header account's: `SERVICE_ACCOUNT_LEVELS`).
  */
 export function AccessLevelFields({
   value,

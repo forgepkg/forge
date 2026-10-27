@@ -21,7 +21,8 @@
 //! trusted-header realm: the headers of the proxy in front then name it (a
 //! realm without `auto_provision` names only the accounts created here).
 //! `role` makes the account a reader (the default), a writer or an
-//! administrator.
+//! administrator; an account of a trusted-header realm is never an
+//! administrator (**400**, #547): its headers never make it one.
 //!
 //! An invited account signs in by no path until its user has chosen the
 //! password. `POST /admin/users/{id}/invitation` makes a new invitation
@@ -512,6 +513,9 @@ pub async fn create(
                     NewAccount::Forwarded { realm_id: r.id }
                 }
                 Ok(Some(r)) if r.kind == crate::auth::KIND_TRUSTED_HEADER => {
+                    if body.role == AccessRole::Admin {
+                        return trusted_header_admin_refused();
+                    }
                     NewAccount::TrustedHeader { realm_id: r.id }
                 }
                 Ok(_) => {
@@ -611,6 +615,18 @@ pub(crate) fn service_account_admin_refused() -> Response {
         StatusCode::BAD_REQUEST,
         "a service account cannot hold the admin role; for admin automation, issue an \
          administrator a token with the admin scope",
+    )
+        .into_response()
+}
+
+/// The **400** to the `admin` role for an account of a trusted-header realm:
+/// its headers never make it an administrator, and holding the role it would
+/// still count as one, so the last real administrator could go (#547).
+pub(crate) fn trusted_header_admin_refused() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "an account of a trusted-header realm cannot hold the admin role: the headers never \
+         make anyone an administrator",
     )
         .into_response()
 }

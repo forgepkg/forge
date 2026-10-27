@@ -151,7 +151,9 @@ public URL, the in-cluster S3 gateway); a value set in .Values.config wins. */}}
 {{- include "forge.requireRootKey" . }}
 {{- $server := dict "bind" (printf "0.0.0.0:%d" (int .Values.containerPort)) "public_base_url" (include "forge.publicBaseUrl" .) }}
 {{- $derived := dict "server" $server }}
-{{- $telemetry := .Values.telemetry }}
+{{- /* `| default dict`: an upgrade with --reuse-values of a release older than
+the block (2.0.0) has no .Values.telemetry (#548). */}}
+{{- $telemetry := .Values.telemetry | default dict }}
 {{- if or $telemetry.metrics $telemetry.traces $telemetry.logs }}
 {{- $_ := set $derived "telemetry" (dict "metrics" $telemetry.metrics "traces" $telemetry.traces "logs" $telemetry.logs) }}
 {{- end }}
@@ -362,7 +364,8 @@ wins without a duplicate entry. */}}
 {{- $env = append $env (dict "name" "FORGE_S3__ACCESS_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" $secret "key" $s3.auth.accessKeyKey))) }}
 {{- $env = append $env (dict "name" "FORGE_S3__SECRET_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" $secret "key" $s3.auth.secretKeyKey))) }}
 {{- end }}
-{{- $telemetry := .Values.telemetry }}
+{{- /* `| default dict`: as in forge.config (#548). */}}
+{{- $telemetry := .Values.telemetry | default dict }}
 {{- if or $telemetry.metrics $telemetry.traces $telemetry.logs }}
 {{- /* The pod's identity, for the resource attributes, and the node's address,
 for an endpoint on the node ($(HOST_IP)): defined before what expands them. */}}

@@ -28,6 +28,7 @@ describe('admin user roles', () => {
         user({ id: 2, username: 'alice' }),
         user({ id: 3, username: 'legacy', is_admin: true }),
         user({ id: 4, username: 'publisher' }),
+        user({ id: 5, username: 'office@example.com', auth_source: 'trusted-header' }),
       ],
       repos: [repo({ id: 10, name: 'internal' }), repo({ id: 11, name: 'public' })],
       selectors: [
@@ -181,6 +182,24 @@ describe('admin user roles', () => {
     await waitFor(() =>
       expect(screen.queryByRole('link', { name: 'ci-pushers' })).toBeNull(),
     )
+  })
+
+  it('never offers admin to an account of a trusted-header realm', async () => {
+    await renderApp('/manage/users/5')
+
+    // Its headers never make it an administrator, so it never holds the
+    // role (#547): neither as its access level nor assigned as a role.
+    const form = await screen.findByRole('form', { name: 'Change access' })
+    await waitFor(() =>
+      expect(within(form).queryByRole('radio', { name: /^Admin/ })).toBeNull(),
+    )
+    expect(within(form).getByRole('radio', { name: /^Writer/ })).toBeInTheDocument()
+    expect(screen.getByText(/never make anyone an admin/)).toBeInTheDocument()
+    const picker = within(screen.getByRole('form', { name: 'Assign role' })).getByLabelText('Role')
+    await waitFor(() =>
+      expect(within(picker).getByRole('option', { name: 'auditors' })).toBeInTheDocument(),
+    )
+    expect(within(picker).queryByRole('option', { name: 'admin' })).toBeNull()
   })
 
   it('shows the refusal to take admin from the last administrator', async () => {

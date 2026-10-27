@@ -945,7 +945,9 @@ What Forge believes, and when:
   administrator issues on the account's page (**Admin → Users → <user> →
   Tokens**, or **Admin → Service accounts → <account>**). State-changing
   requests a browser marks as cross-site are refused (403) before
-  authentication.
+  authentication. An account of the realm never holds the `admin` role
+  either (creating or making it an admin is a 400): it would count as an
+  administrator nobody can act as, and the last real one could go.
 - When the realm last named each account is kept, written at most once a
   minute: **Admin → Service accounts** shows it as the account's last use.
 - Forge answers every feed and registry request the headers authenticated
