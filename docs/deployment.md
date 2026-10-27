@@ -925,7 +925,10 @@ What Forge believes, and when:
 - They name the caller only when the request has **no credential of its
   own**: an API token, a password or a signed-in session is that
   credential's, whatever the headers say, and one that is refused is a 401,
-  never the account the headers name.
+  never the account the headers name. That includes an API token sent as
+  `Authorization: Bearer` to a feed, as npm sends its `_authToken`: an SSO
+  proxy must not forward a Bearer token of its own to `/repository`
+  (oauth2-proxy's `--pass-authorization-header` stays off).
 - The headers present but no realm's secret among them, the right secret
   with no, an empty, a repeated or an invalid name, a name of no account of
   the realm (without `auto_provision`), of a deactivated account, or of an
