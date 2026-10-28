@@ -5,6 +5,9 @@
 # Running Forge
 
 - [Production deployment](deployment.md)
+- [Helm chart](../deploy/helm/forge/README.md)
+- [Kubernetes manifests](../deploy/kubernetes/README.md)
+- [Monitoring](../deploy/monitoring/README.md)
 - [Retention size budgets](retention.md)
 - [Importing from Nexus](nexus-import.md)
 
