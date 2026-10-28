@@ -12,6 +12,13 @@ its [quickstart](../README.md#quickstart);
 - **[Production deployment](deployment.md)**: required settings, TLS and the
   reverse proxy, secret encryption, health probes, backup and restore, and
   upgrades.
+- **[Helm chart](../deploy/helm/forge/README.md)**: the chart published with
+  every release: which image it runs, its values, short-lived S3
+  credentials, routing, optional dependencies and telemetry.
+- **[Kubernetes manifests](../deploy/kubernetes/README.md)**: the kustomize
+  base, components and overlays, for production and for an evaluation.
+- **[Monitoring](../deploy/monitoring/README.md)**: an example OpenTelemetry
+  Collector configuration, Grafana dashboard and Prometheus alerting rules.
 - **[Retention size budgets](retention.md)**: keep a repository under a
   logical size: the budget, how size is counted, and what goes first.
 - **[Importing from Nexus](nexus-import.md)**: copy a Nexus hosted repository

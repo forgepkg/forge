@@ -13,6 +13,7 @@ on:
       - README.md
       - CHANGELOG.md
       - docs/**
+      - deploy/**/README.md
       - xtask/src/docs.rs
       - .github/workflows/pages.yml
   pull_request:

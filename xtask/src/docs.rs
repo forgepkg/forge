@@ -1,10 +1,11 @@
 //! The documentation site, and `cargo xtask docs`.
 //!
 //! The site is an mdBook ([`BOOK_TOML`]) of the pages [`SUMMARY`] lists, in
-//! its order: the README (the start page), the guides under `docs/` and the
-//! changelog. The pages link each other and the source tree relatively, as
-//! GitHub shows the repository, so the site is built from a copy staged in
-//! [`STAGE`] whose links work there:
+//! its order: the README (the start page), the guides under `docs/`, the
+//! READMEs of the Helm chart, the Kubernetes manifests and the monitoring
+//! examples under `deploy/`, and the changelog. The pages link each other and
+//! the source tree relatively, as GitHub shows the repository, so the site is
+//! built from a copy staged in [`STAGE`] whose links work there:
 //!
 //! * a link to another page goes to that page of the site;
 //! * a link into the source tree (`../crates/…`, `../DEVELOPMENT.md`) goes to
@@ -236,11 +237,17 @@ fn stage(tree: &impl Tree, repo: &str) -> Result<Vec<(String, String)>, String> 
     }
 }
 
-/// A page's name on the site: the README is the start page, every other
-/// page keeps its file name, in lower case (`CHANGELOG.md` → `changelog.md`).
+/// A page's name on the site: the README is the start page, the README of a
+/// directory is named after the directory's path (`deploy/kubernetes/README.md`
+/// → `deploy-kubernetes.md`), and every other page keeps its file name, in
+/// lower case (`CHANGELOG.md` → `changelog.md`). The site is flat, since a
+/// page's links name the other pages from the site's root.
 fn site_name(path: &str) -> String {
     if path == "README.md" {
         return "index.md".into();
+    }
+    if let Some(dir) = path.strip_suffix("/README.md") {
+        return format!("{}.md", dir.replace('/', "-").to_lowercase());
     }
     path.rsplit('/').next().unwrap_or(path).to_lowercase()
 }
@@ -651,6 +658,45 @@ mod tests {
         assert_eq!(
             page(&files, "SUMMARY.md"),
             "# Summary\n\n[Home](index.md)\n\n- [Guide](guide.md)\n\n---\n\n[Changes](changelog.md)\n"
+        );
+    }
+
+    #[test]
+    fn a_directory_readme_is_named_after_its_directory() {
+        let tree = repo(&[
+            (
+                "docs/SUMMARY.md",
+                "- [Guide](guide.md)\n- [Chart](../deploy/helm/x/README.md)\n",
+            ),
+            (
+                "docs/guide.md",
+                "# Guide\n\nInstall [the chart](../deploy/helm/x/README.md#values).\n",
+            ),
+            (
+                "deploy/helm/x/README.md",
+                "# Chart\n\n## Values\n\nSee [values](values.yaml), [the guide](../../../docs/guide.md) \
+                 and [the templates](templates).\n",
+            ),
+            ("deploy/helm/x/values.yaml", ""),
+            ("deploy/helm/x/templates/a.yaml", ""),
+        ]);
+        let files = stage(&tree, REPO).expect("stages");
+        let names: Vec<_> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["guide.md", "deploy-helm-x.md", "SUMMARY.md"]);
+        assert_eq!(
+            page(&files, "guide.md"),
+            "# Guide\n\nInstall [the chart](deploy-helm-x.md#values).\n"
+        );
+        assert_eq!(
+            page(&files, "deploy-helm-x.md"),
+            "# Chart\n\n## Values\n\n\
+             See [values](https://github.com/o/r/blob/main/deploy/helm/x/values.yaml), \
+             [the guide](guide.md) \
+             and [the templates](https://github.com/o/r/tree/main/deploy/helm/x/templates).\n"
+        );
+        assert_eq!(
+            page(&files, "SUMMARY.md"),
+            "- [Guide](guide.md)\n- [Chart](deploy-helm-x.md)\n"
         );
     }
 

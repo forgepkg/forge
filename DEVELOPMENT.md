@@ -1087,7 +1087,9 @@ next milestone.
 The guides are also a site, https://forgepkg.github.io/forge/, built with
 [mdBook](https://rust-lang.github.io/mdBook/) from the pages
 [docs/SUMMARY.md](docs/SUMMARY.md) lists: the README (the start page), the
-guides in `docs/` and the changelog. `docs/book.toml` configures it.
+guides in `docs/`, the READMEs of the Helm chart, the Kubernetes manifests
+and the monitoring examples under `deploy/`, and the changelog.
+`docs/book.toml` configures it.
 
 ```bash
 cargo install mdbook --version 0.5.4 --locked
@@ -1099,14 +1101,17 @@ site into `target/docs/book`; open `target/docs/book/index.html`. The pages
 keep linking each other and the source tree relatively, as GitHub shows
 them. The staging rewrites a link to another page into that page of the
 site, and a link into the source tree (`../crates/…`) into the file on
-GitHub, on `main`. It fails on a link to a file or heading that does not
-exist, and on a Markdown file directly in `docs/` that SUMMARY.md does not
-list: a new guide goes into SUMMARY.md, under its part, and into
-[docs/README.md](docs/README.md), the index GitHub shows for the folder. That
-index is no page of the site, but its links are checked as a page's, and the
-staging fails when it does not link a page SUMMARY.md lists. `cargo xtask docs
---check` runs the staging without mdBook; CI's `fmt` job runs it for a change
-to the pages or to the Rust code, whose files the pages link.
+GitHub, on `main`. A README other than the repository's is named after its
+directory on the site: `deploy/kubernetes/README.md` is
+`deploy-kubernetes.html`. The staging fails on a link to a file or heading
+that does not exist, and on a Markdown file directly in `docs/` that
+SUMMARY.md does not list: a new guide goes into SUMMARY.md, under its part,
+and into [docs/README.md](docs/README.md), the index GitHub shows for the
+folder. That index is no page of the site, but its links are checked as a
+page's, and the staging fails when it does not link a page SUMMARY.md
+lists. `cargo xtask docs --check` runs the staging without mdBook; CI's
+`fmt` job runs it for a change to the pages, to `deploy/` or to the Rust
+code, whose files the pages link.
 
 The Pages workflow (`.github/workflows/pages.yml`) deploys the site when a
 push to `main` changes a page, and builds it for a pull request that changes

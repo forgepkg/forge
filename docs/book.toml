@@ -1,8 +1,9 @@
 # The documentation site, https://forgepkg.github.io/forge/.
 #
 # `cargo xtask docs` stages the pages SUMMARY.md lists (the README, the guides
-# in this directory and the changelog) into target/docs/src, with their links
-# rewritten for the site, and builds them with mdBook into target/docs/book.
+# in this directory, the READMEs under deploy/ and the changelog) into
+# target/docs/src, with their links rewritten for the site, and builds them
+# with mdBook into target/docs/book.
 # The Pages workflow (.github/workflows/pages.yml) publishes the build of main.
 
 [book]
