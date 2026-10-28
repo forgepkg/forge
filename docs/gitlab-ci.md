@@ -426,6 +426,79 @@ build:
 - **The jobs run on that runner**: give them its tags, or let it pick up
   untagged jobs.
 
+### The runner writes the NuGet configuration
+
+The runner above exchanges only for a project whose own `nuget.config` names
+Forge. It can write the configuration itself instead, so that a project needs
+none: a job with a token gets Forge's feed and the key, and every other job a
+`NuGet.Config` of your own, which an instance CI/CD variable, `CI_NUGET_CONFIG`,
+holds base64-encoded.
+
+```toml
+[[runners]]
+  # name, url, token, executor, …
+  environment = ["FORGE_URL=https://forge.example.com"]
+  pre_build_script = '''
+nuget_config="$HOME/.nuget/NuGet/NuGet.Config"
+if [ -n "${FORGE_ID_TOKEN:-}" ]; then
+  FORGE_KEY="$(curl --fail --silent --show-error -X POST "$FORGE_URL/api/v2/token" \
+    -H "Authorization: Bearer $FORGE_ID_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"username":"oidc","tokenType":"ApiKey"}' \
+    | sed -n 's/.*"apiKey":"\([^"]*\)".*/\1/p')"
+  test -n "$FORGE_KEY"
+  export FORGE_KEY
+  export NuGetPackageSourceCredentials_forge="Username=oidc;Password=$FORGE_KEY"
+  mkdir -p "$(dirname "$nuget_config")"
+  cat > "$nuget_config" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="forge" value="$FORGE_URL/repository/nuget/index.json" />
+  </packageSources>
+</configuration>
+EOF
+elif [ -n "${CI_NUGET_CONFIG:-}" ]; then
+  mkdir -p "$(dirname "$nuget_config")"
+  printf '%s' "$CI_NUGET_CONFIG" | base64 -d > "$nuget_config"
+fi
+'''
+```
+
+- **The user's configuration.** The runner writes
+  `~/.nuget/NuGet/NuGet.Config`, the file NuGet reads beneath every
+  project's own, in place of the one the image brings (the .NET SDK image's
+  names nuget.org). A project without a `nuget.config` restores from what the
+  runner wrote. A project's own `nuget.config` still comes first: one with
+  `<clear />` drops the runner's sources, and then names Forge under the key
+  `forge` itself, as in [step 5](#5-the-project).
+- **A job with a token** gets Forge's group feed under the key `forge`. Its
+  key goes in `NuGetPackageSourceCredentials_forge`, as above, and stays out
+  of the file. The token decides alone: a project that asks for it uses
+  Forge, whether or not it has a `nuget.config`.
+- **A failed exchange fails the job.** The job does not fall back to
+  `CI_NUGET_CONFIG`: a job that asks for a token is meant to reach Forge with
+  it.
+- **Every other job** gets `CI_NUGET_CONFIG`, decoded as it is: the jobs of
+  a project that asks for no token. Add the variable under **Admin →
+  Settings → CI/CD → Variables**, or in a group's CI/CD variables for that
+  group's projects alone; `base64 -w0 NuGet.Config` prints its value. A value
+  that is no base64 fails the job. While the variable is unset, a job without
+  a token keeps the image's configuration.
+- **`CI_NUGET_CONFIG` is a secret** when it holds credentials. An instance
+  variable reaches every job of every project on every runner, not only this
+  one's, and any of those jobs can print it, as with
+  [the runner's environment](#without-workload-identity). Give a token in it
+  the **read** level alone and an expiry.
+- **A container per job.** With the Docker or Kubernetes executor every job
+  runs in a fresh container, and the file and the key go with it. A shell
+  executor shares `$HOME` between all its jobs, concurrent ones too: they
+  would overwrite each other's configuration, and the last one's would stay.
+  Use this runner only with an executor that gives each job a container.
+- **The image** of a job needs `curl`, `sed`, `base64` and a POSIX shell; the
+  .NET SDK image has them.
+
 ### Without workload identity
 
 A runner can also hand every job a [service account](ci-service-accounts.md)'s
