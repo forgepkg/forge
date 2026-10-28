@@ -713,8 +713,10 @@ async fn package_delay_hides_then_reveals() {
     corpus.insert("sample.lib".to_string(), vers);
     let mock = start_mock(corpus).await;
 
-    // 1-second delay window.
-    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 1, true).await;
+    // A one-hour delay window, which no runner is slow enough to pass between
+    // two calls: a 1-second one passed between the listing and the download
+    // on CI's loaded `test` job (#604).
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 3600, true).await;
     let px = proxy_repo(&pool, cas, cache);
 
     // Inside the window: hidden from enumeration, 404 on direct download.
@@ -748,8 +750,16 @@ async fn package_delay_hides_then_reveals() {
         "delay-gated 404 must never set the negative cache"
     );
 
-    // After the window elapses, it becomes visible and downloadable.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // After the window elapses, it becomes visible and downloadable. The
+    // window elapses without a sleep: the version was first seen two hours ago.
+    sqlx::query(
+        "UPDATE proxy_cached_version SET first_seen_at = now() - interval '2 hours' \
+         WHERE repository_id = $1",
+    )
+    .bind(repo_id(&pool, &repo).await)
+    .execute(&pool)
+    .await
+    .unwrap();
     let versions = px.list_versions(&repo, "Sample.Lib").await.unwrap();
     assert_eq!(
         versions.len(),
