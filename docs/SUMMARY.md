@@ -1,0 +1,26 @@
+# Summary
+
+[Forge](../README.md)
+
+# Running Forge
+
+- [Production deployment](deployment.md)
+- [Retention size budgets](retention.md)
+- [Importing from Nexus](nexus-import.md)
+
+# Formats
+
+- [Docker / OCI registry](docker.md)
+- [npm registries](npm.md)
+- [Raw file repositories](raw.md)
+- [Format plugins](format-plugins.md)
+
+# CI and publishing
+
+- [Trusted publishing](trusted-publishing.md)
+- [GitLab CI with workload identity](gitlab-ci.md)
+- [CI with service accounts](ci-service-accounts.md)
+
+---
+
+[Changelog](../CHANGELOG.md)

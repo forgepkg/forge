@@ -194,6 +194,9 @@ curl -u admin@example.com:<TOKEN> http://localhost:8421/repository/binaries/tool
 
 ## Documentation
 
+The guides below are also a site, with navigation and search:
+**<https://forgepkg.github.io/forge/>**.
+
 - **[Production deployment](./docs/deployment.md)** — required settings, TLS
   and reverse proxy, secret encryption, health probes, backup/restore and
   upgrades. Kubernetes: a Helm chart published with every release

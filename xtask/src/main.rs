@@ -6,6 +6,7 @@
 //! output; a non-zero child exit makes `xtask` exit non-zero too.
 
 mod changelog;
+mod docs;
 mod proc;
 mod release;
 
@@ -86,6 +87,7 @@ fn main() -> ExitCode {
         "docker-build" => docker_build(rest),
         "docker-run" => docker_run(),
         // Release
+        "docs" => docs::docs(rest),
         "changelog" => changelog::changelog(rest),
         "release" => release::release(rest),
         other => {
@@ -160,6 +162,16 @@ Docker image (single container: web SPA + Rust server):
                 `docker buildx build`.
   docker-run    Run the built image against the dev Postgres + versitygw
                 (docker-compose.yml + docker-compose.app.yml), API + SPA on :8421.
+
+Documentation site (mdBook, docs/book.toml; published by .github/workflows/pages.yml):
+  docs          Stage the pages docs/SUMMARY.md lists (README.md, the guides in
+                docs/, CHANGELOG.md) into target/docs/src, with their links
+                rewritten for the site: to another page, the page; into the
+                source tree, the file on GitHub. Then build the site into
+                target/docs/book with mdBook 0.5.4 (`cargo install mdbook
+                --version 0.5.4 --locked`). A link to a missing file or
+                heading, or a docs/*.md that SUMMARY.md does not list, fails.
+  docs --check  Only the staging and its checks, without mdBook.
 
 Changelog (a fragment per change, docs/changes/<milestone>/<ref>.<kind>.md;
 see docs/changes/README.md):
