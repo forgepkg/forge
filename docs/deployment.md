@@ -396,7 +396,7 @@ invited user's page calls `POST /auth/invitations/lookup` and
 ### Deactivating users
 
 To cut a user off without deleting the account, deactivate it on the user's
-page (**Admin → Users → <user> → Deactivate**, or `PATCH /admin/users/{id}`
+page (**Admin → Users → \<user> → Deactivate**, or `PATCH /admin/users/{id}`
 with `{"active": false}`):
 
 - every sign-in is refused: the password, the browser, OIDC, credential
@@ -948,8 +948,8 @@ What Forge believes, and when:
   included. So a request they authenticate holds the account's grants but
   **never the `admin` role**: the admin API and minting tokens refuse it
   (403), and publishing packages or images takes an API token, which an
-  administrator issues on the account's page (**Admin → Users → <user> →
-  Tokens**, or **Admin → Service accounts → <account>**). State-changing
+  administrator issues on the account's page (**Admin → Users → \<user> →
+  Tokens**, or **Admin → Service accounts → \<account>**). State-changing
   requests a browser marks as cross-site are refused (403) before
   authentication. An account of the realm never holds the `admin` role
   either (creating or making it an admin is a 400): it would count as an
