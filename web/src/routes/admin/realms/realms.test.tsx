@@ -28,6 +28,10 @@ import { searchOptions } from '~/lib/search'
  *    server refusal (409) is shown with its reason;
  *  - the create form validates required fields per kind (no POST when
  *    invalid) and POSTs the parsed config when valid;
+ *  - **Edit as JSON** shows a workload-identity realm's rules to copy, and
+ *    replaces them with pasted ones (a guide's whole realm too); JSON it
+ *    cannot read leaves the form unchanged, and the applied rules are checked
+ *    and confirmed on save like typed ones;
  *  - the edit form sends list values containing commas back unchanged,
  *    requires a new client secret once the issuer or client ID changes, and
  *    asks before saving a sign-in realm as disabled or saving a
@@ -218,6 +222,15 @@ async function renderAt(initialPath: string) {
   )
   await waitFor(() => expect(router.state.status).toBe('idle'))
   return router
+}
+
+/** Replace what the rules JSON dialog holds with `text`, and apply it. */
+async function applyRulesJson(u: ReturnType<typeof userEvent.setup>, text: string) {
+  const dialog = screen.getByRole('dialog', { name: 'Edit the rules as JSON' })
+  const field = within(dialog).getByLabelText('Rules')
+  await u.clear(field)
+  await u.paste(text)
+  await u.click(within(dialog).getByRole('button', { name: 'Apply' }))
 }
 
 describe('admin realms list', () => {
@@ -848,6 +861,116 @@ describe('admin realms create', { timeout: 20_000 }, () => {
     ).toBeDisabled()
   })
 
+  it('pastes the realm of a guide into the rules as JSON', async () => {
+    let posted: unknown = null
+    mockApi({
+      realms: [],
+      roles: [role({ id: 4, name: 'gitlab-ci-read' })],
+      onCreate: (body) => {
+        posted = body
+        return json(realm({ id: 9, kind: 'workload_identity' }), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/new')
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
+    await u.type(screen.getByLabelText('Name'), 'gitlab')
+    await u.type(screen.getByLabelText('Issuer URL'), 'https://gitlab.example.com')
+    await u.type(screen.getByLabelText('Allowed audiences'), 'https://forge.example.com')
+
+    await u.click(screen.getByRole('button', { name: 'Edit as JSON' }))
+    const dialog = screen.getByRole('dialog', { name: 'Edit the rules as JSON' })
+    expect(within(dialog).getByLabelText('Rules')).toHaveValue('[]')
+
+    // The realm of docs/gitlab-ci.md as it stands: only its rules are kept.
+    await applyRulesJson(
+      u,
+      JSON.stringify({
+        kind: 'workload_identity',
+        name: 'gitlab',
+        config: {
+          issuer: 'https://gitlab.example.com',
+          allowed_audiences: ['https://forge.example.com'],
+          max_token_age_seconds: 39600,
+          rules: [
+            {
+              role: 'gitlab-ci-read',
+              conditions: [
+                { claim: 'job_project_id', any_of: ['1001', '1002'] },
+                { claim: 'job_namespace_id', any_of: ['42'] },
+              ],
+            },
+          ],
+        },
+      }),
+    )
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    await waitFor(() => expect(screen.getByLabelText('Role')).toHaveValue('gitlab-ci-read'))
+    expect(screen.getAllByLabelText('Claim').map((f) => (f as HTMLInputElement).value)).toEqual([
+      'job_project_id',
+      'job_namespace_id',
+    ])
+    expect(screen.getAllByLabelText('Any of')[0]).toHaveValue('1001\n1002')
+    // The other fields of the pasted realm are not taken.
+    expect(screen.getByLabelText('Maximum token age (seconds)')).toHaveValue(null)
+    // Applying saves nothing.
+    expect(posted).toBeNull()
+
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect((posted as { config: unknown }).config).toEqual({
+      issuer: 'https://gitlab.example.com',
+      allowed_audiences: ['https://forge.example.com'],
+      allow_http_issuer: false,
+      rules: [
+        {
+          role: 'gitlab-ci-read',
+          conditions: [
+            { claim: 'job_project_id', any_of: ['1001', '1002'] },
+            { claim: 'job_namespace_id', any_of: ['42'] },
+          ],
+        },
+      ],
+    })
+  })
+
+  it('checks rules applied as JSON on save, like typed ones', async () => {
+    let posted: unknown = null
+    mockApi({
+      realms: [],
+      onCreate: (body) => {
+        posted = body
+        return json(realm(body as Partial<RealmView>), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/new')
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
+    await u.type(screen.getByLabelText('Name'), 'github-actions')
+    await u.type(
+      screen.getByLabelText('Issuer URL'),
+      'https://token.actions.githubusercontent.com',
+    )
+    await u.type(screen.getByLabelText('Allowed audiences'), 'https://forge.example.com')
+
+    await u.click(screen.getByRole('button', { name: 'Edit as JSON' }))
+    await applyRulesJson(
+      u,
+      '[{ "role": "publisher", "conditions": [{ "claim": "ref", "any_of": ["refs/heads/main"] }] }]',
+    )
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+
+    expect(
+      await screen.findByText(
+        'GitHub Actions rules must include both repository_id and repository_owner_id.',
+      ),
+    ).toBeInTheDocument()
+    expect(posted).toBeNull()
+  })
+
   it('validates required workload_identity fields inline and does not POST', async () => {
     let posted: unknown = null
     mockApi({
@@ -1229,6 +1352,77 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
 
     await waitFor(() => expect(patches).toHaveLength(1))
     expect(patches[0]).toMatchObject({ name: 'github-actions', enabled: true })
+  })
+
+  it("exports a realm's rules as JSON and replaces them, asking before the save", async () => {
+    const patches: unknown[] = []
+    mockApi({
+      realms: [ciRealm],
+      roles: [role({ id: 4, name: 'ci-deployer' }), role({ id: 5, name: 'ci-reader' })],
+      onPatch: (_id, body) => {
+        patches.push(body)
+        return json(ciRealm)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/7')
+
+    await u.click(await screen.findByRole('button', { name: 'Edit as JSON' }))
+    const field = within(
+      screen.getByRole('dialog', { name: 'Edit the rules as JSON' }),
+    ).getByLabelText('Rules')
+    expect(JSON.parse((field as HTMLTextAreaElement).value)).toEqual(
+      (ciRealm.config as { rules: unknown }).rules,
+    )
+
+    // What it cannot read is reported in the dialog, which stays open.
+    await applyRulesJson(u, '[{ "role": "ci-reader", "conditions": [')
+    expect(field).toHaveAccessibleDescription(/^This is not valid JSON: /)
+    expect(field).toHaveFocus()
+    await applyRulesJson(
+      u,
+      '[{ "role": "ci-reader", "conditions": [{ "claim": "repository_id", "any_off": ["1"] }] }]',
+    )
+    expect(field).toHaveAccessibleDescription(
+      'rules[0].conditions[0].any_off is not a key Forge knows: a condition takes claim and any_of.',
+    )
+
+    // Cancelling leaves the form as it was.
+    await u.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.getAllByLabelText('Claim').map((f) => (f as HTMLInputElement).value)).toEqual([
+      'repository_id',
+      'repository_owner_id',
+    ])
+
+    await u.click(screen.getByRole('button', { name: 'Edit as JSON' }))
+    const rules = [
+      {
+        role: 'ci-reader',
+        conditions: [
+          { claim: 'repository_id', any_of: ['111'] },
+          { claim: 'repository_owner_id', any_of: ['222'] },
+        ],
+      },
+    ]
+    await applyRulesJson(u, JSON.stringify(rules))
+    expect(screen.getAllByLabelText('Any of').map((f) => (f as HTMLTextAreaElement).value)).toEqual([
+      '111',
+      '222',
+    ])
+    expect(patches).toEqual([])
+
+    // Saving still asks, since it revokes the realm's keys.
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await u.click(
+      within(screen.getByRole('dialog', { name: 'Save github-actions?' })).getByRole(
+        'button',
+        { name: 'Save and revoke keys' },
+      ),
+    )
+    await waitFor(() => expect(patches).toHaveLength(1))
+    expect(patches[0]).toMatchObject({ config: { rules } })
   })
 
   it('saves a disabled workload-identity realm without asking', async () => {
