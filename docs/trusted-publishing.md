@@ -444,6 +444,11 @@ Forge rejects provenance statements until attestations can be stored.
 
 ## GitLab CI
 
+[GitLab CI with workload identity](gitlab-ci.md) walks through this setup step
+by step, from the role to the `.gitlab-ci.yml`;
+[CI with service accounts](ci-service-accounts.md) covers pipelines that
+cannot use workload identity.
+
 Give the realm's reader role `read` access to the hosted repository and the
 feeds the project restores from. The realm rule accepts jobs from the project,
 so every pipeline can restore; a separate trusted publisher limits writes to
