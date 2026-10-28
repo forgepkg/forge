@@ -1293,14 +1293,15 @@ fn default_proxy_spool_memory_bytes() -> u64 {
 /// Only the `.nuspec` manifest is ever decompressed, so it alone is capped by
 /// size and compression ratio; every other entry (native binaries of hundreds
 /// of MiB included) is only bounded by the archive-shape limits, which reject
-/// pathological archives before the zip central directory is loaded.
+/// pathological archives before the zip central directory is read. The
+/// directory is read one header at a time, so they bound time, not memory.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NugetConfig {
-    /// Maximum number of entries in a package archive. Default 10 000.
+    /// Maximum number of entries in a package archive. Default 1 000 000.
     #[serde(default = "default_nuget_max_entries")]
     pub max_entries: usize,
-    /// Maximum size of the zip central directory (per-entry metadata loaded
-    /// into memory to open the archive). Default 16 MiB.
+    /// Maximum size of the zip central directory (the per-entry metadata,
+    /// read once to check every entry). Default 256 MiB.
     #[serde(default = "default_nuget_max_central_directory_bytes")]
     pub max_central_directory_bytes: u64,
     /// Maximum total declared uncompressed size of all entries. Nothing but

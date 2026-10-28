@@ -1784,6 +1784,8 @@ dependencies = [
 name = "forge-format-nuget"
 version = "1.0.0"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "forge-plugin-api",
  "quick-xml",
  "serde",

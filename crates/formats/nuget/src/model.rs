@@ -121,10 +121,13 @@ impl From<ParsedNupkg> for forge_plugin_api::ParsedPackage {
 /// cannot exhaust Forge's memory or disk. The caps therefore split into:
 ///
 /// * **archive shape** — the entry count and the central-directory size, read
-///   from the end-of-central-directory records *before* the zip reader parses
-///   the central directory, plus a sanity bound on the total declared
-///   uncompressed size (large native packages — CUDA, libtorch, … — routinely
-///   hold single entries of hundreds of MiB and must pass);
+///   from the end-of-central-directory records *before* the central directory
+///   is read, plus a sanity bound on the total declared uncompressed size
+///   (large native packages — CUDA, libtorch, … — routinely hold single
+///   entries of hundreds of MiB and must pass). The directory is read one
+///   header at a time and nothing is kept per entry, so these bound the time
+///   reading it takes, not memory: packages that bundle web assets hold tens
+///   of thousands of files;
 /// * **manifest** — size and compression ratio of the `.nuspec`, the only
 ///   entry that is ever decompressed.
 ///
@@ -134,9 +137,9 @@ impl From<ParsedNupkg> for forge_plugin_api::ParsedPackage {
 pub struct NupkgLimits {
     /// Maximum number of entries in the archive.
     pub max_entries: usize,
-    /// Maximum size of the zip central directory (the per-entry metadata the
-    /// zip reader loads into memory), as declared by the end-of-central-
-    /// directory record.
+    /// Maximum size of the zip central directory (the per-entry metadata,
+    /// read once to check every entry and find the manifest), as declared by
+    /// the end-of-central-directory record.
     pub max_central_directory_bytes: u64,
     /// Maximum total declared uncompressed size across all entries. Nothing
     /// but the `.nuspec` is decompressed, so this only rejects absurd archives.
@@ -152,10 +155,10 @@ pub struct NupkgLimits {
 impl Default for NupkgLimits {
     fn default() -> Self {
         NupkgLimits {
-            max_entries: 10_000,
-            max_central_directory_bytes: 16 * 1024 * 1024, // 16 MiB
+            max_entries: 1_000_000,
+            max_central_directory_bytes: 256 * 1024 * 1024, // 256 MiB
             max_total_uncompressed: 16 * 1024 * 1024 * 1024, // 16 GiB
-            max_nuspec_bytes: 1024 * 1024,                 // 1 MiB
+            max_nuspec_bytes: 1024 * 1024,                  // 1 MiB
             max_nuspec_compression_ratio: 200,
         }
     }

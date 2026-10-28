@@ -9,9 +9,7 @@
 //! `<dependencies>` groups are extracted. The raw manifest bytes are carried in
 //! [`ParsedNupkg::nuspec_bytes`] so the server can store and re-serve them.
 
-use std::cell::Cell;
-use std::io::{Read, Seek, SeekFrom};
-use std::rc::Rc;
+use std::io::{BufReader, Read, SeekFrom};
 
 use forge_plugin_api::PackageSource as ReadSeek;
 use quick_xml::events::Event;
@@ -362,73 +360,45 @@ pub fn synthesize_nuspec(id: &str, version: &str, deps: &[DependencyGroup]) -> V
 ///
 /// Only the manifest is decompressed, so the size and compression-ratio caps
 /// apply to it alone; other entries are bounded only by the archive-shape
-/// limits (entry count, central-directory size, total declared size).
+/// limits (entry count, central-directory size, total declared size). The
+/// central directory is read one header at a time and nothing is kept of an
+/// entry but the manifest's, so a package of many entries costs the time to
+/// read its directory once, not memory.
 fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u8>, NupkgError> {
-    // Vet the end-of-central-directory records before the zip reader loads
-    // the central directory, and bound what it may read while doing so.
-    let vetted = check_archive_directory(file, limits)?;
+    // Vet the end-of-central-directory records before the central directory
+    // they describe is read.
+    let directory = check_archive_directory(file, limits)?;
     // Check every entry and choose the manifest as NuGet would.
-    let manifest_at = find_manifest(file, &vetted, limits)?;
-    let budget = Rc::new(Cell::new(Some(vetted.read_budget)));
-    let reader = BudgetReader {
-        inner: file,
-        budget: budget.clone(),
-    };
-    // Archive offset 0: a .nupkg has no prepended data, and the reader must
-    // not go looking for directory records elsewhere than where the vetted
-    // ones say (an unvetted record's entry count sizes an allocation).
-    let config = zip::read::Config {
-        archive_offset: zip::read::ArchiveOffset::Known(0),
-    };
-    let mut archive = zip::ZipArchive::with_config(config, reader).map_err(|e| {
-        if budget.get() == Some(0) {
-            NupkgError::LimitExceeded(format!(
-                "zip central directory exceeds max {} bytes",
-                limits.max_central_directory_bytes
-            ))
-        } else {
-            NupkgError::InvalidZip(e.to_string())
-        }
-    })?;
-    // The directory is loaded; reading entries is no longer budgeted.
-    budget.set(None);
+    let manifest = find_manifest(file, &directory, limits)?;
+    read_manifest(file, &manifest, limits)
+}
 
-    if archive.len() > limits.max_entries {
-        return Err(NupkgError::LimitExceeded(format!(
-            "{} entries exceeds max {}",
-            archive.len(),
-            limits.max_entries
-        )));
-    }
+/// Local file header signature (`PK\x03\x04`) and the size of its fixed part.
+const LOCAL_HEADER_SIG: [u8; 4] = *b"PK\x03\x04";
+const LOCAL_HEADER_LEN: usize = 30;
+/// The compression methods a manifest is read in: stored, and deflated (what
+/// NuGet writes).
+const STORED: u16 = 0;
+const DEFLATED: u16 = 8;
 
-    // The manifest's name is unique and no entry is renamed (see
-    // [`find_manifest`]), so the zip reader lists the manifest too: it is the
-    // entry whose central header starts where the manifest's does.
-    let index = (0..archive.len())
-        .find(|&i| {
-            archive
-                .by_index_data(i)
-                .is_ok_and(|entry| entry.central_header_start() == manifest_at)
-        })
-        .ok_or_else(|| {
-            NupkgError::InvalidZip("the zip reader does not list the manifest".into())
-        })?;
-
-    // Decompress just the chosen .nuspec under the manifest caps.
-    let mut entry = archive
-        .by_index(index)
-        .map_err(|e| NupkgError::InvalidZip(e.to_string()))?;
-
-    let declared = entry.size();
+/// Decompress the manifest [`find_manifest`] chose, under the manifest caps.
+///
+/// Its sizes, compression method and CRC-32 are its central header's. Of its
+/// local header only the signature and the lengths of the name and the extra
+/// field are read, to find where its data starts, as .NET (and so NuGet) does.
+fn read_manifest(
+    file: &mut dyn ReadSeek,
+    manifest: &ManifestEntry,
+    limits: &NupkgLimits,
+) -> Result<Vec<u8>, NupkgError> {
+    let declared = manifest.uncompressed_size;
     if declared > limits.max_nuspec_bytes {
         return Err(NupkgError::LimitExceeded(format!(
             ".nuspec declared size {declared} exceeds max {}",
             limits.max_nuspec_bytes
         )));
     }
-
-    let compressed = entry.compressed_size();
-    if let Some(ratio) = declared.checked_div(compressed) {
+    if let Some(ratio) = declared.checked_div(manifest.compressed_size) {
         if ratio > limits.max_nuspec_compression_ratio {
             return Err(NupkgError::LimitExceeded(format!(
                 ".nuspec compression ratio {ratio} exceeds max {}",
@@ -437,20 +407,67 @@ fn extract_nuspec(file: &mut dyn ReadSeek, limits: &NupkgLimits) -> Result<Vec<u
         }
     }
 
-    // Read with a hard cap (declared size may lie; the +1 detects overruns).
-    let cap = limits.max_nuspec_bytes.saturating_add(1);
-    let mut buf = Vec::new();
-    let read = entry
-        .by_ref()
-        .take(cap)
-        .read_to_end(&mut buf)
-        .map_err(NupkgError::Io)?;
-    if read as u64 >= cap {
-        return Err(NupkgError::LimitExceeded(
-            ".nuspec exceeds maximum size during decompression".into(),
+    let len = file.seek(SeekFrom::End(0))?;
+    let header = match manifest.local_header.checked_add(LOCAL_HEADER_LEN as u64) {
+        Some(end) if end <= len => read_at(file, manifest.local_header, LOCAL_HEADER_LEN)?,
+        _ => {
+            return Err(NupkgError::InvalidZip(
+                "the manifest's local header lies outside the archive".into(),
+            ))
+        }
+    };
+    if header[..4] != LOCAL_HEADER_SIG {
+        return Err(NupkgError::InvalidZip(
+            "the manifest's local header is corrupt".into(),
+        ));
+    }
+    let data = manifest.local_header
+        + LOCAL_HEADER_LEN as u64
+        + u64::from(le_u16(&header, 26))
+        + u64::from(le_u16(&header, 28));
+    if data
+        .checked_add(manifest.compressed_size)
+        .is_none_or(|end| end > len)
+    {
+        return Err(NupkgError::InvalidZip(
+            "the manifest's data runs past the end of the archive".into(),
         ));
     }
 
+    file.seek(SeekFrom::Start(data))?;
+    let compressed = (&mut *file).take(manifest.compressed_size);
+    // Read with a hard cap: the declared size is within the manifest cap, and
+    // one byte past it tells a manifest that is longer than it says.
+    let cap = declared + 1;
+    let mut buf = Vec::new();
+    let read = match manifest.method {
+        STORED => compressed.take(cap).read_to_end(&mut buf),
+        DEFLATED => flate2::read::DeflateDecoder::new(compressed)
+            .take(cap)
+            .read_to_end(&mut buf),
+        method => {
+            return Err(NupkgError::UnsupportedEntry(format!(
+                "the manifest uses compression method {method}; only stored and deflated are read"
+            )))
+        }
+    };
+    read.map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+            NupkgError::InvalidZip(format!("the manifest does not decompress: {e}"))
+        }
+        _ => NupkgError::Io(e),
+    })?;
+    if buf.len() as u64 != declared {
+        return Err(NupkgError::InvalidZip(format!(
+            "the manifest decompresses to {} bytes, not the {declared} its header declares",
+            buf.len()
+        )));
+    }
+    if crc32fast::hash(&buf) != manifest.crc32 {
+        return Err(NupkgError::InvalidZip(
+            "the manifest does not match its CRC-32".into(),
+        ));
+    }
     Ok(buf)
 }
 
@@ -468,18 +485,6 @@ const ZIP64_EOCD_LEN: u64 = 56;
 /// end of the file: the EOCD with a maximal comment, preceded by the ZIP64
 /// locator and record.
 const ZIP_TRAILER_WINDOW: u64 = EOCD_LEN + u16::MAX as u64 + ZIP64_LOCATOR_LEN + ZIP64_EOCD_LEN;
-/// Read-ahead allowance on top of the vetted region (the zip reader scans in
-/// small blocks and probes a few headers around the central directory).
-const ZIP_READ_SLACK: u64 = 64 * 1024;
-
-/// What [`check_archive_directory`] vetted.
-#[derive(Debug)]
-struct VettedDirectory {
-    /// How many bytes the zip reader may read while opening the archive.
-    read_budget: u64,
-    /// The central directory the vetted record declares.
-    directory: Directory,
-}
 
 /// A central directory, as an end-of-central-directory record declares it.
 #[derive(Debug, Default)]
@@ -488,34 +493,32 @@ struct Directory {
     start: u64,
     /// Its size in bytes.
     size: u64,
-    /// How many entries the zip reader walks.
+    /// How many entries [`find_manifest`] walks.
     entries: u64,
 }
 
 /// Vet the archive's end-of-central-directory records against the entry-count
-/// and central-directory limits **before** `zip::ZipArchive::new` parses (and
-/// allocates for) the central directory they describe.
+/// and central-directory limits **before** the central directory they describe
+/// is read.
 ///
-/// Takes the record NuGet and the zip reader both read: the last EOCD
-/// signature with a whole record after it (plus, for ZIP64, the record its
-/// locator names), refusing one whose comment runs past the end of the file,
-/// which the zip reader passes over and NuGet does not, and one whose ZIP64
-/// marker the two read differently. Earlier signature matches — which ordinary
-/// compressed data or a package signature contains by chance — are never
-/// vetted: the reader consults them only when that record fails a later
-/// consistency check, and whatever it reads then stays inside the returned
-/// read budget, which is derived from the vetted record alone.
+/// Takes the record NuGet reads: the last EOCD signature with a whole record
+/// after it (plus, for ZIP64, the record its locator names), refusing one
+/// whose comment runs past the end of the file, which other zip readers pass
+/// over, and one whose ZIP64 marker they read differently from NuGet. Earlier
+/// signature matches — which ordinary compressed data or a package signature
+/// contains by chance — are never read.
 fn check_archive_directory(
     file: &mut dyn ReadSeek,
     limits: &NupkgLimits,
-) -> Result<VettedDirectory, NupkgError> {
+) -> Result<Directory, NupkgError> {
     let len = file.seek(SeekFrom::End(0))?;
     let trailer = ZIP_TRAILER_WINDOW.min(len);
     // NuGet (.NET's `ZipArchive`) reads the last signature with a whole
     // record after it, whatever its comment says: .NET 8 and .NET Framework
-    // read what comment there is, .NET 9 and later refuse the archive. The
-    // zip reader passes over a record whose comment runs past the end of the
-    // file for an earlier one, so such an archive is refused.
+    // read what comment there is, .NET 9 and later refuse the archive. Other
+    // zip readers (the `zip` crate, for one) pass over a record whose comment
+    // runs past the end of the file for an earlier one, so such an archive is
+    // refused.
     let Some(pos) = find_signatures(file, len - trailer, len, &EOCD_SIG)?
         .into_iter()
         .rev()
@@ -531,24 +534,16 @@ fn check_archive_directory(
             "the end-of-central-directory record's comment runs past the end of the archive".into(),
         ));
     }
-    let directory = check_eocd_candidate(file, pos, len, limits)?;
-    let read_budget = trailer
-        .saturating_add(directory.size)
-        .saturating_add(ZIP_READ_SLACK);
-    file.seek(SeekFrom::Start(0))?;
-    Ok(VettedDirectory {
-        read_budget,
-        directory,
-    })
+    check_eocd_candidate(file, pos, len, limits)
 }
 
 /// Check one EOCD candidate at `pos`. Returns the central directory it
-/// declares, with the number of entries the zip reader walks.
+/// declares, with the number of entries [`find_manifest`] walks.
 ///
-/// Mirrors how the zip reader interprets the record: when a field holds the
-/// ZIP64 marker (`0xFFFF…`) and a ZIP64 locator precedes the record, only the
-/// ZIP64 record's counts are used (the one at the locator's offset), otherwise
-/// the 32-bit counts are; of those, it walks the entries on this disk.
+/// When a field holds the ZIP64 marker (`0xFFFF…`) and a ZIP64 locator
+/// precedes the record, only the ZIP64 record's counts are used (the one at
+/// the locator's offset), otherwise the 32-bit counts are; of those, the
+/// entries on this disk are walked.
 fn check_eocd_candidate(
     file: &mut dyn ReadSeek,
     pos: u64,
@@ -564,10 +559,10 @@ fn check_eocd_candidate(
     let (directory, offset) = (le_u32(&rec, 12), le_u32(&rec, 16));
     let zip64_marker = total == u16::MAX || directory == u32::MAX || offset == u32::MAX;
     // NuGet (.NET's `ZipArchive`) looks for the ZIP64 records when the disk
-    // number, the offset or the entry count holds the marker, the zip reader
-    // when the entry count, the size or the offset does: with the marker in
-    // the size or the disk number alone, the two read different central
-    // directories.
+    // number, the offset or the entry count holds the marker, other zip
+    // readers (the `zip` crate, for one) when the entry count, the size or the
+    // offset does: with the marker in the size or the disk number alone, they
+    // read different central directories.
     if zip64_marker != (disk == u16::MAX || offset == u32::MAX || total == u16::MAX) {
         return Err(NupkgError::InvalidZip(
             "the end-of-central-directory record marks ZIP64 in a field NuGet reads otherwise"
@@ -576,9 +571,9 @@ fn check_eocd_candidate(
     }
 
     // A ZIP64 locator sits immediately before the EOCD. The record it names
-    // must be exactly there: the zip reader is opened at archive offset 0
-    // (see `extract_nuspec`), so it reads that record and no other — and one
-    // that is not there cannot be vetted, so the archive is refused.
+    // must be exactly there: a reader that went looking for it elsewhere (as
+    // the `zip` crate does in an archive with data prepended) would read a
+    // record that was never vetted, so the archive is refused.
     if zip64_marker && pos >= ZIP64_LOCATOR_LEN {
         let loc = read_at(file, pos - ZIP64_LOCATOR_LEN, ZIP64_LOCATOR_LEN as usize)?;
         if loc[..4] == ZIP64_LOCATOR_SIG {
@@ -601,7 +596,7 @@ fn check_eocd_candidate(
 }
 
 /// Check one ZIP64 end-of-central-directory record at `pos`. Returns the
-/// central directory it declares, with the number of entries the zip reader
+/// central directory it declares, with the number of entries [`find_manifest`]
 /// walks (the total).
 fn check_zip64_record(
     file: &mut dyn ReadSeek,
@@ -655,42 +650,64 @@ const UNICODE_PATH_EXTRA_ID: u16 = 0x7075;
 /// the disk, 4), skipping those the header does not mark.
 const ZIP64_FIXED_PLACES_LEN: usize = 28;
 
+/// The manifest's entry, as its central header (and ZIP64 field) declares it.
+#[derive(Debug)]
+struct ManifestEntry {
+    /// Its compression method.
+    method: u16,
+    crc32: u32,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    /// Where its local header starts.
+    local_header: u64,
+}
+
+/// What [`find_manifest`] reads the central directory through.
+const DIRECTORY_BUFFER: usize = 64 * 1024;
+
 /// Check every entry of the central directory [`check_archive_directory`]
-/// vetted, as .NET's zip reader (and so NuGet) lists them, and return where
-/// the central header of the package's one manifest starts.
+/// vetted, as .NET's zip reader (and so NuGet) lists them, and return the
+/// package's one manifest.
 ///
-/// The zip reader Forge decompresses the manifest with indexes entries by
-/// name, so a repeated name hides all but the last of its entries from it;
-/// the entries are read here instead, each one as the directory holds it. A
-/// repeated name is no reason to refuse a package: packages on nuget.org hold
+/// The directory is read one header at a time, and nothing is kept of an
+/// entry but the manifest's: a package of a million entries costs the time to
+/// read its directory, not memory. Each entry is checked as the directory
+/// holds it, so a repeated name hides none of them (a reader that indexes the
+/// entries by name, as the `zip` crate does, sees only the last). A repeated
+/// name is no reason to refuse a package: packages on nuget.org hold
 /// `packageIcon.png` twice (`Microsoft.Extensions.Logging.Abstractions`
 /// 3.1.0, for one), and NuGet restores them. A repeated manifest is: NuGet
 /// then sees several manifests, and refuses the package.
 fn find_manifest(
     file: &mut dyn ReadSeek,
-    vetted: &VettedDirectory,
+    directory: &Directory,
     limits: &NupkgLimits,
-) -> Result<u64, NupkgError> {
+) -> Result<ManifestEntry, NupkgError> {
     let Directory {
         start,
         size,
         entries,
-    } = vetted.directory;
+    } = *directory;
     let len = file.seek(SeekFrom::End(0))?;
-    // The size is within `max_central_directory_bytes` (vetted).
-    let directory = match (start.checked_add(size), usize::try_from(size)) {
-        (Some(end), Ok(size)) if end <= len => read_at(file, start, size)?,
-        _ => {
-            return Err(NupkgError::InvalidZip(
-                "the central directory lies outside the archive".into(),
-            ))
-        }
-    };
-    file.seek(SeekFrom::Start(0))?;
+    if start.checked_add(size).is_none_or(|end| end > len) {
+        return Err(NupkgError::InvalidZip(
+            "the central directory lies outside the archive".into(),
+        ));
+    }
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::with_capacity(DIRECTORY_BUFFER, (&mut *file).take(size));
     let truncated = || {
         NupkgError::InvalidZip(
             "the central directory holds fewer entries than its end record declares".into(),
         )
+    };
+    // Fill `buf` from the directory; running out of it means it holds fewer
+    // headers than its end record declares.
+    let mut read = |buf: &mut [u8]| {
+        reader.read_exact(buf).map_err(|e| match e.kind() {
+            std::io::ErrorKind::UnexpectedEof => truncated(),
+            _ => NupkgError::Io(e),
+        })
     };
 
     // NuGet reads the one `*.nuspec` at the package root (and refuses a
@@ -700,23 +717,22 @@ fn find_manifest(
     // puts at the root counts ([`could_be_root_manifest`]), and the one
     // manifest must be named literally, so no reader can resolve it to a
     // different entry.
-    let mut manifest: Option<u64> = None;
+    let mut manifest: Option<ManifestEntry> = None;
     let mut total_uncompressed: u64 = 0;
-    let mut at = 0;
+    let mut header = [0u8; CENTRAL_HEADER_LEN];
+    // The name, the extra fields and the comment of the header at hand.
+    let mut variable = Vec::new();
     for _ in 0..entries {
-        let header = directory
-            .get(at..at + CENTRAL_HEADER_LEN)
-            .filter(|header| header[..4] == CENTRAL_HEADER_SIG)
-            .ok_or_else(truncated)?;
-        let flags = le_u16(header, 8);
-        let declared = le_u32(header, 24);
-        let name_end = at + CENTRAL_HEADER_LEN + usize::from(le_u16(header, 28));
-        let extra_end = name_end + usize::from(le_u16(header, 30));
-        let next = extra_end + usize::from(le_u16(header, 32));
-        if next > directory.len() {
+        read(&mut header)?;
+        if header[..4] != CENTRAL_HEADER_SIG {
             return Err(truncated());
         }
-        let raw = &directory[at + CENTRAL_HEADER_LEN..name_end];
+        let flags = le_u16(&header, 8);
+        let name_end = usize::from(le_u16(&header, 28));
+        let extra_end = name_end + usize::from(le_u16(&header, 30));
+        variable.resize(extra_end + usize::from(le_u16(&header, 32)), 0);
+        read(&mut variable)?;
+        let raw = &variable[..name_end];
         let name = String::from_utf8_lossy(raw);
 
         if flags & 1 != 0 {
@@ -724,48 +740,51 @@ fn find_manifest(
                 "entry {name:?} is encrypted"
             )));
         }
-        let mut size = u64::from(declared);
+        // The uncompressed size, the compressed size and the local header's
+        // offset, in the order a ZIP64 field holds those the header marks
+        // (`0xFFFFFFFF`).
+        let declared = [
+            le_u32(&header, 24),
+            le_u32(&header, 20),
+            le_u32(&header, 42),
+        ];
+        let marked = declared.map(|v| v == u32::MAX);
+        let mut values = declared.map(u64::from);
         let mut zip64 = false;
-        let mut fields = &directory[name_end..extra_end];
+        let mut fields = &variable[name_end..extra_end];
         while let [a, b, c, d, rest @ ..] = fields {
             let id = u16::from_le_bytes([*a, *b]);
             let Some(data) = rest.get(..usize::from(u16::from_le_bytes([*c, *d]))) else {
                 break;
             };
-            // The zip reader renames an entry after its Info-ZIP Unicode Path
-            // field, which .NET ignores, so the two would not agree on the
-            // name (nor on which entries share one). Neither NuGet nor .NET
-            // writes the field.
+            // Zip readers that apply an Info-ZIP Unicode Path field (the
+            // `zip` crate, for one) rename the entry after it, .NET ignores
+            // it, so they would not agree on the name (nor on which entries
+            // share one). Neither NuGet nor .NET writes the field.
             if id == UNICODE_PATH_EXTRA_ID {
                 return Err(NupkgError::UnsupportedEntry(format!(
                     "entry {name:?} carries an Info-ZIP Unicode Path field"
                 )));
             }
             if id == ZIP64_EXTRA_ID {
-                // .NET reads the first ZIP64 field of a header, the zip
-                // reader applies each in turn, so the last wins: with two,
-                // they would find the entry's data (its local header, its
-                // sizes) in different places, and could read different
-                // manifests. Neither NuGet nor .NET writes a second one.
+                // .NET reads the first ZIP64 field of a header, other zip
+                // readers (the `zip` crate, for one) apply each in turn, so
+                // the last wins: with two, they would find the entry's data
+                // (its local header, its sizes) in different places, and
+                // could read different manifests. Neither NuGet nor .NET
+                // writes a second one.
                 if std::mem::replace(&mut zip64, true) {
                     return Err(NupkgError::UnsupportedEntry(format!(
                         "entry {name:?} carries more than one ZIP64 extra field"
                     )));
                 }
-                // A size that does not fit the header's 32 bits is the
-                // field's first value.
-                if declared == u32::MAX && data.len() >= 8 {
-                    size = le_u64(data, 0);
-                }
-                // The zip reader takes the values the header marks one after
-                // the other from the field's start, .NET (from 28 bytes on)
-                // each at its fixed place: a marked value after one that is
-                // not then sits at two places, so the two would find the
-                // entry's local header (or its compressed size) apart, and
-                // could read different manifests. Neither NuGet nor .NET
-                // writes such a field.
-                let marked =
-                    [declared, le_u32(header, 20), le_u32(header, 42)].map(|v| v == u32::MAX);
+                // Forge, like most zip readers, takes the values the header
+                // marks one after the other from the field's start, .NET
+                // (from 28 bytes on) each at its fixed place: a marked value
+                // after one that is not then sits at two places, so the two
+                // would find the entry's local header (or its compressed
+                // size) apart, and could read different manifests. Neither
+                // NuGet nor .NET writes such a field.
                 if data.len() >= ZIP64_FIXED_PLACES_LEN
                     && marked.windows(2).any(|pair| !pair[0] && pair[1])
                 {
@@ -773,14 +792,24 @@ fn find_manifest(
                         "entry {name:?} carries a ZIP64 extra field whose values NuGet reads from other places"
                     )));
                 }
+                // A marked value the field is too short to hold keeps the
+                // header's `0xFFFFFFFF`, as with .NET.
+                let mut next = data;
+                for (value, _) in values.iter_mut().zip(marked).filter(|(_, m)| *m) {
+                    if let Some((at, rest)) = next.split_first_chunk::<8>() {
+                        *value = u64::from_le_bytes(*at);
+                        next = rest;
+                    }
+                }
             }
             fields = &rest[data.len()..];
         }
+        let [uncompressed_size, compressed_size, local_header] = values;
 
         // Entries other than the manifest are never decompressed, so neither
         // their individual size nor their compression ratio matters here; the
         // total declared size only rejects absurd archives.
-        total_uncompressed = total_uncompressed.saturating_add(size);
+        total_uncompressed = total_uncompressed.saturating_add(uncompressed_size);
         if total_uncompressed > limits.max_total_uncompressed {
             return Err(NupkgError::LimitExceeded(format!(
                 "total uncompressed size exceeds max {}",
@@ -799,9 +828,14 @@ fn find_manifest(
                     "the manifest name {name:?} must not contain '%' or '\\'"
                 )));
             }
-            manifest = Some(start + at as u64);
+            manifest = Some(ManifestEntry {
+                method: le_u16(&header, 10),
+                crc32: le_u32(&header, 16),
+                compressed_size,
+                uncompressed_size,
+                local_header,
+            });
         }
-        at = next;
     }
     manifest.ok_or(NupkgError::MissingNuspec)
 }
@@ -856,37 +890,6 @@ fn le_u64(b: &[u8], at: usize) -> u64 {
     let mut raw = [0u8; 8];
     raw.copy_from_slice(&b[at..at + 8]);
     u64::from_le_bytes(raw)
-}
-
-/// A reader that fails once more than its budget has been read through it
-/// (while a budget is set). Bounds what `zip::ZipArchive::new` may read — its
-/// EOCD search and the central directory — to the region
-/// [`check_archive_directory`] vetted. The budget is shared so it can be lifted
-/// once the archive is open.
-struct BudgetReader<'a> {
-    inner: &'a mut dyn ReadSeek,
-    budget: Rc<Cell<Option<u64>>>,
-}
-
-impl Read for BudgetReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let Some(left) = self.budget.get() else {
-            return self.inner.read(buf);
-        };
-        if left == 0 {
-            return Err(std::io::Error::other("zip directory read budget exhausted"));
-        }
-        let cap = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
-        let n = self.inner.read(&mut buf[..cap])?;
-        self.budget.set(Some(left - n as u64));
-        Ok(n)
-    }
-}
-
-impl Seek for BudgetReader<'_> {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.inner.seek(pos)
-    }
 }
 
 /// Whether some reader could take the entry named `name` (the bytes the
@@ -1694,13 +1697,13 @@ mod tests {
             ("packageIcoN.png", b"two"),
         ]);
         rename_entry(&mut zip, "packageIcoN.png", "packageIcon.png");
-        // The zip reader keys its index by name: it sees one icon.
+        // The `zip` crate keys its index by name: it sees one icon.
         let archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
         assert_eq!(archive.len(), 2);
         assert_eq!(manifest_id(zip).unwrap(), "Real");
 
-        // Two entries named `a.nuspec`: NuGet sees two manifests, the zip
-        // reader only the last one.
+        // Two entries named `a.nuspec`: NuGet sees two manifests, the `zip`
+        // crate only the last one.
         let mut zip = zip_of(&[
             ("a.nuspec", &nuspec_of("First")),
             ("b.nuspec", &nuspec_of("Second")),
@@ -1709,7 +1712,7 @@ mod tests {
         let err = manifest_id(zip).unwrap_err();
         assert!(err.to_string().contains("more than one"), "{err}");
 
-        // An entry the zip reader hides is checked like any other: an
+        // An entry the `zip` crate hides is checked like any other: an
         // encrypted one is refused...
         let mut zip = zip_of(&[
             ("Real.nuspec", &nuspec_of("Real")),
@@ -1721,7 +1724,7 @@ mod tests {
         zip[hidden + 8] |= 1;
         let err = manifest_id(zip).unwrap_err();
         assert!(err.to_string().contains("encrypted"), "{err}");
-        // ...so is one the zip reader renames into another entry's name...
+        // ...so is one the `zip` crate renames into another entry's name...
         let zip = {
             use std::io::Write;
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -1764,6 +1767,101 @@ mod tests {
     }
 
     #[test]
+    fn packages_of_tens_of_thousands_of_entries_are_read() {
+        // A package that bundles web assets: more entries than the 10 000
+        // Forge took at most before.
+        let zip = {
+            use std::io::Write;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for i in 0..30_000 {
+                zw.start_file(format!("content/wwwroot/js/{i}.js"), stored)
+                    .unwrap();
+            }
+            zw.start_file("p.nuspec", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(OK_NUSPEC.as_bytes()).unwrap();
+            zw.finish().unwrap().into_inner()
+        };
+        let parsed = parse_nupkg(
+            &mut std::io::Cursor::new(zip.clone()),
+            &NupkgLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(parsed.id, "a.b");
+        assert_eq!(parsed.nuspec_bytes, OK_NUSPEC.as_bytes());
+
+        let limits = NupkgLimits {
+            max_entries: 10_000,
+            ..NupkgLimits::default()
+        };
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &limits).unwrap_err();
+        assert!(
+            err.to_string().contains("30001 entries exceeds max 10000"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_manifest_is_read_as_its_central_header_declares_it() {
+        let stored = || {
+            use std::io::Write;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("p.nuspec", stored).unwrap();
+            zw.write_all(OK_NUSPEC.as_bytes()).unwrap();
+            zw.finish().unwrap().into_inner()
+        };
+        let refused = |zip: Vec<u8>, why: &str| {
+            let err = manifest_id(zip).unwrap_err();
+            assert!(err.to_string().contains(why), "{why}: {err}");
+        };
+        // Stored and deflated manifests are read.
+        assert_eq!(manifest_id(stored()).unwrap(), "A.B");
+        let deflated = zip_of(&[("p.nuspec", OK_NUSPEC.as_bytes())]);
+        let central = central_headers_of(&deflated, "p.nuspec")[0];
+        assert_eq!(le_u16(&deflated, central + 10), DEFLATED);
+        assert_eq!(manifest_id(deflated.clone()).unwrap(), "A.B");
+
+        // A CRC-32 that does not match.
+        let mut zip = stored();
+        let central = central_headers_of(&zip, "p.nuspec")[0];
+        zip[central + 16] ^= 1;
+        refused(zip, "CRC-32");
+        // A deflate stream that does not decompress to the manifest.
+        let mut zip = deflated.clone();
+        zip[LOCAL_HEADER_LEN + "p.nuspec".len()] ^= 0xFF;
+        let err = manifest_id(zip).unwrap_err();
+        assert!(matches!(err, NupkgError::InvalidZip(_)), "{err}");
+        // A compression method other than stored or deflated (bzip2).
+        let mut zip = stored();
+        let central = central_headers_of(&zip, "p.nuspec")[0];
+        zip[central + 10..central + 12].copy_from_slice(&12u16.to_le_bytes());
+        refused(zip, "compression method 12");
+        // A declared size the manifest does not have.
+        let mut zip = stored();
+        let central = central_headers_of(&zip, "p.nuspec")[0];
+        let size = le_u32(&zip, central + 24) - 1;
+        zip[central + 24..central + 28].copy_from_slice(&size.to_le_bytes());
+        refused(zip, "not the");
+        // A local header that is not one, or lies outside the archive.
+        let mut zip = stored();
+        zip[0] = b'X';
+        refused(zip, "local header is corrupt");
+        let mut zip = stored();
+        let central = central_headers_of(&zip, "p.nuspec")[0];
+        zip[central + 42..central + 46].copy_from_slice(&u32::MAX.to_le_bytes());
+        refused(zip, "outside the archive");
+        // Data that runs past the end of the archive.
+        let mut zip = stored();
+        let central = central_headers_of(&zip, "p.nuspec")[0];
+        zip[central + 20..central + 24].copy_from_slice(&(1u32 << 20).to_le_bytes());
+        refused(zip, "past the end");
+    }
+
+    #[test]
     fn zip64_entry_sizes_count_against_the_total() {
         // The header holds 0xFFFFFFFF and the ZIP64 field the size.
         let zip = {
@@ -1793,7 +1891,7 @@ mod tests {
     fn two_zip64_fields_in_a_header_are_refused() {
         // One central header whose local header offset is in its ZIP64
         // field, twice: .NET (and so NuGet) reads the first field and the
-        // manifest of `Good.Package`, the zip reader the last and that of
+        // manifest of `Good.Package`, the `zip` crate the last and that of
         // `Evil.Package`.
         let (good, evil) = (nuspec_of("Good.Package"), nuspec_of("Evil.Package"));
         let zip = zip64_manifest(&[&good, &evil], crc32(&evil), false, |locals| {
@@ -1803,7 +1901,7 @@ mod tests {
                 .collect()
         });
 
-        // The zip reader really does read the last field's manifest.
+        // The `zip` crate really does read the last field's manifest.
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
         let mut read = Vec::new();
         archive.by_index(0).unwrap().read_to_end(&mut read).unwrap();
@@ -1815,7 +1913,7 @@ mod tests {
     #[test]
     fn a_zip64_field_read_at_other_places_by_net_is_refused() {
         // One ZIP64 field of 28 bytes, the header marking only the local
-        // header offset: the zip reader takes the offset from the field's
+        // header offset: the `zip` crate takes the offset from the field's
         // first 8 bytes and the manifest of `Good.Package`, .NET 8 and later
         // (and so NuGet in `dotnet restore`) from its third 8 and that of
         // `Evil.Package`.
@@ -1952,7 +2050,7 @@ mod tests {
     #[test]
     fn unicode_path_extra_fields_are_refused() {
         // Each entry's Info-ZIP Unicode Path field (0x7075) swaps its name
-        // for the other's role: the zip reader applies the field, .NET (and
+        // for the other's role: the `zip` crate applies the field, .NET (and
         // so NuGet) ignores it and reads `Victim.nuspec` as the manifest.
         let zip = {
             use std::io::Write;
@@ -1965,7 +2063,7 @@ mod tests {
             zw.write_all(&nuspec_of("Victim.Lib")).unwrap();
             zw.finish().unwrap().into_inner()
         };
-        // The zip reader really does see the swapped names.
+        // The `zip` crate really does see the swapped names.
         let archive = zip::ZipArchive::new(std::io::Cursor::new(zip.clone())).unwrap();
         let names: Vec<_> = archive.file_names().map(|n| n.unwrap()).collect();
         assert_eq!(names, ["Allowed.nuspec", "lib/v.dat"]);
@@ -2144,11 +2242,15 @@ mod tests {
         let mut zip = zip_of(&[("p.nuspec", OK_NUSPEC.as_bytes())]);
         let eocd = eocd_offset(&zip);
         assert_eq!(zip[eocd..eocd + 4], EOCD_SIG);
-        // Claim 60 000 entries; the zip reader would only notice the lie
-        // while walking the directory — the pre-check refuses up front.
+        // Claim 60 000 entries; walking the directory would only notice the
+        // lie at its end — the pre-check refuses up front.
         zip[eocd + 8..eocd + 10].copy_from_slice(&60_000u16.to_le_bytes());
         zip[eocd + 10..eocd + 12].copy_from_slice(&60_000u16.to_le_bytes());
-        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
+        let limits = NupkgLimits {
+            max_entries: 50_000,
+            ..NupkgLimits::default()
+        };
+        let err = parse_nupkg(&mut std::io::Cursor::new(zip), &limits).unwrap_err();
         assert!(
             err.to_string().contains("60000 entries exceeds max"),
             "{err}"
@@ -2159,14 +2261,18 @@ mod tests {
     fn eocd_directory_size_is_checked_before_the_directory_is_parsed() {
         let mut zip = zip_of(&[("p.nuspec", OK_NUSPEC.as_bytes())]);
         let eocd = eocd_offset(&zip);
-        zip[eocd + 12..eocd + 16].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+        zip[eocd + 12..eocd + 16].copy_from_slice(&(512u32 * 1024 * 1024).to_le_bytes());
         let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
-        assert!(err.to_string().contains("central directory"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("central directory of 536870912 bytes exceeds max"),
+            "{err}"
+        );
     }
 
     #[test]
     fn zip64_entry_count_is_checked_before_the_directory_is_parsed() {
-        // An empty archive with a ZIP64 trailer claiming a million entries:
+        // An empty archive with a ZIP64 trailer claiming two million entries:
         // [ZIP64 EOCD record][ZIP64 locator][EOCD with 0xFFFF markers].
         let mut zip = Vec::new();
         zip.extend_from_slice(&ZIP64_EOCD_SIG);
@@ -2175,8 +2281,8 @@ mod tests {
         zip.extend_from_slice(&45u16.to_le_bytes()); // version needed
         zip.extend_from_slice(&0u32.to_le_bytes()); // this disk
         zip.extend_from_slice(&0u32.to_le_bytes()); // disk with the directory
-        zip.extend_from_slice(&1_000_000u64.to_le_bytes()); // entries on this disk
-        zip.extend_from_slice(&1_000_000u64.to_le_bytes()); // total entries
+        zip.extend_from_slice(&2_000_000u64.to_le_bytes()); // entries on this disk
+        zip.extend_from_slice(&2_000_000u64.to_le_bytes()); // total entries
         zip.extend_from_slice(&0u64.to_le_bytes()); // directory size
         zip.extend_from_slice(&0u64.to_le_bytes()); // directory offset
         zip.extend_from_slice(&ZIP64_LOCATOR_SIG);
@@ -2190,7 +2296,8 @@ mod tests {
         zip.extend_from_slice(&0u16.to_le_bytes());
         let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
         assert!(
-            err.to_string().contains("1000000 entries exceeds max"),
+            err.to_string()
+                .contains("2000000 entries exceeds max 1000000"),
             "{err}"
         );
     }
@@ -2229,7 +2336,7 @@ mod tests {
     fn signature_lookalikes_in_entry_data_are_not_vetted() {
         // Stored (uncompressed) payload bytes that happen to contain EOCD and
         // ZIP64-record signatures with absurd counts, inside the trailing
-        // window. The zip reader uses the real EOCD at the end, so must we.
+        // window. NuGet reads the real EOCD at the end, so must we.
         let mut payload = Vec::new();
         payload.extend_from_slice(&EOCD_SIG);
         payload.extend_from_slice(&[0xFF; 18]);
@@ -2350,20 +2457,20 @@ mod tests {
             let err = manifest_id(zip).unwrap_err();
             assert!(err.to_string().contains(why), "{why}: {err}");
         };
-        // The ZIP64 marker in the directory size alone: the zip reader reads
+        // The ZIP64 marker in the directory size alone: the `zip` crate reads
         // the ZIP64 record's directory, NuGet the 32-bit offset's.
         let (mut zip, good, evil) = two_directories();
         zip64_trailer(&mut zip, good);
         end_record(&mut zip, 0, (evil.0, u32::MAX), 0);
         refused(zip, "marks ZIP64");
         // The marker in the disk numbers alone (both equal, as NuGet asks):
-        // NuGet reads the ZIP64 record's directory, the zip reader the
+        // NuGet reads the ZIP64 record's directory, the `zip` crate the
         // 32-bit one.
         let (mut zip, good, evil) = two_directories();
         zip64_trailer(&mut zip, evil);
         end_record(&mut zip, u16::MAX, good, 0);
         refused(zip, "marks ZIP64");
-        // A last record whose comment overruns the file: the zip reader
+        // A last record whose comment overruns the file: the `zip` crate
         // takes the one before, .NET 8 and .NET Framework this one.
         let (mut zip, good, evil) = two_directories();
         end_record(&mut zip, 0, good, 0);
