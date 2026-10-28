@@ -486,6 +486,7 @@ mod tests {
         assert!(principal_allows_protocol_mutations(&Principal::Workload {
             realm_id: 1,
             role_id: 2,
+            issuer_wide: false,
             issuer_sha256: [1; 32],
             config_sha256: [3; 32],
             subject_sha256: [2; 32],

@@ -173,8 +173,20 @@ pub struct ClaimRule {
     /// The forge `role.name` to grant on a match. Resolved to a `role.id` at
     /// validation time; a non-existent role denies (fail-closed).
     pub role: String,
+    /// Trust every workload of the realm's issuer, without a workload
+    /// identity condition: the opt-in for a self-managed CI whose projects
+    /// all may read. Refused for GitHub Actions and GitLab.com, whose tokens
+    /// anyone can mint, and only allowed after every other rule. A workload
+    /// that matched such a rule holds its role's grants capped at `read`
+    /// (the `issuer_wide` of [`Principal::Workload`]); trusted publishers, which
+    /// stay pinned to a workload identity, still add `write`. Left out of the
+    /// normalized config while unset, so realms that predate it keep their
+    /// policy digest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub issuer_wide: bool,
     /// Claim conditions, AND-combined. Empty is rejected by config validation
-    /// and fails closed at runtime for defense in depth.
+    /// and fails closed at runtime for defense in depth, except on an
+    /// [`Self::issuer_wide`] rule, where they only narrow it.
     #[serde(default)]
     pub conditions: Vec<ClaimCondition>,
 }
@@ -244,6 +256,7 @@ pub fn trusted_publisher_conditions_match(
         claims,
         &ClaimRule {
             role: "trusted-publisher".into(),
+            issuer_wide: false,
             conditions: conditions.to_vec(),
         },
         identity_claims,
@@ -329,6 +342,7 @@ pub fn validate_workload_identity_config(config: &JsonValue) -> Result<JsonValue
     }
     let issuer = cfg.issuer.clone();
     let identity_claims = cfg.identity_claims.clone();
+    let mut first_issuer_wide = None;
     for (i, rule) in cfg.rules.iter_mut().enumerate() {
         rule.role = rule.role.trim().to_string();
         if rule.role.is_empty() {
@@ -339,10 +353,26 @@ pub fn validate_workload_identity_config(config: &JsonValue) -> Result<JsonValue
                 "rule {i}: workload identity cannot grant the built-in global admin role"
             ));
         }
-        if rule.conditions.is_empty() {
-            return Err(format!(
-                "rule {i}: at least one claim condition is required (catch-all trust is unsafe)"
-            ));
+        if rule.issuer_wide {
+            if is_public_issuer(&issuer) {
+                return Err(format!(
+                    "rule {i}: issuer-wide trust is refused for {issuer}, whose tokens anyone can mint; pin the rule to a repository or project"
+                ));
+            }
+            first_issuer_wide.get_or_insert(i);
+        } else {
+            // Rules are first-match: an issuer-wide rule ahead of this one
+            // would take every workload this one names.
+            if let Some(first) = first_issuer_wide {
+                return Err(format!(
+                    "rule {first}: an issuer-wide rule must come after every other rule, or it shadows rule {i}"
+                ));
+            }
+            if rule.conditions.is_empty() {
+                return Err(format!(
+                    "rule {i}: at least one claim condition is required (catch-all trust is unsafe)"
+                ));
+            }
         }
         for (j, cond) in rule.conditions.iter_mut().enumerate() {
             cond.claim = cond.claim.trim().to_string();
@@ -359,7 +389,7 @@ pub fn validate_workload_identity_config(config: &JsonValue) -> Result<JsonValue
                 ));
             }
         }
-        if !rule_has_identity_scope(&issuer, &identity_claims, rule) {
+        if !rule.issuer_wide && !rule_has_identity_scope(&issuer, &identity_claims, rule) {
             if normalize_issuer(&issuer) == GITHUB_ACTIONS_ISSUER {
                 return Err(format!(
                     "rule {i}: GitHub Actions trust must include both repository_id and repository_owner_id; mutable names/sub/ref/environment are optional extra boundaries, not identity anchors"
@@ -685,7 +715,7 @@ impl WorkloadIdentitySource {
             }
         };
 
-        let Some(role_name) = matched_role(
+        let Some(rule) = matched_rule(
             &verified.claims,
             &realm.config.rules,
             &realm.config.identity_claims,
@@ -697,6 +727,7 @@ impl WorkloadIdentitySource {
             );
             return Err(SourceOutcome::Reject);
         };
+        let role_name = rule.role.as_str();
 
         // Defense in depth for malformed/legacy rows that bypassed config
         // validation: a public CI identity can never mint global Forge admin.
@@ -714,6 +745,7 @@ impl WorkloadIdentitySource {
                     realm = %realm.realm_name,
                     subject = %verified.subject,
                     role = %role_name,
+                    issuer_wide = rule.issuer_wide,
                     "WIF workload authenticated"
                 );
                 let publishers = match forge_db::trusted_publisher_dao::list_for_realm(
@@ -750,6 +782,7 @@ impl WorkloadIdentitySource {
                     principal: Principal::Workload {
                         realm_id: realm.realm_id,
                         role_id,
+                        issuer_wide: rule.issuer_wide,
                         issuer_sha256: sha256_bytes(verified.issuer.trim_end_matches('/')),
                         config_sha256: realm.config_sha256,
                         subject_sha256: workload_subject_hash(&verified.issuer, &verified.subject),
@@ -841,6 +874,7 @@ impl WorkloadIdentitySource {
         SourceOutcome::Authenticated(Principal::Workload {
             realm_id: row.realm_id,
             role_id: row.role_id,
+            issuer_wide: row.issuer_wide,
             issuer_sha256: row.issuer_sha256,
             config_sha256: row.config_sha256,
             subject_sha256: row.subject_sha256,
@@ -1047,30 +1081,44 @@ fn normalize_issuer(issuer: &str) -> &str {
     issuer.trim_end_matches('/')
 }
 
-/// The forge role granted by the **first** rule whose every condition matches
-/// `claims`, or `None` (default deny).
-pub fn matched_role<'a>(
+/// The **first** rule whose every condition matches `claims`, or `None`
+/// (default deny). Its `role` is the forge role granted.
+pub fn matched_rule<'a>(
     claims: &IdTokenClaims,
     rules: &'a [ClaimRule],
     identity_claims: &[String],
-) -> Option<&'a str> {
+) -> Option<&'a ClaimRule> {
     let matched = rules
         .iter()
-        .find(|rule| rule_matches(claims, rule, identity_claims))
-        .map(|r| r.role.as_str())?;
-    (matched != authz_dao::ADMIN_ROLE).then_some(matched)
+        .find(|rule| rule_matches(claims, rule, identity_claims))?;
+    (matched.role != authz_dao::ADMIN_ROLE).then_some(matched)
 }
 
 /// Whether every condition of `rule` matches `claims`. Empty and semantically
 /// context-only rule sets fail closed even if a malformed row bypassed config
-/// validation.
+/// validation, and so does an issuer-wide rule for a public issuer.
 fn rule_matches(claims: &IdTokenClaims, rule: &ClaimRule, identity_claims: &[String]) -> bool {
-    !rule.conditions.is_empty()
-        && rule_has_identity_scope(&claims.iss, identity_claims, rule)
+    let scoped = if rule.issuer_wide {
+        !is_public_issuer(&claims.iss)
+    } else {
+        !rule.conditions.is_empty() && rule_has_identity_scope(&claims.iss, identity_claims, rule)
+    };
+    scoped
         && rule.conditions.iter().all(|cond| {
             let values = claim_values(claims, &cond.claim);
             values.iter().any(|v| cond.any_of.iter().any(|a| a == v))
         })
+}
+
+/// Whether `issuer` is GitHub Actions or GitLab.com, which mint tokens for
+/// anyone who signs up, so an issuer-wide rule never applies to them.
+fn is_public_issuer(issuer: &str) -> bool {
+    // `Url` lowercases the scheme and host and drops a default port, so no
+    // spelling of the URL slips past.
+    let normalized = url::Url::parse(issuer)
+        .map(|url| url.as_str().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| normalize_issuer(issuer).to_string());
+    normalized == GITHUB_ACTIONS_ISSUER || normalized == GITLAB_COM_ISSUER
 }
 
 /// Whether a rule binds trust to a workload identity rather than only to
@@ -1173,6 +1221,15 @@ fn json_to_strings(v: &JsonValue) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::{json, Map};
+
+    /// The role of the first matching rule.
+    fn matched_role<'a>(
+        claims: &IdTokenClaims,
+        rules: &'a [ClaimRule],
+        identity_claims: &[String],
+    ) -> Option<&'a str> {
+        matched_rule(claims, rules, identity_claims).map(|rule| rule.role.as_str())
+    }
 
     fn claims_with(additional: Map<String, JsonValue>) -> IdTokenClaims {
         IdTokenClaims {
@@ -1428,6 +1485,7 @@ mod tests {
             // first rule needs a protected ref on a different project — no match
             ClaimRule {
                 role: "deployer".into(),
+                issuer_wide: false,
                 conditions: vec![ClaimCondition {
                     claim: "project_path".into(),
                     any_of: vec!["group/other".into()],
@@ -1436,6 +1494,7 @@ mod tests {
             // second rule: project + protected ref both match
             ClaimRule {
                 role: "publisher".into(),
+                issuer_wide: false,
                 conditions: vec![
                     ClaimCondition {
                         claim: "project_path".into(),
@@ -1449,6 +1508,158 @@ mod tests {
             },
         ];
         assert_eq!(matched_role(&claims, &rules, &[]), Some("publisher"));
+    }
+
+    #[test]
+    fn issuer_wide_rules_are_for_a_self_managed_issuer_and_come_last() {
+        let pinned = json!({"role": "ci-write", "conditions": [
+            {"claim": "job_project_id", "any_of": ["1001"]}
+        ]});
+        let wide = json!({"role": "ci-read", "issuer_wide": true, "conditions": []});
+        let protected = json!({"role": "ci-protected", "issuer_wide": true, "conditions": [
+            {"claim": "ref_protected", "any_of": ["true"]}
+        ]});
+        let realm = |issuer: &str, rules: JsonValue| json!({"issuer": issuer, "allowed_audiences": ["forge"], "rules": rules});
+
+        let ok = validate_workload_identity_config(&realm(
+            "https://gitlab.example",
+            json!([pinned, protected, wide]),
+        ))
+        .expect("issuer-wide rules after the pinned one");
+        assert!(
+            ok["rules"][0].get("issuer_wide").is_none(),
+            "unset stays out of the normalized config"
+        );
+        assert_eq!(ok["rules"][1]["issuer_wide"], true);
+        assert_eq!(ok["rules"][2]["issuer_wide"], true);
+        validate_workload_identity_config(&realm("https://gitlab.example", json!([wide])))
+            .expect("no condition is required");
+
+        // Anyone can mint a token of a public issuer, however it is spelled.
+        for issuer in [
+            "https://gitlab.com",
+            "https://GitLab.com/",
+            "https://gitlab.com:443",
+            "https://token.actions.githubusercontent.com",
+        ] {
+            let err =
+                validate_workload_identity_config(&realm(issuer, json!([wide]))).expect_err(issuer);
+            assert!(
+                err.contains("issuer-wide trust is refused"),
+                "{issuer}: {err}"
+            );
+        }
+        // Rules are first-match: ahead of a pinned rule it would shadow it.
+        let err = validate_workload_identity_config(&realm(
+            "https://gitlab.example",
+            json!([wide, pinned]),
+        ))
+        .unwrap_err();
+        assert!(err.contains("must come after every other rule"), "{err}");
+        // Its conditions are still checked, and it never grants admin.
+        assert!(validate_workload_identity_config(&realm(
+            "https://gitlab.example",
+            json!([{"role": "ci-read", "issuer_wide": true, "conditions": [
+                {"claim": "ref_protected", "any_of": []}
+            ]}]),
+        ))
+        .is_err());
+        assert!(validate_workload_identity_config(&realm(
+            "https://gitlab.example",
+            json!([{"role": "admin", "issuer_wide": true}]),
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn issuer_wide_rules_match_every_workload_the_rules_ahead_do_not() {
+        let condition = |claim: &str, value: &str| ClaimCondition {
+            claim: claim.into(),
+            any_of: vec![value.into()],
+        };
+        let rules = vec![
+            ClaimRule {
+                role: "ci-write".into(),
+                issuer_wide: false,
+                conditions: vec![condition("job_project_id", "1001")],
+            },
+            ClaimRule {
+                role: "ci-protected".into(),
+                issuer_wide: true,
+                conditions: vec![condition("ref_protected", "true")],
+            },
+            ClaimRule {
+                role: "ci-read".into(),
+                issuer_wide: true,
+                conditions: vec![],
+            },
+        ];
+        let job = |project: &str, protected: bool| {
+            let mut add = Map::new();
+            add.insert("job_project_id".into(), json!(project));
+            add.insert("ref_protected".into(), json!(protected));
+            claims_with(add)
+        };
+        let matched = |claims: IdTokenClaims| {
+            matched_rule(&claims, &rules, &[]).map(|rule| (rule.role.clone(), rule.issuer_wide))
+        };
+        assert_eq!(
+            matched(job("1001", false)),
+            Some(("ci-write".into(), false))
+        );
+        assert_eq!(
+            matched(job("2002", true)),
+            Some(("ci-protected".into(), true))
+        );
+        assert_eq!(matched(job("2002", false)), Some(("ci-read".into(), true)));
+    }
+
+    #[test]
+    fn issuer_wide_rules_fail_closed_for_public_issuers_even_if_a_bad_row_bypasses_validation() {
+        let rules = vec![ClaimRule {
+            role: "ci-read".into(),
+            issuer_wide: true,
+            conditions: vec![],
+        }];
+        for issuer in [
+            GITLAB_COM_ISSUER,
+            "https://gitlab.com/",
+            GITHUB_ACTIONS_ISSUER,
+        ] {
+            let mut claims = claims_with(Map::new());
+            claims.iss = issuer.into();
+            assert_eq!(matched_role(&claims, &rules, &[]), None, "{issuer}");
+        }
+        assert_eq!(
+            matched_role(&claims_with(Map::new()), &rules, &[]),
+            Some("ci-read")
+        );
+    }
+
+    #[test]
+    fn realms_without_issuer_wide_rules_keep_their_config_digest() {
+        let config = json!({
+            "issuer": "https://gitlab.example",
+            "allowed_audiences": ["forge"],
+            "rules": [{"role": "ci", "conditions": [
+                {"claim": "job_project_id", "any_of": ["1001"]}
+            ]}]
+        });
+        // What a realm saved before issuer-wide rules existed normalizes to.
+        assert_eq!(
+            serde_json::to_string(&validate_workload_identity_config(&config).unwrap()).unwrap(),
+            r#"{"allow_http_issuer":false,"allowed_audiences":["forge"],"allowed_authorized_parties":[],"clock_skew_seconds":60,"issuer":"https://gitlab.example","max_token_age_seconds":39600,"positive_cache_seconds":60,"rules":[{"conditions":[{"any_of":["1001"],"claim":"job_project_id"}],"role":"ci"}]}"#
+        );
+        assert_eq!(
+            hex::encode(workload_identity_config_sha256(&config).unwrap()),
+            "895a21172935d94fa9a67417dcb12d373f11d05b44b8628e80b14268ac2cb561"
+        );
+        let mut explicit = config.clone();
+        explicit["rules"][0]["issuer_wide"] = json!(false);
+        assert_eq!(
+            workload_identity_config_sha256(&explicit).unwrap(),
+            workload_identity_config_sha256(&config).unwrap()
+        );
     }
 
     #[test]
@@ -1554,6 +1765,7 @@ mod tests {
         let claims = claims_with(add);
         let rules = vec![ClaimRule {
             role: "publisher".into(),
+            issuer_wide: false,
             conditions: vec![
                 ClaimCondition {
                     claim: "project_path".into(),
@@ -1573,6 +1785,7 @@ mod tests {
         let claims = claims_with(Map::new());
         let rules = vec![ClaimRule {
             role: "reader".into(),
+            issuer_wide: false,
             conditions: vec![],
         }];
         assert_eq!(matched_role(&claims, &rules, &[]), None);
@@ -1585,6 +1798,7 @@ mod tests {
         let claims = claims_with(add);
         let rules = vec![ClaimRule {
             role: "publisher".into(),
+            issuer_wide: false,
             conditions: vec![
                 ClaimCondition {
                     claim: "aud".into(),
@@ -1604,6 +1818,7 @@ mod tests {
         let claims = claims_with(Map::new());
         let rules = vec![ClaimRule {
             role: authz_dao::ADMIN_ROLE.into(),
+            issuer_wide: false,
             conditions: vec![ClaimCondition {
                 claim: "sub".into(),
                 any_of: vec!["subject-1".into()],

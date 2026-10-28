@@ -749,6 +749,105 @@ describe('admin realms create', { timeout: 20_000 }, () => {
     })
   })
 
+  it('takes every project of a self-managed issuer with a last, read-only rule', async () => {
+    let posted: unknown = null
+    mockApi({
+      realms: [],
+      roles: [
+        role({ id: 4, name: 'ci-deployer' }),
+        role({ id: 5, name: 'readers' }),
+      ],
+      onCreate: (body) => {
+        posted = body
+        return json(realm({ id: 9, kind: 'workload_identity' }), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/new')
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
+    await u.type(screen.getByLabelText('Name'), 'gitlab')
+    await u.type(screen.getByLabelText('Issuer URL'), 'https://gitlab.example.com')
+    await u.type(screen.getByLabelText('Allowed audiences'), 'https://forge.example.com')
+
+    await u.click(screen.getByRole('button', { name: 'Add rule' }))
+    const rolePicker = screen.getByLabelText('Role')
+    await waitFor(() =>
+      expect(within(rolePicker).getByRole('option', { name: 'readers' })).toBeInTheDocument(),
+    )
+    await u.selectOptions(rolePicker, 'readers')
+    // Switching it on drops the blank condition: none is required.
+    await u.click(screen.getByRole('switch', { name: 'Rule 1: every project of this issuer' }))
+    expect(screen.queryByLabelText('Claim')).toBeNull()
+    expect(
+      screen
+        .getAllByRole('status')
+        .map((status) => status.textContent)
+        .some((text) =>
+          text?.includes(
+            'Every account that can create a project and run a pipeline on https://gitlab.example.com reads with readers, in a personal namespace or a fork too.',
+          ),
+        ),
+    ).toBe(true)
+
+    // A rule added now goes ahead of it: rules are first-match.
+    await u.click(screen.getByRole('button', { name: 'Add rule' }))
+    await u.selectOptions(screen.getAllByLabelText('Role')[0], 'ci-deployer')
+    await u.type(screen.getByLabelText('Claim'), 'job_project_id')
+    await u.type(screen.getByLabelText('Any of'), '1001')
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect((posted as { config: { rules: unknown } }).config.rules).toEqual([
+      { role: 'ci-deployer', conditions: [{ claim: 'job_project_id', any_of: ['1001'] }] },
+      { role: 'readers', issuer_wide: true, conditions: [] },
+    ])
+  })
+
+  it('refuses a rule for every project ahead of another rule', async () => {
+    let posted: unknown = null
+    mockApi({
+      realms: [],
+      onCreate: (body) => {
+        posted = body
+        return json(realm(body as Partial<RealmView>), 201)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/new')
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
+    await u.type(screen.getByLabelText('Name'), 'gitlab')
+    await u.type(screen.getByLabelText('Issuer URL'), 'https://gitlab.example.com')
+    await u.type(screen.getByLabelText('Allowed audiences'), 'https://forge.example.com')
+    await u.click(screen.getByRole('button', { name: 'Add rule' }))
+    await u.click(screen.getByRole('button', { name: 'Add rule' }))
+    await u.type(screen.getAllByLabelText('Role')[0], 'readers')
+    await u.type(screen.getAllByLabelText('Role')[1], 'ci-deployer')
+    await u.type(screen.getAllByLabelText('Claim')[1], 'job_project_id')
+    await u.type(screen.getAllByLabelText('Any of')[1], '1001')
+    await u.click(screen.getByRole('switch', { name: 'Rule 1: every project of this issuer' }))
+    await u.click(screen.getByRole('button', { name: 'Create realm' }))
+
+    expect(
+      await screen.findByText(/a rule for every project comes after every other rule/),
+    ).toBeInTheDocument()
+    expect(posted).toBeNull()
+  })
+
+  it('offers no rule for every project of GitLab.com', async () => {
+    mockApi({ realms: [] })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/new')
+    await u.click(await screen.findByRole('radio', { name: /^Workload identity/ }))
+    await u.type(screen.getByLabelText('Issuer URL'), 'https://gitlab.com/')
+    await u.click(screen.getByRole('button', { name: 'Add rule' }))
+    expect(
+      screen.getByRole('switch', { name: 'Rule 1: every project of this issuer' }),
+    ).toBeDisabled()
+  })
+
   it('validates required workload_identity fields inline and does not POST', async () => {
     let posted: unknown = null
     mockApi({

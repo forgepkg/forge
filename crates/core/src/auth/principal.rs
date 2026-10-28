@@ -80,6 +80,12 @@ pub enum Principal {
         /// `role.id` the matched claim-rule granted. The authz seam resolves
         /// this role's effective set (deny-all if the role was since deleted).
         role_id: i64,
+        /// Whether the matched claim-rule trusts every workload of the issuer
+        /// rather than one pinned to a workload identity. The authz seam caps
+        /// the role's grants at `read` for it, so a role given `write` does
+        /// not hand it to every project; trusted publishers, which stay
+        /// pinned, still add theirs.
+        issuer_wide: bool,
         /// SHA-256 of the normalized trusted issuer. The publish audit hook
         /// compares this to the current realm row while holding a row lock, so
         /// a stale realm snapshot cannot be attributed to a reconfigured issuer.
@@ -204,6 +210,7 @@ mod tests {
         let workload = Principal::Workload {
             realm_id: 3,
             role_id: 7,
+            issuer_wide: false,
             issuer_sha256: [0; 32],
             config_sha256: [0; 32],
             subject_sha256: [0; 32],

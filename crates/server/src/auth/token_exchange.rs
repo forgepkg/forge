@@ -309,6 +309,7 @@ async fn redeem(
     let Principal::Workload {
         realm_id,
         role_id,
+        issuer_wide,
         issuer_sha256,
         config_sha256,
         subject_sha256,
@@ -344,6 +345,7 @@ async fn redeem(
             key_sha256: &workload_key_sha256(&api_key),
             realm_id,
             role_id,
+            issuer_wide,
             issuer_sha256: &issuer_sha256,
             config_sha256: &config_sha256,
             subject_sha256: &subject_sha256,
