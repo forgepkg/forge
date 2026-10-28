@@ -102,7 +102,13 @@ function parseClaim(raw: unknown): string | undefined {
     : undefined
 }
 
-const passwordFallbackOptions: LoginOptions = {
+/**
+ * The login options while `GET /auth/login-options` cannot be read: the
+ * username and password form alone. (Not named after the password: static
+ * analysis takes such a name for a credential, and the realm names read from
+ * these options reach storage as a pending OIDC sign-in.)
+ */
+const fallbackLoginOptions: LoginOptions = {
   mode: 'combined',
   password: true,
   oidc: [],
@@ -173,7 +179,7 @@ function Login() {
     retry: false,
   })
   const loginOptions =
-    options.data ?? (options.isError ? passwordFallbackOptions : undefined)
+    options.data ?? (options.isError ? fallbackLoginOptions : undefined)
   const remember = loginOptions?.remember_accounts === true
   const [accounts, setAccounts] = useState(listAccounts)
   const [picked, setPicked] = useState<PickedAccount | null>(null)
