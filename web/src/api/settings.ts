@@ -21,6 +21,8 @@ export type LoginMode = 'identifier_first' | 'combined'
 export interface AuthSettings {
   anonymous_mode: AnonymousMode
   login_mode: LoginMode
+  /** The login screen offers the accounts signed in on the device before. */
+  remember_accounts: boolean
   /** Accept a user's password over HTTP Basic on the feeds. */
   allow_password_basic: boolean
   session_idle_ttl_seconds: number

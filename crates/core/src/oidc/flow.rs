@@ -175,12 +175,16 @@ pub struct ValidatedLogin {
 ///
 /// `redirect_to` is the (already open-redirect-validated by the caller) relative
 /// path to send the user to after login; it is persisted so the completing
-/// instance — possibly a *different* one — can honor it.
+/// instance — possibly a *different* one — can honor it. `login_hint` (already
+/// validated by the caller) is the account the user means to sign in as; it
+/// goes to the IdP as the authorize request's `login_hint`, so the IdP can
+/// preselect that account instead of asking for it again.
 pub async fn begin_login(
     pool: &PgPool,
     meta: &OidcMetadataClient,
     client: &ClientParams,
     redirect_to: &str,
+    login_hint: Option<&str>,
 ) -> Result<BeginLogin, FlowError> {
     let discovery = meta.discovery().await?;
 
@@ -215,6 +219,7 @@ pub async fn begin_login(
         &state,
         &nonce,
         &code_challenge,
+        login_hint,
     )
     .map_err(|e| FlowError::TokenResponse(format!("bad authorize endpoint: {e}")))?;
 
@@ -438,6 +443,7 @@ fn build_authorize_url(
     state: &str,
     nonce: &str,
     code_challenge: &str,
+    login_hint: Option<&str>,
 ) -> Result<String, url::ParseError> {
     let mut url = Url::parse(authorization_endpoint)?;
     {
@@ -451,6 +457,9 @@ fn build_authorize_url(
         q.append_pair("nonce", nonce);
         q.append_pair("code_challenge", code_challenge);
         q.append_pair("code_challenge_method", "S256");
+        if let Some(hint) = login_hint {
+            q.append_pair("login_hint", hint);
+        }
     }
     Ok(url.to_string())
 }
@@ -525,6 +534,7 @@ mod tests {
             "the-state",
             "the-nonce",
             "the-challenge",
+            None,
         )
         .unwrap();
         let parsed = Url::parse(&url).unwrap();
@@ -539,6 +549,37 @@ mod tests {
         assert_eq!(pairs["redirect_uri"], client.redirect_url);
         // The secret is never in the authorize URL.
         assert!(!url.contains("shh"));
+        // Without a hint, the IdP gets none.
+        assert!(!pairs.contains_key("login_hint"));
+    }
+
+    #[test]
+    fn authorize_url_carries_the_login_hint_encoded() {
+        let client = ClientParams {
+            client_id: "client-abc".into(),
+            auth: ClientAuth::Secret("shh".into()),
+            redirect_url: "https://forge.test/auth/oidc/callback".into(),
+            scopes: vec!["openid".into()],
+            leeway_seconds: 60,
+        };
+        let url = build_authorize_url(
+            "https://idp.test/authorize?tenant=t1",
+            &client,
+            "s",
+            "n",
+            "c",
+            Some("alice+ci@corp.example&prompt=none"),
+        )
+        .unwrap();
+        let parsed = Url::parse(&url).unwrap();
+        let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+        // One parameter, encoded: it cannot add parameters of its own.
+        let hints: Vec<_> = pairs.iter().filter(|(k, _)| k == "login_hint").collect();
+        assert_eq!(hints.len(), 1, "{url}");
+        assert_eq!(hints[0].1, "alice+ci@corp.example&prompt=none");
+        assert!(!pairs.iter().any(|(k, _)| k == "prompt"), "{url}");
+        // The endpoint's own parameters are kept.
+        assert!(pairs.iter().any(|(k, v)| k == "tenant" && v == "t1"));
     }
 
     #[test]

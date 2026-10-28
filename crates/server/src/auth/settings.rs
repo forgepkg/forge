@@ -1,7 +1,8 @@
 //! Sign-in and anonymous-access policy, set at runtime (#294).
 //!
-//! The anonymous mode, the login screen's mode, password Basic
-//! authentication, the session lifetimes and the password lockout are policy
+//! The anonymous mode, the login screen's mode and its remembered accounts,
+//! password Basic authentication, the session lifetimes and the password
+//! lockout are policy
 //! an administrator changes while Forge runs, and every instance must
 //! apply the same values. They are kept in `forge_setting` under
 //! [`AUTH_SETTINGS_KEY`] as one JSON document ([`AuthSettings`]), changed
@@ -20,8 +21,9 @@
 //! (lockout limits).
 //!
 //! An install that never saved them uses [`AuthSettings::default`]: no
-//! anonymous access, the identifier-first login screen, no password Basic
-//! authentication, 8 h / 7 d sessions and 10 failures per 5 minutes. When the
+//! anonymous access, the identifier-first login screen remembering accounts,
+//! no password Basic authentication, 8 h / 7 d sessions and 10 failures per 5
+//! minutes. When the
 //! row cannot be read, an instance keeps the settings it has (the defaults
 //! before the first read) and tries again after the TTL.
 
@@ -137,6 +139,10 @@ pub struct AuthSettings {
     pub login_max_failures: u32,
     /// Length (seconds) of the failure window and the lockout.
     pub login_failure_window_seconds: u64,
+    /// Whether the login screen remembers the accounts signed in on a
+    /// device and offers them for the next sign-in. The browser keeps them;
+    /// `false` (a kiosk, a shared terminal) has it keep and show none.
+    pub remember_accounts: bool,
 }
 
 impl Default for AuthSettings {
@@ -149,6 +155,7 @@ impl Default for AuthSettings {
             session_absolute_ttl_seconds: 7 * 24 * 60 * 60,
             login_max_failures: 10,
             login_failure_window_seconds: 300,
+            remember_accounts: true,
         }
     }
 }
@@ -216,6 +223,10 @@ impl AuthSettings {
             "login_failure_window_seconds",
             self.login_failure_window_seconds != other.login_failure_window_seconds,
         );
+        diff(
+            "remember_accounts",
+            self.remember_accounts != other.remember_accounts,
+        );
         keys
     }
 }
@@ -233,6 +244,7 @@ pub struct AuthSettingsUpdate {
     pub session_absolute_ttl_seconds: Option<u64>,
     pub login_max_failures: Option<u32>,
     pub login_failure_window_seconds: Option<u64>,
+    pub remember_accounts: Option<bool>,
 }
 
 impl AuthSettingsUpdate {
@@ -259,6 +271,9 @@ impl AuthSettingsUpdate {
         }
         if let Some(window) = self.login_failure_window_seconds {
             next.login_failure_window_seconds = window;
+        }
+        if let Some(remember) = self.remember_accounts {
+            next.remember_accounts = remember;
         }
         next.validate()?;
         Ok(next)
@@ -496,11 +511,14 @@ mod tests {
         assert_eq!(settings.validate().unwrap(), AnonPolicy::Off);
         assert!(!settings.allow_password_basic);
         assert_eq!(settings.login_mode, LoginMode::IdentifierFirst);
-        // An empty or partial stored document takes the defaults.
+        assert!(settings.remember_accounts);
+        // An empty or partial stored document takes the defaults, so a row
+        // saved before `remember_accounts` existed remembers accounts.
         let stored: AuthSettings =
             serde_json::from_str(r#"{"anonymous_mode":"all","removed_later":1}"#).unwrap();
         assert_eq!(stored.anonymous_mode, AnonymousMode::All);
         assert_eq!(stored.session_idle_ttl_seconds, 8 * 60 * 60);
+        assert!(stored.remember_accounts);
     }
 
     #[test]
@@ -531,11 +549,17 @@ mod tests {
         let update: AuthSettingsUpdate = serde_json::from_value(serde_json::json!({
             "anonymous_mode": " All",
             "login_mode": "combined",
+            "remember_accounts": false,
         }))
         .unwrap();
         let next = update.apply_to(&current).unwrap();
         assert_eq!(next.anonymous_mode, AnonymousMode::All);
         assert_eq!(next.login_mode, LoginMode::Combined);
+        assert!(!next.remember_accounts);
+        assert_eq!(
+            current.changed_keys(&next).last(),
+            Some(&"remember_accounts")
+        );
         assert!(next.allow_password_basic, "left out, kept");
         assert_eq!(next.validate().unwrap(), AnonPolicy::All);
     }

@@ -213,6 +213,7 @@ function AnonymousRepositories() {
 
 interface SignInDraft {
   login_mode: LoginMode
+  remember_accounts: boolean
   allow_password_basic: boolean
   session_idle_ttl_seconds: string
   session_absolute_ttl_seconds: string
@@ -241,6 +242,7 @@ function validateSignIn(
   return {
     body: {
       login_mode: draft.login_mode,
+      remember_accounts: draft.remember_accounts,
       allow_password_basic: draft.allow_password_basic,
       session_idle_ttl_seconds: idle!,
       session_absolute_ttl_seconds: absolute!,
@@ -256,12 +258,16 @@ function durationHint(raw: string): string | null {
   return n === null ? null : `= ${formatDuration(n)}`
 }
 
-/** The login screen, password Basic, session lifetimes and the lockout. */
+/**
+ * The login screen and its remembered accounts, password Basic, session
+ * lifetimes and the lockout.
+ */
 function SignInForm({ settings }: { settings: AuthSettings }) {
   const update = useUpdateAuthSettings()
   const realms = useRealms()
   const [draft, setDraft] = useState<SignInDraft>({
     login_mode: settings.login_mode,
+    remember_accounts: settings.remember_accounts,
     allow_password_basic: settings.allow_password_basic,
     session_idle_ttl_seconds: String(settings.session_idle_ttl_seconds),
     session_absolute_ttl_seconds: String(settings.session_absolute_ttl_seconds),
@@ -318,6 +324,15 @@ function SignInForm({ settings }: { settings: AuthSettings }) {
           <option value="identifier_first">Username first</option>
           <option value="combined">Username and password</option>
         </SelectField>
+
+        <Checkbox
+          label="Remember accounts on the login screen"
+          // The label wraps the description too: name the box by its label alone.
+          aria-label="Remember accounts on the login screen"
+          checked={draft.remember_accounts}
+          onChange={(checked) => set('remember_accounts', checked)}
+          description="After a sign-in, the browser keeps the account (its username, name and how it signs in, never a password or a session) and the login screen offers it next time, so signing in again is one click. Turn it off for kiosks and shared computers: their login screens then forget the accounts they kept."
+        />
 
         <Checkbox
           label="Accept passwords over HTTP Basic on the feeds"

@@ -15,8 +15,9 @@
 //!   * `POST /auth/identify`      — identifier-first routing,
 //!     decided ONLY by public realm config (anti-enumeration).
 //!   * `GET  /auth/login-options` — what the login screen should render.
-//!   * `GET  /auth/oidc/login`    — start the auth-code+PKCE flow (302 → IdP);
-//!     404 when no enabled oidc realm exists.
+//!   * `GET  /auth/oidc/login`    — start the auth-code+PKCE flow (302 → IdP,
+//!     with the optional `login_hint` the login screen sends); 404 when no
+//!     enabled oidc realm exists.
 //!   * `GET  /auth/oidc/callback` — complete it, set the session cookie, 302 to a
 //!     validated relative target.
 //!   * `POST /auth/logout`        — revoke the session + clear the cookie (CSRF
@@ -55,7 +56,7 @@ use forge_core::oidc::{
 use forge_core::session::{csrf_token_matches, IssuedSession, SessionService};
 use forge_db::model::{AppUser, Session};
 use forge_db::token_dao::{self, NewToken};
-use forge_db::user_dao;
+use forge_db::{external_identity_dao, user_dao};
 use serde::{Deserialize, Serialize};
 
 use crate::config::OidcConfig;
@@ -177,6 +178,29 @@ pub struct LoginQuery {
     /// Optional post-login relative path; sanitized to defeat open redirects.
     #[serde(default)]
     pub redirect_to: Option<String>,
+    /// Optional account the user means to sign in as (the identifier typed
+    /// on the login screen, or a remembered account's): passed to the IdP as
+    /// `login_hint` once [`sanitize_login_hint`] accepts it.
+    #[serde(default)]
+    pub login_hint: Option<String>,
+}
+
+/// Longest accepted `login_hint` (bytes): an email address or UPN fits many
+/// times over.
+pub const MAX_LOGIN_HINT_BYTES: usize = 256;
+
+/// The `login_hint` to pass to the IdP: `raw` trimmed, when it is not empty,
+/// at most [`MAX_LOGIN_HINT_BYTES`] and free of control characters. Anything
+/// else is dropped rather than refused: the hint only saves the user typing
+/// their account at the IdP again, and the sign-in works without it.
+fn sanitize_login_hint(raw: Option<&str>) -> Option<&str> {
+    let hint = raw.map(str::trim).filter(|h| !h.is_empty())?;
+    if hint.len() > MAX_LOGIN_HINT_BYTES || hint.chars().any(char::is_control) {
+        // It is an email address: never above debug, and only its size.
+        tracing::debug!(bytes = hint.len(), "oidc login_hint dropped");
+        return None;
+    }
+    Some(hint)
 }
 
 /// Build the `/auth` router. Always mounted: sessions exist for local
@@ -250,8 +274,9 @@ async fn oidc_login(
     };
     let rt = &orr.runtime;
     let redirect_to = sanitize_redirect_to(q.redirect_to.as_deref());
+    let login_hint = sanitize_login_hint(q.login_hint.as_deref());
 
-    match begin_login(&state.pool, &rt.meta, &rt.client, &redirect_to).await {
+    match begin_login(&state.pool, &rt.meta, &rt.client, &redirect_to, login_hint).await {
         // Bind the flow to this browser: the callback must present the cookie.
         Ok(begun) => (
             StatusCode::FOUND,
@@ -448,8 +473,26 @@ async fn oidc_callback_inner(
         forge_core::authz::invalidate_user(&state.cache, user.id).await;
     }
 
+    // Link the session to the identity that signed in (`/auth/me` reports its
+    // display name). Display only, so a failed lookup leaves it unlinked.
+    let identity_id = external_identity_dao::find_by_issuer_subject(
+        &state.pool,
+        &validated.issuer,
+        &validated.subject,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "oidc identity lookup failed");
+        None
+    })
+    .map(|identity| identity.id);
+
     // Create a fresh session (login always mints a new row — fixation-proof).
-    let issued = match rt.sessions.create_for_user(user.id, None, None).await {
+    let issued = match rt
+        .sessions
+        .create_for_user(user.id, identity_id, None)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "session creation failed");
@@ -662,6 +705,10 @@ async fn require_session_csrf(
 struct AuthMe {
     user_id: i64,
     username: String,
+    /// The name the identity provider gave for the user, for a session an
+    /// OIDC sign-in opened (`null` otherwise, and when it sent none). Display
+    /// only: the login screen's remembered accounts show it.
+    display_name: Option<String>,
     is_admin: bool,
     /// Per-session double-submit CSRF secret (echo it in `X-CSRF-Token`).
     csrf_token: String,
@@ -687,9 +734,20 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
             method: forge_core::auth::AuthMethod::Session,
         })
         .await;
+    let display_name = match session.external_identity_id {
+        Some(id) => external_identity_dao::display_name(&state.pool, id)
+            .await
+            .unwrap_or_else(|e| {
+                // Display only: answer without it rather than fail the session.
+                tracing::warn!(error = %e, "display name lookup failed");
+                None
+            }),
+        None => None,
+    };
     Json(AuthMe {
         user_id: u.id,
         username: u.username,
+        display_name,
         is_admin,
         csrf_token: session.csrf_secret,
     })
@@ -1147,6 +1205,7 @@ async fn password_login(
         Json(AuthMe {
             user_id: principal.user_id,
             username,
+            display_name: None,
             is_admin: state
                 .authz
                 .is_global_admin(&forge_core::auth::Principal::from_user(principal))
@@ -1412,6 +1471,10 @@ struct LoginOptions {
     password: bool,
     /// Enabled OIDC realm buttons (at most one).
     oidc: Vec<OidcLoginOption>,
+    /// Whether the login screen remembers the accounts signed in on the
+    /// device and offers them (the `remember_accounts` auth setting). The
+    /// accounts are kept in the browser only; the server never lists any.
+    remember_accounts: bool,
 }
 
 /// `GET /auth/login-options` — public, unauthenticated: the login screen asks
@@ -1432,16 +1495,12 @@ async fn login_options(State(state): State<AppState>) -> Response {
             }]
         })
         .unwrap_or_default();
+    let settings = &state.auth_settings.current().await.settings;
     Json(LoginOptions {
-        mode: state
-            .auth_settings
-            .current()
-            .await
-            .settings
-            .login_mode
-            .as_str(),
+        mode: settings.login_mode.as_str(),
         password: snap.chain.is_some(),
         oidc,
+        remember_accounts: settings.remember_accounts,
     })
     .into_response()
 }
@@ -1586,6 +1645,29 @@ mod tests {
         let clear = clear_flow_cookie_value(true);
         assert!(clear.starts_with("__Host-forge_oidc_flow=;"));
         assert!(clear.contains("Path=/;"));
+    }
+
+    #[test]
+    fn login_hint_is_bounded_and_printable() {
+        assert_eq!(sanitize_login_hint(None), None);
+        assert_eq!(sanitize_login_hint(Some("")), None);
+        assert_eq!(sanitize_login_hint(Some("   ")), None);
+        assert_eq!(
+            sanitize_login_hint(Some(" alice@corp.example ")),
+            Some("alice@corp.example")
+        );
+        // Not ASCII-only: a UPN may hold any printable character.
+        assert_eq!(
+            sanitize_login_hint(Some("jürgen@bücher.example")),
+            Some("jürgen@bücher.example")
+        );
+        for bad in ["alice\n@corp.example", "alice\u{0}", "a\tb", "\u{7f}x"] {
+            assert_eq!(sanitize_login_hint(Some(bad)), None, "{bad:?}");
+        }
+        let fits = "a".repeat(MAX_LOGIN_HINT_BYTES);
+        assert_eq!(sanitize_login_hint(Some(&fits)), Some(fits.as_str()));
+        let long = "a".repeat(MAX_LOGIN_HINT_BYTES + 1);
+        assert_eq!(sanitize_login_hint(Some(&long)), None);
     }
 
     #[test]

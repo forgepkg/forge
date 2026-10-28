@@ -354,6 +354,74 @@ async fn login_rejects_open_redirect_target() {
     assert_eq!(row.redirect_to, "/", "absolute URL normalised to root");
 }
 
+/// The `login_hint` query parameter of an authorize URL, if any.
+fn login_hint_from_url(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .expect("authorize url")
+        .query_pairs()
+        .find(|(k, _)| k == "login_hint")
+        .map(|(_, v)| v.into_owned())
+}
+
+/// `login_hint` (the account typed on the login screen, or a remembered
+/// one's) reaches the IdP's authorize request so it can preselect the
+/// account; one that is too long or holds control characters is dropped, and
+/// the sign-in still starts without it.
+#[tokio::test]
+async fn login_passes_a_valid_login_hint_to_the_idp() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let start = |query: String| {
+        let url = format!("{}/auth/oidc/login?{query}", srv.base_url);
+        let authorize = format!("{}/authorize", idp.issuer);
+        async move {
+            let resp = no_redirect_client().get(url).send().await.unwrap();
+            assert_eq!(resp.status(), 302, "the sign-in starts");
+            let location = resp.headers().get("location").unwrap().to_str().unwrap();
+            assert!(location.starts_with(&authorize), "{location}");
+            login_hint_from_url(location)
+        }
+    };
+
+    // Encoded on the way in and out: `&` and `+` stay part of the hint.
+    assert_eq!(
+        start("login_hint=alice%2Bci%40corp.example%26prompt%3Dnone&redirect_to=/browse".into())
+            .await
+            .as_deref(),
+        Some("alice+ci@corp.example&prompt=none")
+    );
+    assert_eq!(start("redirect_to=/browse".into()).await, None, "none sent");
+    assert_eq!(start("login_hint=%20%20".into()).await, None, "blank");
+    assert_eq!(
+        start("login_hint=alice%0A%40corp.example".into()).await,
+        None,
+        "a control character"
+    );
+    let at_bound = format!("{}@x", "a".repeat(254));
+    assert_eq!(
+        start(format!("login_hint={at_bound}")).await.as_deref(),
+        Some(at_bound.as_str()),
+        "256 bytes"
+    );
+    assert_eq!(
+        start(format!("login_hint={}@x", "a".repeat(255))).await,
+        None,
+        "257 bytes"
+    );
+}
+
 // ── callback happy path + /admin/me ──────────────────────────────────────────
 
 #[tokio::test]
@@ -1004,6 +1072,8 @@ async fn auth_me_returns_identity_and_csrf_token() {
         .await
         .unwrap();
     assert_eq!(body["username"], json!(username));
+    // The IdP's `name` claim, for the login screen's remembered account.
+    assert_eq!(body["display_name"], json!(format!("User {username}")));
     assert_eq!(body["is_admin"], json!(false), "no admin role claim");
     assert!(!csrf.is_empty(), "csrf token present");
 }
