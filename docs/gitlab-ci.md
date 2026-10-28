@@ -302,7 +302,17 @@ publish:
   go on without a key. The .NET SDK image has `curl` but no `jq`, so `sed`
   picks the key out of the answer, `{"apiKey":"forge_wif.…","expires":"…"}`.
 - **A job with a `before_script` of its own** replaces the hidden job's, and
-  then has no key: repeat the exchange there.
+  then has no key. List the hidden job's first:
+
+  ```yaml
+  test:
+    extends: .forge
+    before_script:
+      - !reference [.forge, before_script]
+      - dotnet tool restore
+    script:
+      - dotnet test
+  ```
 - **`NuGetPackageSourceCredentials_forge`** gives the `forge` source of
   `nuget.config` the key as its password; the part after the `_` must be the
   source's key. NuGet ignores a malformed value without a message.
@@ -311,6 +321,125 @@ publish:
   of first reading the service index.
 - **The publish job** restores with the read-only role, which every job of
   the project holds, and pushes with the write the trusted publisher adds.
+
+## Every project on a runner
+
+The hidden job above lives in each project. An organization that runs its own
+GitLab Runner for its .NET builds can run the exchange on the runner instead,
+once for every job it builds. Each job then restores with the realm rule's
+read-only role, and only a job that a trusted publisher matches can push. The
+runner's `pre_build_script` runs in the job's shell right before the job's
+`before_script` and `script`, so the key it exports reaches the job.
+
+The runner cannot ask for the token itself: GitLab issues an ID token only to
+a job that declares `id_tokens`. Each project keeps that part.
+
+### The realm rule
+
+The rule of [step 2](#2-the-workload-identity-realm) names every project the
+runner builds. On a self-managed GitLab a rule may pin namespaces alone: every
+project directly in one of the groups matches, and so does a project created
+there later.
+
+```json
+{
+  "role": "gitlab-ci-read",
+  "conditions": [
+    { "claim": "job_namespace_id", "any_of": ["42", "43", "57"] }
+  ]
+}
+```
+
+- **A subgroup is a namespace of its own.** `job_namespace_id` is the group a
+  project sits in directly, so a group's ID does not cover its subgroups:
+  list each of them.
+- **On `https://gitlab.com`** every rule needs project IDs as well: list the
+  projects there.
+- **Keep the role read-only.** Every job of those groups holds it, merge
+  request pipelines included.
+- **Rules are ordered.** A project that needs a role of its own goes into a
+  rule before this one.
+
+### The runner
+
+In the runner's `config.toml`, in its `[[runners]]` entry:
+
+```toml
+[[runners]]
+  # name, url, token, executor, …
+  environment = ["FORGE_URL=https://forge.example.com"]
+  pre_build_script = '''
+if [ -n "${FORGE_ID_TOKEN:-}" ] &&
+  [ -n "$(find "$CI_PROJECT_DIR" -maxdepth 3 -iname nuget.config -exec grep -liF "$FORGE_URL" {} + 2>/dev/null)" ]; then
+  FORGE_KEY="$(curl --fail --silent --show-error -X POST "$FORGE_URL/api/v2/token" \
+    -H "Authorization: Bearer $FORGE_ID_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"username":"oidc","tokenType":"ApiKey"}' \
+    | sed -n 's/.*"apiKey":"\([^"]*\)".*/\1/p')"
+  test -n "$FORGE_KEY"
+  export FORGE_KEY
+  export NuGetPackageSourceCredentials_forge="Username=oidc;Password=$FORGE_KEY"
+fi
+'''
+```
+
+- **Only jobs with a token.** `FORGE_ID_TOKEN` exists only in a job that asks
+  for it, so the runner leaves every other job alone.
+- **Only projects that use Forge.** The exchange runs only when a
+  `nuget.config` up to three directories deep names `$FORGE_URL`, whatever
+  the case of the file's name. The `find` lists nothing both when there is no
+  such file and when none of them names Forge.
+- **A failed exchange fails the job**, as in the hidden job: `test -n` stops
+  it before `dotnet restore` gets 401.
+- **The image** of such a job needs `curl`, `sed`, `find` and a POSIX shell;
+  the .NET SDK image has them. A Windows runner needs a PowerShell version.
+- **The source key is `forge`** in every project's `nuget.config`:
+  `NuGetPackageSourceCredentials_forge` reaches that source alone.
+- **Your own runners only.** GitLab.com's instance runners take no
+  configuration of yours: register a project, group or instance runner of
+  your own.
+
+### The projects
+
+Each project asks for the token in every job, and runs no exchange of its
+own:
+
+```yaml
+default:
+  image: mcr.microsoft.com/dotnet/sdk:10.0
+  id_tokens:
+    FORGE_ID_TOKEN:
+      aud: https://forge.example.com
+
+build:
+  script:
+    - dotnet restore
+    - dotnet build -c Release --no-restore
+    - dotnet test -c Release --no-build
+```
+
+- **No `extends: .forge`.** A token is exchanged once, so the hidden job's
+  exchange would get 401 after the runner's.
+- **The release job** of [step 5](#5-the-project) stays as it is, without
+  `extends: .forge`: it pushes with the `$FORGE_KEY` the runner exported,
+  which the trusted publisher of step 4 gives `write`.
+- **The jobs run on that runner**: give them its tags, or let it pick up
+  untagged jobs.
+
+### Without workload identity
+
+A runner can also hand every job a [service account](ci-service-accounts.md)'s
+read token, with no change to the projects:
+
+```toml
+[[runners]]
+  environment = ["NuGetPackageSourceCredentials_forge=Username=gitlab-ci@example.com;Password=<read token>"]
+```
+
+The token is then a long-lived secret in the runner's configuration, and every
+job the runner runs can print it, whatever project the job belongs to. Give it
+the **read** level alone, an expiry, and only the repositories the builds
+restore from ([step 3](ci-service-accounts.md#3-the-tokens) there).
 
 ## What each identity can do
 
@@ -342,7 +471,7 @@ publish:
 
 | Symptom | Cause |
 | --- | --- |
-| The exchange answers 401 | No rule matched: check the issuer (the tokens' exact `iss`), the audience, and the IDs; on an older GitLab use `project_id` / `namespace_id`. Or the token is older than the maximum token age, or was exchanged already (a retried `curl`, a second exchange in the job). |
+| The exchange answers 401 | No rule matched: check the issuer (the tokens' exact `iss`), the audience, and the IDs; on an older GitLab use `project_id` / `namespace_id`. Or the token is older than the maximum token age, or was exchanged already (a retried `curl`, a second exchange in the job, the project's exchange after the [runner's](#every-project-on-a-runner)). |
 | The exchange answers 503 | Forge cannot fetch GitLab's discovery document or JWKS: the network between them, a proxy, or a certificate Forge does not trust. |
 | `dotnet restore` gets 401 | `NuGetPackageSourceCredentials_<key>` does not name the `nuget.config` source, or the key expired during a long job: raise the exchanged API key lifetime. |
 | A package from a group member is missing | The role reads the group but not that member. |
