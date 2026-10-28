@@ -103,10 +103,17 @@ export interface WorkloadIdentityCondition {
 
 /**
  * A workload-identity rule: grants `role` when ALL `conditions` match (AND).
- * At least one condition is required; catch-all trust is rejected.
+ * At least one condition, pinning a workload identity, is required;
+ * catch-all trust is rejected, except as an `issuer_wide` rule.
  */
 export interface WorkloadIdentityRule {
   role: string
+  /**
+   * Trust every workload of a self-managed issuer: no condition is required,
+   * and the role only reads. Refused for GitHub Actions and GitLab.com, and
+   * allowed only after every other rule. Omitted while off.
+   */
+  issuer_wide?: boolean
   conditions?: WorkloadIdentityCondition[]
 }
 

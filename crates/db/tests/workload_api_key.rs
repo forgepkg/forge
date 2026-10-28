@@ -37,6 +37,7 @@ async fn redeem(
             key_sha256: &digest(n, key_salt),
             realm_id: 1,
             role_id: 1,
+            issuer_wide: false,
             issuer_sha256: &digest(n, 1),
             config_sha256: &digest(n, 2),
             subject_sha256: &digest(n, 3),
@@ -70,6 +71,42 @@ async fn a_token_is_redeemed_once() {
         Redemption::Issued { .. }
     ));
     assert_eq!(redeem(&pool, n, 11, exp, 60).await, Redemption::Replayed);
+}
+
+#[tokio::test]
+async fn a_key_keeps_whether_its_token_matched_an_issuer_wide_rule() {
+    let pool = pool().await;
+    let exp = db_now(&pool).await + Duration::minutes(5);
+    for issuer_wide in [false, true] {
+        let n = unique();
+        let mut conn = pool.acquire().await.unwrap();
+        let issued = workload_api_key_dao::insert(
+            &mut conn,
+            NewWorkloadApiKey {
+                key_sha256: &digest(n, 10),
+                realm_id: 1,
+                role_id: 1,
+                issuer_wide,
+                issuer_sha256: &digest(n, 1),
+                config_sha256: &digest(n, 2),
+                subject_sha256: &digest(n, 3),
+                jti_sha256: &digest(n, 4),
+                token_issued_at: exp - Duration::minutes(5),
+                token_expires_at: exp,
+                token_leeway_seconds: 60,
+                matched_publishers: &[],
+                ttl_seconds: 3600,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(issued, Redemption::Issued { .. }));
+        let key = workload_api_key_dao::find_live(&pool, &digest(n, 10))
+            .await
+            .unwrap()
+            .expect("live key");
+        assert_eq!(key.issuer_wide, issuer_wide);
+    }
 }
 
 #[tokio::test]

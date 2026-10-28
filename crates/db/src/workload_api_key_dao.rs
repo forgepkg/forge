@@ -15,6 +15,9 @@ pub struct NewWorkloadApiKey<'a> {
     pub key_sha256: &'a [u8; 32],
     pub realm_id: i64,
     pub role_id: i64,
+    /// Whether the token matched an issuer-wide rule: the key holds its role
+    /// capped at `read`, as the token did.
+    pub issuer_wide: bool,
     pub issuer_sha256: &'a [u8; 32],
     pub config_sha256: &'a [u8; 32],
     pub subject_sha256: &'a [u8; 32],
@@ -57,6 +60,7 @@ pub struct WorkloadApiKey {
     pub key_sha256: [u8; 32],
     pub realm_id: i64,
     pub role_id: i64,
+    pub issuer_wide: bool,
     pub issuer_sha256: [u8; 32],
     pub config_sha256: [u8; 32],
     pub subject_sha256: [u8; 32],
@@ -97,10 +101,10 @@ pub async fn insert(
         INSERT INTO workload_api_key (
             key_sha256, realm_id, role_id, issuer_sha256, config_sha256,
             subject_sha256, jti_sha256, token_issued_at, token_expires_at,
-            expires_at
+            expires_at, issuer_wide
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-                now() + make_interval(secs => $10))
+                now() + make_interval(secs => $10), $11)
         ON CONFLICT (issuer_sha256, jti_sha256) DO NOTHING
         RETURNING id, expires_at
         "#,
@@ -115,6 +119,7 @@ pub async fn insert(
     .bind(new.token_issued_at)
     .bind(new.token_expires_at)
     .bind(new.ttl_seconds as f64)
+    .bind(new.issuer_wide)
     .fetch_optional(&mut *conn)
     .await?;
     match row {
@@ -159,8 +164,8 @@ pub async fn find_live(
 ) -> sqlx::Result<Option<WorkloadApiKey>> {
     let row = sqlx::query(
         r#"
-        SELECT id, key_sha256, realm_id, role_id, issuer_sha256, config_sha256,
-               subject_sha256, jti_sha256, token_issued_at, expires_at
+        SELECT id, key_sha256, realm_id, role_id, issuer_wide, issuer_sha256,
+               config_sha256, subject_sha256, jti_sha256, token_issued_at, expires_at
         FROM workload_api_key
         WHERE key_sha256 = $1 AND expires_at > now()
         "#,
@@ -179,6 +184,7 @@ pub async fn find_live(
         key_sha256: digest(&row, "key_sha256")?,
         realm_id: row.try_get("realm_id")?,
         role_id: row.try_get("role_id")?,
+        issuer_wide: row.try_get("issuer_wide")?,
         issuer_sha256: digest(&row, "issuer_sha256")?,
         config_sha256: digest(&row, "config_sha256")?,
         subject_sha256: digest(&row, "subject_sha256")?,

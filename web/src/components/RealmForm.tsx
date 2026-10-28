@@ -146,6 +146,8 @@ export interface RealmFormValues {
   /** Ordered claim→role rules; anyOf holds one value per line per condition. */
   wifRules: Array<{
     role: string
+    /** Every project of a self-managed issuer, read-only (`issuer_wide`). */
+    issuerWide: boolean
     conditions: Array<{ claim: string; anyOf: string }>
   }>
   // trusted_header
@@ -305,6 +307,7 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
       wif.api_key_ttl_seconds != null ? String(wif.api_key_ttl_seconds) : '',
     wifRules: (wif.rules ?? []).map((rule) => ({
       role: rule.role ?? '',
+      issuerWide: rule.issuer_wide ?? false,
       conditions: (rule.conditions ?? []).map((c) => ({
         claim: c.claim ?? '',
         anyOf: joinLines(c.any_of),
@@ -499,6 +502,7 @@ export function RealmForm({
       if (values.wifRules.length === 0) {
         next.wifRules = 'At least one rule is required.'
       }
+      const firstIssuerWide = values.wifRules.findIndex((rule) => rule.issuerWide)
       values.wifRules.forEach((rule, ri) => {
         if (rule.role.trim() === '') {
           next[`wifRule.${ri}.role`] = 'A role is required.'
@@ -506,10 +510,19 @@ export function RealmForm({
           next[`wifRule.${ri}.role`] =
             'Workload identity cannot grant the built-in global admin role.'
         }
-        if (rule.conditions.length === 0) {
+        if (!rule.issuerWide && firstIssuerWide !== -1 && firstIssuerWide < ri) {
+          // Rules are first-match: the issuer-wide rule would take this one's
+          // workloads.
+          next[`wifRule.${firstIssuerWide}.issuerWide`] =
+            `Rules are first-match, so a rule for every project comes after every other rule; here it would take the workloads of rule ${ri + 1}. Remove it, and add it again as the last rule.`
+        }
+        if (rule.issuerWide && isPublicWifIssuer(values.issuer)) {
+          next[`wifRule.${ri}.issuerWide`] =
+            'Anyone can mint a GitHub Actions or GitLab.com token: pin the rule to a repository or project instead.'
+        } else if (!rule.issuerWide && rule.conditions.length === 0) {
           next[`wifRule.${ri}.conditions`] =
             'At least one claim condition is required; catch-all trust is not allowed.'
-        } else if (!wifRuleHasIdentityScope(values.issuer, rule.conditions)) {
+        } else if (!wifRuleHasIdentityScope(values.issuer, rule)) {
           next[`wifRule.${ri}.conditions`] = isGitHubActionsIssuer(values.issuer)
             ? 'GitHub Actions rules must include both repository_id and repository_owner_id.'
             : isGitLabComIssuer(values.issuer)
@@ -605,13 +618,34 @@ export function RealmForm({
   }
 
   function addRule() {
-    setValues((v) => ({
-      ...v,
-      wifRules: [
-        ...v.wifRules,
-        { role: '', conditions: [{ claim: '', anyOf: '' }] },
-      ],
-    }))
+    setValues((v) => {
+      // Ahead of the rules for every project, which must come last.
+      const at = v.wifRules.findIndex((r) => r.issuerWide)
+      const end = at === -1 ? v.wifRules.length : at
+      return {
+        ...v,
+        wifRules: [
+          ...v.wifRules.slice(0, end),
+          { role: '', issuerWide: false, conditions: [{ claim: '', anyOf: '' }] },
+          ...v.wifRules.slice(end),
+        ],
+      }
+    })
+  }
+
+  function setIssuerWide(index: number, issuerWide: boolean) {
+    setRule(index, (r) => {
+      // A rule for every project needs no condition: drop the blank ones.
+      const kept = issuerWide
+        ? r.conditions.filter((c) => c.claim.trim() !== '' || c.anyOf.trim() !== '')
+        : r.conditions
+      return {
+        ...r,
+        issuerWide,
+        conditions:
+          !issuerWide && kept.length === 0 ? [{ claim: '', anyOf: '' }] : kept,
+      }
+    })
   }
 
   function removeRule(index: number) {
@@ -1235,7 +1269,7 @@ export function RealmForm({
             <Panel
               title="Rules"
               count={values.wifRules.length}
-              description="Ordered; the first rule whose conditions all match grants its role. Every rule needs a workload identity condition; ref or environment alone is not enough. Public GitHub/GitLab issuers require immutable numeric repository/project and owner/namespace IDs. Global admin is not allowed; grant a repository-scoped role."
+              description="Ordered; the first rule whose conditions all match grants its role. Every rule needs a workload identity condition; ref or environment alone is not enough. Public GitHub/GitLab issuers require immutable numeric repository/project and owner/namespace IDs. On a self-managed issuer, a last rule may take every project, read-only. Global admin is not allowed; grant a repository-scoped role."
             >
               {errors.wifRules && <FormError>{errors.wifRules}</FormError>}
               {values.wifRules.map((rule, ri) => (
@@ -1261,6 +1295,33 @@ export function RealmForm({
                       onChange={(role) => setRule(ri, (r) => ({ ...r, role }))}
                       error={errors[`wifRule.${ri}.role`]}
                     />
+                    <Switch
+                      label="Every project of this issuer"
+                      aria-label={`Rule ${ri + 1}: every project of this issuer`}
+                      description="Matches every CI job the issuer signs a token for, with no workload identity condition; conditions only narrow it. The role only reads: its write and delete grants do not apply. Not for GitHub Actions or GitLab.com."
+                      checked={rule.issuerWide}
+                      disabled={!rule.issuerWide && isPublicWifIssuer(values.issuer)}
+                      onChange={(c) => setIssuerWide(ri, c)}
+                    />
+                    {errors[`wifRule.${ri}.issuerWide`] && (
+                      <FormError>{errors[`wifRule.${ri}.issuerWide`]}</FormError>
+                    )}
+                    {rule.issuerWide && (
+                      <Notice tone="warn" role="status">
+                        Every account that can create a project and run a pipeline on{' '}
+                        {values.issuer.trim() === '' ? (
+                          'this issuer'
+                        ) : (
+                          <Code>{normalizedIssuer(values.issuer)}</Code>
+                        )}{' '}
+                        reads with{' '}
+                        {rule.role.trim() === '' ? 'this role' : <Code>{rule.role.trim()}</Code>}
+                        , in a personal namespace or a fork too. A self-managed GitLab
+                        with open sign-up is as public as GitLab.com. To let a project
+                        publish, add a trusted publisher on the repository, or a rule
+                        for its project ahead of this one.
+                      </Notice>
+                    )}
                   </div>
                   {errors[`wifRule.${ri}.conditions`] && (
                     <FormError>{errors[`wifRule.${ri}.conditions`]}</FormError>
@@ -1722,12 +1783,22 @@ function isGitLabComIssuer(raw: string): boolean {
   return normalizedIssuer(raw) === GITLAB_COM_ISSUER
 }
 
-/** Mirror the server's defense against syntactically non-empty catch-all rules. */
+/** GitHub Actions and GitLab.com: anyone can mint their tokens. */
+function isPublicWifIssuer(raw: string): boolean {
+  return isGitHubActionsIssuer(raw) || isGitLabComIssuer(raw)
+}
+
+/**
+ * Mirror the server's defense against syntactically non-empty catch-all
+ * rules. A rule for every project of a self-managed issuer is scoped by the
+ * issuer alone.
+ */
 function wifRuleHasIdentityScope(
   issuer: string,
-  conditions: Array<{ claim: string }>,
+  rule: { issuerWide: boolean; conditions: Array<{ claim: string }> },
 ): boolean {
-  const claims = conditions.map((condition) => condition.claim.trim())
+  if (rule.issuerWide) return !isPublicWifIssuer(issuer)
+  const claims = rule.conditions.map((condition) => condition.claim.trim())
   if (isGitHubActionsIssuer(issuer)) {
     return (
       claims.includes('repository_id') &&
@@ -1868,7 +1939,9 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
           claim: cond.claim.trim(),
           any_of: parseLines(cond.anyOf),
         }))
-        return { role: rule.role.trim(), conditions }
+        return rule.issuerWide
+          ? { role: rule.role.trim(), issuer_wide: true, conditions }
+          : { role: rule.role.trim(), conditions }
       }),
     }
     const skew = parseNumber(values.clock_skew_seconds)

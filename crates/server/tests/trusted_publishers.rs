@@ -802,3 +802,213 @@ async fn reader_role_can_publish_only_live_publisher_packages() {
         401
     );
 }
+
+#[tokio::test]
+async fn issuer_wide_rule_reads_and_only_pinned_rules_or_publishers_write() {
+    let (issuer, signer) = issuer().await;
+    let srv = common::start().await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let repo = format!("issuer-wide-{}", common::unique());
+    let oci_repo = format!("issuer-wide-oci-{}", common::unique());
+    let image = format!("{oci_repo}/app");
+
+    for body in [
+        json!({"name": repo, "kind": "hosted"}),
+        json!({"name": oci_repo, "kind": "hosted", "format": "docker"}),
+    ] {
+        let response = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&admin, Some(&password))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+    }
+
+    // Both roles may write: the issuer-wide rule's must still only read.
+    let mut roles = Vec::new();
+    for prefix in ["issuer-wide-pinned", "issuer-wide-every"] {
+        let role_name = format!("{prefix}-{}", common::unique());
+        let role: Value = client
+            .post(format!("{}/admin/roles", srv.base_url))
+            .basic_auth(&admin, Some(&password))
+            .json(&json!({"name": role_name}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let role_id = role["id"].as_i64().unwrap();
+        for repository in [&repo, &oci_repo] {
+            let response = client
+                .put(format!("{}/admin/roles/{role_id}/grants", srv.base_url))
+                .basic_auth(&admin, Some(&password))
+                .json(&json!({"repository": repository, "level": "write"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 201);
+        }
+        roles.push(role_name);
+    }
+
+    let realm_name = format!("issuer-wide-wif-{}", common::unique());
+    let pinned_rule = json!({
+        "role": roles[0],
+        "conditions": [
+            {"claim": "repository_id", "any_of": ["7007"]},
+            {"claim": "repository_owner_id", "any_of": ["2001"]}
+        ]
+    });
+    let wide_rule = json!({"role": roles[1], "issuer_wide": true, "conditions": []});
+    let realm = |rules: Value| {
+        json!({
+            "kind": "workload_identity",
+            "name": realm_name,
+            "enabled": true,
+            "config": {
+                "issuer": issuer.uri(),
+                "allow_http_issuer": true,
+                "allowed_audiences": ["https://forge.example.com"],
+                "rules": rules
+            }
+        })
+    };
+    // First-match: ahead of the pinned rule it would shadow it.
+    let response = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&realm(json!([wide_rule, pinned_rule])))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let response = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&realm(json!([pinned_rule, wide_rule])))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+
+    let response = client
+        .post(format!(
+            "{}/admin/repositories/{repo}/trusted-publishers",
+            srv.base_url
+        ))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "name": "widgets-release",
+            "realm": realm_name,
+            "packages": {"includes": ["Acme.Widgets.*"], "excludes": []},
+            "conditions": [
+                {"claim": "repository_id", "any_of": ["1001"]},
+                {"claim": "repository_owner_id", "any_of": ["2001"]}
+            ],
+            "actions": ["write"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+
+    // The pinned rule matches first and writes through its role.
+    let pinned = format!("Acme.Pinned.{}", common::unique());
+    let pinned_token = signer.sign(&claims(&issuer.uri(), "7007"));
+    assert_eq!(
+        push(&srv, &repo, &pinned_token, &pinned).await.status(),
+        201
+    );
+
+    // Any other project of the issuer matches the issuer-wide rule: it reads,
+    // but its role's `write` is capped away, with the CI token and with an
+    // exchanged key alike.
+    let read = |credential: String| {
+        let url = format!(
+            "{}/repository/{repo}/flat/{}/index.json",
+            srv.base_url,
+            pinned.to_lowercase()
+        );
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .header("X-NuGet-ApiKey", credential)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let wide_token = signer.sign(&claims(&issuer.uri(), "3003"));
+    assert_eq!(read(wide_token.clone()).await, 200);
+    let denied = format!("Acme.Widgets.Wide{}", common::unique());
+    assert_eq!(push(&srv, &repo, &wide_token, &denied).await.status(), 403);
+    let wide_key = exchange_workload_key(&srv, signer.sign(&claims(&issuer.uri(), "3003"))).await;
+    assert_eq!(read(wide_key.clone()).await, 200);
+    assert_eq!(push(&srv, &repo, &wide_key, &denied).await.status(), 403);
+
+    // A registry token minted from the key keeps the cap.
+    let registry = client
+        .get(format!("{}/v2/token", srv.base_url))
+        .query(&[
+            ("service", "test.local"),
+            ("scope", &format!("repository:{image}:pull,push")),
+        ])
+        .basic_auth("oidc", Some(&wide_key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(registry.status(), 200);
+    let registry_token = registry.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let token_claims: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(registry_token.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(token_claims["fp"]["wide"], true, "{token_claims}");
+    assert_eq!(
+        token_claims["access"][0]["actions"],
+        json!(["pull"]),
+        "{token_claims}"
+    );
+    let config =
+        br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#;
+    assert!(
+        push_oci_image(&srv, &image, &registry_token, "wide", config)
+            .await
+            .status()
+            .is_client_error()
+    );
+
+    // A trusted publisher pinned to its project still adds `write` on top of
+    // the issuer-wide read, for its packages only.
+    let publisher_token = signer.sign(&claims(&issuer.uri(), "1001"));
+    let released = format!("Acme.Widgets.Release{}", common::unique());
+    assert_eq!(
+        push(&srv, &repo, &publisher_token, &released)
+            .await
+            .status(),
+        201
+    );
+    let other = format!("Acme.Other.{}", common::unique());
+    assert_eq!(
+        push(&srv, &repo, &publisher_token, &other).await.status(),
+        403
+    );
+    let publisher_key =
+        exchange_workload_key(&srv, signer.sign(&claims(&issuer.uri(), "1001"))).await;
+    let exchanged = format!("Acme.Widgets.Exchanged{}", common::unique());
+    assert_eq!(
+        push(&srv, &repo, &publisher_key, &exchanged).await.status(),
+        201
+    );
+}

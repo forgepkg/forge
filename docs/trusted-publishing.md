@@ -51,7 +51,23 @@ A workload token is accepted only when all of these checks pass:
   `namespace_id`, `job_namespace_id`, `project_path`, `namespace_path`) or a
   claim the realm declares in `identity_claims` (for a CI system with its own
   workload identifier); claims such as `actor` or `event_name` can be shared
-  by unrelated jobs and never count as an identity; and
+  by unrelated jobs and never count as an identity. The one exception is an
+  **issuer-wide** rule (`"issuer_wide": true`, **Every project of this
+  issuer** in the web UI), the opt-in for a self-managed issuer whose
+  workloads all may read. It matches every token of the realm's issuer
+  without an identity condition; conditions on context such as
+  `ref_protected` may narrow it, and none is required. Forge refuses it for
+  GitHub Actions and GitLab.com, whose tokens anyone can mint, and a
+  self-managed GitLab with open sign-up is just as public: every account that
+  can create a project and run a pipeline, in a personal namespace or a fork
+  too, gets the role. Rules are first-match, so an issuer-wide rule must come
+  after every other rule. A workload it matched holds its role's grants
+  capped at `read`, with the CI token, an exchanged key and the registry
+  tokens minted from either: a `write` or `delete` grant the role holds, or
+  is given later, never reaches every project. Writes stay pinned to a
+  workload identity: a rule for the project ahead of the issuer-wide one
+  picks a role of its own, and a trusted publisher still adds `write` for its
+  own project on top of the issuer-wide read; and
 - a realm rule must accept the token and map it to a role; a trusted publisher
   alone never authenticates a workload. The role continues to grant base access,
   commonly `read` on hosted and proxy repositories, while a trusted publisher

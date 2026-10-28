@@ -192,6 +192,38 @@ describe('workload identity config', () => {
   it('omits a blank exchanged-key lifetime so the server default applies', () => {
     expect(toRealmConfig(values(''))).not.toHaveProperty('api_key_ttl_seconds')
   })
+
+  it('sends issuer_wide only for a rule that takes every project', () => {
+    const config = toRealmConfig({
+      ...values(''),
+      wifRules: [
+        { role: 'ci', issuerWide: false, conditions: [{ claim: 'pipeline_id', anyOf: '42' }] },
+        { role: 'ci-read', issuerWide: true, conditions: [] },
+      ],
+    })
+    expect(config).toMatchObject({
+      rules: [
+        { role: 'ci', conditions: [{ claim: 'pipeline_id', any_of: ['42'] }] },
+        { role: 'ci-read', issuer_wide: true, conditions: [] },
+      ],
+    })
+    expect((config as { rules: object[] }).rules[0]).not.toHaveProperty('issuer_wide')
+  })
+
+  it('reads issuer_wide back from a stored realm', () => {
+    const seeded = seedRealmFormValues({
+      kind: 'workload_identity',
+      config: {
+        issuer: 'https://gitlab.example.com',
+        allowed_audiences: ['forge'],
+        rules: [
+          { role: 'ci', conditions: [{ claim: 'job_project_id', any_of: ['1001'] }] },
+          { role: 'ci-read', issuer_wide: true, conditions: [] },
+        ],
+      },
+    } as unknown as RealmView)
+    expect(seeded.wifRules.map((rule) => rule.issuerWide)).toEqual([false, true])
+  })
 })
 
 describe('OIDC federated credential', () => {

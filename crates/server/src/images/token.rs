@@ -100,6 +100,11 @@ pub enum TokenPrincipal {
     Workload {
         realm: i64,
         role: i64,
+        /// The workload matched an issuer-wide rule: its role reads only.
+        /// Left out while unset, so tokens minted before it read back as
+        /// before.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        wide: bool,
         iss: String,
         cfg: String,
         sub: String,
@@ -139,6 +144,7 @@ impl TokenPrincipal {
             Principal::Workload {
                 realm_id,
                 role_id,
+                issuer_wide,
                 issuer_sha256,
                 config_sha256,
                 subject_sha256,
@@ -150,6 +156,7 @@ impl TokenPrincipal {
             } => TokenPrincipal::Workload {
                 realm: *realm_id,
                 role: *role_id,
+                wide: *issuer_wide,
                 iss: hex::encode(issuer_sha256),
                 cfg: hex::encode(config_sha256),
                 sub: hex::encode(subject_sha256),
@@ -186,6 +193,7 @@ impl TokenPrincipal {
             TokenPrincipal::Workload {
                 realm,
                 role,
+                wide,
                 iss,
                 cfg,
                 sub,
@@ -197,6 +205,7 @@ impl TokenPrincipal {
             } => Principal::Workload {
                 realm_id: *realm,
                 role_id: *role,
+                issuer_wide: *wide,
                 issuer_sha256: arr(iss)?,
                 config_sha256: arr(cfg)?,
                 subject_sha256: arr(sub)?,
@@ -506,6 +515,7 @@ mod tests {
         let p = Principal::Workload {
             realm_id: 1,
             role_id: 2,
+            issuer_wide: true,
             issuer_sha256: [1; 32],
             config_sha256: [2; 32],
             subject_sha256: [3; 32],
@@ -519,11 +529,15 @@ mod tests {
             }]),
         };
         let tp = TokenPrincipal::of(&p);
+        assert!(serde_json::to_string(&tp)
+            .unwrap()
+            .contains("\"wide\":true"));
         assert_eq!(tp.credential_ends(), Some(7));
         assert_eq!(tp.to_principal(Principal::Unauthenticated), Some(p));
         let direct = Principal::Workload {
             realm_id: 1,
             role_id: 2,
+            issuer_wide: false,
             issuer_sha256: [1; 32],
             config_sha256: [2; 32],
             subject_sha256: [3; 32],
@@ -535,6 +549,8 @@ mod tests {
         };
         let tp = TokenPrincipal::of(&direct);
         assert!(!serde_json::to_string(&tp).unwrap().contains("\"key\""));
+        // A token minted before `wide` existed reads back as pinned.
+        assert!(!serde_json::to_string(&tp).unwrap().contains("\"wide\""));
         assert_eq!(tp.to_principal(Principal::Unauthenticated), Some(direct));
 
         let session = Principal::User {

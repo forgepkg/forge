@@ -147,7 +147,9 @@ API takes it (`POST /admin/realms`):
   GitLab without the `job_*` claims.
 - **More projects** go into the same realm: add their IDs to the rule's
   lists, or add a rule per team with a role of its own. Rules are ordered,
-  and the first rule whose conditions all match picks the role.
+  and the first rule whose conditions all match picks the role. On a
+  self-managed GitLab, a last rule can take
+  [every project of the instance](#every-project-of-the-instance), read-only.
 - **Saving the realm revokes its keys.** Any change to the realm revokes
   every key it has issued, so jobs running at that moment fail and must be
   retried.
@@ -359,6 +361,39 @@ there later.
   request pipelines included.
 - **Rules are ordered.** A project that needs a role of its own goes into a
   rule before this one.
+
+### Every project of the instance
+
+On a self-managed GitLab whose projects all may restore, one rule takes every
+job the instance signs a token for, a project or subgroup created later
+included, where a list of groups must be kept current:
+
+```json
+{ "role": "gitlab-ci-read", "issuer_wide": true, "conditions": [] }
+```
+
+In the web UI it is the rule's **Every project of this issuer** switch.
+
+- **Everyone who runs a pipeline gets the role.** Every account that can
+  create a project and run a pipeline on the instance reads with it, in a
+  personal namespace or a fork too. A GitLab with open sign-up is as public
+  as GitLab.com: close sign-up, or pin the groups as above.
+- **Read-only, whatever the role grants.** A job this rule matched holds the
+  role's grants at `read`, and so do its exchanged key and the registry
+  tokens minted from either: a `write` or `delete` grant on the role does
+  not apply to it, so a role given `write` later does not hand it to every
+  project.
+- **Projects that publish** keep their trusted publisher
+  ([step 4](#4-the-trusted-publisher)), which adds `write` for the project's
+  own packages on top, or get a rule of their own ahead of this one, whose
+  role may write.
+- **Last.** Rules are first-match, so this rule comes after every other rule;
+  Forge refuses the realm otherwise.
+- **Conditions narrow it.** Add context conditions, such as `ref_protected`
+  `true` for the pipelines of protected branches and tags only; none is
+  required.
+- **Not on `https://gitlab.com`** (nor for GitHub Actions): anyone can mint
+  its tokens, and Forge refuses the rule there.
 
 ### The runner
 

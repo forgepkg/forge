@@ -44,6 +44,10 @@
 //!   scope sets `admin: true`; an unscoped token (`NULL` scope) is evaluated
 //!   as the default scope, i.e. the owner's set without `admin`. See
 //!   [`EffectiveSet::intersect_scope`].
+//! * **Workload** — the grants of the one role its realm's claim-rules mapped
+//!   it to, capped at `read` when the rule trusted every workload of the
+//!   issuer (an issuer-wide rule). Trusted publishers add `write` / `delete`
+//!   on top, outside the effective set.
 //! * **Trusted header** — a user the headers of the proxy in front named
 //!   ([`super::AuthMethod::TrustedHeader`]) holds its grants without the
 //!   `admin` role: the headers never make anyone an administrator.
@@ -427,12 +431,21 @@ impl Authz {
             // forge role its realm's claim-rules mapped it to (plus, for reads,
             // the public reach every principal holds). No `app_user`, no token
             // scope — a deleted role resolves to deny-all.
-            Principal::Workload { role_id, .. } => {
-                let role = authz_cache::load_role_effective(&self.pool, &self.cache, *role_id)
+            Principal::Workload {
+                role_id,
+                issuer_wide,
+                ..
+            } => {
+                let mut role = authz_cache::load_role_effective(&self.pool, &self.cache, *role_id)
                     .await
                     .map_err(
                         |e| tracing::error!(error = %e, role_id, "authz workload role load failed"),
                     )?;
+                if *issuer_wide {
+                    // Any workload of the issuer matched: the role only
+                    // reads, as the anonymous role's grants do for others.
+                    role = role.intersect_scope(&read_only_scope());
+                }
                 Ok(
                     match public_read
                         .filter(|_| self.public_read_for_signed_in.load(Ordering::Relaxed))
@@ -475,6 +488,16 @@ impl Authz {
     }
 }
 
+/// A scope that keeps every repository the owner reaches, at `read` and
+/// without `admin`: what a workload of an issuer-wide rule holds of its role.
+fn read_only_scope() -> TokenScope {
+    TokenScope {
+        level: Some(Level::Read),
+        admin: false,
+        repositories: None,
+    }
+}
+
 /// A scope that allows no repositories — intersecting any owner set with it
 /// yields the empty (deny-all) set. Used as the fail-closed fallback for a
 /// token whose stored scope is malformed.
@@ -511,6 +534,35 @@ mod tests {
             .connect_lazy("postgres://forge:forge@localhost:5433/forge")
             .expect("lazy pool");
         Authz::new(pool, Cache::l1_only(16))
+    }
+
+    #[test]
+    fn read_only_scope_caps_every_grant_at_read() {
+        let raw = crate::authz::RawEffectiveSet {
+            is_admin: false,
+            grants: vec![
+                crate::authz::RawGrant {
+                    level: "delete".into(),
+                    repo: None,
+                    selector: None,
+                },
+                crate::authz::RawGrant {
+                    level: "write".into(),
+                    repo: Some(7),
+                    selector: None,
+                },
+            ],
+        };
+        let capped = EffectiveSet::build(&raw)
+            .expect("builds")
+            .intersect_scope(&read_only_scope());
+        assert!(!capped.is_admin());
+        for repo in [1, 7] {
+            assert!(capped.allows_repo(Level::Read, repo));
+            assert!(!capped.allows_repo(Level::Write, repo));
+            assert!(!capped.allows_repo(Level::Delete, repo));
+        }
+        assert!(!capped.allows_every_repo(Level::Write));
     }
 
     #[test]
