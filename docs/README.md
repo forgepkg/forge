@@ -1,0 +1,51 @@
+# Forge documentation
+
+The guides to running Forge and publishing to it. They are also a site, with
+navigation and search: **<https://forgepkg.github.io/forge/>**.
+
+The [README](../README.md) says what Forge is and starts a first instance in
+its [quickstart](../README.md#quickstart);
+[DEVELOPMENT.md](../DEVELOPMENT.md) is the guide to working on Forge itself.
+
+## Running Forge
+
+- **[Production deployment](deployment.md)**: required settings, TLS and the
+  reverse proxy, secret encryption, health probes, backup and restore, and
+  upgrades.
+- **[Retention size budgets](retention.md)**: keep a repository under a
+  logical size: the budget, how size is counted, and what goes first.
+- **[Importing from Nexus](nexus-import.md)**: copy a Nexus hosted repository
+  (NuGet, Docker) into Forge, with its publish dates.
+
+## Formats
+
+- **NuGet**: the README's [quickstart](../README.md#quickstart) points a
+  `dotnet` client at a feed, and the CI guides below publish to one.
+- **[Docker / OCI registry](docker.md)**: image repositories (hosted, proxy,
+  group), naming, `docker login`, retention and garbage collection.
+- **[npm registries](npm.md)**: npm packages for npm, pnpm, Yarn and Bun:
+  `.npmrc`, logins, publishing, dist-tags, proxies of `registry.npmjs.org`
+  and audits.
+- **[Raw file repositories](raw.md)**: files under arbitrary paths: uploads
+  with curl, ranges and checksum sidecars, listings, and proxies of release
+  downloads.
+- **[Format plugins](format-plugins.md)**: further package formats, built
+  into the server: design, operation, and writing one.
+
+## CI and publishing
+
+- **[Trusted publishing](trusted-publishing.md)**: short-lived workload
+  identity for GitHub Actions, GitLab CI and other OIDC issuers, and the
+  exchange of a job's token for an API key.
+- **[GitLab CI with workload identity](gitlab-ci.md)**: step by step, every
+  job of a GitLab project restores from Forge, and only the release job
+  pushes. No secret in GitLab.
+- **[CI with service accounts](ci-service-accounts.md)**: for pipelines that
+  cannot use workload identity, a read token and a release token in GitLab's
+  CI/CD variables.
+
+## Releases
+
+- **[Changelog](../CHANGELOG.md)**: release notes, upgrade notes and known
+  limitations. A change adds its entry as a fragment under
+  [changes/](changes/README.md).

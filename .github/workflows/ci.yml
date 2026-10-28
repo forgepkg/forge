@@ -150,8 +150,9 @@ jobs:
       - name: Changelog fragments (docs/changes)
         run: cargo xtask changelog --check
       # The pages of the documentation site: every link goes to a page, a
-      # heading or a file that exists, and SUMMARY.md lists every guide. A
-      # change to the crates can break them too (a link to a renamed file).
+      # heading or a file that exists, and SUMMARY.md and docs/README.md
+      # list every guide. A change to the crates can break them too (a link
+      # to a renamed file).
       - name: Documentation links (docs/SUMMARY.md)
         run: cargo xtask docs --check
       - name: cargo test -p xtask

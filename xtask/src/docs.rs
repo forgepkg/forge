@@ -12,6 +12,10 @@
 //! * a link to a file or to a heading that does not exist is an error, and so
 //!   is a Markdown file directly under `docs/` that SUMMARY.md does not list.
 //!
+//! [`DOCS_INDEX`], the index GitHub shows for `docs/`, is no page of the site,
+//! which has a start page and a sidebar of its own. Its links are checked as a
+//! page's, and it must link every page, so that no guide is missing from it.
+//!
 //! `cargo xtask docs --check` stops after the staging, without mdBook.
 
 use crate::changelog::repo_url;
@@ -25,6 +29,10 @@ use std::path::Path;
 const DOCS: &str = "docs";
 /// The table of contents: the site's pages, in their order.
 const SUMMARY: &str = "docs/SUMMARY.md";
+/// The index of the guides GitHub shows under the files of `docs/`. On the
+/// site it would be `readme.md`, which mdBook turns into `index.md`, the
+/// README's name there.
+const DOCS_INDEX: &str = "docs/README.md";
 /// mdBook's configuration, copied next to the staged pages.
 const BOOK_TOML: &str = "docs/book.toml";
 /// Where the pages are staged (`src/`, the book's `src`) and the site is
@@ -169,7 +177,7 @@ fn stage(tree: &impl Tree, repo: &str) -> Result<Vec<(String, String)>, String> 
         target.to_string()
     });
     for path in tree.markdown_in(DOCS)? {
-        if path != SUMMARY && !pages.contains_key(&path) {
+        if path != SUMMARY && path != DOCS_INDEX && !pages.contains_key(&path) {
             errors.push(format!("{path}: no page of the site; list it in {SUMMARY}"));
         }
     }
@@ -193,6 +201,27 @@ fn stage(tree: &impl Tree, repo: &str) -> Result<Vec<(String, String)>, String> 
         "SUMMARY.md".into(),
         site.rewrite(SUMMARY, &summary, &mut errors),
     ));
+
+    // The index of docs/ is not staged: only its links and its list count.
+    if tree.entry(DOCS_INDEX) == Some(Entry::File) {
+        let index = tree.read(DOCS_INDEX)?;
+        site.rewrite(DOCS_INDEX, &index, &mut errors);
+        let mut linked = BTreeSet::new();
+        map_links(&index, &mut |target| {
+            linked.extend(resolve(
+                DOCS_INDEX,
+                target.split('#').next().unwrap_or(target),
+            ));
+            target.to_string()
+        });
+        for path in &order {
+            if !linked.contains(path) {
+                errors.push(format!(
+                    "{DOCS_INDEX}: links no {path}, which {SUMMARY} lists"
+                ));
+            }
+        }
+    }
 
     if errors.is_empty() {
         Ok(files)
@@ -649,6 +678,52 @@ mod tests {
         ] {
             assert!(err.contains(problem), "{problem} missing from:\n{err}");
         }
+    }
+
+    #[test]
+    fn the_docs_index_is_no_page_but_links_every_page() {
+        let summary = "[Home](../README.md)\n\n- [Guide](guide.md)\n- [Other](other.md)\n";
+        let pages = [
+            ("docs/SUMMARY.md", summary),
+            ("README.md", "# Home\n## Quickstart\n"),
+            ("docs/guide.md", "# Guide\n"),
+            ("docs/other.md", "# Other\n"),
+        ];
+        let tree = repo(
+            &[
+                &pages[..],
+                &[(
+                    "docs/README.md",
+                    "# Guides\n\n[Home](../README.md#quickstart), [the guide](guide.md), \
+                     [the other](other.md#other).\n",
+                )],
+            ]
+            .concat(),
+        );
+        let files = stage(&tree, REPO).expect("stages");
+        let names: Vec<_> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["index.md", "guide.md", "other.md", "SUMMARY.md"]);
+
+        let tree = repo(
+            &[
+                &pages[..],
+                &[(
+                    "docs/README.md",
+                    "# Guides\n\n[the guide](guide.md#set-up), [gone](gone.md).\n",
+                )],
+            ]
+            .concat(),
+        );
+        let err = stage(&tree, REPO).expect_err("incomplete index");
+        for problem in [
+            "docs/README.md: guide.md#set-up: docs/guide.md has no heading #set-up",
+            "docs/README.md: gone.md links to docs/gone.md, which does not exist",
+            "docs/README.md: links no README.md, which docs/SUMMARY.md lists",
+            "docs/README.md: links no docs/other.md, which docs/SUMMARY.md lists",
+        ] {
+            assert!(err.contains(problem), "{problem} missing from:\n{err}");
+        }
+        assert!(!err.contains("no page of the site"), "{err}");
     }
 
     #[test]
