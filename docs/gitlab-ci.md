@@ -135,6 +135,13 @@ API takes it (`POST /admin/realms`):
 }
 ```
 
+Instead of filling in the rule field by field, paste this document into
+**Edit as JSON**, at the top of **Rules**, and apply it. The dialog keeps only
+the rules of what it is given (the rules alone, a realm's config, a whole
+realm, or one rule) and fills in the form with them; saving the realm saves
+them. It also shows a realm's rules as JSON, to copy them into another realm
+or another Forge.
+
 - **Numeric IDs, not paths.** A project or group can be renamed, and another
   can take its old path. On `https://gitlab.com` every rule must contain a
   project ID and a namespace ID; a self-managed GitLab accepts any

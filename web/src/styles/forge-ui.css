@@ -329,6 +329,7 @@
   .fg-dialog-layer--inline { position: relative; inset: auto; min-height: 100%; padding: var(--space-8) var(--space-4); }
   .fg-dialog-scrim { position: absolute; inset: 0; background: var(--scrim); }
   .fg-dialog { position: relative; display: grid; box-sizing: border-box; width: 480px; max-width: 100%; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-lg); }
+  .fg-dialog--wide { width: min(720px, calc(100vw - 2 * var(--space-4))); }
   .fg-dialog-head { display: flex; align-items: flex-start; gap: 14px; padding: var(--space-5) var(--space-5) 0; }
   .fg-dialog-icon { flex: none; display: grid; place-items: center; width: 40px; height: 40px; border-radius: var(--radius-full); background: var(--surface-sunken); color: var(--ink-muted); }
   .fg-dialog-icon--danger { background: var(--danger-soft); color: var(--danger); }

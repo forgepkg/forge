@@ -9,6 +9,7 @@ import type {
   RealmView,
   TrustedHeaderConfig,
   WorkloadIdentityConfig,
+  WorkloadIdentityRule,
 } from '~/api/realms'
 import { ADMIN_ROLE } from '~/api/rbac'
 import { useRoles } from '~/queries/useRbac'
@@ -48,7 +49,10 @@ import {
  *    password hashes
  *  - **workload_identity** (WIF) → public OIDC issuer / allowed audiences /
  *    optional authorized parties / bounded token lifetime / ordered
- *    claim→role rules (no secrets, no redaction)
+ *    claim→role rules (no secrets, no redaction). **Edit as JSON** shows the
+ *    rules as the admin API takes them, to copy, and replaces them with
+ *    pasted ones (the rules, a realm's config or a whole realm, or one rule);
+ *    applying saves nothing
  *  - **trusted_header** → the header naming the account, the header and
  *    write-only secret the proxy proves itself with (a random one can be
  *    generated and copied into the proxy's configuration before saving),
@@ -305,18 +309,202 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
       wif.positive_cache_seconds != null ? String(wif.positive_cache_seconds) : '',
     api_key_ttl_seconds:
       wif.api_key_ttl_seconds != null ? String(wif.api_key_ttl_seconds) : '',
-    wifRules: (wif.rules ?? []).map((rule) => ({
-      role: rule.role ?? '',
-      issuerWide: rule.issuer_wide ?? false,
-      conditions: (rule.conditions ?? []).map((c) => ({
-        claim: c.claim ?? '',
-        anyOf: joinLines(c.any_of),
-      })),
-    })),
+    wifRules: fromWifRules(wif.rules ?? []),
     username_header: header.username_header ?? '',
     secret_header: header.secret_header ?? '',
     secret: '',
     header_auto_provision: header.auto_provision ?? false,
+  }
+}
+
+/** A workload-identity rule as the form edits it. */
+type WifRuleValues = RealmFormValues['wifRules'][number]
+
+/** Stored (or pasted) workload-identity rules as the form edits them. */
+function fromWifRules(rules: WorkloadIdentityRule[]): WifRuleValues[] {
+  return rules.map((rule) => ({
+    role: rule.role ?? '',
+    issuerWide: rule.issuer_wide ?? false,
+    conditions: (rule.conditions ?? []).map((c) => ({
+      claim: c.claim ?? '',
+      anyOf: joinLines(c.any_of),
+    })),
+  }))
+}
+
+/** The form's rules as the admin API takes them (`WorkloadIdentityConfig.rules`). */
+function toWifRules(rules: WifRuleValues[]): WorkloadIdentityRule[] {
+  return rules.map((rule) => {
+    const conditions = rule.conditions.map((cond) => ({
+      claim: cond.claim.trim(),
+      any_of: parseLines(cond.anyOf),
+    }))
+    return rule.issuerWide
+      ? { role: rule.role.trim(), issuer_wide: true, conditions }
+      : { role: rule.role.trim(), conditions }
+  })
+}
+
+/**
+ * The form's rules as JSON, laid out like the guides' examples: a rule's
+ * keys one per line, each condition on a line of its own.
+ */
+export function formatWifRulesJson(rules: WifRuleValues[]): string {
+  const json = toWifRules(rules)
+  if (json.length === 0) return '[]'
+  const text = (value: string) => JSON.stringify(value)
+  const formatted = json.map((rule) => {
+    const conditions = (rule.conditions ?? []).map(
+      (c) =>
+        `      { "claim": ${text(c.claim)}, "any_of": [${c.any_of.map(text).join(', ')}] }`,
+    )
+    return [
+      '  {',
+      `    "role": ${text(rule.role)},`,
+      ...(rule.issuer_wide ? ['    "issuer_wide": true,'] : []),
+      conditions.length === 0
+        ? '    "conditions": []'
+        : `    "conditions": [\n${conditions.join(',\n')}\n    ]`,
+      '  }',
+    ].join('\n')
+  })
+  return `[\n${formatted.join(',\n')}\n]`
+}
+
+/** The keys the server takes in a rule and in a condition (`deny_unknown_fields`). */
+const WIF_RULE_KEYS = ['role', 'issuer_wide', 'conditions']
+const WIF_CONDITION_KEYS = ['claim', 'any_of']
+
+/** What the rules JSON dialog cannot read, naming where it is. */
+class RulesJsonError extends Error {}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** `path.key`, or `key` at the top of a pasted rule. */
+function jsonPath(path: string, key: string): string {
+  return path === '' ? key : `${path}.${key}`
+}
+
+/**
+ * Read rules pasted into the JSON dialog, checked as the server reads them:
+ * a rule needs a `role`, a condition a `claim`, `any_of` is an array of
+ * strings, and a key the server does not know is refused. Takes the rules
+ * (an array), a realm's config (`{ "rules": … }`), a whole realm as the admin
+ * API takes or returns it (`{ "config": { "rules": … } }`), of which only the
+ * rules are kept, or one rule. What it cannot read comes back as `error`,
+ * naming where it is (`rules[2].conditions[0].any_of`).
+ */
+export function parseWifRulesJson(
+  raw: string,
+): { rules: WifRuleValues[] } | { error: string } {
+  let doc: unknown
+  try {
+    doc = JSON.parse(raw)
+  } catch (e) {
+    return { error: `This is not valid JSON: ${jsonSyntaxError(e, raw)}` }
+  }
+  try {
+    return { rules: fromWifRules(readWifRules(doc)) }
+  } catch (e) {
+    if (e instanceof RulesJsonError) return { error: e.message }
+    throw e
+  }
+}
+
+/** A JSON syntax error, with its line and column where the engine gives only an offset. */
+function jsonSyntaxError(error: unknown, raw: string): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const at = /position (\d+)/.exec(message)
+  if (!at || /line \d+/.test(message)) return message
+  const lines = raw.slice(0, Number(at[1])).split('\n')
+  return `${message} (line ${lines.length} column ${lines[lines.length - 1].length + 1})`
+}
+
+/** The rules of a pasted document, in whichever shape it takes them. */
+function readWifRules(doc: unknown): WorkloadIdentityRule[] {
+  if (Array.isArray(doc)) return readWifRuleList(doc, 'rules')
+  if (isJsonObject(doc)) {
+    if ('rules' in doc) return readWifRuleList(doc.rules, 'rules')
+    if ('config' in doc) {
+      if (!isJsonObject(doc.config)) {
+        throw new RulesJsonError('config must be an object, the realm configuration.')
+      }
+      if (!('rules' in doc.config)) {
+        throw new RulesJsonError('config.rules is missing: the realm has no rules.')
+      }
+      return readWifRuleList(doc.config.rules, 'config.rules')
+    }
+    if (WIF_RULE_KEYS.some((key) => key in doc)) return [readWifRule(doc, '')]
+  }
+  throw new RulesJsonError(
+    "Paste the rules (a JSON array), a realm's config or a whole realm, or one rule.",
+  )
+}
+
+function readWifRuleList(list: unknown, path: string): WorkloadIdentityRule[] {
+  if (!Array.isArray(list)) throw new RulesJsonError(`${path} must be an array of rules.`)
+  return list.map((rule, i) => readWifRule(rule, `${path}[${i}]`))
+}
+
+function readWifRule(rule: unknown, path: string): WorkloadIdentityRule {
+  if (!isJsonObject(rule)) throw new RulesJsonError(`${path} must be an object, a rule.`)
+  refuseUnknownKeys(rule, path, WIF_RULE_KEYS, 'a rule takes role, issuer_wide and conditions')
+  if (!('role' in rule)) throw new RulesJsonError(`${jsonPath(path, 'role')} is missing.`)
+  if (typeof rule.role !== 'string') {
+    throw new RulesJsonError(`${jsonPath(path, 'role')} must be a string, the name of a role.`)
+  }
+  if ('issuer_wide' in rule && typeof rule.issuer_wide !== 'boolean') {
+    throw new RulesJsonError(`${jsonPath(path, 'issuer_wide')} must be true or false.`)
+  }
+  const conditions = 'conditions' in rule ? rule.conditions : []
+  const conditionsPath = jsonPath(path, 'conditions')
+  if (!Array.isArray(conditions)) {
+    throw new RulesJsonError(`${conditionsPath} must be an array of conditions.`)
+  }
+  return {
+    role: rule.role,
+    ...(rule.issuer_wide === true ? { issuer_wide: true } : {}),
+    conditions: conditions.map((c, i) => readWifCondition(c, `${conditionsPath}[${i}]`)),
+  }
+}
+
+function readWifCondition(
+  condition: unknown,
+  path: string,
+): { claim: string; any_of: string[] } {
+  if (!isJsonObject(condition)) {
+    throw new RulesJsonError(`${path} must be an object, a condition.`)
+  }
+  refuseUnknownKeys(condition, path, WIF_CONDITION_KEYS, 'a condition takes claim and any_of')
+  if (!('claim' in condition)) throw new RulesJsonError(`${path}.claim is missing.`)
+  if (typeof condition.claim !== 'string') {
+    throw new RulesJsonError(`${path}.claim must be a string, the name of a claim.`)
+  }
+  const anyOf = 'any_of' in condition ? condition.any_of : []
+  if (!Array.isArray(anyOf) || !anyOf.every((value) => typeof value === 'string')) {
+    throw new RulesJsonError(`${path}.any_of must be an array of strings.`)
+  }
+  // The form edits the values one per line.
+  const broken = anyOf.findIndex((value) => /[\r\n]/.test(value))
+  if (broken !== -1) {
+    throw new RulesJsonError(`${path}.any_of[${broken}] holds a line break; a value is one line.`)
+  }
+  return { claim: condition.claim, any_of: anyOf }
+}
+
+function refuseUnknownKeys(
+  value: Record<string, unknown>,
+  path: string,
+  known: string[],
+  takes: string,
+) {
+  const unknown = Object.keys(value).find((key) => !known.includes(key))
+  if (unknown !== undefined) {
+    throw new RulesJsonError(
+      `${jsonPath(path, unknown)} is not a key Forge knows: ${takes}.`,
+    )
   }
 }
 
@@ -384,6 +572,8 @@ export function RealmForm({
   )
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [confirmSave, setConfirmSave] = useState(false)
+  // The dialog showing the workload-identity rules as JSON is open.
+  const [editingRulesJson, setEditingRulesJson] = useState(false)
   // A secret generated in this form, shown to copy until it is replaced.
   const [generatedSecret, setGeneratedSecret] = useState<string | null>(null)
   // Counts the submits that failed validation: each one moves focus to the
@@ -667,6 +857,17 @@ export function RealmForm({
       ...r,
       conditions: r.conditions.filter((_, i) => i !== condIndex),
     }))
+  }
+
+  function applyRulesJson(wifRules: WifRuleValues[]) {
+    setValues((v) => ({ ...v, wifRules }))
+    // The rules they named are gone; a save checks the new ones.
+    setErrors((e) =>
+      Object.fromEntries(
+        Object.entries(e).filter(([key]) => key !== 'wifRules' && !key.startsWith('wifRule.')),
+      ),
+    )
+    setEditingRulesJson(false)
   }
 
   const nameField = (
@@ -1269,6 +1470,11 @@ export function RealmForm({
             <Panel
               title="Rules"
               count={values.wifRules.length}
+              actions={
+                <Button size="sm" icon="Pencil" onClick={() => setEditingRulesJson(true)}>
+                  Edit as JSON
+                </Button>
+              }
               description="Ordered; the first rule whose conditions all match grants its role. Every rule needs a workload identity condition; ref or environment alone is not enough. Public GitHub/GitLab issuers require immutable numeric repository/project and owner/namespace IDs. On a self-managed issuer, a last rule may take every project, read-only. Global admin is not allowed; grant a repository-scoped role."
             >
               {errors.wifRules && <FormError>{errors.wifRules}</FormError>}
@@ -1503,6 +1709,14 @@ export function RealmForm({
         </FormActions>
       </form>
 
+      {editingRulesJson && (
+        <RulesJsonDialog
+          rules={values.wifRules}
+          onApply={applyRulesJson}
+          onClose={() => setEditingRulesJson(false)}
+        />
+      )}
+
       {saveWarning && (
         <Dialog
           open={confirmSave}
@@ -1518,6 +1732,68 @@ export function RealmForm({
         />
       )}
     </Columns>
+  )
+}
+
+/**
+ * The workload-identity rules as JSON, mounted while open. It starts with the
+ * form's rules as the admin API takes them, to copy; **Apply** replaces the
+ * form's rules with what it holds (see `parseWifRulesJson`) and saves
+ * nothing. JSON it cannot read is reported under the field, which takes the
+ * focus, and leaves the form as it was.
+ */
+function RulesJsonDialog({
+  rules,
+  onApply,
+  onClose,
+}: {
+  rules: WifRuleValues[]
+  onApply: (rules: WifRuleValues[]) => void
+  onClose: () => void
+}) {
+  const [text, setText] = useState(() => formatWifRulesJson(rules))
+  const [error, setError] = useState<string | null>(null)
+  // Counts the applies that failed: each one moves focus to the field, whose
+  // error is read with it.
+  const [failedApplies, setFailedApplies] = useState(0)
+  const field = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    if (failedApplies > 0) field.current?.focus()
+  }, [failedApplies])
+
+  function apply() {
+    const parsed = parseWifRulesJson(text)
+    if ('error' in parsed) {
+      setError(parsed.error)
+      setFailedApplies((n) => n + 1)
+      return
+    }
+    onApply(parsed.rules)
+  }
+
+  return (
+    <Dialog
+      open
+      wide
+      onClose={onClose}
+      title="Edit the rules as JSON"
+      description="Copy the rules from here, or paste others to replace them: the rules, a realm's config or a whole realm as the admin API takes them, or one rule. Apply changes the form only; saving the realm saves the rules."
+      confirmLabel="Apply"
+      onConfirm={apply}
+    >
+      <TextareaField
+        ref={field}
+        label="Rules"
+        mono
+        rows={16}
+        spellCheck={false}
+        autoComplete="off"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        error={error ?? undefined}
+      />
+    </Dialog>
   )
 }
 
@@ -1934,15 +2210,7 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
       issuer: values.issuer.trim(),
       allowed_audiences: parseLines(values.allowed_audiences),
       allow_http_issuer: values.allow_http_issuer,
-      rules: values.wifRules.map((rule) => {
-        const conditions = rule.conditions.map((cond) => ({
-          claim: cond.claim.trim(),
-          any_of: parseLines(cond.anyOf),
-        }))
-        return rule.issuerWide
-          ? { role: rule.role.trim(), issuer_wide: true, conditions }
-          : { role: rule.role.trim(), conditions }
-      }),
+      rules: toWifRules(values.wifRules),
     }
     const skew = parseNumber(values.clock_skew_seconds)
     if (skew !== undefined) config.clock_skew_seconds = skew

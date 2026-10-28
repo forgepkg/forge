@@ -5,8 +5,10 @@ import type { RealmFormValues } from './RealmForm'
 import {
   federatedSubject,
   formatClaimRules,
+  formatWifRulesJson,
   parseClaimRules,
   parseLines,
+  parseWifRulesJson,
   randomSecret,
   secretError,
   seedRealmFormValues,
@@ -223,6 +225,118 @@ describe('workload identity config', () => {
       },
     } as unknown as RealmView)
     expect(seeded.wifRules.map((rule) => rule.issuerWide)).toEqual([false, true])
+  })
+})
+
+describe('workload identity rules as JSON', () => {
+  const rules: RealmFormValues['wifRules'] = [
+    {
+      role: 'gitlab-ci-read',
+      issuerWide: false,
+      conditions: [
+        { claim: 'job_project_id', anyOf: '1001\n1002' },
+        { claim: 'sub', anyOf: 'project_path:acme/api,ref:"main"' },
+      ],
+    },
+    { role: 'readers', issuerWide: true, conditions: [] },
+  ]
+
+  it('exports the rules as the admin API takes them, laid out like the guides', () => {
+    expect(formatWifRulesJson(rules.slice(0, 1))).toBe(
+      [
+        '[',
+        '  {',
+        '    "role": "gitlab-ci-read",',
+        '    "conditions": [',
+        '      { "claim": "job_project_id", "any_of": ["1001", "1002"] },',
+        '      { "claim": "sub", "any_of": ["project_path:acme/api,ref:\\"main\\""] }',
+        '    ]',
+        '  }',
+        ']',
+      ].join('\n'),
+    )
+    expect(JSON.parse(formatWifRulesJson(rules))).toEqual([
+      {
+        role: 'gitlab-ci-read',
+        conditions: [
+          { claim: 'job_project_id', any_of: ['1001', '1002'] },
+          { claim: 'sub', any_of: ['project_path:acme/api,ref:"main"'] },
+        ],
+      },
+      { role: 'readers', issuer_wide: true, conditions: [] },
+    ])
+    expect(formatWifRulesJson([])).toBe('[]')
+  })
+
+  it('imports what it exports', () => {
+    expect(parseWifRulesJson(formatWifRulesJson(rules))).toEqual({ rules })
+  })
+
+  it("takes a realm's config or a whole realm, and keeps only the rules", () => {
+    const stored = [{ role: 'ci', conditions: [{ claim: 'job_project_id', any_of: ['1001'] }] }]
+    const expected = {
+      rules: [{ role: 'ci', issuerWide: false, conditions: [{ claim: 'job_project_id', anyOf: '1001' }] }],
+    }
+    const config = {
+      issuer: 'https://gitlab.example.com',
+      allowed_audiences: ['https://forge.example.com'],
+      rules: stored,
+    }
+    expect(parseWifRulesJson(JSON.stringify(config))).toEqual(expected)
+    expect(
+      parseWifRulesJson(JSON.stringify({ kind: 'workload_identity', name: 'gitlab', config })),
+    ).toEqual(expected)
+    expect(parseWifRulesJson(JSON.stringify(stored[0]))).toEqual(expected)
+  })
+
+  it('takes a condition without any_of, as the server does', () => {
+    expect(
+      parseWifRulesJson('[{ "role": "ci", "conditions": [{ "claim": "sub" }] }]'),
+    ).toEqual({
+      rules: [{ role: 'ci', issuerWide: false, conditions: [{ claim: 'sub', anyOf: '' }] }],
+    })
+  })
+
+  it('reports malformed JSON with where it is', () => {
+    const result = parseWifRulesJson('[\n  { "role": "ci", }\n]')
+    expect(result).toEqual({ error: expect.stringMatching(/^This is not valid JSON: /) })
+    expect(result).toEqual({ error: expect.stringMatching(/line 2 column \d+/) })
+  })
+
+  it.each([
+    ['"rules"', "Paste the rules (a JSON array), a realm's config or a whole realm, or one rule."],
+    ['{ "issuer": "https://gitlab.example.com" }', "Paste the rules (a JSON array), a realm's config or a whole realm, or one rule."],
+    ['{ "rules": {} }', 'rules must be an array of rules.'],
+    ['{ "config": { "issuer": "https://idp.example.com" } }', 'config.rules is missing: the realm has no rules.'],
+    ['[1]', 'rules[0] must be an object, a rule.'],
+    ['[{ "conditions": [] }]', 'rules[0].role is missing.'],
+    ['[{ "role": 4 }]', 'rules[0].role must be a string, the name of a role.'],
+    ['[{ "role": "ci", "issuer_wide": "yes" }]', 'rules[0].issuer_wide must be true or false.'],
+    ['[{ "role": "ci", "conditions": null }]', 'rules[0].conditions must be an array of conditions.'],
+    [
+      '[{ "role": "ci", "conditions": [] }, { "role": "ci", "conditons": [] }]',
+      'rules[1].conditons is not a key Forge knows: a rule takes role, issuer_wide and conditions.',
+    ],
+    ['[{ "role": "ci", "conditions": [{ "any_of": ["1"] }] }]', 'rules[0].conditions[0].claim is missing.'],
+    [
+      '[{ "role": "ci", "conditions": [{ "claim": "sub", "values": ["1"] }] }]',
+      'rules[0].conditions[0].values is not a key Forge knows: a condition takes claim and any_of.',
+    ],
+    [
+      '{ "config": { "rules": [{ "role": "ci", "conditions": [{ "claim": "sub", "any_of": "1" }] }] } }',
+      'config.rules[0].conditions[0].any_of must be an array of strings.',
+    ],
+    [
+      '[{ "role": "ci", "conditions": [{ "claim": "sub", "any_of": [1001] }] }]',
+      'rules[0].conditions[0].any_of must be an array of strings.',
+    ],
+    [
+      '[{ "role": "ci", "conditions": [{ "claim": "sub", "any_of": ["a", "b\\nc"] }] }]',
+      'rules[0].conditions[0].any_of[1] holds a line break; a value is one line.',
+    ],
+    ['{ "role": "ci", "conditions": [{ "claim": 1 }] }', 'conditions[0].claim must be a string, the name of a claim.'],
+  ])('refuses %s', (raw, error) => {
+    expect(parseWifRulesJson(raw)).toEqual({ error })
   })
 })
 

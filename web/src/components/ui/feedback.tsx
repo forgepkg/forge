@@ -184,6 +184,7 @@ export function Dialog({
   onConfirm,
   cancelLabel = 'Cancel',
   footer,
+  wide = false,
 }: {
   open: boolean
   onClose: () => void
@@ -200,6 +201,8 @@ export function Dialog({
   cancelLabel?: string
   /** Replaces the default Cancel / confirm buttons. */
   footer?: ReactNode
+  /** Room for a body to edit (a JSON document), not only to confirm. */
+  wide?: boolean
 }) {
   const titleId = useId()
   const descId = useId()
@@ -253,7 +256,7 @@ export function Dialog({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={description ? descId : undefined}
-        className="fg-dialog"
+        className={clsx('fg-dialog', wide && 'fg-dialog--wide')}
       >
         <div className="fg-dialog-head">
           {icon && (
