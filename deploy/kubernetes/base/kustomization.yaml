@@ -38,4 +38,4 @@ configMapGenerator:
 # deploys the X.Y.Z image.
 images:
   - name: ghcr.io/forgepkg/forge
-    newTag: 2.0.0
+    newTag: 2.1.0

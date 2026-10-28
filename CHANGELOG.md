@@ -12,6 +12,251 @@ until the release folds them in.
 
 ## [Unreleased]
 
+## [2.1.0]
+
+### Upgrade notes
+
+- The anonymous mode `allowlist` and its `anonymous_ip_allowlist` are removed;
+  the anonymous modes are `off` and `all`. An instance whose stored mode is
+  `allowlist` comes up with anonymous access `off`, and the settings API
+  refuses `"anonymous_mode": "allowlist"` and `anonymous_ip_allowlist`. To keep
+  letting a network read without credentials, admit it at the load balancer
+  instead: create a service account under **Admin → Service accounts** in a
+  trusted-header realm, give it read grants on the repositories the network
+  read anonymously (those that allow anonymous reads, and those the
+  `anonymous` role has grants on), and have the load balancer name that
+  account for the networks that were on the allowlist. See the deployment
+  guide, "Trusted-header realms".
+  ([#507](https://github.com/forgepkg/forge/issues/507))
+- **Stop every 2.0.0 instance before the first 2.1.0 instance starts**,
+  rather than rolling the upgrade. The first 2.1.0 instance migrates the
+  database. While 2.0.0 instances still serve, the migration can wait behind
+  a 2.0.0 database connection left inside a transaction, and every sign-in
+  and token check of every instance then waits behind it, for up to 30
+  minutes. An OIDC sign-in on a 2.0.0 instance can also link its identity to
+  an account of a trusted-header realm meanwhile. With the Helm chart,
+  upgrade with `--set strategy.type=Recreate` or scale the deployment to zero
+  first; with the Kubernetes manifests, scale the `forge` deployment to zero
+  before applying 2.1.0.
+  ([#615](https://github.com/forgepkg/forge/issues/615))
+
+### Features
+
+- OpenTelemetry metrics, traces and logs, exported over OTLP/HTTP with the
+  official OpenTelemetry SDK. `[telemetry]` turns each signal on (all are off
+  by default), and the standard `OTEL_*` variables say where they go. The
+  metrics cover requests by surface, proxy lookups by outcome with the upstream
+  requests and bytes, S3 operations and the circuit breaker, the blob cache's
+  counters, staging space, the outbox backlog, cache hits, the connection pool,
+  every background worker's passes and restarts, retention, sign-ins, and an
+  inventory of repositories, versions and stored bytes; no attribute carries a
+  package, version, image, user or path, and `telemetry.per_repository = false`
+  takes the repository names off. A request is a trace, joining the caller's
+  from its `traceparent`, with the proxy lookup, the upstream requests (which
+  carry the trace on) and the S3 operations beneath it; each worker pass is a
+  trace of its own. A span's URL holds no query string, and the secret in the
+  path of an npm web login is recorded as `{secret}`. Exported log records
+  carry the trace they were written in. The Helm chart (`telemetry.*`) and the
+  kustomize component `components/opentelemetry` turn it on, and
+  `deploy/monitoring` has an example Collector configuration, a Grafana
+  dashboard and alerting rules. See the deployment guide's Telemetry section.
+  ([#178](https://github.com/forgepkg/forge/issues/178))
+- Trusted-header realms: a `trusted_header` realm (**Admin → Authentication**)
+  authenticates a request as the account a header of the load balancer or SSO
+  proxy in front of Forge names, when the proxy proves itself with the realm's
+  secret in a second header. The headers count only from a peer in
+  `auth.trusted_proxy_cidrs`, for a request naming one of Forge's own host
+  names, and only when the request has no credential of its own. A realm names
+  only its own accounts (created under **Admin → Users**, or on the first
+  request with `auto_provision`) and never makes anyone an administrator: its
+  accounts never hold the `admin` role. Headers with a wrong secret or a name
+  it may not use (a deactivated account's) name nobody: the request is served
+  as one without credentials, never anonymously, so its own credential and
+  signing in still work. A load balancer can so admit a network as an account
+  with its own grants. See the deployment guide,
+  "Trusted-header realms".
+  ([#506](https://github.com/forgepkg/forge/issues/506))
+- Service accounts: an account for a machine or a network that nobody signs in
+  to, such as a CI pipeline, a build agent or a network the load balancer
+  admits (**Admin → Service accounts**, or `POST /admin/users` with
+  `"kind": "service"`). A service account has a description, roles and grants,
+  and no password, invitation or email. The login screen, password Basic,
+  credential forwarding and OIDC all refuse it, and it never holds the `admin`
+  role. It authenticates with the API tokens an administrator issues for it,
+  and through the one trusted-header realm it may belong to, which alone may
+  name it. Deactivating it stops both. `GET /admin/users` gains `kind`,
+  `description`, `realm` and `last_used_at` in its views, and a `?kind=` filter.
+  The accounts that exist are users. See the deployment guide, "Service
+  accounts".
+  ([#508](https://github.com/forgepkg/forge/issues/508))
+- Administrators delete images from the web UI: on the image page of a hosted
+  docker repository, the whole image, a tag, a manifest (with the platform
+  manifests and referrers only it kept) or a Helm chart's version. The admin
+  API has it as `DELETE /admin/repositories/<name>/images?image=<image>`, with
+  `reference=<tag|digest>` for a tag or a manifest. A hosted docker
+  repository, deleted only once it holds no image, can now be emptied without
+  the registry API.
+  ([#509](https://github.com/forgepkg/forge/issues/509))
+
+### Fixed
+
+- Of two first pushes of the same package version that arrived at the same
+  moment (two CI jobs, or two replicas), the one that lost the race failed
+  with 409 even where the repository allows redeploys. It now replaces the
+  version, as it would have a moment later. This holds for NuGet, npm and
+  the other package formats; a repository without redeploys still answers
+  409.
+  ([#226](https://github.com/forgepkg/forge/issues/226))
+- The retention preview of a package or proxy repository evaluated its rules
+  at the Forge host's clock, while a run evaluates them at the database's.
+  With the two clocks apart, a version near an `older_than_days`,
+  `not_downloaded_for_days` or `not_pulled_for_days` boundary could be shown
+  as kept and then be deleted by the run. The preview now evaluates at the
+  database's clock, as image and file previews already did.
+  ([#227](https://github.com/forgepkg/forge/issues/227))
+- A proxy operation that reads several upstream documents (a version listing,
+  dating the package delay of a package with many versions) kept every
+  document it read until it answered: up to 256 of them, each up to
+  `proxy.max_metadata_bytes`. An upstream serving large pages could make a few
+  such operations hold gigabytes. One operation now keeps at most 4 ×
+  `proxy.max_metadata_bytes` of documents. The documents past that are not
+  read, and the format answers with the others: NuGet leaves the versions of
+  an unread registration page to the listing.
+  ([#230](https://github.com/forgepkg/forge/issues/230))
+- The page of an image with many tags and manifests (a CI that tags every
+  build, or a proxy of an image with thousands of tags upstream) took seconds
+  to answer and held a server thread all the while: it compared every tag
+  with every manifest, 24 s for 50,000 of them. It now answers in
+  milliseconds, and lists the newest 1,000 tags and 1,000 manifests, saying
+  how many the image has (`tags_total` and `manifests_total` in
+  `GET /browse/images/<repo>/<image>`).
+  ([#240](https://github.com/forgepkg/forge/issues/240))
+- The browse of a docker group listed the images and tags of every member the
+  reader could read, ignoring the group's guards. An image a proxy member had
+  cached under one of the group's `reserved_prefixes`, or of a name an owning
+  hosted member has (`prefer_hosted`), was listed with a `docker pull`
+  command that the group then refused, which is exactly the
+  dependency-confusion image the guards keep out. The group's own content
+  selector was not applied either. The images list, an image's page and a
+  chart's page now show what a pull through the group serves. A manifest of
+  a lower priority member no longer wears a tag that a higher priority
+  member's manifest answers.
+  ([#241](https://github.com/forgepkg/forge/issues/241))
+- Browse kept listing repositories as they were for up to 30 seconds after an
+  administrator created, renamed, deleted or took one offline, or changed a
+  group's members, under **Manage**: a renamed repository was still listed
+  under its old name, which then showed as empty. Those changes now refresh
+  what Browse shows.
+  ([#244](https://github.com/forgepkg/forge/issues/244))
+- A docker proxy's images showed when Forge first cached them as "Pushed" (the
+  manifests on an image's page) and "Last pushed" (the images of the
+  repository), as if pushed to the upstream then. A proxy labels them
+  "Cached" and "Last cached", as package versions already were.
+  ([#248](https://github.com/forgepkg/forge/issues/248))
+- The last run of a package or proxy repository's retention policy counted the
+  versions it decided on as `evaluated` ("of N" on the Retention screen), not
+  the versions it inspected. It now counts every candidate version, as the
+  preview does and as docker and raw runs already did.
+  ([#439](https://github.com/forgepkg/forge/issues/439))
+- npm repositories read a package's tarball as npm unpacks it, contiguous-file
+  entries (type `7`) included: a `package.json` of that type after a regular
+  one is the version's manifest, as it is the one npm installs, and such
+  entries count in `dist.fileCount`. Forge skipped them, so a tarball could
+  show other dependencies and install scripts in Forge than run on install.
+  ([#504](https://github.com/forgepkg/forge/issues/504))
+- A NuGet package that repeats an entry name was refused, whether pushed or
+  fetched through a proxy, though NuGet restores it. On nuget.org,
+  `Microsoft.Extensions.Caching.Memory`, `Microsoft.Extensions.Hosting.Abstractions`
+  and `Microsoft.Extensions.Logging.Abstractions` 3.1.0 hold `packageIcon.png`
+  twice, so a restore that needed them failed with 502. Forge now reads every
+  entry of the archive as NuGet does, and refuses only a repeated manifest,
+  which NuGet refuses too.
+  ([#533](https://github.com/forgepkg/forge/issues/533))
+- A request or background task dropped while Forge began a database
+  transaction (a client that went away, a request past its deadline) could
+  leave a database connection inside an open transaction that Forge did not
+  know of. What later ran on that connection was not committed and not seen
+  by others, held its locks, and was rolled back when the connection closed
+  10 to 30 minutes later: requests could hang that long, and writes made in
+  between were lost, such as a resumed Nexus import's record of an item it
+  had copied. Beginning a transaction is now safe against cancellation.
+  ([#570](https://github.com/forgepkg/forge/issues/570))
+
+### Security
+
+- npm repositories read a tarball's directories as npm unpacks them. To npm, a
+  directory entry (of type `5`, or of type `0` with a path ending in `/`) has no
+  body, whatever size its header gives: the next entry starts right after its
+  header. Forge skipped the size the header gave, so a tarball could hide from
+  Forge the `package.json` npm installs, with other dependencies and install
+  scripts than Forge showed, and Forge read an entry `package/package.json/` as
+  the manifest npm takes for a directory. Such a directory is no longer read as
+  a file, and a tarball whose directory entry has a body is refused.
+  ([#540](https://github.com/forgepkg/forge/issues/540))
+- A NuGet package whose entry carries the ZIP64 extra field twice is refused.
+  The field can give where the entry's data starts, and NuGet reads the first
+  one while Forge read the last: a package could so hold two manifests, Forge
+  checking and showing one identity and its dependencies while NuGet installed
+  another. Neither NuGet nor .NET writes the field twice.
+  ([#541](https://github.com/forgepkg/forge/issues/541))
+- npm repositories read a tarball as npm unpacks it in more ways, and refuse
+  one they cannot follow. A tarball could still hold a `package.json` npm
+  installs that Forge never read, with other dependencies and install scripts
+  than Forge showed: after a single zero block, in the body of a header npm
+  rejects (a checksum npm reads over 12 bytes, a link target on a file, an
+  empty path, a base-256 number npm cannot read, a name that goes on past its
+  end), in a second gzip member, or behind a PAX record npm reads otherwise.
+  And a file such as `./package.json`, `package\package.json` or
+  `package/PACKAGE.JSON` is `package.json` to npm, or to npm on another
+  system, but was not to Forge. Forge now reads every gzip member, and refuses
+  data after the end of the archive, such headers and records, and a file it
+  cannot tell npm does not take for `package.json`. `npm pack` writes none of
+  these.
+  ([#554](https://github.com/forgepkg/forge/issues/554))
+- `npm logout` sends the API token it revokes in the request's path, and the
+  `forge::audit` line of the request recorded that path, so the console log
+  held the token, and with telemetry on the request's span (`url.path`) and
+  the exported log record did too. The token stays valid when the logout
+  fails (another account's token, a workload key, a database error). Both now
+  record it as `{secret}`.
+  ([#557](https://github.com/forgepkg/forge/issues/557))
+- npm repositories refuse a tarball holding a `package.json` behind a Windows
+  root. npm (node-tar) strips a drive, a UNC root or a device root at the
+  start of an entry's path, also on Linux and macOS: before the first
+  component is stripped (npm 10), or after it (npm 11.20 and later). A file
+  such as `package/c:package.json`, `package/\\server\share\package.json` or
+  `C:C:package.json` is so the `package.json` npm installs, while Forge read
+  the tarball's other one and showed other dependencies and install scripts
+  than ran on install. `npm pack` writes no such path.
+  ([#571](https://github.com/forgepkg/forge/issues/571))
+- NuGet repositories refuse a package whose end-of-central-directory record
+  NuGet reads otherwise than Forge: one marking ZIP64 in its central
+  directory's size alone, or in its disk numbers alone, and a last record
+  whose comment runs past the end of the file. Forge and NuGet then read
+  different central directories, so a package could hold two manifests,
+  Forge checking and showing one identity and its dependencies while NuGet
+  (.NET 8 and .NET Framework, for the comment) installed the other. Neither
+  NuGet nor .NET writes such a record.
+  ([#572](https://github.com/forgepkg/forge/issues/572))
+- A NuGet package whose entry carries a ZIP64 extra field of 28 bytes or more,
+  with a value its header does not mark before one it does, is refused. .NET 8
+  and later read each value of such a field at its fixed place, Forge one marked
+  value after the other: a package could so point the two at different local
+  headers and hold two manifests, Forge checking and showing one identity and
+  its dependencies while NuGet (`dotnet restore`) installed the other. Neither
+  NuGet nor .NET writes such a field.
+  ([#592](https://github.com/forgepkg/forge/issues/592))
+
+### Documentation
+
+- The Docker guide says what deleting one of several tags of a digest leaves,
+  by a retention rule or the registry API: the manifest stays under its other
+  tags. It also says that a pull counts for every tag of its digest, so
+  `tag_not_pulled_for_days` keeps a tag while another tag of the same digest
+  is pulled, and that aliases such as `latest` take places among the
+  `keep_last_n_tags` unless they are protected.
+  ([#510](https://github.com/forgepkg/forge/issues/510))
+
 ## [2.0.0]
 
 A new major release, installed fresh: 2.0.0 does not upgrade 1.0 or 1.1.
@@ -1259,7 +1504,8 @@ lists the required settings.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/forgepkg/forge/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/forgepkg/forge/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/forgepkg/forge/releases/tag/v2.1.0
 [2.0.0]: https://github.com/forgepkg/forge/releases/tag/v2.0.0
 [1.1.0]: https://github.com/forgepkg/forge/releases/tag/v1.1.0
 [1.0.0]: https://github.com/forgepkg/forge/releases/tag/v1.0.0
