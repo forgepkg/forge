@@ -223,6 +223,14 @@ curl -u admin@example.com:<TOKEN> http://localhost:8421/repository/binaries/tool
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers,
   and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`).
+- **[GitLab CI with workload identity](./docs/gitlab-ci.md)** — step by step:
+  every job of a GitLab project restores from Forge's NuGet feeds, and only
+  the release job, on a protected tag or environment, pushes the packages a
+  trusted publisher names. No secret in GitLab.
+- **[CI with service accounts](./docs/ci-service-accounts.md)** — for
+  pipelines that cannot use workload identity: a read token and a release
+  token of service accounts in GitLab's CI/CD variables, and how both
+  methods run side by side.
 - **[Format plugins](./docs/format-plugins.md)** — further package formats,
   built into the server: design, operation, and writing one.
 - **[Importing from Nexus](./docs/nexus-import.md)** — copy a Nexus hosted
