@@ -53,7 +53,7 @@ By default (`--db local`) the server points at a host Postgres on **:5432**
 `FORGE_DATABASE__URL`; versitygw (S3) still comes up via docker. Use `--db
 docker` for a fully self-contained stack (Postgres on :5433) if you don't run a
 local PostgreSQL. `--db none` starts no infra at all. Run `cargo xtask help` for
-the full command list.
+the full command list. Forge needs PostgreSQL 18 or newer, the host's too.
 
 > First run compiles the workspace (a minute or two) and runs DB migrations
 > automatically. A bootstrap admin **`admin@example.com` / `changeme`** is created (the server
@@ -752,6 +752,10 @@ server hashes its bootstrap admin password.
 
 - `cargo xtask down` stops the containers but **keeps** the Postgres volume. To
   wipe all state (start fresh): `docker compose down -v`.
+- **An empty `--db docker` database after the move to PostgreSQL 18** — the
+  compose PostgreSQL 18 keeps its data in the volume `forge-dev_postgresql`.
+  The PostgreSQL 17 cluster in the earlier volume, `forge-dev_db_data`, is not
+  used (18 cannot open it): `docker volume rm forge-dev_db_data` removes it.
 - **`the database was created by Forge 1.x or by a build before 2.0.0`** — the
   schema started over at one migration in 2.0.0, and a database an earlier
   build migrated is refused (`cargo xtask migrate` and `prepare`, which run

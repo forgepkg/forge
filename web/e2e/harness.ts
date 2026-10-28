@@ -4,7 +4,7 @@
  * bootstrap-admin credentials to the Playwright specs.
  *
  * This deliberately drives the **actual Rust server binary** against the same
- * container images the Rust testcontainers harness uses (Postgres 17 +
+ * container images the Rust testcontainers harness uses (Postgres 18 +
  * versity/versitygw:v1.4.1), proving the single-origin serving model end to end:
  * the browser hits `/`, `/admin/*`, `/browse/*`, `/repository/*` on one origin with no
  * Node proxy.

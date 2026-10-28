@@ -17,7 +17,7 @@ deploy/kubernetes/
 │   ├── high-availability/   two replicas, spread over nodes, PodDisruptionBudget
 │   ├── local-cache/         local blob cache on an emptyDir (faster downloads, serves through an S3 outage)
 │   ├── local-cache-persistent/  the same on a PersistentVolume (one replica, survives restarts)
-│   ├── postgres/            in-cluster PostgreSQL 17 (evaluation / small installs)
+│   ├── postgres/            in-cluster PostgreSQL 18 (evaluation / small installs)
 │   ├── s3-versitygw/        in-cluster S3 gateway on a PersistentVolume (evaluation / small installs)
 │   ├── s3-workload-identity/  short-lived S3 credentials from a projected service-account token (no S3 keys)
 │   ├── opentelemetry/       metrics, traces and logs over OTLP to an OpenTelemetry Collector

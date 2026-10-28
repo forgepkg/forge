@@ -11,7 +11,7 @@ are rate-limited and fail with `429 Too Many Requests`. Pull it through
 Google's mirror, `mirror.gcr.io`, which serves the same images under the same
 digests:
 
-- an official image `postgres:17` is `mirror.gcr.io/library/postgres:17`;
+- an official image `postgres:18` is `mirror.gcr.io/library/postgres:18`;
 - any other `versity/versitygw:v1.4.1` is `mirror.gcr.io/versity/versitygw:v1.4.1`.
 
 This holds for every pull: `docker pull`, `docker run`, testcontainers in new

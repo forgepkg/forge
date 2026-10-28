@@ -1,9 +1,9 @@
 name: forge-dev
 
 services:
-  # PostgreSQL 17 — metadata store
+  # PostgreSQL 18 — metadata store
   db:
-    image: mirror.gcr.io/library/postgres:17
+    image: mirror.gcr.io/library/postgres:18
     environment:
       POSTGRES_DB: forge
       POSTGRES_USER: forge
@@ -13,7 +13,10 @@ services:
       # already be listening on the host's default 5432. forge.toml points here.
       - "5433:5432"
     volumes:
-      - db_data:/var/lib/postgresql/data
+      # The 18 image keeps its cluster in /var/lib/postgresql/18/docker and
+      # refuses to start with a volume on /var/lib/postgresql/data. The volume
+      # of the earlier PostgreSQL 17 (db_data) is not used.
+      - postgresql:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U forge -d forge"]
       interval: 5s
@@ -54,5 +57,5 @@ services:
       retries: 10
 
 volumes:
-  db_data:
+  postgresql:
   s3_data:
