@@ -51,7 +51,7 @@ async fn database_url() -> &'static str {
                 .with_user("forge")
                 .with_password("forge")
                 .with_name("mirror.gcr.io/library/postgres")
-                .with_tag("17")
+                .with_tag("18")
                 .start()
                 .await
                 .expect("start postgres testcontainer (is Docker running? set FORGE_TEST_DATABASE_URL to use an external Postgres)");

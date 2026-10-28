@@ -25,13 +25,13 @@
 #
 # Usage: image-smoke.sh <image> [<commit>]
 # Needs on PATH: docker, curl, jq, cmp, tar. Images (defaults match ci.yml):
-#   FORGE_SMOKE_POSTGRES_IMAGE (mirror.gcr.io/library/postgres:17)
+#   FORGE_SMOKE_POSTGRES_IMAGE (mirror.gcr.io/library/postgres:18)
 #   FORGE_SMOKE_S3_IMAGE       (mirror.gcr.io/versity/versitygw:v1.4.1)
 set -euo pipefail
 
 image="$1"
 commit="${2:-}"
-postgres_image="${FORGE_SMOKE_POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:17}"
+postgres_image="${FORGE_SMOKE_POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:18}"
 s3_image="${FORGE_SMOKE_S3_IMAGE:-mirror.gcr.io/versity/versitygw:v1.4.1}"
 package="$(realpath "$(dirname "$0")/../../fixtures/nuget/sample.lib.1.0.0.nupkg")"
 port="${FORGE_SMOKE_PORT:-18421}"

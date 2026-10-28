@@ -250,7 +250,7 @@ and wired into Forge when enabled:
 
 | Dependency | Enable with | Sets |
 | --- | --- | --- |
-| PostgreSQL 17 (StatefulSet) | `postgresql.enabled` | `FORGE_DATABASE__URL` |
+| PostgreSQL 18 (StatefulSet) | `postgresql.enabled` | `FORGE_DATABASE__URL` |
 | Valkey, cache only (Deployment) | `valkey.enabled` | `FORGE_REDIS__URL` |
 | versitygw S3 gateway (StatefulSet) | `versitygw.enabled` | `s3.endpoint`, `s3.bucket`, `FORGE_S3__ACCESS_KEY` / `_SECRET_KEY` (static root credentials only: not with short-lived `s3.credentials`) |
 

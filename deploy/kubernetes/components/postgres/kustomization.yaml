@@ -1,4 +1,4 @@
-# A single-instance PostgreSQL 17 StatefulSet for evaluation and small
+# A single-instance PostgreSQL 18 StatefulSet for evaluation and small
 # installations, wired into Forge. It has no backups, replication or
 # failover: for production use a managed PostgreSQL or an operator
 # (CloudNativePG, …) and set FORGE_DATABASE__URL in the forge-env Secret

@@ -488,7 +488,7 @@ extraObjects: null
 # auth.password or auth.existingSecret there (and, for Valkey with
 # auth.password, auth.checksumSalt).
 
-# PostgreSQL 17 StatefulSet; sets FORGE_DATABASE__URL.
+# PostgreSQL 18 StatefulSet; sets FORGE_DATABASE__URL.
 postgresql:
   enabled: false
 

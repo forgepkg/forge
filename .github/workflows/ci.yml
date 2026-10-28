@@ -174,7 +174,7 @@ jobs:
       # queries and schema. Pinned by digest; Dependabot does not see
       # workflow images, so bump it with deploy/kubernetes/components/postgres.
       postgres:
-        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        image: mirror.gcr.io/library/postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
         env:
           POSTGRES_DB: forge
           POSTGRES_USER: forge
@@ -341,7 +341,7 @@ jobs:
           cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope=docker-{0}', matrix.arch) || '' }}
       - name: Smoke test the image (as the manifests run it)
         env:
-          FORGE_SMOKE_POSTGRES_IMAGE: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+          FORGE_SMOKE_POSTGRES_IMAGE: mirror.gcr.io/library/postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
           FORGE_SMOKE_S3_IMAGE: mirror.gcr.io/versity/versitygw:v1.4.1@sha256:0400cb59f59da0f1cf9f7fd49505191abc348dfadf54509bf1988caaff4eb96f
         run: .github/scripts/image-smoke.sh forge:ci "${{ github.sha }}"
 
@@ -472,7 +472,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     services:
       postgres:
-        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        image: mirror.gcr.io/library/postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
         env:
           POSTGRES_DB: forge
           POSTGRES_USER: forge
@@ -562,7 +562,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     services:
       postgres:
-        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        image: mirror.gcr.io/library/postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
         env:
           POSTGRES_DB: forge
           POSTGRES_USER: forge
@@ -618,7 +618,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
     services:
       postgres:
-        image: mirror.gcr.io/library/postgres:17@sha256:a63c1ea3f6a3a5a1621f97d2aba3b30faecfab4224c1b0000cc85ced57bb1939
+        image: mirror.gcr.io/library/postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
         env:
           POSTGRES_DB: forge
           POSTGRES_USER: forge
@@ -716,7 +716,7 @@ jobs:
       # (.github/scripts/image-pin-check.sh leaves `docker pull` alone).
       - name: Pre-pull container images
         run: |
-          docker pull mirror.gcr.io/library/postgres:17
+          docker pull mirror.gcr.io/library/postgres:18
           docker pull mirror.gcr.io/versity/versitygw:v1.4.1
           docker pull mirror.gcr.io/versity/versitygw:v1.9.0
           docker pull mirror.gcr.io/library/redis:5.0
@@ -780,7 +780,7 @@ jobs:
       # By tag, like the e2e job: web/e2e names them by tag.
       - name: Pre-pull container images
         run: |
-          docker pull mirror.gcr.io/library/postgres:17
+          docker pull mirror.gcr.io/library/postgres:18
           docker pull mirror.gcr.io/versity/versitygw:v1.4.1
       - name: Install deps (frozen lockfile)
         run: pnpm install --frozen-lockfile

@@ -781,7 +781,7 @@ async fn a_database_of_an_earlier_build_is_refused() {
     }
 }
 
-/// A Postgres server for one test: a throwaway Postgres 17 container matching
+/// A Postgres server for one test: a throwaway Postgres 18 container matching
 /// docker-compose (db/user/pw = forge), or, with FORGE_TEST_DATABASE_URL (no
 /// Docker), that server. Returns the URL of a database on it, and the
 /// container to keep alive.
@@ -794,7 +794,7 @@ async fn server() -> (String, Option<ContainerAsync<Postgres>>) {
         .with_user("forge")
         .with_password("forge")
         .with_name("mirror.gcr.io/library/postgres")
-        .with_tag("17")
+        .with_tag("18")
         .start()
         .await
         .expect("failed to start postgres testcontainer (is Docker running?)");
