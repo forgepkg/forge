@@ -1,0 +1,29 @@
+# The documentation site, https://forgepkg.github.io/forge/.
+#
+# `cargo xtask docs` stages the pages SUMMARY.md lists (the README, the guides
+# in this directory and the changelog) into target/docs/src, with their links
+# rewritten for the site, and builds them with mdBook into target/docs/book.
+# The Pages workflow (.github/workflows/pages.yml) publishes the build of main.
+
+[book]
+title = "Forge"
+description = "A self-hosted NuGet, npm, Docker / OCI and raw file registry"
+language = "en"
+src = "src"
+
+[build]
+# A page SUMMARY.md lists but the staging did not write is an error, not an
+# empty page.
+create-missing = false
+
+[output.html]
+site-url = "/forge/"
+git-repository-url = "https://github.com/forgepkg/forge"
+default-theme = "light"
+preferred-dark-theme = "navy"
+# The pages have no chapter numbers of their own.
+no-section-label = true
+
+# The Rust snippets are excerpts, not programs to run.
+[output.html.playground]
+runnable = false

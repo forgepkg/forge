@@ -270,7 +270,7 @@ fn leading_blank(lines: &[String]) -> usize {
 
 /// The repository's URL, from the `[Unreleased]: <repo>/compare/…` link at
 /// the bottom of the changelog (`<repo>/commits/…` before the first release).
-fn repo_url(changelog: &str) -> Option<&str> {
+pub(crate) fn repo_url(changelog: &str) -> Option<&str> {
     changelog.lines().find_map(|line| {
         let url = line.strip_prefix("[Unreleased]: ")?;
         let (repo, _) = url

@@ -1,0 +1,75 @@
+name: Pages
+
+# The documentation site, https://forgepkg.github.io/forge/: `cargo xtask
+# docs` builds the pages docs/SUMMARY.md lists with mdBook, and a push to the
+# default branch that changes them deploys the build to GitHub Pages
+# (Settings → Pages → Source: GitHub Actions). A pull request that changes how
+# the site is built only builds it; CI's fmt job checks the links of every
+# pull request (`cargo xtask docs --check`).
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - CHANGELOG.md
+      - docs/**
+      - xtask/src/docs.rs
+      - .github/workflows/pages.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - docs/book.toml
+      - docs/SUMMARY.md
+      - xtask/src/docs.rs
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+# A deployment is never cancelled halfway; a newer one waits for it. A pull
+# request's newer commit supersedes its running build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# Every third-party action is pinned to a full commit SHA (the tag it was
+# resolved from is in the trailing comment); Dependabot
+# (.github/dependabot.yml) proposes updates.
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      # The version xtask/src/docs.rs names (MDBOOK).
+      - name: Install mdBook (prebuilt, pinned)
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: mdbook@0.5.4
+      - name: cargo xtask docs
+        run: cargo xtask docs
+      - name: Upload the site
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/docs/book
+
+  deploy:
+    name: deploy
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

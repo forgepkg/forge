@@ -124,8 +124,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/ci-changes.sh
 
-  # ── Formatting, the changelog fragments and xtask's tests ──────────────────
-  # The fragment check and the tests build only xtask, which has no
+  # ── Formatting, the changelog fragments, the docs' links, xtask's tests ────
+  # The fragment and link checks and the tests build only xtask, which has no
   # dependencies. On a pull request the fragment check sees the merge with
   # the base, so a fragment under a milestone that was released after the
   # pull request was written fails. xtask's tests run in `test` as well; here
@@ -149,6 +149,11 @@ jobs:
         run: cargo fmt --all --check
       - name: Changelog fragments (docs/changes)
         run: cargo xtask changelog --check
+      # The pages of the documentation site: every link goes to a page, a
+      # heading or a file that exists, and SUMMARY.md lists every guide. A
+      # change to the crates can break them too (a link to a renamed file).
+      - name: Documentation links (docs/SUMMARY.md)
+        run: cargo xtask docs --check
       - name: cargo test -p xtask
         run: cargo test -p xtask
 

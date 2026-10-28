@@ -57,8 +57,9 @@ RUST=(
     .github/scripts/test-timings-summary.sh .github/scripts/oci-e2e.sh
     .github/scripts/raw-e2e.sh .github/scripts/npm-e2e.sh
 )
-# fmt's second check: the changelog fragments.
-CHANGELOG=(docs/changes)
+# fmt's other checks: the changelog fragments, and the links of the
+# documentation site's pages (the README, docs/ and the changelog).
+CHANGELOG=(docs README.md CHANGELOG.md)
 # What xtask's tests, which fmt runs too (#363), read from outside xtask: the
 # version lines `cargo xtask release` sets, and the release workflow's channel
 # script.

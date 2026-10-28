@@ -780,6 +780,9 @@ Docker image: `docker-build` · `docker-run` (wired to the `Dockerfile`).
 Changelog: `changelog <milestone>` (fold a milestone's fragments into
 `CHANGELOG.md`) · `changelog --check` (see [Changelog entries](#changelog-entries)).
 
+Documentation site: `docs` (build it) · `docs --check` (its links only; see
+[Documentation site](#documentation-site)).
+
 Release: `release <version> [--no-tag]` (see [Releasing](#releasing)).
 
 ## Single-container Docker image
@@ -1078,6 +1081,35 @@ xtask changelog --check`. It refuses a file under `docs/changes` that is not a
 fragment, and a fragment whose milestone is released already. When a pull
 request written before a release merges after it, move its fragment to the
 next milestone.
+
+## Documentation site
+
+The guides are also a site, https://forgepkg.github.io/forge/, built with
+[mdBook](https://rust-lang.github.io/mdBook/) from the pages
+[docs/SUMMARY.md](docs/SUMMARY.md) lists: the README (the start page), the
+guides in `docs/` and the changelog. `docs/book.toml` configures it.
+
+```bash
+cargo install mdbook --version 0.5.4 --locked
+cargo xtask docs
+```
+
+`cargo xtask docs` stages the pages into `target/docs/src` and builds the
+site into `target/docs/book`; open `target/docs/book/index.html`. The pages
+keep linking each other and the source tree relatively, as GitHub shows
+them. The staging rewrites a link to another page into that page of the
+site, and a link into the source tree (`../crates/…`) into the file on
+GitHub, on `main`. It fails on a link to a file or heading that does not
+exist, and on a Markdown file directly in `docs/` that SUMMARY.md does not
+list: a new guide goes into SUMMARY.md, under its part. `cargo xtask docs
+--check` runs the staging without mdBook; CI's `fmt` job runs it for a change
+to the pages or to the Rust code, whose files the pages link.
+
+The Pages workflow (`.github/workflows/pages.yml`) deploys the site when a
+push to `main` changes a page, and builds it for a pull request that changes
+the site's configuration. It needs **Settings → Pages → Source: GitHub
+Actions** in the repository. mdBook's version is pinned in the workflow and
+in `xtask/src/docs.rs`; change both together.
 
 ## Releasing
 
