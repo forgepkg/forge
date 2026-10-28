@@ -532,6 +532,7 @@ wrong.
 | --- | --- | --- |
 | `anonymous_mode` | `off` | `off` or `all`: who is served without credentials. A repository is read anonymously only when it also allows it (**Allow anonymous read**, or a grant of the `anonymous` role). Under `all`, signed-in users also read what anonymous callers may. To let a network read without credentials, have the load balancer name a service account through a [trusted-header realm](#trusted-header-realms). |
 | `login_mode` | `identifier_first` | The login screen: the username first (then a password prompt or the identity provider whose login domains match), or `combined` (username and password, plus the OIDC button). |
+| `remember_accounts` | `true` | The login screen offers the accounts signed in on the device before, so signing in again is one click (see below). `false` for kiosks and shared computers. |
 | `allow_password_basic` | `false` | Accept a user's password over HTTP Basic on the feeds (see below). |
 | `session_idle_ttl_seconds` | `28800` (8 h) | A browser session ends this long after its last use. |
 | `session_absolute_ttl_seconds` | `604800` (7 d) | A browser session ends this long after sign-in. New lifetimes apply to sessions signed in afterwards; an open session's idle window moves to the new idle timeout on its next use. |
@@ -541,6 +542,26 @@ wrong.
 A configuration that still sets one of these (`auth.anonymous_mode`,
 `FORGE_AUTH__ALLOW_PASSWORD_BASIC`, …, or the `oidc.session_*` lifetimes)
 is refused at startup, with a message naming the keys to remove.
+
+#### Remembered accounts
+
+After someone signs in, the login screen shows their account the next time
+instead of an empty username field, like Microsoft's "Pick an account". A
+click on it continues as that account: a password account at the password
+step, an OIDC account at its identity provider, which gets the username as
+`login_hint` and so does not ask for the account again (the username typed
+into the identifier-first form is passed the same way). **Use another
+account** shows the usual form, and each account's ✕ forgets it. Signing out
+keeps the account; the browser keeps at most five, the latest first.
+
+The accounts are kept in the browser only (`localStorage`): the username, the
+name the identity provider gave, the realm and when it was last used, never a
+password, a token or the session. The server never lists accounts, so
+`POST /auth/identify` answers as before, from the realms' configuration alone.
+An account whose OIDC realm was disabled or renamed is routed like a typed
+username. With `remember_accounts` off (**Admin → Settings → Remember accounts
+on the login screen**), the login screen keeps none and forgets those a
+browser kept, the next time it is opened there.
 
 #### Password Basic auth
 

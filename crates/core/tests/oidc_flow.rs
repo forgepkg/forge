@@ -196,7 +196,7 @@ async fn begin_login_persists_flow_and_builds_authorize_url() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
 
-    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/packages")
+    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/packages", None)
         .await
         .expect("begin_login");
 
@@ -233,7 +233,7 @@ async fn complete_login_happy_path_then_replay_fails() {
     let n = unique();
     let sub = format!("sub-{n}");
 
-    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/home")
+    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/home", None)
         .await
         .expect("begin");
 
@@ -310,7 +310,7 @@ async fn complete_login_authenticates_with_a_client_assertion_instead_of_a_secre
         ..idp.client()
     };
 
-    let begun = begin_login(&pool, &idp.meta(), &client, "/")
+    let begun = begin_login(&pool, &idp.meta(), &client, "/", None)
         .await
         .expect("begin");
     let nonce = peek_nonce(&pool, &begun.state).await;
@@ -365,7 +365,7 @@ async fn complete_login_fails_without_calling_the_idp_when_the_assertion_cannot_
         auth: ClientAuth::Assertion(std::sync::Arc::new(FixedAssertion(Err("no keys")))),
         ..idp.client()
     };
-    let begun = begin_login(&pool, &idp.meta(), &client, "/")
+    let begun = begin_login(&pool, &idp.meta(), &client, "/", None)
         .await
         .expect("begin");
 
@@ -395,7 +395,7 @@ async fn complete_login_rejects_nonce_mismatch() {
     let idp = MockIdp::start().await;
     let n = unique();
 
-    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/")
+    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/", None)
         .await
         .expect("begin");
 
@@ -451,7 +451,7 @@ async fn complete_login_rejects_other_browser_without_consuming_flow() {
     let pool = pool().await;
     let idp = MockIdp::start().await;
     let n = unique();
-    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/")
+    let begun = begin_login(&pool, &idp.meta(), &idp.client(), "/", None)
         .await
         .expect("begin");
 
@@ -1156,7 +1156,7 @@ async fn run_login(
     username: &str,
     roles: Value,
 ) -> oidc::ValidatedLogin {
-    let begun = begin_login(pool, &idp.meta(), &idp.client(), "/")
+    let begun = begin_login(pool, &idp.meta(), &idp.client(), "/", None)
         .await
         .expect("begin");
     let nonce = peek_nonce(pool, &begun.state).await;

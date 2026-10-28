@@ -29,6 +29,7 @@ const adminMe: Me = {
 const stored: AuthSettings = {
   anonymous_mode: 'off',
   login_mode: 'identifier_first',
+  remember_accounts: true,
   allow_password_basic: false,
   session_idle_ttl_seconds: 28800,
   session_absolute_ttl_seconds: 604800,
@@ -223,11 +224,17 @@ describe('admin settings', () => {
         name: 'Accept passwords over HTTP Basic on the feeds',
       }),
     )
+    const remember = within(signIn).getByRole('checkbox', {
+      name: 'Remember accounts on the login screen',
+    })
+    expect(remember).toBeChecked()
+    await u.click(remember)
     await u.click(within(signIn).getByRole('button', { name: 'Save sign-in' }))
     await waitFor(() =>
       expect(puts()).toEqual([
         {
           login_mode: 'combined',
+          remember_accounts: false,
           allow_password_basic: true,
           session_idle_ttl_seconds: 600,
           session_absolute_ttl_seconds: 604800,

@@ -1,5 +1,6 @@
 import { queryOptions } from '@tanstack/react-query'
 
+import { completePendingSignIn } from '~/lib/accounts'
 import { getCsrfToken, setSession } from '~/lib/auth'
 import { httpClient } from '~/lib/httpClient'
 
@@ -35,6 +36,11 @@ export interface LoginOptions {
   /** Whether any password-capable realm is enabled (renders the password form). */
   password: boolean
   oidc: OidcLoginOption[]
+  /**
+   * Whether the screen remembers the accounts signed in on this device and
+   * offers them (`~/lib/accounts`). Off, it keeps and shows none.
+   */
+  remember_accounts: boolean
 }
 
 /** `POST /auth/identify` response — where to send this username. */
@@ -49,6 +55,8 @@ export interface IdentifyResponse {
 export interface LoginResponse {
   user_id: number
   username: string
+  /** Always null for a password sign-in (only an IdP gives a name). */
+  display_name?: string | null
   is_admin: boolean
   csrf_token: string
 }
@@ -57,6 +65,8 @@ export interface LoginResponse {
 export interface AuthSession {
   user_id: number
   username: string
+  /** The identity provider's name for the user, for an OIDC session. */
+  display_name?: string | null
   is_admin: boolean
   csrf_token: string
 }
@@ -112,7 +122,9 @@ export function fetchAuthSession(
  * An OIDC sign-in ends with a server redirect that only sets the httpOnly
  * cookie, and a token stored by an earlier session can be stale, so the app
  * shell calls this once per load: without the current token every mutating
- * request (and logout) would be refused. Best-effort — any failure resolves
+ * request (and logout) would be refused. It is also the first identity the
+ * SPA sees after an OIDC sign-in, so it remembers that account for the login
+ * screen (`completePendingSignIn`). Best-effort — any failure resolves
  * to `null` and leaves the stored token alone (a 401 clears it). A 401 is
  * not reported as an expired session: the app shell calls this only once
  * `/admin/me` answered, and a user the proxy in front signs in (a
@@ -124,6 +136,9 @@ export async function syncAuthSession(
   try {
     const session = await fetchAuthSession(signal, true)
     if (getCsrfToken() !== session.csrf_token) setSession(session.csrf_token)
+    // The first identity after an OIDC round trip this tab started: remember
+    // the account for the login screen.
+    completePendingSignIn(session)
     return session
   } catch {
     return null

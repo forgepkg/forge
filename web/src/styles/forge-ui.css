@@ -453,4 +453,16 @@
     .fg-toasts { right: var(--space-4); bottom: var(--space-4); }
   }
   .fg-dialog { max-height: calc(100dvh - 2 * var(--space-4)); overflow-y: auto; }
+
+  /* ---------- App additions: remembered accounts (login screen) ---------- */
+  .fg-accounts { display: grid; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
+  .fg-account { display: flex; align-items: center; gap: var(--space-1); padding-right: var(--space-1); border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface); transition: background-color 120ms ease-out, border-color 120ms ease-out; }
+  .fg-account:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+  .fg-account-pick { display: flex; flex: 1; align-items: center; gap: var(--space-3); min-width: 0; padding: 10px 12px; border: 0; border-radius: var(--radius-md); background: transparent; color: var(--ink); font: inherit; text-align: left; cursor: pointer; }
+  .fg-account-pick:disabled { cursor: progress; }
+  .fg-account-pick:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .fg-account-who { display: grid; flex: 1; min-width: 0; }
+  .fg-account-name, .fg-account-id { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fg-account-name { font-size: 14px; line-height: 20px; font-weight: 600; }
+  .fg-account-id { color: var(--ink-muted); font-size: 12.5px; line-height: 18px; }
 }

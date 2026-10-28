@@ -72,6 +72,18 @@ pub async fn user_has_identity(pool: &PgPool, user_id: i64) -> sqlx::Result<bool
     Ok(linked)
 }
 
+/// The display name the IdP sent for identity `id` at its last sign-in, if
+/// the identity exists and the IdP sent one.
+pub async fn display_name(pool: &PgPool, id: i64) -> sqlx::Result<Option<String>> {
+    let name = sqlx::query_scalar!(
+        "SELECT display_name FROM external_identity WHERE id = $1",
+        id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(name.flatten())
+}
+
 /// Find the identity row for `(issuer, subject)`, if any.
 pub async fn find_by_issuer_subject(
     pool: &PgPool,

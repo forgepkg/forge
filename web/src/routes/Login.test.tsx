@@ -9,6 +9,7 @@ import {
 } from '@tanstack/react-router'
 
 import { makeQueryClient } from '~/lib/queryClient'
+import { listAccounts, rememberAccount } from '~/lib/accounts'
 import { clearSession, getCsrfToken, isAuthenticated } from '~/lib/auth'
 import { assignLocation } from '~/lib/navigation'
 import type { LoginOptions } from '~/api/auth'
@@ -31,7 +32,11 @@ vi.mock('~/lib/navigation', () => ({ assignLocation: vi.fn() }))
  *  - a failed OIDC callback (`?error=<code>`) shows a generic message per
  *    code, never the raw parameter, with a "Try again" link that clears it;
  *  - there is **no** registry-token sign-in: the UI always authenticates with
- *    username+password or via a realm.
+ *    username+password or via a realm;
+ *  - accounts signed in on this device are remembered and offered as tiles
+ *    (unless the server turns remembering off): a tile continues at the
+ *    password step or at the IdP with `login_hint`, an OIDC account whose
+ *    realm is gone is routed by `/auth/identify`, and a tile can be forgotten.
  */
 
 const readerMe: Me = {
@@ -44,6 +49,7 @@ const identifierFirst: LoginOptions = {
   mode: 'identifier_first',
   password: true,
   oidc: [],
+  remember_accounts: true,
 }
 
 const combined: LoginOptions = {
@@ -52,6 +58,7 @@ const combined: LoginOptions = {
   oidc: [
     { name: 'corp', label: 'Corp SSO', login_url: '/auth/oidc/login?realm=corp' },
   ],
+  remember_accounts: true,
 }
 
 function json(body: unknown, status = 200): Response {
@@ -132,11 +139,15 @@ describe('Login', () => {
     fetchMock.mockReset()
     vi.mocked(assignLocation).mockReset()
     clearSession()
+    localStorage.clear()
+    sessionStorage.clear()
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
     clearSession()
+    localStorage.clear()
+    sessionStorage.clear()
   })
 
   describe('identifier-first mode', () => {
@@ -206,7 +217,7 @@ describe('Login', () => {
       expect(isAuthenticated()).toBe(false)
     })
 
-    it('navigates the browser to the IdP on an oidc_redirect decision, carrying redirect_to', async () => {
+    it('navigates the browser to the IdP on an oidc_redirect decision, carrying redirect_to and login_hint', async () => {
       const user = userEvent.setup()
       mockAuthApi({
         options: identifierFirst,
@@ -223,9 +234,10 @@ describe('Login', () => {
       await user.type(await screen.findByLabelText('Username'), 'bob@example.com')
       await user.click(screen.getByRole('button', { name: 'Continue' }))
 
+      // The IdP gets the email typed here, so it does not ask for it again.
       await waitFor(() =>
         expect(assignLocation).toHaveBeenCalledWith(
-          '/auth/oidc/login?realm=corp&redirect_to=%2Fmanage%2Frepositories',
+          '/auth/oidc/login?realm=corp&redirect_to=%2Fmanage%2Frepositories&login_hint=bob%40example.com',
         ),
       )
       // No password step was revealed.
@@ -441,6 +453,272 @@ describe('Login', () => {
       await waitFor(() => expect(router.state.location.pathname).toBe('/'))
       expect(getCsrfToken()).toBe('csrf-fallback')
       expect(screen.queryByLabelText('Registry token')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('remembered accounts', () => {
+    const alice = {
+      identifier: 'alice@corp.example',
+      method: 'password' as const,
+      realm: 'local',
+    }
+    const bob = {
+      identifier: 'bob@corp.example',
+      display_name: 'Bob Builder',
+      method: 'oidc' as const,
+      realm: 'corp',
+    }
+    const aliceSession = {
+      user_id: 2,
+      username: 'alice@corp.example',
+      display_name: null,
+      is_admin: false,
+      csrf_token: 'csrf-abc',
+    }
+    /** An account's tile: the button naming it that is not its "Forget". */
+    const tile = (text: string) =>
+      screen.findByRole('button', {
+        name: (name) => name.includes(text) && !name.startsWith('Forget'),
+      })
+
+    it('remembers a password sign-in and offers it next time', async () => {
+      const user = userEvent.setup()
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: () => json({ mode: 'password', realm: 'local' }),
+        onLogin: () => json(aliceSession),
+      })
+
+      const router = await renderLogin()
+      await user.type(await screen.findByLabelText('Username'), 'alice@corp.example')
+      await user.click(screen.getByRole('button', { name: 'Continue' }))
+      await user.type(await screen.findByLabelText('Password'), 'hunter2')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+
+      // The account, never the password or the session.
+      expect(listAccounts()).toEqual([
+        { ...alice, last_used: expect.any(Number) },
+      ])
+      expect(localStorage.getItem('forge.accounts')).not.toMatch(/hunter2|csrf-abc/)
+
+      // Back at the login screen, it offers the account.
+      await router.navigate({ to: '/login' })
+      expect(await tile('alice@corp.example')).toBeInTheDocument()
+      expect(screen.getByText('Pick an account to continue.')).toBeInTheDocument()
+      expect(screen.queryByLabelText('Username')).not.toBeInTheDocument()
+    })
+
+    it('continues a password account at the password step', async () => {
+      const user = userEvent.setup()
+      rememberAccount(alice)
+      let identified: unknown = null
+      let loggedIn: unknown = null
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: (body) => {
+          identified = body
+          return json({ mode: 'password', realm: 'local' })
+        },
+        onLogin: (body) => {
+          loggedIn = body
+          return json(aliceSession)
+        },
+      })
+
+      const router = await renderLogin()
+      await user.click(await tile('alice@corp.example'))
+
+      // Routed like the identifier typed into the form, then step 2.
+      await waitFor(() => expect(identified).toEqual({ username: 'alice@corp.example' }))
+      expect(await screen.findByText('alice@corp.example')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Change' })).toBeInTheDocument()
+      await user.type(screen.getByLabelText('Password'), 'hunter2')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+
+      await waitFor(() =>
+        expect(loggedIn).toEqual({ username: 'alice@corp.example', password: 'hunter2' }),
+      )
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+    })
+
+    it('continues an OIDC account at its identity provider with login_hint', async () => {
+      const user = userEvent.setup()
+      rememberAccount(bob)
+      mockAuthApi({ options: combined })
+
+      await renderLogin('/login?redirect=%2Ftokens')
+      // The tile shows the IdP's name for the account, and its identifier.
+      const bobTile = await tile('Bob Builder')
+      expect(bobTile).toHaveTextContent(/Bob Builder\s*bob@corp\.example\s*SSO/)
+      await user.click(bobTile)
+
+      expect(assignLocation).toHaveBeenCalledWith(
+        '/auth/oidc/login?realm=corp&redirect_to=%2Ftokens&login_hint=bob%40corp.example',
+      )
+      // The session the round trip opens is remembered as this realm's.
+      expect(sessionStorage.getItem('forge.accounts.pending')).toMatch(/"realm":"corp"/)
+      // The browser is leaving: no second flow can start.
+      expect(bobTile).toBeDisabled()
+    })
+
+    it('routes an OIDC account whose realm is gone through /auth/identify, without a loop', async () => {
+      const user = userEvent.setup()
+      rememberAccount({ ...bob, realm: 'retired' })
+      let identified: unknown = null
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: (body) => {
+          identified = body
+          return json({ mode: 'password', realm: 'local' })
+        },
+      })
+
+      await renderLogin()
+      await user.click(await tile('bob@corp.example'))
+
+      await waitFor(() => expect(identified).toEqual({ username: 'bob@corp.example' }))
+      expect(await screen.findByLabelText('Password')).toBeInTheDocument()
+      expect(assignLocation).not.toHaveBeenCalled()
+    })
+
+    it('follows /auth/identify to the realm that now takes the account', async () => {
+      const user = userEvent.setup()
+      rememberAccount({ ...bob, realm: 'retired' })
+      mockAuthApi({
+        options: identifierFirst,
+        onIdentify: () =>
+          json({
+            mode: 'oidc_redirect',
+            realm: 'corp-new',
+            login_url: '/auth/oidc/login',
+          }),
+      })
+
+      await renderLogin()
+      await user.click(await tile('bob@corp.example'))
+
+      await waitFor(() =>
+        expect(assignLocation).toHaveBeenCalledWith(
+          '/auth/oidc/login?login_hint=bob%40corp.example',
+        ),
+      )
+      expect(sessionStorage.getItem('forge.accounts.pending')).toMatch(/"realm":"corp-new"/)
+    })
+
+    it('fills the form of combined mode for a password account', async () => {
+      const user = userEvent.setup()
+      rememberAccount(alice)
+      mockAuthApi({ options: combined })
+
+      await renderLogin()
+      await user.click(await tile('alice@corp.example'))
+
+      expect(await screen.findByLabelText('Username')).toHaveValue('alice@corp.example')
+      expect(screen.getByLabelText('Password')).toHaveFocus()
+      expect(screen.getByRole('button', { name: 'Login with Corp SSO' })).toBeInTheDocument()
+    })
+
+    it('forgets an account, and shows the form once none is left', async () => {
+      const user = userEvent.setup()
+      rememberAccount(alice, 1)
+      rememberAccount(bob, 2)
+      mockAuthApi({ options: identifierFirst })
+
+      await renderLogin()
+      await user.click(
+        await screen.findByRole('button', { name: 'Forget bob@corp.example' }),
+      )
+      expect(screen.queryByRole('button', { name: /Bob Builder/ })).not.toBeInTheDocument()
+      expect(listAccounts().map((a) => a.identifier)).toEqual(['alice@corp.example'])
+
+      await user.click(screen.getByRole('button', { name: 'Forget alice@corp.example' }))
+      expect(await screen.findByLabelText('Username')).toBeInTheDocument()
+      expect(listAccounts()).toEqual([])
+    })
+
+    it('"Use another account" shows the form, and comes back to the accounts', async () => {
+      const user = userEvent.setup()
+      rememberAccount(alice)
+      mockAuthApi({ options: identifierFirst })
+
+      await renderLogin()
+      await user.click(await screen.findByRole('button', { name: 'Use another account' }))
+      expect(await screen.findByLabelText('Username')).toHaveValue('')
+
+      await user.click(screen.getByRole('button', { name: 'Back to your accounts' }))
+      expect(await tile('alice@corp.example')).toBeInTheDocument()
+    })
+
+    it('shows the accounts after a session expired too', async () => {
+      rememberAccount(alice)
+      mockAuthApi({ options: identifierFirst })
+
+      await renderLogin('/login?expired=true&redirect=%2Ftokens')
+
+      expect(await screen.findByText(/your session expired/i)).toBeInTheDocument()
+      expect(await tile('alice@corp.example')).toBeInTheDocument()
+    })
+
+    it('starts at the form for an invited user', async () => {
+      rememberAccount(alice)
+      mockAuthApi({ options: identifierFirst })
+
+      await renderLogin('/login?username=carol%40corp.example&invited=true')
+
+      expect(await screen.findByLabelText('Username')).toHaveValue('carol@corp.example')
+      expect(screen.queryByRole('button', { name: /alice@corp\.example/ })).toBeNull()
+    })
+
+    it('keeps and shows nothing when the server turns remembering off', async () => {
+      const user = userEvent.setup()
+      rememberAccount(alice)
+      mockAuthApi({
+        options: { ...identifierFirst, remember_accounts: false },
+        onIdentify: () => json({ mode: 'password', realm: 'local' }),
+        onLogin: () => json(aliceSession),
+      })
+
+      const router = await renderLogin()
+
+      // No tiles, and the accounts kept before are forgotten.
+      expect(await screen.findByLabelText('Username')).toBeInTheDocument()
+      expect(screen.queryByRole('list', { name: 'Remembered accounts' })).toBeNull()
+      await waitFor(() => expect(listAccounts()).toEqual([]))
+
+      // A sign-in is not remembered either.
+      await user.type(screen.getByLabelText('Username'), 'alice@corp.example')
+      await user.click(screen.getByRole('button', { name: 'Continue' }))
+      await user.type(await screen.findByLabelText('Password'), 'hunter2')
+      await user.click(screen.getByRole('button', { name: 'Sign in' }))
+      await waitFor(() => expect(router.state.location.pathname).toBe('/'))
+      expect(listAccounts()).toEqual([])
+    })
+
+    it('neither offers nor forgets the accounts while the options cannot be loaded', async () => {
+      rememberAccount(alice)
+      mockAuthApi({ options: undefined })
+
+      await renderLogin()
+
+      expect(await screen.findByRole('status')).toHaveTextContent(
+        /password sign-in is available/i,
+      )
+      expect(screen.getByLabelText('Username')).toBeInTheDocument()
+      expect(listAccounts()).toHaveLength(1)
+    })
+
+    it('drops an OIDC sign-in that came back here instead of opening a session', async () => {
+      sessionStorage.setItem(
+        'forge.accounts.pending',
+        JSON.stringify({ realm: 'corp', started: Date.now() }),
+      )
+      mockAuthApi({ options: combined })
+
+      await renderLogin('/login?error=oidc_failed')
+
+      await screen.findByRole('alert')
+      expect(sessionStorage.getItem('forge.accounts.pending')).toBeNull()
     })
   })
 

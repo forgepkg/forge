@@ -121,6 +121,34 @@ test('the admin route guard redirects a non-admin away from /manage (hard nav)',
   await expect(page.getByRole('heading', { name: /^browse$/i })).toBeVisible()
 })
 
+test('a remembered account signs in again from its tile after sign-out', async ({
+  page,
+}) => {
+  const f = facts()
+  await uiSignIn(page, f.adminUser, f.adminPass)
+  await expect(page.getByRole('heading', { name: /^browse$/i })).toBeVisible()
+  await page.getByRole('button', { name: /sign out/i }).click()
+  await expect(page).toHaveURL(/\/login/)
+
+  // The login screen offers the account instead of an empty username field.
+  const accounts = page.getByRole('list', { name: 'Remembered accounts' })
+  const escaped = f.adminUser.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const tile = accounts.getByRole('button', { name: new RegExp(`^${escaped}`) })
+  await expect(tile).toBeVisible()
+  await expect(page.getByLabel(/^username$/i)).toHaveCount(0)
+  // What the browser keeps names the account; it works as no credential.
+  const stored = await page.evaluate(() => window.localStorage.getItem('forge.accounts'))
+  expect(stored).toContain(f.adminUser)
+  expect(stored).not.toContain(f.adminPass)
+
+  // One click reaches the password step for that account.
+  await tile.click()
+  const passwordField = page.getByLabel(/^password$/i)
+  await passwordField.fill(f.adminPass)
+  await page.getByRole('button', { name: /^sign in$/i }).click()
+  await expect(page.getByRole('heading', { name: /^browse$/i })).toBeVisible()
+})
+
 test('sign out invalidates the session and returns to login', async ({
   page,
 }) => {

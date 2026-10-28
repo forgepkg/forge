@@ -87,18 +87,24 @@ async fn read_index(srv: &TestServer, repo: &str, basic: Option<(&str, &str)>) -
     req.send().await.unwrap().status().as_u16()
 }
 
-/// The login screen's mode (`GET /auth/login-options`).
-async fn login_mode(srv: &TestServer) -> String {
-    let options: Value = srv
-        .client()
+/// What the login screen renders (`GET /auth/login-options`).
+async fn login_options(srv: &TestServer) -> Value {
+    srv.client()
         .get(format!("{}/auth/login-options", srv.base_url))
         .send()
         .await
         .unwrap()
         .json()
         .await
-        .unwrap();
-    options["mode"].as_str().expect("mode").to_string()
+        .unwrap()
+}
+
+/// The login screen's mode (`GET /auth/login-options`).
+async fn login_mode(srv: &TestServer) -> String {
+    login_options(srv).await["mode"]
+        .as_str()
+        .expect("mode")
+        .to_string()
 }
 
 /// Admins read and change the settings; a change names only what it changes,
@@ -119,6 +125,7 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
             "session_absolute_ttl_seconds": 604800,
             "login_max_failures": 10,
             "login_failure_window_seconds": 300,
+            "remember_accounts": true,
         })
     );
 
@@ -146,6 +153,20 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
     assert_eq!(saved["allow_password_basic"], true, "left out, kept");
     assert_eq!(get_settings(&srv).await, saved);
     assert_eq!(login_mode(&srv).await, "combined", "applied at once");
+
+    // The login screen remembers accounts until an administrator turns it
+    // off (a kiosk); the screen learns it from the login options.
+    assert_eq!(login_options(&srv).await["remember_accounts"], true);
+    let resp = put_settings(&srv, json!({"remember_accounts": false})).await;
+    assert_eq!(resp.status(), 200);
+    let saved: Value = resp.json().await.unwrap();
+    assert_eq!(saved["remember_accounts"], false);
+    assert_eq!(saved["login_mode"], "combined", "left out, kept");
+    assert_eq!(
+        login_options(&srv).await["remember_accounts"],
+        false,
+        "applied at once"
+    );
 
     for (body, message) in [
         (
