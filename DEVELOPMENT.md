@@ -1101,7 +1101,10 @@ them. The staging rewrites a link to another page into that page of the
 site, and a link into the source tree (`../crates/…`) into the file on
 GitHub, on `main`. It fails on a link to a file or heading that does not
 exist, and on a Markdown file directly in `docs/` that SUMMARY.md does not
-list: a new guide goes into SUMMARY.md, under its part. `cargo xtask docs
+list: a new guide goes into SUMMARY.md, under its part, and into
+[docs/README.md](docs/README.md), the index GitHub shows for the folder. That
+index is no page of the site, but its links are checked as a page's, and the
+staging fails when it does not link a page SUMMARY.md lists. `cargo xtask docs
 --check` runs the staging without mdBook; CI's `fmt` job runs it for a change
 to the pages or to the Rust code, whose files the pages link.
 
