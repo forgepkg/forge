@@ -17,8 +17,11 @@ repository, which adds `write` there for the jobs its conditions match. A job
 that matches no publisher keeps the read-only role.
 
 [Trusted publishing](trusted-publishing.md) is the reference behind this guide:
-the security model, the token exchange and every setting. For pipelines that
-cannot use workload identity, see [CI with service accounts](ci-service-accounts.md).
+the security model, the token exchange and every setting. Container images,
+pushed with `docker push` or `dotnet publish`, take the same realm and role:
+see [Docker / OCI images](trusted-publishing.md#docker--oci-images) there.
+For pipelines that cannot use workload identity, see
+[CI with service accounts](ci-service-accounts.md).
 
 The examples use these names; substitute your own:
 

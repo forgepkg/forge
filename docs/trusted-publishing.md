@@ -14,7 +14,8 @@ A job uses its token in one of two ways:
   nuget.org's trusted publishing works. It publishes with
   `dotnet nuget push --api-key <key>` and restores with the key as the Basic
   password of the username `oidc`. [npm](#npm) performs its own native
-  exchange automatically. Each token is redeemed once.
+  exchange automatically, and [`docker login`](#docker--oci-images) takes
+  the key as the password of `oidc`. Each token is redeemed once.
 - **Direct token.** The job presents the token itself on every request, as the
   Basic password (username `oidc`), the `X-NuGet-ApiKey` or a Bearer token.
 
@@ -568,6 +569,218 @@ termination can leave the file until the token expires, so prefer ephemeral
 runners. An `anonymous_read` repository can omit this temporary source and push
 directly by URL, but that deliberately exposes the repository's read-side
 metadata according to the configured anonymous policy.
+
+## Docker / OCI images
+
+The registry takes a workload the way the feeds do: the job logs in with the
+username `oidc` and its workload key as the password. The key is the
+workload's, not NuGet's: the [token exchange](#token-exchange) issues it, and
+`NuGet/login` gets one for `docker login` as well. For each pull or push the
+client presents the key to the registry's token service, which answers a
+short-lived registry token for the images and actions the job asks for
+([Logging in](docker.md#logging-in)). A registry token stops working within
+10 seconds of the key's revocation, and expires no later than the key.
+
+Keep the realm and its rule of [GitHub Actions](#github-actions) or
+[GitLab CI](#gitlab-ci), and give the rule's role `read` on the docker
+repositories the jobs pull from. Then add a trusted publisher to the hosted
+docker repository the images go to. Its packages are **image names**, without
+the repository's name: the image `forge.example.com/docker-hosted/acme/widgets`
+of the repository `docker-hosted` is `acme/widgets`. A `*` also matches `/`,
+so `acme/*` takes in `acme/widgets/api` as well.
+
+```json
+{
+  "name": "widgets-images",
+  "description": "Images of acme/widgets from the release workflow",
+  "realm": "github-actions",
+  "packages": { "includes": ["acme/widgets"], "excludes": [] },
+  "actions": ["write"],
+  "conditions": [
+    { "claim": "repository_id", "any_of": ["987654321"] },
+    { "claim": "repository_owner_id", "any_of": ["1234567"] },
+    { "claim": "ref", "any_of": ["refs/heads/main"] },
+    {
+      "claim": "job_workflow_ref",
+      "any_of": ["acme/widgets/.github/workflows/release.yml@refs/heads/main"]
+    },
+    { "claim": "event_name", "any_of": ["push"] }
+  ]
+}
+```
+
+A GitLab publisher takes the conditions of the
+[one above](#token-exchange), with the environment of the job that pushes
+the images. A job the publisher does not match pulls with the role's `read`,
+and its push is refused. Every push of a workload is recorded in
+`trusted_publish_audit`, and so is every delete.
+
+### GitHub Actions
+
+`NuGet/login` exchanges the job's token, and `docker login` takes the key
+from standard input:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Exchange the OIDC token for a Forge API key
+    uses: NuGet/login@v1
+    id: forge
+    with:
+      user: oidc
+      audience: https://forge.example.com
+      token-service-url: https://forge.example.com/api/v2/token
+
+  - name: Log in to Forge's registry
+    shell: bash
+    env:
+      FORGE_KEY: ${{ steps.forge.outputs.NUGET_API_KEY }}
+    run: echo "$FORGE_KEY" | docker login forge.example.com -u oidc --password-stdin
+
+  - name: Build and push the image
+    shell: bash
+    env:
+      IMAGE: forge.example.com/docker-hosted/acme/widgets
+    run: |
+      docker build -t "$IMAGE:$GITHUB_SHA" .
+      docker push "$IMAGE:$GITHUB_SHA"
+```
+
+`docker/login-action` logs in the same way, with `registry:
+forge.example.com`, `username: oidc` and the key as `password`. The login
+serves `docker buildx` and the other clients that read Docker's
+`config.json`, and a `FROM` image in Forge is pulled with it and the role's
+`read`. Helm keeps a login of its own: `helm registry login
+forge.example.com -u oidc --password-stdin`.
+
+The .NET SDK builds and pushes an image itself, with
+[`dotnet publish`](#dotnet-publish):
+
+```yaml
+  - uses: actions/setup-dotnet@v4
+
+  - name: Publish the image
+    shell: bash
+    env:
+      DOTNET_CONTAINER_REGISTRY_UNAME: oidc
+      DOTNET_CONTAINER_REGISTRY_PWORD: ${{ steps.forge.outputs.NUGET_API_KEY }}
+    run: >-
+      dotnet publish -c Release --os linux --arch x64 -t:PublishContainer
+      -p:ContainerRegistry=forge.example.com
+      -p:ContainerRepository=docker-hosted/acme/widgets
+      -p:ContainerImageTag=$GITHUB_SHA
+```
+
+### GitLab CI
+
+The job asks GitLab for an ID token with the realm's audience, exchanges it
+and logs in. The `docker` image has busybox `wget` but no `curl` or `jq`, so
+`wget` runs the exchange and `sed` picks the key out of the answer. The job
+needs a runner set up for Docker-in-Docker (GitLab's
+[Use Docker to build Docker images](https://docs.gitlab.com/ci/docker/using_docker_build/)):
+
+```yaml
+variables:
+  FORGE_URL: https://forge.example.com
+  FORGE_REGISTRY: forge.example.com
+  IMAGE: forge.example.com/docker-hosted/acme/widgets
+
+docker-image:
+  stage: deploy
+  image: mirror.gcr.io/library/docker:29-cli
+  services:
+    - name: mirror.gcr.io/library/docker:29-dind
+      alias: docker
+  id_tokens:
+    FORGE_ID_TOKEN:
+      aud: https://forge.example.com
+  environment:
+    name: image-release
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      FORGE_KEY="$(wget -qO- --header "Authorization: Bearer $FORGE_ID_TOKEN" \
+        --header 'Content-Type: application/json' \
+        --post-data '{"username":"oidc","tokenType":"ApiKey"}' \
+        "$FORGE_URL/api/v2/token" \
+        | sed -n 's/.*"apiKey":"\([^"]*\)".*/\1/p')"
+      test -n "$FORGE_KEY"
+      echo "$FORGE_KEY" | docker login "$FORGE_REGISTRY" -u oidc --password-stdin
+    - docker build -t "$IMAGE:$CI_COMMIT_TAG" .
+    - docker push "$IMAGE:$CI_COMMIT_TAG"
+```
+
+`FORGE_KEY="$(…)"` stays a plain assignment, so that `test -n` fails the job
+when the exchange fails. The `services` entry gives the daemon the host name
+`docker`, where the `docker` image looks for it; GitLab would otherwise name
+the service after its image's path.
+
+With [`dotnet publish`](#dotnet-publish) the job needs no Docker daemon, and
+the .NET SDK image has `curl`:
+
+```yaml
+dotnet-image:
+  stage: deploy
+  image: mcr.microsoft.com/dotnet/sdk:10.0
+  id_tokens:
+    FORGE_ID_TOKEN:
+      aud: https://forge.example.com
+  environment:
+    name: image-release
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      FORGE_KEY="$(curl --fail --silent --show-error -X POST "$FORGE_URL/api/v2/token" \
+        -H "Authorization: Bearer $FORGE_ID_TOKEN" \
+        -H 'Content-Type: application/json' \
+        -d '{"username":"oidc","tokenType":"ApiKey"}' \
+        | sed -n 's/.*"apiKey":"\([^"]*\)".*/\1/p')"
+      test -n "$FORGE_KEY"
+      export DOTNET_CONTAINER_REGISTRY_UNAME=oidc
+      export DOTNET_CONTAINER_REGISTRY_PWORD="$FORGE_KEY"
+    - >-
+      dotnet publish -c Release --os linux --arch x64 -t:PublishContainer
+      -p:ContainerRegistry=$FORGE_REGISTRY
+      -p:ContainerRepository=docker-hosted/acme/widgets
+      -p:ContainerImageTag=$CI_COMMIT_TAG
+```
+
+### dotnet publish
+
+`dotnet publish -t:PublishContainer` (built into the .NET SDK from 8.0.200)
+builds the image and pushes it to `ContainerRegistry` itself, without a
+Docker daemon.
+
+- **Names.** `ContainerRegistry` is Forge's host, and `ContainerRepository`
+  the repository's name followed by the image's:
+  `docker-hosted/acme/widgets`. For a repository with a
+  [host](docker.md#names) of its own, `ContainerRegistry` is that host and
+  `ContainerRepository` the image alone.
+- **Credentials.** The SDK takes them from `DOTNET_CONTAINER_REGISTRY_UNAME`
+  and `DOTNET_CONTAINER_REGISTRY_PWORD`, and from Docker's `config.json`
+  when they are not set: a job that ran `docker login -u oidc` needs no
+  variables.
+- **A base image in Forge** (`-p:ContainerBaseImage=forge.example.com/docker/dotnet/aspnet:10.0`,
+  through a proxy of `https://mcr.microsoft.com`) is pulled with the same
+  variables, or the same `config.json`. They never reach another registry:
+  the default base image comes from MCR without credentials.
+- **`DOTNET_CONTAINER_PUSH_REGISTRY_UNAME` / `_PWORD`** serve the push alone.
+  With them, a base image in Forge needs `DOTNET_CONTAINER_PULL_REGISTRY_UNAME`
+  / `_PWORD` as well, set to the same `oidc` and key; without them or a
+  `config.json`, the publish fails with `CONTAINER1008`.
+- **Identity tokens fail.** A `config.json` entry or credential helper that
+  answers an identity token (the user name `<token>`) makes the SDK ask for
+  the registry token with an OAuth2 `POST` alone. Forge's token service
+  answers `GET` with Basic credentials and refuses the `POST`, so the
+  publish fails with `CONTAINER1016`. `docker login -u oidc` and the
+  variables give a user name and a password.
 
 ## Operational guidance
 
