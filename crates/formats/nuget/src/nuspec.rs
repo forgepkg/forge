@@ -722,6 +722,8 @@ fn find_manifest(
     let mut header = [0u8; CENTRAL_HEADER_LEN];
     // The name, the extra fields and the comment of the header at hand.
     let mut variable = Vec::new();
+    // The bytes of the headers read so far.
+    let mut consumed: u64 = 0;
     for _ in 0..entries {
         read(&mut header)?;
         if header[..4] != CENTRAL_HEADER_SIG {
@@ -732,6 +734,7 @@ fn find_manifest(
         let extra_end = name_end + usize::from(le_u16(&header, 30));
         variable.resize(extra_end + usize::from(le_u16(&header, 32)), 0);
         read(&mut variable)?;
+        consumed += (CENTRAL_HEADER_LEN + variable.len()) as u64;
         let raw = &variable[..name_end];
         let name = String::from_utf8_lossy(raw);
 
@@ -836,6 +839,18 @@ fn find_manifest(
                 local_header,
             });
         }
+    }
+    // .NET reads central headers on until one does not match, whatever size
+    // the end record declares, and refuses an archive with more of them than
+    // the record's count: a header right after the declared ones makes a
+    // package no NuGet client installs, though Forge would list it.
+    let next = start + consumed;
+    if next + CENTRAL_HEADER_SIG.len() as u64 <= len
+        && read_at(file, next, CENTRAL_HEADER_SIG.len())? == CENTRAL_HEADER_SIG
+    {
+        return Err(NupkgError::InvalidZip(
+            "the central directory holds more entries than its end record declares".into(),
+        ));
     }
     manifest.ok_or(NupkgError::MissingNuspec)
 }
@@ -1764,6 +1779,38 @@ mod tests {
         zip[eocd + 8..eocd + 12].copy_from_slice(&[2, 0, 2, 0]);
         let err = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
         assert!(err.to_string().contains("fewer entries"), "{err}");
+    }
+
+    #[test]
+    fn the_central_directory_must_hold_no_more_entries_than_its_end_record_declares() {
+        let zip = zip_of(&[
+            ("p.nuspec", OK_NUSPEC.as_bytes()),
+            ("lib/a.dll", b"a"),
+            ("lib/b.dll", b"b"),
+        ]);
+        let eocd = eocd_offset(&zip);
+        let directory = le_u32(&zip, eocd + 16) as usize;
+        let third = central_headers_of(&zip, "lib/b.dll")[0];
+        // The end record counts two entries, and its size covers all three
+        // headers, as .NET reads them; or only the two, while .NET reads on.
+        for size in [eocd - directory, third - directory] {
+            let mut zip = zip.clone();
+            zip[eocd + 8..eocd + 12].copy_from_slice(&[2, 0, 2, 0]);
+            zip[eocd + 12..eocd + 16].copy_from_slice(&(size as u32).to_le_bytes());
+            let err =
+                parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap_err();
+            assert!(err.to_string().contains("more entries"), "{size}: {err}");
+        }
+        // Whatever follows the declared headers otherwise is no entry.
+        let mut zip = zip_of(&[("p.nuspec", OK_NUSPEC.as_bytes())]);
+        let eocd = eocd_offset(&zip);
+        let directory = le_u32(&zip, eocd + 16) as usize;
+        zip.splice(eocd..eocd, *b"PK\x05\x05\0\0");
+        let size = le_u32(&zip, eocd + 6 + 12) + 6;
+        zip[eocd + 6 + 12..eocd + 6 + 16].copy_from_slice(&size.to_le_bytes());
+        assert_eq!(le_u32(&zip, eocd + 6 + 16) as usize, directory);
+        let parsed = parse_nupkg(&mut std::io::Cursor::new(zip), &NupkgLimits::default()).unwrap();
+        assert_eq!(parsed.id, "a.b");
     }
 
     #[test]
