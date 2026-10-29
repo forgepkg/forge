@@ -13,6 +13,14 @@ use forge_server::state::AppState;
 use forge_server::telemetry::{self, Telemetry};
 use forge_server::workers;
 
+/// jemalloc, not glibc's malloc: large buffers freed after a burst of proxy
+/// traffic mostly stayed in glibc's per-thread arenas, so the resident memory
+/// hardly came down from its peak. jemalloc's background threads hand freed
+/// pages back to the system after `dirty_decay_ms` (10 s). Only the binary:
+/// the tests keep the system allocator.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
