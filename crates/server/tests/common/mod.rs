@@ -251,12 +251,13 @@ fn config_toml(db_url: &str, s3_endpoint: &str, opts: &ServerOpts) -> String {
         Some((u, p)) => format!("[auth.bootstrap_admin]\nusername = \"{u}\"\npassword = \"{p}\"\n"),
         None => String::new(),
     };
-    // Default to a disabled web UI in tests so a missing `web/dist` never
-    // affects API behaviour; tests that exercise SPA serving pass an explicit
-    // assets dir.
+    // The web UI is always mounted. Without an explicit assets dir the
+    // default `web/dist` resolves against this crate's directory, which holds
+    // no built UI, so the fallback answers 404; tests that exercise SPA
+    // serving pass an assets dir.
     let web = match web_assets_dir {
-        Some(dir) => format!("[web]\nenabled = true\nassets_dir = {dir:?}\n"),
-        None => "[web]\nenabled = false\n".to_string(),
+        Some(dir) => format!("[web]\nassets_dir = {dir:?}\n"),
+        None => String::new(),
     };
     format!(
         r#"
@@ -374,8 +375,8 @@ pub async fn envelope(pool: &PgPool) -> std::sync::Arc<forge_crypto::EnvelopeSer
 pub struct ServerOpts {
     pub bootstrap_admin: Option<(String, String)>,
     pub spawn_workers: bool,
-    /// When set, the static SPA is served from this directory; otherwise the
-    /// web UI is disabled for the test.
+    /// When set, the static SPA is served from this directory; otherwise
+    /// from the default `web/dist`, which holds no built UI in a test.
     pub web_assets_dir: Option<String>,
     /// When set, this raw TOML is appended as the `[oidc]` section so the server
     /// builds an `OidcRuntime` + mounts the `/auth/oidc/*` routes.

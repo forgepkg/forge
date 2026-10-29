@@ -162,21 +162,13 @@ async fn password_login(
     .await
 }
 
-/// Without the web UI there is no page to approve a web login on: 404,
-/// and npm falls back to asking for a password.
+/// Start a web login: the page that approves it and the secret to poll with.
 async fn start_web_login(
     state: &AppState,
     repo: &Repository,
     client_ip: IpAddr,
     hostname: Option<String>,
 ) -> Result<AuthOutcome, Response> {
-    if !state.config.web.enabled {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "logins approved in the browser need the web UI",
-        )
-            .into_response());
-    }
     // Starting a login is free for anyone: bounded per client network, as
     // OIDC logins are.
     if !state.oidc_login_starts.allow(client_ip) {

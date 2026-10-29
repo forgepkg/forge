@@ -114,8 +114,8 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 ///   read authz enforced inside the handlers).
 /// * `/repository/{repo}/...` — repositories of every non-Docker format,
 ///   each served by its format's plugin ([`crate::plugins`]).
-/// * everything else — the SPA (when `web.enabled`), whose admin screens live
-///   under `/manage/*` (see [`crate::web_ui`]).
+/// * everything else — the SPA, whose admin screens live under `/manage/*`
+///   (see [`crate::web_ui`]).
 ///
 /// All branches run behind the principal middleware so every handler sees a
 /// resolved [`forge_core::auth::principal::Principal`] extension.
@@ -173,12 +173,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         .route("/repository/{repo}/{*rest}", any(crate::plugins::dispatch));
 
     // Static SPA fallback, installed LAST so the API routers above always win
-    // and only genuine UI paths fall through to `index.html`. Skipped for a
-    // headless deployment (`web.enabled = false`). The admin UI lives under
-    // `/manage/*`; `/admin/*` is the admin API's.
-    if state.config.web.enabled {
-        app = app.fallback_service(spa_service(&state.config.web));
-    }
+    // and only genuine UI paths fall through to `index.html`. The admin UI
+    // lives under `/manage/*`; `/admin/*` is the admin API's.
+    let app = app.fallback_service(spa_service(&state.config.web));
 
     let hsts = state.cookie_secure;
     let public_base_url = state.config.public_base_url();

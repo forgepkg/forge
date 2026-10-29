@@ -908,14 +908,11 @@ async fn a_selector_on_a_write_grant_scopes_publishes_and_reads() {
 
 #[tokio::test]
 async fn npm_login_legacy_and_web_and_logout() {
-    let assets = tempfile::tempdir().unwrap();
-    std::fs::write(assets.path().join("index.html"), "<html></html>").unwrap();
     let admin_user = format!("admin{}@example.com", unique());
     let srv = common::start_with(
         common::pool().await,
         common::ServerOpts {
             bootstrap_admin: Some((admin_user.clone(), "adminpw".into())),
-            web_assets_dir: Some(assets.path().display().to_string()),
             ..Default::default()
         },
     )

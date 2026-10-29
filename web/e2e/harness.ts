@@ -144,7 +144,6 @@ function startServer() {
     FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME: ADMIN_USER,
     FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD: ADMIN_PASS,
     // web UI: serve the freshly built dist (single origin).
-    FORGE_WEB__ENABLED: 'true',
     FORGE_WEB__ASSETS_DIR: path.join(webDir, 'dist'),
     // outbox: drain quickly so a pushed package becomes visible fast.
     FORGE_OUTBOX__POLL_INTERVAL_SECONDS: '1',

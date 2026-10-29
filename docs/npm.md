@@ -101,8 +101,7 @@ npm whoami --registry https://forge.example.com/repository/npm-all/
 Without a browser on the machine (`--browser=false`), npm prints the page's
 URL to open elsewhere. A login waits for its approval for
 `cli_login.web_login_ttl_seconds` (10 minutes), and the page answers only
-the signed-in user who opens it. Logins in the browser need the web UI
-(`[web] enabled`); without it npm falls back to asking for a password.
+the signed-in user who opens it.
 
 **A username and a password**: `yarn npm login` (Yarn 2+) and `npm login
 --auth-type=legacy` send them to Forge, which checks them like the web

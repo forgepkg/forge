@@ -114,9 +114,8 @@ struct Spa {
 /// whereas `not_found_service` forces the status to `404` — wrong for an SPA
 /// history fallback where unknown client routes must return `200 index.html`.
 ///
-/// The caller is responsible for only installing this when `web.enabled` is
-/// true. If `index.html` is missing (UI not built), the fallback yields a 404 —
-/// the API still works.
+/// If `index.html` is missing (UI not built), the fallback yields a 404 — the
+/// API still works.
 pub fn spa_service(cfg: &WebConfig) -> Router {
     let assets_dir = PathBuf::from(&cfg.assets_dir);
     let index = assets_dir.join("index.html");
@@ -231,10 +230,8 @@ mod tests {
         fs::write(dir.path().join("index.html"), "INDEX").unwrap();
         fs::create_dir_all(dir.path().join("assets")).unwrap();
         fs::write(dir.path().join("assets").join("a.js"), "ASSET").unwrap();
-        let cfg = WebConfig {
-            enabled: true,
-            assets_dir: dir.path().to_string_lossy().to_string(),
-        };
+        let mut cfg = WebConfig::default();
+        cfg.assets_dir = dir.path().to_string_lossy().to_string();
         let svc = spa_service(&cfg);
         (dir, svc)
     }

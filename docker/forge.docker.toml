@@ -65,5 +65,4 @@ force_path_style = true
 [web]
 # The server serves the built SPA from here (also set via FORGE_WEB__ASSETS_DIR
 # in the Dockerfile). Matches where stage 1's web/dist is copied in the image.
-enabled = true
 assets_dir = "/app/web/dist"

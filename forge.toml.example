@@ -215,7 +215,7 @@ max_unpacked_bytes = 1073741824  # (default: 1 GiB) the most a published or prox
 
 [cli_login]
 # Logins of command-line clients (`npm login`, `yarn npm login`), with a
-# password or approved in the browser (which needs the web UI).
+# password or approved in the browser.
 token_lifetime_days   = 90   # (default: 90; 0: never expires) the API token a login mints
 web_login_ttl_seconds = 600  # (default: 600; 60-3600) how long a login approved in the browser waits
 

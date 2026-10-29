@@ -69,9 +69,8 @@ password = "changeme"
 # grace_seconds = 3600        # delay before a dereferenced blob is deleted from S3
 # poll_interval_seconds = 10
 
-# Static SPA serving. The Rust server serves the built TanStack Start UI from
-# `assets_dir` (single origin, no Node proxy). Enabled by default; `assets_dir`
-# defaults to `web/dist`. Set `enabled = false` for a headless deployment.
+# Static SPA serving. The Rust server always serves the built TanStack Start UI
+# from `assets_dir` (single origin, no Node proxy); `assets_dir` defaults to
+# `web/dist`.
 # [web]
-# enabled = true
 # assets_dir = "web/dist"
