@@ -245,6 +245,41 @@ newest release of that line; prereleases and patches to older lines never move
 them. Pin deployments to a version or digest. `GET /version` on a running
 instance reports its version and source revision.
 
+### Memory allocator
+
+forge-server allocates with jemalloc, compiled into the binary, not with
+glibc's `malloc`. jemalloc's background threads hand memory freed after a
+burst of requests (mostly large proxy metadata documents) back to the system
+after about 10 s. The resident memory therefore comes down again between
+bursts instead of staying near its peak. The arm64 image uses 64 KiB jemalloc
+pages, so it runs on kernels with 4, 16 or 64 KiB pages alike.
+
+jemalloc reads its run-time options from `_RJEM_MALLOC_CONF`, as
+comma-separated `name:value` pairs. glibc's `MALLOC_*` variables, such as
+`MALLOC_ARENA_MAX`, have no effect on it.
+
+```bash
+_RJEM_MALLOC_CONF=narenas:8,dirty_decay_ms:5000
+```
+
+- **`narenas`** is the number of arenas threads share, 4 per CPU by default.
+  jemalloc counts the CPUs the process may run on. In a container these are
+  usually all of the node's, CPU limit or not: only a cpuset narrows them. On
+  a large node, about 4 per CPU of the pod's request is plenty.
+- **`dirty_decay_ms`** is how long freed memory stays with the process before
+  it goes back to the system, 10 000 by default. A lower value returns it
+  sooner, at the cost of more system calls.
+- **`background_thread:false`** turns the background threads off. Freed memory
+  then goes back to the system only while the process allocates or frees.
+
+With the Helm chart, set it in `env`:
+
+```yaml
+env:
+  - name: _RJEM_MALLOC_CONF
+    value: narenas:8
+```
+
 ## Required configuration
 
 The image ships a secret-free base config (`/app/forge.toml`, from

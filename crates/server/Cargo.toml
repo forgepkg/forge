@@ -100,6 +100,15 @@ lettre = { workspace = true }
 # Config: TOML + FORGE_* env overrides.
 figment = { version = "0.10", features = ["toml", "env"] }
 
+# The binary's global allocator (main.rs): jemalloc, whose background threads
+# hand freed memory back to the system, where glibc's malloc kept it in its
+# per-thread arenas. `background_threads` turns them on by default
+# (`background_thread:true`); `_RJEM_MALLOC_CONF` overrides it at run time.
+# jemalloc refuses to start on a kernel whose pages are larger than the ones
+# it was built for; for aarch64 Linux its configure takes 64 KiB, so the arm64
+# image also runs on kernels with 16 or 64 KiB pages.
+tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
+
 [dev-dependencies]
 # Builds Helm chart archives for the registry tests.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
