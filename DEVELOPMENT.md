@@ -1081,7 +1081,9 @@ next milestone.
 
 ## Releasing
 
-A `v<version>` tag on the default branch publishes the release: the release
+A `v<version>` tag on the default branch (or, for a patch release of an older
+line, on that line's maintenance branch: [Patch releases of an older
+line](#patch-releases-of-an-older-line)) publishes the release: the release
 workflow (`.github/workflows/release.yml`) makes sure the dependency images
 `deploy/` pins are on ghcr.io and public (`mirror-images.yml`), builds, signs
 and pushes `ghcr.io/forgepkg/forge:<version>`, packages the Helm chart pinned
@@ -1162,6 +1164,51 @@ section drafted for a release that then got another number): fold its
 entries into `[Unreleased]` first. Fragments under another milestone are
 refused too, because their changes are on `main` and ship in this release:
 move them to `docs/changes/1.0.1/`.
+
+### Patch releases of an older line
+
+Once `main` carries the next minor version's changes, a patch of the released
+line (2.1.1 while `main` heads for 2.2.0) is cut from the line's maintenance
+branch, `release/<major>.<minor>`, so that it ships the fixes alone. CI runs
+on its pull requests and pushes (e2e and web-e2e included), `cargo xtask
+release` releases from it, and the release workflow accepts a tag whose commit
+passed CI there. The image's `:<major>.<minor>` tag follows the line's newest
+patch, and `:latest` the newest release of all.
+
+1. **Make the branch** from the line's newest tag, once, and protect it like
+   `main` (repository **Settings → Rules → Rulesets**: a ruleset for
+   `refs/heads/release/*` with the same required status checks and pull
+   requests, blocking force pushes and deletion):
+
+   ```bash
+   git fetch --tags origin
+   git push origin 'v2.1.0^{commit}:refs/heads/release/2.1'
+   ```
+
+2. **Backport.** A fix merges into `main` first, with its fragment under the
+   patch's milestone (`docs/changes/2.1.1/`). Then its commits are picked onto
+   a branch off `release/2.1`, fragment included, and a pull request brings
+   them in (`Backport of #<pull request>`, without `Fixes`):
+
+   ```bash
+   git switch -c backport-<issue>-2.1 origin/release/2.1
+   git cherry-pick -x <commits>
+   ```
+
+3. **Release** from the branch: `cargo xtask release` releases from the
+   maintenance branch of the version's line when it is checked out.
+
+   ```bash
+   git switch release/2.1 && git pull --ff-only
+   cargo xtask release 2.1.1
+   ```
+
+4. **Bring the release back to `main`** in a pull request: the `## [2.1.1]`
+   section of the branch's `CHANGELOG.md` goes below `main`'s `[Unreleased]`,
+   with its link at the bottom; the fragments the patch shipped are deleted,
+   and the other fragments under `docs/changes/2.1.1/` move to the next
+   milestone (`git mv docs/changes/2.1.1/<file> docs/changes/2.2.0/`), whose
+   release would refuse them otherwise.
 
 **A failed release run** can simply be re-run. It never builds a version
 twice: a new build would have another digest, and pushing it would move the

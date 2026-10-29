@@ -21,6 +21,9 @@ accepted = [
     # Zero-clause BSD, public-domain-like with no attribution required:
     # quoted_printable, lettre's encoder for email bodies.
     "0BSD",
+    # jemalloc, forge-server's allocator, compiled in by tikv-jemalloc-sys
+    # (clarified below).
+    "BSD-2-Clause",
 ]
 
 # What the image ships: forge-server's normal dependencies on Linux.
@@ -29,3 +32,24 @@ ignore-build-dependencies = true
 ignore-dev-dependencies = true
 # Our own workspace crates (publish = false) are covered by LICENSE.
 private = { ignore = true }
+
+# tikv-jemalloc-sys declares MIT OR Apache-2.0 for its Rust code, but compiles
+# jemalloc's C sources into the binary too, under jemalloc's own BSD-2-Clause
+# license (jemalloc/COPYING), whose copyright notice a binary must reproduce.
+[tikv-jemalloc-sys.clarify]
+license = "(MIT OR Apache-2.0) AND BSD-2-Clause"
+
+[[tikv-jemalloc-sys.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397"
+
+[[tikv-jemalloc-sys.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[tikv-jemalloc-sys.clarify.files]]
+path = "jemalloc/COPYING"
+license = "BSD-2-Clause"
+checksum = "94aa2caa98c25d942f58b956c71dba6a99ff98fc3a31cbc669fe2a4cd0268b53"

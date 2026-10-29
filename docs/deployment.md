@@ -245,6 +245,41 @@ newest release of that line; prereleases and patches to older lines never move
 them. Pin deployments to a version or digest. `GET /version` on a running
 instance reports its version and source revision.
 
+### Memory allocator
+
+forge-server allocates with jemalloc, compiled into the binary, not with
+glibc's `malloc`. jemalloc's background threads hand memory freed after a
+burst of requests (mostly large proxy metadata documents) back to the system
+after about 10 s. The resident memory therefore comes down again between
+bursts instead of staying near its peak. The arm64 image uses 64 KiB jemalloc
+pages, so it runs on kernels with 4, 16 or 64 KiB pages alike.
+
+jemalloc reads its run-time options from `_RJEM_MALLOC_CONF`, as
+comma-separated `name:value` pairs. glibc's `MALLOC_*` variables, such as
+`MALLOC_ARENA_MAX`, have no effect on it.
+
+```bash
+_RJEM_MALLOC_CONF=narenas:8,dirty_decay_ms:5000
+```
+
+- **`narenas`** is the number of arenas threads share, 4 per CPU by default.
+  jemalloc counts the CPUs the process may run on. In a container these are
+  usually all of the node's, CPU limit or not: only a cpuset narrows them. On
+  a large node, about 4 per CPU of the pod's request is plenty.
+- **`dirty_decay_ms`** is how long freed memory stays with the process before
+  it goes back to the system, 10 000 by default. A lower value returns it
+  sooner, at the cost of more system calls.
+- **`background_thread:false`** turns the background threads off. Freed memory
+  then goes back to the system only while the process allocates or frees.
+
+With the Helm chart, set it in `env`:
+
+```yaml
+env:
+  - name: _RJEM_MALLOC_CONF
+    value: narenas:8
+```
+
 ## Required configuration
 
 The image ships a secret-free base config (`/app/forge.toml`, from
@@ -1426,6 +1461,32 @@ extraVolumeMounts:
   - name: blob-cache
     mountPath: /var/cache/forge
 ```
+
+## Memory
+
+Proxies read their upstream's metadata documents (NuGet registration pages,
+npm packuments) into memory, up to `proxy.max_metadata_bytes` (32 MiB) each,
+and their formats parse them, which takes up to as much again. A restore
+against a cold proxy (`npm install`, `dotnet restore`, a CI matrix starting at
+once) reads many of them at the same time. So the documents all reads of an
+instance hold at once share one budget, `proxy.max_metadata_memory_bytes`
+(256 MiB by default):
+
+- A read whose document does not fit lets it go and waits for others to
+  finish, up to `proxy.metadata_timeout_seconds`, then reads it again.
+- A read still waiting then answers **503** with `Retry-After`, which npm and
+  NuGet clients retry, and Forge logs a warning naming
+  `proxy.max_metadata_memory_bytes`. The instance keeps serving everything
+  else, where growing past its memory limit would have had it killed with
+  every request it was serving.
+- A document larger than the whole budget is read alone.
+
+Size the pod's memory limit for twice the budget, plus the in-process cache
+(`cache.l1_max_capacity` × 16 KiB, 156 MiB by default), the password checks
+(about 19 MiB each, `auth.password_verify_concurrency` at once) and what the
+process needs at rest. The defaults fit the Helm chart's 1 GiB limit. With a
+smaller limit, lower the budget; when restores answer 503 with that warning,
+raise the budget and the limit together.
 
 ## Backup and restore
 

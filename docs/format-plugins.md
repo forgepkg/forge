@@ -381,7 +381,9 @@ name the `Accept` it sends (npm's abbreviated and full packuments share a
 URL). One conversation gets at most 4 rounds and 256 fetches, 4 at a time,
 and keeps at most 4 × `proxy.max_metadata_bytes` of documents, all rounds
 together: a document past that comes back as a failure, and so does every
-later fetch of the conversation, which is not sent.
+later fetch of the conversation, which is not sent. A document larger than
+`proxy.max_metadata_bytes` comes back as a failure too, and is not
+downloaded again for as long as it would have been reused.
 
 An unavailable upstream is an outage, not a fault of Forge. Unavailable
 means a fetch or a download got no answer (connection refused, a name that
@@ -394,6 +396,14 @@ unreadable, not the version asked for, not matching its published digest),
 answers **502**: retrying does not help until the upstream or the proxy
 changes. Any other failure answers 500: an answer the plugin cannot use, a
 document over its size bound.
+
+The conversations of an instance hold their documents in one budget,
+`proxy.max_metadata_memory_bytes`, until the plugin has answered. A document
+that does not fit is let go while its conversation waits for room, up to the
+metadata timeout, and is then read again. A conversation that waited in vain
+gets the fetch back as a failure, as from an unavailable upstream: the
+request answers 503 with `Retry-After`, unless the plugin answers from a
+smaller document instead (npm: the abbreviated packument for the full one).
 
 The host sends a fetch only where the upstream points: to the origin (scheme,
 host and port) of `remote_url`, or to an origin that an absolute `http` or

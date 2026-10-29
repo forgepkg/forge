@@ -41,6 +41,12 @@ config:
     # per CPU) counts the node's CPUs when the pod has no CPU limit, which can
     # outgrow the memory limit on a large node.
     password_verify_concurrency: 4
+  # proxy:
+  #   # The upstream metadata documents (npm packuments, NuGet registration
+  #   # pages) proxies hold at once while reading them, which takes up to as
+  #   # much again; reads past it wait, then answer 503. Keep twice this well
+  #   # under resources.limits.memory. Default 256 MiB.
+  #   max_metadata_memory_bytes: 268435456
   # Secret encryption at rest, required: the root key is FORGE_ROOT_KEY in
   # secretEnv, existingSecret or env, and the chart refuses to render without
   # it. For a key file instead: provider: file and root_key_path (mounted with

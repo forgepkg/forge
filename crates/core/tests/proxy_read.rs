@@ -3383,6 +3383,48 @@ async fn search_timeouts_still_back_off_other_queries() {
     server.abort();
 }
 
+/// A document larger than `proxy.max_metadata_bytes` is not read, and not
+/// downloaded again for as long as a document would have been reused: every
+/// read of it would otherwise download up to the limit before it failed.
+#[tokio::test]
+async fn a_document_over_the_size_limit_is_not_downloaded_again() {
+    use forge_core::net::upstream::{UpstreamHttp, UpstreamHttpConfig};
+
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.0.0")).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let count = attempts.clone();
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/flat/sample.lib/index.json",
+            get(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { format!("{{\"versions\": [\"{}\"]}}", "1".repeat(64 * 1024)) }
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    mock.override_index(serde_json::json!({ "version": "3.0.0", "resources": [
+        { "@id": format!("http://{addr}/flat/"), "@type": "PackageBaseAddress/3.0.0" },
+    ] }));
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let http = UpstreamHttp::new(UpstreamHttpConfig {
+        max_metadata_bytes: 16 * 1024,
+        ..Default::default()
+    })
+    .unwrap();
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128)).with_http(http);
+
+    for _ in 0..3 {
+        let _ = px.list_versions(&repo, "sample.lib").await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
 #[tokio::test]
 async fn search_excessive_skip_uses_local_pagination_without_disabling_upstream() {
     let pool = common::pool().await;
@@ -3425,6 +3467,50 @@ async fn search_excessive_skip_uses_local_pagination_without_disabling_upstream(
         .unwrap();
     assert_eq!(result.hits[0].original_id, "Other.Lib");
     assert_eq!(mock.search_queries().len(), 2);
+}
+
+/// #668: the documents the conversations of a process hold come out of one
+/// budget. A conversation that finds it spent waits, within the metadata
+/// timeout, and reads once bytes are given back; one that waits in vain
+/// answers as an unavailable upstream does (503).
+#[tokio::test]
+async fn conversations_wait_for_the_document_budget() {
+    use forge_core::net::upstream::{UpstreamHttp, UpstreamHttpConfig};
+    use std::time::Duration;
+
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.0.0")).await;
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let budget = 1024 * 1024;
+    let http = UpstreamHttp::new(UpstreamHttpConfig {
+        metadata_timeout: Duration::from_millis(500),
+        max_metadata_memory_bytes: budget,
+        ..Default::default()
+    })
+    .unwrap();
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128)).with_http(http.clone());
+
+    // Every other read holds the whole budget, and gives none of it back.
+    let all = http.document_budget().try_hold(budget).unwrap();
+    match px.list_versions(&repo, "sample.lib").await {
+        Err(RepoError::Upstream(reason)) => {
+            assert!(
+                reason.contains("proxy.max_metadata_memory_bytes"),
+                "{reason}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Given back while the read waits, it reads.
+    let (versions, ()) = tokio::join!(px.list_versions(&repo, "sample.lib"), async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(all);
+    });
+    assert_eq!(versions_of(&versions.unwrap()), ["1.0.0"]);
+    // And gives back what it held once it answered.
+    assert!(http.document_budget().try_hold(budget).is_some());
 }
 
 /// #112: upstream hits honor the caller's package filter, live not-found

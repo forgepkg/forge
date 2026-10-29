@@ -86,7 +86,10 @@ One pull request fixes one issue, and one issue is fixed by one pull request:
 its description says `Fixes #<n>` for that issue alone. Never fold the fixes
 of several issues into one pull request, however small each is, and never
 spread one issue over several. A change no issue asks for goes in a pull
-request of its own, not into an issue's.
+request of its own, not into an issue's. The one exception is a backport into
+a maintenance branch (`release/<major>.<minor>`, DEVELOPMENT.md, Patch
+releases of an older line): it carries merged fixes to an older line, says
+`Backport of #<pull request>` for each, and fixes nothing itself.
 
 ## Pull requests: ready for review, never drafts
 

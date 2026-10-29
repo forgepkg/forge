@@ -53,6 +53,8 @@ use serde_json::Value as JsonValue;
 use tracing::Instrument;
 use url::Url;
 
+use super::budget::DocumentBudget;
+
 /// Tuning for outbound proxy traffic. Built from the server's `[proxy]` config
 /// section; [`Default`] carries the documented defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +77,9 @@ pub struct UpstreamHttpConfig {
     /// Bodies up to this size are kept in memory; larger ones spill to a
     /// self-deleting temp file.
     pub spool_memory_bytes: usize,
+    /// The bytes of metadata documents the upstream conversations of the
+    /// process hold at once ([`DocumentBudget`]).
+    pub max_metadata_memory_bytes: u64,
     /// Maximum redirect hops followed per request.
     pub max_redirects: usize,
 }
@@ -89,6 +94,7 @@ impl Default for UpstreamHttpConfig {
             max_metadata_bytes: 32 * 1024 * 1024,
             max_package_bytes: 1024 * 1024 * 1024,
             spool_memory_bytes: 2 * 1024 * 1024,
+            max_metadata_memory_bytes: 256 * 1024 * 1024,
             max_redirects: 5,
         }
     }
@@ -389,6 +395,8 @@ impl TryFrom<String> for Origin {
 pub struct UpstreamHttp {
     client: reqwest::Client,
     config: Arc<UpstreamHttpConfig>,
+    /// What the upstream conversations of every clone hold at once.
+    documents: DocumentBudget,
     /// Which URLs go through an outbound proxy: the same selection reqwest
     /// makes from `HTTP(S)_PROXY`, `ALL_PROXY`, `NO_PROXY` and the platform's
     /// proxy settings.
@@ -441,6 +449,7 @@ impl UpstreamHttp {
             .build()?;
         Ok(UpstreamHttp {
             client,
+            documents: DocumentBudget::new(config.max_metadata_memory_bytes),
             config: Arc::new(config),
             proxies: Arc::new(proxies),
             lookup,
@@ -471,6 +480,12 @@ impl UpstreamHttp {
     /// The active tuning.
     pub fn config(&self) -> &UpstreamHttpConfig {
         &self.config
+    }
+
+    /// The budget the upstream conversations hold their documents in, shared
+    /// by every clone of this client (`proxy.max_metadata_memory_bytes`).
+    pub fn document_budget(&self) -> &DocumentBudget {
+        &self.documents
     }
 
     /// This client (sharing its connections) for the upstream of proxy

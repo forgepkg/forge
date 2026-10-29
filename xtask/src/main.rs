@@ -177,11 +177,12 @@ Release:
                 Kubernetes base's image tag and the Helm chart, fold the fragments
                 of docs/changes/<version>/ into CHANGELOG.md's [Unreleased] and
                 delete them, turn [Unreleased] into its section and commit on
-                release-<version> (HEAD must be origin/main). Then, with `gh`:
-                open a pull request, wait for its CI run, merge it, wait for the
-                merge commit's CI run on main, tag the merge commit v<version> and
-                push the tag. When main already carries <version>, tags main's
-                head once its CI passed. Refuses a changelog with an untagged
+                release-<version> (HEAD must be origin/main, or, for a patch of
+                an older line, origin/release/<major>.<minor>, the base then).
+                Then, with `gh`: open a pull request into the base, wait for its
+                CI run, merge it, wait for the merge commit's CI run on the base,
+                tag the merge commit v<version> and push the tag. When the base
+                already carries <version>, tags its head once its CI passed. Refuses a changelog with an untagged
                 version section, entries under [Unreleased] or fragments next to
                 a drafted <version> section, and fragments of another milestone.
                 --no-tag: only commit, on the current branch; never pushes.
