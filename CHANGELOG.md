@@ -12,6 +12,21 @@ until the release folds them in.
 
 ## [Unreleased]
 
+## [2.1.2]
+
+### Fixed
+
+- A first pull of a large layer through a Docker proxy could fail with
+  `internal error` while the layer was stored all the same, and the next pull
+  served it: the server logged `registry: blob read` with `NoSuchKey`. When the
+  answer to an upload's `CompleteMultipartUpload` (8 MiB and more,
+  `s3.multipart_threshold`) was lost, the S3 client sent it again, and
+  versitygw answers a complete that is still under way with success at once,
+  before the object is in place; the proxy then read the layer back too early.
+  An upload that completes counts as stored only once its object can be read,
+  waited for as long as an answer from S3.
+  ([#682](https://github.com/forgepkg/forge/issues/682))
+
 ## [2.1.1]
 
 ### Features
@@ -1551,7 +1566,8 @@ lists the required settings.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/forgepkg/forge/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/forgepkg/forge/compare/v2.1.2...HEAD
+[2.1.2]: https://github.com/forgepkg/forge/releases/tag/v2.1.2
 [2.1.1]: https://github.com/forgepkg/forge/releases/tag/v2.1.1
 [2.1.0]: https://github.com/forgepkg/forge/releases/tag/v2.1.0
 [2.0.0]: https://github.com/forgepkg/forge/releases/tag/v2.0.0
