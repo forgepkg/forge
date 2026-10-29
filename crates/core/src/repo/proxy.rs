@@ -242,11 +242,14 @@ impl PersistedIndex {
 /// A fetched document as cached: a body (base64, so the cache's JSON
 /// encoding stays compact) with the origins its URLs name
 /// ([`named_origins`], read once per fetch rather than once per
-/// conversation: a Helm index is read by every operation), or a 404.
+/// conversation: a Helm index is read by every operation), a 404, or a
+/// document larger than `proxy.max_metadata_bytes` (not downloaded again
+/// for as long as it would have been reused).
 #[derive(Clone, Serialize, Deserialize)]
 enum CachedFetch {
     Found { body: String, named: Vec<Origin> },
     NotFound,
+    TooLarge { reason: String },
 }
 
 /// The outcome of a proxy lookup that failed with `e`: the upstream's fault
@@ -814,6 +817,12 @@ impl ProxyRepo {
                         Ok(CachedFetch::NotFound)
                     }
                     Ok(None) => Err(None),
+                    // It will not have shrunk by the next read: remembered
+                    // like a document, so that every read does not download
+                    // up to the limit again before it fails.
+                    Err(e @ UpstreamError::TooLarge { .. }) => Ok(CachedFetch::TooLarge {
+                        reason: e.to_string(),
+                    }),
                     Err(e) => Err(Some(FetchFailure {
                         trouble: Trouble::of(&e),
                         reason: e.to_string(),
@@ -834,6 +843,9 @@ impl ProxyRepo {
             }
             Ok(CachedFetch::NotFound) | Err(None) => {
                 (api::Fetched::NotFound, Vec::new(), Trouble::None)
+            }
+            Ok(CachedFetch::TooLarge { reason }) => {
+                (api::Fetched::Failed(reason), Vec::new(), Trouble::None)
             }
             Err(Some(failure)) => (
                 api::Fetched::Failed(failure.reason),

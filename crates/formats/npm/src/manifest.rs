@@ -92,15 +92,25 @@ const DISPLAY_FIELDS: &[&str] = &[
     "main",
 ];
 
+/// Whether a summary keeps the manifest's field `key`.
+fn summarized(key: &str) -> bool {
+    !UNSUMMARIZED.contains(&key) && key != DEPENDENCY_GROUPS
+}
+
 /// The summary of a version manifest: see the module documentation.
 pub fn summary(manifest: &Map<String, Value>) -> Map<String, Value> {
-    let mut out: Map<String, Value> = manifest
-        .iter()
-        .filter(|(key, _)| {
-            !UNSUMMARIZED.contains(&key.as_str()) && key.as_str() != DEPENDENCY_GROUPS
-        })
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    into_summary(
+        manifest
+            .iter()
+            .filter(|(key, _)| summarized(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// [`summary`] of a manifest the caller is done with, without a copy.
+pub fn into_summary(mut out: Map<String, Value>) -> Map<String, Value> {
+    out.retain(|key, _| summarized(key));
     if serde_json::to_vec(&out).map_or(0, |v| v.len()) > MAX_SUMMARY_BYTES {
         out.retain(|key, _| {
             ABBREVIATED_FIELDS.contains(&key.as_str()) || DISPLAY_FIELDS.contains(&key.as_str())
