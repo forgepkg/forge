@@ -31,8 +31,11 @@ use crate::packument::{Packument, PackumentVersion, ABBREVIATED_MEDIA_TYPE, LATE
 use crate::{version, Npm, PackageName};
 
 /// The endpoints of `npm audit` passed on to the upstream, under
-/// `/-/npm/v1/security/`.
+/// [`SECURITY`].
 pub const AUDITS: &[&str] = &["advisories/bulk", "audits/quick", "audits"];
+
+/// Where the endpoints of `npm audit` are.
+const SECURITY: &str = "/-/npm/v1/security/";
 
 /// The largest body of a login, a web login's start or `npm dist-tag add`.
 const SMALL_BODY: u64 = 64 * 1024;
@@ -240,7 +243,7 @@ fn search_query(req: &Request) -> SearchQuery {
 }
 
 /// What a request is: see the module documentation.
-pub fn handle(npm: &Npm, repo: &Repository, req: &Request) -> Action {
+pub fn handle(npm: &Npm, req: &Request) -> Action {
     let route = match parse(&req.path) {
         Ok(route) => route,
         Err(RouteError::NotFound) => return respond(error(404, "not found")),
@@ -297,7 +300,7 @@ pub fn handle(npm: &Npm, repo: &Repository, req: &Request) -> Action {
                     limit: document_limit,
                     used_for: BodyUse::Read,
                 }),
-                Some(body) => audit(repo, req, &kind, body),
+                Some(body) => audit(req, &kind, body),
             }
         }
         ("GET", Route::DistTags(name)) => reads(&name),
@@ -395,39 +398,181 @@ fn tarball_version(name: &PackageName, file: &str) -> Option<String> {
         .and_then(|v| version::normalize(v).ok())
 }
 
-/// An audit, to the upstream: a bulk request through a group without the
-/// packages under its reserved prefixes (an internal scope's names stay
-/// inside; the upstream knows no advisories of them anyway).
-fn audit(repo: &Repository, req: &Request, kind: &str, body: &[u8]) -> Action {
-    let mut body = body.to_vec();
-    if kind == "advisories/bulk" && !repo.reserved_prefixes.is_empty() {
-        if let Some(filtered) = without_reserved(&body, &repo.reserved_prefixes) {
-            body = filtered;
-        }
-    }
+/// An audit, to the upstream. Through a group, the host sends the body
+/// [`forward_body`] leaves of it.
+fn audit(req: &Request, kind: &str, body: &[u8]) -> Action {
     let query = if req.query.is_empty() {
         String::new()
     } else {
         format!("?{}", req.query)
     };
     Action::Forward(Forward {
-        path: format!("/-/npm/v1/security/{kind}{query}"),
+        path: format!("{SECURITY}{kind}{query}"),
         content_type: "application/json".into(),
-        body,
+        body: body.to_vec(),
     })
 }
 
-/// A bulk advisory request (`{name: [versions]}`) without the packages
-/// under `prefixes`.
-pub fn without_reserved(body: &[u8], prefixes: &[String]) -> Option<Vec<u8>> {
-    let Ok(Value::Object(mut packages)) = serde_json::from_slice::<Value>(body) else {
+/// An audit's body without the packages `hidden` names, for a group's
+/// upstream: a bulk request (`{name: [versions]}`, npm 7 and later), or the
+/// dependency tree of a legacy one (`audits/quick` and `audits`: npm 6,
+/// pnpm, and npm's fallback when a bulk request fails). `None` when it
+/// cannot be filtered: a body that is no JSON object, or a tree that names
+/// its packages by their paths (`packages`, npm 7's lockfile).
+pub fn forward_body(forward: &Forward, hidden: &dyn Fn(&str) -> bool) -> Option<Vec<u8>> {
+    let path = forward.path.split('?').next().unwrap_or_default();
+    let kind = path.strip_prefix(SECURITY)?;
+    let Ok(Value::Object(body)) = serde_json::from_slice::<Value>(&forward.body) else {
         return None;
     };
-    packages.retain(|name, _| {
-        let lower = name.to_ascii_lowercase();
-        !prefixes.iter().any(|p| lower.starts_with(p.as_str()))
-    });
-    serde_json::to_vec(&Value::Object(packages)).ok()
+    let filtered = match kind {
+        "advisories/bulk" => body.into_iter().filter(|(name, _)| !hidden(name)).collect(),
+        "audits/quick" | "audits" => tree_without(body, hidden)?,
+        _ => return None,
+    };
+    serde_json::to_vec(&Value::Object(filtered)).ok()
+}
+
+/// The root of a legacy audit's dependency tree without the packages
+/// `hidden` names. Only what the upstream audits with is kept: the
+/// project's name when it is not hidden, the scalars that describe the
+/// client, the client's `metadata`, the packages installed or removed and
+/// the tree ([`node_without`]).
+fn tree_without(
+    mut root: Map<String, Value>,
+    hidden: &dyn Fn(&str) -> bool,
+) -> Option<Map<String, Value>> {
+    if root.contains_key("packages") {
+        return None;
+    }
+    let mut kept = node_without(&mut root, hidden);
+    if let Some(Value::String(name)) = root.remove("name") {
+        if !hidden(&name) {
+            kept.insert("name".into(), Value::String(name));
+        }
+    }
+    for key in ["install", "remove"] {
+        if let Some(Value::Array(specs)) = root.remove(key) {
+            let specs = specs
+                .into_iter()
+                .filter(|spec| {
+                    spec.as_str()
+                        .is_some_and(|spec| !names_hidden(spec, hidden))
+                })
+                .collect();
+            kept.insert(key.into(), Value::Array(specs));
+        }
+    }
+    if let Some(Value::Object(metadata)) = root.remove("metadata") {
+        let metadata = metadata
+            .into_iter()
+            .filter(|(_, value)| !(value.is_object() || value.is_array()))
+            .collect();
+        kept.insert("metadata".into(), Value::Object(metadata));
+    }
+    for key in [
+        "lockfileVersion",
+        "npm_version",
+        "node_version",
+        "platform",
+        "arch",
+        "node_env",
+    ] {
+        if let Some(value) = root
+            .remove(key)
+            .filter(|v| !(v.is_object() || v.is_array()))
+        {
+            kept.insert(key.into(), value);
+        }
+    }
+    Some(kept)
+}
+
+/// A node of a legacy audit's dependency tree without the packages
+/// `hidden` names: they are the keys of `requires` (to a version or a
+/// range) and of `dependencies` (to the nodes below), at every depth, and
+/// the targets of aliases (`npm:@acme/ui@1.0.0`). Of a node only its
+/// version, integrity and kind of dependency are kept: its `resolved` URL
+/// and the `from` it was installed as may name a package too.
+fn node_without(
+    node: &mut Map<String, Value>,
+    hidden: &dyn Fn(&str) -> bool,
+) -> Map<String, Value> {
+    let mut kept = Map::new();
+    match node.remove("requires") {
+        Some(Value::Object(requires)) => {
+            let requires = requires
+                .into_iter()
+                .filter(|(name, spec)| {
+                    !hidden(name)
+                        && spec
+                            .as_str()
+                            .is_some_and(|spec| !aliases_hidden(spec, hidden))
+                })
+                .collect();
+            kept.insert("requires".into(), Value::Object(requires));
+        }
+        // A lockfile's `"requires": true`.
+        Some(Value::Bool(requires)) => {
+            kept.insert("requires".into(), Value::Bool(requires));
+        }
+        _ => {}
+    }
+    if let Some(Value::Object(dependencies)) = node.remove("dependencies") {
+        let dependencies = dependencies
+            .into_iter()
+            .filter(|(name, _)| !hidden(name))
+            .filter_map(|(name, dependency)| {
+                let Value::Object(mut dependency) = dependency else {
+                    return None;
+                };
+                let version = dependency.get("version").and_then(Value::as_str);
+                if version.is_some_and(|version| aliases_hidden(version, hidden)) {
+                    return None;
+                }
+                Some((name, Value::Object(node_without(&mut dependency, hidden))))
+            })
+            .collect();
+        kept.insert("dependencies".into(), Value::Object(dependencies));
+    }
+    for key in [
+        "version",
+        "integrity",
+        "dev",
+        "optional",
+        "devOptional",
+        "peer",
+        "bundled",
+    ] {
+        if let Some(value) = node
+            .remove(key)
+            .filter(|v| !(v.is_object() || v.is_array()))
+        {
+            kept.insert(key.into(), value);
+        }
+    }
+    kept
+}
+
+/// Whether `spec` is an alias (`npm:@acme/ui@^1.0.0`) of a package `hidden`
+/// names.
+fn aliases_hidden(spec: &str, hidden: &dyn Fn(&str) -> bool) -> bool {
+    spec.strip_prefix("npm:")
+        .is_some_and(|target| names_hidden(target, hidden))
+}
+
+/// Whether `spec` (`@acme/ui@1.0.0`, `left-pad`, `ui@npm:@acme/ui@1.0.0`)
+/// names a package `hidden` names, or is an alias of one.
+fn names_hidden(spec: &str, hidden: &dyn Fn(&str) -> bool) -> bool {
+    if aliases_hidden(spec, hidden) {
+        return true;
+    }
+    // The version starts at the first `@` after the scope's.
+    let (name, version) = match spec.char_indices().skip(1).find(|&(_, c)| c == '@') {
+        Some((at, _)) => (&spec[..at], &spec[at + 1..]),
+        None => (spec, ""),
+    };
+    hidden(name) || aliases_hidden(version, hidden)
 }
 
 /// The versions of `id` loaded, if they were.
@@ -873,12 +1018,134 @@ mod tests {
         assert!(!wants_abbreviated(&Request::new("GET", "/x")));
     }
 
+    /// An audit to `kind` with `body`, as the plugin forwards it.
+    fn forwarded(kind: &str, body: &Value) -> Forward {
+        Forward {
+            path: format!("{SECURITY}{kind}"),
+            content_type: "application/json".into(),
+            body: serde_json::to_vec(body).unwrap(),
+        }
+    }
+
+    /// What of `body` goes to the upstream with `@acme/` hidden.
+    fn filtered(kind: &str, body: &Value) -> Option<Value> {
+        let hidden = |name: &str| name.to_ascii_lowercase().starts_with("@acme/");
+        forward_body(&forwarded(kind, body), &hidden)
+            .map(|body| serde_json::from_slice(&body).unwrap())
+    }
+
     #[test]
     fn bulk_audits_keep_internal_names_inside() {
-        let body = br#"{"@acme/ui":["1.0.0"],"left-pad":["1.3.0"],"@ACME/core":["2.0.0"]}"#;
-        let filtered = without_reserved(body, &["@acme/".to_string()]).unwrap();
-        let v: Value = serde_json::from_slice(&filtered).unwrap();
-        assert_eq!(v, json!({"left-pad": ["1.3.0"]}));
-        assert!(without_reserved(b"[1]", &[]).is_none());
+        let body = json!({"@acme/ui": ["1.0.0"], "left-pad": ["1.3.0"], "@ACME/core": ["2.0.0"]});
+        assert_eq!(
+            filtered("advisories/bulk", &body),
+            Some(json!({"left-pad": ["1.3.0"]}))
+        );
+        let mut with_query = forwarded("advisories/bulk", &body);
+        with_query.path.push_str("?x=1");
+        assert!(forward_body(&with_query, &|_: &str| false).is_some());
+    }
+
+    #[test]
+    fn legacy_audits_keep_internal_names_inside_at_every_depth() {
+        // npm 6: the lockfile's tree, the project's name and what an
+        // install adds; an alias of an internal package.
+        let npm6 = json!({
+            "name": "@acme/app",
+            "version": "1.0.0",
+            "requires": {"@acme/ui": "^1.0.0", "left-pad": "^1.3.0", "pad": "npm:@acme/pad@^2.0.0"},
+            "dependencies": {
+                "@acme/ui": {"version": "1.0.0", "integrity": "sha512-a", "requires": {"left-pad": "1.3.0"}},
+                "pad": {"version": "npm:@acme/pad@2.0.0", "integrity": "sha512-b"},
+                "left-pad": {
+                    "version": "1.3.0",
+                    "integrity": "sha512-c",
+                    "resolved": "https://forge.example.com/repository/npm/left-pad/-/left-pad-1.3.0.tgz",
+                    "from": "left-pad@^1.3.0",
+                    "dev": true,
+                    "requires": {"@acme/core": "2.0.0", "right-pad": "1.0.0"},
+                    "dependencies": {
+                        "@acme/core": {"version": "2.0.0"},
+                        "right-pad": {"version": "1.0.0", "bundled": true, "license": "MIT"}
+                    }
+                }
+            },
+            "install": ["@acme/ui@1.0.0", "left-pad@1.3.0", "pad@npm:@acme/pad@2.0.0", 7],
+            "remove": ["@ACME/old"],
+            "metadata": {"npm_version": "6.14.18", "node_version": "v14.21.3", "platform": "linux", "x": {"@acme/ui": 1}}
+        });
+        let expected = json!({
+            "version": "1.0.0",
+            "requires": {"left-pad": "^1.3.0"},
+            "dependencies": {
+                "left-pad": {
+                    "version": "1.3.0",
+                    "integrity": "sha512-c",
+                    "dev": true,
+                    "requires": {"right-pad": "1.0.0"},
+                    "dependencies": {"right-pad": {"version": "1.0.0", "bundled": true}}
+                }
+            },
+            "install": ["left-pad@1.3.0"],
+            "remove": [],
+            "metadata": {"npm_version": "6.14.18", "node_version": "v14.21.3", "platform": "linux"}
+        });
+        assert_eq!(filtered("audits/quick", &npm6), Some(expected.clone()));
+        assert_eq!(filtered("audits", &npm6), Some(expected));
+
+        // pnpm: a node per workspace project, the packages below it.
+        let pnpm = json!({
+            "dependencies": {".": {
+                "dependencies": {"@acme/ui": {"version": "1.0.0", "dev": false}, "left-pad": {"version": "1.3.0", "dev": false}},
+                "dev": false,
+                "requires": {"@acme/ui": "1.0.0", "left-pad": "1.3.0"},
+                "version": "0.0.0"
+            }},
+            "dev": false,
+            "install": [],
+            "metadata": {},
+            "remove": [],
+            "requires": {".": "0.0.0"}
+        });
+        assert_eq!(
+            filtered("audits", &pnpm),
+            Some(json!({
+                "dependencies": {".": {
+                    "dependencies": {"left-pad": {"version": "1.3.0", "dev": false}},
+                    "dev": false,
+                    "requires": {"left-pad": "1.3.0"},
+                    "version": "0.0.0"
+                }},
+                "dev": false,
+                "install": [],
+                "metadata": {},
+                "remove": [],
+                "requires": {".": "0.0.0"}
+            }))
+        );
+    }
+
+    #[test]
+    fn a_body_that_cannot_be_filtered_is_not_forwarded() {
+        for kind in ["advisories/bulk", "audits/quick", "audits"] {
+            assert_eq!(
+                filtered(kind, &json!([{"@acme/ui": ["1.0.0"]}])),
+                None,
+                "{kind}"
+            );
+            let bad = Forward {
+                body: b"{\"@acme/ui\": [".to_vec(),
+                ..forwarded(kind, &json!({}))
+            };
+            assert_eq!(forward_body(&bad, &|_: &str| false), None, "{kind}");
+        }
+        // npm 7's lockfile names its packages by their paths.
+        let lockfile = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {"node_modules/@acme/ui": {"version": "1.0.0"}}
+        });
+        assert_eq!(filtered("audits/quick", &lockfile), None);
+        assert_eq!(filtered("anything", &json!({})), None);
     }
 }

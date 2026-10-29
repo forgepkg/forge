@@ -205,6 +205,18 @@ pub trait FormatPlugin: Send + Sync + 'static {
     /// load, or an action of the host's.
     fn render(&self, repo: &Repository, req: &Request, data: &[Loaded]) -> Action;
 
+    /// The body of an [`Action::Forward`] through a group without the
+    /// packages `hidden` names: the reserved prefixes of every group on the
+    /// way to the proxy keep their packages' names from the upstream.
+    /// `hidden` takes a package id as the body writes it. `None` when the
+    /// body cannot be filtered: the host then refuses the request (400) and
+    /// never sends it on unfiltered. The default filters nothing, so a
+    /// format with forwards that can be filtered implements it.
+    fn forward_body(&self, forward: &Forward, hidden: &dyn Fn(&str) -> bool) -> Option<Vec<u8>> {
+        let _ = (forward, hidden);
+        None
+    }
+
     /// The upstream side of the format's proxy repositories: what to fetch
     /// from `remote` for `op`, and what came of it. `fetched` holds every
     /// fetch of earlier rounds with its result, so a plugin stays stateless.

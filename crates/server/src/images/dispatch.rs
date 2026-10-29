@@ -683,9 +683,6 @@ impl Conversation<'_> {
                 forge_plugin::api::IMAGES_MOUNT
             ),
             inline: false,
-            // A group's reserved prefixes are the host's to apply
-            // (`super::group`).
-            reserved_prefixes: Vec::new(),
         }
     }
 
