@@ -7,19 +7,23 @@
 //! (`docs/changes/<version>/`, see [`crate::changelog`]) into the changelog's
 //! `[Unreleased]` section and deletes them, turns that section into the
 //! version's section, and commits on a `release-<version>` branch off the
-//! default branch. Then, through the GitHub CLI (`gh`), it opens a pull
+//! base branch. Then, through the GitHub CLI (`gh`), it opens a pull
 //! request, waits for its CI run, merges it (with a merge queue: queues it
 //! and waits for it to land), waits for the merge commit's CI run on the
-//! default branch (e2e and web-e2e never run on the pull request), and
+//! base branch (e2e and web-e2e never run on the pull request), and
 //! creates and pushes the annotated `v<version>` tag on the merge commit,
 //! which starts release.yml.
+//!
+//! The base branch is the default branch, or, for a patch release of an
+//! older line, that line's maintenance branch (`release/<major>.<minor>`,
+//! [`maintenance_branch`]) when it is the one checked out.
 //! `--no-tag` only commits, on the current branch, and pushes nothing.
 //! Every edit is computed before the first file is written, so a failed
 //! precondition leaves the tree untouched.
 //!
-//! When the default branch already carries the version (a release pull
+//! When the base branch already carries the version (a release pull
 //! request merged by hand, or a run that stopped after the merge), nothing is
-//! committed: the run starts a manual CI run of the default branch, waits for
+//! committed: the run starts a manual CI run of the base branch, waits for
 //! it and tags its head. A push run runs only the jobs of what the push
 //! changed (#361), every job only for the release commit itself, while
 //! release.yml requires every job; a manual run runs them all.
@@ -81,10 +85,11 @@ pub fn release(args: &[String]) -> Result<(), String> {
     if !git(&["status", "--porcelain"])?.is_empty() {
         return Err("release: the working tree has uncommitted changes".into());
     }
-    // The default branch, fetched with every tag: the release starts from
-    // its head, and the tag checks below see the tags pushed from elsewhere.
+    // The base branch, fetched with every tag: the release starts from its
+    // head, and the tag checks below see the tags pushed from elsewhere. The
+    // default branch, unless the version's maintenance branch is checked out.
     let base = if publish {
-        let base = gh(&[
+        let default = gh(&[
             "repo",
             "view",
             "--json",
@@ -98,13 +103,21 @@ pub fn release(args: &[String]) -> Result<(), String> {
                  GitHub CLI, logged in (`gh auth login`); --no-tag only commits"
             )
         })?;
+        let line = maintenance_branch(&version);
+        let base = if git(&["rev-parse", "--abbrev-ref", "HEAD"])? == line {
+            line
+        } else {
+            default
+        };
         Cmd::new("git")
             .args(["fetch", "--tags", "origin", &base])
             .run()?;
         if git(&["rev-parse", "HEAD"])? != git(&["rev-parse", &format!("origin/{base}")])? {
             return Err(format!(
                 "release: HEAD is not origin/{base}, where the release starts: \
-                 `git switch {base} && git pull --ff-only` first"
+                 `git switch {base} && git pull --ff-only` first (or the maintenance \
+                 branch `{}` for a patch release of its line)",
+                maintenance_branch(&version)
             ));
         }
         Some(base)
@@ -400,6 +413,15 @@ fn read(path: &str) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("release: read {path}: {e}"))
 }
 
+/// The maintenance branch of `version`'s line, `release/<major>.<minor>`,
+/// where its patch releases are cut once the default branch has moved on
+/// (DEVELOPMENT.md, Releasing). release.yml and ci.yml know it by that name.
+pub fn maintenance_branch(version: &str) -> String {
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let line = core.rsplit_once('.').map_or(core, |(line, _)| line);
+    format!("release/{line}")
+}
+
 /// `MAJOR.MINOR.PATCH` with an optional `-PRERELEASE`, as release.yml's
 /// `v*.*.*` tags carry it.
 pub fn is_release_version(v: &str) -> bool {
@@ -590,6 +612,13 @@ pub fn release_changelog(changelog: &str, version: &str) -> Result<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_branches() {
+        assert_eq!(maintenance_branch("2.1.1"), "release/2.1");
+        assert_eq!(maintenance_branch("10.0.12"), "release/10.0");
+        assert_eq!(maintenance_branch("2.1.2-rc.1"), "release/2.1");
+    }
 
     #[test]
     fn release_versions() {

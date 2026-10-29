@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 # Decide which floating image tags a release may move (used by release.yml).
 #
-# Usage: release-channels.sh <version> <default-branch-ref>
+# Usage: release-channels.sh <version> <branch-ref>...
 # Prints `latest=<bool>` and `line_latest=<bool>` (GITHUB_OUTPUT lines).
 #
 # `latest` goes only to the highest non-prerelease version, and
 # `<major>.<minor>` only to the highest non-prerelease version of its line, so
 # a prerelease or a patch to an older line never moves them. Only tags on the
-# default branch count: a version tag pushed on any other branch is never
-# released (release.yml refuses it), and must not keep a real release from
-# moving the floating tags either.
+# branches given count: the default branch and the maintenance branches
+# (`release/<major>.<minor>`), where release.yml releases from. A version tag
+# pushed on any other branch is never released (release.yml refuses it), and
+# must not keep a real release from moving the floating tags either.
 set -euo pipefail
 
 version="$1"
-base="$2"
+shift
+bases=("$@")
 
 stable_tags() {
-  git tag --list 'v*.*.*' --merged "$base" | sed 's/^v//' | grep -Ev -- '-' | sort -V || true
+  for base in "${bases[@]}"; do
+    git tag --list 'v*.*.*' --merged "$base"
+  done | sed 's/^v//' | grep -Ev -- '-' | sort -uV || true
 }
 
 latest=false
