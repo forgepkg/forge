@@ -1205,6 +1205,12 @@ pub struct ProxyConfig {
     /// file that is removed when the request finishes. Default 2 MiB.
     #[serde(default = "default_proxy_spool_memory_bytes")]
     pub spool_memory_bytes: u64,
+    /// The bytes of upstream metadata documents the instance's proxies hold
+    /// at once while their formats read them; a read that would go over
+    /// waits for others, up to `metadata_timeout_seconds`, then answers 503.
+    /// Default 256 MiB.
+    #[serde(default = "default_proxy_max_metadata_memory_bytes")]
+    pub max_metadata_memory_bytes: u64,
 }
 
 impl Default for ProxyConfig {
@@ -1217,6 +1223,7 @@ impl Default for ProxyConfig {
             max_metadata_bytes: default_proxy_max_metadata_bytes(),
             max_package_bytes: default_proxy_max_package_bytes(),
             spool_memory_bytes: default_proxy_spool_memory_bytes(),
+            max_metadata_memory_bytes: default_proxy_max_metadata_memory_bytes(),
         }
     }
 }
@@ -1232,6 +1239,7 @@ impl ProxyConfig {
             max_metadata_bytes: self.max_metadata_bytes,
             max_package_bytes: self.max_package_bytes,
             spool_memory_bytes: usize::try_from(self.spool_memory_bytes).unwrap_or(usize::MAX),
+            max_metadata_memory_bytes: self.max_metadata_memory_bytes,
             ..Default::default()
         }
     }
@@ -1253,6 +1261,10 @@ impl ProxyConfig {
             ),
             ("proxy.max_metadata_bytes", self.max_metadata_bytes),
             ("proxy.max_package_bytes", self.max_package_bytes),
+            (
+                "proxy.max_metadata_memory_bytes",
+                self.max_metadata_memory_bytes,
+            ),
         ] {
             if value == 0 {
                 return Err(ConfigError::Invalid(format!(
@@ -1284,6 +1296,9 @@ fn default_proxy_max_package_bytes() -> u64 {
 }
 fn default_proxy_spool_memory_bytes() -> u64 {
     2 * 1024 * 1024
+}
+fn default_proxy_max_metadata_memory_bytes() -> u64 {
+    256 * 1024 * 1024
 }
 
 /// `nuget.*` — `.nupkg` archive safety limits, applied when a package is

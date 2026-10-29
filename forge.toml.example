@@ -188,6 +188,12 @@ max_package_bytes        = 1073741824  # (default: 1 GiB)
 # temp file that is removed when the request ends. Packages always stream
 # to a temp file.
 spool_memory_bytes       = 2097152     # (default: 2 MiB)
+# The metadata documents all upstream reads of this instance hold at once
+# while their formats parse them (which takes up to as much again). A read
+# that would go over waits for others, up to metadata_timeout_seconds, then
+# answers 503 with Retry-After, instead of growing the process past its
+# memory limit. Size the limit for twice this (docs/deployment.md, Memory).
+max_metadata_memory_bytes = 268435456  # (default: 256 MiB)
 
 [nuget]
 # .nupkg archive safety limits for published and proxied packages. Only the
