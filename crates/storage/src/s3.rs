@@ -9,6 +9,10 @@
 //!   sending a `x-amz-checksum-crc32` (flexible checksum) on every upload.
 //!   versitygw rejects or mishandles these, so we set both request and response
 //!   checksum calculation to `WhenRequired`.
+//! * **A completed multipart upload is confirmed** — versitygw answers a
+//!   repeated `CompleteMultipartUpload` (the SDK's retry of one whose answer
+//!   was lost) with success while the first call still assembles the object,
+//!   so the object is looked for before the upload counts as done.
 //!
 //! CAS object keys use the layout
 //! `blobs/sha256/{aa}/{bb}/{full-hash}/{incarnation}` where `aa`/`bb` are the
@@ -130,6 +134,13 @@ pub struct BlobStore {
 
 /// S3's minimum part size for all but the final part of a multipart upload.
 const MULTIPART_PART_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB
+
+/// How long the object of a completed multipart upload is waited for
+/// ([`BlobStore::await_completed`]): as long as an answer from S3.
+const COMPLETED_OBJECT_WAIT: Duration = S3_READ_TIMEOUT;
+/// The first pause between looks for it, doubled up to the longest.
+const COMPLETED_POLL_FIRST: Duration = Duration::from_millis(50);
+const COMPLETED_POLL_MAX: Duration = Duration::from_secs(1);
 
 impl BlobStore {
     /// Build a store from [`S3Config`], wiring up the versitygw-friendly client.
@@ -577,7 +588,7 @@ impl BlobStore {
                     .send(),
             )
             .await?;
-            Ok(())
+            self.await_completed(key).await
         }
         .await;
 
@@ -588,12 +599,44 @@ impl BlobStore {
             }
             Err(e) => {
                 // A failed `complete` can be ambiguous (the backend may have
-                // completed before the response was lost). Aborting is still
-                // safe: aborting an already-completed upload is a no-op
+                // completed before the response was lost), and so is one
+                // whose object never appeared. Aborting is still safe:
+                // aborting an already-completed upload is a no-op
                 // (`NoSuchUpload`) that never removes the object.
                 guard.abort().await;
                 Err(e)
             }
+        }
+    }
+
+    /// Wait until the object of the multipart upload just completed is at
+    /// `key`.
+    ///
+    /// versitygw answers a `CompleteMultipartUpload` with success at once
+    /// while an earlier call for the same upload still assembles the object,
+    /// and the SDK sends such a call when it retries a complete whose answer
+    /// was lost; the object appears when the first call links it. Callers
+    /// read what they stored right after (a docker proxy streams the layer
+    /// it fetched back to its client), so the upload is done only once the
+    /// object is there.
+    async fn await_completed(&self, key: &str) -> Result<(), S3Error> {
+        let deadline = tokio::time::Instant::now() + COMPLETED_OBJECT_WAIT;
+        let mut pause = COMPLETED_POLL_FIRST;
+        loop {
+            if self.head_object(key).await? {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(S3Error::S3(format!(
+                    "multipart upload of {key} completed, but its object did not appear \
+                     within {}s",
+                    COMPLETED_OBJECT_WAIT.as_secs()
+                )));
+            }
+            tracing::debug!(key, "completed multipart upload not readable yet; waiting");
+            tokio::time::sleep(pause.min(deadline - now)).await;
+            pause = (pause * 2).min(COMPLETED_POLL_MAX);
         }
     }
 
