@@ -397,6 +397,14 @@ answers **502**: retrying does not help until the upstream or the proxy
 changes. Any other failure answers 500: an answer the plugin cannot use, a
 document over its size bound.
 
+The conversations of an instance hold their documents in one budget,
+`proxy.max_metadata_memory_bytes`, until the plugin has answered. A document
+that does not fit is let go while its conversation waits for room, up to the
+metadata timeout, and is then read again. A conversation that waited in vain
+gets the fetch back as a failure, as from an unavailable upstream: the
+request answers 503 with `Retry-After`, unless the plugin answers from a
+smaller document instead (npm: the abbreviated packument for the full one).
+
 The host sends a fetch only where the upstream points: to the origin (scheme,
 host and port) of `remote_url`, or to an origin that an absolute `http` or
 `https` URL names in a document the host fetched for the same operation (in an
