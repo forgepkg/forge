@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime};
 
 use forge_storage::cas::{Cas, CasError, Staging};
 use forge_storage::{BlobStore, ConditionalWrites, S3Config, S3Credentials};
+use sha2::Digest as _;
 
 fn cas(staging: Staging) -> Cas {
     let store = BlobStore::new(S3Config {
@@ -86,6 +87,67 @@ async fn the_budget_refuses_staging_beyond_it_and_is_released_on_drop() {
         Err(CasError::TooLarge { limit: 1_000 })
     ));
     drop(again);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A sized stage (a docker proxy's layer download, #679) reserves all of its
+/// size at once, and is read while it is written. Its temp space goes back
+/// once the stage and every reader are gone.
+#[tokio::test]
+async fn a_sized_stage_is_read_while_it_is_written() {
+    let dir = scratch_dir("sized");
+    let cas = cas(Staging::new(&dir, Some(100_000)).unwrap());
+    let mut stage = cas.stage_sized(60_000).expect("fits");
+    match cas.stage_sized(60_000) {
+        Err(CasError::StagingFull { limit }) => assert_eq!(limit, 100_000),
+        other => panic!("expected StagingFull, got {:?}", other.err()),
+    }
+    let reader = stage.reader();
+    stage.write(&[1u8; 20_000]).await.unwrap();
+    assert_eq!(stage.written(), 20_000);
+    assert_eq!(reader.read_at(0, 30_000).await.unwrap().len(), 20_000);
+    stage.write(&[2u8; 40_000]).await.unwrap();
+    assert_eq!(reader.read_at(19_999, 2).await.unwrap().as_ref(), [1, 2]);
+    assert!(matches!(
+        stage.write(&[3]).await,
+        Err(CasError::SizeMismatch { declared: 60_000 })
+    ));
+
+    let staged = stage.finish().await.unwrap();
+    let expected = [vec![1u8; 20_000], vec![2u8; 40_000]].concat();
+    let sha256: String = sha2::Sha256::digest(&expected)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        (staged.sha256.as_str(), staged.size),
+        (sha256.as_str(), 60_000)
+    );
+
+    // The reader still reads, and still holds the temp space.
+    drop(staged);
+    assert_eq!(reader.read_at(59_999, 10).await.unwrap().as_ref(), [2]);
+    assert!(matches!(
+        cas.stage_sized(60_000),
+        Err(CasError::StagingFull { .. })
+    ));
+    drop(reader);
+    let short = cas.stage_sized(60_000).expect("budget released");
+    assert!(matches!(
+        short.finish().await,
+        Err(CasError::SizeMismatch { declared: 60_000 })
+    ));
+    assert_eq!(staged_files(&dir), 0, "nothing left behind");
+
+    // Sizes above `u32::MAX` are reserved in pieces and given back whole.
+    let cas = self::cas(Staging::new(&dir, Some(6 << 30)).unwrap());
+    let big = cas.stage_sized(5 << 30).expect("fits");
+    assert!(matches!(
+        cas.stage_sized(2 << 30),
+        Err(CasError::StagingFull { .. })
+    ));
+    drop(big);
+    drop(cas.stage_sized(6 << 30).expect("all of it again"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

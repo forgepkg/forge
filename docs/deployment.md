@@ -1315,9 +1315,12 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   (default four times the largest item: a push under the default upload
   limits, `proxy.max_package_bytes` or `docker.max_blob_bytes`, so 4 GiB;
   `0` removes the limit); past it, pushes and downloads are answered `503`
-  with `Retry-After` until space frees up. A repository's upload limit may
-  not exceed the budget (less `nuget.max_nuspec_bytes`), so raise the
-  budget before giving a repository a larger limit. An explicit budget below
+  with `Retry-After` until space frees up. A layer a docker proxy serves
+  while it downloads it reserves its whole size when the download starts,
+  until the download is stored and the last response reading it has ended.
+  A repository's upload limit may not exceed the budget (less
+  `nuget.max_nuspec_bytes`), so raise the budget before giving a repository
+  a larger limit. An explicit budget below
   the 1 GiB docker defaults lowers them to what it holds: docker
   repositories without a limit of their own accept layers up to the budget
   (less `nuget.max_nuspec_bytes`), and so do docker proxy downloads unless

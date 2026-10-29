@@ -17,6 +17,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use common::{unique, TestServer};
+use futures_util::StreamExt as _;
 use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
 use serde_json::{json, Value};
 use sha2::Digest as _;
@@ -2007,6 +2008,9 @@ struct MockRegistry {
     manifest_delay: Mutex<std::time::Duration>,
     /// Hold every blob `GET` this long before answering.
     blob_delay: Mutex<std::time::Duration>,
+    /// Send the first half of every blob `GET`, then wait for a permit of
+    /// this before the rest.
+    blob_hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl MockRegistry {
@@ -2132,7 +2136,22 @@ impl MockRegistry {
                 if self.corrupt.load(Ordering::SeqCst) {
                     body.push(0);
                 }
-                body.into_response()
+                let Some(hold) = self.blob_hold.lock().unwrap().clone() else {
+                    return body.into_response();
+                };
+                let length = body.len();
+                let rest = body.split_off(length / 2);
+                let halves = futures_util::stream::iter([Ok::<_, std::io::Error>(body)]).chain(
+                    futures_util::stream::once(async move {
+                        hold.acquire().await.unwrap().forget();
+                        Ok(rest)
+                    }),
+                );
+                (
+                    [(header::CONTENT_LENGTH, length.to_string())],
+                    Body::from_stream(halves),
+                )
+                    .into_response()
             }
             Some(forge_format_docker::path::Endpoint::TagsList { name }) => {
                 let query = req.uri().query().unwrap_or_default().to_string();
@@ -2429,6 +2448,162 @@ async fn a_slow_layer_download_outlasts_the_request_timeout() {
     assert_eq!(mock.blob_gets.load(Ordering::SeqCst), 1, "cached");
 
     assert_eq!(oci.get(&name, "manifests/1.0").await.status(), 408);
+}
+
+/// A layer of `mib` MiB (more than a config, which a proxy stores before
+/// it serves it), unique to the test.
+fn big_layer(mib: usize) -> Vec<u8> {
+    let mut layer = format!("a big layer {} ", unique()).into_bytes();
+    let len = mib * 1024 * 1024;
+    layer.extend((layer.len()..len).map(|i| (i % 251) as u8));
+    layer
+}
+
+/// Read `resp`'s body until `len` bytes have arrived.
+async fn read_some(resp: &mut reqwest::Response, len: usize) -> Vec<u8> {
+    let mut got = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while got.len() < len {
+            let chunk = resp.chunk().await.unwrap().expect("the body goes on");
+            got.extend_from_slice(&chunk);
+        }
+    })
+    .await
+    .expect("arrived before the upstream sent the rest");
+    got
+}
+
+/// How many blobs `proxy` has linked.
+async fn links(srv: &TestServer, proxy: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM oci_blob_link l JOIN repository r ON r.id = l.repository_id \
+         WHERE r.name = $1",
+    )
+    .bind(proxy)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap()
+}
+
+/// Whether `proxy` has linked a blob, waiting up to 10 s for it: a layer
+/// served while it downloads is linked after its last byte is served.
+async fn linked_soon(srv: &TestServer, proxy: &str) -> bool {
+    for _ in 0..500 {
+        if links(srv, proxy).await > 0 {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// A proxy serves a layer it does not hold yet while it downloads it: the
+/// client receives what has arrived before the upstream sends the rest,
+/// another pull and a range of it are served from the same download, and
+/// the layer is cached once it is verified (#679).
+#[tokio::test]
+async fn a_proxy_serves_a_layer_while_it_downloads_it() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let layer = big_layer(3);
+    let half = layer.len() / 2;
+    mock.put_blob(&layer);
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *mock.blob_hold.lock().unwrap() = Some(hold.clone());
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{proxy}/library/big");
+    let digest = sha(&layer);
+    let path = format!("blobs/{digest}");
+
+    let mut first = oci.get(&name, &path).await;
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.content_length(), Some(layer.len() as u64));
+    assert_eq!(first.headers()["docker-content-digest"], digest.as_str());
+    assert_eq!(read_some(&mut first, half).await, &layer[..half]);
+
+    // Joining the download: what has arrived at once.
+    let mut second = oci.get(&name, &path).await;
+    assert_eq!(second.status(), 200);
+    assert_eq!(read_some(&mut second, half).await, &layer[..half]);
+    let range = oci
+        .request(Method::GET, &format!("/v2/{name}/{path}"), "pull", &name)
+        .await
+        .header(header::RANGE, "bytes=100-199")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(range.status(), 206);
+    assert_eq!(range.bytes().await.unwrap().as_ref(), &layer[100..200]);
+    let head = oci.head(&name, &path).await;
+    assert_eq!(head.status(), 200);
+    assert_eq!(
+        head.headers()[header::CONTENT_LENGTH],
+        layer.len().to_string().as_str()
+    );
+    assert_eq!(mock.blob_gets.load(Ordering::SeqCst), 1, "one download");
+    assert_eq!(
+        links(&srv, &proxy).await,
+        0,
+        "not cached before it is verified"
+    );
+
+    hold.add_permits(1);
+    for resp in [first, second] {
+        let rest = resp.bytes().await.unwrap();
+        assert_eq!(rest.as_ref(), &layer[half..]);
+    }
+    assert!(linked_soon(&srv, &proxy).await, "cached");
+    let cached = oci.get(&name, &path).await;
+    assert_eq!(cached.bytes().await.unwrap().as_ref(), layer.as_slice());
+    assert_eq!(mock.blob_gets.load(Ordering::SeqCst), 1, "from the cache");
+}
+
+/// A layer a proxy serves while it downloads it, and that turns out not to
+/// match its digest, ends every response before its last byte and is not
+/// cached: the next pull downloads it again (#679).
+#[tokio::test]
+async fn a_downloading_layer_that_does_not_match_its_digest_is_cut_short() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let layer = big_layer(2);
+    mock.put_blob(&layer);
+    // The upstream appends a byte: one more than the layer, as declared.
+    mock.corrupt.store(true, Ordering::SeqCst);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{proxy}/library/corrupt");
+    let digest = sha(&layer);
+    let path = format!("blobs/{digest}");
+
+    let resp = oci.get(&name, &path).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.content_length(), Some(layer.len() as u64 + 1));
+    assert!(resp.bytes().await.is_err(), "cut short");
+    assert_eq!(links(&srv, &proxy).await, 0, "not cached");
+
+    mock.corrupt.store(false, Ordering::SeqCst);
+    let resp = oci.get(&name, &path).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), layer.as_slice());
+    assert_eq!(mock.blob_gets.load(Ordering::SeqCst), 2, "downloaded again");
+    assert!(linked_soon(&srv, &proxy).await, "cached");
 }
 
 #[tokio::test]

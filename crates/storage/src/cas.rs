@@ -10,12 +10,18 @@
 //! The returned [`StoredBlob`] keeps the temp file alive ([`tempfile::TempPath`])
 //! so the caller can hand it to a format parser before dropping it.
 //!
+//! [`Cas::stage_sized`] stages a body whose size is known before it arrives
+//! (a download's `Content-Length`) a chunk at a time, for readers that follow
+//! the staged file while it is written ([`StageReader`]): a docker proxy
+//! serves a layer to its clients as it downloads it.
+//!
 //! ## Temp space
 //!
 //! Staged files live in one directory ([`Staging`]) and count against an
 //! optional byte budget shared by every upload and download of the process:
-//! bytes are reserved as they arrive and released when the temp file is
-//! dropped, and a stage that would exceed the budget fails with
+//! bytes are reserved as they arrive (a sized stage's all at once, when it
+//! starts) and released when the temp file and its readers are dropped, and
+//! a stage that would exceed the budget fails with
 //! [`CasError::StagingFull`] instead of filling the disk (a burst of
 //! first-time proxy downloads of large packages would otherwise get the pod
 //! evicted). Each process stages in a subdirectory of its own, locked while
@@ -38,7 +44,7 @@ use std::task::{Context, Poll};
 
 use sqlx::PgPool;
 use tempfile::TempPath;
-use tokio::io::{copy, AsyncRead, ReadBuf};
+use tokio::io::{copy, AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::sync::Semaphore;
 
 use crate::hash::HashingWriter;
@@ -73,6 +79,10 @@ pub enum CasError {
     StagingFull { limit: u64 },
     #[error("content size {size} bytes exceeds i64::MAX and cannot be stored")]
     SizeOverflow { size: u64 },
+    /// A body of known size ([`Cas::stage_sized`]) brought more or fewer
+    /// bytes than it declared.
+    #[error("the content is not the {declared} bytes it declared")]
+    SizeMismatch { declared: u64 },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("s3 error: {0}")]
@@ -117,8 +127,9 @@ pub struct StagedBlob {
     pub temp_path: TempPath,
     /// The handle the bytes were written and hashed through.
     file: std::fs::File,
-    /// The temp-space reservation, released with the temp file.
-    reservation: Option<Reservation>,
+    /// The temp-space reservation, released with the temp file (and the
+    /// readers of a [`SizedStage`]).
+    reservation: Option<Arc<Reservation>>,
     /// Keeps the process's staging subdirectory (and its lock) alive while
     /// the temp file is in it.
     own_dir: Option<Arc<OwnDir>>,
@@ -146,8 +157,9 @@ pub struct StoredBlob {
     /// Lease consumed atomically with the reference-count increment.
     pub ingest_token: uuid::Uuid,
     _lease_guard: IngestLeaseGuard,
-    /// The temp-space reservation, released with the temp file.
-    _reservation: Option<Reservation>,
+    /// The temp-space reservation, released with the temp file (and the
+    /// readers of a [`SizedStage`]).
+    _reservation: Option<Arc<Reservation>>,
     /// Keeps the staging subdirectory alive while the temp file is in it.
     _own_dir: Option<Arc<OwnDir>>,
 }
@@ -353,6 +365,120 @@ fn handle_path(file: &std::fs::File, fallback: &Path) -> PathBuf {
     #[cfg(not(target_os = "linux"))]
     let _ = file;
     fallback.to_path_buf()
+}
+
+/// A stage of a body whose size is known before it arrives, written a chunk
+/// at a time ([`Self::write`]) while readers follow it ([`Self::reader`]).
+/// Its temp space is reserved whole when it starts ([`Cas::stage_sized`]).
+pub struct SizedStage {
+    temp: tempfile::NamedTempFile,
+    /// Through a handle of the file `tempfile` created, never reopened by
+    /// its name.
+    writer: HashingWriter<tokio::fs::File>,
+    size: u64,
+    written: u64,
+    reader: StageReader,
+    reservation: Option<Arc<Reservation>>,
+    own_dir: Option<Arc<OwnDir>>,
+}
+
+/// A read-only handle on a [`SizedStage`]'s file, for reading the bytes it
+/// has written ([`SizedStage::written`]) while it writes more. Readers
+/// sharing it read at offsets of their own ([`Self::read_at`]). The file
+/// stays readable, and its temp space reserved, until the stage, the
+/// [`StagedBlob`] or [`StoredBlob`] it became, and every reader are gone.
+#[derive(Clone, Debug)]
+pub struct StageReader {
+    file: Arc<std::fs::File>,
+    _reservation: Option<Arc<Reservation>>,
+}
+
+impl SizedStage {
+    /// The bytes written so far: a [`StageReader`] reads all of them.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// A handle for reading the staged file.
+    pub fn reader(&self) -> StageReader {
+        self.reader.clone()
+    }
+
+    /// Append `chunk` to the staged file and its hashes. Once this returns,
+    /// readers read it. More bytes than the body declared fail with
+    /// [`CasError::SizeMismatch`].
+    pub async fn write(&mut self, chunk: &[u8]) -> Result<(), CasError> {
+        let len = chunk.len() as u64;
+        if len > self.size - self.written {
+            return Err(CasError::SizeMismatch {
+                declared: self.size,
+            });
+        }
+        self.writer.write_all(chunk).await?;
+        // `tokio::fs::File` writes in the background: on to the file before
+        // the bytes count as written.
+        self.writer.flush().await?;
+        self.written += len;
+        Ok(())
+    }
+
+    /// The staged blob, once all the declared bytes are written; fewer fail
+    /// with [`CasError::SizeMismatch`].
+    pub async fn finish(self) -> Result<StagedBlob, CasError> {
+        if self.written != self.size {
+            return Err(CasError::SizeMismatch {
+                declared: self.size,
+            });
+        }
+        let (sha256, sha512_base64, size) = self.writer.finalize().await?;
+        let (file, temp_path) = self.temp.into_parts();
+        Ok(StagedBlob {
+            sha256,
+            sha512_base64,
+            size,
+            temp_path,
+            file,
+            reservation: self.reservation,
+            own_dir: self.own_dir,
+        })
+    }
+}
+
+impl StageReader {
+    /// Up to `len` bytes of the staged file at `offset`, fewer at its end.
+    pub async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<bytes::Bytes> {
+        let file = Arc::clone(&self.file);
+        tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0; len];
+            let mut filled = 0;
+            while filled < len {
+                match read_at(&file, &mut buf[filled..], offset + filled as u64) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            buf.truncate(filled);
+            Ok(bytes::Bytes::from(buf))
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+}
+
+/// A positional read: it moves no file offset, so the stage's writer and
+/// the readers of one handle never disturb each other.
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+/// Moves the handle's file pointer, which is why a reader's handle on
+/// Windows is one of its own ([`Cas::stage_sized`]).
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
 }
 
 /// Create `dir` (and, with `parents`, its missing parents) with mode `0700`.
@@ -736,7 +862,68 @@ impl Cas {
             size,
             temp_path,
             file,
-            reservation: reader.reservation,
+            reservation: reader.reservation.map(Arc::new),
+            own_dir,
+        })
+    }
+
+    /// Start staging a body of exactly `size` bytes (a download's
+    /// `Content-Length`), written a chunk at a time while [`StageReader`]s
+    /// follow it. All of `size` is reserved from the temp-space budget at
+    /// once: a body that would exceed it fails here, with
+    /// [`CasError::StagingFull`], before any of it is read. The caller
+    /// enforces its own size limit before.
+    pub fn stage_sized(&self, size: u64) -> Result<SizedStage, CasError> {
+        let reservation = match &self.staging.budget {
+            None => None,
+            Some(budget) => {
+                let mut reservation = Reservation {
+                    budget: budget.clone(),
+                    bytes: 0,
+                };
+                // In pieces a tokio permit counts (`u32`); what was taken
+                // goes back with `reservation` when a piece does not fit.
+                while reservation.bytes < size {
+                    let permits = u32::try_from(size - reservation.bytes).unwrap_or(u32::MAX);
+                    let Ok(permit) = budget.try_acquire_many(permits) else {
+                        tracing::warn!(
+                            limit = self.staging.limit,
+                            size,
+                            dir = %self.staging.dir.display(),
+                            "staging budget exhausted; refusing this download for now"
+                        );
+                        return Err(CasError::StagingFull {
+                            limit: self.staging.limit,
+                        });
+                    };
+                    permit.forget();
+                    reservation.bytes += u64::from(permits);
+                }
+                Some(Arc::new(reservation))
+            }
+        };
+        let own_dir = self.staging.own_dir()?;
+        let temp = tempfile::Builder::new()
+            .prefix(Staging::PREFIX)
+            .tempfile_in(own_dir.as_ref().map_or(&self.staging.dir, |own| &own.path))?;
+        let writer = HashingWriter::new(tokio::fs::File::from_std(temp.as_file().try_clone()?));
+        // On Windows a positional read moves the handle's file pointer, so
+        // readers get a handle of their own rather than the writer's.
+        #[cfg(unix)]
+        let file = temp.as_file().try_clone()?;
+        #[cfg(not(unix))]
+        let file = std::fs::File::open(temp.path())?;
+        let reader = StageReader {
+            file: Arc::new(file),
+            _reservation: reservation.clone(),
+        };
+        Ok(SizedStage {
+            temp,
+            writer,
+            size,
+            written: 0,
+            reader,
+            reservation,
             own_dir,
         })
     }

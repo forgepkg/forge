@@ -17,6 +17,8 @@
 //!   immutable tags, the trusted-publishing ledger; manifests, blobs, tags
 //!   and referrers of hosted, proxy and group repositories; an upstream
 //!   registry's token exchange and caching;
+//! * [`download`]: a proxy's first download of a layer, served while it
+//!   arrives;
 //! * [`gc`]: abandoned upload sessions and unreferenced blob links;
 //! * [`import`]: copying images from another registry (a Nexus hosted
 //!   repository) into a hosted repository, through the same store.
@@ -24,6 +26,7 @@
 pub mod auth;
 pub mod digest;
 pub mod dispatch;
+mod download;
 pub mod gc;
 mod group;
 pub mod import;
