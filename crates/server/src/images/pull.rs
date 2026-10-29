@@ -2,6 +2,8 @@
 //! proxy and group repositories alike, and serving a manifest or a blob the
 //! format asked for.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -14,6 +16,7 @@ use futures_util::future::BoxFuture;
 
 use super::digest::ContentDigest;
 use super::dispatch::Caller;
+use super::download::Download;
 use super::{header_value, Failure, ImgResult, Registry};
 
 /// A manifest found for a pull.
@@ -88,9 +91,32 @@ pub(crate) struct BlobHit {
     /// Whether it is an `oci_blob_link` (touched on use) rather than a
     /// manifest read as a blob.
     pub linked: bool,
+    /// The download it is served from while a proxy fetches it; `None` once
+    /// it is in the store.
+    pub download: Option<Arc<Download>>,
 }
 
 impl BlobHit {
+    /// A layer `repo`, a proxy, is downloading for `image`, served from that
+    /// download. Not in the store yet, nor linked.
+    pub fn downloading(
+        repo: &Repository,
+        image: &str,
+        digest: &ContentDigest,
+        download: Arc<Download>,
+    ) -> Self {
+        BlobHit {
+            repository_id: repo.id,
+            image: image.to_string(),
+            digest: digest.to_string(),
+            size: i64::try_from(download.size).unwrap_or(i64::MAX),
+            blob_sha256: String::new(),
+            s3_key: String::new(),
+            linked: false,
+            download: Some(download),
+        }
+    }
+
     /// The blob of the store.
     pub fn blob(&self) -> BlobRef<'_> {
         BlobRef {
@@ -231,6 +257,7 @@ impl Registry {
                 blob_sha256: link.blob_sha256,
                 s3_key: link.s3_key,
                 linked: true,
+                download: None,
             }));
         }
         // A manifest is content too: some clients read one through the blob
@@ -246,6 +273,7 @@ impl Registry {
                     blob_sha256: m.blob_sha256,
                     s3_key: m.s3_key,
                     linked: false,
+                    download: None,
                 }),
         )
     }
@@ -388,20 +416,24 @@ impl Registry {
             }
             (true, None) => (StatusCode::OK, size, Body::empty()),
             (false, range) => {
-                // Through the local blob cache, like package downloads.
-                let stream = self
-                    .inner
-                    .store
-                    .open(hit.blob(), range.map(|(start, end)| start..end + 1))
-                    .await
-                    .map_err(|e| Failure::storage_read("blob read", e))?;
-                match range {
-                    Some((start, end)) => (
-                        StatusCode::PARTIAL_CONTENT,
-                        end - start + 1,
-                        Body::from_stream(stream),
+                let body = match &hit.download {
+                    // Still downloading: as it arrives.
+                    Some(download) => Body::from_stream(
+                        Arc::clone(download)
+                            .stream(range.map_or(0..size, |(start, end)| start..end + 1)),
                     ),
-                    None => (StatusCode::OK, size, Body::from_stream(stream)),
+                    // Through the local blob cache, like package downloads.
+                    None => Body::from_stream(
+                        self.inner
+                            .store
+                            .open(hit.blob(), range.map(|(start, end)| start..end + 1))
+                            .await
+                            .map_err(|e| Failure::storage_read("blob read", e))?,
+                    ),
+                };
+                match range {
+                    Some((start, end)) => (StatusCode::PARTIAL_CONTENT, end - start + 1, body),
+                    None => (StatusCode::OK, size, body),
                 }
             }
         };

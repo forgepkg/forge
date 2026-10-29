@@ -199,6 +199,14 @@ docker pull forge.example.com/docker-hub/nginx:1.27
   count against the rate limit. While the upstream is unreachable or rate
   limits, the cached tag is served; an upstream "not found" is remembered for
   `not_found_ttl_seconds` (default 60).
+- A layer the proxy does not hold yet is served while it downloads: the
+  client receives it as it arrives from the upstream, and other pulls of it
+  on the same instance meanwhile are served from that one download. Its last
+  byte is sent once the whole layer matches its digest; a layer that does
+  not ends the response short, an error the client retries, and is not
+  cached. The download is cached even when its client goes away. Blobs of at
+  most 1 MiB (image configs), and layers whose upstream sends no
+  `Content-Length`, are downloaded and verified before they are served.
 - Multi-arch indexes are cached as they are; each platform's manifest and
   layers are fetched when a client asks for them. Tag lists and referrers
   come from the upstream, or from the cache while it is unreachable. A tag
@@ -382,9 +390,8 @@ and stream them without buffering; see
 
 ## Known limitations
 
-- A proxy downloads a blob completely (and verifies it) before it answers the
-  client, so a client waits for a large layer's first fetch. Concurrent pulls
-  of one layer share a download per instance.
+- Concurrent pulls of a layer a proxy does not hold yet share its download
+  per instance: pulls through two instances download it twice.
 - An upload of several chunks is assembled into a new blob when it finishes
   (the chunks are read back from the object store); one-chunk uploads, what
   docker, podman and containerd send, are stored once.

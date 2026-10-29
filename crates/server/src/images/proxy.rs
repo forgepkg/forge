@@ -3,6 +3,7 @@
 //!
 //! * Blobs and digest-addressed manifests are immutable: once fetched (and
 //!   verified against their digest) they are served from the CAS for good.
+//!   A layer is served while it is fetched ([`super::download`]).
 //! * A tag is re-validated after the repository's metadata TTL with a `HEAD`
 //!   (which Docker Hub does not count against its pull rate limit); while
 //!   the upstream is unreachable, or the repository is offline, the cached
@@ -34,7 +35,7 @@ use forge_plugin::api::images::{ImageUrl, ManifestInfo, Reference, TagPage, MAX_
 use forge_plugin::api::{
     FetchResult, Fetched, FormatError, Remote, UpstreamAnswer, UpstreamOp, UpstreamStep,
 };
-use forge_storage::BlobRef;
+use forge_storage::{BlobRef, StagedBlob};
 use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
 use futures_util::{StreamExt, TryStreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
@@ -43,6 +44,7 @@ use tracing::Instrument;
 
 use super::digest::ContentDigest;
 use super::dispatch::Target;
+use super::download::Download;
 use super::pull::{BlobHit, ManifestHit};
 use super::push::{merge, require_linked};
 use super::{Failure, ImgResult, Registry};
@@ -96,7 +98,8 @@ const MAX_CACHED_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_TOKEN_TTL: Duration = Duration::from_secs(600);
 
 /// In-flight first-time blob downloads, so concurrent pulls of one layer
-/// share a single upstream fetch per process.
+/// share a single upstream fetch per process: a config is fetched and
+/// stored under its gate, a layer's download ([`Download`]) started under it.
 static GATES: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Default::default);
 
@@ -222,7 +225,7 @@ pub(crate) async fn read_limited(response: reqwest::Response, limit: usize) -> I
     Ok(Bytes::from(out))
 }
 
-fn upstream_unreachable(e: &dyn std::fmt::Display) -> Failure {
+pub(crate) fn upstream_unreachable(e: &dyn std::fmt::Display) -> Failure {
     tracing::warn!(error = %e, "registry proxy: upstream request failed");
     Failure::unavailable("the upstream registry is unreachable")
 }
@@ -887,10 +890,15 @@ impl Registry {
             lookup.mark(Outcome::NegativeCached);
             return Ok(None);
         }
-        let gate = gate(format!("{}:{local}:{digest}", repo.id));
+        let key = Download::key(repo, &local, digest);
+        let gate = gate(key.clone());
         let _held = gate.lock().await;
         if let Some(hit) = self.hosted_blob(repo, &local, digest).await? {
             return Ok(Some(hit));
+        }
+        // Being downloaded: served from that download.
+        if let Some(download) = Download::joinable(&key) {
+            return Ok(Some(BlobHit::downloading(repo, &local, digest, download)));
         }
         let upstream = self.upstream(repo).await?;
         let url = self.image_url(
@@ -972,6 +980,17 @@ impl Registry {
         if response.content_length().is_some_and(|l| l > max) {
             return Err(Failure::new(ImageError::TooLarge { limit: max }));
         }
+        // A layer of a declared size is served while it downloads. What may
+        // be a config is stored first, and read whole below.
+        if let Some(size) = response
+            .content_length()
+            .filter(|&size| size > MAX_CONFIG_BYTES as u64)
+        {
+            lookup.mark(Outcome::Fetched);
+            let download =
+                self.start_download(repo, &local, digest, size, response, upstream.http.clone())?;
+            return Ok(Some(BlobHit::downloading(repo, &local, digest, download)));
+        }
         let body = response.bytes_stream().map_err(std::io::Error::other);
         let staged = self
             .inner
@@ -992,13 +1011,30 @@ impl Registry {
         } else {
             None
         };
+        self.store_fetched(repo, &local, digest, staged).await?;
+        if let Some(bytes) = small {
+            self.complete_summaries(repo, &local, digest, bytes.len() as i64, None, Some(bytes))
+                .await;
+        }
+        self.hosted_blob(repo, &local, digest).await
+    }
+
+    /// Store a blob `repo`'s upstream served for `image`, verified against
+    /// its digest, and link it into the image.
+    pub(crate) async fn store_fetched(
+        &self,
+        repo: &Repository,
+        image: &str,
+        digest: &ContentDigest,
+        staged: StagedBlob,
+    ) -> ImgResult<()> {
         let stored = self.inner.cas.commit(staged).await?;
-        let mut tx = forge_db::begin(pool).await?;
+        let mut tx = forge_db::begin(&self.inner.pool).await?;
         still_upstream(&mut tx, repo).await?;
         oci_dao::insert_link_ingested(
             &mut tx,
             repo.id,
-            &local,
+            image,
             digest.as_str(),
             &stored.sha256,
             stored.size as i64,
@@ -1008,11 +1044,7 @@ impl Registry {
         .map_err(Failure::from)
         .and_then(require_linked)?;
         tx.commit().await?;
-        if let Some(bytes) = small {
-            self.complete_summaries(repo, &local, digest, bytes.len() as i64, None, Some(bytes))
-                .await;
-        }
-        self.hosted_blob(repo, &local, digest).await
+        Ok(())
     }
 
     /// A proxy caches a manifest before its config: once the config blob
