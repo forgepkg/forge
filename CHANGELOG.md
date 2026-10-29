@@ -12,6 +12,53 @@ until the release folds them in.
 
 ## [Unreleased]
 
+## [2.1.1]
+
+### Features
+
+- The upstream metadata documents that proxies hold at once while reading them
+  share one budget per instance, `proxy.max_metadata_memory_bytes` (256 MiB by
+  default). A read that would go over it waits for others to finish, up to
+  `proxy.metadata_timeout_seconds`, then answers 503 with `Retry-After`, where
+  before a restore against a cold proxy could grow the process past its memory
+  limit and have it killed. The deployment guide's
+  [Memory](docs/deployment.md#memory) section relates it to the pod's limit.
+  ([#668](https://github.com/forgepkg/forge/issues/668))
+- forge-server allocates memory with jemalloc instead of glibc's `malloc`.
+  Memory freed after a burst of requests, mostly large proxy metadata
+  documents, goes back to the system after about 10 s. With glibc it mostly
+  stayed with the process, whose resident memory climbed under load toward the
+  pod's memory limit and hardly came down. jemalloc takes its run-time options
+  from `_RJEM_MALLOC_CONF` (**Memory allocator** in the deployment guide);
+  glibc's `MALLOC_*` variables no longer apply.
+  ([#669](https://github.com/forgepkg/forge/issues/669))
+- Forge can publish patch releases of an older line, from its maintenance
+  branch, while `main` heads for the next minor version: 2.1.1 ships 2.1.0's
+  fixes without 2.2.0's changes. The image's `:<major>.<minor>` tag follows a
+  line's newest patch, and `:latest` the newest release of all.
+  ([#674](https://github.com/forgepkg/forge/issues/674))
+
+### Fixed
+
+- An npm proxy parsed the whole upstream packument into memory for every
+  operation of a packument read, several times its size each: reading the full
+  packuments of `typescript`, `@types/node`, `react-dom`, `tailwindcss` and
+  `vite` at once took over 600 MiB, and OOMKilled pods with a 1 GiB limit. Each
+  operation now reads only what it needs of it, a quarter of that. A full
+  packument larger than `proxy.max_metadata_bytes` (`vite`'s, 39 MB) no longer
+  answers 500: the full packument Forge serves leaves out the upstream's publish
+  times and the README, and a version's manifest comes from the version's own
+  document. A document over that limit is not downloaded again until the
+  metadata TTL has passed.
+  ([#671](https://github.com/forgepkg/forge/issues/671))
+
+### Security
+
+- The web UI's router serializes its state with `seroval`, which before 1.6.11
+  let serialized output inject code (GHSA-f86p-h4j2-7qgj, GHSA-9wx9-5pv9-3349);
+  the web UI now gets 1.6.12.
+  ([#677](https://github.com/forgepkg/forge/issues/677))
+
 ## [2.1.0]
 
 ### Upgrade notes
@@ -1504,7 +1551,8 @@ lists the required settings.
   `proxy.download_timeout_seconds` (1800); NuGet clients give up far
   earlier anyway.
 
-[Unreleased]: https://github.com/forgepkg/forge/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/forgepkg/forge/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/forgepkg/forge/releases/tag/v2.1.1
 [2.1.0]: https://github.com/forgepkg/forge/releases/tag/v2.1.0
 [2.0.0]: https://github.com/forgepkg/forge/releases/tag/v2.0.0
 [1.1.0]: https://github.com/forgepkg/forge/releases/tag/v1.1.0
