@@ -2,7 +2,7 @@
   "name": "forge-web",
   "private": true,
   "type": "module",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "license": "MIT",
   "packageManager": "pnpm@11.5.0",
   "description": "Forge admin + browse SPA (TanStack Router, SPA mode, served by the Rust server).",
