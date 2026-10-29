@@ -93,7 +93,8 @@ async fn multipart_upload_round_trips() {
 // ── multipart abort (review 2026-10-02 L2) ──────────────────────────────────
 
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -101,13 +102,26 @@ use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use forge_storage::{BlobStore, S3Config, S3Credentials};
 
+/// How long after the first `CompleteMultipartUpload` a fake with
+/// `lost_complete` makes the object readable: past the SDK's first retry
+/// (at most a second of backoff).
+const LANDS_AFTER: Duration = Duration::from_secs(2);
+
 /// A minimal in-process S3 endpoint that speaks just enough of the multipart
 /// protocol to inject the faults versitygw cannot: `CompleteMultipartUpload`
-/// always fails, and `UploadPart` optionally never answers (a stalled
-/// transfer the test can cancel). It records every abort it receives.
+/// fails, or loses its first answer, and `UploadPart` optionally never
+/// answers (a stalled transfer the test can cancel). It records every abort
+/// it receives.
 #[derive(Default)]
 struct FakeS3 {
     stall_parts: bool,
+    /// The first complete answers 500 (an answer lost on the way, which the
+    /// SDK retries) while its object lands [`LANDS_AFTER`] later, and the
+    /// retry answers success at once: what versitygw does with a complete
+    /// that arrives while the first call still assembles the object.
+    lost_complete: bool,
+    /// When the object becomes readable.
+    lands_at: Mutex<Option<Instant>>,
     completes: AtomicUsize,
     aborts: AtomicUsize,
     part_started: tokio::sync::Notify,
@@ -115,13 +129,11 @@ struct FakeS3 {
 }
 
 impl FakeS3 {
-    /// Serve a fake on an ephemeral port and return it with a store pointed at
-    /// it. The threshold of 1 byte sends every body down the multipart path.
-    async fn start(stall_parts: bool) -> (Arc<Self>, BlobStore) {
-        let fake = Arc::new(FakeS3 {
-            stall_parts,
-            ..Default::default()
-        });
+    /// Serve `fake` on an ephemeral port and return it with a store pointed
+    /// at it. The threshold of 1 byte sends every body down the multipart
+    /// path.
+    async fn start(fake: FakeS3) -> (Arc<Self>, BlobStore) {
+        let fake = Arc::new(fake);
         let app = axum::Router::new()
             .fallback(fake_s3)
             .with_state(fake.clone());
@@ -155,8 +167,18 @@ async fn fake_s3(
 ) -> Response {
     let query = uri.query().unwrap_or_default();
     if method == Method::HEAD {
-        // The object is absent, so `put_if_absent` proceeds to upload.
-        StatusCode::NOT_FOUND.into_response()
+        // The object is absent until it lands, so `put_if_absent` proceeds
+        // to upload.
+        let landed = fake
+            .lands_at
+            .lock()
+            .unwrap()
+            .is_some_and(|at| Instant::now() >= at);
+        if landed {
+            StatusCode::OK.into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        }
     } else if method == Method::POST && query.contains("uploads") {
         xml(
             StatusCode::OK,
@@ -170,11 +192,25 @@ async fn fake_s3(
         }
         (StatusCode::OK, [("etag", "\"etag-1\"")]).into_response()
     } else if method == Method::POST && query.contains("uploadId=") {
-        fake.completes.fetch_add(1, SeqCst);
-        xml(
-            StatusCode::BAD_REQUEST,
-            "<Error><Code>InvalidPart</Code><Message>injected</Message></Error>",
-        )
+        let first = fake.completes.fetch_add(1, SeqCst) == 0;
+        if !fake.lost_complete {
+            xml(
+                StatusCode::BAD_REQUEST,
+                "<Error><Code>InvalidPart</Code><Message>injected</Message></Error>",
+            )
+        } else if first {
+            *fake.lands_at.lock().unwrap() = Some(Instant::now() + LANDS_AFTER);
+            xml(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "<Error><Code>InternalError</Code><Message>injected</Message></Error>",
+            )
+        } else {
+            xml(
+                StatusCode::OK,
+                "<CompleteMultipartUploadResult><Bucket>fake</Bucket><Key>k</Key>\
+                 <ETag>\"etag-1\"</ETag></CompleteMultipartUploadResult>",
+            )
+        }
     } else if method == Method::DELETE && query.contains("uploadId=") {
         fake.aborts.fetch_add(1, SeqCst);
         fake.aborted.notify_one();
@@ -188,7 +224,7 @@ async fn fake_s3(
 /// parts) before the error reaches the caller.
 #[tokio::test]
 async fn multipart_upload_aborted_when_complete_fails() {
-    let (fake, store) = FakeS3::start(false).await;
+    let (fake, store) = FakeS3::start(FakeS3::default()).await;
     let tmp = tempfile::NamedTempFile::new().unwrap();
     tokio::fs::write(tmp.path(), vec![7u8; 1024]).await.unwrap();
 
@@ -208,7 +244,11 @@ async fn multipart_upload_aborted_when_complete_fails() {
 /// the request handler) aborts the multipart upload from a spawned task.
 #[tokio::test]
 async fn multipart_upload_aborted_when_cancelled() {
-    let (fake, store) = FakeS3::start(true).await;
+    let (fake, store) = FakeS3::start(FakeS3 {
+        stall_parts: true,
+        ..Default::default()
+    })
+    .await;
     let tmp = tempfile::NamedTempFile::new().unwrap();
     tokio::fs::write(tmp.path(), vec![7u8; 1024]).await.unwrap();
     let path = tmp.path().to_path_buf();
@@ -229,4 +269,41 @@ async fn multipart_upload_aborted_when_cancelled() {
         .expect("a dropped multipart upload must be aborted");
     assert_eq!(fake.aborts.load(SeqCst), 1);
     assert_eq!(fake.completes.load(SeqCst), 0);
+}
+
+/// #682: a `CompleteMultipartUpload` whose answer was lost is retried, and
+/// versitygw answers the retry with success while the first call still
+/// assembles the object. The upload returns only once the object is there,
+/// since its caller reads it right after (a docker proxy streams the layer
+/// back), and leaves the completed upload alone.
+#[tokio::test]
+async fn multipart_upload_waits_for_the_object_of_a_retried_complete() {
+    let (fake, store) = FakeS3::start(FakeS3 {
+        lost_complete: true,
+        ..Default::default()
+    })
+    .await;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    tokio::fs::write(tmp.path(), vec![7u8; 1024]).await.unwrap();
+
+    let uploaded = store
+        .put_if_absent("blobs/fake/retried-complete", tmp.path())
+        .await
+        .expect("the retried complete succeeds");
+    assert!(uploaded);
+    assert_eq!(
+        fake.completes.load(SeqCst),
+        2,
+        "the lost complete is retried"
+    );
+    let lands_at = fake.lands_at.lock().unwrap().expect("completed");
+    assert!(
+        Instant::now() >= lands_at,
+        "the upload returned before its object could be read"
+    );
+    assert_eq!(
+        fake.aborts.load(SeqCst),
+        0,
+        "a completed upload is not aborted"
+    );
 }
