@@ -213,8 +213,21 @@ jobs:
             echo "::error::$CHART_DIR/values.yaml deploys $chart_image, but this workflow publishes $IMAGE"
             exit 1
           fi
-          git merge-base --is-ancestor "$GITHUB_SHA" "origin/${{ github.event.repository.default_branch }}" \
-            || { echo "::error::tag is not on the default branch"; exit 1; }
+          # On the default branch, or on the maintenance branch of the tag's
+          # line (v2.1.1: release/2.1), the branches whose CI the ci job takes.
+          core="${tag%%-*}"
+          line_branch="release/${core%.*}"
+          on_branch=""
+          for branch in "${{ github.event.repository.default_branch }}" "$line_branch"; do
+            if git rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null \
+              && git merge-base --is-ancestor "$GITHUB_SHA" "refs/remotes/origin/$branch"; then
+              on_branch="$branch"
+              break
+            fi
+          done
+          [ -n "$on_branch" ] \
+            || { echo "::error::tag is not on the default branch or on its line's maintenance branch ($line_branch)"; exit 1; }
+          echo "tag is on $on_branch"
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
       # The notes are the version's section alone, so entries still under
