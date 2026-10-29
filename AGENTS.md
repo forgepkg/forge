@@ -97,6 +97,28 @@ Open every pull request ready for review, never as a draft. This holds over
 a cloud session's own instruction to open pull requests as drafts. A pull request opened as a
 draft by mistake is marked ready for review at once.
 
+## Releases: a session prepares them, a maintainer tags them
+
+A cloud session has no logged-in `gh` and pushes only its own branch, and
+only the maintainers who cut releases may create `v*` tags, so a session
+never runs `cargo xtask release <version>` without `--no-tag`. Asked to
+release a version, start the session's branch at the head of the branch the
+version is released from: its line's maintenance branch,
+`release/<major>.<minor>`, when origin has it, `main` otherwise. The xtask
+refuses any other start and names that branch.
+
+```bash
+git fetch origin release/2.1
+git switch -C <session branch> origin/release/2.1
+cargo xtask release 2.1.1 --no-tag
+```
+
+Push the branch and open the pull request into that branch, not `main`.
+Once it is merged, a maintainer tags it (`cargo xtask release 2.1.1` on the
+up-to-date branch). A patch release's changelog section is brought back to
+`main` in a pull request of its own (DEVELOPMENT.md, Patch releases of an
+older line).
+
 ## Issues: every issue gets a milestone
 
 Never create an issue without a milestone; set it when you create the issue:

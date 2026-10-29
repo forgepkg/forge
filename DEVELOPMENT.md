@@ -1183,7 +1183,10 @@ run skipped jobs, start such a run yourself while the commit is `main`'s head
 (`gh workflow run ci.yml --ref main`) and re-run the release workflow.
 
 Without `gh`, `cargo xtask release <version> --no-tag` only prepares the
-commit, on the current branch; the rest is manual:
+commit, on the current branch, and says which branch its pull request goes
+into; the rest is manual. It starts from the same commit as a full release,
+the head of the version's base branch on origin, whatever the branch checked
+out is called:
 
 ```bash
 git switch -c release-1.0.1 origin/main   # clean and up to date
@@ -1194,6 +1197,16 @@ git fetch origin
 git tag -a v1.0.1 -m v1.0.1 <merge commit>
 git push origin v1.0.1
 ```
+
+A Claude Code cloud session prepares a release this way: it has no
+logged-in `gh`, pushes only its own branch, and cannot create a `v*` tag
+(see Protect the release tags below). It starts its branch at the base
+(`git switch -C <its branch> origin/main`), runs `cargo xtask release 1.0.1
+--no-tag`, pushes the branch and opens the pull request into the base. Once
+the pull request is merged, the maintainer cutting the release runs `cargo
+xtask release 1.0.1` on the up-to-date base: the base carries the version
+already, so it commits nothing, starts a CI run of the base and tags it once
+that run passed.
 
 The xtask sets the version in `Cargo.toml`, `Cargo.lock` (`cargo update
 --workspace`), `web/package.json`, the Kubernetes base and the Helm chart. It
@@ -1239,8 +1252,13 @@ patch, and `:latest` the newest release of all.
    git cherry-pick -x <commits>
    ```
 
-3. **Release** from the branch: `cargo xtask release` releases from the
-   maintenance branch of the version's line when it is checked out.
+3. **Release** from the branch: `cargo xtask release` releases a version
+   from its line's maintenance branch whenever origin has one, and from the
+   default branch otherwise. It starts at that branch's head on origin,
+   whatever the branch checked out is called, and refuses any other commit,
+   so 2.1.1 is never released from `main` by mistake. From a cloud session,
+   the session's branch starts at `origin/release/2.1` and `--no-tag`
+   prepares the pull request into `release/2.1`, as above.
 
    ```bash
    git switch release/2.1 && git pull --ff-only

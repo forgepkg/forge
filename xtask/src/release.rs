@@ -14,10 +14,14 @@
 //! creates and pushes the annotated `v<version>` tag on the merge commit,
 //! which starts release.yml.
 //!
-//! The base branch is the default branch, or, for a patch release of an
-//! older line, that line's maintenance branch (`release/<major>.<minor>`,
-//! [`maintenance_branch`]) when it is the one checked out.
-//! `--no-tag` only commits, on the current branch, and pushes nothing.
+//! The version picks the base branch: its line's maintenance branch
+//! (`release/<major>.<minor>`, [`maintenance_branch`]) when origin has it, so
+//! that a patch release of an older line ships its fixes alone, and the
+//! default branch otherwise ([`release_base`]). The release starts at the
+//! base's head on origin, whatever the branch checked out is called (a cloud
+//! session works on a branch of its own). `--no-tag` only commits, on the
+//! current branch, and pushes nothing; it starts from the base all the same,
+//! and names it for the pull request.
 //! Every edit is computed before the first file is written, so a failed
 //! precondition leaves the tree untouched.
 //!
@@ -85,45 +89,49 @@ pub fn release(args: &[String]) -> Result<(), String> {
     if !git(&["status", "--porcelain"])?.is_empty() {
         return Err("release: the working tree has uncommitted changes".into());
     }
-    // The base branch, fetched with every tag: the release starts from its
-    // head, and the tag checks below see the tags pushed from elsewhere. The
-    // default branch, unless the version's maintenance branch is checked out.
-    let base = if publish {
-        let default = gh(&[
-            "repo",
-            "view",
-            "--json",
-            "defaultBranchRef",
-            "--jq",
-            ".defaultBranchRef.name",
-        ])
-        .map_err(|e| {
+    if publish {
+        // Only to fail before anything is written: the pull request needs it.
+        gh(&["repo", "view", "--json", "name", "--jq", ".name"]).map_err(|e| {
             format!(
                 "release: {e}. Opening and merging the release pull request takes the \
                  GitHub CLI, logged in (`gh auth login`); --no-tag only commits"
             )
         })?;
-        let line = maintenance_branch(&version);
-        let base = if git(&["rev-parse", "--abbrev-ref", "HEAD"])? == line {
-            line
+    }
+    // The base branch, picked by the version and not by the name of the
+    // branch checked out (a cloud session works on a branch of its own): the
+    // version's maintenance branch when origin has it, the default branch
+    // otherwise. Fetched with every tag: the release starts at its head on
+    // origin, and the tag checks below see the tags pushed from elsewhere.
+    let line = maintenance_branch(&version);
+    let heads = git(&[
+        "ls-remote",
+        "--symref",
+        "origin",
+        "HEAD",
+        &format!("refs/heads/{line}"),
+    ])?;
+    let base = release_base(&heads, &line).map_err(|e| format!("release: {e}"))?;
+    Cmd::new("git")
+        .args([
+            "fetch",
+            "--tags",
+            "origin",
+            &format!("+refs/heads/{base}:refs/remotes/origin/{base}"),
+        ])
+        .run()?;
+    if git(&["rev-parse", "HEAD"])? != git(&["rev-parse", &format!("origin/{base}")])? {
+        let from = if base == line {
+            "its line's maintenance branch"
         } else {
-            default
+            "the default branch"
         };
-        Cmd::new("git")
-            .args(["fetch", "--tags", "origin", &base])
-            .run()?;
-        if git(&["rev-parse", "HEAD"])? != git(&["rev-parse", &format!("origin/{base}")])? {
-            return Err(format!(
-                "release: HEAD is not origin/{base}, where the release starts: \
-                 `git switch {base} && git pull --ff-only` first (or the maintenance \
-                 branch `{}` for a patch release of its line)",
-                maintenance_branch(&version)
-            ));
-        }
-        Some(base)
-    } else {
-        None
-    };
+        return Err(format!(
+            "release: {version} is released from {from} `{base}`, and HEAD is not \
+             origin/{base}: `git switch {base} && git pull --ff-only` first, or start a \
+             branch of your own there (`git switch -c <branch> origin/{base}`)"
+        ));
+    }
     if git(&[
         "rev-parse",
         "--quiet",
@@ -175,17 +183,31 @@ pub fn release(args: &[String]) -> Result<(), String> {
         contents.push((CHANGELOG, released));
     }
 
-    let Some(base) = base else {
+    if !publish {
+        if contents.is_empty() {
+            // A release pull request merged already: what is left is the tag.
+            println!(
+                "origin/{base} already carries {version}, nothing to commit. Tag it with \
+                 `cargo xtask release {version}` on an up-to-date `{base}`, which starts a CI \
+                 run of it that runs every job and tags it once that run passed."
+            );
+            return Ok(());
+        }
         commit(&contents, fragments_dir.as_deref(), &tag_name)?;
         let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
         println!();
         println!(
-            "Prepared {tag_name} on `{branch}`. Open a pull request; once it is merged and CI \
-             on the merge commit (e2e and web-e2e included) is green, tag that commit:"
+            "Prepared {tag_name} on `{branch}`. Push it and open a pull request into `{base}`; \
+             once it is merged and CI on the merge commit (e2e and web-e2e included) is green, \
+             tag that commit:"
         );
         println!("  git tag -a {tag_name} -m {tag_name} <commit> && git push origin {tag_name}");
+        println!(
+            "or run `cargo xtask release {version}` on an up-to-date `{base}`, which commits \
+             nothing and tags it once a CI run of it passed."
+        );
         return Ok(());
-    };
+    }
     let (target, event) = if contents.is_empty() {
         let head = git(&["rev-parse", "HEAD"])?;
         println!(
@@ -422,6 +444,29 @@ pub fn maintenance_branch(version: &str) -> String {
     format!("release/{line}")
 }
 
+/// The branch a release of `line` starts from, out of `git ls-remote
+/// --symref origin HEAD refs/heads/<line>`: the maintenance branch `line`
+/// when origin has it, origin's default branch otherwise.
+fn release_base(heads: &str, line: &str) -> Result<String, String> {
+    let line_ref = format!("refs/heads/{line}");
+    let mut default = None;
+    for entry in heads.lines() {
+        match entry.split_once('\t') {
+            // `ref: refs/heads/main<TAB>HEAD`; the next line is its commit.
+            Some((target, "HEAD")) => {
+                if let Some(branch) = target.strip_prefix("ref: refs/heads/") {
+                    default = Some(branch);
+                }
+            }
+            Some((_, name)) if name == line_ref => return Ok(line.to_string()),
+            _ => {}
+        }
+    }
+    default.map(str::to_string).ok_or_else(|| {
+        "origin names no default branch (`git ls-remote --symref origin HEAD`)".into()
+    })
+}
+
 /// `MAJOR.MINOR.PATCH` with an optional `-PRERELEASE`, as release.yml's
 /// `v*.*.*` tags carry it.
 pub fn is_release_version(v: &str) -> bool {
@@ -618,6 +663,19 @@ mod tests {
         assert_eq!(maintenance_branch("2.1.1"), "release/2.1");
         assert_eq!(maintenance_branch("10.0.12"), "release/10.0");
         assert_eq!(maintenance_branch("2.1.2-rc.1"), "release/2.1");
+    }
+
+    #[test]
+    fn release_base_is_the_maintenance_branch_when_origin_has_it() {
+        let head = "ref: refs/heads/main\tHEAD\n0f8888798f69116c722e0dde294add4d25cd40cd\tHEAD\n";
+        assert_eq!(release_base(head, "release/2.2").unwrap(), "main");
+        let line =
+            format!("{head}cd6d5446cb73ce73ead177141a7a07666d0e9da7\trefs/heads/release/2.1\n");
+        assert_eq!(release_base(&line, "release/2.1").unwrap(), "release/2.1");
+        // Only the line's own branch: release/2.1 is not release/2.10's.
+        assert_eq!(release_base(&line, "release/2.10").unwrap(), "main");
+        let err = release_base("", "release/2.1").unwrap_err();
+        assert!(err.contains("default branch"), "{err}");
     }
 
     #[test]
