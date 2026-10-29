@@ -1125,6 +1125,80 @@ pub async fn delete_locked_manifest(
     }
 }
 
+/// The ids of the image's manifests, the newest first. An index is pushed
+/// after the manifests it lists, so deleting in this order never leaves
+/// one listing a manifest that is gone.
+pub async fn image_manifest_ids(
+    pool: &PgPool,
+    repository_id: i64,
+    image: &str,
+) -> sqlx::Result<Vec<i64>> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT id FROM oci_manifest
+        WHERE repository_id = $1 AND image = $2
+        ORDER BY id DESC
+        "#,
+        repository_id,
+        image,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Lock (`FOR UPDATE`) those of the manifests `ids` that still exist, in
+/// id order as [`lock_image_for_retention`] locks them, and return them.
+pub async fn lock_manifests(
+    tx: &mut Transaction<'_, Postgres>,
+    ids: &[i64],
+) -> sqlx::Result<Vec<i64>> {
+    sqlx::query_scalar!(
+        "SELECT id FROM oci_manifest WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        ids,
+    )
+    .fetch_all(&mut **tx)
+    .await
+}
+
+/// What [`delete_locked_manifests`] deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeletedManifests {
+    pub manifests: u64,
+    pub tags: u64,
+}
+
+/// [`delete_locked_manifest`] of many manifests the caller has locked
+/// `FOR UPDATE`, in a few statements whatever their number: their tags, the
+/// manifests, and one release of the manifests' own references
+/// ([`blob_dao::decref_many_and_maybe_enqueue_delete`]).
+pub async fn delete_locked_manifests(
+    tx: &mut Transaction<'_, Postgres>,
+    manifest_ids: &[i64],
+    grace: chrono::Duration,
+) -> sqlx::Result<DeletedManifests> {
+    if manifest_ids.is_empty() {
+        return Ok(DeletedManifests::default());
+    }
+    let tags = sqlx::query!(
+        "DELETE FROM oci_tag WHERE manifest_id = ANY($1)",
+        manifest_ids
+    )
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    let shas = sqlx::query_scalar!(
+        "DELETE FROM oci_manifest WHERE id = ANY($1) RETURNING blob_sha256",
+        manifest_ids,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    blob_dao::decref_many_and_maybe_enqueue_delete(tx, &shas, grace).await?;
+    Ok(DeletedManifests {
+        manifests: shas.len() as u64,
+        tags,
+    })
+}
+
 /// One page of an image's tags in byte order, after `last`.
 pub async fn list_tags(
     pool: &PgPool,

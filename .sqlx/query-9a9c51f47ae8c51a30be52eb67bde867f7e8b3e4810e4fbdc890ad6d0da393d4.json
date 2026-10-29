@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM oci_tag WHERE manifest_id = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9a9c51f47ae8c51a30be52eb67bde867f7e8b3e4810e4fbdc890ad6d0da393d4"
+}

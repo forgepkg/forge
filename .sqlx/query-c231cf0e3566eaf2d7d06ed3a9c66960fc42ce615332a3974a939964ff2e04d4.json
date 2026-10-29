@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO blob_outbox (op, sha256, s3_key, available_at)\n        SELECT 'delete_object', z.sha256, z.s3_key, now() + make_interval(secs => $3)\n        FROM unnest($1::text[], $2::text[]) AS z(sha256, s3_key)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c231cf0e3566eaf2d7d06ed3a9c66960fc42ce615332a3974a939964ff2e04d4"
+}

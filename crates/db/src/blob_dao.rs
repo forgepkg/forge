@@ -419,6 +419,67 @@ pub async fn decref_and_maybe_enqueue_delete(
     Ok(true)
 }
 
+/// [`decref_and_maybe_enqueue_delete`] of many references at once, one per
+/// entry of `sha256s` (a blob may be named more than once), in a few
+/// statements whatever their number. The blobs are locked in hash order
+/// first, so two such releases sharing blobs never deadlock. Returns how
+/// many blobs hit zero and were enqueued for deletion.
+pub async fn decref_many_and_maybe_enqueue_delete(
+    tx: &mut Transaction<'_, Postgres>,
+    sha256s: &[String],
+    grace: Duration,
+) -> sqlx::Result<u64> {
+    if sha256s.is_empty() {
+        return Ok(0);
+    }
+    sqlx::query_scalar!(
+        "SELECT sha256 FROM blob WHERE sha256 = ANY($1) ORDER BY sha256 FOR UPDATE",
+        sha256s,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let released = sqlx::query!(
+        r#"
+        UPDATE blob b
+        SET ref_count = b.ref_count - r.n
+        FROM (
+            SELECT sha256, count(*) AS n
+            FROM unnest($1::text[]) AS sha256
+            GROUP BY sha256
+        ) r
+        WHERE b.sha256 = r.sha256
+        RETURNING b.sha256, b.ref_count, b.s3_key
+        "#,
+        sha256s,
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+
+    // Those that hit zero: a deferred delete each, in the same transaction.
+    let (zero, keys): (Vec<String>, Vec<String>) = released
+        .into_iter()
+        .filter(|row| row.ref_count <= 0)
+        .map(|row| (row.sha256, row.s3_key))
+        .unzip();
+    if zero.is_empty() {
+        return Ok(0);
+    }
+    let grace_secs = grace.num_seconds();
+    sqlx::query!(
+        r#"
+        INSERT INTO blob_outbox (op, sha256, s3_key, available_at)
+        SELECT 'delete_object', z.sha256, z.s3_key, now() + make_interval(secs => $3)
+        FROM unnest($1::text[], $2::text[]) AS z(sha256, s3_key)
+        "#,
+        &zero,
+        &keys,
+        grace_secs as f64,
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(zero.len() as u64)
+}
+
 /// Reserve a due outbox blob for deletion.
 pub async fn reserve_outbox_delete(
     pool: &PgPool,

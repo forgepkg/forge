@@ -1298,6 +1298,155 @@ async fn admins_delete_tags_manifests_and_images() {
     assert_eq!(resp.status(), 204);
 }
 
+/// Deleting an image of more manifests than one batch (#612): every
+/// manifest and tag goes, a batch at a time, the newest first, so an index
+/// goes before the manifests it lists; each manifest's own blob is released
+/// once, and a blob another image's manifest still holds is kept.
+#[tokio::test]
+async fn admins_delete_an_image_of_many_manifests_in_batches() {
+    let srv = common::start().await;
+    let repo = repo_name("dock");
+    let created = create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let repo_id = created["id"].as_i64().unwrap();
+    let oci = admin_oci(&srv).await;
+    let name = format!("{repo}/team/app");
+    let other = format!("{repo}/team/other");
+    let (cfg, layer) = (config("amd64"), b"shared layer".to_vec());
+    for image in [&name, &other] {
+        oci.push_blob(image, &cfg).await;
+        oci.push_blob(image, &layer).await;
+    }
+    // More manifests than a batch takes (100), only the first few tagged.
+    let auth = oci.bearer(&name, "pull,push").await;
+    let mut digests = Vec::new();
+    for i in 0..105 {
+        let manifest = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": OCI_CONFIG, "digest": sha(&cfg), "size": cfg.len()},
+            "layers": [{"mediaType": LAYER, "digest": sha(&layer), "size": layer.len()}],
+            "annotations": {"build": i.to_string()},
+        })
+        .to_string()
+        .into_bytes();
+        let digest = sha(&manifest);
+        let reference = if i < 3 {
+            format!("v{i}")
+        } else {
+            digest.clone()
+        };
+        let resp = srv
+            .client()
+            .put(format!("{}/v2/{name}/manifests/{reference}", srv.base_url))
+            .header(AUTHORIZATION, &auth)
+            .header(CONTENT_TYPE, OCI_MANIFEST)
+            .body(manifest.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+        if i == 0 {
+            // The same manifest in another image holds the same blob.
+            let resp = oci
+                .put_manifest(&other, "v0", OCI_MANIFEST, &manifest)
+                .await;
+            assert_eq!(resp.status(), 201);
+        }
+        digests.push(digest);
+    }
+    let index = json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_INDEX,
+        "manifests": [
+            {"mediaType": OCI_MANIFEST, "digest": digests[0], "size": 1},
+            {"mediaType": OCI_MANIFEST, "digest": digests[1], "size": 1},
+        ]
+    })
+    .to_string()
+    .into_bytes();
+    assert_eq!(
+        oci.put_manifest(&name, "multi", OCI_INDEX, &index)
+            .await
+            .status(),
+        201
+    );
+    digests.push(sha(&index));
+
+    // The newest manifest, the index, is the first to go.
+    let ids = forge_db::oci_dao::image_manifest_ids(&srv.pool, repo_id, "team/app")
+        .await
+        .unwrap();
+    let index_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM oci_manifest WHERE repository_id = $1 AND image = 'team/app' AND digest = $2",
+    )
+    .bind(repo_id)
+    .bind(sha(&index))
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!((ids.len(), ids[0]), (106, index_id));
+
+    let (u, p) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .delete(format!("{}/admin/repositories/{repo}/images", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .query(&[("image", "team/app")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap(),
+        json!({"manifests": 106, "tags": 4})
+    );
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM oci_manifest WHERE repository_id = $1 AND image = 'team/app'",
+    )
+    .bind(repo_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+    for tag in ["v0", "v2", "multi"] {
+        assert_eq!(
+            oci.head(&name, &format!("manifests/{tag}")).await.status(),
+            404
+        );
+    }
+
+    // Each manifest's blob is released once: those of this image alone are
+    // queued for deletion, the one the other image holds stays.
+    let blobs: Vec<String> = digests
+        .iter()
+        .map(|d| d.trim_start_matches("sha256:").to_string())
+        .collect();
+    let counts: Vec<(String, i64)> =
+        sqlx::query_as("SELECT sha256, ref_count FROM blob WHERE sha256 = ANY($1)")
+            .bind(&blobs)
+            .fetch_all(&srv.pool)
+            .await
+            .unwrap();
+    assert_eq!(counts.len(), blobs.len());
+    for (sha256, ref_count) in &counts {
+        let expected = i64::from(*sha256 == blobs[0]);
+        assert_eq!(*ref_count, expected, "{sha256}");
+    }
+    let queued: Vec<String> =
+        sqlx::query_scalar("SELECT sha256 FROM blob_outbox WHERE sha256 = ANY($1)")
+            .bind(&blobs)
+            .fetch_all(&srv.pool)
+            .await
+            .unwrap();
+    assert_eq!(queued.len(), blobs.len() - 1);
+    assert!(!queued.contains(&blobs[0]));
+    assert_eq!(oci.head(&other, "manifests/v0").await.status(), 200);
+}
+
 const HELM_CONFIG: &str = "application/vnd.cncf.helm.config.v1+json";
 const HELM_CHART: &str = "application/vnd.cncf.helm.chart.content.v1.tar+gzip";
 
