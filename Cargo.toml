@@ -21,7 +21,7 @@ members = [
 # One version for the whole product: every crate inherits it, so a release
 # bumps it here once (and `web/package.json` to match).
 [workspace.package]
-version = "2.1.0"
+version = "2.1.1"
 edition = "2021"
 rust-version = "1.99"
 # MIT (see LICENSE and README → License).

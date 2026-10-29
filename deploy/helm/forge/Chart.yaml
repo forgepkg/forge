@@ -7,8 +7,8 @@ apiVersion: v2
 name: forge
 description: Self-hosted NuGet, Docker / OCI and Helm registry (hosted, proxy and group repositories)
 type: application
-version: 2.1.0
-appVersion: "2.1.0"
+version: 2.1.1
+appVersion: "2.1.1"
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/forgepkg/forge
 sources:
