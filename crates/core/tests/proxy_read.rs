@@ -3383,6 +3383,48 @@ async fn search_timeouts_still_back_off_other_queries() {
     server.abort();
 }
 
+/// A document larger than `proxy.max_metadata_bytes` is not read, and not
+/// downloaded again for as long as a document would have been reused: every
+/// read of it would otherwise download up to the limit before it failed.
+#[tokio::test]
+async fn a_document_over_the_size_limit_is_not_downloaded_again() {
+    use forge_core::net::upstream::{UpstreamHttp, UpstreamHttpConfig};
+
+    let pool = common::pool().await;
+    let cas = common::cas(&pool).await;
+    let mock = start_mock(sample_corpus("1.0.0")).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let count = attempts.clone();
+    let server = tokio::spawn(async move {
+        let app = Router::new().route(
+            "/flat/sample.lib/index.json",
+            get(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async { format!("{{\"versions\": [\"{}\"]}}", "1".repeat(64 * 1024)) }
+            }),
+        );
+        axum::serve(listener, app).await.unwrap();
+    });
+    mock.override_index(serde_json::json!({ "version": "3.0.0", "resources": [
+        { "@id": format!("http://{addr}/flat/"), "@type": "PackageBaseAddress/3.0.0" },
+    ] }));
+    let repo = make_proxy(&pool, &format!("{}/index.json", mock.base), 0, true).await;
+    let http = UpstreamHttp::new(UpstreamHttpConfig {
+        max_metadata_bytes: 16 * 1024,
+        ..Default::default()
+    })
+    .unwrap();
+    let px = proxy_repo(&pool, cas, Cache::l1_only(128)).with_http(http);
+
+    for _ in 0..3 {
+        let _ = px.list_versions(&repo, "sample.lib").await;
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
 #[tokio::test]
 async fn search_excessive_skip_uses_local_pagination_without_disabling_upstream() {
     let pool = common::pool().await;
