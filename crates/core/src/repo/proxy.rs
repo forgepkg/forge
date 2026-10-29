@@ -132,6 +132,7 @@ use tracing::Instrument;
 
 use crate::authz::PackageFilter;
 use crate::format::Format;
+use crate::net::budget::Held;
 use crate::net::origins::{named_origins, UpstreamOrigins};
 use crate::net::upstream::{
     status_is_unavailable, Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp,
@@ -615,16 +616,22 @@ impl ProxyRepo {
         // for the budget (then nothing more is sent).
         let held = AtomicU64::new(0);
         let exhausted = AtomicBool::new(false);
+        // The documents' bytes in the instance's budget ([`Self::fetch_held`]),
+        // given back when the conversation ends. They go into the format's
+        // task with the documents: a request dropped while the format reads
+        // them gives them back once it is done, not before.
+        let mut holds: Vec<Held> = Vec::new();
         for _ in 0..MAX_UPSTREAM_ROUNDS {
             let format = self.format.clone();
             let (asked, round) = (remote.clone(), op.clone());
-            let (step, back) = tokio::task::spawn_blocking(move || {
+            let (step, back, kept) = tokio::task::spawn_blocking(move || {
                 let step = format.upstream(&asked, &round, &fetched);
-                (step, fetched)
+                (step, fetched, holds)
             })
             .await
             .map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))?;
             fetched = back;
+            holds = kept;
             let wanted = match step
                 .map_err(|e| RepoError::Storage(format!("upstream protocol: {e}")))?
             {
@@ -683,19 +690,19 @@ impl ProxyRepo {
             }
             // Each fetch is judged by the origins known when the round
             // starts; what its document names counts from the next round.
-            let results: Vec<(api::FetchResult, Vec<Origin>, Trouble)> =
+            let results: Vec<(api::FetchResult, Vec<Origin>, Trouble, Option<Held>)> =
                 futures_util::stream::iter(wanted)
                     .map(|fetch| {
                         let permitted = origins.permits(&fetch.url);
                         let (held, exhausted) = (&held, &exhausted);
                         async move {
-                            let (outcome, named, down) = if !permitted {
-                                (self.refuse(repo, &fetch.url), Vec::new(), Trouble::None)
+                            let (outcome, named, down, hold) = if !permitted {
+                                (self.refuse(repo, &fetch.url), Vec::new(), Trouble::None, None)
                             } else if exhausted.load(Ordering::Relaxed) {
-                                (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None)
+                                (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None, None)
                             } else {
-                                match self.fetch(repo, &fetch).await {
-                                    (api::Fetched::Found(body), named, down) => {
+                                match self.fetch_held(repo, &fetch).await {
+                                    (api::Fetched::Found(body), named, down, hold) => {
                                         let size = body.len() as u64;
                                         let kept = held
                                             .try_update(Ordering::Relaxed, Ordering::Relaxed, |h| {
@@ -703,12 +710,12 @@ impl ProxyRepo {
                                             })
                                             .is_ok();
                                         if kept {
-                                            (api::Fetched::Found(body), named, down)
+                                            (api::Fetched::Found(body), named, down, hold)
                                         } else {
                                             if !exhausted.swap(true, Ordering::Relaxed) {
                                                 tracing::warn!(format = %self.format.id(), repo = %repo.name, url = %fetch.url, budget, "an upstream conversation's documents exceed its byte budget; the rest are not read");
                                             }
-                                            (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None)
+                                            (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None, None)
                                         }
                                     }
                                     other => other,
@@ -720,21 +727,75 @@ impl ProxyRepo {
                                 status: None,
                                 headers: Vec::new(),
                             };
-                            (result, named, down)
+                            (result, named, down, hold)
                         }
                     })
                     .buffered(FETCH_CONCURRENCY)
                     .collect()
                     .await;
-            for (result, named, down) in results {
+            for (result, named, down, hold) in results {
                 origins.extend(named);
                 fetched.push(result);
                 trouble = trouble.max(down);
+                holds.extend(hold);
             }
         }
         Err(RepoError::Storage(format!(
             "upstream protocol needed more than {MAX_UPSTREAM_ROUNDS} rounds"
         )))
+    }
+
+    /// [`Self::fetch`], with the document's bytes held in the instance's
+    /// budget ([`DocumentBudget`](crate::net::budget::DocumentBudget),
+    /// `proxy.max_metadata_memory_bytes`). When they are not free, the
+    /// document is let go while the conversation waits for them, up to the
+    /// metadata timeout, then read again (from the local cache, unless it
+    /// expired meanwhile): a waiting conversation holds no document. When
+    /// they do not come free, the fetch fails as an unavailable upstream
+    /// does, and the request answers 503.
+    async fn fetch_held(
+        &self,
+        repo: &Repository,
+        fetch: &api::Fetch,
+    ) -> (api::Fetched, Vec<Origin>, Trouble, Option<Held>) {
+        let budget = self.http.document_budget();
+        let (outcome, named, down) = self.fetch(repo, fetch).await;
+        let size = match &outcome {
+            api::Fetched::Found(body) => body.len() as u64,
+            _ => return (outcome, named, down, None),
+        };
+        if let Some(hold) = budget.try_hold(size) {
+            return (outcome, named, down, Some(hold));
+        }
+        drop(outcome);
+        let Some(mut hold) = budget.hold(size, self.http.config().metadata_timeout).await else {
+            tracing::warn!(format = %self.format.id(), repo = %repo.name, url = %fetch.url, budget = budget.bytes(), "the upstream documents being read hold all of proxy.max_metadata_memory_bytes; not read");
+            let reason = format!(
+                "{}: not read, the upstream documents being read hold all of \
+                 proxy.max_metadata_memory_bytes ({} bytes)",
+                fetch.url,
+                budget.bytes()
+            );
+            return (
+                api::Fetched::Failed(reason),
+                Vec::new(),
+                Trouble::Unavailable,
+                None,
+            );
+        };
+        let (outcome, named, down) = self.fetch(repo, fetch).await;
+        // Read again after it expired, it may have grown: hold the rest too
+        // when it is free, else read it anyway.
+        if let api::Fetched::Found(body) = &outcome {
+            if let Some(more) = (body.len() as u64)
+                .checked_sub(size)
+                .filter(|more| *more > 0)
+                .and_then(|more| budget.try_hold(more))
+            {
+                hold.merge(more);
+            }
+        }
+        (outcome, named, down, Some(hold))
     }
 
     /// The outcome of a fetch past the byte budget of its conversation
