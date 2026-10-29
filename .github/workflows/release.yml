@@ -30,8 +30,10 @@ name: Release
 # comment); Dependabot keeps them current. The build's helpers (BuildKit, the
 # SBOM generator, the Dockerfile frontend) are pinned by digest as well.
 #
-# Guard rails: the tag must point at a commit on the default branch whose CI
-# run (ci.yml) passed, e2e and web-e2e included (the `ci` job waits for it).
+# Guard rails: the tag must point at a commit on the default branch, or on its
+# line's maintenance branch (`release/<major>.<minor>`, for a patch release of
+# an older line; DEVELOPMENT.md, Releasing), whose CI run (ci.yml) passed, e2e
+# and web-e2e included (the `ci` job waits for it).
 # It must equal the workspace version in Cargo.toml, the web/package.json
 # version, the image tag of the Kubernetes base (deploy/kubernetes/base) and
 # the Helm chart's version and appVersion. `cargo xtask release <version>`
@@ -70,9 +72,10 @@ env:
   HELM_VERSION: v4.3.1
 
 jobs:
-  # Nothing is built for a commit whose CI did not pass on the default branch,
+  # Nothing is built for a commit whose CI did not pass on the default branch
+  # or on the maintenance branch of the tag's line (`release/<major>.<minor>`),
   # e2e and web-e2e included: pull requests never run those two. Passes once
-  # one CI run (ci.yml, a push or a manual run on the default branch) of the
+  # one CI run (ci.yml, a push or a manual run on one of those branches) of the
   # tagged commit has succeeded with every job in REQUIRED_JOBS; waits up to an
   # hour for runs still queued or in progress (a tag pushed right after the
   # merge), and fails when every run has finished without passing. A push run
@@ -104,11 +107,18 @@ jobs:
             done
             return 1
           }
+          # v2.1.1: release/2.1, where a patch of the 2.1 line is released.
+          version="${GITHUB_REF_NAME#v}"
+          core="${version%%-*}"
+          LINE_BRANCH="release/${core%.*}"
+          BRANCHES="$DEFAULT_BRANCH or $LINE_BRANCH"
           start=$(date +%s)
           while :; do
             # Newest first; the jobs endpoint reports a run's latest attempt.
-            runs=$(api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&branch=${DEFAULT_BRANCH}&per_page=100" \
-              --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | "\(.id) \(.status) \(.conclusion // "none")"')
+            runs=$(for branch in "$DEFAULT_BRANCH" "$LINE_BRANCH"; do
+              api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&branch=${branch}&per_page=100" \
+                --jq '.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch") | "\(.id) \(.status) \(.conclusion // "none")"'
+            done)
             pending=0
             while read -r id status conclusion; do
               [ -n "$id" ] || continue
@@ -136,11 +146,11 @@ jobs:
             done <<< "$runs"
             elapsed=$(( $(date +%s) - start ))
             if [ -z "$runs" ] && [ "$elapsed" -ge 600 ]; then
-              echo "::error::no CI run of $GITHUB_SHA on $DEFAULT_BRANCH; tag a commit CI ran on (the newest commit of a push to $DEFAULT_BRANCH) once that run passed"
+              echo "::error::no CI run of $GITHUB_SHA on $BRANCHES; tag a commit CI ran on (the newest commit of a push to $BRANCHES) once that run passed"
               exit 1
             fi
             if [ -n "$runs" ] && [ "$pending" -eq 0 ]; then
-              echo "::error::no CI run of $GITHUB_SHA on $DEFAULT_BRANCH passed with every job in: $REQUIRED_JOBS. A push run skips the jobs whose files the push did not change; while the commit is the head of $DEFAULT_BRANCH, start a full run (gh workflow run ci.yml --ref $DEFAULT_BRANCH), then re-run this workflow."
+              echo "::error::no CI run of $GITHUB_SHA on $BRANCHES passed with every job in: $REQUIRED_JOBS. A push run skips the jobs whose files the push did not change; while the commit is the head of its branch, start a full run (gh workflow run ci.yml --ref <branch>), then re-run this workflow."
               exit 1
             fi
             if [ "$elapsed" -ge 3600 ]; then
@@ -683,18 +693,21 @@ jobs:
 
       # Which floating tags this release may move: `latest` only for the
       # highest non-prerelease version and `<major>.<minor>` only for the
-      # highest of its line, counting only tags on the default branch (see the
-      # script; tested by xtask/tests/release_channels.rs). Decided against the
-      # tags as they are now, not at checkout: a newer tag pushed while this
-      # run was building keeps it from moving them.
+      # highest of its line, counting only tags on the default branch and the
+      # maintenance branches (see the script; tested by
+      # xtask/tests/release_channels.rs). Decided against the tags as they are
+      # now, not at checkout: a newer tag pushed while this run was building
+      # keeps it from moving them.
       - name: Decide floating tags
         id: channels
         shell: bash # -eo pipefail: a failing script fails the step
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          git fetch --force --tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
-          .github/scripts/release-channels.sh "$VERSION" "origin/${DEFAULT_BRANCH}" | tee -a "$GITHUB_OUTPUT"
+          git fetch --force --tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}" \
+            "+refs/heads/release/*:refs/remotes/origin/release/*"
+          mapfile -t branches < <(git for-each-ref --format='%(refname:short)' "refs/remotes/origin/${DEFAULT_BRANCH}" 'refs/remotes/origin/release/*')
+          .github/scripts/release-channels.sh "$VERSION" "${branches[@]}" | tee -a "$GITHUB_OUTPUT"
 
       # Attaching them again to the digest they already name (a re-run) changes
       # nothing.
