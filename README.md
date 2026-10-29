@@ -225,7 +225,9 @@ The guides below are also a site, with navigation and search:
   counted, and what goes first.
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers,
-  and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`).
+  and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`)
+  that publishes NuGet packages and pushes container images (`docker push`,
+  `dotnet publish`).
 - **[GitLab CI with workload identity](./docs/gitlab-ci.md)** — step by step:
   every job of a GitLab project restores from Forge's NuGet feeds, and only
   the release job, on a protected tag or environment, pushes the packages a

@@ -72,8 +72,10 @@ docker push forge.example.com/docker-hosted/team/app:1.3
   short-lived token.
 - **CI workloads** with a workload-identity realm pass their OIDC token, or
   the workload key it was exchanged for, as the password with the username
-  `oidc` ([trusted publishing](trusted-publishing.md)); their pushes and
-  deletes are recorded in the trusted-publishing ledger.
+  `oidc`; their pushes and deletes are recorded in the trusted-publishing
+  ledger. [Docker / OCI images](trusted-publishing.md#docker--oci-images)
+  shows the setup, and GitHub Actions and GitLab CI jobs that push with
+  `docker push` or `dotnet publish`.
 - **Anonymous pulls** work for repositories that allow anonymous read (with
   the anonymous mode on, Admin → Settings): clients get an anonymous token
   without logging in.
