@@ -1179,7 +1179,7 @@ async fn auth_routes_absent_when_oidc_disabled() {
         .send()
         .await
         .unwrap();
-    // Web UI is disabled in the default harness, so an unmounted route 404s.
+    // An unmounted route under `/auth` is a 404, not the SPA's `index.html`.
     assert_eq!(resp.status(), 404);
 }
 

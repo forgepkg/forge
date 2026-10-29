@@ -139,8 +139,8 @@ async fn spa_serving_and_api_precedence() {
             assert!(!body.contains("forge-spa"), "{path}: {body}");
         }
     }
-    // Removed feed prefixes are no longer API routes: when the UI is enabled,
-    // they fall through to its SPA fallback rather than reaching a feed.
+    // Removed feed prefixes are no longer API routes: they fall through to
+    // the SPA fallback rather than reaching a feed.
     for path in ["/v3/nuget/index.json", "/raw/binaries/file"] {
         let res = client
             .get(format!("{}{path}", server.base_url))

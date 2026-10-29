@@ -35,9 +35,8 @@ pnpm install --frozen-lockfile
 pnpm run build     # tsc --noEmit + vite build -> dist/
 ```
 
-The Rust server serves `dist/` when `web.enabled = true` (config) with
-`web.assets_dir` pointing at it (default `web/dist`). See
-`crates/server/src/web_ui.rs`.
+The Rust server serves `dist/` from `web.assets_dir` (config, default
+`web/dist`). See `crates/server/src/web_ui.rs`.
 
 ## Test
 

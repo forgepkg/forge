@@ -1684,31 +1684,34 @@ fn default_nuget_max_nuspec_compression_ratio() -> u64 {
 
 /// `web.*` — static SPA serving.
 ///
-/// When `enabled`, the server serves the built TanStack Start SPA from
-/// `assets_dir` (a directory containing `index.html` + `assets/*`), mounted as
-/// the router's fallback **after** the `/admin`, `/repository`, and `/browse` API
-/// routers so API paths always win. Unknown paths fall back to `index.html` so
+/// The server always serves the built TanStack Start SPA from `assets_dir` (a
+/// directory containing `index.html` + `assets/*`), mounted as the router's
+/// fallback **after** the `/admin`, `/repository`, and `/browse` API routers so
+/// API paths always win. Unknown paths fall back to `index.html` so
 /// client-side (TanStack Router) deep links resolve.
 ///
 /// `assets_dir` defaults to the relative path `web/dist`, matching the
 /// repository layout (`web/` is built by Vite into `web/dist/`). Container
-/// images set `FORGE_WEB__ASSETS_DIR` to the in-image asset path. A headless
-/// deployment sets `FORGE_WEB__ENABLED=false`.
+/// images set `FORGE_WEB__ASSETS_DIR` to the in-image asset path.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebConfig {
-    /// Serve the SPA. When false, only the API routers are mounted.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// Directory holding the built SPA (`index.html` + `assets/`).
     #[serde(default = "default_web_assets_dir")]
     pub assets_dir: String,
+    /// The removed `web.enabled`, kept only to refuse `false`: the
+    /// administration screens, the invitation page and the page approving a
+    /// browser login of `npm login` are the web UI's, so Forge always serves
+    /// it. `WebConfig` accepts unknown keys, so without this a headless
+    /// deployment would quietly get a UI. A leftover `true` changes nothing.
+    #[serde(default, rename = "enabled")]
+    removed_enabled: Option<bool>,
 }
 
 impl Default for WebConfig {
     fn default() -> Self {
         WebConfig {
-            enabled: default_true(),
             assets_dir: default_web_assets_dir(),
+            removed_enabled: None,
         }
     }
 }
@@ -2417,6 +2420,15 @@ impl Config {
                  instead (Maximum upload size in the web UI, max_upload_bytes in the admin \
                  API), then remove the setting. A package repository without a limit of its \
                  own accepts pushes of 512 MiB"
+                    .into(),
+            ));
+        }
+        if self.web.removed_enabled == Some(false) {
+            return Err(ConfigError::Invalid(
+                "web.enabled = false was removed: Forge always serves the web UI, which \
+                 holds the administration screens, the invitation page and the page that \
+                 approves an npm login in the browser. Remove web.enabled from the \
+                 configuration (FORGE_WEB__ENABLED included)"
                     .into(),
             ));
         }
@@ -3278,20 +3290,57 @@ mod tests {
         assert_eq!(cfg.outbox.processed_retention_seconds, 7 * 24 * 3600);
         assert_eq!(cfg.retention.poll_interval_seconds, 30);
         assert_eq!(cfg.retention.lease_seconds, 300);
-        // Web UI: enabled by default, served from `web/dist`.
-        assert!(cfg.web.enabled);
+        // Web UI: served from `web/dist`.
         assert_eq!(cfg.web.assets_dir, "web/dist");
     }
 
     #[test]
     fn web_block_overrides_defaults() {
+        let toml = MINIMAL.replace("[auth]", "[auth]\n[web]\nassets_dir = \"/srv/ui\"");
+        let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
+        assert_eq!(cfg.web.assets_dir, "/srv/ui");
+    }
+
+    /// The web UI cannot be turned off any more: `web.enabled = false` is
+    /// refused, naming the setting to remove, and a leftover `true` changes
+    /// nothing.
+    #[test]
+    fn web_enabled_false_is_refused() {
+        let toml = MINIMAL.replace("[auth]", "[auth]\n[web]\nenabled = false");
+        let err = Config::from_figment(fig_from_toml(&toml))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("web.enabled = false was removed")
+                && err.contains("Remove web.enabled")
+                && err.contains("FORGE_WEB__ENABLED"),
+            "{err}"
+        );
         let toml = MINIMAL.replace(
             "[auth]",
-            "[auth]\n[web]\nenabled = false\nassets_dir = \"/srv/ui\"",
+            "[auth]\n[web]\nenabled = true\nassets_dir = \"/srv/ui\"",
         );
         let cfg = Config::from_figment(fig_from_toml(&toml)).expect("valid");
-        assert!(!cfg.web.enabled);
         assert_eq!(cfg.web.assets_dir, "/srv/ui");
+        // No `[web]` section at all.
+        Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn web_enabled_false_variable_is_refused() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env("FORGE_WEB__ENABLED", "false");
+            let err = Config::load(Some(std::path::Path::new("forge.toml"))).unwrap_err();
+            assert!(
+                err.to_string().contains("web.enabled = false was removed"),
+                "{err}"
+            );
+            jail.set_env("FORGE_WEB__ENABLED", "true");
+            Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            Ok(())
+        });
     }
 
     #[test]
@@ -3376,7 +3425,6 @@ mod tests {
             jail.set_env("FORGE_OUTBOX__POLL_INTERVAL_SECONDS", "3");
             jail.set_env("FORGE_RETENTION__POLL_INTERVAL_SECONDS", "11");
             jail.set_env("FORGE_RETENTION__LEASE_SECONDS", "120");
-            jail.set_env("FORGE_WEB__ENABLED", "false");
             jail.set_env("FORGE_WEB__ASSETS_DIR", "/srv/ui");
             // OIDC section (redirect host must match public_base_url = https://forge.test).
             jail.set_env("FORGE_OIDC__ISSUER", "https://idp.test/v2.0");
@@ -3424,7 +3472,6 @@ mod tests {
             assert_eq!(cfg.outbox.poll_interval_seconds, 3);
             assert_eq!(cfg.retention.poll_interval_seconds, 11);
             assert_eq!(cfg.retention.lease_seconds, 120);
-            assert!(!cfg.web.enabled);
             assert_eq!(cfg.web.assets_dir, "/srv/ui");
             let oidc = cfg.oidc.as_ref().expect("oidc set via env");
             assert_eq!(oidc.issuer, "https://idp.test/v2.0");

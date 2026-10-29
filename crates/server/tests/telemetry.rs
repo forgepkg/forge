@@ -923,12 +923,8 @@ async fn a_request_joins_the_callers_trace_down_to_the_upstream_and_s3() {
 /// one that collects the user's token. No span holds either.
 #[tokio::test]
 async fn no_span_holds_the_secrets_of_a_web_login() {
-    // A web login is approved in the web UI: without it, none starts.
-    let assets = tempfile::tempdir().unwrap();
-    std::fs::write(assets.path().join("index.html"), "<html></html>").unwrap();
     let srv = start_with(common::ServerOpts {
         bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
-        web_assets_dir: Some(assets.path().display().to_string()),
         ..Default::default()
     })
     .await;

@@ -242,7 +242,6 @@ password = "$admin_password"
 grace_seconds = 0
 poll_interval_seconds = 2
 [web]
-enabled = true
 assets_dir = "$work/web"
 EOF
 FORGE_CONFIG="$work/forge.toml" RUST_LOG=info "$server_bin" > "$work/server.log" 2>&1 &
