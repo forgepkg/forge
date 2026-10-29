@@ -28,9 +28,15 @@ fn commit_and_tag(dir: &Path, tag: &str) {
 }
 
 fn channels(dir: &Path, version: &str) -> String {
+    channels_of(dir, version, &["main"])
+}
+
+/// The channels of `version`, counting the tags on `branches`.
+fn channels_of(dir: &Path, version: &str, branches: &[&str]) -> String {
     let out = Command::new("bash")
         .arg(script())
-        .args([version, "main"])
+        .arg(version)
+        .args(branches)
         .current_dir(dir)
         .output()
         .expect("run release-channels.sh");
@@ -64,6 +70,50 @@ fn only_default_branch_tags_decide_the_floating_tags() {
     assert_eq!(
         channels(&dir, "1.2.0-rc.1"),
         "latest=false\nline_latest=false\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn maintenance_branch_tags_count_too() {
+    let dir = std::env::temp_dir().join(format!(
+        "forge-release-channels-maintenance-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    commit_and_tag(&dir, "v1.0.0");
+    commit_and_tag(&dir, "v1.1.0");
+    // Maintenance branches off each line's newest release.
+    git(&dir, &["checkout", "-q", "-b", "release/1.0", "v1.0.0"]);
+    commit_and_tag(&dir, "v1.0.1");
+    git(&dir, &["checkout", "-q", "-b", "release/1.1", "v1.1.0"]);
+    commit_and_tag(&dir, "v1.1.1");
+    git(&dir, &["checkout", "-q", "-b", "stray", "main"]);
+    commit_and_tag(&dir, "v9.0.0");
+    git(&dir, &["checkout", "-q", "main"]);
+    let branches = ["main", "release/1.0", "release/1.1"];
+
+    // A patch of the newest line is the newest release.
+    assert_eq!(
+        channels_of(&dir, "1.1.1", &branches),
+        "latest=true\nline_latest=true\n"
+    );
+    // A patch of an older line moves only its line.
+    assert_eq!(
+        channels_of(&dir, "1.0.1", &branches),
+        "latest=false\nline_latest=true\n"
+    );
+    // The release it patches no longer moves either.
+    assert_eq!(
+        channels_of(&dir, "1.1.0", &branches),
+        "latest=false\nline_latest=false\n"
+    );
+    // Counting the default branch alone, a patch tagged elsewhere is unknown.
+    assert_eq!(
+        channels_of(&dir, "1.1.0", &["main"]),
+        "latest=true\nline_latest=true\n"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
