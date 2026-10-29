@@ -27,7 +27,6 @@ fn repo(kind: RepositoryKind) -> Repository {
         kind,
         base_url: BASE.into(),
         inline: false,
-        reserved_prefixes: Vec::new(),
     }
 }
 
@@ -549,8 +548,7 @@ fn search_renders_what_npm_search_prints() {
 
 #[test]
 fn audits_go_upstream_without_internal_names() {
-    let mut group = repo(RepositoryKind::Group);
-    group.reserved_prefixes = vec!["@acme/".into()];
+    let group = repo(RepositoryKind::Group);
     let req = Request::new("POST", "/-/npm/v1/security/advisories/bulk");
     let body = br#"{"@acme/ui": ["1.0.0"], "left-pad": ["1.3.0"]}"#;
     let served = serve_with_body(&Npm::default(), &group, &req, body, |q| {
@@ -560,7 +558,11 @@ fn audits_go_upstream_without_internal_names() {
         panic!("expected a forward, got {:?}", served.outcome);
     };
     assert_eq!(forward.path, "/-/npm/v1/security/advisories/bulk");
-    let sent: Value = serde_json::from_slice(&forward.body).unwrap();
+    assert_eq!(forward.body, body);
+    // Through a group, the host sends what the plugin leaves of the body.
+    let hidden = |name: &str| name.starts_with("@acme/");
+    let sent = Npm::default().forward_body(&forward, &hidden).unwrap();
+    let sent: Value = serde_json::from_slice(&sent).unwrap();
     assert_eq!(sent, json!({"left-pad": ["1.3.0"]}));
     // Other audit endpoints are not forwarded.
     let served = MockRepo::default().serve(&Request::new("POST", "/-/npm/v1/security/anything"));

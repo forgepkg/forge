@@ -223,10 +223,6 @@ pub struct Repository {
     /// [`Action::ServeFile`] serves them. Always `false` for a package
     /// format.
     pub inline: bool,
-    /// A group's reserved prefixes ([`crate::FormatPlugin::reserved_prefix`]
-    /// forms): package ids that are never served from its proxy members.
-    /// Empty for any other repository.
-    pub reserved_prefixes: Vec<String>,
 }
 
 /// An HTTP request from a package client.
@@ -923,7 +919,10 @@ pub enum AuthOutcome {
 /// A request the host sends on to the upstream of the repository (a proxy)
 /// or of a group's first proxy member the caller may read: npm's audits.
 /// The upstream's status, content type and body are the response. A hosted
-/// repository has no upstream: 404.
+/// repository has no upstream: 404. Through a group, the host sends the body
+/// [`FormatPlugin::forward_body`] leaves of it.
+///
+/// [`FormatPlugin::forward_body`]: crate::FormatPlugin::forward_body
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forward {
     /// The path below the upstream's `remote_url`, starting with `/`

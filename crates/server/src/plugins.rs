@@ -361,11 +361,6 @@ async fn serve(
         },
         base_url: repository_url(state, &repo.name),
         inline: stores_files && repo.inline_content(),
-        reserved_prefixes: if repo.kind() == RepoKind::Group {
-            repo.reserved_prefixes()
-        } else {
-            Vec::new()
-        },
     };
     let request = protocol::Request {
         method: method.as_str().to_string(),
@@ -1632,14 +1627,17 @@ impl Ctx<'_> {
 
     /// The proxy whose upstream a forward from `repo` goes to: the
     /// repository itself, or a group's first proxy member (by priority)
-    /// the caller may read, through nested groups.
+    /// the caller may read, through nested groups. With it, the reserved
+    /// prefixes of every group on the way, whose packages the forward
+    /// leaves out: reading through an outer group keeps an inner group's
+    /// packages inside as reading it directly does.
     async fn forward_source(
         &self,
         repo: &Repository,
         depth: u32,
-    ) -> Result<Option<Repository>, RepoError> {
+    ) -> Result<Option<(Repository, Vec<String>)>, RepoError> {
         match repo.kind() {
-            RepoKind::Proxy => Ok(Some(repo.clone())),
+            RepoKind::Proxy => Ok(Some((repo.clone(), Vec::new()))),
             RepoKind::Hosted => Ok(None),
             RepoKind::Group => {
                 let max = self.state.config.groups.max_nesting_depth.max(1) as u32;
@@ -1650,8 +1648,11 @@ impl Ctx<'_> {
                     if member.format != repo.format || !self.may(Level::Read, &member).await {
                         continue;
                     }
-                    if let Some(found) = Box::pin(self.forward_source(&member, depth + 1)).await? {
-                        return Ok(Some(found));
+                    if let Some((proxy, mut reserved)) =
+                        Box::pin(self.forward_source(&member, depth + 1)).await?
+                    {
+                        reserved.extend(repo.reserved_prefixes());
+                        return Ok(Some((proxy, reserved)));
                     }
                 }
                 Ok(None)
@@ -1660,10 +1661,12 @@ impl Ctx<'_> {
     }
 
     /// Send `forward` on to the upstream, with the proxy's credentials (to
-    /// its origin only), and answer with what the upstream said.
+    /// its origin only), and answer with what the upstream said. Through a
+    /// group with reserved prefixes on the way, the body goes without their
+    /// packages ([`FormatPlugin::forward_body`]), or not at all.
     async fn forward(&self, forward: Forward) -> Response {
-        let source = match self.forward_source(self.repo, 0).await {
-            Ok(Some(source)) => source,
+        let (source, reserved) = match self.forward_source(self.repo, 0).await {
+            Ok(Some(found)) => found,
             Ok(None) => {
                 return (
                     StatusCode::NOT_FOUND,
@@ -1687,6 +1690,36 @@ impl Ctx<'_> {
                 .into_response();
         };
         let url = format!("{}{}", remote.trim_end_matches('/'), forward.path);
+        let content_type = forward.content_type.clone();
+        let body = if reserved.is_empty() {
+            forward.body
+        } else {
+            let filtered = self
+                .call(move |plugin| {
+                    // Prefixes are stored lowercase; a name is matched in
+                    // any case, which keeps more inside, never less.
+                    let hidden = |name: &str| {
+                        let lower = name.to_lowercase();
+                        reserved
+                            .iter()
+                            .any(|prefix| lower.starts_with(prefix.as_str()))
+                    };
+                    plugin.forward_body(&forward, &hidden)
+                })
+                .await;
+            match filtered {
+                Ok(Some(body)) => body,
+                Ok(None) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "this request cannot be passed on without the packages this \
+                         repository keeps from its upstream (its reserved prefixes)",
+                    )
+                        .into_response()
+                }
+                Err(failed) => return failed,
+            }
+        };
         let credentials = match forge_core::repo::proxy::upstream_auth(
             &self.state.pool,
             &self.state.envelope,
@@ -1700,7 +1733,7 @@ impl Ctx<'_> {
         };
         let auth = credentials.as_ref().map(|c| c.auth());
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(content_type) = reqwest::header::HeaderValue::from_str(&forward.content_type) {
+        if let Ok(content_type) = reqwest::header::HeaderValue::from_str(&content_type) {
             headers.insert(reqwest::header::CONTENT_TYPE, content_type);
         }
         headers.insert(
@@ -1716,7 +1749,7 @@ impl Ctx<'_> {
                 RequestClass::Metadata,
                 headers,
                 auth.as_ref(),
-                Some(forward.body),
+                Some(body),
             )
             .await
         {

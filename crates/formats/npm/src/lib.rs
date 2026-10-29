@@ -32,7 +32,7 @@ use std::io::{Read, SeekFrom, Write};
 
 use forge_plugin_api::{
     Action, Assets, AuthOutcome, Change, Dependency, DependencyGroup, Descriptor, FetchResult,
-    FormatError, FormatPlugin, Loaded, PackageRef, PackageSource, ParsedPackage, Remote,
+    FormatError, FormatPlugin, Forward, Loaded, PackageRef, PackageSource, ParsedPackage, Remote,
     Repository, RepositoryKind, Request, Response, Storage, Unpacked, Uploaded, UpstreamOp,
     UpstreamStep, UpstreamToken,
 };
@@ -230,12 +230,16 @@ impl FormatPlugin for Npm {
         Ok(prefix)
     }
 
-    fn handle(&self, repo: &Repository, req: &Request) -> Action {
-        protocol::handle(self, repo, req)
+    fn handle(&self, _repo: &Repository, req: &Request) -> Action {
+        protocol::handle(self, req)
     }
 
     fn render(&self, repo: &Repository, req: &Request, data: &[Loaded]) -> Action {
         protocol::render(self, repo, req, data)
+    }
+
+    fn forward_body(&self, forward: &Forward, hidden: &dyn Fn(&str) -> bool) -> Option<Vec<u8>> {
+        protocol::forward_body(forward, hidden)
     }
 
     fn auth_response(&self, repo: &Repository, req: &Request, outcome: &AuthOutcome) -> Response {

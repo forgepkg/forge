@@ -37,7 +37,6 @@ pub fn repository(kind: RepositoryKind) -> Repository {
         kind,
         base_url: "https://forge.example.com/repository/repo".into(),
         inline: false,
-        reserved_prefixes: Vec::new(),
     }
 }
 

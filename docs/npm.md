@@ -271,9 +271,29 @@ A group serves its members, by priority:
 
 `npm audit` (and `pnpm audit`) asks the registry for advisories. A proxy
 passes the request on to its upstream with its credentials, and a group to
-its first proxy member; a group leaves the packages under its reserved
-prefixes out, so your internal package names stay inside. A hosted
+its first proxy member the caller may read, through nested groups. A hosted
 repository has no upstream to ask (404). Auditing needs `read`.
+
+Through a group, the request leaves out the packages under the reserved
+prefixes of every group on the way to that proxy: the group's own, and a
+nested group's when the proxy is its member. Your internal package names
+stay inside, as they do when you audit the nested group directly. Every
+audit request is filtered:
+
+- the bulk request of npm 7 and later
+  (`/-/npm/v1/security/advisories/bulk`), which names each package once;
+- the legacy requests (`/-/npm/v1/security/audits/quick` and `.../audits`:
+  npm 6, `pnpm audit`, and npm when the bulk request fails), whose
+  dependency tree loses those packages at every depth, aliases of them
+  (`npm:@acme/ui@^1.0.0`) and the project's own name when it is under a
+  reserved prefix. Of each package only its version, integrity and kind of
+  dependency go on.
+
+A request through such a group that cannot be filtered is refused (400),
+never passed on: a body that is not a JSON object, and a legacy request
+that names its packages by their paths in `node_modules` (`packages`, the
+lockfile of npm 7 and later). A proxy, or a group with no reserved prefixes
+on the way, passes the request on as it is.
 
 ## Permissions
 

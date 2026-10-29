@@ -1623,6 +1623,135 @@ async fn a_group_merges_and_keeps_internal_scopes_internal() {
 }
 
 #[tokio::test]
+async fn audits_through_nested_groups_keep_every_reserved_name_inside() {
+    let srv = common::start().await;
+    let token = srv.admin_token().await;
+    let upstream = Arc::new(Upstream::default());
+    let base = serve_upstream(upstream.clone()).await;
+    let n = unique();
+    let (hosted, proxy) = (format!("hosted{n}"), format!("proxy{n}"));
+    let (inner, outer) = (format!("inner{n}"), format!("outer{n}"));
+    create(
+        &srv,
+        json!({"name": hosted, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    create(
+        &srv,
+        json!({"name": proxy, "kind": "proxy", "format": "npm", "remote_url": base}),
+    )
+    .await;
+    create(
+        &srv,
+        json!({"name": inner, "kind": "group", "format": "npm", "reserved_prefixes": ["@acme"]}),
+    )
+    .await;
+    add_member(&srv, &inner, &hosted, 10).await;
+    add_member(&srv, &inner, &proxy, 5).await;
+    // The outer group reserves nothing itself: its member's prefixes count.
+    create(
+        &srv,
+        json!({"name": outer, "kind": "group", "format": "npm"}),
+    )
+    .await;
+    add_member(&srv, &outer, &inner, 10).await;
+
+    let audit = |repo: &str, kind: &str, body: Vec<u8>| {
+        let npm = Npm::new(&srv, repo, Some(token.clone()));
+        let kind = kind.to_string();
+        async move {
+            let resp = npm
+                .req(reqwest::Method::POST, &format!("-/npm/v1/security/{kind}"))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, resp.text().await.unwrap())
+        }
+    };
+    let bulk = json!({"@acme/ui": ["1.0.0"], "left-pad": ["1.3.0"]});
+    // npm 6 (`audits/quick` on install, `audits` for `npm audit`), with an
+    // alias of an internal package.
+    let tree = json!({
+        "name": "@acme/app",
+        "version": "1.0.0",
+        "requires": {"@acme/ui": "^1.0.0", "left-pad": "^1.3.0", "ui": "npm:@acme/ui@^1.0.0"},
+        "dependencies": {
+            "@acme/ui": {"version": "1.0.0", "requires": {"left-pad": "1.3.0"}},
+            "ui": {"version": "npm:@acme/ui@1.0.0"},
+            "left-pad": {
+                "version": "1.3.0",
+                "requires": {"@acme/core": "2.0.0"},
+                "dependencies": {"@acme/core": {"version": "2.0.0"}}
+            }
+        },
+        "install": ["@acme/ui@1.0.0", "left-pad@1.3.0"],
+        "remove": [],
+        "metadata": {"npm_version": "6.14.18", "node_version": "v14.21.3", "platform": "linux"}
+    });
+    for repo in [&outer, &inner] {
+        upstream.audits.lock().unwrap().clear();
+        for (kind, body) in [
+            ("advisories/bulk", &bulk),
+            ("audits/quick", &tree),
+            ("audits", &tree),
+        ] {
+            let (status, text) = audit(repo, kind, serde_json::to_vec(body).unwrap()).await;
+            assert_eq!(status, 200, "{kind} through {repo}: {text}");
+        }
+        let sent = upstream.audits.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3, "{sent:?}");
+        assert_eq!(sent[0], json!({"left-pad": ["1.3.0"]}));
+        let filtered = json!({
+            "version": "1.0.0",
+            "requires": {"left-pad": "^1.3.0"},
+            "dependencies": {"left-pad": {"version": "1.3.0", "requires": {}, "dependencies": {}}},
+            "install": ["left-pad@1.3.0"],
+            "remove": [],
+            "metadata": {"npm_version": "6.14.18", "node_version": "v14.21.3", "platform": "linux"}
+        });
+        assert_eq!(sent[1], filtered);
+        assert_eq!(sent[2], filtered);
+        for body in &sent {
+            assert!(!body.to_string().contains("acme"), "{body}");
+        }
+    }
+
+    // A body that cannot be filtered is refused, never passed on.
+    upstream.audits.lock().unwrap().clear();
+    for (kind, body) in [
+        ("advisories/bulk", b"[{\"@acme/ui\": [\"1.0.0\"]}]".to_vec()),
+        ("advisories/bulk", b"{\"@acme/ui\": [".to_vec()),
+        ("audits", b"\"@acme/ui\"".to_vec()),
+        (
+            "audits/quick",
+            serde_json::to_vec(&json!({"lockfileVersion": 3, "packages": {"node_modules/@acme/ui": {"version": "1.0.0"}}}))
+                .unwrap(),
+        ),
+    ] {
+        let (status, text) = audit(&outer, kind, body).await;
+        assert_eq!(status, 400, "{kind}: {text}");
+        assert!(
+            serde_json::from_str::<Value>(&text).unwrap()["error"].is_string(),
+            "{text}"
+        );
+    }
+    assert!(upstream.audits.lock().unwrap().is_empty());
+
+    // The proxy itself reserves nothing: what it is sent goes on as it is.
+    let (status, _) = audit(
+        &proxy,
+        "advisories/bulk",
+        serde_json::to_vec(&bulk).unwrap(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(upstream.audits.lock().unwrap().clone(), vec![bulk]);
+}
+
+#[tokio::test]
 async fn retention_never_deletes_a_tagged_version() {
     let srv = common::start().await;
     let repo = format!("npm{}", unique());

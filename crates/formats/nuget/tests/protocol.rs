@@ -24,7 +24,6 @@ fn repo(kind: RepositoryKind) -> Repository {
         kind,
         base_url: format!("{BASE}/repository/main"),
         inline: false,
-        reserved_prefixes: Vec::new(),
     }
 }
 
