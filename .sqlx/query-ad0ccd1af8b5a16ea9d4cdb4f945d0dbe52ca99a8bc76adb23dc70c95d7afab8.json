@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE blob b\n        SET ref_count = b.ref_count - r.n\n        FROM (\n            SELECT sha256, count(*) AS n\n            FROM unnest($1::text[]) AS sha256\n            GROUP BY sha256\n        ) r\n        WHERE b.sha256 = r.sha256\n        RETURNING b.sha256, b.ref_count, b.s3_key\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob",
+            "name": "sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ref_count",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "blob",
+            "name": "ref_count"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "s3_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "blob",
+            "name": "s3_key"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ad0ccd1af8b5a16ea9d4cdb4f945d0dbe52ca99a8bc76adb23dc70c95d7afab8"
+}

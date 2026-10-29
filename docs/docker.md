@@ -296,6 +296,14 @@ pulling that platform through the index then fails. The answer counts the
 manifests and tags deleted (404 when nothing matched). A hosted repository is
 deleted only once it holds no image, so emptying one is deleting its images.
 
+The whole image goes 100 manifests at a time, the newest first, each batch
+in a transaction of its own: an image of tens of thousands of manifests
+never keeps them all locked, so pulls and pushes wait for one batch at most.
+An index goes before the manifests it lists. A delete that is interrupted
+(the connection dropped, the server stopped) leaves a smaller image whose
+indexes are whole; delete it again to finish. A manifest pushed to the image
+while the delete runs goes too.
+
 The catalog API (`/v2/_catalog`) is not supported.
 
 ## Retention and garbage collection

@@ -11,7 +11,13 @@
 //!   it kept ([`taken_along`]): the manifests an index lists that nothing
 //!   else lists or tags, and its referrers (signatures, SBOMs,
 //!   attestations), as image retention would take them along.
-//! * no `reference`: deletes the image, every manifest and tag of it.
+//! * no `reference`: deletes the image, every manifest and tag of it, in
+//!   batches of [`IMAGE_DELETE_BATCH`] manifests, the newest first, each in
+//!   a transaction of its own: an image of tens of thousands of manifests
+//!   never keeps them all locked, and a pull waits for one batch at most.
+//!   Indexes go before the manifests they list, so an interrupted delete
+//!   leaves a smaller image whose indexes are whole, and deleting it again
+//!   finishes it. A manifest pushed while the delete runs goes too.
 //!
 //! An empty `reference` (`reference=`, as a script with an unset variable
 //! sends it) is refused (**400**): only its absence deletes the whole image.
@@ -101,7 +107,7 @@ pub async fn delete(
                     .into_response();
             };
             (
-                delete_manifests(&state, repo.id, &query.image, Some(digest.as_str()), grace).await,
+                delete_manifest(&state, repo.id, &query.image, digest.as_str(), grace).await,
                 "manifest not found",
             )
         }
@@ -110,7 +116,7 @@ pub async fn delete(
             "tag not found",
         ),
         None => (
-            delete_manifests(&state, repo.id, &query.image, None, grace).await,
+            delete_image(&state, repo.id, &query.image, grace).await,
             "image not found",
         ),
     };
@@ -148,36 +154,64 @@ async fn delete_tag(
     })
 }
 
-/// Delete the manifest `digest` with what only it kept, or (`None`) every
-/// manifest of the image. The image's manifests and tags are locked first,
-/// so a push cannot tag or list a manifest this decided to delete before
-/// it is gone.
-async fn delete_manifests(
+/// How many manifests deleting a whole image deletes per transaction.
+const IMAGE_DELETE_BATCH: usize = 100;
+
+/// Delete the manifest `digest` with what only it kept. The image's
+/// manifests and tags are locked first, so a push cannot tag or list a
+/// manifest this decided to delete before it is gone.
+async fn delete_manifest(
     state: &AppState,
     repo_id: i64,
     image: &str,
-    digest: Option<&str>,
+    digest: &str,
     grace: chrono::Duration,
 ) -> sqlx::Result<Deleted> {
     let mut tx = forge_db::begin(&state.pool).await?;
     let (tags, manifests) = oci_dao::lock_image_for_retention(&mut tx, repo_id, image).await?;
-    let doomed = match digest {
-        None => manifests.iter().map(|m| m.id).collect(),
-        Some(digest) => match manifests.iter().find(|m| m.digest == digest) {
-            Some(target) => taken_along(&manifests, &tags, target.id),
-            None => Vec::new(),
-        },
+    let doomed = match manifests.iter().find(|m| m.digest == digest) {
+        Some(target) => taken_along(&manifests, &tags, target.id),
+        None => Vec::new(),
     };
-    let ids: HashSet<i64> = doomed.iter().copied().collect();
-    let tag_count = tags.iter().filter(|t| ids.contains(&t.manifest_id)).count();
-    for id in &doomed {
-        oci_dao::delete_locked_manifest(&mut tx, *id, grace).await?;
-    }
+    let deleted = oci_dao::delete_locked_manifests(&mut tx, &doomed, grace).await?;
     tx.commit().await?;
-    Ok(Deleted {
-        manifests: doomed.len(),
-        tags: tag_count,
-    })
+    Ok(deleted.into())
+}
+
+/// Delete every manifest of the image, with its tags: the newest first, a
+/// batch per transaction, and then what a push added meanwhile, until none
+/// is left.
+async fn delete_image(
+    state: &AppState,
+    repo_id: i64,
+    image: &str,
+    grace: chrono::Duration,
+) -> sqlx::Result<Deleted> {
+    let mut deleted = Deleted::default();
+    loop {
+        let ids = oci_dao::image_manifest_ids(&state.pool, repo_id, image).await?;
+        if ids.is_empty() {
+            return Ok(deleted);
+        }
+        for batch in ids.chunks(IMAGE_DELETE_BATCH) {
+            let mut tx = forge_db::begin(&state.pool).await?;
+            let locked = oci_dao::lock_manifests(&mut tx, batch).await?;
+            let done = oci_dao::delete_locked_manifests(&mut tx, &locked, grace).await?;
+            tx.commit().await?;
+            let done = Deleted::from(done);
+            deleted.manifests += done.manifests;
+            deleted.tags += done.tags;
+        }
+    }
+}
+
+impl From<oci_dao::DeletedManifests> for Deleted {
+    fn from(deleted: oci_dao::DeletedManifests) -> Self {
+        Deleted {
+            manifests: deleted.manifests as usize,
+            tags: deleted.tags as usize,
+        }
+    }
 }
 
 /// The manifests deleting `target` deletes, `target` first: with it go the
