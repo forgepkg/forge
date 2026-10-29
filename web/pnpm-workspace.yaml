@@ -9,8 +9,12 @@ minimumReleaseAge: 10080
 # source-map-js before 1.2.2 lets indexed source-map section offsets stall the
 # event loop (GHSA-68fv-2mgg-jv7q), and @tailwindcss/node 4.3.3 still accepts
 # 1.2.1. Drop this once Tailwind asks for 1.2.2 or later itself.
+# seroval before 1.6.11 lets serialized output inject code (GHSA-f86p-h4j2-7qgj,
+# GHSA-9wx9-5pv9-3349), and @tanstack/router-core still asks for 1.6.9.
+# Drop this once the router asks for 1.6.11 or later itself.
 overrides:
   source-map-js: ^1.2.2
+  seroval: ~1.6.11
 
 # pnpm blocks dependency install/build scripts by default. List only the
 # packages that legitimately need to run a build script during install.
