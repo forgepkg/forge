@@ -367,6 +367,14 @@ export class FakeRbacApi {
         u.active = body.active
         u.status = body.active ? 'active' : 'inactive'
       }
+      if (
+        typeof body.realm === 'string' &&
+        !(s.realms as { kind?: string; name?: string }[]).some(
+          (r) => r.kind === 'trusted_header' && r.name === body.realm,
+        )
+      ) {
+        return text(`no trusted-header realm is named "${body.realm}"`, 400)
+      }
       if (body.description !== undefined) u.description = body.description
       if (body.realm !== undefined) u.realm = body.realm
       return json(this.userView(u))

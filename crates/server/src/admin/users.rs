@@ -220,7 +220,10 @@ impl AccountKind {
 const MAX_DESCRIPTION_CHARS: usize = 1000;
 
 /// A service account's description, trimmed (`None` when blank), or the
-/// **400** that refuses it.
+/// **400** that refuses it: too long, or holding a control character other
+/// than a newline or tab, or a format character ([`is_format_character`]),
+/// with which the description would read otherwise in the admin list than
+/// it is.
 fn parse_description(description: Option<&str>) -> Result<Option<String>, Response> {
     let Some(description) = description.map(str::trim).filter(|d| !d.is_empty()) else {
         return Ok(None);
@@ -242,7 +245,50 @@ fn parse_description(description: Option<&str>) -> Result<Option<String>, Respon
         )
             .into_response());
     }
+    if let Some(c) = description.chars().find(|&c| is_format_character(c)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "description must not contain invisible formatting characters such as U+{:04X}",
+                c as u32
+            ),
+        )
+            .into_response());
+    }
     Ok(Some(description.to_string()))
+}
+
+/// A Unicode format character (general category `Cf`): the bidirectional
+/// embeddings, overrides and isolates (U+202E reverses what follows it),
+/// zero-width and other invisible characters, and tags. Not the zero-width
+/// non-joiner and joiner (U+200C, U+200D), which emoji and several scripts
+/// need.
+fn is_format_character(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B
+            | 0x200E..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
 }
 
 /// The id of the trusted-header realm named `name`, which a service account
@@ -788,9 +834,10 @@ pub async fn revoke_invitation(State(state): State<AppState>, Path(id): Path<i64
 /// Deactivating the last active administrator is refused (**409**).
 ///
 /// A service account's `description` and `realm` (the trusted-header realm
-/// that names it, or `null` for none) are set here too, before `active`; a
-/// user's are refused (**409**). A new realm names the account from the next
-/// request, and the one before stops naming it.
+/// that names it, or `null` for none) are set here too; a user's are refused
+/// (**409**). A new realm names the account from the next request, and the
+/// one before stops naming it. Every field of a request is applied in one
+/// transaction: all of them, or none.
 pub async fn update(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -804,28 +851,27 @@ pub async fn update(
         )
             .into_response();
     }
-    if body.description.is_some() || body.realm.is_some() {
-        if let Err(resp) = update_service_account(&state, id, &body).await {
-            return resp;
+    let changes = if body.description.is_some() || body.realm.is_some() {
+        match service_account_changes(&state, id, &body).await {
+            Ok(changes) => Some(changes),
+            Err(resp) => return resp,
         }
-    }
-    let Some(active) = body.active else {
-        forge_core::authz::cache::invalidate_user(&state.cache, id).await;
-        return match user_dao::find_user_by_id(&state.pool, id).await {
-            Ok(Some(user)) => match UserView::load(&state, &user).await {
-                Ok(view) => Json(view).into_response(),
-                Err(resp) => resp,
-            },
-            Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
-            Err(e) => db_error(e),
-        };
+    } else {
+        None
     };
-    let user = match set_active_guarded(&state, id, active).await {
+    let user = match apply_update(&state, id, changes.as_ref(), body.active).await {
         Ok(Some(u)) => u,
         Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
         Err(resp) => return resp,
     };
-    if !active {
+    if changes.is_some() {
+        tracing::info!(
+            user_id = user.id,
+            username = %user.username,
+            "service account updated"
+        );
+    }
+    if body.active == Some(false) {
         if let Err(resp) = revoke_sessions_and_verdicts(&state, &user).await {
             return resp;
         }
@@ -843,14 +889,21 @@ pub async fn update(
     }
 }
 
-/// Set the `description` and `realm` a PATCH carries on the service account
-/// `id`, in one transaction: **404** for no account, **409** for a user's,
-/// **400** for a description or realm that is refused.
-async fn update_service_account(
+/// The `description` and `realm` a PATCH sets on a service account, each
+/// `None` when the request leaves it as it is.
+struct ServiceAccountChanges {
+    description: Option<Option<String>>,
+    realm_id: Option<Option<i64>>,
+}
+
+/// The `description` and `realm` a PATCH carries for the service account
+/// `id`, checked: **404** for no account, **409** for a user's, **400** for
+/// a description or realm that is refused.
+async fn service_account_changes(
     state: &AppState,
     id: i64,
     body: &UpdateUser,
-) -> Result<(), Response> {
+) -> Result<ServiceAccountChanges, Response> {
     let user = match user_dao::find_user_by_id(&state.pool, id).await {
         Ok(Some(u)) => u,
         Ok(None) => return Err((StatusCode::NOT_FOUND, "user not found").into_response()),
@@ -873,24 +926,54 @@ async fn update_service_account(
         Some(None) => Some(None),
         None => None,
     };
+    Ok(ServiceAccountChanges {
+        description,
+        realm_id,
+    })
+}
+
+/// Apply a PATCH to the account `id` in one transaction: a service
+/// account's `changes`, then `active` under the last-admin guard (only a
+/// deactivation can remove an admin). `Ok(None)` when no such account
+/// exists.
+async fn apply_update(
+    state: &AppState,
+    id: i64,
+    changes: Option<&ServiceAccountChanges>,
+    active: Option<bool>,
+) -> Result<Option<AppUser>, Response> {
     let mut tx = forge_db::begin(&state.pool).await.map_err(db_error)?;
-    if let Some(description) = &description {
-        user_dao::set_service_account_description(&mut *tx, id, description.as_deref())
-            .await
-            .map_err(db_error)?;
+    if let Some(changes) = changes {
+        if let Some(description) = &changes.description {
+            user_dao::set_service_account_description(&mut *tx, id, description.as_deref())
+                .await
+                .map_err(db_error)?;
+        }
+        if let Some(realm_id) = changes.realm_id {
+            user_dao::set_service_account_realm(&mut *tx, id, realm_id)
+                .await
+                .map_err(db_error)?;
+        }
     }
-    if let Some(realm_id) = realm_id {
-        user_dao::set_service_account_realm(&mut *tx, id, realm_id)
+    let user = match active {
+        Some(active) => {
+            if !active
+                && authz_dao::would_leave_no_admin(&mut tx, id)
+                    .await
+                    .map_err(db_error)?
+            {
+                return Err(last_admin_conflict());
+            }
+            user_dao::set_active(&mut *tx, id, active)
+                .await
+                .map_err(db_error)?
+        }
+        None => user_dao::find_user_by_id(&mut *tx, id)
             .await
-            .map_err(db_error)?;
-    }
+            .map_err(db_error)?,
+    };
     tx.commit().await.map_err(db_error)?;
-    tracing::info!(
-        user_id = id,
-        username = %user.username,
-        "service account updated"
-    );
-    Ok(())
+    Ok(user)
 }
 
 /// `DELETE /admin/users/{id}` — delete the user (sessions, tokens, role
@@ -1034,28 +1117,6 @@ pub(crate) async fn purge_converted(
     Ok(())
 }
 
-/// Set `active` in a transaction under the last-admin guard (only a
-/// deactivation can remove an admin). `Ok(None)` when no such user exists.
-async fn set_active_guarded(
-    state: &AppState,
-    id: i64,
-    active: bool,
-) -> Result<Option<AppUser>, Response> {
-    let mut tx = forge_db::begin(&state.pool).await.map_err(db_error)?;
-    if !active
-        && authz_dao::would_leave_no_admin(&mut tx, id)
-            .await
-            .map_err(db_error)?
-    {
-        return Err(last_admin_conflict());
-    }
-    let user = user_dao::set_active(&mut *tx, id, active)
-        .await
-        .map_err(db_error)?;
-    tx.commit().await.map_err(db_error)?;
-    Ok(user)
-}
-
 /// Delete the user in a transaction under the last-admin guard. `Ok(false)`
 /// when no such user exists.
 async fn delete_guarded(state: &AppState, id: i64) -> Result<bool, Response> {
@@ -1093,4 +1154,49 @@ async fn revoke_sessions_and_verdicts(state: &AppState, user: &AppUser) -> Resul
 
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptions_refuse_what_reads_otherwise_than_it_is() {
+        let parsed = |d: &str| parse_description(Some(d)).ok().flatten();
+        assert_eq!(
+            parsed("  CI of the web team  ").as_deref(),
+            Some("CI of the web team")
+        );
+        assert_eq!(
+            parsed("owner:\n\tplatform").as_deref(),
+            Some("owner:\n\tplatform")
+        );
+        // Emoji and scripts keep their joiners.
+        assert!(parsed("runners \u{1F468}\u{200D}\u{1F4BB}").is_some());
+        assert!(
+            parsed("\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}").is_some()
+        );
+        assert_eq!(parse_description(Some("   ")).ok(), Some(None));
+        for c in [
+            '\u{7}',
+            '\u{202E}',
+            '\u{202D}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{061C}',
+            '\u{200B}',
+            '\u{2060}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{E0041}',
+        ] {
+            assert!(
+                parse_description(Some(&format!("build {c}agent"))).is_err(),
+                "U+{:04X}",
+                c as u32
+            );
+        }
+    }
 }

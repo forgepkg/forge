@@ -102,7 +102,7 @@ function ServiceAccountPage() {
 
 /**
  * The account's description and trusted-header realm (`PATCH
- * /admin/users/{id}`), and its state: deactivating stops its tokens and its
+ * /admin/users/{id}`, with the fields that changed), and its state: deactivating stops its tokens and its
  * realm from authenticating it (the tokens are suspended, not revoked);
  * reactivating lets both work again. Each after a confirmation.
  */
@@ -116,18 +116,21 @@ function ServiceAccountSettings({ account }: { account: UserView }) {
   const [realm, setRealm] = useState(account.realm ?? '')
   const [confirming, setConfirming] = useState<'deactivate' | 'reactivate' | null>(null)
   const [done, setDone] = useState<string | null>(null)
-  const changed =
-    description.trim() !== (account.description ?? '') || realm !== (account.realm ?? '')
+  const descriptionChanged = description.trim() !== (account.description ?? '')
+  const realmChanged = realm !== (account.realm ?? '')
+  const changed = descriptionChanged || realmChanged
   const liveTokens = tokens.data?.filter((t) => tokenStatus(t) === 'active').length
 
+  // Only what was changed is sent: a realm renamed or deleted since the page
+  // loaded would refuse the save of a new description.
   function save(e: React.FormEvent) {
     e.preventDefault()
     setDone(null)
     update.mutate(
       {
         id: account.id,
-        description: description.trim() || null,
-        realm: realm || null,
+        ...(descriptionChanged && { description: description.trim() || null }),
+        ...(realmChanged && { realm: realm || null }),
       },
       { onSuccess: () => setDone(`Saved ${account.username}.`) },
     )
