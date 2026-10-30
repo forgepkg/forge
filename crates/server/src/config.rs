@@ -541,7 +541,8 @@ impl S3WebIdentityConfig {
 /// The access and sign-in policy that used to live here (the anonymous mode
 /// and its allowlist, the login mode, password Basic, the session lifetimes
 /// and the lockout) is set in the web UI and kept in the database
-/// ([`crate::auth::AuthSettings`]); its keys are refused ([`REMOVED_AUTH_KEYS`]).
+/// ([`crate::auth::AuthSettings`], and the password realms'
+/// `accept_client_passwords`); its keys are refused ([`REMOVED_AUTH_KEYS`]).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     /// CIDRs of proxies whose `X-Forwarded-For` we trust, and whose headers
@@ -619,7 +620,8 @@ pub struct AuthConfig {
 
 /// The `[auth]` keys whose settings moved to the database (#294): the web UI's
 /// **Admin → Settings** and `/admin/settings/auth` set them for every
-/// instance. A configuration that still sets one is refused at startup.
+/// instance (`allow_password_basic` is each password realm's own since 2.2,
+/// #647). A configuration that still sets one is refused at startup.
 pub const REMOVED_AUTH_KEYS: [&str; 8] = [
     "anonymous_mode",
     "anonymous_ip_allowlist",
@@ -2592,12 +2594,13 @@ impl Config {
             return Ok(());
         }
         Err(ConfigError::Invalid(format!(
-            "{} {} removed: anonymous access, the login mode, password Basic \
-             authentication, the session lifetimes and the login lockout are set in the \
-             web UI (Admin → Settings) or through /admin/settings/auth, for every \
-             instance at once. Remove {} from the configuration (FORGE_AUTH__* and \
+            "{} {} removed: anonymous access, the login mode, the session lifetimes and \
+             the login lockout are set in the web UI (Admin → Settings) or through \
+             /admin/settings/auth, and whether a realm accepts passwords from clients over \
+             HTTP Basic on the realm (Admin → Authentication, accept_client_passwords), for \
+             every instance at once. Remove {} from the configuration (FORGE_AUTH__* and \
              FORGE_OIDC__* variables included); an install starts with anonymous access \
-             off and password Basic authentication off",
+             off and its local realm accepting no passwords from clients",
             keys.join(", "),
             if keys.len() == 1 { "was" } else { "were" },
             if keys.len() == 1 { "it" } else { "them" },

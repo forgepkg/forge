@@ -113,14 +113,12 @@ async fn login_mode(srv: &TestServer) -> String {
 #[tokio::test]
 async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
     let srv = start(ServerOpts::default()).await;
-    // The harness's database starts with password Basic on, the rest at
-    // the defaults.
+    // The harness's database starts with the defaults.
     assert_eq!(
         get_settings(&srv).await,
         json!({
             "anonymous_mode": "off",
             "login_mode": "identifier_first",
-            "allow_password_basic": true,
             "session_idle_ttl_seconds": 28800,
             "session_absolute_ttl_seconds": 604800,
             "login_max_failures": 10,
@@ -150,7 +148,7 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
     assert_eq!(resp.status(), 200);
     let saved: Value = resp.json().await.unwrap();
     assert_eq!(saved["login_mode"], "combined");
-    assert_eq!(saved["allow_password_basic"], true, "left out, kept");
+    assert_eq!(saved["anonymous_mode"], "off", "left out, kept");
     assert_eq!(get_settings(&srv).await, saved);
     assert_eq!(login_mode(&srv).await, "combined", "applied at once");
 
@@ -241,29 +239,20 @@ async fn anonymous_access_follows_the_setting_without_a_restart() {
     assert_eq!(read_index(&srv, &public, user).await, 403);
 }
 
-/// Password Basic, the session lifetimes and the lockout apply to the next
-/// request after a change.
+/// The session lifetimes and the lockout apply to the next request after a
+/// change. Password Basic is no setting any more (#647): it moved to the
+/// realms, and an update that still names it is refused with where it went.
 #[tokio::test]
-async fn password_basic_sessions_and_lockout_follow_the_settings() {
+async fn sessions_and_lockout_follow_the_settings() {
     let srv = start(ServerOpts::default()).await;
-    let private = create_repo(&srv, false).await;
-    let (admin, admin_password) = srv.admin_password_basic();
-    let (_, admin_token) = srv.admin_basic();
-
-    // Password Basic: on in the harness, then off. A token keeps working.
-    assert_eq!(
-        read_index(&srv, &private, Some((&admin, &admin_password))).await,
-        200
-    );
-    put_settings(&srv, json!({"allow_password_basic": false})).await;
-    assert_eq!(
-        read_index(&srv, &private, Some((&admin, &admin_password))).await,
-        401
-    );
-    assert_eq!(
-        read_index(&srv, &private, Some((&admin, &admin_token))).await,
-        200
-    );
+    let before = get_settings(&srv).await;
+    for allow in [true, false] {
+        let resp = put_settings(&srv, json!({"allow_password_basic": allow})).await;
+        assert_eq!(resp.status(), 400);
+        let message = resp.text().await.unwrap();
+        assert!(message.contains("accept_client_passwords"), "{message}");
+    }
+    assert_eq!(get_settings(&srv).await, before, "nothing changed");
 
     // Session lifetimes: a sign-in after the change gets them.
     put_settings(

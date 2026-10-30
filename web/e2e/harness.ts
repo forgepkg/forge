@@ -190,17 +190,30 @@ async function signInAdmin(): Promise<AdminSession> {
 }
 
 /**
- * Open anonymous reads (so the Browse screen works without a token) and
- * password Basic (so specs can use the bootstrap admin's password on the
- * feeds): auth settings, changed through the admin API.
+ * Open anonymous reads (so the Browse screen works without a token), an auth
+ * setting, and have the local realm accept passwords over Basic (so specs can
+ * use the bootstrap admin's password on the feeds): both through the admin API.
  */
 async function openAccess({ cookie, csrf }: AdminSession): Promise<void> {
+  const headers = { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }
   const res = await fetch(`${BASE_URL}/admin/settings/auth`, {
     method: 'PUT',
-    headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' },
-    body: JSON.stringify({ anonymous_mode: 'all', allow_password_basic: true }),
+    headers,
+    body: JSON.stringify({ anonymous_mode: 'all' }),
   })
   if (!res.ok) throw new Error(`PUT /admin/settings/auth -> ${res.status}`)
+  const realms = await fetch(`${BASE_URL}/admin/realms`, { headers })
+  if (!realms.ok) throw new Error(`GET /admin/realms -> ${realms.status}`)
+  const local = ((await realms.json()) as { id: number; kind: string }[]).find(
+    (realm) => realm.kind === 'local',
+  )
+  if (!local) throw new Error('no local realm')
+  const patched = await fetch(`${BASE_URL}/admin/realms/${local.id}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ config: { accept_client_passwords: true } }),
+  })
+  if (!patched.ok) throw new Error(`PATCH /admin/realms/${local.id} -> ${patched.status}`)
 }
 
 /** Mint an admin-scoped API token for the bootstrap admin from its session. */

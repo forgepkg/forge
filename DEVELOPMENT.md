@@ -76,8 +76,8 @@ With the server running, in a second terminal:
 cargo xtask seed
 ```
 
-This turns anonymous reads and password Basic on (**Admin → Settings**),
-creates an anonymous-readable hosted repo `nuget`, mints a push token, and
+This turns anonymous reads on (**Admin → Settings**), has the local realm
+accept passwords over HTTP Basic (**Admin → Authentication**), creates an anonymous-readable hosted repo `nuget`, mints a push token, and
 pushes the bundled sample package. It prints the feed URL and the available
 versions. The feed is then browsable without auth at
 `http://localhost:8421/repository/nuget/index.json`.
@@ -309,8 +309,8 @@ connections, drains in-flight requests, then stops the background workers.
 
 ### Access and sign-in settings
 
-Anonymous access, the login screen, passwords over HTTP Basic, the session
-lifetimes and the login lockout are **not** in `forge.toml`: they are auth
+Anonymous access, the login screen, the session lifetimes and the login
+lockout are **not** in `forge.toml`: they are auth
 settings kept in the database, set under **Admin → Settings**
 (`/manage/settings`) or through `GET`/`PUT /admin/settings/auth`, and every
 instance applies a change without a restart (the others within
@@ -323,15 +323,19 @@ to set them. See
 | `anonymous_mode` | `off` (default) / `all`. Makes unauthenticated requests an *anonymous principal*. |
 | repo `anonymous_read` | **Also required** for anonymous reads — set it per repository. |
 | `login_mode` | `identifier_first` (default) or `combined`. |
-| `allow_password_basic` | Accept a user's password over HTTP Basic on the feeds (default off; the admin API never takes one). |
 | `session_idle_ttl_seconds` / `session_absolute_ttl_seconds` | Browser-session lifetimes (default 8 h / 7 d). |
 | `login_max_failures` / `login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
 
 > **Anonymous reads need both** the anonymous mode *and* the repo's
 > `anonymous_read=true` (authz = authenticated user **or**
 > anonymous-and-repo-allows). For zero-auth local browsing, `cargo xtask seed`
-> sets the anonymous mode to `all` (and turns password Basic on) and creates
-> an `anonymous_read` repository.
+> sets the anonymous mode to `all` (and has the local realm accept passwords
+> over HTTP Basic) and creates an `anonymous_read` repository.
+>
+> Whether a client may send a password over HTTP Basic is a realm's setting
+> (`accept_client_passwords`, **Admin → Authentication**): off for the local
+> realm, on for a credential-forwarding one, until set. See
+> [docs/deployment.md](./docs/deployment.md#passwords-from-clients).
 
 ## Authentication realms
 
@@ -851,8 +855,9 @@ http://localhost:8421.
 **Runtime configuration.** The baked `forge.toml` carries non-secret defaults
 (`bind 0.0.0.0:8421`, SPA at `/app/web/dist`, no bootstrap admin — that
 comes only from `FORGE_AUTH__BOOTSTRAP_ADMIN__*` env), and no S3 keys.
-Anonymous access and password Basic start off and are set under **Admin →
-Settings** (`cargo xtask seed` turns both on for a dev stack). Placeholder
+Anonymous access and the local realm's passwords from clients start off and
+are set under **Admin → Settings** and **Admin → Authentication** (`cargo
+xtask seed` turns both on for a dev stack). Placeholder
 credentials (`minioadmin` S3 keys, a `changeme` password) are **refused at
 startup**; only the dev compose stack sets
 `FORGE_SERVER__ALLOW_INSECURE_DEFAULTS=true` (plus admin@example.com/changeme).

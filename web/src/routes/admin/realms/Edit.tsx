@@ -38,7 +38,8 @@ export const Route = createFileRoute('/_app/manage/realms/$realmId')({
  * form, and PATCHes an `UpdateRealm`; a save is confirmed with a toast.
  * Secrets are **write-only**: never seeded from the GET and only included
  * when the admin typed a new one (a blank field keeps the stored secret). The
- * built-in local realm has no config — only name/enabled are sent. The side
+ * built-in local realm's config is only whether it accepts passwords from
+ * clients. The side
  * column holds the realm's facts; a credential-forwarding realm's also shows
  * how many of its accounts keep a password hash and can switch them to local
  * accounts.
@@ -71,14 +72,12 @@ function EditRealmScreen() {
   }
 
   function handleSubmit(values: RealmFormValues) {
+    // The full config (a blank secret is omitted by toRealmConfig, keeping
+    // the stored one).
     const body: UpdateRealm = {
       name: values.name.trim(),
       enabled: values.enabled,
-    }
-    // The local realm is config-less; for the others send the full config (a
-    // blank secret is omitted by toRealmConfig, keeping the stored one).
-    if (values.kind !== 'local') {
-      body.config = toRealmConfig(values)
+      config: toRealmConfig(values),
     }
     update.mutate(body, {
       onSuccess: () => toast({ tone: 'ok', title: 'Realm saved' }),

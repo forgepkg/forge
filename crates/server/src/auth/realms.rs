@@ -142,6 +142,13 @@ pub struct CredForwardRealmConfig {
     /// keeps the hashes from being deleted under it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub captured_password_only: bool,
+    /// Accept the realm's passwords from clients over HTTP Basic (the feeds,
+    /// `docker login`, `npm login --auth-type=legacy`), as a Nexus that
+    /// checks them does. On by default; off, the realm's users sign their
+    /// clients in with tokens, and only the browser login takes their
+    /// passwords.
+    #[serde(default = "default_true")]
+    pub accept_client_passwords: bool,
     /// How long a *good* credential is trusted without re-forwarding (seconds).
     #[serde(default = "default_positive_ttl")]
     pub positive_ttl_secs: u64,
@@ -152,6 +159,30 @@ pub struct CredForwardRealmConfig {
     /// **Write-only / redacted.**
     #[serde(default)]
     pub key_pepper: String,
+}
+
+/// `config` shape for the built-in `local` realm.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalRealmConfig {
+    /// Accept local accounts' passwords from clients over HTTP Basic. Off by
+    /// default: local users sign their clients in with tokens (API tokens,
+    /// `npm login --auth-type=web`), and only the browser login takes their
+    /// passwords. A password a client sends for a local account is then
+    /// refused, never forwarded to a credential-forwarding realm.
+    #[serde(default)]
+    pub accept_client_passwords: bool,
+}
+
+impl LocalRealmConfig {
+    /// The stored config of the local realm; one that does not parse accepts
+    /// no passwords from clients (fail closed).
+    fn of(realm: &AuthRealm, config: &JsonValue) -> Self {
+        serde_json::from_value(config.clone()).unwrap_or_else(|e| {
+            tracing::error!(realm = %realm.name, error = %e, "local realm config unreadable; it accepts no passwords from clients");
+            Self::default()
+        })
+    }
 }
 
 impl std::fmt::Debug for CredForwardRealmConfig {
@@ -368,14 +399,17 @@ pub fn secret_keys(kind: &str) -> &'static [&'static str] {
 }
 
 /// Parse + validate a realm `config` document for `kind`. Returns a normalized
-/// document (kind-specific defaults filled) or a human-readable error. `local`
-/// accepts only an empty/no-op config; every other kind refuses unknown keys
-/// (the `<key>_set` markers of [`redact_config`], which a client may echo
-/// back, are dropped first).
+/// document (kind-specific defaults filled) or a human-readable error. Every
+/// kind refuses unknown keys (the `<key>_set` markers of [`redact_config`],
+/// which a client may echo back, are dropped first).
 pub fn validate_config(kind: &str, config: &JsonValue) -> Result<JsonValue, String> {
     let config = &without_secret_markers(kind, config);
     match kind {
-        KIND_LOCAL => Ok(JsonValue::Object(Default::default())),
+        KIND_LOCAL => {
+            let cfg: LocalRealmConfig = serde_json::from_value(config.clone())
+                .map_err(|e| format!("invalid config: {e}"))?;
+            Ok(serde_json::to_value(&cfg).expect("serializable"))
+        }
         KIND_CRED_FORWARD => {
             let cfg: CredForwardRealmConfig = serde_json::from_value(config.clone())
                 .map_err(|e| format!("invalid config: {e}"))?;
@@ -581,12 +615,17 @@ pub struct RealmSnapshot {
     /// All realm rows, in try-order (priority ascending).
     pub realms: Vec<AuthRealm>,
     /// The password chain over the enabled password-capable realms (`local`,
-    /// `credential_forwarding`), or `None` when none are enabled.
+    /// `credential_forwarding`), or `None` when none are enabled: the
+    /// browser login's (`POST /auth/login`).
     pub chain: Option<Arc<Chain>>,
-    /// Whether an enabled credential-forwarding realm was built. It turns the
-    /// **wire** Basic password path on by itself; otherwise the
-    /// `allow_password_basic` setting decides ([`super::AuthSettings`]).
-    pub forwards_credentials: bool,
+    /// The chain of the passwords clients send (HTTP Basic on the feeds and
+    /// `/v2/token`, `npm login --auth-type=legacy`): the realms that accept
+    /// them (`accept_client_passwords`), and a local realm that does not as a
+    /// reject-only guard of its names
+    /// ([`LocalPasswordProvider::reject_only`]). `None` when no realm accepts
+    /// passwords from clients: the path is off, and a client signs in with a
+    /// token.
+    pub client_chain: Option<Arc<Chain>>,
     /// The (at most one — admin API invariant) enabled OIDC realm's runtime.
     pub oidc: Option<OidcRealmRuntime>,
     /// Enabled `workload_identity` (WIF) realms, each with its issuer-scoped
@@ -637,8 +676,7 @@ pub struct RealmAuth {
     pool: PgPool,
     cache: Cache,
     config: Arc<Config>,
-    /// The auth settings: whether passwords are accepted over HTTP Basic,
-    /// and the session service an OIDC login signs in with.
+    /// The auth settings: the session service an OIDC login signs in with.
     settings: Arc<AuthSettingsCache>,
     ttl: Duration,
     snapshot: tokio::sync::RwLock<Option<Arc<RealmSnapshot>>>,
@@ -817,21 +855,17 @@ impl RealmAuth {
     async fn build(&self) -> anyhow::Result<RealmSnapshot> {
         let realms = auth_realm_dao::list_realms(&self.pool).await?;
 
-        let mut providers: Vec<Box<dyn AuthProvider>> = Vec::new();
-        let mut has_cred_forward = false;
+        // The credential-forwarding providers built, in order, each with
+        // whether its realm accepts passwords from clients.
+        let mut forwarding: Vec<(Arc<dyn AuthProvider>, bool)> = Vec::new();
         let mut oidc: Option<OidcRealmRuntime> = None;
         let mut workload: Vec<super::wif::WorkloadIdentityRealm> = Vec::new();
         let mut workload_configured_issuers: Vec<String> = Vec::new();
         let mut trusted_header: Vec<super::trusted_header::TrustedHeaderRealm> = Vec::new();
 
-        // Where the local provider goes, and whether a credential-forwarding
-        // provider was built after it. Then names the local store does not own
-        // go upstream next, and the local provider need not equalize their
-        // timing with a dummy hash. Decided from the providers actually built:
-        // a forwarding realm that is skipped (fail closed) makes no upstream
-        // call, so the local provider must pay the dummy hash itself.
-        let mut local_at: Option<usize> = None;
-        let mut forwarding_follows_local = false;
+        // Where the local provider goes (the number of forwarding providers
+        // ahead of it), and whether its realm accepts passwords from clients.
+        let mut local_at: Option<(usize, bool)> = None;
 
         for realm in realms.iter().filter(|r| r.enabled) {
             // The logical config (encrypted secrets merged in). A realm whose
@@ -845,13 +879,14 @@ impl RealmAuth {
             };
             match realm.kind.as_str() {
                 // Inserted once the loop knows what follows it.
-                KIND_LOCAL => local_at = local_at.or(Some(providers.len())),
+                KIND_LOCAL => {
+                    local_at = local_at.or(Some((
+                        forwarding.len(),
+                        LocalRealmConfig::of(realm, &config).accept_client_passwords,
+                    )))
+                }
                 KIND_CRED_FORWARD => match self.build_cred_forward(realm, &config) {
-                    Ok(p) => {
-                        has_cred_forward = true;
-                        forwarding_follows_local |= local_at.is_some();
-                        providers.push(p);
-                    }
+                    Ok(built) => forwarding.push(built),
                     // One malformed row must not take down the other realms;
                     // its own logins fail (closed) until an admin fixes it.
                     Err(e) => {
@@ -908,23 +943,27 @@ impl RealmAuth {
             }
         }
 
-        if let Some(at) = local_at {
-            providers.insert(
-                at,
-                Box::new(
-                    LocalPasswordProvider::with_limiter(
-                        self.pool.clone(),
-                        self.password_limiter.clone(),
-                    )
-                    .forwarding_follows(forwarding_follows_local),
-                ),
-            );
-        }
-
-        let chain = if providers.is_empty() {
-            None
+        let chain = self.password_chain(local_at.map(|(at, _)| (at, true)), &forwarding);
+        // The clients' chain: the realms that accept their passwords, and a
+        // local realm that does not as a guard of its names. Without any
+        // realm that accepts them, the path is off.
+        let accepted = local_at.is_some_and(|(_, accepts)| accepts)
+            || forwarding.iter().any(|(_, accepts)| *accepts);
+        let client_forwarding: Vec<(Arc<dyn AuthProvider>, bool)> = forwarding
+            .iter()
+            .filter(|(_, accepts)| *accepts)
+            .cloned()
+            .collect();
+        let client_chain = if accepted {
+            // The local provider keeps its place among the forwarding
+            // providers that stay.
+            let client_local = local_at.map(|(at, accepts)| {
+                let ahead = forwarding[..at].iter().filter(|(_, a)| *a).count();
+                (ahead, accepts)
+            });
+            self.password_chain(client_local, &client_forwarding)
         } else {
-            Some(Arc::new(Chain::new(providers)))
+            None
         };
         workload_configured_issuers.sort();
         let workload_ambiguous_issuers = workload_configured_issuers
@@ -940,7 +979,7 @@ impl RealmAuth {
             built_at: Instant::now(),
             realms,
             chain,
-            forwards_credentials: has_cred_forward,
+            client_chain,
             oidc,
             workload,
             workload_configured_issuers,
@@ -949,12 +988,48 @@ impl RealmAuth {
         })
     }
 
-    /// Build the per-realm credential-forwarding provider.
+    /// A password chain of the `forwarding` providers, with the local provider
+    /// inserted after the first `at` of them when `local` is `Some((at,
+    /// verifies))` (checking passwords, or [`LocalPasswordProvider::reject_only`]).
+    /// `None` when it holds no provider.
+    fn password_chain(
+        &self,
+        local: Option<(usize, bool)>,
+        forwarding: &[(Arc<dyn AuthProvider>, bool)],
+    ) -> Option<Arc<Chain>> {
+        let mut providers: Vec<Box<dyn AuthProvider>> = forwarding
+            .iter()
+            .map(|(provider, _)| Box::new(provider.clone()) as Box<dyn AuthProvider>)
+            .collect();
+        if let Some((at, verifies)) = local {
+            // With a forwarding provider after it, names the local store does
+            // not own go upstream next, and the local provider need not
+            // equalize their timing with a dummy hash. Decided from the
+            // providers actually built: a forwarding realm that is skipped
+            // (fail closed) makes no upstream call, so the local provider must
+            // pay the dummy hash itself.
+            let provider = LocalPasswordProvider::with_limiter(
+                self.pool.clone(),
+                self.password_limiter.clone(),
+            )
+            .forwarding_follows(at < forwarding.len());
+            let provider = if verifies {
+                provider
+            } else {
+                provider.reject_only()
+            };
+            providers.insert(at, Box::new(provider));
+        }
+        (!providers.is_empty()).then(|| Arc::new(Chain::new(providers)))
+    }
+
+    /// Build the per-realm credential-forwarding provider, with whether the
+    /// realm accepts passwords from clients.
     fn build_cred_forward(
         &self,
         realm: &AuthRealm,
         config: &JsonValue,
-    ) -> anyhow::Result<Box<dyn AuthProvider>> {
+    ) -> anyhow::Result<(Arc<dyn AuthProvider>, bool)> {
         let cfg: CredForwardRealmConfig =
             serde_json::from_value(config.clone()).map_err(|e| anyhow::anyhow!("config: {e}"))?;
         // Also for rows stored before the https rule: never forward passwords
@@ -989,16 +1064,20 @@ impl RealmAuth {
         // The request's own timeout normally fires first (and is logged as
         // such); the cache's deadline is the backstop its lease is sized by.
         .with_forward_timeout(request_timeout + Duration::from_secs(1));
+        let accepts_clients = cfg.accept_client_passwords;
         if cfg.captured_password_only {
             // The upstream is no longer asked; the accounts' kept hashes
             // decide, through the same (re-keyed) verdict cache.
-            return Ok(Box::new(CapturedPasswordProvider::new(
-                provider_id,
-                realm.id,
-                self.pool.clone(),
-                cred_cache,
-                self.password_limiter.clone(),
-            )));
+            return Ok((
+                Arc::new(CapturedPasswordProvider::new(
+                    provider_id,
+                    realm.id,
+                    self.pool.clone(),
+                    cred_cache,
+                    self.password_limiter.clone(),
+                )),
+                accepts_clients,
+            ));
         }
         let core = forge_core::auth::UpstreamBasicConfig {
             url: cfg.url,
@@ -1015,9 +1094,12 @@ impl RealmAuth {
             realm_id: Some(realm.id),
             capture_password_hash: cfg.capture_password_hash,
         };
-        Ok(Box::new(
-            UpstreamBasicProvider::new(core, client, cred_cache)
-                .with_hash_limiter(self.password_limiter.clone()),
+        Ok((
+            Arc::new(
+                UpstreamBasicProvider::new(core, client, cred_cache)
+                    .with_hash_limiter(self.password_limiter.clone()),
+            ),
+            accepts_clients,
         ))
     }
 
@@ -1111,11 +1193,7 @@ impl RealmAuth {
 impl ChainSource for RealmAuth {
     async fn password_chain(&self) -> Result<Option<Arc<Chain>>, ChainUnavailable> {
         match self.snapshot().await {
-            Ok(s) if s.forwards_credentials => Ok(s.chain.clone()),
-            Ok(s) if self.settings.current().await.settings.allow_password_basic => {
-                Ok(s.chain.clone())
-            }
-            Ok(_) => Ok(None),
+            Ok(s) => Ok(s.client_chain.clone()),
             Err(e) => {
                 tracing::error!(error = %e, "realm snapshot failed; password path denied");
                 Err(ChainUnavailable)
@@ -1251,6 +1329,7 @@ pub async fn seed_auth_realms(
             auto_provision: None,
             capture_password_hash: false,
             captured_password_only: false,
+            accept_client_passwords: true,
             positive_ttl_secs: ub.cache.positive_ttl_secs,
             negative_ttl_secs: ub.cache.negative_ttl_secs,
             key_pepper: ub.cache.key_pepper.clone(),
@@ -1646,11 +1725,27 @@ mod tests {
     }
 
     #[test]
-    fn local_config_is_empty_and_workload_identity_validates() {
-        assert_eq!(
-            validate_config(KIND_LOCAL, &json!({"anything": 1})).unwrap(),
-            json!({})
-        );
+    fn local_config_takes_its_flag_and_workload_identity_validates() {
+        // The local realm's config is whether it accepts passwords from
+        // clients (off until set); any other key is refused.
+        for (config, accepts) in [
+            (json!({}), false),
+            (json!({"accept_client_passwords": true}), true),
+            (json!({"accept_client_passwords": false}), false),
+        ] {
+            assert_eq!(
+                validate_config(KIND_LOCAL, &config).unwrap(),
+                json!({ "accept_client_passwords": accepts })
+            );
+        }
+        assert!(validate_config(KIND_LOCAL, &json!({"anything": 1})).is_err());
+        // A credential-forwarding realm accepts them until set.
+        let forwarding = validate_config(
+            KIND_CRED_FORWARD,
+            &json!({"url": "https://nexus.example/status", "key_pepper": "p"}),
+        )
+        .unwrap();
+        assert_eq!(forwarding["accept_client_passwords"], true);
         // workload_identity validates through the WIF module:
         // an empty config is rejected (no issuer/audiences/rules)…
         assert!(validate_config(KIND_WORKLOAD_IDENTITY, &json!({})).is_err());

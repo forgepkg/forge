@@ -1286,8 +1286,62 @@ describe('admin realms edit', { timeout: 20_000 }, () => {
     await u.click(screen.getByRole('button', { name: 'Disable and save' }))
 
     await waitFor(() =>
-      expect(patches).toEqual([{ name: 'local', enabled: false }]),
+      expect(patches).toEqual([
+        { name: 'local', enabled: false, config: { accept_client_passwords: false } },
+      ]),
     )
+  })
+
+  it('the local realm accepts no client passwords until checked', async () => {
+    const local = realm({ id: 1, kind: 'local', name: 'local' })
+    const patches: unknown[] = []
+    mockApi({
+      realms: [local],
+      onPatch: (_id, body) => {
+        patches.push(body)
+        return json(local)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/1')
+
+    const accept = await screen.findByRole('checkbox', {
+      name: 'Accept passwords from clients (HTTP Basic)',
+    })
+    expect(accept).not.toBeChecked()
+    // Users of a closed realm sign their clients in with tokens.
+    expect(screen.getByText(/local users sign their clients in with tokens/)).toBeInTheDocument()
+    await u.click(accept)
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() =>
+      expect(patches).toEqual([
+        { name: 'local', enabled: true, config: { accept_client_passwords: true } },
+      ]),
+    )
+  })
+
+  it('a forwarding realm keeps its client passwords until unchecked', async () => {
+    let patched: { config?: Record<string, unknown> } | null = null
+    mockApi({
+      realms: [nexus],
+      onPatch: (_id, body) => {
+        patched = body as typeof patched
+        return json(nexus)
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/realms/3')
+    const accept = await screen.findByRole('checkbox', {
+      name: 'Accept passwords from clients (HTTP Basic)',
+    })
+    // A realm stored before the setting existed accepts them, and a new one.
+    expect(accept).toBeChecked()
+    await u.click(accept)
+    await u.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(patched).not.toBeNull())
+    expect(patched!.config).toMatchObject({ accept_client_passwords: false })
   })
 
   it('asks before saving an OIDC realm disabled', async () => {

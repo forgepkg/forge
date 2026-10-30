@@ -3,8 +3,8 @@
 //!
 //! The argon2id password check is the [`LocalPasswordProvider`], invoked
 //! through the [`Chain`]. [`BasicAuthSource`] tries a token presented as the
-//! basic secret first, then falls back to the password chain only when
-//! password-basic is enabled; invalid credentials → 401. These tests assert
+//! basic secret first, then falls back to the password chain only when a
+//! realm accepts passwords from clients; invalid credentials → 401. These tests assert
 //! both the provider's outcomes directly and the `BasicAuthSource` semantics
 //! end-to-end.
 //!
@@ -167,6 +167,41 @@ async fn local_provider_rejects_inactive_user() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_reject_only_provider_refuses_its_names_and_skips_the_others() {
+    // #647: a local realm that accepts no passwords from clients keeps its
+    // names in the clients' chain: the right password of an active local
+    // account is refused like a wrong one (never Skip, which would forward it
+    // upstream), and only a name the local store does not own goes on.
+    let pool = common::pool().await;
+    let username = insert_local(&pool, "pw", true).await;
+    let unknown = format!("nobody-{}@example.com", common::unique());
+    for forwarding_follows in [false, true] {
+        let provider = LocalPasswordProvider::new(pool.clone())
+            .forwarding_follows(forwarding_follows)
+            .reject_only();
+        for password in ["pw", "a-guess"] {
+            assert_eq!(
+                provider.authenticate(&cred(&username, password)).await,
+                AuthOutcome::Rejected,
+                "{password} (forwarding follows: {forwarding_follows})"
+            );
+        }
+        assert_eq!(
+            provider.authenticate(&cred(&unknown, "pw")).await,
+            AuthOutcome::Skip,
+            "forwarding follows: {forwarding_follows}"
+        );
+    }
+    // The same account signs in through a provider that checks passwords.
+    assert!(matches!(
+        LocalPasswordProvider::new(pool.clone())
+            .authenticate(&cred(&username, "pw"))
+            .await,
+        AuthOutcome::Authenticated(_)
+    ));
 }
 
 #[tokio::test]
@@ -340,8 +375,9 @@ async fn basic_password_authenticates_when_enabled() {
 
 #[tokio::test]
 async fn basic_password_disabled_does_not_authenticate() {
-    // allow_password_basic = false → password path is entirely off; a valid
-    // password is treated as an invalid basic credential.
+    // No realm accepts passwords from clients → the password path is
+    // entirely off; a valid password is treated as an invalid basic
+    // credential.
     let pool = common::pool().await;
     let username = insert_local(&pool, "pw", true).await;
     let src = basic_source(&pool, false);

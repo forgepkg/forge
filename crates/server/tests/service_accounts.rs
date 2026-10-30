@@ -382,8 +382,7 @@ async fn a_patch_applies_all_of_its_fields_or_none() {
 #[tokio::test]
 async fn nobody_signs_in_to_a_service_account_but_its_tokens_work() {
     let srv = server().await;
-    srv.set_auth_settings(json!({"allow_password_basic": true}))
-        .await;
+    srv.set_local_client_passwords(true).await;
     let name = format!("ci{}@example.com", common::unique());
     let id = create_service_account(&srv, &name, None).await["id"]
         .as_i64()

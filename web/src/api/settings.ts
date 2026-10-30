@@ -23,8 +23,6 @@ export interface AuthSettings {
   login_mode: LoginMode
   /** The login screen offers the accounts signed in on the device before. */
   remember_accounts: boolean
-  /** Accept a user's password over HTTP Basic on the feeds. */
-  allow_password_basic: boolean
   session_idle_ttl_seconds: number
   session_absolute_ttl_seconds: number
   /** `0` turns the lockout off. */

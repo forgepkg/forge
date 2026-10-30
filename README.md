@@ -152,9 +152,9 @@ identity (IRSA, EKS Pod Identity, STS web identity; see
 bakes no bootstrap admin: `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start,
 named by `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` (a UPN, default `admin@example.com`), and
 once it is removed the image simply starts without one. A new install has
-no anonymous access and accepts no passwords over HTTP Basic (clients use API
-tokens); an administrator changes both in the web UI under **Admin →
-Settings** (see
+no anonymous access and its local realm accepts no passwords over HTTP Basic
+(clients use API tokens); an administrator changes them in the web UI under
+**Admin → Settings** and **Admin → Authentication** (see
 [docs/deployment.md](docs/deployment.md#access-and-sign-in-settings)).
 
 ### Point a `dotnet` client at it

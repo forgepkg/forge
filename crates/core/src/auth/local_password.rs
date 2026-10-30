@@ -203,6 +203,8 @@ pub struct LocalPasswordProvider {
     /// A credential-forwarding provider follows this one in the chain; see
     /// [`Self::forwarding_follows`].
     forwarding_follows: bool,
+    /// Whether a password is checked at all; see [`Self::reject_only`].
+    verifies: bool,
 }
 
 impl LocalPasswordProvider {
@@ -222,6 +224,7 @@ impl LocalPasswordProvider {
             pool,
             limiter,
             forwarding_follows: false,
+            verifies: true,
         }
     }
 
@@ -235,6 +238,17 @@ impl LocalPasswordProvider {
     /// shows in the response time.
     pub fn forwarding_follows(mut self, yes: bool) -> Self {
         self.forwarding_follows = yes;
+        self
+    }
+
+    /// Check no password, but keep the local accounts' names: a name the
+    /// local store owns is refused (after a dummy verification, so it answers
+    /// like a wrong password), and only a foreign one goes on to the next
+    /// provider. The chain of a local realm that accepts no passwords from
+    /// clients holds the provider this way, so that such a password is never
+    /// forwarded to a credential-forwarding realm behind it.
+    pub fn reject_only(mut self) -> Self {
+        self.verifies = false;
         self
     }
 
@@ -330,7 +344,7 @@ impl AuthProvider for LocalPasswordProvider {
         // Skip: neither the owner's password nor a guess may reach a later
         // (upstream) realm. It costs a (dummy) verification and answers like a
         // wrong password, so it does not show that the account is deactivated.
-        if !user.active {
+        if !user.active || !self.verifies {
             return self
                 .after_dummy_verify(cred.password, AuthOutcome::Rejected)
                 .await;
