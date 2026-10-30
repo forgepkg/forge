@@ -329,6 +329,12 @@ async fn image_page(
 /// group's content selector applies, and its guard decides per image which
 /// members serve it (the registry's `GroupMembers`). An image is listed
 /// with the counts of the highest priority member serving it.
+///
+/// Each leaf's images are read a batch at a time by name (a keyset scan,
+/// [`oci_dao::list_images_after`]), so a listing costs what the members
+/// hold, once. Whether an owner holds an image is asked only of the images
+/// a leaf that is no owner would list, a batch at a time: an owner's other
+/// images are never read.
 async fn group_image_page(
     state: &AppState,
     principal: &Principal,
@@ -345,31 +351,59 @@ async fn group_image_page(
         .group_members(principal, group, 0)
         .await
         .map_err(failure_response)?;
-    // The images an owner has, whatever the caller may read: with
-    // `prefer_hosted`, only owners serve them.
-    let mut owned: HashSet<String> = HashSet::new();
-    if members.asks_owners() {
-        for owner in members.owner_ids() {
-            for_each_image(state, owner, &query.q, |image| {
-                owned.insert(image.image);
-            })
-            .await
-            .map_err(db_error)?;
-        }
-    }
+    let owners = members.owner_ids();
     let mut merged: BTreeMap<String, oci_dao::ImageSummary> = BTreeMap::new();
     for (position, leaf) in members.leaves() {
-        for_each_image(state, leaf.id, &query.q, |image| {
-            if merged.contains_key(&image.image) || !group_filter.allows(&image.image) {
-                return;
+        // An owner serves what it holds whoever else holds it.
+        let asks_owners = members.asks_owners() && !owners.contains(&leaf.id);
+        let mut after = String::new();
+        loop {
+            let batch = oci_dao::list_images_after(
+                &state.pool,
+                leaf.id,
+                &query.q,
+                &after,
+                IMAGE_BATCH_SIZE,
+            )
+            .await
+            .map_err(db_error)?;
+            let full = batch.len() as i64 == IMAGE_BATCH_SIZE;
+            let Some(last) = batch.last() else {
+                break;
+            };
+            after = last.image.clone();
+            let candidates: Vec<oci_dao::ImageSummary> = batch
+                .into_iter()
+                .filter(|image| {
+                    !merged.contains_key(&image.image) && group_filter.allows(&image.image)
+                })
+                .collect();
+            // Owned or not makes a difference only where nothing else
+            // (a reserved prefix) keeps the image to the owners already.
+            let ask: Vec<String> = candidates
+                .iter()
+                .filter(|image| asks_owners && !members.owners_only(&image.image, false))
+                .map(|image| image.image.clone())
+                .collect();
+            let owned: HashSet<String> = if ask.is_empty() {
+                HashSet::new()
+            } else {
+                oci_dao::images_held(&state.pool, &owners, &ask)
+                    .await
+                    .map_err(db_error)?
+                    .into_iter()
+                    .collect()
+            };
+            for image in candidates {
+                let owners_only = members.owners_only(&image.image, owned.contains(&image.image));
+                if members.serves(position, &image.image, owners_only) {
+                    merged.insert(image.image.clone(), image);
+                }
             }
-            let owners_only = members.owners_only(&image.image, owned.contains(&image.image));
-            if members.serves(position, &image.image, owners_only) {
-                merged.insert(image.image.clone(), image);
+            if !full {
+                break;
             }
-        })
-        .await
-        .map_err(db_error)?;
+        }
     }
     let total = merged.len();
     let images = merged.into_values().skip(query.skip).take(take).collect();
@@ -377,23 +411,27 @@ async fn group_image_page(
 }
 
 /// Call `each` with every image of repository `repository_id` matching
-/// `q`, read [`IMAGE_BATCH_SIZE`] at a time.
+/// `q`, read [`IMAGE_BATCH_SIZE`] at a time by name.
 async fn for_each_image(
     state: &AppState,
     repository_id: i64,
     q: &str,
     mut each: impl FnMut(oci_dao::ImageSummary),
 ) -> sqlx::Result<()> {
-    let mut offset = 0;
+    let mut after = String::new();
     loop {
         let images =
-            oci_dao::list_images(&state.pool, repository_id, q, offset, IMAGE_BATCH_SIZE).await?;
-        let count = images.len() as i64;
+            oci_dao::list_images_after(&state.pool, repository_id, q, &after, IMAGE_BATCH_SIZE)
+                .await?;
+        let full = images.len() as i64 == IMAGE_BATCH_SIZE;
+        let Some(last) = images.last() else {
+            return Ok(());
+        };
+        after = last.image.clone();
         images.into_iter().for_each(&mut each);
-        if count < IMAGE_BATCH_SIZE {
+        if !full {
             return Ok(());
         }
-        offset += count;
     }
 }
 

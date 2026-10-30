@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH names AS (\n            SELECT DISTINCT image FROM oci_manifest\n            WHERE repository_id = $1 AND image > $3 AND strpos(image, $2) > 0\n            ORDER BY image\n            LIMIT $4\n        )\n        SELECT n.image AS \"image!\",\n               s.tag_count AS \"tag_count!\",\n               s.manifest_count AS \"manifest_count!\",\n               s.last_pushed_at AS \"last_pushed_at!\"\n        FROM names n\n        CROSS JOIN LATERAL (\n            SELECT count(DISTINCT t.tag) AS tag_count,\n                   count(DISTINCT m.id) AS manifest_count,\n                   max(m.created_at) AS last_pushed_at\n            FROM oci_manifest m\n            LEFT JOIN oci_tag t ON t.manifest_id = m.id\n            WHERE m.repository_id = $1 AND m.image = n.image\n        ) s\n        ORDER BY n.image\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "image!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "image"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tag_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "manifest_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "last_pushed_at!",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "cf45729a40c2c11a545304532bb384e12a5d0744c38fa8ac0afc6506cef54623"
+}
