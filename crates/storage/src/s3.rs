@@ -405,7 +405,21 @@ impl BlobStore {
     /// Single-part bodies may use a conditional PUT (`If-None-Match: *`)
     /// instead of HEAD-then-PUT, per [`ConditionalWrites`]; the two paths are
     /// observably identical, the conditional one just saves a round trip.
-    pub async fn put_if_absent(&self, key: &str, path: &Path) -> Result<bool, S3Error> {
+    ///
+    /// The upload is boxed: the SDK's request futures are large, and a caller
+    /// would otherwise hold one inline, and so would every future awaiting
+    /// it, up the whole request (a deep stack in a debug build).
+    pub fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, S3Error>> + Send + 'a>>
+    {
+        Box::pin(self.upload_if_absent(key, path))
+    }
+
+    /// [`Self::put_if_absent`], unboxed.
+    async fn upload_if_absent(&self, key: &str, path: &Path) -> Result<bool, S3Error> {
         self.admit(S3Op::Put)?;
         let size = tokio::fs::metadata(path).await?.len();
 
@@ -472,8 +486,19 @@ impl BlobStore {
 
     /// One conditional PUT attempt. Maps the interesting backend answers
     /// (412 / NotImplemented / 409) into [`ConditionalPut`]; anything else is
-    /// a real error.
-    async fn put_conditional(&self, key: &str, path: &Path) -> Result<ConditionalPut, S3Error> {
+    /// a real error. Boxed, like [`Self::put_if_absent`].
+    fn put_conditional<'a>(
+        &'a self,
+        key: &'a str,
+        path: &'a Path,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ConditionalPut, S3Error>> + Send + 'a>,
+    > {
+        Box::pin(self.send_conditional(key, path))
+    }
+
+    /// [`Self::put_conditional`], unboxed.
+    async fn send_conditional(&self, key: &str, path: &Path) -> Result<ConditionalPut, S3Error> {
         let body = body_from_path(path).await?;
         let call = S3Call::start(S3Op::PutConditional, &self.bucket);
         let result = self
