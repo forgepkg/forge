@@ -146,9 +146,9 @@ pub struct CredForwardRealmConfig {
     /// `docker login`, `npm login --auth-type=legacy`), as a Nexus that
     /// checks them does. On by default; off, the realm's users sign their
     /// clients in with tokens, and only the browser login takes their
-    /// passwords.
-    #[serde(default = "default_true")]
-    pub accept_client_passwords: bool,
+    /// passwords. (`accept_client_passwords` in the config.)
+    #[serde(default = "default_true", rename = "accept_client_passwords")]
+    pub accepts_clients: bool,
     /// How long a *good* credential is trusted without re-forwarding (seconds).
     #[serde(default = "default_positive_ttl")]
     pub positive_ttl_secs: u64,
@@ -170,8 +170,9 @@ pub struct LocalRealmConfig {
     /// `npm login --auth-type=web`), and only the browser login takes their
     /// passwords. A password a client sends for a local account is then
     /// refused, never forwarded to a credential-forwarding realm.
-    #[serde(default)]
-    pub accept_client_passwords: bool,
+    /// (`accept_client_passwords` in the config.)
+    #[serde(default, rename = "accept_client_passwords")]
+    pub accepts_clients: bool,
 }
 
 impl LocalRealmConfig {
@@ -882,7 +883,7 @@ impl RealmAuth {
                 KIND_LOCAL => {
                     local_at = local_at.or(Some((
                         forwarding.len(),
-                        LocalRealmConfig::of(realm, &config).accept_client_passwords,
+                        LocalRealmConfig::of(realm, &config).accepts_clients,
                     )))
                 }
                 KIND_CRED_FORWARD => match self.build_cred_forward(realm, &config) {
@@ -1064,7 +1065,7 @@ impl RealmAuth {
         // The request's own timeout normally fires first (and is logged as
         // such); the cache's deadline is the backstop its lease is sized by.
         .with_forward_timeout(request_timeout + Duration::from_secs(1));
-        let accepts_clients = cfg.accept_client_passwords;
+        let accepts_clients = cfg.accepts_clients;
         if cfg.captured_password_only {
             // The upstream is no longer asked; the accounts' kept hashes
             // decide, through the same (re-keyed) verdict cache.
@@ -1329,7 +1330,7 @@ pub async fn seed_auth_realms(
             auto_provision: None,
             capture_password_hash: false,
             captured_password_only: false,
-            accept_client_passwords: true,
+            accepts_clients: true,
             positive_ttl_secs: ub.cache.positive_ttl_secs,
             negative_ttl_secs: ub.cache.negative_ttl_secs,
             key_pepper: ub.cache.key_pepper.clone(),
