@@ -137,13 +137,17 @@ pub struct ServerConfig {
     /// `true` only for local development / compose stacks.
     #[serde(default)]
     pub allow_insecure_defaults: bool,
-    /// Extra `Host` names (an optional `:port` is ignored) under which the
-    /// server is legitimately reached, besides the host of
-    /// [`Self::public_base_url`]. Only consulted for the trusted-header
-    /// realms: a request whose `Host` matches neither is not named by the
-    /// headers of the proxy in front (a DNS-rebinding page in an internal
-    /// user's browser presents its own host name). Add the names a reverse
-    /// proxy rewrites `Host` to, or that internal clients use. Default empty.
+    /// Extra `Host` names (an optional `:port` is ignored) under which
+    /// clients reach the server, besides the host of
+    /// [`Self::public_base_url`], such as a name internal clients use. Only
+    /// consulted for the trusted-header realms: a request whose `Host`
+    /// matches neither is not named by the headers of the proxy in front (a
+    /// DNS-rebinding page in an internal user's browser presents its own host
+    /// name). The guard needs the client's own `Host`, so the reverse proxy
+    /// must forward it (nginx: `proxy_set_header Host $host`). Never add a
+    /// name the proxy rewrites `Host` to (`forge` for `proxy_pass
+    /// http://forge:8421`): every request then names an allowed host, and
+    /// the guard is off. Default empty.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
     /// Seconds a client may take to send a request's headers before the

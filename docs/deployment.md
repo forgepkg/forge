@@ -991,7 +991,11 @@ What Forge believes, and when:
   `auth.trusted_proxy_cidrs` and the request's `Host` is one of Forge's own
   names (the host of `public_base_url`, or one in `server.allowed_hosts`: a
   DNS-rebinding page reaches the proxy under its own name). From any other
-  request they are ignored.
+  request they are ignored. This guard holds only while the proxy forwards
+  the client's own `Host`: never list the name a proxy rewrites `Host` to
+  (`forge` for an nginx `proxy_pass http://forge:8421` without
+  `proxy_set_header Host $host`) in `server.allowed_hosts`, since every
+  request would then name an allowed host.
 - They name the caller only when the request has **no credential of its
   own**: an API token, a password or a signed-in session is that
   credential's, whatever the headers say, and one that is refused is a 401,
