@@ -3515,13 +3515,87 @@ async fn group_browse_lists_what_its_pulls_serve() {
     assert_eq!(listed(reader), [("other/app".to_string(), 1)]);
 }
 
+/// An image a selector of the caller's grant hides is not found (#703): a
+/// read of it answers 404 `NAME_UNKNOWN` on every endpoint, as a name that
+/// does not exist, where it answered 403, while a push outside the
+/// selector is still refused (403), and a caller who may not read the
+/// repository at all is refused as before.
+#[tokio::test]
+async fn an_image_a_selector_hides_is_not_found() {
+    let srv = common::start().await;
+    let repo = repo_name("sel");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let admin = admin_oci(&srv).await;
+    let digest = admin
+        .push_image(&format!("{repo}/secret/app"), "1", "amd64", b"secret layer")
+        .await;
+    admin
+        .push_image(&format!("{repo}/public/app"), "1", "amd64", b"public layer")
+        .await;
+    let selector = srv.create_selector(&["public/*"]).await;
+    let caller = srv.caller().await;
+    srv.grant_role(caller.id, &[(&repo, "write", Some(selector))])
+        .await;
+    let oci = Oci::new(&srv, Some((caller.username.clone(), caller.token.clone())));
+
+    let hidden = format!("{repo}/secret/app");
+    for path in [
+        "manifests/1".to_string(),
+        format!("manifests/{digest}"),
+        format!("blobs/{}", sha(b"secret layer")),
+        "tags/list".to_string(),
+        format!("referrers/{digest}"),
+    ] {
+        let resp = oci.get(&hidden, &path).await;
+        assert_eq!(resp.status(), 404, "{path}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["errors"][0]["code"], "NAME_UNKNOWN", "{path}: {body}");
+        assert_eq!(oci.head(&hidden, &path).await.status(), 404, "HEAD {path}");
+    }
+    assert_eq!(
+        oci.get(&format!("{repo}/public/app"), "manifests/1")
+            .await
+            .status(),
+        200
+    );
+    // No push outside the selector, and no delete of what it hides.
+    let resp = oci
+        .request(
+            Method::POST,
+            &format!("/v2/{repo}/secret/new/blobs/uploads/"),
+            "pull,push",
+            &format!("{repo}/secret/new"),
+        )
+        .await
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let resp = oci.delete(&hidden, &format!("manifests/{digest}")).await;
+    assert!(
+        resp.status() == 401 || resp.status() == 403,
+        "{}",
+        resp.status()
+    );
+
+    // Who may not read the repository is refused, not told it is absent.
+    let stranger = srv.caller().await;
+    let oci = Oci::new(&srv, Some((stranger.username, stranger.token)));
+    assert_eq!(oci.get(&hidden, "manifests/1").await.status(), 403);
+}
+
 /// A group shows a caller what it could pull from its members directly, no
 /// more (#648): with a member it may not read, a selector on the group's
 /// grant or one on a member's, a hidden image's manifests, blobs, tags and
 /// referrers answer as an image of a name like it that does not exist
-/// (404, or 403 for a name outside a selector of the group's own grant,
-/// which grants no `pull` on it), and the browse API's image list (its
-/// count too), image page and chart page leave it out.
+/// (404; a selector of the group's own grant answers so too, #703, and a
+/// readable name's referrers of an unknown subject are an empty index), and
+/// the browse API's image list (its count too), image page and chart page
+/// leave it out.
 #[tokio::test]
 async fn groups_show_a_caller_only_the_images_it_may_read() {
     let srv = common::start().await;
@@ -3613,7 +3687,7 @@ async fn groups_show_a_caller_only_the_images_it_may_read() {
                 let (expected, absent_body) = (resp.status(), resp.text().await.unwrap());
                 // Referrers of an unknown subject are an empty index.
                 assert!(
-                    matches!(expected.as_u16(), 403 | 404) || path.starts_with("referrers/"),
+                    expected == 404 || path.starts_with("referrers/"),
                     "{label}: {absent} {path}: {expected}"
                 );
                 assert_eq!(status, expected, "{label}: {name} {path}: {body}");

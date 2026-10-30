@@ -83,7 +83,11 @@ docker push forge.example.com/docker-hosted/team/app:1.3
 
 A registry token grants only what the caller may do when it is issued:
 `pull` needs `read` on the repository, `push` needs `write`, and `delete`
-needs `delete`; content selectors match image names (`team/*`). One token
+needs `delete`; content selectors match image names (`team/*`). An image a
+selector hides from a caller who may read the repository is not found: a
+pull, its tags or its referrers answer 404 `NAME_UNKNOWN`, as for a name
+that does not exist (also through a group), while a push or a delete of it
+is refused with 403. One token
 request may name at most 32 repositories (clients ask for one to three); a
 request naming more is refused with `400 UNSUPPORTED`. Every
 request is authorized again against the current permissions, and the user
