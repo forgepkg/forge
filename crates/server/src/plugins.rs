@@ -48,7 +48,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::auth::token::{check_token, TokenCheck};
-use forge_core::authz::Level;
+use forge_core::authz::{Level, PackageFilter};
 use forge_core::format::Format;
 use forge_core::net::upstream::{RequestClass, SpooledBody};
 use forge_core::repo::{
@@ -1627,17 +1627,24 @@ impl Ctx<'_> {
 
     /// The proxy whose upstream a forward from `repo` goes to: the
     /// repository itself, or a group's first proxy member (by priority)
-    /// the caller may read, through nested groups. With it, the reserved
-    /// prefixes of every group on the way, whose packages the forward
-    /// leaves out: reading through an outer group keeps an inner group's
-    /// packages inside as reading it directly does.
+    /// the caller may read, through nested groups. With it, what the
+    /// forward leaves out ([`Withheld`]): the reserved prefixes of every
+    /// group on the way, so that reading through an outer group keeps an
+    /// inner group's packages inside as reading it directly does, and the
+    /// packages the caller's selectors hide on any repository on the way.
     async fn forward_source(
         &self,
         repo: &Repository,
         depth: u32,
-    ) -> Result<Option<(Repository, Vec<String>)>, RepoError> {
+    ) -> Result<Option<(Repository, Withheld)>, RepoError> {
         match repo.kind() {
-            RepoKind::Proxy => Ok(Some((repo.clone(), Vec::new()))),
+            RepoKind::Proxy => Ok(Some((
+                repo.clone(),
+                Withheld {
+                    reserved: Vec::new(),
+                    filters: vec![self.state.authz.package_filter(&self.principal, repo).await],
+                },
+            ))),
             RepoKind::Hosted => Ok(None),
             RepoKind::Group => {
                 let max = self.state.config.groups.max_nesting_depth.max(1) as u32;
@@ -1648,11 +1655,14 @@ impl Ctx<'_> {
                     if member.format != repo.format || !self.may(Level::Read, &member).await {
                         continue;
                     }
-                    if let Some((proxy, mut reserved)) =
+                    if let Some((proxy, mut withheld)) =
                         Box::pin(self.forward_source(&member, depth + 1)).await?
                     {
-                        reserved.extend(repo.reserved_prefixes());
-                        return Ok(Some((proxy, reserved)));
+                        withheld.reserved.extend(repo.reserved_prefixes());
+                        withheld
+                            .filters
+                            .push(self.state.authz.package_filter(&self.principal, repo).await);
+                        return Ok(Some((proxy, withheld)));
                     }
                 }
                 Ok(None)
@@ -1661,11 +1671,12 @@ impl Ctx<'_> {
     }
 
     /// Send `forward` on to the upstream, with the proxy's credentials (to
-    /// its origin only), and answer with what the upstream said. Through a
-    /// group with reserved prefixes on the way, the body goes without their
-    /// packages ([`FormatPlugin::forward_body`]), or not at all.
+    /// its origin only), and answer with what the upstream said. With
+    /// reserved prefixes or the caller's selectors on the way, the body goes
+    /// without the packages they keep inside ([`FormatPlugin::forward_body`]),
+    /// or not at all.
     async fn forward(&self, forward: Forward) -> Response {
-        let (source, reserved) = match self.forward_source(self.repo, 0).await {
+        let (source, withheld) = match self.forward_source(self.repo, 0).await {
             Ok(Some(found)) => found,
             Ok(None) => {
                 return (
@@ -1691,29 +1702,19 @@ impl Ctx<'_> {
         };
         let url = format!("{}{}", remote.trim_end_matches('/'), forward.path);
         let content_type = forward.content_type.clone();
-        let body = if reserved.is_empty() {
+        let body = if withheld.is_empty() {
             forward.body
         } else {
             let filtered = self
-                .call(move |plugin| {
-                    // Prefixes are stored lowercase; a name is matched in
-                    // any case, which keeps more inside, never less.
-                    let hidden = |name: &str| {
-                        let lower = name.to_lowercase();
-                        reserved
-                            .iter()
-                            .any(|prefix| lower.starts_with(prefix.as_str()))
-                    };
-                    plugin.forward_body(&forward, &hidden)
-                })
+                .call(move |plugin| plugin.forward_body(&forward, &|name| withheld.hides(name)))
                 .await;
             match filtered {
                 Ok(Some(body)) => body,
                 Ok(None) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        "this request cannot be passed on without the packages this \
-                         repository keeps from its upstream (its reserved prefixes)",
+                        "this request cannot be passed on without the packages it must \
+                         leave out: those under reserved prefixes, and those you may not read",
                     )
                         .into_response()
                 }
@@ -1865,6 +1866,38 @@ impl Ctx<'_> {
     /// separated) stays inside this repository.
     fn links_within_repository(&self, value: &str) -> bool {
         links_within(value, &self.repo.name, &self.target.base_url)
+    }
+}
+
+/// What a forward leaves out of its body on the way to a proxy's upstream
+/// ([`Ctx::forward_source`]).
+struct Withheld {
+    /// The reserved prefixes of the groups on the way, lowercase.
+    reserved: Vec<String>,
+    /// The caller's package filter on each repository on the way, the
+    /// proxy's included.
+    filters: Vec<PackageFilter>,
+}
+
+impl Withheld {
+    /// Nothing is left out: the body goes on as it is.
+    fn is_empty(&self) -> bool {
+        self.reserved.is_empty()
+            && self
+                .filters
+                .iter()
+                .all(|f| matches!(f, PackageFilter::AllowAll))
+    }
+
+    /// Whether the package `name` (as the body writes it) stays inside.
+    /// Prefixes are stored lowercase, and selectors match a name in any
+    /// case: a name keeps more inside, never less.
+    fn hides(&self, name: &str) -> bool {
+        let lower = name.to_lowercase();
+        self.reserved
+            .iter()
+            .any(|prefix| lower.starts_with(prefix.as_str()))
+            || !self.filters.iter().all(|f| f.allows(name))
     }
 }
 

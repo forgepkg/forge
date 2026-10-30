@@ -494,6 +494,114 @@ async fn browse_group_merges_members() {
     let _ = lower;
 }
 
+/// A NuGet group shows a caller what it could read from its members
+/// directly, no more (#648): with a member it may not read, a selector on
+/// the group's grant or one on a member's, a hidden package has no flat
+/// container, download or registration (404), and the feed's search and
+/// the browse API leave it out, their counts too.
+#[tokio::test]
+async fn a_group_shows_a_caller_only_the_packages_it_may_read() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let n = common::unique();
+    let (a, b, group) = (format!("va{n}"), format!("vb{n}"), format!("vg{n}"));
+    // Indexed like `GroupCaller::sees`.
+    let ids = [
+        "Vis.Public.A",
+        "Vis.Secret.A",
+        "Vis.Public.B",
+        "Vis.Secret.B",
+    ];
+    for (i, id) in ids.iter().enumerate() {
+        publish_one(&srv, if i < 2 { &a } else { &b }, id, "1.0.0", false).await;
+    }
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": group, "kind": "group"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    for (member, priority) in [(&a, 10), (&b, 5)] {
+        let resp = client
+            .post(format!(
+                "{}/admin/repositories/{group}/members",
+                srv.base_url
+            ))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({"member": member, "priority": priority}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+
+    for common::GroupCaller {
+        label,
+        caller,
+        sees,
+    } in srv.group_callers(&group, &a, &b, &["vis.public.*"]).await
+    {
+        let get = |path: String| {
+            caller
+                .apply(client.get(format!("{}{path}", srv.base_url)))
+                .send()
+        };
+        let mut visible = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let lower = id.to_lowercase();
+            let expected = if sees[i] { 200 } else { 404 };
+            for path in [
+                format!("/repository/{group}/flat/{lower}/index.json"),
+                format!("/repository/{group}/flat/{lower}/1.0.0/{lower}.1.0.0.nupkg"),
+                format!("/repository/{group}/registration/{lower}/index.json"),
+                format!("/browse/packages/{group}/{id}"),
+            ] {
+                let resp = get(path.clone()).await.unwrap();
+                assert_eq!(resp.status(), expected, "{label}: {path}");
+            }
+            if sees[i] {
+                visible.push(id.to_string());
+            }
+        }
+        visible.sort_unstable();
+        let search: Value = get(format!(
+            "/repository/{group}/query?q=&prerelease=true&take=20"
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        let mut found: Vec<String> = search["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["id"].as_str().unwrap().to_string())
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, visible, "{label}: {search}");
+        assert_eq!(search["totalHits"], visible.len(), "{label}: {search}");
+        let listed: Value = get(format!("/browse/packages?repo={group}&take=20"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut found: Vec<String> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["original_id"].as_str().unwrap().to_string())
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, visible, "{label}: {listed}");
+        assert_eq!(listed["total"], visible.len(), "{label}: {listed}");
+    }
+}
+
 /// An offline hosted or group repository serves nothing through browse either,
 /// as on its feed (#73): its search and package detail answer 503 with
 /// `Retry-After`, a merged search leaves it out, and `/browse/repos` flags it.

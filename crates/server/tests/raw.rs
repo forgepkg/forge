@@ -876,6 +876,243 @@ async fn selectors_scope_paths() {
     assert_eq!(names(&mixed), ["visible/"]);
 }
 
+/// What `caller` gets of `path` in repository `repo`, redirects not
+/// followed: its status, the `Link` header and the body.
+async fn read_as(
+    srv: &TestServer,
+    caller: &common::Caller,
+    repo: &str,
+    path: &str,
+    accept: &str,
+) -> (u16, Option<String>, String) {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = caller
+        .apply(client.get(format!("{}/repository/{repo}/{path}", srv.base_url)))
+        .header(header::ACCEPT, accept)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let link = resp
+        .headers()
+        .get(header::LINK)
+        .map(|v| v.to_str().unwrap().to_string());
+    (status, link, resp.text().await.unwrap())
+}
+
+/// Every entry of directory `dir` of `repo` that `caller` is shown, a page
+/// of one at a time, with every page's `next`; each page's `Link` header
+/// and HTML page link to the next, and none of them, its JSON neither,
+/// holds any of `hidden`.
+async fn walk_as(
+    srv: &TestServer,
+    caller: &common::Caller,
+    repo: &str,
+    dir: &str,
+    hidden: &[&str],
+) -> (Vec<String>, Vec<String>) {
+    let (mut names, mut nexts) = (Vec::new(), Vec::new());
+    let mut after = String::new();
+    loop {
+        let query = format!("{dir}?limit=1&after={after}");
+        let (status, link, body) = read_as(srv, caller, repo, &query, "application/json").await;
+        assert_eq!(status, 200, "{repo}/{query}: {body}");
+        let page: Value = serde_json::from_str(&body).unwrap();
+        let (_, _, html) = read_as(srv, caller, repo, &query, "text/html").await;
+        for text in [&body, &html, &link.clone().unwrap_or_default()] {
+            for name in hidden {
+                assert!(!text.contains(name), "{repo}/{query} names {name}: {text}");
+            }
+        }
+        names.extend(self::names(&page));
+        match page["next"].as_str() {
+            Some(next) => {
+                let link = link.expect("a Link to the next page");
+                assert!(
+                    link.contains(&format!("after={}", next.replace('/', "%2F"))),
+                    "{link}"
+                );
+                assert!(
+                    html.contains(&format!("after={}", next.replace('/', "%2F"))),
+                    "{html}"
+                );
+                nexts.push(next.to_string());
+                after = next.to_string();
+            }
+            None => {
+                assert_eq!(link, None);
+                return (names, nexts);
+            }
+        }
+    }
+}
+
+/// A group shows a caller what it could read from the members directly, no
+/// more: with a member it may not read, a selector on the group's grant or
+/// one on a member's, no file of the others, no checksum, no name in a
+/// listing or in a listing's `next`, `Link` or HTML link comes through,
+/// and a directory of hidden files alone is not found, however many it
+/// holds (#648). A hosted or proxy repository's listings hold the same.
+#[tokio::test]
+async fn groups_and_selectors_show_only_what_the_caller_may_read() {
+    let srv = common::start().await;
+    let n = unique();
+    let (a, b, group) = (format!("va{n}"), format!("vb{n}"), format!("vg{n}"));
+    for name in [&a, &b] {
+        create(
+            &srv,
+            json!({"name": name, "kind": "hosted", "format": "raw"}),
+        )
+        .await;
+    }
+    create(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "raw"}),
+    )
+    .await;
+    assert_eq!(add_member(&srv, &group, &a, 10).await, 201);
+    assert_eq!(add_member(&srv, &group, &b, 5).await, 201);
+    // Each member holds a file the selector includes, and a directory of
+    // three it does not, listed ahead of it.
+    for (repo, m) in [(&a, "a"), (&b, "b")] {
+        let files = Files::new(&srv, repo).await;
+        assert_eq!(
+            files.put(&format!("public/{m}.txt"), m.as_bytes()).await,
+            201
+        );
+        for i in 1..=3 {
+            assert_eq!(
+                files
+                    .put(&format!("internal-{m}/{i}.txt"), b"internal")
+                    .await,
+                201
+            );
+        }
+    }
+    // Indexed like `GroupCaller::sees`.
+    let files = [
+        "public/a.txt",
+        "internal-a/1.txt",
+        "public/b.txt",
+        "internal-b/1.txt",
+    ];
+    let directories = ["", "internal-a", "", "internal-b"];
+
+    for common::GroupCaller {
+        label,
+        caller,
+        sees,
+    } in srv.group_callers(&group, &a, &b, &["public/**"]).await
+    {
+        for (i, file) in files.iter().enumerate() {
+            let expected = if sees[i] { 200 } else { 404 };
+            for path in [file.to_string(), format!("{file}.sha256")] {
+                let (status, _, _) = read_as(&srv, &caller, &group, &path, "*/*").await;
+                assert_eq!(status, expected, "{label}: {path}");
+            }
+        }
+        let names = ["a.txt", "internal-a", "b.txt", "internal-b"];
+        let hidden: Vec<&str> = (0..4).filter(|i| !sees[*i]).map(|i| names[i]).collect();
+        let mut root = Vec::new();
+        for (i, dir) in [(1, "internal-a/"), (3, "internal-b/")] {
+            if sees[i] {
+                root.push(dir.to_string());
+            }
+        }
+        root.push("public/".to_string());
+        let (listed, nexts) = walk_as(&srv, &caller, &group, "", &hidden).await;
+        assert_eq!(listed, root, "{label}");
+        assert!(
+            nexts.iter().all(|next| root.contains(next)),
+            "{label}: {nexts:?}"
+        );
+        let public: Vec<String> = [(0, "a.txt"), (2, "b.txt")]
+            .into_iter()
+            .filter(|(i, _)| sees[*i])
+            .map(|(_, name)| name.to_string())
+            .collect();
+        assert_eq!(
+            walk_as(&srv, &caller, &group, "public/", &hidden).await.0,
+            public,
+            "{label}"
+        );
+        for (i, dir) in directories.iter().enumerate() {
+            if dir.is_empty() {
+                continue;
+            }
+            if sees[i] {
+                let (status, _, _) = read_as(&srv, &caller, &group, dir, "*/*").await;
+                assert_eq!(status, 301, "{label}: {dir}");
+                continue;
+            }
+            for path in [
+                dir.to_string(),
+                format!("{dir}/"),
+                format!("{dir}/?limit=1"),
+                format!("{dir}/?limit=1&format=json"),
+            ] {
+                let (status, link, body) = read_as(&srv, &caller, &group, &path, "*/*").await;
+                assert_eq!((status, link), (404, None), "{label}: {path}: {body}");
+            }
+        }
+    }
+
+    // A hosted repository's selector hides as much.
+    let reader = srv.caller().await;
+    let selector = srv.create_selector(&["public/**"]).await;
+    srv.grant_role(reader.id, &[(&b, "read", Some(selector))])
+        .await;
+    assert_eq!(
+        walk_as(&srv, &reader, &b, "", &["internal"]).await,
+        (vec!["public/".to_string()], vec![])
+    );
+    for path in ["internal-b", "internal-b/", "internal-b/?limit=1"] {
+        assert_eq!(
+            read_as(&srv, &reader, &b, path, "*/*").await.0,
+            404,
+            "{path}"
+        );
+    }
+
+    // And a proxy's, over what it cached.
+    let upstream = Arc::new(Upstream::default());
+    *upstream.content.lock().unwrap() = b"cached".to_vec();
+    let base = mock_upstreams(upstream).await;
+    let proxy = format!("vp{n}");
+    create(
+        &srv,
+        json!({"name": proxy, "kind": "proxy", "format": "raw",
+               "remote_url": format!("{base}/releases/download/")}),
+    )
+    .await;
+    let cache = Files::new(&srv, &proxy).await;
+    for path in [
+        "internal/1.bin",
+        "internal/2.bin",
+        "internal/3.bin",
+        "public/x.bin",
+    ] {
+        assert_eq!(cache.get(path).await.status(), 200, "{path}");
+    }
+    let reader = srv.caller().await;
+    srv.grant_role(reader.id, &[(&proxy, "read", Some(selector))])
+        .await;
+    assert_eq!(
+        walk_as(&srv, &reader, &proxy, "", &["internal"]).await,
+        (vec!["public/".to_string()], vec![])
+    );
+    for path in ["internal/", "internal/?limit=1"] {
+        assert_eq!(
+            read_as(&srv, &reader, &proxy, path, "*/*").await.0,
+            404,
+            "{path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn forms_the_web_ui_and_the_admin_api() {
     let srv = common::start().await;

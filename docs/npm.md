@@ -276,8 +276,10 @@ repository has no upstream to ask (404). Auditing needs `read`.
 Through a group, the request leaves out the packages under the reserved
 prefixes of every group on the way to that proxy: the group's own, and a
 nested group's when the proxy is its member. Your internal package names
-stay inside, as they do when you audit the nested group directly. Every
-audit request is filtered:
+stay inside, as they do when you audit the nested group directly. It also
+leaves out the packages your content selectors hide on any repository on
+the way, the proxy's included: you learn of advisories only for packages
+you could read through it. Every audit request is filtered:
 
 - the bulk request of npm 7 and later
   (`/-/npm/v1/security/advisories/bulk`), which names each package once;
@@ -288,11 +290,11 @@ audit request is filtered:
   reserved prefix. Of each package only its version, integrity and kind of
   dependency go on.
 
-A request through such a group that cannot be filtered is refused (400),
-never passed on: a body that is not a JSON object, and a legacy request
-that names its packages by their paths in `node_modules` (`packages`, the
-lockfile of npm 7 and later). A proxy, or a group with no reserved prefixes
-on the way, passes the request on as it is.
+A request that must be filtered and cannot be is refused (400), never
+passed on: a body that is not a JSON object, and a legacy request that
+names its packages by their paths in `node_modules` (`packages`, the
+lockfile of npm 7 and later). With no reserved prefixes and no selector of
+yours on the way, a proxy or a group passes the request on as it is.
 
 ## Permissions
 

@@ -276,7 +276,16 @@ curl -u admin@example.com:<admin-token> -H 'content-type: application/json' \
 
 A file outside the caller's selector is not found, its sidecars neither, and
 a listing leaves it out; a directory is listed when the caller may see a file
-in it (among its first 1,000).
+in it (among its first 1,000). The same holds through a group, whichever
+grant holds the selector: the group's, a nested group's or a member's.
+
+A listing never names what the caller may not see, not in `next` either: a
+page reads on past the hidden entries until it holds `limit` visible ones,
+and its `next` is the last of them. That read stops after 1,000 entries; a
+page that reaches it ends at its last visible entry, and the listing ends
+there if it found none, so visible entries behind more than 1,000 hidden
+ones in a row are not listed. A directory that holds only hidden entries is
+not found (`404`), with or without its `/`, however many it holds.
 
 Uploads and deletes are recorded in the audit log (`forge::audit`, "package
 mutation"), and a workload identity's in the trusted-publishing ledger, with
