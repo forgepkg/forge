@@ -1696,6 +1696,138 @@ async fn browse_images_selector_counts_and_pages_after_filtering() {
     }
 }
 
+/// Copy the manifest of image `template` of repository `from` into
+/// repository `to` as the images `team/app-<n>` for `range`, without
+/// registry uploads.
+async fn seed_images(
+    srv: &TestServer,
+    from: i64,
+    template: &str,
+    to: i64,
+    range: std::ops::Range<i64>,
+) {
+    sqlx::query(
+        r#"
+        INSERT INTO oci_manifest
+            (repository_id, image, digest, blob_sha256, media_type, size, summary)
+        SELECT $3, 'team/app-' || lpad(n::text, 5, '0'),
+               digest, blob_sha256, media_type, size, summary
+        FROM oci_manifest CROSS JOIN generate_series($4::bigint, $5::bigint - 1) AS n
+        WHERE repository_id = $1 AND image = $2
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(from)
+    .bind(template)
+    .bind(to)
+    .bind(range.start)
+    .bind(range.end)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+}
+
+/// A group's image list over a large proxy (#596): it reads each member's
+/// images a batch at a time by name (what that costs is
+/// `forge-db`'s `oci_images` test), lists them all, searches them, and
+/// still keeps an image the hosted member owns off the proxy's list for a
+/// caller who may not read that member, asking only of the proxy's images
+/// whether the owner holds them.
+#[tokio::test]
+async fn a_group_lists_a_large_proxys_images_in_batches() {
+    let srv = common::start().await;
+    let (hosted, proxy, group) = (repo_name("own"), repo_name("big"), repo_name("grp"));
+    let hosted_id = create_repo(
+        &srv,
+        json!({"name": hosted, "kind": "hosted", "format": "docker"}),
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+    let proxy_id = create_repo(
+        &srv,
+        json!({"name": proxy, "kind": "proxy", "format": "docker", "remote_url": "http://127.0.0.1:9"}),
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker"}),
+    )
+    .await;
+    for (member, priority) in [(&hosted, 10), (&proxy, 5)] {
+        let resp = admin_post(
+            &srv,
+            &format!("/admin/repositories/{group}/members"),
+            json!({"member": member, "priority": priority}),
+        )
+        .await;
+        assert_eq!(resp.status(), 201);
+    }
+    admin_oci(&srv)
+        .await
+        .push_image(&format!("{hosted}/team/app-02500"), "1", "amd64", b"owned")
+        .await;
+    // More than a batch of images, the owned one among them.
+    seed_images(&srv, hosted_id, "team/app-02500", proxy_id, 0..4_500).await;
+    let (user, token, uid) = user_with_token(&srv).await;
+    grant(&srv, uid, &group, "read").await;
+    grant(&srv, uid, &proxy, "read").await;
+
+    let list = |query: String| {
+        let (srv, user, token, group) = (&srv, &user, &token, &group);
+        async move {
+            let resp = srv
+                .client()
+                .get(format!(
+                    "{}/browse/images?repo={group}&{query}",
+                    srv.base_url
+                ))
+                .basic_auth(user, Some(token))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            let images: Vec<String> = body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["image"].as_str().unwrap().to_string())
+                .collect();
+            (body["total"].clone(), images)
+        }
+    };
+    let (total, images) = list("take=2".into()).await;
+    assert_eq!(total, 4_499, "all but the owned image");
+    assert_eq!(images, ["team/app-00000", "team/app-00001"]);
+    let (total, images) = list("skip=2497&take=4".into()).await;
+    assert_eq!(total, 4_499);
+    assert_eq!(
+        images,
+        [
+            "team/app-02497",
+            "team/app-02498",
+            "team/app-02499",
+            "team/app-02501"
+        ]
+    );
+    let (total, images) = list("q=app-0449&take=20".into()).await;
+    assert_eq!(total, 10);
+    assert_eq!(images.last().unwrap(), "team/app-04499");
+    let (total, _) = list("q=app-0250&take=20".into()).await;
+    assert_eq!(total, 9, "the owned image stays off the search too");
+
+    // Who reads the owner lists its image, from the owner.
+    grant(&srv, uid, &hosted, "read").await;
+    let (total, images) = list("q=app-02500".into()).await;
+    assert_eq!(
+        (total, images),
+        (json!(1), vec!["team/app-02500".to_string()])
+    );
+}
+
 /// Helm charts pushed as artifacts: the image page lists them by their
 /// config type, and `/browse/chart` reads their metadata, README and values
 /// from the blobs Forge holds, through a group too.

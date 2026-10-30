@@ -1329,6 +1329,75 @@ pub async fn list_images(
     .await
 }
 
+/// The next `limit` images of a repository whose name contains `query` (all
+/// when empty), by name, after the image `after` (from the first when
+/// empty): a keyset scan over the `(repository_id, image, digest)` index,
+/// then each image's counts from its own manifests (a lookup per image, so
+/// that no plan reads the repository's other manifests). Reading a
+/// repository's images batch by batch costs each batch alone, not the
+/// batches before it as `OFFSET` does.
+pub async fn list_images_after<'e, E>(
+    executor: E,
+    repository_id: i64,
+    query: &str,
+    after: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<ImageSummary>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let query = query.to_ascii_lowercase();
+    sqlx::query_as!(
+        ImageSummary,
+        r#"
+        WITH names AS (
+            SELECT DISTINCT image FROM oci_manifest
+            WHERE repository_id = $1 AND image > $3 AND strpos(image, $2) > 0
+            ORDER BY image
+            LIMIT $4
+        )
+        SELECT n.image AS "image!",
+               s.tag_count AS "tag_count!",
+               s.manifest_count AS "manifest_count!",
+               s.last_pushed_at AS "last_pushed_at!"
+        FROM names n
+        CROSS JOIN LATERAL (
+            SELECT count(DISTINCT t.tag) AS tag_count,
+                   count(DISTINCT m.id) AS manifest_count,
+                   max(m.created_at) AS last_pushed_at
+            FROM oci_manifest m
+            LEFT JOIN oci_tag t ON t.manifest_id = m.id
+            WHERE m.repository_id = $1 AND m.image = n.image
+        ) s
+        ORDER BY n.image
+        "#,
+        repository_id,
+        query,
+        after,
+        limit,
+    )
+    .fetch_all(executor)
+    .await
+}
+
+/// Which of `images` one of the repositories `repository_ids` holds.
+pub async fn images_held(
+    pool: &PgPool,
+    repository_ids: &[i64],
+    images: &[String],
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT DISTINCT image AS "image!" FROM oci_manifest
+        WHERE repository_id = ANY($1) AND image = ANY($2)
+        "#,
+        repository_ids,
+        images,
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// How many images [`list_images`] would list in total.
 pub async fn count_images(pool: &PgPool, repository_id: i64, query: &str) -> sqlx::Result<i64> {
     let query = query.to_ascii_lowercase();

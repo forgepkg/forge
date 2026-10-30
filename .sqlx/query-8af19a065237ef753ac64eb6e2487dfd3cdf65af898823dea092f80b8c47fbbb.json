@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT image AS \"image!\" FROM oci_manifest\n        WHERE repository_id = ANY($1) AND image = ANY($2)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "image!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oci_manifest",
+            "name": "image"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8af19a065237ef753ac64eb6e2487dfd3cdf65af898823dea092f80b8c47fbbb"
+}
