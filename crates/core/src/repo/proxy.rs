@@ -2259,8 +2259,9 @@ impl ProxyRepo {
     /// versions are loaded for the requested page alone, so an empty query
     /// over a large proxy cache does not load every cached version.
     /// With `enrich`, the returned page carries cached manifests
-    /// ([`Self::enrich_hits`]); a group searches its members without and
-    /// enriches only its own final page.
+    /// ([`Self::enrich_hits`]). A group reads the two halves apart: the ids
+    /// ([`Self::search_names`]), then the hits of its own page
+    /// ([`Self::hits_of`]), which it enriches.
     async fn search_filtered(
         &self,
         repo: &str,
@@ -2269,11 +2270,42 @@ impl ProxyRepo {
         enrich: bool,
     ) -> Result<SearchResult, RepoError> {
         let repo_row = self.proxy_repo(repo).await?;
+        let bounds = self.listable_bounds(&repo_row).await?;
+        let names = self
+            .search_names(&repo_row, &bounds, params, filter)
+            .await?;
+        let total_hits = names.len();
+        let page: Vec<String> = names
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
+        let mut hits = self.hits_of(&repo_row, &bounds, params, &page).await?;
+        if enrich {
+            self.enrich_hits(repo_row.id, &mut hits).await;
+        }
+        Ok(SearchResult { total_hits, hits })
+    }
+
+    /// The `listable` conditions of a cache search, as of now
+    /// ([`ListableBounds`]).
+    async fn listable_bounds(&self, repo_row: &Repository) -> Result<ListableBounds, RepoError> {
         let now = self.db_now().await?;
-        // The `listable` conditions as bounds: past the delay window, and no
-        // not-found marker younger than the TTL.
-        let seen_before = now - Duration::seconds(i64::from(repo_row.package_delay_seconds));
-        let marked_after = now - Self::not_found_ttl(&repo_row);
+        Ok(ListableBounds {
+            seen_before: now - Duration::seconds(i64::from(repo_row.package_delay_seconds)),
+            marked_after: now - Self::not_found_ttl(repo_row),
+        })
+    }
+
+    /// The ids (stored, lowercase) of every cached package a search for
+    /// `params` finds, in byte order.
+    async fn search_names(
+        &self,
+        repo_row: &Repository,
+        bounds: &ListableBounds,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<Vec<String>, RepoError> {
         let query = SearchQuery::parse(&params.q);
         let q = query.prefilter().unwrap_or("").to_string();
         // SemVer 2.0.0 for legacy clients: a `.` after a `-`. `version` is the
@@ -2294,8 +2326,8 @@ impl ProxyRepo {
             "#,
             repo_row.id,
             q,
-            seen_before,
-            marked_after,
+            bounds.seen_before,
+            bounds.marked_after,
             params.prerelease,
             params.include_semver2,
         )
@@ -2308,13 +2340,19 @@ impl ProxyRepo {
         // Byte order, as hosted and group results are ordered (SQL orders by
         // the database collation, which may weigh punctuation differently).
         names.sort_unstable();
-        let total_hits = names.len();
-        let page: Vec<String> = names
-            .into_iter()
-            .skip(params.skip.min(total_hits))
-            .take(params.effective_take())
-            .collect();
+        Ok(names)
+    }
 
+    /// The unenriched search hits of `page` (ids [`Self::search_names`]
+    /// returned for `params`), in its order: each id's listable versions and
+    /// its casing. An id left without one is skipped.
+    async fn hits_of(
+        &self,
+        repo_row: &Repository,
+        bounds: &ListableBounds,
+        params: &SearchParams,
+        page: &[String],
+    ) -> Result<Vec<SearchHit>, RepoError> {
         let rows = sqlx::query_as!(
             forge_db::model::ProxyCachedVersion,
             r#"
@@ -2329,9 +2367,9 @@ impl ProxyRepo {
               AND ($6 OR version !~ '-.*[.]')
             "#,
             repo_row.id,
-            &page,
-            seen_before,
-            marked_after,
+            page,
+            bounds.seen_before,
+            bounds.marked_after,
             params.prerelease,
             params.include_semver2,
         )
@@ -2349,12 +2387,12 @@ impl ProxyRepo {
 
         // The id as the package spells it (rows hold the lowercased one).
         let original_ids: HashMap<String, String> =
-            proxy_dao::original_ids(&self.pool, repo_row.id, &page)
+            proxy_dao::original_ids(&self.pool, repo_row.id, page)
                 .await?
                 .into_iter()
                 .collect();
         let mut hits: Vec<SearchHit> = Vec::with_capacity(page.len());
-        for name in &page {
+        for name in page {
             let Some(mut versions) = by_id.remove(name) else {
                 // Changed between the two queries.
                 continue;
@@ -2375,10 +2413,7 @@ impl ProxyRepo {
                 ..Default::default()
             });
         }
-        if enrich {
-            self.enrich_hits(repo_row.id, &mut hits).await;
-        }
-        Ok(SearchResult { total_hits, hits })
+        Ok(hits)
     }
 
     /// Attach each hit's latest manifest. Manifests are known for cached
@@ -2916,6 +2951,42 @@ impl RepoReadOps for ProxyRepo {
         self.enrich_hits(repo_row.id, hits).await;
         Ok(())
     }
+
+    /// The cached packages' ids: a group asks a proxy for them only where it
+    /// searches the cache (without the upstream, or while offline).
+    async fn search_ids(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<Vec<String>, RepoError> {
+        let repo_row = self.proxy_repo(repo).await?;
+        let bounds = self.listable_bounds(&repo_row).await?;
+        self.search_names(&repo_row, &bounds, params, filter).await
+    }
+
+    async fn search_hits(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        ids: &[String],
+    ) -> Result<Vec<SearchHit>, RepoError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let repo_row = self.proxy_repo(repo).await?;
+        let bounds = self.listable_bounds(&repo_row).await?;
+        self.hits_of(&repo_row, &bounds, params, ids).await
+    }
+}
+
+/// The `listable` conditions of a search of a proxy's cache as bounds, taken
+/// at one instant: a version is listed once first seen at or before
+/// `seen_before` (past the package delay), unless a not-found marker set
+/// after `marked_after` (younger than the TTL) hides it.
+struct ListableBounds {
+    seen_before: DateTime<Utc>,
+    marked_after: DateTime<Utc>,
 }
 
 /// One page of an upstream's search results, reduced to what a search hit

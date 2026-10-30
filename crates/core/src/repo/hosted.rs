@@ -93,8 +93,9 @@ impl HostedRepo {
     /// before paging: the ids that match are listed once, filtered by the
     /// selector, counted and paged, and only the page's versions are loaded.
     /// With `enrich`, the returned page carries manifests and download totals
-    /// ([`Self::enrich_hits`]); a group searches its members without and
-    /// enriches only its own final page.
+    /// ([`Self::enrich_hits`]). A group reads the two halves apart: the ids
+    /// ([`Self::search_names`]), then the hits of its own page
+    /// ([`Self::hits_of`]), which it enriches.
     async fn search_filtered(
         &self,
         repo: &str,
@@ -103,10 +104,32 @@ impl HostedRepo {
         enrich: bool,
     ) -> Result<SearchResult, RepoError> {
         let repo_id = self.repo_id(repo).await?;
+        // Page over ids, not versions: versions are loaded for the returned
+        // page only.
+        let names = self.search_names(repo_id, params, filter).await?;
+        let total_hits = names.len();
+        let page: Vec<String> = names
+            .into_iter()
+            .skip(params.skip.min(total_hits))
+            .take(params.effective_take())
+            .collect();
+        let mut hits = self.hits_of(repo_id, params, &page).await?;
+        if enrich {
+            self.enrich_hits(repo_id, &mut hits).await?;
+        }
+        Ok(SearchResult { total_hits, hits })
+    }
+
+    /// The ids (stored, lowercase) of every package a search for `params`
+    /// finds, in byte order. The filters run in SQL, the selector and the
+    /// query's terms on the (much shorter) id list.
+    async fn search_names(
+        &self,
+        repo_id: i64,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<Vec<String>, RepoError> {
         let query = SearchQuery::parse(&params.q);
-        // Page over ids, not versions: the filters run in SQL, the selector
-        // and the query's terms on the (much shorter) id list, and versions
-        // are loaded for the returned page only.
         let mut names: Vec<String> = component_dao::search_names(
             &self.pool,
             repo_id,
@@ -121,19 +144,24 @@ impl HostedRepo {
         // Byte order, as group results are ordered (SQL orders by the
         // database collation, which may weigh punctuation differently).
         names.sort_unstable();
-        let total_hits = names.len();
-        let page: Vec<String> = names
-            .into_iter()
-            .skip(params.skip.min(total_hits))
-            .take(params.effective_take())
-            .collect();
+        Ok(names)
+    }
 
+    /// The unenriched search hits of `page` (ids [`Self::search_names`]
+    /// returned for `params`), in its order: each id's matching versions and
+    /// its casing. An id left without a matching version is skipped.
+    async fn hits_of(
+        &self,
+        repo_id: i64,
+        params: &SearchParams,
+        page: &[String],
+    ) -> Result<Vec<SearchHit>, RepoError> {
         use std::collections::HashMap;
         let mut by_id: HashMap<String, Vec<forge_db::model::Component>> = HashMap::new();
         for c in component_dao::search_versions(
             &self.pool,
             repo_id,
-            &page,
+            page,
             params.prerelease,
             params.include_semver2,
         )
@@ -142,7 +170,7 @@ impl HostedRepo {
             by_id.entry(c.name.clone()).or_default().push(c);
         }
         let mut hits: Vec<SearchHit> = Vec::with_capacity(page.len());
-        for name in &page {
+        for name in page {
             let Some(comps) = by_id.remove(name) else {
                 // Changed between the two queries.
                 continue;
@@ -165,10 +193,7 @@ impl HostedRepo {
                 ..Default::default()
             });
         }
-        if enrich {
-            self.enrich_hits(repo_id, &mut hits).await?;
-        }
-        Ok(SearchResult { total_hits, hits })
+        Ok(hits)
     }
 
     /// Attach the latest version's manifest and the download total to each
@@ -530,6 +555,29 @@ impl RepoReadOps for HostedRepo {
         }
         let repo_id = self.repo_id(repo).await?;
         self.enrich_hits(repo_id, hits).await
+    }
+
+    async fn search_ids(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<Vec<String>, RepoError> {
+        let repo_id = self.repo_id(repo).await?;
+        self.search_names(repo_id, params, filter).await
+    }
+
+    async fn search_hits(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        ids: &[String],
+    ) -> Result<Vec<SearchHit>, RepoError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let repo_id = self.repo_id(repo).await?;
+        self.hits_of(repo_id, params, ids).await
     }
 }
 

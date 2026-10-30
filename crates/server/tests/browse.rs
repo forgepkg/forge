@@ -494,6 +494,117 @@ async fn browse_group_merges_members() {
     let _ = lower;
 }
 
+/// A group's browse reaches every id its members hold, past each member's
+/// first 1,000, and counts them all (#536): here a proxy whose cache lists
+/// 1,500 ids (seeded in SQL) and a hosted member that owns one of them.
+#[tokio::test]
+async fn a_group_browses_every_cached_id_of_its_proxy() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let suffix = common::unique();
+    let hosted = format!("bigh{suffix}");
+    let proxy = format!("bigp{suffix}");
+    let group = format!("bigg{suffix}");
+    let prefix = format!("Big{suffix}");
+    let id = |n: usize| format!("{prefix}.P{n:04}");
+
+    publish_one(&srv, &hosted, &id(1490), "9.0.0", false).await;
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": proxy, "kind": "proxy",
+                      "remote_url": "https://feed.example/v3/index.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let proxy_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    sqlx::query(
+        "INSERT INTO proxy_cached_version
+             (repository_id, name, version, first_seen_at, original_id)
+         SELECT $1, lower(id), v, now() - interval '1 day', id
+         FROM (SELECT $2 || '.P' || lpad(n::text, 4, '0') AS id
+               FROM generate_series(0, 1499) AS n) AS ids,
+              unnest(ARRAY['1.0.0', '1.1.0', '1.2.0']) AS v",
+    )
+    .bind(proxy_id)
+    .bind(&prefix)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": group, "kind": "group"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    for (member, priority) in [(&hosted, 100), (&proxy, 10)] {
+        let resp = client
+            .post(format!(
+                "{}/admin/repositories/{group}/members",
+                srv.base_url
+            ))
+            .basic_auth(&u, Some(&p))
+            .json(&json!({"member": member, "priority": priority}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+
+    let page = |query: String| {
+        let (client, srv, group) = (&client, &srv, &group);
+        let (u, p) = (u.clone(), p.clone());
+        async move {
+            let resp = client
+                .get(format!(
+                    "{}/browse/packages?repo={group}&{query}",
+                    srv.base_url
+                ))
+                .basic_auth(&u, Some(&p))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            let items: Vec<(String, String)> = body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    (
+                        item["original_id"].as_str().unwrap().to_string(),
+                        item["latest_version"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            (body["total"].as_u64().unwrap(), items)
+        }
+    };
+    let expected = |range: std::ops::Range<usize>| -> Vec<(String, String)> {
+        range
+            .map(|n| {
+                let version = if n == 1490 { "9.0.0" } else { "1.2.0" };
+                (id(n), version.to_string())
+            })
+            .collect()
+    };
+
+    assert_eq!(page("take=20".into()).await, (1500, expected(0..20)));
+    assert_eq!(
+        page("skip=1480&take=20".into()).await,
+        (1500, expected(1480..1500)),
+        "the cache's ids past 1,000, the owned one from the hosted member"
+    );
+    assert_eq!(
+        page(format!("q={}&take=5", id(1495).to_lowercase())).await,
+        (1, expected(1495..1496))
+    );
+}
+
 /// A NuGet group shows a caller what it could read from its members
 /// directly, no more (#648): with a member it may not read, a selector on
 /// the group's grant or one on a member's, a hidden package has no flat

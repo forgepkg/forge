@@ -2826,8 +2826,9 @@ async fn upstream_searches_are_merged_in_turn() {
     assert_eq!(totals[0], 100);
 }
 
-/// An offline proxy searches its cache: the group asks it for all its hits
-/// and counts them exactly, as it does a hosted member's.
+/// An offline proxy searches its cache: the group asks it for all its ids
+/// and counts them exactly, as it does a hosted member's, then for the hits
+/// of its page. (The stub answers both through its search, unwindowed.)
 #[tokio::test]
 async fn an_offline_proxy_is_searched_like_a_local_member() {
     let pool = common::pool().await;
@@ -2851,7 +2852,10 @@ async fn an_offline_proxy_is_searched_like_a_local_member() {
     let (pages, totals) = search_pages(&g, &group.name, "Cached", 20, 1).await;
     assert_eq!(pages[0], ids("Cached", 0..20));
     assert_eq!(totals[0], 60);
-    assert_eq!(upstream.takes(), [SearchParams::MAX_TAKE]);
+    assert_eq!(
+        upstream.takes(),
+        [SearchParams::MAX_TAKE, SearchParams::MAX_TAKE]
+    );
 }
 
 /// Only the upstream search whose hits hold the page back is widened: one
@@ -3006,4 +3010,340 @@ async fn an_upstream_window_the_proxy_emptied_keeps_the_total_past_the_page() {
     let (pages, totals) = search_pages(&g, &group.name, "", 20, 3).await;
     assert_eq!(totals[0], 41, "one past the 40 local ids");
     assert_eq!(pages[2], ids("Delayed", 32..52));
+}
+
+// ── local members merged on ids (#536) ──────────────────────────────────────
+
+/// One search call a [`Recording`] member saw, with the member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchCall {
+    /// `search_ids`.
+    Ids(String),
+    /// `search_hits`, for these ids.
+    Hits(String, Vec<String>),
+    /// A search of hits with their versions (`search`, `search_unenriched`).
+    Search(String),
+}
+
+/// A member's read ops that record every search call before passing it on.
+struct Recording {
+    inner: Arc<dyn RepoReadOps>,
+    calls: Arc<std::sync::Mutex<Vec<SearchCall>>>,
+}
+
+#[async_trait]
+impl RepoReadOps for Recording {
+    async fn list_versions(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<forge_core::repo::VersionEntry>, RepoError> {
+        self.inner.list_versions(repo, id).await
+    }
+
+    async fn resolve_nupkg(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        self.inner.resolve_nupkg(repo, id, version).await
+    }
+
+    async fn resolve_nuspec(
+        &self,
+        repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        self.inner.resolve_nuspec(repo, id, version).await
+    }
+
+    async fn registration(
+        &self,
+        repo: &str,
+        id: &str,
+    ) -> Result<Vec<forge_core::repo::RegistrationEntry>, RepoError> {
+        self.inner.registration(repo, id).await
+    }
+
+    async fn search(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+    ) -> Result<forge_core::repo::SearchResult, RepoError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(SearchCall::Search(repo.into()));
+        self.inner.search(repo, params).await
+    }
+
+    async fn search_unenriched(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &forge_core::authz::PackageFilter,
+    ) -> Result<forge_core::repo::SearchResult, RepoError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(SearchCall::Search(repo.into()));
+        self.inner.search_unenriched(repo, params, filter).await
+    }
+
+    async fn enrich_search_hits(
+        &self,
+        repo: &str,
+        hits: &mut [forge_core::repo::SearchHit],
+    ) -> Result<(), RepoError> {
+        self.inner.enrich_search_hits(repo, hits).await
+    }
+
+    async fn search_ids(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &forge_core::authz::PackageFilter,
+    ) -> Result<Vec<String>, RepoError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(SearchCall::Ids(repo.into()));
+        self.inner.search_ids(repo, params, filter).await
+    }
+
+    async fn search_hits(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        ids: &[String],
+    ) -> Result<Vec<forge_core::repo::SearchHit>, RepoError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(SearchCall::Hits(repo.into(), ids.to_vec()));
+        self.inner.search_hits(repo, params, ids).await
+    }
+}
+
+/// Hosted members, recorded ([`Recording`]); proxy-kind members are
+/// [`RankedUpstream`]s by id, searched locally while offline.
+struct RecordingFactory {
+    hosted: HostedFactory,
+    upstreams: HashMap<i64, Arc<RankedUpstream>>,
+    calls: Arc<std::sync::Mutex<Vec<SearchCall>>>,
+}
+
+impl MemberOpsFactory for RecordingFactory {
+    fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        if let Some(upstream) = self.upstreams.get(&member.id) {
+            return Ok(upstream.clone());
+        }
+        Ok(Arc::new(Recording {
+            inner: self.hosted.ops_for(member)?,
+            calls: self.calls.clone(),
+        }))
+    }
+}
+
+fn recording_group_repo(
+    pool: &PgPool,
+    principal: Principal,
+    upstreams: &[(&Repository, &Arc<RankedUpstream>)],
+) -> (GroupRepo, Arc<std::sync::Mutex<Vec<SearchCall>>>) {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let factory = Arc::new(RecordingFactory {
+        hosted: HostedFactory {
+            pool: pool.clone(),
+            blobs: StubBlobs::default(),
+        },
+        upstreams: upstreams
+            .iter()
+            .map(|(proxy, upstream)| (proxy.id, Arc::clone(upstream)))
+            .collect(),
+        calls: calls.clone(),
+    });
+    let authz = Authz::new(pool.clone(), Cache::l1_only(16));
+    let g = GroupRepo::new(pool.clone(), principal, factory, authz, TEST_MAX_DEPTH)
+        .with_format(Arc::new(nuget()));
+    (g, calls)
+}
+
+/// Seed `<prefix>.<n>` (`n` zero-padded to four digits) for each `n` of
+/// `range` into hosted `repo_id`, each in `versions`, `listed` or not: bare
+/// component rows, all a search reads.
+async fn seed_ids(
+    pool: &PgPool,
+    repo_id: i64,
+    prefix: &str,
+    range: std::ops::Range<i32>,
+    versions: &[&str],
+    listed: bool,
+) {
+    let versions: Vec<String> = versions.iter().map(|v| v.to_string()).collect();
+    sqlx::query(
+        "INSERT INTO component (repository_id, name, original_id, version, version_original, listed)
+         SELECT $1, lower(id), id, v, v, $6
+         FROM (SELECT $2 || '.' || lpad(n::text, 4, '0') AS id
+               FROM generate_series($3, $4 - 1) AS n) AS ids,
+              unnest($5::text[]) AS v",
+    )
+    .bind(repo_id)
+    .bind(prefix)
+    .bind(range.start)
+    .bind(range.end)
+    .bind(&versions)
+    .bind(listed)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn padded(prefix: &str, range: std::ops::Range<usize>) -> Vec<String> {
+    range.map(|n| format!("{prefix}.{n:04}")).collect()
+}
+
+/// A group pages its local members' ids, and loads versions and casing for
+/// its page alone, each hit through the member that won it (#536). It reads
+/// past each member's first 1,000 ids, and counts every merged id.
+#[tokio::test]
+async fn a_group_pages_local_ids_and_loads_only_its_page() {
+    let pool = common::pool().await;
+    let high = seed_member(&pool, false).await;
+    let low = seed_member(&pool, false).await;
+    let group = seed_group(&pool).await;
+    let p = format!("Local{}", common::unique());
+    // high: 0000..1199 in three versions; low: 1100..1399 in two, so
+    // 1100..1199 are shared and high's copy wins them.
+    seed_ids(
+        &pool,
+        high.id,
+        &p,
+        0..1200,
+        &["1.0.0", "1.1.0", "1.2.0"],
+        true,
+    )
+    .await;
+    seed_ids(&pool, low.id, &p, 1100..1400, &["2.0.0", "2.1.0"], true).await;
+    repository_dao::add_group_member(&pool, group.id, high.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, low.id, 10)
+        .await
+        .unwrap();
+    let (g, calls) = recording_group_repo(&pool, user(&pool).await, &[]);
+
+    let search = |skip: usize| {
+        let (g, group, q) = (&g, &group.name, p.clone());
+        async move {
+            g.search(
+                group,
+                &SearchParams {
+                    q,
+                    skip,
+                    take: 20,
+                    include_upstream: false,
+                    ..SearchParams::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let result = search(1190).await;
+    assert_eq!(result.total_hits, 1400, "every merged id counts");
+    let page: Vec<&str> = result.hits.iter().map(|h| h.original_id.as_str()).collect();
+    assert_eq!(
+        page,
+        padded(&p, 1190..1210),
+        "ids past 1,000, with their casing"
+    );
+    for hit in &result.hits {
+        let n: usize = hit.original_id.rsplit('.').next().unwrap().parse().unwrap();
+        let (versions, latest) = if n < 1200 {
+            (vec!["1.0.0", "1.1.0", "1.2.0"], "1.2.0")
+        } else {
+            (vec!["2.0.0", "2.1.0"], "2.1.0")
+        };
+        let got: Vec<&str> = hit.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(
+            got, versions,
+            "{}: the winning member's versions",
+            hit.original_id
+        );
+        assert_eq!(hit.latest_version, latest);
+    }
+    let lower = |range| -> Vec<String> {
+        padded(&p, range)
+            .into_iter()
+            .map(|id| id.to_lowercase())
+            .collect()
+    };
+    let mut seen = calls.lock().unwrap().clone();
+    seen.sort_by_key(|call| format!("{call:?}"));
+    let mut expected = vec![
+        SearchCall::Ids(high.name.clone()),
+        SearchCall::Ids(low.name.clone()),
+        SearchCall::Hits(high.name.clone(), lower(1190..1200)),
+        SearchCall::Hits(low.name.clone(), lower(1200..1210)),
+    ];
+    expected.sort_by_key(|call| format!("{call:?}"));
+    assert_eq!(
+        seen, expected,
+        "each member lists its ids once, and loads the hits it won on the page, no others"
+    );
+
+    let last = search(1390).await;
+    assert_eq!(last.total_hits, 1400);
+    let page: Vec<&str> = last.hits.iter().map(|h| h.original_id.as_str()).collect();
+    assert_eq!(page, padded(&p, 1390..1400), "the last page is reached");
+}
+
+/// The total of a group over a local member past its first 1,000 ids is
+/// exact under the dependency-confusion guard: ids an owner holds (here
+/// unlisted only, so it lists none of them) are taken off a cache's hits,
+/// wherever they sort.
+#[tokio::test]
+async fn a_guard_takes_ids_past_the_first_thousand_off_the_total() {
+    let pool = common::pool().await;
+    let hosted = seed_member(&pool, false).await;
+    let proxy = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, proxy.id, 10)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE repository SET online = false WHERE id = $1")
+        .bind(proxy.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let p = format!("Owned{}", common::unique());
+    seed_ids(&pool, hosted.id, &p, 1050..1060, &["1.0.0"], false).await;
+    let cache = RankedUpstream::new(padded(&p, 0..1100), 1100);
+    let (g, _) = recording_group_repo(&pool, user(&pool).await, &[(&proxy, &cache)]);
+
+    let result = g
+        .search(
+            &group.name,
+            &SearchParams {
+                q: p.clone(),
+                skip: 1040,
+                take: 20,
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.total_hits, 1090);
+    let page: Vec<String> = result.hits.into_iter().map(|h| h.original_id).collect();
+    assert_eq!(
+        page,
+        [padded(&p, 1040..1050), padded(&p, 1060..1070)].concat(),
+        "the owned ids are left out"
+    );
 }

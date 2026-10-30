@@ -90,19 +90,23 @@
 //! while walking and a repeated group is expanded only when reached at a
 //! strictly shallower depth or under other active guards. A repeated leaf is queried once at its first
 //! package-visible sighting. Search also queries each unique leaf once (a
-//! proxy searching its upstream again for more hits, see below) and uses
-//! the same package-specific walk to select the highest-priority winner.
-//! Members answer search **unenriched** ([`RepoReadOps::search_unenriched`]);
-//! the group merges, counts and pages their hits, then enriches only the final
+//! local member again for the hits of the final page, a proxy searching its
+//! upstream again for more hits, see below) and uses the same
+//! package-specific walk to select the highest-priority winner. Members
+//! answer search **unenriched** ([`RepoReadOps::search_unenriched`]); the
+//! group merges, counts and pages their hits, then enriches only the final
 //! page through the member that won each hit, so per-hit manifest reads are
 //! bounded by the client's `take`, not by every member's result.
 //!
 //! ## Search
 //! A group pages the merge of its members' hits, so it asks each member for
-//! its first hits, not for the client's page. A local member (hosted, or a
-//! proxy searching its cache: an offline one, or for a search without the
-//! upstream, like browse's) is asked for its first
-//! [`SearchParams::MAX_TAKE`]. A proxy searching its upstream is asked for
+//! its first hits, not for the client's page, a few members at a time. A
+//! local member (hosted, or a proxy searching its cache: an offline one, or
+//! for a search without the upstream, like browse's) is asked for the ids
+//! of all its hits ([`RepoReadOps::search_ids`]), without their versions or
+//! casing: the group merges, counts and pages the ids, then loads the hits
+//! of its page alone, each through the member that won it
+//! ([`RepoReadOps::search_hits`]). A proxy searching its upstream is asked for
 //! its first `skip + take`, rounded up to a power of two
 //! (`upstream_window`). While the hits returned do not settle the page (the
 //! proxy or the group's guards left some out), the searches that returned
@@ -113,7 +117,8 @@
 //! for `MAX_TAKE` at once.
 //!
 //! The merge serves each id once, from the highest-priority member whose
-//! hits include it. The local members' ids come first, ordered by id; then
+//! hits include it. The local members' ids come first, ordered by id (all
+//! of them, so the group pages through every id its members hold); then
 //! the upstream searches' ids, one hit of each search in turn, in the
 //! upstreams' (relevance) order. An id keeps the place its first hit gives
 //! it, so more hits only add ids after the settled ones: successive pages
@@ -310,6 +315,15 @@ impl GroupGraph {
     /// root lets through. A group whose guard is active for the id
     /// ([`Self::guard_active`]) lets through only its owners.
     fn serving_leaves(&self, package_id: &str, id: &IdGuards<'_>) -> Vec<i64> {
+        // Most ids meet no active guard: then the walk admits every visible
+        // leaf, and the memoized visible leaves answer without one.
+        if self
+            .guards
+            .keys()
+            .all(|group_id| self.guard_active(*group_id, id).is_none())
+        {
+            return self.visible_leaves(package_id).ordered.clone();
+        }
         let key = crate::format::lower_invariant(package_id);
         let mut path = HashSet::from([self.root_id]);
         let mut best_group_depth = HashMap::from([((self.root_id, Vec::new()), 0)]);
@@ -332,7 +346,13 @@ impl GroupGraph {
     /// Visible leaf ids for `package_id`, in the same package-specific stable
     /// pre-order as the former path-expanding traversal.
     fn visible_leaves(&self, package_id: &str) -> Arc<VisibleLeaves> {
-        let key = crate::format::lower_invariant(package_id);
+        // Without package filters every id sees the same leaves: one entry
+        // serves them all (a group search asks for every id of its members).
+        let key = if self.unfiltered {
+            String::new()
+        } else {
+            crate::format::lower_invariant(package_id)
+        };
         if let Some(cached) = self
             .visible_leaf_cache
             .lock()
@@ -857,17 +877,21 @@ impl GroupRepo {
     /// production backend's single corpus scan rather than repeatedly
     /// re-running the whole group search for successive filtered pages.
     ///
-    /// A proxy that searches its upstream is asked for the leading window of
-    /// its hits the page needs ([`upstream_window`]), and for a larger one
-    /// while the hits it returned do not settle the page; see the module docs
-    /// for the order and the count. Members answer unenriched; only the
-    /// merged, paged result is enriched ([`Self::enrich_page`]).
+    /// A local member is asked for its ids, and for the hits of those it won
+    /// on the final page ([`Self::page_hits`]). A proxy that searches its
+    /// upstream is asked for the leading window of its hits the page needs
+    /// ([`upstream_window`]), and for a larger one while the hits it returned
+    /// do not settle the page; see the module docs for the order and the
+    /// count. Members answer unenriched; only the merged, paged result is
+    /// enriched ([`Self::enrich_page`]).
     async fn search_filtered(
         &self,
         repo: &str,
         params: &SearchParams,
         filter: &PackageFilter,
     ) -> Result<SearchResult, RepoError> {
+        use futures_util::StreamExt;
+
         let graph = self.group_graph(repo).await?;
         let wanted = params.skip.saturating_add(params.effective_take());
 
@@ -875,30 +899,34 @@ impl GroupRepo {
         // `graph.leaves[i]`.
         let mut member_ops: Vec<Arc<dyn RepoReadOps>> = Vec::with_capacity(graph.leaves.len());
         let mut filters: Vec<PackageFilter> = Vec::with_capacity(graph.leaves.len());
+        for leaf in &graph.leaves {
+            member_ops.push(self.member_ops(leaf)?);
+            filters.push(graph.filter_for_leaf(leaf.id).intersect(filter.clone()));
+        }
+        // The members' reads are independent: a few at a time.
+        let reads: Vec<_> = graph
+            .leaves
+            .iter()
+            .zip(member_ops.iter().zip(&filters))
+            .map(|(leaf, (ops, leaf_filter))| first_search(ops, leaf, params, leaf_filter, wanted))
+            .collect();
+        let outcomes: Vec<Result<MemberSearch, RepoError>> = futures_util::stream::iter(reads)
+            .buffered(MEMBER_SEARCHES)
+            .collect()
+            .await;
         let mut searches: Vec<MemberSearch> = Vec::with_capacity(graph.leaves.len());
         let mut failures = MemberFailures::default();
-        for leaf in &graph.leaves {
-            let ops = self.member_ops(leaf)?;
-            let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
-            // An offline proxy searches its cache, like a hosted member.
-            let upstream = params.include_upstream && leaf.kind() == RepoKind::Proxy && leaf.online;
-            // A filter may hide most of the upstream's hits, and the proxy
-            // then counts only those it returns: it is asked for them all.
-            let window = (upstream && matches!(leaf_filter, PackageFilter::AllowAll))
-                .then(|| upstream_window(wanted));
-            let search = match search_member(&ops, leaf, params, window, &leaf_filter).await {
-                Ok(result) => {
+        for (leaf, outcome) in graph.leaves.iter().zip(outcomes) {
+            searches.push(match outcome {
+                Ok(search) => {
                     failures.ok();
-                    MemberSearch::new(upstream, window, result)
+                    search
                 }
                 Err(e) => {
                     failures.failed(&leaf.name, e);
-                    MemberSearch::failed(upstream)
+                    MemberSearch::failed(searches_upstream(params, leaf))
                 }
-            };
-            member_ops.push(ops);
-            filters.push(leaf_filter);
-            searches.push(search);
+            });
         }
         failures.into_result()?;
 
@@ -913,8 +941,8 @@ impl GroupRepo {
                 if !graph.may_yield(leaf.id) {
                     continue;
                 }
-                for hit in &search.hits {
-                    let lower = self.lower_id(&hit.original_id);
+                for id in &search.ids {
+                    let lower = self.lower_id(id);
                     if looked_up.insert(lower.clone()) {
                         lookup.push(lower);
                     }
@@ -931,10 +959,10 @@ impl GroupRepo {
             let shortest = searches
                 .iter()
                 .filter(|search| search.growable())
-                .map(|search| search.hits.len())
+                .map(|search| search.ids.len())
                 .min();
             for (member, search) in searches.iter_mut().enumerate() {
-                if !search.growable() || Some(search.hits.len()) != shortest {
+                if !search.growable() || Some(search.ids.len()) != shortest {
                     continue;
                 }
                 let Some(window) = search.window else {
@@ -958,7 +986,7 @@ impl GroupRepo {
                 .await
                 {
                     Ok(result) if search.extended_by(&result) => {
-                        *search = MemberSearch::new(search.upstream, Some(window), result)
+                        *search = MemberSearch::upstream(Some(window), result)
                     }
                     // A proxy whose upstream search failed answers from its
                     // cache instead, with other hits.
@@ -975,18 +1003,80 @@ impl GroupRepo {
         };
 
         let total_hits = merged.order.len().saturating_add(merged.unseen);
-        let page: Vec<RankedHit> = merged
+        let page: Vec<(usize, usize)> = merged
             .order
             .into_iter()
             .skip(params.skip)
             .take(params.effective_take())
-            .map(|(member, position)| RankedHit {
-                member,
-                hit: std::mem::take(&mut searches[member].hits[position]),
-            })
             .collect();
+        let page = self
+            .page_hits(&graph, &member_ops, &mut searches, params, page)
+            .await?;
         let hits = self.enrich_page(&graph, &member_ops, page).await;
         Ok(SearchResult { total_hits, hits })
+    }
+
+    /// The hits of the final page, given as the `(member, position)` of each
+    /// id in `searches`: an upstream search's hit as it returned it, a local
+    /// member's loaded now ([`RepoReadOps::search_hits`]), one batch per
+    /// member, a few members at a time. An id a member no longer finds (its
+    /// last matching version was deleted since) is left out. A member that
+    /// fails to load its hits fails the search: it answered for those ids a
+    /// moment ago, and a page left short would read as the last one.
+    async fn page_hits(
+        &self,
+        graph: &GroupGraph,
+        member_ops: &[Arc<dyn RepoReadOps>],
+        searches: &mut [MemberSearch],
+        params: &SearchParams,
+        page: Vec<(usize, usize)>,
+    ) -> Result<Vec<RankedHit>, RepoError> {
+        use futures_util::{StreamExt, TryStreamExt};
+
+        let mut local: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for &(member, position) in &page {
+            if !searches[member].upstream {
+                local
+                    .entry(member)
+                    .or_default()
+                    .push(searches[member].ids[position].clone());
+            }
+        }
+        let reads: Vec<_> = local
+            .into_iter()
+            .map(|(member, ids)| {
+                load_hits(
+                    &member_ops[member],
+                    &graph.leaves[member],
+                    params,
+                    member,
+                    ids,
+                )
+            })
+            .collect();
+        let loaded: Vec<(usize, Vec<SearchHit>)> = futures_util::stream::iter(reads)
+            .buffered(MEMBER_SEARCHES)
+            .try_collect()
+            .await?;
+        let mut loaded: HashMap<(usize, String), SearchHit> = loaded
+            .into_iter()
+            .flat_map(|(member, hits)| {
+                hits.into_iter()
+                    .map(move |hit| ((member, self.lower_id(&hit.original_id)), hit))
+            })
+            .collect();
+        Ok(page
+            .into_iter()
+            .filter_map(|(member, position)| {
+                let search = &mut searches[member];
+                let hit = if search.upstream {
+                    std::mem::take(&mut search.hits[position])
+                } else {
+                    loaded.remove(&(member, self.lower_id(&search.ids[position])))?
+                };
+                Some(RankedHit { member, hit })
+            })
+            .collect())
     }
 
     /// Merge the members' search hits: each id once, from the
@@ -1008,26 +1098,23 @@ impl GroupRepo {
         for (member, search) in searches.iter().enumerate() {
             let leaf_id = graph.leaves[member].id;
             let keys = search
-                .hits
+                .ids
                 .iter()
                 .enumerate()
-                .map(|(position, hit)| {
-                    let rank = graph.leaf_rank(&hit.original_id, leaf_id)?;
-                    let lower = self.lower_id(&hit.original_id);
+                .map(|(position, id)| {
+                    let rank = graph.leaf_rank(id, leaf_id)?;
+                    let lower = self.lower_id(id);
                     let leaves = serving.entry(lower.clone()).or_insert_with(|| {
                         let guards = IdGuards {
                             lower_id: &lower,
                             owned_in: owned_in.get(&lower).unwrap_or(&no_owner),
                         };
-                        graph
-                            .serving_leaves(&hit.original_id, &guards)
-                            .into_iter()
-                            .collect()
+                        graph.serving_leaves(id, &guards).into_iter().collect()
                     });
                     if !leaves.contains(&leaf_id) {
                         return None;
                     }
-                    let key = crate::format::lower_invariant(&hit.original_id);
+                    let key = crate::format::lower_invariant(id);
                     let winner = winners
                         .entry(key.clone())
                         .or_insert((rank, member, position));
@@ -1066,12 +1153,12 @@ impl GroupRepo {
         let settled_rounds = upstream
             .iter()
             .filter(|member| searches[**member].growable())
-            .map(|member| searches[*member].hits.len())
+            .map(|member| searches[*member].ids.len())
             .min()
             .unwrap_or(usize::MAX);
         let rounds = upstream
             .iter()
-            .map(|member| searches[*member].hits.len())
+            .map(|member| searches[*member].ids.len())
             .max()
             .unwrap_or(0);
         let mut settled = order.len();
@@ -1097,13 +1184,13 @@ impl GroupRepo {
             .iter()
             .map(|&member| &searches[member])
             .zip(upstream.iter().map(|&member| credited[member]))
-            .filter(|(search, _)| search.incomplete() && !search.hits.is_empty())
+            .filter(|(search, _)| search.incomplete() && !search.ids.is_empty())
             .map(|(search, credited)| {
                 let more = search
                     .total
                     .min(SearchParams::MAX_TAKE)
-                    .saturating_sub(search.hits.len());
-                more.saturating_mul(credited) / search.hits.len()
+                    .saturating_sub(search.ids.len());
+                more.saturating_mul(credited) / search.ids.len()
             })
             .fold(0_usize, usize::saturating_add);
         // A search with more hits than it returned may still add ids, though
@@ -1492,8 +1579,52 @@ fn upstream_window(wanted: usize) -> usize {
         .min(SearchParams::MAX_TAKE)
 }
 
-/// Search one member for a group: its first `window` hits, or its first
-/// [`SearchParams::MAX_TAKE`] without one.
+/// How many members a group searches at a time.
+const MEMBER_SEARCHES: usize = 4;
+
+/// Whether a group search reads `leaf` through its upstream's search: an
+/// online proxy, when `params` include the upstream. Every other member,
+/// an offline proxy included, is searched locally (its own packages or its
+/// cache).
+fn searches_upstream(params: &SearchParams, leaf: &Repository) -> bool {
+    params.include_upstream && leaf.kind() == RepoKind::Proxy && leaf.online
+}
+
+/// A group's first search of one member: a local member's ids, all of them;
+/// a proxy searching its upstream for the window `wanted` hits need.
+async fn first_search(
+    ops: &Arc<dyn RepoReadOps>,
+    leaf: &Repository,
+    params: &SearchParams,
+    filter: &PackageFilter,
+    wanted: usize,
+) -> Result<MemberSearch, RepoError> {
+    if !searches_upstream(params, leaf) {
+        let ids = ops.search_ids(&leaf.name, params, filter).await?;
+        return Ok(MemberSearch::local(ids));
+    }
+    // A filter may hide most of the upstream's hits, and the proxy then
+    // counts only those it returns: it is asked for them all.
+    let window = matches!(filter, PackageFilter::AllowAll).then(|| upstream_window(wanted));
+    let result = search_member(ops, leaf, params, window, filter).await?;
+    Ok(MemberSearch::upstream(window, result))
+}
+
+/// The hits of `ids` a local `member` won on the final page
+/// ([`RepoReadOps::search_hits`]), tagged with the member.
+async fn load_hits(
+    ops: &Arc<dyn RepoReadOps>,
+    leaf: &Repository,
+    params: &SearchParams,
+    member: usize,
+    ids: Vec<String>,
+) -> Result<(usize, Vec<SearchHit>), RepoError> {
+    let hits = ops.search_hits(&leaf.name, params, &ids).await?;
+    Ok((member, hits))
+}
+
+/// Search one member's upstream for a group: its first `window` hits, or its
+/// first [`SearchParams::MAX_TAKE`] without one.
 async fn search_member(
     ops: &Arc<dyn RepoReadOps>,
     leaf: &Repository,
@@ -1517,7 +1648,11 @@ struct MemberSearch {
     /// The window of an upstream search the group bounds; `None` when the
     /// member was asked for all its hits, or can be asked for no more.
     window: Option<usize>,
-    /// The member's first hits, in its order.
+    /// The ids of the member's first hits (a local member's: of all its
+    /// hits), in its order.
+    ids: Vec<String>,
+    /// An upstream search's hits, one per id. A local member's are loaded
+    /// for the final page only ([`GroupRepo::page_hits`]).
     hits: Vec<SearchHit>,
     /// The member's total.
     total: usize,
@@ -1527,10 +1662,28 @@ struct MemberSearch {
 }
 
 impl MemberSearch {
-    fn new(upstream: bool, window: Option<usize>, result: SearchResult) -> Self {
+    /// A local member's ids: all of them.
+    fn local(ids: Vec<String>) -> Self {
         MemberSearch {
-            upstream,
+            upstream: false,
+            window: None,
+            total: ids.len(),
+            ids,
+            hits: Vec::new(),
+            stalled: false,
+        }
+    }
+
+    /// An upstream search's first hits, for `window`.
+    fn upstream(window: Option<usize>, result: SearchResult) -> Self {
+        MemberSearch {
+            upstream: true,
             window,
+            ids: result
+                .hits
+                .iter()
+                .map(|hit| hit.original_id.clone())
+                .collect(),
             hits: result.hits,
             total: result.total_hits,
             stalled: false,
@@ -1542,6 +1695,7 @@ impl MemberSearch {
         MemberSearch {
             upstream,
             window: None,
+            ids: Vec::new(),
             hits: Vec::new(),
             total: 0,
             stalled: false,
@@ -1552,7 +1706,7 @@ impl MemberSearch {
     fn incomplete(&self) -> bool {
         self.window
             .is_some_and(|window| window < SearchParams::MAX_TAKE)
-            && self.hits.len() < self.total
+            && self.ids.len() < self.total
     }
 
     /// Whether the member is to be asked for a larger window.
@@ -1563,12 +1717,12 @@ impl MemberSearch {
     /// Whether `result`, for a larger window, extends the hits returned so
     /// far: the same ids first, in the same order.
     fn extended_by(&self, result: &SearchResult) -> bool {
-        result.hits.len() >= self.hits.len()
+        result.hits.len() >= self.ids.len()
             && self
-                .hits
+                .ids
                 .iter()
                 .zip(&result.hits)
-                .all(|(had, got)| had.original_id == got.original_id)
+                .all(|(had, got)| *had == got.original_id)
     }
 }
 
