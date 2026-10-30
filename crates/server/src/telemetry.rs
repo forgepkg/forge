@@ -13,7 +13,9 @@
 //!   every request (joining the caller's trace from its `traceparent`) and
 //!   the HTTP metrics: request duration by surface (from the route, never
 //!   the raw path), method and status, the requests in flight and the
-//!   response body sizes.
+//!   response body sizes. It also counts the request in the traffic
+//!   statistics ([`crate::traffic`]) by day, repository and client address,
+//!   which the metrics' bounded attributes leave out.
 //! * [`install_live_source`]: what the SDK reads from the process when it
 //!   collects (the connection pool, the blob cache's counters, those of `GET
 //!   /admin/blob-cache`, the circuit breaker, the staging space, the
@@ -27,18 +29,20 @@
 
 use std::borrow::Cow;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use axum::body::{Body, Bytes};
-use axum::extract::{MatchedPath, Request};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderMap};
 use axum::middleware::Next;
 use axum::response::Response;
 use forge_db::model::RepoKind;
 use forge_telemetry::http::Surface;
 use forge_telemetry::{inventory, live, storage};
+use forge_traffic::Recorder;
 use http_body::{Frame, SizeHint};
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::propagation::Extractor;
@@ -476,8 +480,9 @@ fn unsampled() -> opentelemetry::Context {
 }
 
 /// Middleware of the main listener: the request's server span and its
-/// metrics, and the size of its response body.
-pub async fn track(req: Request, next: Next) -> Response {
+/// metrics, the size of its response body, and its count in the traffic
+/// statistics ([`forge_traffic`]).
+pub async fn track(State(recorder): State<Arc<Recorder>>, req: Request, next: Next) -> Response {
     let surface = surface_of(req.uri().path());
     let method = forge_telemetry::http::method(req.method().as_str());
     let route = req
@@ -485,9 +490,18 @@ pub async fn track(req: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map(|p| p.as_str().to_owned());
     let span = request_span(&req, surface, route.as_deref());
+    // Health probes are no traffic.
+    let counted = (surface != Surface::Health && recorder.enabled()).then(|| Counted {
+        slot: forge_traffic::Slot::new(),
+        recorder,
+    });
     let started = Instant::now();
     let active = forge_telemetry::http::Active::start(method);
-    let mut response = next.run(req).instrument(span.clone()).await;
+    let run = next.run(req).instrument(span.clone());
+    let mut response = match &counted {
+        Some(counted) => counted.slot.scope(run).await,
+        None => run.await,
+    };
     drop(active);
     let surface = response
         .extensions_mut()
@@ -507,9 +521,17 @@ pub async fn track(req: Request, next: Next) -> Response {
             method,
             status,
             bytes: 0,
+            counted,
             _span: span,
         })
     })
+}
+
+/// A request to count in the traffic statistics once its body is sent.
+struct Counted {
+    recorder: Arc<Recorder>,
+    /// What the layers inside noted.
+    slot: forge_traffic::Slot,
 }
 
 /// A response body that counts the bytes it yields: their total is
@@ -521,6 +543,7 @@ struct CountingBody {
     method: &'static str,
     status: u16,
     bytes: u64,
+    counted: Option<Counted>,
     _span: tracing::Span,
 }
 
@@ -554,6 +577,13 @@ impl http_body::Body for CountingBody {
 impl Drop for CountingBody {
     fn drop(&mut self) {
         forge_telemetry::http::response_size(self.surface, self.method, self.status, self.bytes);
+        if let Some(counted) = self.counted.take() {
+            counted.recorder.record(forge_traffic::Event {
+                at: chrono::Utc::now(),
+                bytes: self.bytes,
+                noted: counted.slot.take(),
+            });
+        }
     }
 }
 

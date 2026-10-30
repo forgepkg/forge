@@ -1,0 +1,36 @@
+[package]
+name = "forge-traffic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The object store the statistics are kept in (BlobStore implements
+# `Objects`).
+forge-storage = { path = "../storage" }
+
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+parquet = { workspace = true }
+parquet_derive = { workspace = true }
+# Country and ASN lookups in MaxMind databases (GeoLite2, GeoIP2).
+maxminddb = { workspace = true }
+bytes = "1"
+chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+moka = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde_json = { workspace = true }
+
+[features]
+# `testing`: a writer of small MaxMind databases, for the tests of the crates
+# that use this one.
+testing = []

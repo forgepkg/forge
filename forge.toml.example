@@ -284,6 +284,13 @@ processed_retention_seconds = 604800  # (default: 604800 = 7 days) keep processe
 # bytes, and the outbox backlog for the metrics (database queries).
 # inventory_interval_seconds = 300 # (default: 300, at least 10)
 
+[traffic]
+# The traffic statistics (Admin → Traffic; docs/deployment.md → Traffic
+# statistics). What they record and the MaxMind account their country and
+# ASN databases come from are set in the web UI. Where Forge downloads those
+# databases: MaxMind, or a mirror answering its download API.
+# maxmind_url = "https://download.maxmind.com" # (default)
+
 # Optional: OpenID Connect / Microsoft Entra interactive login.
 # This block is a one-shot SEED — on first boot it is imported into an
 # `auth_realm` row and authentication is managed in the admin UI from then on

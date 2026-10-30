@@ -641,6 +641,7 @@ pub mod storage {
             CompleteMultipart => "CompleteMultipartUpload",
             AbortMultipart => "AbortMultipartUpload",
             Get => "GetObject",
+            List => "ListObjectsV2",
             Delete => "DeleteObject",
         }
     }

@@ -22,6 +22,7 @@ forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
 forge-telemetry = { path = "../telemetry" }
+forge-traffic = { path = "../traffic" }
 # The built-in format plugins (crates/formats/docker, crates/formats/nuget,
 # crates/formats/npm, crates/formats/raw), linked in.
 forge-format-docker = { path = "../formats/docker" }
@@ -79,6 +80,8 @@ tokio-util = { workspace = true }
 multer = "3"
 # npm audits: a gzip-compressed request body.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# The MaxMind databases of the traffic statistics come as `.tar.gz`.
+tar = { version = "0.4", default-features = false }
 # The file store: the MD5 of uploads (the `.md5` sidecar), file names in
 # headers, HTTP dates (`Last-Modified`, `If-Modified-Since`) and content
 # types guessed from file names.
@@ -110,6 +113,9 @@ figment = { version = "0.10", features = ["toml", "env"] }
 tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 
 [dev-dependencies]
+# Small MaxMind databases for the traffic statistics' tests.
+forge-traffic = { path = "../traffic", features = ["testing"] }
+tar = { version = "0.4", default-features = false }
 # Builds Helm chart archives for the registry tests.
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "test-util"] }

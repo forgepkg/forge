@@ -31,4 +31,4 @@ pub use blob_cache::{BlobCache, BlobCacheConfig, BlobCacheStats, BlobStream, Cac
 pub use cas::{Cas, CasError, SizedStage, StageReader, StagedBlob, Staging, StoredBlob};
 pub use credentials::{S3Credentials, WebIdentity};
 pub use read::BlobRef;
-pub use s3::{BlobStore, ConditionalWrites, S3Config, S3Error};
+pub use s3::{BlobStore, ConditionalWrites, ListedObject, Listing, S3Config, S3Error};

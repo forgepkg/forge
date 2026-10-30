@@ -68,6 +68,13 @@ const SECTIONS = [
       'Whether retention runs, for every repository, and how long its audit log is kept.',
   },
   {
+    to: '/manage/traffic',
+    title: 'Traffic',
+    icon: 'Activity',
+    description:
+      'Requests of every instance over time, by repository and status; the top clients and their request logs.',
+  },
+  {
     to: '/manage/system',
     title: 'System',
     icon: 'Database',
@@ -84,8 +91,8 @@ const SECTIONS = [
  * Admin landing. Only reachable once the `AdminLayout` guard has confirmed
  * `is_admin`. A card per admin screen, with the rail's icon for it: the
  * repositories, users (incl. per-user tokens and roles), service accounts, roles, content
- * selectors, authentication-realm, settings, email-service, retention and
- * system screens.
+ * selectors, authentication-realm, settings, email-service, retention,
+ * traffic and system screens.
  */
 function AdminHome() {
   return (
@@ -97,8 +104,8 @@ function AdminHome() {
             Manage repositories and their retention policies, users and
             service accounts and their API tokens, roles and their grants,
             content selectors, authentication realms, the sign-in and
-            anonymous-access settings, the email service, and the secret
-            encryption and blob cache.
+            anonymous-access settings, the email service, the traffic of every
+            instance, and the secret encryption and blob cache.
           </>
         }
       />

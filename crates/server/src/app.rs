@@ -178,6 +178,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     let app = app.fallback_service(spa_service(&state.config.web));
 
     let hsts = state.cookie_secure;
+    let recorder = state.traffic.recorder.clone();
     let public_base_url = state.config.public_base_url();
     let images = images.map(|p| p.implementation().clone());
     let server = state.config.server.clone();
@@ -249,7 +250,10 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
         // The request's OpenTelemetry span and metrics, outermost so they
         // time and count every answer, the ones the layers above give
         // themselves (a timeout) included.
-        .layer(axum::middleware::from_fn(crate::telemetry::track))
+        .layer(axum::middleware::from_fn_with_state(
+            recorder,
+            crate::telemetry::track,
+        ))
         .with_state(state)
 }
 

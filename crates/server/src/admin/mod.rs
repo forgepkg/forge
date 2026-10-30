@@ -70,6 +70,7 @@ pub mod roles;
 pub mod settings;
 pub mod token_scope;
 pub mod tokens;
+pub mod traffic;
 pub mod trusted_publishers;
 pub mod user_roles;
 pub mod users;
@@ -351,6 +352,22 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route("/crypto/keys", get(crypto::list_keys))
         // --- local blob cache ----------------------------------------------
         .route("/blob-cache", get(blob_cache::stats))
+        // --- traffic statistics --------------------------------------------
+        .route("/traffic", get(traffic::overview))
+        .route(
+            "/traffic/geoip",
+            get(traffic::get_geoip)
+                .put(traffic::put_geoip)
+                .delete(traffic::delete_geoip),
+        )
+        .route(
+            "/traffic/geoip/update",
+            axum::routing::post(traffic::update_geoip),
+        )
+        .route(
+            "/settings/traffic",
+            get(traffic::get_settings).put(traffic::put_settings),
+        )
         // --- the email service ---------------------------------------------
         .route(
             "/settings/email",

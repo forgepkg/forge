@@ -455,6 +455,25 @@
   }
   .fg-dialog { max-height: calc(100dvh - 2 * var(--space-4)); overflow-y: auto; }
 
+  /* ---------- App additions: charts (Admin → Traffic) ---------- */
+  /* One series in categorical slot 1, checked against both surfaces. */
+  .fg-chart { --chart-series: #2a78d6; position: relative; min-width: 0; }
+  [data-theme='dark'] .fg-chart { --chart-series: #3987e5; }
+  .fg-chart svg { display: block; overflow: visible; }
+  .fg-chart svg:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: var(--radius-xs); }
+  .fg-chart-grid { stroke: var(--line); stroke-width: 1; shape-rendering: crispEdges; }
+  .fg-chart-axis { fill: var(--ink-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .fg-chart-line { fill: none; stroke: var(--chart-series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .fg-chart-area { fill: var(--chart-series); opacity: 0.1; }
+  .fg-chart-cross { stroke: var(--line-strong); stroke-width: 1; }
+  .fg-chart-dot { fill: var(--chart-series); stroke: var(--surface); stroke-width: 2; }
+  .fg-chart-tip { position: absolute; top: 0; transform: translateX(-50%); pointer-events: none; padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); box-shadow: var(--shadow-md); font-size: 12.5px; line-height: 18px; white-space: nowrap; }
+  .fg-chart-tip-value { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .fg-chart-tip-label { color: var(--ink-muted); }
+  .fg-chart-key { display: inline-block; width: 12px; height: 2px; margin-right: 6px; border-radius: 1px; background: var(--chart-series); vertical-align: middle; }
+  .fg-filters { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); min-width: 0; }
+  .fg-filters > .fg-seg { max-width: 100%; overflow-x: auto; }
+
   /* ---------- App additions: remembered accounts (login screen) ---------- */
   .fg-accounts { display: grid; gap: var(--space-2); margin: 0; padding: 0; list-style: none; }
   .fg-account { display: flex; align-items: center; gap: var(--space-1); padding-right: var(--space-1); border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface); transition: background-color 120ms ease-out, border-color 120ms ease-out; }

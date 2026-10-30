@@ -22,7 +22,8 @@
 //! [`insert_realm_with_secrets`] / [`realm_config`]).
 //!
 //! Secrets kept in `forge_setting` ([`SECRET_SETTINGS`]: the generated
-//! registry-token key, the OIDC issuer keys) are text values,
+//! registry-token key, the OIDC issuer keys, the MaxMind license key) are
+//! text values,
 //! `sealed:<base64 envelope>`, AAD-bound to `('forge_setting', 'value', 0)`
 //! plus the setting's key. They take part in the re-encrypt sweep and the DEK
 //! reference scan like the secret columns ([`store_secret_setting`],
@@ -1073,8 +1074,16 @@ pub const REGISTRY_TOKEN_KEY_SETTING: &str = "docker_token_key";
 /// assertions with.
 pub const OIDC_ISSUER_KEYS_SETTING: &str = "oidc_issuer_keys";
 
+/// `forge_setting` key of the MaxMind license key the traffic statistics'
+/// geolocation databases are downloaded with.
+pub const MAXMIND_LICENSE_KEY_SETTING: &str = "traffic_maxmind_license_key";
+
 /// The `forge_setting` keys whose values are secrets (module docs).
-pub const SECRET_SETTINGS: &[&str] = &[REGISTRY_TOKEN_KEY_SETTING, OIDC_ISSUER_KEYS_SETTING];
+pub const SECRET_SETTINGS: &[&str] = &[
+    REGISTRY_TOKEN_KEY_SETTING,
+    OIDC_ISSUER_KEYS_SETTING,
+    MAXMIND_LICENSE_KEY_SETTING,
+];
 
 /// Prefix of a sealed secret setting: `sealed:<base64 envelope>`.
 const SEALED_SETTING: &str = "sealed:";

@@ -379,6 +379,7 @@ impl Registry {
     /// grammar already.
     pub(crate) async fn resolve(&self, site: &Site, name: &str) -> ImgResult<Option<Target>> {
         if let Some(repo) = &site.host_repo {
+            forge_traffic::note_repository(&repo.name);
             return Ok(Some(Target {
                 repo: repo.clone(),
                 image: name.to_string(),
@@ -392,7 +393,11 @@ impl Registry {
             }));
         };
         let repo = repository_dao::find_repository_by_name(&self.inner.pool, repo_name).await?;
-        Ok(repo.filter(|r| self.serves(r)).map(|repo| Target {
+        let repo = repo.filter(|r| self.serves(r));
+        if let Some(repo) = &repo {
+            forge_traffic::note_repository(&repo.name);
+        }
+        Ok(repo.map(|repo| Target {
             repo,
             image: image.to_string(),
             name: name.to_string(),

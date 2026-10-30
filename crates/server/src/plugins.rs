@@ -271,7 +271,10 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
     };
 
     let repo = match repository_dao::find_repository_by_name(&state.pool, repo_name).await {
-        Ok(Some(r)) => r,
+        Ok(Some(r)) => {
+            forge_traffic::note_repository(&r.name);
+            r
+        }
         // As for the NuGet feed: an unknown name answers like a repository
         // the caller may not read, except to a global admin.
         Ok(None) if state.authz.is_global_admin(&principal).await => {

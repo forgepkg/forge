@@ -89,6 +89,23 @@ pub enum ConditionalWrites {
     Off,
 }
 
+/// The answer of [`BlobStore::list`].
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    pub objects: Vec<ListedObject>,
+    /// The common prefixes, each ending with the delimiter.
+    pub prefixes: Vec<String>,
+}
+
+/// An object [`BlobStore::list`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    pub key: String,
+    pub size: u64,
+    /// Changes whenever the object is replaced.
+    pub etag: Option<String>,
+}
+
 /// Connection + behavior configuration for [`BlobStore`]. `Debug` omits the
 /// secret key.
 #[derive(Debug, Clone)]
@@ -388,7 +405,21 @@ impl BlobStore {
     /// Single-part bodies may use a conditional PUT (`If-None-Match: *`)
     /// instead of HEAD-then-PUT, per [`ConditionalWrites`]; the two paths are
     /// observably identical, the conditional one just saves a round trip.
-    pub async fn put_if_absent(&self, key: &str, path: &Path) -> Result<bool, S3Error> {
+    ///
+    /// The upload is boxed: the SDK's request futures are large, and a caller
+    /// would otherwise hold one inline, and so would every future awaiting
+    /// it, up the whole request (a deep stack in a debug build).
+    pub fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, S3Error>> + Send + 'a>>
+    {
+        Box::pin(self.upload_if_absent(key, path))
+    }
+
+    /// [`Self::put_if_absent`], unboxed.
+    async fn upload_if_absent(&self, key: &str, path: &Path) -> Result<bool, S3Error> {
         self.admit(S3Op::Put)?;
         let size = tokio::fs::metadata(path).await?.len();
 
@@ -455,8 +486,19 @@ impl BlobStore {
 
     /// One conditional PUT attempt. Maps the interesting backend answers
     /// (412 / NotImplemented / 409) into [`ConditionalPut`]; anything else is
-    /// a real error.
-    async fn put_conditional(&self, key: &str, path: &Path) -> Result<ConditionalPut, S3Error> {
+    /// a real error. Boxed, like [`Self::put_if_absent`].
+    fn put_conditional<'a>(
+        &'a self,
+        key: &'a str,
+        path: &'a Path,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ConditionalPut, S3Error>> + Send + 'a>,
+    > {
+        Box::pin(self.send_conditional(key, path))
+    }
+
+    /// [`Self::put_conditional`], unboxed.
+    async fn send_conditional(&self, key: &str, path: &Path) -> Result<ConditionalPut, S3Error> {
         let body = body_from_path(path).await?;
         let call = S3Call::start(S3Op::PutConditional, &self.bucket);
         let result = self
@@ -665,6 +707,94 @@ impl BlobStore {
         };
         let out = self.call(S3Op::Get, request.send()).await?;
         Ok(out.body)
+    }
+
+    /// Store `body` at `key`, replacing what is there: for objects Forge
+    /// rewrites (the traffic statistics), never for content-addressed blobs
+    /// ([`Self::put_if_absent`]).
+    pub async fn put_bytes(&self, key: &str, body: Vec<u8>) -> Result<(), S3Error> {
+        self.admit(S3Op::Put)?;
+        self.call(
+            S3Op::Put,
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .send(),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The whole object at `key`, or `None` when there is none.
+    pub async fn get_bytes(&self, key: &str) -> Result<Option<bytes::Bytes>, S3Error> {
+        self.admit(S3Op::Get)?;
+        let call = S3Call::start(S3Op::Get, &self.bucket);
+        let result = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .instrument(call.span())
+            .await;
+        self.observe(call, &result);
+        let out = match result {
+            Ok(out) => out,
+            Err(e) if is_not_found(&e) => return Ok(None),
+            Err(e) => return Err(self.error(e)),
+        };
+        let body = out
+            .body
+            .collect()
+            .await
+            .map_err(|e| S3Error::S3(format!("read {key}: {e}")))?;
+        Ok(Some(body.into_bytes()))
+    }
+
+    /// The objects whose keys start with `prefix`. With `delimiter`, keys
+    /// that continue past the next delimiter after the prefix are listed
+    /// once each, as a common prefix (a "directory"), instead.
+    pub async fn list(&self, prefix: &str, delimiter: Option<&str>) -> Result<Listing, S3Error> {
+        let mut listing = Listing::default();
+        let mut token: Option<String> = None;
+        loop {
+            self.admit(S3Op::List)?;
+            let page = self
+                .call(
+                    S3Op::List,
+                    self.client
+                        .list_objects_v2()
+                        .bucket(&self.bucket)
+                        .prefix(prefix)
+                        .set_delimiter(delimiter.map(str::to_string))
+                        .set_continuation_token(token.take())
+                        .send(),
+                )
+                .await?;
+            listing
+                .objects
+                .extend(page.contents().iter().filter_map(|object| {
+                    Some(ListedObject {
+                        key: object.key()?.to_string(),
+                        size: object
+                            .size()
+                            .and_then(|s| u64::try_from(s).ok())
+                            .unwrap_or(0),
+                        etag: object.e_tag().map(str::to_string),
+                    })
+                }));
+            listing.prefixes.extend(
+                page.common_prefixes()
+                    .iter()
+                    .filter_map(|p| p.prefix().map(str::to_string)),
+            );
+            match page.next_continuation_token() {
+                Some(next) if page.is_truncated() == Some(true) => token = Some(next.to_string()),
+                _ => return Ok(listing),
+            }
+        }
     }
 
     /// Delete the object at `key`. Idempotent: a missing object is `Ok(())`.
