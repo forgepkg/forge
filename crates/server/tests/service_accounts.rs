@@ -300,6 +300,85 @@ async fn the_admin_api_creates_lists_and_updates_service_accounts() {
     assert_eq!(view["roles"], json!(["writer"]));
 }
 
+/// A PATCH applies its fields in one transaction (#585): when deactivating
+/// fails, the description and realm it carries are not applied either; when
+/// it succeeds, the account is inactive in its new realm at once. A
+/// description that would read otherwise than it is (a right-to-left
+/// override, a zero-width space) is refused, on create and on update.
+#[tokio::test]
+async fn a_patch_applies_all_of_its_fields_or_none() {
+    let srv = server().await;
+    let realm = create_realm(&srv, false).await;
+    let name = format!("lb{}@example.com", common::unique());
+    let id = create_service_account(&srv, &name, None).await["id"]
+        .as_i64()
+        .unwrap();
+
+    // The database refuses the deactivation, after the realm and the
+    // description were written in the same request.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION refuse_deactivation() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.id = {id} AND NOT NEW.active THEN RAISE EXCEPTION 'refused'; END IF; \
+         RETURN NEW; END $$; \
+         CREATE TRIGGER refuse_deactivation BEFORE UPDATE ON app_user \
+         FOR EACH ROW EXECUTE FUNCTION refuse_deactivation();"
+    )))
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    let (status, _) = patch(
+        &srv,
+        id,
+        json!({"active": false, "description": "the load balancer", "realm": realm.name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let view = |users: Vec<Value>| users.into_iter().find(|u| u["id"] == json!(id)).unwrap();
+    let account = view(list(&srv, "?kind=service").await);
+    assert_eq!(account["active"], json!(true), "{account}");
+    assert_eq!(account["realm"], Value::Null, "{account}");
+    assert_eq!(
+        account["description"],
+        json!("The build agents; owner: platform"),
+        "{account}"
+    );
+    sqlx::raw_sql(
+        "DROP TRIGGER refuse_deactivation ON app_user; DROP FUNCTION refuse_deactivation();",
+    )
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+
+    let (status, body) = patch(
+        &srv,
+        id,
+        json!({"active": false, "description": "the load balancer", "realm": realm.name}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["active"], json!(false));
+    assert_eq!(body["realm"], json!(realm.name));
+    assert_eq!(body["description"], json!("the load balancer"));
+
+    for description in ["admin \u{202E}lanigiro", "build\u{200B}agents"] {
+        let (status, body) = patch(&srv, id, json!({"description": description})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.as_str().unwrap().contains("formatting"), "{body}");
+        let (status, body) = create(
+            &srv,
+            json!({
+                "username": format!("svc{}@example.com", common::unique()),
+                "kind": "service",
+                "description": description,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    let account = view(list(&srv, "?kind=service").await);
+    assert_eq!(account["description"], json!("the load balancer"));
+}
+
 #[tokio::test]
 async fn nobody_signs_in_to_a_service_account_but_its_tokens_work() {
     let srv = server().await;

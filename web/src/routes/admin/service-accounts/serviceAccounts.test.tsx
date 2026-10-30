@@ -14,7 +14,8 @@ import { renderApp } from '~/test/renderApp'
  *    them out;
  *  - the create page POSTs `kind: 'service'` with the description, realm
  *    and access level, offers no admin level and takes no email;
- *  - the account page saves its description and realm, never offers the
+ *  - the account page saves what changed of its description and realm (a
+ *    realm deleted since is not sent again), never offers the
  *    admin role or level, issues a token whose secret shows once, and
  *    deactivates it after a confirmation.
  */
@@ -159,14 +160,11 @@ describe('admin service accounts', () => {
     expect(await within(settings).findByText('Saved ci@example.com.')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByText(/^Realm:/)).toHaveTextContent('edge-lb'))
 
-    // Back to no realm: the realm is sent as null.
+    // Back to no realm: the realm alone is sent, as null.
     await u.selectOptions(within(settings).getByLabelText('Trusted-header realm'), '')
     await u.click(within(settings).getByRole('button', { name: 'Save' }))
     await waitFor(() =>
-      expect(api.sent('PATCH', /^\/admin\/users\/4$/)[1]?.body).toEqual({
-        description: 'CI of the web team',
-        realm: null,
-      }),
+      expect(api.sent('PATCH', /^\/admin\/users\/4$/)[1]?.body).toEqual({ realm: null }),
     )
 
     // The access level has no admin, and neither do the roles to assign.
@@ -180,6 +178,25 @@ describe('admin service accounts', () => {
       expect(within(assign).getByRole('option', { name: 'anonymous' })).toBeInTheDocument(),
     )
     expect(within(assign).queryByRole('option', { name: 'admin' })).toBeNull()
+  })
+
+  it('saves a description alone once its realm is gone, without re-sending the realm', async () => {
+    // The account's realm was deleted (or renamed) since it was assigned.
+    api.state.realms = []
+    const u = userEvent.setup()
+    await renderApp('/manage/service-accounts/3')
+
+    const settings = await screen.findByRole('form', { name: 'Service account' })
+    const field = within(settings).getByLabelText(/Description/)
+    await u.clear(field)
+    await u.type(field, 'The office network')
+    await u.click(within(settings).getByRole('button', { name: 'Save' }))
+    await waitFor(() =>
+      expect(api.sent('PATCH', /^\/admin\/users\/3$/)[0]?.body).toEqual({
+        description: 'The office network',
+      }),
+    )
+    expect(await within(settings).findByText('Saved office-lan@example.com.')).toBeInTheDocument()
   })
 
   it('issues a token for a service account, showing the secret once', async () => {

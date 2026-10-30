@@ -507,8 +507,12 @@ or `writer`), and the optional `realm` (the name of a trusted-header realm).
 `GET /admin/users?kind=service` lists the service accounts; every user view
 carries `kind`, `description`, `realm` and `last_used_at`. `PATCH
 /admin/users/{id}` sets a service account's `description` and `realm`
-(`null` clears either) besides `active`. Tokens are
-`POST /admin/users/{id}/tokens`, roles `PUT /admin/users/{id}/roles`.
+(`null` clears either) besides `active`, all of them in one transaction.
+A description holds at most 1,000 characters, and no control character but
+a newline or a tab, nor an invisible formatting character such as a
+right-to-left override (U+202E), with which it would read otherwise than it
+is. Tokens are `POST /admin/users/{id}/tokens`, roles `PUT
+/admin/users/{id}/roles`.
 
 ### Usernames
 

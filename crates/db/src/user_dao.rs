@@ -399,7 +399,10 @@ pub async fn find_user_by_username(pool: &PgPool, username: &str) -> sqlx::Resul
 }
 
 /// Find a user by id.
-pub async fn find_user_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<AppUser>> {
+pub async fn find_user_by_id<'e, E>(executor: E, id: i64) -> sqlx::Result<Option<AppUser>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         AppUser,
         r#"
@@ -411,7 +414,7 @@ pub async fn find_user_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<AppU
         "#,
         id,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
