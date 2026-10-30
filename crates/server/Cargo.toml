@@ -22,6 +22,7 @@ forge-core = { path = "../core" }
 forge-crypto = { path = "../crypto" }
 forge-plugin = { path = "../plugin" }
 forge-telemetry = { path = "../telemetry" }
+forge-traffic = { path = "../traffic" }
 # The built-in format plugins (crates/formats/docker, crates/formats/nuget,
 # crates/formats/npm, crates/formats/raw), linked in.
 forge-format-docker = { path = "../formats/docker" }

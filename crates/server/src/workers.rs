@@ -60,6 +60,11 @@
 //!    bytes, and the outbox backlog for the metrics
 //!    ([`crate::telemetry::spawn_inventory`]). Read-only, per instance.
 //!
+//! 10. **Traffic statistics** — writes this instance's request counts, top
+//!     clients and request log to the object store every minute, and deletes
+//!     the files past their retention every hour ([`crate::traffic`]). Each
+//!     instance writes only files of its own; deleting is idempotent.
+//!
 //! Every loop reports to the metrics (`forge.worker.*`): its restarts, and
 //! for the periodic ones each pass's outcome and duration, the time of the
 //! last successful one and the interval it runs at. Each pass is a trace of
@@ -121,6 +126,8 @@ pub struct WorkerHandles {
     /// Counts the inventory for the metrics. Present only with the metrics
     /// exported (`telemetry.metrics`).
     pub metrics_inventory: Option<JoinHandle<()>>,
+    /// Writes and prunes the traffic statistics.
+    pub traffic: JoinHandle<()>,
 }
 
 impl WorkerHandles {
@@ -147,6 +154,7 @@ impl WorkerHandles {
         if let Some(h) = &self.metrics_inventory {
             h.abort();
         }
+        self.traffic.abort();
     }
 }
 
@@ -337,6 +345,15 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         })
     });
 
+    // The traffic statistics: every instance writes its own files.
+    let traffic = {
+        let state = state.clone();
+        forge_telemetry::workers::set_interval(crate::traffic::WORKER, Duration::from_secs(60));
+        supervise(crate::traffic::WORKER, move || {
+            crate::traffic::spawn_worker(state.clone())
+        })
+    };
+
     WorkerHandles {
         outbox,
         reconciler,
@@ -351,6 +368,7 @@ pub fn spawn_all(state: &AppState) -> WorkerHandles {
         blob_cache,
         nexus_import,
         metrics_inventory,
+        traffic,
     }
 }
 

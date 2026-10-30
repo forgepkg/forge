@@ -7,6 +7,7 @@ members = [
     "crates/core",
     "crates/crypto",
     "crates/telemetry",
+    "crates/traffic",
     "crates/plugin-api",
     "crates/plugin",
     "crates/server",
@@ -191,6 +192,12 @@ jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"
 # itself (forge_core::oidc::assertion): the crypto backend `jsonwebtoken`
 # already links, used directly where `jsonwebtoken` has no key generation.
 aws-lc-rs = { version = "1.18" }
+
+# Traffic statistics (crates/traffic): Parquet files in the object store.
+# Without the Arrow layer (its record API suffices) and with Snappy alone, a
+# pure-Rust codec.
+parquet = { version = "60", default-features = false, features = ["snap"] }
+parquet_derive = { version = "60" }
 
 # Temp files
 tempfile = { version = "3" }

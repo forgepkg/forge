@@ -24,6 +24,7 @@ import { Route as adminRolesListRouteImport } from './routes/admin/roles/List'
 import { Route as adminServiceAccountsListRouteImport } from './routes/admin/service-accounts/List'
 import { Route as adminSettingsSettingsRouteImport } from './routes/admin/settings/Settings'
 import { Route as adminSystemSystemRouteImport } from './routes/admin/system/System'
+import { Route as adminTrafficTrafficRouteImport } from './routes/admin/traffic/Traffic'
 import { Route as adminUsersListRouteImport } from './routes/admin/users/List'
 import { Route as RepoBrowseRouteImport } from './routes/RepoBrowse'
 import { Route as ImageDetailRouteImport } from './routes/ImageDetail'
@@ -38,6 +39,8 @@ import { Route as adminServiceAccountsEditRouteImport } from './routes/admin/ser
 import { Route as adminServiceAccountsCreateRouteImport } from './routes/admin/service-accounts/Create'
 import { Route as adminSettingsEmailRouteImport } from './routes/admin/settings/Email'
 import { Route as adminSettingsRetentionSettingsRouteImport } from './routes/admin/settings/RetentionSettings'
+import { Route as adminTrafficClientRouteImport } from './routes/admin/traffic/Client'
+import { Route as adminTrafficSettingsRouteImport } from './routes/admin/traffic/Settings'
 import { Route as adminUsersEditRouteImport } from './routes/admin/users/Edit'
 import { Route as adminUsersCreateRouteImport } from './routes/admin/users/Create'
 import { Route as PackageDetailRouteImport } from './routes/PackageDetail'
@@ -120,6 +123,11 @@ const adminSystemSystemRoute = adminSystemSystemRouteImport.update({
   path: '/system',
   getParentRoute: () => AdminLayoutRoute,
 } as any)
+const adminTrafficTrafficRoute = adminTrafficTrafficRouteImport.update({
+  id: '/traffic',
+  path: '/traffic',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
 const adminUsersListRoute = adminUsersListRouteImport.update({
   id: '/users',
   path: '/users',
@@ -193,6 +201,16 @@ const adminSettingsRetentionSettingsRoute =
     path: '/settings/retention',
     getParentRoute: () => AdminLayoutRoute,
   } as any)
+const adminTrafficClientRoute = adminTrafficClientRouteImport.update({
+  id: '/traffic/client',
+  path: '/traffic/client',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
+const adminTrafficSettingsRoute = adminTrafficSettingsRouteImport.update({
+  id: '/traffic/settings',
+  path: '/traffic/settings',
+  getParentRoute: () => AdminLayoutRoute,
+} as any)
 const adminUsersEditRoute = adminUsersEditRouteImport.update({
   id: '/users/$userId',
   path: '/users/$userId',
@@ -241,6 +259,7 @@ export interface FileRoutesByFullPath {
   '/manage/service-accounts': typeof adminServiceAccountsListRoute
   '/manage/settings': typeof adminSettingsSettingsRoute
   '/manage/system': typeof adminSystemSystemRoute
+  '/manage/traffic': typeof adminTrafficTrafficRoute
   '/manage/users': typeof adminUsersListRoute
   '/repos/$repo': typeof RepoBrowseRoute
   '/images/$repo/$': typeof ImageDetailRoute
@@ -255,6 +274,8 @@ export interface FileRoutesByFullPath {
   '/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
   '/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
+  '/manage/traffic/client': typeof adminTrafficClientRoute
+  '/manage/traffic/settings': typeof adminTrafficSettingsRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
   '/manage/users/new': typeof adminUsersCreateRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
@@ -276,6 +297,7 @@ export interface FileRoutesByTo {
   '/manage/service-accounts': typeof adminServiceAccountsListRoute
   '/manage/settings': typeof adminSettingsSettingsRoute
   '/manage/system': typeof adminSystemSystemRoute
+  '/manage/traffic': typeof adminTrafficTrafficRoute
   '/manage/users': typeof adminUsersListRoute
   '/repos/$repo': typeof RepoBrowseRoute
   '/images/$repo/$': typeof ImageDetailRoute
@@ -290,6 +312,8 @@ export interface FileRoutesByTo {
   '/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
   '/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
+  '/manage/traffic/client': typeof adminTrafficClientRoute
+  '/manage/traffic/settings': typeof adminTrafficSettingsRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
   '/manage/users/new': typeof adminUsersCreateRoute
   '/packages/$repo/$id': typeof PackageDetailRoute
@@ -314,6 +338,7 @@ export interface FileRoutesById {
   '/_app/manage/service-accounts': typeof adminServiceAccountsListRoute
   '/_app/manage/settings': typeof adminSettingsSettingsRoute
   '/_app/manage/system': typeof adminSystemSystemRoute
+  '/_app/manage/traffic': typeof adminTrafficTrafficRoute
   '/_app/manage/users': typeof adminUsersListRoute
   '/_app/repos/$repo': typeof RepoBrowseRoute
   '/_app/images/$repo/$': typeof ImageDetailRoute
@@ -328,6 +353,8 @@ export interface FileRoutesById {
   '/_app/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/_app/manage/settings/email': typeof adminSettingsEmailRoute
   '/_app/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
+  '/_app/manage/traffic/client': typeof adminTrafficClientRoute
+  '/_app/manage/traffic/settings': typeof adminTrafficSettingsRoute
   '/_app/manage/users/$userId': typeof adminUsersEditRoute
   '/_app/manage/users/new': typeof adminUsersCreateRoute
   '/_app/packages/$repo/$id': typeof PackageDetailRoute
@@ -352,6 +379,7 @@ export interface FileRouteTypes {
     | '/manage/service-accounts'
     | '/manage/settings'
     | '/manage/system'
+    | '/manage/traffic'
     | '/manage/users'
     | '/repos/$repo'
     | '/images/$repo/$'
@@ -366,6 +394,8 @@ export interface FileRouteTypes {
     | '/manage/service-accounts/new'
     | '/manage/settings/email'
     | '/manage/settings/retention'
+    | '/manage/traffic/client'
+    | '/manage/traffic/settings'
     | '/manage/users/$userId'
     | '/manage/users/new'
     | '/packages/$repo/$id'
@@ -387,6 +417,7 @@ export interface FileRouteTypes {
     | '/manage/service-accounts'
     | '/manage/settings'
     | '/manage/system'
+    | '/manage/traffic'
     | '/manage/users'
     | '/repos/$repo'
     | '/images/$repo/$'
@@ -401,6 +432,8 @@ export interface FileRouteTypes {
     | '/manage/service-accounts/new'
     | '/manage/settings/email'
     | '/manage/settings/retention'
+    | '/manage/traffic/client'
+    | '/manage/traffic/settings'
     | '/manage/users/$userId'
     | '/manage/users/new'
     | '/packages/$repo/$id'
@@ -424,6 +457,7 @@ export interface FileRouteTypes {
     | '/_app/manage/service-accounts'
     | '/_app/manage/settings'
     | '/_app/manage/system'
+    | '/_app/manage/traffic'
     | '/_app/manage/users'
     | '/_app/repos/$repo'
     | '/_app/images/$repo/$'
@@ -438,6 +472,8 @@ export interface FileRouteTypes {
     | '/_app/manage/service-accounts/new'
     | '/_app/manage/settings/email'
     | '/_app/manage/settings/retention'
+    | '/_app/manage/traffic/client'
+    | '/_app/manage/traffic/settings'
     | '/_app/manage/users/$userId'
     | '/_app/manage/users/new'
     | '/_app/packages/$repo/$id'
@@ -559,6 +595,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminSystemSystemRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/manage/traffic': {
+      id: '/_app/manage/traffic'
+      path: '/traffic'
+      fullPath: '/manage/traffic'
+      preLoaderRoute: typeof adminTrafficTrafficRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
     '/_app/manage/users': {
       id: '/_app/manage/users'
       path: '/users'
@@ -657,6 +700,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminSettingsRetentionSettingsRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
+    '/_app/manage/traffic/client': {
+      id: '/_app/manage/traffic/client'
+      path: '/traffic/client'
+      fullPath: '/manage/traffic/client'
+      preLoaderRoute: typeof adminTrafficClientRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
+    '/_app/manage/traffic/settings': {
+      id: '/_app/manage/traffic/settings'
+      path: '/traffic/settings'
+      fullPath: '/manage/traffic/settings'
+      preLoaderRoute: typeof adminTrafficSettingsRouteImport
+      parentRoute: typeof AdminLayoutRoute
+    }
     '/_app/manage/users/$userId': {
       id: '/_app/manage/users/$userId'
       path: '/users/$userId'
@@ -711,6 +768,7 @@ interface AdminLayoutRouteChildren {
   adminServiceAccountsListRoute: typeof adminServiceAccountsListRoute
   adminSettingsSettingsRoute: typeof adminSettingsSettingsRoute
   adminSystemSystemRoute: typeof adminSystemSystemRoute
+  adminTrafficTrafficRoute: typeof adminTrafficTrafficRoute
   adminUsersListRoute: typeof adminUsersListRoute
   adminSelectorsEditRoute: typeof adminSelectorsEditRoute
   adminSelectorsCreateRoute: typeof adminSelectorsCreateRoute
@@ -723,6 +781,8 @@ interface AdminLayoutRouteChildren {
   adminServiceAccountsCreateRoute: typeof adminServiceAccountsCreateRoute
   adminSettingsEmailRoute: typeof adminSettingsEmailRoute
   adminSettingsRetentionSettingsRoute: typeof adminSettingsRetentionSettingsRoute
+  adminTrafficClientRoute: typeof adminTrafficClientRoute
+  adminTrafficSettingsRoute: typeof adminTrafficSettingsRoute
   adminUsersEditRoute: typeof adminUsersEditRoute
   adminUsersCreateRoute: typeof adminUsersCreateRoute
   adminRepositoriesImportRoute: typeof adminRepositoriesImportRoute
@@ -739,6 +799,7 @@ const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminServiceAccountsListRoute: adminServiceAccountsListRoute,
   adminSettingsSettingsRoute: adminSettingsSettingsRoute,
   adminSystemSystemRoute: adminSystemSystemRoute,
+  adminTrafficTrafficRoute: adminTrafficTrafficRoute,
   adminUsersListRoute: adminUsersListRoute,
   adminSelectorsEditRoute: adminSelectorsEditRoute,
   adminSelectorsCreateRoute: adminSelectorsCreateRoute,
@@ -751,6 +812,8 @@ const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminServiceAccountsCreateRoute: adminServiceAccountsCreateRoute,
   adminSettingsEmailRoute: adminSettingsEmailRoute,
   adminSettingsRetentionSettingsRoute: adminSettingsRetentionSettingsRoute,
+  adminTrafficClientRoute: adminTrafficClientRoute,
+  adminTrafficSettingsRoute: adminTrafficSettingsRoute,
   adminUsersEditRoute: adminUsersEditRoute,
   adminUsersCreateRoute: adminUsersCreateRoute,
   adminRepositoriesImportRoute: adminRepositoriesImportRoute,

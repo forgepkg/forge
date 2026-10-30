@@ -181,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
     let workers = workers::spawn_all(&state);
 
     let downloads = state.downloads.clone();
+    let (traffic, pool) = (state.traffic.clone(), state.pool.clone());
     let app = build_router(state, layer);
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -196,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
     workers.abort();
     // Download counts not written yet would be lost with the process.
     downloads.write_pending().await;
+    // So would the traffic counted since the last minute's flush.
+    forge_server::traffic::flush_on_shutdown(&traffic, &pool).await;
     tracing::info!("forge-server stopped");
     // Export what the telemetry still buffers.
     tokio::task::spawn_blocking(move || telemetry.shutdown())

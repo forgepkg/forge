@@ -28,6 +28,7 @@ const ADMINISTRATION: RailLink[] = [
   { label: 'Settings', to: '/manage/settings', icon: 'Sliders' },
   { label: 'Email', to: '/manage/settings/email', icon: 'Mail' },
   { label: 'Retention', to: '/manage/settings/retention', icon: 'Clock' },
+  { label: 'Traffic', to: '/manage/traffic', icon: 'Activity' },
   { label: 'System', to: '/manage/system', icon: 'Database' },
 ]
 

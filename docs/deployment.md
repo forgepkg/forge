@@ -69,7 +69,9 @@ for the bucket `forge`; MinIO and Ceph RGW use the same action names):
 These are the S3 calls behind the policy: `HeadBucket`, `CreateBucket` (only
 when the bucket is missing), `HeadObject`, `GetObject`, `PutObject`,
 `DeleteObject`, `CreateMultipartUpload`, `UploadPart`,
-`CompleteMultipartUpload` and `AbortMultipartUpload`. The policy is the same
+`CompleteMultipartUpload`, `AbortMultipartUpload` and `ListObjectsV2` (the
+[traffic statistics](#traffic-statistics) list their files, under
+`traffic/`). The policy is the same
 for static keys and for the role behind short-lived credentials.
 
 ### Short-lived S3 credentials
@@ -1297,6 +1299,54 @@ console log is) is exported too, each record with the trace and span it was
 written in, so a backend links a request's log lines to its trace. The
 console log stays as it is.
 
+## Traffic statistics
+
+**Admin → Traffic** (`/manage/traffic`) shows what every instance answered:
+requests over time, data sent, 4xx and 5xx answers and latency, by
+repository, surface and status, and the 20 client networks with the most
+requests. A client opens its own view with its requests from the request
+log: time, method, path, status, size, duration, account, user agent and
+the instance that answered. Health probes are not counted.
+
+Each instance counts its requests in memory and writes them to Forge's
+bucket once a minute, as Parquet files under `traffic/v1/`. Every instance
+writes files of its own, so the page reads the files of all of them from the
+bucket and sums them: it needs no Redis and no call between instances, and
+it shows every instance, or one, whichever answers it. The files are plain
+Parquet, so DuckDB, pandas or Spark read them too:
+
+| Files | What they hold | Kept |
+| --- | --- | --- |
+| `minutes/<date>/<hour>/<instance>.buckets.parquet` | An hour's requests by minute, repository, surface, method and status: count, bytes, a latency histogram | 3 days (the views of the last 48 hours) |
+| `hours/<date>/<instance>.buckets.parquet` | The same of a day, by hour | **Statistics**, 400 days by default |
+| `…/<instance>.clients.parquet` (both) | The top 100 client networks of each minute or hour | **Top clients**, 30 days by default |
+| `requests/<date>/<hour>/<instance>.<ms>.parquet` | The request log: a file per instance and minute | **Request log**, 7 days by default |
+
+What is recorded and how long it is kept is set under **Admin → Traffic →
+Settings** (`/admin/settings/traffic`), for every instance at once. Each
+instance deletes the files past their retention about once an hour,
+whichever instance wrote them.
+
+- **Client addresses are personal data.** The address is the one Forge
+  resolves for the login lockout: the socket peer, or the `X-Forwarded-For`
+  of a [trusted proxy](#reverse-proxy). An IPv6 client is counted by its
+  /64. Addresses are kept only in the top clients and the request log, with
+  retentions of their own; **Client addresses** off records neither, and
+  **Request log** off keeps the counts and the top clients without the log.
+- **Size.** The counts are a few small files per instance and hour. The
+  request log grows with the traffic: a row per request, with its path
+  (secrets in a path, such as a command-line login's, are replaced) and user
+  agent, compressed with Snappy.
+- **Accuracy.** The last minute shows once the instances have written it.
+  An instance that stops writes what it counted on a graceful shutdown; one
+  that is killed loses its last minute. The top lists are counted in bounded
+  memory: under a flood of addresses a client's count can come out low,
+  never high. A client's view reads the request log of at most the last 24
+  hours of its range, and shows the newest 500 requests.
+
+The statistics are separate from the [OpenTelemetry metrics](#telemetry),
+which carry no address, path or user and need a backend of their own.
+
 ## Running more than one instance
 
 Instances coordinate through PostgreSQL (row locks and leases), so any number
@@ -1578,7 +1628,8 @@ incomplete multipart uploads, for example after one day:
 (`aws s3api put-bucket-lifecycle-configuration --bucket forge
 --lifecycle-configuration file://lifecycle.json`; MinIO and Ceph RGW accept
 the same rule.) Do not add expiration rules for current objects: Forge's own
-garbage collection decides when a blob may go.
+garbage collection decides when a blob may go, and Forge deletes the
+[traffic statistics](#traffic-statistics) past their retention itself.
 
 To restore: stop every Forge instance, restore PostgreSQL, restore the bucket
 as described above, then start Forge. Practise this before you need it.

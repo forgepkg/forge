@@ -278,6 +278,9 @@ pub async fn attach_principal(
     next: Next,
 ) -> Response {
     let peer = peer_ip(&req);
+    let xff = forwarded_for(req.headers());
+    let client_ip = resolve_client_ip(peer, xff.as_deref(), &layer.trusted_proxies);
+    crate::traffic::note_client(client_ip);
 
     if !req.method().is_safe()
         && cross_site_browser_request(req.headers(), layer.public_origin.as_deref())
@@ -295,9 +298,6 @@ pub async fn attach_principal(
     {
         return next.run(req).await;
     }
-
-    let xff = forwarded_for(req.headers());
-    let client_ip = resolve_client_ip(peer, xff.as_deref(), &layer.trusted_proxies);
 
     let anon = match &layer.anon {
         AnonSource::Fixed(policy) => *policy,
@@ -342,6 +342,7 @@ pub async fn attach_principal(
             ..
         }
     );
+    crate::traffic::note_principal(&resolved.principal);
     req.extensions_mut().insert(resolved.principal);
     let mut resp = next.run(req).await;
     if named_by_headers {

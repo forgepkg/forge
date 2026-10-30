@@ -101,6 +101,9 @@ pub struct AppState {
     /// This process among the instances of an install, as per-instance
     /// reports (the local blob cache's statistics) name it.
     pub instance: Arc<Instance>,
+    /// The traffic statistics (Admin → Traffic): this instance's counts,
+    /// written to the object store by the traffic worker.
+    pub traffic: forge_traffic::Traffic,
     /// Forge's own OIDC issuer: the keys a `federated_credential` OIDC realm
     /// signs its client assertions with, published under `/.well-known/`.
     pub assertion_issuer: AssertionIssuer,
@@ -349,6 +352,11 @@ impl AppState {
         ));
 
         let (pool_for_mailer, config_for_mailer) = (pool.clone(), config.clone());
+        let instance = Arc::new(Instance::current());
+        let traffic = forge_traffic::Traffic::new(
+            Arc::new(blob_store.clone()),
+            forge_traffic::instance_id(instance.host.as_deref(), instance.started_at),
+        );
         AppState {
             downloads: DownloadTally::new(pool.clone()),
             pool,
@@ -375,7 +383,8 @@ impl AppState {
                 rand::rng().fill_bytes(&mut key);
                 key
             }]),
-            instance: Arc::new(Instance::current()),
+            instance,
+            traffic,
             mailer: Arc::new(crate::email::Mailer::new(
                 pool_for_mailer,
                 envelope.clone(),

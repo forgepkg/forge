@@ -81,6 +81,7 @@ const ICONS = {
   Eye: [EYE, circ(10, 10, 2.5)],
   EyeOff: [EYE, circ(10, 10, 2.5), 'M3 3l14 14'],
   Clock: [circ(10, 10, 7), 'M10 6v4l2.5 2.5'],
+  Activity: ['M2.5 10.5h3l2.2-5.5 4.6 10 2.2-4.5h3'],
   Alert: ['M10 3l8 14H2z', 'M10 8.5V12', 'M10 14.6v.1'],
   Info: [circ(10, 10, 7), 'M10 9v5', 'M10 6.4v.1'],
   X: ['M5 5l10 10', 'M15 5L5 15'],
