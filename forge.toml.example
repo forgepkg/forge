@@ -30,9 +30,13 @@ allow_insecure_defaults = true  # (default: false)
 # It also caps the upload limit a repository may be given. Set below 1 GiB, it
 # lowers the docker defaults (upload limit, docker.max_blob_bytes) to fit.
 # Host names (port ignored) clients reach this server under besides the host of
-# public_base_url, e.g. the name a reverse proxy rewrites Host to. Only gates
-# the trusted-header realms (Admin → Authentication): a request naming any
-# other host is not named by the proxy's headers (DNS-rebinding guard).
+# public_base_url, e.g. a name internal clients use. Only gates the
+# trusted-header realms (Admin → Authentication): a request naming any other
+# host is not named by the proxy's headers (DNS-rebinding guard). The guard
+# needs the client's own Host: the reverse proxy must forward it (nginx:
+# proxy_set_header Host $host). Never add a name the proxy rewrites Host to
+# ("forge" for proxy_pass http://forge:8421): every request then names an
+# allowed host, and the guard is off.
 allowed_hosts = []              # (default: [])
 # Connection and request time limits. A client that takes longer to send its
 # request headers, or whose request body stalls longer, is cut off; a handler
