@@ -400,14 +400,15 @@ impl Registry {
     }
 
     /// Whether the caller may `action` the target's image: the repository
-    /// permission and its content selectors, then a registry token's scope
-    /// (checked against the name the client used).
+    /// permission and its content selectors ([`Self::rbac_decision`]), then
+    /// a registry token's scope (checked against the name the client used).
     pub(crate) async fn decide(&self, caller: &Caller, target: &Target, action: Level) -> Decision {
-        if !self
-            .rbac_allows(&caller.principal, &target.repo, &target.image, action)
+        match self
+            .rbac_decision(&caller.principal, &target.repo, &target.image, action)
             .await
         {
-            return Decision::Deny;
+            Decision::Allow => {}
+            refused => return refused,
         }
         match &caller.claims {
             Some(claims) if !claims_allow(claims, &target.name, action) => Decision::NeedsScope,
@@ -415,7 +416,40 @@ impl Registry {
         }
     }
 
-    /// The RBAC part of [`Self::decide`].
+    /// The RBAC part of [`Self::decide`]: the repository permission, then
+    /// its content selectors. An image a selector hides from a caller who
+    /// may read the repository is [`Decision::Hidden`] to a read, and
+    /// [`Decision::Deny`] to a push or a delete.
+    async fn rbac_decision(
+        &self,
+        principal: &Principal,
+        repo: &Repository,
+        image: &str,
+        action: Level,
+    ) -> Decision {
+        let authz = &self.inner.authz;
+        let allowed = match action {
+            Level::Read => authz.can_read(principal, repo).await,
+            Level::Write => authz.can_write(principal, repo).await,
+            Level::Delete => authz.can_delete(principal, repo).await,
+        };
+        if !allowed {
+            Decision::Deny
+        } else if authz
+            .package_filter_for(principal, repo, action)
+            .await
+            .allows(image)
+        {
+            Decision::Allow
+        } else if action == Level::Read {
+            Decision::Hidden
+        } else {
+            Decision::Deny
+        }
+    }
+
+    /// Whether RBAC allows the caller `action` on `repo`'s `image`
+    /// ([`Self::rbac_decision`]).
     pub(crate) async fn rbac_allows(
         &self,
         principal: &Principal,
@@ -423,17 +457,7 @@ impl Registry {
         image: &str,
         action: Level,
     ) -> bool {
-        let authz = &self.inner.authz;
-        let allowed = match action {
-            Level::Read => authz.can_read(principal, repo).await,
-            Level::Write => authz.can_write(principal, repo).await,
-            Level::Delete => authz.can_delete(principal, repo).await,
-        };
-        allowed
-            && authz
-                .package_filter_for(principal, repo, action)
-                .await
-                .allows(image)
+        self.rbac_decision(principal, repo, image, action).await == Decision::Allow
     }
 
     /// Where a push or delete addressed to `target` lands (the repository
@@ -453,7 +477,12 @@ impl Registry {
         let landing = match target.repo.kind() {
             RepoKind::Hosted => target.clone(),
             RepoKind::Proxy | RepoKind::Group => {
-                let decision = self.decide(caller, target, Level::Read).await;
+                // A push of an image a selector hides is refused, not
+                // answered as a name that does not exist.
+                let decision = match self.decide(caller, target, Level::Read).await {
+                    Decision::Hidden => Decision::Deny,
+                    decision => decision,
+                };
                 if decision != Decision::Allow {
                     return Err(self.refusal(
                         caller,
@@ -523,7 +552,9 @@ impl Registry {
 
     /// The refusal of `permission` on `name`: a challenge (401) when
     /// credentials or a token for the scope could help, a denial (403) for
-    /// an authenticated caller the permission is missing for.
+    /// an authenticated caller the permission is missing for, and for an
+    /// image a selector hides the answer to a name that does not exist
+    /// (404 `NAME_UNKNOWN`).
     pub(crate) fn refusal(
         &self,
         caller: &Caller,
@@ -535,6 +566,9 @@ impl Registry {
         let authenticated = mutation_credential(&caller.principal);
         let error = caller.claims.as_ref().map(|_| "insufficient_scope");
         match decision {
+            Decision::Hidden => Failure::new(ImageError::NameUnknown {
+                name: name.to_string(),
+            }),
             Decision::NeedsScope => challenge(site, name, permission, error),
             Decision::Deny if !authenticated => challenge(site, name, permission, error),
             _ => Failure::new(ImageError::Denied {
@@ -1067,6 +1101,11 @@ pub(crate) enum Decision {
     /// RBAC allows it, but the registry token presented does not cover it:
     /// the client should fetch a token for this scope.
     NeedsScope,
+    /// The caller may read the repository, but a content selector of its
+    /// grant hides the image: a read is answered as for a name that does
+    /// not exist (404), as the other formats answer a package a selector
+    /// hides.
+    Hidden,
     Deny,
 }
 
