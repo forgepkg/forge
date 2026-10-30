@@ -273,6 +273,15 @@ pub struct TagPage {
     pub more: bool,
 }
 
+/// A page of an upstream registry's catalog ([`crate::UpstreamOp::ImageCatalog`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogPage {
+    /// Image names, in byte order.
+    pub images: Vec<String>,
+    /// There are images after these the page leaves out.
+    pub more: bool,
+}
+
 /// An upload session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadState {

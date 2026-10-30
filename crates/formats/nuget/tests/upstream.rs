@@ -368,3 +368,27 @@ fn search_offsets_beyond_nuget_orgs_limit_request_local_fallback() {
         assert!(done.fetches.is_empty());
     }
 }
+
+#[test]
+fn an_import_walks_every_package_beyond_nuget_orgs_offset_limit() {
+    let url = "https://search.example/query?q=&skip=5000&take=2&prerelease=true&semVerLevel=2.0.0";
+    let page = found(json!({ "totalHits": 5002, "data": [
+        { "id": "Contoso.Lib", "version": "1.0.0" },
+        { "id": "Contoso.Web", "version": "2.0.0-beta.1" },
+    ]}));
+    let done = run(
+        &remote(&resources()),
+        UpstreamOp::Packages {
+            skip: 5_000,
+            take: 2,
+        },
+        &docs([(url.to_string(), page)]),
+    );
+    assert_eq!(done.fetches[0].url, url);
+    let UpstreamAnswer::Search(Some(search)) = done.answer else {
+        panic!("{:?}", done.answer)
+    };
+    assert_eq!(search.total, 5002);
+    let ids: Vec<&str> = search.hits.iter().map(|hit| hit.id.as_str()).collect();
+    assert_eq!(ids, ["Contoso.Lib", "Contoso.Web"]);
+}

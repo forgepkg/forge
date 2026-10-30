@@ -1,0 +1,299 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, repository_id, url, source_repository, registry_url, names, username,\n               (password_enc IS NOT NULL) AS \"has_password!\",\n               on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,\n               cancel_requested, source_server, source_total,\n               last_error, created_by, created_at, started_at, finished_at, updated_at\n        FROM repository_import\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "source_repository",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "source_repository"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "registry_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "registry_url"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "names",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "names"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "username"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "has_password!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "on_conflict",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "on_conflict"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "concurrency",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "concurrency"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "dry_run",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "dry_run"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "phase",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "phase"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "scan_listing",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "scan_listing"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "cursor",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "cursor"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "cancel_requested",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "cancel_requested"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "source_server",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "source_server"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "source_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "source_total"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "last_error",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "last_error"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "started_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "started_at"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "finished_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "finished_at"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      null,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "a597333c3c4a106ff419d7c1a3c75f737b9b577dd404f7a4661c32235c2328f2"
+}

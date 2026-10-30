@@ -104,9 +104,11 @@ URL to open elsewhere. A login waits for its approval for
 the signed-in user who opens it.
 
 **A username and a password**: `yarn npm login` (Yarn 2+) and `npm login
---auth-type=legacy` send them to Forge, which checks them like the web
-login does (local passwords, credential forwarding, the lockout after
-failed attempts) and mints a token. No account is ever created by a login.
+--auth-type=legacy` send them to Forge, which checks them through the realms
+that accept passwords from clients ([Admin →
+Authentication](deployment.md#passwords-from-clients): a credential-forwarding
+realm by default, the local realm once it is set to), with the lockout after
+failed attempts, and mints a token. No account is ever created by a login.
 npm's legacy login refuses a username containing an `@`, which every Forge
 account has (an e-mail address): use the browser login, Yarn's, or a token
 from the web UI.

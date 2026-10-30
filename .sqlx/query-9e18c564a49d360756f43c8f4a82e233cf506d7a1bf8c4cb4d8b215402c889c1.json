@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT coalesce(sum(a.download_count), 0)::bigint AS \"n!\"\n            FROM asset a JOIN component c ON c.id = a.component_id\n            JOIN repository r ON r.id = c.repository_id\n            WHERE r.name = 'nuget-source'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9e18c564a49d360756f43c8f4a82e233cf506d7a1bf8c4cb4d8b215402c889c1"
+}

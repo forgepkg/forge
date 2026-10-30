@@ -64,10 +64,11 @@ docker push forge.example.com/docker-hosted/team/app:1.3
 
 - **API tokens** (created on the Tokens page, or `POST /admin/me/tokens`) are
   the password to use. A token's repository scope applies.
-- **Passwords** work where Basic passwords are allowed at all: the
-  `allow_password_basic` setting (Admin → Settings), or an enabled
-  credential-forwarding realm (so
-  users of an existing Nexus or LDAP sign in with their upstream password).
+- **Passwords** work for the users of a realm that accepts passwords from
+  clients ([Admin → Authentication](deployment.md#passwords-from-clients)):
+  a credential-forwarding realm by default (so users of an existing Nexus or
+  LDAP sign in with their upstream password), the local realm once it is set
+  to.
   The password goes to the token endpoint only; the registry itself sees the
   short-lived token.
 - **CI workloads** with a workload-identity realm pass their OIDC token, or
@@ -141,9 +142,10 @@ with any `artifactType`; Docker schema 1 is refused.
   Upload sessions are shared by all instances; an abandoned one expires
   after `docker.upload_ttl_seconds`.
 
-The images of a Nexus docker-hosted repository move over with an import,
-digests, multi-platform indexes, signatures and SBOMs included
-([nexus-import.md](nexus-import.md)).
+The images of another registry (a Nexus docker-hosted repository, Harbor, a
+`distribution` registry, another Forge) move over with an import, through
+the registry API: digests, multi-platform indexes, signatures and SBOMs
+included ([import.md](import.md)).
 
 ### Signatures, SBOMs and attestations
 

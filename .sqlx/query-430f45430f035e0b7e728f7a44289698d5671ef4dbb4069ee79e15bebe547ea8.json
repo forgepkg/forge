@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM repository_import WHERE id = $1 AND state NOT IN ('queued', 'running')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "430f45430f035e0b7e728f7a44289698d5671ef4dbb4069ee79e15bebe547ea8"
+}

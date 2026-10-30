@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT url, registry_url FROM repository_import WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "registry_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "registry_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "32a681fad30926b74bbf1a6a49a7db56b445baf0fbd06c0f2694cc4d31605a22"
+}

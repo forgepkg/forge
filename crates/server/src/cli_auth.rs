@@ -32,7 +32,7 @@ use forge_db::token_dao::{self, NewToken};
 use forge_db::user_dao;
 use forge_plugin::api::{AuthOutcome, AuthRequest};
 
-use crate::auth::{verify_password_login, LoginRefusal};
+use crate::auth::{verify_password_login, LoginRefusal, PasswordFrom};
 use crate::state::AppState;
 
 /// The longest host name a web login keeps.
@@ -135,7 +135,9 @@ async fn password_login(
     username: &str,
     password: &str,
 ) -> Result<AuthOutcome, Response> {
-    let (principal, _) = match verify_password_login(state, client_ip, username, password).await {
+    let verified =
+        verify_password_login(state, client_ip, username, password, PasswordFrom::Client).await;
+    let (principal, _) = match verified {
         Ok(verified) => verified,
         Err(refusal) => {
             tracing::info!(

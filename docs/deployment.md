@@ -584,7 +584,6 @@ wrong.
 | `anonymous_mode` | `off` | `off` or `all`: who is served without credentials. A repository is read anonymously only when it also allows it (**Allow anonymous read**, or a grant of the `anonymous` role). Under `all`, signed-in users also read what anonymous callers may. To let a network read without credentials, have the load balancer name a service account through a [trusted-header realm](#trusted-header-realms). |
 | `login_mode` | `identifier_first` | The login screen: the username first (then a password prompt or the identity provider whose login domains match), or `combined` (username and password, plus the OIDC button). |
 | `remember_accounts` | `true` | The login screen offers the accounts signed in on the device before, so signing in again is one click (see below). `false` for kiosks and shared computers. |
-| `allow_password_basic` | `false` | Accept a user's password over HTTP Basic on the feeds (see below). |
 | `session_idle_ttl_seconds` | `28800` (8 h) | A browser session ends this long after its last use. |
 | `session_absolute_ttl_seconds` | `604800` (7 d) | A browser session ends this long after sign-in. New lifetimes apply to sessions signed in afterwards; an open session's idle window moves to the new idle timeout on its next use. |
 | `login_max_failures` | `10` | Failed passwords per client network and username before the lockout; `0` turns it off. Each instance counts its own. |
@@ -614,17 +613,34 @@ username. With `remember_accounts` off (**Admin → Settings → Remember accoun
 on the login screen**), the login screen keeps none and forgets those a
 browser kept, the next time it is opened there.
 
-#### Password Basic auth
+#### Passwords from clients
 
-`allow_password_basic` is off by default: the web UI signs in through its
-login form (not affected by this setting), and NuGet clients and scripts
-authenticate with API tokens (a token in the Basic password field is always
-accepted). An enabled credential-forwarding realm turns the Basic password
-path on by itself, because its users have no tokens until they first sign in
-— and that path runs the whole password chain, so **local** users' passwords
-are then accepted over Basic too, whatever this setting says. Turn it on only
-if a client must send a local user's password over Basic without such a
-realm.
+Whether a client may send a user's password over HTTP Basic (a NuGet, raw or
+Helm feed, `docker login` through the registry's token service, `npm login
+--auth-type=legacy`) is set **per realm**: **Accept passwords from clients
+(HTTP Basic)** on the realm's page under **Admin → Authentication**
+(`accept_client_passwords` in the config of the `local` realm or a
+`credential_forwarding` one, `PATCH /admin/realms/{id}`).
+
+- **The local realm: off by default.** Local users sign their clients in
+  with tokens: an API token from their **Tokens** page (also the password of
+  `docker login`), or `npm login --auth-type=web`. Turn it on only if a
+  client must send a local user's password.
+- **A credential-forwarding realm: on by default,** as against a Nexus that
+  checks the passwords: the realm's users have no token until they first
+  sign in. Turned off, they sign in in the browser and use tokens.
+- **The browser login takes every realm's passwords,** whatever the flag:
+  it is how a user gets a token. An API token sent as the Basic password
+  always works.
+- **A closed local realm still guards its names.** A password a client
+  sends for a local account is refused with the 401 of a wrong password (the
+  lockout counts it), and is never forwarded to a credential-forwarding
+  realm behind it.
+
+Before 2.2 this was one setting, `allow_password_basic` under **Admin →
+Settings**, and an enabled credential-forwarding realm turned it on for every
+realm. The upgrade copies its value onto the local realm, and `PUT
+/admin/settings/auth` refuses the key with where it went.
 
 A password sent over Basic is a **feed** credential only: the admin API
 (`/admin/*`) and token minting refuse it with 403, even for an administrator,

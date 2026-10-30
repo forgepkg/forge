@@ -152,9 +152,9 @@ identity (IRSA, EKS Pod Identity, STS web identity; see
 bakes no bootstrap admin: `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` creates one on the first start,
 named by `FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` (a UPN, default `admin@example.com`), and
 once it is removed the image simply starts without one. A new install has
-no anonymous access and accepts no passwords over HTTP Basic (clients use API
-tokens); an administrator changes both in the web UI under **Admin →
-Settings** (see
+no anonymous access and its local realm accepts no passwords over HTTP Basic
+(clients use API tokens); an administrator changes them in the web UI under
+**Admin → Settings** and **Admin → Authentication** (see
 [docs/deployment.md](docs/deployment.md#access-and-sign-in-settings)).
 
 ### Point a `dotnet` client at it
@@ -238,9 +238,10 @@ The guides below are also a site, with navigation and search:
   methods run side by side.
 - **[Format plugins](./docs/format-plugins.md)** — further package formats,
   built into the server: design, operation, and writing one.
-- **[Importing from Nexus](./docs/nexus-import.md)** — copy a Nexus hosted
-  repository (NuGet, Docker) into Forge, with its publish dates:
-  dry run, conflicts, resuming, and the cutover.
+- **[Importing repositories](./docs/import.md)** — copy a hosted repository
+  of Nexus, Artifactory, a registry or another Forge (NuGet, Docker) into
+  Forge through the format's own protocol: dry run, conflicts, resuming, and
+  the cutover.
 
 Run `cargo xtask help` for the complete command list.
 

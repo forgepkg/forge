@@ -374,6 +374,45 @@ describe('OIDC federated credential', () => {
   })
 })
 
+describe('passwords from clients', () => {
+  const stored = (kind: RealmView['kind'], config: RealmView['config']): RealmView => ({
+    id: 1,
+    kind,
+    name: kind,
+    enabled: true,
+    priority: 1,
+    config,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+  })
+
+  it('the local realm sends its flag, off until set', () => {
+    expect(toRealmConfig(seedRealmFormValues(stored('local', {})))).toEqual({
+      accept_client_passwords: false,
+    })
+    for (const accept of [true, false]) {
+      const config = { accept_client_passwords: accept }
+      expect(toRealmConfig(seedRealmFormValues(stored('local', config)))).toEqual(config)
+    }
+  })
+
+  it('a forwarding realm sends it only when off, its default being on', () => {
+    const base = { url: 'https://nexus.example.com/status' }
+    expect(seedRealmFormValues(stored('credential_forwarding', base)).accept_client_passwords).toBe(
+      true,
+    )
+    const closed = { ...base, accept_client_passwords: false }
+    expect(toRealmConfig(seedRealmFormValues(stored('credential_forwarding', closed)))).toEqual(
+      closed,
+    )
+    expect(
+      toRealmConfig(
+        seedRealmFormValues(stored('credential_forwarding', { ...base, accept_client_passwords: true })),
+      ),
+    ).toEqual(base)
+  })
+})
+
 describe('kept password options', () => {
   const stored = (config: RealmView['config']): RealmView => ({
     id: 1,

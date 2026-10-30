@@ -214,6 +214,23 @@ pub trait AuthProvider: Send + Sync {
     async fn authenticate(&self, cred: &PasswordCredential<'_>) -> AuthOutcome;
 }
 
+/// A provider shared by several chains (a realm's, in the chain of the
+/// browser login and in the one of the clients' passwords).
+#[async_trait::async_trait]
+impl<P: AuthProvider + ?Sized> AuthProvider for std::sync::Arc<P> {
+    fn id(&self) -> &str {
+        (**self).id()
+    }
+
+    fn source(&self) -> AuthSource {
+        (**self).source()
+    }
+
+    async fn authenticate(&self, cred: &PasswordCredential<'_>) -> AuthOutcome {
+        (**self).authenticate(cred).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

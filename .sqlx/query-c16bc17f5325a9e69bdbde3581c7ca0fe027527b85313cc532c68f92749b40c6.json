@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE repository_import\n        SET state = CASE WHEN state = 'queued' THEN 'cancelled' ELSE state END,\n            finished_at = CASE WHEN state = 'queued' THEN now() ELSE finished_at END,\n            cancel_requested = (state = 'running'),\n            updated_at = now()\n        WHERE id = $1 AND state IN ('queued', 'running')\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c16bc17f5325a9e69bdbde3581c7ca0fe027527b85313cc532c68f92749b40c6"
+}

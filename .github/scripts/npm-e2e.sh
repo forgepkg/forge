@@ -298,6 +298,11 @@ done
 [ "$(npm whoami --registry "$(reg npm-hosted)")" = "$admin_user" ] || fail "npm whoami (hosted)"
 
 step "legacy login with Yarn, and logout"
+# Yarn sends the admin's password: the local realm takes passwords from
+# clients only once it accepts them.
+local_realm=$(admin GET /admin/realms | jq -r '.[] | select(.kind == "local") | .id')
+[ -n "$local_realm" ] || fail "no local realm"
+admin PATCH "/admin/realms/$local_realm" '{"config":{"accept_client_passwords":true}}' >/dev/null
 yarn_js="${YARN_BERRY:-}"
 if [ -z "$yarn_js" ]; then
   mkdir -p "$work/yarn"

@@ -1037,24 +1037,42 @@ impl IntoResponse for LoginRefusal {
     }
 }
 
-/// Check a username and password as an interactive login does: through the
-/// realm chain (local and credential-forwarding realms, in priority order),
+/// Who sends the password [`verify_password_login`] checks, which picks the
+/// realm chain that checks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasswordFrom {
+    /// The browser login: every password-capable realm
+    /// ([`RealmSnapshot::chain`]).
+    Browser,
+    /// A client (`npm login --auth-type=legacy`): only the realms that accept
+    /// passwords from clients ([`RealmSnapshot::client_chain`]).
+    Client,
+}
+
+/// Check a username and password as a login does: through the realm chain
+/// `from` picks (local and credential-forwarding realms, in priority order),
 /// under the login lockout, and never for a secret that is a token Forge
-/// issued. Not gated by `allow_password_basic`, which governs passwords on
-/// the feeds only. Returns the signed-in user and the canonical username.
-/// `POST /auth/login` and `npm login` sign in through it.
+/// issued. Returns the signed-in user and the canonical username.
+/// `POST /auth/login` signs in through it as [`PasswordFrom::Browser`],
+/// `npm login --auth-type=legacy` as [`PasswordFrom::Client`].
 pub(crate) async fn verify_password_login(
     state: &AppState,
     client_ip: IpAddr,
     username: &str,
     password: &str,
+    from: PasswordFrom,
 ) -> Result<(forge_core::auth::principal::UserPrincipal, String), LoginRefusal> {
     let snap = snapshot_or_resp(state)
         .await
         .map_err(|_| LoginRefusal::Unavailable)?;
-    let Some(chain) = snap.chain.clone() else {
-        // No enabled password-capable realm. Uniform denial (the UI learns
-        // whether to even offer the form from /auth/login-options).
+    let chain = match from {
+        PasswordFrom::Browser => snap.chain.clone(),
+        PasswordFrom::Client => snap.client_chain.clone(),
+    };
+    let Some(chain) = chain else {
+        // No enabled password-capable realm (for a client: none that accepts
+        // passwords from clients). Uniform denial (the UI learns whether to
+        // even offer the form from /auth/login-options).
         return Err(LoginRefusal::Invalid);
     };
     if username.len() > MAX_USERNAME_BYTES || password.is_empty() {
@@ -1162,9 +1180,10 @@ pub(crate) async fn verify_password_login(
 /// chain (local + credential-forwarding realms, in priority order) and mint a
 /// browser session.
 ///
-/// This is the form-login counterpart of the wire Basic path: it runs the SAME
-/// chain with the same fail-closed semantics, but is **not** gated by
-/// `auth.allow_password_basic` (that flag governs API Basic auth only). The
+/// This is the form-login counterpart of the wire Basic path, with the same
+/// fail-closed semantics, but it runs the chain of **every** password-capable
+/// realm: a realm's `accept_client_passwords` governs only the passwords
+/// clients send (it is how a local user gets a token). The
 /// response mirrors `/auth/me` so the SPA can bootstrap immediately; failures
 /// are a uniform 401 (no username-exists oracle). A username over
 /// [`MAX_USERNAME_BYTES`], or one containing `:`, is refused the same way
@@ -1177,11 +1196,18 @@ async fn password_login(
     Json(body): Json<LoginBody>,
 ) -> Response {
     let client_ip = login_client_ip(&state, connect.map(|Extension(ci)| ci.0), &headers);
-    let (principal, username) =
-        match verify_password_login(&state, client_ip, &body.username, &body.password).await {
-            Ok(verified) => verified,
-            Err(refusal) => return refusal.into_response(),
-        };
+    let (principal, username) = match verify_password_login(
+        &state,
+        client_ip,
+        &body.username,
+        &body.password,
+        PasswordFrom::Browser,
+    )
+    .await
+    {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(),
+    };
 
     // Fresh session per login (fixation-proof), same as the OIDC callback.
     let issued = match state

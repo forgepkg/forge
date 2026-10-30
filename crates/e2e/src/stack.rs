@@ -540,6 +540,15 @@ impl StackBuilder {
         forge_server::app::ensure_auth_realms(&config, &pool, &envelope)
             .await
             .expect("seed auth realms");
+        // Tests sign in over Basic: the local realm accepts passwords from
+        // clients. A peer on the same database sets the same.
+        sqlx::query(
+            "UPDATE auth_realm SET config = config || '{\"accept_client_passwords\": true}' \
+             WHERE kind = 'local'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed the local realm's client passwords");
 
         let cache = match &redis {
             Some(url) => Cache::with_redis(config.cache.l1_max_capacity, url)
@@ -552,10 +561,10 @@ impl StackBuilder {
             .expect("registry token key");
         let state = AppState::new(pool.clone(), store, cache, config, envelope)
             .with_registry_keys(registry_keys);
-        // The access policy is stored in the database: password Basic on
-        // (tests sign in over Basic), the stack's anonymous mode, and any
-        // further settings. A peer on the same database stores the same.
-        let mut update = serde_json::json!({"allow_password_basic": true});
+        // The access policy is stored in the database: the stack's anonymous
+        // mode, and any further settings. A peer on the same database stores
+        // the same.
+        let mut update = serde_json::json!({});
         for extra in [Some(self.anon.settings()), self.auth_settings.clone()]
             .into_iter()
             .flatten()

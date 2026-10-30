@@ -119,30 +119,27 @@ pub async fn pool() -> PgPool {
         let _guard = INIT_LOCK.lock().await;
         if MIGRATED.get().is_none() {
             forge_db::migrate(&pool).await.expect("migrate");
-            seed_auth_settings(&pool).await;
+            seed_client_passwords(&pool).await;
             MIGRATED.set(()).ok();
         }
     }
     pool
 }
 
-/// The auth settings every test database starts with: password Basic on
-/// (tests sign in over Basic), everything else at its default (anonymous
-/// access off). A test that needs others changes them on a database of its
-/// own ([`fresh_pool`], [`TestServer::set_auth_settings`]): the shared one
-/// serves every test of the binary at once.
-async fn seed_auth_settings(pool: &PgPool) {
-    let settings = forge_server::auth::AuthSettings {
-        allow_password_basic: true,
-        ..Default::default()
-    };
-    forge_db::authz_dao::set_setting(
-        pool,
-        forge_server::auth::AUTH_SETTINGS_KEY,
-        &serde_json::to_string(&settings).expect("settings serialize"),
+/// Every test database starts with its local realm accepting passwords from
+/// clients (tests sign in over Basic), and the auth settings at their
+/// defaults (anonymous access off). A test that needs others changes them on
+/// a database of its own ([`fresh_pool`], [`TestServer::set_auth_settings`],
+/// [`TestServer::set_local_client_passwords`]): the shared one serves every
+/// test of the binary at once.
+async fn seed_client_passwords(pool: &PgPool) {
+    sqlx::query(
+        "UPDATE auth_realm SET config = config || '{\"accept_client_passwords\": true}' \
+         WHERE kind = 'local'",
     )
+    .execute(pool)
     .await
-    .expect("seed auth settings");
+    .expect("seed the local realm's client passwords");
 }
 
 /// A migrated pool over a fresh, uniquely named database on the same Postgres
@@ -167,7 +164,7 @@ pub async fn fresh_pool() -> PgPool {
         .await
         .expect("connect fresh database");
     forge_db::migrate(&pool).await.expect("migrate");
-    seed_auth_settings(&pool).await;
+    seed_client_passwords(&pool).await;
     pool
 }
 
@@ -601,6 +598,22 @@ impl TestServer {
             .expect("save auth settings")
             .settings
             .clone()
+    }
+
+    /// Have the local realm accept passwords from clients, or not
+    /// (`accept_client_passwords`), as of the next request. For a server on a
+    /// database of its own ([`fresh_pool`]).
+    pub async fn set_local_client_passwords(&self, accept: bool) {
+        sqlx::query(
+            "UPDATE auth_realm \
+             SET config = config || jsonb_build_object('accept_client_passwords', $1::boolean) \
+             WHERE kind = 'local'",
+        )
+        .bind(accept)
+        .execute(&self.pool)
+        .await
+        .expect("set the local realm's client passwords");
+        self.state.realms.invalidate().await;
     }
 
     /// Sign `username` in through `/auth/login` (password realms).

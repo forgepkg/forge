@@ -42,7 +42,7 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
  * the update when the admin typed a new one (an empty field leaves the stored
  * secret unchanged); "Remove stored credentials" clears it explicitly. The
  * header links group repos to the Members editor, hosted NuGet and Docker
- * repositories to the import from Nexus, and every other repository to its
+ * repositories to their import, and every other repository to its
  * retention policy. Beside the form: for proxies,
  * their cache invalidation, and the repository's anonymous access (the flag
  * together with the anonymous role's grants that cover it, read-only, linking
@@ -136,7 +136,7 @@ function EditRepository() {
                   className="fg-btn fg-btn--secondary fg-btn--md"
                 >
                   <Icon name="Download" size={16} />
-                  <span>Import from Nexus</span>
+                  <span>Import</span>
                 </Link>
               )}
             {repo.data.kind !== 'group' && (

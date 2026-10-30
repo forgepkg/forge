@@ -39,6 +39,7 @@ import {
   TableHeader,
   TableRow,
   TextField,
+  TextareaField,
   type Tone,
 } from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
@@ -70,10 +71,12 @@ const ITEM_TONES: Record<ItemState, Tone> = {
 }
 
 /**
- * Import a Nexus hosted repository into this hosted repository (the admin
- * API under `/admin/repositories/{name}/imports`). The form starts an import
- * (or a dry run); the server checks the source before it accepts one and
- * says what is wrong. Below, the repository's imports with their progress,
+ * Import a repository from another server into this hosted repository (the
+ * admin API under `/admin/repositories/{name}/imports`): a NuGet feed or a
+ * registry, read through the format's own protocol, so Nexus, Artifactory,
+ * ProGet, BaGet, Harbor, a `distribution` registry or another Forge alike.
+ * The form starts an import (or a dry run); the server checks the source
+ * before it accepts one and says what is wrong. Below, the repository's imports with their progress,
  * re-read every two seconds while one runs: cancel, resume, retry the failed
  * items, delete, and the conflicts and failures of each.
  */
@@ -121,7 +124,7 @@ function ImportRepository() {
         crumbs={crumbs}
         kind={repo.data.kind}
         format={repo.data.format}
-        description="Copy the packages of a Nexus 3 hosted repository of the same format into this repository, with their publish dates, last downloads and uploaders. Versions Forge already has with the same bytes are skipped, so running an import again copies only what is new: import once, then again just before clients switch to Forge."
+        description="Copy the packages of a NuGet feed, or the images of a registry, into this repository, read through the format's own protocol: from Nexus, Artifactory, ProGet, BaGet, Harbor, a distribution registry or another Forge. Versions Forge already has with the same bytes are skipped, so running an import again copies only what is new: import once, then again just before clients switch to Forge."
       />
 
       {!supported ? (
@@ -183,10 +186,9 @@ function StartImportForm({
 }) {
   const create = useCreateImport(repo)
   const [url, setUrl] = useState(previous?.url ?? '')
-  const [source, setSource] = useState(previous?.source_repository ?? '')
+  const [names, setNames] = useState((previous?.names ?? []).join('\n'))
   const [username, setUsername] = useState(previous?.username ?? '')
   const [password, setPassword] = useState('')
-  const [registryUrl, setRegistryUrl] = useState(previous?.registry_url ?? '')
   const [onConflict, setOnConflict] = useState<OnConflict>(
     previous?.on_conflict ?? 'skip',
   )
@@ -196,16 +198,21 @@ function StartImportForm({
   // A first import starts as a dry run; after a dry run, the real one.
   const [dryRun, setDryRun] = useState(previous === undefined)
   const [formError, setFormError] = useState<string | null>(null)
+  const what = docker ? 'images' : 'packages'
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setFormError(null)
-    if (!url.trim() || !source.trim()) {
-      setFormError('Enter the Nexus URL and the repository to import.')
+    if (!url.trim()) {
+      setFormError(
+        docker
+          ? 'Enter the URL of the registry to import from.'
+          : 'Enter the URL of the feed to import from.',
+      )
       return
     }
     if (username.trim() !== '' && password === '') {
-      setFormError('Enter the password of the Nexus user.')
+      setFormError('Enter the password of the user.')
       return
     }
     const n = Number(concurrency)
@@ -215,17 +222,17 @@ function StartImportForm({
     }
     const body: CreateImport = {
       url: url.trim(),
-      repository: source.trim(),
       on_conflict: onConflict,
       concurrency: n,
       dry_run: dryRun,
     }
+    const named = parseNames(names)
+    if (named.length > 0) {
+      body.names = named
+    }
     if (username.trim() !== '') {
       body.username = username.trim()
       body.password = password
-    }
-    if (docker && registryUrl.trim() !== '') {
-      body.registry_url = registryUrl.trim()
     }
     create.mutate(body, { onSuccess: () => setPassword('') })
   }
@@ -234,7 +241,7 @@ function StartImportForm({
     <Panel
       as="form"
       onSubmit={handleSubmit}
-      title="Import from Nexus"
+      title="Start an import"
       footer={
         <Button
           type="submit"
@@ -243,7 +250,7 @@ function StartImportForm({
           disabled={create.isPending}
         >
           {create.isPending
-            ? 'Checking Nexus…'
+            ? 'Checking the source…'
             : dryRun
               ? 'Start dry run'
               : 'Start import'}
@@ -251,24 +258,46 @@ function StartImportForm({
       }
     >
       <div className="fg-form">
-        <div className="fg-fieldrow">
-          <TextField
-            label="Nexus URL"
-            mono
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://nexus.example.com"
-            description="With its context path, if it has one."
-          />
-          <TextField
-            label="Nexus repository"
-            mono
-            value={source}
-            onChange={(e) => setSource(e.target.value)}
-            placeholder={docker ? 'docker-hosted' : 'nuget-hosted'}
-            description="A hosted repository of the same format."
-          />
-        </div>
+        <TextField
+          label={docker ? 'Registry URL' : 'Feed URL'}
+          mono
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder={
+            docker
+              ? 'https://registry.example.com'
+              : 'https://nexus.example.com/repository/nuget-hosted/index.json'
+          }
+          description={
+            docker ? (
+              <>
+                The registry API. Nexus: the repository&rsquo;s connector, e.g.{' '}
+                <Code>http://nexus.example.com:8082</Code>, or its path route,{' '}
+                <Code>&lt;Nexus URL&gt;/repository/&lt;name&gt;</Code>.
+              </>
+            ) : (
+              <>
+                A NuGet v3 feed&rsquo;s service index. Nexus:{' '}
+                <Code>&lt;Nexus URL&gt;/repository/&lt;name&gt;/index.json</Code>. Point it
+                at a hosted repository: a group or a proxy lists its upstream&rsquo;s
+                packages too.
+              </>
+            )
+          }
+        />
+        <TextareaField
+          label={docker ? 'Images' : 'Package IDs'}
+          optional
+          mono
+          rows={3}
+          value={names}
+          onChange={(e) => setNames(e.target.value)}
+          description={
+            docker
+              ? 'One per line. Empty: every image the registry’s catalog lists. Name them for a registry without a catalog (Docker Hub, GHCR, ECR).'
+              : 'One per line. Empty: every package the feed’s search finds. Name them for a feed without a search, or for packages a search misses (Nexus stops at 10,000; a package whose versions are all unlisted is in no search result).'
+          }
+        />
         <div className="fg-fieldrow">
           <TextField
             label="Username"
@@ -287,22 +316,6 @@ function StartImportForm({
             description="Sealed with the secret encryption, and deleted when the import completes."
           />
         </div>
-        {docker && (
-          <TextField
-            label="Registry URL"
-            optional
-            mono
-            value={registryUrl}
-            onChange={(e) => setRegistryUrl(e.target.value)}
-            description={
-              <>
-                The Nexus repository&rsquo;s registry API. Empty: its path route,{' '}
-                <Code>&lt;Nexus URL&gt;/repository/&lt;name&gt;</Code>; otherwise its
-                connector, e.g. <Code>http://nexus.example.com:8082</Code>.
-              </>
-            }
-          />
-        )}
         <div className="fg-fieldrow">
           <SelectField
             label="A version Forge has with other bytes"
@@ -310,7 +323,7 @@ function StartImportForm({
             onChange={(e) => setOnConflict(e.target.value as OnConflict)}
           >
             <option value="skip">Skip it and report it</option>
-            <option value="overwrite">Overwrite it with Nexus&rsquo; bytes</option>
+            <option value="overwrite">Overwrite it with the source&rsquo;s bytes</option>
             <option value="fail">Fail the import</option>
           </SelectField>
           <TextField
@@ -326,17 +339,25 @@ function StartImportForm({
           label="Dry run"
           checked={dryRun}
           onChange={setDryRun}
-          description="Count what would be copied, its size and the conflicts, without writing anything."
+          description={`Count the ${what} that would be copied and the conflicts, without writing anything.`}
         />
         {formError && <Notice tone="danger">{formError}</Notice>}
         {create.isError && (
-          <Notice tone="danger" title="Nexus refused the import">
+          <Notice tone="danger" title="The import was refused">
             {create.error.body || create.error.message}
           </Notice>
         )}
       </div>
     </Panel>
   )
+}
+
+/** The names of a names field: one per line (or separated by commas or spaces). */
+function parseNames(text: string): string[] {
+  return text
+    .split(/[\s,]+/)
+    .map((name) => name.trim())
+    .filter((name) => name !== '')
 }
 
 /** One import of the repository: its state, progress, counts and actions. */
@@ -378,20 +399,25 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
           <StatusBadge tone="warn">cancelling</StatusBadge>
         )}
         <span className="fg-mono min-w-0 text-ink [overflow-wrap:anywhere]">
-          {imp.url} · {imp.source_repository}
+          {imp.url}
         </span>
+        {imp.names && (
+          <StatusBadge tone="neutral" dot={false}>
+            {`${imp.names.length} named`}
+          </StatusBadge>
+        )}
       </div>
       <p className="fg-text">
         {imp.state === 'queued'
           ? 'Waiting for a worker.'
           : imp.phase === 'scan' && active
-            ? `Scanning Nexus: ${p.found} found so far.`
+            ? `Scanning the source: ${p.found} found so far.`
             : `${done} of ${p.found} done.`}{' '}
-        {p.assets > 0 &&
-          `The Nexus repository holds ${p.assets} assets, ${formatBytes(p.size)}. `}
+        {imp.source_total !== null &&
+          `The feed's search found ${imp.source_total} packages. `}
         Started {formatDateTime(imp.started_at ?? imp.created_at)}
         {imp.finished_at && `, ended ${formatDateTime(imp.finished_at)}`}.
-        {imp.nexus_version && ` ${imp.nexus_version}.`}
+        {imp.source_server && ` ${imp.source_server}.`}
       </p>
       {p.found > 0 && (
         <ProgressBar
@@ -428,7 +454,7 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
         <li>
           <StatusBadge dot={false}>{`${formatBytes(p.bytes_copied)} copied`}</StatusBadge>
         </li>
-        {imp.dry_run && p.planned > 0 && (
+        {imp.dry_run && p.planned_size > 0 && (
           <li>
             <StatusBadge dot={false}>
               {`would copy ${formatBytes(p.planned_size)}`}
@@ -450,7 +476,7 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
         )}
         {!active && needsPassword && (p.failed > 0 || imp.state !== 'completed') && (
           <TextField
-            label="Nexus password"
+            label="Password"
             type="password"
             className="min-w-56"
             value={password}
@@ -537,7 +563,7 @@ function ItemList({
             <TableCell lead>
               <CellStack sub={item.detail ?? undefined}>
                 <span className="font-mono">
-                  {item.name} {item.version}
+                  {item.version ? `${item.name} ${item.version}` : item.name}
                 </span>
               </CellStack>
             </TableCell>

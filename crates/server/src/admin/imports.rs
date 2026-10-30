@@ -1,16 +1,19 @@
-//! Imports from Nexus into a hosted repository ([`crate::nexus_import`]).
+//! Imports into a hosted repository from another server ([`crate::import`]):
+//! a NuGet feed or a registry, read through the format's own protocol.
 //! **Admin-only.**
 //!
 //! * `GET    /admin/repositories/{name}/imports` — the repository's imports,
 //!   newest first ([`ImportView`]).
 //! * `POST   /admin/repositories/{name}/imports` — start one
 //!   ([`CreateImport`]). The source is checked first (the **preflight**):
-//!   Nexus answers its status endpoint, the Nexus repository exists, is
-//!   hosted and of the repository's format, and, for Docker, its registry
-//!   API answers. A failed check is a 400 (502 when Nexus is unreachable)
-//!   saying what is wrong; nothing is stored. A repository runs one import
-//!   at a time (409). `dry_run` decides every item without writing a
-//!   package: what would be copied, how much, and the conflicts.
+//!   a feed's service index resolves and its search answers (with how many
+//!   packages it finds), or a registry answers its API and serves a
+//!   catalog; an import that names its package ids or images needs no
+//!   search or catalog. A failed check is a 400 (502 when the source is
+//!   unreachable or failing) saying what is wrong; nothing is stored. A
+//!   repository runs one import at a time (409). `dry_run` decides every
+//!   item without writing a package: what would be copied, and the
+//!   conflicts.
 //! * `GET    …/imports/{id}` — one import and its progress.
 //! * `GET    …/imports/{id}/items?state=&after=&limit=` — its items in the
 //!   order they were found ([`forge_db::import_dao::ImportItem`]), paged
@@ -37,14 +40,19 @@ use axum::Extension;
 use chrono::{DateTime, Utc};
 use forge_core::auth::principal::Principal;
 use forge_core::net::ssrf::validate_url;
-use forge_db::import_dao::{self, NewImport, NexusImport};
+use forge_core::repo::proxy::Credentials;
+use forge_db::import_dao::{self, NewImport, RepositoryImport};
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{repository_dao, secret_dao};
 use serde::{Deserialize, Serialize};
 
 use super::db_error;
-use crate::nexus_import::nexus::{Nexus, NexusError};
-use crate::nexus_import::{default_registry_url, password_secret, FORMATS};
+use crate::images::import::ImportSource;
+use crate::import::feed::Feed;
+use crate::import::{
+    nexus_source_url, password_secret, source_url, Listing, SourceError, FORMATS, MAX_NAMES,
+    SEARCH_PAGE,
+};
 use crate::state::AppState;
 
 /// Imports listed per repository.
@@ -85,20 +93,30 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateImport {
-    /// The Nexus server, e.g. `https://nexus.example.com` (with its context
-    /// path, if it has one).
+    /// The source: a NuGet feed's service index
+    /// (`https://nexus.example.com/repository/nuget-hosted/index.json`), or a
+    /// registry (`https://registry.example.com`). With `repository`, a Nexus
+    /// server instead (the request before imports read the format's
+    /// protocol).
     pub url: String,
-    /// The Nexus hosted repository to copy.
-    pub repository: String,
-    /// Nexus credentials (both, or neither for anonymous access).
+    /// The Nexus repository at `url` to read (with `url` naming the Nexus
+    /// server): its service index, `<url>/repository/<name>/index.json`, or
+    /// its registry API, `registry_url` or `<url>/repository/<name>`.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// With `repository`: the Nexus Docker repository's connector, e.g.
+    /// `http://nexus.example.com:8082`.
+    #[serde(default)]
+    pub registry_url: Option<String>,
+    /// The package ids or images to copy, instead of every package the
+    /// feed's search finds (every image the registry's catalog lists).
+    #[serde(default)]
+    pub names: Option<Vec<String>>,
+    /// The source's credentials (both, or neither for anonymous access).
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    /// Docker: the Nexus repository's registry API, e.g. its connector
-    /// `http://nexus.example.com:8082`. Default: `<url>/repository/<name>`.
-    #[serde(default)]
-    pub registry_url: Option<String>,
     /// A version Forge holds with other bytes: `skip` (and report),
     /// `overwrite`, or `fail` the import.
     #[serde(default = "default_on_conflict")]
@@ -123,7 +141,7 @@ fn default_concurrency() -> i32 {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResumeImport {
-    /// The Nexus password, when the import no longer holds it (it
+    /// The source's password, when the import no longer holds it (it
     /// completed) or it changed.
     #[serde(default)]
     pub password: Option<String>,
@@ -156,13 +174,10 @@ pub struct Progress {
     pub failed: i64,
     /// Dry run: items that would be copied.
     pub planned: i64,
-    /// Their size in Nexus.
+    /// Their size, where the source says (a referrer's).
     pub planned_size: i64,
-    /// Bytes downloaded from Nexus.
+    /// Bytes downloaded from the source.
     pub bytes_copied: i64,
-    /// Every asset the scan saw in the Nexus repository, and their size.
-    pub assets: i64,
-    pub size: i64,
 }
 
 /// An import, without its password.
@@ -170,10 +185,11 @@ pub struct Progress {
 pub struct ImportView {
     pub id: i64,
     pub repository: String,
-    /// The Nexus server and repository.
+    /// The source: a feed's service index or a registry.
     pub url: String,
-    pub source_repository: String,
-    pub registry_url: Option<String>,
+    /// The package ids or images it copies; `null`: every one the source's
+    /// search or catalog lists.
+    pub names: Option<Vec<String>>,
     pub username: Option<String>,
     pub has_password: bool,
     pub on_conflict: String,
@@ -184,7 +200,11 @@ pub struct ImportView {
     /// `scan` or `copy`.
     pub phase: String,
     pub cancel_requested: bool,
-    pub nexus_version: Option<String>,
+    /// The `Server` header the source answered the preflight with.
+    pub source_server: Option<String>,
+    /// How many packages the feed's search finds: what it reported in the
+    /// preflight, or as many as the scan walked, whichever is more.
+    pub source_total: Option<i64>,
     pub last_error: Option<String>,
     pub created_by: Option<i64>,
     pub created_at: DateTime<Utc>,
@@ -197,7 +217,7 @@ pub struct ImportView {
 async fn view(
     state: &AppState,
     repo: &Repository,
-    import: NexusImport,
+    import: RepositoryImport,
 ) -> sqlx::Result<ImportView> {
     let counts = import_dao::counts(&state.pool, import.id).await?;
     let count = |s: &str| counts.get(s).map(|c| c.items).unwrap_or(0);
@@ -212,15 +232,12 @@ async fn view(
         planned: count("planned"),
         planned_size: counts.get("planned").map(|c| c.size).unwrap_or(0),
         bytes_copied: counts.values().map(|c| c.bytes_copied).sum(),
-        assets: import.assets_seen,
-        size: import.bytes_seen,
     };
     Ok(ImportView {
         id: import.id,
         repository: repo.name.clone(),
-        url: import.base_url,
-        source_repository: import.source_repository,
-        registry_url: import.registry_url,
+        url: source_url(&import, state.formats.stores_images(&repo.format)),
+        names: import.names,
         username: import.username,
         has_password: import.has_password,
         on_conflict: import.on_conflict,
@@ -229,7 +246,8 @@ async fn view(
         state: import.state,
         phase: import.phase,
         cancel_requested: import.cancel_requested,
-        nexus_version: import.nexus_version,
+        source_server: import.source_server,
+        source_total: import.source_total,
         last_error: import.last_error,
         created_by: import.created_by,
         created_at: import.created_at,
@@ -240,7 +258,7 @@ async fn view(
     })
 }
 
-async fn view_response(state: &AppState, repo: &Repository, import: NexusImport) -> Response {
+async fn view_response(state: &AppState, repo: &Repository, import: RepositoryImport) -> Response {
     match view(state, repo, import).await {
         Ok(view) => Json(view).into_response(),
         Err(e) => db_error(e),
@@ -260,7 +278,7 @@ async fn resolve(
     state: &AppState,
     name: &str,
     id: i64,
-) -> Result<(Repository, NexusImport), Response> {
+) -> Result<(Repository, RepositoryImport), Response> {
     let repo = resolve_repo(state, name).await?;
     match import_dao::get(&state.pool, id).await {
         Ok(Some(import)) if import.repository_id == repo.id => Ok((repo, import)),
@@ -270,11 +288,11 @@ async fn resolve(
 }
 
 /// A preflight failure as the administrator sees it.
-fn preflight_error(what: &str, e: NexusError) -> Response {
-    let status = match e {
-        NexusError::Unreachable(_) => StatusCode::BAD_GATEWAY,
-        NexusError::Status { status, .. } if status.is_server_error() => StatusCode::BAD_GATEWAY,
-        _ => StatusCode::BAD_REQUEST,
+fn preflight_error(what: &str, e: SourceError) -> Response {
+    let status = if e.is_transient() {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::BAD_REQUEST
     };
     (status, format!("{what}: {e}")).into_response()
 }
@@ -324,21 +342,73 @@ pub async fn create(
     }
     if !FORMATS.contains(&repo.format.as_str()) {
         return bad_request(format!(
-            "importing {} repositories from Nexus is not supported; supported: {}",
+            "importing {} repositories is not supported; supported: {}",
             repo.format,
             FORMATS.join(", ")
         ));
     }
+    let images = state.formats.stores_images(&repo.format);
+    let Some(format) = state.formats.get(&repo.format) else {
+        return bad_request(format!("the {} format is not loaded", repo.format));
+    };
 
     // The request itself.
     let url = body.url.trim().trim_end_matches('/').to_string();
     if let Err(e) = validate_url(&url) {
         return bad_request(format!("invalid url: {e}"));
     }
-    let source_repository = body.repository.trim().to_string();
-    if source_repository.is_empty() || source_repository.contains('/') {
-        return bad_request("repository must name one Nexus repository");
-    }
+    let registry_url = body
+        .registry_url
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty());
+    let source = match body.repository.map(|r| r.trim().to_string()) {
+        Some(repository) => {
+            if repository.is_empty() || repository.contains('/') {
+                return bad_request("repository must name one Nexus repository");
+            }
+            if registry_url.is_some() && !images {
+                return bad_request("registry_url applies to Docker repositories only");
+            }
+            if let Some(registry_url) = &registry_url {
+                if let Err(e) = validate_url(registry_url) {
+                    return bad_request(format!("invalid registry_url: {e}"));
+                }
+            }
+            nexus_source_url(&url, &repository, registry_url.as_deref(), images)
+        }
+        None if registry_url.is_some() => {
+            return bad_request(
+                "registry_url goes with repository (a Nexus server's url); give the registry as url",
+            );
+        }
+        None => url,
+    };
+    let names = match body.names {
+        None => None,
+        Some(names) => {
+            let mut seen = std::collections::HashSet::new();
+            let mut kept = Vec::new();
+            for name in names {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                if let Err(e) = format.validate_id(&name) {
+                    return bad_request(format!("names: {name:?} is no valid name: {e}"));
+                }
+                if seen.insert(format.lower_id(&name)) {
+                    kept.push(name);
+                }
+            }
+            if kept.is_empty() {
+                return bad_request("names lists no package id or image; leave it out to copy every one the source lists");
+            }
+            if kept.len() > MAX_NAMES {
+                return bad_request(format!("names lists more than {MAX_NAMES}"));
+            }
+            Some(kept)
+        }
+    };
     let username = body.username.filter(|u| !u.is_empty());
     let password = password_secret(body.password);
     if username.is_some() != password.is_some() {
@@ -350,74 +420,76 @@ pub async fn create(
     if !(1..=16).contains(&body.concurrency) {
         return bad_request("concurrency must be between 1 and 16");
     }
-    let images = state.formats.stores_images(&repo.format);
-    let registry_url = match body
-        .registry_url
-        .map(|u| u.trim().trim_end_matches('/').to_string())
-    {
-        Some(_) if !images => {
-            return bad_request("registry_url applies to Docker repositories only")
-        }
-        Some(u) if u.is_empty() => None,
-        Some(u) => match validate_url(&u) {
-            Ok(()) => Some(u),
-            Err(e) => return bad_request(format!("invalid registry_url: {e}")),
-        },
-        None => None,
-    };
 
-    // The preflight: is it Nexus, and the right repository?
-    let nexus = Nexus::new(
-        state.upstream.clone(),
-        &url,
-        username.clone(),
-        password.clone(),
-    );
-    let version = match nexus.status().await {
-        Ok(version) => version,
-        Err(e) => return preflight_error(&format!("Nexus at {url}"), e),
-    };
-    match nexus.repository(&source_repository).await {
-        Ok(Some(source)) => {
-            if source.kind != "hosted" {
-                return bad_request(format!(
-                    "{source_repository} is a {} repository in Nexus; only hosted repositories are imported (a proxy refills from its upstream, a group is configuration)",
-                    source.kind
-                ));
+    // The preflight: does the source speak the format's protocol, and list
+    // what to copy?
+    let (server, total) = if images {
+        let credentials = match (&username, &password) {
+            (Some(username), Some(password)) => Some(Credentials::for_url(
+                &source,
+                username.clone(),
+                password.clone(),
+            )),
+            _ => None,
+        };
+        let from = ImportSource::new(&source, credentials, "import:preflight".into());
+        let registry = state.registry();
+        let server = match registry.probe_source(&from).await {
+            Ok(server) => server,
+            Err(e) => {
+                return preflight_error(
+                    &format!("the registry API does not answer at {source}/v2/"),
+                    SourceError::of_image(e),
+                )
             }
-            if source.format != repo.format {
-                return bad_request(format!(
-                    "{source_repository} is a {} repository in Nexus, but {} holds {}",
-                    source.format, repo.name, repo.format
-                ));
+        };
+        if names.is_none() {
+            match registry.source_catalog(&from, None, 1).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return bad_request(format!(
+                        "the registry at {source} serves no catalog (/v2/_catalog); name the images to import"
+                    ))
+                }
+                Err(e) => {
+                    return preflight_error("reading the registry's catalog", SourceError::of_image(e))
+                }
             }
         }
-        Ok(None) => {
-            return bad_request(format!(
-                "Nexus has no repository {source_repository}, or the credentials may not see it"
-            ));
-        }
-        Err(e) => return preflight_error("listing the Nexus repositories", e),
-    }
-    if images {
-        let registry = registry_url
-            .clone()
-            .unwrap_or_else(|| default_registry_url(&url, &source_repository));
-        let probe = Nexus::new(
+        (server, None)
+    } else {
+        let feed = match Feed::open(
             state.upstream.clone(),
-            &registry,
+            format,
+            &source,
             username.clone(),
             password.clone(),
-        );
-        if let Err(e) = probe.probe_registry(&format!("{registry}/v2/")).await {
-            return preflight_error(
-                &format!(
-                    "the registry API of {source_repository} does not answer at {registry}/v2/ (set registry_url to the repository's connector, e.g. http://nexus.example.com:8082)"
-                ),
-                e,
-            );
-        }
-    }
+        )
+        .await
+        {
+            Ok(feed) => feed,
+            Err(e) => return preflight_error(&format!("the NuGet feed at {source}"), e),
+        };
+        let total = if names.is_none() {
+            // A page's worth: Nexus reports the hits of the page it answers
+            // as the search's total.
+            match feed.search(0, SEARCH_PAGE).await {
+                Ok(Some((total, ids))) => {
+                    Some(i64::try_from(total.max(ids.len() as u64)).unwrap_or(i64::MAX))
+                }
+                Ok(None) => {
+                    return bad_request(format!(
+                        "the NuGet feed at {source} offers no search; name the packages to import"
+                    ))
+                }
+                Err(e) => return preflight_error("searching the feed", e),
+            }
+        } else {
+            None
+        };
+        (feed.server().map(str::to_string), total)
+    };
+    let listing = Listing::of(images, names.is_some());
 
     let created = async {
         let mut tx = forge_db::begin(&state.pool).await?;
@@ -425,14 +497,15 @@ pub async fn create(
             &mut *tx,
             NewImport {
                 repository_id: repo.id,
-                base_url: &url,
-                source_repository: &source_repository,
-                registry_url: registry_url.as_deref(),
+                url: &source,
+                names: names.as_deref(),
                 username: username.as_deref(),
                 on_conflict: &body.on_conflict,
                 concurrency: body.concurrency,
                 dry_run: body.dry_run,
-                nexus_version: Some(&version),
+                scan_listing: listing.as_str(),
+                source_server: server.as_deref(),
+                source_total: total,
                 created_by: Some(user_id),
             },
         )
@@ -462,11 +535,11 @@ pub async fn create(
     tracing::info!(
         import = id,
         repository = %repo.name,
-        source = %url,
-        source_repository = %source_repository,
-        nexus = %version,
+        source = %source,
+        server = server.as_deref(),
+        total,
         dry_run = body.dry_run,
-        "nexus import queued"
+        "import queued"
     );
     match import_dao::get(&state.pool, id).await {
         Ok(Some(import)) => match view(&state, &repo, import).await {
@@ -563,11 +636,11 @@ pub async fn resume(
     }
     let password = password_secret(body.password);
     if password.is_some() && import.username.is_none() {
-        return bad_request("the import reads Nexus anonymously; it takes no password");
+        return bad_request("the import reads its source anonymously; it takes no password");
     }
     if import.username.is_some() && !import.has_password && password.is_none() {
         return bad_request(
-            "the import's password was deleted when it completed; give the Nexus password again",
+            "the import's password was deleted when it completed; give the source's password again",
         );
     }
     let resumed = async {

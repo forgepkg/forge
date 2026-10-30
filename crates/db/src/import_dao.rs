@@ -1,5 +1,6 @@
-//! Data access for imports from Nexus (`nexus_import`, `nexus_import_item`):
-//! an import's job row, its scan cursor and lease, and the items it found.
+//! Data access for imports into hosted repositories (`repository_import`,
+//! `repository_import_item`): an import's job row, its scan cursor and lease,
+//! and the items it found.
 //!
 //! An import runs on one instance at a time: the worker claims a queued (or
 //! abandoned) import with `FOR UPDATE SKIP LOCKED` and holds it with a
@@ -8,7 +9,7 @@
 //! on its `run_id`, so an instance whose lease expired cannot overwrite the
 //! progress of the one that took over.
 //!
-//! The Nexus password is not read or written here: it is a secret column of
+//! The source's password is not read or written here: it is a secret column of
 //! [`crate::secret_dao`] ([`crate::secret_dao::set_import_password`]).
 
 use std::collections::HashMap;
@@ -21,12 +22,20 @@ use uuid::Uuid;
 
 /// An import job, without its password.
 #[derive(Debug, Clone, Serialize)]
-pub struct NexusImport {
+pub struct RepositoryImport {
     pub id: i64,
     pub repository_id: i64,
-    pub base_url: String,
-    pub source_repository: String,
+    /// The source: a NuGet service index or a registry. For an import stored
+    /// before 2.2, the Nexus server that `source_repository` names a
+    /// repository of.
+    pub url: String,
+    /// The Nexus repository of an import stored before 2.2; `None` since.
+    pub source_repository: Option<String>,
+    /// The registry API of a Docker import stored before 2.2.
     pub registry_url: Option<String>,
+    /// The package ids or images the import copies; `None`: whatever the
+    /// source's search (or catalog) finds.
+    pub names: Option<Vec<String>>,
     pub username: Option<String>,
     /// Whether a password is stored.
     pub has_password: bool,
@@ -38,14 +47,16 @@ pub struct NexusImport {
     pub state: String,
     /// `scan` or `copy`.
     pub phase: String,
-    /// `components` or `assets`.
+    /// What the scan walks: `search`, `catalog` or `names`.
     pub scan_listing: String,
     #[serde(skip)]
     pub cursor: Option<String>,
     pub cancel_requested: bool,
-    pub assets_seen: i64,
-    pub bytes_seen: i64,
-    pub nexus_version: Option<String>,
+    /// The `Server` header the source answered the preflight with.
+    pub source_server: Option<String>,
+    /// How many packages the feed's search found: what it reported in the
+    /// preflight, or as many as the scan walked, whichever is more.
+    pub source_total: Option<i64>,
     pub last_error: Option<String>,
     pub created_by: Option<i64>,
     pub created_at: DateTime<Utc>,
@@ -54,7 +65,7 @@ pub struct NexusImport {
     pub updated_at: DateTime<Utc>,
 }
 
-impl NexusImport {
+impl RepositoryImport {
     /// Whether the import waits for, or is held by, a worker.
     pub fn is_active(&self) -> bool {
         matches!(self.state.as_str(), "queued" | "running")
@@ -64,14 +75,16 @@ impl NexusImport {
 /// A new import.
 pub struct NewImport<'a> {
     pub repository_id: i64,
-    pub base_url: &'a str,
-    pub source_repository: &'a str,
-    pub registry_url: Option<&'a str>,
+    pub url: &'a str,
+    pub names: Option<&'a [String]>,
     pub username: Option<&'a str>,
     pub on_conflict: &'a str,
     pub concurrency: i32,
     pub dry_run: bool,
-    pub nexus_version: Option<&'a str>,
+    /// Where the scan starts: `search`, `catalog` or `names`.
+    pub scan_listing: &'a str,
+    pub source_server: Option<&'a str>,
+    pub source_total: Option<i64>,
     pub created_by: Option<i64>,
 }
 
@@ -83,21 +96,22 @@ where
 {
     sqlx::query_scalar!(
         r#"
-        INSERT INTO nexus_import
-            (repository_id, base_url, source_repository, registry_url, username,
-             on_conflict, concurrency, dry_run, nexus_version, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO repository_import
+            (repository_id, url, names, username, on_conflict, concurrency, dry_run,
+             scan_listing, source_server, source_total, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING id
         "#,
         new.repository_id,
-        new.base_url,
-        new.source_repository,
-        new.registry_url,
+        new.url,
+        new.names,
         new.username,
         new.on_conflict,
         new.concurrency,
         new.dry_run,
-        new.nexus_version,
+        new.scan_listing,
+        new.source_server,
+        new.source_total,
         new.created_by,
     )
     .fetch_one(executor)
@@ -105,19 +119,19 @@ where
 }
 
 /// The import `id`.
-pub async fn get<'e, E>(executor: E, id: i64) -> sqlx::Result<Option<NexusImport>>
+pub async fn get<'e, E>(executor: E, id: i64) -> sqlx::Result<Option<RepositoryImport>>
 where
     E: PgExecutor<'e>,
 {
     sqlx::query_as!(
-        NexusImport,
+        RepositoryImport,
         r#"
-        SELECT id, repository_id, base_url, source_repository, registry_url, username,
+        SELECT id, repository_id, url, source_repository, registry_url, names, username,
                (password_enc IS NOT NULL) AS "has_password!",
                on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,
-               cancel_requested, assets_seen, bytes_seen, nexus_version, last_error,
-               created_by, created_at, started_at, finished_at, updated_at
-        FROM nexus_import
+               cancel_requested, source_server, source_total,
+               last_error, created_by, created_at, started_at, finished_at, updated_at
+        FROM repository_import
         WHERE id = $1
         "#,
         id,
@@ -127,16 +141,20 @@ where
 }
 
 /// A repository's imports, newest first.
-pub async fn list(pool: &PgPool, repository_id: i64, limit: i64) -> sqlx::Result<Vec<NexusImport>> {
+pub async fn list(
+    pool: &PgPool,
+    repository_id: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<RepositoryImport>> {
     sqlx::query_as!(
-        NexusImport,
+        RepositoryImport,
         r#"
-        SELECT id, repository_id, base_url, source_repository, registry_url, username,
+        SELECT id, repository_id, url, source_repository, registry_url, names, username,
                (password_enc IS NOT NULL) AS "has_password!",
                on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,
-               cancel_requested, assets_seen, bytes_seen, nexus_version, last_error,
-               created_by, created_at, started_at, finished_at, updated_at
-        FROM nexus_import
+               cancel_requested, source_server, source_total,
+               last_error, created_by, created_at, started_at, finished_at, updated_at
+        FROM repository_import
         WHERE repository_id = $1
         ORDER BY id DESC
         LIMIT $2
@@ -153,7 +171,7 @@ pub async fn list(pool: &PgPool, repository_id: i64, limit: i64) -> sqlx::Result
 pub struct StateCount {
     /// Items in the state.
     pub items: i64,
-    /// Their size in Nexus.
+    /// Their size at the source, where it says.
     pub size: i64,
     /// Bytes copied for them.
     pub bytes_copied: i64,
@@ -167,7 +185,7 @@ pub async fn counts(pool: &PgPool, import_id: i64) -> sqlx::Result<HashMap<Strin
                count(*) AS "items!",
                coalesce(sum(size), 0)::bigint AS "size!",
                coalesce(sum(bytes_copied), 0)::bigint AS "bytes_copied!"
-        FROM nexus_import_item
+        FROM repository_import_item
         WHERE import_id = $1
         GROUP BY state
         "#,
@@ -199,19 +217,19 @@ pub async fn claim_next(
     tx: &mut Transaction<'_, Postgres>,
     now: DateTime<Utc>,
     lease: Duration,
-) -> sqlx::Result<Option<(NexusImport, Uuid)>> {
+) -> sqlx::Result<Option<(RepositoryImport, Uuid)>> {
     let run_id = Uuid::new_v4();
     let id = sqlx::query_scalar!(
         r#"
         WITH due AS (
-            SELECT id FROM nexus_import
+            SELECT id FROM repository_import
             WHERE state IN ('queued', 'running')
               AND (locked_until IS NULL OR locked_until < $1)
             ORDER BY id
             FOR UPDATE SKIP LOCKED
             LIMIT 1
         )
-        UPDATE nexus_import i
+        UPDATE repository_import i
         SET state = 'running',
             run_id = $2,
             locked_until = $1 + make_interval(secs => $3),
@@ -242,7 +260,7 @@ pub async fn renew_lease(
 ) -> sqlx::Result<bool> {
     let res = sqlx::query!(
         r#"
-        UPDATE nexus_import SET locked_until = $3
+        UPDATE repository_import SET locked_until = $3
         WHERE id = $1 AND run_id = $2 AND state = 'running'
         "#,
         id,
@@ -259,7 +277,7 @@ pub async fn renew_lease(
 pub async fn poll(pool: &PgPool, id: i64, run_id: Uuid) -> sqlx::Result<Option<bool>> {
     sqlx::query_scalar!(
         r#"
-        SELECT cancel_requested FROM nexus_import
+        SELECT cancel_requested FROM repository_import
         WHERE id = $1 AND run_id = $2 AND state = 'running'
         "#,
         id,
@@ -269,35 +287,32 @@ pub async fn poll(pool: &PgPool, id: i64, run_id: Uuid) -> sqlx::Result<Option<b
     .await
 }
 
-/// Record a scanned page: where the scan continues (`listing`, `cursor`),
-/// whether it moves on to copying, and what the page held. Fenced on
-/// `run_id`; returns whether the lease was still held.
-#[allow(clippy::too_many_arguments)]
+/// Record a scanned page: where the scan continues (`cursor`), whether it
+/// moves on to copying, and, for a search, how many packages it has walked
+/// (`walked`, which raises `source_total`). Fenced on `run_id`; returns
+/// whether the lease was still held.
 pub async fn save_scan_page(
     tx: &mut Transaction<'_, Postgres>,
     id: i64,
     run_id: Uuid,
-    listing: &str,
     cursor: Option<&str>,
     phase: &str,
-    assets: i64,
-    bytes: i64,
+    walked: Option<i64>,
 ) -> sqlx::Result<bool> {
     let res = sqlx::query!(
         r#"
-        UPDATE nexus_import
-        SET scan_listing = $3, cursor = $4, phase = $5,
-            assets_seen = assets_seen + $6, bytes_seen = bytes_seen + $7,
+        UPDATE repository_import
+        SET cursor = $3, phase = $4,
+            source_total = CASE WHEN $5::bigint IS NULL THEN source_total
+                                ELSE greatest(coalesce(source_total, 0), $5) END,
             updated_at = now()
         WHERE id = $1 AND run_id = $2 AND state = 'running'
         "#,
         id,
         run_id,
-        listing,
         cursor,
         phase,
-        assets,
-        bytes,
+        walked,
     )
     .execute(&mut **tx)
     .await?;
@@ -317,7 +332,7 @@ pub async fn finish(
 ) -> sqlx::Result<bool> {
     let res = sqlx::query!(
         r#"
-        UPDATE nexus_import
+        UPDATE repository_import
         SET state = $3,
             last_error = $4,
             finished_at = now(),
@@ -342,10 +357,10 @@ pub async fn finish(
 
 /// Cancel an import: a queued one at once, a running one at its worker's
 /// next check. Returns the import as it is now, `None` if there is none.
-pub async fn cancel(pool: &PgPool, id: i64) -> sqlx::Result<Option<NexusImport>> {
+pub async fn cancel(pool: &PgPool, id: i64) -> sqlx::Result<Option<RepositoryImport>> {
     sqlx::query!(
         r#"
-        UPDATE nexus_import
+        UPDATE repository_import
         SET state = CASE WHEN state = 'queued' THEN 'cancelled' ELSE state END,
             finished_at = CASE WHEN state = 'queued' THEN now() ELSE finished_at END,
             cancel_requested = (state = 'running'),
@@ -372,12 +387,12 @@ pub async fn requeue(
 ) -> sqlx::Result<Option<u64>> {
     let queued = sqlx::query!(
         r#"
-        UPDATE nexus_import i
+        UPDATE repository_import i
         SET state = 'queued', run_id = NULL, locked_until = NULL, finished_at = NULL,
             last_error = NULL, cancel_requested = false, updated_at = now()
         WHERE id = $1 AND state IN ('cancelled', 'failed', 'completed')
           AND NOT EXISTS (
-              SELECT 1 FROM nexus_import o
+              SELECT 1 FROM repository_import o
               WHERE o.repository_id = i.repository_id AND o.id <> i.id
                 AND o.state IN ('queued', 'running')
           )
@@ -394,7 +409,7 @@ pub async fn requeue(
     }
     let retried = sqlx::query!(
         r#"
-        UPDATE nexus_import_item
+        UPDATE repository_import_item
         SET state = 'pending', detail = NULL, updated_at = now()
         WHERE import_id = $1 AND state = 'failed'
           AND ($2::bigint[] IS NULL OR id = ANY($2))
@@ -411,7 +426,7 @@ pub async fn requeue(
 /// active or gone.
 pub async fn delete(pool: &PgPool, id: i64) -> sqlx::Result<bool> {
     let res = sqlx::query!(
-        r#"DELETE FROM nexus_import WHERE id = $1 AND state NOT IN ('queued', 'running')"#,
+        r#"DELETE FROM repository_import WHERE id = $1 AND state NOT IN ('queued', 'running')"#,
         id,
     )
     .execute(pool)
@@ -466,7 +481,7 @@ pub async fn insert_items(
     for item in items {
         sqlx::query!(
             r#"
-            INSERT INTO nexus_import_item
+            INSERT INTO repository_import_item
                 (import_id, kind, name, version, size, published_at, downloaded_at,
                  uploader, source)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -502,7 +517,7 @@ pub async fn pending_items(
         r#"
         SELECT id, import_id, kind, name, version, state, detail, size, bytes_copied,
                published_at, downloaded_at, uploader, source, attempts, updated_at
-        FROM nexus_import_item
+        FROM repository_import_item
         WHERE import_id = $1 AND kind = $2 AND state = 'pending' AND id > $3
         ORDER BY id
         LIMIT $4
@@ -526,7 +541,7 @@ pub async fn finish_item(
 ) -> sqlx::Result<()> {
     sqlx::query!(
         r#"
-        UPDATE nexus_import_item
+        UPDATE repository_import_item
         SET state = $2, detail = $3, bytes_copied = bytes_copied + $4,
             attempts = attempts + 1, updated_at = now()
         WHERE id = $1
@@ -541,10 +556,10 @@ pub async fn finish_item(
     Ok(())
 }
 
-/// Forget an item: a manifest Nexus holds by digest that turned out not to
-/// be a referrer of an imported image.
+/// Forget an item: a manifest the source holds by digest that turned out not
+/// to be a referrer of an imported image.
 pub async fn drop_item(pool: &PgPool, item_id: i64) -> sqlx::Result<()> {
-    sqlx::query!("DELETE FROM nexus_import_item WHERE id = $1", item_id)
+    sqlx::query!("DELETE FROM repository_import_item WHERE id = $1", item_id)
         .execute(pool)
         .await?;
     Ok(())
@@ -564,7 +579,7 @@ pub async fn list_items(
         r#"
         SELECT id, import_id, kind, name, version, state, detail, size, bytes_copied,
                published_at, downloaded_at, uploader, source, attempts, updated_at
-        FROM nexus_import_item
+        FROM repository_import_item
         WHERE import_id = $1 AND ($2::text IS NULL OR state = $2) AND id > $3
         ORDER BY id
         LIMIT $4
