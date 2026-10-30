@@ -1748,6 +1748,226 @@ async fn audits_through_nested_groups_keep_every_reserved_name_inside() {
     assert_eq!(upstream.audits.lock().unwrap().clone(), vec![bulk]);
 }
 
+/// A group shows a caller what it could read from its members directly, no
+/// more (#648): with a member it may not read, a selector on the group's
+/// grant or one on a member's, a hidden package has no packument, tarball
+/// or dist-tags (404), and search and the browse API leave it out, their
+/// counts too.
+#[tokio::test]
+async fn groups_show_a_caller_only_the_packages_it_may_read() {
+    let srv = common::start().await;
+    let token = srv.admin_token().await;
+    let n = unique();
+    let (a, b, group) = (format!("va{n}"), format!("vb{n}"), format!("vg{n}"));
+    for name in [&a, &b] {
+        create(
+            &srv,
+            json!({"name": name, "kind": "hosted", "format": "npm"}),
+        )
+        .await;
+    }
+    create(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "npm"}),
+    )
+    .await;
+    add_member(&srv, &group, &a, 10).await;
+    add_member(&srv, &group, &b, 5).await;
+    // Indexed like `GroupCaller::sees`.
+    let packages = [
+        "vis-public-a",
+        "vis-secret-a",
+        "vis-public-b",
+        "vis-secret-b",
+    ];
+    for (i, name) in packages.iter().enumerate() {
+        let repo = if i < 2 { &a } else { &b };
+        let resp = Npm::new(&srv, repo, Some(token.clone()))
+            .publish(name, "1.0.0", &["latest"])
+            .await;
+        assert_eq!(resp.status(), 201, "{name}");
+    }
+
+    for common::GroupCaller {
+        label,
+        caller,
+        sees,
+    } in srv.group_callers(&group, &a, &b, &["vis-public-*"]).await
+    {
+        let npm = Npm::new(&srv, &group, Some(caller.token.clone()));
+        let browse = |path: String| {
+            caller
+                .apply(srv.client().get(format!("{}{path}", srv.base_url)))
+                .send()
+        };
+        let mut visible = Vec::new();
+        for (i, name) in packages.iter().enumerate() {
+            let expected = if sees[i] { 200 } else { 404 };
+            for abbreviated in [true, false] {
+                assert_eq!(
+                    npm.packument(name, abbreviated).await.0,
+                    expected,
+                    "{label}: {name}"
+                );
+            }
+            for path in [
+                format!("{name}/-/{name}-1.0.0.tgz"),
+                format!("-/package/{name}/dist-tags"),
+            ] {
+                let resp = npm.req(reqwest::Method::GET, &path).send().await.unwrap();
+                assert_eq!(resp.status(), expected, "{label}: {path}");
+            }
+            let resp = browse(format!("/browse/packages/{group}/{name}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expected, "{label}: browse {name}");
+            if sees[i] {
+                visible.push(name.to_string());
+            }
+        }
+        visible.sort_unstable();
+        let found: Value = npm
+            .req(reqwest::Method::GET, "-/v1/search?text=vis&size=20")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut names: Vec<String> = found["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["package"]["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, visible, "{label}: {found}");
+        assert_eq!(found["total"], visible.len(), "{label}: {found}");
+        let listed: Value = browse(format!("/browse/packages?repo={group}&take=20"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut names: Vec<String> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["original_id"].as_str().unwrap().to_string())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, visible, "{label}: {listed}");
+        assert_eq!(listed["total"], visible.len(), "{label}: {listed}");
+    }
+}
+
+/// An audit tells the upstream only of packages the caller could read
+/// through the path to the proxy (#648): a selector on the group's grant,
+/// on a nested group's or on the proxy's own leaves the packages it hides
+/// out of the body, in a bulk and in a legacy request alike, also when
+/// the proxy is audited directly.
+#[tokio::test]
+async fn audits_leave_out_what_the_callers_selectors_hide() {
+    let srv = common::start().await;
+    let upstream = Arc::new(Upstream::default());
+    let base = serve_upstream(upstream.clone()).await;
+    let n = unique();
+    let (proxy, inner, outer) = (format!("ap{n}"), format!("ai{n}"), format!("ao{n}"));
+    create(
+        &srv,
+        json!({"name": proxy, "kind": "proxy", "format": "npm", "remote_url": base}),
+    )
+    .await;
+    create(
+        &srv,
+        json!({"name": inner, "kind": "group", "format": "npm"}),
+    )
+    .await;
+    add_member(&srv, &inner, &proxy, 10).await;
+    create(
+        &srv,
+        json!({"name": outer, "kind": "group", "format": "npm"}),
+    )
+    .await;
+    add_member(&srv, &outer, &inner, 10).await;
+    let selector = srv.create_selector(&["left-*"]).await;
+
+    let bulk = json!({"left-pad": ["1.3.0"], "private-lib": ["2.0.0"]});
+    let tree = json!({
+        "name": "app",
+        "version": "1.0.0",
+        "requires": {"left-pad": "^1.3.0", "private-lib": "^2.0.0"},
+        "dependencies": {
+            "left-pad": {"version": "1.3.0"},
+            "private-lib": {"version": "2.0.0"}
+        },
+        "install": [],
+        "remove": [],
+        "metadata": {"npm_version": "6.14.18"}
+    });
+    // Who reads all three, the selector on one of them; audited through
+    // the outer group, and directly through the proxy for the last.
+    for (label, scoped, audited) in [
+        ("the outer group's grant", &outer, &outer),
+        ("the inner group's grant", &inner, &outer),
+        ("the proxy's grant", &proxy, &outer),
+        ("the proxy's grant, audited directly", &proxy, &proxy),
+    ] {
+        let caller = srv.caller().await;
+        let grants: Vec<(&str, &str, Option<i64>)> = [&outer, &inner, &proxy]
+            .into_iter()
+            .map(|repo| {
+                let selector = (repo == scoped).then_some(selector);
+                (repo.as_str(), "read", selector)
+            })
+            .collect();
+        srv.grant_role(caller.id, &grants).await;
+        let npm = Npm::new(&srv, audited, Some(caller.token.clone()));
+        upstream.audits.lock().unwrap().clear();
+        for (kind, body) in [("advisories/bulk", &bulk), ("audits/quick", &tree)] {
+            let resp = npm
+                .req(reqwest::Method::POST, &format!("-/npm/v1/security/{kind}"))
+                .json(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{label}: {kind}");
+        }
+        let sent = upstream.audits.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "{label}: {sent:?}");
+        assert_eq!(sent[0], json!({"left-pad": ["1.3.0"]}), "{label}");
+        for body in &sent {
+            assert!(!body.to_string().contains("private-lib"), "{label}: {body}");
+        }
+        assert_eq!(
+            sent[1]["dependencies"],
+            json!({"left-pad": {"version": "1.3.0"}}),
+            "{label}"
+        );
+    }
+
+    // Without a selector on the way, the body goes on as it is.
+    let caller = srv.caller().await;
+    srv.grant_role(
+        caller.id,
+        &[
+            (&outer, "read", None),
+            (&inner, "read", None),
+            (&proxy, "read", None),
+        ],
+    )
+    .await;
+    upstream.audits.lock().unwrap().clear();
+    let resp = Npm::new(&srv, &outer, Some(caller.token))
+        .req(reqwest::Method::POST, "-/npm/v1/security/advisories/bulk")
+        .json(&bulk)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(upstream.audits.lock().unwrap().clone(), vec![bulk]);
+}
+
 #[tokio::test]
 async fn retention_never_deletes_a_tagged_version() {
     let srv = common::start().await;

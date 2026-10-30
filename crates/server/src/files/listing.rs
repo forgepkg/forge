@@ -13,6 +13,14 @@
 //! whose first [`SUBDIRECTORY_SCAN`] files is visible is left out). A
 //! group lists the merged entries of the members the caller may read, the
 //! highest-priority member's file first; a proxy lists what it has cached.
+//!
+//! Nothing a selector hides is named, not even by `next`: a page reads on
+//! past hidden entries until it holds `limit` visible ones, and `next` is
+//! the last of them. That walk is bounded ([`LISTING_SCAN`] entries): a
+//! page that reaches the bound ends at its last visible entry, and the
+//! listing ends where it found none. A directory exists for the caller
+//! when it holds a visible entry, so one of hidden entries alone is not
+//! found, whatever its size.
 
 use std::collections::BTreeMap;
 
@@ -32,6 +40,14 @@ pub const MAX_LIMIT: usize = 1000;
 /// How many of a subdirectory's files a listing reads, at most, to find one
 /// a selector-restricted caller may see.
 pub const SUBDIRECTORY_SCAN: usize = 1000;
+
+/// How many entries of a directory a page walks, at most, to find the
+/// `limit` a selector-restricted caller may see (a page of `MAX_LIMIT`
+/// walks one more, to know whether another follows).
+pub const LISTING_SCAN: usize = 1000;
+
+/// How many entries a selector-restricted page walks at once, at least.
+const WALK_BATCH: usize = 100;
 
 /// One entry of a page.
 #[derive(Debug, Clone)]
@@ -64,21 +80,24 @@ fn resume_at(prefix: &str, after: Option<&str>) -> Result<String, FileError> {
     let Some(after) = after.filter(|a| !a.is_empty()) else {
         return Ok(prefix.to_string());
     };
-    let (name, directory) = match after.strip_suffix('/') {
-        Some(name) => (name, true),
-        None => (after, false),
-    };
+    let name = after.strip_suffix('/').unwrap_or(after);
     files::validate_segment(name).map_err(|e| FileError::BadRequest(format!("after: {e}")))?;
-    Ok(if directory {
-        format!("{prefix}{name}0")
-    } else {
-        format!("{prefix}{name}\u{1}")
-    })
+    Ok(past(prefix, after))
+}
+
+/// The least path past the entry `entry` of directory `prefix`, a name
+/// the walk read (see [`resume_at`]).
+fn past(prefix: &str, entry: &str) -> String {
+    match entry.strip_suffix('/') {
+        Some(name) => format!("{prefix}{name}0"),
+        None => format!("{prefix}{entry}\u{1}"),
+    }
 }
 
 /// One repository's entries of a page: what it has after `from`, as far as
-/// it read (`more`: it has entries past the last one returned, up to and
-/// including the entry named `more`, which it has read).
+/// it read (`more`: it may have entries past the last one returned, and
+/// has all of them up to and including the entry named `more`, which it
+/// returned: a name the caller may see).
 struct Partial {
     entries: Vec<Entry>,
     more: Option<String>,
@@ -86,7 +105,8 @@ struct Partial {
 
 impl Files<'_> {
     /// The entries of `prefix` in hosted or proxy `repo` from `from` on,
-    /// visible through every one of `filters`.
+    /// visible through every one of `filters`: `limit` of them, walking
+    /// past the hidden ones up to [`LISTING_SCAN`] entries.
     async fn list_local(
         &self,
         repo: &Repository,
@@ -95,48 +115,82 @@ impl Files<'_> {
         limit: usize,
         filters: &[PackageFilter],
     ) -> Result<Partial, FileError> {
-        let walked = raw_dao::walk_directory(
-            &self.state.pool,
-            repo.id,
-            prefix,
-            from,
-            i64::try_from(limit + 1).unwrap_or(i64::MAX),
-        )
-        .await?;
-        let more = walked.len() > limit;
+        // One visible entry past the page says that another page follows.
+        let wanted = limit + 1;
+        let unfiltered = filters.iter().all(|f| matches!(f, PackageFilter::AllowAll));
+        let bound = if unfiltered {
+            wanted
+        } else {
+            wanted.max(LISTING_SCAN)
+        };
         let mut entries = Vec::new();
-        let mut last = None;
-        for walked in walked.into_iter().take(limit) {
-            let rest = &walked.path[prefix.len()..];
-            let (entry, key) = match (rest.find('/'), &walked.file) {
-                (None, Some(file)) => {
-                    let visible = filters.iter().all(|f| f.allows(&file.path));
-                    let entry = Entry {
-                        name: rest.to_string(),
-                        kind: EntryKind::File(Box::new(file.clone())),
-                    };
-                    (visible.then_some(entry), rest.to_string())
+        let mut walked_count = 0;
+        let mut from = from.to_string();
+        let mut ended = false;
+        while entries.len() < wanted && walked_count < bound {
+            let batch = if unfiltered {
+                wanted - entries.len()
+            } else {
+                (wanted - entries.len()).max(WALK_BATCH)
+            }
+            .min(bound - walked_count);
+            let walked = raw_dao::walk_directory(
+                &self.state.pool,
+                repo.id,
+                prefix,
+                &from,
+                i64::try_from(batch).unwrap_or(i64::MAX),
+            )
+            .await?;
+            ended = walked.len() < batch;
+            walked_count += walked.len();
+            let mut last = None;
+            for walked in walked {
+                if entries.len() == wanted {
+                    break;
                 }
-                (Some(i), _) => {
-                    let name = &rest[..i];
-                    let dir = format!("{prefix}{name}/");
-                    let visible = self.directory_visible(repo, &dir, filters).await?;
-                    let entry = Entry {
-                        name: format!("{name}/"),
-                        kind: EntryKind::Directory(dir),
-                    };
-                    (visible.then_some(entry), format!("{name}/"))
-                }
-                // A file row vanished between the walk and the join.
-                (None, None) => (None, rest.to_string()),
-            };
-            entries.extend(entry);
-            last = Some(key);
+                let rest = &walked.path[prefix.len()..];
+                let (entry, key) = match (rest.find('/'), &walked.file) {
+                    (None, Some(file)) => {
+                        let visible = filters.iter().all(|f| f.allows(&file.path));
+                        let entry = Entry {
+                            name: rest.to_string(),
+                            kind: EntryKind::File(Box::new(file.clone())),
+                        };
+                        (visible.then_some(entry), rest.to_string())
+                    }
+                    (Some(i), _) => {
+                        let name = &rest[..i];
+                        let dir = format!("{prefix}{name}/");
+                        let visible = self.directory_visible(repo, &dir, filters).await?;
+                        let entry = Entry {
+                            name: format!("{name}/"),
+                            kind: EntryKind::Directory(dir),
+                        };
+                        (visible.then_some(entry), format!("{name}/"))
+                    }
+                    // A file row vanished between the walk and the join.
+                    (None, None) => (None, rest.to_string()),
+                };
+                entries.extend(entry);
+                last = Some(key);
+            }
+            match last {
+                Some(last) if !ended => from = past(prefix, &last),
+                _ => break,
+            }
         }
-        Ok(Partial {
-            entries,
-            more: if more { last } else { None },
-        })
+        // Past the page, at the walk's bound or at the directory's end, the
+        // page ends at its last visible entry: never at a hidden one.
+        let more = if entries.len() > limit {
+            entries.truncate(limit);
+            entries.last().map(|e| e.name.clone())
+        } else if ended {
+            None
+        } else {
+            entries.last().map(|e| e.name.clone())
+        };
+        Ok(Partial { entries, more })
     }
 
     /// Whether directory `dir` of `repo` holds a file visible through every

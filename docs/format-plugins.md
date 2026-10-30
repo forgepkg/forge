@@ -147,7 +147,9 @@ in this order:
      plugin renders the outcome (`auth_response`).
    - `forward`: a POST to the repository's upstream (a proxy's, or a
      group's first proxy member's), with the proxy's credentials; its answer
-     is passed back. npm's audits go so. Needs read.
+     is passed back. npm's audits go so. Needs read. The body goes without
+     the packages the reserved prefixes on the way and the caller's
+     selectors keep inside (`forward_body`), or not at all (400).
 
    A host error (a refusal, a conflict, a missing package) is rendered by
    the plugin's `error_response` when it has one: npm clients print

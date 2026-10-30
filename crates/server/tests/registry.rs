@@ -3383,6 +3383,144 @@ async fn group_browse_lists_what_its_pulls_serve() {
     assert_eq!(listed(reader), [("other/app".to_string(), 1)]);
 }
 
+/// A group shows a caller what it could pull from its members directly, no
+/// more (#648): with a member it may not read, a selector on the group's
+/// grant or one on a member's, a hidden image's manifests, blobs, tags and
+/// referrers answer as an image of a name like it that does not exist
+/// (404, or 403 for a name outside a selector of the group's own grant,
+/// which grants no `pull` on it), and the browse API's image list (its
+/// count too), image page and chart page leave it out.
+#[tokio::test]
+async fn groups_show_a_caller_only_the_images_it_may_read() {
+    let srv = common::start().await;
+    let (a, b, group) = (repo_name("va"), repo_name("vb"), repo_name("vg"));
+    for repo in [&a, &b] {
+        create_repo(
+            &srv,
+            json!({"name": repo, "kind": "hosted", "format": "docker"}),
+        )
+        .await;
+    }
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker"}),
+    )
+    .await;
+    for (member, priority) in [(&a, 10), (&b, 5)] {
+        let resp = admin_post(
+            &srv,
+            &format!("/admin/repositories/{group}/members"),
+            json!({"member": member, "priority": priority}),
+        )
+        .await;
+        assert_eq!(resp.status(), 201);
+    }
+    // Indexed like `GroupCaller::sees`: a chart each, signed.
+    let images = ["public/a", "secret/a", "public/b", "secret/b"];
+    let oci = admin_oci(&srv).await;
+    let mut pushed = Vec::new();
+    for (i, image) in images.iter().enumerate() {
+        let name = format!("{}/{image}", if i < 2 { &a } else { &b });
+        let (config, archive, manifest) = helm_chart(&image.replace('/', "-"), "1.0.0");
+        oci.push_blob(&name, &config).await;
+        oci.push_blob(&name, &archive).await;
+        let resp = oci
+            .put_manifest(&name, "1.0.0", OCI_MANIFEST, &manifest)
+            .await;
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+        let digest = sha(&manifest);
+        let signature = json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "artifactType": "application/vnd.dev.cosign.artifact.sig.v1+json",
+            "config": {"mediaType": "application/vnd.oci.empty.v1+json", "digest": sha(b"{}"), "size": 2},
+            "layers": [],
+            "subject": {"mediaType": OCI_MANIFEST, "digest": digest, "size": manifest.len()},
+        })
+        .to_string()
+        .into_bytes();
+        let resp = oci
+            .put_manifest(&name, &sha(&signature), OCI_MANIFEST, &signature)
+            .await;
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+        pushed.push((digest, sha(&archive)));
+    }
+
+    for common::GroupCaller {
+        label,
+        caller,
+        sees,
+    } in srv.group_callers(&group, &a, &b, &["public/*"]).await
+    {
+        let oci = Oci::new(&srv, Some((caller.username.clone(), caller.token.clone())));
+        let browse = |path: String| {
+            caller
+                .apply(srv.client().get(format!("{}{path}", srv.base_url)))
+                .send()
+        };
+        let mut visible = Vec::new();
+        for (i, image) in images.iter().enumerate() {
+            let name = format!("{group}/{image}");
+            // An image of the same directory that does not exist.
+            let absent = format!("{group}/{}/none", image.split('/').next().unwrap());
+            let (digest, archive) = &pushed[i];
+            for path in [
+                "manifests/1.0.0".to_string(),
+                format!("manifests/{digest}"),
+                format!("blobs/{archive}"),
+                "tags/list".to_string(),
+                format!("referrers/{digest}"),
+            ] {
+                let resp = oci.get(&name, &path).await;
+                let (status, body) = (resp.status(), resp.text().await.unwrap());
+                if sees[i] {
+                    assert_eq!(status, 200, "{label}: {name} {path}");
+                    continue;
+                }
+                let resp = oci.get(&absent, &path).await;
+                let (expected, absent_body) = (resp.status(), resp.text().await.unwrap());
+                // Referrers of an unknown subject are an empty index.
+                assert!(
+                    matches!(expected.as_u16(), 403 | 404) || path.starts_with("referrers/"),
+                    "{label}: {absent} {path}: {expected}"
+                );
+                assert_eq!(status, expected, "{label}: {name} {path}: {body}");
+                assert_eq!(
+                    body.replace(image, "<image>"),
+                    absent_body.replace(&absent[group.len() + 1..], "<image>"),
+                    "{label}: {path}"
+                );
+            }
+            let expected = if sees[i] { 200 } else { 404 };
+            for path in [
+                format!("/browse/images/{group}/{image}"),
+                format!("/browse/chart?repo={group}&image={image}&digest={digest}"),
+            ] {
+                let resp = browse(path.clone()).await.unwrap();
+                assert_eq!(resp.status(), expected, "{label}: {path}");
+            }
+            if sees[i] {
+                visible.push(image.to_string());
+            }
+        }
+        visible.sort_unstable();
+        let listed: Value = browse(format!("/browse/images?repo={group}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let names: Vec<String> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["image"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, visible, "{label}: {listed}");
+        assert_eq!(listed["total"], visible.len(), "{label}: {listed}");
+    }
+}
+
 // ── Admin API ───────────────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -205,9 +205,10 @@ pub trait FormatPlugin: Send + Sync + 'static {
     /// load, or an action of the host's.
     fn render(&self, repo: &Repository, req: &Request, data: &[Loaded]) -> Action;
 
-    /// The body of an [`Action::Forward`] through a group without the
-    /// packages `hidden` names: the reserved prefixes of every group on the
-    /// way to the proxy keep their packages' names from the upstream.
+    /// The body of an [`Action::Forward`] without the packages `hidden`
+    /// names: the reserved prefixes of every group on the way to the proxy,
+    /// and the caller's content selectors on every repository on the way,
+    /// keep their packages' names from the upstream.
     /// `hidden` takes a package id as the body writes it. `None` when the
     /// body cannot be filtered: the host then refuses the request (400) and
     /// never sends it on unfiltered. The default filters nothing, so a

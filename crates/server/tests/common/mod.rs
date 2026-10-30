@@ -745,6 +745,166 @@ impl TestServer {
             .unwrap();
         body["token"].as_str().expect("plaintext token").to_string()
     }
+
+    /// An admin API call with the admin's token, expecting a success.
+    async fn admin_call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let (u, p) = self.admin_basic();
+        let resp = self
+            .client()
+            .request(method, format!("{}{path}", self.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert!(status.is_success(), "{path} {body}: {status} {text}");
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// A new account without roles, and an API token of it.
+    pub async fn caller(&self) -> Caller {
+        let username = format!("caller{}x{}@example.com", std::process::id(), unique());
+        let id = self
+            .create_user(&username, "caller-password-1", "reader")
+            .await;
+        let token = self
+            .admin_call(
+                reqwest::Method::POST,
+                &format!("/admin/users/{id}/tokens"),
+                serde_json::json!({"name": "caller"}),
+            )
+            .await["token"]
+            .as_str()
+            .expect("plaintext token")
+            .to_string();
+        Caller {
+            id,
+            username,
+            token,
+        }
+    }
+
+    /// A content selector of `includes`; returns its id.
+    pub async fn create_selector(&self, includes: &[&str]) -> i64 {
+        self.admin_call(
+            reqwest::Method::POST,
+            "/admin/content-selectors",
+            serde_json::json!({"name": format!("sel{}x{}", std::process::id(), unique()), "includes": includes}),
+        )
+        .await["id"]
+            .as_i64()
+            .expect("selector id")
+    }
+
+    /// Give account `user_id` a role of its own that holds `grants`:
+    /// `(repository, level, selector id)`.
+    pub async fn grant_role(&self, user_id: i64, grants: &[(&str, &str, Option<i64>)]) {
+        let role = self
+            .admin_call(
+                reqwest::Method::POST,
+                "/admin/roles",
+                serde_json::json!({"name": format!("role{}x{}", std::process::id(), unique())}),
+            )
+            .await["id"]
+            .as_i64()
+            .expect("role id");
+        for (repository, level, selector) in grants {
+            self.admin_call(
+                reqwest::Method::PUT,
+                &format!("/admin/roles/{role}/grants"),
+                serde_json::json!({"repository": repository, "level": level, "selector_id": selector}),
+            )
+            .await;
+        }
+        self.admin_call(
+            reqwest::Method::PUT,
+            &format!("/admin/users/{user_id}/roles"),
+            serde_json::json!({"role_id": role}),
+        )
+        .await;
+    }
+
+    /// The callers of a group of members `a` and `b` that see only part of
+    /// it (#648), each with read on the group: who reads `a` alone of its
+    /// members; who reads both, the group through a selector of
+    /// `includes`; and who reads both, `b` through that selector.
+    pub async fn group_callers(
+        &self,
+        group: &str,
+        a: &str,
+        b: &str,
+        includes: &[&str],
+    ) -> Vec<GroupCaller> {
+        let selector = self.create_selector(includes).await;
+        let cases = [
+            (
+                "a reader of one member",
+                vec![(group, "read", None), (a, "read", None)],
+                [true, true, false, false],
+            ),
+            (
+                "a selector on the group's grant",
+                vec![
+                    (group, "read", Some(selector)),
+                    (a, "read", None),
+                    (b, "read", None),
+                ],
+                [true, false, true, false],
+            ),
+            (
+                "a selector on a member's grant",
+                vec![
+                    (group, "read", None),
+                    (a, "read", None),
+                    (b, "read", Some(selector)),
+                ],
+                [true, true, true, false],
+            ),
+        ];
+        let mut callers = Vec::new();
+        for (label, grants, sees) in cases {
+            let caller = self.caller().await;
+            self.grant_role(caller.id, &grants).await;
+            callers.push(GroupCaller {
+                label,
+                caller,
+                sees,
+            });
+        }
+        callers
+    }
+}
+
+/// A caller of [`TestServer::group_callers`], and what it sees of the
+/// group: of `a`, what the selector includes and what it does not; then
+/// the same of `b`.
+#[derive(Clone, Debug)]
+pub struct GroupCaller {
+    pub label: &'static str,
+    pub caller: Caller,
+    pub sees: [bool; 4],
+}
+
+/// An account of a test, with an API token of it.
+#[derive(Clone, Debug)]
+pub struct Caller {
+    pub id: i64,
+    pub username: String,
+    pub token: String,
+}
+
+impl Caller {
+    /// Attach the caller's token as Basic credentials.
+    pub fn apply(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        rb.basic_auth(&self.username, Some(&self.token))
+    }
 }
 
 /// Build a minimal valid `.nupkg` (a zip with `[Content_Types].xml` + a
