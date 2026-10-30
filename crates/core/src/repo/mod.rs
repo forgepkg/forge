@@ -697,10 +697,10 @@ pub trait RepoReadOps: Send + Sync {
     /// the hits carry ids and versions, but [`SearchHit::nuspec_bytes`] and
     /// [`SearchHit::total_downloads`] may be left unset.
     ///
-    /// A group asks its local members for up to [`SearchParams::MAX_TAKE`]
-    /// hits, and a proxy that searches its upstream for the leading window of
-    /// its hits the client's page needs; it merges and counts them, and
-    /// renders only the client's page (see [`group`]).
+    /// A group asks a proxy that searches its upstream for the leading window
+    /// of its hits the client's page needs (its local members for their ids,
+    /// [`Self::search_ids`]); it merges and counts them, and renders only the
+    /// client's page (see [`group`]).
     /// It therefore searches its members through this method and enriches just
     /// the final page via [`Self::enrich_search_hits`], so manifest reads (S3)
     /// are bounded by the client's `take` rather than by every member's corpus.
@@ -726,6 +726,84 @@ pub trait RepoReadOps: Send + Sync {
         _hits: &mut [SearchHit],
     ) -> Result<(), RepoError> {
         Ok(())
+    }
+
+    /// The id of every hit of a search of what `repo` holds itself: the hits
+    /// [`Self::search_unenriched`] finds for `params` without the upstream
+    /// (whatever `params.include_upstream`, `skip` and `take` say), in its
+    /// order. The hosted and proxy backends return the stored (lowercase)
+    /// ids, in byte order.
+    ///
+    /// A group pages its local members' ids rather than their hits, then
+    /// loads the hits of its page alone, each through the member that won it
+    /// ([`Self::search_hits`]): the versions of one page, not of every
+    /// member's leading hits (see [`group`]).
+    ///
+    /// The default pages through [`Self::search_unenriched`]: correct for any
+    /// implementation, merely not cheaper.
+    async fn search_ids(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<Vec<String>, RepoError> {
+        Ok(all_local_hits(self, repo, params, filter)
+            .await?
+            .into_iter()
+            .map(|hit| hit.original_id)
+            .collect())
+    }
+
+    /// The unenriched hits ([`Self::search_unenriched`]) of `ids`, which
+    /// [`Self::search_ids`] returned for the same `params`, in the order of
+    /// `ids`. An id that is no hit any more (its last matching version was
+    /// deleted since) is left out.
+    ///
+    /// The default searches again ([`Self::search_ids`]' default).
+    async fn search_hits(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        ids: &[String],
+    ) -> Result<Vec<SearchHit>, RepoError> {
+        let mut hits: std::collections::HashMap<String, SearchHit> =
+            all_local_hits(self, repo, params, &PackageFilter::AllowAll)
+                .await?
+                .into_iter()
+                .map(|hit| (hit.original_id.clone(), hit))
+                .collect();
+        Ok(ids.iter().filter_map(|id| hits.remove(id)).collect())
+    }
+}
+
+/// Every unenriched hit of a search of what `repo` holds itself, page by
+/// page: the defaults of [`RepoReadOps::search_ids`] and
+/// [`RepoReadOps::search_hits`].
+async fn all_local_hits<R: RepoReadOps + ?Sized>(
+    ops: &R,
+    repo: &str,
+    params: &SearchParams,
+    filter: &PackageFilter,
+) -> Result<Vec<SearchHit>, RepoError> {
+    let mut hits = Vec::new();
+    loop {
+        let page = ops
+            .search_unenriched(
+                repo,
+                &SearchParams {
+                    skip: hits.len(),
+                    take: SearchParams::MAX_TAKE,
+                    include_upstream: false,
+                    ..params.clone()
+                },
+                filter,
+            )
+            .await?;
+        let returned = page.hits.len();
+        hits.extend(page.hits);
+        if returned == 0 || hits.len() >= page.total_hits {
+            return Ok(hits);
+        }
     }
 }
 
@@ -898,6 +976,28 @@ impl RepoReadOps for PackageFilteredReadOps {
         // The hits came out of the filtered search above, so they already pass
         // the predicate; enrichment adds no package identities.
         self.inner.enrich_search_hits(repo, hits).await
+    }
+
+    async fn search_ids(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        filter: &PackageFilter,
+    ) -> Result<Vec<String>, RepoError> {
+        let combined = self.filter.clone().intersect(filter.clone());
+        self.inner.search_ids(repo, params, &combined).await
+    }
+
+    async fn search_hits(
+        &self,
+        repo: &str,
+        params: &SearchParams,
+        ids: &[String],
+    ) -> Result<Vec<SearchHit>, RepoError> {
+        // The ids came out of the filtered search above; an id named any other
+        // way is refused all the same.
+        let ids: Vec<String> = ids.iter().filter(|id| self.allows(id)).cloned().collect();
+        self.inner.search_hits(repo, params, &ids).await
     }
 }
 
