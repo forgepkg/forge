@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT password_enc FROM repository_import WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "password_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "password_enc"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "e932ab583448f575388b9abfe0ba0117c00dfd6241855b08490cda7c1a1ce136"
+}

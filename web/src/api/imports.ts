@@ -1,20 +1,23 @@
 import { httpClient } from '~/lib/httpClient'
 
 /**
- * Imports from Nexus into a hosted repository
+ * Imports into a hosted repository from another server, read through the
+ * format's own protocol: a NuGet feed or a registry
  * (`crates/server/src/admin/imports.rs`).
  *
  *  - `POST /admin/repositories/{name}/imports` checks the source first (the
- *    preflight: Nexus answers, the Nexus repository is hosted and of the same
- *    format, a Docker repository's registry API answers) and answers 400/502
- *    with the reason, or 409 while the repository has an import running.
- *  - An import scans Nexus (`phase: scan`), then copies the items it found
- *    (`phase: copy`). A dry run decides every item without writing a package.
+ *    preflight: a feed's service index resolves and its search answers, or a
+ *    registry answers its API and serves a catalog; an import that names its
+ *    packages or images needs neither) and answers 400/502 with the reason,
+ *    or 409 while the repository has an import running.
+ *  - An import scans the source (`phase: scan`), then copies the items it
+ *    found (`phase: copy`). A dry run decides every item without writing a
+ *    package.
  *  - The password is write-only (`has_password`) and is deleted when the
  *    import completes; a cancelled or failed import keeps it to be resumed.
  */
 
-/** Formats an import copies (`crates/server/src/nexus_import/mod.rs`). */
+/** Formats an import copies (`crates/server/src/import/mod.rs`). */
 export const IMPORT_FORMATS = ['nuget', 'docker']
 
 /** `queued` → `running` → `completed` | `failed` | `cancelled`. */
@@ -47,22 +50,20 @@ export interface ImportProgress {
   identical: number
   conflict: number
   failed: number
-  /** Dry run: items that would be copied, and their size in Nexus. */
+  /** Dry run: items that would be copied, and their size where the source says. */
   planned: number
   planned_size: number
-  /** Bytes downloaded from Nexus. */
+  /** Bytes downloaded from the source. */
   bytes_copied: number
-  /** Every asset the scan saw in the Nexus repository, and their size. */
-  assets: number
-  size: number
 }
 
 export interface ImportView {
   id: number
   repository: string
+  /** The source: a feed's service index, or a registry. */
   url: string
-  source_repository: string
-  registry_url: string | null
+  /** The package ids or images it copies; `null`: every one the source lists. */
+  names: string[] | null
   username: string | null
   has_password: boolean
   on_conflict: OnConflict
@@ -71,7 +72,10 @@ export interface ImportView {
   state: ImportState
   phase: 'scan' | 'copy'
   cancel_requested: boolean
-  nexus_version: string | null
+  /** The `Server` header the source answered the preflight with. */
+  source_server: string | null
+  /** How many packages the feed's search reported in the preflight. */
+  source_total: number | null
   last_error: string | null
   created_by: number | null
   created_at: string
@@ -83,7 +87,7 @@ export interface ImportView {
 
 export interface ImportItem {
   id: number
-  /** `component`, or a Docker `manifest` Nexus holds by digest (a referrer). */
+  /** `component` (a version, a tag), or a Docker `manifest` held by digest (a referrer). */
   kind: 'component' | 'manifest'
   name: string
   version: string
@@ -100,12 +104,12 @@ export interface ImportItem {
 
 /** `POST /admin/repositories/{name}/imports` (unknown fields are refused). */
 export interface CreateImport {
+  /** A feed's service index (`…/index.json`), or a registry. */
   url: string
-  repository: string
+  /** The package ids or images to copy, instead of every one the source lists. */
+  names?: string[]
   username?: string
   password?: string
-  /** Docker only: the Nexus repository's registry API (its connector). */
-  registry_url?: string
   on_conflict?: OnConflict
   concurrency?: number
   dry_run?: boolean

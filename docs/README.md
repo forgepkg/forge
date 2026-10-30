@@ -21,8 +21,11 @@ its [quickstart](../README.md#quickstart);
   Collector configuration, Grafana dashboard and Prometheus alerting rules.
 - **[Retention size budgets](retention.md)**: keep a repository under a
   logical size: the budget, how size is counted, and what goes first.
-- **[Importing from Nexus](nexus-import.md)**: copy a Nexus hosted repository
-  (NuGet, Docker) into Forge, with its publish dates.
+- **[Importing repositories](import.md)**: copy a hosted repository of
+  another server (a NuGet feed, a registry: Nexus, Artifactory, another
+  Forge) into Forge, with its publish dates.
+- **[Importing from Nexus](nexus-import.md)**: where Nexus serves its feeds
+  and registries, its search's limits, and imports stored before 2.2.
 
 ## Formats
 

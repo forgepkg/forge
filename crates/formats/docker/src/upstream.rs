@@ -12,10 +12,12 @@
 //!   to the upstream only) to fill one page of Forge's; an upstream that
 //!   refuses a large `n` (400) is asked again without one.
 //! * Referrers come from the upstream's referrers API, where it has one.
+//! * The catalog (`/v2/_catalog`, which an import walks) is paged like a
+//!   tag list; an upstream that does not serve it, or refuses it, has none.
 
 use std::collections::BTreeSet;
 
-use forge_plugin_api::images::{ImageUrl, ManifestInfo, Reference, TagPage};
+use forge_plugin_api::images::{CatalogPage, ImageUrl, ManifestInfo, Reference, TagPage};
 use forge_plugin_api::{
     Fetch, FetchResult, Fetched, FormatError, Freshness, Remote, UpstreamAnswer, UpstreamOp,
     UpstreamStep,
@@ -75,6 +77,9 @@ pub fn step(
             tags(&base, image, last.as_deref(), *n as usize, fetched)
         }
         UpstreamOp::ImageReferrers { image, digest } => referrers(&base, image, digest, fetched),
+        UpstreamOp::ImageCatalog { last, n } => {
+            catalog(&base, last.as_deref(), *n as usize, fetched)
+        }
         _ => Err(FormatError::Internal(
             "Docker proxies have only image operations".into(),
         )),
@@ -117,12 +122,8 @@ fn get(url: String, image: &str, accept: Option<&str>) -> Fetch {
     }
 }
 
-/// Up to `limit` of the upstream's tags of `image` after `last`: one more
-/// is asked for, to know whether there are more, and the upstream's own
-/// pages are followed for up to [`MAX_UPSTREAM_TAG_PAGES`] requests. An
-/// upstream that refuses so large an `n` (400, as registries that cap it
-/// answer) is asked again without one: its own page size and links take
-/// over. The steps so far are in `fetched`.
+/// Up to `limit` of the upstream's tags of `image` after `last`
+/// ([`list`]).
 fn tags(
     base: &str,
     image: &str,
@@ -130,6 +131,124 @@ fn tags(
     limit: usize,
     fetched: &[FetchResult],
 ) -> Result<UpstreamStep, FormatError> {
+    Ok(
+        match list(base, &Listing::Tags(image), last, limit, fetched) {
+            Listed::Fetch(fetch) => UpstreamStep::Fetch(vec![fetch]),
+            Listed::Unknown => UpstreamStep::Done(UpstreamAnswer::ImageTags(None)),
+            Listed::Failed(reason) => UpstreamStep::Done(UpstreamAnswer::Failed(reason)),
+            Listed::Page(tags, more) => {
+                UpstreamStep::Done(UpstreamAnswer::ImageTags(Some(TagPage { tags, more })))
+            }
+        },
+    )
+}
+
+/// Up to `limit` of the names of the upstream's images after `last`, from
+/// its catalog (`/v2/_catalog`, [`list`]). The catalog is no part of the
+/// distribution spec: an upstream that does not serve it (404), or refuses
+/// it (401, 403: Docker Hub), has none.
+fn catalog(
+    base: &str,
+    last: Option<&str>,
+    limit: usize,
+    fetched: &[FetchResult],
+) -> Result<UpstreamStep, FormatError> {
+    if fetched
+        .first()
+        .is_some_and(|first| matches!(first.status, Some(401 | 403)))
+    {
+        return Ok(UpstreamStep::Done(UpstreamAnswer::ImageCatalog(None)));
+    }
+    Ok(match list(base, &Listing::Catalog, last, limit, fetched) {
+        Listed::Fetch(fetch) => UpstreamStep::Fetch(vec![fetch]),
+        Listed::Unknown => UpstreamStep::Done(UpstreamAnswer::ImageCatalog(None)),
+        Listed::Failed(reason) => UpstreamStep::Done(UpstreamAnswer::Failed(reason)),
+        Listed::Page(images, more) => {
+            UpstreamStep::Done(UpstreamAnswer::ImageCatalog(Some(CatalogPage {
+                images,
+                more,
+            })))
+        }
+    })
+}
+
+/// A paged list of names the registry API serves.
+enum Listing<'a> {
+    /// The tags of an image (`/v2/<image>/tags/list`).
+    Tags(&'a str),
+    /// The registry's images (`/v2/_catalog`).
+    Catalog,
+}
+
+impl Listing<'_> {
+    fn url(&self, base: &str) -> String {
+        match self {
+            Listing::Tags(image) => format!("{base}/v2/{image}/tags/list"),
+            Listing::Catalog => format!("{base}/v2/_catalog"),
+        }
+    }
+
+    /// The key of the document's name array.
+    fn key(&self) -> &'static str {
+        match self {
+            Listing::Tags(_) => "tags",
+            Listing::Catalog => "repositories",
+        }
+    }
+
+    fn scope(&self) -> String {
+        match self {
+            Listing::Tags(image) => scope(image),
+            Listing::Catalog => "registry:catalog:*".to_string(),
+        }
+    }
+
+    fn valid(&self, name: &str) -> bool {
+        match self {
+            Listing::Tags(_) => reference::valid_tag(name),
+            Listing::Catalog => reference::valid_name(name),
+        }
+    }
+
+    fn what(&self) -> &'static str {
+        match self {
+            Listing::Tags(_) => "tag list",
+            Listing::Catalog => "catalog",
+        }
+    }
+
+    fn get(&self, url: String) -> Fetch {
+        Fetch {
+            scope: Some(self.scope()),
+            ..Fetch::new(url, Freshness::Metadata)
+        }
+    }
+}
+
+/// Where [`list`] stands.
+enum Listed {
+    /// Fetch this page next.
+    Fetch(Fetch),
+    /// The upstream does not have the list (404).
+    Unknown,
+    Failed(String),
+    /// The names, and whether there are more after them.
+    Page(Vec<String>, bool),
+}
+
+/// Up to `limit` of the names of `listing` after `last`: one more is asked
+/// for, to know whether there are more, and the upstream's own pages are
+/// followed for up to [`MAX_UPSTREAM_TAG_PAGES`] requests. An upstream that
+/// refuses so large an `n` (400, as registries that cap it answer) is asked
+/// again without one: its own page size and links take over. The steps so
+/// far are in `fetched`.
+fn list(
+    base: &str,
+    listing: &Listing<'_>,
+    last: Option<&str>,
+    limit: usize,
+    fetched: &[FetchResult],
+) -> Listed {
     let first = |n: Option<usize>| {
         let mut query = url::form_urlencoded::Serializer::new(String::new());
         if let Some(n) = n {
@@ -139,31 +258,29 @@ fn tags(
             query.append_pair("last", last);
         }
         let query = query.finish();
-        let url = format!("{base}/v2/{image}/tags/list");
+        let url = listing.url(base);
         let url = if query.is_empty() {
             url
         } else {
             format!("{url}?{query}")
         };
-        get(url, image, None)
+        listing.get(url)
     };
     if fetched.is_empty() {
-        return Ok(UpstreamStep::Fetch(vec![first(Some(
-            limit.saturating_add(1),
-        ))]));
+        return Listed::Fetch(first(Some(limit.saturating_add(1))));
     }
-    let mut tags: BTreeSet<String> = BTreeSet::new();
+    let mut names: BTreeSet<String> = BTreeSet::new();
     let mut pages = 0;
     let mut left_out = false;
     for (i, result) in fetched.iter().enumerate() {
         let latest = i + 1 == fetched.len();
         if pages == 0 {
             if result.outcome == Fetched::NotFound {
-                return Ok(UpstreamStep::Done(UpstreamAnswer::ImageTags(None)));
+                return Listed::Unknown;
             }
             if i == 0 && result.status == Some(400) {
                 if latest {
-                    return Ok(UpstreamStep::Fetch(vec![first(None)]));
+                    return Listed::Fetch(first(None));
                 }
                 continue;
             }
@@ -171,52 +288,46 @@ fn tags(
         let body = match &result.outcome {
             Fetched::Found(body) => body,
             Fetched::NotFound => {
-                return Ok(UpstreamStep::Done(UpstreamAnswer::Failed(
-                    "the upstream lost a page of the tag list".into(),
-                )))
+                return Listed::Failed(format!(
+                    "the upstream lost a page of the {}",
+                    listing.what()
+                ))
             }
-            Fetched::Failed(reason) => {
-                return Ok(UpstreamStep::Done(UpstreamAnswer::Failed(reason.clone())))
-            }
+            Fetched::Failed(reason) => return Listed::Failed(reason.clone()),
         };
         pages += 1;
-        #[derive(serde::Deserialize)]
-        struct TagList {
-            #[serde(default)]
-            tags: Option<Vec<String>>,
-        }
-        let Ok(list) = serde_json::from_slice::<TagList>(body) else {
-            return Ok(UpstreamStep::Done(UpstreamAnswer::Failed(
-                "the upstream served an invalid tag list".into(),
-            )));
+        let Ok(document) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return Listed::Failed(format!("the upstream served an invalid {}", listing.what()));
         };
-        tags.extend(
-            list.tags
-                .unwrap_or_default()
+        let listed = match document.get(listing.key()) {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(listed)) => listed.clone(),
+            Some(_) => {
+                return Listed::Failed(format!("the upstream served an invalid {}", listing.what()))
+            }
+        };
+        names.extend(
+            listed
                 .into_iter()
-                .filter(|t| reference::valid_tag(t))
-                .filter(|t| last.is_none_or(|l| t.as_bytes() > l.as_bytes())),
+                .filter_map(|name| name.as_str().map(str::to_string))
+                .filter(|name| listing.valid(name))
+                .filter(|name| last.is_none_or(|l| name.as_bytes() > l.as_bytes())),
         );
-        if tags.len() > limit {
+        if names.len() > limit {
             break;
         }
         if latest {
             match next_link(result, base) {
                 Some(next) if pages < MAX_UPSTREAM_TAG_PAGES => {
-                    return Ok(UpstreamStep::Fetch(vec![get(next, image, None)]))
+                    return Listed::Fetch(listing.get(next))
                 }
                 Some(_) => left_out = true,
                 None => {}
             }
         }
     }
-    let more = left_out || tags.len() > limit;
-    Ok(UpstreamStep::Done(UpstreamAnswer::ImageTags(Some(
-        TagPage {
-            tags: tags.into_iter().take(limit).collect(),
-            more,
-        },
-    ))))
+    let more = left_out || names.len() > limit;
+    Listed::Page(names.into_iter().take(limit).collect(), more)
 }
 
 /// The `next` page a tag list's `Link` header names (RFC 8288), resolved
@@ -402,6 +513,81 @@ mod tests {
             "http://up.test/v2/team/app/tags/list?n=2&last=b"
         );
         assert_eq!(conversed.fetches.len(), 2, "no link off the upstream");
+    }
+
+    #[test]
+    fn the_catalog_is_paged_like_a_tag_list() {
+        let mut pages = vec![
+            (
+                vec!["team/app", "team/db"],
+                Some("</v2/_catalog?n=2&last=team%2Fdb>; rel=\"next\""),
+            ),
+            (vec!["Not A Name", "tools/cli"], None),
+        ]
+        .into_iter();
+        let op = UpstreamOp::ImageCatalog {
+            last: Some("base".into()),
+            n: 10,
+        };
+        let conversed = converse_answered(&Docker, &remote("http://up.test"), &op, |fetch| {
+            let (images, link) = pages.next().expect("no more pages");
+            FetchResult {
+                fetch: fetch.clone(),
+                outcome: Fetched::Found(
+                    serde_json::to_vec(&json!({ "repositories": images })).unwrap(),
+                ),
+                status: Some(200),
+                headers: link
+                    .map(|l| vec![("link".to_string(), l.to_string())])
+                    .unwrap_or_default(),
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            conversed.answer,
+            UpstreamAnswer::ImageCatalog(Some(CatalogPage {
+                images: vec!["team/app".into(), "team/db".into(), "tools/cli".into()],
+                more: false,
+            })),
+            "an invalid name is left out"
+        );
+        assert_eq!(
+            conversed.fetches[0].url,
+            "http://up.test/v2/_catalog?n=11&last=base"
+        );
+        assert_eq!(
+            conversed.fetches[0].scope.as_deref(),
+            Some("registry:catalog:*")
+        );
+        assert_eq!(
+            conversed.fetches[1].url,
+            "http://up.test/v2/_catalog?n=2&last=team%2Fdb"
+        );
+    }
+
+    #[test]
+    fn a_registry_without_a_catalog_has_none() {
+        for (status, outcome) in [
+            (404, Fetched::NotFound),
+            (401, Fetched::Failed("401".into())),
+            (403, Fetched::Failed("403".into())),
+        ] {
+            let op = UpstreamOp::ImageCatalog { last: None, n: 5 };
+            let conversed = converse_answered(&Docker, &remote("http://up.test"), &op, |fetch| {
+                FetchResult {
+                    fetch: fetch.clone(),
+                    outcome: outcome.clone(),
+                    status: Some(status),
+                    headers: Vec::new(),
+                }
+            })
+            .unwrap();
+            assert_eq!(
+                conversed.answer,
+                UpstreamAnswer::ImageCatalog(None),
+                "{status}"
+            );
+        }
     }
 
     #[test]

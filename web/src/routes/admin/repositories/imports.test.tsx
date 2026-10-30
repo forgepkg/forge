@@ -17,11 +17,11 @@ import { routeTree } from '~/routeTree.gen'
 import { searchOptions } from '~/lib/search'
 
 /**
- * The import-from-Nexus screen (`/manage/repositories/$repo/import`), driven
- * against the real route tree and query hooks:
+ * The import screen (`/manage/repositories/$repo/import`), driven against
+ * the real route tree and query hooks:
  *  - a hosted repository's edit screen links to it, a proxy's does not;
- *  - the form posts the import (a dry run by default) and shows the
- *    server's preflight refusal;
+ *  - the form posts the import (a dry run by default) from a feed's URL, with
+ *    the package ids it names, and shows the server's preflight refusal;
  *  - an import shows its progress, its conflicts on demand, and a completed
  *    import's failed items are retried with the password it no longer holds;
  *    the form starts from the last import.
@@ -63,9 +63,8 @@ function imp(over: Partial<ImportView>): ImportView {
   return {
     id: 7,
     repository: 'nuget-internal',
-    url: 'https://nexus.example.com',
-    source_repository: 'nuget-hosted',
-    registry_url: null,
+    url: 'https://nexus.example.com/repository/nuget-hosted/index.json',
+    names: null,
     username: 'migrator',
     has_password: false,
     on_conflict: 'skip',
@@ -74,7 +73,8 @@ function imp(over: Partial<ImportView>): ImportView {
     state: 'completed',
     phase: 'copy',
     cancel_requested: false,
-    nexus_version: 'Nexus/3.70.1-02 (OSS)',
+    source_server: 'Nexus/3.70.1-02 (OSS)',
+    source_total: 10,
     last_error: null,
     created_by: 1,
     created_at: '2026-10-22T10:00:00Z',
@@ -92,8 +92,6 @@ function imp(over: Partial<ImportView>): ImportView {
       planned: 0,
       planned_size: 0,
       bytes_copied: 4096,
-      assets: 10,
-      size: 8192,
     },
     ...over,
   }
@@ -207,7 +205,7 @@ function requests(method: string, suffix: string) {
   })
 }
 
-describe('import from Nexus', () => {
+describe('import', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockReset()
@@ -226,7 +224,7 @@ describe('import from Nexus', () => {
       ],
     })
     const router = await renderAt('/manage/repositories/nuget-internal')
-    const link = await screen.findByRole('link', { name: 'Import from Nexus' })
+    const link = await screen.findByRole('link', { name: 'Import' })
     await userEvent.click(link)
     await waitFor(() =>
       expect(router.state.location.pathname).toBe(
@@ -240,7 +238,7 @@ describe('import from Nexus', () => {
     })
     await screen.findByText(/Edit/)
     expect(
-      screen.queryByRole('link', { name: 'Import from Nexus' }),
+      screen.queryByRole('link', { name: 'Import' }),
     ).not.toBeInTheDocument()
   })
 
@@ -251,7 +249,7 @@ describe('import from Nexus', () => {
       onCreate: (body) => {
         created = body
         return new Response(
-          'nuget-proxy is a proxy repository in Nexus; only hosted repositories are imported',
+          'the NuGet feed at https://feed.example.com/v3/index.json: the source answered 404',
           { status: 400 },
         )
       },
@@ -260,21 +258,19 @@ describe('import from Nexus', () => {
     await screen.findByText('No imports yet')
 
     await userEvent.type(
-      screen.getByPlaceholderText('https://nexus.example.com'),
-      'https://nexus.example.com',
+      screen.getByLabelText('Feed URL'),
+      'https://feed.example.com/v3/index.json',
     )
     await userEvent.type(
-      screen.getByPlaceholderText('nuget-hosted'),
-      'nuget-proxy',
+      screen.getByLabelText(/Package IDs/),
+      'Acme.Core\nAcme.Web, Acme.Cli',
     )
     await userEvent.click(screen.getByRole('button', { name: 'Start dry run' }))
 
-    expect(
-      await screen.findByText(/only hosted repositories are imported/),
-    ).toBeInTheDocument()
+    expect(await screen.findByText(/answered 404/)).toBeInTheDocument()
     expect(created).toEqual({
-      url: 'https://nexus.example.com',
-      repository: 'nuget-proxy',
+      url: 'https://feed.example.com/v3/index.json',
+      names: ['Acme.Core', 'Acme.Web', 'Acme.Cli'],
       on_conflict: 'skip',
       concurrency: 4,
       dry_run: true,
@@ -295,11 +291,14 @@ describe('import from Nexus', () => {
     await renderAt('/manage/repositories/nuget-internal/import')
     const card = await screen.findByRole('article', { name: 'Import 7' })
     // The form starts from the last import, for the run before a cutover.
-    expect(
-      screen.getByPlaceholderText('https://nexus.example.com'),
-    ).toHaveValue('https://nexus.example.com')
+    expect(screen.getByLabelText('Feed URL')).toHaveValue(
+      'https://nexus.example.com/repository/nuget-hosted/index.json',
+    )
     expect(screen.getByRole('button', { name: 'Start import' })).toBeEnabled()
     expect(within(card).getByText('10 of 10 done.', { exact: false })).toBeInTheDocument()
+    expect(
+      within(card).getByText(/search found 10 packages/, { exact: false }),
+    ).toBeInTheDocument()
     expect(within(card).getByRole('progressbar')).toHaveAttribute(
       'aria-valuenow',
       '10',
@@ -312,9 +311,73 @@ describe('import from Nexus', () => {
     // The completed import's password was deleted: retrying needs it again.
     const retry = within(card).getByRole('button', { name: 'Retry failed items' })
     expect(retry).toBeDisabled()
-    await userEvent.type(within(card).getByLabelText('Nexus password'), 's3cret')
+    await userEvent.type(within(card).getByLabelText('Password'), 's3cret')
     await userEvent.click(retry)
     await waitFor(() => expect(resumed).toEqual({ retry_failed: true, password: 's3cret' }))
     expect(requests('POST', '/imports/7/resume')).toHaveLength(1)
+  })
+
+  it('imports the named images of a registry without a catalog', async () => {
+    let created: unknown
+    mockApi({
+      repositories: [repo({ name: 'images', format: 'docker' })],
+      imports: [
+        imp({
+          repository: 'images',
+          url: 'https://registry.example.com',
+          names: ['team/app'],
+          source_total: null,
+          progress: {
+            found: 1,
+            pending: 0,
+            imported: 0,
+            replaced: 0,
+            identical: 0,
+            conflict: 0,
+            failed: 1,
+            planned: 0,
+            planned_size: 0,
+            bytes_copied: 0,
+          },
+        }),
+      ],
+      items: [
+        item({
+          name: 'team/gone',
+          version: '',
+          state: 'failed',
+          detail: 'the source has no tag of this image',
+        }),
+      ],
+      onCreate: (body) => {
+        created = body
+        return json(imp({ state: 'queued' }), 201)
+      },
+    })
+    await renderAt('/manage/repositories/images/import')
+    const card = await screen.findByRole('article', { name: 'Import 7' })
+    expect(within(card).getByText('1 named')).toBeInTheDocument()
+    await userEvent.click(within(card).getByRole('button', { name: 'Show failed' }))
+    expect(await within(card).findByText('team/gone')).toBeInTheDocument()
+
+    expect(screen.getByLabelText('Registry URL')).toHaveValue(
+      'https://registry.example.com',
+    )
+    expect(screen.getByLabelText(/Images/)).toHaveValue('team/app')
+    // The password is never prefilled.
+    const form = screen.getByRole('button', { name: 'Start import' }).closest('form')!
+    await userEvent.type(within(form).getByLabelText('Password'), 's3cret')
+    await userEvent.click(screen.getByRole('button', { name: 'Start import' }))
+    await waitFor(() =>
+      expect(created).toEqual({
+        url: 'https://registry.example.com',
+        names: ['team/app'],
+        username: 'migrator',
+        password: 's3cret',
+        on_conflict: 'skip',
+        concurrency: 4,
+        dry_run: false,
+      }),
+    )
   })
 })

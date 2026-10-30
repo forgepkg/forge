@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE repository_import SET locked_until = $3\n        WHERE id = $1 AND run_id = $2 AND state = 'running'\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4fcb159341379dc599bf179e2721dc6f50cba5847f5c970c6eae1b54660a8da2"
+}

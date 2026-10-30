@@ -742,10 +742,10 @@ impl HostedWrite {
         })
     }
 
-    /// The SHA-256 of the package file of `(id, version)` in the hosted
-    /// repository `repository_id`, if the version exists: what an import
-    /// compares the source's checksum with before downloading anything.
-    pub async fn package_sha256(
+    /// The SHA-512 (base64) of the package file of `id` `version`, if the
+    /// repository holds that version and the digest was recorded: an import
+    /// compares it with what the source lists.
+    pub async fn package_sha512(
         &self,
         repository_id: i64,
         id: &str,
@@ -761,7 +761,12 @@ impl HostedWrite {
         else {
             return Ok(None);
         };
-        self.stored_package_sha256(&self.pool, comp.id).await
+        Ok(
+            asset_dao::find_asset(&self.pool, comp.id, self.format.package_asset_path())
+                .await
+                .map_err(RepoError::from)?
+                .and_then(|asset| asset.sha512_base64),
+        )
     }
 
     /// The SHA-256 of a component's package file.

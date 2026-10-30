@@ -37,9 +37,10 @@
 //! stored `config`
 //! ([`store_email_settings`], [`email_config`]).
 //!
-//! An import from Nexus keeps the Nexus password in
-//! `nexus_import.password_enc` until it completes, AAD-bound to
-//! `('nexus_import', 'password_enc', <row id>)` plus the origins it is sent
+//! An import keeps its source's password in
+//! `repository_import.password_enc` until it completes, AAD-bound to
+//! `('nexus_import', 'password_enc', <row id>)` (the table's name before 2.2,
+//! kept so that passwords sealed then still open) plus the origins it is sent
 //! to ([`import_destination`]) ([`set_import_password`],
 //! [`get_import_password`]).
 //!
@@ -434,7 +435,7 @@ pub async fn reseal_upstream_passwords_batch(
 
 /// Every DEK version still referenced by stored ciphertext, across all
 /// encrypted columns (`repository.upstream_password_enc`,
-/// `auth_realm.secrets_enc`, `nexus_import.password_enc`,
+/// `auth_realm.secrets_enc`, `repository_import.password_enc`,
 /// `email_settings.secrets_enc`, the sealed
 /// [`SECRET_SETTINGS`]; future secret columns add their scan here). Used
 /// by the sweep to decide which `retiring` DEKs are safe to revoke.
@@ -499,7 +500,7 @@ async fn scan_referenced_dek_versions(
         }
     }
     let import_blobs = sqlx::query!(
-        r#"SELECT id, password_enc AS "password_enc!" FROM nexus_import WHERE password_enc IS NOT NULL"#,
+        r#"SELECT id, password_enc AS "password_enc!" FROM repository_import WHERE password_enc IS NOT NULL"#,
     )
     .fetch_all(&mut *conn)
     .await?;
@@ -1236,24 +1237,27 @@ pub async fn reseal_secret_settings(
     Ok(resealed)
 }
 
-// ── Nexus import passwords ───────────────────────────────────────────────────
+// ── Import passwords ─────────────────────────────────────────────────────────
 
-/// Owning table of an import's sealed Nexus password (AAD component).
+/// Owning table of an import's sealed password (AAD component): the table's
+/// name before 2.2 (`repository_import` since), kept so that a password
+/// sealed then still opens.
 pub const IMPORT_PASSWORD_TABLE: &str = "nexus_import";
-/// Owning column of an import's sealed Nexus password (AAD component).
+/// Owning column of an import's sealed password (AAD component).
 pub const IMPORT_PASSWORD_COLUMN: &str = "password_enc";
 
-/// Where an import's Nexus password may be sent: the origin of its
-/// `base_url` and, when it is elsewhere, of its Docker `registry_url`.
-pub fn import_destination(base_url: &str, registry_url: Option<&str>) -> String {
-    let base = upstream_destination(Some(base_url));
+/// Where an import's password may be sent: the origin of its `url` (the
+/// source) and, for a Docker import stored before 2.2 whose registry is
+/// elsewhere, of its `registry_url`.
+pub fn import_destination(url: &str, registry_url: Option<&str>) -> String {
+    let base = upstream_destination(Some(url));
     match registry_url.map(|url| upstream_destination(Some(url))) {
         Some(registry) if registry != base => format!("{base} {registry}"),
         _ => base,
     }
 }
 
-/// The AAD binding of `nexus_import.password_enc` of one row.
+/// The AAD binding of `repository_import.password_enc` of one row.
 fn import_binding(import_id: i64, destination: &str) -> AeadBinding<'_> {
     AeadBinding {
         table: IMPORT_PASSWORD_TABLE,
@@ -1263,7 +1267,7 @@ fn import_binding(import_id: i64, destination: &str) -> AeadBinding<'_> {
     }
 }
 
-/// Store an import's Nexus password, sealed (bound to the row and to
+/// Store an import's password, sealed (bound to the row and to
 /// [`import_destination`]). Runs on the connection of the transaction that
 /// created the import.
 pub async fn set_import_password(
@@ -1273,19 +1277,19 @@ pub async fn set_import_password(
     secret: &PlaintextSecret,
 ) -> Result<(), SecretDbError> {
     let row = sqlx::query!(
-        r#"SELECT base_url, registry_url FROM nexus_import WHERE id = $1 FOR UPDATE"#,
+        r#"SELECT url, registry_url FROM repository_import WHERE id = $1 FOR UPDATE"#,
         import_id,
     )
     .fetch_optional(&mut *conn)
     .await?
     .ok_or(SecretDbError::ImportNotFound(import_id))?;
-    let destination = import_destination(&row.base_url, row.registry_url.as_deref());
+    let destination = import_destination(&row.url, row.registry_url.as_deref());
     let blob = envelope
         .seal(secret, import_binding(import_id, &destination))
         .await?;
     lock_sealing_dek(conn, envelope, &blob).await?;
     sqlx::query!(
-        r#"UPDATE nexus_import SET password_enc = $2 WHERE id = $1"#,
+        r#"UPDATE repository_import SET password_enc = $2 WHERE id = $1"#,
         import_id,
         &blob,
     )
@@ -1294,7 +1298,7 @@ pub async fn set_import_password(
     Ok(())
 }
 
-/// An import's Nexus password, `None` when it has none (an anonymous
+/// An import's password, `None` when it has none (an anonymous
 /// source, or the import completed).
 pub async fn get_import_password(
     pool: &PgPool,
@@ -1303,8 +1307,8 @@ pub async fn get_import_password(
 ) -> Result<Option<PlaintextSecret>, SecretDbError> {
     let row = sqlx::query!(
         r#"
-        SELECT base_url, registry_url, password_enc
-        FROM nexus_import WHERE id = $1
+        SELECT url, registry_url, password_enc
+        FROM repository_import WHERE id = $1
         "#,
         import_id,
     )
@@ -1314,7 +1318,7 @@ pub async fn get_import_password(
     let Some(blob) = row.password_enc else {
         return Ok(None);
     };
-    let destination = import_destination(&row.base_url, row.registry_url.as_deref());
+    let destination = import_destination(&row.url, row.registry_url.as_deref());
     let secret = envelope
         .open(&blob, import_binding(import_id, &destination))
         .await?;
@@ -1330,8 +1334,8 @@ pub async fn reseal_import_passwords(
 ) -> Result<usize, SecretDbError> {
     let rows = sqlx::query!(
         r#"
-        SELECT id, base_url, registry_url, password_enc AS "password_enc!"
-        FROM nexus_import WHERE password_enc IS NOT NULL
+        SELECT id, url, registry_url, password_enc AS "password_enc!"
+        FROM repository_import WHERE password_enc IS NOT NULL
         ORDER BY id
         "#,
     )
@@ -1339,7 +1343,7 @@ pub async fn reseal_import_passwords(
     .await?;
     let mut resealed = 0;
     for row in rows {
-        let destination = import_destination(&row.base_url, row.registry_url.as_deref());
+        let destination = import_destination(&row.url, row.registry_url.as_deref());
         let bound = import_binding(row.id, &destination);
         let Some(new_blob) = reseal_if_due(envelope, &row.password_enc, bound).await? else {
             continue;
@@ -1353,7 +1357,7 @@ pub async fn reseal_import_passwords(
                 WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'
                 FOR SHARE
             )
-            UPDATE nexus_import SET password_enc = $2
+            UPDATE repository_import SET password_enc = $2
             WHERE id = $1 AND password_enc = $3 AND EXISTS (SELECT 1 FROM dek)
             "#,
             row.id,

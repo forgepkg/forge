@@ -136,7 +136,18 @@ pub(crate) fn step(
         UpstreamOp::Manifest(target) => manifest(&resources, target, fetched, limits),
         UpstreamOp::Metadata(wanted) => metadata(&resources, wanted, false, fetched),
         UpstreamOp::Dating(wanted) => metadata(&resources, wanted, true, fetched),
-        UpstreamOp::Search(query) => search(&resources, query, fetched),
+        UpstreamOp::Search(query) => search(&resources, query, true, fetched),
+        UpstreamOp::Packages { skip, take } => {
+            let query = SearchQuery {
+                text: String::new(),
+                skip: *skip,
+                take: *take,
+                prerelease: true,
+                semver2: true,
+                upstream: true,
+            };
+            search(&resources, &query, false, fetched)
+        }
         // A feed holds packages: it has no files to fetch.
         UpstreamOp::File(_) => done(UpstreamAnswer::File(None)),
         // NuGet has no tags.
@@ -145,7 +156,8 @@ pub(crate) fn step(
         | UpstreamOp::ImageManifest { .. }
         | UpstreamOp::ImageBlob { .. }
         | UpstreamOp::ImageTags { .. }
-        | UpstreamOp::ImageReferrers { .. } => failed("a feed holds no images"),
+        | UpstreamOp::ImageReferrers { .. }
+        | UpstreamOp::ImageCatalog { .. } => failed("a feed holds no images"),
     })
 }
 
@@ -289,6 +301,10 @@ struct Leaf {
     /// The `@id` of the version's catalog entry, which names when the
     /// version was created even when it is unlisted.
     catalog_url: Option<String>,
+    /// The package's SHA-512 (base64), where the entry lists it inline (a
+    /// `packageHash` with `packageHashAlgorithm` `SHA512`, as Forge's
+    /// registration does; nuget.org's lists it in the catalog leaf only).
+    sha512: Option<String>,
 }
 
 /// One page of a registration index.
@@ -458,6 +474,7 @@ fn metadata(
                 summary: nuspec::manifest_summary(&manifest)
                     .ok()
                     .and_then(|summary| serde_json::to_string(&summary).ok()),
+                sha512: leaf.sha512.clone(),
             }
         })
         .collect();
@@ -534,6 +551,16 @@ fn registration_leaves(page: &Value) -> BTreeMap<String, Leaf> {
                 published,
                 groups,
                 catalog_url: entry.get("@id").and_then(Value::as_str).map(str::to_string),
+                sha512: entry
+                    .get("packageHash")
+                    .and_then(Value::as_str)
+                    .filter(|_| {
+                        entry
+                            .get("packageHashAlgorithm")
+                            .and_then(Value::as_str)
+                            .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case("SHA512"))
+                    })
+                    .map(str::to_string),
             },
         );
     }
@@ -572,10 +599,18 @@ fn year(raw: &str) -> Option<i32> {
 }
 
 /// A page of the upstream's `SearchQueryService` results for `query`.
-fn search(resources: &Resources, query: &SearchQuery, fetched: &[FetchResult]) -> UpstreamStep {
+/// `capped`: a proxy's search, which does not ask for offsets beyond
+/// nuget.org's; an import's walk asks for every offset the upstream allows
+/// (Nexus: 10,000 packages).
+fn search(
+    resources: &Resources,
+    query: &SearchQuery,
+    capped: bool,
+    fetched: &[FetchResult],
+) -> UpstreamStep {
     // nuget.org limits skip to 3,000. Deeper pages use the proxy's local search
     // rather than requesting a rejected offset or silently changing the page.
-    if query.skip > 3_000 {
+    if capped && query.skip > 3_000 {
         return done(UpstreamAnswer::Search(None));
     }
     let Some(service) = &resources.search_query_service else {
@@ -770,5 +805,20 @@ mod tests {
         assert!(!leaves["1.0.0"].listed);
         assert!(leaves["2.0.0"].listed);
         assert!(leaves["3.0.0"].listed);
+    }
+
+    #[test]
+    fn an_inline_sha512_package_hash_is_read() {
+        let page = serde_json::json!({ "items": [
+            { "catalogEntry": { "version": "1.0.0", "packageHash": "c2hhNTEy",
+                                "packageHashAlgorithm": "SHA512" } },
+            { "catalogEntry": { "version": "2.0.0", "packageHash": "bWQ1",
+                                "packageHashAlgorithm": "MD5" } },
+            { "catalogEntry": { "version": "3.0.0", "packageHash": "c2hhNTEy" } },
+        ]});
+        let leaves = registration_leaves(&page);
+        assert_eq!(leaves["1.0.0"].sha512.as_deref(), Some("c2hhNTEy"));
+        assert_eq!(leaves["2.0.0"].sha512, None, "another algorithm");
+        assert_eq!(leaves["3.0.0"].sha512, None, "no algorithm named");
     }
 }

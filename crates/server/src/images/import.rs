@@ -1,6 +1,8 @@
-//! Imports into a hosted repository from another registry's API (a Nexus
-//! hosted repository's): a tag with everything it references, copied the
-//! way `crane copy` copies it, and stored through the same checks as a push.
+//! Imports into a hosted repository from another registry's API (Nexus,
+//! Harbor, a `distribution` registry, another Forge): what the source lists
+//! (its catalog, tag lists and referrers, [`Registry::source_catalog`] and
+//! its siblings), and a tag with everything it references, copied the way
+//! `crane copy` copies it, and stored through the same checks as a push.
 //!
 //! * Digests are kept: a manifest is stored as the source served it, once
 //!   its bytes matched the digest it was asked for (a tag's: the source's
@@ -36,9 +38,10 @@ use forge_core::repo::proxy::Credentials;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, LinkOutcome, TagWrite};
 use forge_plugin::api::images::{
-    ImageError, ManifestBlob, ParsedManifest, Reference, MAX_MANIFEST_BYTES,
+    CatalogPage, ImageError, ManifestBlob, ManifestInfo, ParsedManifest, Reference, TagPage,
+    MAX_MANIFEST_BYTES,
 };
-use forge_plugin::api::UpstreamOp;
+use forge_plugin::api::{UpstreamAnswer, UpstreamOp};
 use futures_util::TryStreamExt;
 use reqwest::Method;
 
@@ -76,6 +79,99 @@ impl ImportSource {
             owner: self.owner.clone(),
             remote: self.base.clone(),
             creds: self.credentials.clone(),
+        }
+    }
+}
+
+impl Registry {
+    /// Check that `source` answers the registry API (`GET /v2/`: 200, or 200
+    /// once its token challenge is answered). Returns the `Server` header it
+    /// answered with.
+    pub async fn probe_source(&self, source: &ImportSource) -> ImgResult<Option<String>> {
+        let upstream = source.upstream(self);
+        let base = source.base.trim_end_matches('/');
+        let url = format!("{}/v2/", base.strip_suffix("/v2").unwrap_or(base));
+        let response = upstream
+            .send(Method::GET, &url, None, None, RequestClass::Metadata)
+            .await?;
+        if !response.status().is_success() {
+            return Err(source_status(response.status(), "/v2/"));
+        }
+        Ok(response
+            .headers()
+            .get(reqwest::header::SERVER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string))
+    }
+
+    /// Up to `n` images of the source's catalog after `last`; `None` when it
+    /// serves no catalog.
+    pub async fn source_catalog(
+        &self,
+        source: &ImportSource,
+        last: Option<&str>,
+        n: u32,
+    ) -> ImgResult<Option<CatalogPage>> {
+        let op = UpstreamOp::ImageCatalog {
+            last: last.map(str::to_string),
+            n,
+        };
+        match source.upstream(self).converse(self, &op).await? {
+            UpstreamAnswer::ImageCatalog(page) => Ok(page),
+            UpstreamAnswer::Failed(reason) => Err(Failure::unavailable(reason)),
+            other => Err(Failure::internal(
+                "source catalog",
+                format!("the images format answered {other:?}"),
+            )),
+        }
+    }
+
+    /// Up to `n` tags of `image` at the source after `last`; `None` when the
+    /// source does not know the image.
+    pub async fn source_tags(
+        &self,
+        source: &ImportSource,
+        image: &str,
+        last: Option<&str>,
+        n: u32,
+    ) -> ImgResult<Option<TagPage>> {
+        let op = UpstreamOp::ImageTags {
+            image: image.to_string(),
+            last: last.map(str::to_string),
+            n,
+        };
+        match source.upstream(self).converse(self, &op).await? {
+            UpstreamAnswer::ImageTags(page) => Ok(page),
+            UpstreamAnswer::Failed(reason) => Err(Failure::unavailable(reason)),
+            other => Err(Failure::internal(
+                "source tags",
+                format!("the images format answered {other:?}"),
+            )),
+        }
+    }
+
+    /// The referrers the source lists for the manifest `digest` of `image`
+    /// (its referrers API); `None` when it has no such API: a referrer is
+    /// then reached through a tag (the referrers tag schema's
+    /// `sha256-<digest>`, cosign's `sha256-<digest>.sig`), which an import
+    /// copies like any other.
+    pub async fn source_referrers(
+        &self,
+        source: &ImportSource,
+        image: &str,
+        digest: &str,
+    ) -> ImgResult<Option<Vec<ManifestInfo>>> {
+        let op = UpstreamOp::ImageReferrers {
+            image: image.to_string(),
+            digest: digest.to_string(),
+        };
+        match source.upstream(self).converse(self, &op).await? {
+            UpstreamAnswer::ImageReferrers(found) => Ok(found),
+            UpstreamAnswer::Failed(reason) => Err(Failure::unavailable(reason)),
+            other => Err(Failure::internal(
+                "source referrers",
+                format!("the images format answered {other:?}"),
+            )),
         }
     }
 }

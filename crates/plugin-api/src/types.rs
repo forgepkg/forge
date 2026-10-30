@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::images::{
-    ImageAnswer, ImageName, ImageQuery, ImageUrl, ManifestInfo, Reference, TagPage,
+    CatalogPage, ImageAnswer, ImageName, ImageQuery, ImageUrl, ManifestInfo, Reference, TagPage,
 };
 
 /// A dependency on another package of the same format.
@@ -1031,6 +1031,12 @@ pub enum UpstreamOp {
     Dating(PackageVersions),
     /// A page of the upstream's search results.
     Search(SearchQuery),
+    /// Package formats: up to `take` of every package the upstream lists,
+    /// after the first `skip` ([`UpstreamAnswer::Search`]): what an import
+    /// walks. Unlike a proxy's [`UpstreamOp::Search`], every version counts
+    /// (prerelease, SemVer 2.0.0) and the offset is not capped below what
+    /// the upstream allows. `None`: the upstream lists no packages.
+    Packages { skip: u32, take: u32 },
     /// The tags the upstream gives a package (canonical id).
     Tags(String),
     /// The URL of the file at a path (files formats). The host downloads it,
@@ -1063,6 +1069,10 @@ pub enum UpstreamOp {
     /// Images formats: the upstream's referrers of a manifest
     /// ([`UpstreamAnswer::ImageReferrers`]).
     ImageReferrers { image: String, digest: String },
+    /// Images formats: up to `n` of the names of the images the upstream
+    /// holds after `last`, in byte order ([`UpstreamAnswer::ImageCatalog`]):
+    /// what an import of a registry walks.
+    ImageCatalog { last: Option<String>, n: u32 },
 }
 
 /// How long the host may reuse a fetched document.
@@ -1167,6 +1177,10 @@ pub struct VersionMetadata {
     ///
     /// [`FormatPlugin::manifest_summary`]: crate::FormatPlugin::manifest_summary
     pub summary: Option<String>,
+    /// The SHA-512 of the version's package, base64, where the upstream's
+    /// metadata lists it: an import verifies the package against it, and
+    /// skips a version it holds with these bytes without downloading it.
+    pub sha512: Option<String>,
 }
 
 /// The answer to [`UpstreamOp::Metadata`] and [`UpstreamOp::Dating`].
@@ -1247,6 +1261,9 @@ pub enum UpstreamAnswer {
     /// `None`: the upstream offers no referrers API (the host lists the
     /// referrers its cache holds).
     ImageReferrers(Option<Vec<ManifestInfo>>),
+    /// `None`: the upstream serves no catalog (it is no part of the
+    /// distribution spec: Docker Hub, GHCR and ECR serve none), or refuses it.
+    ImageCatalog(Option<CatalogPage>),
     /// The upstream answered something unusable: the host serves what it
     /// has cached.
     Failed(String),

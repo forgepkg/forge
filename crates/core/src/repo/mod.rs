@@ -212,7 +212,7 @@ pub struct ImportOptions {
     pub downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Who published it at the source, for the audit trail.
     pub uploader: Option<String>,
-    /// Where it came from, for the audit trail (`<nexus url> <repository>`).
+    /// Where it came from, for the audit trail (the source's URL).
     pub source: String,
 }
 
