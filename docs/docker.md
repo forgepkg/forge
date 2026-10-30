@@ -142,9 +142,10 @@ with any `artifactType`; Docker schema 1 is refused.
   Upload sessions are shared by all instances; an abandoned one expires
   after `docker.upload_ttl_seconds`.
 
-The images of a Nexus docker-hosted repository move over with an import,
-digests, multi-platform indexes, signatures and SBOMs included
-([nexus-import.md](nexus-import.md)).
+The images of another registry (a Nexus docker-hosted repository, Harbor, a
+`distribution` registry, another Forge) move over with an import, through
+the registry API: digests, multi-platform indexes, signatures and SBOMs
+included ([import.md](import.md)).
 
 ### Signatures, SBOMs and attestations
 

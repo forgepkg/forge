@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE repository_import_item\n        SET state = 'pending', detail = NULL, updated_at = now()\n        WHERE import_id = $1 AND state = 'failed'\n          AND ($2::bigint[] IS NULL OR id = ANY($2))\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "426f15afec440cec0f4f1dc397035b1889669d3f11a30eb5bf9db8bd220e8869"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE repository_import i\n        SET state = 'queued', run_id = NULL, locked_until = NULL, finished_at = NULL,\n            last_error = NULL, cancel_requested = false, updated_at = now()\n        WHERE id = $1 AND state IN ('cancelled', 'failed', 'completed')\n          AND NOT EXISTS (\n              SELECT 1 FROM repository_import o\n              WHERE o.repository_id = i.repository_id AND o.id <> i.id\n                AND o.state IN ('queued', 'running')\n          )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cbf56582f6a6d29f724c916948d9289ce31989989e995e61c72f9a84a87edd7d"
+}

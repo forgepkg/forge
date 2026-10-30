@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT url, registry_url, password_enc\n        FROM repository_import WHERE id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "url"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "registry_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "registry_url"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "password_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "password_enc"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "fdb3ed8114bfe2e9193b887f66c3281d784f0d9220cbcd18c3d3a9a7e86c29d2"
+}

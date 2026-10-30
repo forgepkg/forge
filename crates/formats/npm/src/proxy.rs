@@ -274,13 +274,16 @@ pub fn upstream(remote: &Remote, op: &UpstreamOp, fetched: &[FetchResult]) -> Up
             }
         }
         UpstreamOp::Search(query) => search(remote, query, fetched),
+        // No import walks an npm registry yet.
+        UpstreamOp::Packages { .. } => done(UpstreamAnswer::Search(None)),
         // A registry holds packages: it has no files to fetch.
         UpstreamOp::File(_) => done(UpstreamAnswer::File(None)),
         UpstreamOp::ImageName(_)
         | UpstreamOp::ImageManifest { .. }
         | UpstreamOp::ImageBlob { .. }
         | UpstreamOp::ImageTags { .. }
-        | UpstreamOp::ImageReferrers { .. } => failed("a registry of packages holds no images"),
+        | UpstreamOp::ImageReferrers { .. }
+        | UpstreamOp::ImageCatalog { .. } => failed("a registry of packages holds no images"),
     }
 }
 
@@ -382,6 +385,9 @@ fn metadata(doc: Option<UpstreamPackument>, wanted: &[String]) -> PackageMetadat
                     created: time,
                     summary,
                     version,
+                    // npm's integrity is checked from the version's dist
+                    // when its tarball is located, not here.
+                    sha512: None,
                 }
             })
             .collect(),

@@ -24,8 +24,9 @@
 //! * [`blob_cache`] — the local blob cache's statistics.
 //! * [`proxy_cache`] — invalidating what a proxy repository cached from its
 //!   upstream (its "not found" answers, listings and documents).
-//! * [`imports`] — importing a Nexus hosted repository into a hosted
-//!   repository (start with a preflight, progress, cancel, resume, retry).
+//! * [`imports`] — importing a repository from another server (a NuGet feed,
+//!   a registry) into a hosted repository (start with a preflight, progress,
+//!   cancel, resume, retry).
 //! * [`email`] — the email service's settings and a test send.
 //! * [`email_oauth`] — registering and authorizing Forge for the email
 //!   service's SMTP with OAuth.

@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH due AS (\n            SELECT id FROM repository_import\n            WHERE state IN ('queued', 'running')\n              AND (locked_until IS NULL OR locked_until < $1)\n            ORDER BY id\n            FOR UPDATE SKIP LOCKED\n            LIMIT 1\n        )\n        UPDATE repository_import i\n        SET state = 'running',\n            run_id = $2,\n            locked_until = $1 + make_interval(secs => $3),\n            started_at = coalesce(i.started_at, $1),\n            updated_at = $1\n        FROM due\n        WHERE i.id = due.id\n        RETURNING i.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ff454fad056b994bafa995d317a8ce32a87eb4ffe41e499aad73e218dd739de0"
+}

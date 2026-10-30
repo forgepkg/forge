@@ -1,9 +1,19 @@
 //! Integration test: spin up a real Postgres in a container, run the migrations,
-//! and assert every expected table exists; and refuse a database an earlier
-//! build created.
+//! and assert every expected table exists; refuse a database an earlier
+//! build created; and carry an earlier migration's rows through a later one.
 //!
 //! Requires Docker to be available on the host running the test.
 
+use std::sync::Arc;
+
+use forge_crypto::envelope::{AeadBinding, Algorithm};
+use forge_crypto::kms::StaticRootProvider;
+use forge_crypto::service::{EnvelopeService, EnvelopeServiceConfig};
+use forge_crypto::{ExposeSecret, KeyBytes, PlaintextSecret};
+use forge_db::encryption_key_dao::PgKeyStore;
+use forge_db::import_dao::{self, NewImport};
+use forge_db::repository_dao::{self, NewRepository};
+use forge_db::secret_dao;
 use sqlx::Row;
 use testcontainers_modules::{
     postgres::Postgres,
@@ -779,6 +789,169 @@ async fn a_database_of_an_earlier_build_is_refused() {
             .expect("look up repository");
         assert_eq!(migrated, None, "{label}: nothing is migrated");
     }
+}
+
+/// An import stored before imports read the formats' protocols (0007): its
+/// rows, its items and its sealed password come through the rename, and a
+/// scan that walked Nexus' REST API starts over.
+#[tokio::test]
+async fn an_import_of_a_nexus_repository_survives_the_rename() {
+    let (server, _container) = server().await;
+    let url = fresh_database(&server, "import_rename").await;
+    let pool = forge_db::connect(&url).await.expect("connect");
+    sqlx::migrate!("../../migrations")
+        .run_to(6, &pool)
+        .await
+        .expect("migrate to 0006");
+
+    let nuget = repository_dao::insert_repository(&pool, NewRepository::hosted("nuget-internal"))
+        .await
+        .unwrap();
+    let images = repository_dao::insert_repository(
+        &pool,
+        NewRepository {
+            format: "docker".into(),
+            ..NewRepository::hosted("images")
+        },
+    )
+    .await
+    .unwrap();
+    let insert = |repository_id: i64,
+                  repository: &'static str,
+                  registry: Option<&'static str>,
+                  phase: &'static str,
+                  listing: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO nexus_import (repository_id, base_url, source_repository, registry_url, \
+                     username, state, phase, scan_listing, cursor, nexus_version) \
+                 VALUES ($1, 'https://nexus.example.com', $2, $3, 'migrator', 'failed', $4, $5, \
+                     'token-1', 'Nexus/3.70.1-02 (OSS)') RETURNING id",
+            )
+            .bind(repository_id)
+            .bind(repository)
+            .bind(registry)
+            .bind(phase)
+            .bind(listing)
+            .fetch_one(&pool)
+            .await
+            .expect("insert an import")
+        }
+    };
+    let scanning = insert(nuget.id, "nuget-hosted", None, "scan", "components").await;
+    let copying = insert(
+        images.id,
+        "docker-hosted",
+        Some("https://nexus.example.com:8082"),
+        "copy",
+        "assets",
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO nexus_import_item (import_id, kind, name, version, source) \
+         VALUES ($1, 'component', 'app', '1.0', '{\"assets\": []}')",
+    )
+    .bind(copying)
+    .execute(&pool)
+    .await
+    .expect("insert an item");
+    // The password, sealed as before the rename.
+    let envelope = EnvelopeService::new(
+        Arc::new(PgKeyStore::new(pool.clone())),
+        Arc::new(StaticRootProvider::new(
+            "env",
+            Algorithm::Aes256Gcm,
+            KeyBytes::generate(),
+            vec![],
+        )),
+        EnvelopeServiceConfig::default(),
+    );
+    let destination = secret_dao::import_destination(
+        "https://nexus.example.com",
+        Some("https://nexus.example.com:8082"),
+    );
+    let sealed = envelope
+        .seal(
+            &PlaintextSecret::from("nexus-secret".to_string()),
+            AeadBinding {
+                table: "nexus_import",
+                column: "password_enc",
+                row_pk: copying,
+                destination: Some(&destination),
+            },
+        )
+        .await
+        .expect("seal");
+    sqlx::query("UPDATE nexus_import SET password_enc = $2 WHERE id = $1")
+        .bind(copying)
+        .bind(&sealed)
+        .execute(&pool)
+        .await
+        .expect("store the password");
+
+    forge_db::migrate(&pool).await.expect("migrate the rest");
+
+    let scanned = import_dao::get(&pool, scanning).await.unwrap().unwrap();
+    assert_eq!(scanned.url, "https://nexus.example.com");
+    assert_eq!(scanned.source_repository.as_deref(), Some("nuget-hosted"));
+    assert_eq!(
+        scanned.source_server.as_deref(),
+        Some("Nexus/3.70.1-02 (OSS)")
+    );
+    assert_eq!(
+        (scanned.scan_listing.as_str(), scanned.cursor.as_deref()),
+        ("search", None),
+        "the scan starts over"
+    );
+    assert_eq!((scanned.names, scanned.source_total), (None, None));
+    let copied = import_dao::get(&pool, copying).await.unwrap().unwrap();
+    assert_eq!(copied.scan_listing, "catalog");
+    assert_eq!(copied.phase, "copy");
+    assert_eq!(
+        copied.registry_url.as_deref(),
+        Some("https://nexus.example.com:8082")
+    );
+    let items = import_dao::list_items(&pool, copying, None, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].source, serde_json::json!({"assets": []}));
+    let password = secret_dao::get_import_password(&pool, &envelope, copying)
+        .await
+        .expect("the password opens")
+        .expect("a password");
+    assert_eq!(password.expose_secret(), "nexus-secret");
+
+    // One active import per repository, as before.
+    let queued = || NewImport {
+        repository_id: nuget.id,
+        url: "https://feed.example.com/v3/index.json",
+        names: None,
+        username: None,
+        on_conflict: "skip",
+        concurrency: 4,
+        dry_run: false,
+        scan_listing: "search",
+        source_server: None,
+        source_total: Some(3),
+        created_by: None,
+    };
+    import_dao::insert(&pool, queued())
+        .await
+        .expect("a queued import");
+    assert!(import_dao::insert(&pool, queued()).await.is_err());
+    let leftovers: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM pg_constraint WHERE conname LIKE 'nexus%') \
+              + (SELECT count(*) FROM pg_class WHERE relname LIKE 'nexus%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        leftovers, 0,
+        "no constraint, index or sequence keeps the old name"
+    );
 }
 
 /// A Postgres server for one test: a throwaway Postgres 18 container matching

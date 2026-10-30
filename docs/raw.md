@@ -368,7 +368,7 @@ the other curl checks of this page.
   upstream's own directory listings are not read.
 - **Ranges.** One range per request; a multi-range request is answered in
   full.
-- **No Nexus import.** Importing a Nexus raw repository is not supported yet
-  ([nexus-import.md](nexus-import.md) covers NuGet and Docker).
+- **No import.** Importing a raw repository from another server is not
+  supported yet ([import.md](import.md) covers NuGet and Docker).
 - **No directory delete through the repository URL.** A directory is deleted through the
   admin API or the web UI (administrators).

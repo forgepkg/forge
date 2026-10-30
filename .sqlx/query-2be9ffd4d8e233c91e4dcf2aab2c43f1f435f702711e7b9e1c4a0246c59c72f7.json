@@ -1,0 +1,49 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT state,\n               count(*) AS \"items!\",\n               coalesce(sum(size), 0)::bigint AS \"size!\",\n               coalesce(sum(bytes_copied), 0)::bigint AS \"bytes_copied!\"\n        FROM repository_import_item\n        WHERE import_id = $1\n        GROUP BY state\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import_item",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "items!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "size!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "bytes_copied!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "2be9ffd4d8e233c91e4dcf2aab2c43f1f435f702711e7b9e1c4a0246c59c72f7"
+}
