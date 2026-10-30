@@ -405,9 +405,10 @@ password, at least 12 characters, and then sign in.
   [access and sign-in settings](#access-and-sign-in-settings)).
 - **Until the user has chosen the password**, the account signs in by no
   path: the login and HTTP Basic refuse every password, nothing is forwarded
-  to a credential-forwarding realm, and an OIDC login does not link to it by
-  name. **Admin → Users** shows it as *invited*, or *invitation expired* once
-  its link no longer works.
+  to a credential-forwarding realm (while the `local` realm comes before it,
+  see [Service accounts](#service-accounts)), and an OIDC login does not
+  link to it by name. **Admin → Users** shows it as *invited*, or
+  *invitation expired* once its link no longer works.
 - **The user's page** offers **Resend invitation** (a new email, to another
   address if needed), **Copy invitation link** (a new link shown once, for an
   install without email or a mailbox that does not receive it) and **Revoke
@@ -468,9 +469,18 @@ network that nobody signs in to.
   access level of reader or writer.
 - **It never has** a password, an invitation or an email address, and
   nobody signs in to it: the login screen, a password over HTTP Basic,
-  credential forwarding (its name is never forwarded upstream) and OIDC
-  (no identity is linked to it by name) all refuse it. **Sign out
-  everywhere**, invitations and the switch to a local account do not apply.
+  credential forwarding and OIDC (no identity is linked to it by name) all
+  refuse it. **Sign out everywhere**, invitations and the switch to a local
+  account do not apply.
+- **Its name is not forwarded upstream while the `local` realm comes
+  first.** The realms are asked in the order **Admin → Authentication**
+  lists them, and `local` ends a password attempt as a service account
+  before any later realm sees it. A new realm is added after `local`, but
+  with a credential-forwarding realm moved ahead of it, or `local` disabled,
+  a login or Basic attempt as `ci@example.com` sends `ci` and the typed
+  password to that realm's upstream. The attempt is still refused, since
+  only the realm's own accounts sign in through it; the same holds for
+  local and invited accounts.
 - **It never holds the built-in `admin` role.** For admin automation, issue
   an administrator a token with the `admin` scope instead.
 - **It authenticates** with the API tokens an administrator issues on its
