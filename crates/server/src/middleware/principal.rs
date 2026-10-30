@@ -342,7 +342,6 @@ pub async fn attach_principal(
             ..
         }
     );
-    crate::traffic::note_principal(&resolved.principal);
     req.extensions_mut().insert(resolved.principal);
     let mut resp = next.run(req).await;
     if named_by_headers {

@@ -25,10 +25,10 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  *                                                web login: `npm login`)
  *       /manage         -> AdminLayout.tsx      (beforeLoad: require is_admin;
  *                                                /manage/traffic: every instance's
- *                                                traffic, /traffic/client: one
- *                                                client's, with its request log,
- *                                                /traffic/settings: what is
- *                                                recorded and kept)
+ *                                                requests by day, repository and
+ *                                                client; /traffic/settings: what
+ *                                                is recorded and kept, and the
+ *                                                geolocation databases)
  *
  * The admin screens live under `/manage/*`, NOT `/admin/*`: `/admin/*` is the
  * admin REST API, which the server routes before the SPA fallback, so a UI
@@ -78,7 +78,6 @@ export const routes = rootRoute('root.tsx', [
       route('/settings/email', 'admin/settings/Email.tsx'),
       route('/settings/retention', 'admin/settings/RetentionSettings.tsx'),
       route('/traffic', 'admin/traffic/Traffic.tsx'),
-      route('/traffic/client', 'admin/traffic/Client.tsx'),
       route('/traffic/settings', 'admin/traffic/Settings.tsx'),
       route('/system', 'admin/system/System.tsx'),
     ]),

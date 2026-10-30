@@ -266,7 +266,6 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    crate::traffic::note_principal(&principal);
     let Some((repo_name, rest)) = split_path(uri.path()) else {
         return (StatusCode::NOT_FOUND, "repository not found").into_response();
     };

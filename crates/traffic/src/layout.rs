@@ -1,194 +1,84 @@
 //! Where the files are, what writes them and what deletes them.
 //!
-//! Every key is under `traffic/v1/` in Forge's bucket, by area, then date
-//! and hour (UTC), then the writing instance ([`instance_id`]):
+//! Every key is under `traffic/v1/` in Forge's bucket:
 //!
-//! * `minutes/{date}/{hour}/{instance}.buckets.parquet` and
-//!   `….clients.parquet`: one instance's counts and top clients of an hour,
-//!   by minute; rewritten every minute while the hour lasts. Kept
-//!   [`MINUTE_RETENTION_DAYS`] (the clients no longer than the clients'
-//!   retention).
-//! * `hours/{date}/{instance}.buckets.parquet` and `….clients.parquet`:
-//!   the same of a day, by hour; rewritten every minute while the day lasts.
-//!   Kept as long as the settings say ([`TrafficSettings`]).
-//! * `requests/{date}/{hour}/{instance}.{unix ms}.parquet`: the request
-//!   log's rows of one flush.
+//! * `days/{date}/{instance}.parquet`: one instance's requests of a day
+//!   (UTC), a row per repository and client network with their country and
+//!   autonomous system; rewritten every minute while the day lasts. Kept as
+//!   long as the settings say ([`TrafficSettings::retention_days`]).
+//! * `geoip/{country,asn}.mmdb`: the geolocation databases
+//!   ([`crate::geo`]).
 //!
-//! Each instance writes only files named after itself, so two instances
-//! never write the same object and a restarted process (a new name) never
-//! overwrites what its predecessor wrote.
+//! Each instance writes only files named after itself ([`instance_id`]), so
+//! two instances never write the same object and a restarted process (a new
+//! name) never overwrites what its predecessor wrote.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use futures_util::{stream, StreamExt};
 
+use crate::geo::{Geo, Location};
 use crate::objects::Objects;
-use crate::record::Drained;
-use crate::rows::{encode, BucketKey, BucketRow, ClientRow, Counts};
-use crate::top::{ClientCounts, TopClients};
+use crate::record::{Drained, OTHER};
+use crate::rows::{encode, DayRow};
 use crate::TrafficSettings;
 
-/// The prefix of every key.
-pub const ROOT: &str = "traffic/v1/";
-/// How long the counts by minute are kept: long enough for the views of the
-/// last 48 hours.
-pub const MINUTE_RETENTION_DAYS: u32 = 3;
-/// The top clients a file keeps per time bucket.
-pub const TOP_PER_BUCKET: usize = 100;
-/// The networks an hour of a day file keeps track of before its top list
-/// is cut to [`TOP_PER_BUCKET`].
-const HOUR_CLIENTS: usize = 4_096;
+/// The prefix of the day files.
+pub const DAYS: &str = "traffic/v1/days/";
+/// The rows a day file holds before new client networks are counted as
+/// [`OTHER`]: a bound on the memory and the file whatever the number of
+/// addresses.
+const MAX_DAY_ROWS: usize = 500_000;
 /// Deletes and reads in flight at once.
 pub(crate) const CONCURRENCY: usize = 16;
 
-const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
 
-/// The three areas of files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Area {
-    /// By minute, a file per instance and hour.
-    Minutes,
-    /// By hour, a file per instance and day.
-    Hours,
-    /// The request log.
-    Requests,
-}
-
-impl Area {
-    /// The prefix of the area's keys.
-    pub fn prefix(self) -> &'static str {
-        match self {
-            Area::Minutes => "traffic/v1/minutes/",
-            Area::Hours => "traffic/v1/hours/",
-            Area::Requests => "traffic/v1/requests/",
-        }
-    }
-
-    /// How long one of its files covers, in seconds.
-    pub fn span(self) -> i64 {
-        match self {
-            Area::Minutes | Area::Requests => HOUR,
-            Area::Hours => DAY,
-        }
-    }
-
-    /// The prefix of its files of the day starting at `day` (Unix seconds).
-    pub fn day_prefix(self, day: i64) -> String {
-        format!("{}{}/", self.prefix(), date(day))
-    }
-}
-
-/// What a file holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileKind {
-    Buckets,
-    Clients,
-    Requests,
-}
-
-/// A file, as its key names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileKey {
-    pub area: Area,
-    pub kind: FileKind,
-    /// The start of the time it covers ([`Area::span`]), Unix seconds.
-    pub start: i64,
-    /// The instance that wrote it ([`instance_id`]).
-    pub instance: String,
-}
-
-fn date(start: i64) -> String {
-    Utc.timestamp_opt(start, 0)
+/// The UTC date of `day` (Unix seconds), as the keys write it.
+pub(crate) fn date(day: i64) -> String {
+    Utc.timestamp_opt(day, 0)
         .single()
         .map(|t| t.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
 }
 
-fn hour_of_day(start: i64) -> String {
-    format!("{:02}", start.rem_euclid(DAY) / HOUR)
-}
-
-fn kind_suffix(kind: FileKind) -> &'static str {
-    match kind {
-        FileKind::Buckets => "buckets",
-        FileKind::Clients => "clients",
-        FileKind::Requests => "requests",
-    }
-}
-
-/// The key of the counts file (`kind` buckets or clients) of `instance`
-/// covering the hour (minutes area) or day (hours area) starting at
-/// `start`.
-pub fn counts_key(area: Area, start: i64, instance: &str, kind: FileKind) -> String {
-    let suffix = kind_suffix(kind);
-    match area {
-        Area::Minutes => format!(
-            "{}{}/{}/{instance}.{suffix}.parquet",
-            area.prefix(),
-            date(start),
-            hour_of_day(start)
-        ),
-        Area::Hours | Area::Requests => {
-            format!(
-                "{}{}/{instance}.{suffix}.parquet",
-                area.prefix(),
-                date(start)
-            )
-        }
-    }
-}
-
-/// The key of the request log file `instance` flushes at `at`.
-pub fn log_key(at: DateTime<Utc>, instance: &str) -> String {
-    let start = at.timestamp();
-    format!(
-        "{}{}/{}/{instance}.{}.parquet",
-        Area::Requests.prefix(),
-        date(start),
-        hour_of_day(start),
-        at.timestamp_millis()
+/// The start of the day `date` (`YYYY-MM-DD`) names, in Unix seconds.
+pub(crate) fn day_of(date: &str) -> Option<i64> {
+    Some(
+        NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc()
+            .timestamp(),
     )
 }
 
-/// What `key`, a key of `area`, names; `None` for a key Forge did not
-/// write.
-pub fn parse_key(area: Area, key: &str) -> Option<FileKey> {
-    let rest = key.strip_prefix(area.prefix())?;
-    let mut parts = rest.split('/');
-    let day = NaiveDate::parse_from_str(parts.next()?, "%Y-%m-%d").ok()?;
-    let mut start = day.and_hms_opt(0, 0, 0)?.and_utc().timestamp();
-    if area != Area::Hours {
-        let hour: i64 = parts.next()?.parse().ok()?;
-        if !(0..24).contains(&hour) {
-            return None;
-        }
-        start += hour * HOUR;
-    }
-    let name = parts.next()?.strip_suffix(".parquet")?;
-    if parts.next().is_some() {
+/// The prefix of the files of `day`.
+pub fn day_prefix(day: i64) -> String {
+    format!("{DAYS}{}/", date(day))
+}
+
+/// The key of `instance`'s file of `day`.
+pub fn day_key(day: i64, instance: &str) -> String {
+    format!("{}{instance}.parquet", day_prefix(day))
+}
+
+/// The day and the instance `key`, a day file's key, names; `None` for a
+/// key Forge did not write.
+pub fn parse_day_key(key: &str) -> Option<(i64, String)> {
+    let (date, name) = key.strip_prefix(DAYS)?.split_once('/')?;
+    let instance = name.strip_suffix(".parquet")?;
+    if instance.is_empty() || instance.contains('/') {
         return None;
     }
-    let (instance, suffix) = name.split_once('.')?;
-    let kind = match (area, suffix) {
-        (Area::Requests, millis) if millis.parse::<i64>().is_ok() => FileKind::Requests,
-        (Area::Minutes | Area::Hours, "buckets") => FileKind::Buckets,
-        (Area::Minutes | Area::Hours, "clients") => FileKind::Clients,
-        _ => return None,
-    };
-    Some(FileKey {
-        area,
-        kind,
-        start,
-        instance: instance.to_string(),
-    })
+    Some((day_of(date)?, instance.to_string()))
 }
 
 /// This process's name in the files: its host name (`-` for anything a
 /// host name does not hold), when it started and a random suffix, so that
-/// two processes never share one. No `.` or `_` but the separators.
+/// two processes never share one. No `.`, `_` or `/` but the separators.
 pub fn instance_id(host: Option<&str>, started_at: DateTime<Utc>) -> String {
     let host: String = host
         .unwrap_or("forge")
@@ -226,51 +116,35 @@ pub fn instance_parts(id: &str) -> (String, Option<DateTime<Utc>>) {
     (host, started)
 }
 
-/// One instance's counts of an hour (by minute) or a day (by hour), as
-/// written to its files.
+/// What a day's row is counted under. With client addresses, the network
+/// (its country and autonomous system are looked up when the file is
+/// written); without, the country and autonomous system, looked up before
+/// the address is dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct RowKey {
+    repository: String,
+    network: String,
+    country: String,
+    asn: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RowCounts {
+    requests: u64,
+    bytes: u64,
+    /// The last address seen; `""` without addresses.
+    address: String,
+    /// The autonomous system's organisation, for a row without a network.
+    as_org: String,
+}
+
+/// One instance's counts of a day.
 #[derive(Debug, Default)]
-struct Period {
-    buckets: BTreeMap<(i64, BucketKey), Counts>,
-    clients: BTreeMap<i64, TopClients>,
+struct Day {
+    rows: BTreeMap<RowKey, RowCounts>,
+    /// Where each network is, looked up once a day (again while unknown).
+    located: HashMap<String, Location>,
     dirty: bool,
-}
-
-impl Period {
-    fn bucket_rows(&self) -> Vec<BucketRow> {
-        self.buckets
-            .iter()
-            .map(|((start, key), counts)| BucketRow::new(*start, key, counts))
-            .collect()
-    }
-
-    fn client_rows(&self) -> Vec<ClientRow> {
-        let mut rows = Vec::new();
-        for (start, top) in &self.clients {
-            for (network, c) in top.top(TOP_PER_BUCKET) {
-                rows.push(client_row(*start, network, c));
-            }
-        }
-        rows
-    }
-}
-
-fn client_row(start: i64, network: &str, c: &ClientCounts) -> ClientRow {
-    let signed = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
-    ClientRow {
-        start,
-        network: network.to_string(),
-        address: c.address.clone(),
-        requests: signed(c.requests),
-        bytes: signed(c.bytes),
-        client_errors: signed(c.client_errors),
-        denied: signed(c.denied),
-        not_found: signed(c.not_found),
-        throttled: signed(c.throttled),
-        server_errors: signed(c.server_errors),
-        user_agent: c.user_agent.clone(),
-        account: c.account.clone(),
-        user_id: c.user_id.unwrap_or(0),
-    }
 }
 
 /// What a flush did.
@@ -278,19 +152,19 @@ fn client_row(start: i64, network: &str, c: &ClientCounts) -> ClientRow {
 pub struct FlushReport {
     /// Files written.
     pub files: usize,
-    /// Request log rows written.
-    pub log_rows: usize,
-    /// Writes that failed (retried with the next flush, but for the log).
+    /// Files that could not be written (written with the next flush).
     pub failures: usize,
 }
 
-/// Writes one instance's files: the counts of the hours and days not over
-/// yet, and the request log.
+/// Writes one instance's day files.
 pub struct Flusher {
     objects: Arc<dyn Objects>,
     instance: Arc<str>,
-    hours: BTreeMap<i64, Period>,
-    days: BTreeMap<i64, Period>,
+    days: BTreeMap<i64, Day>,
+}
+
+fn signed(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
 impl Flusher {
@@ -299,216 +173,161 @@ impl Flusher {
         Flusher {
             objects,
             instance,
-            hours: BTreeMap::new(),
             days: BTreeMap::new(),
         }
     }
 
-    /// Add `drained` to the hours and days it falls in and write the files
-    /// that changed, and the request log rows. A file that cannot be written
-    /// is written with the next flush; log rows that cannot be are dropped.
+    /// Add `drained` to its days, locating the client networks with `geo`,
+    /// and write the files of the days that changed. A file that cannot be
+    /// written is written with the next flush.
     pub async fn flush(
         &mut self,
         drained: Drained,
         settings: &TrafficSettings,
+        geo: &Geo,
         now: DateTime<Utc>,
     ) -> FlushReport {
-        let mut report = FlushReport::default();
-        for minute in drained.minutes {
-            let hour = minute.start - minute.start.rem_euclid(HOUR);
-            let day = minute.start - minute.start.rem_euclid(DAY);
-            let in_hour = self.hours.entry(hour).or_default();
-            let in_day = self.days.entry(day).or_default();
-            for (key, counts) in &minute.buckets {
-                in_hour
-                    .buckets
-                    .entry((minute.start, key.clone()))
-                    .or_default()
-                    .add(counts);
-                in_day
-                    .buckets
-                    .entry((hour, key.clone()))
-                    .or_default()
-                    .add(counts);
-            }
-            if settings.client_addresses && !minute.clients.is_empty() {
-                let top = in_hour
-                    .clients
-                    .entry(minute.start)
-                    .or_insert_with(|| TopClients::new(TOP_PER_BUCKET));
-                top.merge(&minute.clients);
-                top.truncate(TOP_PER_BUCKET);
-                in_day
-                    .clients
-                    .entry(hour)
-                    .or_insert_with(|| TopClients::new(HOUR_CLIENTS))
-                    .merge(&minute.clients);
-            }
-            in_hour.dirty = true;
-            in_day.dirty = true;
-        }
-        if !settings.client_addresses {
-            for period in self.hours.values_mut().chain(self.days.values_mut()) {
-                period.clients.clear();
-            }
-        }
-
-        let instance = self.instance.clone();
-        for (area, periods) in [
-            (Area::Minutes, &mut self.hours),
-            (Area::Hours, &mut self.days),
-        ] {
-            for (start, period) in periods.iter_mut().filter(|(_, p)| p.dirty) {
-                let mut ok = true;
-                let mut files = vec![(FileKind::Buckets, encode(&period.bucket_rows()))];
-                if settings.client_addresses {
-                    files.push((FileKind::Clients, encode(&period.client_rows())));
-                }
-                for (kind, body) in files {
-                    let key = counts_key(area, *start, &instance, kind);
-                    match body {
-                        Ok(body) => match self.objects.put(&key, body).await {
-                            Ok(()) => report.files += 1,
-                            Err(e) => {
-                                tracing::warn!(error = %e, key, "cannot write the traffic statistics");
-                                ok = false;
-                            }
-                        },
-                        Err(e) => {
-                            tracing::error!(error = %e, key, "cannot encode the traffic statistics");
-                            ok = false;
-                        }
-                    }
-                }
-                if ok {
-                    period.dirty = false;
-                } else {
-                    report.failures += 1;
-                }
-            }
-        }
-
-        if drained.log_dropped > 0 {
+        if drained.overflowed > 0 {
             tracing::warn!(
-                dropped = drained.log_dropped,
-                "the request log dropped rows: more requests than it holds between two flushes"
+                requests = drained.overflowed,
+                "more client networks than the traffic statistics hold between two flushes; \
+                 counted as `other`"
             );
         }
-        if !drained.log.is_empty() {
-            let key = log_key(now, &instance);
-            let written = match encode(&drained.log) {
+        for (key, counts) in drained.counts {
+            let day = self.days.entry(key.day).or_default();
+            day.dirty = true;
+            let address = counts.address.map(|a| a.to_string()).unwrap_or_default();
+            let mut row = if !settings.client_addresses || key.network.is_empty() {
+                // No network to keep: locate the address now, then drop it.
+                let at = counts.address.map(|a| geo.locate(a)).unwrap_or_default();
+                (
+                    RowKey {
+                        repository: key.repository,
+                        network: String::new(),
+                        country: at.country,
+                        asn: at.asn,
+                    },
+                    String::new(),
+                    at.as_org,
+                )
+            } else {
+                (
+                    RowKey {
+                        repository: key.repository,
+                        network: key.network,
+                        country: String::new(),
+                        asn: 0,
+                    },
+                    address,
+                    String::new(),
+                )
+            };
+            if day.rows.len() >= MAX_DAY_ROWS && !day.rows.contains_key(&row.0) {
+                row.0.network = OTHER.to_string();
+                row.1.clear();
+            }
+            let (row_key, address, as_org) = row;
+            let entry = day.rows.entry(row_key).or_default();
+            entry.requests += counts.requests;
+            entry.bytes += counts.bytes;
+            if !address.is_empty() {
+                entry.address = address;
+            }
+            if !as_org.is_empty() {
+                entry.as_org = as_org;
+            }
+        }
+
+        let mut report = FlushReport::default();
+        for (start, day) in self.days.iter_mut().filter(|(_, d)| d.dirty) {
+            let rows = day_rows(*start, day, geo);
+            let key = day_key(*start, &self.instance);
+            let written = match encode(&rows) {
                 Ok(body) => self.objects.put(&key, body).await,
                 Err(e) => Err(e),
             };
             match written {
                 Ok(()) => {
+                    day.dirty = false;
                     report.files += 1;
-                    report.log_rows = drained.log.len();
                 }
                 Err(e) => {
                     report.failures += 1;
-                    tracing::warn!(
-                        error = %e,
-                        key,
-                        rows = drained.log.len(),
-                        "cannot write the request log; its rows are lost"
-                    );
+                    tracing::warn!(error = %e, key, "cannot write the traffic statistics");
                 }
             }
         }
-
-        self.forget(now);
+        // Keep today and yesterday (a request that ended after midnight
+        // counts in its own day), and any day not written yet but for a
+        // week at most.
+        let today = now.timestamp().div_euclid(DAY) * DAY;
+        self.days
+            .retain(|start, day| *start >= today - DAY || (day.dirty && *start >= today - 7 * DAY));
         report
     }
+}
 
-    /// Drop the periods that are over and written, and the ones that could
-    /// not be written for too long; cut the top lists of the hours that are
-    /// over.
-    fn forget(&mut self, now: DateTime<Utc>) {
-        let now = now.timestamp();
-        let this_hour = now - now.rem_euclid(HOUR);
-        let today = now - now.rem_euclid(DAY);
-        self.hours.retain(|start, period| {
-            *start >= this_hour || (period.dirty && *start >= this_hour - 3 * HOUR)
-        });
-        self.days
-            .retain(|start, period| *start >= today || (period.dirty && *start >= today - DAY));
-        for day in self.days.values_mut() {
-            for (hour, top) in day.clients.iter_mut() {
-                if *hour < this_hour {
-                    top.truncate(TOP_PER_BUCKET);
-                }
+/// The rows of `day`, its networks located with `geo`.
+fn day_rows(start: i64, day: &mut Day, geo: &Geo) -> Vec<DayRow> {
+    let mut rows = Vec::with_capacity(day.rows.len());
+    for (key, counts) in &day.rows {
+        let at = if key.network.is_empty() || key.network == OTHER || counts.address.is_empty() {
+            Location {
+                country: key.country.clone(),
+                asn: key.asn,
+                as_org: counts.as_org.clone(),
             }
-        }
+        } else {
+            let known = day.located.get(&key.network);
+            if known.is_some_and(|l| !l.country.is_empty() || l.asn != 0) {
+                known.cloned().unwrap_or_default()
+            } else {
+                let at = counts
+                    .address
+                    .parse()
+                    .map(|ip| geo.locate(ip))
+                    .unwrap_or_default();
+                day.located.insert(key.network.clone(), at.clone());
+                at
+            }
+        };
+        rows.push(DayRow {
+            day: start,
+            repository: key.repository.clone(),
+            network: key.network.clone(),
+            address: counts.address.clone(),
+            country: at.country,
+            asn: i64::from(at.asn),
+            as_org: at.as_org,
+            requests: signed(counts.requests),
+            bytes: signed(counts.bytes),
+        });
     }
+    rows
 }
 
-/// How long the files of `area` holding `kind` are kept, in seconds;
-/// `None` to keep them.
-pub fn retention(settings: &TrafficSettings, area: Area, kind: FileKind) -> Option<i64> {
-    let days = |d: u32| i64::from(d) * DAY;
-    match (area, kind) {
-        (Area::Minutes, FileKind::Clients) => Some(days(
-            MINUTE_RETENTION_DAYS.min(settings.client_retention_days),
-        )),
-        (Area::Minutes, _) => Some(days(MINUTE_RETENTION_DAYS)),
-        (Area::Hours, FileKind::Clients) => Some(days(settings.client_retention_days)),
-        (Area::Hours, _) => match settings.statistics_retention_days {
-            0 => None,
-            d => Some(days(d)),
-        },
-        (Area::Requests, _) => Some(days(settings.request_log_retention_days)),
-    }
-}
-
-/// Delete the files past their retention ([`retention`]), whoever wrote
-/// them. Idempotent and safe on every instance at once. Returns how many
-/// files it deleted.
+/// Delete the day files past `settings`' retention, whoever wrote them.
+/// Idempotent and safe on every instance at once. Returns how many files it
+/// deleted.
 pub async fn prune(
     objects: &dyn Objects,
     settings: &TrafficSettings,
     now: DateTime<Utc>,
 ) -> anyhow::Result<usize> {
-    let now = now.timestamp();
+    let today = now.timestamp().div_euclid(DAY) * DAY;
+    let oldest_kept = today - i64::from(settings.retention_days.max(1) - 1) * DAY;
     let mut expired = Vec::new();
-    for area in [Area::Minutes, Area::Hours, Area::Requests] {
-        let kinds: &[FileKind] = match area {
-            Area::Requests => &[FileKind::Requests],
-            _ => &[FileKind::Buckets, FileKind::Clients],
-        };
-        // A day can hold expired files once the shortest retention of the
-        // area has passed since it ended.
-        let Some(shortest) = kinds
-            .iter()
-            .filter_map(|kind| retention(settings, area, *kind))
-            .min()
+    for dir in objects.list_dirs(DAYS).await? {
+        let Some(day) = dir
+            .strip_prefix(DAYS)
+            .and_then(|d| d.strip_suffix('/'))
+            .and_then(day_of)
         else {
             continue;
         };
-        for dir in objects.list_dirs(area.prefix()).await? {
-            let Some(day) = dir
-                .strip_prefix(area.prefix())
-                .and_then(|d| d.strip_suffix('/'))
-                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-                .and_then(|d| d.and_hms_opt(0, 0, 0))
-                .map(|d| d.and_utc().timestamp())
-            else {
-                continue;
-            };
-            if day + area.span() + shortest > now {
-                // Even its earliest file is within the shortest retention.
-                continue;
-            }
-            for listed in objects.list(&dir).await? {
-                let Some(file) = parse_key(area, &listed.key) else {
-                    continue;
-                };
-                if retention(settings, area, file.kind)
-                    .is_some_and(|keep| file.start + area.span() + keep <= now)
-                {
-                    expired.push(listed.key);
-                }
-            }
+        if day < oldest_kept {
+            expired.extend(objects.list(&dir).await?.into_iter().map(|o| o.key));
         }
     }
     let deleted = expired.len();
@@ -527,11 +346,12 @@ pub async fn prune(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo::GeoKind;
     use crate::objects::MemoryObjects;
     use crate::record::{Event, Recorder};
     use crate::rows::decode;
     use crate::slot::Noted;
-    use std::time::Duration;
+    use crate::testing::{asn_db, country_db};
 
     fn t(rfc3339: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc3339).unwrap().to_utc()
@@ -539,36 +359,17 @@ mod tests {
 
     #[test]
     fn keys_name_what_they_hold() {
-        let start = t("2026-10-30T14:00:00Z").timestamp();
-        let key = counts_key(Area::Minutes, start, "web-1_x_0001", FileKind::Clients);
-        assert_eq!(
-            key,
-            "traffic/v1/minutes/2026-10-30/14/web-1_x_0001.clients.parquet"
-        );
-        let parsed = parse_key(Area::Minutes, &key).unwrap();
-        assert_eq!(
-            (parsed.start, parsed.kind, parsed.instance.as_str()),
-            (start, FileKind::Clients, "web-1_x_0001")
-        );
-
         let day = t("2026-10-30T00:00:00Z").timestamp();
-        let key = counts_key(Area::Hours, day, "web-1", FileKind::Buckets);
-        assert_eq!(key, "traffic/v1/hours/2026-10-30/web-1.buckets.parquet");
-        assert_eq!(parse_key(Area::Hours, &key).unwrap().start, day);
+        let key = day_key(day, "web-1_x_0001");
+        assert_eq!(key, "traffic/v1/days/2026-10-30/web-1_x_0001.parquet");
+        assert_eq!(parse_key_ok(&key), (day, "web-1_x_0001".to_string()));
+        assert!(parse_day_key("traffic/v1/days/2026-13-30/a.parquet").is_none());
+        assert!(parse_day_key("traffic/v1/days/2026-10-30/a.csv").is_none());
+        assert!(parse_day_key("traffic/v1/geoip/country.mmdb").is_none());
+    }
 
-        let key = log_key(t("2026-10-30T14:05:01.250Z"), "web-1");
-        assert_eq!(
-            key,
-            "traffic/v1/requests/2026-10-30/14/web-1.1793369101250.parquet"
-        );
-        assert_eq!(parse_key(Area::Requests, &key).unwrap().start, start);
-
-        assert!(parse_key(
-            Area::Minutes,
-            "traffic/v1/minutes/2026-10-30/24/a.buckets.parquet"
-        )
-        .is_none());
-        assert!(parse_key(Area::Hours, "traffic/v1/hours/2026-10-30/a.other.parquet").is_none());
+    fn parse_key_ok(key: &str) -> (i64, String) {
+        parse_day_key(key).unwrap()
     }
 
     #[test]
@@ -583,110 +384,154 @@ mod tests {
         assert!(instance_id(None, started).starts_with("forge_"));
     }
 
-    fn event(at: DateTime<Utc>, network: &str) -> Event {
+    fn event(at: &str, client: &str, repository: Option<&str>) -> Event {
         Event {
-            at,
-            surface: "oci",
-            method: "GET",
-            status: 200,
-            duration: Duration::from_millis(3),
+            at: t(at),
             bytes: 10,
-            path: "/v2/".into(),
-            user_agent: None,
             noted: Noted {
-                client: network.parse().ok(),
-                network: Some(network.into()),
-                account: None,
-                repository: Some("docker".into()),
+                client: client.parse().ok(),
+                network: Some(client.into()),
+                repository: repository.map(str::to_string),
             },
         }
     }
 
-    #[tokio::test]
-    async fn a_flush_writes_the_hour_the_day_and_the_log() {
-        let objects = Arc::new(MemoryObjects::default());
-        let mut flusher = Flusher::new(objects.clone(), "a".into());
-        let settings = TrafficSettings::default();
-        let recorder = Recorder::new();
-        recorder.record(event(t("2026-10-30T14:00:10Z"), "192.0.2.1"));
-        recorder.record(event(t("2026-10-30T14:00:20Z"), "192.0.2.1"));
-        recorder.record(event(t("2026-10-30T14:01:20Z"), "192.0.2.2"));
-        let now = t("2026-10-30T14:02:00Z");
-        let report = flusher.flush(recorder.drain(now), &settings, now).await;
-        assert_eq!(
-            report,
-            FlushReport {
-                files: 5,
-                log_rows: 3,
-                failures: 0
-            }
-        );
-        let keys = objects.keys();
-        assert!(keys.contains(&"traffic/v1/hours/2026-10-30/a.buckets.parquet".to_string()));
-
-        let rows: Vec<BucketRow> = decode(
-            objects
-                .get("traffic/v1/minutes/2026-10-30/14/a.buckets.parquet")
-                .await
-                .unwrap()
-                .unwrap(),
+    fn geo() -> Geo {
+        let geo = Geo::default();
+        geo.load(
+            GeoKind::Country,
+            country_db(&[("192.0.2.0/24", "DE")]),
+            "1".into(),
         )
         .unwrap();
-        assert_eq!(rows.len(), 2, "one row per minute and key");
-        assert_eq!(rows[0].requests, 2);
-
-        // The next hour: the previous hour's files are not rewritten.
-        recorder.record(event(t("2026-10-30T15:00:05Z"), "192.0.2.1"));
-        let now = t("2026-10-30T15:01:00Z");
-        let report = flusher.flush(recorder.drain(now), &settings, now).await;
-        assert_eq!(
-            report.files, 5,
-            "the new hour's two, the day's two, the log"
-        );
-        assert_eq!(flusher.hours.len(), 1, "the hour that is over is forgotten");
-        let day: Vec<BucketRow> = decode(
-            objects
-                .get("traffic/v1/hours/2026-10-30/a.buckets.parquet")
-                .await
-                .unwrap()
-                .unwrap(),
+        geo.load(
+            GeoKind::Asn,
+            asn_db(&[("192.0.2.0/24", 64_500, "Example AS")]),
+            "1".into(),
         )
         .unwrap();
-        assert_eq!(day.len(), 2, "one row per hour");
-        assert_eq!(day.iter().map(|r| r.requests).sum::<i64>(), 4);
+        geo
+    }
+
+    async fn rows(objects: &MemoryObjects, key: &str) -> Vec<DayRow> {
+        decode(objects.get(key).await.unwrap().unwrap()).unwrap()
     }
 
     #[tokio::test]
-    async fn pruning_deletes_by_area_and_kind() {
+    async fn a_flush_writes_the_day_with_countries_and_networks() {
+        let objects = Arc::new(MemoryObjects::default());
+        let mut flusher = Flusher::new(objects.clone(), "a".into());
+        let settings = TrafficSettings::default();
+        let geo = geo();
+        let recorder = Recorder::new();
+        recorder.record(event("2026-10-30T14:00:10Z", "192.0.2.1", Some("npm")));
+        recorder.record(event("2026-10-30T14:00:20Z", "192.0.2.1", Some("npm")));
+        recorder.record(event("2026-10-30T14:01:20Z", "198.51.100.2", None));
+        let now = t("2026-10-30T14:02:00Z");
+        let report = flusher.flush(recorder.drain(), &settings, &geo, now).await;
+        assert_eq!(
+            report,
+            FlushReport {
+                files: 1,
+                failures: 0
+            }
+        );
+
+        recorder.record(event("2026-10-30T14:03:00Z", "192.0.2.1", Some("npm")));
+        flusher.flush(recorder.drain(), &settings, &geo, now).await;
+        let day = rows(&objects, "traffic/v1/days/2026-10-30/a.parquet").await;
+        assert_eq!(day.len(), 2);
+        let npm = day.iter().find(|r| r.repository == "npm").unwrap();
+        assert_eq!((npm.requests, npm.bytes), (3, 30), "added up over flushes");
+        assert_eq!(
+            (
+                npm.network.as_str(),
+                npm.country.as_str(),
+                npm.asn,
+                npm.as_org.as_str()
+            ),
+            ("192.0.2.1", "DE", 64_500, "Example AS")
+        );
+        let other = day.iter().find(|r| r.repository.is_empty()).unwrap();
+        assert_eq!(
+            (other.country.as_str(), other.asn),
+            ("", 0),
+            "not in the databases"
+        );
+
+        // Nothing new: nothing written.
+        let report = flusher.flush(recorder.drain(), &settings, &geo, now).await;
+        assert_eq!(report.files, 0);
+        // The next day: the day before is still kept, the one before that is not.
+        recorder.record(event("2026-10-31T00:00:05Z", "192.0.2.1", Some("npm")));
+        flusher
+            .flush(recorder.drain(), &settings, &geo, t("2026-11-01T00:00:10Z"))
+            .await;
+        assert!(objects
+            .keys()
+            .contains(&"traffic/v1/days/2026-10-31/a.parquet".to_string()));
+        assert_eq!(flusher.days.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_addresses_rows_keep_the_country_alone() {
+        let objects = Arc::new(MemoryObjects::default());
+        let mut flusher = Flusher::new(objects.clone(), "a".into());
+        let settings = TrafficSettings {
+            client_addresses: false,
+            ..TrafficSettings::default()
+        };
+        let recorder = Recorder::new();
+        recorder.record(event("2026-10-30T14:00:10Z", "192.0.2.1", Some("npm")));
+        recorder.record(event("2026-10-30T14:00:20Z", "192.0.2.2", Some("npm")));
+        let now = t("2026-10-30T14:02:00Z");
+        flusher
+            .flush(recorder.drain(), &settings, &geo(), now)
+            .await;
+        let day = rows(&objects, "traffic/v1/days/2026-10-30/a.parquet").await;
+        assert_eq!(day.len(), 1, "both addresses in one row");
+        assert_eq!(
+            (
+                day[0].network.as_str(),
+                day[0].address.as_str(),
+                day[0].country.as_str()
+            ),
+            ("", "", "DE")
+        );
+        assert_eq!((day[0].requests, day[0].asn), (2, 64_500));
+    }
+
+    #[tokio::test]
+    async fn pruning_deletes_the_days_past_the_retention() {
         let objects = MemoryObjects::default();
         let day = |d: &str| t(&format!("{d}T00:00:00Z")).timestamp();
         for key in [
-            counts_key(Area::Minutes, day("2026-10-25"), "a", FileKind::Buckets),
-            counts_key(Area::Minutes, day("2026-10-29"), "a", FileKind::Buckets),
-            counts_key(Area::Hours, day("2025-01-01"), "a", FileKind::Buckets),
-            counts_key(Area::Hours, day("2026-09-01"), "a", FileKind::Buckets),
-            counts_key(Area::Hours, day("2026-09-01"), "a", FileKind::Clients),
-            log_key(t("2026-10-20T10:00:00Z"), "a"),
-            log_key(t("2026-10-29T10:00:00Z"), "a"),
-            "traffic/v1/hours/not-a-date/x.buckets.parquet".to_string(),
+            day_key(day("2026-07-31"), "a"),
+            day_key(day("2026-08-01"), "a"),
+            day_key(day("2026-08-01"), "b"),
+            day_key(day("2026-10-30"), "a"),
+            "traffic/v1/days/not-a-date/x.parquet".to_string(),
+            "traffic/v1/geoip/country.mmdb".to_string(),
         ] {
             objects.put(&key, vec![1]).await.unwrap();
         }
+        // 90 days up to 2026-10-29: from 2026-08-01 on.
         let deleted = prune(
             &objects,
             &TrafficSettings::default(),
-            t("2026-10-30T12:00:00Z"),
+            t("2026-10-29T12:00:00Z"),
         )
         .await
         .unwrap();
-        assert_eq!(deleted, 4);
+        assert_eq!(deleted, 1);
         assert_eq!(
             objects.keys(),
             vec![
-                "traffic/v1/hours/2026-09-01/a.buckets.parquet",
-                "traffic/v1/hours/not-a-date/x.buckets.parquet",
-                "traffic/v1/minutes/2026-10-29/00/a.buckets.parquet",
-                "traffic/v1/requests/2026-10-29/10/a.1793268000000.parquet",
+                "traffic/v1/days/2026-08-01/a.parquet",
+                "traffic/v1/days/2026-08-01/b.parquet",
+                "traffic/v1/days/2026-10-30/a.parquet",
+                "traffic/v1/days/not-a-date/x.parquet",
+                "traffic/v1/geoip/country.mmdb",
             ]
         );
     }

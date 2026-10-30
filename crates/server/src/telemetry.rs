@@ -14,8 +14,8 @@
 //!   the HTTP metrics: request duration by surface (from the route, never
 //!   the raw path), method and status, the requests in flight and the
 //!   response body sizes. It also counts the request in the traffic
-//!   statistics ([`crate::traffic`]), which the metrics' bounded attributes
-//!   leave out: the repository, the client address, the path.
+//!   statistics ([`crate::traffic`]) by day, repository and client address,
+//!   which the metrics' bounded attributes leave out.
 //! * [`install_live_source`]: what the SDK reads from the process when it
 //!   collects (the connection pool, the blob cache's counters, those of `GET
 //!   /admin/blob-cache`, the circuit breaker, the staging space, the
@@ -492,19 +492,8 @@ pub async fn track(State(recorder): State<Arc<Recorder>>, req: Request, next: Ne
     let span = request_span(&req, surface, route.as_deref());
     // Health probes are no traffic.
     let counted = (surface != Surface::Health && recorder.enabled()).then(|| Counted {
-        path: if recorder.logs_requests() {
-            recorded_path(req.uri().path()).into_owned()
-        } else {
-            String::new()
-        },
-        user_agent: req
-            .headers()
-            .get(header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string),
         slot: forge_traffic::Slot::new(),
         recorder,
-        elapsed: Duration::ZERO,
     });
     let started = Instant::now();
     let active = forge_telemetry::http::Active::start(method);
@@ -524,8 +513,7 @@ pub async fn track(State(recorder): State<Arc<Recorder>>, req: Request, next: Ne
     if status >= 500 {
         span.record("otel.status_code", "ERROR");
     }
-    let elapsed = started.elapsed();
-    forge_telemetry::http::request(surface, method, status, elapsed);
+    forge_telemetry::http::request(surface, method, status, started.elapsed());
     response.map(|inner| {
         Body::new(CountingBody {
             inner,
@@ -533,7 +521,7 @@ pub async fn track(State(recorder): State<Arc<Recorder>>, req: Request, next: Ne
             method,
             status,
             bytes: 0,
-            counted: counted.map(|c| Counted { elapsed, ..c }),
+            counted,
             _span: span,
         })
     })
@@ -544,11 +532,6 @@ struct Counted {
     recorder: Arc<Recorder>,
     /// What the layers inside noted.
     slot: forge_traffic::Slot,
-    /// For the request log; empty when it is off.
-    path: String,
-    user_agent: Option<String>,
-    /// Time to the response headers.
-    elapsed: Duration,
 }
 
 /// A response body that counts the bytes it yields: their total is
@@ -597,13 +580,7 @@ impl Drop for CountingBody {
         if let Some(counted) = self.counted.take() {
             counted.recorder.record(forge_traffic::Event {
                 at: chrono::Utc::now(),
-                surface: self.surface.as_str(),
-                method: self.method,
-                status: self.status,
-                duration: counted.elapsed,
                 bytes: self.bytes,
-                path: counted.path,
-                user_agent: counted.user_agent,
                 noted: counted.slot.take(),
             });
         }

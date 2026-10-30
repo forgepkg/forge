@@ -1,16 +1,19 @@
 //! The traffic statistics (Admin → Traffic). **Admin-only.**
 //!
-//! * `GET /admin/traffic?range=&instance=&repository=` — the traffic of a
-//!   range ([`forge_traffic::query::Overview`]) over every instance or the
-//!   one `instance` names: counts by time bucket, surface, repository and
-//!   status, latency, and the top clients. `range` is one of [`RANGES`]
-//!   (default `24h`), or `from` and `to` (RFC 3339) give the range.
-//! * `GET /admin/traffic/client?network=&range=&instance=` — one client
-//!   network's traffic and its requests in the request log
-//!   ([`forge_traffic::query::ClientDetail`]).
+//! * `GET /admin/traffic?range=&instance=&repository=&network=&country=&asn=`
+//!   — the requests of a range of days ([`forge_traffic::query::Overview`])
+//!   over every instance or the one `instance` names: by day, repository,
+//!   country, autonomous system and client network. `range` is one of
+//!   [`RANGES`] (default `30d`), or `from` and `to` (dates, both included)
+//!   give it. `repository=-` keeps the requests that addressed no
+//!   repository, `country=-` and `asn=0` the ones from nowhere known.
 //! * `GET /admin/settings/traffic` answers the [`TrafficSettings`]; `PUT`
 //!   changes the fields a body names, for every instance (each follows with
 //!   its next flush).
+//! * `GET /admin/traffic/geoip` — the geolocation databases this instance
+//!   loaded and the MaxMind download's account and outcome; `PUT` sets the
+//!   account ID and license key (sealed), `DELETE` forgets them and deletes
+//!   the databases, `POST /admin/traffic/geoip/update` downloads them now.
 //!
 //! The files are read from the object store, so the answers cover every
 //! instance; a store that cannot be read answers 503.
@@ -18,44 +21,44 @@
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 use forge_core::auth::principal::Principal;
-use forge_traffic::query::{self, Filter, Span};
-use forge_traffic::TrafficSettings;
+use forge_traffic::query::{self, Filter};
+use forge_traffic::{DbInfo, GeoKind, TrafficSettings};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::state::AppState;
+use crate::traffic::maxmind::{self, MaxmindState};
 use crate::traffic::{read_settings, write_settings};
 
-/// The ranges `range` names, and their length.
-pub const RANGES: [(&str, i64); 6] = [
-    ("1h", 3_600),
-    ("6h", 6 * 3_600),
-    ("24h", 24 * 3_600),
-    ("7d", 7 * 86_400),
-    ("30d", 30 * 86_400),
-    ("90d", 90 * 86_400),
+/// The ranges `range` names, in days up to today (included).
+pub const RANGES: [(&str, i64); 5] = [
+    ("today", 1),
+    ("7d", 7),
+    ("30d", 30),
+    ("90d", 90),
+    ("365d", 365),
 ];
 
-/// The longest range `from` and `to` may give.
-const MAX_RANGE_DAYS: i64 = 400;
+/// What a filter value says for "none" (no repository, no known country).
+const NONE: &str = "-";
 
-/// The most users whose names an answer looks up.
-const MAX_USERNAMES: usize = 50;
-
-/// The query of both views.
+/// The query of the overview.
 #[derive(Debug, Default, Deserialize)]
-pub struct RangeQuery {
+pub struct OverviewQuery {
     pub range: Option<String>,
-    pub from: Option<DateTime<Utc>>,
-    pub to: Option<DateTime<Utc>>,
+    pub from: Option<NaiveDate>,
+    pub to: Option<NaiveDate>,
     /// Only this instance's files (an id of the answer's `instances`).
     pub instance: Option<String>,
-    /// The overview: only this repository's counts.
+    /// Only this repository's requests; `-` for the ones to none.
     pub repository: Option<String>,
-    /// The client view: the network ([`crate::traffic::network_label`]).
+    /// Only this client network's requests.
     pub network: Option<String>,
+    /// Only this country's requests (ISO code); `-` for unknown.
+    pub country: Option<String>,
+    /// Only this autonomous system's requests; `0` for unknown.
+    pub asn: Option<u32>,
 }
 
 fn bad_request(msg: impl Into<String>) -> Response {
@@ -71,81 +74,68 @@ fn unavailable(e: anyhow::Error) -> Response {
         .into_response()
 }
 
-impl RangeQuery {
-    fn span(&self, now: DateTime<Utc>) -> Result<Span, Response> {
-        let (from, to) = match (self.from, self.to) {
+fn some(value: &Option<String>) -> Option<String> {
+    value.as_deref().filter(|v| !v.is_empty()).map(|v| {
+        if v == NONE {
+            String::new()
+        } else {
+            v.to_string()
+        }
+    })
+}
+
+impl OverviewQuery {
+    /// The days the query covers, both included.
+    fn days(&self, today: NaiveDate) -> Result<(NaiveDate, NaiveDate), Response> {
+        match (self.from, self.to) {
             (Some(from), Some(to)) => {
-                if to <= from {
-                    return Err(bad_request("to must be after from"));
+                if to < from {
+                    return Err(bad_request("to must not be before from"));
                 }
-                if to - from > Duration::days(MAX_RANGE_DAYS) {
+                if (to - from).num_days() >= query::MAX_DAYS {
                     return Err(bad_request(format!(
-                        "a range is at most {MAX_RANGE_DAYS} days"
+                        "a range is at most {} days",
+                        query::MAX_DAYS
                     )));
                 }
-                (from, to)
+                Ok((from, to))
             }
             (None, None) => {
-                let name = self.range.as_deref().unwrap_or("24h");
-                let Some((_, secs)) = RANGES.iter().find(|(n, _)| *n == name) else {
+                let name = self.range.as_deref().unwrap_or("30d");
+                let Some((_, days)) = RANGES.iter().find(|(n, _)| *n == name) else {
                     let names: Vec<&str> = RANGES.iter().map(|(n, _)| *n).collect();
                     return Err(bad_request(format!(
                         "range must be one of {}",
                         names.join(", ")
                     )));
                 };
-                (now - Duration::seconds(*secs), now)
+                Ok((today - Duration::days(days - 1), today))
             }
-            _ => return Err(bad_request("give both from and to, or neither")),
-        };
-        Ok(Span::new(from, to, now))
-    }
-
-    fn instance(&self) -> Option<String> {
-        self.instance.clone().filter(|i| !i.is_empty())
-    }
-}
-
-/// The names of the users `ids` name, as far as they still exist.
-async fn usernames(state: &AppState, ids: impl Iterator<Item = i64>) -> HashMap<i64, String> {
-    let mut wanted: Vec<i64> = ids.collect();
-    wanted.sort_unstable();
-    wanted.dedup();
-    wanted.truncate(MAX_USERNAMES);
-    let mut names = HashMap::new();
-    for id in wanted {
-        match forge_db::user_dao::find_user_by_id(&state.pool, id).await {
-            Ok(Some(user)) => {
-                names.insert(id, user.username);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                forge_db::observe_error(&e);
-                tracing::warn!(error = %e, "cannot look up the users of the traffic statistics");
-                break;
-            }
+            _ => Err(bad_request("give both from and to, or neither")),
         }
     }
-    names
+
+    fn filter(&self) -> Filter {
+        Filter {
+            instance: self.instance.clone().filter(|i| !i.is_empty()),
+            repository: some(&self.repository),
+            network: self.network.clone().filter(|n| !n.is_empty()),
+            country: some(&self.country),
+            asn: self.asn,
+        }
+    }
 }
 
-/// What the views say of the settings, so the page can tell why something
-/// is missing.
+/// What is recorded now and what can be looked up, so the page can tell why
+/// something is missing.
 #[derive(Debug, Serialize)]
 pub struct Recording {
     pub enabled: bool,
     pub client_addresses: bool,
-    pub request_log: bool,
-}
-
-impl From<&TrafficSettings> for Recording {
-    fn from(s: &TrafficSettings) -> Self {
-        Recording {
-            enabled: s.enabled,
-            client_addresses: s.client_addresses,
-            request_log: s.request_log,
-        }
-    }
+    /// Whether this instance has a country database loaded.
+    pub countries: bool,
+    /// Whether this instance has an autonomous system database loaded.
+    pub asns: bool,
 }
 
 /// `GET /admin/traffic`.
@@ -157,90 +147,29 @@ pub struct OverviewView {
 }
 
 /// `GET /admin/traffic`
-pub async fn overview(State(state): State<AppState>, Query(q): Query<RangeQuery>) -> Response {
-    let span = match q.span(Utc::now()) {
-        Ok(span) => span,
+pub async fn overview(State(state): State<AppState>, Query(q): Query<OverviewQuery>) -> Response {
+    let (from, to) = match q.days(Utc::now().date_naive()) {
+        Ok(days) => days,
         Err(resp) => return resp,
     };
     let settings = match stored(&state).await {
         Ok(settings) => settings,
         Err(resp) => return resp,
     };
-    let filter = Filter {
-        instance: q.instance(),
-        repository: q.repository.clone().filter(|r| !r.is_empty()),
-    };
     let traffic = &state.traffic;
-    let mut overview = match query::overview(&*traffic.objects, &traffic.cache, span, &filter).await
-    {
-        Ok(overview) => overview,
-        Err(e) => return unavailable(e),
-    };
-    let names = usernames(&state, overview.clients.iter().filter_map(|c| c.user_id)).await;
-    for client in &mut overview.clients {
-        client.username = client.user_id.and_then(|id| names.get(&id).cloned());
-    }
+    let overview =
+        match query::overview(&*traffic.objects, &traffic.cache, from, to, &q.filter()).await {
+            Ok(overview) => overview,
+            Err(e) => return unavailable(e),
+        };
     Json(OverviewView {
         overview,
-        recording: Recording::from(&settings),
-    })
-    .into_response()
-}
-
-/// `GET /admin/traffic/client`.
-#[derive(Debug, Serialize)]
-pub struct ClientView {
-    #[serde(flatten)]
-    pub detail: query::ClientDetail,
-    pub recording: Recording,
-}
-
-/// `GET /admin/traffic/client`
-pub async fn client(State(state): State<AppState>, Query(q): Query<RangeQuery>) -> Response {
-    let Some(network) = q.network.clone().filter(|n| !n.is_empty()) else {
-        return bad_request("network is required");
-    };
-    let span = match q.span(Utc::now()) {
-        Ok(span) => span,
-        Err(resp) => return resp,
-    };
-    let settings = match stored(&state).await {
-        Ok(settings) => settings,
-        Err(resp) => return resp,
-    };
-    let traffic = &state.traffic;
-    let instance = q.instance();
-    let mut detail = match query::client(
-        &*traffic.objects,
-        &traffic.cache,
-        span,
-        instance.as_deref(),
-        &network,
-    )
-    .await
-    {
-        Ok(detail) => detail,
-        Err(e) => return unavailable(e),
-    };
-    let ids = detail
-        .totals
-        .iter()
-        .filter_map(|t| t.user_id)
-        .chain(detail.log.entries.iter().filter_map(|e| e.user_id))
-        .chain(detail.log.accounts.iter().filter_map(|a| a.user_id));
-    let names = usernames(&state, ids).await;
-    if let Some(totals) = &mut detail.totals {
-        totals.username = totals.user_id.and_then(|id| names.get(&id).cloned());
-    }
-    for entry in &mut detail.log.entries {
-        entry.username = entry.user_id.and_then(|id| names.get(&id).cloned());
-    }
-    for account in &mut detail.log.accounts {
-        account.username = account.user_id.and_then(|id| names.get(&id).cloned());
-    }
-    Json(ClientView {
-        detail,
-        recording: Recording::from(&settings),
+        recording: Recording {
+            enabled: settings.enabled,
+            client_addresses: settings.client_addresses,
+            countries: traffic.geo.info(GeoKind::Country).is_some(),
+            asns: traffic.geo.info(GeoKind::Asn).is_some(),
+        },
     })
     .into_response()
 }
@@ -264,10 +193,7 @@ async fn stored(state: &AppState) -> Result<TrafficSettings, Response> {
 pub struct TrafficSettingsUpdate {
     pub enabled: Option<bool>,
     pub client_addresses: Option<bool>,
-    pub request_log: Option<bool>,
-    pub statistics_retention_days: Option<u32>,
-    pub client_retention_days: Option<u32>,
-    pub request_log_retention_days: Option<u32>,
+    pub retention_days: Option<u32>,
 }
 
 /// `GET /admin/settings/traffic`
@@ -289,23 +215,16 @@ pub async fn put_settings(
         Ok(settings) => settings,
         Err(resp) => return resp,
     };
-    let mut next = current.clone();
     let TrafficSettingsUpdate {
         enabled,
         client_addresses,
-        request_log,
-        statistics_retention_days,
-        client_retention_days,
-        request_log_retention_days,
+        retention_days,
     } = update;
-    next.enabled = enabled.unwrap_or(next.enabled);
-    next.client_addresses = client_addresses.unwrap_or(next.client_addresses);
-    next.request_log = request_log.unwrap_or(next.request_log);
-    next.statistics_retention_days =
-        statistics_retention_days.unwrap_or(next.statistics_retention_days);
-    next.client_retention_days = client_retention_days.unwrap_or(next.client_retention_days);
-    next.request_log_retention_days =
-        request_log_retention_days.unwrap_or(next.request_log_retention_days);
+    let next = TrafficSettings {
+        enabled: enabled.unwrap_or(current.enabled),
+        client_addresses: client_addresses.unwrap_or(current.client_addresses),
+        retention_days: retention_days.unwrap_or(current.retention_days),
+    };
     if let Err(msg) = next.check() {
         return bad_request(msg);
     }
@@ -313,7 +232,7 @@ pub async fn put_settings(
         if let Err(e) = write_settings(&state.pool, &next).await {
             return super::db_error(e);
         }
-        state.traffic.recorder.apply(&next);
+        state.traffic.recorder.set_enabled(next.enabled);
         tracing::info!(
             target: "forge::audit",
             settings = ?next,
@@ -324,39 +243,239 @@ pub async fn put_settings(
     Json(next).into_response()
 }
 
+/// `GET /admin/traffic/geoip`.
+#[derive(Debug, Serialize)]
+pub struct GeoipView {
+    /// The databases the answering instance loaded.
+    pub country: Option<DbInfo>,
+    pub asn: Option<DbInfo>,
+    /// The MaxMind download.
+    pub maxmind: MaxmindView,
+}
+
+/// The MaxMind download, without the license key.
+#[derive(Debug, Serialize)]
+pub struct MaxmindView {
+    pub account_id: Option<String>,
+    pub license_key_set: bool,
+    pub last_attempt: Option<chrono::DateTime<Utc>>,
+    pub last_success: Option<chrono::DateTime<Utc>>,
+    pub last_error: Option<String>,
+    /// Where the databases are downloaded from (`traffic.maxmind_url`).
+    pub url: String,
+    /// The editions downloaded.
+    pub editions: Vec<&'static str>,
+}
+
+async fn geoip_view(state: &AppState) -> Result<GeoipView, Response> {
+    let (stored, _) = maxmind::read_state(&state.pool)
+        .await
+        .map_err(super::db_error)?;
+    let license_key_set = maxmind::has_license_key(&state.pool)
+        .await
+        .map_err(super::db_error)?;
+    let MaxmindState {
+        account_id,
+        last_attempt,
+        last_success,
+        last_error,
+    } = stored;
+    Ok(GeoipView {
+        country: state.traffic.geo.info(GeoKind::Country),
+        asn: state.traffic.geo.info(GeoKind::Asn),
+        maxmind: MaxmindView {
+            account_id,
+            license_key_set,
+            last_attempt,
+            last_success,
+            last_error,
+            url: state.config.traffic.maxmind_base().to_string(),
+            editions: maxmind::EDITIONS.iter().map(|(_, e)| *e).collect(),
+        },
+    })
+}
+
+/// `GET /admin/traffic/geoip`
+pub async fn get_geoip(State(state): State<AppState>) -> Response {
+    // Pick up databases another instance stored a moment ago.
+    crate::traffic::refresh_geo(&state.traffic).await;
+    match geoip_view(&state).await {
+        Ok(view) => Json(view).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `PUT /admin/traffic/geoip` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeoipCredentials {
+    pub account_id: String,
+    /// Left out (or empty) keeps the stored one.
+    #[serde(default)]
+    pub license_key: Option<String>,
+}
+
+/// `PUT /admin/traffic/geoip` — set the MaxMind account ID and license key.
+/// The databases are downloaded with the worker's next check, or at once
+/// with `POST /admin/traffic/geoip/update`.
+pub async fn put_geoip(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    Json(body): Json<GeoipCredentials>,
+) -> Response {
+    let account_id = body.account_id.trim();
+    if account_id.is_empty()
+        || account_id.len() > 32
+        || !account_id.chars().all(|c| c.is_ascii_digit())
+    {
+        return bad_request("account_id must be the MaxMind account ID, a number");
+    }
+    let license_key = body
+        .license_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    if let Some(key) = license_key {
+        if key.len() > 256 || !key.chars().all(|c| c.is_ascii_graphic()) {
+            return bad_request("license_key must be a MaxMind license key");
+        }
+    } else {
+        match maxmind::has_license_key(&state.pool).await {
+            Ok(true) => {}
+            Ok(false) => return bad_request("license_key is required"),
+            Err(e) => return super::db_error(e),
+        }
+    }
+    if let Err(e) = maxmind::set_credentials(&state, account_id, license_key).await {
+        tracing::error!(error = %format!("{e:#}"), "cannot store the MaxMind credentials");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot store the MaxMind credentials",
+        )
+            .into_response();
+    }
+    tracing::info!(
+        target: "forge::audit",
+        account_id,
+        license_key_changed = license_key.is_some(),
+        principal = %principal.audit_label(),
+        "MaxMind credentials changed"
+    );
+    match geoip_view(&state).await {
+        Ok(view) => Json(view).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// `DELETE /admin/traffic/geoip` — forget the MaxMind credentials and delete
+/// the databases: requests are no longer located.
+pub async fn delete_geoip(
+    State(state): State<AppState>,
+    axum::Extension(principal): axum::Extension<Principal>,
+) -> Response {
+    if let Err(e) = maxmind::forget(&state).await {
+        tracing::error!(error = %format!("{e:#}"), "cannot remove the geolocation databases");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cannot remove the geolocation databases",
+        )
+            .into_response();
+    }
+    tracing::info!(
+        target: "forge::audit",
+        principal = %principal.audit_label(),
+        "MaxMind credentials and geolocation databases removed"
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST /admin/traffic/geoip/update` — download the databases now. Answers
+/// the status, the download's error included; 409 without credentials.
+pub async fn update_geoip(State(state): State<AppState>) -> Response {
+    let (stored, raw) = match maxmind::read_state(&state.pool).await {
+        Ok(found) => found,
+        Err(e) => return super::db_error(e),
+    };
+    match maxmind::has_license_key(&state.pool).await {
+        Ok(true) if stored.account_id.is_some() => {}
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                "set the MaxMind account ID and license key first",
+            )
+                .into_response()
+        }
+        Err(e) => return super::db_error(e),
+    }
+    match maxmind::claim(&state.pool, &stored, raw.as_deref(), Utc::now()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                "another instance is downloading the databases; try again in a moment",
+            )
+                .into_response()
+        }
+        Err(e) => return super::db_error(e),
+    }
+    // The outcome, a failure included, is in the answer's `last_error`.
+    let _ = maxmind::update(&state).await;
+    match geoip_view(&state).await {
+        Ok(view) => Json(view).into_response(),
+        Err(resp) => resp,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn at(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().to_utc()
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
     }
 
     #[test]
     fn ranges_are_named_or_given() {
-        let now = at("2026-10-30T14:10:00Z");
-        let span = RangeQuery::default().span(now).unwrap();
-        assert_eq!(span.from, at("2026-10-29T14:10:00Z"), "24 hours by default");
-        let q = RangeQuery {
-            range: Some("7d".into()),
-            ..RangeQuery::default()
+        let today = d("2026-10-30");
+        assert_eq!(
+            OverviewQuery::default().days(today).unwrap(),
+            (d("2026-10-01"), today),
+            "30 days by default, today included"
+        );
+        let q = OverviewQuery {
+            range: Some("today".into()),
+            ..OverviewQuery::default()
         };
-        assert_eq!(q.span(now).unwrap().resolution, "hour");
-        let q = RangeQuery {
+        assert_eq!(q.days(today).unwrap(), (today, today));
+        let q = OverviewQuery {
             range: Some("2h".into()),
-            ..RangeQuery::default()
+            ..OverviewQuery::default()
         };
-        assert!(q.span(now).is_err());
-        let q = RangeQuery {
-            from: Some(at("2026-10-30T10:00:00Z")),
-            to: Some(at("2026-10-30T11:00:00Z")),
-            ..RangeQuery::default()
+        assert!(q.days(today).is_err());
+        let q = OverviewQuery {
+            from: Some(d("2026-10-10")),
+            to: Some(d("2026-10-12")),
+            ..OverviewQuery::default()
         };
-        assert_eq!(q.span(now).unwrap().to, at("2026-10-30T11:00:00Z"));
-        let q = RangeQuery {
-            from: Some(at("2026-10-30T10:00:00Z")),
-            ..RangeQuery::default()
+        assert_eq!(q.days(today).unwrap(), (d("2026-10-10"), d("2026-10-12")));
+        let q = OverviewQuery {
+            from: Some(d("2026-10-10")),
+            ..OverviewQuery::default()
         };
-        assert!(q.span(now).is_err(), "from alone");
+        assert!(q.days(today).is_err(), "from alone");
+    }
+
+    #[test]
+    fn a_dash_filters_for_none() {
+        let q = OverviewQuery {
+            repository: Some("-".into()),
+            country: Some("DE".into()),
+            network: Some(String::new()),
+            ..OverviewQuery::default()
+        };
+        let f = q.filter();
+        assert_eq!(f.repository.as_deref(), Some(""));
+        assert_eq!(f.country.as_deref(), Some("DE"));
+        assert_eq!(f.network, None);
     }
 }

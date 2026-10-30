@@ -4,31 +4,33 @@ import { httpClient } from '~/lib/httpClient'
  * Admin traffic API: the traffic statistics every instance writes to the
  * object store (`crates/server/src/admin/traffic.rs`, `crates/traffic`).
  *
- *  - `GET /admin/traffic` answers the traffic of a range over every instance
- *    (or the one `instance` names): counts by time bucket, surface,
- *    repository and status, latency, and the top 20 client networks.
- *  - `GET /admin/traffic/client` answers one client network's counts and
- *    its requests in the request log (the last 24 hours of the range at
- *    most, the newest 500).
- *  - `GET` / `PUT /admin/settings/traffic`: what is recorded and how long
- *    it is kept; `PUT` changes the fields it names.
+ *  - `GET /admin/traffic` answers the requests of a range of days over every
+ *    instance (or the one `instance` names), by day, repository, country,
+ *    autonomous system and client network, narrowed by the filters given.
+ *  - `GET` / `PUT /admin/settings/traffic`: what is recorded and how long it
+ *    is kept; `PUT` changes the fields it names.
+ *  - `/admin/traffic/geoip`: the geolocation databases and the MaxMind
+ *    download (`PUT` the account, `DELETE` it and the databases, `POST
+ *    …/update` to download now).
  */
 
-/** The ranges the views offer. */
-export type TrafficRange = '1h' | '6h' | '24h' | '7d' | '30d' | '90d'
+/** The ranges the screen offers, in days up to today. */
+export type TrafficRange = 'today' | '7d' | '30d' | '90d' | '365d'
 
 export const TRAFFIC_RANGES: { id: TrafficRange; label: string }[] = [
-  { id: '1h', label: '1 hour' },
-  { id: '6h', label: '6 hours' },
-  { id: '24h', label: '24 hours' },
+  { id: 'today', label: 'Today' },
   { id: '7d', label: '7 days' },
   { id: '30d', label: '30 days' },
   { id: '90d', label: '90 days' },
+  { id: '365d', label: '1 year' },
 ]
 
 export function isTrafficRange(value: unknown): value is TrafficRange {
   return TRAFFIC_RANGES.some((r) => r.id === value)
 }
+
+/** What a filter value says for "none": no repository, no known country. */
+export const NONE = '-'
 
 /** An instance whose files the range holds. */
 export interface TrafficInstance {
@@ -37,166 +39,116 @@ export interface TrafficInstance {
   started_at: string | null
 }
 
-/** A point of a series: the counts of one step. */
-export interface TrafficPoint {
-  start: string
+/** A day of the range. */
+export interface TrafficDay {
+  /** `YYYY-MM-DD`, UTC. */
+  day: string
   requests: number
   bytes: number
-  client_errors: number
-  server_errors: number
+  /** The client networks that made requests that day. */
+  clients: number
 }
 
-/** What is recorded now (the settings), so a view can say why data is missing. */
-export interface TrafficRecording {
-  enabled: boolean
-  client_addresses: boolean
-  request_log: boolean
-}
-
-/** The span a view covers. */
-interface TrafficSpan {
-  from: string
-  to: string
-  step_seconds: number
-  /** What the files read count by. */
-  resolution: 'minute' | 'hour'
-}
-
-export interface TrafficTotals {
+/** A share of the range. */
+export interface TrafficShare {
   requests: number
   bytes: number
-  /** 4xx answers (the next three included). */
-  client_errors: number
-  /** 401 and 403 answers. */
-  denied: number
-  not_found: number
-  /** 429 answers. */
-  throttled: number
-  /** 5xx answers. */
-  server_errors: number
-  mean_ms: number | null
-  /** The latency bound half, 95 % and 99 % of the requests stayed within. */
-  p50_ms: number | null
-  p95_ms: number | null
-  p99_ms: number | null
+  clients: number
 }
 
-/** A client network's counts. */
+/** A client network's requests. */
 export interface TrafficClient {
   network: string
   address: string
+  /** ISO 3166-1 alpha-2; `""` unknown. */
+  country: string
+  /** `0` unknown. */
+  asn: number
+  as_org: string
   requests: number
   bytes: number
-  client_errors: number
-  denied: number
-  not_found: number
-  throttled: number
-  server_errors: number
-  user_agent: string | null
-  account: string | null
-  user_id: number | null
-  username: string | null
-  hosts: string[]
-  first_seen: string | null
-  last_seen: string | null
+  /** The repositories it made the most requests to (`""`: none). */
+  repositories: string[]
+  days: number
+  first_day: string | null
+  last_day: string | null
 }
 
 /** `GET /admin/traffic`. */
-export interface TrafficOverview extends TrafficSpan {
+export interface TrafficOverview {
+  from: string
+  to: string
   instances: TrafficInstance[]
-  totals: TrafficTotals
-  series: TrafficPoint[]
-  surfaces: { surface: string; requests: number; bytes: number }[]
-  repositories: {
-    name: string
+  totals: {
     requests: number
     bytes: number
-    client_errors: number
-    server_errors: number
-  }[]
-  statuses: { status: number; requests: number }[]
-  clients: TrafficClient[]
-  recording: TrafficRecording
-}
-
-/** A request of the request log. */
-export interface TrafficLogEntry {
-  time: string
-  address: string
-  method: string
-  path: string
-  surface: string
-  repository: string | null
-  status: number
-  bytes: number
-  duration_ms: number
-  user_agent: string | null
-  account: string | null
-  user_id: number | null
-  username: string | null
-  host: string
-}
-
-/** How often a value occurs in a client's log. */
-export interface TrafficTally {
-  value: string
-  requests: number
-}
-
-/** How often an account occurs in a client's log. */
-export interface TrafficAccountTally {
-  account: string | null
-  user_id: number | null
-  username: string | null
-  requests: number
-}
-
-/** `GET /admin/traffic/client`. */
-export interface TrafficClientDetail extends TrafficSpan {
-  network: string
-  instances: TrafficInstance[]
-  /** Its counts in the time buckets it was among the top clients of. */
-  totals: TrafficClient | null
-  series: TrafficPoint[]
-  log: {
-    from: string
-    to: string
-    matched: number
-    entries: TrafficLogEntry[]
-    paths: TrafficTally[]
-    user_agents: TrafficTally[]
-    accounts: TrafficAccountTally[]
-    statuses: TrafficTally[]
+    clients: number
+    countries: number
+    asns: number
   }
-  recording: TrafficRecording
+  days: TrafficDay[]
+  /** `""` names the requests that addressed no repository. */
+  repositories: ({ name: string } & TrafficShare)[]
+  countries: ({ country: string } & TrafficShare)[]
+  asns: ({ asn: number; org: string } & TrafficShare)[]
+  clients: TrafficClient[]
+  recording: {
+    enabled: boolean
+    client_addresses: boolean
+    /** Whether a country database is loaded. */
+    countries: boolean
+    /** Whether an autonomous system database is loaded. */
+    asns: boolean
+  }
 }
 
 /** `GET /admin/settings/traffic`. */
 export interface TrafficSettings {
   enabled: boolean
   client_addresses: boolean
-  request_log: boolean
-  /** Days the counts by hour are kept; `0` keeps them. */
-  statistics_retention_days: number
-  client_retention_days: number
-  request_log_retention_days: number
+  retention_days: number
 }
 
 /** `PUT /admin/settings/traffic` body: the fields to change. */
 export type TrafficSettingsUpdate = Partial<TrafficSettings>
 
-/** What a view asks for. */
+/** A loaded geolocation database. */
+export interface GeoDatabase {
+  database_type: string
+  built_at: string | null
+  size: number
+}
+
+/** `GET /admin/traffic/geoip`. */
+export interface GeoipStatus {
+  country: GeoDatabase | null
+  asn: GeoDatabase | null
+  maxmind: {
+    account_id: string | null
+    license_key_set: boolean
+    last_attempt: string | null
+    last_success: string | null
+    last_error: string | null
+    url: string
+    editions: string[]
+  }
+}
+
+/** What the screen asks for: a range and the filters. */
 export interface TrafficQuery {
   range: TrafficRange
   instance?: string
   repository?: string
+  network?: string
+  country?: string
+  asn?: string
 }
 
 export const trafficKeys = {
   all: ['traffic'] as const,
   overview: (q: TrafficQuery) => ['traffic', 'overview', q] as const,
-  client: (network: string, q: TrafficQuery) => ['traffic', 'client', network, q] as const,
   settings: () => ['settings', 'traffic'] as const,
+  geoip: () => ['traffic', 'geoip'] as const,
 }
 
 /** `GET /admin/traffic`. */
@@ -206,19 +158,14 @@ export function fetchTrafficOverview(
 ): Promise<TrafficOverview> {
   return httpClient.get<TrafficOverview>('/admin/traffic', {
     signal,
-    query: { range: q.range, instance: q.instance, repository: q.repository },
-  })
-}
-
-/** `GET /admin/traffic/client`. */
-export function fetchTrafficClient(
-  network: string,
-  q: TrafficQuery,
-  signal?: AbortSignal,
-): Promise<TrafficClientDetail> {
-  return httpClient.get<TrafficClientDetail>('/admin/traffic/client', {
-    signal,
-    query: { network, range: q.range, instance: q.instance },
+    query: {
+      range: q.range,
+      instance: q.instance,
+      repository: q.repository,
+      network: q.network,
+      country: q.country,
+      asn: q.asn,
+    },
   })
 }
 
@@ -230,4 +177,27 @@ export function fetchTrafficSettings(signal?: AbortSignal): Promise<TrafficSetti
 /** `PUT /admin/settings/traffic`. */
 export function updateTrafficSettings(body: TrafficSettingsUpdate): Promise<TrafficSettings> {
   return httpClient.put<TrafficSettings>('/admin/settings/traffic', body)
+}
+
+/** `GET /admin/traffic/geoip`. */
+export function fetchGeoip(signal?: AbortSignal): Promise<GeoipStatus> {
+  return httpClient.get<GeoipStatus>('/admin/traffic/geoip', { signal })
+}
+
+/** `PUT /admin/traffic/geoip`: the license key left out keeps the stored one. */
+export function updateGeoip(body: {
+  account_id: string
+  license_key?: string
+}): Promise<GeoipStatus> {
+  return httpClient.put<GeoipStatus>('/admin/traffic/geoip', body)
+}
+
+/** `POST /admin/traffic/geoip/update`. */
+export function downloadGeoip(): Promise<GeoipStatus> {
+  return httpClient.post<GeoipStatus>('/admin/traffic/geoip/update')
+}
+
+/** `DELETE /admin/traffic/geoip`. */
+export function removeGeoip(): Promise<void> {
+  return httpClient.delete<void>('/admin/traffic/geoip')
 }

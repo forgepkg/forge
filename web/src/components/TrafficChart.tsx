@@ -1,24 +1,23 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
 
-import type { TrafficPoint } from '~/api/traffic'
+import type { TrafficDay } from '~/api/traffic'
 import { formatBytes } from '~/lib/oci'
+import { dayLabel } from '~/lib/traffic'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '~/components/ui'
 
-/** What the chart plots of each point. */
-export type TrafficMetric = 'requests' | 'bytes' | 'client_errors' | 'server_errors'
+/** What the chart plots of each day. */
+export type TrafficMetric = 'requests' | 'bytes' | 'clients'
 
 export const TRAFFIC_METRICS: { id: TrafficMetric; label: string }[] = [
   { id: 'requests', label: 'Requests' },
   { id: 'bytes', label: 'Data sent' },
-  { id: 'client_errors', label: '4xx' },
-  { id: 'server_errors', label: '5xx' },
+  { id: 'clients', label: 'Clients' },
 ]
 
 const METRIC_NAMES: Record<TrafficMetric, string> = {
   requests: 'Requests',
   bytes: 'Data sent',
-  client_errors: '4xx answers',
-  server_errors: '5xx answers',
+  clients: 'Client networks',
 }
 
 const compact = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 })
@@ -46,56 +45,42 @@ function niceTicks(max: number, count = 4): number[] {
   return ticks
 }
 
-/** A point's time as the axis and the tooltip say it. */
-function timeLabel(iso: string, stepSeconds: number, withDate: boolean): string {
-  const d = new Date(iso)
-  if (stepSeconds >= 86_400) return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
-  return withDate
-    ? `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${time}`
-    : time
+/** A day on the axis: `Oct 30`. */
+function shortDay(day: string): string {
+  const d = new Date(`${day}T00:00:00Z`)
+  return Number.isNaN(d.getTime())
+    ? day
+    : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' })
 }
 
-/** The intervals time labels may be apart, in seconds. */
-const LABEL_INTERVALS = [
-  60, 300, 600, 900, 1_800, 3_600, 7_200, 10_800, 21_600, 43_200, 86_400, 172_800, 604_800,
-]
+/** How many days apart the axis labels may be. */
+const LABEL_EVERY = [1, 2, 7, 14, 30, 61, 91]
 
 const HEIGHT = 220
-const MARGIN = { top: 12, right: 12, bottom: 28, left: 64 }
+const MARGIN = { top: 12, right: 16, bottom: 28, left: 64 }
 
 /**
- * One series of a traffic view over time: an area with a 2px line, a
- * crosshair that snaps to the nearest point and a tooltip with its value
- * (the arrow keys step through the points), or the same points as a table.
- * Drawn at the width it is given, so its text keeps its size.
+ * One measure of the traffic by day: an area with a 2px line, a crosshair
+ * that snaps to the nearest day and a tooltip with its value (the arrow keys
+ * step through the days), or the same days as a table. Drawn at the width it
+ * is given, so its text keeps its size.
  */
 export function TrafficChart({
-  points,
-  stepSeconds,
+  days,
   metric,
   view,
 }: {
-  points: TrafficPoint[]
-  stepSeconds: number
+  days: TrafficDay[]
   metric: TrafficMetric
   view: 'chart' | 'table'
 }) {
   if (view === 'table') {
-    return <PointTable points={points} stepSeconds={stepSeconds} metric={metric} />
+    return <DayTable days={days} metric={metric} />
   }
-  return <AreaChart points={points} stepSeconds={stepSeconds} metric={metric} />
+  return <AreaChart days={days} metric={metric} />
 }
 
-function AreaChart({
-  points,
-  stepSeconds,
-  metric,
-}: {
-  points: TrafficPoint[]
-  stepSeconds: number
-  metric: TrafficMetric
-}) {
+function AreaChart({ days, metric }: { days: TrafficDay[]; metric: TrafficMetric }) {
   const box = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(720)
   const [active, setActive] = useState<number | null>(null)
@@ -112,53 +97,44 @@ function AreaChart({
     return () => observer.disconnect()
   }, [])
 
-  const values = points.map((p) => p[metric])
+  const values = days.map((d) => d[metric])
   const max = Math.max(0, ...values)
   const ticks = niceTicks(max)
   const top = ticks[ticks.length - 1] || 1
   const plotW = Math.max(width - MARGIN.left - MARGIN.right, 1)
   const plotH = HEIGHT - MARGIN.top - MARGIN.bottom
   const x = (i: number) =>
-    MARGIN.left + (points.length <= 1 ? plotW / 2 : (i / (points.length - 1)) * plotW)
+    MARGIN.left + (days.length <= 1 ? plotW / 2 : (i / (days.length - 1)) * plotW)
   const y = (v: number) => MARGIN.top + plotH - (v / top) * plotH
-  const line = points.map((_, i) => `${i === 0 ? 'M' : 'L'}${x(i)},${y(values[i])}`).join('')
+  const line = days.map((_, i) => `${i === 0 ? 'M' : 'L'}${x(i)},${y(values[i])}`).join('')
   const area =
-    points.length > 0
-      ? `${line}L${x(points.length - 1)},${y(0)}L${x(0)},${y(0)}Z`
-      : ''
-  const multiDay =
-    points.length > 1 &&
-    new Date(points[0].start).toDateString() !==
-      new Date(points[points.length - 1].start).toDateString()
-  // Room for a time label: about 6.5px a character, and a gap.
-  const withDate = multiDay && stepSeconds < 86_400
-  const labelWidth = (points[0] ? timeLabel(points[0].start, stepSeconds, withDate).length : 5) * 6.5 + 24
-  const perPoint = points.length <= 1 ? plotW : plotW / (points.length - 1)
-  // Labels on round times (every 3 hours, every day), as far apart as they need.
-  const wanted = Math.max(1, Math.ceil(labelWidth / perPoint)) * stepSeconds
-  const interval =
-    LABEL_INTERVALS.find((s) => s >= wanted && s % stepSeconds === 0) ?? wanted
-  const labelled = (iso: string) => (Date.parse(iso) / 1000) % interval === 0
+    days.length > 0 ? `${line}L${x(days.length - 1)},${y(0)}L${x(0)},${y(0)}Z` : ''
+  // Room for a label: about 6.5px a character, and a gap; counted back from
+  // the last day, so today always has one.
+  const perDay = days.length <= 1 ? plotW : plotW / (days.length - 1)
+  const wanted = Math.ceil((shortDay(days[0]?.day ?? '').length * 6.5 + 24) / perDay)
+  const every = LABEL_EVERY.find((n) => n >= wanted) ?? wanted
+  const labelled = (i: number) => (days.length - 1 - i) % every === 0
   const total = values.reduce((a, b) => a + b, 0)
 
   function nearest(e: PointerEvent<SVGSVGElement>): number | null {
-    if (points.length === 0) return null
+    if (days.length === 0) return null
     const rect = e.currentTarget.getBoundingClientRect()
     const px = e.clientX - rect.left - MARGIN.left
-    const i = points.length <= 1 ? 0 : Math.round((px / plotW) * (points.length - 1))
-    return Math.min(points.length - 1, Math.max(0, i))
+    const i = days.length <= 1 ? 0 : Math.round((px / plotW) * (days.length - 1))
+    return Math.min(days.length - 1, Math.max(0, i))
   }
 
   function onKey(e: KeyboardEvent<SVGSVGElement>) {
-    if (points.length === 0) return
+    if (days.length === 0) return
     const step = { ArrowLeft: -1, ArrowRight: 1, Home: -Infinity, End: Infinity }[e.key]
     if (step === undefined) return
     e.preventDefault()
-    const from = active ?? (step > 0 ? -1 : points.length)
-    setActive(Math.min(points.length - 1, Math.max(0, from + step)))
+    const from = active ?? (step > 0 ? -1 : days.length)
+    setActive(Math.min(days.length - 1, Math.max(0, from + step)))
   }
 
-  const tip = active !== null ? points[active] : null
+  const tip = active !== null ? days[active] : null
   const tipLeft = active !== null ? Math.min(Math.max(x(active), 80), width - 80) : 0
 
   return (
@@ -168,7 +144,7 @@ function AreaChart({
         height={HEIGHT}
         role="img"
         tabIndex={0}
-        aria-label={`${METRIC_NAMES[metric]} over time: ${formatMetric(metric, total)} in all, at most ${formatMetric(metric, max)} per point. Use the arrow keys to read each point.`}
+        aria-label={`${METRIC_NAMES[metric]} by day: ${formatMetric(metric, total)} in all, at most ${formatMetric(metric, max)} a day. Use the arrow keys to read each day.`}
         aria-describedby={tip ? tipId : undefined}
         onPointerMove={(e) => setActive(nearest(e))}
         onPointerLeave={() => setActive(null)}
@@ -183,10 +159,10 @@ function AreaChart({
             </text>
           </g>
         ))}
-        {points.map((p, i) =>
-          labelled(p.start) ? (
-            <text key={p.start} className="fg-chart-axis" x={x(i)} y={HEIGHT - 8} textAnchor="middle">
-              {timeLabel(p.start, stepSeconds, withDate)}
+        {days.map((d, i) =>
+          labelled(i) ? (
+            <text key={d.day} className="fg-chart-axis" x={x(i)} y={HEIGHT - 8} textAnchor="middle">
+              {shortDay(d.day)}
             </text>
           ) : null,
         )}
@@ -206,7 +182,7 @@ function AreaChart({
             {formatMetric(metric, values[active])}
           </div>
           <div className="fg-chart-tip-label">
-            {METRIC_NAMES[metric]}, {timeLabel(tip.start, stepSeconds, true)}
+            {METRIC_NAMES[metric]}, {dayLabel(tip.day)}
           </div>
         </div>
       )}
@@ -214,33 +190,23 @@ function AreaChart({
   )
 }
 
-/** The points of the chart as rows, newest first. */
-function PointTable({
-  points,
-  stepSeconds,
-  metric,
-}: {
-  points: TrafficPoint[]
-  stepSeconds: number
-  metric: TrafficMetric
-}) {
+/** The days of the chart as rows, newest first. */
+function DayTable({ days, metric }: { days: TrafficDay[]; metric: TrafficMetric }) {
   return (
-    <Table caption={`${METRIC_NAMES[metric]} over time`}>
+    <Table caption={`${METRIC_NAMES[metric]} by day`}>
       <TableHead>
-        <TableHeader>From</TableHeader>
+        <TableHeader>Day</TableHeader>
         <TableHeader align="right">Requests</TableHeader>
         <TableHeader align="right">Data sent</TableHeader>
-        <TableHeader align="right">4xx</TableHeader>
-        <TableHeader align="right">5xx</TableHeader>
+        <TableHeader align="right">Clients</TableHeader>
       </TableHead>
       <TableBody>
-        {[...points].reverse().map((p) => (
-          <TableRow key={p.start}>
-            <TableCell nowrap>{timeLabel(p.start, stepSeconds, true)}</TableCell>
-            <TableCell align="right">{full.format(p.requests)}</TableCell>
-            <TableCell align="right">{formatBytes(p.bytes)}</TableCell>
-            <TableCell align="right">{full.format(p.client_errors)}</TableCell>
-            <TableCell align="right">{full.format(p.server_errors)}</TableCell>
+        {[...days].reverse().map((d) => (
+          <TableRow key={d.day}>
+            <TableCell nowrap>{dayLabel(d.day)}</TableCell>
+            <TableCell align="right">{full.format(d.requests)}</TableCell>
+            <TableCell align="right">{formatBytes(d.bytes)}</TableCell>
+            <TableCell align="right">{full.format(d.clients)}</TableCell>
           </TableRow>
         ))}
       </TableBody>

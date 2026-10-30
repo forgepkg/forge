@@ -198,6 +198,8 @@ aws-lc-rs = { version = "1.18" }
 # pure-Rust codec.
 parquet = { version = "60", default-features = false, features = ["snap"] }
 parquet_derive = { version = "60" }
+# Country and ASN lookups in MaxMind databases (crates/traffic).
+maxminddb = { version = "0.32" }
 
 # Temp files
 tempfile = { version = "3" }

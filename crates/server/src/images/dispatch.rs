@@ -290,7 +290,6 @@ impl Registry {
             .refresh_principal(principal)
             .await?
             .ok_or_else(invalid)?;
-        crate::traffic::note_principal(&principal);
         Ok(Caller {
             principal,
             claims: Some(claims),

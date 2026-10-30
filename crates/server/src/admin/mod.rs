@@ -353,7 +353,16 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route("/blob-cache", get(blob_cache::stats))
         // --- traffic statistics --------------------------------------------
         .route("/traffic", get(traffic::overview))
-        .route("/traffic/client", get(traffic::client))
+        .route(
+            "/traffic/geoip",
+            get(traffic::get_geoip)
+                .put(traffic::put_geoip)
+                .delete(traffic::delete_geoip),
+        )
+        .route(
+            "/traffic/geoip/update",
+            axum::routing::post(traffic::update_geoip),
+        )
         .route(
             "/settings/traffic",
             get(traffic::get_settings).put(traffic::put_settings),

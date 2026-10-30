@@ -1301,51 +1301,72 @@ console log stays as it is.
 
 ## Traffic statistics
 
-**Admin → Traffic** (`/manage/traffic`) shows what every instance answered:
-requests over time, data sent, 4xx and 5xx answers and latency, by
-repository, surface and status, and the 20 client networks with the most
-requests. A client opens its own view with its requests from the request
-log: time, method, path, status, size, duration, account, user agent and
-the instance that answered. Health probes are not counted.
+**Admin → Traffic** (`/manage/traffic`) shows how many requests each client
+made to each repository, day by day, over every instance, and where the
+requests came from: the countries and autonomous systems (the provider or
+company a network belongs to) of the clients. Every list narrows the view:
+open a repository to see where its requests came from, or a country, a
+network or a client to see what it used. Health probes are not counted.
 
-Each instance counts its requests in memory and writes them to Forge's
-bucket once a minute, as Parquet files under `traffic/v1/`. Every instance
-writes files of its own, so the page reads the files of all of them from the
-bucket and sums them: it needs no Redis and no call between instances, and
-it shows every instance, or one, whichever answers it. The files are plain
-Parquet, so DuckDB, pandas or Spark read them too:
+Each instance counts its requests in memory, by day (UTC), repository and
+client network, and writes them to Forge's bucket once a minute, as one
+Parquet file per instance and day:
+`traffic/v1/days/<date>/<instance>.parquet`, a row per repository and
+client with its country, autonomous system, requests and bytes sent. Every
+instance writes files of its own, so the page reads the files of all of
+them from the bucket and sums them: it needs no Redis and no call between
+instances. The files are plain Parquet, so DuckDB, pandas or Spark read them
+too.
 
-| Files | What they hold | Kept |
-| --- | --- | --- |
-| `minutes/<date>/<hour>/<instance>.buckets.parquet` | An hour's requests by minute, repository, surface, method and status: count, bytes, a latency histogram | 3 days (the views of the last 48 hours) |
-| `hours/<date>/<instance>.buckets.parquet` | The same of a day, by hour | **Statistics**, 400 days by default |
-| `…/<instance>.clients.parquet` (both) | The top 100 client networks of each minute or hour | **Top clients**, 30 days by default |
-| `requests/<date>/<hour>/<instance>.<ms>.parquet` | The request log: a file per instance and minute | **Request log**, 7 days by default |
-
-What is recorded and how long it is kept is set under **Admin → Traffic →
-Settings** (`/admin/settings/traffic`), for every instance at once. Each
-instance deletes the files past their retention about once an hour,
-whichever instance wrote them.
+What is recorded and how long it is kept (90 days by default) is set under
+**Admin → Traffic → Settings** (`/admin/settings/traffic`), for every
+instance at once. Each instance deletes the days past the retention about
+once an hour, whichever instance wrote them.
 
 - **Client addresses are personal data.** The address is the one Forge
   resolves for the login lockout: the socket peer, or the `X-Forwarded-For`
   of a [trusted proxy](#reverse-proxy). An IPv6 client is counted by its
-  /64. Addresses are kept only in the top clients and the request log, with
-  retentions of their own; **Client addresses** off records neither, and
-  **Request log** off keeps the counts and the top clients without the log.
-- **Size.** The counts are a few small files per instance and hour. The
-  request log grows with the traffic: a row per request, with its path
-  (secrets in a path, such as a command-line login's, are replaced) and user
-  agent, compressed with Snappy.
-- **Accuracy.** The last minute shows once the instances have written it.
-  An instance that stops writes what it counted on a graceful shutdown; one
-  that is killed loses its last minute. The top lists are counted in bounded
-  memory: under a flood of addresses a client's count can come out low,
-  never high. A client's view reads the request log of at most the last 24
-  hours of its range, and shows the newest 500 requests.
+  /64. With **Client addresses** off, requests are still counted by
+  repository, country and autonomous system: the address is looked up in
+  memory and dropped before anything is written.
+- **Accuracy.** Today fills in as the instances write it, once a minute. An
+  instance that stops writes what it counted on a graceful shutdown; one
+  that is killed loses its last minute. Past 500,000 clients a day on one
+  instance, new ones are counted together as `other`.
 
 The statistics are separate from the [OpenTelemetry metrics](#telemetry),
-which carry no address, path or user and need a backend of their own.
+which carry no address or repository per client and need a backend of their
+own.
+
+### Countries and networks (MaxMind)
+
+The countries and autonomous systems come from MaxMind databases: the free
+GeoLite2-Country and GeoLite2-ASN, or the commercial GeoIP2 editions. Forge
+keeps them in its bucket, as `traffic/v1/geoip/country.mmdb` and
+`traffic/v1/geoip/asn.mmdb`, and every instance loads them from there,
+again within ten minutes of a change. A client is located when its row of
+the day is first written; days written before a database was there stay
+unknown.
+
+- **Downloaded by Forge.** Create a free MaxMind account and a license key
+  at [maxmind.com](https://www.maxmind.com/en/geolite2/signup) and enter
+  them under **Admin → Traffic → Settings → Geolocation**. The license key
+  is sealed like Forge's other secrets. One instance downloads the
+  databases at once with **Download now**, then every three days, and
+  stores them in the bucket; a failed download is retried six hours later,
+  and the settings show its error. Forge needs outbound HTTPS to
+  `download.maxmind.com` and the storage it redirects to; a mirror that
+  answers the same download API can be set as
+  `traffic.maxmind_url` (`FORGE_TRAFFIC__MAXMIND_URL`). **Turn off** forgets
+  the account and deletes the databases.
+- **Put there yourself.** Without internet access, or for a commercial
+  edition, upload the `.mmdb` files to the bucket under those two keys (for
+  example with `geoipupdate` and `aws s3 cp`). A Country or City edition
+  fills `country.mmdb`, an ASN or ISP edition `asn.mmdb`; a file of another
+  edition is refused and logged.
+
+MaxMind's GeoLite license asks for its databases to be kept current and for
+the credit the traffic screen shows next to the countries and networks.
 
 ## Running more than one instance
 

@@ -96,6 +96,10 @@ pub struct Config {
     /// metrics report.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// The traffic statistics (Admin → Traffic): where the geolocation
+    /// databases are downloaded from. What is recorded is set in the web UI.
+    #[serde(default)]
+    pub traffic: TrafficConfig,
 }
 
 /// `server.*`
@@ -1458,6 +1462,50 @@ impl TelemetryConfig {
     }
 }
 
+/// `[traffic]`: the traffic statistics ([`crate::traffic`]). What they
+/// record, how long they keep it and the MaxMind account the geolocation
+/// databases are downloaded with are set in the web UI (Admin → Traffic →
+/// Settings).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrafficConfig {
+    /// Where the MaxMind databases are downloaded from: MaxMind's download
+    /// service, or a mirror that answers its API
+    /// (`{url}/geoip/databases/{edition}/download?suffix=tar.gz`, HTTP Basic
+    /// with the account ID and license key). Default
+    /// `https://download.maxmind.com`.
+    #[serde(default = "default_maxmind_url")]
+    pub maxmind_url: String,
+}
+
+impl Default for TrafficConfig {
+    fn default() -> Self {
+        TrafficConfig {
+            maxmind_url: default_maxmind_url(),
+        }
+    }
+}
+
+fn default_maxmind_url() -> String {
+    "https://download.maxmind.com".into()
+}
+
+impl TrafficConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        match url::Url::parse(&self.maxmind_url) {
+            Ok(url) if matches!(url.scheme(), "https" | "http") && url.host().is_some() => Ok(()),
+            _ => Err(ConfigError::Invalid(format!(
+                "traffic.maxmind_url must be an http(s) URL, not {:?}",
+                self.maxmind_url
+            ))),
+        }
+    }
+
+    /// [`Self::maxmind_url`] without a trailing `/`.
+    pub fn maxmind_base(&self) -> &str {
+        self.maxmind_url.trim_end_matches('/')
+    }
+}
+
 /// `[docker]`: the Docker / OCI registry served under `/v2`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DockerConfig {
@@ -2375,6 +2423,7 @@ impl Config {
     fn validate(&self) -> Result<(), ConfigError> {
         self.server.bind_addr()?;
         self.telemetry.validate()?;
+        self.traffic.validate()?;
         self.validate_public_base_url()?;
         // The DNS-rebinding guard's host list, checked before migrations run
         // rather than when the router is built.

@@ -39,7 +39,6 @@ import { Route as adminServiceAccountsEditRouteImport } from './routes/admin/ser
 import { Route as adminServiceAccountsCreateRouteImport } from './routes/admin/service-accounts/Create'
 import { Route as adminSettingsEmailRouteImport } from './routes/admin/settings/Email'
 import { Route as adminSettingsRetentionSettingsRouteImport } from './routes/admin/settings/RetentionSettings'
-import { Route as adminTrafficClientRouteImport } from './routes/admin/traffic/Client'
 import { Route as adminTrafficSettingsRouteImport } from './routes/admin/traffic/Settings'
 import { Route as adminUsersEditRouteImport } from './routes/admin/users/Edit'
 import { Route as adminUsersCreateRouteImport } from './routes/admin/users/Create'
@@ -201,11 +200,6 @@ const adminSettingsRetentionSettingsRoute =
     path: '/settings/retention',
     getParentRoute: () => AdminLayoutRoute,
   } as any)
-const adminTrafficClientRoute = adminTrafficClientRouteImport.update({
-  id: '/traffic/client',
-  path: '/traffic/client',
-  getParentRoute: () => AdminLayoutRoute,
-} as any)
 const adminTrafficSettingsRoute = adminTrafficSettingsRouteImport.update({
   id: '/traffic/settings',
   path: '/traffic/settings',
@@ -274,7 +268,6 @@ export interface FileRoutesByFullPath {
   '/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
   '/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
-  '/manage/traffic/client': typeof adminTrafficClientRoute
   '/manage/traffic/settings': typeof adminTrafficSettingsRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
   '/manage/users/new': typeof adminUsersCreateRoute
@@ -312,7 +305,6 @@ export interface FileRoutesByTo {
   '/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/manage/settings/email': typeof adminSettingsEmailRoute
   '/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
-  '/manage/traffic/client': typeof adminTrafficClientRoute
   '/manage/traffic/settings': typeof adminTrafficSettingsRoute
   '/manage/users/$userId': typeof adminUsersEditRoute
   '/manage/users/new': typeof adminUsersCreateRoute
@@ -353,7 +345,6 @@ export interface FileRoutesById {
   '/_app/manage/service-accounts/new': typeof adminServiceAccountsCreateRoute
   '/_app/manage/settings/email': typeof adminSettingsEmailRoute
   '/_app/manage/settings/retention': typeof adminSettingsRetentionSettingsRoute
-  '/_app/manage/traffic/client': typeof adminTrafficClientRoute
   '/_app/manage/traffic/settings': typeof adminTrafficSettingsRoute
   '/_app/manage/users/$userId': typeof adminUsersEditRoute
   '/_app/manage/users/new': typeof adminUsersCreateRoute
@@ -394,7 +385,6 @@ export interface FileRouteTypes {
     | '/manage/service-accounts/new'
     | '/manage/settings/email'
     | '/manage/settings/retention'
-    | '/manage/traffic/client'
     | '/manage/traffic/settings'
     | '/manage/users/$userId'
     | '/manage/users/new'
@@ -432,7 +422,6 @@ export interface FileRouteTypes {
     | '/manage/service-accounts/new'
     | '/manage/settings/email'
     | '/manage/settings/retention'
-    | '/manage/traffic/client'
     | '/manage/traffic/settings'
     | '/manage/users/$userId'
     | '/manage/users/new'
@@ -472,7 +461,6 @@ export interface FileRouteTypes {
     | '/_app/manage/service-accounts/new'
     | '/_app/manage/settings/email'
     | '/_app/manage/settings/retention'
-    | '/_app/manage/traffic/client'
     | '/_app/manage/traffic/settings'
     | '/_app/manage/users/$userId'
     | '/_app/manage/users/new'
@@ -700,13 +688,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof adminSettingsRetentionSettingsRouteImport
       parentRoute: typeof AdminLayoutRoute
     }
-    '/_app/manage/traffic/client': {
-      id: '/_app/manage/traffic/client'
-      path: '/traffic/client'
-      fullPath: '/manage/traffic/client'
-      preLoaderRoute: typeof adminTrafficClientRouteImport
-      parentRoute: typeof AdminLayoutRoute
-    }
     '/_app/manage/traffic/settings': {
       id: '/_app/manage/traffic/settings'
       path: '/traffic/settings'
@@ -781,7 +762,6 @@ interface AdminLayoutRouteChildren {
   adminServiceAccountsCreateRoute: typeof adminServiceAccountsCreateRoute
   adminSettingsEmailRoute: typeof adminSettingsEmailRoute
   adminSettingsRetentionSettingsRoute: typeof adminSettingsRetentionSettingsRoute
-  adminTrafficClientRoute: typeof adminTrafficClientRoute
   adminTrafficSettingsRoute: typeof adminTrafficSettingsRoute
   adminUsersEditRoute: typeof adminUsersEditRoute
   adminUsersCreateRoute: typeof adminUsersCreateRoute
@@ -812,7 +792,6 @@ const AdminLayoutRouteChildren: AdminLayoutRouteChildren = {
   adminServiceAccountsCreateRoute: adminServiceAccountsCreateRoute,
   adminSettingsEmailRoute: adminSettingsEmailRoute,
   adminSettingsRetentionSettingsRoute: adminSettingsRetentionSettingsRoute,
-  adminTrafficClientRoute: adminTrafficClientRoute,
   adminTrafficSettingsRoute: adminTrafficSettingsRoute,
   adminUsersEditRoute: adminUsersEditRoute,
   adminUsersCreateRoute: adminUsersCreateRoute,
