@@ -553,15 +553,19 @@ fn seed() -> Result<(), String> {
         ])
     };
 
-    // A dev stack reads anonymously and takes passwords over Basic (so
-    // `curl -u admin@example.com:changeme` works on the feeds). These are
-    // auth settings now, set in the web UI (Admin → Settings) rather than in
-    // forge.toml.
-    println!("Opening anonymous reads and password Basic (Admin → Settings)…");
+    // A dev stack reads anonymously (an auth setting, Admin → Settings) and
+    // its local realm takes passwords over Basic (Admin → Authentication), so
+    // `curl -u admin@example.com:changeme` works on the feeds.
+    println!("Opening anonymous reads (Admin → Settings)…");
+    session("PUT", "/admin/settings/auth", r#"{"anonymous_mode":"all"}"#).output_string()?;
+    println!("Accepting the local realm's passwords over Basic (Admin → Authentication)…");
+    let realms = session("GET", "/admin/realms", "").output_string()?;
+    let local = local_realm_id(&realms)
+        .ok_or_else(|| "could not find the local realm in /admin/realms".to_string())?;
     session(
-        "PUT",
-        "/admin/settings/auth",
-        r#"{"anonymous_mode":"all","allow_password_basic":true}"#,
+        "PATCH",
+        &format!("/admin/realms/{local}"),
+        r#"{"config":{"accept_client_passwords":true}}"#,
     )
     .output_string()?;
 
@@ -610,6 +614,15 @@ fn seed() -> Result<(), String> {
         .unwrap_or_default();
     println!("  versions: {versions}");
     Ok(())
+}
+
+/// The id of the `local` realm in a `GET /admin/realms` answer, whose
+/// objects start with `"id":<n>,"kind":"<kind>"` (the runner has no JSON
+/// dependency).
+fn local_realm_id(json: &str) -> Option<u64> {
+    let kind = json.find(r#""kind":"local""#)?;
+    let id = json[..kind].rfind(r#""id":"#)? + r#""id":"#.len();
+    json[id..kind].trim_end_matches(',').parse().ok()
 }
 
 /// Escape `"` and `\\` for a JSON string literal (the runner has no JSON
@@ -818,4 +831,16 @@ fn compose_app(sub: &[&str]) -> Cmd {
             "docker-compose.app.yml",
         ])
         .args(sub)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_realm_id_reads_the_local_realm_of_a_realm_list() {
+        let realms = r#"[{"id":7,"kind":"oidc","name":"entra"},{"id":12,"kind":"local","name":"local","config":{}}]"#;
+        assert_eq!(local_realm_id(realms), Some(12));
+        assert_eq!(local_realm_id(r#"[{"id":3,"kind":"oidc"}]"#), None);
+    }
 }

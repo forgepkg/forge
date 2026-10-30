@@ -1,8 +1,7 @@
 //! Sign-in and anonymous-access policy, set at runtime (#294).
 //!
 //! The anonymous mode, the login screen's mode and its remembered accounts,
-//! password Basic authentication, the session lifetimes and the password
-//! lockout are policy
+//! the session lifetimes and the password lockout are policy
 //! an administrator changes while Forge runs, and every instance must
 //! apply the same values. They are kept in `forge_setting` under
 //! [`AUTH_SETTINGS_KEY`] as one JSON document ([`AuthSettings`]), changed
@@ -22,8 +21,9 @@
 //!
 //! An install that never saved them uses [`AuthSettings::default`]: no
 //! anonymous access, the identifier-first login screen remembering accounts,
-//! no password Basic authentication, 8 h / 7 d sessions and 10 failures per 5
-//! minutes. When the
+//! 8 h / 7 d sessions and 10 failures per 5 minutes. (Whether a realm accepts
+//! passwords from clients over HTTP Basic is the realm's own setting,
+//! `accept_client_passwords`.) When the
 //! row cannot be read, an instance keeps the settings it has (the defaults
 //! before the first read) and tries again after the TTL.
 
@@ -124,10 +124,6 @@ pub struct AuthSettings {
     pub anonymous_mode: AnonymousMode,
     /// What the login screen asks for first.
     pub login_mode: LoginMode,
-    /// Accept a user's password over HTTP Basic on the feeds (an API token
-    /// always works). An enabled credential-forwarding realm accepts its
-    /// passwords there regardless.
-    pub allow_password_basic: bool,
     /// A browser session ends this long (seconds) after its last use.
     pub session_idle_ttl_seconds: u64,
     /// A browser session ends this long (seconds) after sign-in, used or not.
@@ -150,7 +146,6 @@ impl Default for AuthSettings {
         AuthSettings {
             anonymous_mode: AnonymousMode::Off,
             login_mode: LoginMode::IdentifierFirst,
-            allow_password_basic: false,
             session_idle_ttl_seconds: 8 * 60 * 60,
             session_absolute_ttl_seconds: 7 * 24 * 60 * 60,
             login_max_failures: 10,
@@ -204,10 +199,6 @@ impl AuthSettings {
         );
         diff("login_mode", self.login_mode != other.login_mode);
         diff(
-            "allow_password_basic",
-            self.allow_password_basic != other.allow_password_basic,
-        );
-        diff(
             "session_idle_ttl_seconds",
             self.session_idle_ttl_seconds != other.session_idle_ttl_seconds,
         );
@@ -239,7 +230,10 @@ impl AuthSettings {
 pub struct AuthSettingsUpdate {
     pub anonymous_mode: Option<String>,
     pub login_mode: Option<String>,
-    pub allow_password_basic: Option<bool>,
+    /// Gone in 2.2: whether passwords are accepted from clients is set per
+    /// realm (`accept_client_passwords`). Refused with where it went.
+    #[serde(default, rename = "allow_password_basic")]
+    removed_allow_password_basic: Option<serde::de::IgnoredAny>,
     pub session_idle_ttl_seconds: Option<u64>,
     pub session_absolute_ttl_seconds: Option<u64>,
     pub login_max_failures: Option<u32>,
@@ -250,15 +244,15 @@ pub struct AuthSettingsUpdate {
 impl AuthSettingsUpdate {
     /// `current` with this update's values applied, validated.
     pub fn apply_to(self, current: &AuthSettings) -> Result<AuthSettings, String> {
+        if self.removed_allow_password_basic.is_some() {
+            return Err(ALLOW_PASSWORD_BASIC_MOVED.to_string());
+        }
         let mut next = current.clone();
         if let Some(mode) = self.anonymous_mode {
             next.anonymous_mode = mode.parse()?;
         }
         if let Some(mode) = self.login_mode {
             next.login_mode = mode.parse()?;
-        }
-        if let Some(allow) = self.allow_password_basic {
-            next.allow_password_basic = allow;
         }
         if let Some(ttl) = self.session_idle_ttl_seconds {
             next.session_idle_ttl_seconds = ttl;
@@ -279,6 +273,12 @@ impl AuthSettingsUpdate {
         Ok(next)
     }
 }
+
+/// The answer to a settings update that still sets `allow_password_basic`.
+const ALLOW_PASSWORD_BASIC_MOVED: &str =
+    "allow_password_basic is gone: whether passwords are accepted from clients over HTTP \
+     Basic is set per realm, as accept_client_passwords in the config of the local and \
+     credential-forwarding realms (Admin → Authentication, PATCH /admin/realms/{id})";
 
 /// The settings stored for the install, [`AuthSettings::default`] when none
 /// were saved. A stored document that does not validate is an error.
@@ -509,7 +509,6 @@ mod tests {
     fn defaults_are_closed_and_valid() {
         let settings = AuthSettings::default();
         assert_eq!(settings.validate().unwrap(), AnonPolicy::Off);
-        assert!(!settings.allow_password_basic);
         assert_eq!(settings.login_mode, LoginMode::IdentifierFirst);
         assert!(settings.remember_accounts);
         // An empty or partial stored document takes the defaults, so a row
@@ -530,7 +529,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stored.anonymous_mode, AnonymousMode::Off);
-        assert!(stored.allow_password_basic);
+        assert!(
+            serde_json::to_value(&stored)
+                .unwrap()
+                .get("allow_password_basic")
+                .is_none(),
+            "the moved setting is read past, and not written back"
+        );
         assert_eq!(stored.validate().unwrap(), AnonPolicy::Off);
         let off: AuthSettings = serde_json::from_str(r#"{"anonymous_mode":"off"}"#).unwrap();
         assert_eq!(off.anonymous_mode, AnonymousMode::Off);
@@ -543,7 +548,7 @@ mod tests {
     #[test]
     fn an_update_keeps_what_it_leaves_out() {
         let current = AuthSettings {
-            allow_password_basic: true,
+            login_max_failures: 3,
             ..AuthSettings::default()
         };
         let update: AuthSettingsUpdate = serde_json::from_value(serde_json::json!({
@@ -560,7 +565,7 @@ mod tests {
             current.changed_keys(&next).last(),
             Some(&"remember_accounts")
         );
-        assert!(next.allow_password_basic, "left out, kept");
+        assert_eq!(next.login_max_failures, 3, "left out, kept");
         assert_eq!(next.validate().unwrap(), AnonPolicy::All);
     }
 
@@ -596,6 +601,11 @@ mod tests {
             serde_json::json!({"anonymous_ip_allowlist": ["10.0.0.0/8"]}),
         ] {
             assert!(serde_json::from_value::<AuthSettingsUpdate>(body).is_err());
+        }
+        // The moved setting is refused with where it went, whatever its value.
+        for allow in [true, false] {
+            assert!(refused(serde_json::json!({"allow_password_basic": allow}))
+                .contains("accept_client_passwords"),);
         }
     }
 }

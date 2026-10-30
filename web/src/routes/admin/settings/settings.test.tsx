@@ -30,7 +30,6 @@ const stored: AuthSettings = {
   anonymous_mode: 'off',
   login_mode: 'identifier_first',
   remember_accounts: true,
-  allow_password_basic: false,
   session_idle_ttl_seconds: 28800,
   session_absolute_ttl_seconds: 604800,
   login_max_failures: 10,
@@ -141,7 +140,7 @@ describe('admin settings', () => {
 
   it('shows the stored settings and the repositories allowing anonymous reads', async () => {
     mockApi({
-      settings: { ...stored, login_mode: 'combined', allow_password_basic: true },
+      settings: { ...stored, login_mode: 'combined' },
       repositories: [
         repo({ id: 1, name: 'public-feed', anonymous_read: true }),
         repo({ id: 2, name: 'private-feed' }),
@@ -163,18 +162,13 @@ describe('admin settings', () => {
     expect(within(signIn).getByRole('combobox', { name: 'Login screen' })).toHaveValue(
       'combined',
     )
-    expect(
-      within(signIn).getByRole('checkbox', {
-        name: 'Accept passwords over HTTP Basic on the feeds',
-      }),
-    ).toBeChecked()
+    // Passwords from clients are a realm's setting, not one here.
+    expect(within(signIn).queryByRole('checkbox', { name: /HTTP Basic/ })).toBeNull()
+    expect(within(signIn).getByText(/over HTTP Basic is set per realm/)).toBeInTheDocument()
     expect(
       within(signIn).getByRole('textbox', { name: 'Session idle timeout (seconds)' }),
     ).toHaveValue('28800')
     expect(within(signIn).getByText(/\(= 8 hours\)/)).toBeInTheDocument()
-    expect(
-      await within(signIn).findByText(/credential-forwarding realm nexus accepts passwords/),
-    ).toBeInTheDocument()
   })
 
   it('saving anonymous access PUTs its own fields only', async () => {
@@ -219,11 +213,6 @@ describe('admin settings', () => {
       within(signIn).getByRole('combobox', { name: 'Login screen' }),
       'combined',
     )
-    await u.click(
-      within(signIn).getByRole('checkbox', {
-        name: 'Accept passwords over HTTP Basic on the feeds',
-      }),
-    )
     const remember = within(signIn).getByRole('checkbox', {
       name: 'Remember accounts on the login screen',
     })
@@ -235,7 +224,6 @@ describe('admin settings', () => {
         {
           login_mode: 'combined',
           remember_accounts: false,
-          allow_password_basic: true,
           session_idle_ttl_seconds: 600,
           session_absolute_ttl_seconds: 604800,
           login_max_failures: 10,

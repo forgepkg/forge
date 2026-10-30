@@ -84,6 +84,11 @@ export interface CredentialForwardingConfig {
   capture_password_hash?: boolean
   /** Stop forwarding: sign in with the kept hashes (needs `capture_password_hash`). */
   captured_password_only?: boolean
+  /**
+   * Accept the realm's passwords from clients over HTTP Basic (feeds,
+   * `docker login`, `npm login`). Absent means on.
+   */
+  accept_client_passwords?: boolean
   positive_ttl_secs?: number
   negative_ttl_secs?: number
   /** SECRET — write-only; required on create, omit to keep on update. */
@@ -153,13 +158,22 @@ export interface TrustedHeaderConfig {
   auto_provision?: boolean
 }
 
-/** Kind-specific config; `local` has none. */
+/** The built-in `local` realm's config. */
+export interface LocalRealmConfig {
+  /**
+   * Accept local accounts' passwords from clients over HTTP Basic (feeds,
+   * `docker login`, `npm login`). Absent means off.
+   */
+  accept_client_passwords?: boolean
+}
+
+/** Kind-specific config. */
 export type RealmConfig =
   | OidcRealmConfig
   | CredentialForwardingConfig
   | WorkloadIdentityConfig
   | TrustedHeaderConfig
-  | Record<string, never>
+  | LocalRealmConfig
 
 /**
  * What the IdP's federated credential must name for an OIDC realm that

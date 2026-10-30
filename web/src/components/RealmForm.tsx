@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type {
   ClientAuthentication,
   CredentialForwardingConfig,
+  LocalRealmConfig,
   OidcRealmConfig,
   RealmConfig,
   RealmKind,
@@ -45,8 +46,8 @@ import {
  *    enter in the IdP's app registration: the redirect URI and, for a
  *    federated credential, the issuer, subject and audience it must name.
  *  - **credential_forwarding** → upstream URL / acceptance criteria /
- *    write-only key pepper / groups / timeouts and caching TTLs / kept
- *    password hashes
+ *    write-only key pepper / passwords from clients (on by default) / groups /
+ *    timeouts and caching TTLs / kept password hashes
  *  - **workload_identity** (WIF) → public OIDC issuer / allowed audiences /
  *    optional authorized parties / bounded token lifetime / ordered
  *    claim→role rules (no secrets, no redaction). **Edit as JSON** shows the
@@ -57,7 +58,8 @@ import {
  *    write-only secret the proxy proves itself with (a random one can be
  *    generated and copied into the proxy's configuration before saving),
  *    account provisioning; the side column says what the proxy must do
- *  - **local** → no config; only name + enabled are editable (built-in realm)
+ *  - **local** → name + enabled, and whether clients may send its passwords
+ *    over HTTP Basic (built-in realm; off by default)
  *
  * On **create** the kind is chosen from cards (local is built-in and cannot
  * be created); on **edit** it is fixed and shown read-only, and saving a realm
@@ -128,6 +130,8 @@ export interface RealmFormValues {
   capture_password_hash: boolean
   /** Credential forwarding: stop forwarding, sign in with the kept hashes. */
   captured_password_only: boolean
+  /** Local and credential forwarding: accept the passwords clients send over Basic. */
+  accept_client_passwords: boolean
   admin_group: string
   positive_ttl_secs: string
   negative_ttl_secs: string
@@ -202,6 +206,35 @@ export function disableRealmWarning(kind: RealmKind, name: string): string | nul
   }
 }
 
+/** Whether a password realm accepts its passwords from clients over Basic. */
+function ClientPasswordsPanel({
+  checked,
+  onChange,
+  description,
+}: {
+  checked: boolean
+  onChange: (checked: boolean) => void
+  description: string
+}) {
+  return (
+    <Panel
+      title="Clients"
+      description="An API token always works on the feeds; the admin API never takes a password over Basic."
+    >
+      <div className="fg-form">
+        <Checkbox
+          label="Accept passwords from clients (HTTP Basic)"
+          // The label wraps the description too: name the box by its label alone.
+          aria-label="Accept passwords from clients (HTTP Basic)"
+          description={description}
+          checked={checked}
+          onChange={onChange}
+        />
+      </div>
+    </Panel>
+  )
+}
+
 /** A string list as one entry per line (entries may contain commas). */
 function joinLines(list?: string[]): string {
   return (list ?? []).join('\n')
@@ -250,6 +283,7 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
   const header = (
     existing?.kind === 'trusted_header' ? existing.config : {}
   ) as TrustedHeaderConfig
+  const local = (existing?.kind === 'local' ? existing.config : {}) as LocalRealmConfig
   return {
     kind: existing?.kind ?? 'oidc',
     name: existing?.name ?? '',
@@ -296,6 +330,11 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
     allow_http: fwd.allow_http ?? false,
     capture_password_hash: fwd.capture_password_hash ?? false,
     captured_password_only: fwd.captured_password_only ?? false,
+    // The local realm's is off until set, a forwarding realm's on.
+    accept_client_passwords:
+      existing?.kind === 'local'
+        ? (local.accept_client_passwords ?? false)
+        : (fwd.accept_client_passwords ?? true),
     admin_group: fwd.admin_group ?? '',
     positive_ttl_secs: fwd.positive_ttl_secs != null ? String(fwd.positive_ttl_secs) : '',
     negative_ttl_secs: fwd.negative_ttl_secs != null ? String(fwd.negative_ttl_secs) : '',
@@ -903,7 +942,7 @@ export function RealmForm({
           title="General"
           description={
             isLocal
-              ? 'The local realm is built in (argon2 passwords); it has no configuration beyond its name and enabled flag.'
+              ? 'The local realm is built in (argon2 passwords). Besides its name and enabled flag, it sets only whether clients may send its passwords.'
               : undefined
           }
         >
@@ -942,6 +981,14 @@ export function RealmForm({
             }}
           />
         </Panel>
+
+        {isLocal && (
+          <ClientPasswordsPanel
+            checked={values.accept_client_passwords}
+            onChange={(c) => set('accept_client_passwords', c)}
+            description="Lets a client (NuGet, raw and Helm feeds, docker login, npm login --auth-type=legacy) send a local user's password over HTTP Basic. Off, local users sign their clients in with tokens: an API token from their tokens page, or npm login --auth-type=web. The browser login takes their passwords either way, and a password a client sends while this is off is refused, never passed on to a credential-forwarding realm."
+          />
+        )}
 
         {isOidc && (
           <>
@@ -1220,6 +1267,12 @@ export function RealmForm({
                 />
               </div>
             </Panel>
+
+            <ClientPasswordsPanel
+              checked={values.accept_client_passwords}
+              onChange={(c) => set('accept_client_passwords', c)}
+              description="Lets the realm's users sign a client (NuGet, raw and Helm feeds, docker login, npm login --auth-type=legacy) in with the password the upstream checks, as they did against a Nexus. Off, they sign their clients in with tokens, which the browser login gets them; the browser login takes their passwords either way."
+            />
 
             <Panel
               title="Groups"
@@ -2197,6 +2250,8 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
       config.capture_password_hash = true
       if (values.captured_password_only) config.captured_password_only = true
     }
+    // On unless set (the server's default).
+    if (!values.accept_client_passwords) config.accept_client_passwords = false
     if (values.admin_group.trim() !== '') config.admin_group = values.admin_group.trim()
     const positive = parseNumber(values.positive_ttl_secs)
     if (positive !== undefined) config.positive_ttl_secs = positive
@@ -2237,7 +2292,10 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     if (values.secret !== '') config.secret = values.secret
     return config
   }
-  // local (and reserved kinds): no config.
+  if (values.kind === 'local') {
+    return { accept_client_passwords: values.accept_client_passwords }
+  }
+  // Reserved kinds: no config.
   return {}
 }
 

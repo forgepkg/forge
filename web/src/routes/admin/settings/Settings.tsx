@@ -7,7 +7,6 @@ import type {
   AuthSettingsUpdate,
   LoginMode,
 } from '~/api/settings'
-import { useRealms } from '~/queries/useRealms'
 import { useRepositories } from '~/queries/useRepositories'
 import { useAuthSettings, useUpdateAuthSettings } from '~/queries/useSettings'
 import {
@@ -214,7 +213,6 @@ function AnonymousRepositories() {
 interface SignInDraft {
   login_mode: LoginMode
   remember_accounts: boolean
-  allow_password_basic: boolean
   session_idle_ttl_seconds: string
   session_absolute_ttl_seconds: string
   login_max_failures: string
@@ -243,7 +241,6 @@ function validateSignIn(
     body: {
       login_mode: draft.login_mode,
       remember_accounts: draft.remember_accounts,
-      allow_password_basic: draft.allow_password_basic,
       session_idle_ttl_seconds: idle!,
       session_absolute_ttl_seconds: absolute!,
       login_max_failures: failures!,
@@ -259,16 +256,15 @@ function durationHint(raw: string): string | null {
 }
 
 /**
- * The login screen and its remembered accounts, password Basic, session
- * lifetimes and the lockout.
+ * The login screen and its remembered accounts, session lifetimes and the
+ * lockout. (Passwords from clients are accepted per realm, under
+ * Authentication.)
  */
 function SignInForm({ settings }: { settings: AuthSettings }) {
   const update = useUpdateAuthSettings()
-  const realms = useRealms()
   const [draft, setDraft] = useState<SignInDraft>({
     login_mode: settings.login_mode,
     remember_accounts: settings.remember_accounts,
-    allow_password_basic: settings.allow_password_basic,
     session_idle_ttl_seconds: String(settings.session_idle_ttl_seconds),
     session_absolute_ttl_seconds: String(settings.session_absolute_ttl_seconds),
     login_max_failures: String(settings.login_max_failures),
@@ -291,9 +287,6 @@ function SignInForm({ settings }: { settings: AuthSettings }) {
     update.mutate(checked.body)
   }
 
-  const forwarding = (realms.data ?? []).filter(
-    (r) => r.enabled && r.kind === 'credential_forwarding',
-  )
   const serverError = update.isError ? update.error.body || update.error.message : null
 
   return (
@@ -334,24 +327,15 @@ function SignInForm({ settings }: { settings: AuthSettings }) {
           description="After a sign-in, the browser keeps the account (its username, name and how it signs in, never a password or a session) and the login screen offers it next time, so signing in again is one click. Turn it off for kiosks and shared computers: their login screens then forget the accounts they kept."
         />
 
-        <Checkbox
-          label="Accept passwords over HTTP Basic on the feeds"
-          // The label wraps the description too: name the box by its label alone.
-          aria-label="Accept passwords over HTTP Basic on the feeds"
-          checked={draft.allow_password_basic}
-          onChange={(checked) => set('allow_password_basic', checked)}
-          description={
-            <>
-              Lets a NuGet client or script send a user&apos;s password instead of
-              an API token, which always works. The admin API never accepts a
-              password over Basic.
-              {forwarding.length > 0 &&
-                ` The enabled credential-forwarding realm${forwarding.length === 1 ? '' : 's'} ${forwarding
-                  .map((r) => r.name)
-                  .join(', ')} accept${forwarding.length === 1 ? 's' : ''} passwords there whatever this says.`}
-            </>
-          }
-        />
+        <p className="fg-text fg-text--small">
+          Whether a client (a NuGet feed, <Code>docker login</Code>,{' '}
+          <Code>npm login</Code>) may send a user&apos;s password over HTTP Basic is
+          set per realm, under{' '}
+          <Link to="/manage/realms" className="fg-link">
+            Authentication
+          </Link>
+          . An API token always works there.
+        </p>
 
         <Fieldset
           legend="Sessions"

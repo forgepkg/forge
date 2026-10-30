@@ -289,9 +289,8 @@ impl PrincipalSource for TokenHeaderSource {
 /// username, run through the [`crate::auth::Chain`] of
 /// [`crate::auth::AuthProvider`]s:
 /// * token-as-basic always wins first;
-/// * the password path is gated — when no chain is configured (neither
-///   `allow_password_basic` nor an enabled credential-forwarding realm) the
-///   password path is skipped entirely;
+/// * the password path is gated — when no chain is configured (no realm
+///   accepts passwords from clients) the password path is skipped entirely;
 /// * a present-but-wrong / unknown password yields
 ///   [`SourceOutcome::Invalid`] (→ 401, never downgraded to anonymous).
 ///

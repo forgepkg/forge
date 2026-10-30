@@ -43,8 +43,8 @@ use crate::web_ui::spa_service;
 ///
 /// The Basic source's password path asks [`crate::auth::RealmAuth`] for the
 /// chain on every attempt, so admin realm edits apply without a restart
-/// (and the wire path stays disabled unless the `allow_password_basic` auth
-/// setting or an enabled credential-forwarding realm allows it). The
+/// (the wire path holds only the realms that accept passwords from clients,
+/// `accept_client_passwords`, and stays disabled without one). The
 /// anonymous policy comes from the auth settings on every request too
 /// ([`AnonSource::Settings`]). The session source is
 /// always mounted — local password logins mint sessions too — and every
