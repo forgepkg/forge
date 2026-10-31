@@ -25,6 +25,10 @@
 //!   * `POST /auth/invitations/lookup` / `…/accept` — an invited user's link
 //!     (#322, [`crate::invitations`]): whose account it is, and choosing its
 //!     password. Failures are throttled per client network.
+//!   * `POST /auth/device/code`, `/auth/device/token`, `…/lookup`,
+//!     `…/decide` and `GET /.well-known/oauth-authorization-server` — the
+//!     device authorization grant (RFC 8628) of command-line clients and the
+//!     web UI's `/device` page that approves it ([`device`]).
 //!
 //! All ephemeral flow state and the sessions live in Postgres (`oidc_flow` /
 //! `session`), so any instance can complete a callback another started, and a
@@ -63,6 +67,7 @@ use crate::config::OidcConfig;
 use crate::middleware::principal::auth_unavailable;
 use crate::state::AppState;
 
+mod device;
 mod issuer;
 mod realms;
 mod redirect;
@@ -71,6 +76,9 @@ mod token_exchange;
 mod trusted_header;
 mod wif;
 
+pub use device::{
+    AUTHORIZATION_SERVER_METADATA_PATH, DEVICE_CODE_GRANT, DEVICE_CODE_PATH, DEVICE_TOKEN_PATH,
+};
 pub use issuer::{
     issuer_router, spawn_issuer_refresh, AssertionIssuer, DISCOVERY_PATH, ISSUER_KEYS_SETTING,
     JWKS_PATH,
@@ -223,6 +231,9 @@ pub fn auth_router() -> Router<AppState> {
             "/auth/cli-login/{secret}",
             get(cli_login_info).post(cli_login_decide),
         )
+        // The device authorization grant (RFC 8628) and its discovery
+        // document, see [`device`].
+        .merge(device::device_router())
 }
 
 /// Resolve the realm snapshot or produce the fail-closed error response.

@@ -290,11 +290,21 @@ pub async fn attach_principal(
 
     // npm's exchange authenticates its ****** including JSON refusals.
     // Do not let the ordinary credential chain reject it with a plain-text 401.
+    // So do the device grant's OAuth endpoints (RFC 8628): a client is known
+    // by its `client_id` alone, and every answer is RFC 6749 JSON, never
+    // the credential chain's 401 for a header the client happens to send.
     if req.method() == axum::http::Method::POST
         && req
             .extensions()
             .get::<axum::extract::MatchedPath>()
-            .is_some_and(|path| path.as_str() == crate::auth::NPM_TOKEN_EXCHANGE_PATH)
+            .is_some_and(|path| {
+                [
+                    crate::auth::NPM_TOKEN_EXCHANGE_PATH,
+                    crate::auth::DEVICE_CODE_PATH,
+                    crate::auth::DEVICE_TOKEN_PATH,
+                ]
+                .contains(&path.as_str())
+            })
     {
         return next.run(req).await;
     }

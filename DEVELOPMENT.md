@@ -325,6 +325,7 @@ to set them. See
 | `login_mode` | `identifier_first` (default) or `combined`. |
 | `session_idle_ttl_seconds` / `session_absolute_ttl_seconds` | Browser-session lifetimes (default 8 h / 7 d). |
 | `login_max_failures` / `login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
+| `device_login` / `device_poll_interval_seconds` | The device login (RFC 8628) of command-line clients, approved on the `/device` page (default on, polled every 5 s). See [docs/deployment.md](./docs/deployment.md#device-login). |
 
 > **Anonymous reads need both** the anonymous mode *and* the repo's
 > `anonymous_read=true` (authz = authenticated user **or**
@@ -463,6 +464,9 @@ Settings) for a classic combined form with per-realm OIDC buttons.
 | `GET` | `/auth/me` | Who-am-I for the SPA: `{user_id, username, is_admin, csrf_token}`; 401 if no session. |
 | `POST` | `/auth/logout` | Revoke the session + clear the cookie (CSRF-protected). |
 | `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens (unscoped; `/admin/me/tokens` also takes a `scope`). |
+| `POST` | `/auth/device/code`, `/auth/device/token` | The device authorization grant (RFC 8628) of Forge's command-line helpers: start a login, poll it for the token. RFC 6749 JSON errors. |
+| `GET` | `/.well-known/oauth-authorization-server` | Public: the RFC 8414 metadata naming those two endpoints. |
+| `POST` | `/auth/device/lookup`, `/auth/device/decide` | The `/device` page (session + CSRF): look a user code up, approve or deny it; wrong codes are limited per network and session. |
 
 State-changing cookie endpoints (`logout`, token mint/revoke) require a
 **double-submit CSRF token**: read `csrf_token` from `/auth/me` (or the

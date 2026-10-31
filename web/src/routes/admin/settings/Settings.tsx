@@ -40,6 +40,8 @@ const DESCRIPTION =
  *    repositories that allow anonymous reads (the other half of the switch).
  *  - **Sign-in**: the login screen's mode, password Basic on the feeds, the
  *    session lifetimes and the password lockout.
+ *  - **Device login**: whether command-line clients sign in with a code
+ *    entered on the `/device` page (RFC 8628), and how often they poll.
  *
  * Each section is a form panel that saves its own fields (`PUT` changes only
  * what it names), so saving one never undoes a change another administrator
@@ -63,6 +65,7 @@ function SettingsScreen() {
         <Columns aside={<AnonymousRepositories />} asideLabel="Anonymous reads">
           <AnonymousAccessForm settings={settings.data} />
           <SignInForm settings={settings.data} />
+          <DeviceLoginForm settings={settings.data} />
         </Columns>
       )}
     </Page>
@@ -388,6 +391,72 @@ function SignInForm({ settings }: { settings: AuthSettings }) {
             />
           </div>
         </Fieldset>
+      </div>
+      <SaveOutcome saved={update.isSuccess} error={serverError} />
+    </Panel>
+  )
+}
+
+/** The longest polling interval the server accepts. */
+const MAX_DEVICE_POLL_INTERVAL_SECONDS = 60
+
+/**
+ * The device login (RFC 8628): `forge login` and the Docker and NuGet
+ * credential helpers show a code, which a signed-in user enters on the
+ * `/device` page and approves.
+ */
+function DeviceLoginForm({ settings }: { settings: AuthSettings }) {
+  const update = useUpdateAuthSettings()
+  const [enabled, setEnabled] = useState(settings.device_login)
+  const [pollInterval, setPollInterval] = useState(String(settings.device_poll_interval_seconds))
+  const [error, setError] = useState<string | null>(null)
+
+  function handleSubmit(e: FormEvent) {
+    e.preventDefault()
+    const seconds = parseCount(pollInterval, 1)
+    if (seconds === null || seconds > MAX_DEVICE_POLL_INTERVAL_SECONDS) {
+      setError(`Enter a number of seconds from 1 to ${MAX_DEVICE_POLL_INTERVAL_SECONDS}.`)
+      return
+    }
+    update.mutate({ device_login: enabled, device_poll_interval_seconds: seconds })
+  }
+
+  const serverError = update.isError ? update.error.body || update.error.message : null
+  return (
+    <Panel
+      as="form"
+      onSubmit={handleSubmit}
+      title="Device login"
+      description={
+        <>
+          <Code>forge login</Code> and the Docker and NuGet credential helpers sign in through
+          the browser: they show a code, which a signed-in user enters on the{' '}
+          <Code>/device</Code> page and approves. The client then gets an API token of that
+          user, listed under their tokens. A request waits for its approval, and the token
+          lasts, as long as npm&apos;s browser login: <Code>[cli_login]</Code> in the
+          configuration.
+        </>
+      }
+      footer={<SaveButton pending={update.isPending}>Save device login</SaveButton>}
+    >
+      <div className="fg-form">
+        <Checkbox
+          label="Let command-line clients sign in with a code"
+          aria-label="Let command-line clients sign in with a code"
+          checked={enabled}
+          onChange={setEnabled}
+          description="Off, the clients are refused and sign in with an API token only. A request waiting for its approval can no longer collect its token."
+        />
+        <SecondsField
+          label="Polling interval (seconds)"
+          value={pollInterval}
+          error={error ?? undefined}
+          onChange={(v) => {
+            setPollInterval(v)
+            setError(null)
+          }}
+          hint={`How long a client waits between two checks whether its sign-in was approved; at most ${MAX_DEVICE_POLL_INTERVAL_SECONDS}. A client that checks sooner is told to wait five seconds longer.`}
+        />
       </div>
       <SaveOutcome saved={update.isSuccess} error={serverError} />
     </Panel>

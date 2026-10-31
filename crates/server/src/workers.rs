@@ -24,7 +24,7 @@
 //!
 //! 4. **Auth reaper** — periodically deletes expired/used `oidc_flow` and
 //!    `email_oauth_flow` rows, revoked/expired `session` rows, expired `cli_login`
-//!    rows and `login_known_network` rows past the
+//!    and `device_authorization` rows and `login_known_network` rows past the
 //!    login throttle's 30-day memory. All are pure `DELETE`s (no advisory
 //!    locks, no leases): the auth-code-flow rows are single-use and
 //!    short-lived, sessions carry their own validity predicate, so running the
@@ -536,6 +536,18 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
                     Err(e) => {
                         ok = false;
                         tracing::error!(error = %e, "cli login reap failed")
+                    }
+                }
+                // Device logins (RFC 8628) past their lifetime: never
+                // approved, denied, or collected already.
+                match forge_db::device_auth_dao::delete_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        tracing::debug!(reaped = n, "auth reaper deleted expired device logins")
+                    }
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "device login reap failed")
                     }
                 }
                 // Exchanged workload keys whose CI token has expired as well,

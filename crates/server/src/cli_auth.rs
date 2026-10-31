@@ -15,6 +15,11 @@
 //!   `cli_login.web_login_ttl_seconds` (10 minutes).
 //! * A **logout** revokes the token, when it is the caller's own.
 //!
+//! The device login (RFC 8628: `/auth/device/*` and the web UI's `/device`
+//! page) is the same mechanism for every Forge helper, for the host rather
+//! than one repository; it lives in [`crate::auth`] and builds its tokens
+//! with [`login_token`].
+//!
 //! Tokens minted by a login carry the user's rights (no scope), expire
 //! after `cli_login.token_lifetime_days`, and are listed and revocable on
 //! the user's tokens page like every token. Logins, mints and revocations
@@ -27,7 +32,7 @@ use axum::response::{IntoResponse, Response};
 use forge_core::auth::principal::Principal;
 use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_db::cli_login_dao::{self, CliLoginState};
-use forge_db::model::Repository;
+use forge_db::model::{AppUser, Repository};
 use forge_db::token_dao::{self, NewToken};
 use forge_db::user_dao;
 use forge_plugin::api::{AuthOutcome, AuthRequest};
@@ -83,6 +88,29 @@ pub async fn perform(
     }
 }
 
+/// The row of a login token for `user` named `name`, whose secret is
+/// `secret`: it expires after `cli_login.token_lifetime_days` (never for
+/// `0`). The npm logins and the device login ([`crate::auth`]'s
+/// `/auth/device/token`) mint their tokens alike.
+pub(crate) fn login_token(
+    state: &AppState,
+    user: &AppUser,
+    name: String,
+    secret: &str,
+) -> NewToken {
+    let days = state.config.cli_login.token_lifetime_days;
+    NewToken {
+        user_id: user.id,
+        name,
+        token_hash: hash_token(secret),
+        expires_at: (days > 0)
+            .then(|| chrono::Utc::now() + chrono::Duration::days(i64::from(days))),
+        // A credential-forwarding account's login came through its
+        // upstream: an admin-forced reauth revokes the token.
+        minted_with_forwarded_credential: user.auth_source == "upstream-basic",
+    }
+}
+
 /// Mint a login token for `user_id`, named `name`.
 async fn mint(
     state: &AppState,
@@ -96,23 +124,10 @@ async fn mint(
         .map_err(db_error)?
         .filter(|u| u.active)
         .ok_or_else(|| unauthorized("the account is not active"))?;
-    let days = state.config.cli_login.token_lifetime_days;
     let secret = generate_token_secret();
-    let token = token_dao::insert_token(
-        &state.pool,
-        NewToken {
-            user_id,
-            name,
-            token_hash: hash_token(&secret),
-            expires_at: (days > 0)
-                .then(|| chrono::Utc::now() + chrono::Duration::days(i64::from(days))),
-            // A credential-forwarding account's login came through its
-            // upstream: an admin-forced reauth revokes the token.
-            minted_with_forwarded_credential: user.auth_source == "upstream-basic",
-        },
-    )
-    .await
-    .map_err(db_error)?;
+    let token = token_dao::insert_token(&state.pool, login_token(state, &user, name, &secret))
+        .await
+        .map_err(db_error)?;
     tracing::info!(
         target: "forge::audit",
         user_id,
