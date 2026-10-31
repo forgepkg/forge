@@ -614,6 +614,30 @@ pub async fn set_imported_times(
     Ok(())
 }
 
+/// Why version `version` of `name` is deprecated: `None` when there is no
+/// such version, `Some(None)` when it is not deprecated.
+pub async fn deprecation<'e, E>(
+    executor: E,
+    repository_id: i64,
+    name: &str,
+    version: &str,
+) -> sqlx::Result<Option<Option<String>>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query_scalar!(
+        r#"
+        SELECT deprecation FROM component
+        WHERE repository_id = $1 AND name = $2 AND version = $3
+        "#,
+        repository_id,
+        name,
+        version,
+    )
+    .fetch_optional(executor)
+    .await
+}
+
 /// Deprecate version `version` of `name` with `message`, or (`None`) no
 /// longer. Returns whether the version exists.
 pub async fn set_deprecation<'e, E>(

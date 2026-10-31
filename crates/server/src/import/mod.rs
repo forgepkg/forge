@@ -1,22 +1,30 @@
 //! Importing a repository from another server into a Forge hosted
-//! repository of the same format (NuGet, Docker), one repository at a time.
-//! The source is read through the format's own protocol, so it may be any
-//! server that speaks it: Nexus, Artifactory, ProGet, BaGet, Harbor, a
-//! `distribution` registry or another Forge.
+//! repository of the same format (NuGet, npm, Docker), one repository at a
+//! time. The source is read through the format's own protocol, so it may be
+//! any server that speaks it: Nexus, Artifactory, ProGet, BaGet, Verdaccio,
+//! Harbor, a `distribution` registry or another Forge.
 //!
 //! * **NuGet:** a feed's service index (`…/index.json`, [`feed::Feed`]):
 //!   its search names the package ids, its package base address lists each
 //!   package's versions (unlisted ones included) and serves the `.nupkg`,
 //!   its registration says when each version was published and, where the
 //!   feed lists it inline, its SHA-512.
+//! * **npm:** a registry ([`npm::NpmRegistry`]): its search
+//!   (`/-/v1/search`), or where that lists nothing its legacy `/-/all`,
+//!   names the packages; each package's full packument lists its versions
+//!   with their SHA-512 (`dist.integrity`), publish times (`time`) and
+//!   deprecations, and its dist-tags. A tarball is downloaded from the
+//!   import's URL, whatever host `dist.tarball` names.
 //! * **Docker:** a registry's API ([`ImportSource`]): its catalog
 //!   (`/v2/_catalog`) names the images, their tag lists the tags, and the
 //!   referrers API the signatures and SBOMs of each copied manifest.
 //!
 //! An import can name its package ids or images instead (`names`): a feed's
 //! search may miss some (Nexus stops at 10,000 packages; a package whose
-//! versions are all unlisted is in no search result), and Docker Hub, GHCR
-//! and ECR serve no catalog.
+//! versions are all unlisted is in no search result), Docker Hub, GHCR and
+//! ECR serve no catalog, and an npm registry may serve neither a search
+//! that lists every package nor `/-/all` (an npm import names scopes too,
+//! `@acme`).
 //!
 //! An administrator starts an import on a hosted repository
 //! ([`crate::admin::imports`]); this worker runs it, on one instance at a
@@ -54,7 +62,13 @@
 //!      time for a tag, so a tag is created at its import;
 //!    * a version Forge holds with other bytes is a conflict: skipped and
 //!      reported (`skip`), replaced (`overwrite`), or it fails the import
-//!      (`fail`).
+//!      (`fail`);
+//!    * npm: a version's deprecation comes along, and once the versions are
+//!      copied, the dist-tags are set (`tag` items). A dist-tag Forge points
+//!      at another version, or a deprecation Forge gives otherwise, is a
+//!      conflict too, unless an earlier import of the repository set what
+//!      Forge holds: then it follows the source (a tag the source moved
+//!      since moves along).
 //!
 //! A dry run scans and decides every item (`planned`, `identical`,
 //! `conflict`) without writing a package; it downloads no package. Running
@@ -72,6 +86,7 @@
 //! import completes.
 
 pub mod feed;
+pub mod npm;
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -81,14 +96,14 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Utc};
 use forge_core::auth::principal::{AuthMethod, Principal};
-use forge_core::authz::Level;
+use forge_core::authz::{Level, PackageFilter};
 use forge_core::repo::hosted::HostedWrite;
 use forge_core::repo::proxy::Credentials;
 use forge_core::repo::{ImportOptions, ImportOutcome, RepoKind, WriteError};
 use forge_crypto::PlaintextSecret;
 use forge_db::import_dao::{self, ImportItem, NewItem, RepositoryImport};
 use forge_db::model::Repository;
-use forge_db::{repository_dao, secret_dao, user_dao};
+use forge_db::{component_dao, repository_dao, secret_dao, tag_dao, user_dao};
 use forge_plugin::api::images::ImageError;
 use forge_plugin::api::VersionMetadata;
 use forge_storage::StagedBlob;
@@ -103,10 +118,11 @@ use crate::images::import::{ImageImportOptions, ImageOutcome, ImportSource};
 use crate::images::{Failure, Registry};
 use crate::state::AppState;
 use feed::Feed;
+use npm::NpmRegistry;
 
-/// The formats an import copies: NuGet packages, and Docker images into
-/// the image store.
-pub const FORMATS: &[&str] = &["nuget", "docker"];
+/// The formats an import copies: NuGet and npm packages, and Docker images
+/// into the image store.
+pub const FORMATS: &[&str] = &["nuget", "npm", "docker"];
 
 /// How often an idle instance looks for an import to run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -129,6 +145,10 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Package ids a page of a feed's search names.
 pub const SEARCH_PAGE: u32 = 100;
+
+/// npm packages a scan page reads: a page of the registry's search, or of
+/// its `/-/all`.
+pub const NPM_PAGE: u32 = 100;
 
 /// Images a page of a registry's catalog names.
 const CATALOG_PAGE: u32 = 100;
@@ -194,6 +214,8 @@ pub enum Listing {
     Search,
     /// A registry's catalog.
     Catalog,
+    /// An npm registry's legacy listing of every package, `/-/all`.
+    All,
     /// The package ids or images the import names.
     Names,
 }
@@ -212,6 +234,7 @@ impl Listing {
         match self {
             Listing::Search => "search",
             Listing::Catalog => "catalog",
+            Listing::All => "all",
             Listing::Names => "names",
         }
     }
@@ -219,40 +242,65 @@ impl Listing {
     fn parse(s: &str) -> Listing {
         match s {
             "catalog" => Listing::Catalog,
+            "all" => Listing::All,
             "names" => Listing::Names,
             _ => Listing::Search,
         }
     }
 }
 
+/// The protocol an import reads its source through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// A NuGet v3 feed.
+    NuGet,
+    /// An npm registry.
+    Npm,
+    /// A registry API (Docker / OCI images).
+    Images,
+}
+
+impl Protocol {
+    /// The protocol of a repository of `format` (`images`: an images
+    /// format).
+    pub fn of(format: &str, images: bool) -> Protocol {
+        match format {
+            _ if images => Protocol::Images,
+            "npm" => Protocol::Npm,
+            _ => Protocol::NuGet,
+        }
+    }
+}
+
 /// Where in a Nexus server a repository is: `<url>/repository/<name>`.
-/// Nexus serves a NuGet repository's service index below it, and a Docker
-/// repository's registry API at it (for reads, on its own port), unless the
-/// repository has a connector of its own (`registry_url`).
+/// Nexus serves a NuGet repository's service index below it, an npm
+/// repository's registry at it, and a Docker repository's registry API at
+/// it (for reads, on its own port), unless the repository has a connector
+/// of its own (`registry_url`).
 pub fn nexus_source_url(
     url: &str,
     repository: &str,
     registry_url: Option<&str>,
-    images: bool,
+    protocol: Protocol,
 ) -> String {
     let path = format!("{}/repository/{repository}", url.trim_end_matches('/'));
-    match registry_url {
-        Some(registry_url) if images => registry_url.to_string(),
-        _ if images => path,
-        _ => format!("{path}/index.json"),
+    match (protocol, registry_url) {
+        (Protocol::Images, Some(registry_url)) => registry_url.to_string(),
+        (Protocol::Images | Protocol::Npm, _) => path,
+        (Protocol::NuGet, _) => format!("{path}/index.json"),
     }
 }
 
 /// The source `import` reads: its `url`, or, for an import stored before
 /// imports read the format's protocol (a Nexus server and repository), that
 /// repository's service index or registry API ([`nexus_source_url`]).
-pub fn source_url(import: &RepositoryImport, images: bool) -> String {
+pub fn source_url(import: &RepositoryImport, protocol: Protocol) -> String {
     match &import.source_repository {
         Some(repository) => nexus_source_url(
             &import.url,
             repository,
             import.registry_url.as_deref(),
-            images,
+            protocol,
         ),
         None => import.url.clone(),
     }
@@ -323,6 +371,7 @@ impl ImportWorker {
             lost,
             stopping: AtomicBool::new(false),
             last_search: std::sync::Mutex::new(Vec::new()),
+            npm_all: tokio::sync::Mutex::new(None),
         };
         let end = AssertUnwindSafe(run.execute())
             .catch_unwind()
@@ -368,10 +417,18 @@ fn db_failed(e: sqlx::Error) -> End {
 
 /// Where the items of a run come from and go.
 enum Target {
-    /// A package format: from a feed, through the hosted write path.
+    /// NuGet: from a feed, through the hosted write path.
     Packages {
         feed: Box<Feed>,
         writer: Box<HostedWrite>,
+    },
+    /// npm: from a registry, through the hosted write path; the dist-tags
+    /// and deprecations beside it, as the administrator's package
+    /// selectors (`filter`) allow.
+    Npm {
+        registry: Box<NpmRegistry>,
+        writer: Box<HostedWrite>,
+        filter: PackageFilter,
     },
     /// Docker: from a registry's API, through the registry.
     Images {
@@ -398,10 +455,27 @@ struct ItemSource {
     /// The package's SHA-512, base64, where the feed lists it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sha512: Option<String>,
+    /// npm: `dist.integrity` (an SRI string) and `dist.shasum` (hex SHA-1),
+    /// checked where no SHA-512 is listed (an old package's SHA-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integrity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shasum: Option<String>,
+    /// npm: where the tarball is downloaded, below the import's URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tarball: Option<String>,
+    /// npm: why the version is deprecated, if it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deprecated: Option<String>,
+    /// npm, a `tag` item: the version the dist-tag points at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
 }
 
 /// A version or tag the scan found.
 struct Found {
+    /// `component`, or `tag` (an npm dist-tag).
+    kind: &'static str,
     name: String,
     /// Empty for a named package or image the source does not have.
     version: String,
@@ -414,6 +488,7 @@ impl Found {
     /// fails, so the import reports it.
     fn missing(name: &str) -> Found {
         Found {
+            kind: "component",
             name: name.to_string(),
             version: String::new(),
             published_at: None,
@@ -465,6 +540,9 @@ struct Run<'a> {
     /// The ids of the search page read last: a feed whose search ignores
     /// `skip` answers the same page again.
     last_search: std::sync::Mutex<Vec<String>>,
+    /// npm: the names `/-/all` lists, once read (`Some(None)`: the registry
+    /// does not serve it).
+    npm_all: tokio::sync::Mutex<Option<Option<Arc<Vec<String>>>>>,
 }
 
 impl Run<'_> {
@@ -495,7 +573,7 @@ impl Run<'_> {
             .ok_or_else(|| End::Failed("the repository was deleted".into()))?;
         if repo.kind() != RepoKind::Hosted || !FORMATS.contains(&repo.format.as_str()) {
             return Err(End::Failed(format!(
-                "imports go to a hosted NuGet or Docker repository; {} is a {} {} repository",
+                "imports go to a hosted NuGet, npm or Docker repository; {} is a {} {} repository",
                 repo.name, repo.format, repo.kind
             )));
         }
@@ -529,7 +607,8 @@ impl Run<'_> {
         }
 
         let images = self.state.formats.stores_images(&repo.format);
-        let url = source_url(import, images);
+        let protocol = Protocol::of(&repo.format, images);
+        let url = source_url(import, protocol);
         let target = if images {
             let credentials = match (&import.username, password) {
                 (Some(username), Some(password)) => {
@@ -547,14 +626,21 @@ impl Run<'_> {
                 .formats
                 .for_repository(&repo)
                 .map_err(|e| End::Failed(e.to_string()))?;
-            let feed = self
-                .retrying("reading the feed's service index", || {
-                    let (http, format, url) =
-                        (self.state.upstream.clone(), format.clone(), url.clone());
-                    let (username, password) = (import.username.clone(), password.clone());
-                    async move { Feed::open(http, format, &url, username, password).await }.boxed()
-                })
-                .await?;
+            // An npm registry needs nothing resolved: its documents are at
+            // fixed URLs.
+            let feed = match protocol {
+                Protocol::Npm => None,
+                _ => Some(
+                    self.retrying("reading the feed's service index", || {
+                        let (http, format, url) =
+                            (self.state.upstream.clone(), format.clone(), url.clone());
+                        let (username, password) = (import.username.clone(), password.clone());
+                        async move { Feed::open(http, format, &url, username, password).await }
+                            .boxed()
+                    })
+                    .await?,
+                ),
+            };
             let authz = &self.state.authz;
             let filter = authz
                 .package_filter_for(&principal, &repo, Level::Write)
@@ -574,14 +660,26 @@ impl Run<'_> {
                 repo.id,
                 repo.name.clone(),
                 principal.clone(),
-                filter,
+                filter.clone(),
                 replace,
                 role_filter,
                 role_replace,
             ));
-            Target::Packages {
-                feed: Box::new(feed),
-                writer,
+            match feed {
+                Some(feed) => Target::Packages {
+                    feed: Box::new(feed),
+                    writer,
+                },
+                None => Target::Npm {
+                    registry: Box::new(NpmRegistry::new(
+                        self.state.upstream.clone(),
+                        &url,
+                        import.username.clone(),
+                        password,
+                    )),
+                    writer,
+                    filter,
+                },
             }
         };
         Ok(Ctx {
@@ -649,7 +747,7 @@ impl Run<'_> {
                 .iter()
                 .zip(&sources)
                 .map(|(found, source)| NewItem {
-                    kind: "component",
+                    kind: found.kind,
                     name: &found.name,
                     version: &found.version,
                     size: None,
@@ -743,6 +841,61 @@ impl Run<'_> {
                     walked: Some(i64::try_from(walked).unwrap_or(i64::MAX)),
                 })
             }
+            (Target::Npm { registry, .. }, Listing::Search) => {
+                let from = cursor.and_then(|c| c.parse::<u32>().ok()).unwrap_or(0);
+                let Some(page) = registry.search("", from, NPM_PAGE).await? else {
+                    return Err(SourceError::Invalid(
+                        "the registry no longer offers a search; name the packages or scopes to \
+                         import instead"
+                            .into(),
+                    ));
+                };
+                let names = page.names;
+                {
+                    let mut last = self
+                        .last_search
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if from > 0 && !names.is_empty() && *last == names {
+                        return Err(SourceError::Invalid(format!(
+                            "the registry's search answers the same page at {from} as before it: \
+                             it ignores from; name the packages or scopes to import instead"
+                        )));
+                    }
+                    last.clone_from(&names);
+                }
+                let walked = u64::from(from) + names.len() as u64;
+                let next = (!names.is_empty()).then(|| walked.to_string());
+                // A package the search lists but the registry serves no
+                // packument of is an item that fails: Nexus' search names a
+                // scoped package without its scope.
+                let found = self.expand(ctx, &names, true, concurrency).await?;
+                Ok(Page {
+                    found,
+                    next,
+                    walked: Some(i64::try_from(walked).unwrap_or(i64::MAX)),
+                })
+            }
+            (Target::Npm { registry, .. }, Listing::All) => {
+                let Some(names) = self.npm_all(registry).await? else {
+                    return Err(SourceError::Invalid(
+                        "the registry no longer serves /-/all; name the packages or scopes to \
+                         import instead"
+                            .into(),
+                    ));
+                };
+                // The names are sorted: the cursor is the last one recorded.
+                let start = cursor.map_or(0, |last| names.partition_point(|n| n.as_str() <= last));
+                let end = (start + NPM_PAGE as usize).min(names.len());
+                let page = &names[start..end];
+                let next = page.last().filter(|_| end < names.len()).cloned();
+                let found = self.expand(ctx, page, true, concurrency).await?;
+                Ok(Page {
+                    found,
+                    next,
+                    walked: None,
+                })
+            }
             (Target::Images { registry, source }, Listing::Catalog) => {
                 let page = registry
                     .source_catalog(source, cursor, CATALOG_PAGE)
@@ -784,7 +937,7 @@ impl Run<'_> {
         // The reads are made up front: futures do nothing until polled.
         let reads: Vec<_> = names
             .iter()
-            .map(|name| expand_one(&ctx.target, name, named))
+            .map(|name| self.expand_one(ctx, name, named, concurrency))
             .collect();
         let pages: Vec<Vec<Found>> = futures_util::stream::iter(reads)
             .buffered(concurrency)
@@ -793,12 +946,80 @@ impl Run<'_> {
         Ok(pages.into_iter().flatten().collect())
     }
 
+    /// The versions of the package id `name`, or the tags of the image
+    /// `name`; for npm, the versions and dist-tags of the package `name`, or
+    /// of every package of the scope `name` (`@acme`).
+    async fn expand_one(
+        &self,
+        ctx: &Ctx,
+        name: &str,
+        named: bool,
+        concurrency: usize,
+    ) -> Result<Vec<Found>, SourceError> {
+        match &ctx.target {
+            Target::Packages { feed, .. } => package_versions(feed, name, named).await,
+            Target::Images { registry, source } => image_tags(registry, source, name, named).await,
+            Target::Npm { registry, .. } => {
+                let Some(scope) = forge_format_npm::import::parse_scope(name) else {
+                    return npm_package(registry, name, named).await;
+                };
+                let packages = self.npm_scope(registry, &scope).await?;
+                if packages.is_empty() {
+                    return Ok(vec![Found::missing(name)]);
+                }
+                let reads: Vec<_> = packages
+                    .iter()
+                    .map(|package| npm_package(registry, package, true))
+                    .collect();
+                let found: Vec<Vec<Found>> = futures_util::stream::iter(reads)
+                    .buffered(concurrency)
+                    .try_collect()
+                    .await?;
+                Ok(found.into_iter().flatten().collect())
+            }
+        }
+    }
+
+    /// What `/-/all` lists, read once a run; `None` when the registry does
+    /// not serve it.
+    async fn npm_all(
+        &self,
+        registry: &NpmRegistry,
+    ) -> Result<Option<Arc<Vec<String>>>, SourceError> {
+        let mut all = self.npm_all.lock().await;
+        if let Some(all) = &*all {
+            return Ok(all.clone());
+        }
+        let read = registry.all().await?.map(Arc::new);
+        *all = Some(read.clone());
+        Ok(read)
+    }
+
+    /// The packages of the scope `scope` (`@acme`): from `/-/all` where the
+    /// registry serves it, otherwise from its search for the scope.
+    async fn npm_scope(
+        &self,
+        registry: &NpmRegistry,
+        scope: &str,
+    ) -> Result<Vec<String>, SourceError> {
+        let prefix = format!("{scope}/");
+        match self.npm_all(registry).await? {
+            Some(all) => Ok(all
+                .iter()
+                .filter(|name| name.starts_with(&prefix))
+                .cloned()
+                .collect()),
+            None => registry.search_scope(scope).await,
+        }
+    }
+
     /// Copy the pending items: tags and versions first, then (Docker) the
-    /// referrers their copies found.
+    /// referrers their copies found, then (npm) the dist-tags, once their
+    /// versions are in Forge.
     async fn copy(&self, ctx: &Ctx) -> Result<(), End> {
         let failures = AtomicUsize::new(0);
         let concurrency = self.import.concurrency.clamp(1, 16) as usize;
-        for kind in ["component", "manifest"] {
+        for kind in ["component", "manifest", "tag"] {
             let mut after = 0;
             loop {
                 self.check().await?;
@@ -862,14 +1083,40 @@ impl Run<'_> {
         let copied = if item.version.is_empty() {
             Err(match ctx.target {
                 Target::Packages { .. } => "the source has no package of this id".to_string(),
+                Target::Npm { .. }
+                    if forge_format_npm::import::parse_scope(&item.name).is_some() =>
+                {
+                    "the source has no package of this scope".to_string()
+                }
+                Target::Npm { .. } => "the source has no package of this name".to_string(),
                 Target::Images { .. } => "the source has no tag of this image".to_string(),
             })
         } else {
+            let source: ItemSource =
+                serde_json::from_value(item.source.clone()).unwrap_or_default();
             match &ctx.target {
                 Target::Packages { feed, writer } => {
-                    let source: ItemSource =
-                        serde_json::from_value(item.source.clone()).unwrap_or_default();
-                    self.copy_package(ctx, feed, writer, &item, &source).await
+                    self.copy_package(ctx, PackageSource::Feed(feed), writer, &item, &source)
+                        .await
+                }
+                Target::Npm { filter, .. } if item.kind == "tag" => {
+                    self.copy_dist_tag(ctx, filter, &item, &source).await
+                }
+                Target::Npm {
+                    registry,
+                    writer,
+                    filter,
+                } => {
+                    let copied = self
+                        .copy_package(ctx, PackageSource::Npm(registry), writer, &item, &source)
+                        .await;
+                    match copied {
+                        Ok(copied) => {
+                            self.carry_deprecation(ctx, filter, &item, &source, copied)
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Target::Images { registry, source } => {
                     self.copy_image(ctx, registry, source, &item).await
@@ -919,7 +1166,7 @@ impl Run<'_> {
     async fn copy_package(
         &self,
         ctx: &Ctx,
-        feed: &Feed,
+        from: PackageSource<'_>,
         writer: &HostedWrite,
         item: &ImportItem,
         source: &ItemSource,
@@ -943,7 +1190,10 @@ impl Run<'_> {
                 (None, _) => copied("planned", None, 0),
                 (Some(_), None) => copied(
                     "planned",
-                    Some("Forge has this version; the feed lists no SHA-512 to compare".into()),
+                    Some(format!(
+                        "Forge has this version; the {} lists no SHA-512 to compare",
+                        from.noun()
+                    )),
                     0,
                 ),
                 (Some(_), Some(_)) if overwrite => copied(
@@ -955,11 +1205,24 @@ impl Run<'_> {
             });
         }
 
-        let url = feed
-            .package_url(&item.name, &item.version)
-            .await
-            .map_err(|e| e.to_string())?;
-        let response = feed.download(&url).await.map_err(|e| e.to_string())?;
+        let (url, response) = match from {
+            PackageSource::Feed(feed) => {
+                let url = feed
+                    .package_url(&item.name, &item.version)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let response = feed.download(&url).await.map_err(|e| e.to_string())?;
+                (url, response)
+            }
+            PackageSource::Npm(registry) => {
+                let url = source
+                    .tarball
+                    .clone()
+                    .ok_or("the registry names no tarball of this version")?;
+                let response = registry.download(&url).await.map_err(|e| e.to_string())?;
+                (url, response)
+            }
+        };
         if response.content_length().is_some_and(|l| l > ctx.limit) {
             return Err(WriteError::TooLarge { limit: ctx.limit }.to_string());
         }
@@ -970,7 +1233,7 @@ impl Run<'_> {
             .stage(tokio_util::io::StreamReader::new(body), ctx.limit)
             .await
             .map_err(|e| WriteError::from(e).to_string())?;
-        verify(&staged, &url, source)?;
+        verify(&staged, &url, source, from.noun()).await?;
         let bytes = staged.size;
         let options = ImportOptions {
             overwrite,
@@ -979,6 +1242,10 @@ impl Run<'_> {
             downloaded_at: Some(item.downloaded_at.unwrap_or_else(Utc::now)),
             uploader: item.uploader.clone(),
             source: ctx.source.clone(),
+            // A registry names the tarball in the package's packument: it
+            // must be that package.
+            expected: matches!(from, PackageSource::Npm(_))
+                .then(|| (item.name.clone(), item.version.clone())),
         };
         let outcome = writer
             .import_staged(&ctx.repo.name, staged, ctx.limit, &options)
@@ -994,6 +1261,200 @@ impl Run<'_> {
             ImportOutcome::Identical { .. } => copied("identical", None, bytes),
             ImportOutcome::Conflict { .. } => conflict_item(),
             ImportOutcome::Planned { .. } => copied("planned", None, bytes),
+        })
+    }
+
+    /// What an earlier import of the repository recorded of `item` it
+    /// copied or found identical ([`import_dao::earlier_source`]).
+    async fn earlier(&self, ctx: &Ctx, item: &ImportItem) -> Result<Option<ItemSource>, String> {
+        let earlier = import_dao::earlier_source(
+            &self.state.pool,
+            ctx.repo.id,
+            self.import.id,
+            &item.kind,
+            &item.name,
+            &item.version,
+        )
+        .await
+        .map_err(|e| format!("database error: {e}"))?;
+        Ok(earlier.map(|source| serde_json::from_value(source).unwrap_or_default()))
+    }
+
+    /// npm: bring a copied version's deprecation along (`outcome`: what became
+    /// of its bytes). A version Forge holds with these bytes takes the
+    /// source's deprecation where Forge gives none, or the one an earlier
+    /// import gave; a deprecation Forge gives otherwise is a conflict
+    /// (replaced with `overwrite`).
+    async fn carry_deprecation(
+        &self,
+        ctx: &Ctx,
+        filter: &PackageFilter,
+        item: &ImportItem,
+        source: &ItemSource,
+        outcome: Copied,
+    ) -> Result<Copied, String> {
+        let Copied::Item {
+            state,
+            detail,
+            bytes,
+        } = outcome
+        else {
+            return Ok(outcome);
+        };
+        // A version that stays out of Forge (a conflict skipped) keeps
+        // Forge's; one a dry run plans is not there yet.
+        if !matches!(state, "imported" | "replaced" | "identical") {
+            return Ok(Copied::Item {
+                state,
+                detail,
+                bytes,
+            });
+        }
+        let db = |e: sqlx::Error| format!("database error: {e}");
+        let pool = &self.state.pool;
+        let Some(current) =
+            component_dao::deprecation(pool, ctx.repo.id, &item.name, &item.version)
+                .await
+                .map_err(db)?
+        else {
+            return Ok(Copied::Item {
+                state,
+                detail,
+                bytes,
+            });
+        };
+        let wanted = source.deprecated.clone();
+        if current == wanted {
+            return Ok(Copied::Item {
+                state,
+                detail,
+                bytes,
+            });
+        }
+        let own = match self.earlier(ctx, item).await? {
+            Some(earlier) => earlier.deprecated == current,
+            None => current.is_none(),
+        };
+        let overwrite = self.import.on_conflict == "overwrite";
+        if !(own || overwrite || state == "replaced") {
+            let conflict = match (&current, &wanted) {
+                (Some(current), Some(wanted)) => format!(
+                    "Forge deprecates this version ({current:?}); the source deprecates it \
+                     otherwise ({wanted:?})"
+                ),
+                (Some(current), None) => {
+                    format!("Forge deprecates this version ({current:?}); the source does not")
+                }
+                (None, _) => format!(
+                    "the source deprecates this version ({:?}); Forge no longer does",
+                    wanted.unwrap_or_default()
+                ),
+            };
+            return Ok(copied("conflict", Some(conflict), bytes));
+        }
+        if !filter.allows(&item.name) {
+            return Err(
+                "the package selectors of the administrator who started the import do not \
+                 allow deprecating this package"
+                    .into(),
+            );
+        }
+        let said = match &wanted {
+            Some(message) => format!("deprecated: {message}"),
+            None => "no longer deprecated".to_string(),
+        };
+        if self.import.dry_run {
+            return Ok(copied(state, Some(format!("would be {said}")), bytes));
+        }
+        component_dao::set_deprecation(
+            pool,
+            ctx.repo.id,
+            &item.name,
+            &item.version,
+            wanted.as_deref(),
+        )
+        .await
+        .map_err(db)?;
+        Ok(copied(state, Some(detail.unwrap_or(said)), bytes))
+    }
+
+    /// npm: set a dist-tag (`item.version`) of the package `item.name` to
+    /// the version the source points it at, once that version is in Forge.
+    /// A tag Forge points at another version is a conflict, unless an
+    /// earlier import pointed it there: then it moves with the source.
+    async fn copy_dist_tag(
+        &self,
+        ctx: &Ctx,
+        filter: &PackageFilter,
+        item: &ImportItem,
+        source: &ItemSource,
+    ) -> Result<Copied, String> {
+        let db = |e: sqlx::Error| format!("database error: {e}");
+        let pool = &self.state.pool;
+        let tag = &item.version;
+        let target = source
+            .target
+            .as_deref()
+            .ok_or("the source names no version for this dist-tag")?;
+        if !crate::plugins::valid_tag(tag) {
+            return Err(format!("{tag:?} is no dist-tag Forge stores"));
+        }
+        let tags = tag_dao::tags(pool, ctx.repo.id, &item.name)
+            .await
+            .map_err(db)?;
+        let current = tags.get(tag);
+        if current.map(String::as_str) == Some(target) {
+            return Ok(copied("identical", Some(format!("points at {target}")), 0));
+        }
+        if let Some(current) = current {
+            let own = self
+                .earlier(ctx, item)
+                .await?
+                .is_some_and(|earlier| earlier.target.as_ref() == Some(current));
+            if !own && self.import.on_conflict != "overwrite" {
+                return Ok(copied(
+                    "conflict",
+                    Some(format!(
+                        "Forge points it at {current}; the source at {target}"
+                    )),
+                    0,
+                ));
+            }
+        }
+        if !filter.allows(&item.name) {
+            return Err(
+                "the package selectors of the administrator who started the import do not \
+                 allow tagging this package"
+                    .into(),
+            );
+        }
+        if self.import.dry_run {
+            return Ok(copied(
+                "planned",
+                Some(match current {
+                    Some(current) => format!("would move it from {current} to {target}"),
+                    None => format!("would point it at {target}"),
+                }),
+                0,
+            ));
+        }
+        if component_dao::find_component(pool, ctx.repo.id, &item.name, target)
+            .await
+            .map_err(db)?
+            .is_none()
+        {
+            return Err(format!("version {target} is not in Forge"));
+        }
+        tag_dao::set_tag(pool, ctx.repo.id, &item.name, tag, target)
+            .await
+            .map_err(db)?;
+        Ok(match current {
+            Some(current) => copied(
+                "replaced",
+                Some(format!("moved from {current} to {target}")),
+                0,
+            ),
+            None => copied("imported", Some(format!("points at {target}")), 0),
         })
     }
 
@@ -1109,14 +1570,6 @@ impl Run<'_> {
     }
 }
 
-/// The versions of the package id `name`, or the tags of the image `name`.
-async fn expand_one(target: &Target, name: &str, named: bool) -> Result<Vec<Found>, SourceError> {
-    match target {
-        Target::Packages { feed, .. } => package_versions(feed, name, named).await,
-        Target::Images { registry, source } => image_tags(registry, source, name, named).await,
-    }
-}
-
 /// Every version the feed lists of the package `id`, with what its
 /// registration says of each. A package the feed does not know is left
 /// out, or found as missing when the import `named` it.
@@ -1148,15 +1601,69 @@ async fn package_versions(feed: &Feed, id: &str, named: bool) -> Result<Vec<Foun
         .map(|version| {
             let meta = metadata.get(&version.to_lowercase());
             Found {
+                kind: "component",
                 name: id.to_string(),
                 published_at: meta.and_then(|m| published_at(m.published.as_deref())),
                 source: ItemSource {
                     sha512: meta.and_then(|m| m.sha512.clone()),
+                    ..ItemSource::default()
                 },
                 version,
             }
         })
         .collect())
+}
+
+/// Every version of the npm package `name` at the registry, with its
+/// checksums, publish time, deprecation and tarball, and its dist-tags. A
+/// package the registry does not have (or has no version of) is left out,
+/// or found as missing when `named`.
+async fn npm_package(
+    registry: &NpmRegistry,
+    name: &str,
+    named: bool,
+) -> Result<Vec<Found>, SourceError> {
+    let package = registry
+        .package(name)
+        .await?
+        .filter(|p| !p.releases.is_empty());
+    let Some(package) = package else {
+        return Ok(if named {
+            vec![Found::missing(name)]
+        } else {
+            Vec::new()
+        });
+    };
+    let mut found: Vec<Found> = Vec::with_capacity(package.releases.len());
+    for release in &package.releases {
+        found.push(Found {
+            kind: "component",
+            name: package.name.clone(),
+            version: release.version.clone(),
+            published_at: release.published,
+            source: ItemSource {
+                sha512: release.sha512(),
+                integrity: release.integrity.clone(),
+                shasum: release.shasum.clone(),
+                tarball: registry.tarball_url(&package.name, &release.file),
+                deprecated: release.deprecated.clone(),
+                target: None,
+            },
+        });
+    }
+    for (tag, version) in &package.dist_tags {
+        found.push(Found {
+            kind: "tag",
+            name: package.name.clone(),
+            version: tag.clone(),
+            published_at: None,
+            source: ItemSource {
+                target: Some(version.clone()),
+                ..ItemSource::default()
+            },
+        });
+    }
+    Ok(found)
 }
 
 /// Every tag of `image` at the source. An image the source does not have
@@ -1181,6 +1688,7 @@ async fn image_tags(
         let more = page.more && !page.tags.is_empty();
         last = page.tags.last().cloned().or(last);
         found.extend(page.tags.into_iter().map(|tag| Found {
+            kind: "component",
             name: image.to_string(),
             version: tag,
             published_at: None,
@@ -1221,13 +1729,52 @@ fn conflict_item() -> Copied {
     )
 }
 
-/// Check a staged download against the SHA-512 the feed lists for it.
-fn verify(staged: &StagedBlob, url: &str, source: &ItemSource) -> Result<(), String> {
-    match &source.sha512 {
-        Some(expected) if *expected != staged.sha512_base64 => Err(format!(
-            "the download of {url} does not match the SHA-512 the feed lists for it"
-        )),
-        _ => Ok(()),
+/// Check a staged download against the SHA-512 the source (a `lister`, the
+/// feed or the registry) lists for it, or, for an npm tarball listed without
+/// one, against its `dist.integrity` and `dist.shasum`.
+async fn verify(
+    staged: &StagedBlob,
+    url: &str,
+    source: &ItemSource,
+    lister: &str,
+) -> Result<(), String> {
+    if let Some(expected) = &source.sha512 {
+        if *expected != staged.sha512_base64 {
+            return Err(format!(
+                "the download of {url} does not match the SHA-512 the {lister} lists for it"
+            ));
+        }
+        return Ok(());
+    }
+    if source.integrity.is_none() && source.shasum.is_none() {
+        return Ok(());
+    }
+    let path = staged.read_path();
+    let digests = tokio::task::spawn_blocking(move || {
+        std::fs::File::open(path).and_then(forge_format_npm::integrity::Digests::of)
+    })
+    .await
+    .map_err(|e| format!("checking the download: {e}"))?
+    .map_err(|e| format!("checking the download: {e}"))?;
+    digests
+        .verify(source.integrity.as_deref(), source.shasum.as_deref())
+        .map_err(|e| format!("the download of {url} does not match the {lister}'s checksums: {e}"))
+}
+
+/// Where a package version is copied from.
+#[derive(Clone, Copy)]
+enum PackageSource<'a> {
+    Feed(&'a Feed),
+    Npm(&'a NpmRegistry),
+}
+
+impl PackageSource<'_> {
+    /// What the source is called in a message.
+    fn noun(self) -> &'static str {
+        match self {
+            PackageSource::Feed(_) => "feed",
+            PackageSource::Npm(_) => "registry",
+        }
     }
 }
 
@@ -1312,11 +1859,30 @@ mod tests {
     #[test]
     fn a_nexus_repository_reads_through_its_protocol() {
         assert_eq!(
-            nexus_source_url("https://nexus.example.com/", "nuget-hosted", None, false),
+            nexus_source_url(
+                "https://nexus.example.com/",
+                "nuget-hosted",
+                None,
+                Protocol::NuGet
+            ),
             "https://nexus.example.com/repository/nuget-hosted/index.json"
         );
         assert_eq!(
-            nexus_source_url("https://nexus.example.com", "docker-hosted", None, true),
+            nexus_source_url(
+                "https://nexus.example.com",
+                "npm-hosted",
+                Some("ignored"),
+                Protocol::Npm
+            ),
+            "https://nexus.example.com/repository/npm-hosted"
+        );
+        assert_eq!(
+            nexus_source_url(
+                "https://nexus.example.com",
+                "docker-hosted",
+                None,
+                Protocol::Images
+            ),
             "https://nexus.example.com/repository/docker-hosted"
         );
         assert_eq!(
@@ -1324,10 +1890,13 @@ mod tests {
                 "https://nexus.example.com",
                 "docker-hosted",
                 Some("https://nexus.example.com:8082"),
-                true
+                Protocol::Images
             ),
             "https://nexus.example.com:8082"
         );
+        assert_eq!(Protocol::of("npm", false), Protocol::Npm);
+        assert_eq!(Protocol::of("nuget", false), Protocol::NuGet);
+        assert_eq!(Protocol::of("docker", true), Protocol::Images);
     }
 
     #[test]
@@ -1335,7 +1904,12 @@ mod tests {
         assert_eq!(Listing::of(false, false), Listing::Search);
         assert_eq!(Listing::of(true, false), Listing::Catalog);
         assert_eq!(Listing::of(true, true), Listing::Names);
-        for listing in [Listing::Search, Listing::Catalog, Listing::Names] {
+        for listing in [
+            Listing::Search,
+            Listing::Catalog,
+            Listing::All,
+            Listing::Names,
+        ] {
             assert_eq!(Listing::parse(listing.as_str()), listing);
         }
     }
@@ -1349,5 +1923,25 @@ mod tests {
         });
         let source: ItemSource = serde_json::from_value(legacy).unwrap();
         assert_eq!(source.sha512, None);
+    }
+
+    #[test]
+    fn an_item_source_stores_only_what_it_has() {
+        let nuget = ItemSource {
+            sha512: Some("abc".into()),
+            ..ItemSource::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&nuget).unwrap(),
+            serde_json::json!({"sha512": "abc"})
+        );
+        let tag = ItemSource {
+            target: Some("1.0.0".into()),
+            ..ItemSource::default()
+        };
+        let stored = serde_json::to_value(&tag).unwrap();
+        assert_eq!(stored, serde_json::json!({"target": "1.0.0"}));
+        let read: ItemSource = serde_json::from_value(stored).unwrap();
+        assert_eq!(read.target.as_deref(), Some("1.0.0"));
     }
 }

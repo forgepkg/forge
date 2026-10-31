@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE package_tag SET version = '1.0.0' WHERE repository_id = $1 AND package = 'alpha' AND tag = 'next'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1633b8039e8f13812668b97d0b09ea4f43199955578f439fc23348a8a9a6a58d"
+}
