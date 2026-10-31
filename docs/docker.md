@@ -64,6 +64,13 @@ docker push forge.example.com/docker-hosted/team/app:1.3
 
 - **API tokens** (created on the Tokens page, or `POST /admin/me/tokens`) are
   the password to use. A token's repository scope applies.
+- **Browser sign-in** (OIDC or Entra included): the Docker CLI has none for
+  a registry other than Docker Hub. A client gets an API token through
+  Forge's [device login](deployment.md#device-login) instead (the coming
+  `docker-credential-forge` helper does): it shows a code, you approve it
+  on the web UI's `/device` page, and it receives a token of yours (with
+  the `scope` it asked for, e.g. `read repository:docker-hosted`), which
+  is the password of `docker login`.
 - **Passwords** work for the users of a realm that accepts passwords from
   clients ([Admin → Authentication](deployment.md#passwords-from-clients)):
   a credential-forwarding realm by default (so users of an existing Nexus or

@@ -13,6 +13,7 @@ import { Route as AppLayoutRouteImport } from './routes/AppLayout'
 import { Route as InviteRouteImport } from './routes/Invite'
 import { Route as LoginRouteImport } from './routes/Login'
 import { Route as BrowseRouteImport } from './routes/Browse'
+import { Route as DeviceRouteImport } from './routes/Device'
 import { Route as AdminLayoutRouteImport } from './routes/AdminLayout'
 import { Route as TokensRouteImport } from './routes/Tokens'
 import { Route as CliLoginRouteImport } from './routes/CliLogin'
@@ -64,6 +65,11 @@ const LoginRoute = LoginRouteImport.update({
 const BrowseRoute = BrowseRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => AppLayoutRoute,
+} as any)
+const DeviceRoute = DeviceRouteImport.update({
+  id: '/device',
+  path: '/device',
   getParentRoute: () => AppLayoutRoute,
 } as any)
 const AdminLayoutRoute = AdminLayoutRouteImport.update({
@@ -242,6 +248,7 @@ export interface FileRoutesByFullPath {
   '/': typeof BrowseRoute
   '/invite': typeof InviteRoute
   '/login': typeof LoginRoute
+  '/device': typeof DeviceRoute
   '/manage': typeof AdminLayoutRouteWithChildren
   '/tokens': typeof TokensRoute
   '/manage/': typeof adminAdminHomeRoute
@@ -280,6 +287,7 @@ export interface FileRoutesByTo {
   '/invite': typeof InviteRoute
   '/login': typeof LoginRoute
   '/': typeof BrowseRoute
+  '/device': typeof DeviceRoute
   '/tokens': typeof TokensRoute
   '/manage': typeof adminAdminHomeRoute
   '/cli-login/$secret': typeof CliLoginRoute
@@ -319,6 +327,7 @@ export interface FileRoutesById {
   '/invite': typeof InviteRoute
   '/login': typeof LoginRoute
   '/_app/': typeof BrowseRoute
+  '/_app/device': typeof DeviceRoute
   '/_app/manage': typeof AdminLayoutRouteWithChildren
   '/_app/tokens': typeof TokensRoute
   '/_app/manage/': typeof adminAdminHomeRoute
@@ -359,6 +368,7 @@ export interface FileRouteTypes {
     | '/'
     | '/invite'
     | '/login'
+    | '/device'
     | '/manage'
     | '/tokens'
     | '/manage/'
@@ -397,6 +407,7 @@ export interface FileRouteTypes {
     | '/invite'
     | '/login'
     | '/'
+    | '/device'
     | '/tokens'
     | '/manage'
     | '/cli-login/$secret'
@@ -435,6 +446,7 @@ export interface FileRouteTypes {
     | '/invite'
     | '/login'
     | '/_app/'
+    | '/_app/device'
     | '/_app/manage'
     | '/_app/tokens'
     | '/_app/manage/'
@@ -504,6 +516,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof BrowseRouteImport
+      parentRoute: typeof AppLayoutRoute
+    }
+    '/_app/device': {
+      id: '/_app/device'
+      path: '/device'
+      fullPath: '/device'
+      preLoaderRoute: typeof DeviceRouteImport
       parentRoute: typeof AppLayoutRoute
     }
     '/_app/manage': {
@@ -806,6 +825,7 @@ const AdminLayoutRouteWithChildren = AdminLayoutRoute._addFileChildren(
 
 interface AppLayoutRouteChildren {
   BrowseRoute: typeof BrowseRoute
+  DeviceRoute: typeof DeviceRoute
   AdminLayoutRoute: typeof AdminLayoutRouteWithChildren
   TokensRoute: typeof TokensRoute
   CliLoginRoute: typeof CliLoginRoute
@@ -816,6 +836,7 @@ interface AppLayoutRouteChildren {
 
 const AppLayoutRouteChildren: AppLayoutRouteChildren = {
   BrowseRoute: BrowseRoute,
+  DeviceRoute: DeviceRoute,
   AdminLayoutRoute: AdminLayoutRouteWithChildren,
   TokensRoute: TokensRoute,
   CliLoginRoute: CliLoginRoute,

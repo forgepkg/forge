@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO device_authorization\n            (device_code_hash, user_code, client_id, scope, client_ip, interval_seconds, expires_at)\n        VALUES ($1, $2, $3, $4, $5, $6, $7)\n        ON CONFLICT (user_code) DO NOTHING\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "device_authorization",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6e33da34931d13a51229fd5e9798d3779a21d48eea365a94aa2ec7e2d5b7e673"
+}

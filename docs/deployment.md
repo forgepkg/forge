@@ -588,6 +588,8 @@ wrong.
 | `session_absolute_ttl_seconds` | `604800` (7 d) | A browser session ends this long after sign-in. New lifetimes apply to sessions signed in afterwards; an open session's idle window moves to the new idle timeout on its next use. |
 | `login_max_failures` | `10` | Failed passwords per client network and username before the lockout; `0` turns it off. Each instance counts its own. |
 | `login_failure_window_seconds` | `300` | The failure window, and how long a lockout lasts (at most a day). |
+| `device_login` | `true` | Command-line clients may sign in with a code entered on the `/device` page ([device login](#device-login)). Off, they are refused with `unauthorized_client`. |
+| `device_poll_interval_seconds` | `5` | How long a device login's client waits between two polls (1 to 60); one that polls sooner is told to wait five seconds longer. |
 
 A configuration that still sets one of these (`auth.anonymous_mode`,
 `FORGE_AUTH__ALLOW_PASSWORD_BASIC`, …, or the `oidc.session_*` lifetimes)
@@ -648,6 +650,96 @@ because NuGet clients store that password and replay it on every request.
 Administer through a browser session (the web UI, or `POST /auth/login` plus
 the returned CSRF token), or mint an admin-scoped token
 (`{"scope": {"admin": true}}`) for automation.
+
+### Device login
+
+A command-line client signs in through the browser with the OAuth 2.0
+device authorization grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)):
+it shows its user a code and the address of the web UI's `/device` page,
+the user signs in there as always (a password, OIDC or Entra, identifier
+first) and approves, and the client receives an API token. It is what
+Forge's command-line helpers sign in with: `forge login`,
+`docker-credential-forge` (the Docker CLI has no browser login for a
+registry other than Docker Hub) and `nuget-plugin-forge`, which are still
+to come; any RFC 8628 client using one of their client ids works today.
+It is the same mechanism as npm's browser login
+(`npm login`, [npm registries](npm.md#logging-in)), for the Forge host
+rather than one repository.
+
+**The endpoints.** A client finds them from the server URL alone, in the
+authorization server metadata ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414)):
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/.well-known/oauth-authorization-server` | `issuer` (`server.public_base_url`), `device_authorization_endpoint`, `token_endpoint`, `grant_types_supported` (`urn:ietf:params:oauth:grant-type:device_code`). |
+| `POST` | `/auth/device/code` | Start a login (RFC 8628 §3.1): `client_id` and an optional `scope`, form-encoded. Answers `device_code`, `user_code`, `verification_uri` (`<base>/device`), `verification_uri_complete` (`<base>/device?code=BCDF-GHJK`), `expires_in` and `interval`. |
+| `POST` | `/auth/device/token` | Poll it (§3.4): `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Answers `authorization_pending` until the user decides, `slow_down` when polled sooner than the interval (which then grows by five seconds), `access_denied`, `expired_token`, or the token: `access_token`, `token_type` `Bearer`, `expires_in`, `scope` when one was asked for, and `username`, whose token it is. |
+
+```bash
+curl -s https://forge.example.com/auth/device/code \
+  -d client_id=forge-cli -d scope=read
+curl -s https://forge.example.com/auth/device/token \
+  -d grant_type=urn:ietf:params:oauth:grant-type:device_code \
+  -d client_id=forge-cli -d device_code=<device_code>
+```
+
+Every refusal of these two endpoints is an RFC 6749 §5.2 JSON object
+(`{"error": "…", "error_description": "…"}`, `400`), never an HTML page,
+whatever credentials the request carries; `503` with `Retry-After` when
+Forge's database does not answer, `429` when a network starts too many
+logins (`auth.oidc_login_starts_per_minute`, as for OIDC sign-ins).
+
+- **Clients.** Forge has no client registration: it accepts its helpers'
+  fixed client ids, `forge-cli`, `docker-credential-forge` and
+  `nuget-plugin-forge`, so the `/device` page names the client truthfully.
+  Any other is `invalid_client`.
+- **Scope.** `scope` narrows the token, like a token scope set on the
+  **Tokens** page: `read`, `write` or `delete` is its level (the highest one
+  named), and `repository:<name>`, given once per repository, the
+  repositories it reaches (a name no repository has reaches nothing).
+  `scope=write repository:npm-all` is a token that reads and publishes in
+  `npm-all` alone. Without a scope the token carries the user's rights, as
+  npm's does. Anything else is `invalid_scope`; the admin API is never in
+  reach.
+- **No refresh token.** The token is a long-lived API token of the approving
+  user, as npm's browser login mints: it lasts
+  `cli_login.token_lifetime_days` (90 days; `0`: never), is named after the
+  client and the host (`docker-credential-forge login (forge.example.com)`),
+  and is listed and revocable on the user's **Tokens** page. A token of a
+  credential-forwarding account is revoked by an administrator's forced
+  re-authentication, like every token minted in such an account's session.
+- **Codes.** The device code is a 256-bit secret of which Forge stores only
+  the SHA-256. The user code is eight letters without vowels or look-alikes
+  (`BCDF-GHJK`), typed in any case, with or without the hyphen. A request
+  waits for its approval for `cli_login.web_login_ttl_seconds` (10
+  minutes); its token is answered to one poll, and a second poll gets
+  `expired_token`. The auth reaper deletes the requests past their lifetime.
+- **The `/device` page.** A signed-in user types the code, or arrives with it
+  filled in from `verification_uri_complete`; a visitor is sent through the
+  sign-in and back, with the code. The page shows which client asks, for
+  what, from which address and since when, and the code to compare with the
+  terminal, and signs the client in only on **Approve**: a filled-in code is
+  never approved without that click, against remote phishing (RFC 8628
+  §5.4). **Deny** refuses it (`access_denied`).
+- **Guessing.** Each instance counts the wrong codes entered on the page
+  per client network (IPv6 by /64) and per browser session: after ten within
+  five minutes, every code from that network or session is refused with
+  `429` until the five minutes are over, so a pending code cannot be guessed
+  within its lifetime. Finding a code clears no failure.
+- **Settings.** **Admin → Settings → Device login** turns the device login
+  off (`device_login`, see [above](#access-and-sign-in-settings)) and sets
+  the polling interval (`device_poll_interval_seconds`, 5 s). The lifetimes
+  are npm's browser login's, in the configuration:
+
+  ```toml
+  [cli_login]
+  token_lifetime_days   = 90
+  web_login_ttl_seconds = 600
+  ```
+
+Requests, approvals, denials and minted tokens are audit-logged
+(`forge::audit`: `device login requested`, `device login decided`, `device
+login: token minted`).
 
 ## Email
 
