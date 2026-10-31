@@ -47,8 +47,9 @@ pub struct RepositoryImport {
     pub state: String,
     /// `scan` or `copy`.
     pub phase: String,
-    /// What the scan walks: `search`, `catalog`, `assets` (Nexus' asset
-    /// listing), `directories` (another Forge's raw listing) or `names`.
+    /// What the scan walks: `search`, `catalog`, `all` (npm's `/-/all`),
+    /// `assets` (Nexus' asset listing), `directories` (another Forge's raw
+    /// listing) or `names`.
     pub scan_listing: String,
     #[serde(skip)]
     pub cursor: Option<String>,
@@ -82,8 +83,8 @@ pub struct NewImport<'a> {
     pub on_conflict: &'a str,
     pub concurrency: i32,
     pub dry_run: bool,
-    /// Where the scan starts: `search`, `catalog`, `assets`, `directories`
-    /// or `names`.
+    /// Where the scan starts: `search`, `catalog`, `all`, `assets`,
+    /// `directories` or `names`.
     pub scan_listing: &'a str,
     pub source_server: Option<&'a str>,
     pub source_total: Option<i64>,
@@ -445,7 +446,8 @@ pub struct ImportItem {
     #[serde(skip)]
     pub import_id: i64,
     /// `component` (a version, a Docker tag), `manifest` (a Docker referrer
-    /// held by digest) or `file` (a raw file: `name` its path, `version`
+    /// held by digest), `tag` (an npm dist-tag: `name` the package,
+    /// `version` the tag) or `file` (a raw file: `name` its path, `version`
     /// empty).
     pub kind: String,
     pub name: String,
@@ -558,6 +560,40 @@ pub async fn finish_item(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// What the newest earlier import into repository `repository_id` (before
+/// import `import_id`, a dry run none of them) recorded of the item `kind`
+/// `name` `version` it copied or found identical: its `source`. Where Forge
+/// still holds what that import set (a dist-tag where it pointed it, a
+/// deprecation it gave), a later import follows the source.
+pub async fn earlier_source(
+    pool: &PgPool,
+    repository_id: i64,
+    import_id: i64,
+    kind: &str,
+    name: &str,
+    version: &str,
+) -> sqlx::Result<Option<JsonValue>> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT i.source
+        FROM repository_import_item i
+        JOIN repository_import r ON r.id = i.import_id
+        WHERE r.repository_id = $1 AND r.id < $2 AND NOT r.dry_run
+          AND i.kind = $3 AND i.name = $4 AND i.version = $5
+          AND i.state IN ('imported', 'replaced', 'identical')
+        ORDER BY r.id DESC
+        LIMIT 1
+        "#,
+        repository_id,
+        import_id,
+        kind,
+        name,
+        version,
+    )
+    .fetch_optional(pool)
+    .await
 }
 
 /// Forget an item: a manifest the source holds by digest that turned out not

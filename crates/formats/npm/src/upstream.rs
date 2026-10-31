@@ -8,7 +8,9 @@
 //! a stream and keeps only what the operation asks for ([`Select`]): the
 //! name and the dist-tags, which versions there are, the objects of the
 //! versions asked for (without their READMEs) or just their summaries, and
-//! the publish times and the top-level README (bounded) when asked.
+//! the publish times and the top-level README (bounded) when asked. An
+//! import of another registry ([`crate::import`]) keeps what it copies of
+//! every version ([`Keep::Release`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -32,6 +34,8 @@ pub struct Select<'a> {
     /// The versions (normalized) whose objects are kept, as `keep` says;
     /// every other version is only listed ([`Kept::Listed`]).
     pub versions: &'a [String],
+    /// Keep the object of every version, not only of `versions`.
+    pub every: bool,
     pub keep: Keep,
     /// The publish times (`time`).
     pub time: bool,
@@ -47,14 +51,21 @@ pub enum Keep {
     Manifest,
     /// Its summary ([`manifest::summary`]) alone, as JSON.
     Summary,
+    /// What an import copies of it, as a [`Kept::Manifest`]: its `name`,
+    /// `version`, `dist` and `deprecated`.
+    Release,
 }
+
+/// The fields of a version object [`Keep::Release`] keeps.
+const RELEASE_FIELDS: &[&str] = &["name", "version", "dist", "deprecated"];
 
 /// A version object as [`read`] kept it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kept {
     /// Not kept: the version is listed, nothing more.
     Listed,
-    /// The manifest, without its README.
+    /// The manifest, without its README (or, with [`Keep::Release`], the
+    /// fields it keeps).
     Manifest(Map<String, Value>),
     /// Its summary, as JSON.
     Summary(String),
@@ -115,6 +126,14 @@ impl<'a> UpstreamVersion<'a> {
         self.dist()
             .and_then(|d| d.get("shasum"))
             .and_then(Value::as_str)
+    }
+
+    /// Why the version is deprecated, if it is (an empty message is none).
+    pub fn deprecated(&self) -> Option<&'a str> {
+        self.manifest()?
+            .get("deprecated")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
     }
 
     fn dist(&self) -> Option<&'a Map<String, Value>> {
@@ -246,6 +265,7 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
                 "versions" => {
                     out.versions = map.next_value_seed(VersionsSeed {
                         wanted: &self.wanted,
+                        every: self.select.every,
                         keep: self.select.keep,
                     })?
                 }
@@ -265,10 +285,11 @@ impl<'de> Visitor<'de> for TopVisitor<'_> {
     }
 }
 
-/// The `versions` object: the objects of the `wanted` versions (normalized)
-/// kept as `keep` says, the others only listed.
+/// The `versions` object: the objects of the `wanted` versions (normalized),
+/// or of `every` version, kept as `keep` says, the others only listed.
 struct VersionsSeed<'s, 'a> {
     wanted: &'s HashSet<&'a str>,
+    every: bool,
     keep: Keep,
 }
 
@@ -298,10 +319,8 @@ impl<'de> Visitor<'de> for VersionsSeed<'_, '_> {
                 map.next_value::<IgnoredAny>()?;
                 continue;
             };
-            let keep = self
-                .wanted
-                .contains(normalized.as_str())
-                .then_some(self.keep);
+            let keep =
+                (self.every || self.wanted.contains(normalized.as_str())).then_some(self.keep);
             if let Some(kept) = map.next_value_seed(ObjectSeed(keep))? {
                 out.insert(key, kept);
             }
@@ -353,14 +372,18 @@ impl<'de> Visitor<'de> for ObjectSeed {
         };
         let mut out = Map::new();
         while let Some(key) = map.next_key::<String>()? {
-            if key == "readme" || key == "readmeFilename" {
+            let skipped = match keep {
+                Keep::Release => !RELEASE_FIELDS.contains(&key.as_str()),
+                Keep::Manifest | Keep::Summary => key == "readme" || key == "readmeFilename",
+            };
+            if skipped {
                 map.next_value::<IgnoredAny>()?;
             } else {
                 out.insert(key, map.next_value::<Value>()?);
             }
         }
         Ok(Some(match keep {
-            Keep::Manifest => Kept::Manifest(out),
+            Keep::Manifest | Keep::Release => Kept::Manifest(out),
             Keep::Summary => Kept::Summary(
                 serde_json::to_string(&manifest::into_summary(out))
                     .map_err(<A::Error as serde::de::Error>::custom)?,
@@ -407,6 +430,7 @@ mod tests {
             &left_pad()[..],
             Select {
                 versions: &versions,
+                every: false,
                 keep: Keep::Manifest,
                 time: true,
                 readme: true,

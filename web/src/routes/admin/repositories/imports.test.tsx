@@ -25,6 +25,8 @@ import { searchOptions } from '~/lib/search'
  *  - an import shows its progress, its conflicts on demand, and a completed
  *    import's failed items are retried with the password it no longer holds;
  *    the form starts from the last import;
+ *  - an npm hosted repository offers the import of a registry, with named
+ *    packages and scopes, and shows its dist-tag conflicts;
  *  - a raw hosted repository offers the import of a raw repository, with
  *    paths one per line (spaces and commas kept), and names the listing.
  */
@@ -318,6 +320,81 @@ describe('import', () => {
     await userEvent.click(retry)
     await waitFor(() => expect(resumed).toEqual({ retry_failed: true, password: 's3cret' }))
     expect(requests('POST', '/imports/7/resume')).toHaveLength(1)
+  })
+
+  it('offers the import on an npm hosted repository, with packages and scopes', async () => {
+    let created: unknown
+    mockApi({
+      repositories: [repo({ name: 'npm-internal', format: 'npm' })],
+      imports: [
+        imp({
+          repository: 'npm-internal',
+          url: 'https://nexus.example.com/repository/npm-hosted',
+          username: null,
+          listing: 'all',
+          source_total: 3,
+          progress: {
+            found: 5,
+            pending: 0,
+            imported: 4,
+            replaced: 0,
+            identical: 0,
+            conflict: 1,
+            failed: 0,
+            planned: 0,
+            planned_size: 0,
+            bytes_copied: 2048,
+          },
+        }),
+      ],
+      items: [
+        item({
+          kind: 'tag',
+          name: '@acme/ui',
+          version: 'latest',
+          detail: 'Forge points it at 1.0.0; the source at 1.1.0',
+        }),
+      ],
+      onCreate: (body) => {
+        created = body
+        return json(imp({ state: 'queued' }), 201)
+      },
+    })
+    const router = await renderAt('/manage/repositories/npm-internal')
+    await userEvent.click(await screen.findByRole('link', { name: 'Import' }))
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe(
+        '/manage/repositories/npm-internal/import',
+      ),
+    )
+    const card = await screen.findByRole('article', { name: 'Import 7' })
+    expect(
+      within(card).getByText(/\/-\/all lists 3 packages/, { exact: false }),
+    ).toBeInTheDocument()
+    await userEvent.click(within(card).getByRole('button', { name: 'Show conflict' }))
+    expect(
+      await within(card).findByText('@acme/ui dist-tag latest'),
+    ).toBeInTheDocument()
+    expect(
+      within(card).getByText('Forge points it at 1.0.0; the source at 1.1.0'),
+    ).toBeInTheDocument()
+
+    const url = screen.getByLabelText('Registry URL')
+    expect(url).toHaveValue('https://nexus.example.com/repository/npm-hosted')
+    await userEvent.type(
+      screen.getByLabelText(/Packages or scopes/),
+      '@acme\nleft-pad',
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Start import' }))
+    await waitFor(() =>
+      expect(created).toEqual({
+        url: 'https://nexus.example.com/repository/npm-hosted',
+        names: ['@acme', 'left-pad'],
+        on_conflict: 'skip',
+        concurrency: 4,
+        dry_run: false,
+      }),
+    )
   })
 
   it('offers the import on a raw hosted repository, with paths one per line', async () => {

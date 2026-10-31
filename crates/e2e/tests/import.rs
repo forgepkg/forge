@@ -8,18 +8,27 @@
 //!   referrers tag schema);
 //! * a `distribution` registry (`registry:2`): Docker through its catalog;
 //! * another Forge: NuGet from a Forge NuGet repository, whose registration
-//!   lists each package's SHA-512, so a second run downloads nothing.
+//!   lists each package's SHA-512, so a second run downloads nothing;
+//! * npm from Nexus' npm hosted repository and from Verdaccio
+//!   (`verdaccio/verdaccio`), both through their `/-/all`: scoped and
+//!   unscoped packages, a prerelease, dist-tags and a deprecated version
+//!   arrive with the source's bytes and publish times, `npm install` from
+//!   Forge works (when npm is installed), and a second run copies only the
+//!   new release and moves `latest`.
 //!
 //! After an import, bytes and digests are the source's and so are the NuGet
 //! publish dates; a second run copies only what was added since. (Resuming
 //! a killed import, the conflict policies, the dry run and a source without
 //! a search or catalog are covered against a mock source in
 //! `crates/server/tests/import.rs`.) Gated behind `forge-e2e`; Nexus takes a
-//! minute or two to start.
+//! minute or two to start, and the tests that start one take turns.
 
 #![cfg(feature = "forge-e2e")]
 
+use std::collections::BTreeMap;
 use std::time::Duration;
+
+use base64::Engine;
 
 use forge_e2e::{make_nupkg, StackBuilder, TestServer};
 use forge_server::import::ImportWorker;
@@ -552,6 +561,7 @@ async fn assert_signed_index(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn import_from_a_real_nexus() {
+    let _turn = NEXUS.lock().await;
     let (nexus, _container) = Nexus::start().await;
     nexus.seed_repositories().await;
 
@@ -781,4 +791,462 @@ async fn import_from_another_forge() {
     assert_eq!(done["progress"]["identical"], 3, "{done}");
     assert_eq!(done["progress"]["bytes_copied"], 0, "{done}");
     assert_eq!(downloads().await, before);
+}
+
+// ── npm ─────────────────────────────────────────────────────────────────────
+
+const VERDACCIO_IMAGE: &str = "mirror.gcr.io/verdaccio/verdaccio";
+const VERDACCIO_TAG: &str = "6.11.1";
+
+/// Verdaccio without an uplink (it would refuse a publish while
+/// registry.npmjs.org is out of reach), with a user database, and the
+/// `@acme` scope readable by its users only: the import must send its
+/// credentials.
+const VERDACCIO_CONFIG: &str = "\
+storage: /verdaccio/storage/data
+plugins: /verdaccio/plugins
+auth:
+  htpasswd:
+    file: /verdaccio/storage/htpasswd
+    max_users: 100
+packages:
+  '@acme/*':
+    access: $authenticated
+    publish: $authenticated
+    unpublish: $authenticated
+  '**':
+    access: $all
+    publish: $authenticated
+    unpublish: $authenticated
+log:
+  type: stdout
+  format: pretty
+  level: http
+";
+
+/// Nexus takes a few GiB: the tests that start one take turns.
+static NEXUS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// An npm registry to publish to, as npm does.
+struct NpmSource {
+    /// The registry's URL, without a trailing `/`.
+    url: String,
+    /// The `Authorization` header npm sends.
+    auth: String,
+    client: reqwest::Client,
+}
+
+/// A tarball of `name@version`.
+fn npm_tgz(name: &str, version: &str) -> Vec<u8> {
+    let package_json = json!({
+        "name": name, "version": version, "main": "index.js",
+        "description": format!("{name} for the import e2e"),
+    })
+    .to_string();
+    let index = format!("module.exports = {:?};\n", format!("{name}@{version}"));
+    forge_format_npm::tarball::build(&[
+        ("package/package.json", package_json.as_bytes()),
+        ("package/index.js", index.as_bytes()),
+    ])
+}
+
+impl NpmSource {
+    fn escaped(name: &str) -> String {
+        name.replacen('/', "%2f", 1)
+    }
+
+    /// `npm publish` of `tarball` as `name@version`, tagged `tag`.
+    async fn publish(&self, name: &str, version: &str, tag: &str, tarball: &[u8]) {
+        let digests = forge_format_npm::integrity::Digests::of(tarball).unwrap();
+        let unscoped = name.rsplit('/').next().unwrap();
+        let file = format!("{unscoped}-{version}.tgz");
+        let body = json!({
+            "_id": name, "name": name,
+            "description": format!("{name} for the import e2e"),
+            "dist-tags": {tag: version},
+            "versions": {version: {
+                "name": name, "version": version, "main": "index.js",
+                "description": format!("{name} for the import e2e"),
+                "_id": format!("{name}@{version}"),
+                "dist": {
+                    "integrity": digests.integrity(), "shasum": digests.sha1_hex,
+                    "tarball": format!("{}/{name}/-/{file}", self.url),
+                },
+            }},
+            "access": null,
+            "_attachments": {file: {
+                "content_type": "application/octet-stream",
+                "data": base64::engine::general_purpose::STANDARD.encode(tarball),
+                "length": tarball.len(),
+            }},
+        });
+        let resp = self
+            .client
+            .put(format!("{}/{}", self.url, Self::escaped(name)))
+            .header("authorization", &self.auth)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "publish {name}@{version}: {} {}",
+            resp.status(),
+            resp.text().await.unwrap()
+        );
+    }
+
+    /// `npm dist-tag add name@version tag`.
+    async fn tag(&self, name: &str, version: &str, tag: &str) {
+        let resp = self
+            .client
+            .put(format!(
+                "{}/-/package/{}/dist-tags/{tag}",
+                self.url,
+                Self::escaped(name)
+            ))
+            .header("authorization", &self.auth)
+            .json(&json!(version))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "dist-tag: {}", resp.status());
+    }
+
+    /// The full packument of `name`.
+    async fn packument(&self, name: &str) -> Value {
+        let resp = self
+            .client
+            .get(format!("{}/{}", self.url, Self::escaped(name)))
+            .header("authorization", &self.auth)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "packument of {name}");
+        resp.json().await.unwrap()
+    }
+
+    /// `npm deprecate name@version message`: the packument, written back
+    /// with the version's `deprecated`.
+    async fn deprecate(&self, name: &str, version: &str, message: &str) {
+        let mut doc = self.packument(name).await;
+        doc["versions"][version]["deprecated"] = json!(message);
+        if let Some(doc) = doc.as_object_mut() {
+            doc.remove("_attachments");
+        }
+        let resp = self
+            .client
+            .put(format!("{}/{}", self.url, Self::escaped(name)))
+            .header("authorization", &self.auth)
+            .json(&doc)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "deprecate {name}@{version}: {} {}",
+            resp.status(),
+            resp.text().await.unwrap()
+        );
+    }
+
+    /// The packages the e2e imports: scoped and unscoped, a prerelease
+    /// under `next`, a dist-tag of its own on an older version, and a
+    /// deprecated version. Returns the tarballs by `name@version`.
+    async fn seed(&self) -> BTreeMap<String, Vec<u8>> {
+        let mut tarballs = BTreeMap::new();
+        for (name, version, tag) in [
+            ("alpha", "1.0.0", "latest"),
+            ("alpha", "1.1.0", "latest"),
+            ("alpha", "2.0.0-beta.1", "next"),
+            ("@acme/ui", "1.0.0", "latest"),
+            ("@acme/ui", "1.0.1", "latest"),
+            ("@acme/core", "0.1.0", "latest"),
+        ] {
+            let tarball = npm_tgz(name, version);
+            self.publish(name, version, tag, &tarball).await;
+            tarballs.insert(format!("{name}@{version}"), tarball);
+        }
+        self.tag("@acme/ui", "1.0.0", "stable").await;
+        self.deprecate("alpha", "1.0.0", "use 1.1.0").await;
+        tarballs
+    }
+}
+
+/// A Verdaccio, its user's credentials, and an npm client of it.
+async fn verdaccio() -> (
+    NpmSource,
+    (String, String),
+    testcontainers::ContainerAsync<GenericImage>,
+) {
+    let container = GenericImage::new(VERDACCIO_IMAGE, VERDACCIO_TAG)
+        .with_exposed_port(4873.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("http address"))
+        .with_copy_to(
+            "/verdaccio/conf/config.yaml",
+            VERDACCIO_CONFIG.as_bytes().to_vec(),
+        )
+        .with_startup_timeout(Duration::from_secs(120))
+        .start()
+        .await
+        .expect("start verdaccio (is Docker running?)");
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(4873).await.unwrap();
+    let url = format!("http://{host}:{port}");
+    let client = reqwest::Client::new();
+    let (user, password) = ("importer".to_string(), "importer-secret".to_string());
+    let resp = client
+        .put(format!("{url}/-/user/org.couchdb.user:{user}"))
+        .json(&json!({"name": user, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "add the user");
+    let token = resp.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (
+        NpmSource {
+            url,
+            auth: format!("Bearer {token}"),
+            client,
+        },
+        (user, password),
+        container,
+    )
+}
+
+/// The Forge packument of `name` in `repo`.
+async fn forge_packument(srv: &TestServer, repo: &str, name: &str) -> Value {
+    serde_json::from_slice(
+        &download(
+            srv,
+            &format!("/repository/{repo}/{}", NpmSource::escaped(name)),
+        )
+        .await,
+    )
+    .unwrap()
+}
+
+/// After an import of `source`'s packages into `repo`: their bytes, publish
+/// times, dist-tags and deprecation are the source's.
+async fn assert_npm_copied(
+    srv: &TestServer,
+    repo: &str,
+    source: &NpmSource,
+    tarballs: &BTreeMap<String, Vec<u8>>,
+) {
+    for (spec, tarball) in tarballs {
+        let (name, version) = spec.rsplit_once('@').unwrap();
+        let unscoped = name.rsplit('/').next().unwrap();
+        assert_eq!(
+            &download(
+                srv,
+                &format!("/repository/{repo}/{name}/-/{unscoped}-{version}.tgz")
+            )
+            .await,
+            tarball,
+            "{spec}"
+        );
+    }
+    for name in ["alpha", "@acme/ui", "@acme/core"] {
+        let theirs = source.packument(name).await;
+        let ours = forge_packument(srv, repo, name).await;
+        assert_eq!(ours["dist-tags"], theirs["dist-tags"], "{name}");
+        for (version, object) in theirs["versions"].as_object().unwrap() {
+            assert_eq!(
+                ours["versions"][version]["dist"]["integrity"], object["dist"]["integrity"],
+                "{name}@{version}"
+            );
+            assert_eq!(
+                ours["versions"][version].get("deprecated"),
+                object.get("deprecated").filter(|m| m != &&json!("")),
+                "{name}@{version}"
+            );
+            let time = |doc: &Value| {
+                chrono::DateTime::parse_from_rfc3339(doc["time"][version].as_str().unwrap())
+                    .unwrap()
+            };
+            assert_eq!(time(&ours), time(&theirs), "{name}@{version}");
+        }
+    }
+    assert_eq!(
+        forge_packument(srv, repo, "alpha").await["versions"]["1.0.0"]["deprecated"],
+        "use 1.1.0"
+    );
+}
+
+/// `npm install` of `specs` from Forge's `repo`, with the admin's token;
+/// the versions installed, by package. `None` without npm.
+fn npm_install(srv: &TestServer, repo: &str, specs: &[&str]) -> Option<BTreeMap<String, String>> {
+    let has_npm = std::process::Command::new("npm")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_npm {
+        eprintln!("npm is not installed: the npm install from Forge is skipped");
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let registry = format!("{}/repository/{repo}/", srv.base_url);
+    let (_, token) = srv.admin_basic();
+    let host = registry.trim_start_matches("http:");
+    std::fs::write(
+        dir.path().join(".npmrc"),
+        format!("registry={registry}\n{host}:_authToken={token}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"name": "consumer", "version": "1.0.0", "private": true}"#,
+    )
+    .unwrap();
+    let out = std::process::Command::new("npm")
+        .args(["install", "--no-audit", "--no-fund", "--no-update-notifier"])
+        .args(specs)
+        .current_dir(dir.path())
+        .env("npm_config_cache", dir.path().join(".cache"))
+        .output()
+        .expect("run npm");
+    assert!(
+        out.status.success(),
+        "npm install {specs:?}: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut installed = BTreeMap::new();
+    for spec in specs {
+        let name = match spec.rfind('@') {
+            Some(at) if at > 0 => &spec[..at],
+            _ => spec,
+        };
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join("node_modules")
+                    .join(name)
+                    .join("package.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        installed.insert(
+            name.to_string(),
+            manifest["version"].as_str().unwrap().to_string(),
+        );
+    }
+    Some(installed)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn npm_import_from_a_real_nexus() {
+    let _turn = NEXUS.lock().await;
+    let (nexus, _container) = Nexus::start().await;
+    let hosted = json!({
+        "name": "npm-hosted", "online": true,
+        "storage": {"blobStoreName": "default", "strictContentTypeValidation": true, "writePolicy": "allow_once"},
+    });
+    let resp = nexus
+        .api(reqwest::Method::POST, "repositories/npm/hosted")
+        .json(&hosted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    let basic =
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", ADMIN.0, ADMIN.1));
+    let source = NpmSource {
+        url: format!("{}/repository/npm-hosted", nexus.url),
+        auth: format!("Basic {basic}"),
+        client: reqwest::Client::new(),
+    };
+    let mut tarballs = source.seed().await;
+
+    let srv = StackBuilder::default().start().await;
+    create_repo(
+        &srv,
+        json!({"name": "npm", "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let body = json!({"url": source.url, "username": ADMIN.0, "password": ADMIN.1});
+    let done = import(&srv, "npm", body.clone()).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    // Nexus' search finds nothing without a text: its /-/all lists them.
+    assert_eq!(done["listing"], "all", "{done}");
+    assert_eq!(done["source_total"], 3, "{done}");
+    assert!(
+        done["source_server"]
+            .as_str()
+            .unwrap()
+            .starts_with("Nexus/"),
+        "{done}"
+    );
+    // Six versions; alpha's latest and next, @acme/ui's latest and stable,
+    // @acme/core's latest.
+    assert_eq!(done["progress"]["failed"], 0, "{done}");
+    assert_eq!(done["progress"]["imported"], 11, "{done}");
+    assert_npm_copied(&srv, "npm", &source, &tarballs).await;
+    if let Some(installed) = npm_install(&srv, "npm", &["alpha", "@acme/ui@stable", "@acme/core"]) {
+        assert_eq!(
+            installed,
+            BTreeMap::from([
+                ("alpha".to_string(), "1.1.0".to_string()),
+                ("@acme/ui".to_string(), "1.0.0".to_string()),
+                ("@acme/core".to_string(), "0.1.0".to_string()),
+            ])
+        );
+    }
+
+    // A new release becomes latest at Nexus: a second run copies it alone
+    // and moves the tag.
+    let newer = npm_tgz("alpha", "1.2.0");
+    source.publish("alpha", "1.2.0", "latest", &newer).await;
+    tarballs.insert("alpha@1.2.0".into(), newer.clone());
+    let done = import(&srv, "npm", body).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["imported"], 1, "{done}");
+    assert_eq!(done["progress"]["replaced"], 1, "{done}");
+    assert_eq!(done["progress"]["identical"], 10, "{done}");
+    assert_eq!(done["progress"]["bytes_copied"], newer.len(), "{done}");
+    assert_npm_copied(&srv, "npm", &source, &tarballs).await;
+    if let Some(installed) = npm_install(&srv, "npm", &["alpha", "alpha@next"]) {
+        assert_eq!(installed["alpha"], "2.0.0-beta.1");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn npm_import_from_verdaccio() {
+    let (source, (user, password), _container) = verdaccio().await;
+    let tarballs = source.seed().await;
+
+    let srv = StackBuilder::default().start().await;
+    create_repo(
+        &srv,
+        json!({"name": "npm", "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let body = json!({"url": source.url, "username": user, "password": password});
+    let done = import(&srv, "npm", body.clone()).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    // Verdaccio's search needs a text: its /-/all lists them, the @acme
+    // scope to its users alone.
+    assert_eq!(done["listing"], "all", "{done}");
+    assert_eq!(done["source_total"], 3, "{done}");
+    assert_eq!(done["progress"]["failed"], 0, "{done}");
+    assert_eq!(done["progress"]["imported"], 11, "{done}");
+    assert_npm_copied(&srv, "npm", &source, &tarballs).await;
+    if let Some(installed) = npm_install(&srv, "npm", &["alpha@next", "@acme/ui"]) {
+        assert_eq!(installed["alpha"], "2.0.0-beta.1");
+        assert_eq!(installed["@acme/ui"], "1.0.1");
+    }
+
+    // A scope named: its packages from /-/all. Everything is there already.
+    let mut named = body;
+    named["names"] = json!(["@acme"]);
+    let done = import(&srv, "npm", named).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["identical"], 6, "{done}");
+    assert_eq!(done["progress"]["bytes_copied"], 0, "{done}");
 }

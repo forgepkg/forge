@@ -23,7 +23,16 @@
 //!   it, through the referrers tag schema, digests kept;
 //! * an import stored before imports read the formats' protocols lists and
 //!   resumes;
-//! * with `[crypto]`, the password is sealed at rest.
+//! * with `[crypto]`, the password is sealed at rest;
+//! * npm, from a mock registry at `/repository/<name>/`: a search that lists
+//!   every package (as another Forge's does), paged; `/-/all` where the
+//!   search lists nothing (Nexus) or refuses an empty text (Verdaccio);
+//!   named packages and scopes. Bytes, publish times, dist-tags and
+//!   deprecations arrive, tarballs come from the import's URL whatever
+//!   host `dist.tarball` names, and are checked against `dist.integrity`
+//!   (or `dist.shasum` alone). A second run downloads only what is new and
+//!   moves the tags the source moved; a tag or deprecation changed in Forge
+//!   is a conflict; the dry run downloads nothing.
 
 mod common;
 
@@ -110,6 +119,44 @@ struct SourceState {
     downloads: HashMap<String, usize>,
     /// Slows every package download.
     delay: Duration,
+    /// npm registries, by repository.
+    npm: HashMap<String, NpmSource>,
+}
+
+/// A version of an npm package at a mock registry.
+#[derive(Clone)]
+struct NpmVersion {
+    bytes: Vec<u8>,
+    published: Option<String>,
+    deprecated: Option<String>,
+    /// The packument lists `dist.integrity` (old packages have only
+    /// `dist.shasum`).
+    integrity: bool,
+}
+
+/// How a mock registry's search answers a search for every package (an
+/// empty `text`).
+#[derive(Clone, Copy, Default, PartialEq)]
+enum NpmSearch {
+    /// Every package, scoped ones with their scope (another Forge).
+    #[default]
+    Lists,
+    /// Nothing; and a search with a text names a scoped package without its
+    /// scope (Nexus 3.70).
+    Nothing,
+    /// 400: a text is required (Verdaccio).
+    Refused,
+}
+
+#[derive(Default)]
+struct NpmSource {
+    /// name → version → version.
+    packages: BTreeMap<String, BTreeMap<String, NpmVersion>>,
+    /// name → dist-tag → version.
+    tags: BTreeMap<String, BTreeMap<String, String>>,
+    search: NpmSearch,
+    /// Serves `/-/all`.
+    all: bool,
 }
 
 #[derive(Clone)]
@@ -299,6 +346,9 @@ async fn answer(state: &Mutex<SourceState>, base: &str, req: Request) -> Respons
         return StatusCode::NOT_FOUND.into_response();
     };
     let (repo, inner) = rest.split_once('/').unwrap_or((rest, ""));
+    if state.lock().unwrap().npm.contains_key(repo) {
+        return npm_registry(state, repo, inner, &query);
+    }
     if let Some(api) = inner.strip_prefix("v2/") {
         return registry(state, repo, api, &query);
     }
@@ -527,6 +577,198 @@ fn registry(
         };
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// The host the mock registries' packuments name tarballs on, as a Nexus
+/// configured with a base URL clients use names its own: the import does
+/// not reach it.
+const NPM_TARBALL_HOST: &str = "http://npm.internal.invalid";
+
+/// An npm registry at `/repository/<repo>/<inner>`.
+fn npm_registry(
+    state: &Mutex<SourceState>,
+    repo: &str,
+    inner: &str,
+    query: &HashMap<String, String>,
+) -> Response {
+    let mut s = state.lock().unwrap();
+    let page_size = s.page_size;
+    let registry = &s.npm[repo];
+    match inner {
+        "-/ping" => return json_response(json!({})),
+        "-/all" if registry.all => {
+            let mut all = serde_json::Map::new();
+            all.insert("_updated".into(), json!(1));
+            for (name, versions) in &registry.packages {
+                let tags = registry.tags.get(name).cloned().unwrap_or_default();
+                all.insert(
+                    name.clone(),
+                    json!({"name": name, "dist-tags": tags, "versions": versions.keys().map(|v| (v.clone(), json!("latest"))).collect::<serde_json::Map<_, _>>()}),
+                );
+            }
+            return json_response(Value::Object(all));
+        }
+        "-/v1/search" => {
+            let text = query.get("text").cloned().unwrap_or_default();
+            if text.is_empty() && registry.search == NpmSearch::Refused {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "'text' query parameter is required"}).to_string(),
+                )
+                    .into_response();
+            }
+            let found: Vec<&String> = registry
+                .packages
+                .keys()
+                .filter(|name| match registry.search {
+                    NpmSearch::Nothing if text.is_empty() => false,
+                    _ => name.contains(text.as_str()),
+                })
+                .collect();
+            let from: usize = query.get("from").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let size: usize = query.get("size").and_then(|v| v.parse().ok()).unwrap_or(20);
+            let objects: Vec<Value> = found
+                .iter()
+                .skip(from)
+                .take(size.min(page_size))
+                .map(|name| match registry.search {
+                    // Nexus: the name without its scope, and no scope.
+                    NpmSearch::Nothing => {
+                        json!({"package": {"name": name.rsplit('/').next().unwrap(), "version": "1.0.0"}})
+                    }
+                    _ => {
+                        let scope = name
+                            .strip_prefix('@')
+                            .and_then(|n| n.split_once('/'))
+                            .map_or("unscoped", |(scope, _)| scope);
+                        json!({"package": {"name": name, "scope": scope, "version": "1.0.0"}})
+                    }
+                })
+                .collect();
+            return json_response(json!({"objects": objects, "total": found.len()}));
+        }
+        _ => {}
+    }
+    // A tarball, `<name>/-/<file>`.
+    if let Some((name, file)) = inner.split_once("/-/") {
+        let unscoped = name.rsplit('/').next().unwrap();
+        let Some(version) = file
+            .strip_suffix(".tgz")
+            .and_then(|f| f.strip_prefix(unscoped))
+            .and_then(|f| f.strip_prefix('-'))
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let Some(found) = registry
+            .packages
+            .get(name)
+            .and_then(|versions| versions.get(version))
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let bytes = found.bytes.clone();
+        let key = format!("npm/{repo}/{name}/{version}");
+        *s.downloads.entry(key.clone()).or_default() += 1;
+        return s
+            .corrupt
+            .get(&key)
+            .cloned()
+            .unwrap_or(bytes)
+            .into_response();
+    }
+    // A packument, `<name>` or `@scope%2fname`.
+    let name = inner.replacen("%2f", "/", 1).replacen("%2F", "/", 1);
+    let Some(versions) = registry.packages.get(&name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let unscoped = name.rsplit('/').next().unwrap();
+    let mut time = serde_json::Map::new();
+    let mut objects = serde_json::Map::new();
+    for (version, v) in versions {
+        let digests = forge_format_npm::integrity::Digests::of(&v.bytes[..]).unwrap();
+        let mut dist = json!({
+            "shasum": digests.sha1_hex,
+            "tarball": format!("{NPM_TARBALL_HOST}/repository/{repo}/{name}/-/{unscoped}-{version}.tgz"),
+        });
+        if v.integrity {
+            dist["integrity"] = json!(digests.integrity());
+        }
+        let mut object = json!({"name": name, "version": version, "readme": "# big", "dist": dist});
+        if let Some(message) = &v.deprecated {
+            object["deprecated"] = json!(message);
+        }
+        if let Some(published) = &v.published {
+            time.insert(version.clone(), json!(published));
+        }
+        objects.insert(version.clone(), object);
+    }
+    json_response(json!({
+        "_id": name, "name": name,
+        "dist-tags": registry.tags.get(&name).cloned().unwrap_or_default(),
+        "time": time,
+        "versions": objects,
+    }))
+}
+
+/// A gzip-compressed npm tarball of `name@version`, with `content`.
+fn tgz(name: &str, version: &str, content: &str) -> Vec<u8> {
+    let package_json = json!({"name": name, "version": version, "main": "index.js"}).to_string();
+    forge_format_npm::tarball::build(&[
+        ("package/package.json", package_json.as_bytes()),
+        ("package/index.js", content.as_bytes()),
+    ])
+}
+
+impl Source {
+    /// The npm registry `name`, set up by `f`.
+    fn npm(&self, name: &str, f: impl FnOnce(&mut NpmSource)) {
+        self.with(|s| f(s.npm.entry(name.into()).or_default()));
+    }
+
+    /// Add (or replace) a version of an npm package, with its integrity.
+    fn npm_version(
+        &self,
+        registry: &str,
+        name: &str,
+        version: &str,
+        bytes: Vec<u8>,
+        published: &str,
+    ) {
+        self.npm(registry, |r| {
+            r.packages.entry(name.into()).or_default().insert(
+                version.into(),
+                NpmVersion {
+                    bytes,
+                    published: Some(published.into()),
+                    deprecated: None,
+                    integrity: true,
+                },
+            );
+        });
+    }
+
+    fn npm_tag(&self, registry: &str, name: &str, tag: &str, version: &str) {
+        self.npm(registry, |r| {
+            r.tags
+                .entry(name.into())
+                .or_default()
+                .insert(tag.into(), version.into());
+        });
+    }
+
+    /// The registry API of `name`: npm's.
+    fn npm_url(&self, name: &str) -> String {
+        format!("{}/repository/{name}", self.url)
+    }
+
+    fn npm_downloads(&self, registry: &str, name: &str, version: &str) -> usize {
+        self.with(|s| {
+            s.downloads
+                .get(&format!("npm/{registry}/{name}/{version}"))
+                .copied()
+                .unwrap_or(0)
+        })
+    }
 }
 
 // ── Forge helpers ───────────────────────────────────────────────────────────
@@ -1742,4 +1984,585 @@ async fn the_password_is_sealed_at_rest() {
     let done = run(&srv, &repo, id).await;
     assert_eq!(done["state"], "completed", "{done}");
     assert_eq!(done["progress"]["imported"], 1);
+}
+
+// ── npm ─────────────────────────────────────────────────────────────────────
+
+/// A path of an npm repository of Forge, read as the administrator.
+async fn npm_get(srv: &TestServer, repo: &str, path: &str) -> reqwest::Response {
+    let (u, p) = srv.admin_basic();
+    srv.client()
+        .get(format!("{}/repository/{repo}/{path}", srv.base_url))
+        .basic_auth(u, Some(p))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Forge's full packument of `name`.
+async fn packument(srv: &TestServer, repo: &str, name: &str) -> Value {
+    let resp = npm_get(srv, repo, &name.replacen('/', "%2f", 1)).await;
+    assert_eq!(resp.status(), 200, "{name}");
+    resp.json().await.unwrap()
+}
+
+/// The tarball of `name@version` Forge serves, if it has it.
+async fn npm_tarball(srv: &TestServer, repo: &str, name: &str, version: &str) -> Option<Vec<u8>> {
+    let unscoped = name.rsplit('/').next().unwrap();
+    let resp = npm_get(srv, repo, &format!("{name}/-/{unscoped}-{version}.tgz")).await;
+    (resp.status() == 200).then_some(resp.bytes().await.unwrap().to_vec())
+}
+
+/// The item of an import of `kind` `name` `version`.
+async fn item_of(srv: &TestServer, repo: &str, id: i64, name: &str, version: &str) -> Value {
+    items(srv, repo, id, None)
+        .await
+        .into_iter()
+        .find(|i| i["name"] == name && i["version"] == version)
+        .unwrap_or_else(|| panic!("no item {name} {version}"))
+}
+
+fn parse_time(t: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc)
+}
+
+#[tokio::test]
+async fn npm_import_keeps_bytes_times_tags_and_deprecations_and_a_second_run_copies_only_what_is_new(
+) {
+    let srv = forge().await;
+    let source = Source::start().await;
+    let reg = "npm-hosted";
+    let alpha = tgz("alpha", "1.0.0", "one");
+    source.npm_version(
+        reg,
+        "alpha",
+        "1.0.0",
+        alpha.clone(),
+        "2020-01-02T03:04:05.678Z",
+    );
+    source.npm_version(
+        reg,
+        "alpha",
+        "1.1.0",
+        tgz("alpha", "1.1.0", "two"),
+        "2021-01-01T00:00:00.000Z",
+    );
+    source.npm_version(
+        reg,
+        "alpha",
+        "2.0.0-beta.1",
+        tgz("alpha", "2.0.0-beta.1", "three"),
+        "2022-01-01T00:00:00.000Z",
+    );
+    source.npm_tag(reg, "alpha", "latest", "1.1.0");
+    source.npm_tag(reg, "alpha", "next", "2.0.0-beta.1");
+    source.npm(reg, |r| {
+        r.packages
+            .get_mut("alpha")
+            .unwrap()
+            .get_mut("1.0.0")
+            .unwrap()
+            .deprecated = Some("use 1.1.0".into())
+    });
+    let ui = tgz("@acme/ui", "1.0.0", "ui");
+    source.npm_version(
+        reg,
+        "@acme/ui",
+        "1.0.0",
+        ui.clone(),
+        "2023-05-06T07:08:09.000Z",
+    );
+    source.npm_tag(reg, "@acme/ui", "latest", "1.0.0");
+    // An old package, with `dist.shasum` alone.
+    source.npm_version(
+        reg,
+        "legacy",
+        "0.1.0",
+        tgz("legacy", "0.1.0", "old"),
+        "2015-01-01T00:00:00.000Z",
+    );
+    source.npm(reg, |r| {
+        r.packages
+            .get_mut("legacy")
+            .unwrap()
+            .get_mut("0.1.0")
+            .unwrap()
+            .integrity = false
+    });
+    source.npm_tag(reg, "legacy", "latest", "0.1.0");
+
+    let repo = repo_name("npm-import");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let id = start(&srv, &repo, from(source.npm_url(reg))).await;
+    let queued = get_import(&srv, &repo, id).await;
+    assert_eq!(queued["url"], source.npm_url(reg));
+    // Another Forge's search lists every package; it pages by two here.
+    assert_eq!(queued["listing"], "search");
+    assert_eq!(queued["source_total"], 3);
+    assert_eq!(queued["source_server"], SERVER);
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    // Five versions and four dist-tags.
+    assert_eq!(done["progress"]["found"], 9, "{done}");
+    assert_eq!(done["progress"]["imported"], 9, "{done}");
+    assert_eq!(done["has_password"], false);
+
+    // The tarballs came from the import's URL (the packuments name another
+    // host), with their bytes; the publish times are the registry's.
+    assert_eq!(
+        npm_tarball(&srv, &repo, "alpha", "1.0.0").await.unwrap(),
+        alpha
+    );
+    assert_eq!(
+        npm_tarball(&srv, &repo, "@acme/ui", "1.0.0").await.unwrap(),
+        ui
+    );
+    assert_eq!(source.npm_downloads(reg, "alpha", "1.0.0"), 1);
+    let (created, _) = times(&srv, &repo, "alpha", "1.0.0").await;
+    assert_eq!(created, parse_time("2020-01-02T03:04:05.678Z"));
+    let (created, _) = times(&srv, &repo, "legacy", "0.1.0").await;
+    assert_eq!(created, parse_time("2015-01-01T00:00:00Z"));
+    let doc = packument(&srv, &repo, "alpha").await;
+    assert_eq!(
+        doc["dist-tags"],
+        json!({"latest": "1.1.0", "next": "2.0.0-beta.1"})
+    );
+    assert_eq!(doc["versions"]["1.0.0"]["deprecated"], "use 1.1.0");
+    assert!(doc["versions"]["1.1.0"].get("deprecated").is_none());
+    assert_eq!(
+        parse_time(doc["time"]["1.1.0"].as_str().unwrap()),
+        parse_time("2021-01-01T00:00:00Z")
+    );
+    assert_eq!(
+        doc["versions"]["1.0.0"]["dist"]["integrity"],
+        forge_format_npm::integrity::Digests::of(&alpha[..])
+            .unwrap()
+            .integrity()
+    );
+    let doc = packument(&srv, &repo, "@acme/ui").await;
+    assert_eq!(doc["dist-tags"], json!({"latest": "1.0.0"}));
+    let tag = item_of(&srv, &repo, id, "alpha", "next").await;
+    assert_eq!(tag["kind"], "tag");
+    assert_eq!(tag["detail"], "points at 2.0.0-beta.1");
+
+    // The source moves on: a new version becomes latest, a version is
+    // deprecated.
+    let newer = tgz("alpha", "1.2.0", "four");
+    source.npm_version(
+        reg,
+        "alpha",
+        "1.2.0",
+        newer.clone(),
+        "2024-02-03T04:05:06.000Z",
+    );
+    source.npm_tag(reg, "alpha", "latest", "1.2.0");
+    source.npm(reg, |r| {
+        r.packages
+            .get_mut("@acme/ui")
+            .unwrap()
+            .get_mut("1.0.0")
+            .unwrap()
+            .deprecated = Some("gone".into())
+    });
+    let again = start(&srv, &repo, from(source.npm_url(reg))).await;
+    let done = run(&srv, &repo, again).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["found"], 10, "{done}");
+    assert_eq!(done["progress"]["imported"], 1, "{done}");
+    assert_eq!(done["progress"]["replaced"], 1, "the tag the source moved");
+    assert_eq!(done["progress"]["identical"], 8, "{done}");
+    // Only the new version is downloaded, and the one the registry lists no
+    // SHA-512 of, to compare.
+    assert_eq!(source.npm_downloads(reg, "alpha", "1.0.0"), 1);
+    assert_eq!(source.npm_downloads(reg, "alpha", "1.2.0"), 1);
+    assert_eq!(source.npm_downloads(reg, "@acme/ui", "1.0.0"), 1);
+    assert_eq!(source.npm_downloads(reg, "legacy", "0.1.0"), 2);
+    assert_eq!(
+        npm_tarball(&srv, &repo, "alpha", "1.2.0").await.unwrap(),
+        newer
+    );
+    let doc = packument(&srv, &repo, "alpha").await;
+    assert_eq!(doc["dist-tags"]["latest"], "1.2.0");
+    let moved = item_of(&srv, &repo, again, "alpha", "latest").await;
+    assert_eq!(moved["state"], "replaced");
+    assert_eq!(moved["detail"], "moved from 1.1.0 to 1.2.0");
+    let doc = packument(&srv, &repo, "@acme/ui").await;
+    assert_eq!(doc["versions"]["1.0.0"]["deprecated"], "gone");
+    let deprecated = item_of(&srv, &repo, again, "@acme/ui", "1.0.0").await;
+    assert_eq!(
+        (deprecated["state"].as_str(), deprecated["detail"].as_str()),
+        (Some("identical"), Some("deprecated: gone"))
+    );
+
+    // Forge's own changes: a dist-tag pointed elsewhere and a deprecation
+    // lifted, in Forge. A run that skips conflicts keeps them, and says so.
+    let repo_id = repository_id(&srv, &repo).await;
+    sqlx::query!(
+        "UPDATE package_tag SET version = '1.0.0' WHERE repository_id = $1 AND package = 'alpha' AND tag = 'next'",
+        repo_id
+    )
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    sqlx::query!(
+        "UPDATE component SET deprecation = NULL WHERE repository_id = $1 AND name = 'alpha' AND version = '1.0.0'",
+        repo_id
+    )
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    let skipped = start(&srv, &repo, from(source.npm_url(reg))).await;
+    let done = run(&srv, &repo, skipped).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["conflict"], 2, "{done}");
+    let tag = item_of(&srv, &repo, skipped, "alpha", "next").await;
+    assert_eq!(
+        tag["detail"],
+        "Forge points it at 1.0.0; the source at 2.0.0-beta.1"
+    );
+    let version = item_of(&srv, &repo, skipped, "alpha", "1.0.0").await;
+    assert_eq!(version["state"], "conflict");
+    assert!(
+        version["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Forge no longer does"),
+        "{version}"
+    );
+    let doc = packument(&srv, &repo, "alpha").await;
+    assert_eq!(doc["dist-tags"]["next"], "1.0.0");
+    assert!(doc["versions"]["1.0.0"].get("deprecated").is_none());
+
+    // With overwrite, the source's.
+    let mut overwrite = from(source.npm_url(reg));
+    overwrite["on_conflict"] = json!("overwrite");
+    let overwritten = start(&srv, &repo, overwrite).await;
+    let done = run(&srv, &repo, overwritten).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["conflict"], 0, "{done}");
+    assert_eq!(done["progress"]["replaced"], 1, "{done}");
+    let doc = packument(&srv, &repo, "alpha").await;
+    assert_eq!(doc["dist-tags"]["next"], "2.0.0-beta.1");
+    assert_eq!(doc["versions"]["1.0.0"]["deprecated"], "use 1.1.0");
+    assert_eq!(source.npm_downloads(reg, "alpha", "1.0.0"), 1);
+}
+
+#[tokio::test]
+async fn npm_import_walks_all_where_the_search_lists_nothing_and_checks_every_tarball() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    // Nexus: a search without a text finds nothing, `/-/all` lists all.
+    let reg = "npm-nexus";
+    source.npm(reg, |r| {
+        r.search = NpmSearch::Nothing;
+        r.all = true;
+    });
+    for (name, version) in [
+        ("@acme/core", "0.1.0"),
+        ("@acme/ui", "1.0.0"),
+        ("zeta", "1.0.0"),
+    ] {
+        source.npm_version(
+            reg,
+            name,
+            version,
+            tgz(name, version, name),
+            "2022-02-02T00:00:00.000Z",
+        );
+        source.npm_tag(reg, name, "latest", version);
+    }
+    let legacy = tgz("legacy", "0.1.0", "old");
+    source.npm_version(
+        reg,
+        "legacy",
+        "0.1.0",
+        legacy.clone(),
+        "2015-01-01T00:00:00.000Z",
+    );
+    source.npm(reg, |r| {
+        r.packages
+            .get_mut("legacy")
+            .unwrap()
+            .get_mut("0.1.0")
+            .unwrap()
+            .integrity = false
+    });
+    // Two tarballs the registry serves corrupt: one listed with its
+    // integrity, one with its shasum alone.
+    source.with(|s| {
+        s.corrupt.insert(
+            format!("npm/{reg}/zeta/1.0.0"),
+            tgz("zeta", "1.0.0", "tampered"),
+        );
+        s.corrupt.insert(
+            format!("npm/{reg}/legacy/0.1.0"),
+            tgz("legacy", "0.1.0", "tampered"),
+        );
+    });
+
+    let repo = repo_name("npm-all");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let id = start(&srv, &repo, from(source.npm_url(reg))).await;
+    let queued = get_import(&srv, &repo, id).await;
+    assert_eq!(queued["listing"], "all");
+    assert_eq!(queued["source_total"], 4);
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    // Four versions and three tags; zeta's version, and with it its tag,
+    // and legacy's version failed.
+    assert_eq!(done["progress"]["found"], 7, "{done}");
+    assert_eq!(done["progress"]["imported"], 4, "{done}");
+    assert_eq!(done["progress"]["failed"], 3, "{done}");
+    let failed = items(&srv, &repo, id, Some("failed")).await;
+    let detail = |name: &str, version: &str| {
+        failed
+            .iter()
+            .find(|i| i["name"] == name && i["version"] == version)
+            .unwrap_or_else(|| panic!("{failed:?}"))["detail"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert!(
+        detail("zeta", "1.0.0").contains("does not match the SHA-512 the registry lists"),
+        "{failed:?}"
+    );
+    assert!(
+        detail("legacy", "0.1.0").contains("dist.shasum"),
+        "{failed:?}"
+    );
+    assert_eq!(detail("zeta", "latest"), "version 1.0.0 is not in Forge");
+    assert!(npm_tarball(&srv, &repo, "zeta", "1.0.0").await.is_none());
+    assert!(npm_tarball(&srv, &repo, "@acme/core", "0.1.0")
+        .await
+        .is_some());
+
+    // Retried once the registry serves them right: the versions, then the tag.
+    source.with(|s| s.corrupt.clear());
+    let resp = admin(
+        &srv,
+        reqwest::Method::POST,
+        &format!("/admin/repositories/{repo}/imports/{id}/resume"),
+        Some(json!({"retry_failed": true, "password": PASSWORD})),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["failed"], 0, "{done}");
+    assert_eq!(done["progress"]["imported"], 7, "{done}");
+    assert_eq!(
+        npm_tarball(&srv, &repo, "legacy", "0.1.0").await.unwrap(),
+        legacy
+    );
+    assert_eq!(
+        packument(&srv, &repo, "zeta").await["dist-tags"]["latest"],
+        "1.0.0"
+    );
+}
+
+#[tokio::test]
+async fn npm_preflight_names_scopes_conflicts_and_the_dry_run() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    // Verdaccio: a search needs a text, and there is no `/-/all`.
+    let reg = "npm-verdaccio";
+    source.npm(reg, |r| r.search = NpmSearch::Refused);
+    for (name, version) in [
+        ("@acme/core", "0.1.0"),
+        ("@acme/ui", "1.0.0"),
+        ("@other/x", "1.0.0"),
+        ("alpha", "1.0.0"),
+    ] {
+        source.npm_version(
+            reg,
+            name,
+            version,
+            tgz(name, version, name),
+            "2022-02-02T00:00:00.000Z",
+        );
+        source.npm_tag(reg, name, "latest", version);
+    }
+    let repo = repo_name("npm-named");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let attempt = |body: Value| {
+        let srv = &srv;
+        let repo = repo.clone();
+        async move {
+            let resp = admin(
+                srv,
+                reqwest::Method::POST,
+                &format!("/admin/repositories/{repo}/imports"),
+                Some(body),
+            )
+            .await;
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+    let (status, text) = attempt(from(source.npm_url(reg))).await;
+    assert_eq!(status, 400);
+    assert!(text.contains("lists no packages"), "{text}");
+    let mut wrong = from(source.npm_url(reg));
+    wrong["password"] = json!("wrong");
+    wrong["names"] = json!(["alpha"]);
+    let (status, text) = attempt(wrong).await;
+    assert_eq!(status, 400);
+    assert!(text.contains("refused the credentials"), "{text}");
+    let mut invalid = from(source.npm_url(reg));
+    invalid["names"] = json!(["alpha", "../admin"]);
+    let (status, text) = attempt(invalid).await;
+    assert_eq!(status, 400);
+    assert!(text.contains("../admin"), "{text}");
+
+    // Named packages and scopes; a scope's packages come from the search
+    // for it. A dry run downloads nothing.
+    let mut named = from(source.npm_url(reg));
+    named["names"] = json!(["@acme", "alpha", "missing", "@nobody/*"]);
+    named["dry_run"] = json!(true);
+    let id = start(&srv, &repo, named.clone()).await;
+    let queued = get_import(&srv, &repo, id).await;
+    assert_eq!(queued["listing"], "names");
+    assert_eq!(
+        queued["names"],
+        json!(["@acme", "alpha", "missing", "@nobody"])
+    );
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["planned"], 6, "{done}");
+    assert_eq!(done["progress"]["failed"], 2, "{done}");
+    let failed = items(&srv, &repo, id, Some("failed")).await;
+    let details: BTreeMap<String, String> = failed
+        .iter()
+        .map(|i| {
+            (
+                i["name"].as_str().unwrap().to_string(),
+                i["detail"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        details,
+        BTreeMap::from([
+            (
+                "@nobody".to_string(),
+                "the source has no package of this scope".to_string()
+            ),
+            (
+                "missing".to_string(),
+                "the source has no package of this name".to_string()
+            ),
+        ])
+    );
+    assert_eq!(source.npm_downloads(reg, "alpha", "1.0.0"), 0);
+    assert!(npm_tarball(&srv, &repo, "alpha", "1.0.0").await.is_none());
+
+    named["dry_run"] = json!(false);
+    let id = start(&srv, &repo, named.clone()).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["progress"]["imported"], 6, "{done}");
+    assert!(npm_tarball(&srv, &repo, "@acme/ui", "1.0.0")
+        .await
+        .is_some());
+    assert_eq!(npm_get(&srv, &repo, "@other%2fx").await.status(), 404);
+
+    // The source's alpha 1.0.0 is now another tarball: a dry run tells
+    // from the checksums alone, a run skips and reports it.
+    let other = tgz("alpha", "1.0.0", "republished");
+    source.npm_version(
+        reg,
+        "alpha",
+        "1.0.0",
+        other.clone(),
+        "2022-02-02T00:00:00.000Z",
+    );
+    named["names"] = json!(["alpha"]);
+    named["dry_run"] = json!(true);
+    let id = start(&srv, &repo, named.clone()).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["progress"]["conflict"], 1, "{done}");
+    assert_eq!(done["progress"]["identical"], 1, "the tag: {done}");
+    assert_eq!(source.npm_downloads(reg, "alpha", "1.0.0"), 1);
+    named["dry_run"] = json!(false);
+    let id = start(&srv, &repo, named.clone()).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["progress"]["conflict"], 1, "{done}");
+    assert_eq!(
+        item_of(&srv, &repo, id, "alpha", "1.0.0").await["detail"],
+        "Forge has other bytes for this version"
+    );
+    assert_ne!(
+        npm_tarball(&srv, &repo, "alpha", "1.0.0").await.unwrap(),
+        other
+    );
+    named["on_conflict"] = json!("overwrite");
+    let id = start(&srv, &repo, named).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["progress"]["replaced"], 1, "{done}");
+    assert_eq!(
+        npm_tarball(&srv, &repo, "alpha", "1.0.0").await.unwrap(),
+        other
+    );
+}
+
+/// The previous request form names a Nexus server and its npm repository.
+#[tokio::test]
+async fn npm_import_names_a_nexus_repository_in_the_previous_request_form() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    source.npm("npm-hosted", |r| {
+        r.search = NpmSearch::Nothing;
+        r.all = true;
+    });
+    source.npm_version(
+        "npm-hosted",
+        "alpha",
+        "1.0.0",
+        tgz("alpha", "1.0.0", "a"),
+        "2022-02-02T00:00:00.000Z",
+    );
+    // A packument whose tarball is another version: refused, whatever its
+    // checksums say.
+    source.npm_version(
+        "npm-hosted",
+        "beta",
+        "1.0.0",
+        tgz("beta", "9.9.9", "b"),
+        "2022-02-02T00:00:00.000Z",
+    );
+    let repo = repo_name("npm-nexus-form");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let mut body = from(source.url.clone());
+    body["repository"] = json!("npm-hosted");
+    let id = start(&srv, &repo, body).await;
+    let queued = get_import(&srv, &repo, id).await;
+    assert_eq!(queued["url"], source.npm_url("npm-hosted"));
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["imported"], 1, "{done}");
+    assert_eq!(done["progress"]["failed"], 1, "{done}");
+    let refused = item_of(&srv, &repo, id, "beta", "1.0.0").await;
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the package is beta 9.9.9, not beta 1.0.0"),
+        "{refused}"
+    );
+    assert_eq!(npm_get(&srv, &repo, "beta").await.status(), 404);
 }

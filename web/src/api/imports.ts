@@ -2,16 +2,17 @@ import { httpClient } from '~/lib/httpClient'
 
 /**
  * Imports into a hosted repository from another server, read through the
- * format's own protocol: a NuGet feed or a registry, or a raw repository
- * (`crates/server/src/admin/imports.rs`).
+ * format's own protocol: a NuGet feed, an npm registry or a registry API,
+ * or a raw repository (`crates/server/src/admin/imports.rs`).
  *
  *  - `POST /admin/repositories/{name}/imports` checks the source first (the
- *    preflight: a feed's service index resolves and its search answers, a
+ *    preflight: a feed's service index resolves and its search answers, an
+ *    npm registry lists its packages through its search or `/-/all`, a
  *    registry answers its API and serves a catalog, or a raw repository
  *    serves a listing, another Forge's or Nexus' asset listing; an import
- *    that names its packages, images or paths needs none of it) and answers
- *    400/502 with the reason, or 409 while the repository has an import
- *    running.
+ *    that names its packages, scopes, images or paths needs none of it) and
+ *    answers 400/502 with the reason, or 409 while the repository has an
+ *    import running.
  *  - An import scans the source (`phase: scan`), then copies the items it
  *    found (`phase: copy`). A dry run decides every item without writing a
  *    package.
@@ -20,7 +21,7 @@ import { httpClient } from '~/lib/httpClient'
  */
 
 /** Formats an import copies (`crates/server/src/import/mod.rs`). */
-export const IMPORT_FORMATS = ['nuget', 'docker', 'raw']
+export const IMPORT_FORMATS = ['nuget', 'npm', 'docker', 'raw']
 
 /** `queued` → `running` → `completed` | `failed` | `cancelled`. */
 export type ImportState =
@@ -40,17 +41,22 @@ export type ItemState =
   | 'failed'
   | 'planned'
 
-/** A version (raw: a file) Forge holds with other bytes. */
+/**
+ * A version Forge holds with other bytes (npm: or a dist-tag pointed
+ * elsewhere; raw: a file).
+ */
 export type OnConflict = 'skip' | 'overwrite' | 'fail'
 
 /**
- * What the scan walks: a feed's `search`, a registry's `catalog`, Nexus'
- * asset listing (`assets`) or another Forge's JSON listing (`directories`)
- * of a raw repository, or the `names` the import gives.
+ * What the scan walks: a feed's or an npm registry's `search`, a registry's
+ * `catalog`, an npm registry's legacy `/-/all`, Nexus' asset listing
+ * (`assets`) or another Forge's JSON listing (`directories`) of a raw
+ * repository, or the `names` the import gives.
  */
 export type ImportListing =
   | 'search'
   | 'catalog'
+  | 'all'
   | 'assets'
   | 'directories'
   | 'names'
@@ -88,7 +94,7 @@ export interface ImportView {
   cancel_requested: boolean
   /** The `Server` header the source answered the preflight with. */
   source_server: string | null
-  /** How many packages the feed's search reported in the preflight. */
+  /** How many packages the feed's search reported in the preflight (npm: the registry's search, or `/-/all`). */
   source_total: number | null
   listing: ImportListing
   last_error: string | null
@@ -103,10 +109,11 @@ export interface ImportView {
 export interface ImportItem {
   id: number
   /**
-   * `component` (a version, a tag), a Docker `manifest` held by digest (a
-   * referrer), or a raw `file` (`name` its path, `version` empty).
+   * `component` (a version, a Docker tag), a Docker `manifest` held by digest
+   * (a referrer), an npm dist-`tag` (`name` the package, `version` the tag),
+   * or a raw `file` (`name` its path, `version` empty).
    */
-  kind: 'component' | 'manifest' | 'file'
+  kind: 'component' | 'manifest' | 'tag' | 'file'
   name: string
   version: string
   state: ItemState
@@ -122,11 +129,15 @@ export interface ImportItem {
 
 /** `POST /admin/repositories/{name}/imports` (unknown fields are refused). */
 export interface CreateImport {
-  /** A feed's service index (`…/index.json`), a registry, or a raw repository. */
+  /**
+   * A feed's service index (`…/index.json`), an npm registry, a registry, or
+   * a raw repository.
+   */
   url: string
   /**
    * The package ids or images to copy, instead of every one the source lists
-   * (raw: the paths of the files, below `url`).
+   * (npm: package names, or scopes such as `@acme`; raw: the paths of the
+   * files, below `url`).
    */
   names?: string[]
   username?: string
