@@ -42,7 +42,7 @@ CI=.github/workflows/ci.yml
 declare -A CI_JOB_GROUP=(
     [fmt]=changelog [clippy]=rust [audit]=audit [test]=rust
     [docker-platform]=image [docker]=image [kubernetes]=kubernetes [web]=web
-    [oci-e2e]=rust [raw-e2e]=rust [npm-e2e]=rust [e2e]=rust [web-e2e]=web
+    [oci-e2e]=rust [raw-e2e]=rust [apt-e2e]=rust [npm-e2e]=rust [e2e]=rust [web-e2e]=web
 )
 
 # Rust: the workspace, what its build and tests read from outside the crates
@@ -55,7 +55,7 @@ RUST=(
     web/index.html docker/forge.docker.toml
     .github/scripts/test-parallel.sh .github/scripts/test-timings-runner.sh
     .github/scripts/test-timings-summary.sh .github/scripts/oci-e2e.sh
-    .github/scripts/raw-e2e.sh .github/scripts/npm-e2e.sh
+    .github/scripts/raw-e2e.sh .github/scripts/apt-e2e.sh .github/scripts/npm-e2e.sh
 )
 # fmt's other checks: the changelog fragments, and the links of the
 # documentation site's pages (the README, docs/, the READMEs under deploy/ and

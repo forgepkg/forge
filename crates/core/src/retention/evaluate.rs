@@ -239,23 +239,28 @@ pub struct DecisionReason {
     pub last_used_at: Option<DateTime<Utc>>,
 }
 
-/// Whether a **normalized** version string denotes a prerelease.
-///
-/// Format-agnostic heuristic: a normalized version carrying a prerelease label
-/// renders it after a `-` (NuGet's `to_normalized_string`, SemVer 2.0.0). We do
-/// not import a concrete format here, honoring the "order/classify via the seam"
-/// rule. Build metadata (`+...`) is already stripped during normalization.
+/// Whether a **normalized** version string denotes a prerelease under the
+/// default rule ([`Format::is_prerelease`]): a normalized version carrying a
+/// prerelease label renders it after a `-` (NuGet's `to_normalized_string`,
+/// SemVer 2.0.0). Build metadata (`+...`) is already stripped during
+/// normalization.
+#[cfg(test)]
 fn is_prerelease(normalized_version: &str) -> bool {
     normalized_version.contains('-')
 }
 
 /// Whether a rule's static filters (`release_type`, `package_name_prefix`)
 /// admit a given component, independent of its triggers.
-fn rule_filters_match(rule: &RetentionRule, package_name: &str, version: &str) -> bool {
+fn rule_filters_match(
+    format: &dyn Format,
+    rule: &RetentionRule,
+    package_name: &str,
+    version: &str,
+) -> bool {
     match rule.release_type {
         ReleaseType::Any => {}
-        ReleaseType::Releases if is_prerelease(version) => return false,
-        ReleaseType::Prereleases if !is_prerelease(version) => return false,
+        ReleaseType::Releases if format.is_prerelease(version) => return false,
+        ReleaseType::Prereleases if !format.is_prerelease(version) => return false,
         _ => {}
     }
     if let Some(prefix) = &rule.package_name_prefix {
@@ -397,6 +402,7 @@ fn group_by_package<C: Protectable>(candidates: &[C]) -> Vec<Vec<&C>> {
 /// `ordered` is the group's candidates sorted newest-first (by version): a
 /// hosted package's components, or a proxy package's cached versions.
 fn protected_indices<C: Protectable>(
+    format: &dyn Format,
     policy: &RetentionPolicy,
     scope: Scope,
     ordered: &[&C],
@@ -410,7 +416,14 @@ fn protected_indices<C: Protectable>(
         }
         // The rule's pool, still newest-first.
         let pool: Vec<usize> = (0..ordered.len())
-            .filter(|&i| rule_filters_match(rule, ordered[i].package_name(), ordered[i].version()))
+            .filter(|&i| {
+                rule_filters_match(
+                    format,
+                    rule,
+                    ordered[i].package_name(),
+                    ordered[i].version(),
+                )
+            })
             .collect();
 
         if let Some(n) = c.keep_last_n {
@@ -470,7 +483,7 @@ pub fn evaluate(
         // This group's components, newest-first by version.
         group.sort_by(|a, b| format.compare_versions(&b.version, &a.version)); // desc
 
-        let protected = protected_indices(policy, Scope::Hosted, &group);
+        let protected = protected_indices(format, policy, Scope::Hosted, &group);
 
         for (idx, cand) in group.iter().enumerate() {
             if protected[idx] {
@@ -480,7 +493,7 @@ pub fn evaluate(
             // Find the highest-severity action among rules that select it.
             let mut winning: Option<(&RetentionRule, DecisionReason)> = None;
             for rule in policy.rules.iter().filter(|r| r.scope == Scope::Hosted) {
-                if !rule_filters_match(rule, &cand.package_name, &cand.version) {
+                if !rule_filters_match(format, rule, &cand.package_name, &cand.version) {
                     continue;
                 }
                 let Some(reason) = triggers_match(&rule.criteria, now, cand) else {
@@ -540,7 +553,7 @@ pub fn evaluate_proxy(
         // This package's cached versions, newest-first by version.
         group.sort_by(|a, b| format.compare_versions(&b.version, &a.version)); // desc
 
-        let protected = protected_indices(policy, Scope::ProxyCached, &group);
+        let protected = protected_indices(format, policy, Scope::ProxyCached, &group);
 
         for (idx, cand) in group.iter().enumerate() {
             if protected[idx] {
@@ -554,7 +567,7 @@ pub fn evaluate_proxy(
                 .filter(|r| r.scope == Scope::ProxyCached)
             {
                 // release_type / prefix filters apply to proxy entries too.
-                if !rule_filters_match(rule, &cand.package_name, &cand.version) {
+                if !rule_filters_match(format, rule, &cand.package_name, &cand.version) {
                     continue;
                 }
                 let Some(days) = rule.criteria.not_pulled_for_days else {
@@ -679,7 +692,7 @@ pub fn evaluate_size_budget(
                 }
             }
             let ordered: Vec<&CandidateComponent> = survivors.iter().collect();
-            let protected = protected_indices(policy, Scope::Hosted, &ordered);
+            let protected = protected_indices(format, policy, Scope::Hosted, &ordered);
             let newest_listed = survivors.iter().find(|c| c.listed).map(|c| c.component_id);
             for (idx, candidate) in survivors.into_iter().enumerate() {
                 if !protected[idx]
@@ -731,7 +744,7 @@ pub fn evaluate_size_budget(
                 .cloned()
                 .collect();
             let ordered: Vec<&ProxyCandidate> = survivors.iter().collect();
-            let protected = protected_indices(policy, Scope::ProxyCached, &ordered);
+            let protected = protected_indices(format, policy, Scope::ProxyCached, &ordered);
             proxy_protected.extend(survivors.iter().zip(protected).filter_map(
                 |(candidate, protected)| protected.then_some(candidate.cached_version_id),
             ));
@@ -824,7 +837,7 @@ pub fn size_budget_protected_ids(
             }
         }
         let ordered: Vec<&CandidateComponent> = survivors.iter().collect();
-        let protected = protected_indices(policy, Scope::Hosted, &ordered);
+        let protected = protected_indices(format, policy, Scope::Hosted, &ordered);
         let newest_listed = survivors.iter().find(|c| c.listed).map(|c| c.component_id);
         hosted_ids.extend(
             survivors
@@ -843,7 +856,7 @@ pub fn size_budget_protected_ids(
             .cloned()
             .collect();
         let ordered: Vec<&ProxyCandidate> = survivors.iter().collect();
-        let protected = protected_indices(policy, Scope::ProxyCached, &ordered);
+        let protected = protected_indices(format, policy, Scope::ProxyCached, &ordered);
         proxy_ids.extend(
             survivors
                 .iter()

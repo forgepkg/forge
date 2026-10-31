@@ -36,6 +36,9 @@ pub struct RawFile {
     pub upstream_etag: Option<String>,
     pub upstream_last_modified: Option<String>,
     pub checked_at: Option<DateTime<Utc>>,
+    /// The file never changes at its path: a proxy never re-validates it,
+    /// and a content-addressed index file outlives its index by a day.
+    pub immutable: bool,
 }
 
 /// The bounds of the files under directory `prefix` (`""` for the root, else
@@ -56,7 +59,7 @@ pub async fn find(pool: &PgPool, repository_id: i64, path: &str) -> sqlx::Result
         SELECT f.id, f.repository_id, f.path, f.blob_sha256, b.s3_key, f.size,
                f.content_type, f.sha512_base64, f.sha1, f.md5, f.created_at,
                f.updated_at, f.last_downloaded_at, f.upstream_etag,
-               f.upstream_last_modified, f.checked_at
+               f.upstream_last_modified, f.checked_at, f.immutable
         FROM raw_file f
         JOIN blob b ON b.sha256 = f.blob_sha256
         WHERE f.repository_id = $1 AND f.path = $2
@@ -121,6 +124,8 @@ pub struct NewRawFile<'a> {
     pub upstream_etag: Option<&'a str>,
     pub upstream_last_modified: Option<&'a str>,
     pub checked: bool,
+    /// The file never changes at its path ([`RawFile::immutable`]).
+    pub immutable: bool,
 }
 
 /// Whether [`store`] may replace a file that exists with other content.
@@ -165,9 +170,9 @@ pub async fn store(
             r#"
             INSERT INTO raw_file (repository_id, path, blob_sha256, size, content_type,
                                   sha512_base64, sha1, md5, upstream_etag,
-                                  upstream_last_modified, checked_at)
+                                  upstream_last_modified, checked_at, immutable)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    CASE WHEN $11 THEN now() END)
+                    CASE WHEN $11 THEN now() END, $12)
             ON CONFLICT (repository_id, path) DO NOTHING
             RETURNING id
             "#,
@@ -182,6 +187,7 @@ pub async fn store(
             file.upstream_etag,
             file.upstream_last_modified,
             file.checked,
+            file.immutable,
         )
         .fetch_optional(&mut **tx)
         .await?;
@@ -214,7 +220,8 @@ pub async fn store(
                 SET content_type = $2,
                     upstream_etag = $3,
                     upstream_last_modified = $4,
-                    checked_at = CASE WHEN $5 THEN now() ELSE checked_at END
+                    checked_at = CASE WHEN $5 THEN now() ELSE checked_at END,
+                    immutable = $6
                 WHERE id = $1
                 "#,
                 existing.id,
@@ -222,6 +229,7 @@ pub async fn store(
                 file.upstream_etag,
                 file.upstream_last_modified,
                 file.checked,
+                file.immutable,
             )
             .execute(&mut **tx)
             .await?;
@@ -237,6 +245,7 @@ pub async fn store(
             SET blob_sha256 = $2, size = $3, content_type = $4, sha512_base64 = $5,
                 sha1 = $6, md5 = $7, upstream_etag = $8, upstream_last_modified = $9,
                 checked_at = CASE WHEN $10 THEN now() END,
+                immutable = $11,
                 updated_at = greatest(now(), updated_at + interval '1 microsecond')
             WHERE id = $1
             "#,
@@ -250,6 +259,7 @@ pub async fn store(
             file.upstream_etag,
             file.upstream_last_modified,
             file.checked,
+            file.immutable,
         )
         .execute(&mut **tx)
         .await?;
@@ -511,7 +521,7 @@ pub async fn walk_directory(
                f.id, f.repository_id, f.path, f.blob_sha256, b.s3_key, f.size,
                f.content_type, f.sha512_base64, f.sha1, f.md5, f.created_at,
                f.updated_at, f.last_downloaded_at, f.upstream_etag,
-               f.upstream_last_modified, f.checked_at
+               f.upstream_last_modified, f.checked_at, f.immutable
         FROM walk w
         LEFT JOIN raw_file f
                ON f.repository_id = $1 AND f.path = w.path

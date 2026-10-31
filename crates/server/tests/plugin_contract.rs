@@ -34,6 +34,9 @@ const PROBE: Descriptor = Descriptor {
         manifest_type: "text/plain",
     },
     upstream_token: UpstreamToken::None,
+    options: &[],
+    prereleases: forge_plugin::api::Prereleases::Dash,
+    indexes: false,
 };
 
 /// A package is text whose first line is `<id> <version>`.

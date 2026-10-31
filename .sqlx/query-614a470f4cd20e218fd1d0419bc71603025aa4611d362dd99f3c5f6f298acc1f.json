@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE raw_file\n                SET content_type = $2,\n                    upstream_etag = $3,\n                    upstream_last_modified = $4,\n                    checked_at = CASE WHEN $5 THEN now() ELSE checked_at END,\n                    immutable = $6\n                WHERE id = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "614a470f4cd20e218fd1d0419bc71603025aa4611d362dd99f3c5f6f298acc1f"
+}

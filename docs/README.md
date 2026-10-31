@@ -31,6 +31,9 @@ its [quickstart](../README.md#quickstart);
 
 - **NuGet**: the README's [quickstart](../README.md#quickstart) points a
   `dotnet` client at a feed, and the CI guides below publish to one.
+- **[apt repositories](apt.md)**: Debian and Ubuntu packages for `apt`:
+  `.deb` uploads, signed indexes and key rotation, `sources.list` and
+  `auth.conf.d`, proxies of Debian and Ubuntu mirrors.
 - **[Docker / OCI registry](docker.md)**: image repositories (hosted, proxy,
   group), naming, `docker login`, retention and garbage collection.
 - **[npm registries](npm.md)**: npm packages for npm, pnpm, Yarn and Bun:

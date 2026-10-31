@@ -351,6 +351,7 @@ mod tests {
             kind: RepositoryKind::Hosted,
             base_url: "https://forge.example.com/repository/bin".into(),
             inline: false,
+            options: Vec::new(),
         }
     }
 

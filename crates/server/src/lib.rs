@@ -28,6 +28,7 @@ pub mod files;
 pub mod health;
 pub mod images;
 pub mod import;
+pub mod indexes;
 pub mod invitations;
 pub mod me;
 pub mod me_tokens;

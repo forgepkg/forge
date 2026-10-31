@@ -79,6 +79,20 @@ pub trait Format: Send + Sync {
     /// Order two **normalized** version strings.
     fn compare_versions(&self, a: &str, b: &str) -> Ordering;
 
+    /// Whether a **normalized** version is a prerelease (retention's release
+    /// type). The default is SemVer's: a `-` before the prerelease label.
+    fn is_prerelease(&self, normalized_version: &str) -> bool {
+        normalized_version.contains('-')
+    }
+
+    /// Whether any version can be a prerelease. A format without (apt,
+    /// whose `-` starts the Debian revision) has every version shown where
+    /// prereleases are hidden: the database's prerelease filter is the
+    /// default rule.
+    fn has_prereleases(&self) -> bool {
+        true
+    }
+
     /// Lowercase / canonicalize a package id for case-insensitive lookups.
     fn lower_id(&self, id: &str) -> String;
 

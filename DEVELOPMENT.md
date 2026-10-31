@@ -655,6 +655,21 @@ cargo build -p forge-server
 .github/scripts/raw-e2e.sh target/debug/forge-server target/raw-e2e
 ```
 
+apt repositories have theirs, CI's `apt-e2e` job: the real `apt-get` in a
+`debian:bookworm` container against a live server (uploads of packages built
+with `dpkg-deb`, Nexus' raw-body `POST` and a `PUT`; the redeploy refusal and
+path traversal; `InRelease` and `Release.gpg` verified with `gpgv`;
+`apt-get update` without a warning, an install and an upgrade with
+`signed-by` and `auth.conf.d` credentials; a signing key rotation; a proxy
+of a mock mirror, signed with its own key, installing again while the mirror
+is down). It needs curl, jq, python3, docker, `dpkg-deb`,
+`dpkg-scanpackages` (dpkg-dev), gpg and gpgv, a Postgres and an S3 endpoint:
+
+```bash
+cargo build -p forge-server
+.github/scripts/apt-e2e.sh target/debug/forge-server target/apt-e2e
+```
+
 npm repositories have theirs, CI's `npm-e2e` job: the real clients against a
 live server and a mock upstream registry (npm's browser login, approved
 through the page's API, and Yarn's password login; logout; publishes with
@@ -884,7 +899,7 @@ backups, upgrades) follow [docs/deployment.md](docs/deployment.md).
 ## CI and the merge queue
 
 CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
-`test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e` and `npm-e2e`, and the slow
+`test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `apt-e2e` and `npm-e2e`, and the slow
 `e2e` and `web-e2e`, which pull requests skip: those two run in the merge
 queue and on every push to `main`. It runs on pull requests that target
 `main` only; a stacked one waits (see [Stacked pull
@@ -915,7 +930,7 @@ It sorts the change into groups of paths:
 
 | Group | Paths | Jobs |
 |---|---|---|
-| Rust | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh`, `npm-e2e.sh` | `fmt`, `clippy`, `test`, `oci-e2e`, `raw-e2e`, `npm-e2e`, `e2e`, `web-e2e` |
+| Rust | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh`, `apt-e2e.sh`, `npm-e2e.sh` | `fmt`, `clippy`, `test`, `oci-e2e`, `raw-e2e`, `apt-e2e`, `npm-e2e`, `e2e`, `web-e2e` |
 | Changelog | `docs/changes/` | `fmt` |
 | Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
@@ -925,7 +940,7 @@ It sorts the change into groups of paths:
 
 A change to `ci-changes.sh` counts for every group. A change to `ci.yml`
 counts for the groups whose jobs it changes (#365): `fmt` is in Changelog;
-`clippy`, `test`, `oci-e2e`, `raw-e2e`, `npm-e2e` and `e2e` in Rust; `audit`
+`clippy`, `test`, `oci-e2e`, `raw-e2e`, `apt-e2e`, `npm-e2e` and `e2e` in Rust; `audit`
 in Audit; `web` and `web-e2e` in Web; `docker` and `docker-platform` in
 Image and `kubernetes` in Kubernetes. A change outside the jobs (the triggers, the settings, the
 `changes` job) or to a job missing from `CI_JOB_GROUP` in `ci-changes.sh`
@@ -971,7 +986,7 @@ To turn it on, edit the ruleset (or branch protection rule) of `main`:
 1. Enable **Require merge queue**. Keep its **status check timeout** above
    the run time of `e2e` and `web-e2e` (60 minutes by default).
 2. Under **Require status checks to pass**, require `fmt`, `clippy`, `audit`,
-   `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `npm-e2e`,
+   `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `apt-e2e`, `npm-e2e`,
    `e2e` and `web-e2e` from GitHub Actions: every job of `ci.yml` but
    `changes`, the jobs the release workflow requires of the tagged commit
    (`REQUIRED_JOBS` in `.github/workflows/release.yml`). A job left out here

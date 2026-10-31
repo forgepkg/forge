@@ -186,7 +186,7 @@ const UPSTREAM_SEARCH_BACKOFF: std::time::Duration = std::time::Duration::from_s
 /// answers. Ids without cached versions still ask it.
 const UPSTREAM_LISTING_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 /// Default metadata TTL when a proxy leaves `metadata_ttl_seconds` unset.
-const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
+pub const DEFAULT_METADATA_TTL_SECONDS: i64 = 600;
 /// Default negative-cache TTL when a proxy leaves `not_found_ttl_seconds` unset.
 pub const DEFAULT_NOT_FOUND_TTL_SECONDS: i64 = 600;
 /// How long a document the upstream publishes once and never changes
@@ -595,6 +595,7 @@ impl ProxyRepo {
         let remote = api::Remote {
             url: repo.remote_url.clone().unwrap_or_default(),
             index: index.map(PersistedIndex::index),
+            options: repo.format_options(),
         };
         let mut origins = UpstreamOrigins::new(
             &remote.url,
@@ -924,12 +925,13 @@ impl ProxyRepo {
         &self,
         repo: &Repository,
         path: &str,
-    ) -> Result<Option<String>, RepoError> {
+    ) -> Result<Option<api::FileLocation>, RepoError> {
         match self
             .converse_resolved(repo, api::UpstreamOp::File(path.to_string()))
             .await?
         {
-            api::UpstreamAnswer::File(url) => Ok(url),
+            api::UpstreamAnswer::File(url) => Ok(url.map(api::FileLocation::at)),
+            api::UpstreamAnswer::FileAt(location) => Ok(Some(location)),
             api::UpstreamAnswer::Failed(reason) => Err(RepoError::Storage(reason)),
             _ => Err(RepoError::Storage(
                 "upstream protocol answered file with something else".into(),

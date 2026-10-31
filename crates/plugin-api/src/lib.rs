@@ -252,6 +252,51 @@ pub trait FormatPlugin: Send + Sync + 'static {
         Err(ImageError::NotAnEndpoint)
     }
 
+    /// The value a repository of `kind` keeps for option `name`
+    /// ([`Descriptor::options`]) when an administrator sets it to `value`,
+    /// or why it is refused (shown to the administrator). The host has
+    /// checked that the format has the option and that `kind` takes it. The
+    /// default takes the value trimmed: one line of at most 256 bytes, not
+    /// empty.
+    fn check_option(
+        &self,
+        kind: RepositoryKind,
+        name: &str,
+        value: &str,
+    ) -> Result<String, FormatError> {
+        let _ = (kind, name);
+        let value = value.trim();
+        if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+            return Err(FormatError::InvalidId(
+                "an option is one line of at most 256 bytes".into(),
+            ));
+        }
+        Ok(value.to_string())
+    }
+
+    /// Formats with [`Descriptor::indexes`]: the files of a repository's
+    /// indexes, made of its packages ([`IndexInput`]). The host calls it
+    /// when a client asks for an index ([`Query::Index`]) and the
+    /// repository's packages, options or signing keys changed since the
+    /// last one; it signs the copies each file names
+    /// ([`IndexFile::signed`]) with every signing key of the repository,
+    /// and replaces the previous index with all the files at once. Must be
+    /// deterministic but for [`IndexInput::generated`]. The default makes
+    /// none.
+    fn index(&self, repo: &Repository, input: &IndexInput) -> Result<Vec<IndexFile>, FormatError> {
+        let _ = (repo, input);
+        Err(FormatError::Internal("this format keeps no indexes".into()))
+    }
+
+    /// A package format: the package (canonical id) the file the host keeps
+    /// at `path` belongs to, which package selectors decide on (a proxy's
+    /// copy of a package); `None` for a file of no package (an index), which
+    /// every reader of the repository may read. The default: none.
+    fn file_package(&self, path: &str) -> Option<String> {
+        let _ = path;
+        None
+    }
+
     /// Images formats: the response to a request the host refused, or to
     /// what failed while it served it outside a query ([`ImageError`]).
     /// The host adds its own headers (a Bearer challenge). The default is

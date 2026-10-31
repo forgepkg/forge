@@ -4,7 +4,14 @@
 [advisories]
 ignore = [
     # rsa 0.9 Marvin timing side channel (no fixed release): a dev-dependency
-    # only (forge-core, forge-server and forge-e2e tests sign test JWTs with
-    # it); not in the shipped forge-server binary.
+    # (forge-core, forge-server and forge-e2e tests sign test JWTs with it),
+    # and linked into forge-server by rPGP (pgp, apt's signing keys), which
+    # never signs or decrypts with RSA there: Forge's signing keys are Ed25519,
+    # generated or imported (other algorithms are refused).
     "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5 timing variability (no fixed 0.5 release): linked by
+    # rPGP (pgp) for its NIST-curve and X448 support (elliptic-curve 0.13,
+    # cx448), which forge-server never uses with a secret key: apt's signing
+    # keys are Ed25519 (curve25519-dalek), other algorithms are refused.
+    "RUSTSEC-2026-0387",
 ]

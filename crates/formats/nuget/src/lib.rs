@@ -57,6 +57,9 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
         manifest_type: "application/xml",
     },
     upstream_token: UpstreamToken::None,
+    options: &[],
+    prereleases: forge_plugin_api::Prereleases::Dash,
+    indexes: false,
 };
 
 /// The NuGet format, with the zip-bomb limits applied while parsing packages.

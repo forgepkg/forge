@@ -28,6 +28,7 @@ fn remote(resources: &Resources) -> Remote {
     Remote {
         url: FEED.into(),
         index: Some(serde_json::to_string(resources).unwrap()),
+        options: Vec::new(),
     }
 }
 
@@ -73,6 +74,7 @@ fn the_index_is_the_service_indexs_resources() {
     let unresolved = Remote {
         url: FEED.into(),
         index: None,
+        options: Vec::new(),
     };
     let done = run(
         &unresolved,

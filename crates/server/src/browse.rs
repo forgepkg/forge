@@ -100,6 +100,9 @@ pub struct BrowseRepo {
     /// What the repository holds: `packages`, `files` (a files format: raw,
     /// browsed through its listings) or `images` (docker).
     pub storage: &'static str,
+    /// The settings of its format's own (apt's `distribution`), for the
+    /// connect snippets.
+    pub options: std::collections::BTreeMap<String, String>,
 }
 
 /// Query parameters for `GET /browse/repos`.
@@ -149,6 +152,7 @@ pub async fn list_repos(
                     .filter(|plugin| plugin.descriptor().storage != Storage::Images)
                     .map(|_| crate::plugins::repository_url(&state, &repo.name)),
                 storage: state.storage(&repo.format).as_str(),
+                options: repo.format_options().into_iter().collect(),
             });
         }
     }
@@ -293,7 +297,8 @@ pub async fn search_packages(
             q: query.q.clone(),
             skip,
             take,
-            prerelease: query.prerelease,
+            // A format without prereleases (apt) shows every version.
+            prerelease: query.prerelease || !format.has_prereleases(),
             // The web UI shows every version; only legacy NuGet clients
             // need SemVer 2.0.0 hidden.
             include_semver2: true,

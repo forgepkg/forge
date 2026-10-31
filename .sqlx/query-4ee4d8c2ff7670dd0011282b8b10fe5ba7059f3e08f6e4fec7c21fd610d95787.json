@@ -1,0 +1,112 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, repository_id, fingerprint, algorithm, user_id, public_key,\n               secret_key_enc, created_at\n        FROM repository_signing_key\n        WHERE repository_id = $1\n        ORDER BY created_at, id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "repository_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "repository_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "fingerprint",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "fingerprint"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "algorithm",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "algorithm"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "user_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "public_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "public_key"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "secret_key_enc",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "secret_key_enc"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "4ee4d8c2ff7670dd0011282b8b10fe5ba7059f3e08f6e4fec7c21fd610d95787"
+}

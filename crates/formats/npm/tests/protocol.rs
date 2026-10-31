@@ -27,6 +27,7 @@ fn repo(kind: RepositoryKind) -> Repository {
         kind,
         base_url: BASE.into(),
         inline: false,
+        options: Vec::new(),
     }
 }
 

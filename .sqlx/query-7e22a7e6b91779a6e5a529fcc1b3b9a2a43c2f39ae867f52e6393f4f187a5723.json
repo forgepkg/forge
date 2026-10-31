@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO raw_file (repository_id, path, blob_sha256, size, content_type,\n                                  sha512_base64, sha1, md5, upstream_etag,\n                                  upstream_last_modified, checked_at, immutable)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,\n                    CASE WHEN $11 THEN now() END, $12)\n            ON CONFLICT (repository_id, path) DO NOTHING\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7e22a7e6b91779a6e5a529fcc1b3b9a2a43c2f39ae867f52e6393f4f187a5723"
+}

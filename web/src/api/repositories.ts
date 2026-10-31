@@ -95,6 +95,11 @@ export interface RepoView {
    * whether it changed (`0`: never). `null` otherwise.
    */
   max_age_seconds?: number | null
+  /**
+   * The settings of its format's own (`FormatView.options`), by name: apt's
+   * `distribution`. Empty for formats without any.
+   */
+  options?: Record<string, string>
 }
 
 /** A hosted raw repository's deployment policy, as Nexus'. */
@@ -138,6 +143,8 @@ export interface CreateRepo {
   content_disposition?: 'attachment' | 'inline'
   /** Raw proxy only. Absent: a day. */
   max_age_seconds?: number
+  /** The settings of the format's own (`FormatView.options`), by name. */
+  options?: Record<string, string>
 }
 
 /**
@@ -181,6 +188,8 @@ export interface UpdateRepo {
   content_disposition?: 'attachment' | 'inline'
   /** Raw proxy only; `null` clears it (a day). */
   max_age_seconds?: number | null
+  /** Each one given is set (`null` clears one that is not required). */
+  options?: Record<string, string | null>
 }
 
 /**
@@ -202,6 +211,50 @@ export interface FormatView {
   default_max_upload_bytes?: number
   /** The largest upload limit a repository may be given; `null`: unbounded. */
   max_upload_bytes_limit?: number | null
+  /** The settings of the format's own its repositories carry (apt's distribution). */
+  options?: FormatOption[]
+  /** Its hosted repositories keep indexes signed with keys of their own (apt). */
+  signed_indexes?: boolean
+}
+
+/** A setting of a format's own (`OptionView`). */
+export interface FormatOption {
+  name: string
+  label: string
+  description: string
+  /** The repository kinds that take it. */
+  kinds: RepoKind[]
+  /** Whether every repository of those kinds sets it. */
+  required: boolean
+  /** An example value, for the form's placeholder. */
+  example: string
+}
+
+/** The options of `format` a repository of `kind` takes. */
+export function optionsFor(format: FormatView | undefined, kind: RepoKind): FormatOption[] {
+  return (format?.options ?? []).filter((option) => option.kinds.includes(kind))
+}
+
+/**
+ * An OpenPGP key that signs a repository's indexes (`KeyView` of
+ * `/admin/repositories/{name}/signing-keys`); its secret is never returned.
+ */
+export interface SigningKey {
+  /** The primary key's fingerprint, uppercase hex. */
+  fingerprint: string
+  algorithm: string
+  user_id: string
+  /** The ASCII-armored public key. */
+  public_key: string
+  created_at: string
+}
+
+/** `POST …/signing-keys`: `{}` generates a key, `secret_key` imports one. */
+export interface AddSigningKey {
+  generate?: boolean
+  /** An ASCII-armored OpenPGP secret key. */
+  secret_key?: string
+  passphrase?: string
 }
 
 /**
@@ -278,6 +331,7 @@ export const repoKeys = {
   list: () => ['repositories', 'list'] as const,
   detail: (name: string) => ['repositories', 'detail', name] as const,
   members: (name: string) => ['repositories', 'members', name] as const,
+  signingKeys: (name: string) => ['repositories', 'signing-keys', name] as const,
   trustedPublishers: (name: string) =>
     ['repositories', 'trusted-publishers', name] as const,
 }
@@ -419,5 +473,28 @@ export function updateTrustedPublisher(
 export function deleteTrustedPublisher(name: string, id: number): Promise<void> {
   return httpClient.delete<void>(
     `/admin/repositories/${encodeURIComponent(name)}/trusted-publishers/${id}`,
+  )
+}
+
+/** `GET /admin/repositories/{name}/signing-keys` — the keys that sign its indexes. */
+export function fetchSigningKeys(name: string, signal?: AbortSignal): Promise<SigningKey[]> {
+  return httpClient.get<SigningKey[]>(
+    `/admin/repositories/${encodeURIComponent(name)}/signing-keys`,
+    { signal },
+  )
+}
+
+/** `POST /admin/repositories/{name}/signing-keys` — generate or import a key (201). */
+export function addSigningKey(name: string, body: AddSigningKey): Promise<SigningKey> {
+  return httpClient.post<SigningKey>(
+    `/admin/repositories/${encodeURIComponent(name)}/signing-keys`,
+    body,
+  )
+}
+
+/** `DELETE /admin/repositories/{name}/signing-keys/{fingerprint}` (204; 409 for the last key). */
+export function deleteSigningKey(name: string, fingerprint: string): Promise<void> {
+  return httpClient.delete<void>(
+    `/admin/repositories/${encodeURIComponent(name)}/signing-keys/${encodeURIComponent(fingerprint)}`,
   )
 }

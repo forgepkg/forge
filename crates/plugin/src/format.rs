@@ -298,6 +298,17 @@ impl Format for PluginFormat {
         self.plugin.compare_versions(a, b)
     }
 
+    fn is_prerelease(&self, normalized_version: &str) -> bool {
+        match self.plugin.descriptor().prereleases {
+            api::Prereleases::Dash => normalized_version.contains('-'),
+            api::Prereleases::None => false,
+        }
+    }
+
+    fn has_prereleases(&self) -> bool {
+        self.plugin.descriptor().prereleases != api::Prereleases::None
+    }
+
     fn lower_id(&self, id: &str) -> String {
         self.plugin.canonical_id(id)
     }
@@ -369,6 +380,9 @@ mod tests {
         storage: Storage::Packages,
         assets: Assets::DEFAULT,
         upstream_token: UpstreamToken::None,
+        options: &[],
+        prereleases: forge_plugin_api::Prereleases::Dash,
+        indexes: false,
     };
 
     impl FormatPlugin for Unlimited {

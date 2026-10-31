@@ -91,6 +91,7 @@ fn remote() -> Remote {
     Remote {
         url: "https://registry.npmjs.org".into(),
         index: Some("{}".into()),
+        options: Vec::new(),
     }
 }
 

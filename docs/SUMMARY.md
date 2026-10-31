@@ -14,6 +14,7 @@
 
 # Formats
 
+- [apt repositories](apt.md)
 - [Docker / OCI registry](docker.md)
 - [npm registries](npm.md)
 - [Raw file repositories](raw.md)

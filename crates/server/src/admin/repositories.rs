@@ -14,7 +14,7 @@
 //! `/repositories/{name}`), so they are validated on create and rename (see
 //! [`validate_repo_name`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -23,9 +23,9 @@ use forge_core::format::Format;
 use forge_core::net::ssrf::validate_url;
 use forge_db::model::{
     DeploymentPolicy, RepoKind, Repository, CONTENT_DISPOSITION_KEY, DEPLOYMENT_POLICY_KEY,
-    DOCKER_HOST_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY,
-    MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY,
-    WRITABLE_MEMBER_ID_KEY,
+    DOCKER_HOST_KEY, FORMAT_OPTIONS_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY,
+    MAX_AGE_SECONDS_KEY, MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY,
+    RESERVED_PREFIXES_KEY, WRITABLE_MEMBER_ID_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{component_dao, oci_dao, raw_dao};
@@ -84,6 +84,9 @@ pub struct RepoView {
     /// What the repository holds: `packages`, `files` (a files format: raw)
     /// or `images` (Docker).
     pub storage: &'static str,
+    /// The settings of its format's own (`GET /admin/formats` lists them):
+    /// apt's `distribution`.
+    pub options: BTreeMap<String, String>,
 }
 
 impl RepoView {
@@ -126,6 +129,7 @@ impl RepoView {
             max_age_seconds: (stores_files && r.kind() == RepoKind::Proxy)
                 .then(|| r.max_age_seconds()),
             storage: storage.as_str(),
+            options: r.format_options().into_iter().collect(),
         }
     }
 }
@@ -206,6 +210,10 @@ pub struct CreateRepo {
     /// never). Absent: a day.
     #[serde(default)]
     pub max_age_seconds: Option<u64>,
+    /// Settings of the format's own, by name (`GET /admin/formats` lists
+    /// each format's): apt's `distribution`, which apt repositories need.
+    #[serde(default)]
+    pub options: Option<BTreeMap<String, String>>,
 }
 
 /// Update-repository request body (`PUT /admin/repositories/{name}`).
@@ -281,6 +289,10 @@ pub struct UpdateRepo {
     /// Raw proxy only; `null` clears it (a day).
     #[serde(default, deserialize_with = "double_option")]
     pub max_age_seconds: Option<Option<u64>>,
+    /// Settings of the format's own: each one given is set, `null` clears
+    /// one that is not required; the others are kept.
+    #[serde(default)]
+    pub options: Option<BTreeMap<String, Option<String>>>,
 }
 
 /// Update response: the [`RepoView`] plus whether this update dropped the
@@ -629,6 +641,11 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     if images && body.package_delay_seconds != 0 {
         return bad_request("package_delay_seconds is not supported for docker repositories");
     }
+    if keeps_signed_indexes(&state, &body.format) && body.package_delay_seconds != 0 {
+        return bad_request(
+            "package_delay_seconds is not supported for apt repositories: a proxy passes its upstream's signed indexes on as they are",
+        );
+    }
     if images && body.allow_redeploy {
         return bad_request(
             "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
@@ -726,6 +743,21 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             config[RESERVED_PREFIXES_KEY] = json!(prefixes);
         }
     }
+    let given = body
+        .options
+        .clone()
+        .map(|options| options.into_iter().map(|(k, v)| (k, Some(v))).collect());
+    match format_options(
+        &state,
+        &body.format,
+        parsed_kind,
+        &serde_json::Map::new(),
+        given,
+    ) {
+        Ok(options) if options.is_empty() => {}
+        Ok(options) => config[FORMAT_OPTIONS_KEY] = serde_json::Value::Object(options),
+        Err(resp) => return resp,
+    }
 
     // The row is created first (the AAD binds the sealed password to the row
     // id, which does not exist before the INSERT) and the password is sealed
@@ -779,6 +811,13 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     if let Err(e) = tx.commit().await {
         return db_error(e);
     }
+    // A repository that keeps signed indexes (apt) gets its first key now,
+    // so that its key is there to download before its first index.
+    if crate::indexes::keeps_indexes(&state, &repo) {
+        if let Err(e) = crate::indexes::keys(&state, &repo).await {
+            tracing::error!(repo = %repo.name, error = %e, "the repository's signing key could not be made; it is made with its first index");
+        }
+    }
     // Re-fetched so the view reflects the sealed secret.
     let repo = if sealed {
         match repository_dao::find_repository_by_id(&state.pool, repo.id).await {
@@ -793,6 +832,81 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         Ok(view) => (StatusCode::CREATED, Json(view)).into_response(),
         Err(e) => db_error(e),
     }
+}
+
+/// Whether `format` keeps signed indexes (apt): its proxies pass their
+/// upstream's indexes on, so they have no package delay.
+fn keeps_signed_indexes(state: &AppState, format: &str) -> bool {
+    state
+        .formats
+        .plugin(format)
+        .is_some_and(|plugin| plugin.descriptor().indexes)
+}
+
+/// The settings of a format's own of a repository of `format` and `kind`
+/// (`config.options`): `given` checked by the format's plugin and merged into
+/// `existing` (a `None` value clears one), every option the kind requires
+/// set. Returns the options to store.
+#[allow(clippy::result_large_err)]
+fn format_options(
+    state: &AppState,
+    format: &str,
+    kind: RepoKind,
+    existing: &serde_json::Map<String, serde_json::Value>,
+    given: Option<BTreeMap<String, Option<String>>>,
+) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
+    let plugin = state.formats.plugin(format);
+    let declared = plugin
+        .as_ref()
+        .map(|p| p.descriptor().options)
+        .unwrap_or(&[]);
+    let api_kind = match kind {
+        RepoKind::Hosted => forge_plugin::api::RepositoryKind::Hosted,
+        RepoKind::Proxy => forge_plugin::api::RepositoryKind::Proxy,
+        RepoKind::Group => forge_plugin::api::RepositoryKind::Group,
+    };
+    let mut options = existing.clone();
+    for (name, value) in given.unwrap_or_default() {
+        let Some(option) = declared.iter().find(|o| o.name == name) else {
+            return Err(bad_request(format!(
+                "format {format} has no option {name:?}"
+            )));
+        };
+        if !option.kinds.contains(&api_kind) {
+            return Err(bad_request(format!(
+                "option {name:?} is not valid for {} repositories",
+                kind.as_str()
+            )));
+        }
+        match value {
+            None => {
+                options.remove(&name);
+            }
+            Some(value) => {
+                let implementation = plugin.as_ref().map(|p| p.implementation().clone());
+                let checked = match implementation {
+                    Some(plugin) => plugin.check_option(api_kind, &name, &value),
+                    None => Ok(value),
+                };
+                match checked {
+                    Ok(value) => {
+                        options.insert(name, serde_json::Value::String(value));
+                    }
+                    Err(e) => return Err(bad_request(format!("{}: {e}", option.label))),
+                }
+            }
+        }
+    }
+    for option in declared {
+        if option.required && option.kinds.contains(&api_kind) && !options.contains_key(option.name)
+        {
+            return Err(bad_request(format!(
+                "{} repositories need the option {:?} ({}), e.g. {:?}",
+                format, option.name, option.label, option.example
+            )));
+        }
+    }
+    Ok(options)
 }
 
 /// The docker options of a create or update request (`None`: not sent;
@@ -1122,6 +1236,13 @@ pub async fn update(
     if images && body.package_delay_seconds.is_some_and(|d| d != 0) {
         return bad_request("package_delay_seconds is not supported for docker repositories");
     }
+    if keeps_signed_indexes(&state, &existing.format)
+        && body.package_delay_seconds.is_some_and(|d| d != 0)
+    {
+        return bad_request(
+            "package_delay_seconds is not supported for apt repositories: a proxy passes its upstream's signed indexes on as they are",
+        );
+    }
     if images && body.allow_redeploy == Some(true) {
         return bad_request(
             "allow_redeploy is a NuGet option; docker tags move unless immutable_tags is set",
@@ -1230,6 +1351,39 @@ pub async fn update(
             }
         }
         None => {}
+    }
+
+    if let Some(given) = body.options.clone() {
+        let stored = existing
+            .config
+            .get(FORMAT_OPTIONS_KEY)
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        match format_options(
+            &state,
+            &existing.format,
+            existing.kind(),
+            &stored,
+            Some(given),
+        ) {
+            Ok(options) => {
+                if !config.is_object() {
+                    config = json!({});
+                }
+                if let Some(map) = config.as_object_mut() {
+                    if options.is_empty() {
+                        map.remove(FORMAT_OPTIONS_KEY);
+                    } else {
+                        map.insert(
+                            FORMAT_OPTIONS_KEY.into(),
+                            serde_json::Value::Object(options),
+                        );
+                    }
+                }
+            }
+            Err(resp) => return resp,
+        }
     }
 
     // Stored credentials belong to the upstream origin they were entered for:
@@ -1444,7 +1598,8 @@ pub async fn delete(State(state): State<AppState>, Path(name): Path<String>) -> 
         Err(e) => return db_error(e),
     };
     let grace = state.config.outbox.grace();
-    match delete_repository_locked(&state, existing.id, existing.kind(), grace).await {
+    let stores_files = state.formats.stores_files(&existing.format);
+    match delete_repository_locked(&state, existing.id, existing.kind(), stores_files, grace).await {
         Ok(RepoDelete::Deleted) => StatusCode::NO_CONTENT.into_response(),
         Ok(RepoDelete::NotFound) => (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Ok(RepoDelete::HasPackages) if state.formats.stores_images(&existing.format) => (
@@ -1492,6 +1647,7 @@ async fn delete_repository_locked(
     state: &AppState,
     repo_id: i64,
     kind: RepoKind,
+    stores_files: bool,
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
     // A proxy delete locks its cached versions before the repository row,
@@ -1501,7 +1657,7 @@ async fn delete_repository_locked(
     // whole transaction rolled back, so retrying the delete is safe.
     let mut attempt = 0;
     loop {
-        match delete_repository_once(state, repo_id, kind, grace).await {
+        match delete_repository_once(state, repo_id, kind, stores_files, grace).await {
             Err(sqlx::Error::Database(db))
                 if db.code().as_deref() == Some("40P01") && attempt < 3 =>
             {
@@ -1517,6 +1673,7 @@ async fn delete_repository_once(
     state: &AppState,
     repo_id: i64,
     kind: RepoKind,
+    stores_files: bool,
     grace: chrono::Duration,
 ) -> sqlx::Result<RepoDelete> {
     let mut tx = forge_db::begin(&state.pool).await?;
@@ -1536,10 +1693,11 @@ async fn delete_repository_once(
     if kind == RepoKind::Hosted {
         // Hosted repos may still own (non-reproducible) components or image
         // manifests; require them gone first so the deletion is an explicit
-        // admin action.
+        // admin action. A package repository's files are its indexes, made
+        // of its packages again whenever they are needed.
         if component_dao::repository_has_components(&mut *tx, repo_id).await?
             || oci_dao::repository_has_images(&mut *tx, repo_id).await?
-            || raw_dao::repository_has_files(&mut *tx, repo_id).await?
+            || (stores_files && raw_dao::repository_has_files(&mut *tx, repo_id).await?)
         {
             return Ok(RepoDelete::HasPackages);
         }

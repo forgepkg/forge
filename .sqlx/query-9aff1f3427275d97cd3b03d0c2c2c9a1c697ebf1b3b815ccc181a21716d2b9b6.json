@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM repository_signing_key WHERE repository_id = $1 AND fingerprint = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9aff1f3427275d97cd3b03d0c2c2c9a1c697ebf1b3b815ccc181a21716d2b9b6"
+}

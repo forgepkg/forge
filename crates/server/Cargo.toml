@@ -25,6 +25,7 @@ forge-telemetry = { path = "../telemetry" }
 forge-traffic = { path = "../traffic" }
 # The built-in format plugins (crates/formats/docker, crates/formats/nuget,
 # crates/formats/npm, crates/formats/raw), linked in.
+forge-format-apt = { path = "../formats/apt" }
 forge-format-docker = { path = "../formats/docker" }
 forge-format-nuget = { path = "../formats/nuget" }
 forge-format-npm = { path = "../formats/npm" }
@@ -95,6 +96,12 @@ bytes = "1"
 uuid = { workspace = true }
 # Registry token signing key generation.
 rand = { workspace = true }
+# OpenPGP keys that sign apt repositories' indexes (rPGP, MIT/Apache-2.0;
+# Forge is also offered under the envisia license). Its default `bzip2`
+# feature (compressed messages) is not needed to sign. rPGP draws its
+# randomness through rand_core 0.6.
+pgp = { version = "0.21", default-features = false }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 # Registry Bearer tokens (HS256), the same crate the OIDC verifier uses.
 jsonwebtoken = { workspace = true }
 # Outgoing email (invitations): SMTP submission.
