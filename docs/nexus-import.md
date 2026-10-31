@@ -33,3 +33,11 @@ with the feed or registry it now reads. Resumed, its scan starts again (its
 cursor was a Nexus `continuationToken`), and what it copied already comes
 out `identical`. The protocols carry no last download and no uploader: those
 Nexus recorded are not carried over.
+
+Once the repositories are imported, the cutover can keep every client's
+configuration: Forge serves each repository but Docker's at the same
+`/repository/<name>/` path as Nexus, so point the Nexus host name at Forge
+and list it in `server.alias_base_urls`. Clients that reach Forge under it
+are then handed every URL on it (a NuGet feed's resources, the registry's
+token service), never the public URL. See
+[Further host names](deployment.md#further-host-names-aliases).

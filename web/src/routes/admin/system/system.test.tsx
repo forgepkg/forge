@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event'
 
 import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
-import type { BlobCacheStats, CryptoKeys } from '~/api/system'
+import type { BlobCacheStats, CryptoKeys, ServerAddresses } from '~/api/system'
 import { renderApp } from '~/test/renderApp'
 
 /**
@@ -13,7 +13,8 @@ import { renderApp } from '~/test/renderApp'
  *  - the secret encryption's keys and root key version;
  *  - each rotation asks first, posts to its layer, reports what it did and
  *    reads the keys again; a held rotation lock reads as a retryable conflict;
- *  - the blob cache's numbers, or its absence, with the answering instance.
+ *  - the blob cache's numbers, or its absence, with the answering instance;
+ *  - the public and alias base URLs, or that there are no aliases.
  */
 
 const adminMe: Me = {
@@ -94,9 +95,15 @@ function json(body: unknown, status = 200): Response {
 
 const fetchMock = vi.fn()
 
+const addresses: ServerAddresses = {
+  public_base_url: 'https://forge.example.com',
+  alias_base_urls: ['https://nexus.example.com', 'http://old.example.com:8081'],
+}
+
 interface ApiHandlers {
   keys?: CryptoKeys
   cache?: BlobCacheStats
+  addresses?: ServerAddresses
   onRotate?: (layer: string) => Response
 }
 
@@ -112,6 +119,7 @@ function mockApi(h: ApiHandlers) {
       return Promise.resolve(h.onRotate ? h.onRotate(rotate[1]) : json({}))
     }
     if (path.endsWith('/admin/blob-cache')) return Promise.resolve(json(h.cache ?? cacheStats))
+    if (path.endsWith('/admin/addresses')) return Promise.resolve(json(h.addresses ?? addresses))
     return Promise.resolve(new Response('not found', { status: 404 }))
   })
 }
@@ -240,5 +248,29 @@ describe('admin system screen', () => {
     const before = requests('GET', /blob-cache$/).length
     await user.click(within(panel).getByRole('button', { name: 'Refresh' }))
     await waitFor(() => expect(requests('GET', /blob-cache$/).length).toBe(before + 1))
+  })
+
+  it('shows the public URL and the aliases', async () => {
+    mockApi({})
+    await renderApp('/manage/system')
+
+    const panel = await screen.findByRole('region', { name: 'Addresses' })
+    expect(await within(panel).findByText('https://forge.example.com')).toBeInTheDocument()
+    const aliases = within(panel).getByRole('list', { name: 'Aliases' })
+    expect(within(aliases).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+      'https://nexus.example.com',
+      'http://old.example.com:8081',
+    ])
+    expect(within(panel).getByText(/a page opened under an alias is redirected/)).toBeInTheDocument()
+  })
+
+  it('says when there are no aliases', async () => {
+    mockApi({ addresses: { public_base_url: 'https://forge.example.com', alias_base_urls: [] } })
+    await renderApp('/manage/system')
+
+    const panel = await screen.findByRole('region', { name: 'Addresses' })
+    expect(await within(panel).findByText('None')).toBeInTheDocument()
+    expect(within(panel).queryByRole('list', { name: 'Aliases' })).toBeNull()
+    expect(within(panel).getAllByText('server.alias_base_urls').length).toBeGreaterThan(1)
   })
 })

@@ -11,6 +11,9 @@ import { httpClient } from '~/lib/httpClient'
  *    cluster-wide lock; it can simply be retried.
  *  - `GET /admin/blob-cache` reports the local blob cache of the instance
  *    that answered (`instance`); each replica has a cache of its own.
+ *  - `GET /admin/addresses` (`crates/server/src/admin/addresses.rs`) names
+ *    the public base URL and the alias base URLs the server is reached
+ *    under, as `forge.toml` sets them (read-only here).
  */
 
 /** A key layer: `kek` (wraps the DEKs) or `dek` (encrypts the secrets). */
@@ -87,10 +90,21 @@ export type BlobCacheStats =
       bypassed: number
     }
 
+/**
+ * `GET /admin/addresses`: `server.public_base_url`, and
+ * `server.alias_base_urls`, further host names (an old Nexus host pointed
+ * at Forge) whose clients are handed URLs on the alias they asked.
+ */
+export interface ServerAddresses {
+  public_base_url: string
+  alias_base_urls: string[]
+}
+
 /** Query keys of the system screen. */
 export const systemKeys = {
   cryptoKeys: () => ['system', 'crypto-keys'] as const,
   blobCache: () => ['system', 'blob-cache'] as const,
+  addresses: () => ['system', 'addresses'] as const,
 }
 
 /** `GET /admin/crypto/keys`. */
@@ -106,4 +120,9 @@ export function rotateKeys(layer: RotationLayer): Promise<RotationResult> {
 /** `GET /admin/blob-cache`. */
 export function fetchBlobCache(signal?: AbortSignal): Promise<BlobCacheStats> {
   return httpClient.get<BlobCacheStats>('/admin/blob-cache', { signal })
+}
+
+/** `GET /admin/addresses`. */
+export function fetchAddresses(signal?: AbortSignal): Promise<ServerAddresses> {
+  return httpClient.get<ServerAddresses>('/admin/addresses', { signal })
 }
