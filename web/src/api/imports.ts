@@ -2,14 +2,16 @@ import { httpClient } from '~/lib/httpClient'
 
 /**
  * Imports into a hosted repository from another server, read through the
- * format's own protocol: a NuGet feed or a registry
+ * format's own protocol: a NuGet feed or a registry, or a raw repository
  * (`crates/server/src/admin/imports.rs`).
  *
  *  - `POST /admin/repositories/{name}/imports` checks the source first (the
- *    preflight: a feed's service index resolves and its search answers, or a
- *    registry answers its API and serves a catalog; an import that names its
- *    packages or images needs neither) and answers 400/502 with the reason,
- *    or 409 while the repository has an import running.
+ *    preflight: a feed's service index resolves and its search answers, a
+ *    registry answers its API and serves a catalog, or a raw repository
+ *    serves a listing, another Forge's or Nexus' asset listing; an import
+ *    that names its packages, images or paths needs none of it) and answers
+ *    400/502 with the reason, or 409 while the repository has an import
+ *    running.
  *  - An import scans the source (`phase: scan`), then copies the items it
  *    found (`phase: copy`). A dry run decides every item without writing a
  *    package.
@@ -18,7 +20,7 @@ import { httpClient } from '~/lib/httpClient'
  */
 
 /** Formats an import copies (`crates/server/src/import/mod.rs`). */
-export const IMPORT_FORMATS = ['nuget', 'docker']
+export const IMPORT_FORMATS = ['nuget', 'docker', 'raw']
 
 /** `queued` → `running` → `completed` | `failed` | `cancelled`. */
 export type ImportState =
@@ -38,8 +40,20 @@ export type ItemState =
   | 'failed'
   | 'planned'
 
-/** A version Forge holds with other bytes. */
+/** A version (raw: a file) Forge holds with other bytes. */
 export type OnConflict = 'skip' | 'overwrite' | 'fail'
+
+/**
+ * What the scan walks: a feed's `search`, a registry's `catalog`, Nexus'
+ * asset listing (`assets`) or another Forge's JSON listing (`directories`)
+ * of a raw repository, or the `names` the import gives.
+ */
+export type ImportListing =
+  | 'search'
+  | 'catalog'
+  | 'assets'
+  | 'directories'
+  | 'names'
 
 export interface ImportProgress {
   /** Items the scan found so far. */
@@ -76,6 +90,7 @@ export interface ImportView {
   source_server: string | null
   /** How many packages the feed's search reported in the preflight. */
   source_total: number | null
+  listing: ImportListing
   last_error: string | null
   created_by: number | null
   created_at: string
@@ -87,8 +102,11 @@ export interface ImportView {
 
 export interface ImportItem {
   id: number
-  /** `component` (a version, a tag), or a Docker `manifest` held by digest (a referrer). */
-  kind: 'component' | 'manifest'
+  /**
+   * `component` (a version, a tag), a Docker `manifest` held by digest (a
+   * referrer), or a raw `file` (`name` its path, `version` empty).
+   */
+  kind: 'component' | 'manifest' | 'file'
   name: string
   version: string
   state: ItemState
@@ -104,9 +122,12 @@ export interface ImportItem {
 
 /** `POST /admin/repositories/{name}/imports` (unknown fields are refused). */
 export interface CreateImport {
-  /** A feed's service index (`…/index.json`), or a registry. */
+  /** A feed's service index (`…/index.json`), a registry, or a raw repository. */
   url: string
-  /** The package ids or images to copy, instead of every one the source lists. */
+  /**
+   * The package ids or images to copy, instead of every one the source lists
+   * (raw: the paths of the files, below `url`).
+   */
   names?: string[]
   username?: string
   password?: string

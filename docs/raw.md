@@ -33,6 +33,7 @@ several paths, or in several repositories, is stored once.
 - [Group repositories](#group-repositories)
 - [Permissions](#permissions)
 - [Retention](#retention)
+- [Importing another server's repository](#importing-another-servers-repository)
 - [Example: the pdfium binaries](#example-the-pdfium-binaries)
 - [Limitations](#limitations)
 
@@ -330,6 +331,29 @@ Retention policies may also include a `size_budget` to evict least-recently
 used files when the repository exceeds a logical size limit. See
 [Retention size budgets](retention.md) for configuration and size accounting.
 
+## Importing another server's repository
+
+An [import](import.md) copies the files of another server's raw repository
+into a hosted raw repository: a Nexus raw-hosted repository (through Nexus'
+asset listing), another Forge's (through its [listing](#listings)), or the
+files a plain web server serves under the paths the import names (each
+checked against its `.sha256` sidecar, where the server has one). Each file
+arrives with its bytes, verified against the checksums listed, its content
+type, its upload time and its last download, so `Last-Modified` and
+retention see it as the source did; a path Forge refuses (see
+[Paths](#paths)) fails as its own item. Open the repository under
+**Admin → Repositories** and choose **Import**, or:
+
+```bash
+curl -u admin@example.com:<admin-scoped token> -X POST \
+  https://forge.example.com/admin/repositories/binaries/imports \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://nexus.example.com/repository/raw-hosted",
+       "username": "migrator", "password": "…", "dry_run": true}'
+```
+
+[Raw files](import.md#raw-files) in the import guide has the details.
+
 ## Example: the pdfium binaries
 
 The [pdfium binaries](https://github.com/bblanchon/pdfium-binaries) are
@@ -368,7 +392,5 @@ the other curl checks of this page.
   upstream's own directory listings are not read.
 - **Ranges.** One range per request; a multi-range request is answered in
   full.
-- **No import.** Importing a raw repository from another server is not
-  supported yet ([import.md](import.md) covers NuGet and Docker).
 - **No directory delete through the repository URL.** A directory is deleted through the
   admin API or the web UI (administrators).
