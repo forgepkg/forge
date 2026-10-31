@@ -29,6 +29,8 @@ use forge_plugin_api::{
 };
 use serde_json::{Map, Value};
 
+use crate::import::encode;
+use crate::integrity::sha512_of;
 use crate::packument::{timestamp, LATEST};
 use crate::upstream::{self, Keep, Kept, Select, UpstreamPackument};
 use crate::{manifest, version, PackageName};
@@ -149,26 +151,6 @@ fn with_packument(
     answer_from(packument(remote, id, full, fetched, select), answer)
 }
 
-/// The SHA-512 of an SRI `integrity` (`sha512-<base64>`), if it has one.
-fn sha512_of(integrity: &str) -> Option<String> {
-    integrity
-        .split_whitespace()
-        .find_map(|sri| sri.strip_prefix("sha512-"))
-        .map(|b64| b64.split('?').next().unwrap_or(b64).to_string())
-}
-
-/// `s` percent-encoded for a query string.
-fn encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
 /// One round of the upstream conversation for `op`.
 pub fn upstream(remote: &Remote, op: &UpstreamOp, fetched: &[FetchResult]) -> UpstreamStep {
     match op {
@@ -274,7 +256,9 @@ pub fn upstream(remote: &Remote, op: &UpstreamOp, fetched: &[FetchResult]) -> Up
             }
         }
         UpstreamOp::Search(query) => search(remote, query, fetched),
-        // No import walks an npm registry yet.
+        // An import of a registry reads its listings and packuments through
+        // `crate::import` (a full packument per package), not through this
+        // conversation.
         UpstreamOp::Packages { .. } => done(UpstreamAnswer::Search(None)),
         // A registry holds packages: it has no files to fetch.
         UpstreamOp::File(_) => done(UpstreamAnswer::File(None)),

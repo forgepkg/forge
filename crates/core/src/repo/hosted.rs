@@ -827,6 +827,22 @@ impl HostedWrite {
             ))
         };
 
+        // An import of a package the source named otherwise stores nothing.
+        if let Some((id, version)) = import.and_then(|options| options.expected.as_ref()) {
+            let same_version = self
+                .format
+                .normalize_version(version)
+                .is_ok_and(|v| v == parsed.version);
+            if self.format.lower_id(id) != parsed.id || !same_version {
+                return Err(WriteError::InvalidPackage(
+                    crate::domain::FormatError::InvalidPackage(format!(
+                        "the package is {} {}, not {id} {version}",
+                        parsed.original_id, parsed.version
+                    )),
+                ));
+            }
+        }
+
         let mut publish_context =
             self.publish_policy
                 .as_ref()

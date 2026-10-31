@@ -26,6 +26,7 @@ retention and the web UI are the same as for every other format.
 - [Installing and searching](#installing-and-searching)
 - [Proxy repositories](#proxy-repositories)
 - [Group repositories](#group-repositories)
+- [Importing another registry](#importing-another-registry)
 - [Audits](#audits)
 - [Permissions](#permissions)
 - [Retention](#retention)
@@ -267,6 +268,26 @@ A group serves its members, by priority:
 - the **writable member**, a hosted npm repository that is also a member,
   takes publishes, dist-tag changes, deprecations and unpublishing through
   the group; without one they are refused.
+
+## Importing another registry
+
+An [import](import.md) copies the packages of another registry's hosted
+repository (Nexus, Verdaccio, Artifactory, another Forge) into a hosted npm
+repository: every version's tarball, its publish time and deprecation, and
+the dist-tags. In the web UI, open the hosted repository under **Admin →
+Repositories** and choose **Import**, or:
+
+```bash
+api https://forge.example.com/admin/repositories/npm-hosted/imports \
+  -d '{"url": "https://nexus.example.com/repository/npm-hosted",
+       "username": "migrator", "password": "…", "dry_run": true}'
+```
+
+The registry's search, or else its `/-/all`, names the packages; `names`
+lists packages or scopes (`"names": ["@acme", "left-pad"]`) for a registry
+that serves neither. Tarballs come from the import's URL and are checked
+against `dist.integrity`; a second run copies only what is new, and moves the
+dist-tags the source moved. See [Importing repositories](import.md#npm-dist-tags-and-deprecations).
 
 ## Audits
 

@@ -786,8 +786,11 @@ impl UpstreamHttp {
     }
 
     /// GET a metadata body, size-capped and spooled; a gzip-encoded body is
-    /// inflated (on the blocking pool) under the same cap.
-    async fn get_metadata_body(
+    /// inflated (on the blocking pool) under the same cap. `Ok(None)` on a
+    /// 404; any other non-2xx is an error. A large document (an npm
+    /// packument) is read from the spool as it streams by, rather than held
+    /// in memory whole.
+    pub async fn get_metadata_body(
         &self,
         url: &str,
         auth: Option<&UpstreamAuth<'_>>,

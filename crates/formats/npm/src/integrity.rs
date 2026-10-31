@@ -6,6 +6,15 @@ use std::io::Read;
 use base64::Engine as _;
 use sha1::Digest as _;
 
+/// The SHA-512 of an SRI `integrity` (`sha512-<base64>`), base64, if it
+/// has one.
+pub fn sha512_of(integrity: &str) -> Option<String> {
+    integrity
+        .split_whitespace()
+        .find_map(|sri| sri.strip_prefix("sha512-"))
+        .map(|b64| b64.split('?').next().unwrap_or(b64).to_string())
+}
+
 /// The digests of a tarball.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Digests {
