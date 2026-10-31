@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 
+pub use forge_plugin_api::VersionClass;
 use forge_plugin_api::{FetchResult, Remote, UpstreamOp, UpstreamStep};
 
 use crate::domain::{FormatError, ParsedUpload};
@@ -81,6 +82,26 @@ pub trait Format: Send + Sync {
 
     /// Lowercase / canonicalize a package id for case-insensitive lookups.
     fn lower_id(&self, id: &str) -> String;
+
+    /// Retention: the class of a **normalized** version (release, prerelease
+    /// or snapshot). The default is SemVer's rule: a version with a `-` is a
+    /// prerelease (build metadata is gone once normalized), any other a
+    /// release. See [`forge_plugin_api::FormatPlugin::version_class`].
+    fn version_class(&self, version: &str) -> VersionClass {
+        if version.contains('-') {
+            VersionClass::Prerelease
+        } else {
+            VersionClass::Release
+        }
+    }
+
+    /// Retention: the partition of package `id`'s versions within which the
+    /// keep-N rules count; `None` (the default) keeps the whole package one
+    /// partition. See [`forge_plugin_api::FormatPlugin::retention_partition`].
+    fn retention_partition(&self, id: &str, version: &str) -> Option<String> {
+        let _ = (id, version);
+        None
+    }
 
     /// The asset path a version's package archive is stored under (the
     /// `asset.path` of its component). Internal to the repository: clients

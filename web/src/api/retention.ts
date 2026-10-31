@@ -9,7 +9,7 @@ import { httpClient } from '~/lib/httpClient'
  *    which arms the worker; `DELETE` removes it.
  *  - `POST …/preview` dry-runs the stored policy, or a draft `policy` from
  *    the body: checked like a `PUT` of it, evaluated even when disabled, and
- *    never stored.
+ *    never stored. A policy with a `schedule` also lists its next runs.
  *  - `POST …/run` makes the policy due now; the worker starts the run on its
  *    next poll. 409 without a policy, or while retention runs are switched
  *    off for every repository (`/admin/settings/retention`).
@@ -20,15 +20,20 @@ import { httpClient } from '~/lib/httpClient'
  * (`crates/core/src/retention/{model,files,images}.rs`): package rules for
  * NuGet and other package formats (hosted rules, or on a proxy
  * `scope: proxy_cached` eviction rules), file rules for raw repositories,
- * image rules for docker. Every shape has the same envelope. Unknown fields
- * are refused (422); an invalid rule is a 400 naming it.
+ * image rules for docker. Every shape has the same envelope, with its
+ * scheduling: `min_run_interval_seconds`, or a cron `schedule` in a
+ * `schedule_timezone`, and `max_run_seconds`. Unknown fields are refused
+ * (422); an invalid rule is a 400 naming it.
  */
 
 /** What a package rule does with a version it selects. */
 export type RetentionAction = 'unlist' | 'hard_delete'
 
-/** The versions a package rule looks at. */
-export type ReleaseType = 'any' | 'releases' | 'prereleases'
+/**
+ * The versions a package rule looks at, by the class the format gives a
+ * version (snapshots: formats that have them, such as Maven).
+ */
+export type ReleaseType = 'any' | 'releases' | 'prereleases' | 'snapshots'
 
 /** A package rule's protections and triggers (all optional). */
 export interface PackageCriteria {
@@ -38,6 +43,12 @@ export interface PackageCriteria {
   not_downloaded_for_days?: number
   /** Proxy rules only. */
   not_pulled_for_days?: number
+  /** Hosted rules only: a prerelease once a newer release is this old. */
+  prerelease_superseded_for_days?: number
+  /** Hosted rules only, with `hard_delete`: unlisted this long. */
+  unlisted_for_days?: number
+  /** Not among the newest N versions of its package (a pure count). */
+  max_versions_per_package?: number
 }
 
 export interface PackageRule {
@@ -47,6 +58,11 @@ export interface PackageRule {
   scope?: 'hosted' | 'proxy_cached'
   release_type?: ReleaseType
   package_name_prefix?: string | null
+  /** A content selector's name: only the packages it admits. */
+  selector?: string
+  /** A glob on the version, ignoring case (`*-ci.*`). */
+  version_pattern?: string
+  exclude_version_pattern?: string
   criteria: PackageCriteria
 }
 
@@ -63,6 +79,9 @@ export interface FileRule {
 export interface ImageRule {
   id: string
   image_prefix?: string
+  /** A glob on the tag (`pr-*`): only the tags it matches. */
+  tag_pattern?: string
+  exclude_tag_pattern?: string
   keep_last_n_tags?: number
   protected_tags?: string[]
   tag_older_than_days?: number
@@ -86,6 +105,12 @@ export interface RetentionPolicy<R extends RetentionRule = RetentionRule> {
   dry_run_only?: boolean
   /** Default 3600. Runs are at least a minute apart whatever this says. */
   min_run_interval_seconds?: number
+  /** A 5-field cron pattern; runs at its times instead of the interval. */
+  schedule?: string
+  /** The IANA time zone of `schedule` (default UTC). */
+  schedule_timezone?: string
+  /** A run stops after this long; the next one goes on with the rest. */
+  max_run_seconds?: number
   size_budget?: SizeBudget
   rules: R[]
 }
@@ -97,6 +122,8 @@ export interface RunSummary {
   deleted?: number
   blobs_enqueued?: number
   skipped?: number
+  /** Left for the next run: the run reached its `max_run_seconds`. */
+  deferred?: number
   size_before?: number
   size_after?: number
   target_bytes?: number
@@ -184,6 +211,8 @@ export interface PreviewView {
   size_after?: number
   target_bytes?: number
   target_reached?: boolean
+  /** With a `schedule`: its next runs (RFC 3339, UTC). */
+  next_runs?: string[]
 }
 
 /**

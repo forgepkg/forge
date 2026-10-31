@@ -1089,7 +1089,7 @@ async fn retention_settings_switch_runs_off_and_on() {
     assert_eq!(view["runs_enabled"], json!(false), "{view}");
 
     // Nothing is claimed while off, even a repository that is due.
-    retention_dao::fail_run(&srv.pool, repo_id, Some(run_id), "test", now)
+    retention_dao::fail_run(&srv.pool, repo_id, Some(run_id), "test", now, None)
         .await
         .unwrap();
     let mut tx = srv.pool.begin().await.unwrap();
@@ -1212,4 +1212,386 @@ async fn proxy_rules_keep_the_newest_and_recently_pulled_cached_versions() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+/// #185: the new fields are validated like the others (unknown fields 422, an
+/// invalid value 400 naming it), a rule's content selector must exist, and a
+/// policy with a schedule is first due at the schedule's next time, not at
+/// once. A selector a policy names cannot be deleted.
+#[tokio::test]
+async fn schedules_triggers_and_selectors_are_validated_and_stored() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("rets{s}");
+    let repo_id = seed_hosted_with_versions(&srv, &name, "Sample.Lib", &["1.0.0"]).await;
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let put = |policy: Value| {
+        client
+            .put(&url)
+            .basic_auth(&u, Some(&p))
+            .json(&json!({ "policy": policy }))
+            .send()
+    };
+    let selector = format!("ret-ci-{s}");
+    let policy = json!({
+        "version": 1,
+        "schedule": "0 3 * * *",
+        "schedule_timezone": "Europe/Berlin",
+        "max_run_seconds": 3600,
+        "rules": [
+            { "id": "ci", "action": "hard_delete", "release_type": "prereleases",
+              "selector": selector, "version_pattern": "*-ci.*",
+              "exclude_version_pattern": "*-ci.0",
+              "criteria": { "prerelease_superseded_for_days": 14, "keep_last_n": 2 } },
+            { "id": "unlisted", "action": "hard_delete",
+              "criteria": { "unlisted_for_days": 90 } },
+            { "id": "cap", "action": "unlist",
+              "criteria": { "max_versions_per_package": 50 } }
+        ]
+    });
+
+    // The selector does not exist yet.
+    let resp = put(policy.clone()).await.unwrap();
+    assert_eq!(resp.status(), 400);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("does not exist"), "{msg}");
+
+    let resp = client
+        .post(format!("{}/admin/content-selectors", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "name": selector, "includes": ["sample.*"], "excludes": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let selector_id = resp.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+
+    let before = chrono::Utc::now();
+    let resp = put(policy.clone()).await.unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let view: Value = client
+        .get(&url)
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Stored in its canonical form, with every new field.
+    let stored = &view["policy"];
+    assert_eq!(stored["schedule"], "0 3 * * *", "{view}");
+    assert_eq!(stored["schedule_timezone"], "Europe/Berlin");
+    assert_eq!(stored["max_run_seconds"], 3600);
+    assert_eq!(stored["rules"][0]["selector"], selector.as_str());
+    assert_eq!(stored["rules"][0]["version_pattern"], "*-ci.*");
+    assert_eq!(stored["rules"][0]["exclude_version_pattern"], "*-ci.0");
+    assert_eq!(
+        stored["rules"][0]["criteria"]["prerelease_superseded_for_days"],
+        14
+    );
+    assert_eq!(stored["rules"][1]["criteria"]["unlisted_for_days"], 90);
+    assert_eq!(
+        stored["rules"][2]["criteria"]["max_versions_per_package"],
+        50
+    );
+    // Due at the next 03:00 in Berlin, not now.
+    let next: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(view["last_run"]["next_run_at"].clone()).unwrap();
+    let expected =
+        forge_core::retention::schedule::Schedule::parse("0 3 * * *", Some("Europe/Berlin"))
+            .unwrap()
+            .next_after(before)
+            .unwrap();
+    assert_eq!(next, expected, "{view}");
+
+    // Run now still runs at once.
+    let resp = client
+        .post(format!("{url}/run"))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let due: bool = sqlx::query_scalar(
+        "SELECT next_run_at <= now() + interval '1 minute' FROM retention_run WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert!(due);
+
+    // A schedule replaced by an interval runs by the interval again, not at
+    // the old schedule's next time.
+    sqlx::query("UPDATE retention_run SET next_run_at = now() + interval '20 hours' WHERE repository_id = $1")
+        .bind(repo_id)
+        .execute(&srv.pool)
+        .await
+        .unwrap();
+    let mut hourly = policy.clone();
+    let envelope = hourly.as_object_mut().unwrap();
+    for key in ["schedule", "schedule_timezone"] {
+        envelope.remove(key);
+    }
+    let resp = put(hourly).await.unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let soon: bool = sqlx::query_scalar(
+        "SELECT next_run_at <= now() + interval '61 minutes' FROM retention_run WHERE repository_id = $1",
+    )
+    .bind(repo_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert!(soon);
+
+    // The selector is in use.
+    let resp = client
+        .delete(format!(
+            "{}/admin/content-selectors/{selector_id}",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains(&name), "{msg}");
+
+    // Invalid values: 400 naming the field.
+    for (edit, needle) in [
+        (json!({"schedule": "0 3 * *"}), "5 fields"),
+        (
+            json!({"schedule": "0 3 * * *", "schedule_timezone": "Europe/Atlantis"}),
+            "IANA",
+        ),
+        (
+            json!({"schedule": null, "schedule_timezone": "UTC"}),
+            "needs a schedule",
+        ),
+        (json!({"max_run_seconds": 5}), "max_run_seconds"),
+    ] {
+        let mut bad = policy.clone();
+        for (k, v) in edit.as_object().unwrap() {
+            if v.is_null() {
+                bad.as_object_mut().unwrap().remove(k);
+            } else {
+                bad[k] = v.clone();
+            }
+        }
+        let resp = put(bad).await.unwrap();
+        assert_eq!(resp.status(), 400, "{edit}");
+        let msg = resp.text().await.unwrap();
+        assert!(msg.contains(needle), "{edit}: {msg}");
+    }
+    for (rule, field, value, needle) in [
+        (0, "version_pattern", json!("1.[0"), "version_pattern"),
+        (1, "action", json!("unlist"), "unlisted_for_days"),
+        (2, "release_type", json!("nightlies"), "unknown variant"),
+    ] {
+        let mut bad = policy.clone();
+        bad["rules"][rule][field] = value;
+        let resp = put(bad).await.unwrap();
+        assert!(
+            resp.status() == 400 || resp.status() == 422,
+            "{field}: {}",
+            resp.status()
+        );
+        let msg = resp.text().await.unwrap();
+        assert!(msg.contains(needle), "{field}: {msg}");
+    }
+    let mut zero = policy.clone();
+    zero["rules"][2]["criteria"]["max_versions_per_package"] = json!(0);
+    assert_eq!(put(zero).await.unwrap().status(), 400);
+    let mut typo = policy.clone();
+    typo["rules"][0]["criteria"]["prerelease_superseded_days"] = json!(14);
+    assert_eq!(put(typo).await.unwrap().status(), 422);
+    let mut typo = policy.clone();
+    typo["schedule_tz"] = json!("UTC");
+    assert_eq!(put(typo).await.unwrap().status(), 422);
+}
+
+/// #185: the preview shows each new trigger's decisions with the reason a
+/// run records (the release that superseded a prerelease, how long a
+/// version has been unlisted, its place past the cap), filters narrow them,
+/// protections win, and a scheduled draft lists its next runs.
+#[tokio::test]
+async fn preview_shows_the_new_triggers_decisions_and_the_next_runs() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("retp{s}");
+    let repo_id = seed_hosted_with_versions(
+        &srv,
+        &name,
+        "Sample.Lib",
+        &[
+            "1.0.0-ci.1",
+            "1.0.0-ci.2",
+            "1.0.0",
+            "1.1.0",
+            "1.2.0",
+            "2.0.0-beta.1",
+        ],
+    )
+    .await;
+    // 1.0.0 was published 20 days ago, the CI builds before it; 1.1.0 has
+    // been unlisted for 100 days.
+    sqlx::query(
+        "UPDATE component SET created_at = now() - interval '20 days' \
+         WHERE repository_id = $1 AND version = '1.0.0'",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE component SET listed = false WHERE repository_id = $1 AND version = '1.1.0'",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE component SET unlisted_at = now() - interval '100 days' \
+         WHERE repository_id = $1 AND version = '1.1.0'",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let preview = |policy: Value| {
+        let client = client.clone();
+        let (u, p, url) = (u.clone(), p.clone(), url.clone());
+        async move {
+            let resp = client
+                .post(format!("{url}/preview"))
+                .basic_auth(&u, Some(&p))
+                .json(&json!({ "policy": policy }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+    let by_version = |body: &Value| -> std::collections::BTreeMap<String, Value> {
+        body["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| (d["version"].as_str().unwrap().to_string(), d.clone()))
+            .collect()
+    };
+
+    let body = preview(json!({
+        "version": 1,
+        "schedule": "30 2 * * *",
+        "schedule_timezone": "Europe/Berlin",
+        "rules": [
+            { "id": "ci", "action": "hard_delete", "version_pattern": "*-ci.*",
+              "criteria": { "prerelease_superseded_for_days": 14 } },
+            { "id": "unlisted", "action": "hard_delete",
+              "criteria": { "unlisted_for_days": 90 } }
+        ]
+    }))
+    .await;
+    let decided = by_version(&body);
+    assert_eq!(
+        decided.keys().collect::<Vec<_>>(),
+        vec!["1.0.0-ci.1", "1.0.0-ci.2", "1.1.0"],
+        "{body}"
+    );
+    assert_eq!(decided["1.0.0-ci.1"]["reason"]["superseded_by"], "1.0.0");
+    assert_eq!(
+        decided["1.0.0-ci.1"]["reason"]["prerelease_superseded_for_days"],
+        14
+    );
+    assert_eq!(decided["1.1.0"]["reason"]["unlisted_for_days"], 90);
+    assert_eq!(decided["1.1.0"]["rule_id"], "unlisted");
+    let runs = body["next_runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 5);
+    for run in runs {
+        let at: chrono::DateTime<chrono::Utc> = serde_json::from_value(run.clone()).unwrap();
+        let local = at.with_timezone(&chrono_tz::Europe::Berlin);
+        // 02:30, or 03:00 on the day the clocks skip it.
+        assert!(
+            ["02:30", "03:00"].contains(&local.format("%H:%M").to_string().as_str()),
+            "{local}"
+        );
+    }
+
+    // A count: two newest of the package stay, listed or not; keep_last_n
+    // (newest listed) in another rule wins over it.
+    let body = preview(json!({
+        "version": 1,
+        "rules": [
+            { "id": "cap", "action": "hard_delete",
+              "criteria": { "max_versions_per_package": 2 } },
+            { "id": "keep", "action": "hard_delete", "release_type": "releases",
+              "criteria": { "keep_last_n": 2, "older_than_days": 1000 } }
+        ]
+    }))
+    .await;
+    let decided = by_version(&body);
+    assert_eq!(
+        decided.keys().collect::<Vec<_>>(),
+        vec!["1.0.0-ci.1", "1.0.0-ci.2", "1.1.0"],
+        "2.0.0-beta.1 and 1.2.0 are the newest two; 1.2.0 and 1.0.0 the newest listed \
+         releases, which the other rule keeps: {body}"
+    );
+    assert_eq!(decided["1.1.0"]["reason"]["rank"], 3);
+    assert_eq!(decided["1.0.0-ci.1"]["reason"]["rank"], 6);
+    assert!(body.get("next_runs").is_none(), "no schedule: {body}");
+}
+
+/// #185: image rules take tag patterns and globs in `protected_tags`.
+#[tokio::test]
+async fn image_rules_take_tag_patterns_and_glob_protected_tags() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let name = format!("reti{s}");
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "name": name, "kind": "hosted", "format": "docker" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+    let url = format!("{}/admin/repositories/{name}/retention", srv.base_url);
+    let policy = json!({
+        "version": 1,
+        "schedule": "0 4 * * 0",
+        "rules": [
+            { "id": "prs", "tag_pattern": "pr-*", "exclude_tag_pattern": "pr-keep*",
+              "tag_older_than_days": 7, "protected_tags": ["release-*", "latest"] }
+        ]
+    });
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": policy }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let mut bad = policy.clone();
+    bad["rules"][0]["tag_pattern"] = json!("pr-[");
+    let resp = client
+        .put(&url)
+        .basic_auth(&u, Some(&p))
+        .json(&json!({ "policy": bad }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("tag_pattern"));
 }

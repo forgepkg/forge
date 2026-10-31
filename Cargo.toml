@@ -207,6 +207,15 @@ tempfile = { version = "3" }
 # Date/time (shared with forge-db's model types)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Retention schedules (`schedule` + `schedule_timezone` in a retention
+# policy): croner parses 5-field cron patterns and finds their next time in a
+# chrono time zone, with Vixie-cron/OCPS rules across daylight-saving
+# changes (a time in a skipped hour runs right after it, a time in a repeated
+# hour once); chrono-tz is the IANA time-zone database compiled in, so a zone
+# resolves the same in a container image without /usr/share/zoneinfo.
+croner = { version = "4.0.1", default-features = false, features = ["chrono"] }
+chrono-tz = { version = "0.10" }
+
 # Tests build unoptimized, yet the mock IdPs generate RSA keys and every test
 # server hashes its bootstrap admin password: ~30x (RSA-2048 keygen, ~3 s) and
 # ~15x (Argon2 default, ~0.3 s) slower than optimized. Optimize just those

@@ -44,7 +44,7 @@ export function policyShape(repo: {
   return repo.kind === 'proxy' ? 'proxy' : 'package'
 }
 
-type FieldKind = 'count' | 'days' | 'text' | 'tags' | 'select'
+type FieldKind = 'count' | 'days' | 'text' | 'tags' | 'select' | 'selector'
 
 interface FieldSpec {
   /** The field's place in the rule's JSON. */
@@ -85,11 +85,13 @@ const RELEASE_TYPE: FieldSpec = {
   path: ['release_type'],
   label: 'Versions',
   kind: 'select',
-  description: 'A prerelease has a label after a dash, such as 2.0.0-beta.1.',
+  description:
+    'As the format classes a version: a prerelease has a label after a dash, such as 2.0.0-beta.1; snapshots are builds such as Maven’s -SNAPSHOT ones.',
   options: [
     { value: 'any', label: 'Every version' },
     { value: 'releases', label: 'Releases only' },
     { value: 'prereleases', label: 'Prereleases only' },
+    { value: 'snapshots', label: 'Snapshots only' },
   ],
 }
 
@@ -99,6 +101,47 @@ const PACKAGE_PREFIX: FieldSpec = {
   kind: 'text',
   placeholder: 'acme.',
   description: 'Only packages whose id starts with this, ignoring case. Empty: every package.',
+}
+
+const SELECTOR: FieldSpec = {
+  path: ['selector'],
+  label: 'Content selector',
+  kind: 'selector',
+  description:
+    'Only packages a content selector admits (Admin → Content selectors). Empty: every package.',
+}
+
+const VERSION_PATTERN: FieldSpec = {
+  path: ['version_pattern'],
+  label: 'Version pattern',
+  kind: 'text',
+  placeholder: '*-ci.*',
+  description:
+    'Only versions this glob matches, ignoring case; {*-ci.*,*-pr.*} for either. Empty: every version.',
+}
+
+const EXCLUDE_VERSION_PATTERN: FieldSpec = {
+  path: ['exclude_version_pattern'],
+  label: 'Except versions matching',
+  kind: 'text',
+  placeholder: '*-rc.*',
+  description: 'Never the versions this glob matches.',
+}
+
+const PACKAGE_FILTERS = [
+  RELEASE_TYPE,
+  PACKAGE_PREFIX,
+  SELECTOR,
+  VERSION_PATTERN,
+  EXCLUDE_VERSION_PATTERN,
+]
+
+const MAX_VERSIONS: FieldSpec = {
+  path: ['criteria', 'max_versions_per_package'],
+  label: 'More than N versions',
+  kind: 'count',
+  description:
+    'Not among the newest N versions of its package (among the versions above), listed or not. Needs no age.',
 }
 
 const SHAPES: Record<PolicyShape, ShapeSpec> = {
@@ -118,11 +161,11 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
       },
     ],
     groups: [
-      { legend: 'Versions it looks at', fields: [RELEASE_TYPE, PACKAGE_PREFIX] },
+      { legend: 'Versions it looks at', fields: PACKAGE_FILTERS },
       {
         legend: 'Always keep',
         description:
-          'Per package, among the versions above. A version any rule keeps is never unlisted or deleted.',
+          'Per package, among the versions above. A version any rule keeps is never unlisted or deleted, whatever selects it.',
         fields: [
           {
             path: ['criteria', 'keep_last_n'],
@@ -153,6 +196,21 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
             kind: 'days',
             description: 'A version never downloaded counts from its publication.',
           },
+          {
+            path: ['criteria', 'prerelease_superseded_for_days'],
+            label: 'Superseded by a release for (days)',
+            kind: 'days',
+            description:
+              'A prerelease, once a release that comes after it has been out this long: 2.3.0-ci.417 once 2.3.0 is.',
+          },
+          {
+            path: ['criteria', 'unlisted_for_days'],
+            label: 'Unlisted for (days)',
+            kind: 'days',
+            description:
+              'Unlisted at least this long: with “Delete”, the second step after a rule that unlists.',
+          },
+          MAX_VERSIONS,
         ],
       },
     ],
@@ -170,7 +228,7 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
       'A cached version is evicted when any rule selects it. What any rule keeps is never evicted, so each package can keep a working set however long nobody pulls it.',
     head: [],
     groups: [
-      { legend: 'Versions it looks at', fields: [RELEASE_TYPE, PACKAGE_PREFIX] },
+      { legend: 'Versions it looks at', fields: PACKAGE_FILTERS },
       {
         legend: 'Always keep',
         description:
@@ -200,6 +258,11 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
             label: 'Not pulled for (days)',
             kind: 'days',
             description: 'A version never pulled counts from when the proxy first saw it.',
+          },
+          {
+            ...MAX_VERSIONS,
+            description:
+              'Not among the newest N cached versions of its package (among the versions above), however recently pulled.',
           },
         ],
       },
@@ -282,6 +345,20 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
             placeholder: 'team/',
             description: 'Only images whose name starts with this. Empty: every image.',
           },
+          {
+            path: ['tag_pattern'],
+            label: 'Tag pattern',
+            kind: 'text',
+            placeholder: 'pr-*',
+            description: 'Only tags this glob matches, as written. Empty: every tag.',
+          },
+          {
+            path: ['exclude_tag_pattern'],
+            label: 'Except tags matching',
+            kind: 'text',
+            placeholder: 'v*',
+            description: 'Never the tags this glob matches.',
+          },
         ],
       },
       {
@@ -298,8 +375,9 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
             path: ['protected_tags'],
             label: 'Protected tags',
             kind: 'tags',
-            placeholder: 'latest, stable',
-            description: 'Never deleted by this rule. Separate them with commas or spaces.',
+            placeholder: 'latest, release-*',
+            description:
+              'Never deleted by this rule: names or globs. Separate them with commas or spaces.',
           },
         ],
       },
@@ -343,6 +421,15 @@ const SHAPES: Record<PolicyShape, ShapeSpec> = {
     },
   },
 }
+
+const UNIT_OPTIONS = (
+  <>
+    <option value="minutes">Minutes</option>
+    <option value="hours">Hours</option>
+    <option value="days">Days</option>
+    <option value="seconds">Seconds</option>
+  </>
+)
 
 function fieldsOf(shape: PolicyShape): FieldSpec[] {
   const spec = SHAPES[shape]
@@ -421,8 +508,16 @@ export interface PolicyDraft {
   base: Record<string, unknown>
   enabled: boolean
   dryRunOnly: boolean
+  /** Runs at most every `interval`, or at the times of a cron `schedule`. */
+  scheduleMode: 'interval' | 'cron'
   interval: string
   intervalUnit: IntervalUnit
+  /** A 5-field cron pattern, and its IANA time zone (empty: UTC). */
+  schedule: string
+  scheduleTimezone: string
+  /** How long a run may take (empty: no limit), in `maxRunUnit`. */
+  maxRun: string
+  maxRunUnit: IntervalUnit
   /** The size budget's maximum and target, in `sizeBudgetUnit`. */
   sizeBudgetMax: string
   sizeBudgetTarget: string
@@ -492,8 +587,13 @@ export function draftFromPolicy(
       base: { version: 1 },
       enabled: true,
       dryRunOnly: true,
+      scheduleMode: 'interval',
       interval: '1',
       intervalUnit: 'hours',
+      schedule: '',
+      scheduleTimezone: '',
+      maxRun: '',
+      maxRunUnit: 'hours',
       sizeBudgetMax: '',
       sizeBudgetTarget: '',
       sizeBudgetUnit: 'GiB',
@@ -505,12 +605,19 @@ export function draftFromPolicy(
   const budget = policy.size_budget
   const sizes = budget ? [budget.max_bytes, budget.target_bytes ?? 0] : []
   const unit = unitOf(sizes)
+  const maxRun =
+    policy.max_run_seconds === undefined ? null : intervalFromSeconds(policy.max_run_seconds)
   return {
     base: structuredClone(base),
     enabled: policy.enabled ?? true,
     dryRunOnly: policy.dry_run_only ?? false,
+    scheduleMode: policy.schedule ? 'cron' : 'interval',
     interval: interval.value,
     intervalUnit: interval.unit,
+    schedule: policy.schedule ?? '',
+    scheduleTimezone: policy.schedule_timezone ?? '',
+    maxRun: maxRun?.value ?? '',
+    maxRunUnit: maxRun?.unit ?? 'hours',
     sizeBudgetMax: budget ? amountIn(budget.max_bytes, unit) : '',
     sizeBudgetTarget:
       budget?.target_bytes === undefined ? '' : amountIn(budget.target_bytes, unit),
@@ -522,6 +629,8 @@ export function draftFromPolicy(
 /** What is wrong with the form, field by field. */
 export interface DraftErrors {
   interval?: string
+  schedule?: string
+  maxRun?: string
   sizeBudgetMax?: string
   sizeBudgetTarget?: string
   /** A message for the rules as a whole. */
@@ -532,6 +641,11 @@ export interface DraftErrors {
 
 const WHOLE = /^\d+$/
 const DECIMAL = /^\d+(\.\d+)?$/
+/** Five fields (the server checks each), or a nickname such as @daily. */
+const CRON = /^(@[a-z]+|\S+(\s+\S+){4})$/i
+/** The bounds of `max_run_seconds`: a minute and a week. */
+const MIN_MAX_RUN = 60
+const MAX_MAX_RUN = 7 * 86400
 
 /** The browser's checks; `null` when the form can be sent. */
 export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErrors | null {
@@ -541,6 +655,18 @@ export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErro
   if (!WHOLE.test(interval) || Number(interval) < 1) {
     errors.interval = 'Enter a whole number of at least 1.'
     failed = true
+  }
+  if (draft.scheduleMode === 'cron' && !CRON.test(draft.schedule.trim())) {
+    errors.schedule = 'Enter a cron pattern of 5 fields, such as 0 3 * * *.'
+    failed = true
+  }
+  const maxRun = draft.maxRun.trim()
+  if (maxRun !== '') {
+    const seconds = Number(maxRun) * UNIT_SECONDS[draft.maxRunUnit]
+    if (!WHOLE.test(maxRun) || seconds < MIN_MAX_RUN || seconds > MAX_MAX_RUN) {
+      errors.maxRun = 'Enter a time between a minute and a week, or leave it empty.'
+      failed = true
+    }
   }
   const max = draft.sizeBudgetMax.trim()
   const target = draft.sizeBudgetTarget.trim()
@@ -607,7 +733,7 @@ export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPo
       } else if (field.kind === 'tags') {
         const tags = raw.split(/[\s,]+/).filter((t) => t !== '')
         value = tags.length > 0 ? tags : undefined
-      } else if (field.kind === 'text' && raw === '' && field !== RULE_ID) {
+      } else if ((field.kind === 'text' || field.kind === 'selector') && raw === '' && field !== RULE_ID) {
         value = undefined
       } else {
         value = raw
@@ -617,6 +743,18 @@ export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPo
     return json as unknown as RetentionRule
   })
   const base = structuredClone(draft.base)
+  if (draft.scheduleMode === 'cron') {
+    base.schedule = draft.schedule.trim().replace(/\s+/g, ' ')
+    const zone = draft.scheduleTimezone.trim()
+    if (zone === '') delete base.schedule_timezone
+    else base.schedule_timezone = zone
+  } else {
+    delete base.schedule
+    delete base.schedule_timezone
+  }
+  const maxRun = draft.maxRun.trim()
+  if (maxRun === '') delete base.max_run_seconds
+  else base.max_run_seconds = Number(maxRun) * UNIT_SECONDS[draft.maxRunUnit]
   const max = draft.sizeBudgetMax.trim()
   const target = draft.sizeBudgetTarget.trim()
   if (max === '') {
@@ -644,6 +782,24 @@ export function policyDeletes(shape: PolicyShape, policy: RetentionPolicy): bool
   if (policy.size_budget) return true
   if (shape !== 'package') return policy.rules.length > 0
   return policy.rules.some((r) => 'action' in r && r.action === 'hard_delete')
+}
+
+/** When a stored policy runs: its schedule, or its interval. */
+export function describeSchedule(policy: RetentionPolicy): string {
+  const limit =
+    policy.max_run_seconds === undefined
+      ? ''
+      : `; a run stops after ${durationText(policy.max_run_seconds)}`
+  if (policy.schedule) {
+    return `${policy.schedule} (${policy.schedule_timezone ?? 'UTC'})${limit}`
+  }
+  return `at most every ${durationText(policy.min_run_interval_seconds ?? 3600)}${limit}`
+}
+
+function durationText(seconds: number): string {
+  const { value, unit } = intervalFromSeconds(seconds)
+  const n = Number(value)
+  return `${n.toLocaleString()} ${n === 1 ? unit.replace(/s$/, '') : unit}`
 }
 
 function plural(n: number, one: string, many = `${one}s`): string {
@@ -681,10 +837,19 @@ function days(n: number): string {
   return plural(n, 'day')
 }
 
-const REASONS: Record<string, (n: number) => string> = {
+const REASONS: Record<string, (n: number, reason: DecisionReason) => string> = {
   older_than_days: (n) => `older than ${days(n)}`,
   not_downloaded_for_days: (n) => `not downloaded for ${days(n)}`,
   not_pulled_for_days: (n) => `not pulled for ${days(n)}`,
+  prerelease_superseded_for_days: (n, r) =>
+    typeof r.superseded_by === 'string'
+      ? `superseded by ${r.superseded_by} for over ${days(n)}`
+      : `superseded by a release for over ${days(n)}`,
+  unlisted_for_days: (n) => `unlisted for ${days(n)}`,
+  max_versions_per_package: (n, r) =>
+    typeof r.rank === 'number'
+      ? `number ${r.rank} of its package, beyond the newest ${n}`
+      : `beyond the newest ${n} of its package`,
   keep_newest_per_directory: (n) => `not among the ${n} newest in its directory`,
   keep_last_n_tags: (n) => `not among the ${n} newest tags`,
   tag_older_than_days: (n) => `pushed over ${days(n)} ago`,
@@ -704,7 +869,7 @@ export function describeReason(reason: DecisionReason | null | undefined): strin
   if (!reason) return ''
   return Object.entries(REASONS)
     .filter(([key]) => typeof reason[key] === 'number')
-    .map(([key, phrase]) => phrase(reason[key] as number))
+    .map(([key, phrase]) => phrase(reason[key] as number, reason))
     .join(', ')
 }
 
@@ -718,12 +883,15 @@ export function RetentionPolicyForm({
   draft,
   errors,
   currentSizeBytes = 0,
+  selectors,
   onChange,
 }: {
   shape: PolicyShape
   draft: PolicyDraft
   errors: DraftErrors | null
   currentSizeBytes?: number
+  /** The content selectors a rule may name; `undefined`: typed by name. */
+  selectors?: string[]
   onChange: (draft: PolicyDraft) => void
 }) {
   const spec = SHAPES[shape]
@@ -762,26 +930,81 @@ export function RetentionPolicyForm({
         />
       </div>
       <div className="fg-fieldrow">
+        <SelectField
+          label="When it runs"
+          value={draft.scheduleMode}
+          onChange={(e) =>
+            onChange({
+              ...draft,
+              scheduleMode: e.target.value as PolicyDraft['scheduleMode'],
+            })
+          }
+          description="On a schedule, the worker runs the policy at its times only, such as outside working hours."
+        >
+          <option value="interval">At most every…</option>
+          <option value="cron">On a cron schedule</option>
+        </SelectField>
+        {draft.scheduleMode === 'interval' ? (
+          <>
+            <TextField
+              label="Minimum time between runs"
+              inputMode="numeric"
+              mono
+              value={draft.interval}
+              onChange={(e) => onChange({ ...draft, interval: e.target.value })}
+              error={errors?.interval}
+              description="Run now does not wait for it. Runs are at least a minute apart."
+            />
+            <SelectField
+              label="Unit"
+              value={draft.intervalUnit}
+              onChange={(e) =>
+                onChange({ ...draft, intervalUnit: e.target.value as IntervalUnit })
+              }
+            >
+              {UNIT_OPTIONS}
+            </SelectField>
+          </>
+        ) : (
+          <>
+            <TextField
+              label="Cron schedule"
+              mono
+              placeholder="0 3 * * *"
+              value={draft.schedule}
+              onChange={(e) => onChange({ ...draft, schedule: e.target.value })}
+              error={errors?.schedule}
+              description="Minute, hour, day of month, month, day of week: 0 3 * * * is 03:00 every day, 0 3 * * 6 Saturdays. Run now does not wait for it."
+            />
+            <TextField
+              label="Time zone"
+              optional
+              mono
+              placeholder="Europe/Berlin"
+              value={draft.scheduleTimezone}
+              onChange={(e) => onChange({ ...draft, scheduleTimezone: e.target.value })}
+              description="An IANA time zone; UTC when empty. The schedule keeps its local time across daylight-saving changes."
+            />
+          </>
+        )}
+      </div>
+      <div className="fg-fieldrow">
         <TextField
-          label="Minimum time between runs"
+          label="Stop a run after"
+          optional
           inputMode="numeric"
           mono
-          value={draft.interval}
-          onChange={(e) => onChange({ ...draft, interval: e.target.value })}
-          error={errors?.interval}
-          description="Run now does not wait for it. Runs are at least a minute apart."
+          value={draft.maxRun}
+          onChange={(e) => onChange({ ...draft, maxRun: e.target.value })}
+          error={errors?.maxRun}
+          description="A run still going then stops before its next batch, and the next run goes on with the rest. Empty: no limit."
         />
         <SelectField
-          label="Unit"
-          value={draft.intervalUnit}
-          onChange={(e) =>
-            onChange({ ...draft, intervalUnit: e.target.value as IntervalUnit })
-          }
+          label="Time unit"
+          value={draft.maxRunUnit}
+          onChange={(e) => onChange({ ...draft, maxRunUnit: e.target.value as IntervalUnit })}
         >
-          <option value="minutes">Minutes</option>
-          <option value="hours">Hours</option>
-          <option value="days">Days</option>
-          <option value="seconds">Seconds</option>
+          {UNIT_OPTIONS}
         </SelectField>
       </div>
 
@@ -834,6 +1057,7 @@ export function RetentionPolicyForm({
           spec={spec}
           rule={rule}
           errors={errors?.fields[rule.key]}
+          selectors={selectors}
           onChange={(values) => setRule(rule.key, values)}
           onMove={(by) => move(i, by)}
           onRemove={() =>
@@ -871,6 +1095,7 @@ function RuleFields({
   spec,
   rule,
   errors,
+  selectors,
   onChange,
   onMove,
   onRemove,
@@ -880,6 +1105,7 @@ function RuleFields({
   spec: ShapeSpec
   rule: RuleDraft
   errors?: Record<string, string>
+  selectors?: string[]
   onChange: (values: Record<string, string>) => void
   onMove: (by: -1 | 1) => void
   onRemove: () => void
@@ -941,6 +1167,7 @@ function RuleFields({
                 field={f}
                 rule={rule}
                 error={errors?.[keyOf(f)]}
+                selectors={selectors}
                 onChange={onChange}
               />
             ))}
@@ -955,16 +1182,37 @@ function Field({
   field,
   rule,
   error,
+  selectors,
   onChange,
 }: {
   field: FieldSpec
   rule: RuleDraft
   error?: string
+  selectors?: string[]
   onChange: (values: Record<string, string>) => void
 }) {
   const key = keyOf(field)
   const value = rule.values[key]
   const set = (v: string) => onChange({ ...rule.values, [key]: v })
+  if (field.kind === 'selector' && selectors) {
+    return (
+      <SelectField
+        label={field.label}
+        value={value}
+        onChange={(e) => set(e.target.value)}
+        description={field.description}
+      >
+        <option value="">Every package</option>
+        {selectors.map((name) => (
+          <option key={name} value={name}>
+            {name}
+          </option>
+        ))}
+        {/* A selector deleted since stays as loaded; the server refuses it. */}
+        {value && !selectors.includes(value) && <option value={value}>{value}</option>}
+      </SelectField>
+    )
+  }
   if (field.kind === 'select') {
     return (
       <SelectField

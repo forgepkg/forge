@@ -295,8 +295,9 @@ the file's path and SHA-256.
 ## Retention
 
 A raw repository's retention policy has the envelope of a package policy
-(`version`, `enabled`, `dry_run_only`, `min_run_interval_seconds`) with file
-rules:
+(`version`, `enabled`, `dry_run_only`, `min_run_interval_seconds` or a cron
+`schedule` in a `schedule_timezone`, `max_run_seconds`; see
+[Retention](retention.md#when-a-policy-runs)) with file rules:
 
 | Field | |
 | --- | --- |
@@ -329,7 +330,7 @@ policy and lists the audit log.
 
 Retention policies may also include a `size_budget` to evict least-recently
 used files when the repository exceeds a logical size limit. See
-[Retention size budgets](retention.md) for configuration and size accounting.
+[Retention](retention.md#size-budgets) for configuration and size accounting.
 
 ## Importing another server's repository
 

@@ -8,7 +8,8 @@
 //! * `GET    /admin/content-selectors/{id}`   — fetch one.
 //! * `PATCH  /admin/content-selectors/{id}`   — update description/includes/excludes
 //!   (true PATCH: an omitted field keeps its stored value).
-//! * `DELETE /admin/content-selectors/{id}`   — delete (cascades scoped grants).
+//! * `DELETE /admin/content-selectors/{id}`   — delete (cascades scoped grants);
+//!   refused (409) while a repository's retention policy names it in a rule.
 //! * `GET    /admin/content-selectors/{id}/grants` — the grants the selector
 //!   scopes, in every role: what a delete removes.
 //! * `POST   /admin/content-selectors/match`  — test a package name against
@@ -242,8 +243,31 @@ pub async fn test_match(Json(body): Json<MatchRequest>) -> Response {
     }
 }
 
-/// `DELETE /admin/content-selectors/{id}`
+/// `DELETE /admin/content-selectors/{id}`. A selector a retention rule
+/// names (`"selector": "<name>"`) is not deleted (409, naming the
+/// repositories): the rule would no longer know which packages it covers.
 pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let selector = match authz_dao::find_content_selector_by_id(&state.pool, id).await {
+        Ok(Some(selector)) => selector,
+        Ok(None) => return (StatusCode::NOT_FOUND, "content selector not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+    match forge_db::retention_dao::repositories_using_selector(&state.pool, &selector.name).await {
+        Ok(repositories) if !repositories.is_empty() => {
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "content selector {:?} is used by the retention policy of {}; \
+                     remove it from their rules first",
+                    selector.name,
+                    repositories.join(", ")
+                ),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return db_error(e),
+    }
     match authz_dao::delete_content_selector(&state.pool, id).await {
         Ok(true) => {
             invalidate_all(&state.cache).await;

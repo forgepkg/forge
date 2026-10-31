@@ -351,7 +351,8 @@ versions as kept.
 
 Package retention policies may include a `size_budget` to evict least-recently
 used eligible versions when a repository exceeds its logical size limit. See
-[Retention size budgets](retention.md) for configuration and size accounting.
+[Retention](retention.md#size-budgets) for configuration and size accounting.
+The rules themselves, and their schedules, are in [Retention](retention.md).
 
 ## Limits
 

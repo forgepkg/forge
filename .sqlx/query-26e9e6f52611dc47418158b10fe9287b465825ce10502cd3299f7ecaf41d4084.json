@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT r.name\n        FROM repository r\n        WHERE r.retention_policy IS NOT NULL\n          AND jsonb_path_exists(\n                r.retention_policy,\n                '$.rules[*] ? (@.selector == $name)',\n                jsonb_build_object('name', $1::text)\n              )\n        ORDER BY r.name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "26e9e6f52611dc47418158b10fe9287b465825ce10502cd3299f7ecaf41d4084"
+}
