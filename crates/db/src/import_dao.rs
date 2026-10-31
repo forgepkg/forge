@@ -25,9 +25,9 @@ use uuid::Uuid;
 pub struct RepositoryImport {
     pub id: i64,
     pub repository_id: i64,
-    /// The source: a NuGet service index or a registry. For an import stored
-    /// before 2.2, the Nexus server that `source_repository` names a
-    /// repository of.
+    /// The source: a NuGet service index, a registry, or a raw repository.
+    /// For an import stored before 2.2, the Nexus server that
+    /// `source_repository` names a repository of.
     pub url: String,
     /// The Nexus repository of an import stored before 2.2; `None` since.
     pub source_repository: Option<String>,
@@ -47,7 +47,8 @@ pub struct RepositoryImport {
     pub state: String,
     /// `scan` or `copy`.
     pub phase: String,
-    /// What the scan walks: `search`, `catalog` or `names`.
+    /// What the scan walks: `search`, `catalog`, `assets` (Nexus' asset
+    /// listing), `directories` (another Forge's raw listing) or `names`.
     pub scan_listing: String,
     #[serde(skip)]
     pub cursor: Option<String>,
@@ -81,7 +82,8 @@ pub struct NewImport<'a> {
     pub on_conflict: &'a str,
     pub concurrency: i32,
     pub dry_run: bool,
-    /// Where the scan starts: `search`, `catalog` or `names`.
+    /// Where the scan starts: `search`, `catalog`, `assets`, `directories`
+    /// or `names`.
     pub scan_listing: &'a str,
     pub source_server: Option<&'a str>,
     pub source_total: Option<i64>,
@@ -442,7 +444,9 @@ pub struct ImportItem {
     pub id: i64,
     #[serde(skip)]
     pub import_id: i64,
-    /// `component` or `manifest`.
+    /// `component` (a version, a Docker tag), `manifest` (a Docker referrer
+    /// held by digest) or `file` (a raw file: `name` its path, `version`
+    /// empty).
     pub kind: String,
     pub name: String,
     pub version: String,

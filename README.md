@@ -239,9 +239,9 @@ The guides below are also a site, with navigation and search:
 - **[Format plugins](./docs/format-plugins.md)** — further package formats,
   built into the server: design, operation, and writing one.
 - **[Importing repositories](./docs/import.md)** — copy a hosted repository
-  of Nexus, Artifactory, a registry or another Forge (NuGet, Docker) into
-  Forge through the format's own protocol: dry run, conflicts, resuming, and
-  the cutover.
+  of Nexus, Artifactory, a registry or another Forge (NuGet, Docker, raw)
+  into Forge through the format's own protocol: dry run, conflicts, resuming,
+  and the cutover.
 
 Run `cargo xtask help` for the complete command list.
 

@@ -1,5 +1,6 @@
 //! Importing a repository from another server into a Forge hosted
-//! repository of the same format (NuGet, Docker), one repository at a time.
+//! repository of the same format (NuGet, Docker, raw), one repository at a
+//! time.
 //! The source is read through the format's own protocol, so it may be any
 //! server that speaks it: Nexus, Artifactory, ProGet, BaGet, Harbor, a
 //! `distribution` registry or another Forge.
@@ -12,11 +13,15 @@
 //! * **Docker:** a registry's API ([`ImportSource`]): its catalog
 //!   (`/v2/_catalog`) names the images, their tag lists the tags, and the
 //!   referrers API the signatures and SBOMs of each copied manifest.
+//! * **Raw:** a raw repository ([`raw::RawSource`]), which has no protocol
+//!   beyond a `GET` of a path: Nexus' asset listing, or another Forge's JSON
+//!   listing, names its files with their checksums and times.
 //!
-//! An import can name its package ids or images instead (`names`): a feed's
-//! search may miss some (Nexus stops at 10,000 packages; a package whose
-//! versions are all unlisted is in no search result), and Docker Hub, GHCR
-//! and ECR serve no catalog.
+//! An import can name its package ids, images or paths instead (`names`): a
+//! feed's search may miss some (Nexus stops at 10,000 packages; a package
+//! whose versions are all unlisted is in no search result), Docker Hub, GHCR
+//! and ECR serve no catalog, and a plain web server lists no files (a named
+//! file is checked against its `.sha256` sidecar, where it has one).
 //!
 //! An administrator starts an import on a hosted repository
 //! ([`crate::admin::imports`]); this worker runs it, on one instance at a
@@ -52,6 +57,15 @@
 //!      is no publish time). The protocols carry no last download, so an
 //!      imported version counts as downloaded at its import, and no push
 //!      time for a tag, so a tag is created at its import;
+//!    * a raw file is downloaded from the import's URL and its path,
+//!      verified against its size and the checksums the source lists, and
+//!      stored through the file store ([`crate::files::store::import`]):
+//!      the path rules, the administrator's selectors, the read-only policy,
+//!      CAS dedup and the audit trail. Its upload time and last download are
+//!      the source's (Nexus' `blobCreated` and `lastDownloaded`, another
+//!      Forge's `last_modified` and `last_downloaded`, a web server's
+//!      `Last-Modified`), its last download the import's where the source
+//!      names none. A path Forge refuses fails as its item;
 //!    * a version Forge holds with other bytes is a conflict: skipped and
 //!      reported (`skip`), replaced (`overwrite`), or it fails the import
 //!      (`fail`).
@@ -72,6 +86,7 @@
 //! import completes.
 
 pub mod feed;
+pub mod raw;
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -79,6 +94,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use chrono::{DateTime, Datelike, Utc};
 use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::authz::Level;
@@ -88,7 +104,8 @@ use forge_core::repo::{ImportOptions, ImportOutcome, RepoKind, WriteError};
 use forge_crypto::PlaintextSecret;
 use forge_db::import_dao::{self, ImportItem, NewItem, RepositoryImport};
 use forge_db::model::Repository;
-use forge_db::{repository_dao, secret_dao, user_dao};
+use forge_db::{raw_dao, repository_dao, secret_dao, user_dao};
+use forge_plugin::api::files;
 use forge_plugin::api::images::ImageError;
 use forge_plugin::api::VersionMetadata;
 use forge_storage::StagedBlob;
@@ -99,14 +116,17 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::files::store::{self as file_store, Imported, ImportedFile};
+use crate::files::Files;
 use crate::images::import::{ImageImportOptions, ImageOutcome, ImportSource};
 use crate::images::{Failure, Registry};
 use crate::state::AppState;
 use feed::Feed;
+use raw::RawSource;
 
-/// The formats an import copies: NuGet packages, and Docker images into
-/// the image store.
-pub const FORMATS: &[&str] = &["nuget", "docker"];
+/// The formats an import copies: NuGet packages, Docker images into the
+/// image store, and raw files into the file store.
+pub const FORMATS: &[&str] = &["nuget", "docker", "raw"];
 
 /// How often an idle instance looks for an import to run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -194,7 +214,11 @@ pub enum Listing {
     Search,
     /// A registry's catalog.
     Catalog,
-    /// The package ids or images the import names.
+    /// Raw: Nexus' asset listing (`/service/rest/v1/assets`).
+    Assets,
+    /// Raw: another Forge's JSON listing, a directory at a time.
+    Directories,
+    /// The package ids, images or paths the import names.
     Names,
 }
 
@@ -212,6 +236,8 @@ impl Listing {
         match self {
             Listing::Search => "search",
             Listing::Catalog => "catalog",
+            Listing::Assets => "assets",
+            Listing::Directories => "directories",
             Listing::Names => "names",
         }
     }
@@ -219,6 +245,8 @@ impl Listing {
     fn parse(s: &str) -> Listing {
         match s {
             "catalog" => Listing::Catalog,
+            "assets" => Listing::Assets,
+            "directories" => Listing::Directories,
             "names" => Listing::Names,
             _ => Listing::Search,
         }
@@ -378,6 +406,8 @@ enum Target {
         registry: Registry,
         source: ImportSource,
     },
+    /// Raw: from a raw repository, through the file store.
+    Files { source: Box<RawSource> },
 }
 
 /// What a run works with.
@@ -395,30 +425,72 @@ struct Ctx {
 /// `source`). An item an import stored before reads as none of it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ItemSource {
-    /// The package's SHA-512, base64, where the feed lists it.
+    /// The package's SHA-512, base64, where the feed lists it (raw: where
+    /// Nexus lists it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sha512: Option<String>,
+    /// Raw: the file's SHA-256 and SHA-1 (hex), where the source lists them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha1: Option<String>,
+    /// Raw: the SHA-256 is the one its `.sha256` sidecar holds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sidecar: bool,
+    /// Raw: the content type the source lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    /// Raw: why the item fails without being copied (a path Forge
+    /// refuses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// Raw: a named file the source did not have when it was scanned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    missing: bool,
 }
 
-/// A version or tag the scan found.
+/// A version, tag or file the scan found.
 struct Found {
+    /// `component`, or `file` (raw).
+    kind: &'static str,
     name: String,
-    /// Empty for a named package or image the source does not have.
+    /// Empty for a named package or image the source does not have, and
+    /// for a file.
     version: String,
+    /// The size the source lists (raw).
+    size: Option<i64>,
     published_at: Option<DateTime<Utc>>,
+    /// When the source last served it (raw).
+    downloaded_at: Option<DateTime<Utc>>,
+    /// Who uploaded it to the source (raw, from Nexus).
+    uploader: Option<String>,
     source: ItemSource,
 }
 
 impl Found {
+    /// A package version or image tag.
+    fn component(
+        name: &str,
+        version: String,
+        published_at: Option<DateTime<Utc>>,
+        source: ItemSource,
+    ) -> Found {
+        Found {
+            kind: "component",
+            name: name.to_string(),
+            version,
+            size: None,
+            published_at,
+            downloaded_at: None,
+            uploader: None,
+            source,
+        }
+    }
+
     /// A named package or image the source does not have: an item that
     /// fails, so the import reports it.
     fn missing(name: &str) -> Found {
-        Found {
-            name: name.to_string(),
-            version: String::new(),
-            published_at: None,
-            source: ItemSource::default(),
-        }
+        Found::component(name, String::new(), None, ItemSource::default())
     }
 }
 
@@ -495,7 +567,7 @@ impl Run<'_> {
             .ok_or_else(|| End::Failed("the repository was deleted".into()))?;
         if repo.kind() != RepoKind::Hosted || !FORMATS.contains(&repo.format.as_str()) {
             return Err(End::Failed(format!(
-                "imports go to a hosted NuGet or Docker repository; {} is a {} {} repository",
+                "imports go to a hosted NuGet, Docker or raw repository; {} is a {} {} repository",
                 repo.name, repo.format, repo.kind
             )));
         }
@@ -530,7 +602,16 @@ impl Run<'_> {
 
         let images = self.state.formats.stores_images(&repo.format);
         let url = source_url(import, images);
-        let target = if images {
+        let target = if self.state.formats.stores_files(&repo.format) {
+            Target::Files {
+                source: Box::new(RawSource::new(
+                    self.state.upstream.clone(),
+                    &url,
+                    import.username.clone(),
+                    password,
+                )),
+            }
+        } else if images {
             let credentials = match (&import.username, password) {
                 (Some(username), Some(password)) => {
                     Some(Credentials::for_url(&url, username.clone(), password))
@@ -649,13 +730,13 @@ impl Run<'_> {
                 .iter()
                 .zip(&sources)
                 .map(|(found, source)| NewItem {
-                    kind: "component",
+                    kind: found.kind,
                     name: &found.name,
                     version: &found.version,
-                    size: None,
+                    size: found.size,
                     published_at: found.published_at,
-                    downloaded_at: None,
-                    uploader: None,
+                    downloaded_at: found.downloaded_at,
+                    uploader: found.uploader.as_deref(),
                     source,
                 })
                 .collect();
@@ -763,6 +844,50 @@ impl Run<'_> {
                     walked: None,
                 })
             }
+            (Target::Files { source }, Listing::Assets) => {
+                let page = source.assets(cursor).await?;
+                if page.next.is_some() && page.next.as_deref() == cursor {
+                    return Err(SourceError::Invalid(format!(
+                        "Nexus' asset listing answers the continuationToken {} again",
+                        cursor.unwrap_or_default()
+                    )));
+                }
+                Ok(Page {
+                    found: page.files.into_iter().map(listed_file).collect(),
+                    next: page.next,
+                    walked: None,
+                })
+            }
+            (Target::Files { source }, Listing::Directories) => {
+                let walk = raw::Walk::parse(cursor)?;
+                let page = source.directory(&walk.dir, walk.after.as_deref()).await?;
+                let step = walk.step(page);
+                if step.next.as_ref() == Some(&walk) {
+                    return Err(SourceError::Invalid(format!(
+                        "the listing of {:?} answers the same page after {:?} again",
+                        walk.dir,
+                        walk.after.unwrap_or_default()
+                    )));
+                }
+                let mut found: Vec<Found> = step.files.into_iter().map(listed_file).collect();
+                found.extend(step.refused.into_iter().map(|(dir, reason)| {
+                    let error = format!(
+                        "Forge refuses the directory ({reason}): nothing below it is copied"
+                    );
+                    file_item(
+                        &dir,
+                        ItemSource {
+                            error: Some(error),
+                            ..ItemSource::default()
+                        },
+                    )
+                }));
+                Ok(Page {
+                    found,
+                    next: step.next.map(|walk| walk.cursor()),
+                    walked: None,
+                })
+            }
             _ => Err(SourceError::Invalid(format!(
                 "a {} repository's import does not walk a {}",
                 ctx.repo.format,
@@ -798,7 +923,7 @@ impl Run<'_> {
     async fn copy(&self, ctx: &Ctx) -> Result<(), End> {
         let failures = AtomicUsize::new(0);
         let concurrency = self.import.concurrency.clamp(1, 16) as usize;
-        for kind in ["component", "manifest"] {
+        for kind in ["component", "manifest", "file"] {
             let mut after = 0;
             loop {
                 self.check().await?;
@@ -859,21 +984,22 @@ impl Run<'_> {
             return Ok(Recorded::NotStarted);
         }
         let pool = &self.state.pool;
-        let copied = if item.version.is_empty() {
-            Err(match ctx.target {
-                Target::Packages { .. } => "the source has no package of this id".to_string(),
-                Target::Images { .. } => "the source has no tag of this image".to_string(),
-            })
-        } else {
-            match &ctx.target {
-                Target::Packages { feed, writer } => {
-                    let source: ItemSource =
-                        serde_json::from_value(item.source.clone()).unwrap_or_default();
-                    self.copy_package(ctx, feed, writer, &item, &source).await
-                }
-                Target::Images { registry, source } => {
-                    self.copy_image(ctx, registry, source, &item).await
-                }
+        let copied = match &ctx.target {
+            // A file's item has no version.
+            Target::Files { source } => self.copy_file(ctx, source, &item).await,
+            Target::Packages { .. } if item.version.is_empty() => {
+                Err("the source has no package of this id".to_string())
+            }
+            Target::Images { .. } if item.version.is_empty() => {
+                Err("the source has no tag of this image".to_string())
+            }
+            Target::Packages { feed, writer } => {
+                let source: ItemSource =
+                    serde_json::from_value(item.source.clone()).unwrap_or_default();
+                self.copy_package(ctx, feed, writer, &item, &source).await
+            }
+            Target::Images { registry, source } => {
+                self.copy_image(ctx, registry, source, &item).await
             }
         };
         match copied {
@@ -896,9 +1022,8 @@ impl Run<'_> {
                 .await?;
                 if state == "conflict" && self.import.on_conflict == "fail" {
                     return Ok(Recorded::Conflict(format!(
-                        "{} {}: {}",
-                        item.name,
-                        item.version,
+                        "{}: {}",
+                        item_label(&item),
                         detail.unwrap_or_default()
                     )));
                 }
@@ -907,10 +1032,7 @@ impl Run<'_> {
             Err(error) => {
                 tracing::warn!(import = self.import.id, name = %item.name, version = %item.version, %error, "import item failed");
                 import_dao::finish_item(pool, item.id, "failed", Some(&error), 0).await?;
-                Ok(Recorded::Failed(format!(
-                    "{} {}: {error}",
-                    item.name, item.version
-                )))
+                Ok(Recorded::Failed(format!("{}: {error}", item_label(&item))))
             }
         }
     }
@@ -994,6 +1116,120 @@ impl Run<'_> {
             ImportOutcome::Identical { .. } => copied("identical", None, bytes),
             ImportOutcome::Conflict { .. } => conflict_item(),
             ImportOutcome::Planned { .. } => copied("planned", None, bytes),
+        })
+    }
+
+    /// Copy a raw file through the file store. A file Forge holds with the
+    /// SHA-256 the source lists is `identical` without a download, and one
+    /// it holds with another SHA-256 a conflict (unless the import
+    /// overwrites); a dry run decides from the listing alone. Otherwise the
+    /// file is downloaded from the import's URL and its path, checked
+    /// against its size and every checksum listed, and stored.
+    async fn copy_file(
+        &self,
+        ctx: &Ctx,
+        source: &RawSource,
+        item: &ImportItem,
+    ) -> Result<Copied, String> {
+        let listed: ItemSource = serde_json::from_value(item.source.clone()).unwrap_or_default();
+        // A path Forge refuses, or a file the source does not have, says
+        // nothing of the source: it fails as its item and does not count
+        // towards the failures in a row that stop an import.
+        if let Some(error) = listed.error {
+            return Ok(copied("failed", Some(error), 0));
+        }
+        let path = item.name.as_str();
+        let files = Files {
+            state: self.state,
+            principal: ctx.principal.clone(),
+        };
+        if let Some(refused) = file_store::import_refusal(&files, &ctx.repo, path).await {
+            return Err(refused.message());
+        }
+        if let Some(size) = item.size.filter(|&size| size as u64 > ctx.limit) {
+            return Err(format!(
+                "the file is {size} bytes, more than the repository's upload limit of {} bytes",
+                ctx.limit
+            ));
+        }
+        let overwrite = self.import.on_conflict == "overwrite";
+        let stored = raw_dao::find(&self.state.pool, ctx.repo.id, path)
+            .await
+            .map_err(|e| format!("database error: {e}"))?;
+        if let (Some(stored), Some(expected)) = (&stored, &listed.sha256) {
+            if stored.blob_sha256 == *expected {
+                return Ok(copied("identical", None, 0));
+            }
+            if !overwrite {
+                return Ok(file_conflict());
+            }
+        }
+        if self.import.dry_run {
+            return Ok(match (&stored, &listed.sha256) {
+                _ if listed.missing => copied("failed", Some(NO_FILE.into()), 0),
+                (None, _) => copied("planned", None, 0),
+                (Some(_), None) => copied(
+                    "planned",
+                    Some("Forge has this file; the source lists no SHA-256 to compare".into()),
+                    0,
+                ),
+                (Some(_), Some(_)) => copied(
+                    "planned",
+                    Some("would replace the file Forge has with other bytes".into()),
+                    0,
+                ),
+            });
+        }
+
+        let url = source.file_url(path);
+        let Some(response) = source.download(path).await.map_err(|e| e.to_string())? else {
+            return Ok(copied("failed", Some(NO_FILE.into()), 0));
+        };
+        if response.content_length().is_some_and(|l| l > ctx.limit) {
+            return Err(WriteError::TooLarge { limit: ctx.limit }.to_string());
+        }
+        let declared = listed.content_type.clone().or_else(|| {
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        });
+        let body = response.bytes_stream().map_err(std::io::Error::other);
+        let staged = file_store::stage(&files, body, ctx.limit)
+            .await
+            .map_err(|e| e.message())?;
+        verify_file(&staged, item.size, &listed, &url)?;
+        let bytes = staged.blob.size;
+        let imported = file_store::import(
+            &files,
+            &ctx.repo,
+            staged,
+            &ImportedFile {
+                path,
+                declared: declared.as_deref(),
+                overwrite,
+                uploaded_at: item.published_at,
+                downloaded_at: Some(item.downloaded_at.unwrap_or_else(Utc::now)),
+                uploader: item.uploader.as_deref(),
+                source: &ctx.source,
+            },
+        )
+        .await
+        .map_err(|e| e.message())?;
+        Ok(match imported {
+            Imported::Created => copied("imported", None, bytes),
+            Imported::Replaced => copied(
+                "replaced",
+                Some("replaced the file Forge had with other bytes".into()),
+                bytes,
+            ),
+            Imported::Identical => copied("identical", None, bytes),
+            Imported::Conflict => copied(
+                "conflict",
+                Some("Forge has other bytes at this path".into()),
+                bytes,
+            ),
         })
     }
 
@@ -1114,7 +1350,105 @@ async fn expand_one(target: &Target, name: &str, named: bool) -> Result<Vec<Foun
     match target {
         Target::Packages { feed, .. } => package_versions(feed, name, named).await,
         Target::Images { registry, source } => image_tags(registry, source, name, named).await,
+        Target::Files { source } => Ok(vec![named_file(source, name).await?]),
     }
+}
+
+/// The file at the named `path`: what a `HEAD` says of it, and the SHA-256
+/// of its `.sha256` sidecar, where the source serves one. A file the source
+/// does not have is found as one that fails.
+async fn named_file(source: &RawSource, path: &str) -> Result<Found, SourceError> {
+    let Some(head) = source.head(path).await? else {
+        return Ok(file_item(
+            path,
+            ItemSource {
+                missing: true,
+                ..ItemSource::default()
+            },
+        ));
+    };
+    let sha256 = source.sidecar(path).await?;
+    Ok(listed_file(raw::Listed {
+        path: path.to_string(),
+        size: head.size,
+        content_type: head.content_type,
+        sidecar: sha256.is_some(),
+        sha256,
+        created: head.last_modified,
+        ..raw::Listed::default()
+    }))
+}
+
+/// A file a raw source lists, as an item: a path Forge refuses fails as its
+/// item, with the reason; a time at the epoch (a file unpacked without its
+/// times) is none; Nexus' SHA-512 is kept in base64, as the store keeps it.
+fn listed_file(listed: raw::Listed) -> Found {
+    let error = files::validate_path(&listed.path).err().map(|e| {
+        let reason = e.to_string();
+        format!(
+            "Forge refuses the path: {}",
+            reason.trim_start_matches("invalid path: ")
+        )
+    });
+    let after_epoch = |t: &DateTime<Utc>| t.timestamp() > 86_400;
+    Found {
+        kind: "file",
+        name: item_path(&listed.path),
+        version: String::new(),
+        size: listed.size.and_then(|s| i64::try_from(s).ok()),
+        published_at: listed.created.filter(after_epoch),
+        downloaded_at: listed.downloaded.filter(after_epoch),
+        uploader: listed.uploader,
+        source: ItemSource {
+            sha512: listed
+                .sha512
+                .and_then(|hex| hex::decode(hex).ok())
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            sha256: listed.sha256,
+            sha1: listed.sha1,
+            sidecar: listed.sidecar,
+            content_type: listed.content_type,
+            error,
+            missing: false,
+        },
+    }
+}
+
+/// A file (or directory) of a raw source the source lists nothing of: one
+/// that fails (its `error`), or a named file it did not have (`missing`).
+fn file_item(path: &str, source: ItemSource) -> Found {
+    Found {
+        kind: "file",
+        name: item_path(path),
+        version: String::new(),
+        size: None,
+        published_at: None,
+        downloaded_at: None,
+        uploader: None,
+        source,
+    }
+}
+
+/// A source's path as an item names it: as it is, unless Forge refuses it
+/// (and the item fails): then its control characters escaped (a database
+/// text holds no NUL) and cut to the longest path Forge stores.
+fn item_path(path: &str) -> String {
+    if files::validate_path(path).is_ok() {
+        return path.to_string();
+    }
+    let mut out = String::new();
+    for c in path.chars() {
+        if out.len() >= files::MAX_PATH_BYTES {
+            out.push('…');
+            break;
+        }
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Every version the feed lists of the package `id`, with what its
@@ -1147,14 +1481,15 @@ async fn package_versions(feed: &Feed, id: &str, named: bool) -> Result<Vec<Foun
         .into_iter()
         .map(|version| {
             let meta = metadata.get(&version.to_lowercase());
-            Found {
-                name: id.to_string(),
-                published_at: meta.and_then(|m| published_at(m.published.as_deref())),
-                source: ItemSource {
-                    sha512: meta.and_then(|m| m.sha512.clone()),
-                },
+            Found::component(
+                id,
                 version,
-            }
+                meta.and_then(|m| published_at(m.published.as_deref())),
+                ItemSource {
+                    sha512: meta.and_then(|m| m.sha512.clone()),
+                    ..ItemSource::default()
+                },
+            )
         })
         .collect())
 }
@@ -1180,12 +1515,11 @@ async fn image_tags(
         };
         let more = page.more && !page.tags.is_empty();
         last = page.tags.last().cloned().or(last);
-        found.extend(page.tags.into_iter().map(|tag| Found {
-            name: image.to_string(),
-            version: tag,
-            published_at: None,
-            source: ItemSource::default(),
-        }));
+        found.extend(
+            page.tags
+                .into_iter()
+                .map(|tag| Found::component(image, tag, None, ItemSource::default())),
+        );
         if !more {
             break;
         }
@@ -1219,6 +1553,67 @@ fn conflict_item() -> Copied {
         Some("Forge has other bytes for this version".into()),
         0,
     )
+}
+
+/// An item as an error names it: a package version or image tag, or a
+/// file's path.
+fn item_label(item: &ImportItem) -> String {
+    if item.version.is_empty() {
+        item.name.clone()
+    } else {
+        format!("{} {}", item.name, item.version)
+    }
+}
+
+/// Why a file the source does not have fails.
+const NO_FILE: &str = "the source has no file at this path";
+
+fn file_conflict() -> Copied {
+    copied(
+        "conflict",
+        Some("Forge has other bytes at this path".into()),
+        0,
+    )
+}
+
+/// Check a downloaded file against the size and every checksum the source
+/// lists for it (Nexus: SHA-512, SHA-256 and SHA-1; another Forge: SHA-256;
+/// a named file: its `.sha256` sidecar).
+fn verify_file(
+    staged: &file_store::Staged,
+    size: Option<i64>,
+    listed: &ItemSource,
+    url: &str,
+) -> Result<(), String> {
+    let blob = &staged.blob;
+    if let Some(size) = size.filter(|&size| u64::try_from(size).ok() != Some(blob.size)) {
+        return Err(format!(
+            "the download of {url} is {} bytes; the source lists {size}",
+            blob.size
+        ));
+    }
+    let checks = [
+        (
+            "SHA-512",
+            listed.sha512.as_deref(),
+            blob.sha512_base64.as_str(),
+        ),
+        ("SHA-256", listed.sha256.as_deref(), blob.sha256.as_str()),
+        ("SHA-1", listed.sha1.as_deref(), staged.sha1.as_str()),
+    ];
+    for (name, expected, actual) in checks {
+        if expected.is_some_and(|expected| expected != actual) {
+            let whose = if name == "SHA-256" && listed.sidecar {
+                "its .sha256 sidecar holds"
+            } else {
+                "the source lists for it"
+            };
+            return Err(format!(
+                "the download of {url} does not match the {name} {whose}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check a staged download against the SHA-512 the feed lists for it.
@@ -1335,9 +1730,79 @@ mod tests {
         assert_eq!(Listing::of(false, false), Listing::Search);
         assert_eq!(Listing::of(true, false), Listing::Catalog);
         assert_eq!(Listing::of(true, true), Listing::Names);
-        for listing in [Listing::Search, Listing::Catalog, Listing::Names] {
+        for listing in [
+            Listing::Search,
+            Listing::Catalog,
+            Listing::Assets,
+            Listing::Directories,
+            Listing::Names,
+        ] {
             assert_eq!(Listing::parse(listing.as_str()), listing);
         }
+    }
+
+    #[test]
+    fn a_listed_file_keeps_what_the_source_says_and_fails_on_a_path_forge_refuses() {
+        let sha512 = "ab".repeat(64);
+        let created: DateTime<Utc> = "2024-05-06T07:08:09.123Z".parse().unwrap();
+        let found = listed_file(raw::Listed {
+            path: "docs/a bü.txt".into(),
+            size: Some(12),
+            content_type: Some("text/plain".into()),
+            sha512: Some(sha512.clone()),
+            sha256: Some("cd".repeat(32)),
+            created: Some(created),
+            downloaded: Some(DateTime::UNIX_EPOCH),
+            uploader: Some("admin".into()),
+            ..raw::Listed::default()
+        });
+        assert_eq!(found.kind, "file");
+        assert_eq!(found.name, "docs/a bü.txt");
+        assert_eq!(found.version, "");
+        assert_eq!(found.size, Some(12));
+        assert_eq!(found.published_at, Some(created));
+        // A time at the epoch is none.
+        assert_eq!(found.downloaded_at, None);
+        assert_eq!(found.uploader.as_deref(), Some("admin"));
+        assert_eq!(found.source.error, None);
+        // Nexus' hex SHA-512 is kept in base64, as the store keeps it.
+        assert_eq!(
+            found.source.sha512.as_deref(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(hex::decode(&sha512).unwrap())
+                    .as_str()
+            )
+        );
+        let stored = serde_json::to_value(&found.source).unwrap();
+        assert_eq!(stored["content_type"], "text/plain");
+        assert!(stored.get("missing").is_none() && stored.get("sidecar").is_none());
+
+        for (path, reason) in [
+            ("a//b", "empty segment"),
+            ("a/../b", "`..` segments"),
+            ("a\\b", "backslashes"),
+            ("a/b\u{7}c", "control characters"),
+            (&format!("a/{}", "x".repeat(256)), "longer than 255 bytes"),
+            (&"abc/".repeat(300), "longer than 1024 bytes"),
+        ] {
+            let found = listed_file(raw::Listed {
+                path: path.to_string(),
+                ..raw::Listed::default()
+            });
+            let error = found.source.error.unwrap_or_default();
+            assert!(error.starts_with("Forge refuses the path: "), "{error}");
+            assert!(error.contains(reason), "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_refused_path_is_named_printably() {
+        assert_eq!(item_path("a/b c"), "a/b c");
+        assert_eq!(item_path("a/b\0c\n"), "a/b\\u{0}c\\n");
+        let long = item_path(&"ü".repeat(2000));
+        assert!(long.ends_with('…'));
+        assert!(long.len() <= files::MAX_PATH_BYTES + 4);
     }
 
     #[test]
