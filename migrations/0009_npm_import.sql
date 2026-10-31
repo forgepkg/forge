@@ -1,5 +1,6 @@
 -- ---------------------------------------------------------------------------
--- Imports of npm registries (#643)
+-- Imports of npm registries (#643). 0008 is the device authorization grant
+-- (#649); the two touch different tables and apply in either order.
 --
 -- An import copies an npm registry's packages into a hosted npm repository.
 -- npm's protocol has no listing of every package: an import walks the
