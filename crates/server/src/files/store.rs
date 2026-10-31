@@ -24,7 +24,7 @@ use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError}
 use forge_db::model::{DeploymentPolicy, RepoKind, Repository};
 use forge_db::raw_dao::{self, NewRawFile, Redeploy, StoreOutcome};
 use forge_plugin::api::files;
-use forge_storage::{CasError, StoredBlob};
+use forge_storage::{CasError, StagedBlob, StoredBlob};
 use futures_util::{Stream, TryStreamExt};
 use md5::Md5;
 use serde::Serialize;
@@ -48,6 +48,9 @@ pub enum Via {
     /// The web UI's endpoints: a signed-in session (whose CSRF token the
     /// principal middleware checked) or a token.
     Browser,
+    /// An import ([`crate::import`]), running as the administrator who
+    /// started it.
+    Import,
 }
 
 /// Uploaded content, stored in the CAS (its reference still to be taken),
@@ -93,8 +96,16 @@ pub enum Content {
     Staged(Ingested),
 }
 
-/// Stage `body` (at most `limit` bytes) and store it content-addressed.
-pub async fn ingest<S, E>(files: &Files<'_>, body: S, limit: u64) -> Result<Ingested, FileError>
+/// Received content, staged but not yet stored, with the digests the CAS
+/// does not keep: what an import checks before it stores it.
+pub struct Staged {
+    pub blob: StagedBlob,
+    pub sha1: String,
+    pub md5: String,
+}
+
+/// Stage `body` (at most `limit` bytes), hashing it on the way.
+pub async fn stage<S, E>(files: &Files<'_>, body: S, limit: u64) -> Result<Staged, FileError>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + Unpin,
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -108,18 +119,37 @@ where
             d.sha1.update(chunk);
             d.md5.update(chunk);
         });
-    let staged = files
+    let blob = files
         .state
         .cas
         .stage(tokio_util::io::StreamReader::new(body), limit)
         .await
         .map_err(cas_error)?;
     let digests = std::mem::take(&mut *digests.lock().unwrap_or_else(PoisonError::into_inner));
-    let stored = files.state.cas.commit(staged).await.map_err(cas_error)?;
-    Ok(Ingested {
-        stored,
+    Ok(Staged {
+        blob,
         sha1: hex::encode(digests.sha1.finalize()),
         md5: hex::encode(digests.md5.finalize()),
+    })
+}
+
+/// Stage `body` (at most `limit` bytes) and store it content-addressed.
+pub async fn ingest<S, E>(files: &Files<'_>, body: S, limit: u64) -> Result<Ingested, FileError>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let staged = stage(files, body, limit).await?;
+    let stored = files
+        .state
+        .cas
+        .commit(staged.blob)
+        .await
+        .map_err(cas_error)?;
+    Ok(Ingested {
+        stored,
+        sha1: staged.sha1,
+        md5: staged.md5,
     })
 }
 
@@ -197,6 +227,7 @@ pub async fn refusal(
                 }
             ) || matches!(files.principal, Principal::Workload { .. })
         }
+        Via::Import => true,
     };
     if !credential {
         return Some(FileError::CredentialRequired);
@@ -550,6 +581,182 @@ pub async fn remove(
     .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+// ── Imports ─────────────────────────────────────────────────────────────────
+
+/// A file an import ([`crate::import`]) copies from another server.
+pub struct ImportedFile<'a> {
+    pub path: &'a str,
+    /// The content type the source serves it with, kept as an upload's
+    /// declared type is ([`content_type`]).
+    pub declared: Option<&'a str>,
+    /// Replace a file the path holds with other bytes (otherwise it is a
+    /// [`Imported::Conflict`]), even where the repository refuses
+    /// redeploys.
+    pub overwrite: bool,
+    /// When the source stored the content: the file's upload time.
+    pub uploaded_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the source last served it: the file's last download.
+    pub downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Who uploaded it to the source, for the audit trail.
+    pub uploader: Option<&'a str>,
+    /// Where it came from (the source's URL), for the audit trail.
+    pub source: &'a str,
+}
+
+/// What an import did with one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Imported {
+    /// The path was free; the file is stored.
+    Created,
+    /// The path held other bytes; they were replaced.
+    Replaced,
+    /// The path holds these bytes already; nothing was written.
+    Identical,
+    /// The path holds other bytes and was left alone.
+    Conflict,
+}
+
+/// Why an import may not store a file at `path` of hosted `repo`, as the
+/// administrator it runs as (`files.principal`): the repository is not
+/// hosted or is read-only, or the administrator's package selectors leave
+/// the path out. A dry run asks this too.
+pub async fn import_refusal(files: &Files<'_>, repo: &Repository, path: &str) -> Option<FileError> {
+    if let Err(e) = files::validate_path(path) {
+        return Some(FileError::BadRequest(e.to_string()));
+    }
+    if let Some(refused) = refusal(files, repo, Level::Write, Via::Import).await {
+        return Some(refused);
+    }
+    let write = files
+        .state
+        .authz
+        .package_filter_for(&files.principal, repo, Level::Write)
+        .await;
+    (!write.allows(path)).then(|| FileError::Forbidden(format!("you may not upload to {path}")))
+}
+
+/// Store a file an import downloaded (`staged`, checked against what the
+/// source lists) in hosted `repo`, through the same rules as an upload: the
+/// path rules, the selectors of the administrator the import runs as, the
+/// read-only policy, deduplication in the content-addressed store, and the
+/// audit trail. A path that holds the same bytes is
+/// [`Imported::Identical`]; one with other bytes is replaced only with
+/// [`ImportedFile::overwrite`] (and the delete level on the path), else it
+/// is an [`Imported::Conflict`]. A stored file takes the source's times.
+pub async fn import(
+    files: &Files<'_>,
+    repo: &Repository,
+    staged: Staged,
+    file: &ImportedFile<'_>,
+) -> Result<Imported, FileError> {
+    let path = file.path;
+    if let Some(refused) = import_refusal(files, repo, path).await {
+        return Err(refused);
+    }
+    let authz = &files.state.authz;
+    let may_replace = authz.can_delete(&files.principal, repo).await
+        && authz
+            .package_filter_for(&files.principal, repo, Level::Delete)
+            .await
+            .allows(path);
+    // Nothing reaches the object store for a path that keeps what it holds.
+    if let Some(existing) = raw_dao::find(&files.state.pool, repo.id, path).await? {
+        if existing.blob_sha256 == staged.blob.sha256 {
+            return Ok(Imported::Identical);
+        }
+        if !file.overwrite {
+            return Ok(Imported::Conflict);
+        }
+        if !may_replace {
+            return Err(FileError::Forbidden(format!(
+                "{path} exists; replacing a file needs the delete permission"
+            )));
+        }
+    }
+    let stored = files
+        .state
+        .cas
+        .commit(staged.blob)
+        .await
+        .map_err(cas_error)?;
+    let content_type = content_type(file.declared, path);
+    let new = NewRawFile {
+        path,
+        sha256: &stored.sha256,
+        size: i64::try_from(stored.size).map_err(|_| FileError::TooLarge(stored.size))?,
+        content_type: &content_type,
+        sha512_base64: &stored.sha512_base64,
+        sha1: &staged.sha1,
+        md5: &staged.md5,
+        upstream_etag: None,
+        upstream_last_modified: None,
+        checked: false,
+        immutable: false,
+    };
+    let redeploy = if file.overwrite && may_replace {
+        Redeploy::Allow
+    } else {
+        Redeploy::Deny
+    };
+    let grace = files.state.config.outbox.grace();
+    let mut tx = forge_db::begin(&files.state.pool).await?;
+    let previous = raw_dao::lock_updated_at(&mut tx, repo.id, path).await?;
+    let imported =
+        match raw_dao::store(&mut tx, repo.id, &new, stored.ingest_token, redeploy, grace).await? {
+            StoreOutcome::Created(id) => {
+                raw_dao::set_imported_times(
+                    &mut tx,
+                    id,
+                    file.uploaded_at,
+                    file.downloaded_at,
+                    None,
+                )
+                .await?;
+                Imported::Created
+            }
+            StoreOutcome::Replaced(id) => {
+                raw_dao::set_imported_times(
+                    &mut tx,
+                    id,
+                    file.uploaded_at,
+                    file.downloaded_at,
+                    previous,
+                )
+                .await?;
+                Imported::Replaced
+            }
+            // Stored meanwhile, by an upload or another import.
+            StoreOutcome::Unchanged(_) => Imported::Identical,
+            StoreOutcome::Exists => Imported::Conflict,
+        };
+    if matches!(imported, Imported::Created | Imported::Replaced) {
+        record(
+            files,
+            repo,
+            PackageMutation::Publish,
+            path,
+            &stored.sha256,
+            imported == Imported::Replaced,
+            &mut tx,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    tracing::info!(
+        target: "forge::audit",
+        action = "import",
+        repo = %repo.name,
+        path,
+        sha256 = %stored.sha256,
+        outcome = ?imported,
+        principal = %files.principal.audit_label(),
+        source = %file.source,
+        uploader = file.uploader.unwrap_or(""),
+        "file imported"
+    );
+    Ok(imported)
 }
 
 #[cfg(test)]

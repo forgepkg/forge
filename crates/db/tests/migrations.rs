@@ -959,6 +959,80 @@ async fn an_import_of_a_nexus_repository_survives_the_rename() {
     );
 }
 
+/// Versions unlisted before `component.unlisted_at` existed (0011) take
+/// their `updated_at` (every unlist path set it to that moment), listed ones
+/// none; from then on the trigger records each unlisting.
+#[tokio::test]
+async fn versions_unlisted_before_the_upgrade_count_from_their_last_change() {
+    let (server, _container) = server().await;
+    let url = fresh_database(&server, "unlisted_at").await;
+    let pool = forge_db::connect(&url).await.expect("connect");
+    sqlx::migrate!("../../migrations")
+        .run_to(7, &pool)
+        .await
+        .expect("migrate to 0007");
+
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted("nuget"))
+        .await
+        .unwrap();
+    let insert = |version: &'static str, listed: bool, changed_days_ago: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO component (repository_id, name, original_id, version, \
+                     version_original, listed, created_at, updated_at) \
+                 VALUES ($1, 'lib', 'Lib', $2, $2, $3, now() - interval '400 days', \
+                     now() - make_interval(days => $4)) RETURNING id",
+            )
+            .bind(repo.id)
+            .bind(version)
+            .bind(listed)
+            .bind(changed_days_ago)
+            .fetch_one(&pool)
+            .await
+            .expect("insert a version")
+        }
+    };
+    let unlisted = insert("1.0.0", false, 120).await;
+    let listed = insert("2.0.0", true, 30).await;
+
+    forge_db::migrate(&pool).await.expect("migrate the rest");
+
+    let row = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<
+                _,
+                (
+                    Option<chrono::DateTime<chrono::Utc>>,
+                    chrono::DateTime<chrono::Utc>,
+                ),
+            >("SELECT unlisted_at, updated_at FROM component WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (unlisted_at, updated_at) = row(unlisted).await;
+    assert_eq!(
+        unlisted_at,
+        Some(updated_at),
+        "the last change is the default"
+    );
+    assert_eq!(row(listed).await.0, None);
+
+    // From now on, the trigger.
+    sqlx::query("UPDATE component SET listed = false WHERE id = $1")
+        .bind(listed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (now_unlisted, _) = row(listed).await;
+    let age = chrono::Utc::now() - now_unlisted.expect("unlisting records the time");
+    assert!(age < chrono::Duration::minutes(5), "{age}");
+}
+
 /// A Postgres server for one test: a throwaway Postgres 18 container matching
 /// docker-compose (db/user/pw = forge), or, with FORGE_TEST_DATABASE_URL (no
 /// Docker), that server. Returns the URL of a database on it, and the

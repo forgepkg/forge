@@ -51,6 +51,9 @@ pub struct CandidateRow {
     pub created_at: DateTime<Utc>,
     /// Denormalized last-download timestamp (`component.last_downloaded_at`).
     pub last_downloaded_at: Option<DateTime<Utc>>,
+    /// When the version was unlisted (`component.unlisted_at`), `None` while
+    /// it is listed.
+    pub unlisted_at: Option<DateTime<Utc>>,
     /// Sum of the component's asset sizes, in bytes.
     pub size_bytes: i64,
 }
@@ -183,6 +186,10 @@ pub struct RunSummary {
     pub blobs_enqueued: u64,
     /// Decisions skipped at apply time (row changed under us).
     pub skipped: u64,
+    /// Decisions left for the next run: the run stopped at its policy's
+    /// `max_run_seconds`, and the next run evaluates them again.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deferred: u64,
     /// Logical size before a size-budget run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_before: Option<u64>,
@@ -195,6 +202,10 @@ pub struct RunSummary {
     /// Whether the run reached its target watermark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_reached: Option<bool>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Ensure a `retention_run` ledger row exists for `repository_id` (idempotent).
@@ -344,12 +355,19 @@ where
 /// With `run_id`, the update is **fenced** to the run that still owns the
 /// lease: a worker whose lease expired and was re-claimed by another instance
 /// cannot clear the newer owner's lease. Returns whether the row was updated.
+///
+/// `policy` is the stored policy the run evaluated. When the repository's
+/// policy is another one by now (it was changed while the run worked),
+/// `next_run_at` is left as the write of the new policy set it
+/// ([`write_policy_at`]), so a schedule saved mid-run is not overridden by
+/// the old policy's next time. `None` always sets it.
 pub async fn finish_run<'e, E>(
     executor: E,
     repository_id: i64,
     run_id: Option<uuid::Uuid>,
     summary: &RunSummary,
     next_run_at: DateTime<Utc>,
+    policy: Option<&JsonValue>,
 ) -> sqlx::Result<bool>
 where
     E: PgExecutor<'e>,
@@ -362,7 +380,12 @@ where
             finished_at = now(),
             locked_until = NULL,
             current_run_id = NULL,
-            next_run_at = $2,
+            next_run_at = CASE
+                WHEN $5::jsonb IS NULL
+                  OR (SELECT r.retention_policy FROM repository r WHERE r.id = $1) = $5::jsonb
+                THEN $2
+                ELSE retention_run.next_run_at
+            END,
             last_run_summary = $3
         WHERE repository_id = $1
           AND ($4::uuid IS NULL OR current_run_id = $4)
@@ -371,6 +394,7 @@ where
         next_run_at,
         summary_json,
         run_id,
+        policy,
     )
     .execute(executor)
     .await?;
@@ -378,13 +402,15 @@ where
 }
 
 /// Record a run-level error and release the lease so the repo is retried.
-/// Fenced to `run_id` like [`finish_run`].
+/// Fenced to `run_id`, and keeping the next run time of a policy changed
+/// meanwhile, like [`finish_run`].
 pub async fn fail_run<'e, E>(
     executor: E,
     repository_id: i64,
     run_id: Option<uuid::Uuid>,
     error: &str,
     next_run_at: DateTime<Utc>,
+    policy: Option<&JsonValue>,
 ) -> sqlx::Result<bool>
 where
     E: PgExecutor<'e>,
@@ -396,7 +422,12 @@ where
             finished_at = now(),
             locked_until = NULL,
             current_run_id = NULL,
-            next_run_at = $2,
+            next_run_at = CASE
+                WHEN $5::jsonb IS NULL
+                  OR (SELECT r.retention_policy FROM repository r WHERE r.id = $1) = $5::jsonb
+                THEN $2
+                ELSE retention_run.next_run_at
+            END,
             last_error = $3
         WHERE repository_id = $1
           AND ($4::uuid IS NULL OR current_run_id = $4)
@@ -405,6 +436,7 @@ where
         next_run_at,
         error,
         run_id,
+        policy,
     )
     .execute(executor)
     .await?;
@@ -481,6 +513,7 @@ where
             c.listed        AS listed,
             c.created_at    AS created_at,
             c.last_downloaded_at AS last_downloaded_at,
+            c.unlisted_at   AS unlisted_at,
             COALESCE((SELECT SUM(a.size) FROM asset a WHERE a.component_id = c.id), 0)::bigint
                 AS "size_bytes!",
             (
@@ -512,6 +545,7 @@ where
                         listed: r.listed,
                         created_at: r.created_at,
                         last_downloaded_at: r.last_downloaded_at,
+                        unlisted_at: r.unlisted_at,
                         size_bytes: r.size_bytes,
                     },
                     sha,
@@ -688,6 +722,19 @@ pub async fn write_policy(
     repository_id: i64,
     policy: Option<&JsonValue>,
 ) -> sqlx::Result<bool> {
+    write_policy_at(pool, repository_id, policy, None).await
+}
+
+/// [`write_policy`], and with `next_run_at`, set the ledger's next run to it
+/// (a policy with a schedule runs at the schedule's next time, not as soon
+/// as it is saved). `None` leaves an existing ledger row's next run as it
+/// is, and a new row due at once.
+pub async fn write_policy_at(
+    pool: &PgPool,
+    repository_id: i64,
+    policy: Option<&JsonValue>,
+    next_run_at: Option<DateTime<Utc>>,
+) -> sqlx::Result<bool> {
     let mut tx = crate::begin(pool).await?;
     let res = sqlx::query!(
         r#"
@@ -708,9 +755,40 @@ pub async fn write_policy(
 
     if policy.is_some() {
         upsert_retention_run(&mut *tx, repository_id).await?;
+        if let Some(next_run_at) = next_run_at {
+            sqlx::query!(
+                r#"UPDATE retention_run SET next_run_at = $2 WHERE repository_id = $1"#,
+                repository_id,
+                next_run_at,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
     }
     tx.commit().await?;
     Ok(true)
+}
+
+/// The repositories whose retention policy names the content selector
+/// `name` in a rule (`"selector": name`), by name: the selector cannot be
+/// deleted while they do.
+pub async fn repositories_using_selector(pool: &PgPool, name: &str) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT r.name
+        FROM repository r
+        WHERE r.retention_policy IS NOT NULL
+          AND jsonb_path_exists(
+                r.retention_policy,
+                '$.rules[*] ? (@.selector == $name)',
+                jsonb_build_object('name', $1::text)
+              )
+        ORDER BY r.name
+        "#,
+        name,
+    )
+    .fetch_all(pool)
+    .await
 }
 
 /// Fetch the current `retention_run` state for a repository (for the admin GET
@@ -858,6 +936,7 @@ pub async fn lock_package_candidates(
             c.listed        AS listed,
             c.created_at    AS created_at,
             c.last_downloaded_at AS last_downloaded_at,
+            c.unlisted_at   AS unlisted_at,
             EXISTS (
                 SELECT 1 FROM asset a
                 WHERE a.component_id = c.id AND (a.path = $3 OR a.path LIKE '%.nupkg')
@@ -885,6 +964,7 @@ pub async fn lock_package_candidates(
             listed: r.listed,
             created_at: r.created_at,
             last_downloaded_at: r.last_downloaded_at,
+            unlisted_at: r.unlisted_at,
             size_bytes: r.size_bytes,
         })
         .collect())

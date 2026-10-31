@@ -39,6 +39,7 @@ repositories ([docker.md](docker.md#helm-charts)).
 - [Images formats](#images-formats)
 - [Signed indexes](#signed-indexes)
 - [Format options](#format-options)
+- [Retention](#retention)
 - [Proxy repositories](#proxy-repositories)
 - [Using a plugin](#using-a-plugin)
 - [Security model](#security-model)
@@ -118,7 +119,7 @@ The pieces:
 | Logins | Checks a password through the realm chain, or runs a login approved in the browser, and mints, lists and revokes the API tokens; accepts `Authorization: Bearer` API tokens | Says what a request asks (`auth`) and renders the outcome (`auth_response`) |
 | Proxies | Sends every upstream request (credentials only to the upstream's origin, bounded, cached), downloads and verifies packages, keeps the package delay, the not-found markers and the offline mode | `upstream`: which documents an operation needs, and what they say ([Proxy repositories](#proxy-repositories)) |
 | Groups | Merges members by priority; the dependency-confusion guards apply | Nothing: a group of plugin repositories just works |
-| Retention | Evaluates policies, ordering versions with the plugin's `compare_versions` | Nothing more |
+| Retention | Evaluates policies on a schedule, ordering versions with the plugin's `compare_versions` ([Retention](#retention)) | Optionally, a version's class (`version_class`) and the partition keep-N counts within (`retention_partition`) |
 | Files (a files format) | Keeps files under paths, content-addressed with their digests: serving, ranges and validators, uploads under the deployment policy, listings, proxies and groups, selectors on paths, retention by path ([Files formats](#files-formats)) | Which path a request names, which file or directory it needs, what the response looks like |
 
 A request to every non-Docker repository is served under
@@ -418,10 +419,41 @@ update clears one that is not required); the plugin checks and normalizes
 each value (`check_option`), and gets the repository's in
 `Repository::options` and a proxy's in `Remote::options`.
 
-Which versions are prereleases is the descriptor's too (`prereleases`): a
-`-` in the normalized version (SemVer: NuGet, npm), or none (apt, whose
-`-` starts the Debian revision): the web UI then lists every version, and
-retention's release type takes every version for a release.
+Which versions the host's search filter takes for prereleases is the
+descriptor's too (`prereleases`): those with a `-` in the normalized version
+(SemVer: NuGet, npm), or none (apt, whose `-` starts the Debian revision), so
+the web UI lists every version. Retention asks the plugin instead
+(`version_class`, [Retention](#retention)).
+
+## Retention
+
+The host runs every retention rule ([retention.md](retention.md)) for a
+package format; the plugin only says what its versions mean. Ordering is
+`compare_versions`, and two hooks, both with defaults, say the rest:
+
+| Hook | Says | Default |
+| --- | --- | --- |
+| `version_class(version)` | Whether a normalized version is a `Release`, a `Prerelease` or a `Snapshot` ([`VersionClass`](../crates/plugin-api/src/types.rs)). A rule's `release_type` filters on it, and `prerelease_superseded_for_days` deletes what is not a release once a listed release that `compare_versions` orders after it has been out long enough. | SemVer's: a `-` makes a prerelease |
+| `retention_partition(id, version)` | The partition of a package's versions keep-N counts within (`keep_last_n`, `keep_n_most_downloaded`, `max_versions_per_package`): versions with the same key are counted together. | `None`: the package is one partition |
+
+NuGet and npm keep the defaults. A format whose versions differ overrides
+them; these are the hooks the formats planned next need:
+
+- **Maven:** `33.0.0-jre` is a release and `1.0-SNAPSHOT` (with its
+  timestamped builds) a snapshot, so `version_class` reads Maven's rules
+  rather than the `-`. `retention_partition` returns the base `-SNAPSHOT`
+  version for a snapshot build, so `keep_last_n` keeps the newest N builds
+  of each snapshot version, and `None` for releases, which count per
+  `groupId:artifactId`. `compare_versions` orders a version's snapshots
+  before its release, so `prerelease_superseded_for_days` deletes them once
+  the release exists, and `release_type: snapshots` with `older_than_days`
+  deletes builds older than N days.
+- **apt:** every version is a release (`version_class`: a `-` starts the
+  Debian revision). A package id is `<name>:<architecture>`, so keep-N already
+  counts per package and architecture, without a `retention_partition`.
+
+Both run inline for every version and rule a run evaluates: keep them quick
+and free of I/O.
 
 ## Proxy repositories
 
@@ -698,9 +730,11 @@ to lift them:
 - **One package file per version.** Formats that publish several files per
   version (PyPI wheels per platform, Maven's jar, pom and sources) need
   multi-asset versions.
-- **Prerelease is "contains a `-`", or nothing is.** This is right for
-  SemVer formats and apt ([Format options](#format-options)); a format with
-  another rule (PEP 440's `1.0a1`) needs a contract function for it.
+- **Prerelease is "contains a `-`", or nothing is, for searches.** This is
+  right for SemVer formats and apt ([Format options](#format-options)).
+  Retention asks the plugin (`version_class`, [Retention](#retention)), but
+  the host's search filter (`prerelease`) still reads the `-`; a format with
+  another rule (PEP 440's `1.0a1`) needs the search to ask it too.
 - **Listings are bounded.** A response may load at most 2,048 answers, so
   a listing of every package of a repository covers at most about 2,000
   packages.

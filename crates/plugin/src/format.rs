@@ -298,19 +298,20 @@ impl Format for PluginFormat {
         self.plugin.compare_versions(a, b)
     }
 
-    fn is_prerelease(&self, normalized_version: &str) -> bool {
-        match self.plugin.descriptor().prereleases {
-            api::Prereleases::Dash => normalized_version.contains('-'),
-            api::Prereleases::None => false,
-        }
-    }
-
     fn has_prereleases(&self) -> bool {
         self.plugin.descriptor().prereleases != api::Prereleases::None
     }
 
     fn lower_id(&self, id: &str) -> String {
         self.plugin.canonical_id(id)
+    }
+
+    fn version_class(&self, version: &str) -> forge_core::format::VersionClass {
+        self.plugin.version_class(version)
+    }
+
+    fn retention_partition(&self, id: &str, version: &str) -> Option<String> {
+        self.plugin.retention_partition(id, version)
     }
 
     /// Whether the plugin takes `id`, which is never longer than
@@ -520,5 +521,63 @@ mod tests {
         for parsed in [package(&longer_id, "1.0.0"), original_id] {
             assert!(matches!(parse(parsed), Err(FormatError::InvalidPackage(_))));
         }
+    }
+
+    /// A plugin with retention hooks of its own: Maven-like snapshots,
+    /// counted per base version.
+    struct Snapshots;
+
+    impl FormatPlugin for Snapshots {
+        fn descriptor(&self) -> &'static api::Descriptor {
+            &UNLIMITED
+        }
+
+        fn version_class(&self, version: &str) -> api::VersionClass {
+            if version.ends_with("-SNAPSHOT") {
+                api::VersionClass::Snapshot
+            } else {
+                api::VersionClass::Release
+            }
+        }
+
+        fn retention_partition(&self, _id: &str, version: &str) -> Option<String> {
+            version.strip_suffix("-SNAPSHOT").map(str::to_string)
+        }
+
+        fn handle(&self, _repo: &api::Repository, _req: &api::Request) -> api::Action {
+            api::Action::Respond(api::Response::text(404, "not found"))
+        }
+
+        fn render(
+            &self,
+            _repo: &api::Repository,
+            _req: &api::Request,
+            _data: &[api::Loaded],
+        ) -> api::Action {
+            api::Action::Respond(api::Response::text(404, "not found"))
+        }
+    }
+
+    #[test]
+    fn retention_hooks_reach_the_host() {
+        use forge_core::format::VersionClass;
+        // The defaults: SemVer's prereleases, one partition per package.
+        let plain = unlimited(None, package("demo", "1.0.0"));
+        assert_eq!(plain.version_class("1.0.0"), VersionClass::Release);
+        assert_eq!(plain.version_class("1.0.0-ci.1"), VersionClass::Prerelease);
+        assert_eq!(plain.retention_partition("demo", "1.0.0-ci.1"), None);
+        // A plugin's own.
+        let snapshots = PluginFormat::new(&Plugin::builtin(Snapshots));
+        assert_eq!(snapshots.version_class("33.0.0-jre"), VersionClass::Release);
+        assert_eq!(
+            snapshots.version_class("1.0-SNAPSHOT"),
+            VersionClass::Snapshot
+        );
+        assert_eq!(
+            snapshots
+                .retention_partition("g:a", "1.0-SNAPSHOT")
+                .as_deref(),
+            Some("1.0")
+        );
     }
 }

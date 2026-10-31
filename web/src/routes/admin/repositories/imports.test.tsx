@@ -26,7 +26,9 @@ import { searchOptions } from '~/lib/search'
  *    import's failed items are retried with the password it no longer holds;
  *    the form starts from the last import;
  *  - an npm hosted repository offers the import of a registry, with named
- *    packages and scopes, and shows its dist-tag conflicts.
+ *    packages and scopes, and shows its dist-tag conflicts;
+ *  - a raw hosted repository offers the import of a raw repository, with
+ *    paths one per line (spaces and commas kept), and names the listing.
  */
 
 const adminMe: Me = {
@@ -388,6 +390,81 @@ describe('import', () => {
       expect(created).toEqual({
         url: 'https://nexus.example.com/repository/npm-hosted',
         names: ['@acme', 'left-pad'],
+        on_conflict: 'skip',
+        concurrency: 4,
+        dry_run: false,
+      }),
+    )
+  })
+
+  it('offers the import on a raw hosted repository, with paths one per line', async () => {
+    let created: unknown
+    mockApi({
+      repositories: [repo({ name: 'binaries', format: 'raw' })],
+      imports: [
+        imp({
+          repository: 'binaries',
+          url: 'https://nexus.example.com/repository/raw-hosted',
+          username: null,
+          listing: 'assets',
+          source_total: null,
+          progress: {
+            found: 3,
+            pending: 0,
+            imported: 2,
+            replaced: 0,
+            identical: 0,
+            conflict: 0,
+            failed: 1,
+            planned: 0,
+            planned_size: 0,
+            bytes_copied: 2048,
+          },
+        }),
+      ],
+      items: [
+        item({
+          kind: 'file',
+          name: 'odd/back\\slash.txt',
+          version: '',
+          state: 'failed',
+          detail: 'Forge refuses the path: backslashes are not allowed',
+        }),
+      ],
+      onCreate: (body) => {
+        created = body
+        return json(imp({ state: 'queued' }), 201)
+      },
+    })
+    const router = await renderAt('/manage/repositories/binaries')
+    await userEvent.click(await screen.findByRole('link', { name: 'Import' }))
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe(
+        '/manage/repositories/binaries/import',
+      ),
+    )
+    const card = await screen.findByRole('article', { name: 'Import 7' })
+    expect(
+      within(card).getByText(/Nexus' asset listing names the files/, { exact: false }),
+    ).toBeInTheDocument()
+    await userEvent.click(within(card).getByRole('button', { name: 'Show failed' }))
+    expect(await within(card).findByText('odd/back\\slash.txt')).toBeInTheDocument()
+    expect(
+      within(card).getByText('Forge refuses the path: backslashes are not allowed'),
+    ).toBeInTheDocument()
+
+    expect(screen.getByLabelText('Repository URL')).toHaveValue(
+      'https://nexus.example.com/repository/raw-hosted',
+    )
+    await userEvent.type(
+      screen.getByLabelText(/Paths/),
+      'pdfium/7350/a b, c.tgz\n docs/ü.txt \n',
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Start import' }))
+    await waitFor(() =>
+      expect(created).toEqual({
+        url: 'https://nexus.example.com/repository/raw-hosted',
+        names: ['pdfium/7350/a b, c.tgz', 'docs/ü.txt'],
         on_conflict: 'skip',
         concurrency: 4,
         dry_run: false,

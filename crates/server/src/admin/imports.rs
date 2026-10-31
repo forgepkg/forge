@@ -1,6 +1,6 @@
 //! Imports into a hosted repository from another server ([`crate::import`]):
 //! a NuGet feed, an npm registry or a registry API, read through the
-//! format's own protocol. **Admin-only.**
+//! format's own protocol, or a raw repository. **Admin-only.**
 //!
 //! * `GET    /admin/repositories/{name}/imports` — the repository's imports,
 //!   newest first ([`ImportView`]).
@@ -8,9 +8,11 @@
 //!   ([`CreateImport`]). The source is checked first (the **preflight**):
 //!   a feed's service index resolves and its search answers (with how many
 //!   packages it finds), an npm registry lists its packages (its search,
-//!   or `/-/all`), or a registry answers its API and serves a catalog; an
-//!   import that names its package ids, npm packages or scopes, or images
-//!   needs no search or catalog. A failed check is a 400 (502 when the source is
+//!   or `/-/all`), a registry answers its API and serves a catalog, or a
+//!   raw repository serves a listing (another Forge's JSON listing, or
+//!   Nexus' asset listing); an import that names its package ids, npm
+//!   packages or scopes, images or paths needs no search, catalog or
+//!   listing. A failed check is a 400 (502 when the source is
 //!   unreachable or failing) saying what is wrong; nothing is stored. A
 //!   repository runs one import at a time (409). `dry_run` decides every
 //!   item without writing a package: what would be copied, and the
@@ -43,14 +45,16 @@ use forge_core::auth::principal::Principal;
 use forge_core::net::ssrf::validate_url;
 use forge_core::repo::proxy::Credentials;
 use forge_db::import_dao::{self, NewImport, RepositoryImport};
-use forge_db::model::{RepoKind, Repository};
+use forge_db::model::{DeploymentPolicy, RepoKind, Repository};
 use forge_db::{repository_dao, secret_dao};
+use forge_plugin::api::files;
 use serde::{Deserialize, Serialize};
 
 use super::db_error;
 use crate::images::import::ImportSource;
 use crate::import::feed::Feed;
 use crate::import::npm::NpmRegistry;
+use crate::import::raw::RawSource;
 use crate::import::{
     nexus_source_url, password_secret, source_url, Listing, Protocol, SourceError, FORMATS,
     MAX_NAMES, NPM_PAGE, SEARCH_PAGE,
@@ -97,15 +101,17 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 pub struct CreateImport {
     /// The source: a NuGet feed's service index
     /// (`https://nexus.example.com/repository/nuget-hosted/index.json`), an
-    /// npm registry (`https://nexus.example.com/repository/npm-hosted`), or a
-    /// registry (`https://registry.example.com`). With `repository`, a Nexus
-    /// server instead (the request before imports read the format's
-    /// protocol).
+    /// npm registry (`https://nexus.example.com/repository/npm-hosted`), a
+    /// registry (`https://registry.example.com`), or a raw repository
+    /// (`https://nexus.example.com/repository/raw-hosted`, a directory of a
+    /// web server). With `repository`, a Nexus server instead (the request
+    /// before imports read the format's protocol).
     pub url: String,
     /// The Nexus repository at `url` to read (with `url` naming the Nexus
     /// server): its service index, `<url>/repository/<name>/index.json`, its
-    /// npm registry, `<url>/repository/<name>`, or its registry API,
-    /// `registry_url` or `<url>/repository/<name>`.
+    /// npm registry, `<url>/repository/<name>`, its registry API,
+    /// `registry_url` or `<url>/repository/<name>`, or (raw) the repository,
+    /// `<url>/repository/<name>`.
     #[serde(default)]
     pub repository: Option<String>,
     /// With `repository`: the Nexus Docker repository's connector, e.g.
@@ -114,7 +120,9 @@ pub struct CreateImport {
     pub registry_url: Option<String>,
     /// The package ids or images to copy, instead of every package the
     /// feed's search finds (every image the registry's catalog lists). npm:
-    /// package names, or scopes (`@acme`: every package of the scope).
+    /// package names, or scopes (`@acme`: every package of the scope). Raw:
+    /// the paths of the files to copy, below `url`, instead of every file
+    /// the source's listing names.
     #[serde(default)]
     pub names: Option<Vec<String>>,
     /// The source's credentials (both, or neither for anonymous access).
@@ -211,8 +219,9 @@ pub struct ImportView {
     /// preflight, or as many as the scan walked, whichever is more. npm: what
     /// the registry's search reports, or how many `/-/all` lists.
     pub source_total: Option<i64>,
-    /// What the scan walks: `search`, `catalog`, `all` (npm's `/-/all`) or
-    /// `names`.
+    /// What the scan walks: `search`, `catalog`, `all` (npm's `/-/all`),
+    /// `assets` (Nexus' asset listing), `directories` (another Forge's raw
+    /// listing) or `names`.
     pub listing: String,
     pub last_error: Option<String>,
     pub created_by: Option<i64>,
@@ -362,9 +371,13 @@ pub async fn create(
     }
     let images = state.formats.stores_images(&repo.format);
     let protocol = Protocol::of(&repo.format, images);
+    let raw = protocol == Protocol::Raw;
     let Some(format) = state.formats.get(&repo.format) else {
         return bad_request(format!("the {} format is not loaded", repo.format));
     };
+    if raw && repo.deployment_policy() == DeploymentPolicy::ReadOnly {
+        return bad_request("the repository is read-only: an import stores no file in it");
+    }
 
     // The request itself.
     let url = body.url.trim().trim_end_matches('/').to_string();
@@ -407,6 +420,27 @@ pub async fn create(
                 if name.is_empty() {
                     continue;
                 }
+                if raw {
+                    // A path below the source's URL, as the file is stored
+                    // in Forge.
+                    if name.ends_with('/') {
+                        return bad_request(format!(
+                            "names: {name:?} is a directory; name files, or leave names out to copy every file the source lists"
+                        ));
+                    }
+                    match files::normalize(&name) {
+                        Ok(path) => name = path,
+                        Err(e) => {
+                            return bad_request(format!(
+                                "names: Forge refuses the path {name:?}: {e}"
+                            ))
+                        }
+                    }
+                    if seen.insert(name.clone()) {
+                        kept.push(name);
+                    }
+                    continue;
+                }
                 // npm: a scope stands for every package of it.
                 let scope = (protocol == Protocol::Npm)
                     .then(|| forge_format_npm::import::parse_scope(&name))
@@ -447,7 +481,33 @@ pub async fn create(
     // The preflight: does the source speak the format's protocol, and list
     // what to copy?
     let mut listing = Listing::of(images, names.is_some());
-    let (server, total) = if protocol == Protocol::Npm {
+    let (server, total) = if raw {
+        let mut from = RawSource::new(
+            state.upstream.clone(),
+            &source,
+            username.clone(),
+            password.clone(),
+        );
+        match &names {
+            Some(names) => {
+                if let Err(e) = from.probe_named(&names[0]).await {
+                    return preflight_error(&format!("the source at {source}"), e);
+                }
+            }
+            None => match from.probe().await {
+                Ok(Some(found)) => listing = found,
+                Ok(None) => {
+                    return bad_request(format!(
+                        "the source at {source} lists no files: it serves neither a Forge raw \
+                         repository's JSON listing nor, as a Nexus repository \
+                         (<nexus>/repository/<name>), Nexus' asset listing; name the paths to import"
+                    ))
+                }
+                Err(e) => return preflight_error(&format!("the source at {source}"), e),
+            },
+        }
+        (from.server().map(str::to_string), None)
+    } else if protocol == Protocol::Npm {
         let mut registry = NpmRegistry::new(
             state.upstream.clone(),
             &source,

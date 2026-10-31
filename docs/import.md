@@ -10,14 +10,17 @@ content.
 An import reads the source through the format's own protocol, the one
 clients speak, so the source can be any server that speaks it: Nexus,
 Artifactory, ProGet, BaGet, Verdaccio, Harbor, a `distribution` registry or
-another Forge. [Importing from Nexus](nexus-import.md) says where Nexus
-serves them, and what to know of its searches.
+another Forge. Raw files have no protocol beyond a `GET` of a path: an import
+reads Nexus' asset listing, another Forge's listing, or the paths it names
+([below](#raw-files)). [Importing from Nexus](nexus-import.md) says where
+Nexus serves them, and what to know of its searches.
 
 | Format | The source | What is copied |
 | --- | --- | --- |
 | NuGet | A NuGet v3 feed: its service index, `…/index.json` | the `.nupkg` of every version, unlisted ones included |
 | npm | An npm registry: the URL clients use as `--registry` | the tarball of every version, prereleases included, with its publish time and deprecation; the dist-tags |
 | Docker | A registry API | every tag with everything it references: config and layers, the child manifests of a multi-platform index; signatures and SBOMs (cosign's `sha256-<digest>.sig` tags, the referrers the registry's referrers API lists, and those an OCI 1.1 client stored under the referrers tag schema's `sha256-<digest>` tag) |
+| Raw | A raw repository: Nexus' `<nexus>/repository/<name>`, another Forge's `<forge>/repository/<name>`, or a directory of a web server | every file, with its content type, upload time and last download |
 
 apt ([#644](https://github.com/forgepkg/forge/issues/644)) follows. Proxy
 repositories are not imported (they refill from their upstream), nor are
@@ -43,10 +46,10 @@ curl -u admin@example.com:<admin-scoped token> -X POST \
 
 | Field | |
 | --- | --- |
-| `url` | The source: a NuGet feed's service index (`…/index.json`), an npm registry (`https://nexus.example.com/repository/npm-hosted`, `https://verdaccio.example.com`), or a registry (`https://registry.example.com`, or a path below which a server serves the registry API, as Nexus' `…/repository/<name>`). |
-| `names` | The package ids or images to copy (up to 10,000), instead of every package the feed's search finds or every image the registry's catalog lists. npm: package names (`left-pad`, `@acme/ui`) or scopes (`@acme`, every package of the scope). |
+| `url` | The source: a NuGet feed's service index (`…/index.json`), an npm registry (`https://nexus.example.com/repository/npm-hosted`, `https://verdaccio.example.com`), a registry (`https://registry.example.com`, or a path below which a server serves the registry API, as Nexus' `…/repository/<name>`), or a raw repository (`https://nexus.example.com/repository/raw-hosted`, `https://forge.example.com/repository/binaries`, a directory of a web server). |
+| `names` | The package ids or images to copy (up to 10,000), instead of every package the feed's search finds or every image the registry's catalog lists. npm: package names (`left-pad`, `@acme/ui`) or scopes (`@acme`, every package of the scope). Raw: the paths of the files, below `url` (`pdfium/7350/pdfium-linux-x64.tgz`), instead of every file the source lists. |
 | `username`, `password` | A user of the source that may read the repository; both, or neither for anonymous access. |
-| `on_conflict` | A version Forge already has with other bytes: `skip` it and report it (default), `overwrite` it with the source's bytes, or `fail` the import. npm: likewise a dist-tag Forge points at another version, or a deprecation Forge gives otherwise ([below](#npm-dist-tags-and-deprecations)). |
+| `on_conflict` | A version (raw: a file) Forge already has with other bytes: `skip` it and report it (default), `overwrite` it with the source's bytes, or `fail` the import. npm: likewise a dist-tag Forge points at another version, or a deprecation Forge gives otherwise ([below](#npm-dist-tags-and-deprecations)). |
 | `concurrency` | Items copied at a time, 1–16 (default 4), so the source is not overwhelmed. |
 | `dry_run` | Decide every item and write nothing. |
 
@@ -71,9 +74,15 @@ Before an import is accepted, Forge checks the source (the **preflight**):
   refused: name the packages or scopes to import.
 - Docker: the registry answers its API (`GET /v2/`, with its token challenge
   answered), and serves a catalog (`/v2/_catalog`).
+- Raw: the source lists its files: another Forge's JSON listing of `url`,
+  or, for a URL of a Nexus repository (`<nexus>/repository/<name>`), Nexus'
+  asset listing. The import records which (`listing`: `directories` or
+  `assets`). A source that serves neither is refused: name the paths to
+  import. A raw repository that is read-only takes no import.
 
-An import that names its packages, scopes or images needs no search or
-catalog. A
+An import that names its packages, scopes, images or paths needs no search,
+catalog or listing (raw: the first named file is asked for, so wrong
+credentials are reported at once). A
 failed check answers 400 (502 when the source cannot be reached or fails)
 with what is wrong, and nothing is stored. A repository runs one import at a
 time.
@@ -86,18 +95,22 @@ nuget.org, an import would walk nuget.org's search. The preflight's
 A **dry run** reports what would be copied and the conflicts with versions
 Forge already has, without writing anything. It downloads no package: a
 version Forge has is compared through the SHA-512 the feed or registry
-lists, and where it lists none it is planned with a note saying so.
+lists, and where it lists none it is planned with a note saying so. A raw
+dry run reports the files with their size (`planned_size`), the conflicts,
+compared through the SHA-256 the source lists, and the paths that would
+fail.
 
 ## What an import does
 
 1. **Scan.** The source's listing is walked page by page: a feed's search
    (with an empty query, prerelease and SemVer 2.0.0 versions included), an
-   npm registry's search or `/-/all`, a registry's catalog, or the names the
-   import gives. For each package id, the feed's package base address lists
-   its versions, unlisted ones included; for each npm package, its full
-   packument lists its versions and dist-tags (a named scope's packages come
-   from `/-/all`, or else from the search for the scope); for each image,
-   the registry lists its tags. Each page's
+   npm registry's search or `/-/all`, a registry's catalog, a raw
+   repository's listing, or the names the import gives. For each package id,
+   the feed's package base address lists its versions, unlisted ones
+   included; for each npm package, its full packument lists its versions and
+   dist-tags (a named scope's packages come from `/-/all`, or else from the
+   search for the scope); for each image, the registry lists its tags. Each
+   page's
    versions or tags are recorded as the import's items, and its position as
    the import's cursor, in one transaction: an import resumes after a
    restart, a failure or a cancel at the page it had not recorded. A named
@@ -134,6 +147,8 @@ lists, and where it lists none it is planned with a note saying so.
      `sha256-<digest>`), which are copied like any other. An untagged
      manifest no tag or referrer reaches is not copied, and a Docker schema 1
      manifest is refused as on a push (its tag fails).
+   - A raw file is downloaded from the import's URL and its path, checked,
+     and stored through the same rules as an upload ([below](#raw-files)).
 3. **Metadata.** What the protocols carry is kept, and what they do not is
    set so that retention does not take an import for an old, unused version:
    - A NuGet version's `published` time in the feed's registration becomes
@@ -150,9 +165,79 @@ lists, and where it lists none it is planned with a note saying so.
    - The registry API has no push time for a tag: a tag is created at its
      import. (The image config's `created` is no substitute: it is the build
      time, which reproducible builds set to the epoch.)
+   - A raw file keeps the source's upload time and last download, where the
+     source names them ([below](#raw-files)).
 
-Every imported version is audited as an import: a `forge::audit` log line
-with `action = "import"`, the administrator and the source.
+Every imported version and file is audited as an import: a `forge::audit`
+log line with `action = "import"`, the administrator and the source (raw:
+the uploader too, where Nexus names one).
+
+## Raw files
+
+Raw has no protocol beyond a `GET` of a path, and no standard listing. An
+import of a raw repository reads one of these, and copies every file it
+names:
+
+- **Nexus' asset listing**, `GET <nexus>/service/rest/v1/assets?repository=<name>`,
+  paged with `continuationToken`, for a `url` of a Nexus repository,
+  `<nexus>/repository/<name>`. It lists each file's path, size, content
+  type, SHA-1, SHA-256 and SHA-512, when its blob was created, when it was
+  last downloaded, and who uploaded it. It is part of Nexus' REST API, and
+  the only listing of a Nexus raw repository with checksums (its HTML browse
+  pages have none), so for raw the import reads it
+  ([Importing from Nexus](nexus-import.md#raw)).
+- **Another Forge's listing**, `GET <directory>/` as JSON
+  ([raw.md](raw.md#listings)), paged with `after`: each file's size, content
+  type, SHA-256, upload time (`last_modified`) and last download. The import
+  walks it a directory at a time; its cursor is the directory it is in and
+  the entry it got to, so a stopped import resumes in that directory.
+- **The paths the import names** (`names`), for a server with no listing,
+  such as a plain web server: a `HEAD` of each says its size, content type
+  and `Last-Modified`, and where the server serves a `.sha256` sidecar next
+  to it (`<hex>`, or `<hex>  <name>` as `sha256sum` prints it), the file is
+  checked against it. A named file the server does not have fails, and is
+  looked for again when the failed items are retried.
+
+Each file is copied like this:
+
+- **Path.** The file keeps its path below `url`. A path Forge refuses (an
+  empty, `.` or `..` segment, a backslash, a control character, a segment
+  over 255 bytes, more than 1,024 bytes in all; [raw.md](raw.md#paths))
+  fails as its own item, with the reason, and the import goes on. A
+  directory of another Forge's listing that Forge refuses is not walked,
+  and fails as an item too.
+- **Download and checks.** The file is downloaded from the import's URL and
+  its path, never from Nexus' `downloadUrl` (which names the base URL Nexus
+  is configured with). It is checked against its size and every checksum
+  the source lists (Nexus: SHA-512, SHA-256 and SHA-1; another Forge:
+  SHA-256; a named file: its sidecar), then stored through the same path as
+  an upload: the path rules, the package selectors of the administrator who
+  started the import, the repository's upload limit, its read-only policy,
+  deduplication in the content-addressed store, and the audit trail.
+- **Files Forge already has.** A file at the same path with the SHA-256 the
+  source lists is `identical` and is not downloaded. One with another
+  SHA-256 follows `on_conflict`, decided without a download: `skip` reports
+  it, `overwrite` replaces it (even where the repository refuses redeploys,
+  but only with the delete permission on the path), `fail` fails the
+  import. Where the source lists no SHA-256 (a named file without a
+  sidecar), the file is downloaded and compared.
+- **Content type.** The source's content type (Nexus' `contentType`,
+  another Forge's `content_type`, a web server's `Content-Type`) is kept, as
+  an upload's declared type is: one that only says "bytes"
+  (`application/octet-stream`) gives way to the file name's.
+- **Times.** When the source stored the file (Nexus' `blobCreated`, another
+  Forge's `last_modified`, a web server's `Last-Modified`) becomes its
+  upload time, which `Last-Modified`, `older_than_days` and
+  `keep_newest_per_directory` read. Nexus' `lastDownloaded` (another Forge's
+  `last_downloaded`) becomes its last download, which
+  `not_downloaded_for_days` reads; a file whose source names no last
+  download counts as downloaded at its import, so retention does not delete
+  it right after. A time at the Unix epoch (a file unpacked without its
+  times) is none. A replaced file's upload time stays after that of the
+  content it replaced, so a client's `If-Modified-Since` never takes the new
+  content for the cached one.
+- **Uploader.** Nexus' uploader is recorded with the item and in the audit
+  trail.
 
 ### npm: dist-tags and deprecations
 

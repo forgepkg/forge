@@ -8,7 +8,7 @@
 - [Helm chart](../deploy/helm/forge/README.md)
 - [Kubernetes manifests](../deploy/kubernetes/README.md)
 - [Monitoring](../deploy/monitoring/README.md)
-- [Retention size budgets](retention.md)
+- [Retention](retention.md)
 - [Importing repositories](import.md)
   - [Importing from Nexus](nexus-import.md)
 

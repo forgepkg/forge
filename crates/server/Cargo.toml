@@ -137,6 +137,8 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+# Retention schedules' local times in the admin API tests.
+chrono-tz = { workspace = true }
 # Mock OIDC IdP for the /auth route integration tests: serve
 # discovery/JWKS/token, sign a self-issued ID token with a throwaway RSA key.
 # Mirrors the forge-core OIDC test harness.

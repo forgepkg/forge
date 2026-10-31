@@ -33,7 +33,7 @@ use forge_plugin_api::{
     Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FormatError, FormatOption,
     FormatPlugin, IndexFile, IndexInput, Loaded, PackageRef, PackageSource, ParsedPackage,
     Prereleases, PublishRequest, Query, Remote, Repository, RepositoryKind, Request, Response,
-    Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken,
+    Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken, VersionClass,
 };
 
 use crate::layout::{PoolPath, Target, KEY_ASC, KEY_GPG};
@@ -101,6 +101,13 @@ impl FormatPlugin for Apt {
 
     fn compare_versions(&self, a: &str, b: &str) -> Ordering {
         version::compare(a, b)
+    }
+
+    // Every version is a release: a `-` starts the Debian revision. (A
+    // package id is `<name>:<architecture>`, so retention's keep-N counts
+    // per architecture without a partition of its own.)
+    fn version_class(&self, _version: &str) -> VersionClass {
+        VersionClass::Release
     }
 
     fn parse_package(&self, package: &mut dyn PackageSource) -> Result<ParsedPackage, FormatError> {

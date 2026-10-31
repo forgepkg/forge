@@ -280,6 +280,58 @@ pub async fn store(
     )))
 }
 
+/// When the file at `path` last changed (`updated_at`), locked `FOR UPDATE`
+/// in `tx`: what an import that replaces it keeps its new upload time after.
+pub async fn lock_updated_at(
+    tx: &mut Transaction<'_, Postgres>,
+    repository_id: i64,
+    path: &str,
+) -> sqlx::Result<Option<DateTime<Utc>>> {
+    sqlx::query_scalar(
+        "SELECT updated_at FROM raw_file WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// Give file `id`, which an import just stored, the times its source names:
+/// `uploaded_at` (when the source stored the content) becomes its upload
+/// time, which `Last-Modified` and retention's age rules read, and
+/// `downloaded_at` its last download.
+///
+/// A file the import `replaced` keeps an upload time after `replaced`, the
+/// one of the content it replaced: a client that cached that content and
+/// asks `If-Modified-Since` must not be told it is current.
+pub async fn set_imported_times(
+    tx: &mut Transaction<'_, Postgres>,
+    id: i64,
+    uploaded_at: Option<DateTime<Utc>>,
+    downloaded_at: Option<DateTime<Utc>>,
+    replaced: Option<DateTime<Utc>>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE raw_file
+        SET created_at = CASE WHEN $4::timestamptz IS NULL
+                              THEN coalesce($2, created_at) ELSE created_at END,
+            updated_at = CASE WHEN $2::timestamptz IS NULL THEN updated_at
+                              WHEN $4::timestamptz IS NULL THEN $2
+                              ELSE greatest($2, $4 + interval '1 microsecond') END,
+            last_downloaded_at = coalesce($3, last_downloaded_at)
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(uploaded_at)
+    .bind(downloaded_at)
+    .bind(replaced)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Delete the file at `path`, releasing its blob reference. Returns whether
 /// there was one.
 pub async fn delete(
