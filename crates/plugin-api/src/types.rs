@@ -75,6 +75,23 @@ pub struct ParsedPackage {
     pub dependencies: Vec<DependencyGroup>,
 }
 
+/// What kind of version a normalized version is, as retention rules see it
+/// ([`FormatPlugin::version_class`]): a rule's `release_type` picks one of
+/// them, and `prerelease_superseded_for_days` deletes what is not a release
+/// once a release orders after it.
+///
+/// [`FormatPlugin::version_class`]: crate::FormatPlugin::version_class
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VersionClass {
+    /// A stable release (`1.2.0`; Maven's `33.0.0-jre`).
+    Release,
+    /// A prerelease (`1.2.0-beta.1`, `2.3.0-ci.417`).
+    Prerelease,
+    /// A build of a version still in development (Maven's `-SNAPSHOT`
+    /// builds), which its release supersedes.
+    Snapshot,
+}
+
 /// How a repository stores its packages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepositoryKind {

@@ -1,8 +1,9 @@
 //! Retention of raw files.
 //!
 //! A raw repository's `retention_policy` has the envelope of a package
-//! policy (`version`, `enabled`, `dry_run_only`, `min_run_interval_seconds`,
-//! `rules`) with file rules. Each rule looks at the files under its
+//! policy (`version`, `enabled`, `dry_run_only`, `min_run_interval_seconds`
+//! or a `schedule` in a `schedule_timezone`, `max_run_seconds`, `rules`) with
+//! file rules. Each rule looks at the files under its
 //! `path_prefix` (all files without one), directory by directory:
 //!
 //! * `keep_newest_per_directory` keeps the N most recently deployed files of
@@ -45,6 +46,13 @@ pub struct FileRetentionPolicy {
     pub dry_run_only: bool,
     #[serde(default = "default_interval")]
     pub min_run_interval_seconds: u64,
+    /// A cron schedule, as for package policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_budget: Option<SizeBudget>,
     pub rules: Vec<FileRule>,
@@ -96,6 +104,12 @@ pub fn validate_file_policy(policy: &FileRetentionPolicy, kind: RepoKind) -> Res
             "min_run_interval_seconds must be at most {MAX_MIN_RUN_INTERVAL_SECONDS}"
         ));
     }
+    super::schedule::validate(
+        policy.schedule.as_deref(),
+        policy.schedule_timezone.as_deref(),
+        policy.max_run_seconds,
+        Utc::now(),
+    )?;
     if policy.rules.is_empty() && policy.size_budget.is_none() {
         return Err("a policy needs at least one rule".into());
     }
@@ -360,13 +374,16 @@ const FILE_BATCH: usize = 100;
 /// Apply decisions (or, `dry_run`, only audit them).
 ///
 /// Decisions are applied per directory, in batches of up to
-/// [`FILE_BATCH`], one transaction each. With a `fence`, each batch first
+/// [`FILE_BATCH`], one transaction each. With a `deadline`, the run stops
+/// before the first batch that would start after it (the first batch always
+/// goes); the decisions left are `deferred` to the next run. With a `fence`, each batch first
 /// checks that the run still owns its lease and that the stored policy is
 /// still the one it evaluated, or the run stops (the next run evaluates the
 /// rest). It then locks the directory's files and evaluates the policy on
 /// them again: a decision their current state no longer produces (a file
 /// downloaded or redeployed since, a newer one deleted meanwhile) is
 /// skipped.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_files(
     pool: &PgPool,
     repository_id: i64,
@@ -375,8 +392,10 @@ pub async fn apply_files(
     grace: Duration,
     dry_run: bool,
     fence: Option<&FileRunFence<'_>>,
+    deadline: Option<std::time::Instant>,
 ) -> sqlx::Result<RunSummary> {
     let mut summary = RunSummary::default();
+    let mut clock = super::schedule::RunClock::new(deadline);
     let mut directories: Vec<(&str, Vec<&FileDecision>)> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     for d in decisions {
@@ -390,6 +409,17 @@ pub async fn apply_files(
     let mut remaining = decisions.len();
     for (dir, all) in &directories {
         for batch in all.chunks(FILE_BATCH) {
+            if clock.out_of_time() {
+                tracing::info!(
+                    repository_id,
+                    %run_id,
+                    remaining,
+                    "file retention run stopped at its max_run_seconds; \
+                     the next run goes on with the rest"
+                );
+                summary.deferred += remaining as u64;
+                return Ok(summary);
+            }
             let mut tx = forge_db::begin(pool).await?;
             let mut decided_now: Option<HashSet<i64>> = None;
             if let Some(fence) = fence.filter(|_| !dry_run) {
@@ -510,6 +540,9 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            schedule: None,
+            schedule_timezone: None,
+            max_run_seconds: None,
             size_budget: None,
             rules,
         }
@@ -602,6 +635,29 @@ mod tests {
             serde_json::json!({"version": 1, "rules": [{"id": "x", "keep_last_n": 1}]}),
         );
         assert!(parsed.is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn schedule_fields_are_validated() {
+        let mut keep = rule("keep");
+        keep.keep_newest_per_directory = Some(3);
+        let mut p = policy(vec![keep]);
+        p.schedule = Some("0 3 * * *".into());
+        p.schedule_timezone = Some("Europe/Berlin".into());
+        p.max_run_seconds = Some(3600);
+        assert!(validate_file_policy(&p, RepoKind::Hosted).is_ok());
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["schedule"], "0 3 * * *");
+        p.schedule = Some("0 3 * *".into());
+        assert!(validate_file_policy(&p, RepoKind::Hosted).is_err());
+        p.schedule = None;
+        assert!(
+            validate_file_policy(&p, RepoKind::Hosted).is_err(),
+            "a time zone needs a schedule"
+        );
+        p.schedule_timezone = None;
+        p.max_run_seconds = Some(1);
+        assert!(validate_file_policy(&p, RepoKind::Hosted).is_err());
     }
 
     #[test]

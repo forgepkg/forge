@@ -14,8 +14,14 @@
 //! 3. runs the **pure** [`evaluate`] / [`evaluate_proxy`];
 //! 4. [`apply`]s the decisions — each in its own tx, decref + `blob_outbox`
 //!    only (no direct S3 delete);
-//! 5. records the run summary + schedules the next run on the ledger;
+//! 5. records the run summary + schedules the next run on the ledger: at the
+//!    policy's cron `schedule` (in its `schedule_timezone`), or
+//!    `min_run_interval_seconds` later ([`crate::retention::schedule`]);
 //! 6. invalidates the read cache for every affected package.
+//!
+//! A policy's `max_run_seconds` bounds how long a run applies decisions: it
+//! stops before the first batch that would start later, and the next run
+//! evaluates the repository again and goes on with what is left.
 //!
 //! All S3 deletion flows through the transactional blob outbox; this worker
 //! never touches S3. A `dry_run_only` policy (or a disabled one) audits/no-ops
@@ -26,7 +32,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures_util::FutureExt;
 use sqlx::PgPool;
 use tracing::Instrument;
@@ -41,6 +47,7 @@ use crate::retention::evaluate::{
     plan_package_run, CandidateComponent, PackagePlan, ProxyCandidate,
 };
 use crate::retention::model::{validate_policy, RetentionPolicy, SizeBudgetSummary};
+use crate::retention::{schedule, SelectorError};
 
 /// The shortest interval the worker ever schedules between two automatic runs
 /// of a repository, whatever the config and the policy say (both accept 0).
@@ -189,12 +196,15 @@ impl RetentionWorker {
         // The size before the run, for the bytes it frees (metrics only: a
         // failed read records none).
         let size_before = self.repository_size(&repo).await.ok();
+        // The policy's `max_run_seconds`, counted from the claim.
+        let deadline =
+            schedule::max_run_duration(&repo.policy).map(|limit| std::time::Instant::now() + limit);
         // A panic in `process` (a bug, or a panicking `Format`) is recorded
         // like any other failed run instead of unwinding past `fail_run` and
         // leaving the ledger row `running` until its lease expires. Nothing is
         // shared mutably across the unwind: every applied decision committed
         // in its batch's transaction, and the in-flight one rolled back on drop.
-        let result = AssertUnwindSafe(self.process(&repo, run_id))
+        let result = AssertUnwindSafe(self.process(&repo, run_id, deadline))
             .catch_unwind()
             .await
             .unwrap_or_else(|panic| Err(WorkerError::Panicked(panic_message(&*panic))));
@@ -212,13 +222,14 @@ impl RetentionWorker {
                 let now = forge_db::db_now(&self.pool)
                     .await
                     .unwrap_or_else(|_| Utc::now());
-                let next = now + self.retry_interval(&repo.policy);
+                let next = self.next_run_at(&repo.policy, now);
                 if let Err(e2) = retention_dao::fail_run(
                     &self.pool,
                     repo.repository_id,
                     Some(run_id),
                     &e.to_string(),
                     next,
+                    Some(&repo.policy),
                 )
                 .await
                 {
@@ -277,6 +288,7 @@ impl RetentionWorker {
         &self,
         repo: &retention_dao::ClaimedRepo,
         run_id: uuid::Uuid,
+        deadline: Option<std::time::Instant>,
     ) -> Result<RunSummary, WorkerError> {
         let kind = RepoKind::from(repo.kind.as_str());
         // An images format's repositories (Docker) hold images.
@@ -285,7 +297,7 @@ impl RetentionWorker {
             .resolve(&repo.format)
             .is_some_and(|format| format.stores_images())
         {
-            return self.process_images(repo, kind, run_id).await;
+            return self.process_images(repo, kind, run_id, deadline).await;
         }
         // A files format's repositories (raw) hold files under paths.
         if self
@@ -293,7 +305,7 @@ impl RetentionWorker {
             .resolve(&repo.format)
             .is_some_and(|format| format.stores_files())
         {
-            return self.process_files(repo, kind, run_id).await;
+            return self.process_files(repo, kind, run_id, deadline).await;
         }
 
         // Parse + validate the policy. A malformed or repo-kind-incoherent policy
@@ -316,7 +328,7 @@ impl RetentionWorker {
         // The database's clock: `next_run_at` is compared with it, and the
         // ages evaluated below are of timestamps it wrote.
         let now = forge_db::db_now(&self.pool).await?;
-        let next_run_at = now + self.next_interval(&policy);
+        let next_run_at = self.next_run_at(&repo.policy, now);
 
         // Disabled policy ⇒ no-op run (still advance the schedule).
         if !policy.enabled {
@@ -326,10 +338,21 @@ impl RetentionWorker {
                 Some(run_id),
                 &RunSummary::default(),
                 next_run_at,
+                Some(&repo.policy),
             )
             .await?;
             return Ok(RunSummary::default());
         }
+
+        // The content selectors the rules name. One that is gone (deleted
+        // since the policy was stored) fails the run without mutating
+        // anything: a rule must never run with a filter it cannot apply.
+        let selectors = crate::retention::resolve_selectors(&self.pool, &policy)
+            .await
+            .map_err(|e| match e {
+                SelectorError::Db(e) => WorkerError::Db(e),
+                other => WorkerError::Policy(other.to_string()),
+            })?;
 
         // ── Snapshot candidates (no tx held across apply; apply re-locks rows). ──
         // A proxy's components are cache entries owned by its
@@ -352,6 +375,7 @@ impl RetentionWorker {
                 listed: r.listed,
                 created_at: r.created_at,
                 last_downloaded_at: r.last_downloaded_at,
+                unlisted_at: r.unlisted_at,
                 size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
             })
             .collect()
@@ -395,11 +419,13 @@ impl RetentionWorker {
         let evaluation = {
             let format = Arc::clone(&format);
             let policy = policy.clone();
+            let selectors = selectors.clone();
             tokio::task::spawn_blocking(move || {
                 plan_package_run(
                     format.as_ref(),
                     now,
                     &policy,
+                    &selectors,
                     &hosted,
                     &proxy,
                     &tagged_hosted_ids,
@@ -446,7 +472,9 @@ impl RetentionWorker {
                 stored_policy: &repo.policy,
                 policy: &policy,
                 format: format.as_ref(),
+                selectors: &selectors,
             }),
+            deadline,
         };
         let mut summary = apply(&ctx, &hosted_decisions, &proxy_decisions).await?;
         summary.evaluated = evaluated;
@@ -466,6 +494,7 @@ impl RetentionWorker {
             Some(run_id),
             &summary,
             next_run_at,
+            Some(&repo.policy),
         )
         .await?
         {
@@ -494,6 +523,7 @@ impl RetentionWorker {
         repo: &retention_dao::ClaimedRepo,
         kind: RepoKind,
         run_id: uuid::Uuid,
+        deadline: Option<std::time::Instant>,
     ) -> Result<RunSummary, WorkerError> {
         use crate::retention::images;
         let policy: images::ImageRetentionPolicy = serde_json::from_value(repo.policy.clone())
@@ -501,12 +531,7 @@ impl RetentionWorker {
         images::validate_image_policy(&policy, kind)
             .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
         let now = forge_db::db_now(&self.pool).await?;
-        let secs = policy
-            .min_run_interval_seconds
-            .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
-        let next_run_at = now
-            + Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
-                .max(self.config.default_run_interval);
+        let next_run_at = self.next_run_at(&repo.policy, now);
         let mut summary = RunSummary::default();
         if policy.enabled {
             let (decisions, evaluated, budget) =
@@ -524,6 +549,7 @@ impl RetentionWorker {
                 self.config.delete_grace,
                 policy.dry_run_only,
                 Some(&fence),
+                deadline,
             )
             .await?;
             summary.evaluated = evaluated;
@@ -542,6 +568,7 @@ impl RetentionWorker {
             Some(run_id),
             &summary,
             next_run_at,
+            Some(&repo.policy),
         )
         .await?
         {
@@ -559,6 +586,7 @@ impl RetentionWorker {
         repo: &retention_dao::ClaimedRepo,
         kind: RepoKind,
         run_id: uuid::Uuid,
+        deadline: Option<std::time::Instant>,
     ) -> Result<RunSummary, WorkerError> {
         use crate::retention::files;
         let policy: files::FileRetentionPolicy = serde_json::from_value(repo.policy.clone())
@@ -566,12 +594,7 @@ impl RetentionWorker {
         files::validate_file_policy(&policy, kind)
             .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
         let now = forge_db::db_now(&self.pool).await?;
-        let secs = policy
-            .min_run_interval_seconds
-            .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
-        let next_run_at = now
-            + Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
-                .max(self.config.default_run_interval);
+        let next_run_at = self.next_run_at(&repo.policy, now);
         let mut summary = RunSummary::default();
         if policy.enabled {
             let (decisions, evaluated, budget) =
@@ -589,6 +612,7 @@ impl RetentionWorker {
                 self.config.delete_grace,
                 policy.dry_run_only,
                 Some(&fence),
+                deadline,
             )
             .await?;
             summary.evaluated = evaluated;
@@ -607,6 +631,7 @@ impl RetentionWorker {
             Some(run_id),
             &summary,
             next_run_at,
+            Some(&repo.policy),
         )
         .await?
         {
@@ -619,24 +644,24 @@ impl RetentionWorker {
         Ok(summary)
     }
 
-    /// The next-run interval for a policy: the larger of the repo's
-    /// `min_run_interval_seconds` and the global default (which [`Self::new`]
-    /// raised to at least [`MIN_RUN_INTERVAL_SECONDS`]).
-    fn next_interval(&self, policy: &RetentionPolicy) -> Duration {
-        // Clamped defensively: validation already bounds the policy value, and
-        // an out-of-range interval must never panic the worker loop.
-        let secs = policy
-            .min_run_interval_seconds
-            .min(crate::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS);
-        let per_repo = Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX));
-        per_repo.max(self.config.default_run_interval)
+    /// When a repository whose run started at `now` runs next, finished or
+    /// failed: at the first time of its policy's `schedule` that is at least
+    /// the floor (the global default, which [`Self::new`] raised to at least
+    /// [`MIN_RUN_INTERVAL_SECONDS`]) after `now`; without a schedule, after
+    /// [`Self::interval`]. Read from the raw document of any policy shape
+    /// (which may be what failed to parse), so a broken policy is not
+    /// retried every minute either.
+    fn next_run_at(&self, policy: &serde_json::Value, now: DateTime<Utc>) -> DateTime<Utc> {
+        let floor = self.config.default_run_interval;
+        schedule::of_policy(policy)
+            .and_then(|schedule| schedule.next_after(now + floor - Duration::seconds(1)))
+            .unwrap_or_else(|| now + self.interval(policy))
     }
 
-    /// When a failed run is tried again: after its policy's
-    /// `min_run_interval_seconds`, read from the raw document (which may be
-    /// what failed to parse) or the default when it names none, and no sooner
-    /// than the floor, so a broken policy is not retried every minute.
-    fn retry_interval(&self, policy: &serde_json::Value) -> Duration {
+    /// The next-run interval for a policy: the larger of its
+    /// `min_run_interval_seconds` (the default when it names none) and the
+    /// floor.
+    fn interval(&self, policy: &serde_json::Value) -> Duration {
         let secs = policy
             .get("min_run_interval_seconds")
             .and_then(serde_json::Value::as_u64)

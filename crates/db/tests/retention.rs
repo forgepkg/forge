@@ -193,7 +193,7 @@ async fn finished_run_advances_next_run_and_goes_idle() {
         blobs_enqueued: 2,
         ..Default::default()
     };
-    retention_dao::finish_run(&pool, repo_id, None, &summary, next)
+    retention_dao::finish_run(&pool, repo_id, None, &summary, next, None)
         .await
         .expect("finish");
 
@@ -227,6 +227,7 @@ async fn running_repo_is_not_claimed_until_due_and_idle() {
         None,
         &RunSummary::default(),
         now + Duration::seconds(3600),
+        None,
     )
     .await
     .unwrap();
@@ -516,6 +517,7 @@ async fn schedule_now_makes_repo_immediately_due() {
         None,
         &RunSummary::default(),
         now + Duration::seconds(99999),
+        None,
     )
     .await
     .unwrap();
@@ -571,11 +573,12 @@ async fn run_completion_and_renewal_are_fenced_to_the_lease_owner() {
         Some(stranger),
         &RunSummary::default(),
         now + Duration::seconds(3600),
+        None,
     )
     .await
     .unwrap());
     assert!(
-        !retention_dao::fail_run(&pool, repo_id, Some(stranger), "x", now)
+        !retention_dao::fail_run(&pool, repo_id, Some(stranger), "x", now, None)
             .await
             .unwrap()
     );
@@ -591,6 +594,7 @@ async fn run_completion_and_renewal_are_fenced_to_the_lease_owner() {
         Some(run_id),
         &RunSummary::default(),
         now + Duration::seconds(3600),
+        None,
     )
     .await
     .unwrap());
@@ -599,4 +603,235 @@ async fn run_completion_and_renewal_are_fenced_to_the_lease_owner() {
         .unwrap()
         .unwrap();
     assert_eq!(run.state, "idle");
+}
+
+/// `component.unlisted_at` (for `unlisted_for_days`), kept by a trigger on
+/// every path: set when a version is unlisted or arrives unlisted, kept while
+/// it stays unlisted, cleared when it is listed again.
+#[tokio::test]
+async fn unlisting_records_when_on_every_path() {
+    let pool = common::pool().await;
+    let n = common::unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted(format!("unl-{n}")))
+        .await
+        .unwrap();
+    let insert = |version: &'static str, listed: bool| {
+        let pool = pool.clone();
+        async move {
+            component_dao::insert_component(
+                &pool,
+                NewComponent {
+                    repository_id: repo.id,
+                    name: "lib".into(),
+                    original_id: "Lib".into(),
+                    version: version.into(),
+                    version_original: version.into(),
+                    listed,
+                },
+            )
+            .await
+            .unwrap()
+            .id
+        }
+    };
+    let unlisted_at = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
+                "SELECT unlisted_at FROM component WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let listed = insert("1.0.0", true).await;
+    assert_eq!(unlisted_at(listed).await, None);
+    // A version pushed unlisted.
+    let pushed_unlisted = insert("2.0.0", false).await;
+    assert!(unlisted_at(pushed_unlisted).await.is_some());
+
+    // A client's unlist (NuGet's DELETE, npm) and its relist.
+    assert!(
+        component_dao::set_listed(&pool, repo.id, "lib", "1.0.0", false)
+            .await
+            .unwrap()
+    );
+    let first = unlisted_at(listed)
+        .await
+        .expect("unlisting records the time");
+    // Backdated, as a test or an operator might; unlisting again keeps it.
+    sqlx::query("UPDATE component SET unlisted_at = now() - interval '40 days' WHERE id = $1")
+        .bind(listed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let backdated = unlisted_at(listed).await.unwrap();
+    assert!(backdated < first - Duration::days(39));
+    component_dao::set_listed(&pool, repo.id, "lib", "1.0.0", false)
+        .await
+        .unwrap();
+    assert_eq!(unlisted_at(listed).await, Some(backdated));
+    component_dao::set_listed(&pool, repo.id, "lib", "1.0.0", true)
+        .await
+        .unwrap();
+    assert_eq!(unlisted_at(listed).await, None);
+
+    // Retention's own unlist goes through the same column; the candidates
+    // carry it.
+    sqlx::query("UPDATE component SET listed = false, updated_at = now() WHERE id = $1")
+        .bind(listed)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let sha = format!("{:064x}", n);
+    blob_dao::upsert_pending(&pool, &sha, 10, &format!("k/{sha}"))
+        .await
+        .unwrap();
+    asset_dao::insert_asset(
+        &pool,
+        NewAsset {
+            component_id: listed,
+            path: "lib.1.0.0.nupkg".into(),
+            content_type: "application/octet-stream".into(),
+            blob_sha256: sha,
+            size: 10,
+            sha512_base64: None,
+        },
+    )
+    .await
+    .unwrap();
+    let cands = retention_dao::load_candidate_components(&pool, repo.id, "package.nupkg")
+        .await
+        .unwrap();
+    assert_eq!(cands.len(), 1);
+    assert!(!cands[0].0.listed);
+    assert_eq!(cands[0].0.unlisted_at, unlisted_at(listed).await);
+    assert!(cands[0].0.unlisted_at.is_some());
+}
+
+/// A policy with a schedule sets the ledger's next run when it is saved;
+/// a run that finishes after its policy was changed keeps the next run the
+/// change set, instead of the old policy's.
+#[tokio::test]
+async fn a_saved_schedule_sets_the_next_run_and_a_stale_run_keeps_it() {
+    let pool = common::pool().await;
+    let repo_id = armed_hosted_repo(&pool, common::unique()).await;
+    let old_policy = hosted_policy_json();
+
+    let window = Utc::now() + Duration::days(1);
+    let mut scheduled = hosted_policy_json();
+    scheduled["schedule"] = json!("0 3 * * *");
+    assert!(
+        retention_dao::write_policy_at(&pool, repo_id, Some(&scheduled), Some(window))
+            .await
+            .unwrap()
+    );
+    let run = retention_dao::get_run(&pool, repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((run.next_run_at - window).num_milliseconds().abs() < 1);
+
+    // A run of the old policy ends: its next time is not the one to keep.
+    let stale_next = Utc::now() + Duration::hours(1);
+    assert!(retention_dao::finish_run(
+        &pool,
+        repo_id,
+        None,
+        &RunSummary::default(),
+        stale_next,
+        Some(&old_policy),
+    )
+    .await
+    .unwrap());
+    let run = retention_dao::get_run(&pool, repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((run.next_run_at - window).num_milliseconds().abs() < 1);
+    assert_eq!(run.state, "idle");
+    assert!(
+        retention_dao::fail_run(&pool, repo_id, None, "x", stale_next, Some(&old_policy))
+            .await
+            .unwrap()
+    );
+    let run = retention_dao::get_run(&pool, repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((run.next_run_at - window).num_milliseconds().abs() < 1);
+
+    // A run of the stored policy sets its next run.
+    let stored = retention_dao::read_policy(&pool, repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    retention_dao::finish_run(
+        &pool,
+        repo_id,
+        None,
+        &RunSummary::default(),
+        stale_next,
+        Some(&stored),
+    )
+    .await
+    .unwrap();
+    let run = retention_dao::get_run(&pool, repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((run.next_run_at - stale_next).num_milliseconds().abs() < 1);
+}
+
+/// A run that stopped at its time limit records how many decisions it left.
+#[tokio::test]
+async fn the_summary_records_deferred_decisions_only_when_there_are_some() {
+    let summary = RunSummary {
+        deleted: 3,
+        deferred: 7,
+        ..RunSummary::default()
+    };
+    let json = serde_json::to_value(&summary).unwrap();
+    assert_eq!(json["deferred"], 7);
+    let none = serde_json::to_value(RunSummary::default()).unwrap();
+    assert!(none.get("deferred").is_none());
+    // A summary recorded before the field existed reads as none deferred.
+    let back: RunSummary = serde_json::from_value(json!({
+        "evaluated": 1, "unlisted": 0, "deleted": 0, "blobs_enqueued": 0, "skipped": 0
+    }))
+    .unwrap();
+    assert_eq!(back.deferred, 0);
+}
+
+/// The repositories whose retention rules name a content selector.
+#[tokio::test]
+async fn repositories_using_a_selector_are_found_by_their_rules() {
+    let pool = common::pool().await;
+    let n = common::unique();
+    let selector = format!("sel-{n}");
+    let using = armed_hosted_repo(&pool, n).await;
+    let mut policy = hosted_policy_json();
+    policy["rules"][0]["selector"] = json!(selector);
+    retention_dao::write_policy(&pool, using, Some(&policy))
+        .await
+        .unwrap();
+    let other = armed_hosted_repo(&pool, common::unique()).await;
+    let mut unrelated = hosted_policy_json();
+    unrelated["rules"][0]["selector"] = json!(format!("{selector}-other"));
+    retention_dao::write_policy(&pool, other, Some(&unrelated))
+        .await
+        .unwrap();
+    let names = retention_dao::repositories_using_selector(&pool, &selector)
+        .await
+        .unwrap();
+    assert_eq!(names, vec![format!("ret-{n}")]);
+    assert!(
+        retention_dao::repositories_using_selector(&pool, "nobody-uses-this")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

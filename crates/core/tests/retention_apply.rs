@@ -26,12 +26,7 @@ const GRACE: Duration = Duration::seconds(60);
 fn reason() -> DecisionReason {
     DecisionReason {
         older_than_days: Some(30),
-        not_downloaded_for_days: None,
-        not_pulled_for_days: None,
-        size_budget: None,
-        target_bytes: None,
-        size_bytes: None,
-        last_used_at: None,
+        ..DecisionReason::default()
     }
 }
 
@@ -120,6 +115,7 @@ fn ctx<'a>(pool: &'a PgPool, repo_id: i64, name: &'a str, run_id: uuid::Uuid) ->
         dry_run: false,
         evaluated_at: None,
         fence: None,
+        deadline: None,
     }
 }
 
@@ -424,13 +420,8 @@ fn evict(cached_version_id: i64) -> ProxyDecision {
         version: "1.0.0".into(),
         rule_id: "evict".into(),
         reason: DecisionReason {
-            older_than_days: None,
-            not_downloaded_for_days: None,
             not_pulled_for_days: Some(30),
-            size_budget: None,
-            target_bytes: None,
-            size_bytes: None,
-            last_used_at: None,
+            ..DecisionReason::default()
         },
     }
 }
@@ -566,4 +557,87 @@ async fn proxy_eviction_of_a_row_without_cached_bytes_is_skipped() {
     let rows = audit_rows(&pool, run).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, "skipped");
+}
+
+/// `max_run_seconds`: a run past its deadline stops before its next batch
+/// and leaves the rest `deferred`; the next run (a re-evaluation, here the
+/// decisions not applied yet) goes on where it stopped. The first batch of
+/// a run always goes, so each run makes progress however short its window.
+#[tokio::test]
+async fn a_run_past_its_deadline_stops_and_the_next_one_resumes() {
+    let pool = common::pool().await;
+    let n = common::unique();
+    let repo = repository_dao::insert_repository(&pool, NewRepository::hosted(format!("d-{n}")))
+        .await
+        .unwrap();
+    // Three packages: one batch each.
+    let mut decisions = Vec::new();
+    for name in ["alpha", "beta", "gamma"] {
+        let sha = seed_blob(&pool, common::unique(), 1).await;
+        let id = seed_component(&pool, repo.id, name, "1.0.0", &sha).await;
+        decisions.push(Decision {
+            component_id: id,
+            package_name: name.into(),
+            version: "1.0.0".into(),
+            action: Action::HardDelete,
+            rule_id: "r".into(),
+            reason: reason(),
+        });
+    }
+    let remaining = |pool: &PgPool| {
+        let pool = pool.clone();
+        let repo_id = repo.id;
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM component WHERE repository_id = $1 ORDER BY name",
+            )
+            .bind(repo_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    // The deadline has passed already: the first batch goes, the rest waits.
+    let mut left = decisions.clone();
+    let mut runs = 0;
+    while !left.is_empty() {
+        runs += 1;
+        let ctx = ApplyContext {
+            deadline: Some(std::time::Instant::now()),
+            ..ctx(&pool, repo.id, &repo.name, uuid::Uuid::new_v4())
+        };
+        let summary = apply(&ctx, &left, &[]).await.expect("apply");
+        assert_eq!(summary.deleted, 1, "run {runs}");
+        assert_eq!(summary.deferred, left.len() as u64 - 1, "run {runs}");
+        assert_eq!(summary.skipped, 0);
+        left.remove(0);
+        let expected: Vec<String> = left.iter().map(|d| d.package_name.clone()).collect();
+        assert_eq!(remaining(&pool).await, expected, "run {runs}");
+    }
+    assert_eq!(runs, 3);
+
+    // Without a deadline in reach, one run applies everything.
+    let sha = seed_blob(&pool, common::unique(), 1).await;
+    let id = seed_component(&pool, repo.id, "delta", "1.0.0", &sha).await;
+    let sha = seed_blob(&pool, common::unique(), 1).await;
+    let id2 = seed_component(&pool, repo.id, "epsilon", "1.0.0", &sha).await;
+    let all: Vec<Decision> = [(id, "delta"), (id2, "epsilon")]
+        .into_iter()
+        .map(|(component_id, name)| Decision {
+            component_id,
+            package_name: name.into(),
+            version: "1.0.0".into(),
+            action: Action::HardDelete,
+            rule_id: "r".into(),
+            reason: reason(),
+        })
+        .collect();
+    let ctx = ApplyContext {
+        deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)),
+        ..ctx(&pool, repo.id, &repo.name, uuid::Uuid::new_v4())
+    };
+    let summary = apply(&ctx, &all, &[]).await.expect("apply");
+    assert_eq!((summary.deleted, summary.deferred), (2, 0));
+    assert!(remaining(&pool).await.is_empty());
 }

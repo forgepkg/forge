@@ -334,7 +334,8 @@ A docker repository's retention policy (`PUT
   "version": 1,
   "rules": [
     {"id": "keep-10", "image_prefix": "team/", "keep_last_n_tags": 10,
-     "protected_tags": ["latest", "stable"]},
+     "protected_tags": ["latest", "stable", "release-*"]},
+    {"id": "pr-tags", "tag_pattern": "pr-*", "tag_older_than_days": 7},
     {"id": "stale-tags", "tag_older_than_days": 90, "tag_not_pulled_for_days": 30},
     {"id": "untagged", "delete_untagged_after_days": 7}
   ]
@@ -342,8 +343,11 @@ A docker repository's retention policy (`PUT
 ```
 
 - **Tag rules** delete tags. Per image (only those under `image_prefix`, when
-  set), the `keep_last_n_tags` most recently pushed tags and the
-  `protected_tags` stay; any other tag goes when every trigger the rule sets
+  set), a rule looks at the tags its `tag_pattern` glob matches and its
+  `exclude_tag_pattern` does not (every tag without either; `pr-*`, `v*`,
+  case as written). Of those, the `keep_last_n_tags` most recently pushed
+  tags and the `protected_tags` (names, or globs such as `release-*`) stay;
+  any other tag goes when every trigger the rule sets
   holds (`tag_older_than_days` since its push, `tag_not_pulled_for_days`). A
   `GET` or a `HEAD` of a tag's manifest counts as a pull, so a tag that
   containerd (Kubernetes, nerdctl, BuildKit) only resolves stays pulled. A
@@ -361,8 +365,9 @@ A docker repository's retention policy (`PUT
   tag for that long, except what something kept refers to: the platforms of
   a kept index, and the signatures, SBOMs and attestations (referrers) of a
   kept manifest.
-- `dry_run_only`, `enabled`, `min_run_interval_seconds`, preview, run and
-  audit work as for NuGet repositories; audit rows carry the image as
+- `dry_run_only`, `enabled`, `min_run_interval_seconds` or a cron
+  `schedule` in a `schedule_timezone`, `max_run_seconds`, preview, run and
+  audit work as for NuGet repositories ([Retention](retention.md)); audit rows carry the image as
   `package_name` and the tag or digest as `version`. Group repositories have
   no policy of their own. The repository's **Retention** screen in the web UI
   (Repositories → the repository → Retention) edits the rules, previews a
@@ -379,7 +384,7 @@ A docker repository's retention policy (`PUT
 
 An image retention policy may also include a `size_budget`; it evicts
 least-recently used unprotected manifests and tags after its ordinary rules.
-See [Retention size budgets](retention.md) for configuration and logical size
+See [Retention](retention.md#size-budgets) for configuration and logical size
 accounting.
 
 ## Configuration

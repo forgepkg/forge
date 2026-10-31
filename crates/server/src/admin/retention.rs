@@ -6,12 +6,14 @@
 //! [`forge_db::retention_dao`].
 //!
 //! * `GET    …/retention`         — the stored policy + the ledger run state.
-//! * `PUT    …/retention`         — validate + store a policy (arms the worker).
+//! * `PUT    …/retention`         — validate + store a policy (arms the worker;
+//!   a policy with a cron `schedule` is first due at the schedule's next time).
 //! * `DELETE …/retention`         — clear the policy (disarm; ledger row left).
 //! * `POST   …/retention/preview` — **dry run**: snapshot + the pure evaluator,
 //!   returning what *would* be deleted/unlisted with **zero** mutation and
 //!   **zero** outbox rows. Evaluates the stored policy, or a draft `policy`
-//!   from the body (checked like `PUT`, never stored).
+//!   from the body (checked like `PUT`, never stored). A policy with a
+//!   `schedule` also lists its next run times (`next_runs`).
 //! * `POST   …/retention/run`     — schedule a run promptly (`next_run_at=now()`);
 //!   the background worker claims it on its next poll (does **not** run inline).
 //!   Refused (409) while retention runs are switched off for every repository
@@ -28,11 +30,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use chrono::Utc;
 use forge_core::retention::evaluate::{
-    plan_package_run, CandidateComponent, PackagePlan, ProxyCandidate,
+    plan_package_run, CandidateComponent, PackagePlan, ProxyCandidate, Selectors,
 };
 use forge_core::retention::files::{validate_file_policy, FileDecision, FileRetentionPolicy};
 use forge_core::retention::images::{validate_image_policy, ImageDecisions, ImageRetentionPolicy};
 use forge_core::retention::model::{validate_policy, RetentionPolicy, SizeBudgetSummary};
+use forge_core::retention::{resolve_selectors, schedule, SelectorError};
 use forge_db::model::RepoKind;
 use forge_db::{repository_dao, retention_dao};
 use serde::{Deserialize, Serialize};
@@ -117,6 +120,57 @@ async fn preview_now(
         Some(at) => Ok(at),
         None => forge_db::db_now(&state.pool).await.map_err(db_error),
     }
+}
+
+/// How many of a scheduled policy's next run times a preview lists.
+const PREVIEW_NEXT_RUNS: usize = 5;
+
+/// The content selectors `policy`'s rules name, or the response refusing it
+/// (`invalid` words the 400) when one is missing or unusable.
+async fn selectors_for(
+    state: &AppState,
+    policy: &RetentionPolicy,
+    invalid: impl FnOnce(SelectorError) -> Response,
+) -> Result<Selectors, Response> {
+    match resolve_selectors(&state.pool, policy).await {
+        Ok(selectors) => Ok(selectors),
+        Err(SelectorError::Db(e)) => Err(db_error(e)),
+        Err(other) => Err(invalid(other)),
+    }
+}
+
+/// The next run to set on the ledger when `policy` (any shape, as stored)
+/// is saved: a schedule's next time after `now`; for an interval policy,
+/// `min_run_interval_seconds` after the last run started (and not before
+/// now), when the ledger has the next run later than that (a schedule
+/// replaced by an interval, a shorter interval). `None` leaves the ledger's
+/// next run as it is.
+async fn next_run_on_save(
+    state: &AppState,
+    repository_id: i64,
+    policy: &JsonValue,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<chrono::DateTime<Utc>>, Response> {
+    if let Some(schedule) = schedule::of_policy(policy) {
+        return Ok(schedule.next_after(now));
+    }
+    let Some(run) = retention_dao::get_run(&state.pool, repository_id)
+        .await
+        .map_err(db_error)?
+    else {
+        return Ok(None);
+    };
+    let secs = policy
+        .get("min_run_interval_seconds")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(3600)
+        .clamp(
+            forge_core::retention::worker::MIN_RUN_INTERVAL_SECONDS as u64,
+            forge_core::retention::model::MAX_MIN_RUN_INTERVAL_SECONDS,
+        );
+    let interval = chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX));
+    let due = (run.started_at.unwrap_or(now) + interval).max(now);
+    Ok((run.next_run_at > due).then_some(due))
 }
 
 /// `GET /admin/repositories/{name}/retention`
@@ -218,14 +272,32 @@ pub async fn put(
         if let Err(e) = validate_policy(&policy, repo.kind()) {
             return bad_request(format!("invalid retention policy: {e}"));
         }
+        // Every content selector a rule names must exist.
+        if let Err(resp) = selectors_for(&state, &policy, |e| {
+            bad_request(format!("invalid retention policy: {e}"))
+        })
+        .await
+        {
+            return resp;
+        }
         serde_json::to_value(&policy)
     };
     let policy_json = match normalized {
         Ok(v) => v,
         Err(e) => return bad_request(format!("could not serialize policy: {e}")),
     };
+    let now = match forge_db::db_now(&state.pool).await {
+        Ok(now) => now,
+        Err(e) => return db_error(e),
+    };
+    let next_run_at = match next_run_on_save(&state, repo.id, &policy_json, now).await {
+        Ok(next) => next,
+        Err(resp) => return resp,
+    };
 
-    match retention_dao::write_policy(&state.pool, repo.id, Some(&policy_json)).await {
+    match retention_dao::write_policy_at(&state.pool, repo.id, Some(&policy_json), next_run_at)
+        .await
+    {
         Ok(true) => {
             let current_size_bytes = match current_size_bytes(&state, &repo).await {
                 Ok(size) => size,
@@ -350,6 +422,9 @@ pub struct PreviewView {
     /// (`size_before`, `size_after`, `target_bytes`, `target_reached`).
     #[serde(flatten)]
     pub budget: Option<PreviewBudget>,
+    /// With a `schedule`: the next times it would run, in UTC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_runs: Option<Vec<chrono::DateTime<Utc>>>,
 }
 
 /// A preview's size budget: the size before, the size projected once the
@@ -408,17 +483,26 @@ pub async fn preview(
                     file_decisions: state.formats.stores_files(&repo.format).then(Vec::new),
                     counts: PreviewCounts::default(),
                     budget: None,
+                    next_runs: None,
                 })
                 .into_response()
             }
             Err(e) => return db_error(e),
         },
     };
+    // A schedule's next times, as of the instant the preview evaluates at.
+    let next_runs = match schedule::of_policy(&policy_json) {
+        Some(schedule) => match preview_now(&state, at).await {
+            Ok(now) => Some(schedule.next_runs(now, PREVIEW_NEXT_RUNS)),
+            Err(resp) => return resp,
+        },
+        None => None,
+    };
     if state.formats.stores_images(&repo.format) {
-        return preview_images(&state, &repo, policy_json, source, at).await;
+        return preview_images(&state, &repo, policy_json, source, at, next_runs).await;
     }
     if state.formats.stores_files(&repo.format) {
-        return preview_files(&state, &repo, policy_json, source, at).await;
+        return preview_files(&state, &repo, policy_json, source, at, next_runs).await;
     }
     let mut policy: RetentionPolicy = match source.parse(policy_json) {
         Ok(p) => p,
@@ -427,6 +511,10 @@ pub async fn preview(
     if let Err(e) = validate_policy(&policy, repo.kind()) {
         return source.invalid(e);
     }
+    let selectors = match selectors_for(&state, &policy, |e| source.invalid(e)).await {
+        Ok(selectors) => selectors,
+        Err(resp) => return resp,
+    };
     if !source.enable(&mut policy.enabled) {
         return Json(PreviewView {
             decisions: Vec::new(),
@@ -435,6 +523,7 @@ pub async fn preview(
             file_decisions: None,
             counts: PreviewCounts::default(),
             budget: None,
+            next_runs,
         })
         .into_response();
     }
@@ -470,6 +559,7 @@ pub async fn preview(
                     listed: r.listed,
                     created_at: r.created_at,
                     last_downloaded_at: r.last_downloaded_at,
+                    unlisted_at: r.unlisted_at,
                     size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
                 })
                 .collect(),
@@ -519,6 +609,7 @@ pub async fn preview(
             format.as_ref(),
             now,
             &policy,
+            &selectors,
             &hosted,
             &proxy,
             &tagged_hosted_ids,
@@ -561,6 +652,7 @@ pub async fn preview(
             deleted,
         },
         budget: budget.map(PreviewBudget::from),
+        next_runs,
     })
     .into_response()
 }
@@ -572,6 +664,7 @@ async fn preview_images(
     policy_json: JsonValue,
     source: PolicySource,
     at: Option<chrono::DateTime<Utc>>,
+    next_runs: Option<Vec<chrono::DateTime<Utc>>>,
 ) -> Response {
     let mut policy: ImageRetentionPolicy = match source.parse(policy_json) {
         Ok(p) => p,
@@ -590,6 +683,7 @@ async fn preview_images(
             ..PreviewCounts::default()
         },
         budget: None,
+        next_runs: next_runs.clone(),
     };
     if !source.enable(&mut policy.enabled) {
         return Json(empty(0)).into_response();
@@ -614,6 +708,7 @@ async fn preview_images(
                     deleted,
                 },
                 budget: budget.map(PreviewBudget::from),
+                next_runs,
             })
             .into_response()
         }
@@ -627,6 +722,7 @@ async fn preview_files(
     policy_json: JsonValue,
     source: PolicySource,
     at: Option<chrono::DateTime<Utc>>,
+    next_runs: Option<Vec<chrono::DateTime<Utc>>>,
 ) -> Response {
     let mut policy: FileRetentionPolicy = match source.parse(policy_json) {
         Ok(p) => p,
@@ -646,6 +742,7 @@ async fn preview_files(
         },
         file_decisions: Some(decisions),
         budget: None,
+        next_runs: next_runs.clone(),
     };
     if !source.enable(&mut policy.enabled) {
         return Json(view(Vec::new(), 0)).into_response();

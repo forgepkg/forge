@@ -36,6 +36,12 @@
 //! When `dry_run` is set (preview or a `dry_run_only` policy) no mutation runs;
 //! we still record `dry_run = true` audit rows so an operator can inspect what
 //! *would* happen.
+//!
+//! With a `deadline` (the policy's `max_run_seconds`), the run stops before
+//! the first batch or eviction that would start after it: the decisions left
+//! are counted as `deferred`, and the next run evaluates the repository again
+//! and goes on with them. The first step always goes, so a run whose
+//! evaluation alone outlasts its window still makes progress.
 
 use std::collections::{HashMap, HashSet};
 
@@ -49,9 +55,10 @@ use forge_db::{asset_dao, blob_dao, component_dao};
 use crate::format::Format;
 use crate::retention::evaluate::{
     evaluate, evaluate_proxy, size_budget_protected_ids, CandidateComponent, Decision,
-    ProxyCandidate, ProxyDecision,
+    ProxyCandidate, ProxyDecision, Selectors,
 };
 use crate::retention::model::{Action, RetentionPolicy};
+use crate::retention::schedule::RunClock;
 
 /// What a run's decisions were made under, re-checked before each one is
 /// applied (see the module docs).
@@ -63,6 +70,9 @@ pub struct RunFence<'a> {
     pub policy: &'a RetentionPolicy,
     /// The repository's format: orders versions for the re-evaluation.
     pub format: &'a dyn Format,
+    /// The content selectors the policy's rules name, as the run resolved
+    /// them.
+    pub selectors: &'a Selectors,
 }
 
 /// Whether the run goes on after a step.
@@ -98,6 +108,9 @@ pub struct ApplyContext<'a> {
     /// Fence and re-evaluate every mutating step (the worker always sets
     /// it). `None` applies the decisions as given.
     pub fence: Option<RunFence<'a>>,
+    /// When the run must stop applying (`max_run_seconds` after it
+    /// started); `None` applies everything.
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// Whether a download-driven decision became stale: the target was fetched
@@ -143,15 +156,22 @@ pub async fn apply(
 ) -> Result<RunSummary, sqlx::Error> {
     let total = hosted.len() + proxy.len();
     let mut summary = RunSummary::default();
+    let mut clock = RunClock::new(ctx.deadline);
 
     let mut done = 0;
     if ctx.dry_run {
         for d in hosted {
+            if clock.out_of_time() {
+                return Ok(deferred(ctx, summary, total - done));
+            }
             record_hosted_dry_run(ctx, d, &mut summary).await?;
+            done += 1;
         }
-        done += hosted.len();
     } else {
         for batch in package_batches(hosted) {
+            if clock.out_of_time() {
+                return Ok(deferred(ctx, summary, total - done));
+            }
             if apply_hosted_batch(ctx, &batch, &mut summary).await? == Step::Stop {
                 return Ok(stopped(ctx, summary, total - done));
             }
@@ -160,6 +180,9 @@ pub async fn apply(
     }
     if ctx.dry_run {
         for d in proxy {
+            if clock.out_of_time() {
+                return Ok(deferred(ctx, summary, total - done));
+            }
             if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
                 return Ok(stopped(ctx, summary, total - done));
             }
@@ -167,6 +190,9 @@ pub async fn apply(
         }
     } else {
         for d in proxy.iter().filter(|d| d.reason.size_budget.is_none()) {
+            if clock.out_of_time() {
+                return Ok(deferred(ctx, summary, total - done));
+            }
             if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
                 return Ok(stopped(ctx, summary, total - done));
             }
@@ -182,6 +208,9 @@ pub async fn apply(
         });
         if revalidate_protections {
             for batch in proxy_budget_batches(proxy) {
+                if clock.out_of_time() {
+                    return Ok(deferred(ctx, summary, total - done));
+                }
                 if apply_proxy_budget_batch(ctx, &batch, &mut summary).await? == Step::Stop {
                     return Ok(stopped(ctx, summary, total - done));
                 }
@@ -189,6 +218,9 @@ pub async fn apply(
             }
         } else {
             for d in proxy.iter().filter(|d| d.reason.size_budget.is_some()) {
+                if clock.out_of_time() {
+                    return Ok(deferred(ctx, summary, total - done));
+                }
                 if apply_proxy(ctx, d, &mut summary).await? == Step::Stop {
                     return Ok(stopped(ctx, summary, total - done));
                 }
@@ -249,6 +281,19 @@ fn stopped(ctx: &ApplyContext<'_>, mut summary: RunSummary, remaining: usize) ->
     summary
 }
 
+/// The summary of a run that reached its deadline with `remaining`
+/// decisions unapplied (deferred: the next run evaluates them again).
+fn deferred(ctx: &ApplyContext<'_>, mut summary: RunSummary, remaining: usize) -> RunSummary {
+    tracing::info!(
+        repository = ctx.repository_name,
+        run_id = %ctx.run_id,
+        remaining,
+        "retention run stopped at its max_run_seconds; the next run goes on with the rest"
+    );
+    summary.deferred += remaining as u64;
+    summary
+}
+
 /// What evaluating `package_name`'s current versions (locked by this call)
 /// under the run's policy decides now, by component id.
 async fn decided_now(
@@ -273,11 +318,18 @@ async fn decided_now(
         listed: r.listed,
         created_at: r.created_at,
         last_downloaded_at: r.last_downloaded_at,
+        unlisted_at: r.unlisted_at,
         size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
     })
     .collect();
     let now = ctx.evaluated_at.unwrap_or_else(chrono::Utc::now);
-    let mut ordinary = evaluate(fence.format, now, fence.policy, &candidates);
+    let mut ordinary = evaluate(
+        fence.format,
+        now,
+        fence.policy,
+        fence.selectors,
+        &candidates,
+    );
     if !budget_ids.is_empty() {
         let tagged: HashSet<(String, String)> =
             forge_db::tag_dao::tagged_versions(&mut *tx, ctx.repository_id)
@@ -293,8 +345,15 @@ async fn decided_now(
         .map(|again| (again.component_id, again.action))
         .collect();
     if !budget_ids.is_empty() && fence.policy.size_budget.is_some() {
-        let (protected, _) =
-            size_budget_protected_ids(fence.format, fence.policy, &candidates, &[], &ordinary, &[]);
+        let (protected, _) = size_budget_protected_ids(
+            fence.format,
+            fence.policy,
+            fence.selectors,
+            &candidates,
+            &[],
+            &ordinary,
+            &[],
+        );
         for candidate in &candidates {
             if budget_ids.contains(&candidate.component_id)
                 && !protected.contains(&candidate.component_id)
@@ -718,10 +777,18 @@ async fn apply_proxy_budget_batch(
         fence.format,
         ctx.evaluated_at.unwrap_or_else(chrono::Utc::now),
         fence.policy,
+        fence.selectors,
         &candidates,
     );
-    let (_, protected) =
-        size_budget_protected_ids(fence.format, fence.policy, &[], &candidates, &[], &ordinary);
+    let (_, protected) = size_budget_protected_ids(
+        fence.format,
+        fence.policy,
+        fence.selectors,
+        &[],
+        &candidates,
+        &[],
+        &ordinary,
+    );
     let candidates_by_id: HashMap<i64, &ProxyCandidate> = candidates
         .iter()
         .map(|candidate| (candidate.cached_version_id, candidate))

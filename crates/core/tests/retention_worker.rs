@@ -20,6 +20,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use forge_core::repo::NoopCacheInvalidator;
+use forge_core::retention::evaluate::Selectors;
 use forge_core::retention::worker::{
     RetentionConfig, RetentionWorker, WorkerError, MIN_RUN_INTERVAL_SECONDS,
 };
@@ -881,12 +882,18 @@ async fn claim_and_evaluate(
                     listed: r.listed,
                     created_at: r.created_at,
                     last_downloaded_at: r.last_downloaded_at,
+                    unlisted_at: r.unlisted_at,
                     size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
                 },
             )
             .collect();
-    let decisions =
-        forge_core::retention::evaluate::evaluate(&nuget(), Utc::now(), &policy, &candidates);
+    let decisions = forge_core::retention::evaluate::evaluate(
+        &nuget(),
+        Utc::now(),
+        &policy,
+        &Selectors::none(),
+        &candidates,
+    );
     (claimed, run_id, policy, decisions)
 }
 
@@ -910,7 +917,9 @@ async fn apply_fenced(
             stored_policy: &claimed.policy,
             policy,
             format: &format,
+            selectors: &Selectors::none(),
         }),
+        deadline: None,
     };
     forge_core::retention::apply::apply(&ctx, decisions, &[])
         .await
@@ -1291,14 +1300,20 @@ async fn proxy_size_budget_rechecks_keep_last_n_after_a_newer_version_is_unliste
             size_bytes: u64::try_from(r.size_bytes).unwrap_or_default(),
         })
         .collect();
-    let ordinary =
-        forge_core::retention::evaluate::evaluate_proxy(&format, now, &policy, &candidates);
+    let ordinary = forge_core::retention::evaluate::evaluate_proxy(
+        &format,
+        now,
+        &policy,
+        &Selectors::none(),
+        &candidates,
+    );
     let size_before = retention_dao::package_repository_size(&pool, repo.id)
         .await
         .unwrap();
     let mut plan = forge_core::retention::evaluate::evaluate_size_budget(
         &format,
         &policy,
+        &Selectors::none(),
         &[],
         &candidates,
         size_before,
@@ -1339,7 +1354,9 @@ async fn proxy_size_budget_rechecks_keep_last_n_after_a_newer_version_is_unliste
             stored_policy: &claimed.policy,
             policy: &policy,
             format: &format,
+            selectors: &Selectors::none(),
         }),
+        deadline: None,
     };
     let summary = forge_core::retention::apply::apply(&ctx, &[], &decisions)
         .await
@@ -1366,4 +1383,187 @@ async fn proxy_size_budget_rechecks_keep_last_n_after_a_newer_version_is_unliste
     assert!(!component_exists(&pool, repo.id, "lib", "1.0.0").await);
     assert!(component_exists(&pool, repo.id, "lib", "2.0.0").await);
     assert!(component_exists(&pool, repo.id, "lib", "3.0.0").await);
+}
+
+/// #185: a policy with a cron schedule runs next at the schedule's next
+/// time in its time zone, not `min_run_interval_seconds` later.
+#[tokio::test]
+async fn a_scheduled_policy_runs_next_at_its_schedule() {
+    let pool = pool().await;
+    let n = unique();
+    let repo =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw-cron-{n}")))
+            .await
+            .unwrap();
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "schedule": "0 3 * * *",
+            "schedule_timezone": "Europe/Berlin",
+            "max_run_seconds": 3600,
+            "rules": [{ "id": "sweep", "action": "hard_delete", "criteria": { "older_than_days": 30 } }]
+        }),
+    )
+    .await;
+
+    let before = Utc::now();
+    let summary = worker(&pool, config())
+        .tick_repo(repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.deferred, 0, "the run had all the time it needed");
+    let run = retention_dao::get_run(&pool, repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let local = run.next_run_at.with_timezone(&chrono_tz::Europe::Berlin);
+    assert_eq!(local.format("%H:%M:%S").to_string(), "03:00:00", "{local}");
+    assert!(run.next_run_at > before);
+    assert!(
+        run.next_run_at <= before + Duration::hours(25),
+        "{}",
+        run.next_run_at
+    );
+    let expected =
+        forge_core::retention::schedule::Schedule::parse("0 3 * * *", Some("Europe/Berlin"))
+            .unwrap()
+            .next_after(before)
+            .unwrap();
+    assert_eq!(run.next_run_at, expected);
+}
+
+/// #185: `unlisted_for_days` deletes versions unlisted long enough, by the
+/// time the unlisting recorded; `prerelease_superseded_for_days` deletes a
+/// prerelease once its release has been out long enough.
+#[tokio::test]
+async fn unlisted_and_superseded_versions_go_after_their_days() {
+    let pool = pool().await;
+    let n = unique();
+    let repo =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw-two-{n}")))
+            .await
+            .unwrap();
+    for (i, (name, version, days)) in [
+        ("old", "1.0.0", 400),
+        ("old", "1.1.0", 400),
+        ("old", "1.2.0", 400),
+        ("app", "2.0.0-ci.1", 60),
+        ("app", "2.0.0", 30),
+        ("app", "2.1.0-ci.1", 5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, name, version, &sha, days).await;
+    }
+    // 1.0.0 was unlisted 100 days ago, 1.1.0 yesterday; 1.2.0 is listed.
+    for version in ["1.0.0", "1.1.0"] {
+        component_dao::set_listed(&pool, repo.id, "old", version, false)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "UPDATE component SET unlisted_at = now() - interval '100 days' \
+         WHERE repository_id = $1 AND name = 'old' AND version = '1.0.0'",
+    )
+    .bind(repo.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [
+                { "id": "unlisted", "action": "hard_delete", "criteria": { "unlisted_for_days": 90 } },
+                { "id": "ci", "action": "hard_delete", "release_type": "prereleases",
+                  "version_pattern": "*-ci.*",
+                  "criteria": { "prerelease_superseded_for_days": 14 } }
+            ]
+        }),
+    )
+    .await;
+
+    let summary = worker(&pool, config())
+        .tick_repo(repo.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.deleted, 2);
+    assert!(!component_exists(&pool, repo.id, "old", "1.0.0").await);
+    assert!(component_exists(&pool, repo.id, "old", "1.1.0").await);
+    assert!(component_exists(&pool, repo.id, "old", "1.2.0").await);
+    assert!(!component_exists(&pool, repo.id, "app", "2.0.0-ci.1").await);
+    assert!(component_exists(&pool, repo.id, "app", "2.0.0").await);
+    assert!(component_exists(&pool, repo.id, "app", "2.1.0-ci.1").await);
+    let reasons: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT rule_id, reason FROM retention_audit WHERE repository_id = $1 ORDER BY rule_id",
+    )
+    .bind(repo.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reasons.len(), 2);
+    assert_eq!(reasons[0].0, "ci");
+    assert_eq!(reasons[0].1["superseded_by"], "2.0.0");
+    assert_eq!(reasons[1].0, "unlisted");
+    assert_eq!(reasons[1].1["unlisted_for_days"], 90);
+}
+
+/// #185: a rule's content selector is read on every run. While it is
+/// missing the run fails without touching anything; once it exists, the
+/// rule covers the packages it admits only.
+#[tokio::test]
+async fn a_rules_selector_filters_packages_and_a_missing_one_fails_the_run() {
+    let pool = pool().await;
+    let n = unique();
+    let repo =
+        repository_dao::insert_repository(&pool, NewRepository::hosted(format!("rw-sel-{n}")))
+            .await
+            .unwrap();
+    for (i, name) in ["acme.core", "acme.keep", "other"].into_iter().enumerate() {
+        let sha = seed_blob(&pool, n * 100 + i as u64, 1).await;
+        seed_component(&pool, repo.id, name, "1.0.0", &sha, 100).await;
+    }
+    let selector = format!("rw-acme-{n}");
+    arm(
+        &pool,
+        repo.id,
+        &json!({
+            "version": 1,
+            "rules": [{ "id": "acme", "action": "hard_delete", "selector": selector,
+                        "criteria": { "older_than_days": 30 } }]
+        }),
+    )
+    .await;
+
+    let w = worker(&pool, config());
+    let err = w.tick_repo(repo.id).await.unwrap_err();
+    assert!(
+        matches!(&err, WorkerError::Policy(m) if m.contains("does not exist")),
+        "{err}"
+    );
+    for name in ["acme.core", "acme.keep", "other"] {
+        assert!(component_exists(&pool, repo.id, name, "1.0.0").await);
+    }
+
+    forge_db::authz_dao::insert_content_selector(
+        &pool,
+        &selector,
+        &["acme.*".to_string()],
+        &["acme.keep".to_string()],
+    )
+    .await
+    .unwrap();
+    retention_dao::schedule_now(&pool, repo.id).await.unwrap();
+    let summary = w.tick_repo(repo.id).await.unwrap().unwrap();
+    assert_eq!(summary.deleted, 1);
+    assert!(!component_exists(&pool, repo.id, "acme.core", "1.0.0").await);
+    assert!(component_exists(&pool, repo.id, "acme.keep", "1.0.0").await);
+    assert!(component_exists(&pool, repo.id, "other", "1.0.0").await);
 }

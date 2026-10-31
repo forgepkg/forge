@@ -31,6 +31,10 @@ uuid = { workspace = true }
 # into a GlobSet held behind Arc in the cached effective set.
 globset = { workspace = true }
 
+# Retention schedules: cron patterns and IANA time zones.
+croner = { workspace = true }
+chrono-tz = { workspace = true }
+
 # Auth
 argon2 = { workspace = true }
 sha2 = { workspace = true }

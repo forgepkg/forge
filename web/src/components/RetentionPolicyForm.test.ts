@@ -4,6 +4,7 @@ import type { RetentionPolicy } from '~/api/retention'
 import {
   buildPolicy,
   describeReason,
+  describeSchedule,
   draftFromPolicy,
   intervalFromSeconds,
   newRule,
@@ -192,5 +193,93 @@ describe('retention policy model', () => {
     expect(describeReason({ size_budget: 1024 ** 3, target_bytes: 512 * 1024 ** 2 })).toBe(
       'repository exceeds 1 GiB, target 0.5 GiB',
     )
+  })
+
+  it('round-trips a schedule, a time limit and the new rule fields', () => {
+    const stored = {
+      version: 1,
+      enabled: true,
+      dry_run_only: false,
+      min_run_interval_seconds: 3600,
+      schedule: '0 3 * * 1-5',
+      schedule_timezone: 'Europe/Berlin',
+      max_run_seconds: 7200,
+      rules: [
+        {
+          id: 'ci',
+          action: 'hard_delete',
+          scope: 'hosted',
+          release_type: 'snapshots',
+          selector: 'ci-feeds',
+          version_pattern: '*-ci.*',
+          exclude_version_pattern: '*-ci.0',
+          criteria: {
+            prerelease_superseded_for_days: 14,
+            unlisted_for_days: 90,
+            max_versions_per_package: 20,
+          },
+        },
+      ],
+    } as unknown as RetentionPolicy
+    const draft = draftFromPolicy('package', stored)
+    expect(draft.scheduleMode).toBe('cron')
+    expect([draft.schedule, draft.scheduleTimezone]).toEqual(['0 3 * * 1-5', 'Europe/Berlin'])
+    expect([draft.maxRun, draft.maxRunUnit]).toEqual(['2', 'hours'])
+    expect(draft.rules[0].values.selector).toBe('ci-feeds')
+    expect(draft.rules[0].values['criteria.prerelease_superseded_for_days']).toBe('14')
+    expect(validateDraft('package', draft)).toBeNull()
+    expect(buildPolicy('package', draft)).toEqual(stored)
+
+    // Back to an interval: the schedule goes, the time limit stays.
+    const interval = buildPolicy('package', { ...draft, scheduleMode: 'interval' })
+    expect(interval.schedule).toBeUndefined()
+    expect(interval.schedule_timezone).toBeUndefined()
+    expect(interval.max_run_seconds).toBe(7200)
+    // Without a time zone or a limit, neither is sent; nor an empty selector.
+    draft.scheduleTimezone = ' '
+    draft.maxRun = ''
+    draft.rules[0].values.selector = ''
+    const plain = buildPolicy('package', draft)
+    expect(plain.schedule_timezone).toBeUndefined()
+    expect(plain.max_run_seconds).toBeUndefined()
+    expect('selector' in plain.rules[0]).toBe(false)
+  })
+
+  it('checks a cron pattern and a time limit', () => {
+    const draft = { ...draftFromPolicy('image', null), scheduleMode: 'cron' as const }
+    expect(validateDraft('image', draft)?.schedule).toMatch(/5 fields/)
+    for (const ok of ['0 3 * * *', '*/15  2-4 * * MON-FRI', '@daily']) {
+      expect(validateDraft('image', { ...draft, schedule: ok })).toBeNull()
+    }
+    expect(validateDraft('image', { ...draft, schedule: '0 3 * *' })?.schedule).toBeDefined()
+    const timed = { ...draft, schedule: '0 3 * * *', maxRunUnit: 'seconds' as const }
+    expect(validateDraft('image', { ...timed, maxRun: '30' })?.maxRun).toMatch(/minute/)
+    expect(validateDraft('image', { ...timed, maxRun: '60' })).toBeNull()
+    expect(
+      validateDraft('image', { ...timed, maxRun: '8', maxRunUnit: 'days' })?.maxRun,
+    ).toMatch(/week/)
+  })
+
+  it('says why the new triggers selected a version, and when a policy runs', () => {
+    expect(
+      describeReason({ prerelease_superseded_for_days: 14, superseded_by: '2.3.0' }),
+    ).toBe('superseded by 2.3.0 for over 14 days')
+    expect(describeReason({ unlisted_for_days: 90 })).toBe('unlisted for 90 days')
+    expect(describeReason({ max_versions_per_package: 3, rank: 5 })).toBe(
+      'number 5 of its package, beyond the newest 3',
+    )
+    const base = { version: 1, rules: [] }
+    expect(describeSchedule({ ...base, min_run_interval_seconds: 3600 })).toBe(
+      'at most every 1 hour',
+    )
+    expect(
+      describeSchedule({
+        ...base,
+        schedule: '0 3 * * *',
+        schedule_timezone: 'Europe/Berlin',
+        max_run_seconds: 5400,
+      }),
+    ).toBe('0 3 * * * (Europe/Berlin); a run stops after 90 minutes')
+    expect(describeSchedule({ ...base, schedule: '@daily' })).toBe('@daily (UTC)')
   })
 })

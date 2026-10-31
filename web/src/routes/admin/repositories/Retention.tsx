@@ -11,6 +11,7 @@ import {
   type RetentionView,
 } from '~/api/retention'
 import { useRepository } from '~/queries/useRepositories'
+import { useSelectors } from '~/queries/useRbac'
 import {
   useDeleteRetention,
   usePreviewRetention,
@@ -23,6 +24,7 @@ import {
   RetentionPolicyForm,
   buildPolicy,
   describeReason,
+  describeSchedule,
   draftFromPolicy,
   policyDeletes,
   policyShape,
@@ -244,6 +246,12 @@ function PolicyPanel({
   const save = useSaveRetention(repo)
   const remove = useDeleteRetention(repo)
   const preview = usePreviewRetention(repo)
+  // Package rules may name a content selector; offered by name once loaded.
+  const selectorList = useSelectors()
+  const selectors =
+    shape === 'package' || shape === 'proxy'
+      ? selectorList.data?.map((s) => s.name).sort()
+      : undefined
   const [draft, setDraft] = useState<PolicyDraft>(() => draftFromPolicy(shape, stored))
   const [errors, setErrors] = useState<DraftErrors | null>(null)
   const [refused, setRefused] = useState<string | null>(null)
@@ -368,6 +376,7 @@ function PolicyPanel({
           draft={draft}
           errors={errors}
           currentSizeBytes={currentSizeBytes}
+          selectors={selectors}
           onChange={change}
         />
         {errors && (
@@ -582,6 +591,16 @@ function PreviewPanel({
               nothing.
             </Notice>
           )}
+          {previewed.result.next_runs && previewed.result.next_runs.length > 0 && (
+            <div className="grid gap-1">
+              <h3 className="fg-subtitle">Next runs</h3>
+              <ul className="fg-text">
+                {previewed.result.next_runs.map((at) => (
+                  <li key={at}>{formatDateTime(at)}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           {previewSections(shape, previewed.result)
             .filter((s) => s.rows.length > 0)
             .map((s) => (
@@ -699,6 +718,7 @@ function RunPanel({
                 ),
               },
               { term: 'Next run', value: nextRun },
+              ...(policy ? [{ term: 'Schedule', value: describeSchedule(policy) }] : []),
               { term: 'Last started', value: formatDateTime(ledger.started_at) },
               { term: 'Last finished', value: formatDateTime(ledger.finished_at) },
               ...(summary
@@ -711,6 +731,14 @@ function RunPanel({
                       term: 'Blobs queued for deletion',
                       value: String(summary.blobs_enqueued ?? 0),
                     },
+                    ...(summary.deferred
+                      ? [
+                          {
+                            term: 'Left for the next run',
+                            value: `${summary.deferred}: the run reached its time limit`,
+                          },
+                        ]
+                      : []),
                   ]
                 : []),
             ]}
@@ -742,7 +770,7 @@ function RunPanel({
           </Button>
           <p className="fg-field-desc mt-2">
             {policy
-              ? 'Runs the stored policy without waiting for the minimum time between runs.'
+              ? 'Runs the stored policy now, without waiting for its schedule or the minimum time between runs.'
               : 'Save a policy to run it.'}
           </p>
         </div>

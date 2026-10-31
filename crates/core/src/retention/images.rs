@@ -1,14 +1,18 @@
 //! Retention of Docker / OCI images.
 //!
 //! A docker repository's `retention_policy` has the envelope of a package
-//! policy (`version`, `enabled`, `dry_run_only`, `min_run_interval_seconds`,
-//! `rules`) with image rules:
+//! policy (`version`, `enabled`, `dry_run_only`, `min_run_interval_seconds`
+//! or a `schedule` in a `schedule_timezone`, `max_run_seconds`, `rules`) with
+//! image rules:
 //!
 //! * **Tag rules** delete tags: per image (optionally only those under an
-//!   `image_prefix`), the `keep_last_n_tags` most recently pushed tags and the
-//!   `protected_tags` stay; any other tag goes when every set trigger holds
-//!   (`tag_older_than_days` since it was pushed, `tag_not_pulled_for_days`).
-//!   A rule with only `keep_last_n_tags` keeps N tags per image.
+//!   `image_prefix`), among the tags the rule looks at (those `tag_pattern`
+//!   matches and `exclude_tag_pattern` does not, all without either), the
+//!   `keep_last_n_tags` most recently pushed tags and the `protected_tags`
+//!   (names or globs: `latest`, `release-*`) stay; any other tag goes when
+//!   every set trigger holds (`tag_older_than_days` since it was pushed,
+//!   `tag_not_pulled_for_days`). A rule with only `keep_last_n_tags` keeps N
+//!   tags per image.
 //! * **Untagged rules** (`delete_untagged_after_days`) delete manifests that
 //!   have had no tag for that long — unless something kept refers to them:
 //!   the children of a kept index, and the referrers (signatures, SBOMs,
@@ -24,6 +28,7 @@ use chrono::{DateTime, Duration, Utc};
 use forge_db::model::RepoKind;
 use forge_db::oci_dao::{self, RetentionManifest, RetentionTag};
 use forge_db::retention_dao::{self, AuditRow, RunSummary};
+use globset::{GlobMatcher, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -47,6 +52,13 @@ pub struct ImageRetentionPolicy {
     pub dry_run_only: bool,
     #[serde(default = "default_interval")]
     pub min_run_interval_seconds: u64,
+    /// A cron schedule, as for package policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_budget: Option<SizeBudget>,
     pub rules: Vec<ImageRule>,
@@ -60,11 +72,19 @@ pub struct ImageRule {
     /// Only images whose name starts with this (e.g. `team/`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_prefix: Option<String>,
+    /// Only tags this glob matches (`pr-*`); all tags without one. Tags are
+    /// matched as written (case matters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_pattern: Option<String>,
+    /// Never tags this glob matches (`v*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_tag_pattern: Option<String>,
     /// Tags kept per image: the most recently pushed ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_last_n_tags: Option<u32>,
-    /// Tags never deleted by this rule (e.g. `latest`, `stable`), kept in
-    /// addition to the `keep_last_n_tags` newest others.
+    /// Tags never deleted by this rule (e.g. `latest`, `stable`, or a glob
+    /// such as `release-*`), kept in addition to the `keep_last_n_tags`
+    /// newest others.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub protected_tags: Vec<String>,
     /// Trigger: the tag was pushed at least this many days ago.
@@ -93,6 +113,73 @@ impl ImageRule {
     }
 }
 
+/// Compile a tag glob: `*`, `?`, `[…]` and `{a,b}` over the whole tag, case
+/// sensitive (`pr-*`, `release-*`). A plain tag matches itself.
+fn tag_glob(pattern: &str) -> Result<globset::Glob, globset::Error> {
+    globset::GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .build()
+}
+
+/// A tag rule's tag globs, compiled once per evaluation.
+struct TagFilter {
+    include: Option<GlobMatcher>,
+    exclude: Option<GlobMatcher>,
+    protected: GlobSet,
+    /// A glob that does not compile (validation refuses one): the rule then
+    /// deletes no tag.
+    broken: bool,
+}
+
+impl TagFilter {
+    fn new(rule: &ImageRule) -> Self {
+        let mut broken = false;
+        let mut matcher = |pattern: &Option<String>| match pattern.as_deref().map(tag_glob) {
+            None => None,
+            Some(Ok(glob)) => Some(glob.compile_matcher()),
+            Some(Err(_)) => {
+                broken = true;
+                None
+            }
+        };
+        let include = matcher(&rule.tag_pattern);
+        let exclude = matcher(&rule.exclude_tag_pattern);
+        let mut protected = GlobSetBuilder::new();
+        for tag in &rule.protected_tags {
+            match tag_glob(tag) {
+                Ok(glob) => {
+                    protected.add(glob);
+                }
+                Err(_) => broken = true,
+            }
+        }
+        let protected = protected.build().unwrap_or_else(|_| {
+            broken = true;
+            GlobSet::empty()
+        });
+        TagFilter {
+            include,
+            exclude,
+            protected,
+            broken,
+        }
+    }
+
+    /// Whether `protected_tags` names `tag`.
+    fn protects(&self, tag: &str) -> bool {
+        self.protected.is_match(tag)
+    }
+
+    /// Whether the rule looks at `tag`: its patterns admit it and it is not
+    /// protected.
+    fn in_pool(&self, tag: &str) -> bool {
+        !self.broken
+            && self.include.as_ref().is_none_or(|g| g.is_match(tag))
+            && !self.exclude.as_ref().is_some_and(|g| g.is_match(tag))
+            && !self.protects(tag)
+    }
+}
+
 /// Validate an image policy for a repository of `kind`.
 pub fn validate_image_policy(policy: &ImageRetentionPolicy, kind: RepoKind) -> Result<(), String> {
     if kind == RepoKind::Group {
@@ -111,6 +198,12 @@ pub fn validate_image_policy(policy: &ImageRetentionPolicy, kind: RepoKind) -> R
             "min_run_interval_seconds must be at most {MAX_MIN_RUN_INTERVAL_SECONDS}"
         ));
     }
+    super::schedule::validate(
+        policy.schedule.as_deref(),
+        policy.schedule_timezone.as_deref(),
+        policy.max_run_seconds,
+        Utc::now(),
+    )?;
     if policy.rules.is_empty() && policy.size_budget.is_none() {
         return Err("a policy needs at least one rule".into());
     }
@@ -157,6 +250,37 @@ pub fn validate_image_policy(policy: &ImageRetentionPolicy, kind: RepoKind) -> R
                 "rule {:?}: protected_tags needs a tag criterion",
                 rule.id
             ));
+        }
+        for (field, pattern) in [
+            ("tag_pattern", &rule.tag_pattern),
+            ("exclude_tag_pattern", &rule.exclude_tag_pattern),
+        ] {
+            let Some(pattern) = pattern else {
+                continue;
+            };
+            if !rule.has_tag_criteria() {
+                return Err(format!("rule {:?}: {field} needs a tag criterion", rule.id));
+            }
+            if pattern.trim().is_empty() {
+                return Err(format!("rule {:?}: {field} is empty", rule.id));
+            }
+            if let Err(e) = tag_glob(pattern) {
+                return Err(format!(
+                    "rule {:?}: {field} is not a valid glob: {e}",
+                    rule.id
+                ));
+            }
+        }
+        for tag in &rule.protected_tags {
+            if tag.trim().is_empty() {
+                return Err(format!("rule {:?}: a protected tag is empty", rule.id));
+            }
+            if let Err(e) = tag_glob(tag) {
+                return Err(format!(
+                    "rule {:?}: protected tag {tag:?} is not a valid glob: {e}",
+                    rule.id
+                ));
+            }
         }
     }
     Ok(())
@@ -208,15 +332,17 @@ pub fn evaluate_images(
     }
     let mut deleted_tags: HashSet<(&str, &str)> = HashSet::new();
     for rule in policy.rules.iter().filter(|r| r.has_tag_criteria()) {
+        let filter = TagFilter::new(rule);
         for (image, image_tags) in &by_image {
             if !rule.matches(image) {
                 continue;
             }
-            // Protected tags stay on top of the N kept ones.
+            // The tags the rule looks at; protected tags stay on top of the
+            // N kept ones.
             let mut ordered: Vec<&RetentionTag> = image_tags
                 .iter()
                 .copied()
-                .filter(|t| !rule.protected_tags.iter().any(|p| p == &t.tag))
+                .filter(|t| filter.in_pool(&t.tag))
                 .collect();
             ordered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.tag.cmp(&b.tag)));
             let keep = rule.keep_last_n_tags.unwrap_or(0) as usize;
@@ -890,6 +1016,7 @@ fn budget_protected_tags(
         by_image.entry(&tag.image).or_default().push(tag);
     }
     for rule in &policy.rules {
+        let filter = TagFilter::new(rule);
         for (image, image_tags) in &by_image {
             if !rule.matches(image) {
                 continue;
@@ -897,13 +1024,13 @@ fn budget_protected_tags(
             protected.extend(
                 image_tags
                     .iter()
-                    .filter(|t| rule.protected_tags.iter().any(|p| p == &t.tag))
+                    .filter(|t| filter.protects(&t.tag))
                     .map(|t| (t.image.clone(), t.tag.clone())),
             );
             if let Some(keep) = rule.keep_last_n_tags {
                 let mut ordered: Vec<_> = image_tags
                     .iter()
-                    .filter(|t| !rule.protected_tags.iter().any(|p| p == &t.tag))
+                    .filter(|t| filter.in_pool(&t.tag))
                     .copied()
                     .collect();
                 ordered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.tag.cmp(&b.tag)));
@@ -1047,6 +1174,10 @@ impl DecidedNow {
 
 /// Apply decisions (or, `dry_run`, only audit them).
 ///
+/// With a `deadline`, the run stops before the first batch that would start
+/// after it (the first batch always goes); the decisions left are
+/// `deferred` to the next run.
+///
 /// Decisions are applied per image, in batches of up to [`IMAGE_BATCH`]
 /// (its tags first, then its manifests, indexes before their children),
 /// one transaction each. With a `fence`, each batch first checks that the
@@ -1057,6 +1188,7 @@ impl DecidedNow {
 /// state no longer produces (a tag pulled or pushed since, newer tags
 /// deleted meanwhile, a referrer whose subject was tagged again) is
 /// skipped.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_images(
     pool: &PgPool,
     repository_id: i64,
@@ -1065,11 +1197,24 @@ pub async fn apply_images(
     grace: Duration,
     dry_run: bool,
     fence: Option<&ImageRunFence<'_>>,
+    deadline: Option<std::time::Instant>,
 ) -> sqlx::Result<RunSummary> {
     let mut summary = RunSummary::default();
+    let mut clock = super::schedule::RunClock::new(deadline);
     let batches = image_batches(decisions);
     let mut remaining = decisions.tags.len() + decisions.manifests.len();
     for (image, batch) in &batches {
+        if clock.out_of_time() {
+            tracing::info!(
+                repository_id,
+                %run_id,
+                remaining,
+                "image retention run stopped at its max_run_seconds; \
+                 the next run goes on with the rest"
+            );
+            summary.deferred += remaining as u64;
+            return Ok(summary);
+        }
         let mut tx = forge_db::begin(pool).await?;
         let mut decided = None;
         if let Some(fence) = fence.filter(|_| !dry_run) {
@@ -1424,6 +1569,9 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            schedule: None,
+            schedule_timezone: None,
+            max_run_seconds: None,
             size_budget: None,
             rules,
         }
@@ -1432,6 +1580,8 @@ mod tests {
         ImageRule {
             id: id.into(),
             image_prefix: None,
+            tag_pattern: None,
+            exclude_tag_pattern: None,
             keep_last_n_tags: None,
             protected_tags: Vec::new(),
             tag_older_than_days: None,
@@ -1457,6 +1607,59 @@ mod tests {
         let deleted: Vec<&str> = d.tags.iter().map(|t| t.tag.as_str()).collect();
         // `latest` is protected on top of the two newest others (3, 2).
         assert_eq!(deleted, vec!["1"]);
+    }
+
+    #[test]
+    fn tag_patterns_choose_the_tags_a_rule_looks_at() {
+        let tags = vec![
+            tag("app", "pr-12", 1, 30),
+            tag("app", "pr-13", 2, 20),
+            tag("app", "pr-14", 3, 1),
+            tag("app", "pr-keep", 4, 30),
+            tag("app", "v1.0", 5, 30),
+            tag("app", "main", 6, 30),
+        ];
+        // Delete `pr-*` tags after 7 days, except `pr-keep`.
+        let mut r = rule("prs");
+        r.tag_pattern = Some("pr-*".into());
+        r.exclude_tag_pattern = Some("*-keep".into());
+        r.tag_older_than_days = Some(7);
+        let d = evaluate_images(now(), &policy(vec![r.clone()]), &tags, &[]);
+        let mut deleted: Vec<&str> = d.tags.iter().map(|t| t.tag.as_str()).collect();
+        deleted.sort_unstable();
+        assert_eq!(deleted, vec!["pr-12", "pr-13"]);
+
+        // keep_last_n_tags counts only the tags the rule looks at: the newest
+        // `pr-*` tag is kept, whatever `main` and `v1.0` are.
+        r.tag_older_than_days = None;
+        r.exclude_tag_pattern = None;
+        r.keep_last_n_tags = Some(1);
+        let d = evaluate_images(now(), &policy(vec![r]), &tags, &[]);
+        let mut deleted: Vec<&str> = d.tags.iter().map(|t| t.tag.as_str()).collect();
+        deleted.sort_unstable();
+        assert_eq!(deleted, vec!["pr-12", "pr-13", "pr-keep"]);
+    }
+
+    #[test]
+    fn protected_tags_take_globs_in_rules_and_the_budget() {
+        let tags = vec![
+            tag("app", "release-1", 1, 300),
+            tag("app", "release-2", 2, 200),
+            tag("app", "latest", 2, 200),
+            tag("app", "build-7", 3, 100),
+            tag("app", "build-8", 4, 90),
+        ];
+        let mut r = rule("old");
+        r.tag_older_than_days = Some(30);
+        r.protected_tags = vec!["release-*".into(), "latest".into()];
+        let d = evaluate_images(now(), &policy(vec![r.clone()]), &tags, &[]);
+        let mut deleted: Vec<&str> = d.tags.iter().map(|t| t.tag.as_str()).collect();
+        deleted.sort_unstable();
+        assert_eq!(deleted, vec!["build-7", "build-8"]);
+        let kept = budget_protected_tags(&policy(vec![r]), &tags);
+        let mut kept: Vec<&str> = kept.iter().map(|(_, t)| t.as_str()).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec!["latest", "release-1", "release-2"]);
     }
 
     #[test]
@@ -1595,6 +1798,34 @@ mod tests {
             serde_json::json!({"version": 1, "rules": [{"id": "x", "keep": 1}]}),
         );
         assert!(parsed.is_err(), "unknown fields are refused");
+
+        // Tag globs compile, are not empty, and need a tag criterion.
+        let mut prs = rule("prs");
+        prs.tag_pattern = Some("pr-*".into());
+        prs.tag_older_than_days = Some(7);
+        prs.protected_tags = vec!["release-*".into()];
+        assert!(validate_image_policy(&policy(vec![prs.clone()]), RepoKind::Hosted).is_ok());
+        for broken in ["pr-[", ""] {
+            let mut bad = prs.clone();
+            bad.tag_pattern = Some(broken.into());
+            assert!(validate_image_policy(&policy(vec![bad]), RepoKind::Hosted).is_err());
+            let mut bad = prs.clone();
+            bad.protected_tags = vec![broken.into()];
+            assert!(validate_image_policy(&policy(vec![bad]), RepoKind::Hosted).is_err());
+        }
+        let mut untagged = rule("untagged");
+        untagged.delete_untagged_after_days = Some(7);
+        untagged.exclude_tag_pattern = Some("v*".into());
+        assert!(validate_image_policy(&policy(vec![untagged]), RepoKind::Hosted).is_err());
+
+        // The schedule fields of the envelope.
+        let mut scheduled = ok.clone();
+        scheduled.schedule = Some("30 2 * * 0".into());
+        scheduled.schedule_timezone = Some("America/New_York".into());
+        scheduled.max_run_seconds = Some(1800);
+        assert!(validate_image_policy(&scheduled, RepoKind::Hosted).is_ok());
+        scheduled.schedule_timezone = Some("Nowhere/Land".into());
+        assert!(validate_image_policy(&scheduled, RepoKind::Hosted).is_err());
     }
 
     #[test]

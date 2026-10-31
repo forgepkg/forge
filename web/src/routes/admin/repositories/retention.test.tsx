@@ -178,6 +178,14 @@ function mockApi(h: Handlers) {
       const body = init?.body ? JSON.parse(init.body as string) : {}
 
       if (path.endsWith('/admin/me')) return Promise.resolve(json(adminMe))
+      if (path.endsWith('/admin/content-selectors') && method === 'GET') {
+        return Promise.resolve(
+          json([
+            { id: 1, name: 'ci-feeds', description: '', includes: ['acme.*'], excludes: [] },
+            { id: 2, name: 'all-internal', description: '', includes: [], excludes: [] },
+          ]),
+        )
+      }
       if (path.endsWith('/retention/preview') && method === 'POST') {
         return Promise.resolve(h.onPreview ? h.onPreview(body) : json(preview({})))
       }
@@ -663,5 +671,95 @@ describe('retention screen', () => {
         },
       }),
     )
+  })
+
+  it('edits a schedule and the new filters and triggers, and shows the next runs', async () => {
+    const scheduled: RetentionPolicy = {
+      ...storedPolicy,
+      schedule: '0 3 * * *',
+      schedule_timezone: 'Europe/Berlin',
+      max_run_seconds: 3600,
+    }
+    let previewed: { policy?: RetentionPolicy } | undefined
+    mockApi({
+      repositories: [repo({})],
+      view: {
+        policy: scheduled,
+        last_run: {
+          ...ledger,
+          last_run_summary: { ...ledger!.last_run_summary!, deferred: 40 },
+        },
+        runs_enabled: true,
+        current_size_bytes: 0,
+      },
+      onPreview: (body) => {
+        previewed = body
+        return json(
+          preview({
+            decisions: [
+              {
+                component_id: 21,
+                package_name: 'acme.core',
+                version: '2.3.0-ci.417',
+                action: 'hard_delete',
+                rule_id: 'stale-releases',
+                reason: { prerelease_superseded_for_days: 14, superseded_by: '2.3.0' },
+              },
+            ],
+            next_runs: ['2026-11-01T02:00:00Z', '2026-11-02T02:00:00Z'],
+          }),
+        )
+      },
+    })
+    await renderAt('/manage/repositories/nuget-internal/retention')
+    expect(await screen.findByLabelText('When it runs')).toHaveValue('cron')
+    expect(screen.getByLabelText('Cron schedule')).toHaveValue('0 3 * * *')
+    expect(screen.getByLabelText(/^Time zone/)).toHaveValue('Europe/Berlin')
+    expect(screen.getByLabelText(/^Stop a run after/)).toHaveValue('1')
+    expect(screen.queryByLabelText('Minimum time between runs')).not.toBeInTheDocument()
+    const runs = within(screen.getByRole('complementary', { name: 'Runs' }))
+    expect(
+      runs.getByText('0 3 * * * (Europe/Berlin); a run stops after 1 hour'),
+    ).toBeInTheDocument()
+    expect(runs.getByText('40: the run reached its time limit')).toBeInTheDocument()
+
+    // The content selectors are offered by name, once they are loaded.
+    await waitFor(() =>
+      expect(rule(1).getByLabelText(/^Content selector/).tagName).toBe('SELECT'),
+    )
+    const selector = rule(1).getByLabelText(/^Content selector/)
+    expect(within(selector).getByRole('option', { name: 'ci-feeds' })).toBeInTheDocument()
+    await userEvent.selectOptions(selector, 'ci-feeds')
+    await userEvent.type(rule(1).getByLabelText(/^Version pattern/), '*-ci.*')
+    await userEvent.type(rule(1).getByLabelText(/^Superseded by a release for/), '14')
+    await userEvent.type(rule(1).getByLabelText(/^More than N versions/), '50')
+    await userEvent.clear(screen.getByLabelText('Cron schedule'))
+    await userEvent.type(screen.getByLabelText('Cron schedule'), '30 2 * * 6')
+    await userEvent.click(screen.getByRole('button', { name: 'Preview' }))
+
+    expect(await screen.findByText('superseded by 2.3.0 for over 14 days')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Next runs' })).toBeInTheDocument()
+    expect(previewed?.policy).toMatchObject({
+      schedule: '30 2 * * 6',
+      schedule_timezone: 'Europe/Berlin',
+      max_run_seconds: 3600,
+      rules: [
+        {
+          selector: 'ci-feeds',
+          version_pattern: '*-ci.*',
+          criteria: {
+            keep_last_n: 5,
+            older_than_days: 180,
+            prerelease_superseded_for_days: 14,
+            max_versions_per_package: 50,
+          },
+        },
+      ],
+    })
+
+    // Back to an interval.
+    await userEvent.selectOptions(screen.getByLabelText('When it runs'), 'interval')
+    expect(screen.getByLabelText('Minimum time between runs')).toHaveValue('1')
+    expect(screen.queryByLabelText('Cron schedule')).not.toBeInTheDocument()
   })
 })

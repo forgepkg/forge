@@ -19,8 +19,10 @@ its [quickstart](../README.md#quickstart);
   base, components and overlays, for production and for an evaluation.
 - **[Monitoring](../deploy/monitoring/README.md)**: an example OpenTelemetry
   Collector configuration, Grafana dashboard and Prometheus alerting rules.
-- **[Retention size budgets](retention.md)**: keep a repository under a
-  logical size: the budget, how size is counted, and what goes first.
+- **[Retention](retention.md)**: every retention rule with examples (age,
+  downloads, superseded prereleases, unlisted versions, version and tag
+  patterns, keep-N), cron schedules in a time zone with a time limit per
+  run, and size budgets.
 - **[Importing repositories](import.md)**: copy a hosted repository of
   another server (a NuGet feed, a registry: Nexus, Artifactory, another
   Forge) into Forge, with its publish dates.
