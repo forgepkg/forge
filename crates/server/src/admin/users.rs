@@ -28,6 +28,10 @@
 //! password. `POST /admin/users/{id}/invitation` makes a new invitation
 //! (sent, or as a link to copy), replacing the previous one, and `DELETE`
 //! revokes it; deactivating or deleting the account revokes it too.
+//! `POST /admin/users/{id}/invitation/accept` accepts it on the user's
+//! behalf with a password the administrator sets (#653), for an account
+//! handed over ready to use: the only way an administrator sets another
+//! person's password.
 //!
 //! A credential-forwarding account whose realm keeps password hashes
 //! (`capture_password_hash`) can be switched to a local account with the last
@@ -809,6 +813,81 @@ pub async fn revoke_invitation(State(state): State<AppState>, Path(id): Path<i64
         }
         Ok(false) => (StatusCode::NOT_FOUND, "no invitation to revoke").into_response(),
         Err(e) => db_error(e),
+    }
+}
+
+/// `POST /admin/users/{id}/invitation/accept` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptInvitation {
+    /// The account's password from now on.
+    pub password: String,
+}
+
+/// `POST /admin/users/{id}/invitation/accept`: accept an invited account's
+/// invitation on its user's behalf, with a password the administrator sets,
+/// for an account handed over ready to use (an install without email, a
+/// user without a mailbox). The password becomes the account's, the account
+/// is `active`, and its invitation, if there is one, is marked accepted, so
+/// its link stops working: one transaction. It works with a live invitation
+/// waiting or without one (`invited`, `invitation_expired`). This is the
+/// only way an administrator sets another person's password.
+///
+/// **400** for a password the invitation page refuses too
+/// ([`invitations::check_password`]); **404** for no account; **409** for an
+/// account that is not an active invited one (its user chose a password
+/// already, an account of another realm, a service account, a deactivated
+/// account).
+pub async fn accept_invitation(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<i64>,
+    Json(body): Json<AcceptInvitation>,
+) -> Response {
+    const NOT_INVITED: &str = "only an active local account whose user has not chosen a \
+                               password yet can have its invitation accepted";
+    if let Err(why) = invitations::check_password(&body.password) {
+        return (StatusCode::BAD_REQUEST, why).into_response();
+    }
+    let user = match user_dao::find_user_by_id(&state.pool, id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return (StatusCode::NOT_FOUND, "user not found").into_response(),
+        Err(e) => return db_error(e),
+    };
+    // Before the argon2 work; the update checks again, in its transaction.
+    let invited = match invitation_dao::onboarding(&state.pool, id).await {
+        Ok(onboarding) => onboarding.is_some_and(|o| o.invited),
+        Err(e) => return db_error(e),
+    };
+    if !invited || !user.active || user.auth_source != "local" || user.is_service_account() {
+        return (StatusCode::CONFLICT, NOT_INVITED).into_response();
+    }
+    let password_hash = match super::hash_password(body.password).await {
+        Ok(hash) => hash,
+        Err(resp) => return resp,
+    };
+    let accepted = match invitation_dao::accept_for_user(&state.pool, id, &password_hash).await {
+        Ok(Some(user)) => user,
+        // Accepted, deactivated or deleted meanwhile.
+        Ok(None) => {
+            return match user_dao::find_user_by_id(&state.pool, id).await {
+                Ok(Some(_)) => (StatusCode::CONFLICT, NOT_INVITED).into_response(),
+                Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
+                Err(e) => db_error(e),
+            }
+        }
+        Err(e) => return db_error(e),
+    };
+    tracing::info!(
+        target: "forge::audit",
+        user_id = accepted.id,
+        username = %accepted.username,
+        principal = %principal.audit_label(),
+        "invitation accepted by an administrator: the password is set"
+    );
+    match UserView::load(&state, &accepted).await {
+        Ok(view) => Json(view).into_response(),
+        Err(resp) => resp,
     }
 }
 

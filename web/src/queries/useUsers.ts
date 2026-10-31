@@ -5,6 +5,7 @@ import { realmKeys } from '~/api/realms'
 import { roleKeys } from '~/api/rbac'
 import { tokenKeys } from '~/api/tokens'
 import {
+  acceptUserInvitation,
   convertUserToLocal,
   createUser,
   deleteUser,
@@ -66,6 +67,24 @@ export function useInviteUser() {
   >({
     mutationFn: ({ id, ...body }) => inviteUser(id, body),
     onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: userKeys.list() })
+    },
+  })
+}
+
+/**
+ * Accept `id`'s invitation for its user with a password the administrator
+ * sets. The answer replaces the user in the cached list at once (the page
+ * shows the account active), and the list is re-fetched.
+ */
+export function useAcceptInvitation() {
+  const queryClient = useQueryClient()
+  return useMutation<UserView, ApiError, { id: number; password: string }>({
+    mutationFn: ({ id, password }) => acceptUserInvitation(id, password),
+    onSuccess: (view) => {
+      queryClient.setQueryData<UserView[]>(userKeys.list(), (users) =>
+        users?.map((u) => (u.id === view.id ? view : u)),
+      )
       void queryClient.invalidateQueries({ queryKey: userKeys.list() })
     },
   })

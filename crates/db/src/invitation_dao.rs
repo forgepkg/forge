@@ -249,6 +249,43 @@ pub async fn accept(
     Ok(user)
 }
 
+/// Accept the invitation of the account `user_id` on its user's behalf, with
+/// a password an administrator sets: its password becomes `password_hash`
+/// and it is no longer invited, and its invitation, live or expired, is
+/// marked accepted, so its link stops working. Whether an invitation waits
+/// or not does not matter. `None` when the account is not an active invited
+/// local one (its user chose a password already, an account of another
+/// realm, a service account, a deactivated or a deleted account).
+pub async fn accept_for_user(
+    pool: &PgPool,
+    user_id: i64,
+    password_hash: &str,
+) -> sqlx::Result<Option<AppUser>> {
+    let mut tx = crate::begin(pool).await?;
+    let user: Option<AppUser> = sqlx::query_as(
+        "UPDATE app_user SET password_hash = $2, invited = false, updated_at = now() \
+         WHERE id = $1 AND invited AND active AND auth_source = 'local' AND kind = 'user' \
+         RETURNING id, username, password_hash, active, auth_source, external_subject, \
+                   kind, created_at, updated_at",
+    )
+    .bind(user_id)
+    .bind(password_hash)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if user.is_none() {
+        return Ok(None);
+    }
+    sqlx::query(
+        "UPDATE user_invitation SET accepted_at = now() \
+         WHERE user_id = $1 AND accepted_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
 /// Revoke the invitation of `user_id` (unless accepted). Returns whether
 /// there was one.
 pub async fn revoke<'e, E>(executor: E, user_id: i64) -> sqlx::Result<bool>

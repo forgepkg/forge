@@ -26,7 +26,9 @@ import type { AccessLevel } from '~/api/rbac'
  *    administrator issues for it, or through its trusted-header realm.
  *    `POST /admin/users/{id}/reauth` signs the user out everywhere. The
  *    other per-user writes are `DELETE /admin/users/{id}`, invitations
- *    (`POST`/`DELETE /admin/users/{id}/invitation`), switching a
+ *    (`POST`/`DELETE /admin/users/{id}/invitation`, and `POST
+ *    /admin/users/{id}/invitation/accept`, which accepts one for its user
+ *    with a password the administrator sets), switching a
  *    credential-forwarding account to a local one (`POST
  *    /admin/users/{id}/convert-to-local`), token management (see
  *    `tokens.ts`) and role assignment (see `rbac.ts`).
@@ -252,6 +254,17 @@ export function inviteUser(
 /** `DELETE /admin/users/{id}/invitation` — revoke the invitation (204). */
 export function revokeInvitation(id: number): Promise<void> {
   return httpClient.delete<void>(`/admin/users/${id}/invitation`)
+}
+
+/**
+ * `POST /admin/users/{id}/invitation/accept` — accept an invited account's
+ * invitation for its user, with a password the administrator sets: the
+ * account is active, and its link stops working. Answers the updated view;
+ * 400 for a password the invitation page refuses too, 409 for an account
+ * that is not an active invited one.
+ */
+export function acceptUserInvitation(id: number, password: string): Promise<UserView> {
+  return httpClient.post<UserView>(`/admin/users/${id}/invitation/accept`, { password })
 }
 
 /**

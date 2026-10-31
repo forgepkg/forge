@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
 import type { CreatedToken, TokenView } from '~/api/tokens'
@@ -17,7 +17,9 @@ import {
   type IssuedInvitation,
   type UserView,
 } from '~/api/users'
+import { invitationPasswordProblem, MIN_INVITATION_PASSWORD_CHARS } from '~/api/auth'
 import {
+  useAcceptInvitation,
   useConvertUserToLocal,
   useInviteUser,
   useReauthUser,
@@ -60,6 +62,7 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  TextField,
 } from '~/components/ui'
 import { AccessBadge } from '~/components/AccessBadge'
 import { UserStatusBadge } from './List'
@@ -115,7 +118,8 @@ const ADD_STRIP = 'grid gap-4 border-b border-line px-5 py-4'
  * kept its password hash can be switched to a local account with that
  * password from here. An invited account (its user has not chosen a password
  * yet) shows its invitation, which can be resent, copied as a link (shown
- * once) or revoked. The account section on top deactivates, reactivates and
+ * once), revoked, or accepted for the user with a password the
+ * administrator sets. The account section on top deactivates, reactivates and
  * signs the user out everywhere.
  */
 function UserPage() {
@@ -127,6 +131,9 @@ function UserPage() {
   const user = users.data?.find((u) => u.id === id)
   const name = user ? user.username : `User #${id}`
   const trustedHeader = user ? isTrustedHeaderAccount(user) : false
+  // The user whose invitation was just accepted here: its panel is gone,
+  // and this says what happened instead.
+  const [acceptedFor, setAcceptedFor] = useState<number | null>(null)
 
   if (user && isServiceAccount(user)) {
     return (
@@ -171,7 +178,13 @@ function UserPage() {
 
       {user && <UserAccount user={user} />}
       {user && (user.status === 'invited' || user.status === 'invitation_expired') && (
-        <UserInvitation user={user} />
+        <UserInvitation user={user} onAccepted={() => setAcceptedFor(user.id)} />
+      )}
+      {user && acceptedFor === user.id && user.status === 'active' && (
+        <Notice tone="ok" role="status">
+          Invitation accepted: {user.username} signs in with the password you set. Pass it on
+          through a channel you trust; the invitation link no longer works.
+        </Notice>
       )}
       {user?.captured_password_at && <KeptPassword user={user} />}
 
@@ -714,11 +727,14 @@ function ScopeEditor({
 /**
  * An invited account's invitation: where it went and until when, sending a
  * new one (the old link stops working), making a link to copy instead (shown
- * once, like a token), and revoking it.
+ * once, like a token), revoking it, and accepting it for the user with a
+ * password the administrator sets (#653), for an account handed over ready
+ * to use.
  */
-function UserInvitation({ user }: { user: UserView }) {
+function UserInvitation({ user, onAccepted }: { user: UserView; onAccepted: () => void }) {
   const invite = useInviteUser()
   const revoke = useRevokeInvitation()
+  const [accepting, setAccepting] = useState(false)
   // The answer of the last resend or copy: its link is shown once, held
   // here and never cached.
   const [issued, setIssued] = useState<IssuedInvitation | null>(null)
@@ -757,6 +773,9 @@ function UserInvitation({ user }: { user: UserView }) {
               Revoke invitation
             </Button>
           )}
+          <Button icon="Key" onClick={() => setAccepting(true)}>
+            Accept invitation
+          </Button>
           <Button icon="Copy" disabled={invite.isPending} onClick={() => make(false)}>
             Copy invitation link
           </Button>
@@ -803,7 +822,87 @@ function UserInvitation({ user }: { user: UserView }) {
           Resending makes a new link; the one sent before stops working.
         </p>
       )}
+      {accepting && (
+        <AcceptInvitationDialog
+          user={user}
+          onClose={() => setAccepting(false)}
+          onAccepted={() => {
+            setAccepting(false)
+            onAccepted()
+          }}
+        />
+      )}
     </Panel>
+  )
+}
+
+/**
+ * **Accept invitation**: the administrator sets the invited account's
+ * password (twice, by the invitation page's rules) and the account is
+ * active, its link dead. The only way an administrator sets another
+ * person's password; the server's refusal (409: the user chose one
+ * meanwhile) shows here.
+ */
+function AcceptInvitationDialog({
+  user,
+  onClose,
+  onAccepted,
+}: {
+  user: UserView
+  onClose: () => void
+  onAccepted: () => void
+}) {
+  const accept = useAcceptInvitation()
+  const formId = useId()
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [problem, setProblem] = useState<string | null>(null)
+
+  function submit(e: React.FormEvent) {
+    e.preventDefault()
+    const why = invitationPasswordProblem(password, confirm)
+    setProblem(why)
+    if (why) return
+    accept.mutate({ id: user.id, password }, { onSuccess: onAccepted })
+  }
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      icon="Key"
+      title={`Accept the invitation for ${user.username}?`}
+      description="You set their password, and they sign in with it once you pass it on: the account is active, and the invitation link stops working. Use this to hand over an account ready to use, for example on an install without email."
+      footer={
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button type="submit" form={formId} variant="primary" disabled={accept.isPending}>
+            {accept.isPending ? 'Setting…' : 'Set password'}
+          </Button>
+        </>
+      }
+    >
+      <form id={formId} className="flex flex-col gap-4" aria-label="Set the password" onSubmit={submit}>
+        <TextField
+          label="Password"
+          type="password"
+          autoComplete="new-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          description={`At least ${MIN_INVITATION_PASSWORD_CHARS} characters.`}
+        />
+        <TextField
+          label="Password again"
+          type="password"
+          autoComplete="new-password"
+          value={confirm}
+          onChange={(e) => setConfirm(e.target.value)}
+        />
+      </form>
+      {(problem || accept.isError) && (
+        <InlineError>{problem ?? (accept.error?.body || accept.error?.message)}</InlineError>
+      )}
+    </Dialog>
   )
 }
 

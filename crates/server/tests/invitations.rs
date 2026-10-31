@@ -592,6 +592,208 @@ async fn creating_a_user_takes_no_password() {
     assert_eq!(status, 409, "only local accounts are invited");
 }
 
+/// `POST /admin/users/{id}/invitation/accept` (#653): an administrator
+/// accepts an invited account's invitation for its user, with a password
+/// they set, whether a live invitation waits or not. The user signs in with
+/// it, the account is active, and the old link answers as invalid. The
+/// password follows the invitation page's rules (400); an account that is
+/// not an active invited local one is refused (409), and no account is 404.
+#[tokio::test]
+async fn an_administrator_accepts_an_invitation_with_a_password_they_set() {
+    let upstream = MockServer::start().await;
+    let srv = server().await;
+    let n = common::unique();
+    let accept = |id: i64, password: &str| {
+        let srv = &srv;
+        let body = json!({ "password": password });
+        async move {
+            admin(
+                srv,
+                reqwest::Method::POST,
+                &format!("/admin/users/{id}/invitation/accept"),
+                Some(body),
+            )
+            .await
+        }
+    };
+    let create = |body: Value| {
+        let srv = &srv;
+        async move {
+            let (status, created) =
+                admin(srv, reqwest::Method::POST, "/admin/users", Some(body)).await;
+            assert_eq!(status, 201, "{created}");
+            created
+        }
+    };
+
+    // A live invitation waits.
+    let username = format!("gina{n}@example.com");
+    let created = create(json!({ "username": username })).await;
+    let id = created["id"].as_i64().unwrap();
+    let token = token_of(created["invitation"]["link"].as_str().unwrap());
+    assert_eq!(created["status"], "invited");
+
+    // The invitation page's rules.
+    let (status, body) = accept(id, "too-short").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.as_str().unwrap().contains("12"), "{body}");
+    let (status, body) = accept(id, &"x".repeat(1025)).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.as_str().unwrap().contains("1024"), "{body}");
+    assert_eq!(user_view(&srv, id).await["status"], "invited");
+    assert!(
+        live(&srv, &token).await,
+        "a refused password changes nothing"
+    );
+
+    let (status, view) = accept(id, "set-by-the-administrator").await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["id"], json!(id));
+    assert_eq!(view["status"], "active");
+    assert_eq!(view["invitation"], Value::Null);
+    assert_eq!(user_view(&srv, id).await["status"], "active");
+    assert_eq!(
+        login(&srv, &username, "set-by-the-administrator").await,
+        200
+    );
+    let accepted_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT accepted_at FROM user_invitation WHERE user_id = $1")
+            .bind(id)
+            .fetch_one(&srv.pool)
+            .await
+            .unwrap();
+    assert!(accepted_at.is_some(), "the invitation is marked accepted");
+
+    // The old link answers as invalid.
+    assert!(!live(&srv, &token).await);
+    let resp = srv.accept_invitation(&token, "the-users-own-choice").await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(login(&srv, &username, "the-users-own-choice").await, 401);
+
+    // Its user has a password now: once only.
+    let (status, _) = accept(id, "another-long-password").await;
+    assert_eq!(status, 409);
+    assert_eq!(
+        login(&srv, &username, "set-by-the-administrator").await,
+        200
+    );
+
+    // The invitation expired.
+    let expired = format!("hank{n}@example.com");
+    let created = create(json!({ "username": expired })).await;
+    let expired_id = created["id"].as_i64().unwrap();
+    sqlx::query(
+        "UPDATE user_invitation SET expires_at = now() - interval '1 second' WHERE user_id = $1",
+    )
+    .bind(expired_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        user_view(&srv, expired_id).await["status"],
+        "invitation_expired"
+    );
+    let (status, view) = accept(expired_id, "set-after-it-expired").await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["status"], "active");
+    assert_eq!(login(&srv, &expired, "set-after-it-expired").await, 200);
+
+    // No invitation at all: revoked.
+    let revoked = format!("iris{n}@example.com");
+    let created = create(json!({ "username": revoked })).await;
+    let revoked_id = created["id"].as_i64().unwrap();
+    let (status, _) = admin(
+        &srv,
+        reqwest::Method::DELETE,
+        &format!("/admin/users/{revoked_id}/invitation"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (status, view) = accept(revoked_id, "set-without-a-link").await;
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(view["status"], "active");
+    assert_eq!(login(&srv, &revoked, "set-without-a-link").await, 200);
+
+    // A deactivated invited account: refused, and still invited.
+    let inactive = format!("jack{n}@example.com");
+    let created = create(json!({ "username": inactive })).await;
+    let inactive_id = created["id"].as_i64().unwrap();
+    let (status, _) = admin(
+        &srv,
+        reqwest::Method::PATCH,
+        &format!("/admin/users/{inactive_id}"),
+        Some(json!({"active": false})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = accept(inactive_id, "set-while-deactivated").await;
+    assert_eq!(status, 409);
+    let (status, _) = admin(
+        &srv,
+        reqwest::Method::PATCH,
+        &format!("/admin/users/{inactive_id}"),
+        Some(json!({"active": true})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        user_view(&srv, inactive_id).await["status"],
+        "invitation_expired"
+    );
+    assert_eq!(login(&srv, &inactive, "set-while-deactivated").await, 401);
+
+    // An account of another realm, a service account, the administrator.
+    let (status, _) = admin(
+        &srv,
+        reqwest::Method::POST,
+        "/admin/realms",
+        Some(json!({
+            "kind": "credential_forwarding",
+            "name": "directory",
+            "config": {"url": format!("{}/status", upstream.uri()), "key_pepper": "pepper"},
+        })),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let forwarded = create(json!({
+        "username": format!("kate{n}@example.com"),
+        "realm": "directory",
+    }))
+    .await;
+    let service = create(json!({
+        "username": format!("ci{n}@example.com"),
+        "kind": "service",
+        "description": "The build agents",
+    }))
+    .await;
+    let (admin_name, _) = srv.admin_basic();
+    let admin_id = {
+        let (status, users) = admin(&srv, reqwest::Method::GET, "/admin/users", None).await;
+        assert_eq!(status, 200);
+        users
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["username"] == json!(admin_name))
+            .expect("the administrator is listed")["id"]
+            .as_i64()
+            .unwrap()
+    };
+    for id in [
+        forwarded["id"].as_i64().unwrap(),
+        service["id"].as_i64().unwrap(),
+        admin_id,
+    ] {
+        let (status, body) = accept(id, "not-for-this-account").await;
+        assert_eq!(status, 409, "{id}: {body}");
+    }
+
+    // No account.
+    let (status, _) = accept(i64::MAX, "for-nobody-at-all").await;
+    assert_eq!(status, 404);
+}
+
 /// Failed lookups and acceptances are throttled per client network.
 #[tokio::test]
 async fn invitation_failures_are_throttled() {

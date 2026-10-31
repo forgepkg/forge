@@ -389,7 +389,8 @@ admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
 
 ### Inviting users
 
-An administrator never sets another person's password. **Admin → Users →
+An administrator sets another person's password only by accepting their
+invitation for them (below). **Admin → Users →
 New user** (`/manage/users/new`) takes the [username](#usernames), the email
 address the invitation goes to (the username unless entered: a UPN is not
 always a mailbox) and the access level (reader, writer or admin). Forge
@@ -418,6 +419,17 @@ password, at least 12 characters, and then sign in.
   Deactivating or deleting the account revokes its invitation.
 - **Without an email service**, or when the send fails, the account is still
   created and the link is shown once on the page to pass on yourself.
+- **Accept invitation** on the user's page finishes the invitation for its
+  user, with a password you set (twice, by the same rules: at least 12
+  characters). Use it to hand an account over ready to use: an install
+  without email, a user without a mailbox, an account set up by hand. It
+  works whether the account is *invited* or its *invitation expired*. The
+  password becomes the account's, the account is active, and its link, if
+  one is still out, stops working. This is the only way an administrator
+  sets another person's password, and only before they chose one: an
+  account whose user has a password, an account of another realm, a service
+  account and a deactivated account are refused. Pass the password on
+  through a channel you trust.
 - Accounts of a credential-forwarding realm (see [Usernames](#usernames)) and
   OIDC accounts are not invited: they sign in through their realm. The
   bootstrap admin keeps its configured password.
@@ -427,7 +439,10 @@ The admin API is `POST /admin/users` with `{"username", "email", "role"}`
 credential-forwarding account. It takes no password: the answer carries
 `invitation` (`email_sent`, `error`, `expires_at`, and the `link` when no
 email went out). `POST /admin/users/{id}/invitation` (`{"send_email": true |
-false, "email": "…"}`) makes a new invitation and `DELETE` revokes it. The
+false, "email": "…"}`) makes a new invitation and `DELETE` revokes it.
+`POST /admin/users/{id}/invitation/accept` (`{"password": "…"}`) accepts it
+for the user: **400** for a password the rules refuse, **409** for an account
+that is not an active invited one, **404** for no account. The
 invited user's page calls `POST /auth/invitations/lookup` and
 `POST /auth/invitations/accept` (`{"token", "password"}`).
 
