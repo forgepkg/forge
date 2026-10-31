@@ -726,6 +726,7 @@ jobs:
           docker pull mirror.gcr.io/library/redis:5.0
           docker pull mirror.gcr.io/sonatype/nexus3:3.70.1
           docker pull mirror.gcr.io/verdaccio/verdaccio:6.11.1
+          docker pull mirror.gcr.io/library/nginx:1.27.5-alpine
 
       - name: Run e2e tests (forge-e2e feature)
         id: tests

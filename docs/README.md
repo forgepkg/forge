@@ -22,10 +22,12 @@ its [quickstart](../README.md#quickstart);
 - **[Retention size budgets](retention.md)**: keep a repository under a
   logical size: the budget, how size is counted, and what goes first.
 - **[Importing repositories](import.md)**: copy a hosted repository of
-  another server (a NuGet feed, an npm registry, a registry: Nexus,
-  Artifactory, Verdaccio, another Forge) into Forge, with its publish dates.
-- **[Importing from Nexus](nexus-import.md)**: where Nexus serves its feeds
-  and registries, its search's limits, and imports stored before 2.2.
+  another server (a NuGet feed, an npm registry, a registry, a raw
+  repository: Nexus, Artifactory, Verdaccio, a web server, another Forge)
+  into Forge, with its publish dates.
+- **[Importing from Nexus](nexus-import.md)**: where Nexus serves its feeds,
+  registries and raw files, its search's limits, and imports stored before
+  2.2.
 
 ## Formats
 

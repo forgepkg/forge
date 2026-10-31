@@ -240,8 +240,8 @@ The guides below are also a site, with navigation and search:
   built into the server: design, operation, and writing one.
 - **[Importing repositories](./docs/import.md)** — copy a hosted repository
   of Nexus, Artifactory, Verdaccio, a registry or another Forge (NuGet, npm,
-  Docker) into Forge through the format's own protocol: dry run, conflicts, resuming, and
-  the cutover.
+  Docker, raw) into Forge through the format's own protocol: dry run,
+  conflicts, resuming, and the cutover.
 
 Run `cargo xtask help` for the complete command list.
 
