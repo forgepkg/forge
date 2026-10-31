@@ -25,7 +25,8 @@ import { searchOptions } from '~/lib/search'
  *    an invitation link once (access levels are covered by
  *    `userRoles.test.tsx`);
  *  - the user page of an invited account resends, copies (shown once) and
- *    revokes its invitation;
+ *    revokes its invitation, and accepts it for the user with a password the
+ *    administrator sets (twice, by the invitation page's rules);
  *  - the user page deactivates, reactivates and signs a user out everywhere,
  *    each after a confirmation saying what happens, and the list and the page
  *    show the new status at once; a refused deactivation (409 for the last
@@ -93,6 +94,7 @@ interface ApiHandlers {
   onConvertUser?: (id: number) => Response
   onInvite?: (id: number, body: unknown) => Response
   onRevokeInvitation?: (id: number) => Response
+  onAcceptInvitation?: (id: number, body: unknown) => Response
   onSetActive?: (id: number, body: unknown) => Response
   onReauth?: (id: number) => Response
   email?: unknown
@@ -123,6 +125,16 @@ function mockApi(h: ApiHandlers) {
             h.onRevokeInvitation ? h.onRevokeInvitation(id) : new Response(null, { status: 204 }),
           )
         }
+      }
+      const acceptMatch = path.match(/\/admin\/users\/(\d+)\/invitation\/accept$/)
+      if (acceptMatch && method === 'POST') {
+        const id = Number(acceptMatch[1])
+        const body = init?.body ? JSON.parse(init.body as string) : {}
+        return Promise.resolve(
+          h.onAcceptInvitation
+            ? h.onAcceptInvitation(id, body)
+            : json(user({ id, status: 'active' })),
+        )
       }
       if (path.endsWith('/admin/realms') && method === 'GET') {
         return Promise.resolve(json(h.realms ?? []))
@@ -559,6 +571,83 @@ describe('admin users', () => {
     await u.click(screen.getByRole('button', { name: 'Revoke invitation' }))
     await waitFor(() => expect(revoked).toBe(1))
     expect(screen.queryByText('https://forge.example.com/invite#copied')).toBeNull()
+  })
+
+  it("accepts an invited user's invitation with a password the administrator sets", async () => {
+    const accepted: unknown[] = []
+    let users = [
+      user({ id: 9, username: 'frank@example.com', status: 'invitation_expired' }),
+    ]
+    mockApi({
+      get users() {
+        return users
+      },
+      onAcceptInvitation: (id, body) => {
+        accepted.push(body)
+        users = [user({ id, username: 'frank@example.com', status: 'active' })]
+        return json(users[0])
+      },
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/9')
+
+    await u.click(await screen.findByRole('button', { name: 'Accept invitation' }))
+    const dialog = screen.getByRole('dialog', {
+      name: 'Accept the invitation for frank@example.com?',
+    })
+    expect(dialog).toHaveTextContent(/the invitation link stops working/)
+    const setPassword = within(dialog).getByRole('button', { name: 'Set password' })
+
+    // The invitation page's rules, before anything is sent.
+    await u.type(within(dialog).getByLabelText('Password'), 'short')
+    await u.type(within(dialog).getByLabelText('Password again'), 'short')
+    await u.click(setPassword)
+    expect(within(dialog).getByText('Choose at least 12 characters.')).toBeInTheDocument()
+    await u.clear(within(dialog).getByLabelText('Password'))
+    await u.type(within(dialog).getByLabelText('Password'), 'set-by-the-administrator')
+    await u.click(setPassword)
+    expect(within(dialog).getByText('The two passwords differ.')).toBeInTheDocument()
+    expect(accepted).toEqual([])
+
+    await u.clear(within(dialog).getByLabelText('Password again'))
+    await u.type(within(dialog).getByLabelText('Password again'), 'set-by-the-administrator')
+    await u.click(setPassword)
+    await waitFor(() => expect(accepted).toEqual([{ password: 'set-by-the-administrator' }]))
+
+    expect(
+      await screen.findByText(/Invitation accepted: frank@example.com signs in with the password you set/),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Accept invitation' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Resend invitation' })).toBeNull()
+    expect(screen.getByText('active')).toBeInTheDocument()
+  })
+
+  it('shows why accepting an invitation was refused and keeps the dialog open', async () => {
+    const reason =
+      'only an active local account whose user has not chosen a password yet can have its invitation accepted'
+    mockApi({
+      users: [user({ id: 9, username: 'frank@example.com', status: 'invited' })],
+      onAcceptInvitation: () => new Response(reason, { status: 409 }),
+    })
+
+    const u = userEvent.setup()
+    await renderAt('/manage/users/9')
+
+    await u.click(await screen.findByRole('button', { name: 'Accept invitation' }))
+    const dialog = screen.getByRole('dialog', {
+      name: 'Accept the invitation for frank@example.com?',
+    })
+    await u.type(within(dialog).getByLabelText('Password'), 'set-by-the-administrator')
+    await u.type(within(dialog).getByLabelText('Password again'), 'set-by-the-administrator')
+    await u.click(within(dialog).getByRole('button', { name: 'Set password' }))
+
+    expect(await within(dialog).findByText(reason)).toBeInTheDocument()
+    expect(screen.queryByText(/Invitation accepted/)).toBeNull()
+    await u.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Accept invitation' })).toBeInTheDocument()
   })
 
   it('deactivates a user after a confirmation, and both screens show it at once', async () => {

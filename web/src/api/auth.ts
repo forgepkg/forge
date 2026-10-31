@@ -178,6 +178,26 @@ export const INVALID_INVITATION =
 /** The fewest characters a password chosen from an invitation has. */
 export const MIN_INVITATION_PASSWORD_CHARS = 12
 
+/** The most bytes it has (the server's limit). */
+export const MAX_INVITATION_PASSWORD_BYTES = 1024
+
+/**
+ * Why `password` cannot be an invited account's password (the server's
+ * rules, and both entries the same), or `null` when it can.
+ */
+export function invitationPasswordProblem(password: string, confirm: string): string | null {
+  if ([...password].length < MIN_INVITATION_PASSWORD_CHARS) {
+    return `Choose at least ${MIN_INVITATION_PASSWORD_CHARS} characters.`
+  }
+  if (new TextEncoder().encode(password).length > MAX_INVITATION_PASSWORD_BYTES) {
+    return 'That password is too long.'
+  }
+  if (password !== confirm) {
+    return 'The two passwords differ.'
+  }
+  return null
+}
+
 /**
  * `POST /auth/invitations/lookup` — whose account the invitation `token`
  * (the link's fragment) is for. A 400 is the generic answer.

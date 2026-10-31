@@ -14,8 +14,9 @@
 //! * [`images`] — deleting a tag, a manifest or an image of a hosted
 //!   repository of images.
 //! * [`users`] — user CRUD: local accounts are invited to choose their
-//!   password ([`crate::invitations`]), never given one here; service
-//!   accounts (#508) have none at all.
+//!   password ([`crate::invitations`]), or an administrator accepts the
+//!   invitation for them with a password they set; service accounts (#508)
+//!   have none at all.
 //! * [`tokens`] — token issue (plaintext returned **once**, only the hash is
 //!   stored) + revoke + list.
 //! * [`members`] — group membership management.
@@ -271,6 +272,10 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/users/{id}/invitation",
             axum::routing::post(users::invite).delete(users::revoke_invitation),
+        )
+        .route(
+            "/users/{id}/invitation/accept",
+            axum::routing::post(users::accept_invitation),
         )
         .route(
             "/users/{id}/convert-to-local",
