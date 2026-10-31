@@ -23,6 +23,8 @@
 //! * [`crypto`] — secret-encryption key **metadata** + per-layer rotation
 //!   triggers (never returns key bytes or decrypted secrets).
 //! * [`blob_cache`] — the local blob cache's statistics.
+//! * [`addresses`] — the public and alias base URLs the server is reached
+//!   under (read-only: `forge.toml`).
 //! * [`proxy_cache`] — invalidating what a proxy repository cached from its
 //!   upstream (its "not found" answers, listings and documents).
 //! * [`imports`] — importing a repository from another server (a NuGet feed,
@@ -52,6 +54,7 @@
 //! refused here too (403): the proxy adds them to every request of the
 //! clients it admits, and they never make anyone an administrator.
 
+pub mod addresses;
 pub mod blob_cache;
 pub mod content_selectors;
 pub mod crypto;
@@ -357,6 +360,8 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route("/crypto/keys", get(crypto::list_keys))
         // --- local blob cache ----------------------------------------------
         .route("/blob-cache", get(blob_cache::stats))
+        // --- the server's addresses ----------------------------------------
+        .route("/addresses", get(addresses::get))
         // --- traffic statistics --------------------------------------------
         .route("/traffic", get(traffic::overview))
         .route(

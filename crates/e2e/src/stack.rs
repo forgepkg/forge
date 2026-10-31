@@ -217,6 +217,7 @@ fn config_toml(
     trusted_proxies: &[String],
     cache_ttl_seconds: u64,
     public_base_url: &str,
+    alias_base_urls: &[String],
     oidc_block: &str,
     auth_block: &str,
     blob_cache: Option<&BlobCacheSetup>,
@@ -250,12 +251,17 @@ fn config_toml(
         let quoted: Vec<String> = trusted_proxies.iter().map(|t| format!("{t:?}")).collect();
         format!("trusted_proxy_cidrs = [{}]\n", quoted.join(", "))
     };
+    let aliases = {
+        let quoted: Vec<String> = alias_base_urls.iter().map(|a| format!("{a:?}")).collect();
+        format!("alias_base_urls = [{}]", quoted.join(", "))
+    };
     std::env::set_var(ROOT_KEY_VAR, ROOT_KEY);
     format!(
         r#"
 [server]
 bind = "127.0.0.1:0"
 public_base_url = "{public_base_url}"
+{aliases}
 
 [database]
 url = "{db_url}"
@@ -328,6 +334,11 @@ pub struct StackBuilder {
     blob_cache: Option<BlobCacheSetup>,
     /// `None` ⇒ the static test keys.
     s3_credentials: Option<String>,
+    /// The host of `server.public_base_url`; `None` ⇒ the listener's
+    /// address (`127.0.0.1`).
+    public_host: Option<String>,
+    /// Hosts of `server.alias_base_urls` (`http://<host>:<port>`).
+    alias_hosts: Vec<String>,
 }
 
 impl Default for StackBuilder {
@@ -347,6 +358,8 @@ impl Default for StackBuilder {
             s3_endpoint: None,
             blob_cache: None,
             s3_credentials: None,
+            public_host: None,
+            alias_hosts: Vec::new(),
         }
     }
 }
@@ -426,6 +439,23 @@ impl StackBuilder {
         self
     }
 
+    /// Name the server `http://<host>:<port>` in `server.public_base_url`
+    /// instead of its listener's address. [`TestServer::base_url`] stays the
+    /// listener's address, so the harness reaches the server whether `host`
+    /// resolves or not (`forge.invalid` never does: a client handed a URL on
+    /// it cannot follow it).
+    pub fn public_host(mut self, host: impl Into<String>) -> Self {
+        self.public_host = Some(host.into());
+        self
+    }
+
+    /// Add `http://<host>:<port>` to `server.alias_base_urls` (#312), the
+    /// port the server listens on.
+    pub fn alias_host(mut self, host: impl Into<String>) -> Self {
+        self.alias_hosts.push(host.into());
+        self
+    }
+
     /// Enable the local blob cache at `path`, `max_bytes` bytes large
     /// (`None`: `"auto"`). The server then starts even while S3 is down.
     pub fn blob_cache(
@@ -478,6 +508,15 @@ impl StackBuilder {
             .expect("bind ephemeral");
         let addr = listener.local_addr().expect("local addr");
         let base_url = format!("http://{addr}");
+        let public_base_url = match &self.public_host {
+            Some(host) => format!("http://{host}:{}", addr.port()),
+            None => base_url.clone(),
+        };
+        let alias_base_urls: Vec<String> = self
+            .alias_hosts
+            .iter()
+            .map(|host| format!("http://{host}:{}", addr.port()))
+            .collect();
 
         let admin_ref = self
             .bootstrap_admin
@@ -488,7 +527,7 @@ impl StackBuilder {
         let oidc_block = self
             .oidc_block_fn
             .as_ref()
-            .map(|f| f(&base_url))
+            .map(|f| f(&public_base_url))
             .unwrap_or_default();
         let toml = config_toml(
             &db_url,
@@ -497,7 +536,8 @@ impl StackBuilder {
             redis.as_deref(),
             &self.trusted_proxies,
             self.cache_ttl_seconds,
-            &base_url,
+            &public_base_url,
+            &alias_base_urls,
             &oidc_block,
             self.auth_block.as_deref().unwrap_or_default(),
             self.blob_cache.as_ref(),

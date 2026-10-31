@@ -93,14 +93,24 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
         sessions: Some(state.sessions.clone()),
         cookie_secure: state.cookie_secure,
         public_origin: crate::middleware::principal::origin_of(&state.config.public_base_url()),
-        // DNS-rebinding guard for the trusted-header realms.
-        allowed_hosts: Arc::new(
-            crate::middleware::principal::allowed_hosts(
+        // DNS-rebinding guard for the trusted-header realms: the public
+        // host, `server.allowed_hosts`, and the alias hosts, which are the
+        // server's own names too.
+        allowed_hosts: Arc::new({
+            let mut hosts = crate::middleware::principal::allowed_hosts(
                 &state.config.public_base_url(),
                 &state.config.server.allowed_hosts,
             )
-            .map_err(anyhow::Error::msg)?,
-        ),
+            .map_err(anyhow::Error::msg)?;
+            hosts.extend(
+                state
+                    .base_urls
+                    .aliases()
+                    .iter()
+                    .map(|alias| alias.host.clone()),
+            );
+            hosts
+        }),
     })
 }
 
@@ -175,11 +185,11 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     // Static SPA fallback, installed LAST so the API routers above always win
     // and only genuine UI paths fall through to `index.html`. The admin UI
     // lives under `/manage/*`; `/admin/*` is the admin API's.
-    let app = app.fallback_service(spa_service(&state.config.web));
+    let app = app.fallback_service(spa_service(&state.config.web, state.base_urls.clone()));
 
     let hsts = state.cookie_secure;
     let recorder = state.traffic.recorder.clone();
-    let public_base_url = state.config.public_base_url();
+    let base_urls = state.base_urls.clone();
     let images = images.map(|p| p.implementation().clone());
     let server = state.config.server.clone();
     let app = app
@@ -193,7 +203,7 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
             response_policy(
                 hsts,
                 feeds.clone(),
-                public_base_url.clone(),
+                base_urls.clone(),
                 images.clone(),
                 req,
                 next,
@@ -276,14 +286,16 @@ const REGISTRY_VARY: &str = "Authorization, Cookie, Accept";
 ///   credentials: [`crate::middleware::principal::NamedByTrustedHeaders`]);
 ///   registry responses (`/v2/...`) likewise, with
 ///   [`REGISTRY_VARY`], and a 401 the authentication middleware answered
-///   there gets the registry's Bearer challenge; Anonymous responses carry no `Cache-Control`;
+///   there gets the registry's Bearer challenge (on the alias host the
+///   request addressed, [`crate::base_urls`]); Anonymous responses carry no
+///   `Cache-Control`;
 /// * with an `https` public URL every response carries HSTS.
 ///
 /// The SPA keeps its own cache headers (hashed assets are immutable).
 async fn response_policy(
     hsts: bool,
     feeds: std::sync::Arc<Vec<String>>,
-    public_base_url: String,
+    base_urls: Arc<crate::base_urls::BaseUrls>,
     images: Option<std::sync::Arc<dyn forge_plugin::FormatPlugin>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -295,6 +307,13 @@ async fn response_policy(
     let registry = images
         .as_ref()
         .filter(|_| under(forge_plugin::api::IMAGES_MOUNT));
+    // The registry's challenge names the host the request addressed when
+    // it is an alias, as the registry's own do.
+    let registry_base = registry.map(|_| {
+        base_urls
+            .for_authority(crate::base_urls::request_authority(&req))
+            .to_string()
+    });
     let headers = req.headers();
     let credentials = headers.contains_key(header::AUTHORIZATION)
         || headers.contains_key("x-nuget-apikey")
@@ -305,8 +324,8 @@ async fn response_policy(
             .extensions()
             .get::<crate::middleware::principal::NamedByTrustedHeaders>()
             .is_some();
-    if let Some(images) = registry {
-        resp = crate::registry::amend_registry_rejection(&public_base_url, images.as_ref(), resp);
+    if let (Some(images), Some(base)) = (registry, registry_base.as_deref()) {
+        resp = crate::registry::amend_registry_rejection(base, images.as_ref(), resp);
     }
     let registry = registry.is_some();
     let out = resp.headers_mut();
@@ -329,6 +348,33 @@ async fn response_policy(
         );
     }
     resp
+}
+
+/// Refuse to start while a docker repository's `host` is the host of an
+/// alias (`server.alias_base_urls`). The registry serves an alias host as one
+/// of the server's own, every repository by path, so that repository would
+/// silently lose its host. The admin API refuses such a host; this catches
+/// one stored before the alias was configured (or by an instance without
+/// it).
+pub async fn check_alias_hosts(state: &AppState) -> anyhow::Result<()> {
+    let Some(images) = state.formats.images_plugin() else {
+        return Ok(());
+    };
+    for alias in state.base_urls.aliases() {
+        let taken =
+            forge_db::oci_dao::find_repository_by_host(&state.pool, &alias.host, images.id())
+                .await
+                .context("look up the docker repository hosts")?;
+        if let Some(repo) = taken {
+            anyhow::bail!(
+                "server.alias_base_urls: the alias {} has the host of the docker repository \
+                 {:?}; remove the repository's host (Admin -> Repositories) or the alias",
+                alias.url,
+                repo.name
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `forge_setting` key prefix (`<prefix>:<username>`) recording that the

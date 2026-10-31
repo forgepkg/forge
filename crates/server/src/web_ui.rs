@@ -44,11 +44,19 @@
 //! The admin **UI** therefore lives under [`UI_ADMIN_PREFIX`] (`/manage/*`),
 //! not `/admin/*`: a UI route sharing the API's paths would answer a refresh,
 //! bookmark or deep link with raw JSON (or a 404/405).
+//!
+//! ## Alias hosts
+//! The web UI is served on `server.public_base_url` alone: its session cookie
+//! is bound to that host, and its sign-in and OIDC redirects go there. A
+//! `GET` (or `HEAD`) of a UI path on an alias host (`server.alias_base_urls`,
+//! [`crate::base_urls`]) is redirected (`302`) to the same path and query on
+//! the public base URL, which covers bookmarks to the old Nexus UI.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use base64::Engine as _;
@@ -56,6 +64,7 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::base_urls::BaseUrls;
 use crate::config::WebConfig;
 
 /// Path prefix of the admin UI in the SPA (the admin REST API keeps `/admin`).
@@ -92,6 +101,8 @@ struct Spa {
     shell: ServeDir<ServeFile>,
     /// `Content-Security-Policy` for every SPA response.
     csp: HeaderValue,
+    /// The public base URL a UI request on an alias host is redirected to.
+    base_urls: Arc<BaseUrls>,
 }
 
 /// Build the static SPA file service from [`WebConfig`].
@@ -108,6 +119,8 @@ struct Spa {
 ///   links.
 /// * `/` serves `index.html` (ServeDir appends the directory index by default).
 /// * `Cache-Control` is set as described in the [module docs](self).
+/// * A `GET` or `HEAD` of a UI path on an alias host of `base_urls` is
+///   redirected to the public base URL ([module docs](self#alias-hosts)).
 ///
 /// We use [`ServeDir::fallback`] (not `not_found_service`): `fallback` serves
 /// the fallback's response **verbatim** (so a found `index.html` returns `200`),
@@ -116,7 +129,7 @@ struct Spa {
 ///
 /// If `index.html` is missing (UI not built), the fallback yields a 404 — the
 /// API still works.
-pub fn spa_service(cfg: &WebConfig) -> Router {
+pub fn spa_service(cfg: &WebConfig, base_urls: Arc<BaseUrls>) -> Router {
     let assets_dir = PathBuf::from(&cfg.assets_dir);
     let index = assets_dir.join("index.html");
     // A missing index.html (UI not built) only drops the inline-script hashes;
@@ -128,6 +141,7 @@ pub fn spa_service(cfg: &WebConfig) -> Router {
         files: ServeDir::new(&assets_dir),
         shell: ServeDir::new(&assets_dir).fallback(ServeFile::new(index)),
         csp,
+        base_urls,
     };
     Router::new().fallback(serve_spa).with_state(spa)
 }
@@ -138,6 +152,10 @@ async fn serve_spa(State(spa): State<Spa>, req: Request) -> Response {
     let path = req.uri().path();
     if API_PREFIXES.iter().any(|prefix| is_under(path, prefix)) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    if matches!(*req.method(), Method::GET | Method::HEAD) && spa.base_urls.alias_of(&req).is_some()
+    {
+        return to_public(spa.base_urls.public(), &req);
     }
     if path.starts_with(ASSETS_PREFIX) {
         let mut res = match spa.files.oneshot(req).await {
@@ -164,6 +182,24 @@ async fn serve_spa(State(spa): State<Spa>, req: Request) -> Response {
         res.headers_mut()
             .insert(header::CONTENT_SECURITY_POLICY, spa.csp);
         res
+    }
+}
+
+/// A `302` from a UI request on an alias host to the same path and query on
+/// `public` (the public base URL, which may have a path of its own).
+fn to_public(public: &str, req: &Request) -> Response {
+    let path_and_query = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+    let target = format!("{}{path_and_query}", public.trim_end_matches('/'));
+    match HeaderValue::from_str(&target) {
+        Ok(location) => (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, location),
+                (header::CACHE_CONTROL, NO_CACHE),
+            ],
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
@@ -232,7 +268,12 @@ mod tests {
         fs::write(dir.path().join("assets").join("a.js"), "ASSET").unwrap();
         let mut cfg = WebConfig::default();
         cfg.assets_dir = dir.path().to_string_lossy().to_string();
-        let svc = spa_service(&cfg);
+        let base_urls = BaseUrls::new(
+            "https://forge.example.com/ui",
+            &["http://nexus.example.com:8081".to_string()],
+        )
+        .unwrap();
+        let svc = spa_service(&cfg, Arc::new(base_urls));
         (dir, svc)
     }
 
@@ -334,6 +375,54 @@ mod tests {
                     <script async src='/y.js'></script><script data-srcx=\"1\">b()</script></head>";
         assert_eq!(inline_scripts(html), vec!["a()", "b()"]);
         assert!(inline_scripts("<script>unterminated").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_page_on_an_alias_host_is_redirected_to_the_public_url() {
+        let (_dir, svc) = fake_spa();
+        let request = |method: &str, uri: &str, host: &str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap()
+        };
+        for (method, uri) in [
+            ("GET", "/"),
+            ("GET", "/?x=1"),
+            ("GET", "/manage/repositories?tab=all"),
+            ("HEAD", "/deep/link"),
+            ("GET", "/assets/a.js"),
+        ] {
+            let res = svc
+                .clone()
+                .oneshot(request(method, uri, "NEXUS.example.com"))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::FOUND, "{method} {uri}");
+            assert_eq!(
+                res.headers()[header::LOCATION],
+                format!("https://forge.example.com/ui{uri}").as_str(),
+                "{method} {uri}"
+            );
+        }
+        // An API path stays a 404 there, as on the public host.
+        let res = svc
+            .clone()
+            .oneshot(request("GET", "/admin/nope", "nexus.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        // The public host, and a host that is no alias, are served the page.
+        for host in ["forge.example.com", "other.example.com"] {
+            let res = svc
+                .clone()
+                .oneshot(request("GET", "/manage/repositories", host))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{host}");
+        }
     }
 
     #[tokio::test]

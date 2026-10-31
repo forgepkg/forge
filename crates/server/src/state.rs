@@ -59,6 +59,9 @@ pub struct AppState {
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
+    /// The base URLs client-protocol URLs are rendered on: the public one,
+    /// and the alias a request's `Host` names ([`crate::base_urls`]).
+    pub base_urls: Arc<crate::base_urls::BaseUrls>,
     /// DB-backed auth realms: the snapshot cache the password chain, the OIDC
     /// login runtime and the login UX endpoints are built from.
     pub realms: Arc<RealmAuth>,
@@ -382,6 +385,7 @@ impl AppState {
                 config.nuget.limits(),
                 config.npm.limits(),
             )),
+            base_urls: Arc::new(config.base_urls()),
             config,
             realms,
             sessions,
@@ -434,6 +438,7 @@ impl AppState {
             envelope: self.envelope.clone(),
             config: crate::images::RegistryConfig {
                 public_base_url: self.config.public_base_url(),
+                base_urls: self.base_urls.clone(),
                 max_blob_bytes: self.config.docker_max_blob_bytes(),
                 default_max_upload_bytes: self
                     .config

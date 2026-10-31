@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type { ApiError } from '~/lib/httpClient'
 import {
+  fetchAddresses,
   fetchBlobCache,
   fetchCryptoKeys,
   rotateKeys,
@@ -10,6 +11,7 @@ import {
   type CryptoKeys,
   type RotationLayer,
   type RotationResult,
+  type ServerAddresses,
 } from '~/api/system'
 
 /** The secret encryption's key metadata (`GET /admin/crypto/keys`). */
@@ -34,5 +36,14 @@ export function useBlobCache() {
   return useQuery<BlobCacheStats, ApiError>({
     queryKey: systemKeys.blobCache(),
     queryFn: ({ signal }) => fetchBlobCache(signal),
+  })
+}
+
+/** The public and alias base URLs (`GET /admin/addresses`); they change only with a restart. */
+export function useAddresses() {
+  return useQuery<ServerAddresses, ApiError>({
+    queryKey: systemKeys.addresses(),
+    queryFn: ({ signal }) => fetchAddresses(signal),
+    staleTime: Infinity,
   })
 }

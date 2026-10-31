@@ -38,6 +38,18 @@ allow_insecure_defaults = true  # (default: false)
 # ("forge" for proxy_pass http://forge:8421): every request then names an
 # allowed host, and the guard is off.
 allowed_hosts = []              # (default: [])
+# Further base URLs clients reach this server under, such as the old Nexus host
+# pointed at Forge: a scheme, a host and an optional port, no path. A request
+# whose Host names one (case-insensitive, port ignored) is handed the URLs of
+# its protocol on that alias: a NuGet feed's resources, an npm package's
+# tarballs, the registry's token service (docker login <alias>). Any other Host
+# gets URLs on public_base_url. The web UI, sign-in and the connect snippets
+# stay on public_base_url, and a web UI page asked for on an alias is redirected
+# there. An alias is one of this server's names for the trusted-header realms
+# (no need to repeat it in allowed_hosts), and no docker repository may have it
+# as its host. Keep Host intact in the reverse proxy and cover the alias with
+# its certificate. See docs/deployment.md, "Further host names (aliases)".
+alias_base_urls = []            # (default: []) e.g. ["https://nexus.example.com"]
 # Connection and request time limits. A client that takes longer to send its
 # request headers, or whose request body stalls longer, is cut off; a handler
 # that has not answered within request_timeout_seconds gets 408 (an already

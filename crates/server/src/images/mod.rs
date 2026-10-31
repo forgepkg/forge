@@ -58,6 +58,9 @@ use token::TokenKeys;
 pub struct RegistryConfig {
     /// `server.public_base_url`, without a trailing `/`.
     pub public_base_url: String,
+    /// The public base URL and the aliases: a request on an alias host is
+    /// served with the alias as its token realm and service.
+    pub base_urls: Arc<crate::base_urls::BaseUrls>,
     /// Largest blob (layer) a proxy downloads from its upstream.
     pub max_blob_bytes: u64,
     /// Largest blob a push to a hosted repository may carry when the
