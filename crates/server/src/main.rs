@@ -172,6 +172,8 @@ async fn main() -> anyhow::Result<()> {
         .context("load the registry token key")?;
     let state =
         AppState::new(pool, blob_store, cache, config, envelope).with_registry_keys(registry_keys);
+    // No docker repository may have the host of an alias base URL.
+    forge_server::app::check_alias_hosts(&state).await?;
     let layer = principal_layer(&state)?;
     telemetry::install_live_source(&state);
     let serve_options = forge_server::serve::ServeOptions::from_config(&state.config);

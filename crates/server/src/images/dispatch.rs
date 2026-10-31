@@ -228,9 +228,24 @@ impl Registry {
 
     /// Which host the request reached and the token realm and service that
     /// go with it. A host that names a repository of the images format
-    /// (`config.host`) serves that repository at the registry root.
+    /// (`config.host`) serves that repository at the registry root. An
+    /// alias host (`server.alias_base_urls`) is one of the server's own:
+    /// repositories by path, with the alias as token realm and service, as
+    /// on a repository's own host. It is checked first, so a repository
+    /// host equal to an alias (which the admin API and startup refuse)
+    /// never takes it over.
     pub(crate) async fn site(&self, host: Option<String>) -> ImgResult<Site> {
         let public = &self.inner.config.public_base_url;
+        if let Some(alias) = self.inner.config.base_urls.alias(host.as_deref()) {
+            let (scheme, alias_host) = registry_origin(&alias.url);
+            return Ok(Site {
+                realm: format!("{scheme}://{alias_host}/v2/token"),
+                service: alias_host,
+                issuer: token::issuer(public),
+                base_url: alias.url.clone(),
+                host_repo: None,
+            });
+        }
         let (scheme, public_host) = registry_origin(public);
         let host = host.map(|h| h.to_ascii_lowercase());
         let host_repo = match &host {
@@ -251,6 +266,7 @@ impl Registry {
             service,
             realm,
             issuer: token::issuer(public),
+            base_url: public.clone(),
             host_repo,
         })
     }
@@ -718,7 +734,7 @@ impl Conversation<'_> {
             },
             base_url: format!(
                 "{}{}",
-                self.reg.inner.config.public_base_url,
+                self.ctx.site.base_url,
                 forge_plugin::api::IMAGES_MOUNT
             ),
             inline: false,
@@ -1123,6 +1139,9 @@ pub(crate) struct Site {
     /// The token endpoint URL.
     pub realm: String,
     pub issuer: String,
+    /// The base URL the request is served on: the alias it addressed, else
+    /// `server.public_base_url`.
+    pub base_url: String,
     /// The repository this host serves (host-based routing).
     pub host_repo: Option<Repository>,
 }

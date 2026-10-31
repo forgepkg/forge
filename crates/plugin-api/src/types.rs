@@ -265,8 +265,12 @@ impl Default for Assets {
 pub struct Repository {
     pub name: String,
     pub kind: RepositoryKind,
-    /// The absolute URL the repository is served at, without a trailing
-    /// slash (e.g. `https://forge.example.com/repository/charts`).
+    /// The absolute URL the repository is served at for this request,
+    /// without a trailing slash (e.g.
+    /// `https://forge.example.com/repository/charts`): on the server's public
+    /// base URL, or on the alias base URL the request's `Host` named
+    /// (`server.alias_base_urls`). Build every absolute URL from it, so a
+    /// client stays on the host it asked.
     pub base_url: String,
     /// Files formats: whether the repository's files are displayed by a
     /// browser (its `inline` content disposition) rather than downloaded, as

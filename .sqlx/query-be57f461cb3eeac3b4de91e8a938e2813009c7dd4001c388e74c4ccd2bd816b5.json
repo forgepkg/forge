@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT deprecation FROM component\n        WHERE repository_id = $1 AND name = $2 AND version = $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deprecation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "deprecation"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "be57f461cb3eeac3b4de91e8a938e2813009c7dd4001c388e74c4ccd2bd816b5"
+}

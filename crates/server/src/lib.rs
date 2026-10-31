@@ -16,6 +16,7 @@
 pub mod admin;
 pub mod app;
 pub mod auth;
+pub mod base_urls;
 pub mod browse;
 pub mod browse_images;
 pub mod cli_auth;

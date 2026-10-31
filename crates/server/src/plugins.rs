@@ -34,6 +34,9 @@
 //! * **Responses** the plugin renders keep only the headers in
 //!   [`PASSED_RESPONSE_HEADERS`] (no cookies, no CORS, no redirects or links
 //!   off this repository) and get the feed's hardening headers.
+//! * **URLs** the plugin renders start with the repository's absolute URL
+//!   ([`repository_url_for`]): on the alias base URL the request's `Host`
+//!   names (`server.alias_base_urls`), else on `server.public_base_url`.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -363,7 +366,9 @@ async fn serve(
             RepoKind::Proxy => protocol::RepositoryKind::Proxy,
             RepoKind::Group => protocol::RepositoryKind::Group,
         },
-        base_url: repository_url(state, &repo.name),
+        // On the alias host the request addressed, if any: every URL the
+        // plugin renders, and the redirects it may return, stay there.
+        base_url: repository_url_for(state, crate::base_urls::request_authority(&req), &repo.name),
         inline: stores_files && repo.inline_content(),
         options: repo.format_options(),
     };
@@ -2002,7 +2007,7 @@ fn outcome(result: Result<DeleteOutcome, WriteError>) -> Result<(), Response> {
 }
 
 /// A tag: a short word of letters, digits, `.`, `_` and `-`.
-fn valid_tag(tag: &str) -> bool {
+pub(crate) fn valid_tag(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() <= 64
         && tag
@@ -2179,12 +2184,24 @@ fn directory_page(page: crate::files::listing::Page) -> protocol::DirectoryPage 
     }
 }
 
-/// The absolute URL of repository `name`, the base its plugin builds URLs on.
+/// The absolute URL of repository `name` on `server.public_base_url`, as the
+/// web UI shows it (its connect snippets are a browser surface, which stays on
+/// the public base URL).
 pub fn repository_url(state: &AppState, name: &str) -> String {
-    format!(
-        "{}/repository/{name}",
-        state.config.public_base_url().trim_end_matches('/')
-    )
+    repository_url_on(state.base_urls.public(), name)
+}
+
+/// The absolute URL of repository `name` as a request that addressed
+/// `authority` is served it, the base its plugin builds URLs on: on the alias
+/// the request's `Host` names, else on `server.public_base_url`
+/// ([`crate::base_urls`]).
+pub fn repository_url_for(state: &AppState, authority: Option<&str>, name: &str) -> String {
+    repository_url_on(state.base_urls.for_authority(authority), name)
+}
+
+/// The absolute URL of repository `name` on `base` (no trailing `/`).
+fn repository_url_on(base: &str, name: &str) -> String {
+    format!("{}/repository/{name}", base.trim_end_matches('/'))
 }
 
 /// See [`Ctx::within_repository`]. A path may also start with the path of

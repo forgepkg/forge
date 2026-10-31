@@ -666,7 +666,9 @@ rules hold:
 - **Ask for data, don't assume it.** `handle` returns `Action::Load(queries)`;
   `render` gets each query with its answer and may load more, respond, or
   hand the request to the host (a download, a publish, serving a file). Build absolute
-  URLs from the repository's `base_url`. Groups and kinds are already
+  URLs from the repository's `base_url`: it is on the host the request
+  named when that is an [alias](deployment.md#further-host-names-aliases),
+  so the client stays there. Groups and kinds are already
   resolved by the time data reaches you.
 - **Test the protocol without a server.** `forge-plugin-api`'s `testing`
   feature runs `handle` and `render` against canned answers to the queries

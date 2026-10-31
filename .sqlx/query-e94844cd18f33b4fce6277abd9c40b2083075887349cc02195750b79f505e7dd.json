@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE component SET deprecation = NULL WHERE repository_id = $1 AND name = 'alpha' AND version = '1.0.0'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e94844cd18f33b4fce6277abd9c40b2083075887349cc02195750b79f505e7dd"
+}

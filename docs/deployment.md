@@ -1033,9 +1033,9 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   default).
 - Serve `/v2` at the root of the host: Docker clients always talk to
   `https://<host>/v2/`, whatever path `public_base_url` has. A docker
-  repository with a `host` ([docs/docker.md](docker.md#names)) needs that
-  name routed to Forge with `Host` preserved, and covered by the
-  certificate.
+  repository with a `host` ([docs/docker.md](docker.md#names)), and an
+  [alias](#further-host-names-aliases), need that name routed to Forge with
+  `Host` preserved, and covered by the certificate.
 - Disable response buffering or give it enough room. Package downloads are
   streamed.
 - Do not rewrite the `Origin` or `Sec-Fetch-Site` headers. Forge refuses
@@ -1086,6 +1086,65 @@ server {
 }
 ```
 
+### Further host names (aliases)
+
+The simplest cutover from Nexus points the Nexus host name at Forge, so
+clients keep their configuration: every repository but Docker's is served
+under the same `/repository/<name>/` path as on Nexus, so
+`https://nexus.example.com/repository/nuget-group/index.json` keeps working.
+Forge answers a request for any host name, but it builds the absolute URLs it
+hands clients on `public_base_url`. A client that came in on the old name
+would be sent to the public name after its first request (a NuGet feed's
+resources, an npm package's tarballs, the registry's token service), and
+would then have to reach that host too (network, egress proxy, TLS), and
+send its credentials there.
+
+List such names in `server.alias_base_urls`
+(`FORGE_SERVER__ALIAS_BASE_URLS=[https://nexus.example.com]`):
+
+```toml
+[server]
+public_base_url = "https://forge.example.com"
+alias_base_urls = ["https://nexus.example.com"]
+```
+
+- Each entry is a scheme, a host and an optional port (`http://nexus.example.com:8081`),
+  without a path. Startup refuses a malformed entry, one with a path, query
+  or credentials, a host listed twice, and the host of `public_base_url`. It
+  warns about an entry that is not https.
+- A request whose `Host` names an alias is answered with URLs on that alias.
+  Hosts are matched the way `server.allowed_hosts` matches them:
+  case-insensitive, without a trailing dot, and the port ignored, so the
+  alias's own port is used even when the proxy drops it from `Host`. A
+  NuGet service index fetched there lists its resources there, an npm
+  packument its tarballs, `npm login` polls there, and the registry names
+  the alias as its token realm and service
+  (`https://nexus.example.com/v2/token`, see
+  [docs/docker.md](docker.md#names)).
+- Only listed names count. A request for any other host gets URLs on
+  `public_base_url`, as before, so a forged `Host` cannot make Forge render
+  links to a host of its choosing (cache poisoning).
+- Forge reads `Host`, never `X-Forwarded-Host`, as it does for a docker
+  repository's own host. Route the alias to Forge with `Host` preserved
+  (nginx: the alias in `server_name`, `proxy_set_header Host $host`), and
+  cover it with the TLS certificate. With the Helm chart, list it next to
+  `host` in `httpRoute.hostnames` and `certificate.dnsNames` (and give it a
+  listener in `listenerSet.listeners`), which default to `host` alone.
+- An alias is one of Forge's own names for the
+  [trusted-header realms](#trusted-header-realms): it need not be in
+  `server.allowed_hosts` too.
+- No docker repository may have an alias as its `host`. The admin API
+  refuses one, and startup fails while a repository has one (from before the
+  alias was configured): remove the repository's host or the alias.
+- Browser surfaces stay on `public_base_url`: the web UI, sign-in and OIDC
+  redirects, the session cookie, the CSRF origin check, links in emails, the
+  approval page of `npm login`, and the connect snippets the web UI shows. A
+  web UI page requested on an alias (a bookmark to the old Nexus UI) is
+  redirected (302) to the same path on `public_base_url`. The APIs
+  (`/admin`, `/auth`, `/browse`) answer on an alias as on the public host.
+
+**Admin → System** shows the public URL and the aliases.
+
 ### Trusted-header realms
 
 A `trusted_header` realm (**Admin → Authentication → New realm → Trusted
@@ -1114,7 +1173,8 @@ What Forge believes, and when:
 
 - The headers count only when the **socket peer** is in
   `auth.trusted_proxy_cidrs` and the request's `Host` is one of Forge's own
-  names (the host of `public_base_url`, or one in `server.allowed_hosts`: a
+  names (the host of `public_base_url`, of an
+  [alias](#further-host-names-aliases), or one in `server.allowed_hosts`: a
   DNS-rebinding page reaches the proxy under its own name). From any other
   request they are ignored. This guard holds only while the proxy forwards
   the client's own `Host`: never list the name a proxy rewrites `Host` to
