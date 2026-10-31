@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE raw_file\n            SET blob_sha256 = $2, size = $3, content_type = $4, sha512_base64 = $5,\n                sha1 = $6, md5 = $7, upstream_etag = $8, upstream_last_modified = $9,\n                checked_at = CASE WHEN $10 THEN now() END,\n                immutable = $11,\n                updated_at = greatest(now(), updated_at + interval '1 microsecond')\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fc7378cc859a92d60264d8343c125e8e7574e053537d15aec3ce04939c920acd"
+}

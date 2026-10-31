@@ -45,6 +45,8 @@ export interface BrowseRepo {
    * for a format this server does not have installed.
    */
   url?: string
+  /** The settings of its format's own (apt's `distribution`). */
+  options?: Record<string, string>
 }
 
 /**

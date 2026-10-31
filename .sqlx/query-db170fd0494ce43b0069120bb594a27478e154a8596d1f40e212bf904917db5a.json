@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE repository_index SET fingerprint = $2, generated_at = now()\n        WHERE repository_id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "db170fd0494ce43b0069120bb594a27478e154a8596d1f40e212bf904917db5a"
+}

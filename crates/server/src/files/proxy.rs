@@ -26,10 +26,13 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use forge_core::net::upstream::{RequestClass, UpstreamAuth};
-use forge_core::repo::proxy::{upstream_credentials, Credentials, DEFAULT_NOT_FOUND_TTL_SECONDS};
+use forge_core::repo::proxy::{
+    upstream_credentials, Credentials, DEFAULT_METADATA_TTL_SECONDS, DEFAULT_NOT_FOUND_TTL_SECONDS,
+};
 use forge_db::model::Repository;
 use forge_db::oci_dao;
 use forge_db::raw_dao::{self, NewRawFile, RawFile, Redeploy};
+use forge_plugin::api::FileLocation;
 use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
 use futures_util::TryStreamExt;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
@@ -122,13 +125,13 @@ impl Files<'_> {
             .map_err(|e| FileError::Internal(format!("proxy credentials: {e}")))
     }
 
-    /// The upstream URL of `path`, as the format's plugin names it; `None`
-    /// when the upstream cannot have it.
-    async fn upstream_url(
+    /// Where the upstream keeps `path`, as the format's plugin names it;
+    /// `None` when the upstream cannot have it.
+    async fn upstream_location(
         &self,
         repo: &Repository,
         path: &str,
-    ) -> Result<Option<String>, FileError> {
+    ) -> Result<Option<FileLocation>, FileError> {
         let format = self
             .state
             .formats
@@ -185,11 +188,13 @@ impl Files<'_> {
             })
     }
 
-    /// Cache a successful upstream response as `path`.
+    /// Cache a successful upstream response as `path`, unless it is not the
+    /// size and digest `location` gives it.
     async fn store_response(
         &self,
         repo: &Repository,
         path: &str,
+        location: &FileLocation,
         response: reqwest::Response,
     ) -> Result<RawFile, FileError> {
         let limit = self.state.upstream.config().max_package_bytes;
@@ -214,6 +219,25 @@ impl Files<'_> {
         })?;
         let stored = &ingested.stored;
         forge_telemetry::proxy::upstream_bytes(&repo.name, stored.size);
+        let wrong_size = location.size.is_some_and(|size| size != stored.size);
+        let wrong_digest = location
+            .sha256
+            .as_deref()
+            .is_some_and(|sha256| !sha256.eq_ignore_ascii_case(&stored.sha256));
+        if wrong_size || wrong_digest {
+            tracing::warn!(
+                repo = %repo.name,
+                %path,
+                size = stored.size,
+                sha256 = %stored.sha256,
+                expected_size = ?location.size,
+                expected_sha256 = ?location.sha256,
+                "file proxy: the upstream's file is not the one its index names; not cached"
+            );
+            return Err(FileError::BadGateway(
+                "the upstream's file does not match the size and digest its index gives it".into(),
+            ));
+        }
         let content_type = content_type(declared.as_deref(), path);
         let mut tx = forge_db::begin(&self.state.pool).await?;
         if !oci_dao::lock_proxy_upstream(&mut tx, repo.id, repo.remote_url.as_deref()).await? {
@@ -235,6 +259,7 @@ impl Files<'_> {
                 upstream_etag: etag.as_deref(),
                 upstream_last_modified: last_modified.as_deref(),
                 checked: true,
+                immutable: location.immutable,
             },
             stored.ingest_token,
             Redeploy::Allow,
@@ -262,8 +287,8 @@ impl Files<'_> {
 
     /// [`Self::fresh`], marking what it does on `lookup`.
     async fn fresh_file(&self, repo: &Repository, file: RawFile, lookup: &mut Lookup) -> RawFile {
-        let max_age = repo.max_age_seconds();
-        if max_age == 0 || !repo.online || !is_due(&file, max_age) {
+        let max_age = self.max_age(repo);
+        if file.immutable || max_age == 0 || !repo.online || !is_due(&file, max_age) {
             return file;
         }
         let gate = gate(repo.id, &file.path);
@@ -284,19 +309,32 @@ impl Files<'_> {
         }
     }
 
+    /// How long a proxy's cached copy is served before it is re-validated:
+    /// a files format's `max_age_seconds`, a package format's metadata TTL.
+    fn max_age(&self, repo: &Repository) -> u64 {
+        if self.state.formats.stores_files(&repo.format) {
+            repo.max_age_seconds()
+        } else {
+            repo.metadata_ttl_seconds
+                .map(i64::from)
+                .unwrap_or(DEFAULT_METADATA_TTL_SECONDS)
+                .max(0) as u64
+        }
+    }
+
     async fn revalidate(
         &self,
         repo: &Repository,
         file: &RawFile,
         lookup: &mut Lookup,
     ) -> Result<RawFile, FileError> {
-        let Some(url) = self.upstream_url(repo, &file.path).await? else {
+        let Some(location) = self.upstream_location(repo, &file.path).await? else {
             // The upstream cannot have it (any more): the cached copy stands.
             raw_dao::mark_checked(&self.state.pool, file.id, None, None).await?;
             return Ok(file.clone());
         };
         let response = self
-            .upstream_get(repo, &file.path, &url, Some(file))
+            .upstream_get(repo, &file.path, &location.url, Some(file))
             .await?;
         let status = response.status();
         if status == StatusCode::NOT_MODIFIED {
@@ -312,7 +350,9 @@ impl Files<'_> {
         }
         if status.is_success() {
             lookup.mark(Outcome::Fetched);
-            return self.store_response(repo, &file.path, response).await;
+            return self
+                .store_response(repo, &file.path, &location, response)
+                .await;
         }
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
             lookup.mark(Outcome::StaleServed);
@@ -369,11 +409,11 @@ impl Files<'_> {
             lookup.mark(Outcome::NegativeCached);
             return Ok(None);
         }
-        let Some(url) = self.upstream_url(repo, path).await? else {
+        let Some(location) = self.upstream_location(repo, path).await? else {
             self.remember_not_found(repo, path).await;
             return Ok(None);
         };
-        let response = self.upstream_get(repo, path, &url, None).await?;
+        let response = self.upstream_get(repo, path, &location.url, None).await?;
         let status = response.status();
         if matches!(status, StatusCode::NOT_FOUND | StatusCode::GONE) {
             self.remember_not_found(repo, path).await;
@@ -386,7 +426,9 @@ impl Files<'_> {
             )));
         }
         lookup.mark(Outcome::Fetched);
-        self.store_response(repo, path, response).await.map(Some)
+        self.store_response(repo, path, &location, response)
+            .await
+            .map(Some)
     }
 }
 

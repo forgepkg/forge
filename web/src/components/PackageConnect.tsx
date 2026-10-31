@@ -9,6 +9,12 @@ interface Snippet {
   copyLabel: string
 }
 
+/** What else the snippets of some formats need: apt's kind and distribution. */
+export interface ConnectContext {
+  kind?: string
+  options?: Record<string, string>
+}
+
 /**
  * The client commands for a repository of `format` at `url` (its
  * `/browse/repos` address), named `repo` in the client's configuration.
@@ -20,8 +26,42 @@ export function connectSnippets(
   repo: string,
   url: string,
   canPush: boolean,
+  context: ConnectContext = {},
 ): Snippet[] {
   switch (format) {
+    case 'apt': {
+      const distribution = context.options?.distribution ?? '<distribution>'
+      if (context.kind === 'proxy') {
+        return [
+          {
+            label: 'Add the source (the upstream signs its indexes: trust its keyring)',
+            command: `echo "deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] ${url}/ ${distribution} main" | sudo tee /etc/apt/sources.list.d/${repo}.list`,
+            copyLabel: 'Copy add-source command',
+          },
+        ]
+      }
+      return [
+        {
+          label: 'Trust the repository’s signing keys',
+          command: `curl -fsSL ${url}/key.asc | sudo tee /etc/apt/keyrings/${repo}.asc > /dev/null`,
+          copyLabel: 'Copy key download command',
+        },
+        {
+          label: 'Add the source',
+          command: `echo "${aptSource(repo, url, distribution)}" | sudo tee /etc/apt/sources.list.d/${repo}.list`,
+          copyLabel: 'Copy add-source command',
+        },
+        ...(canPush
+          ? [
+              {
+                label: 'Upload a package',
+                command: `curl -u <username>:<token> -H "Content-Type: multipart/form-data" --data-binary "@<package>.deb" ${url}/`,
+                copyLabel: 'Copy upload command',
+              },
+            ]
+          : []),
+      ]
+    }
     case 'nuget':
       return [
         {
@@ -87,6 +127,26 @@ export function npmrc(url: string): string {
   return `registry=${url}/\n${path}/:_authToken=<token>`
 }
 
+/** The `sources.list` line of a hosted apt repository, its keys at `/etc/apt/keyrings/<repo>.asc`. */
+export function aptSource(repo: string, url: string, distribution: string): string {
+  return `deb [signed-by=/etc/apt/keyrings/${repo}.asc] ${url}/ ${distribution} main`
+}
+
+/**
+ * The `/etc/apt/auth.conf.d/` entry of the repository at `url`: apt sends
+ * credentials over plain HTTP only to a machine written with `http://`.
+ */
+export function aptAuth(url: string): string {
+  let machine = url
+  try {
+    const parsed = new URL(url)
+    machine = `${parsed.protocol === 'http:' ? 'http://' : ''}${parsed.host}${parsed.pathname.replace(/\/$/, '')}`
+  } catch {
+    // Not a URL: shown as it is.
+  }
+  return `machine ${machine}\nlogin <username>\npassword <token>`
+}
+
 /** The `.yarnrc.yml` settings of Yarn 2 and later for the registry at `url`. */
 export function yarnrc(url: string): string {
   return `npmRegistryServer: "${url}/"\nnpmAlwaysAuth: true\nnpmAuthToken: "<token>"`
@@ -103,14 +163,20 @@ export function PackageConnect({
   format,
   repo,
   url,
+  kind,
+  options,
   canPush = false,
 }: {
   format: string
   repo: string
   url: string
+  /** The repository's kind (apt's snippets differ for a proxy). */
+  kind?: string
+  /** The settings of its format's own (apt's distribution). */
+  options?: Record<string, string>
   canPush?: boolean
 }) {
-  const snippets = connectSnippets(format, repo, url, canPush)
+  const snippets = connectSnippets(format, repo, url, canPush, { kind, options })
   const tokens = (
     <Link to="/tokens" className="fg-link">
       Your tokens
@@ -140,9 +206,47 @@ export function PackageConnect({
       {format === 'npm' && (
         <CopyField label="Registry URL" value={`${url}/`} copyLabel="Copy registry URL" />
       )}
+      {format === 'apt' && (
+        <CopyField
+          label="Repository URL"
+          value={`${url}/`}
+          copyLabel="Copy repository URL"
+          description={
+            options?.distribution ? (
+              <>
+                Distribution <code>{options.distribution}</code>, components from the
+                packages’ sections (<code>main</code> unless a section says otherwise).
+              </>
+            ) : undefined
+          }
+        />
+      )}
       {snippets.map((snippet) => (
         <CommandSnippet key={snippet.label} {...snippet} prompt={snippet.command !== url} />
       ))}
+      {format === 'apt' && (
+        <>
+          {kind !== 'proxy' && (
+            <CodeBlock
+              title={`/etc/apt/sources.list.d/${repo}.list`}
+              copyLabel="Copy sources.list line"
+              code={aptSource(repo, url, options?.distribution ?? '<distribution>')}
+              placeholders={['<distribution>']}
+            />
+          )}
+          <CodeBlock
+            title={`/etc/apt/auth.conf.d/${repo}.conf`}
+            copyLabel="Copy auth.conf entry"
+            code={aptAuth(url)}
+          />
+          {kind !== 'proxy' && (
+            <p className="fg-field-desc">
+              Download the signing keys: <a href={`${url}/key.asc`} className="fg-link">key.asc</a>{' '}
+              (armored) or <a href={`${url}/key.gpg`} className="fg-link">key.gpg</a> (binary keyring).
+            </p>
+          )}
+        </>
+      )}
       {format === 'npm' && (
         <>
           <CodeBlock

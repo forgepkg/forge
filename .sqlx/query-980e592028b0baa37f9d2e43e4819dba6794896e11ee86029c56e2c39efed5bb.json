@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE repository_signing_key SET secret_key_enc = $2 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "980e592028b0baa37f9d2e43e4819dba6794896e11ee86029c56e2c39efed5bb"
+}

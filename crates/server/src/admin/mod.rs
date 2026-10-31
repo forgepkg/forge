@@ -72,6 +72,7 @@ pub mod repositories;
 pub mod retention;
 pub mod roles;
 pub mod settings;
+pub mod signing_keys;
 pub mod token_scope;
 pub mod tokens;
 pub mod traffic;
@@ -229,6 +230,14 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/repositories/{name}/proxy-cache/invalidate",
             axum::routing::post(proxy_cache::invalidate),
+        )
+        .route(
+            "/repositories/{name}/signing-keys",
+            get(signing_keys::list).post(signing_keys::add),
+        )
+        .route(
+            "/repositories/{name}/signing-keys/{fingerprint}",
+            axum::routing::delete(signing_keys::delete),
         )
         .route(
             "/repositories/{name}/imports",

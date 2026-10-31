@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT fingerprint FROM repository_signing_key\n        WHERE repository_id = $1\n        ORDER BY id\n        FOR UPDATE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fingerprint",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "fingerprint"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c6ded420e770d039677246cb5949faca8efb5fd75ff5d7b67ad8987900dc2674"
+}

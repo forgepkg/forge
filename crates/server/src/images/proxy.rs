@@ -266,6 +266,7 @@ impl Upstream {
         Remote {
             url: self.remote.clone(),
             index: None,
+            options: Vec::new(),
         }
     }
 
@@ -562,6 +563,7 @@ impl Registry {
         let remote = Remote {
             url: remote.to_string(),
             index: None,
+            options: Vec::new(),
         };
         match self.plugin().upstream(&remote, op, &[]) {
             Ok(UpstreamStep::Done(answer)) => Ok(answer),

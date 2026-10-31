@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT c.name, c.version, c.version_original, c.manifest_summary, c.created_at,\n               a.size, a.blob_sha256 AS sha256, a.sha512_base64\n        FROM component c\n        JOIN asset a ON a.component_id = c.id AND a.path = $2\n        WHERE c.repository_id = $1 AND c.listed\n        ORDER BY c.name, c.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "version_original",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "version_original"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "manifest_summary",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "manifest_summary"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "component",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "blob_sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "sha512_base64",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "asset",
+            "name": "sha512_base64"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "b5ac992cdbf1cb4c70996b43c1d07e080df16a30cc40389632467e12f29693a8"
+}

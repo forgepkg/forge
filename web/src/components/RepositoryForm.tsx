@@ -1,12 +1,13 @@
 import { useState, type ReactNode } from 'react'
 
-import type {
-  CreateRepo,
-  DeploymentPolicy,
-  FormatView,
-  RepoKind,
-  RepoView,
-  UpdateRepo,
+import {
+  optionsFor,
+  type CreateRepo,
+  type DeploymentPolicy,
+  type FormatView,
+  type RepoKind,
+  type RepoView,
+  type UpdateRepo,
 } from '~/api/repositories'
 import {
   Button,
@@ -214,6 +215,8 @@ export interface RepoFormValues {
   inline_content: boolean
   /** Raw proxy: seconds before a cached file is re-validated; blank = a day. */
   max_age_seconds: string
+  /** The settings of the format's own (`FormatView.options`), by name. */
+  options: Record<string, string>
 }
 
 export interface RepositoryFormProps {
@@ -274,8 +277,12 @@ function seed(existing?: RepoView): RepoFormValues {
       existing.max_age_seconds !== DEFAULT_RAW_MAX_AGE_SECONDS
         ? String(existing.max_age_seconds)
         : '',
+    options: { ...(existing?.options ?? {}) },
   }
 }
+
+/** The form's values seeded from `existing` (the defaults without one). */
+export const toFormValues = seed
 
 const MIB = 1024 * 1024
 
@@ -391,6 +398,11 @@ export function RepositoryForm({
       const hostError = validateDockerHost(values.host)
       if (hostError) next.host = hostError
     }
+    for (const option of optionsFor(format, values.kind)) {
+      if (option.required && (values.options[option.name] ?? '').trim() === '') {
+        next[`option:${option.name}`] = `${option.label} is required.`
+      }
+    }
     if (values.kind === 'hosted' && values.max_upload_mib.trim() !== '') {
       const bytes = mibToBytes(values.max_upload_mib)
       const ceiling = format.max_upload_bytes_limit
@@ -427,8 +439,16 @@ export function RepositoryForm({
       ...v,
       format: next.id,
       kind: next.kinds.includes(v.kind) ? v.kind : 'hosted',
+      // Options are the format's own.
+      options: next.id === v.format ? v.options : {},
     }))
   }
+
+  function setOption(name: string, value: string) {
+    setValues((v) => ({ ...v, options: { ...v.options, [name]: value } }))
+  }
+
+  const formatOptions = optionsFor(format, values.kind)
 
   const isProxy = values.kind === 'proxy'
   const isHosted = values.kind === 'hosted'
@@ -533,6 +553,21 @@ export function RepositoryForm({
               />
             )}
           </div>
+
+          {formatOptions.map((option) => (
+            <TextField
+              key={option.name}
+              label={option.label}
+              type="text"
+              mono
+              optional={!option.required}
+              placeholder={option.example}
+              value={values.options[option.name] ?? ''}
+              onChange={(e) => setOption(option.name, e.target.value)}
+              error={announced(errors[`option:${option.name}`])}
+              description={option.description}
+            />
+          ))}
 
           <Switch
             label="Online"
@@ -736,7 +771,7 @@ export function RepositoryForm({
               />
             )}
 
-            {!isDocker && !isRaw && (
+            {!isDocker && !isRaw && !format.signed_indexes && (
               <TextField
                 label="Package delay (seconds)"
                 type="number"
@@ -1076,6 +1111,12 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
   }
   // Absent means NuGet, the server's default.
   if (values.format !== 'nuget') body.format = values.format
+  const options = Object.fromEntries(
+    Object.entries(values.options)
+      .map(([name, value]) => [name, value.trim()] as const)
+      .filter(([, value]) => value !== ''),
+  )
+  if (Object.keys(options).length > 0) body.options = options
   if (docker && values.host.trim() !== '') {
     body.host = values.host.trim()
   }
@@ -1161,6 +1202,14 @@ export function toUpdateBody(
     body.anonymous_read = values.anonymous_read
   }
   if (values.online !== before.online) body.online = values.online
+  const changed: Record<string, string | null> = {}
+  for (const [name, raw] of Object.entries(values.options)) {
+    const value = raw.trim()
+    if (value !== (before.options[name] ?? '').trim()) {
+      changed[name] = value === '' ? null : value
+    }
+  }
+  if (Object.keys(changed).length > 0) body.options = changed
   if (
     !docker &&
     values.kind === 'hosted' &&

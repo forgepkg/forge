@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT md5(coalesce(string_agg(\n                   c.id::text || ':' || c.version || ':' || a.blob_sha256 || ':'\n                       || c.updated_at::text,\n                   ',' ORDER BY c.id), '')) AS \"digest!\"\n        FROM component c\n        JOIN asset a ON a.component_id = c.id AND a.path = $2\n        WHERE c.repository_id = $1 AND c.listed\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "digest!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "273a55548f16aa07d44458ec0882b1a8dc0c2d19bfe31f08a98d5375f772a07f"
+}

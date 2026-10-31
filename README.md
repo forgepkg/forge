@@ -1,7 +1,7 @@
 # Forge
 
-A self-hosted **NuGet package registry, npm registry, Docker / OCI registry
-and raw file repository** written in Rust. It speaks the NuGet **V3**
+A self-hosted **NuGet package registry, npm registry, Docker / OCI registry,
+apt repository and raw file repository** written in Rust. It speaks the NuGet **V3**
 protocol, the **npm registry** protocol (npm, pnpm, Yarn, Bun) and the **OCI Distribution Spec**
 v1.1 (Docker, Podman, containerd, crane, Helm, cosign), and supports the
 three repository types you expect from an enterprise registry (more package
@@ -27,7 +27,9 @@ registry, and groups — see **[docs/docker.md](./docs/docker.md)** — and for 
 under arbitrary paths (binaries, installers, fixtures), like Nexus' raw
 repositories, with ranges, checksum sidecars and proxies of any HTTP(S)
 download URL such as GitHub release assets — see
-**[docs/raw.md](./docs/raw.md)**.
+**[docs/raw.md](./docs/raw.md)**; and for Debian and Ubuntu packages, apt
+repositories whose indexes Forge signs with keys of their own, and proxies of
+Debian and Ubuntu mirrors — see **[docs/apt.md](./docs/apt.md)**.
 
 Storage is **content-addressed (CAS)** on top of any **S3-compatible** object
 store; package metadata lives in **PostgreSQL**. Access control is **fine-grained
@@ -57,7 +59,7 @@ A Cargo workspace of small crates plus the web SPA:
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
 | `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
-| `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
+| `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `apt`, `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
 | `server` | `forge-server` | Axum HTTP server: the format plugins' feeds under `/repository/{repo}` (except Docker at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
@@ -209,6 +211,10 @@ The guides below are also a site, with navigation and search:
 - **[DEVELOPMENT.md](./DEVELOPMENT.md)** — full local-dev guide: every
   `cargo xtask` command, configuration knobs, OIDC/Entra setup, the web UI dev
   server, tests, and Docker packaging details.
+- **[apt repositories](./docs/apt.md)** — Debian and Ubuntu packages (hosted,
+  proxy) for `apt`: `.deb` uploads, indexes signed with the repository's keys
+  and their rotation, `sources.list` and `auth.conf.d`, proxies of Debian and
+  Ubuntu mirrors.
 - **[Docker / OCI registry](./docs/docker.md)** — image repositories (hosted,
   proxy, group), naming and host-based routing, `docker login`, retention and
   garbage collection.

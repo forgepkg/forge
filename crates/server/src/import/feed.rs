@@ -65,6 +65,7 @@ impl Feed {
             remote: Remote {
                 url: url.to_string(),
                 index: None,
+                options: Vec::new(),
             },
             origins: Mutex::new(UpstreamOrigins::new(url, [])),
             username,

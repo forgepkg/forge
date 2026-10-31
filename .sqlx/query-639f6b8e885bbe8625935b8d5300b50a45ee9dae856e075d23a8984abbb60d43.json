@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT fingerprint FROM repository_index WHERE repository_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fingerprint",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_index",
+            "name": "fingerprint"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "639f6b8e885bbe8625935b8d5300b50a45ee9dae856e075d23a8984abbb60d43"
+}

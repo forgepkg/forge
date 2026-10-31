@@ -66,6 +66,9 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // A proxy given only a password (a registry token) sends it as a Bearer
     // token, as npm clients do with `_authToken`.
     upstream_token: UpstreamToken::Bearer,
+    options: &[],
+    prereleases: forge_plugin_api::Prereleases::Dash,
+    indexes: false,
 };
 
 /// What the plugin reads of a request, beyond the package the repository's
