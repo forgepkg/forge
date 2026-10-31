@@ -1412,6 +1412,7 @@ async fn retention_deletes_old_files_and_keeps_the_newest() {
         chrono::Duration::zero(),
         false,
         None,
+        None,
     )
     .await
     .unwrap();

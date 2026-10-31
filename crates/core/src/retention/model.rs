@@ -9,10 +9,18 @@
 //!
 //! Parity subset of Nexus cleanup policies + Artifactory retention:
 //!   * protections: `keep_last_n`, `keep_n_most_downloaded`
-//!   * triggers (ANDed within a rule): `older_than_days`, `not_downloaded_for_days`
-//!   * filters: `release_type` (release vs prerelease), `package_name_prefix`
-//!   * proxy rules: `scope: proxy_cached` with `not_pulled_for_days`, and the
-//!     same protections over each package's cached versions
+//!   * triggers (ANDed within a rule): `older_than_days`, `not_downloaded_for_days`,
+//!     `prerelease_superseded_for_days`, `unlisted_for_days`,
+//!     `max_versions_per_package`
+//!   * filters: `release_type` (release, prerelease or snapshot, as the format
+//!     classes a version), `package_name_prefix`, `selector` (a content
+//!     selector), `version_pattern` / `exclude_version_pattern` (globs)
+//!   * proxy rules: `scope: proxy_cached` with `not_pulled_for_days` (or
+//!     `max_versions_per_package`), and the same protections over each
+//!     package's cached versions
+//!   * scheduling: `min_run_interval_seconds`, or a cron `schedule` in a
+//!     `schedule_timezone`, and `max_run_seconds` (see
+//!     [`crate::retention::schedule`])
 //!
 //! These types are **pure data** + a `validate_policy` function; no I/O. They are
 //! (de)serialized straight to/from the jsonb column with serde.
@@ -45,6 +53,19 @@ pub struct RetentionPolicy {
     /// never schedules runs less than 60 s apart, whatever this says.
     #[serde(default = "default_min_run_interval")]
     pub min_run_interval_seconds: u64,
+    /// A 5-field cron pattern (`0 3 * * *`): the worker runs the policy at
+    /// its times instead of every `min_run_interval_seconds`. A manual run
+    /// still runs at once. See [`crate::retention::schedule`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    /// The IANA time zone of `schedule`'s times (`Europe/Berlin`); UTC when
+    /// absent. Only with a `schedule`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_timezone: Option<String>,
+    /// How long a run may apply decisions before it stops; the next run
+    /// goes on with what is left. `None`: as long as it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_seconds: Option<u64>,
     /// Optional repository-wide logical-size budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_budget: Option<SizeBudget>,
@@ -118,6 +139,20 @@ pub struct RetentionRule {
     /// Optional case-insensitive package-id prefix filter (`None` ⇒ all ids).
     #[serde(default)]
     pub package_name_prefix: Option<String>,
+    /// Optional content selector, by name: only packages its include and
+    /// exclude globs admit (as a grant scoped by it would). Resolved when
+    /// the policy is stored and on every run; a selector that is gone fails
+    /// the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    /// Optional glob on the normalized version, ignoring case (`*-ci.*`,
+    /// `{*-pr.*,*-ci.*}`): only versions it matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_pattern: Option<String>,
+    /// Optional glob on the normalized version, ignoring case: never the
+    /// versions it matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_version_pattern: Option<String>,
     /// The protections + triggers for this rule.
     #[serde(default)]
     pub criteria: Criteria,
@@ -163,17 +198,20 @@ pub enum Scope {
     ProxyCached,
 }
 
-/// Release-type filter for a rule.
+/// Release-type filter for a rule: the version classes it admits, as the
+/// repository's format classes a version ([`crate::format::Format::version_class`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseType {
     /// Match every version.
     #[default]
     Any,
-    /// Match only stable releases (no prerelease label).
+    /// Match only stable releases (for SemVer formats: no prerelease label).
     Releases,
     /// Match only prerelease versions.
     Prereleases,
+    /// Match only snapshot builds (formats that have them, such as Maven).
+    Snapshots,
 }
 
 /// Protections + triggers for a rule. All fields optional; an empty `Criteria`
@@ -215,6 +253,24 @@ pub struct Criteria {
     /// `scope: proxy_cached` rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_pulled_for_days: Option<u32>,
+    /// Trigger: a prerelease (or snapshot) whose package has had, for at
+    /// least this many days, a **listed release that orders after it** (for
+    /// SemVer: a release of the same or a higher base version, so
+    /// `2.3.0-ci.417` once `2.3.0` or `2.4.0` is out). Counted from the
+    /// publication of the first such release. Hosted rules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prerelease_superseded_for_days: Option<u32>,
+    /// Trigger: unlisted for at least this many days (`component.unlisted_at`);
+    /// a listed version never matches. With `action: hard_delete` it is the
+    /// second step of "unlist, then delete later". Hosted rules only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlisted_for_days: Option<u32>,
+    /// Trigger: not among the newest N versions (by format version order,
+    /// listed or not) of its package in this rule's pool, per partition
+    /// ([`crate::format::Format::retention_partition`]). A pure count: no age
+    /// needed. On proxy rules it counts the package's cached versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_versions_per_package: Option<u32>,
 }
 
 impl Criteria {
@@ -225,6 +281,9 @@ impl Criteria {
         self.older_than_days.is_some()
             || self.not_downloaded_for_days.is_some()
             || self.not_pulled_for_days.is_some()
+            || self.prerelease_superseded_for_days.is_some()
+            || self.unlisted_for_days.is_some()
+            || self.max_versions_per_package.is_some()
     }
 
     /// Whether this rule defines any protection.
@@ -260,7 +319,11 @@ pub enum PolicyError {
     #[error("rule id must not be empty")]
     EmptyRuleId,
     /// A rule had no deletion trigger (only protections / nothing).
-    #[error("rule {0:?} has no trigger criterion (older_than_days / not_downloaded_for_days / not_pulled_for_days)")]
+    #[error(
+        "rule {0:?} has no trigger criterion (older_than_days, not_downloaded_for_days, \
+         prerelease_superseded_for_days, unlisted_for_days, max_versions_per_package or \
+         not_pulled_for_days)"
+    )]
     RuleHasNoTrigger(String),
     /// A `keep_*` count was zero (meaningless — protects nothing; use absence
     /// instead).
@@ -313,6 +376,35 @@ pub enum PolicyError {
         /// The upper bound.
         max: u64,
     },
+    /// `schedule`, `schedule_timezone` or `max_run_seconds` is invalid.
+    #[error("{0}")]
+    InvalidSchedule(String),
+    /// A version glob does not compile.
+    #[error("rule {rule:?} field {field} is not a valid glob: {reason}")]
+    InvalidPattern {
+        /// The offending rule id.
+        rule: String,
+        /// The offending field name.
+        field: &'static str,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// A rule's `selector` names no selector (empty).
+    #[error("rule {0:?} field selector must name a content selector")]
+    EmptySelector(String),
+    /// `unlisted_for_days` selects versions already unlisted: unlisting them
+    /// again does nothing.
+    #[error(
+        "rule {0:?} uses unlisted_for_days, which selects versions already unlisted; \
+         its action must be hard_delete"
+    )]
+    UnlistedTriggerUnlists(String),
+    /// `prerelease_superseded_for_days` on a rule that admits only releases.
+    #[error(
+        "rule {0:?} uses prerelease_superseded_for_days, but release_type \"releases\" \
+         admits no prerelease"
+    )]
+    SupersededOnReleases(String),
 }
 
 /// Upper bound on a policy's `min_run_interval_seconds` (one year). Larger
@@ -353,6 +445,13 @@ pub fn validate_policy(policy: &RetentionPolicy, repo_kind: RepoKind) -> Result<
             max: MAX_MIN_RUN_INTERVAL_SECONDS,
         });
     }
+    crate::retention::schedule::validate(
+        policy.schedule.as_deref(),
+        policy.schedule_timezone.as_deref(),
+        policy.max_run_seconds,
+        chrono::Utc::now(),
+    )
+    .map_err(PolicyError::InvalidSchedule)?;
 
     let mut seen_ids: Vec<&str> = Vec::with_capacity(policy.rules.len());
     for rule in &policy.rules {
@@ -396,6 +495,20 @@ fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), Policy
                     field: "not_downloaded_for_days",
                 });
             }
+            // A proxy's cached versions are listed or not as the upstream
+            // says, and are never unlisted here.
+            if c.prerelease_superseded_for_days.is_some() {
+                return Err(PolicyError::HostedFieldOnProxyScope {
+                    rule: rule.id.clone(),
+                    field: "prerelease_superseded_for_days",
+                });
+            }
+            if c.unlisted_for_days.is_some() {
+                return Err(PolicyError::HostedFieldOnProxyScope {
+                    rule: rule.id.clone(),
+                    field: "unlisted_for_days",
+                });
+            }
         }
         Scope::Hosted if repo_kind == RepoKind::Proxy => {
             return Err(PolicyError::HostedScopeOnProxy(rule.id.clone()));
@@ -420,6 +533,12 @@ fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), Policy
             field: "keep_n_most_downloaded",
         });
     }
+    if c.max_versions_per_package == Some(0) {
+        return Err(PolicyError::ZeroCount {
+            rule: rule.id.clone(),
+            field: "max_versions_per_package",
+        });
+    }
     // Days must be positive when present.
     if c.older_than_days == Some(0) {
         return Err(PolicyError::ZeroDays {
@@ -439,6 +558,52 @@ fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), Policy
             field: "not_pulled_for_days",
         });
     }
+    if c.prerelease_superseded_for_days == Some(0) {
+        return Err(PolicyError::ZeroDays {
+            rule: rule.id.clone(),
+            field: "prerelease_superseded_for_days",
+        });
+    }
+    if c.unlisted_for_days == Some(0) {
+        return Err(PolicyError::ZeroDays {
+            rule: rule.id.clone(),
+            field: "unlisted_for_days",
+        });
+    }
+    if c.unlisted_for_days.is_some() && rule.action == Action::Unlist {
+        return Err(PolicyError::UnlistedTriggerUnlists(rule.id.clone()));
+    }
+    if c.prerelease_superseded_for_days.is_some() && rule.release_type == ReleaseType::Releases {
+        return Err(PolicyError::SupersededOnReleases(rule.id.clone()));
+    }
+
+    // Filters must compile (a broken one would admit nothing at run time).
+    for (field, pattern) in [
+        ("version_pattern", &rule.version_pattern),
+        ("exclude_version_pattern", &rule.exclude_version_pattern),
+    ] {
+        if let Some(pattern) = pattern {
+            let refused = if pattern.trim().is_empty() {
+                Some("it is empty".to_string())
+            } else {
+                version_glob(pattern).err().map(|e| e.to_string())
+            };
+            if let Some(reason) = refused {
+                return Err(PolicyError::InvalidPattern {
+                    rule: rule.id.clone(),
+                    field,
+                    reason,
+                });
+            }
+        }
+    }
+    if rule
+        .selector
+        .as_deref()
+        .is_some_and(|s| s.trim().is_empty())
+    {
+        return Err(PolicyError::EmptySelector(rule.id.clone()));
+    }
 
     // Every rule must express at least one trigger; pure-protection rules
     // delete nothing and are almost certainly a config error.
@@ -447,6 +612,28 @@ fn validate_rule(rule: &RetentionRule, repo_kind: RepoKind) -> Result<(), Policy
     }
 
     Ok(())
+}
+
+/// Compile a rule's version glob: matched against the whole normalized
+/// version, ignoring case (`*-ci.*`, `{*-pr.*,*-ci.*}`, `1.?.*`).
+pub fn version_glob(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
+    Ok(globset::GlobBuilder::new(pattern)
+        .case_insensitive(true)
+        .literal_separator(false)
+        .build()?
+        .compile_matcher())
+}
+
+/// The content selectors a policy's rules name, each once.
+pub fn selector_names(policy: &RetentionPolicy) -> Vec<String> {
+    let mut names: Vec<String> = policy
+        .rules
+        .iter()
+        .filter_map(|r| r.selector.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 #[cfg(test)]
@@ -462,12 +649,14 @@ mod tests {
             scope: Scope::Hosted,
             release_type: ReleaseType::Any,
             package_name_prefix: None,
+            selector: None,
+            version_pattern: None,
+            exclude_version_pattern: None,
             criteria: Criteria {
                 keep_last_n: Some(10),
-                keep_n_most_downloaded: None,
                 older_than_days: Some(90),
                 not_downloaded_for_days: Some(30),
-                not_pulled_for_days: None,
+                ..Default::default()
             },
         }
     }
@@ -479,6 +668,9 @@ mod tests {
             scope: Scope::ProxyCached,
             release_type: ReleaseType::Any,
             package_name_prefix: None,
+            selector: None,
+            version_pattern: None,
+            exclude_version_pattern: None,
             criteria: Criteria {
                 not_pulled_for_days: Some(30),
                 ..Default::default()
@@ -492,6 +684,9 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            schedule: None,
+            schedule_timezone: None,
+            max_run_seconds: None,
             size_budget: None,
             rules: vec![example_hosted_rule()],
         }
@@ -504,6 +699,9 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            schedule: None,
+            schedule_timezone: None,
+            max_run_seconds: None,
             size_budget: None,
             rules: vec![example_hosted_rule(), example_proxy_rule()],
         };
@@ -813,6 +1011,9 @@ mod tests {
             scope: Scope::Hosted,
             release_type: ReleaseType::Any,
             package_name_prefix: None,
+            selector: None,
+            version_pattern: None,
+            exclude_version_pattern: None,
             criteria: Criteria {
                 keep_last_n: Some(5),
                 ..Default::default()
@@ -843,5 +1044,193 @@ mod tests {
         p.rules[0].criteria.keep_last_n = Some(0);
         // Even disabled, a broken rule is rejected so a later enable is safe.
         assert!(validate_policy(&p, RepoKind::Hosted).is_err());
+    }
+
+    #[test]
+    fn new_triggers_and_filters_round_trip_and_validate() {
+        let json = r#"{
+            "version": 1,
+            "schedule": "0 3 * * *",
+            "schedule_timezone": "Europe/Berlin",
+            "max_run_seconds": 3600,
+            "rules": [
+                {
+                    "id": "ci",
+                    "action": "hard_delete",
+                    "release_type": "prereleases",
+                    "selector": "internal",
+                    "version_pattern": "*-ci.*",
+                    "exclude_version_pattern": "*-ci.0",
+                    "criteria": { "prerelease_superseded_for_days": 14 }
+                },
+                {
+                    "id": "unlisted",
+                    "action": "hard_delete",
+                    "criteria": { "unlisted_for_days": 90 }
+                },
+                {
+                    "id": "cap",
+                    "action": "unlist",
+                    "release_type": "snapshots",
+                    "criteria": { "max_versions_per_package": 50 }
+                }
+            ]
+        }"#;
+        let policy: RetentionPolicy = serde_json::from_str(json).unwrap();
+        validate_policy(&policy, RepoKind::Hosted).unwrap();
+        assert_eq!(policy.schedule.as_deref(), Some("0 3 * * *"));
+        assert_eq!(policy.rules[0].selector.as_deref(), Some("internal"));
+        assert_eq!(policy.rules[2].release_type, ReleaseType::Snapshots);
+        assert_eq!(selector_names(&policy), vec!["internal".to_string()]);
+        let back: RetentionPolicy =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        assert_eq!(back, policy);
+        // Absent new fields are not written, so policies stored before keep
+        // their shape.
+        let plain = serde_json::to_value(minimal_valid()).unwrap();
+        for absent in ["schedule", "schedule_timezone", "max_run_seconds"] {
+            assert!(plain.get(absent).is_none(), "{absent}");
+        }
+        assert!(plain["rules"][0].get("version_pattern").is_none());
+        // Unknown fields are still refused.
+        let typo = json.replace("version_pattern", "version_patern");
+        assert!(serde_json::from_str::<RetentionPolicy>(&typo).is_err());
+    }
+
+    fn with_rule(edit: impl FnOnce(&mut RetentionRule)) -> RetentionPolicy {
+        let mut p = minimal_valid();
+        edit(&mut p.rules[0]);
+        p
+    }
+
+    #[test]
+    fn rejects_invalid_new_triggers_and_filters() {
+        let zero_days = with_rule(|r| r.criteria.prerelease_superseded_for_days = Some(0));
+        assert!(matches!(
+            validate_policy(&zero_days, RepoKind::Hosted),
+            Err(PolicyError::ZeroDays {
+                field: "prerelease_superseded_for_days",
+                ..
+            })
+        ));
+        let zero_days = with_rule(|r| r.criteria.unlisted_for_days = Some(0));
+        assert!(matches!(
+            validate_policy(&zero_days, RepoKind::Hosted),
+            Err(PolicyError::ZeroDays {
+                field: "unlisted_for_days",
+                ..
+            })
+        ));
+        let zero_count = with_rule(|r| r.criteria.max_versions_per_package = Some(0));
+        assert!(matches!(
+            validate_policy(&zero_count, RepoKind::Hosted),
+            Err(PolicyError::ZeroCount {
+                field: "max_versions_per_package",
+                ..
+            })
+        ));
+        let unlists_unlisted = with_rule(|r| {
+            r.action = Action::Unlist;
+            r.criteria.unlisted_for_days = Some(30);
+        });
+        assert_eq!(
+            validate_policy(&unlists_unlisted, RepoKind::Hosted),
+            Err(PolicyError::UnlistedTriggerUnlists(
+                "keep-recent-releases".into()
+            ))
+        );
+        let releases_only = with_rule(|r| {
+            r.release_type = ReleaseType::Releases;
+            r.criteria.prerelease_superseded_for_days = Some(7);
+        });
+        assert_eq!(
+            validate_policy(&releases_only, RepoKind::Hosted),
+            Err(PolicyError::SupersededOnReleases(
+                "keep-recent-releases".into()
+            ))
+        );
+        for (field, pattern) in [
+            ("version_pattern", "1.[0"),
+            ("exclude_version_pattern", " "),
+        ] {
+            let p = with_rule(|r| {
+                if field == "version_pattern" {
+                    r.version_pattern = Some(pattern.into());
+                } else {
+                    r.exclude_version_pattern = Some(pattern.into());
+                }
+            });
+            assert!(
+                matches!(
+                    validate_policy(&p, RepoKind::Hosted),
+                    Err(PolicyError::InvalidPattern { field: f, .. }) if f == field
+                ),
+                "{field}"
+            );
+        }
+        let empty_selector = with_rule(|r| r.selector = Some("  ".into()));
+        assert_eq!(
+            validate_policy(&empty_selector, RepoKind::Hosted),
+            Err(PolicyError::EmptySelector("keep-recent-releases".into()))
+        );
+    }
+
+    #[test]
+    fn hosted_only_triggers_are_refused_on_proxy_rules() {
+        for field in ["prerelease_superseded_for_days", "unlisted_for_days"] {
+            let mut rule = example_proxy_rule();
+            if field == "unlisted_for_days" {
+                rule.criteria.unlisted_for_days = Some(30);
+            } else {
+                rule.criteria.prerelease_superseded_for_days = Some(30);
+            }
+            let p = RetentionPolicy {
+                rules: vec![rule],
+                ..minimal_valid()
+            };
+            assert_eq!(
+                validate_policy(&p, RepoKind::Proxy),
+                Err(PolicyError::HostedFieldOnProxyScope {
+                    rule: "proxy-evict-cold".into(),
+                    field,
+                })
+            );
+        }
+        // A count is a trigger of its own on a proxy too, with filters.
+        let mut rule = example_proxy_rule();
+        rule.criteria.not_pulled_for_days = None;
+        rule.criteria.max_versions_per_package = Some(5);
+        rule.version_pattern = Some("*-ci.*".into());
+        let p = RetentionPolicy {
+            rules: vec![rule],
+            ..minimal_valid()
+        };
+        validate_policy(&p, RepoKind::Proxy).unwrap();
+    }
+
+    #[test]
+    fn schedule_fields_are_validated() {
+        let mut p = minimal_valid();
+        p.schedule = Some("0 3 * * 1-5".into());
+        p.schedule_timezone = Some("Europe/Berlin".into());
+        p.max_run_seconds = Some(7200);
+        validate_policy(&p, RepoKind::Hosted).unwrap();
+        for (schedule, zone, max) in [
+            (Some("0 3 * *"), None, None),
+            (Some("0 3 * * *"), Some("Europe/Atlantis"), None),
+            (None, Some("UTC"), None),
+            (None, None, Some(10)),
+        ] {
+            p.schedule = schedule.map(Into::into);
+            p.schedule_timezone = zone.map(Into::into);
+            p.max_run_seconds = max;
+            assert!(
+                matches!(
+                    validate_policy(&p, RepoKind::Hosted),
+                    Err(PolicyError::InvalidSchedule(_))
+                ),
+                "{schedule:?} {zone:?} {max:?}"
+            );
+        }
     }
 }

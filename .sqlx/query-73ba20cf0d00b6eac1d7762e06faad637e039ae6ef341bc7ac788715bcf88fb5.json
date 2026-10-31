@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE retention_run\n        SET state = 'idle',\n            finished_at = now(),\n            locked_until = NULL,\n            current_run_id = NULL,\n            next_run_at = CASE\n                WHEN $5::jsonb IS NULL\n                  OR (SELECT r.retention_policy FROM repository r WHERE r.id = $1) = $5::jsonb\n                THEN $2\n                ELSE retention_run.next_run_at\n            END,\n            last_run_summary = $3\n        WHERE repository_id = $1\n          AND ($4::uuid IS NULL OR current_run_id = $4)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamptz",
+        "Jsonb",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "73ba20cf0d00b6eac1d7762e06faad637e039ae6ef341bc7ac788715bcf88fb5"
+}

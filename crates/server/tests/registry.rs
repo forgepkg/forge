@@ -4392,6 +4392,7 @@ async fn apply_image_run(
         chrono::Duration::seconds(60),
         false,
         Some(&fence),
+        None,
     )
     .await
     .unwrap()

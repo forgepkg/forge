@@ -3,29 +3,38 @@
 //! Given a policy and a snapshot of a repository's components (or a proxy repo's
 //! cached versions), [`evaluate`] / [`evaluate_proxy`] compute the set of
 //! `Decision`s the worker should apply. There is **no I/O** here: every input is
-//! plain data plus a `&dyn Format` used only to order versions, so the whole
-//! algorithm is unit-testable without a database or clock.
+//! plain data, the content selectors the rules name ([`Selectors`], resolved
+//! by the caller), and a `&dyn Format` used to order and classify versions,
+//! so the whole algorithm is unit-testable without a database or clock.
 //!
 //! ## Algorithm (hosted, [`evaluate`])
 //!
-//! 1. Filter out components whose version fails to apply to any rule's
-//!    `release_type` / `package_name_prefix` — handled per rule.
-//! 2. **Group by package id.** Within a group, order versions newest-first using
+//! 1. **Group by package id.** Within a group, order versions newest-first using
 //!    [`Format::compare_versions`] (format-agnostic — we never import a concrete
 //!    format here).
-//! 3. **Compute protections per group, per rule.** Each rule's protections
-//!    are taken over that rule's own *pool* — the group's versions its
-//!    `release_type` / `package_name_prefix` filters admit: `keep_last_n` is
-//!    the newest N **listed** versions of the pool (unlisted versions neither
-//!    count nor are protected), `keep_n_most_downloaded` the N most-recently
-//!    downloaded versions of the pool, listed or not (nulls last). The
-//!    protected set is the **union** over all rules; a protected version is
-//!    **never** deleted or unlisted, by any rule.
-//! 4. For each version, a rule *selects* it iff the rule's filters match **and**
-//!    all of the rule's present triggers are satisfied (ANDed):
-//!    `older_than_days` (age since `created_at`) and `not_downloaded_for_days`
+//! 2. **A rule's pool** is the group's versions its filters admit:
+//!    `release_type` (the version's [`Format::version_class`]),
+//!    `package_name_prefix`, `selector` (a content selector's globs on the
+//!    package name) and `version_pattern` / `exclude_version_pattern` (globs
+//!    on the version). Keep-N counts run per **partition** of the pool
+//!    ([`Format::retention_partition`]; the whole package by default).
+//! 3. **Compute protections per group, per rule**, over each partition of
+//!    the rule's pool: `keep_last_n` is the newest N **listed** versions
+//!    (unlisted versions neither count nor are protected),
+//!    `keep_n_most_downloaded` the N most-recently downloaded versions,
+//!    listed or not (nulls last). The protected set is the **union** over all
+//!    rules; a protected version is **never** deleted or unlisted, by any
+//!    rule, whatever trigger selects it.
+//! 4. For each version, a rule *selects* it iff the rule's pool holds it
+//!    **and** all of the rule's present triggers are satisfied (ANDed):
+//!    `older_than_days` (age since `created_at`), `not_downloaded_for_days`
 //!    (days since the last download or, for a version never downloaded, since
-//!    it was published — so a fresh push is not cold on its first run).
+//!    it was published — so a fresh push is not cold on its first run),
+//!    `prerelease_superseded_for_days` (a prerelease or snapshot, once the
+//!    first listed release of its package that orders after it has been
+//!    published that long), `unlisted_for_days` (unlisted that long, by
+//!    `unlisted_at`) and `max_versions_per_package` (not among the newest N
+//!    of its partition of the pool, listed or not).
 //! 5. Protection overrides selection. Otherwise the highest-severity action
 //!    wins (`hard_delete` > `unlist`).
 //!
@@ -33,21 +42,25 @@
 //!
 //! `scope: proxy_cached` rules evict a cached version when `not_pulled_for_days`
 //! is satisfied, comparing against `last_downloaded_at` or, when never pulled,
-//! `first_seen_at`. Only versions whose bytes are cached locally are
-//! candidates. Their protections work as on hosted rules, over each package's
-//! cached versions: `keep_last_n` keeps the newest N the upstream lists,
-//! `keep_n_most_downloaded` the N pulled last, and a version any proxy rule
-//! keeps is never evicted. Proxy entries are never unlisted — eviction always
-//! deletes the cached bytes (the version stays listed and re-caches on the
-//! next pull).
+//! `first_seen_at`, and/or when `max_versions_per_package` counts it out of
+//! its package's newest cached versions. Only versions whose bytes are cached
+//! locally are candidates. Filters and protections work as on hosted rules,
+//! over each package's cached versions: `keep_last_n` keeps the newest N the
+//! upstream lists, `keep_n_most_downloaded` the N pulled last, and a version
+//! any proxy rule keeps is never evicted. Proxy entries are never unlisted —
+//! eviction always deletes the cached bytes (the version stays listed and
+//! re-caches on the next pull).
 
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use globset::GlobMatcher;
 
-use crate::format::Format;
+use crate::authz::CompiledSelector;
+use crate::format::{Format, VersionClass};
 use crate::retention::model::{
-    Action, Criteria, ReleaseType, RetentionPolicy, RetentionRule, Scope, SizeBudgetSummary,
+    version_glob, Action, Criteria, ReleaseType, RetentionPolicy, RetentionRule, Scope,
+    SizeBudgetSummary,
 };
 
 /// One hosted component in the evaluation snapshot. All fields come straight
@@ -66,6 +79,9 @@ pub struct CandidateComponent {
     pub created_at: DateTime<Utc>,
     /// Last download timestamp, or `None` if never downloaded.
     pub last_downloaded_at: Option<DateTime<Utc>>,
+    /// When the version was unlisted (`component.unlisted_at`, for
+    /// `unlisted_for_days`); `None` while it is listed.
+    pub unlisted_at: Option<DateTime<Utc>>,
     /// Sum of this version's asset sizes, in bytes.
     pub size_bytes: u64,
 }
@@ -166,32 +182,61 @@ pub struct PackagePlan {
     pub budget: Option<SizeBudgetSummary>,
 }
 
+/// The content selectors a policy's rules name (`selector`), compiled and
+/// looked up by name. The caller resolves them (the worker and the preview
+/// read them from `content_selector`); a rule naming a selector missing
+/// here admits nothing.
+#[derive(Debug, Clone, Default)]
+pub struct Selectors {
+    by_name: HashMap<String, CompiledSelector>,
+}
+
+impl Selectors {
+    /// No selectors: rules that name one admit nothing.
+    pub fn none() -> Selectors {
+        Selectors::default()
+    }
+
+    /// Add `selector` under `name`.
+    pub fn insert(&mut self, name: impl Into<String>, selector: CompiledSelector) {
+        self.by_name.insert(name.into(), selector);
+    }
+
+    /// The selector named `name`.
+    pub fn get(&self, name: &str) -> Option<&CompiledSelector> {
+        self.by_name.get(name)
+    }
+}
+
 /// What one run of `policy` decides for a package repository as of `now`:
 /// the rules' decisions, less those on versions a package tag names
 /// (`tagged_hosted_ids`, which retention never touches), then the size
 /// budget's on top of them when the policy has one (`repository_size_bytes`
 /// is the repository's size then). A version the budget deletes is not also
 /// unlisted. The worker and the preview both plan with this.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_package_run(
     format: &dyn Format,
     now: DateTime<Utc>,
     policy: &RetentionPolicy,
+    selectors: &Selectors,
     hosted: &[CandidateComponent],
     proxy: &[ProxyCandidate],
     tagged_hosted_ids: &HashSet<i64>,
     repository_size_bytes: Option<u64>,
 ) -> PackagePlan {
-    let mut hosted_decisions = evaluate(format, now, policy, hosted);
+    let mut hosted_decisions = evaluate(format, now, policy, selectors, hosted);
     let before = hosted_decisions.len();
     hosted_decisions.retain(|d| !tagged_hosted_ids.contains(&d.component_id));
     let spared = before - hosted_decisions.len();
-    let mut proxy_decisions = evaluate_proxy(format, now, policy, proxy);
+    let mut proxy_decisions = evaluate_proxy(format, now, policy, selectors, proxy);
 
     let mut budget = None;
     if let (Some(_), Some(size)) = (policy.size_budget, repository_size_bytes) {
         let mut plan = evaluate_size_budget(
             format,
             policy,
+            selectors,
             hosted,
             proxy,
             size,
@@ -218,7 +263,7 @@ pub fn plan_package_run(
 
 /// Structured explanation of why a version was selected, recorded on the audit
 /// row's `reason` jsonb.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DecisionReason {
     /// Whether `older_than_days` was a matched trigger (and its threshold).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,6 +274,23 @@ pub struct DecisionReason {
     /// Whether `not_pulled_for_days` was a matched trigger (proxy).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_pulled_for_days: Option<u32>,
+    /// Whether `prerelease_superseded_for_days` was a matched trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prerelease_superseded_for_days: Option<u32>,
+    /// The release that superseded the prerelease: the first one published
+    /// of the listed releases that order after it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// Whether `unlisted_for_days` was a matched trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unlisted_for_days: Option<u32>,
+    /// Whether `max_versions_per_package` was a matched trigger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_versions_per_package: Option<u32>,
+    /// With `max_versions_per_package`: the version's place among its
+    /// package's (partition's) versions in the rule's pool, newest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_budget: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,33 +301,90 @@ pub struct DecisionReason {
     pub last_used_at: Option<DateTime<Utc>>,
 }
 
-/// Whether a **normalized** version string denotes a prerelease.
-///
-/// Format-agnostic heuristic: a normalized version carrying a prerelease label
-/// renders it after a `-` (NuGet's `to_normalized_string`, SemVer 2.0.0). We do
-/// not import a concrete format here, honoring the "order/classify via the seam"
-/// rule. Build metadata (`+...`) is already stripped during normalization.
-fn is_prerelease(normalized_version: &str) -> bool {
-    normalized_version.contains('-')
+/// A rule's filters, compiled once per evaluation.
+struct RuleFilter<'a> {
+    rule: &'a RetentionRule,
+    /// `package_name_prefix`, lowercased.
+    prefix: Option<String>,
+    include: Option<GlobMatcher>,
+    exclude: Option<GlobMatcher>,
+    selector: Option<&'a CompiledSelector>,
+    /// A glob that does not compile, or a selector the caller did not
+    /// resolve: the rule admits nothing (validation refuses both, so this
+    /// only fails closed).
+    admits_nothing: bool,
 }
 
-/// Whether a rule's static filters (`release_type`, `package_name_prefix`)
-/// admit a given component, independent of its triggers.
-fn rule_filters_match(rule: &RetentionRule, package_name: &str, version: &str) -> bool {
-    match rule.release_type {
-        ReleaseType::Any => {}
-        ReleaseType::Releases if is_prerelease(version) => return false,
-        ReleaseType::Prereleases if !is_prerelease(version) => return false,
-        _ => {}
-    }
-    if let Some(prefix) = &rule.package_name_prefix {
-        // Case-insensitive prefix match. `package_name` is already lowercased by
-        // the loader; lowercase the configured prefix to be safe.
-        if !package_name.starts_with(&crate::format::lower_invariant(prefix)) {
-            return false;
+impl<'a> RuleFilter<'a> {
+    fn new(rule: &'a RetentionRule, selectors: &'a Selectors) -> Self {
+        let mut admits_nothing = false;
+        let mut glob = |pattern: &Option<String>| match pattern.as_deref().map(version_glob) {
+            None => None,
+            Some(Ok(matcher)) => Some(matcher),
+            Some(Err(_)) => {
+                admits_nothing = true;
+                None
+            }
+        };
+        let include = glob(&rule.version_pattern);
+        let exclude = glob(&rule.exclude_version_pattern);
+        let selector = match &rule.selector {
+            None => None,
+            Some(name) => {
+                let found = selectors.get(name);
+                admits_nothing |= found.is_none();
+                found
+            }
+        };
+        RuleFilter {
+            rule,
+            prefix: rule
+                .package_name_prefix
+                .as_deref()
+                .map(crate::format::lower_invariant),
+            include,
+            exclude,
+            selector,
+            admits_nothing,
         }
     }
-    true
+
+    /// Whether the rule's filters admit `version` of `package_name`,
+    /// independent of its triggers.
+    fn admits(&self, format: &dyn Format, package_name: &str, version: &str) -> bool {
+        if self.admits_nothing {
+            return false;
+        }
+        let class_ok = match self.rule.release_type {
+            ReleaseType::Any => true,
+            ReleaseType::Releases => format.version_class(version) == VersionClass::Release,
+            ReleaseType::Prereleases => format.version_class(version) == VersionClass::Prerelease,
+            ReleaseType::Snapshots => format.version_class(version) == VersionClass::Snapshot,
+        };
+        // `package_name` is already lowercased by the loader.
+        class_ok
+            && self
+                .prefix
+                .as_deref()
+                .is_none_or(|prefix| package_name.starts_with(prefix))
+            && self.include.as_ref().is_none_or(|g| g.is_match(version))
+            && !self.exclude.as_ref().is_some_and(|g| g.is_match(version))
+            && self.selector.is_none_or(|s| s.matches(package_name))
+    }
+}
+
+/// The compiled filters of `policy`'s rules of `scope`, in policy order.
+fn rule_filters<'a>(
+    policy: &'a RetentionPolicy,
+    scope: Scope,
+    selectors: &'a Selectors,
+) -> Vec<RuleFilter<'a>> {
+    policy
+        .rules
+        .iter()
+        .filter(|r| r.scope == scope)
+        .map(|r| RuleFilter::new(r, selectors))
+        .collect()
 }
 
 /// Whole-days elapsed from `then` to `now` (floored). Negative spans (a
@@ -279,6 +398,15 @@ fn days_since(now: DateTime<Utc>, then: DateTime<Utc>) -> i64 {
     }
 }
 
+/// What one candidate's group says about it for one rule's triggers.
+struct TriggerInputs<'a> {
+    /// The release that superseded it ([`superseding_releases`]).
+    superseded_by: Option<&'a CandidateComponent>,
+    /// Its place (1-based) in its partition of the rule's pool, when that is
+    /// past the rule's `max_versions_per_package`.
+    over_cap: Option<u32>,
+}
+
 /// Evaluate the hosted `Criteria` triggers (ANDed) for one component. Returns
 /// `Some(reason)` when **all present triggers** match, else `None`. A criteria
 /// block with no triggers never selects (the rule was rejected at validation
@@ -287,17 +415,10 @@ fn triggers_match(
     c: &Criteria,
     now: DateTime<Utc>,
     cand: &CandidateComponent,
+    inputs: &TriggerInputs<'_>,
 ) -> Option<DecisionReason> {
     let mut any_trigger = false;
-    let mut reason = DecisionReason {
-        older_than_days: None,
-        not_downloaded_for_days: None,
-        not_pulled_for_days: None,
-        size_budget: None,
-        target_bytes: None,
-        size_bytes: None,
-        last_used_at: None,
-    };
+    let mut reason = DecisionReason::default();
 
     if let Some(days) = c.older_than_days {
         any_trigger = true;
@@ -318,6 +439,37 @@ fn triggers_match(
             return None;
         }
         reason.not_downloaded_for_days = Some(days);
+    }
+
+    if let Some(days) = c.prerelease_superseded_for_days {
+        any_trigger = true;
+        // A release is never superseded; a prerelease only by a release.
+        let release = inputs.superseded_by?;
+        if days_since(now, release.created_at) < days as i64 {
+            return None;
+        }
+        reason.prerelease_superseded_for_days = Some(days);
+        reason.superseded_by = Some(release.version.clone());
+    }
+
+    if let Some(days) = c.unlisted_for_days {
+        any_trigger = true;
+        // A listed version is not unlisted at all; an unlisted one without
+        // its unlisting time (never after the migration) is not judged.
+        if cand.listed {
+            return None;
+        }
+        let unlisted_at = cand.unlisted_at?;
+        if days_since(now, unlisted_at) < days as i64 {
+            return None;
+        }
+        reason.unlisted_for_days = Some(days);
+    }
+
+    if let Some(cap) = c.max_versions_per_package {
+        any_trigger = true;
+        reason.rank = Some(inputs.over_cap?);
+        reason.max_versions_per_package = Some(cap);
     }
 
     if any_trigger {
@@ -381,65 +533,134 @@ fn group_by_package<C: Protectable>(candidates: &[C]) -> Vec<Vec<&C>> {
     groups
 }
 
+/// What the rules of one scope see in one package's candidates, ordered
+/// newest-first by version.
+struct GroupView {
+    /// Per rule (in filter order), whether it admits each candidate.
+    admitted: Vec<Vec<bool>>,
+    /// Each candidate's partition ([`Format::retention_partition`]).
+    partition: Vec<Option<String>>,
+}
+
+impl GroupView {
+    fn new<C: Protectable>(
+        format: &dyn Format,
+        filters: &[RuleFilter<'_>],
+        ordered: &[&C],
+    ) -> Self {
+        GroupView {
+            admitted: filters
+                .iter()
+                .map(|f| {
+                    ordered
+                        .iter()
+                        .map(|c| f.admits(format, c.package_name(), c.version()))
+                        .collect()
+                })
+                .collect(),
+            partition: ordered
+                .iter()
+                .map(|c| format.retention_partition(c.package_name(), c.version()))
+                .collect(),
+        }
+    }
+
+    /// Rule `rule`'s pool split by partition: each part newest-first, the
+    /// parts in the order they first appear.
+    fn pools(&self, rule: usize) -> Vec<Vec<usize>> {
+        let mut parts: Vec<Vec<usize>> = Vec::new();
+        let mut index: HashMap<&Option<String>, usize> = HashMap::new();
+        for (i, admitted) in self.admitted[rule].iter().enumerate() {
+            if !admitted {
+                continue;
+            }
+            let at = *index.entry(&self.partition[i]).or_insert_with(|| {
+                parts.push(Vec::new());
+                parts.len() - 1
+            });
+            parts[at].push(i);
+        }
+        parts
+    }
+
+    /// Per rule, each candidate's place (1-based) in its partition of the
+    /// rule's pool when that is past the rule's `max_versions_per_package`.
+    fn over_cap(&self, filters: &[RuleFilter<'_>]) -> Vec<Vec<Option<u32>>> {
+        filters
+            .iter()
+            .enumerate()
+            .map(|(r, f)| {
+                let mut ranks = vec![None; self.partition.len()];
+                if let Some(cap) = f.rule.criteria.max_versions_per_package {
+                    for pool in self.pools(r) {
+                        for (rank, &idx) in pool.iter().enumerate().skip(cap as usize) {
+                            ranks[idx] = Some(u32::try_from(rank + 1).unwrap_or(u32::MAX));
+                        }
+                    }
+                }
+                ranks
+            })
+            .collect()
+    }
+}
+
 /// Compute which of a group's versions (indices into its newest-first
-/// ordering) are **protected**: the union, over every rule of `scope`, of
+/// ordering) are **protected**: the union, over every rule of `filters`, of
 /// that rule's `keep_last_n` / `keep_n_most_downloaded` protections.
 ///
 /// Each rule's protections are computed over the versions the rule itself
-/// governs — those its `release_type` / `package_name_prefix` filters admit —
-/// never over the whole package. Otherwise a `releases`-only rule with
-/// `keep_last_n: 3` would "protect" the three newest prereleases and leave
-/// every stable release unprotected. `keep_last_n` further counts only
-/// **listed** versions, so unlisted versions cannot use up its slots;
-/// `keep_n_most_downloaded` ranks listed and unlisted versions alike by
-/// download recency (see [`Criteria`]).
+/// governs — those its filters admit — never over the whole package.
+/// Otherwise a `releases`-only rule with `keep_last_n: 3` would "protect"
+/// the three newest prereleases and leave every stable release unprotected.
+/// They count per partition of that pool ([`Format::retention_partition`]).
+/// `keep_last_n` further counts only **listed** versions, so unlisted
+/// versions cannot use up its slots; `keep_n_most_downloaded` ranks listed
+/// and unlisted versions alike by download recency (see [`Criteria`]).
 ///
 /// `ordered` is the group's candidates sorted newest-first (by version): a
 /// hosted package's components, or a proxy package's cached versions.
 fn protected_indices<C: Protectable>(
-    policy: &RetentionPolicy,
-    scope: Scope,
+    filters: &[RuleFilter<'_>],
+    view: &GroupView,
     ordered: &[&C],
 ) -> Vec<bool> {
     let mut protected = vec![false; ordered.len()];
 
-    for rule in policy.rules.iter().filter(|r| r.scope == scope) {
-        let c = &rule.criteria;
+    for (r, filter) in filters.iter().enumerate() {
+        let c = &filter.rule.criteria;
         if !c.has_protection() {
             continue;
         }
-        // The rule's pool, still newest-first.
-        let pool: Vec<usize> = (0..ordered.len())
-            .filter(|&i| rule_filters_match(rule, ordered[i].package_name(), ordered[i].version()))
-            .collect();
-
-        if let Some(n) = c.keep_last_n {
-            for &idx in pool
-                .iter()
-                .filter(|&&i| ordered[i].listed())
-                .take(n as usize)
-            {
-                protected[idx] = true;
-            }
-        }
-
-        if let Some(n) = c.keep_n_most_downloaded {
-            // Order by download recency: most-recent first, nulls last. The
-            // sort is stable, so ties keep the pool's version-desc order.
-            let mut by_download = pool.clone();
-            by_download.sort_by(|&a, &b| {
-                match (
-                    ordered[a].last_downloaded_at(),
-                    ordered[b].last_downloaded_at(),
-                ) {
-                    (Some(x), Some(y)) => y.cmp(&x), // more recent first
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
+        for pool in view.pools(r) {
+            if let Some(n) = c.keep_last_n {
+                for &idx in pool
+                    .iter()
+                    .filter(|&&i| ordered[i].listed())
+                    .take(n as usize)
+                {
+                    protected[idx] = true;
                 }
-            });
-            for &idx in by_download.iter().take(n as usize) {
-                protected[idx] = true;
+            }
+
+            if let Some(n) = c.keep_n_most_downloaded {
+                // Order by download recency: most-recent first, nulls last.
+                // The sort is stable, so ties keep the pool's version-desc
+                // order.
+                let mut by_download = pool.clone();
+                by_download.sort_by(|&a, &b| {
+                    match (
+                        ordered[a].last_downloaded_at(),
+                        ordered[b].last_downloaded_at(),
+                    ) {
+                        (Some(x), Some(y)) => y.cmp(&x), // more recent first
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    }
+                });
+                for &idx in by_download.iter().take(n as usize) {
+                    protected[idx] = true;
+                }
             }
         }
     }
@@ -447,22 +668,85 @@ fn protected_indices<C: Protectable>(
     protected
 }
 
+/// [`protected_indices`] of one group, for the size budget.
+fn protected_in<C: Protectable>(
+    format: &dyn Format,
+    filters: &[RuleFilter<'_>],
+    ordered: &[&C],
+) -> Vec<bool> {
+    let view = GroupView::new(format, filters, ordered);
+    protected_indices(filters, &view, ordered)
+}
+
+/// For each of a hosted group's versions (newest first), the release that
+/// supersedes it when it is not a release itself: of the package's
+/// **listed** releases that order strictly after it, the one published
+/// first (from then on the prerelease has had a release).
+fn superseding_releases<'g>(
+    format: &dyn Format,
+    ordered: &[&'g CandidateComponent],
+) -> Vec<Option<&'g CandidateComponent>> {
+    let classes: Vec<VersionClass> = ordered
+        .iter()
+        .map(|c| format.version_class(&c.version))
+        .collect();
+    let mut out = vec![None; ordered.len()];
+    // The first-published listed release among the strictly newer versions.
+    let mut first: Option<&CandidateComponent> = None;
+    let mut i = 0;
+    while i < ordered.len() {
+        // A run of versions the format orders equal: none supersedes another.
+        let mut j = i + 1;
+        while j < ordered.len()
+            && format.compare_versions(&ordered[j].version, &ordered[i].version)
+                == std::cmp::Ordering::Equal
+        {
+            j += 1;
+        }
+        for k in i..j {
+            if classes[k] != VersionClass::Release {
+                out[k] = first;
+            }
+        }
+        for k in i..j {
+            let c = ordered[k];
+            if c.listed
+                && classes[k] == VersionClass::Release
+                && first.is_none_or(|f| c.created_at < f.created_at)
+            {
+                first = Some(c);
+            }
+        }
+        i = j;
+    }
+    out
+}
+
 /// Evaluate a hosted retention policy over a component snapshot, producing the
 /// ordered set of decisions to apply. **Pure**: no I/O, `now` is injected.
 ///
-/// `format` is used only to order versions within a package group. The cost is
-/// linear in the snapshot plus sorting each package's versions, but it is
-/// still CPU-bound on a large repository, so async callers run it on the
-/// blocking pool.
+/// `format` orders and classifies versions within a package group, and
+/// partitions them for keep-N; `selectors` are the content selectors the
+/// rules name. The cost is linear in the snapshot plus sorting each
+/// package's versions, but it is still CPU-bound on a large repository, so
+/// async callers run it on the blocking pool.
 pub fn evaluate(
     format: &dyn Format,
     now: DateTime<Utc>,
     policy: &RetentionPolicy,
+    selectors: &Selectors,
     candidates: &[CandidateComponent],
 ) -> Vec<Decision> {
     if !policy.enabled {
         return Vec::new();
     }
+    let filters = rule_filters(policy, Scope::Hosted, selectors);
+    if filters.is_empty() {
+        return Vec::new();
+    }
+    let supersession = filters
+        .iter()
+        .any(|f| f.rule.criteria.prerelease_superseded_for_days.is_some());
 
     let mut decisions = Vec::new();
 
@@ -470,7 +754,14 @@ pub fn evaluate(
         // This group's components, newest-first by version.
         group.sort_by(|a, b| format.compare_versions(&b.version, &a.version)); // desc
 
-        let protected = protected_indices(policy, Scope::Hosted, &group);
+        let view = GroupView::new(format, &filters, &group);
+        let protected = protected_indices(&filters, &view, &group);
+        let over_cap = view.over_cap(&filters);
+        let superseded = if supersession {
+            superseding_releases(format, &group)
+        } else {
+            vec![None; group.len()]
+        };
 
         for (idx, cand) in group.iter().enumerate() {
             if protected[idx] {
@@ -479,19 +770,23 @@ pub fn evaluate(
 
             // Find the highest-severity action among rules that select it.
             let mut winning: Option<(&RetentionRule, DecisionReason)> = None;
-            for rule in policy.rules.iter().filter(|r| r.scope == Scope::Hosted) {
-                if !rule_filters_match(rule, &cand.package_name, &cand.version) {
+            for (r, filter) in filters.iter().enumerate() {
+                if !view.admitted[r][idx] {
                     continue;
                 }
-                let Some(reason) = triggers_match(&rule.criteria, now, cand) else {
+                let inputs = TriggerInputs {
+                    superseded_by: superseded[idx],
+                    over_cap: over_cap[r][idx],
+                };
+                let Some(reason) = triggers_match(&filter.rule.criteria, now, cand, &inputs) else {
                     continue;
                 };
                 let better = match &winning {
                     None => true,
-                    Some((cur, _)) => rule.action.severity() > cur.action.severity(),
+                    Some((cur, _)) => filter.rule.action.severity() > cur.action.severity(),
                 };
                 if better {
-                    winning = Some((rule, reason));
+                    winning = Some((filter.rule, reason));
                 }
             }
 
@@ -521,16 +816,21 @@ pub fn evaluate(
 /// snapshot. **Pure**: no I/O. Only `scope: proxy_cached` rules participate.
 ///
 /// `format` orders each package's cached versions newest-first, for the
-/// rules' `keep_last_n` protections; a version any proxy rule protects is
-/// never evicted. Like [`evaluate`], async callers run it on the blocking
-/// pool.
+/// rules' keep-N protections and `max_versions_per_package`; a version any
+/// proxy rule protects is never evicted. Like [`evaluate`], async callers
+/// run it on the blocking pool.
 pub fn evaluate_proxy(
     format: &dyn Format,
     now: DateTime<Utc>,
     policy: &RetentionPolicy,
+    selectors: &Selectors,
     candidates: &[ProxyCandidate],
 ) -> Vec<ProxyDecision> {
     if !policy.enabled {
+        return Vec::new();
+    }
+    let filters = rule_filters(policy, Scope::ProxyCached, selectors);
+    if filters.is_empty() {
         return Vec::new();
     }
 
@@ -540,57 +840,61 @@ pub fn evaluate_proxy(
         // This package's cached versions, newest-first by version.
         group.sort_by(|a, b| format.compare_versions(&b.version, &a.version)); // desc
 
-        let protected = protected_indices(policy, Scope::ProxyCached, &group);
+        let view = GroupView::new(format, &filters, &group);
+        let protected = protected_indices(&filters, &view, &group);
+        let over_cap = view.over_cap(&filters);
 
         for (idx, cand) in group.iter().enumerate() {
             if protected[idx] {
                 continue; // protection always wins — never evict.
             }
 
-            let mut winning: Option<(&RetentionRule, u32)> = None;
-            for rule in policy
-                .rules
-                .iter()
-                .filter(|r| r.scope == Scope::ProxyCached)
-            {
-                // release_type / prefix filters apply to proxy entries too.
-                if !rule_filters_match(rule, &cand.package_name, &cand.version) {
+            // All proxy rules delete; of the rules that select the version,
+            // keep the one with the smallest `not_pulled_for_days` for the
+            // most specific reason (the first such rule on a tie).
+            let mut winning: Option<(&RetentionRule, DecisionReason)> = None;
+            for (r, filter) in filters.iter().enumerate() {
+                if !view.admitted[r][idx] {
                     continue;
                 }
-                let Some(days) = rule.criteria.not_pulled_for_days else {
-                    continue;
-                };
-                // Use last pull, else first-seen (never pulled since caching).
-                let reference = cand.last_downloaded_at.unwrap_or(cand.first_seen_at);
-                if days_since(now, reference) < days as i64 {
-                    continue;
+                let c = &filter.rule.criteria;
+                let mut reason = DecisionReason::default();
+                if let Some(days) = c.not_pulled_for_days {
+                    // Use last pull, else first-seen (never pulled since caching).
+                    let reference = cand.last_downloaded_at.unwrap_or(cand.first_seen_at);
+                    if days_since(now, reference) < days as i64 {
+                        continue;
+                    }
+                    reason.not_pulled_for_days = Some(days);
                 }
-                // All proxy rules delete; first matching rule is enough, but keep
-                // the one with the smallest threshold for the most specific reason.
+                if let Some(cap) = c.max_versions_per_package {
+                    let Some(rank) = over_cap[r][idx] else {
+                        continue;
+                    };
+                    reason.max_versions_per_package = Some(cap);
+                    reason.rank = Some(rank);
+                }
+                if reason == DecisionReason::default() {
+                    continue; // no proxy trigger (refused at validation).
+                }
+                let threshold =
+                    |reason: &DecisionReason| reason.not_pulled_for_days.unwrap_or(u32::MAX);
                 let take = match &winning {
                     None => true,
-                    Some((_, cur_days)) => days < *cur_days,
+                    Some((_, cur)) => threshold(&reason) < threshold(cur),
                 };
                 if take {
-                    winning = Some((rule, days));
+                    winning = Some((filter.rule, reason));
                 }
             }
 
-            if let Some((rule, days)) = winning {
+            if let Some((rule, reason)) = winning {
                 decisions.push(ProxyDecision {
                     cached_version_id: cand.cached_version_id,
                     package_name: cand.package_name.clone(),
                     version: cand.version.clone(),
                     rule_id: rule.id.clone(),
-                    reason: DecisionReason {
-                        older_than_days: None,
-                        not_downloaded_for_days: None,
-                        not_pulled_for_days: Some(days),
-                        size_budget: None,
-                        target_bytes: None,
-                        size_bytes: None,
-                        last_used_at: None,
-                    },
+                    reason,
                 });
             }
         }
@@ -604,6 +908,7 @@ pub fn evaluate_proxy(
 pub fn evaluate_size_budget(
     format: &dyn Format,
     policy: &RetentionPolicy,
+    selectors: &Selectors,
     hosted: &[CandidateComponent],
     proxy: &[ProxyCandidate],
     repository_size_bytes: u64,
@@ -620,6 +925,8 @@ pub fn evaluate_size_budget(
             target_reached: true,
         };
     };
+    let hosted_filters = rule_filters(policy, Scope::Hosted, selectors);
+    let proxy_filters = rule_filters(policy, Scope::ProxyCached, selectors);
     let hosted_decisions = inputs.hosted_decisions;
     let proxy_decisions = inputs.proxy_decisions;
     let tagged_hosted_ids = inputs.tagged_hosted_ids;
@@ -679,7 +986,7 @@ pub fn evaluate_size_budget(
                 }
             }
             let ordered: Vec<&CandidateComponent> = survivors.iter().collect();
-            let protected = protected_indices(policy, Scope::Hosted, &ordered);
+            let protected = protected_in(format, &hosted_filters, &ordered);
             let newest_listed = survivors.iter().find(|c| c.listed).map(|c| c.component_id);
             for (idx, candidate) in survivors.into_iter().enumerate() {
                 if !protected[idx]
@@ -709,15 +1016,13 @@ pub fn evaluate_size_budget(
                 action: Action::HardDelete,
                 rule_id: "size_budget".into(),
                 reason: DecisionReason {
-                    older_than_days: None,
-                    not_downloaded_for_days: None,
-                    not_pulled_for_days: None,
                     size_budget: Some(budget.max_bytes),
                     target_bytes: Some(target_bytes),
                     size_bytes: Some(candidate.size_bytes),
                     last_used_at: Some(
                         candidate.last_downloaded_at.unwrap_or(candidate.created_at),
                     ),
+                    ..DecisionReason::default()
                 },
             });
             size_after = size_after.saturating_sub(candidate.size_bytes);
@@ -731,7 +1036,7 @@ pub fn evaluate_size_budget(
                 .cloned()
                 .collect();
             let ordered: Vec<&ProxyCandidate> = survivors.iter().collect();
-            let protected = protected_indices(policy, Scope::ProxyCached, &ordered);
+            let protected = protected_in(format, &proxy_filters, &ordered);
             proxy_protected.extend(survivors.iter().zip(protected).filter_map(
                 |(candidate, protected)| protected.then_some(candidate.cached_version_id),
             ));
@@ -759,9 +1064,6 @@ pub fn evaluate_size_budget(
                 version: candidate.version.clone(),
                 rule_id: "size_budget".into(),
                 reason: DecisionReason {
-                    older_than_days: None,
-                    not_downloaded_for_days: None,
-                    not_pulled_for_days: None,
                     size_budget: Some(budget.max_bytes),
                     target_bytes: Some(target_bytes),
                     size_bytes: Some(candidate.size_bytes),
@@ -770,6 +1072,7 @@ pub fn evaluate_size_budget(
                             .last_downloaded_at
                             .unwrap_or(candidate.first_seen_at),
                     ),
+                    ..DecisionReason::default()
                 },
             });
             size_after = size_after.saturating_sub(candidate.size_bytes);
@@ -791,11 +1094,14 @@ pub fn evaluate_size_budget(
 pub fn size_budget_protected_ids(
     format: &dyn Format,
     policy: &RetentionPolicy,
+    selectors: &Selectors,
     hosted: &[CandidateComponent],
     proxy: &[ProxyCandidate],
     hosted_decisions: &[Decision],
     proxy_decisions: &[ProxyDecision],
 ) -> (HashSet<i64>, HashSet<i64>) {
+    let hosted_filters = rule_filters(policy, Scope::Hosted, selectors);
+    let proxy_filters = rule_filters(policy, Scope::ProxyCached, selectors);
     let hosted_hard_deleted: HashSet<i64> = hosted_decisions
         .iter()
         .filter(|decision| decision.action == Action::HardDelete)
@@ -824,7 +1130,7 @@ pub fn size_budget_protected_ids(
             }
         }
         let ordered: Vec<&CandidateComponent> = survivors.iter().collect();
-        let protected = protected_indices(policy, Scope::Hosted, &ordered);
+        let protected = protected_in(format, &hosted_filters, &ordered);
         let newest_listed = survivors.iter().find(|c| c.listed).map(|c| c.component_id);
         hosted_ids.extend(
             survivors
@@ -843,7 +1149,7 @@ pub fn size_budget_protected_ids(
             .cloned()
             .collect();
         let ordered: Vec<&ProxyCandidate> = survivors.iter().collect();
-        let protected = protected_indices(policy, Scope::ProxyCached, &ordered);
+        let protected = protected_in(format, &proxy_filters, &ordered);
         proxy_ids.extend(
             survivors
                 .iter()
@@ -932,6 +1238,7 @@ mod tests {
             listed: true,
             created_at: days_ago(created_days_ago),
             last_downloaded_at: last_dl_days_ago.map(days_ago),
+            unlisted_at: None,
             size_bytes: 1,
         }
     }
@@ -942,6 +1249,9 @@ mod tests {
             enabled: true,
             dry_run_only: false,
             min_run_interval_seconds: 3600,
+            schedule: None,
+            schedule_timezone: None,
+            max_run_seconds: None,
             size_budget: None,
             rules,
         }
@@ -954,6 +1264,9 @@ mod tests {
             scope: Scope::Hosted,
             release_type: ReleaseType::Any,
             package_name_prefix: None,
+            selector: None,
+            version_pattern: None,
+            exclude_version_pattern: None,
             criteria,
         }
     }
@@ -964,11 +1277,16 @@ mod tests {
         v
     }
 
+    fn is_prerelease(version: &str) -> bool {
+        fmt().version_class(version) == VersionClass::Prerelease
+    }
+
     #[test]
-    fn is_prerelease_detects_label() {
-        assert!(!is_prerelease("1.0.0"));
+    fn the_default_version_class_is_semver() {
+        assert_eq!(fmt().version_class("1.0.0"), VersionClass::Release);
         assert!(is_prerelease("1.0.0-beta"));
         assert!(is_prerelease("2.1.0-rc.1"));
+        assert_eq!(fmt().retention_partition("lib", "1.0.0"), None);
     }
 
     #[test]
@@ -987,7 +1305,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.1", "1.0.2"]);
     }
 
@@ -1008,7 +1326,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         // newest two (2.0.0, 1.5.0) protected; 1.0.0 deleted.
         assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
     }
@@ -1027,7 +1345,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["2.0.0"]);
     }
 
@@ -1047,7 +1365,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0", "3.0.0"]);
     }
 
@@ -1067,7 +1385,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
     }
 
@@ -1088,7 +1406,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["2.0.0", "3.0.0"]);
     }
 
@@ -1109,7 +1427,7 @@ mod tests {
                 },
             )
         }]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
     }
 
@@ -1130,7 +1448,7 @@ mod tests {
                 },
             )
         }]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["2.0.0-beta"]);
     }
 
@@ -1151,7 +1469,7 @@ mod tests {
                 },
             )
         }]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].package_name, "acme.core");
     }
@@ -1173,7 +1491,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
     }
 
@@ -1205,7 +1523,7 @@ mod tests {
                 },
             ),
         ]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
     }
 
@@ -1230,7 +1548,7 @@ mod tests {
                 },
             ),
         ]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].action, Action::HardDelete);
         assert_eq!(d[0].rule_id, "d");
@@ -1247,7 +1565,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].action, Action::Unlist);
     }
@@ -1265,7 +1583,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.1.0"]);
 
         // A hard-delete rule still reaches an unlisted version.
@@ -1279,7 +1597,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &[hidden]);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &[hidden]);
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].action, Action::HardDelete);
     }
@@ -1296,7 +1614,7 @@ mod tests {
             },
         )]);
         p.enabled = false;
-        assert!(evaluate(&fmt(), now(), &p, &cands).is_empty());
+        assert!(evaluate(&fmt(), now(), &p, &Selectors::none(), &cands).is_empty());
     }
 
     #[test]
@@ -1309,7 +1627,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        assert!(evaluate(&fmt(), now(), &p, &[]).is_empty());
+        assert!(evaluate(&fmt(), now(), &p, &Selectors::none(), &[]).is_empty());
     }
 
     #[test]
@@ -1330,7 +1648,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         let mut pairs: Vec<(String, String)> = d
             .iter()
             .map(|x| (x.package_name.clone(), x.version.clone()))
@@ -1346,6 +1664,7 @@ mod tests {
 
     fn unlisted(mut c: CandidateComponent) -> CandidateComponent {
         c.listed = false;
+        c.unlisted_at = Some(c.created_at);
         c
     }
 
@@ -1376,7 +1695,7 @@ mod tests {
                 },
             )
         }]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
     }
 
@@ -1402,7 +1721,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0", "1.3.0", "1.4.0"]);
     }
 
@@ -1438,7 +1757,7 @@ mod tests {
                 },
             ),
         ]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         let mut pairs: Vec<(String, String)> = d
             .iter()
             .map(|x| (x.package_name.clone(), x.version.clone()))
@@ -1484,7 +1803,7 @@ mod tests {
                 },
             ),
         ]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0", "2.0.0-beta.1"]);
     }
 
@@ -1510,7 +1829,7 @@ mod tests {
                 },
             )
         }]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
     }
 
@@ -1533,7 +1852,7 @@ mod tests {
                 ..Default::default()
             },
         )]);
-        let d = evaluate(&fmt(), now(), &p, &cands);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
         assert_eq!(deleted_versions(&d), vec!["1.0.0", "1.2.0"]);
     }
 
@@ -1606,10 +1925,10 @@ mod tests {
             },
         ]);
 
-        let decisions = evaluate(&fmt(), now(), &p, &all);
+        let decisions = evaluate(&fmt(), now(), &p, &Selectors::none(), &all);
         let expected: Vec<Decision> = by_package
             .iter()
-            .flat_map(|group| evaluate(&fmt(), now(), &p, group))
+            .flat_map(|group| evaluate(&fmt(), now(), &p, &Selectors::none(), group))
             .collect();
         assert_eq!(decisions.len(), expected.len());
         assert!(
@@ -1662,6 +1981,9 @@ mod tests {
             scope: Scope::ProxyCached,
             release_type: ReleaseType::Any,
             package_name_prefix: None,
+            selector: None,
+            version_pattern: None,
+            exclude_version_pattern: None,
             criteria: Criteria {
                 not_pulled_for_days: Some(days),
                 ..Default::default()
@@ -1678,7 +2000,7 @@ mod tests {
             proxy(4, "lib", "4.0.0", 10, None),      // never pulled, seen 10d ago → warm
         ];
         let p = policy_with(vec![proxy_rule("evict", 30)]);
-        let d = evaluate_proxy(&fmt(), now(), &p, &cands);
+        let d = evaluate_proxy(&fmt(), now(), &p, &Selectors::none(), &cands);
         let mut ids: Vec<i64> = d.iter().map(|x| x.cached_version_id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 3]);
@@ -1701,11 +2023,11 @@ mod tests {
             proxy_rule("p", 30),
         ]);
         // hosted evaluator only sees the hosted rule
-        let hd = evaluate(&fmt(), now(), &p, &hosted_cands);
+        let hd = evaluate(&fmt(), now(), &p, &Selectors::none(), &hosted_cands);
         assert_eq!(hd.len(), 1);
         assert_eq!(hd[0].rule_id, "h");
         // proxy evaluator only sees the proxy rule
-        let pd = evaluate_proxy(&fmt(), now(), &p, &proxy_cands);
+        let pd = evaluate_proxy(&fmt(), now(), &p, &Selectors::none(), &proxy_cands);
         assert_eq!(pd.len(), 1);
         assert_eq!(pd[0].rule_id, "p");
     }
@@ -1715,7 +2037,7 @@ mod tests {
         let cands = vec![proxy(1, "lib", "1.0.0", 100, None)];
         let mut p = policy_with(vec![proxy_rule("p", 1)]);
         p.enabled = false;
-        assert!(evaluate_proxy(&fmt(), now(), &p, &cands).is_empty());
+        assert!(evaluate_proxy(&fmt(), now(), &p, &Selectors::none(), &cands).is_empty());
     }
 
     /// A proxy rule evicting what nobody pulled for 30 days, keeping the
@@ -1740,7 +2062,7 @@ mod tests {
     }
 
     fn evicted(p: &RetentionPolicy, cands: &[ProxyCandidate]) -> Vec<i64> {
-        let mut ids: Vec<i64> = evaluate_proxy(&fmt(), now(), p, cands)
+        let mut ids: Vec<i64> = evaluate_proxy(&fmt(), now(), p, &Selectors::none(), cands)
             .iter()
             .map(|d| d.cached_version_id)
             .collect();
@@ -1837,6 +2159,7 @@ mod tests {
         let plan = evaluate_size_budget(
             &fmt(),
             &policy,
+            &Selectors::none(),
             &candidates,
             &[],
             120,
@@ -1883,6 +2206,7 @@ mod tests {
         let plan = evaluate_size_budget(
             &fmt(),
             &policy,
+            &Selectors::none(),
             &candidates,
             &[],
             150,
@@ -1915,12 +2239,7 @@ mod tests {
             rule_id: "prerelease".into(),
             reason: DecisionReason {
                 older_than_days: Some(1),
-                not_downloaded_for_days: None,
-                not_pulled_for_days: None,
-                size_budget: None,
-                target_bytes: None,
-                size_bytes: None,
-                last_used_at: None,
+                ..DecisionReason::default()
             },
         }];
         let mut policy = policy_with(Vec::new());
@@ -1931,6 +2250,7 @@ mod tests {
         let plan = evaluate_size_budget(
             &fmt(),
             &policy,
+            &Selectors::none(),
             &candidates,
             &[],
             200,
@@ -1960,6 +2280,7 @@ mod tests {
         let plan = evaluate_size_budget(
             &fmt(),
             &policy,
+            &Selectors::none(),
             &[],
             &[],
             95,
@@ -1991,6 +2312,7 @@ mod tests {
         let plan = evaluate_size_budget(
             &fmt(),
             &policy,
+            &Selectors::none(),
             &candidates,
             &[],
             150,
@@ -2024,6 +2346,7 @@ mod tests {
         let plan = evaluate_size_budget(
             &fmt(),
             &policy,
+            &Selectors::none(),
             &[],
             &candidates,
             150,
@@ -2043,5 +2366,522 @@ mod tests {
         assert_eq!(plan.size_after, 60);
         assert!(plan.target_reached);
         assert!(plan.proxy.iter().all(|d| d.rule_id == "size_budget"));
+    }
+
+    // ---- #185: more triggers and filters ----
+
+    fn with_criteria(id: &str, action: Action, criteria: Criteria) -> RetentionRule {
+        rule(id, action, criteria)
+    }
+
+    fn hard_delete(criteria: Criteria) -> RetentionPolicy {
+        policy_with(vec![with_criteria("r", Action::HardDelete, criteria)])
+    }
+
+    fn superseded(days: u32) -> Criteria {
+        Criteria {
+            prerelease_superseded_for_days: Some(days),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prerelease_superseded_once_a_release_has_been_out_long_enough() {
+        let cands = vec![
+            comp(1, "lib", "2.2.0-beta.1", 120, None),
+            comp(2, "lib", "2.2.0", 90, None),
+            comp(3, "lib", "2.3.0-ci.417", 60, None),
+            comp(4, "lib", "2.3.0", 20, None),
+            // No release orders after it: never superseded.
+            comp(5, "lib", "2.4.0-ci.5", 10, None),
+        ];
+        let d = evaluate(
+            &fmt(),
+            now(),
+            &hard_delete(superseded(14)),
+            &Selectors::none(),
+            &cands,
+        );
+        assert_eq!(deleted_versions(&d), vec!["2.2.0-beta.1", "2.3.0-ci.417"]);
+        let ci = d.iter().find(|d| d.version == "2.3.0-ci.417").unwrap();
+        assert_eq!(ci.reason.prerelease_superseded_for_days, Some(14));
+        assert_eq!(ci.reason.superseded_by.as_deref(), Some("2.3.0"));
+        // The beta has had a release since 2.2.0 came out, 90 days ago.
+        let beta = d.iter().find(|d| d.version == "2.2.0-beta.1").unwrap();
+        assert_eq!(beta.reason.superseded_by.as_deref(), Some("2.2.0"));
+
+        // 2.3.0 has been out for 20 days only.
+        let d = evaluate(
+            &fmt(),
+            now(),
+            &hard_delete(superseded(30)),
+            &Selectors::none(),
+            &cands,
+        );
+        assert_eq!(deleted_versions(&d), vec!["2.2.0-beta.1"]);
+    }
+
+    #[test]
+    fn supersession_counts_from_the_first_published_newer_release_that_is_listed() {
+        // 3.0.0 was published before 2.0.0 (a hotfix line): the prerelease
+        // has had a newer release for 50 days. An unlisted release supersedes
+        // nothing.
+        let mut cands = vec![
+            comp(1, "lib", "2.0.0-rc.1", 100, None),
+            comp(2, "lib", "2.0.0", 5, None),
+            comp(3, "lib", "3.0.0", 50, None),
+            unlisted(comp(4, "lib", "4.0.0", 80, None)),
+        ];
+        let d = evaluate(
+            &fmt(),
+            now(),
+            &hard_delete(superseded(40)),
+            &Selectors::none(),
+            &cands,
+        );
+        assert_eq!(deleted_versions(&d), vec!["2.0.0-rc.1"]);
+        assert_eq!(d[0].reason.superseded_by.as_deref(), Some("3.0.0"));
+
+        // Without 3.0.0 only the 5-day-old 2.0.0 is left.
+        cands.remove(2);
+        let d = evaluate(
+            &fmt(),
+            now(),
+            &hard_delete(superseded(40)),
+            &Selectors::none(),
+            &cands,
+        );
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn unlisted_for_days_deletes_versions_unlisted_long_enough() {
+        let mut long_ago = unlisted(comp(1, "lib", "1.0.0", 400, None));
+        long_ago.unlisted_at = Some(days_ago(100));
+        let mut lately = unlisted(comp(2, "lib", "1.1.0", 400, None));
+        lately.unlisted_at = Some(days_ago(10));
+        // Unlisted, but when is not known: not judged.
+        let mut unknown = unlisted(comp(3, "lib", "1.2.0", 400, None));
+        unknown.unlisted_at = None;
+        let listed = comp(4, "lib", "1.3.0", 400, None);
+        let cands = vec![long_ago, lately, unknown, listed];
+        let p = hard_delete(Criteria {
+            unlisted_for_days: Some(90),
+            ..Default::default()
+        });
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0.0"]);
+        assert_eq!(d[0].action, Action::HardDelete);
+        assert_eq!(d[0].reason.unlisted_for_days, Some(90));
+    }
+
+    #[test]
+    fn two_step_policy_unlists_then_deletes_later() {
+        // Rule 1 unlists versions older than 30 days, rule 2 deletes what has
+        // been unlisted for 60 days.
+        let mut old_unlisted = unlisted(comp(1, "lib", "1.0.0", 200, None));
+        old_unlisted.unlisted_at = Some(days_ago(70));
+        let cands = vec![
+            old_unlisted,
+            comp(2, "lib", "1.1.0", 40, None),
+            comp(3, "lib", "1.2.0", 5, None),
+        ];
+        let p = policy_with(vec![
+            with_criteria(
+                "unlist-old",
+                Action::Unlist,
+                Criteria {
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            ),
+            with_criteria(
+                "delete-unlisted",
+                Action::HardDelete,
+                Criteria {
+                    unlisted_for_days: Some(60),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
+        let by_version: HashMap<&str, (&str, Action)> = d
+            .iter()
+            .map(|d| (d.version.as_str(), (d.rule_id.as_str(), d.action)))
+            .collect();
+        assert_eq!(by_version["1.0.0"], ("delete-unlisted", Action::HardDelete));
+        assert_eq!(by_version["1.1.0"], ("unlist-old", Action::Unlist));
+        assert_eq!(by_version.len(), 2);
+    }
+
+    #[test]
+    fn max_versions_per_package_is_a_pure_count() {
+        // All published today: no age needed. Unlisted versions count too.
+        let cands = vec![
+            comp(1, "lib", "1.0.0", 0, None),
+            unlisted(comp(2, "lib", "1.1.0", 0, None)),
+            comp(3, "lib", "1.2.0", 0, None),
+            comp(4, "lib", "1.3.0", 0, None),
+            comp(5, "lib", "1.4.0", 0, None),
+            comp(6, "other", "1.0.0", 0, None),
+        ];
+        let p = hard_delete(Criteria {
+            max_versions_per_package: Some(3),
+            ..Default::default()
+        });
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0.0", "1.1.0"]);
+        let ranks: HashMap<&str, Option<u32>> = d
+            .iter()
+            .map(|d| (d.version.as_str(), d.reason.rank))
+            .collect();
+        assert_eq!(ranks["1.1.0"], Some(4));
+        assert_eq!(ranks["1.0.0"], Some(5));
+        assert!(d
+            .iter()
+            .all(|d| d.reason.max_versions_per_package == Some(3)));
+    }
+
+    #[test]
+    fn max_versions_per_package_counts_the_rules_own_pool_and_ands_with_age() {
+        let cands = vec![
+            comp(1, "lib", "1.0.0", 100, None),
+            comp(2, "lib", "1.1.0-ci.1", 100, None),
+            comp(3, "lib", "1.1.0-ci.2", 100, None),
+            comp(4, "lib", "1.1.0-ci.3", 1, None),
+            comp(5, "lib", "1.1.0-ci.4", 100, None),
+            comp(6, "lib", "1.1.0", 100, None),
+        ];
+        // At most 1 prerelease (the newest, ci.4), and only those older
+        // than 30 days go: ci.3 is too young.
+        let p = policy_with(vec![RetentionRule {
+            release_type: ReleaseType::Prereleases,
+            ..with_criteria(
+                "ci",
+                Action::HardDelete,
+                Criteria {
+                    max_versions_per_package: Some(1),
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            )
+        }]);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.1.0-ci.1", "1.1.0-ci.2"]);
+    }
+
+    #[test]
+    fn version_patterns_include_and_exclude_ignoring_case() {
+        let cands = vec![
+            comp(1, "lib", "1.0.0-ci.1", 100, None),
+            comp(2, "lib", "1.0.0-pr.7", 100, None),
+            comp(3, "lib", "1.0.0-beta.1", 100, None),
+            comp(4, "lib", "1.0.0-ci.keep", 100, None),
+            comp(5, "lib", "1.0.0", 100, None),
+        ];
+        let p = policy_with(vec![RetentionRule {
+            version_pattern: Some("{*-CI.*,*-pr.*}".into()),
+            exclude_version_pattern: Some("*.keep".into()),
+            ..with_criteria(
+                "ci-and-pr",
+                Action::HardDelete,
+                Criteria {
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            )
+        }]);
+        let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0.0-ci.1", "1.0.0-pr.7"]);
+    }
+
+    fn selector(includes: &[&str], excludes: &[&str]) -> CompiledSelector {
+        crate::authz::SelectorPatterns {
+            includes: includes.iter().map(|s| s.to_string()).collect(),
+            excludes: excludes.iter().map(|s| s.to_string()).collect(),
+        }
+        .compile()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_selector_filters_packages_and_an_unresolved_one_admits_nothing() {
+        let cands = vec![
+            comp(1, "acme.core", "1.0.0", 100, None),
+            comp(2, "acme.keep.this", "1.0.0", 100, None),
+            comp(3, "other.lib", "1.0.0", 100, None),
+        ];
+        let p = policy_with(vec![RetentionRule {
+            selector: Some("internal".into()),
+            ..with_criteria(
+                "internal",
+                Action::HardDelete,
+                Criteria {
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            )
+        }]);
+        let mut selectors = Selectors::none();
+        selectors.insert("internal", selector(&["Acme.*"], &["acme.keep.*"]));
+        let d = evaluate(&fmt(), now(), &p, &selectors, &cands);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].package_name, "acme.core");
+        // Fail closed: a selector the caller could not resolve selects
+        // nothing.
+        assert!(evaluate(&fmt(), now(), &p, &Selectors::none(), &cands).is_empty());
+    }
+
+    #[test]
+    fn protections_win_over_every_new_trigger() {
+        // Every version would be selected by each trigger below...
+        let mut gone = unlisted(comp(1, "lib", "1.0.0-ci.1", 100, Some(50)));
+        gone.unlisted_at = Some(days_ago(100));
+        let mut gone_too = unlisted(comp(2, "lib", "1.0.0-ci.2", 100, Some(60)));
+        gone_too.unlisted_at = Some(days_ago(100));
+        let cands = vec![
+            gone,
+            gone_too,
+            comp(3, "lib", "1.0.0", 100, None),
+            comp(4, "lib", "2.0.0", 100, None),
+        ];
+        let triggers = [
+            Criteria {
+                prerelease_superseded_for_days: Some(1),
+                ..Default::default()
+            },
+            Criteria {
+                unlisted_for_days: Some(1),
+                ..Default::default()
+            },
+            Criteria {
+                max_versions_per_package: Some(1),
+                ..Default::default()
+            },
+        ];
+        for criteria in triggers {
+            let alone = hard_delete(criteria.clone());
+            let selected = evaluate(&fmt(), now(), &alone, &Selectors::none(), &cands);
+            assert!(!selected.is_empty(), "{criteria:?} selects nothing alone");
+            // ...but a rule that keeps them (in this rule or another one)
+            // wins: the newest listed and the most recently downloaded.
+            for keep_in_same_rule in [true, false] {
+                let keep = Criteria {
+                    keep_last_n: Some(10),
+                    keep_n_most_downloaded: Some(10),
+                    older_than_days: Some(1000),
+                    ..Default::default()
+                };
+                let p = if keep_in_same_rule {
+                    hard_delete(Criteria {
+                        keep_last_n: Some(10),
+                        keep_n_most_downloaded: Some(10),
+                        ..criteria.clone()
+                    })
+                } else {
+                    policy_with(vec![
+                        with_criteria("keep", Action::HardDelete, keep),
+                        with_criteria("trigger", Action::HardDelete, criteria.clone()),
+                    ])
+                };
+                let d = evaluate(&fmt(), now(), &p, &Selectors::none(), &cands);
+                assert!(d.is_empty(), "{criteria:?}: {d:?}");
+            }
+        }
+    }
+
+    /// A Maven-like format: `<base>-SNAPSHOT` builds are written
+    /// `<base>-<timestamp>-<n>`, are snapshots, sort before their release
+    /// and are counted per base version; releases are counted per package.
+    struct SnapshotFormat;
+
+    impl SnapshotFormat {
+        fn split(v: &str) -> (Vec<u64>, Option<&str>) {
+            let (base, build) = v.split_once('-').map_or((v, None), |(b, s)| (b, Some(s)));
+            (
+                base.split('.').map(|c| c.parse().unwrap_or(0)).collect(),
+                build,
+            )
+        }
+    }
+
+    impl Format for SnapshotFormat {
+        fn id(&self) -> &'static str {
+            "snapshots"
+        }
+        fn parse_upload(&self, _f: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
+            unreachable!()
+        }
+        fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
+            Ok(raw.to_string())
+        }
+        fn compare_versions(&self, a: &str, b: &str) -> Ordering {
+            let (ab, abuild) = Self::split(a);
+            let (bb, bbuild) = Self::split(b);
+            ab.cmp(&bb).then(match (abuild, bbuild) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(x), Some(y)) => x.cmp(y),
+            })
+        }
+        fn lower_id(&self, id: &str) -> String {
+            id.to_lowercase()
+        }
+        fn version_class(&self, version: &str) -> VersionClass {
+            if version.contains('-') {
+                VersionClass::Snapshot
+            } else {
+                VersionClass::Release
+            }
+        }
+        fn retention_partition(&self, _id: &str, version: &str) -> Option<String> {
+            version
+                .split_once('-')
+                .map(|(base, _)| format!("{base}-SNAPSHOT"))
+        }
+    }
+
+    #[test]
+    fn format_hooks_partition_keep_n_and_class_snapshots() {
+        let cands = vec![
+            comp(1, "g:a", "1.0-20260101.000000-1", 100, None),
+            comp(2, "g:a", "1.0-20260102.000000-2", 100, None),
+            comp(3, "g:a", "1.0-20260103.000000-3", 100, None),
+            comp(4, "g:a", "1.1-20260104.000000-1", 100, None),
+            comp(5, "g:a", "1.1-20260105.000000-2", 100, None),
+            comp(6, "g:a", "0.9", 100, None),
+            comp(7, "g:a", "0.8", 100, None),
+        ];
+        // Keep the newest build of each -SNAPSHOT version; delete the other
+        // builds older than 30 days. Releases are not snapshots.
+        let p = policy_with(vec![RetentionRule {
+            release_type: ReleaseType::Snapshots,
+            ..with_criteria(
+                "snapshots",
+                Action::HardDelete,
+                Criteria {
+                    keep_last_n: Some(1),
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            )
+        }]);
+        let d = evaluate(&SnapshotFormat, now(), &p, &Selectors::none(), &cands);
+        assert_eq!(
+            deleted_versions(&d),
+            vec![
+                "1.0-20260101.000000-1",
+                "1.0-20260102.000000-2",
+                "1.1-20260104.000000-1"
+            ]
+        );
+
+        // The newest 2 builds of each snapshot version, as a count.
+        let p = policy_with(vec![RetentionRule {
+            release_type: ReleaseType::Snapshots,
+            ..with_criteria(
+                "builds",
+                Action::HardDelete,
+                Criteria {
+                    max_versions_per_package: Some(2),
+                    ..Default::default()
+                },
+            )
+        }]);
+        let d = evaluate(&SnapshotFormat, now(), &p, &Selectors::none(), &cands);
+        assert_eq!(deleted_versions(&d), vec!["1.0-20260101.000000-1"]);
+
+        // A version's snapshots go once its release exists.
+        let mut released = cands.clone();
+        released.push(comp(8, "g:a", "1.0", 20, None));
+        let d = evaluate(
+            &SnapshotFormat,
+            now(),
+            &hard_delete(superseded(7)),
+            &Selectors::none(),
+            &released,
+        );
+        assert_eq!(
+            deleted_versions(&d),
+            vec![
+                "1.0-20260101.000000-1",
+                "1.0-20260102.000000-2",
+                "1.0-20260103.000000-3"
+            ]
+        );
+        assert!(d
+            .iter()
+            .all(|d| d.reason.superseded_by.as_deref() == Some("1.0")));
+
+        // Release rules count the releases of the package (one partition):
+        // `prereleases` admits no snapshot of this format.
+        let p = policy_with(vec![RetentionRule {
+            release_type: ReleaseType::Releases,
+            ..with_criteria(
+                "releases",
+                Action::HardDelete,
+                Criteria {
+                    keep_last_n: Some(1),
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            )
+        }]);
+        let d = evaluate(&SnapshotFormat, now(), &p, &Selectors::none(), &cands);
+        assert_eq!(deleted_versions(&d), vec!["0.8"]);
+        let p = policy_with(vec![RetentionRule {
+            release_type: ReleaseType::Prereleases,
+            ..with_criteria(
+                "none",
+                Action::HardDelete,
+                Criteria {
+                    older_than_days: Some(30),
+                    ..Default::default()
+                },
+            )
+        }]);
+        assert!(evaluate(&SnapshotFormat, now(), &p, &Selectors::none(), &cands).is_empty());
+    }
+
+    #[test]
+    fn proxy_rules_take_filters_and_max_versions_per_package() {
+        let cands = vec![
+            proxy(1, "lib", "1.0.0", 100, Some(1)),
+            proxy(2, "lib", "1.1.0", 100, Some(1)),
+            proxy(3, "lib", "1.2.0-ci.1", 100, Some(1)),
+            proxy(4, "lib", "1.2.0", 100, Some(1)),
+        ];
+        // Pulled yesterday, but more than 2 cached versions: a count needs
+        // no cold trigger.
+        let mut count = proxy_rule("count", 30);
+        count.criteria.not_pulled_for_days = None;
+        count.criteria.max_versions_per_package = Some(2);
+        let d = evaluate_proxy(
+            &fmt(),
+            now(),
+            &policy_with(vec![count.clone()]),
+            &Selectors::none(),
+            &cands,
+        );
+        let ids: Vec<i64> = d.iter().map(|d| d.cached_version_id).collect();
+        assert_eq!(ids, vec![2, 1]);
+        assert!(d
+            .iter()
+            .all(|d| d.reason.max_versions_per_package == Some(2)));
+        // Only the CI builds count and go.
+        count.version_pattern = Some("*-ci.*".into());
+        count.criteria.max_versions_per_package = Some(1);
+        let mut second = cands.clone();
+        second.push(proxy(5, "lib", "1.3.0-ci.1", 100, Some(1)));
+        let d = evaluate_proxy(
+            &fmt(),
+            now(),
+            &policy_with(vec![count]),
+            &Selectors::none(),
+            &second,
+        );
+        let ids: Vec<i64> = d.iter().map(|d| d.cached_version_id).collect();
+        assert_eq!(ids, vec![3]);
     }
 }

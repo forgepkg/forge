@@ -88,6 +88,34 @@ pub trait FormatPlugin: Send + Sync + 'static {
         a.cmp(b)
     }
 
+    /// Retention: the class of a normalized version (release, prerelease
+    /// or snapshot), which a rule's `release_type` filters on and
+    /// `prerelease_superseded_for_days` reads. The default is SemVer's rule:
+    /// a version with a `-` is a prerelease, any other a release. A format
+    /// whose versions say it otherwise (Maven: `33.0.0-jre` is a release,
+    /// `1.0-SNAPSHOT` a snapshot) overrides it.
+    fn version_class(&self, version: &str) -> VersionClass {
+        if version.contains('-') {
+            VersionClass::Prerelease
+        } else {
+            VersionClass::Release
+        }
+    }
+
+    /// Retention: the partition of a package's versions within which the
+    /// keep-N rules count (`keep_last_n`, `keep_n_most_downloaded`,
+    /// `max_versions_per_package`), so that a format defines what "the
+    /// newest N" means. `None` (the default): the package is one partition,
+    /// so its newest N versions are kept. A format returns a key of its own
+    /// for versions it counts apart: Maven the base version of a timestamped
+    /// snapshot build (the newest N builds of each `-SNAPSHOT` version), apt
+    /// the architecture a build is for. `id` is canonical, `version`
+    /// normalized; called once per version and rule, so keep it quick.
+    fn retention_partition(&self, id: &str, version: &str) -> Option<String> {
+        let _ = (id, version);
+        None
+    }
+
     /// Read a package's identity, manifest and dependencies. `package` is
     /// positioned at its start. The default reads none.
     fn parse_package(&self, package: &mut dyn PackageSource) -> Result<ParsedPackage, FormatError> {
