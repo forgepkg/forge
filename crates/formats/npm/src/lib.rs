@@ -7,8 +7,9 @@
 //! search, publishing (the tarball comes inside a JSON document,
 //! [`publish`]), dist-tags, deprecations, unpublishing, the logins, and
 //! audits passed to an upstream. Proxies read another registry through
-//! [`proxy`]. Forge keeps the rest: storage, authentication, the tags and
-//! deprecations themselves, hosted/proxy/group semantics and retention.
+//! [`proxy`], and an import copies one's packages through [`import`].
+//! Forge keeps the rest: storage, authentication, the tags and deprecations
+//! themselves, hosted/proxy/group semantics and retention.
 //!
 //! The pure parts: [`name`] and [`version`] rules, [`tarball`] reading,
 //! [`integrity`] checks, the [`document`]s clients `PUT`, version
@@ -16,6 +17,7 @@
 //! [`upstream`] packuments.
 
 pub mod document;
+pub mod import;
 pub mod integrity;
 pub mod manifest;
 pub mod name;

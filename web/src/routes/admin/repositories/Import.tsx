@@ -5,6 +5,7 @@ import {
   IMPORT_FORMATS,
   isActive,
   type CreateImport,
+  type ImportItem,
   type ImportState,
   type ImportView,
   type ItemState,
@@ -72,9 +73,10 @@ const ITEM_TONES: Record<ItemState, Tone> = {
 
 /**
  * Import a repository from another server into this hosted repository (the
- * admin API under `/admin/repositories/{name}/imports`): a NuGet feed or a
- * registry, read through the format's own protocol, so Nexus, Artifactory,
- * ProGet, BaGet, Harbor, a `distribution` registry or another Forge alike.
+ * admin API under `/admin/repositories/{name}/imports`): a NuGet feed, an npm
+ * registry or a registry API, read through the format's own protocol, so
+ * Nexus, Artifactory, ProGet, BaGet, Verdaccio, Harbor, a `distribution`
+ * registry or another Forge alike.
  * The form starts an import (or a dry run); the server checks the source
  * before it accepts one and says what is wrong. Below, the repository's imports with their progress,
  * re-read every two seconds while one runs: cancel, resume, retry the failed
@@ -124,12 +126,12 @@ function ImportRepository() {
         crumbs={crumbs}
         kind={repo.data.kind}
         format={repo.data.format}
-        description="Copy the packages of a NuGet feed, or the images of a registry, into this repository, read through the format's own protocol: from Nexus, Artifactory, ProGet, BaGet, Harbor, a distribution registry or another Forge. Versions Forge already has with the same bytes are skipped, so running an import again copies only what is new: import once, then again just before clients switch to Forge."
+        description="Copy the packages of a NuGet feed or an npm registry, or the images of a registry, into this repository, read through the format's own protocol: from Nexus, Artifactory, ProGet, BaGet, Verdaccio, Harbor, a distribution registry or another Forge. Versions Forge already has with the same bytes are skipped, so running an import again copies only what is new: import once, then again just before clients switch to Forge."
       />
 
       {!supported ? (
         <Notice tone="info">
-          Imports go to a hosted NuGet or Docker repository; this is a{' '}
+          Imports go to a hosted NuGet, npm or Docker repository; this is a{' '}
           {repo.data.format} {repo.data.kind} repository.
         </Notice>
       ) : active ? (
@@ -140,7 +142,7 @@ function ImportRepository() {
         <StartImportForm
           key={imports.data[0]?.id ?? 'first'}
           repo={name}
-          docker={repo.data.format === 'docker'}
+          format={repo.data.format}
           previous={imports.data[0]}
         />
       ) : null}
@@ -162,7 +164,7 @@ function ImportRepository() {
           all.map((i, n) => (
             <Fragment key={i.id}>
               {n > 0 && <hr className="fg-divider" />}
-              <ImportCard repo={name} imp={i} />
+              <ImportCard repo={name} format={repo.data.format} imp={i} />
             </Fragment>
           ))
         )}
@@ -177,13 +179,15 @@ function ImportRepository() {
  */
 function StartImportForm({
   repo,
-  docker,
+  format,
   previous,
 }: {
   repo: string
-  docker: boolean
+  format: string
   previous?: ImportView
 }) {
+  const docker = format === 'docker'
+  const npm = format === 'npm'
   const create = useCreateImport(repo)
   const [url, setUrl] = useState(previous?.url ?? '')
   const [names, setNames] = useState((previous?.names ?? []).join('\n'))
@@ -205,7 +209,7 @@ function StartImportForm({
     setFormError(null)
     if (!url.trim()) {
       setFormError(
-        docker
+        docker || npm
           ? 'Enter the URL of the registry to import from.'
           : 'Enter the URL of the feed to import from.',
       )
@@ -259,17 +263,28 @@ function StartImportForm({
     >
       <div className="fg-form">
         <TextField
-          label={docker ? 'Registry URL' : 'Feed URL'}
+          label={docker || npm ? 'Registry URL' : 'Feed URL'}
           mono
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder={
             docker
               ? 'https://registry.example.com'
-              : 'https://nexus.example.com/repository/nuget-hosted/index.json'
+              : npm
+                ? 'https://nexus.example.com/repository/npm-hosted'
+                : 'https://nexus.example.com/repository/nuget-hosted/index.json'
           }
           description={
-            docker ? (
+            npm ? (
+              <>
+                The npm registry, as clients use it with{' '}
+                <Code>--registry</Code>. Nexus:{' '}
+                <Code>&lt;Nexus URL&gt;/repository/&lt;name&gt;</Code>. Tarballs are
+                downloaded from this URL, whatever host the registry&rsquo;s metadata
+                names. Point it at a hosted repository: a group or a proxy lists its
+                upstream&rsquo;s packages too.
+              </>
+            ) : docker ? (
               <>
                 The registry API. Nexus: the repository&rsquo;s connector, e.g.{' '}
                 <Code>http://nexus.example.com:8082</Code>, or its path route,{' '}
@@ -286,7 +301,7 @@ function StartImportForm({
           }
         />
         <TextareaField
-          label={docker ? 'Images' : 'Package IDs'}
+          label={docker ? 'Images' : npm ? 'Packages or scopes' : 'Package IDs'}
           optional
           mono
           rows={3}
@@ -295,7 +310,9 @@ function StartImportForm({
           description={
             docker
               ? 'One per line. Empty: every image the registry’s catalog lists. Name them for a registry without a catalog (Docker Hub, GHCR, ECR).'
-              : 'One per line. Empty: every package the feed’s search finds. Name them for a feed without a search, or for packages a search misses (Nexus stops at 10,000; a package whose versions are all unlisted is in no search result).'
+              : npm
+                ? 'One per line: a package (left-pad, @acme/ui) or a scope (@acme, every package of it). Empty: every package the registry’s search lists, or else its /-/all. Name them for a registry that serves neither.'
+                : 'One per line. Empty: every package the feed’s search finds. Name them for a feed without a search, or for packages a search misses (Nexus stops at 10,000; a package whose versions are all unlisted is in no search result).'
           }
         />
         <div className="fg-fieldrow">
@@ -318,7 +335,11 @@ function StartImportForm({
         </div>
         <div className="fg-fieldrow">
           <SelectField
-            label="A version Forge has with other bytes"
+            label={
+              npm
+                ? 'A version Forge has with other bytes, or a dist-tag or deprecation Forge set otherwise'
+                : 'A version Forge has with other bytes'
+            }
             value={onConflict}
             onChange={(e) => setOnConflict(e.target.value as OnConflict)}
           >
@@ -361,7 +382,15 @@ function parseNames(text: string): string[] {
 }
 
 /** One import of the repository: its state, progress, counts and actions. */
-function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
+function ImportCard({
+  repo,
+  format,
+  imp,
+}: {
+  repo: string
+  format: string
+  imp: ImportView
+}) {
   const cancel = useCancelImport(repo)
   const resume = useResumeImport(repo)
   const remove = useDeleteImport(repo)
@@ -413,8 +442,7 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
           : imp.phase === 'scan' && active
             ? `Scanning the source: ${p.found} found so far.`
             : `${done} of ${p.found} done.`}{' '}
-        {imp.source_total !== null &&
-          `The feed's search found ${imp.source_total} packages. `}
+        {imp.source_total !== null && `${sourceTotal(imp, format)} `}
         Started {formatDateTime(imp.started_at ?? imp.created_at)}
         {imp.finished_at && `, ended ${formatDateTime(imp.finished_at)}`}.
         {imp.source_server && ` ${imp.source_server}.`}
@@ -534,6 +562,22 @@ function ImportCard({ repo, imp }: { repo: string; imp: ImportView }) {
   )
 }
 
+/** What the preflight (and the scan) found at the source. */
+function sourceTotal(imp: ImportView, format: string): string {
+  const n = imp.source_total
+  if (imp.listing === 'all') return `The registry's /-/all lists ${n} packages.`
+  return format === 'npm'
+    ? `The registry's search found ${n} packages.`
+    : `The feed's search found ${n} packages.`
+}
+
+/** An item as the lists name it: a version, an image's tag, an npm dist-tag. */
+function itemLabel(item: ImportItem): string {
+  if (!item.version) return item.name
+  if (item.kind === 'tag') return `${item.name} dist-tag ${item.version}`
+  return `${item.name} ${item.version}`
+}
+
 /** The items of an import in one state (its conflicts, its failures). */
 function ItemList({
   repo,
@@ -562,9 +606,7 @@ function ItemList({
           <TableRow key={item.id}>
             <TableCell lead>
               <CellStack sub={item.detail ?? undefined}>
-                <span className="font-mono">
-                  {item.version ? `${item.name} ${item.version}` : item.name}
-                </span>
+                <span className="font-mono">{itemLabel(item)}</span>
               </CellStack>
             </TableCell>
             <TableCell align="right" nowrap>

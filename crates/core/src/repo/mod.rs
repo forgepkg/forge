@@ -214,6 +214,12 @@ pub struct ImportOptions {
     pub uploader: Option<String>,
     /// Where it came from, for the audit trail (the source's URL).
     pub source: String,
+    /// The package the source says this is, `(id, version)` as the format
+    /// writes them: a package that turns out to be another one is refused
+    /// before anything is written ([`crate::domain::FormatError`]). An npm
+    /// registry names a tarball in a package's packument, and the tarball's
+    /// `package.json` must agree.
+    pub expected: Option<(String, String)>,
 }
 
 /// What an import did with one package version.

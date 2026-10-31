@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT i.source\n        FROM repository_import_item i\n        JOIN repository_import r ON r.id = i.import_id\n        WHERE r.repository_id = $1 AND r.id < $2 AND NOT r.dry_run\n          AND i.kind = $3 AND i.name = $4 AND i.version = $5\n          AND i.state IN ('imported', 'replaced', 'identical')\n        ORDER BY r.id DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "source",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "repository_import_item",
+            "name": "source"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7f1c4828bf0ff818ceeb6815333c10042c2c391c8743083468a4d65b1ff5a6b2"
+}

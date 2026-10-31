@@ -1927,7 +1927,7 @@ fn outcome(result: Result<DeleteOutcome, WriteError>) -> Result<(), Response> {
 }
 
 /// A tag: a short word of letters, digits, `.`, `_` and `-`.
-fn valid_tag(tag: &str) -> bool {
+pub(crate) fn valid_tag(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() <= 64
         && tag

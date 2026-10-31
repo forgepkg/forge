@@ -1,15 +1,16 @@
 //! Imports into a hosted repository from another server ([`crate::import`]):
-//! a NuGet feed or a registry, read through the format's own protocol.
-//! **Admin-only.**
+//! a NuGet feed, an npm registry or a registry API, read through the
+//! format's own protocol. **Admin-only.**
 //!
 //! * `GET    /admin/repositories/{name}/imports` — the repository's imports,
 //!   newest first ([`ImportView`]).
 //! * `POST   /admin/repositories/{name}/imports` — start one
 //!   ([`CreateImport`]). The source is checked first (the **preflight**):
 //!   a feed's service index resolves and its search answers (with how many
-//!   packages it finds), or a registry answers its API and serves a
-//!   catalog; an import that names its package ids or images needs no
-//!   search or catalog. A failed check is a 400 (502 when the source is
+//!   packages it finds), an npm registry lists its packages (its search,
+//!   or `/-/all`), or a registry answers its API and serves a catalog; an
+//!   import that names its package ids, npm packages or scopes, or images
+//!   needs no search or catalog. A failed check is a 400 (502 when the source is
 //!   unreachable or failing) saying what is wrong; nothing is stored. A
 //!   repository runs one import at a time (409). `dry_run` decides every
 //!   item without writing a package: what would be copied, and the
@@ -49,9 +50,10 @@ use serde::{Deserialize, Serialize};
 use super::db_error;
 use crate::images::import::ImportSource;
 use crate::import::feed::Feed;
+use crate::import::npm::NpmRegistry;
 use crate::import::{
-    nexus_source_url, password_secret, source_url, Listing, SourceError, FORMATS, MAX_NAMES,
-    SEARCH_PAGE,
+    nexus_source_url, password_secret, source_url, Listing, Protocol, SourceError, FORMATS,
+    MAX_NAMES, NPM_PAGE, SEARCH_PAGE,
 };
 use crate::state::AppState;
 
@@ -94,14 +96,16 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct CreateImport {
     /// The source: a NuGet feed's service index
-    /// (`https://nexus.example.com/repository/nuget-hosted/index.json`), or a
+    /// (`https://nexus.example.com/repository/nuget-hosted/index.json`), an
+    /// npm registry (`https://nexus.example.com/repository/npm-hosted`), or a
     /// registry (`https://registry.example.com`). With `repository`, a Nexus
     /// server instead (the request before imports read the format's
     /// protocol).
     pub url: String,
     /// The Nexus repository at `url` to read (with `url` naming the Nexus
-    /// server): its service index, `<url>/repository/<name>/index.json`, or
-    /// its registry API, `registry_url` or `<url>/repository/<name>`.
+    /// server): its service index, `<url>/repository/<name>/index.json`, its
+    /// npm registry, `<url>/repository/<name>`, or its registry API,
+    /// `registry_url` or `<url>/repository/<name>`.
     #[serde(default)]
     pub repository: Option<String>,
     /// With `repository`: the Nexus Docker repository's connector, e.g.
@@ -109,7 +113,8 @@ pub struct CreateImport {
     #[serde(default)]
     pub registry_url: Option<String>,
     /// The package ids or images to copy, instead of every package the
-    /// feed's search finds (every image the registry's catalog lists).
+    /// feed's search finds (every image the registry's catalog lists). npm:
+    /// package names, or scopes (`@acme`: every package of the scope).
     #[serde(default)]
     pub names: Option<Vec<String>>,
     /// The source's credentials (both, or neither for anonymous access).
@@ -203,8 +208,12 @@ pub struct ImportView {
     /// The `Server` header the source answered the preflight with.
     pub source_server: Option<String>,
     /// How many packages the feed's search finds: what it reported in the
-    /// preflight, or as many as the scan walked, whichever is more.
+    /// preflight, or as many as the scan walked, whichever is more. npm: what
+    /// the registry's search reports, or how many `/-/all` lists.
     pub source_total: Option<i64>,
+    /// What the scan walks: `search`, `catalog`, `all` (npm's `/-/all`) or
+    /// `names`.
+    pub listing: String,
     pub last_error: Option<String>,
     pub created_by: Option<i64>,
     pub created_at: DateTime<Utc>,
@@ -236,7 +245,10 @@ async fn view(
     Ok(ImportView {
         id: import.id,
         repository: repo.name.clone(),
-        url: source_url(&import, state.formats.stores_images(&repo.format)),
+        url: source_url(
+            &import,
+            Protocol::of(&repo.format, state.formats.stores_images(&repo.format)),
+        ),
         names: import.names,
         username: import.username,
         has_password: import.has_password,
@@ -248,6 +260,7 @@ async fn view(
         cancel_requested: import.cancel_requested,
         source_server: import.source_server,
         source_total: import.source_total,
+        listing: import.scan_listing,
         last_error: import.last_error,
         created_by: import.created_by,
         created_at: import.created_at,
@@ -348,6 +361,7 @@ pub async fn create(
         ));
     }
     let images = state.formats.stores_images(&repo.format);
+    let protocol = Protocol::of(&repo.format, images);
     let Some(format) = state.formats.get(&repo.format) else {
         return bad_request(format!("the {} format is not loaded", repo.format));
     };
@@ -366,7 +380,7 @@ pub async fn create(
             if repository.is_empty() || repository.contains('/') {
                 return bad_request("repository must name one Nexus repository");
             }
-            if registry_url.is_some() && !images {
+            if registry_url.is_some() && protocol != Protocol::Images {
                 return bad_request("registry_url applies to Docker repositories only");
             }
             if let Some(registry_url) = &registry_url {
@@ -374,7 +388,7 @@ pub async fn create(
                     return bad_request(format!("invalid registry_url: {e}"));
                 }
             }
-            nexus_source_url(&url, &repository, registry_url.as_deref(), images)
+            nexus_source_url(&url, &repository, registry_url.as_deref(), protocol)
         }
         None if registry_url.is_some() => {
             return bad_request(
@@ -389,12 +403,21 @@ pub async fn create(
             let mut seen = std::collections::HashSet::new();
             let mut kept = Vec::new();
             for name in names {
-                let name = name.trim().to_string();
+                let mut name = name.trim().to_string();
                 if name.is_empty() {
                     continue;
                 }
-                if let Err(e) = format.validate_id(&name) {
-                    return bad_request(format!("names: {name:?} is no valid name: {e}"));
+                // npm: a scope stands for every package of it.
+                let scope = (protocol == Protocol::Npm)
+                    .then(|| forge_format_npm::import::parse_scope(&name))
+                    .flatten();
+                match scope {
+                    Some(scope) => name = scope,
+                    None => {
+                        if let Err(e) = format.validate_id(&name) {
+                            return bad_request(format!("names: {name:?} is no valid name: {e}"));
+                        }
+                    }
                 }
                 if seen.insert(format.lower_id(&name)) {
                     kept.push(name);
@@ -423,7 +446,53 @@ pub async fn create(
 
     // The preflight: does the source speak the format's protocol, and list
     // what to copy?
-    let (server, total) = if images {
+    let mut listing = Listing::of(images, names.is_some());
+    let (server, total) = if protocol == Protocol::Npm {
+        let mut registry = NpmRegistry::new(
+            state.upstream.clone(),
+            &source,
+            username.clone(),
+            password.clone(),
+        );
+        if let Err(e) = registry.ping().await {
+            return preflight_error(&format!("the npm registry at {source}"), e);
+        }
+        let total = if names.is_none() {
+            // The search for every package, then `/-/all`: Nexus' search
+            // finds nothing without a text, and Verdaccio refuses one.
+            let searched = match registry.search("", 0, NPM_PAGE).await {
+                Ok(searched) => searched,
+                // An answer that is no search result: no search to walk.
+                Err(SourceError::Invalid(_)) => None,
+                Err(e) => return preflight_error("searching the registry", e),
+            };
+            match searched {
+                Some(page) if !page.names.is_empty() => {
+                    Some(i64::try_from(page.total.max(page.names.len() as u64)).unwrap_or(i64::MAX))
+                }
+                searched => match registry.all().await {
+                    Ok(Some(all)) => {
+                        listing = Listing::All;
+                        Some(i64::try_from(all.len()).unwrap_or(i64::MAX))
+                    }
+                    // A search that answers, and finds nothing: an empty
+                    // registry.
+                    Ok(None) if searched.is_some() => Some(0),
+                    Ok(None) => {
+                        return bad_request(format!(
+                            "the npm registry at {source} lists no packages: it offers no search \
+                             for every package (/-/v1/search) and no /-/all; name the packages or \
+                             scopes to import"
+                        ))
+                    }
+                    Err(e) => return preflight_error("reading the registry's /-/all", e),
+                },
+            }
+        } else {
+            None
+        };
+        (registry.server().map(str::to_string), total)
+    } else if images {
         let credentials = match (&username, &password) {
             (Some(username), Some(password)) => Some(Credentials::for_url(
                 &source,
@@ -489,7 +558,6 @@ pub async fn create(
         };
         (feed.server().map(str::to_string), total)
     };
-    let listing = Listing::of(images, names.is_some());
 
     let created = async {
         let mut tx = forge_db::begin(&state.pool).await?;
