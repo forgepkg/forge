@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{db_error, double_option};
+use crate::base_urls::BaseUrls;
 use crate::state::AppState;
 
 /// Public, password-free view of a repository (REDACTED secrets).
@@ -445,8 +446,10 @@ fn deployment_policy_of(r: &Repository) -> DeploymentPolicy {
 }
 
 /// Validate and normalize a docker repository's `host`: a lowercase DNS name
-/// (no port, no scheme) other than the server's own public host.
-fn normalize_docker_host(raw: &str, public_base_url: &str) -> Result<String, String> {
+/// (no port, no scheme) other than the server's own host names: the public
+/// host and the alias hosts (`server.alias_base_urls`), where every
+/// repository is reachable by path.
+fn normalize_docker_host(raw: &str, base_urls: &BaseUrls) -> Result<String, String> {
     let host = raw.trim().trim_end_matches('.').to_ascii_lowercase();
     let label_ok = |l: &str| {
         !l.is_empty()
@@ -460,7 +463,7 @@ fn normalize_docker_host(raw: &str, public_base_url: &str) -> Result<String, Str
             "invalid host {raw:?}: give a DNS name such as docker.example.com (no scheme or port)"
         ));
     }
-    let public_host = url::Url::parse(public_base_url)
+    let public_host = url::Url::parse(base_urls.public())
         .ok()
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
     if public_host.as_deref() == Some(host.as_str()) {
@@ -468,6 +471,13 @@ fn normalize_docker_host(raw: &str, public_base_url: &str) -> Result<String, Str
             "host must differ from the server's own host (repositories are reachable there by path)"
                 .into(),
         );
+    }
+    if let Some(alias) = base_urls.aliases().iter().find(|alias| alias.host == host) {
+        return Err(format!(
+            "host {host} is an alias of the server ({}, server.alias_base_urls): repositories \
+             are reachable there by path; choose another host name",
+            alias.url
+        ));
     }
     Ok(host)
 }
@@ -865,8 +875,7 @@ async fn docker_options(
     }
     match options.host {
         Some(Some(host)) => {
-            let host = normalize_docker_host(&host, &state.config.public_base_url())
-                .map_err(bad_request)?;
+            let host = normalize_docker_host(&host, &state.base_urls).map_err(bad_request)?;
             config.insert(DOCKER_HOST_KEY.into(), json!(host));
         }
         Some(None) => {
@@ -1651,5 +1660,27 @@ mod tests {
         assert!(!msg.contains("  "), "{msg}");
         assert!(msg.contains("characters from A-Z"), "{msg}");
         assert!(validate_repo_name("nuget-hosted.v3_x").is_ok());
+    }
+
+    #[test]
+    fn a_docker_host_is_none_of_the_servers_own_names() {
+        let urls = BaseUrls::new(
+            "https://forge.example.com",
+            &["https://nexus.example.com".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            normalize_docker_host(" Docker.Example.com. ", &urls).as_deref(),
+            Ok("docker.example.com")
+        );
+        let err = normalize_docker_host("forge.example.com", &urls).unwrap_err();
+        assert!(err.contains("the server's own host"), "{err}");
+        for alias in ["nexus.example.com", "NEXUS.example.com."] {
+            let err = normalize_docker_host(alias, &urls).unwrap_err();
+            assert!(
+                err.contains("alias") && err.contains("https://nexus.example.com"),
+                "{alias}: {err}"
+            );
+        }
     }
 }

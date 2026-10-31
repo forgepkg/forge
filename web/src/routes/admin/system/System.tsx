@@ -1,10 +1,16 @@
 import { useState } from 'react'
 import { createFileRoute } from '@tanstack/react-router'
 
-import type { BlobCacheStats, KeyView, RotationLayer, RotationResult } from '~/api/system'
+import type {
+  BlobCacheStats,
+  KeyView,
+  RotationLayer,
+  RotationResult,
+  ServerAddresses,
+} from '~/api/system'
 import type { ApiError } from '~/lib/httpClient'
 import { formatBytes, formatDateTime } from '~/lib/oci'
-import { useBlobCache, useCryptoKeys, useRotateKeys } from '~/queries/useSystem'
+import { useAddresses, useBlobCache, useCryptoKeys, useRotateKeys } from '~/queries/useSystem'
 import { ErrorState } from '~/components/ErrorState'
 import {
   Button,
@@ -36,21 +42,93 @@ export const Route = createFileRoute('/_app/manage/system')({
 })
 
 /**
- * The system screen: the secret encryption at rest (key metadata, and the
- * on-demand rotations of `POST /admin/crypto/rotate/{dek,kek,root}`) and the
- * local blob cache of the instance that answered. Both are read-only views
- * of `/admin/crypto/keys` and `/admin/blob-cache` but for the rotations.
+ * The system screen: the addresses the server is reached under (the public
+ * and alias base URLs of `forge.toml`), the secret encryption at rest (key
+ * metadata, and the on-demand rotations of
+ * `POST /admin/crypto/rotate/{dek,kek,root}`) and the local blob cache of the
+ * instance that answered. All are read-only views of `/admin/addresses`,
+ * `/admin/crypto/keys` and `/admin/blob-cache` but for the rotations.
  */
 function SystemPage() {
   return (
     <Page>
       <PageHeader
         title="System"
-        description="How Forge protects the secrets it stores, and how the local blob cache of this instance is doing."
+        description="The addresses clients reach Forge under, how Forge protects the secrets it stores, and how the local blob cache of this instance is doing."
       />
+      <Addresses />
       <SecretEncryption />
       <BlobCache />
     </Page>
+  )
+}
+
+/** The public base URL and the alias base URLs (`forge.toml`, read-only). */
+function Addresses() {
+  const addresses = useAddresses()
+  return (
+    <Panel
+      title="Addresses"
+      description={
+        <>
+          The URLs clients reach Forge under, set in <Code>forge.toml</Code>:{' '}
+          <Code>server.public_base_url</Code> and <Code>server.alias_base_urls</Code>.
+        </>
+      }
+    >
+      {addresses.isError ? (
+        <ErrorState
+          title="Could not load the addresses"
+          message={addresses.error.message}
+          onRetry={() => void addresses.refetch()}
+        />
+      ) : !addresses.data ? (
+        <Skeleton label="Loading the addresses…" />
+      ) : (
+        <AddressesBody addresses={addresses.data} />
+      )}
+    </Panel>
+  )
+}
+
+function AddressesBody({ addresses }: { addresses: ServerAddresses }) {
+  const aliases = addresses.alias_base_urls
+  return (
+    <>
+      <FactList
+        items={[
+          { term: 'Public URL', value: addresses.public_base_url, mono: true },
+          {
+            term: aliases.length === 1 ? 'Alias' : 'Aliases',
+            value:
+              aliases.length === 0 ? (
+                'None'
+              ) : (
+                <ul className="m-0 grid list-none gap-1 p-0" aria-label="Aliases">
+                  {aliases.map((alias) => (
+                    <li key={alias}>
+                      <Code>{alias}</Code>
+                    </li>
+                  ))}
+                </ul>
+              ),
+          },
+        ]}
+      />
+      <p className="fg-text fg-text--small">
+        {aliases.length === 0 && (
+          <>
+            Further host names, such as an old Nexus host pointed at Forge, go in{' '}
+            <Code>server.alias_base_urls</Code>.{' '}
+          </>
+        )}
+        A client that reaches Forge under an alias is handed the URLs of its protocol on that alias:
+        a NuGet feed&apos;s resources, an npm package&apos;s tarballs, the registry&apos;s token
+        service. The web UI, sign-in and the connect snippets stay on the public URL, and a page
+        opened under an alias is redirected there. No docker repository may have an alias as its
+        host.
+      </p>
+    </>
   )
 }
 

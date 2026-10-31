@@ -154,6 +154,21 @@ pub struct ServerConfig {
     /// the guard is off. Default empty.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Further base URLs the server is reached under, such as the old Nexus
+    /// host pointed at Forge (`https://nexus.example.com`): each a scheme,
+    /// a host and an optional port, without a path. A request whose `Host`
+    /// names an alias (matched like [`Self::allowed_hosts`]: case-insensitive,
+    /// without a trailing dot, the port ignored) is answered with the
+    /// client protocols' absolute URLs on that alias: a NuGet service
+    /// index's resources, an npm packument's tarballs, the registry's token
+    /// realm and service. Browser surfaces (the web UI, sign-in, cookies,
+    /// emails, connect snippets) stay on [`Self::public_base_url`], and a web
+    /// UI page requested on an alias is redirected there. An alias is one of
+    /// the server's own names for the DNS-rebinding guard, and no docker
+    /// repository may have its host. See [`crate::base_urls`]. Default
+    /// empty.
+    #[serde(default)]
+    pub alias_base_urls: Vec<String>,
     /// Seconds a client may take to send a request's headers before the
     /// connection is closed (slow-header "slowloris" defence). The same timer
     /// closes a keep-alive connection that stays idle this long, so keep it
@@ -2434,6 +2449,8 @@ impl Config {
             &self.server.allowed_hosts,
         )
         .map_err(|e| ConfigError::Invalid(format!("server.allowed_hosts: {e}")))?;
+        crate::base_urls::BaseUrls::new(&self.public_base_url(), &self.server.alias_base_urls)
+            .map_err(|e| ConfigError::Invalid(format!("server.alias_base_urls: {e}")))?;
         self.validate_removed_auth_keys()?;
         self.validate_removed_retention_keys()?;
         // Eagerly validate the trusted CIDRs so a bad value fails at startup
@@ -2788,6 +2805,16 @@ impl Config {
                 "server.public_base_url ({base}) is not https: session cookies are issued \
                  without Secure; terminate TLS in front of Forge and use an https:// URL"
             ));
+        }
+        for alias in self.base_urls().aliases() {
+            if !alias.url.starts_with("https://") {
+                warnings.push(format!(
+                    "server.alias_base_urls entry {} is not https: clients that reach Forge \
+                     under it send their credentials in clear text; terminate TLS for it in \
+                     front of Forge and use an https:// URL",
+                    alias.url
+                ));
+            }
         }
         let plain_sts = self.s3.credentials == S3CredentialsMode::WebIdentity
             && self
@@ -3212,6 +3239,19 @@ impl Config {
             .public_base_url
             .trim_end_matches('/')
             .to_string()
+    }
+
+    /// The public base URL and `server.alias_base_urls`, parsed
+    /// ([`crate::base_urls`]). [`Self::validate`] refused a configuration
+    /// whose aliases do not parse; one that skipped it is served on the
+    /// public base URL alone.
+    pub fn base_urls(&self) -> crate::base_urls::BaseUrls {
+        crate::base_urls::BaseUrls::new(&self.public_base_url(), &self.server.alias_base_urls)
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "server.alias_base_urls ignored");
+                crate::base_urls::BaseUrls::new(&self.public_base_url(), &[])
+                    .expect("no aliases always parse")
+            })
     }
 }
 
@@ -4169,6 +4209,88 @@ mod tests {
         );
         let err = Config::from_figment(fig_from_toml(&toml)).unwrap_err();
         assert!(err.to_string().contains("server.allowed_hosts"), "{err}");
+    }
+
+    /// `MINIMAL` with `server.alias_base_urls = <list>`.
+    fn with_aliases(list: &str) -> String {
+        MINIMAL.replace(
+            "public_base_url = \"https://forge.example.com/\"",
+            &format!("public_base_url = \"https://forge.example.com/\"\nalias_base_urls = {list}"),
+        )
+    }
+
+    #[test]
+    fn alias_base_urls_are_checked_at_startup() {
+        let cfg = Config::from_figment(fig_from_toml(MINIMAL)).expect("valid");
+        assert!(cfg.server.alias_base_urls.is_empty());
+        assert!(cfg.base_urls().aliases().is_empty());
+
+        let cfg = Config::from_figment(fig_from_toml(&with_aliases(
+            r#"["HTTPS://Nexus.Example.com/", "https://old.example.com:8443"]"#,
+        )))
+        .expect("valid");
+        let urls: Vec<_> = cfg
+            .base_urls()
+            .aliases()
+            .iter()
+            .map(|a| a.url.clone())
+            .collect();
+        assert_eq!(
+            urls,
+            ["https://nexus.example.com", "https://old.example.com:8443"]
+        );
+        assert!(cfg.deployment_warnings().is_empty());
+
+        for (bad, why) in [
+            (r#"["nexus.example.com"]"#, "absolute URL"),
+            (r#"["https://nexus.example.com/repository"]"#, "path"),
+            (r#"["https://nexus.example.com?x"]"#, "query"),
+            (
+                r#"["https://nexus.example.com", "https://NEXUS.example.com:8443"]"#,
+                "twice",
+            ),
+            (r#"["https://forge.example.com"]"#, "server.public_base_url"),
+            (
+                r#"["http://forge.example.com:8421/"]"#,
+                "server.public_base_url",
+            ),
+        ] {
+            let err = Config::from_figment(fig_from_toml(&with_aliases(bad))).unwrap_err();
+            let err = err.to_string();
+            assert!(
+                err.contains("server.alias_base_urls") && err.contains(why),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_http_alias_is_a_deployment_warning() {
+        let cfg = Config::from_figment(fig_from_toml(&with_aliases(
+            r#"["http://nexus.example.com:8081"]"#,
+        )))
+        .expect("valid");
+        let w = cfg.deployment_warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("http://nexus.example.com:8081"), "{w:?}");
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // figment::Jail's closure returns figment::Error.
+    fn alias_base_urls_are_set_by_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("forge.toml", MINIMAL)?;
+            jail.set_env(
+                "FORGE_SERVER__ALIAS_BASE_URLS",
+                "[https://nexus.example.com, http://old.example.com:8081]",
+            );
+            let cfg = Config::load(Some(std::path::Path::new("forge.toml"))).expect("valid");
+            assert_eq!(
+                cfg.server.alias_base_urls,
+                ["https://nexus.example.com", "http://old.example.com:8081"]
+            );
+            Ok(())
+        });
     }
 
     #[test]

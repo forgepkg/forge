@@ -289,6 +289,7 @@ with `FORGE_*` env vars using **double-underscore** nesting, e.g.
 | --- | --- |
 | `auth.bootstrap_admin` | First-run admin username (a UPN, default `admin@example.com`) / password. No or a blank password means no bootstrap admin. |
 | `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme` or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
+| `server.alias_base_urls` | Further base URLs, such as the old Nexus host pointed at Forge (`["https://nexus.example.com"]`): a request for an alias host is handed the client protocols' URLs on that alias instead of `public_base_url`. See [docs/deployment.md](./docs/deployment.md#further-host-names-aliases). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
 | `[blob_cache]` | Optional local disk cache for blobs (`path`, `max_bytes` = `"auto"` or bytes, `min_free_bytes`): hot downloads skip S3 and cached packages keep resolving while S3 is down. See [docs/deployment.md](./docs/deployment.md#local-blob-cache). |
 | `[telemetry]` | OpenTelemetry export over OTLP/HTTP: `metrics`, `traces`, `logs` (each off by default), sent where the `OTEL_*` variables say (`OTEL_EXPORTER_OTLP_ENDPOINT`, default `http://localhost:4318`). See [docs/deployment.md](./docs/deployment.md#telemetry). |
