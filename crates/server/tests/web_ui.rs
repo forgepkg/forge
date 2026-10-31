@@ -79,6 +79,26 @@ async fn spa_serving_and_api_precedence() {
         body.contains("forge-spa"),
         "deep link should fall back to index.html: {body}"
     );
+    // The device login's page (`verification_uri_complete`) is a UI route;
+    // its discovery document is the API's.
+    let res = client
+        .get(format!("{}/device?code=BCDF-GHJK", server.base_url))
+        .send()
+        .await
+        .expect("GET /device");
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert!(res.text().await.expect("body").contains("forge-spa"));
+    let res = client
+        .get(format!(
+            "{}/.well-known/oauth-authorization-server",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("GET the authorization server metadata");
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let metadata: serde_json::Value = res.json().await.expect("metadata JSON");
+    assert!(metadata["device_authorization_endpoint"].is_string());
 
     // 3. A real asset file is served as itself (not the index fallback).
     let res = client

@@ -57,12 +57,13 @@
 //! `X-Forwarded-For` line behind the trusted proxies, with IPv4-mapped IPv6
 //! addresses canonicalized ([`forge_core::auth::client_ip`]). The
 //! trusted-header realms additionally require the request's `Host` to name
-//! this server (the host of `server.public_base_url` or an entry of
-//! `server.allowed_hosts`): a DNS-rebinding page in an internal user's browser
-//! reaches the server through the proxy that adds the headers, but under its
-//! own host name, and the headers of such a request are ignored. Requests with
-//! credentials of their own, the anonymous policy, and handlers that ignore
-//! the principal (health probes), do not depend on the host.
+//! this server (the host of `server.public_base_url`, of an entry of
+//! `server.alias_base_urls`, or an entry of `server.allowed_hosts`): a
+//! DNS-rebinding page in an internal user's browser reaches the server
+//! through the proxy that adds the headers, but under its own host name, and
+//! the headers of such a request are ignored. Requests with credentials of
+//! their own, the anonymous policy, and handlers that ignore the principal
+//! (health probes), do not depend on the host.
 //!
 //! ## Stale session cookies
 //! A session cookie that no longer names a live session is treated as absent
@@ -86,6 +87,7 @@ use forge_core::session::{csrf_token_matches, SessionService};
 use ipnet::IpNet;
 
 use crate::auth::AuthSettingsCache;
+use crate::base_urls::{normalize_host, request_authority};
 
 /// The header carrying the per-session double-submit CSRF token.
 pub const CSRF_HEADER: &str = "x-csrf-token";
@@ -152,14 +154,6 @@ impl From<AnonPolicy> for AnonSource {
     }
 }
 
-/// The lowercase host of an authority (`host[:port]`, IPv6 in brackets),
-/// without port or trailing dot; `None` if it does not parse.
-fn normalize_host(authority: &str) -> Option<String> {
-    let authority: http::uri::Authority = authority.trim().parse().ok()?;
-    let host = authority.host().trim_end_matches('.').to_ascii_lowercase();
-    (!host.is_empty()).then_some(host)
-}
-
 /// The host names a request may address for the trusted-header realms:
 /// the host of `public_base_url` plus each `extra` entry (`host` or
 /// `host:port`; the port is ignored — a rebinding page cannot present this
@@ -185,14 +179,9 @@ pub fn allowed_hosts(public_base_url: &str, extra: &[String]) -> Result<Vec<Stri
 /// URI authority of an HTTP/2 request). A missing or unparsable host never
 /// matches.
 fn host_is_allowed<B>(req: &Request<B>, allowed: &[String]) -> bool {
-    let host = match req.headers().get(header::HOST) {
-        Some(value) => value.to_str().ok().and_then(normalize_host),
-        None => req
-            .uri()
-            .authority()
-            .and_then(|a| normalize_host(a.as_str())),
-    };
-    host.is_some_and(|host| allowed.contains(&host))
+    request_authority(req)
+        .and_then(normalize_host)
+        .is_some_and(|host| allowed.contains(&host))
 }
 
 /// Refuse a state-changing request a **browser** marked as cross-site.
@@ -290,11 +279,21 @@ pub async fn attach_principal(
 
     // npm's exchange authenticates its ****** including JSON refusals.
     // Do not let the ordinary credential chain reject it with a plain-text 401.
+    // So do the device grant's OAuth endpoints (RFC 8628): a client is known
+    // by its `client_id` alone, and every answer is RFC 6749 JSON, never
+    // the credential chain's 401 for a header the client happens to send.
     if req.method() == axum::http::Method::POST
         && req
             .extensions()
             .get::<axum::extract::MatchedPath>()
-            .is_some_and(|path| path.as_str() == crate::auth::NPM_TOKEN_EXCHANGE_PATH)
+            .is_some_and(|path| {
+                [
+                    crate::auth::NPM_TOKEN_EXCHANGE_PATH,
+                    crate::auth::DEVICE_CODE_PATH,
+                    crate::auth::DEVICE_TOKEN_PATH,
+                ]
+                .contains(&path.as_str())
+            })
     {
         return next.run(req).await;
     }

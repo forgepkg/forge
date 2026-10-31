@@ -1,7 +1,7 @@
 //! Data access for `token` (API access tokens).
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 use crate::model::Token;
 
@@ -39,6 +39,38 @@ pub async fn insert_token(pool: &PgPool, new: NewToken) -> sqlx::Result<Token> {
         new.minted_with_forwarded_credential,
     )
     .fetch_one(pool)
+    .await
+}
+
+/// Insert a token with its `scope` jsonb (`None`: unscoped) in one
+/// statement, so no unscoped row ever exists for a scoped token. Accepts any
+/// [`PgExecutor`], so the insert can join a caller's transaction.
+pub async fn insert_scoped_token<'e, E>(
+    executor: E,
+    new: NewToken,
+    scope: Option<&serde_json::Value>,
+) -> sqlx::Result<Token>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        Token,
+        r#"
+        INSERT INTO token
+            (user_id, name, token_hash, expires_at, minted_with_forwarded_credential, scope)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING
+            id, user_id, name, token_hash, expires_at, revoked_at,
+            last_used_at, created_at, scope
+        "#,
+        new.user_id,
+        new.name,
+        new.token_hash,
+        new.expires_at,
+        new.minted_with_forwarded_credential,
+        scope,
+    )
+    .fetch_one(executor)
     .await
 }
 

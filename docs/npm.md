@@ -125,6 +125,11 @@ token_lifetime_days   = 90
 web_login_ttl_seconds = 600
 ```
 
+The same `[cli_login]` lifetimes apply to the [device
+login](deployment.md#device-login) that Forge's command-line helpers
+(`forge login`, `docker-credential-forge`, `nuget-plugin-forge`) sign in
+with: the user approves it with a code on the web UI's `/device` page.
+
 ## Publishing
 
 ```bash

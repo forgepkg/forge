@@ -1,7 +1,8 @@
 //! Sign-in and anonymous-access policy, set at runtime (#294).
 //!
 //! The anonymous mode, the login screen's mode and its remembered accounts,
-//! the session lifetimes and the password lockout are policy
+//! the session lifetimes, the password lockout and the device login
+//! (RFC 8628, [`super::device`]) are policy
 //! an administrator changes while Forge runs, and every instance must
 //! apply the same values. They are kept in `forge_setting` under
 //! [`AUTH_SETTINGS_KEY`] as one JSON document ([`AuthSettings`]), changed
@@ -21,7 +22,8 @@
 //!
 //! An install that never saved them uses [`AuthSettings::default`]: no
 //! anonymous access, the identifier-first login screen remembering accounts,
-//! 8 h / 7 d sessions and 10 failures per 5 minutes. (Whether a realm accepts
+//! 8 h / 7 d sessions, 10 failures per 5 minutes and the device login on,
+//! polled every 5 seconds. (Whether a realm accepts
 //! passwords from clients over HTTP Basic is the realm's own setting,
 //! `accept_client_passwords`.) When the
 //! row cannot be read, an instance keeps the settings it has (the defaults
@@ -47,6 +49,9 @@ pub const MAX_SESSION_TTL_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
 
 /// Longest accepted lockout window (a day).
 pub const MAX_LOGIN_FAILURE_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+
+/// Longest accepted device login polling interval (a minute).
+pub const MAX_DEVICE_POLL_INTERVAL_SECONDS: u64 = 60;
 
 /// Who is served anonymously (without credentials). A repository is read
 /// anonymously only when it allows anonymous reads too.
@@ -139,6 +144,14 @@ pub struct AuthSettings {
     /// device and offers them for the next sign-in. The browser keeps them;
     /// `false` (a kiosk, a shared terminal) has it keep and show none.
     pub remember_accounts: bool,
+    /// Whether command-line clients may sign in with a code the user enters
+    /// on the `/device` page (the device authorization grant, RFC 8628).
+    /// Off, `POST /auth/device/code` and `/auth/device/token` refuse them
+    /// with `unauthorized_client`.
+    pub device_login: bool,
+    /// How long (seconds) a client waits between two polls of the token
+    /// endpoint (the `interval` it is given; `slow_down` adds five).
+    pub device_poll_interval_seconds: u64,
 }
 
 impl Default for AuthSettings {
@@ -151,6 +164,8 @@ impl Default for AuthSettings {
             login_max_failures: 10,
             login_failure_window_seconds: 300,
             remember_accounts: true,
+            device_login: true,
+            device_poll_interval_seconds: 5,
         }
     }
 }
@@ -177,6 +192,13 @@ impl AuthSettings {
             return Err(format!(
                 "login_failure_window_seconds must be between 1 and \
                  {MAX_LOGIN_FAILURE_WINDOW_SECONDS} (a day), got {window}"
+            ));
+        }
+        let interval = self.device_poll_interval_seconds;
+        if !(1..=MAX_DEVICE_POLL_INTERVAL_SECONDS).contains(&interval) {
+            return Err(format!(
+                "device_poll_interval_seconds must be between 1 and \
+                 {MAX_DEVICE_POLL_INTERVAL_SECONDS} (a minute), got {interval}"
             ));
         }
         Ok(match self.anonymous_mode {
@@ -218,6 +240,11 @@ impl AuthSettings {
             "remember_accounts",
             self.remember_accounts != other.remember_accounts,
         );
+        diff("device_login", self.device_login != other.device_login);
+        diff(
+            "device_poll_interval_seconds",
+            self.device_poll_interval_seconds != other.device_poll_interval_seconds,
+        );
         keys
     }
 }
@@ -239,6 +266,8 @@ pub struct AuthSettingsUpdate {
     pub login_max_failures: Option<u32>,
     pub login_failure_window_seconds: Option<u64>,
     pub remember_accounts: Option<bool>,
+    pub device_login: Option<bool>,
+    pub device_poll_interval_seconds: Option<u64>,
 }
 
 impl AuthSettingsUpdate {
@@ -268,6 +297,12 @@ impl AuthSettingsUpdate {
         }
         if let Some(remember) = self.remember_accounts {
             next.remember_accounts = remember;
+        }
+        if let Some(on) = self.device_login {
+            next.device_login = on;
+        }
+        if let Some(interval) = self.device_poll_interval_seconds {
+            next.device_poll_interval_seconds = interval;
         }
         next.validate()?;
         Ok(next)
@@ -518,6 +553,10 @@ mod tests {
         assert_eq!(stored.anonymous_mode, AnonymousMode::All);
         assert_eq!(stored.session_idle_ttl_seconds, 8 * 60 * 60);
         assert!(stored.remember_accounts);
+        // A row saved before the device login existed has it on, polled
+        // every 5 seconds.
+        assert!(stored.device_login);
+        assert_eq!(stored.device_poll_interval_seconds, 5);
     }
 
     #[test]
@@ -595,6 +634,12 @@ mod tests {
             refused(serde_json::json!({"login_failure_window_seconds": 0}))
                 .starts_with("login_failure_window_seconds must be between 1 and")
         );
+        for interval in [0, 61] {
+            assert!(
+                refused(serde_json::json!({"device_poll_interval_seconds": interval}))
+                    .starts_with("device_poll_interval_seconds must be between 1 and 60")
+            );
+        }
         // An unknown field is refused, not dropped.
         for body in [
             serde_json::json!({"anonymous": "all"}),

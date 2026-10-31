@@ -92,9 +92,11 @@ impl crate::images::WorkloadCheck for WorkloadLiveness {
 
 /// A 401 the authentication middleware answered itself (wrong credentials)
 /// on a `/v2` path, made a registry error: the Bearer challenge clients
-/// expect, and the images format's answer to invalid credentials.
+/// expect, naming the token service of `base_url` (the public base URL, or
+/// the alias the request addressed), and the images format's answer to
+/// invalid credentials.
 pub(crate) fn amend_registry_rejection(
-    public_base_url: &str,
+    base_url: &str,
     images: &dyn FormatPlugin,
     response: Response,
 ) -> Response {
@@ -103,7 +105,7 @@ pub(crate) fn amend_registry_rejection(
     {
         return response;
     }
-    let (scheme, service) = crate::images::registry_origin(public_base_url);
+    let (scheme, service) = crate::images::registry_origin(base_url);
     let challenge = format!("Bearer realm=\"{scheme}://{service}/v2/token\",service=\"{service}\"");
     let mut amended =
         crate::images::dispatch::rendered(images.image_error(&ImageError::InvalidCredentials));

@@ -124,6 +124,8 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
             "login_max_failures": 10,
             "login_failure_window_seconds": 300,
             "remember_accounts": true,
+            "device_login": true,
+            "device_poll_interval_seconds": 5,
         })
     );
 
@@ -186,6 +188,10 @@ async fn admins_read_and_change_the_settings_and_wrong_values_are_refused() {
         (
             json!({"login_failure_window_seconds": 0}),
             "login_failure_window_seconds must be between 1 and 86400 (a day), got 0",
+        ),
+        (
+            json!({"device_poll_interval_seconds": 61}),
+            "device_poll_interval_seconds must be between 1 and 60 (a minute), got 61",
         ),
     ] {
         let resp = put_settings(&srv, body.clone()).await;

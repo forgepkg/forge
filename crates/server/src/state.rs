@@ -59,6 +59,9 @@ pub struct AppState {
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
+    /// The base URLs client-protocol URLs are rendered on: the public one,
+    /// and the alias a request's `Host` names ([`crate::base_urls`]).
+    pub base_urls: Arc<crate::base_urls::BaseUrls>,
     /// DB-backed auth realms: the snapshot cache the password chain, the OIDC
     /// login runtime and the login UX endpoints are built from.
     pub realms: Arc<RealmAuth>,
@@ -79,6 +82,11 @@ pub struct AppState {
     /// with the login lockout's budget and window, which follow
     /// [`Self::auth_settings`].
     pub invitation_throttle: Arc<forge_core::auth::LoginThrottle>,
+    /// Wrong codes entered on the `/device` page (the device login, RFC
+    /// 8628), per client network and per browser session: ten per five
+    /// minutes each, whatever the login lockout says, so a pending code
+    /// cannot be guessed within its lifetime.
+    pub device_code_throttle: Arc<forge_core::auth::LoginThrottle>,
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
     pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
@@ -321,6 +329,15 @@ impl AppState {
             )),
         );
         let invitation_throttle = Arc::new(forge_core::auth::LoginThrottle::default());
+        // The keys are a network or a session, not a username: no soft
+        // backoff across networks, which would hold up everyone's codes.
+        let device_code_throttle = Arc::new(
+            forge_core::auth::LoginThrottle::default().with_user_backoff(
+                0,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            ),
+        );
         let auth_settings = Arc::new(
             AuthSettingsCache::new(
                 pool.clone(),
@@ -368,6 +385,7 @@ impl AppState {
                 config.nuget.limits(),
                 config.npm.limits(),
             )),
+            base_urls: Arc::new(config.base_urls()),
             config,
             realms,
             sessions,
@@ -375,6 +393,7 @@ impl AppState {
             cookie_secure,
             login_throttle,
             invitation_throttle,
+            device_code_throttle,
             oidc_login_starts,
             upstream,
             registry_keys: crate::images::token::TokenKeys::new(vec![{
@@ -419,6 +438,7 @@ impl AppState {
             envelope: self.envelope.clone(),
             config: crate::images::RegistryConfig {
                 public_base_url: self.config.public_base_url(),
+                base_urls: self.base_urls.clone(),
                 max_blob_bytes: self.config.docker_max_blob_bytes(),
                 default_max_upload_bytes: self
                     .config

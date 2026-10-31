@@ -366,17 +366,20 @@ describe('admin repositories', () => {
     )
   })
 
-  it('create-docker surfaces the server refusal inline', async () => {
+  it.each([
+    [409, 'another docker repository already answers on this host'],
+    [
+      400,
+      'host nexus.example.com is an alias of the server (https://nexus.example.com, server.alias_base_urls): repositories are reachable there by path; choose another host name',
+    ],
+  ])('create-docker surfaces the server refusal (%i) inline', async (status, refusal) => {
     mockApi({
       repositories: [],
       formats: [
         { id: 'docker', name: 'Docker / OCI', kinds: ['hosted', 'proxy', 'group'] },
         { id: 'nuget', name: 'NuGet', kinds: ['hosted', 'proxy', 'group'] },
       ],
-      onCreate: () =>
-        new Response('another docker repository already answers on this host', {
-          status: 409,
-        }),
+      onCreate: () => new Response(refusal, { status }),
     })
 
     const user = userEvent.setup()
@@ -385,12 +388,10 @@ describe('admin repositories', () => {
     await screen.findByRole('option', { name: 'Docker / OCI' })
     await user.selectOptions(screen.getByLabelText('Format'), 'docker')
     await user.type(screen.getByLabelText('Name'), 'docker-hosted')
-    await user.type(screen.getByLabelText('Host'), 'docker.example.com')
+    await user.type(screen.getByLabelText('Host'), 'nexus.example.com')
     await user.click(screen.getByRole('button', { name: 'Create repository' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'another docker repository already answers on this host',
-    )
+    expect(await screen.findByRole('alert')).toHaveTextContent(refusal)
   })
 
   it('create blocks an invalid repository name before requesting', async () => {

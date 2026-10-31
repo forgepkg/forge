@@ -585,6 +585,8 @@ export function RepositoryForm({
                   repository at its root (<Code>&lt;host&gt;/&lt;image&gt;</Code>), in
                   addition to{' '}
                   <Code>&lt;server&gt;/{values.name.trim() || '<name>'}/&lt;image&gt;</Code>.
+                  Not one of the server&apos;s own addresses (Admin → System), where
+                  every repository is reachable by path.
                 </>
               }
             />

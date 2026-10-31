@@ -389,7 +389,8 @@ admin API (`/admin/*` answers 403; only `/admin/me` answers, and reports the
 
 ### Inviting users
 
-An administrator never sets another person's password. **Admin → Users →
+An administrator sets another person's password only by accepting their
+invitation for them (below). **Admin → Users →
 New user** (`/manage/users/new`) takes the [username](#usernames), the email
 address the invitation goes to (the username unless entered: a UPN is not
 always a mailbox) and the access level (reader, writer or admin). Forge
@@ -418,6 +419,17 @@ password, at least 12 characters, and then sign in.
   Deactivating or deleting the account revokes its invitation.
 - **Without an email service**, or when the send fails, the account is still
   created and the link is shown once on the page to pass on yourself.
+- **Accept invitation** on the user's page finishes the invitation for its
+  user, with a password you set (twice, by the same rules: at least 12
+  characters). Use it to hand an account over ready to use: an install
+  without email, a user without a mailbox, an account set up by hand. It
+  works whether the account is *invited* or its *invitation expired*. The
+  password becomes the account's, the account is active, and its link, if
+  one is still out, stops working. This is the only way an administrator
+  sets another person's password, and only before they chose one: an
+  account whose user has a password, an account of another realm, a service
+  account and a deactivated account are refused. Pass the password on
+  through a channel you trust.
 - Accounts of a credential-forwarding realm (see [Usernames](#usernames)) and
   OIDC accounts are not invited: they sign in through their realm. The
   bootstrap admin keeps its configured password.
@@ -427,7 +439,10 @@ The admin API is `POST /admin/users` with `{"username", "email", "role"}`
 credential-forwarding account. It takes no password: the answer carries
 `invitation` (`email_sent`, `error`, `expires_at`, and the `link` when no
 email went out). `POST /admin/users/{id}/invitation` (`{"send_email": true |
-false, "email": "…"}`) makes a new invitation and `DELETE` revokes it. The
+false, "email": "…"}`) makes a new invitation and `DELETE` revokes it.
+`POST /admin/users/{id}/invitation/accept` (`{"password": "…"}`) accepts it
+for the user: **400** for a password the rules refuse, **409** for an account
+that is not an active invited one, **404** for no account. The
 invited user's page calls `POST /auth/invitations/lookup` and
 `POST /auth/invitations/accept` (`{"token", "password"}`).
 
@@ -588,6 +603,8 @@ wrong.
 | `session_absolute_ttl_seconds` | `604800` (7 d) | A browser session ends this long after sign-in. New lifetimes apply to sessions signed in afterwards; an open session's idle window moves to the new idle timeout on its next use. |
 | `login_max_failures` | `10` | Failed passwords per client network and username before the lockout; `0` turns it off. Each instance counts its own. |
 | `login_failure_window_seconds` | `300` | The failure window, and how long a lockout lasts (at most a day). |
+| `device_login` | `true` | Command-line clients may sign in with a code entered on the `/device` page ([device login](#device-login)). Off, they are refused with `unauthorized_client`. |
+| `device_poll_interval_seconds` | `5` | How long a device login's client waits between two polls (1 to 60); one that polls sooner is told to wait five seconds longer. |
 
 A configuration that still sets one of these (`auth.anonymous_mode`,
 `FORGE_AUTH__ALLOW_PASSWORD_BASIC`, …, or the `oidc.session_*` lifetimes)
@@ -648,6 +665,96 @@ because NuGet clients store that password and replay it on every request.
 Administer through a browser session (the web UI, or `POST /auth/login` plus
 the returned CSRF token), or mint an admin-scoped token
 (`{"scope": {"admin": true}}`) for automation.
+
+### Device login
+
+A command-line client signs in through the browser with the OAuth 2.0
+device authorization grant ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)):
+it shows its user a code and the address of the web UI's `/device` page,
+the user signs in there as always (a password, OIDC or Entra, identifier
+first) and approves, and the client receives an API token. It is what
+Forge's command-line helpers sign in with: `forge login`,
+`docker-credential-forge` (the Docker CLI has no browser login for a
+registry other than Docker Hub) and `nuget-plugin-forge`, which are still
+to come; any RFC 8628 client using one of their client ids works today.
+It is the same mechanism as npm's browser login
+(`npm login`, [npm registries](npm.md#logging-in)), for the Forge host
+rather than one repository.
+
+**The endpoints.** A client finds them from the server URL alone, in the
+authorization server metadata ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414)):
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/.well-known/oauth-authorization-server` | `issuer` (`server.public_base_url`), `device_authorization_endpoint`, `token_endpoint`, `grant_types_supported` (`urn:ietf:params:oauth:grant-type:device_code`). |
+| `POST` | `/auth/device/code` | Start a login (RFC 8628 §3.1): `client_id` and an optional `scope`, form-encoded. Answers `device_code`, `user_code`, `verification_uri` (`<base>/device`), `verification_uri_complete` (`<base>/device?code=BCDF-GHJK`), `expires_in` and `interval`. |
+| `POST` | `/auth/device/token` | Poll it (§3.4): `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Answers `authorization_pending` until the user decides, `slow_down` when polled sooner than the interval (which then grows by five seconds), `access_denied`, `expired_token`, or the token: `access_token`, `token_type` `Bearer`, `expires_in`, `scope` when one was asked for, and `username`, whose token it is. |
+
+```bash
+curl -s https://forge.example.com/auth/device/code \
+  -d client_id=forge-cli -d scope=read
+curl -s https://forge.example.com/auth/device/token \
+  -d grant_type=urn:ietf:params:oauth:grant-type:device_code \
+  -d client_id=forge-cli -d device_code=<device_code>
+```
+
+Every refusal of these two endpoints is an RFC 6749 §5.2 JSON object
+(`{"error": "…", "error_description": "…"}`, `400`), never an HTML page,
+whatever credentials the request carries; `503` with `Retry-After` when
+Forge's database does not answer, `429` when a network starts too many
+logins (`auth.oidc_login_starts_per_minute`, as for OIDC sign-ins).
+
+- **Clients.** Forge has no client registration: it accepts its helpers'
+  fixed client ids, `forge-cli`, `docker-credential-forge` and
+  `nuget-plugin-forge`, so the `/device` page names the client truthfully.
+  Any other is `invalid_client`.
+- **Scope.** `scope` narrows the token, like a token scope set on the
+  **Tokens** page: `read`, `write` or `delete` is its level (the highest one
+  named), and `repository:<name>`, given once per repository, the
+  repositories it reaches (a name no repository has reaches nothing).
+  `scope=write repository:npm-all` is a token that reads and publishes in
+  `npm-all` alone. Without a scope the token carries the user's rights, as
+  npm's does. Anything else is `invalid_scope`; the admin API is never in
+  reach.
+- **No refresh token.** The token is a long-lived API token of the approving
+  user, as npm's browser login mints: it lasts
+  `cli_login.token_lifetime_days` (90 days; `0`: never), is named after the
+  client and the host (`docker-credential-forge login (forge.example.com)`),
+  and is listed and revocable on the user's **Tokens** page. A token of a
+  credential-forwarding account is revoked by an administrator's forced
+  re-authentication, like every token minted in such an account's session.
+- **Codes.** The device code is a 256-bit secret of which Forge stores only
+  the SHA-256. The user code is eight letters without vowels or look-alikes
+  (`BCDF-GHJK`), typed in any case, with or without the hyphen. A request
+  waits for its approval for `cli_login.web_login_ttl_seconds` (10
+  minutes); its token is answered to one poll, and a second poll gets
+  `expired_token`. The auth reaper deletes the requests past their lifetime.
+- **The `/device` page.** A signed-in user types the code, or arrives with it
+  filled in from `verification_uri_complete`; a visitor is sent through the
+  sign-in and back, with the code. The page shows which client asks, for
+  what, from which address and since when, and the code to compare with the
+  terminal, and signs the client in only on **Approve**: a filled-in code is
+  never approved without that click, against remote phishing (RFC 8628
+  §5.4). **Deny** refuses it (`access_denied`).
+- **Guessing.** Each instance counts the wrong codes entered on the page
+  per client network (IPv6 by /64) and per browser session: after ten within
+  five minutes, every code from that network or session is refused with
+  `429` until the five minutes are over, so a pending code cannot be guessed
+  within its lifetime. Finding a code clears no failure.
+- **Settings.** **Admin → Settings → Device login** turns the device login
+  off (`device_login`, see [above](#access-and-sign-in-settings)) and sets
+  the polling interval (`device_poll_interval_seconds`, 5 s). The lifetimes
+  are npm's browser login's, in the configuration:
+
+  ```toml
+  [cli_login]
+  token_lifetime_days   = 90
+  web_login_ttl_seconds = 600
+  ```
+
+Requests, approvals, denials and minted tokens are audit-logged
+(`forge::audit`: `device login requested`, `device login decided`, `device
+login: token minted`).
 
 ## Email
 
@@ -926,9 +1033,9 @@ key fail to unwrap KEKs that a new instance has already re-wrapped.
   default).
 - Serve `/v2` at the root of the host: Docker clients always talk to
   `https://<host>/v2/`, whatever path `public_base_url` has. A docker
-  repository with a `host` ([docs/docker.md](docker.md#names)) needs that
-  name routed to Forge with `Host` preserved, and covered by the
-  certificate.
+  repository with a `host` ([docs/docker.md](docker.md#names)), and an
+  [alias](#further-host-names-aliases), need that name routed to Forge with
+  `Host` preserved, and covered by the certificate.
 - Disable response buffering or give it enough room. Package downloads are
   streamed.
 - Do not rewrite the `Origin` or `Sec-Fetch-Site` headers. Forge refuses
@@ -979,6 +1086,65 @@ server {
 }
 ```
 
+### Further host names (aliases)
+
+The simplest cutover from Nexus points the Nexus host name at Forge, so
+clients keep their configuration: every repository but Docker's is served
+under the same `/repository/<name>/` path as on Nexus, so
+`https://nexus.example.com/repository/nuget-group/index.json` keeps working.
+Forge answers a request for any host name, but it builds the absolute URLs it
+hands clients on `public_base_url`. A client that came in on the old name
+would be sent to the public name after its first request (a NuGet feed's
+resources, an npm package's tarballs, the registry's token service), and
+would then have to reach that host too (network, egress proxy, TLS), and
+send its credentials there.
+
+List such names in `server.alias_base_urls`
+(`FORGE_SERVER__ALIAS_BASE_URLS=[https://nexus.example.com]`):
+
+```toml
+[server]
+public_base_url = "https://forge.example.com"
+alias_base_urls = ["https://nexus.example.com"]
+```
+
+- Each entry is a scheme, a host and an optional port (`http://nexus.example.com:8081`),
+  without a path. Startup refuses a malformed entry, one with a path, query
+  or credentials, a host listed twice, and the host of `public_base_url`. It
+  warns about an entry that is not https.
+- A request whose `Host` names an alias is answered with URLs on that alias.
+  Hosts are matched the way `server.allowed_hosts` matches them:
+  case-insensitive, without a trailing dot, and the port ignored, so the
+  alias's own port is used even when the proxy drops it from `Host`. A
+  NuGet service index fetched there lists its resources there, an npm
+  packument its tarballs, `npm login` polls there, and the registry names
+  the alias as its token realm and service
+  (`https://nexus.example.com/v2/token`, see
+  [docs/docker.md](docker.md#names)).
+- Only listed names count. A request for any other host gets URLs on
+  `public_base_url`, as before, so a forged `Host` cannot make Forge render
+  links to a host of its choosing (cache poisoning).
+- Forge reads `Host`, never `X-Forwarded-Host`, as it does for a docker
+  repository's own host. Route the alias to Forge with `Host` preserved
+  (nginx: the alias in `server_name`, `proxy_set_header Host $host`), and
+  cover it with the TLS certificate. With the Helm chart, list it next to
+  `host` in `httpRoute.hostnames` and `certificate.dnsNames` (and give it a
+  listener in `listenerSet.listeners`), which default to `host` alone.
+- An alias is one of Forge's own names for the
+  [trusted-header realms](#trusted-header-realms): it need not be in
+  `server.allowed_hosts` too.
+- No docker repository may have an alias as its `host`. The admin API
+  refuses one, and startup fails while a repository has one (from before the
+  alias was configured): remove the repository's host or the alias.
+- Browser surfaces stay on `public_base_url`: the web UI, sign-in and OIDC
+  redirects, the session cookie, the CSRF origin check, links in emails, the
+  approval page of `npm login`, and the connect snippets the web UI shows. A
+  web UI page requested on an alias (a bookmark to the old Nexus UI) is
+  redirected (302) to the same path on `public_base_url`. The APIs
+  (`/admin`, `/auth`, `/browse`) answer on an alias as on the public host.
+
+**Admin → System** shows the public URL and the aliases.
+
 ### Trusted-header realms
 
 A `trusted_header` realm (**Admin → Authentication → New realm → Trusted
@@ -1007,7 +1173,8 @@ What Forge believes, and when:
 
 - The headers count only when the **socket peer** is in
   `auth.trusted_proxy_cidrs` and the request's `Host` is one of Forge's own
-  names (the host of `public_base_url`, or one in `server.allowed_hosts`: a
+  names (the host of `public_base_url`, of an
+  [alias](#further-host-names-aliases), or one in `server.allowed_hosts`: a
   DNS-rebinding page reaches the proxy under its own name). From any other
   request they are ignored. This guard holds only while the proxy forwards
   the client's own `Host`: never list the name a proxy rewrites `Host` to

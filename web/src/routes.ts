@@ -23,6 +23,10 @@ import { index, layout, rootRoute, route } from '@tanstack/virtual-file-routes'
  *       /tokens         -> Tokens.tsx           (self-service registry tokens)
  *       /cli-login/$secret -> CliLogin.tsx      (approve a command-line client's
  *                                                web login: `npm login`)
+ *       /device         -> Device.tsx           (enter a command-line client's
+ *                                                code and approve its device
+ *                                                login, RFC 8628; `?code=` from
+ *                                                the client's link)
  *       /manage         -> AdminLayout.tsx      (beforeLoad: require is_admin;
  *                                                /manage/traffic: every instance's
  *                                                requests by day, repository and
@@ -46,6 +50,7 @@ export const routes = rootRoute('root.tsx', [
     route('/images/$repo/$', 'ImageDetail.tsx'),
     route('/tokens', 'Tokens.tsx'),
     route('/cli-login/$secret', 'CliLogin.tsx'),
+    route('/device', 'Device.tsx'),
     route('/manage', 'AdminLayout.tsx', [
       index('admin/AdminHome.tsx'),
       route('/repositories', 'admin/repositories/List.tsx'),

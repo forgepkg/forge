@@ -39,6 +39,20 @@ repository in the image name:
   in the reverse proxy, and add it to `server.allowed_hosts` if a
   [trusted-header realm](deployment.md#trusted-header-realms) names its
   clients.
+- **On an alias** (optional): a host name in `server.alias_base_urls`, such
+  as the old Nexus host pointed at Forge
+  ([Further host names](deployment.md#further-host-names-aliases)), is one
+  of Forge's own. It serves every repository by path, as the public host
+  does (`nexus.example.com/docker-hosted/team/app:1.2`), and its challenge
+  names the alias as token realm and service
+  (`Bearer realm="https://nexus.example.com/v2/token",service="nexus.example.com"`),
+  so `docker login nexus.example.com` never reaches the public host. A
+  repository's `host` may not be an alias: the admin API refuses one.
+
+A registry token is issued for the host it was asked on (its audience) and
+is accepted there alone: a token of the public host does not work on a
+repository's host or an alias, nor the other way round. Clients ask for a
+token on the host they talk to, so they never notice.
 
 A docker repository's name is part of every image name, so it follows the
 spec's name grammar: lowercase letters and digits, separated by `.`, `_`,
@@ -64,6 +78,13 @@ docker push forge.example.com/docker-hosted/team/app:1.3
 
 - **API tokens** (created on the Tokens page, or `POST /admin/me/tokens`) are
   the password to use. A token's repository scope applies.
+- **Browser sign-in** (OIDC or Entra included): the Docker CLI has none for
+  a registry other than Docker Hub. A client gets an API token through
+  Forge's [device login](deployment.md#device-login) instead (the coming
+  `docker-credential-forge` helper does): it shows a code, you approve it
+  on the web UI's `/device` page, and it receives a token of yours (with
+  the `scope` it asked for, e.g. `read repository:docker-hosted`), which
+  is the password of `docker login`.
 - **Passwords** work for the users of a realm that accepts passwords from
   clients ([Admin → Authentication](deployment.md#passwords-from-clients)):
   a credential-forwarding realm by default (so users of an existing Nexus or

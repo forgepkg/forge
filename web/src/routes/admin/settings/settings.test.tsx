@@ -34,6 +34,8 @@ const stored: AuthSettings = {
   session_absolute_ttl_seconds: 604800,
   login_max_failures: 10,
   login_failure_window_seconds: 300,
+  device_login: true,
+  device_poll_interval_seconds: 5,
 }
 
 function repo(over: Partial<RepoView>): RepoView {
@@ -234,6 +236,49 @@ describe('admin settings', () => {
     expect(await within(signIn).findByRole('alert')).toHaveTextContent(
       'login_failure_window_seconds must be between 1 and 86400 (a day), got 99999',
     )
+  })
+})
+
+describe('device login settings', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockReset()
+    setSession('admin-csrf')
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    clearSession()
+  })
+
+  it('turns the device login off and sets its interval, refusing a wrong one first', async () => {
+    mockApi({})
+    const u = userEvent.setup()
+    await renderApp('/manage/settings')
+    const device = await waitFor(() => section('Device login'))
+
+    const enabled = within(device).getByRole('checkbox', {
+      name: 'Let command-line clients sign in with a code',
+    })
+    expect(enabled).toBeChecked()
+    const interval = within(device).getByRole('textbox', { name: 'Polling interval (seconds)' })
+    expect(interval).toHaveValue('5')
+
+    await u.clear(interval)
+    await u.type(interval, '61')
+    await u.click(within(device).getByRole('button', { name: 'Save device login' }))
+    expect(
+      await within(device).findByText('Enter a number of seconds from 1 to 60.'),
+    ).toBeInTheDocument()
+    expect(puts()).toEqual([])
+
+    await u.clear(interval)
+    await u.type(interval, '10')
+    await u.click(enabled)
+    await u.click(within(device).getByRole('button', { name: 'Save device login' }))
+    await waitFor(() =>
+      expect(puts()).toEqual([{ device_login: false, device_poll_interval_seconds: 10 }]),
+    )
+    expect(await within(device).findByRole('status')).toHaveTextContent('Saved.')
   })
 })
 

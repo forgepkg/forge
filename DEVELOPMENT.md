@@ -289,6 +289,7 @@ with `FORGE_*` env vars using **double-underscore** nesting, e.g.
 | --- | --- |
 | `auth.bootstrap_admin` | First-run admin username (a UPN, default `admin@example.com`) / password. No or a blank password means no bootstrap admin. |
 | `server.allow_insecure_defaults` | Default `false`: startup fails while the bootstrap-admin password is `changeme` or the S3 keys are `minioadmin`. `true` only in dev configs (`forge.toml`, `.env.example`, `docker-compose.app.yml`). |
+| `server.alias_base_urls` | Further base URLs, such as the old Nexus host pointed at Forge (`["https://nexus.example.com"]`): a request for an alias host is handed the client protocols' URLs on that alias instead of `public_base_url`. See [docs/deployment.md](./docs/deployment.md#further-host-names-aliases). |
 | `[redis]` | Optional shared L2 cache + cross-instance invalidation. Omit for in-process cache only. `connect_timeout_ms` / `response_timeout_ms` (default 2000) bound every Redis call. |
 | `[blob_cache]` | Optional local disk cache for blobs (`path`, `max_bytes` = `"auto"` or bytes, `min_free_bytes`): hot downloads skip S3 and cached packages keep resolving while S3 is down. See [docs/deployment.md](./docs/deployment.md#local-blob-cache). |
 | `[telemetry]` | OpenTelemetry export over OTLP/HTTP: `metrics`, `traces`, `logs` (each off by default), sent where the `OTEL_*` variables say (`OTEL_EXPORTER_OTLP_ENDPOINT`, default `http://localhost:4318`). See [docs/deployment.md](./docs/deployment.md#telemetry). |
@@ -325,6 +326,7 @@ to set them. See
 | `login_mode` | `identifier_first` (default) or `combined`. |
 | `session_idle_ttl_seconds` / `session_absolute_ttl_seconds` | Browser-session lifetimes (default 8 h / 7 d). |
 | `login_max_failures` / `login_failure_window_seconds` | Password-failure lockout per client IP + username for `/auth/login` and Basic password auth (default 10 per 300 s; `0` disables). |
+| `device_login` / `device_poll_interval_seconds` | The device login (RFC 8628) of command-line clients, approved on the `/device` page (default on, polled every 5 s). See [docs/deployment.md](./docs/deployment.md#device-login). |
 
 > **Anonymous reads need both** the anonymous mode *and* the repo's
 > `anonymous_read=true` (authz = authenticated user **or**
@@ -463,6 +465,9 @@ Settings) for a classic combined form with per-realm OIDC buttons.
 | `GET` | `/auth/me` | Who-am-I for the SPA: `{user_id, username, is_admin, csrf_token}`; 401 if no session. |
 | `POST` | `/auth/logout` | Revoke the session + clear the cookie (CSRF-protected). |
 | `GET`/`POST`/`DELETE` | `/auth/tokens[/{id}]` | List / mint / revoke the session user's repository tokens (unscoped; `/admin/me/tokens` also takes a `scope`). |
+| `POST` | `/auth/device/code`, `/auth/device/token` | The device authorization grant (RFC 8628) of Forge's command-line helpers: start a login, poll it for the token. RFC 6749 JSON errors. |
+| `GET` | `/.well-known/oauth-authorization-server` | Public: the RFC 8414 metadata naming those two endpoints. |
+| `POST` | `/auth/device/lookup`, `/auth/device/decide` | The `/device` page (session + CSRF): look a user code up, approve or deny it; wrong codes are limited per network and session. |
 
 State-changing cookie endpoints (`logout`, token mint/revoke) require a
 **double-submit CSRF token**: read `csrf_token` from `/auth/me` (or the

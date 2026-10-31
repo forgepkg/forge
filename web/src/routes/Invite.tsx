@@ -5,6 +5,7 @@ import { createFileRoute, Link, useNavigate, useRouterState } from '@tanstack/re
 import {
   acceptInvitation,
   INVALID_INVITATION,
+  invitationPasswordProblem,
   lookupInvitation,
   MIN_INVITATION_PASSWORD_CHARS,
 } from '~/api/auth'
@@ -15,9 +16,6 @@ import { Button, Icon, Notice, Skeleton, TextField } from '~/components/ui'
 export const Route = createFileRoute('/invite')({
   component: Invite,
 })
-
-/** The most bytes a chosen password has (the server's limit). */
-const MAX_PASSWORD_BYTES = 1024
 
 /** The server's reason for a refused request, or the generic answer. */
 function reason(e: unknown): string {
@@ -62,19 +60,9 @@ function Invite() {
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
-    if ([...password].length < MIN_INVITATION_PASSWORD_CHARS) {
-      setProblem(`Choose at least ${MIN_INVITATION_PASSWORD_CHARS} characters.`)
-      return
-    }
-    if (new TextEncoder().encode(password).length > MAX_PASSWORD_BYTES) {
-      setProblem('That password is too long.')
-      return
-    }
-    if (password !== confirm) {
-      setProblem('The two passwords differ.')
-      return
-    }
-    setProblem(null)
+    const why = invitationPasswordProblem(password, confirm)
+    setProblem(why)
+    if (why) return
     accept.mutate(password)
   }
 

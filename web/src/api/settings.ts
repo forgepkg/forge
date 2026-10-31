@@ -28,6 +28,13 @@ export interface AuthSettings {
   /** `0` turns the lockout off. */
   login_max_failures: number
   login_failure_window_seconds: number
+  /**
+   * Command-line clients may sign in with a code entered on the `/device`
+   * page (the device authorization grant, RFC 8628).
+   */
+  device_login: boolean
+  /** Seconds a client waits between two polls of a device login (1–60). */
+  device_poll_interval_seconds: number
 }
 
 /** `PUT /admin/settings/auth` body: the fields to change. */
