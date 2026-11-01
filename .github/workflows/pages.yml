@@ -48,7 +48,7 @@ jobs:
         uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
       # The version xtask/src/docs.rs names (MDBOOK).
       - name: Install mdBook (prebuilt, pinned)
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: mdbook@0.5.4
       - name: cargo xtask docs
