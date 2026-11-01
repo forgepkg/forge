@@ -63,7 +63,7 @@ RUN pnpm run build
 # ── Stage 2a: cargo-chef base ─────────────────────────────────────────────────
 # Pin the Rust toolchain to match rust-toolchain.toml (1.99.1). cargo-chef lets
 # us cache the dependency compile separately from the workspace sources.
-FROM rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS chef
+FROM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS chef
 # Use the image's preinstalled 1.99.1 as-is; the copied rust-toolchain.toml
 # would otherwise make rustup download its dev components (rustfmt, clippy).
 ENV RUSTUP_TOOLCHAIN=1.99.1
