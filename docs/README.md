@@ -23,6 +23,9 @@ its [quickstart](../README.md#quickstart);
   downloads, superseded prereleases, unlisted versions, version and tag
   patterns, keep-N), cron schedules in a time zone with a time limit per
   run, and size budgets.
+- **[Package delay](package-delay.md)**: a proxy's dependency cooldown for
+  new upstream releases, other delays for some packages (by content
+  selector or pattern), and releasing one version early.
 - **[Importing repositories](import.md)**: copy a hosted repository of
   another server (a NuGet feed, an npm registry, a registry, a raw
   repository: Nexus, Artifactory, Verdaccio, a web server, another Forge)
