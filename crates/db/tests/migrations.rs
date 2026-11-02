@@ -31,6 +31,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "asset",
     "proxy_cached_version",
     "proxy_upstream_index",
+    "proxy_document",
     "app_user",
     "token",
     // retention

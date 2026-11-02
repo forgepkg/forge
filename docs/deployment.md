@@ -1448,7 +1448,7 @@ repositories add up.
 | Area | Instruments (attributes) |
 | --- | --- |
 | HTTP | `http.server.request.duration` (`forge.surface`, `http.request.method`, `http.response.status_code`), to the response headers; `http.server.active_requests` (`http.request.method`); `http.server.response.body.size` |
-| Proxies | `forge.proxy.lookups` (`forge.repository`, `forge.proxy.kind`: `metadata`, `package`, `manifest`, `blob`, `file`; `forge.proxy.outcome`: `hit`, `fetched`, `stale_served`, `negative_cached`, `delay_gated`, `not_found`, `offline`, `upstream_error`, `error`); `http.client.request.duration` of the requests to the upstreams (`forge.repository`, `http.request.method`, `http.response.status_code`, or `error.type` when none came); `forge.proxy.upstream.fetched` (bytes) |
+| Proxies | `forge.proxy.lookups` (`forge.repository`, `forge.proxy.kind`: `metadata`, `package`, `manifest`, `blob`, `file`; `forge.proxy.outcome`: `hit`, `fetched`, `stale_served`, `negative_cached`, `delay_gated`, `not_found`, `offline`, `upstream_error`, `error`); `http.client.request.duration` of the requests to the upstreams (`forge.repository`, `http.request.method`, `http.response.status_code`, or `error.type` when none came; a revalidation that found the document unchanged is a `304`); `forge.proxy.upstream.fetched` (bytes downloaded; a `304` counts none); `forge.proxy.upstream.documents`, the upstream documents read past the in-process cache (`forge.repository`, `forge.proxy.document.source`: `stored` without asking the upstream, `revalidated` by a `304`, `downloaded`) |
 | Storage | `forge.s3.operation.duration` (`forge.s3.operation`, `forge.s3.outcome`: `ok`, `not_found`, `precondition_failed`, `unreachable`, `breaker_open`, `error`); `forge.s3.circuit_breaker.open` (with the local blob cache); the counters of `GET /admin/blob-cache` as `forge.blob_cache.*` (`hits`, `served`, `hits_while_store_down`, `misses`, `fills`, `fill_failures`, `corrupt`, `evictions`, `evicted`, `bypassed`, `verifications`, and `entries`, `usage`, `reserved`, `limit`); `forge.staging.usage` against `forge.staging.limit` (`server.max_staging_bytes`); `forge.outbox.pending`, `forge.outbox.due`, `forge.outbox.oldest_due.age`; `forge.gc.deleted` (`forge.gc.source`) |
 | Cache | `forge.cache.lookups` (`forge.cache.tier`: `l1` in process, `l2` Redis; `forge.cache.result`); `forge.cache.backplane.connected` (with Redis); `forge.cache.invalidations` (`forge.cache.direction`: `sent`, `received`) |
 | Database | `db.client.connection.count` (`db.client.connection.state`: `idle`, `used`), `db.client.connection.max`, `db.client.connection.wait_time`, `db.client.connection.timeouts` |
@@ -1592,6 +1592,31 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   to the instance first (for Kubernetes a `preStop` sleep of 5 to 10 s),
   otherwise requests routed in that gap are refused, and a refused push is
   not retried.
+- **Proxy metadata.** The documents a proxy repository reads from its
+  upstream (npm packuments, NuGet registrations and version listings,
+  service indexes) are stored for every instance: their bytes in the object
+  store, content-addressed like packages, and in PostgreSQL per repository,
+  URL and `Accept` header, with when the upstream last sent or confirmed
+  each and its `ETag` / `Last-Modified`. Within the repository's metadata
+  TTL (`metadata_ttl_seconds`, 10 minutes by default; a day for a document
+  that never changes, such as a NuGet catalog entry) every instance serves
+  the stored copy without asking the upstream, a restarted one too, and
+  keeps it in its in-process cache (`cache.l1_max_capacity`) for what is
+  left of the TTL. Past the TTL the proxy asks the upstream whether the
+  document changed (`If-None-Match`, `If-Modified-Since`): a
+  `304 Not Modified` serves the stored copy for another TTL and downloads
+  nothing, a new document replaces it, and one the upstream no longer has
+  (or that grew past `proxy.max_metadata_bytes`) is deleted. An upstream
+  that sends neither validator is downloaded again each time. A stored
+  document is served without asking only for the `remote_url` it came from
+  and while the repository is unchanged: any edit of the repository has its
+  documents revalidated first, and invalidating its cache, repointing it or
+  deleting it deletes them. A search's result pages and an import's walk are
+  not stored. Documents no request read for a week are removed by the
+  orphan reconciler (with their blobs, after `outbox.grace_seconds`). A
+  document that cannot be stored (the object store is down, the temp space
+  is full) is served all the same. The `forge.proxy.upstream.documents`
+  metric ([Telemetry](#telemetry)) shows how often each happens.
 - **Temp space.** Pushes and first-time proxy downloads are staged in
   `server.staging_dir` (default `forge-staging` in the system temp
   directory). All staged files of an instance share `server.max_staging_bytes`
@@ -1650,7 +1675,10 @@ therefore keeps every value a security decision or a client rests on **out of
 Redis**: authorization sets, credential-forwarding verdicts, OIDC discovery
 documents and signing keys, workload-identity token verdicts, and a proxy's
 upstream service index, manifests and registrations are cached in each
-instance's memory only. Redis carries only their invalidations, so the worst
+instance's memory only, and the upstream documents proxies share between
+instances are kept in PostgreSQL and the object store
+([proxy metadata](#running-more-than-one-instance)), never in Redis. Redis
+carries only their invalidations, so the worst
 a Redis writer can do to them is evict them early. Publishing invalidations
 for ever new names cannot grow an instance's memory without bound either: the
 per-name bookkeeping is capped (100,000 names), and an instance that reaches

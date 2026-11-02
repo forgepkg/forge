@@ -590,8 +590,9 @@ fn spawn_auth_reaper(pool: PgPool, interval: Duration) -> JoinHandle<()> {
 }
 
 /// Spawn the orphan-reconciler loop. Each tick also prunes processed
-/// `blob_outbox` rows older than `prune_outbox` (`None` keeps them all) and
-/// `retention_audit` rows older than the stored retention settings say.
+/// `blob_outbox` rows older than `prune_outbox` (`None` keeps them all),
+/// `retention_audit` rows older than the stored retention settings say, and
+/// the upstream documents proxies stored that nobody read for a week.
 fn spawn_reconciler(
     pool: PgPool,
     store: BlobStore,
@@ -667,6 +668,23 @@ fn spawn_reconciler(
                     Err(e) => {
                         ok = false;
                         tracing::error!(error = %e, "proxy version prune failed")
+                    }
+                }
+                // Upstream documents proxies stored that nobody read for a
+                // week.
+                match forge_db::proxy_document_dao::prune_unused(
+                    &pool,
+                    chrono::Duration::seconds(forge_core::repo::proxy::UNUSED_DOCUMENT_SECONDS),
+                    1000,
+                    grace,
+                )
+                .await
+                {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(pruned = n, "pruned unused proxy documents"),
+                    Err(e) => {
+                        ok = false;
+                        tracing::error!(error = %e, "proxy document prune failed")
                     }
                 }
                 ok

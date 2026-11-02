@@ -985,6 +985,21 @@ fn upstream_hits(mock: &MockUpstream) -> [usize; 6] {
     ]
 }
 
+/// The metadata TTL of the upstream documents proxy `repo` stored for every
+/// instance passes (`proxy_document`): with a fresh cache, that stands in for
+/// an expired metadata TTL, as a fresh cache alone did while each instance
+/// kept its documents to itself.
+async fn expire_documents(pool: &PgPool, repo: &str) {
+    sqlx::query(
+        "UPDATE proxy_document SET fetched_at = now() - interval '2 days' \
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1)",
+    )
+    .bind(repo)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// Point proxy `repo` at another upstream, as the admin update does: the new
 /// URL (bumping `updated_at`), and in the same transaction the reset of what
 /// the proxy learned from the previous one.
@@ -1247,6 +1262,7 @@ async fn service_index_without_a_package_base_address_is_an_upstream_failure() {
         .execute(&pool)
         .await
         .unwrap();
+        expire_documents(&pool, &repo).await;
     };
 
     // A good index first, then the upstream answers an empty one.
@@ -1727,9 +1743,10 @@ async fn planted_not_found_marker_is_cleared_by_a_later_listing() {
         ["1.0.0"]
     );
 
-    // The release appears upstream; a fresh cache stands in for an expired
-    // metadata TTL (the not-found TTL of 600 s has NOT elapsed).
+    // The release appears upstream; the metadata TTL passes (the not-found
+    // TTL of 600 s has NOT elapsed).
     mock.publish("contoso.lib", "2.0.0", make_nupkg("Contoso.Lib", "2.0.0"));
+    expire_documents(&pool, &repo).await;
     let px = proxy_repo(&pool, cas, Cache::l1_only(128));
     assert_eq!(
         versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -1769,8 +1786,9 @@ async fn versions_deleted_upstream_leave_the_listings() {
     );
 
     mock.unpublish("contoso.lib", "2.1.0");
-    // A fresh cache stands in for an expired metadata TTL. One listing
-    // without the version is no deletion yet (it may be partial)...
+    // The metadata TTL passes. One listing without the version is no
+    // deletion yet (it may be partial)...
+    expire_documents(&pool, &repo).await;
     let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
     assert_eq!(
         versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -1787,6 +1805,7 @@ async fn versions_deleted_upstream_leave_the_listings() {
     .execute(&pool)
     .await
     .unwrap();
+    expire_documents(&pool, &repo).await;
     let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
     assert_eq!(
         versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -1812,6 +1831,7 @@ async fn versions_deleted_upstream_leave_the_listings() {
     );
 
     mock.publish("contoso.lib", "2.1.0", make_nupkg("Contoso.Lib", "2.1.0"));
+    expire_documents(&pool, &repo).await;
     let px = proxy_repo(&pool, cas, Cache::l1_only(128));
     assert_eq!(
         versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -1839,6 +1859,7 @@ async fn a_partial_listing_during_an_upstream_incident_retires_nothing() {
     // The incident: only 1.0.0 is listed.
     mock.unpublish("contoso.lib", "2.0.0");
     mock.unpublish("contoso.lib", "3.0.0");
+    expire_documents(&pool, &repo).await;
     let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
     assert_eq!(
         versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -1853,6 +1874,7 @@ async fn a_partial_listing_during_an_upstream_incident_retires_nothing() {
     // partial listing starts counting afresh.
     mock.publish("contoso.lib", "2.0.0", make_nupkg("Contoso.Lib", "2.0.0"));
     mock.publish("contoso.lib", "3.0.0", make_nupkg("Contoso.Lib", "3.0.0"));
+    expire_documents(&pool, &repo).await;
     let px = proxy_repo(&pool, cas, Cache::l1_only(128));
     assert_eq!(
         versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -2021,7 +2043,8 @@ async fn an_empty_or_malformed_listing_retires_nothing() {
             .lock()
             .unwrap()
             .insert("contoso.lib".into(), doc.clone());
-        // A fresh cache stands in for an expired metadata TTL.
+        // The metadata TTL passes.
+        expire_documents(&pool, &repo).await;
         let px = proxy_repo(&pool, cas.clone(), Cache::l1_only(128));
         assert_eq!(
             versions_of(&px.list_versions(&repo, "Contoso.Lib").await.unwrap()),
@@ -2190,6 +2213,14 @@ async fn prune_during_a_first_download_does_not_fail_it() {
         .unwrap();
     let (arrived, release) = mock.hold_nupkgs();
     let px = Arc::new(proxy_repo(&pool, cas, Cache::l1_only(128)));
+    // The upstream index first: stored for every instance, it takes a while
+    // under load, in which another test's prune (of every repository) would
+    // remove the download's row before the assertion below.
+    let row_of_repo = repository_dao::find_repository_by_name(&pool, &repo)
+        .await
+        .unwrap()
+        .unwrap();
+    px.resolve_upstream_index(&row_of_repo).await.unwrap();
 
     let download = {
         let (px, repo) = (px.clone(), repo.clone());
@@ -2350,6 +2381,7 @@ async fn planted_row_does_not_shorten_the_package_delay() {
     .unwrap();
 
     mock.publish("contoso.lib", "2.0.0", make_nupkg("Contoso.Lib", "2.0.0"));
+    expire_documents(&pool, &repo).await;
     let px = proxy_repo(&pool, cas, Cache::l1_only(128));
     assert!(
         px.list_versions(&repo, "Contoso.Lib")

@@ -551,6 +551,7 @@ impl AppState {
         .with_http(self.upstream.clone())
         .with_blob_fetch(self.blob_bytes())
         .with_download_tally(self.downloads.clone())
+        .with_delete_grace(self.config.outbox.grace())
     }
 
     /// A member-ops factory for group resolution (hosted/proxy members only).
@@ -564,6 +565,7 @@ impl AppState {
             envelope: self.envelope.clone(),
             upstream: self.upstream.clone(),
             downloads: self.downloads.clone(),
+            delete_grace: self.config.outbox.grace(),
         }
     }
 }
@@ -643,6 +645,9 @@ pub struct MemberFactory {
     upstream: UpstreamHttp,
     /// Shared download counts.
     downloads: Arc<DownloadTally>,
+    /// `outbox.grace_seconds`, for the blobs of the proxies' replaced
+    /// upstream documents.
+    delete_grace: chrono::Duration,
 }
 
 impl MemberOpsFactory for MemberFactory {
@@ -671,7 +676,8 @@ impl MemberOpsFactory for MemberFactory {
                 .with_blob_fetch(Arc::new(BlobBytes {
                     store: self.blob_store.clone(),
                 }))
-                .with_download_tally(self.downloads.clone()),
+                .with_download_tally(self.downloads.clone())
+                .with_delete_grace(self.delete_grace),
             )),
             RepoKind::Group => Err(RepoError::WrongKind {
                 name: member.name.clone(),

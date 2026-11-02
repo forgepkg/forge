@@ -484,7 +484,11 @@ GETs (`fetch`), and is called again with every fetch so far and how it went
 fetch says how long its document may be reused: for the repository's
 metadata TTL, or for a day when it never changes once published, and may
 name the `Accept` it sends (npm's abbreviated and full packuments share a
-URL). One conversation gets at most 4 rounds and 256 fetches, 4 at a time,
+URL). The host keeps the documents it fetched for every instance (in the
+database and the object store) and, once that time has passed, asks the
+upstream whether one changed (`If-None-Match`, `If-Modified-Since`): the
+plugin is handed the same bytes either way. A search's pages and an
+import's walk are not kept. One conversation gets at most 4 rounds and 256 fetches, 4 at a time,
 and keeps at most 4 × `proxy.max_metadata_bytes` of documents, all rounds
 together: a document past that comes back as a failure, and so does every
 later fetch of the conversation, which is not sent. A document larger than

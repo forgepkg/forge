@@ -549,8 +549,9 @@ pub async fn reserve_dangling_delete(
 }
 
 /// How many rows name the blob (under the caller's blob row lock): package
-/// assets, the Docker/OCI image links, manifests and upload chunks, and raw
-/// files, each of which holds one reference.
+/// assets, the Docker/OCI image links, manifests and upload chunks, raw
+/// files and proxies' upstream documents, each of which holds one
+/// reference.
 async fn asset_references(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     sha256: &str,
@@ -562,6 +563,7 @@ async fn asset_references(
              + (SELECT count(*) FROM oci_manifest WHERE blob_sha256 = $1)
              + (SELECT count(*) FROM oci_upload_part WHERE blob_sha256 = $1)
              + (SELECT count(*) FROM raw_file WHERE blob_sha256 = $1)
+             + (SELECT count(*) FROM proxy_document WHERE blob_sha256 = $1)
         "#,
     )
     .bind(sha256)
