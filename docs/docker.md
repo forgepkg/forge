@@ -111,7 +111,10 @@ needs `delete`; content selectors match image names (`team/*`). An image a
 selector hides from a caller who may read the repository is not found: a
 pull, its tags or its referrers answer 404 `NAME_UNKNOWN`, as for a name
 that does not exist (also through a group), while a push or a delete of it
-is refused with 403. One token
+is refused with 403. A request that sends no credentials of its own
+(anonymous, or an account a trusted-header realm names) gets the 401
+challenge for it instead, since containerd and Kubernetes send their
+credentials only after one. One token
 request may name at most 32 repositories (clients ask for one to three); a
 request naming more is refused with `400 UNSUPPORTED`. Every
 request is authorized again against the current permissions, and the user

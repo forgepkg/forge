@@ -3645,6 +3645,154 @@ async fn an_image_a_selector_hides_is_not_found() {
     assert_eq!(oci.get(&hidden, "manifests/1").await.status(), 403);
 }
 
+/// A request that sent no credential of its own is challenged for an image
+/// a selector hides (#787), as in 2.1: containerd, and so a Kubernetes pull
+/// with an imagePullSecret, sends its credentials only after a 401, and the
+/// image may be theirs to pull. Here the anonymous role and a trusted-header
+/// account read the repository through a selector that hides `secret/app`,
+/// which Alice may pull. A request with a registry token, an anonymous one
+/// included, still finds no such image (#703).
+#[tokio::test]
+async fn a_hidden_image_challenges_a_request_without_credentials() {
+    const SECRET: &str = "the-proxys-secret-0123456789abcdef";
+    let srv = common::start_with(
+        common::fresh_pool().await,
+        common::ServerOpts {
+            bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
+            auth_extra: Some(r#"trusted_proxy_cidrs = ["127.0.0.1"]"#.into()),
+            server_extra: Some(r#"allowed_hosts = ["127.0.0.1"]"#.into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    srv.set_auth_settings(json!({"anonymous_mode": "all"}))
+        .await;
+    let (u, p) = srv.admin_basic();
+    let admin_send = |method: Method, path: &str, body: Value| {
+        srv.client()
+            .request(method, format!("{}{path}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+    };
+
+    let repo = repo_name("sel");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let admin = admin_oci(&srv).await;
+    admin
+        .push_image(&format!("{repo}/secret/app"), "1", "amd64", b"secret layer")
+        .await;
+    admin
+        .push_image(&format!("{repo}/public/app"), "1", "amd64", b"public layer")
+        .await;
+    let selector = srv.create_selector(&["public/*"]).await;
+
+    // The anonymous role reads `public/*` of the repository.
+    let anonymous = forge_db::authz_dao::role_id_by_name(&srv.pool, "anonymous")
+        .await
+        .unwrap()
+        .expect("anonymous role seeded");
+    let resp = admin_send(
+        Method::PUT,
+        &format!("/admin/roles/{anonymous}/grants"),
+        json!({"repository": repo, "level": "read", "selector_id": selector}),
+    )
+    .await
+    .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.text().await.unwrap());
+
+    // So does an account a trusted-header realm names.
+    let n = unique();
+    let (user_header, secret_header) = (format!("X-User-{n}"), format!("X-Proxy-Secret-{n}"));
+    let realm = format!("proxy-{n}");
+    let resp = admin_send(
+        Method::POST,
+        "/admin/realms",
+        json!({
+            "kind": "trusted_header",
+            "name": realm,
+            "config": {
+                "username_header": user_header,
+                "secret_header": secret_header,
+                "secret": SECRET,
+                "auto_provision": false,
+            },
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    let office = format!("office{n}@example.com");
+    let resp = admin_send(
+        Method::POST,
+        "/admin/users",
+        json!({"username": office, "realm": realm, "role": "roles_only"}),
+    )
+    .await
+    .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let office_id = body["id"].as_i64().expect("account created");
+    srv.grant_role(office_id, &[(&repo, "read", Some(selector))])
+        .await;
+
+    // Alice may pull every image of the repository.
+    let alice = srv.caller().await;
+    srv.grant_role(alice.id, &[(&repo, "read", None)]).await;
+
+    let hidden = format!("{repo}/secret/app");
+    let url = format!("{}/v2/{hidden}/manifests/1", srv.base_url);
+    for (who, headers) in [
+        ("anonymous", vec![]),
+        (
+            "the trusted-header account",
+            vec![
+                (secret_header.as_str(), SECRET),
+                (user_header.as_str(), office.as_str()),
+            ],
+        ),
+    ] {
+        for method in [Method::GET, Method::HEAD] {
+            let mut req = srv.client().request(method.clone(), &url);
+            for (name, value) in &headers {
+                req = req.header(*name, *value);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 401, "{who}: {method} of a hidden image");
+            let challenge = resp.headers()[WWW_AUTHENTICATE].to_str().unwrap();
+            assert!(challenge.starts_with("Bearer realm="), "{who}: {challenge}");
+            assert!(
+                challenge.contains(&format!("scope=\"repository:{hidden}:pull\"")),
+                "{who}: {challenge}"
+            );
+        }
+        // What the selector shows is served as before.
+        let mut req = srv
+            .client()
+            .get(format!("{}/v2/{repo}/public/app/manifests/1", srv.base_url));
+        for (name, value) in &headers {
+            req = req.header(*name, *value);
+        }
+        assert_eq!(req.send().await.unwrap().status(), 200, "{who}: public/app");
+    }
+
+    // With the anonymous token a credential-less client then gets, the
+    // hidden image is not found.
+    let resp = Oci::new(&srv, None).get(&hidden, "manifests/1").await;
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "NAME_UNKNOWN", "{body}");
+
+    // With Alice's credentials, sent after the challenge, the pull works.
+    let resp = Oci::new(&srv, Some((alice.username, alice.token)))
+        .get(&hidden, "manifests/1")
+        .await;
+    assert_eq!(resp.status(), 200);
+}
+
 /// A group shows a caller what it could pull from its members directly, no
 /// more (#648): with a member it may not read, a selector on the group's
 /// grant or one on a member's, a hidden image's manifests, blobs, tags and

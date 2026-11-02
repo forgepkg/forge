@@ -575,7 +575,11 @@ impl Registry {
     /// credentials or a token for the scope could help, a denial (403) for
     /// an authenticated caller the permission is missing for, and for an
     /// image a selector hides the answer to a name that does not exist
-    /// (404 `NAME_UNKNOWN`).
+    /// (404 `NAME_UNKNOWN`). A request that presented no credential of its
+    /// own (anonymous, or an ambient session or trusted-header account) is
+    /// challenged for a hidden image instead: containerd, and so Kubernetes,
+    /// sends its credentials only after a 401, and the image may be its
+    /// credentials' to pull (#787).
     pub(crate) fn refusal(
         &self,
         caller: &Caller,
@@ -587,6 +591,9 @@ impl Registry {
         let authenticated = mutation_credential(&caller.principal);
         let error = caller.claims.as_ref().map(|_| "insufficient_scope");
         match decision {
+            Decision::Hidden if !authenticated && caller.claims.is_none() => {
+                challenge(site, name, permission, None)
+            }
             Decision::Hidden => Failure::new(ImageError::NameUnknown {
                 name: name.to_string(),
             }),
