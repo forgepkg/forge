@@ -23,6 +23,8 @@
 //!   only, and an optional scope can only narrow the owner's privileges. An
 //!   unknown scope key (e.g. a mistyped `repos`) is a 400, never an unscoped
 //!   token. Without a scope the token carries no `admin` reach.
+//! * Every mint and revocation is audit-logged (`forge::audit`), like the
+//!   tokens a client login mints and the admin API's changes.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -35,7 +37,10 @@ use forge_db::token_dao::{self, NewToken};
 use forge_db::user_dao;
 
 use crate::admin::db_error;
-use crate::admin::tokens::{store_scope, validate_expiry, CreateToken, CreatedToken, TokenView};
+use crate::admin::tokens::{
+    audit_self_service_mint, audit_self_service_revoke, store_scope, validate_expiry, CreateToken,
+    CreatedToken, TokenView,
+};
 use crate::middleware::principal_of;
 use crate::state::AppState;
 
@@ -159,6 +164,7 @@ pub async fn create(State(state): State<AppState>, req: axum::extract::Request) 
         Ok(scope) => scope,
         Err(resp) => return resp,
     };
+    audit_self_service_mint(&t, scope.as_ref());
 
     let mut view = TokenView::from(&t);
     view.scope = scope;
@@ -196,7 +202,10 @@ pub async fn revoke(
         Err(e) => return db_error(e),
     }
     match token_dao::revoke_token(&state.pool, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            audit_self_service_revoke(user_id, id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, "token not found or already revoked").into_response(),
         Err(e) => db_error(e),
     }

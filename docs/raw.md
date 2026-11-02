@@ -25,6 +25,7 @@ several paths, or in several repositories, is stored once.
 
 ## Contents
 
+- [Logging in](#logging-in)
 - [Hosted repositories](#hosted-repositories)
 - [Downloads](#downloads)
 - [Listings](#listings)
@@ -36,6 +37,42 @@ several paths, or in several repositories, is stored once.
 - [Importing another server's repository](#importing-another-servers-repository)
 - [Example: the pdfium binaries](#example-the-pdfium-binaries)
 - [Limitations](#limitations)
+
+## Logging in
+
+curl, wget and every other HTTP client send their credentials over HTTP
+Basic, as against Nexus' raw repositories, or as a Bearer token:
+
+```bash
+curl -u <username>:<token> -O https://forge.example.com/repository/binaries/tools/1.0/tool.tgz
+curl -H 'Authorization: Bearer <token>' -O https://forge.example.com/repository/binaries/tools/1.0/tool.tgz
+```
+
+- **API tokens** are the credential to use, as the Basic password or as a
+  Bearer token. Create one under **Your tokens** in the web UI, or with
+  `POST /admin/me/tokens`; the page then shows these commands with the
+  token and your username filled in. A token's scope applies.
+- **Passwords** work for the users of a realm that accepts passwords from
+  clients ([Admin → Authentication](deployment.md#passwords-from-clients)).
+  A credential-forwarding realm accepts them by default, so scripts that
+  sent a Nexus password keep working; the local realm accepts them once an
+  administrator turns that on. A password downloads and lists, but never
+  uploads or deletes: those take an API token or a workload. Every failed
+  password counts toward the sign-in lockout (**Admin → Settings**).
+- **Browser sign-in** (OIDC or Entra included) has no counterpart in a
+  plain HTTP client: sign in to the web UI and create an API token.
+- **CI workloads** with a workload-identity realm send their OIDC token, or
+  the API key it was exchanged for, as the password with the username
+  `oidc` ([Trusted publishing](trusted-publishing.md)).
+- **Anonymous downloads** work for repositories that allow anonymous read,
+  with the anonymous mode on (**Admin → Settings**).
+
+A `~/.netrc` entry keeps the token off the command line (`curl -n`,
+`wget` reads it by itself):
+
+```text
+machine forge.example.com login <username> password <token>
+```
 
 ## Hosted repositories
 

@@ -642,9 +642,9 @@ browser kept, the next time it is opened there.
 
 #### Passwords from clients
 
-Whether a client may send a user's password over HTTP Basic (a NuGet, raw or
-Helm feed, `docker login` through the registry's token service, `npm login
---auth-type=legacy`) is set **per realm**: **Accept passwords from clients
+Whether a client may send a user's password over HTTP Basic (a NuGet, npm,
+raw or apt repository, `docker login` and `helm registry login` through the
+registry's token service, `npm login --auth-type=legacy`) is set **per realm**: **Accept passwords from clients
 (HTTP Basic)** on the realm's page under **Admin → Authentication**
 (`accept_client_passwords` in the config of the `local` realm or a
 `credential_forwarding` one, `PATCH /admin/realms/{id}`).
@@ -1627,7 +1627,13 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   image and the Kubernetes manifests are not affected.)
 - **Audit log.** Package mutations and admin changes are logged at INFO
   under the `forge::audit` target, with the user/token or workload that
-  made them; keep those lines.
+  made them; keep those lines. So are sign-ins and tokens: the web UI's
+  sign-ins (`browser login`, `browser login refused`, never the username
+  a refused one typed), the tokens users create and revoke there (`token
+  minted in the web UI`, `token revoked in the web UI`), the registry
+  tokens `docker login` gets (`registry token issued`), npm's logins and
+  logouts (`cli login …`) and the [device login](#device-login)'s
+  requests and tokens.
 - **Outbound proxy.** Proxy repositories send upstream traffic through
   `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` unless `NO_PROXY` exempts the
   host. Forge never sends an upstream request, or follows a redirect, to a

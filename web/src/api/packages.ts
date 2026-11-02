@@ -45,6 +45,17 @@ export interface BrowseRepo {
    * for a format this server does not have installed.
    */
   url?: string
+  /**
+   * The registry host a docker repository is logged in to (`docker login
+   * <registry>`): the repository's own host, or the server's. Absent for
+   * every other repository.
+   */
+  registry?: string
+  /**
+   * What a docker repository's image names start with (`<registry>/<repo>`,
+   * or the repository's own host). Absent for every other repository.
+   */
+  pull_prefix?: string
   /** The settings of its format's own (apt's `distribution`). */
   options?: Record<string, string>
 }

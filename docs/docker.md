@@ -76,8 +76,10 @@ docker pull forge.example.com/docker-hosted/team/app:1.2
 docker push forge.example.com/docker-hosted/team/app:1.3
 ```
 
-- **API tokens** (created on the Tokens page, or `POST /admin/me/tokens`) are
-  the password to use. A token's repository scope applies.
+- **API tokens** (created under **Your tokens** in the web UI, or `POST
+  /admin/me/tokens`) are the password to use. A token's repository scope
+  applies. Once a token is created, the page shows the `docker login` and
+  `helm registry login` commands with it and your username filled in.
 - **Browser sign-in** (OIDC or Entra included): the Docker CLI has none for
   a registry other than Docker Hub. A client gets an API token through
   Forge's [device login](deployment.md#device-login) instead (the coming
