@@ -88,7 +88,10 @@ pub async fn find_realm_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<Aut
 }
 
 /// Find a realm by its unique name.
-pub async fn find_realm_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<AuthRealm>> {
+pub async fn find_realm_by_name<'e, E>(executor: E, name: &str) -> sqlx::Result<Option<AuthRealm>>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         AuthRealm,
         r#"
@@ -98,19 +101,22 @@ pub async fn find_realm_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Optio
         "#,
         name,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Whether any realm of `kind` exists (enabled or not). Used by the one-shot
 /// legacy-config import to avoid re-seeding a kind the operator already
 /// manages.
-pub async fn kind_exists(pool: &PgPool, kind: &str) -> sqlx::Result<bool> {
+pub async fn kind_exists<'e, E>(executor: E, kind: &str) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_scalar!(
         r#"SELECT EXISTS(SELECT 1 FROM auth_realm WHERE kind = $1) AS "exists!""#,
         kind,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
