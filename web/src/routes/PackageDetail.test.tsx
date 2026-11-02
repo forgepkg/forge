@@ -18,7 +18,8 @@ import { searchOptions } from '~/lib/search'
 
 /**
  * Package-detail screen: renders versions + dependency groups; a delayed proxy
- * version shows the delay badge; a proxy labels the time column "Cached" (when
+ * version shows the delay badge, and an administrator releases it early with
+ * a reason; a proxy labels the time column "Cached" (when
  * Forge downloaded it), a hosted repository "Published"; a 404 renders the
  * not-found empty state; an offline repository's 503 says so (without
  * retrying). Drives the real route tree + `usePackageDetail`.
@@ -114,11 +115,14 @@ function mockApi(
     me = anonMe,
     format = 'nuget',
     deleteVersion,
+    release,
     repos = [{ name: 'internal', format }],
   }: {
     me?: Me
     format?: string
     deleteVersion?: () => Response | Promise<Response>
+    /** `POST …/release-delay`: the path and the body. */
+    release?: (path: string, body: unknown) => Response
     repos?: { name: string; format: string }[]
   } = {},
 ) {
@@ -140,6 +144,9 @@ function mockApi(
     }
     if (init?.method === 'DELETE' && deleteVersion) {
       return Promise.resolve(deleteVersion())
+    }
+    if (init?.method === 'POST' && release && url.pathname.endsWith('/release-delay')) {
+      return Promise.resolve(release(url.pathname, JSON.parse(init.body as string)))
     }
     if (url.pathname.endsWith('/browse/packages')) {
       return Promise.resolve(jsonResponse({ total: 0, items: [] }))
@@ -384,6 +391,76 @@ describe('PackageDetail', () => {
     // The available version shows the available badge, not delayed.
     const stableRow = within(table).getByText('13.0.3').closest('tr') as HTMLElement
     expect(within(stableRow).getByText('available')).toBeInTheDocument()
+  })
+
+  it('releases a delayed proxy version early, with a reason, for an administrator', async () => {
+    const user = userEvent.setup()
+    let current: PackageDetail = {
+      ...proxyDetail,
+      package_delay: { delay_seconds: 86400, source: { kind: 'pattern', pattern: 'newtonsoft.*' } },
+    }
+    const posts: [string, unknown][] = []
+    mockApi(() => jsonResponse(current), {
+      me: adminMe,
+      repos: [{ name: 'proxy', format: 'nuget' }],
+      release: (path, body) => {
+        posts.push([path, body])
+        current = {
+          ...current,
+          versions: current.versions.map((v) =>
+            v.version === '14.0.0-beta'
+              ? {
+                  ...v,
+                  delay_status: 'available' as const,
+                  delayed_until: null,
+                  delay_released_at: '2026-11-02T10:00:00Z',
+                }
+              : v,
+          ),
+        }
+        return jsonResponse({
+          package: 'newtonsoft.json',
+          version: '14.0.0-beta',
+          reason: 'CVE-2026-1234',
+          released_by: 'user:1 session',
+          released_at: '2026-11-02T10:00:00Z',
+          seen: true,
+        })
+      },
+    })
+
+    await renderDetail('/packages/proxy/newtonsoft.json')
+    await screen.findByRole('heading', { name: 'Newtonsoft.Json' })
+    // The package's delay and the override that decides it.
+    expect(screen.getByText('1 d (newtonsoft.*)')).toBeInTheDocument()
+    // Only the delayed version offers the release.
+    expect(screen.getAllByRole('button', { name: /^Release .* now$/ })).toHaveLength(1)
+    await user.click(screen.getByRole('button', { name: 'Release 14.0.0-beta now' }))
+    const dialog = await screen.findByRole('dialog')
+    const confirm = within(dialog).getByRole('button', { name: 'Release now' })
+    expect(confirm).toBeDisabled()
+    await user.type(within(dialog).getByLabelText('Reason'), 'CVE-2026-1234')
+    await user.click(confirm)
+    await waitFor(() => expect(posts).toHaveLength(1))
+    expect(posts[0]).toEqual([
+      '/admin/repositories/proxy/packages/newtonsoft.json/versions/14.0.0-beta/release-delay',
+      { reason: 'CVE-2026-1234' },
+    ])
+    expect(await screen.findByText('released early')).toBeInTheDocument()
+  })
+
+  it('offers no early release to a reader', async () => {
+    mockApi(() =>
+      jsonResponse({
+        ...proxyDetail,
+        package_delay: { delay_seconds: 86400, source: { kind: 'default' } },
+      }),
+    )
+
+    await renderDetail('/packages/proxy/newtonsoft.json')
+    await screen.findByRole('heading', { name: 'Newtonsoft.Json' })
+    expect(screen.getByText('1 d (repository default)')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Release .* now$/ })).toBeNull()
   })
 
   it('labels the time column "Cached" on a proxy', async () => {

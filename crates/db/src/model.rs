@@ -365,6 +365,45 @@ impl Repository {
     }
 }
 
+/// `repository.config` key of [`Repository::package_delay_overrides`].
+pub const PACKAGE_DELAY_OVERRIDES_KEY: &str = "package_delay_overrides";
+
+/// One entry of a proxy's package-delay overrides (stored in
+/// `config.package_delay_overrides`, an ordered JSON array): the packages it
+/// matches get `delay_seconds` instead of the repository's
+/// `package_delay_seconds`. Exactly one of `selector` (a content selector's
+/// name, whose include/exclude globs match) and `pattern` (an inline glob) is
+/// set; the admin API refuses anything else.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageDelayOverride {
+    /// A content selector's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    /// A glob on the lowercased package id, in the content selectors' syntax.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// The delay of the packages it matches: `0` is none, and a value above
+    /// the repository's default holds them back longer.
+    pub delay_seconds: i32,
+}
+
+impl Repository {
+    /// A proxy's package-delay overrides, in order: the first one that
+    /// matches a package decides its delay. Empty for other kinds, and when
+    /// the stored value does not read (the admin API never writes one that
+    /// does not).
+    pub fn package_delay_overrides(&self) -> Vec<PackageDelayOverride> {
+        if self.kind() != RepoKind::Proxy {
+            return Vec::new();
+        }
+        let Some(stored) = self.config.get(PACKAGE_DELAY_OVERRIDES_KEY) else {
+            return Vec::new();
+        };
+        serde_json::from_value(stored.clone()).unwrap_or_default()
+    }
+}
+
 /// `repository.config` key of [`Repository::prefer_hosted`].
 pub const PREFER_HOSTED_KEY: &str = "prefer_hosted";
 

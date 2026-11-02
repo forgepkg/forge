@@ -48,6 +48,11 @@ export interface RepoView {
   remote_url: string | null
   /** Proxy package-delay window in seconds (0 = no delay). */
   package_delay_seconds: number
+  /**
+   * Proxy: packages with another delay than `package_delay_seconds`, in
+   * order; the first entry that matches a package decides. Empty otherwise.
+   */
+  package_delay_overrides?: PackageDelayOverride[]
   /** Proxy upstream basic-auth username, if set. */
   upstream_username: string | null
   /** Whether an upstream password is stored (the value is never returned). */
@@ -102,6 +107,40 @@ export interface RepoView {
   options?: Record<string, string>
 }
 
+/**
+ * One entry of a proxy's `package_delay_overrides`: the packages it matches
+ * get `delay_seconds` (0: no delay; longer than the default holds them back
+ * longer). Exactly one of `selector` (a content selector's name, whose
+ * include/exclude globs match) and `pattern` (a glob on the lowercased
+ * package id, in the selectors' syntax) is set.
+ */
+export interface PackageDelayOverride {
+  selector?: string
+  pattern?: string
+  delay_seconds: number
+}
+
+/**
+ * A version released from a proxy's package delay early (`ReleaseView` of
+ * `crates/server/src/admin/package_delay.rs`).
+ */
+export interface DelayRelease {
+  /** The package id, lowercased as the proxy stores it. */
+  package: string
+  /** The normalized version. */
+  version: string
+  /** Why it was released early. */
+  reason: string
+  /** The administrator who released it (an audit label). */
+  released_by: string
+  released_at: string
+  /**
+   * Whether the proxy has seen the version upstream yet; a release of one it
+   * has not seen applies once it does.
+   */
+  seen: boolean
+}
+
 /** A hosted raw repository's deployment policy, as Nexus'. */
 export type DeploymentPolicy = 'allow_redeploy' | 'disable_redeploy' | 'read_only'
 
@@ -116,6 +155,8 @@ export interface CreateRepo {
   // Proxy fields:
   remote_url?: string | null
   package_delay_seconds?: number
+  /** Proxy (with a package delay) only. */
+  package_delay_overrides?: PackageDelayOverride[]
   upstream_username?: string | null
   upstream_password?: string | null
   metadata_ttl_seconds?: number | null
@@ -164,6 +205,8 @@ export interface UpdateRepo {
   online?: boolean
   remote_url?: string | null
   package_delay_seconds?: number
+  /** Proxy only; replaces the whole list (`[]` clears it). */
+  package_delay_overrides?: PackageDelayOverride[]
   upstream_username?: string | null
   upstream_password?: string | null
   metadata_ttl_seconds?: number | null
@@ -353,6 +396,7 @@ export const repoKeys = {
   signingKeys: (name: string) => ['repositories', 'signing-keys', name] as const,
   trustedPublishers: (name: string) =>
     ['repositories', 'trusted-publishers', name] as const,
+  delayReleases: (name: string) => ['repositories', 'delay-releases', name] as const,
 }
 
 /** Query key of the installed formats. */
@@ -418,6 +462,47 @@ export function invalidateProxyCache(
     `/admin/repositories/${encodeURIComponent(name)}/proxy-cache/invalidate`,
     body,
   )
+}
+
+/** `GET /admin/repositories/{name}/delay-releases` — a proxy's early releases, newest first. */
+export function fetchDelayReleases(
+  name: string,
+  signal?: AbortSignal,
+): Promise<DelayRelease[]> {
+  return httpClient.get<DelayRelease[]>(
+    `/admin/repositories/${encodeURIComponent(name)}/delay-releases`,
+    { signal },
+  )
+}
+
+function releasePath(name: string, id: string, version: string): string {
+  return `/admin/repositories/${encodeURIComponent(name)}/packages/${encodeURIComponent(
+    id,
+  )}/versions/${encodeURIComponent(version)}/release-delay`
+}
+
+/**
+ * `POST …/packages/{id}/versions/{version}/release-delay` — release one
+ * version from a proxy's package delay now (a reason is required). A version
+ * the proxy has not seen yet can be released too; the release applies once
+ * it does. Releasing a released version again keeps the first release.
+ */
+export function releaseFromDelay(
+  name: string,
+  id: string,
+  version: string,
+  reason: string,
+): Promise<DelayRelease> {
+  return httpClient.post<DelayRelease>(releasePath(name, id, version), { reason })
+}
+
+/** `DELETE …/release-delay` — withdraw a release: the version waits out its delay again. */
+export function withdrawDelayRelease(
+  name: string,
+  id: string,
+  version: string,
+): Promise<void> {
+  return httpClient.delete<void>(releasePath(name, id, version))
 }
 
 /** `GET /admin/repositories/{name}/members` — a group's ordered members. */

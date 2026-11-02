@@ -251,7 +251,10 @@ any registry that speaks npm's protocol:
 - **Publication delay.** `package_delay_seconds` holds back versions
   published upstream less than that long ago (counted from the upstream's
   publish time, not from when Forge first saw them): a new release, possibly
-  a compromised one, reaches your builds only after the delay.
+  a compromised one, reaches your builds only after the delay. Overrides
+  give some packages another delay (none for `@acme/*`, a longer one for a
+  package you watch), and an administrator can release one version early;
+  see [Package delay](package-delay.md).
 - **Outages.** While the upstream is down, what is cached is served: the
   packument as last read, and every tarball downloaded before. A tarball
   never downloaded answers 503 with `Retry-After`. An upstream that refuses

@@ -1,6 +1,7 @@
-import type { DetailVersion } from '~/api/packages'
+import type { AppliedDelay, DetailVersion } from '~/api/packages'
 import {
   Button,
+  CellActions,
   StatusBadge,
   Table,
   TableBody,
@@ -26,6 +27,10 @@ import { RetentionBadge } from './RetentionBadge'
  *
  * An npm package's versions also show the dist-tags that point at them and
  * whether they are deprecated (the message in the badge's title).
+ *
+ * On a proxy, the delay badge names the override that decides the package's
+ * delay (`delay`), and an administrator gets **Release now** next to a
+ * version still inside it (`onRelease`).
  */
 export function VersionTable({
   versions,
@@ -33,6 +38,9 @@ export function VersionTable({
   caption,
   onDelete,
   deletePending,
+  onRelease,
+  releasePending,
+  delay,
   distTags,
   deprecated,
 }: {
@@ -42,11 +50,17 @@ export function VersionTable({
   caption?: string
   onDelete?: (version: DetailVersion) => void
   deletePending?: boolean
+  /** Proxy, for administrators: release a delayed version early. */
+  onRelease?: (version: DetailVersion) => void
+  releasePending?: boolean
+  /** Proxy: the package's delay and what decides it. */
+  delay?: AppliedDelay
   /** npm: tag → version. */
   distTags?: Record<string, string>
   /** npm: version → deprecation message. */
   deprecated?: Record<string, string>
 }) {
+  const actions = !!onDelete || !!onRelease
   const tagsOf = (version: string) =>
     Object.entries(distTags ?? {})
       .filter(([, v]) => v === version)
@@ -66,7 +80,7 @@ export function VersionTable({
           Size
         </TableHeader>
         <TableHeader>Status</TableHeader>
-        {onDelete && <TableHeader align="right">Actions</TableHeader>}
+        {actions && <TableHeader align="right">Actions</TableHeader>}
       </TableHead>
       <TableBody>
         {versions.map((v) => (
@@ -91,20 +105,41 @@ export function VersionTable({
                   </StatusBadge>
                 )}
                 {!v.listed && <StatusBadge>unlisted</StatusBadge>}
-                <DelayBadge status={v.delay_status} delayedUntil={v.delayed_until} />
+                <DelayBadge
+                  status={v.delay_status}
+                  delayedUntil={v.delayed_until}
+                  releasedAt={v.delay_released_at}
+                  delay={delay}
+                />
                 <RetentionBadge status={v.retention_status} />
               </span>
             </TableCell>
-            {onDelete && (
+            {actions && (
               <TableCell align="right">
-                <Button
-                  size="sm"
-                  variant="danger"
-                  disabled={deletePending}
-                  onClick={() => onDelete(v)}
-                >
-                  Delete
-                </Button>
+                <CellActions>
+                  {onRelease && v.delay_status === 'delayed_until' && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      icon="Clock"
+                      disabled={releasePending}
+                      onClick={() => onRelease(v)}
+                      aria-label={`Release ${v.version_original} now`}
+                    >
+                      Release now
+                    </Button>
+                  )}
+                  {onDelete && (
+                    <Button
+                      size="sm"
+                      variant="danger"
+                      disabled={deletePending}
+                      onClick={() => onDelete(v)}
+                    >
+                      Delete
+                    </Button>
+                  )}
+                </CellActions>
               </TableCell>
             )}
           </TableRow>

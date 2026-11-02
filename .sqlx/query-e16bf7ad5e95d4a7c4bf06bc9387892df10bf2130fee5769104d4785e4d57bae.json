@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT v.name, v.version, v.listed, v.first_seen_at,\n                   (r.version IS NOT NULL) AS \"released!\"\n            FROM proxy_cached_version v\n            LEFT JOIN package_delay_release r\n              ON r.repository_id = v.repository_id AND r.name = v.name AND r.version = v.version\n            WHERE v.repository_id = $1 AND v.name = ANY($2::text[])\n              AND v.version <> '*' AND v.confirmed AND NOT v.upstream_missing AND v.listed\n              AND (v.first_seen_at <= $3 OR r.version IS NOT NULL)\n              AND NOT (v.not_found AND v.not_found_at IS NOT NULL AND v.not_found_at > $4)\n              AND ($5 OR strpos(v.version, '-') = 0)\n              AND ($6 OR v.version !~ '-.*[.]')\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "listed",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "listed"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "first_seen_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "first_seen_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "released!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "TextArray",
+        "Timestamptz",
+        "Timestamptz",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "e16bf7ad5e95d4a7c4bf06bc9387892df10bf2130fee5769104d4785e4d57bae"
+}

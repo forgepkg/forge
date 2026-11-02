@@ -13,6 +13,7 @@ pub mod authz_dao;
 pub mod blob_dao;
 pub mod cli_login_dao;
 pub mod component_dao;
+pub mod delay_release_dao;
 pub mod device_auth_dao;
 pub mod download_dao;
 pub mod email_oauth_flow_dao;

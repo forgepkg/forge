@@ -22,10 +22,10 @@ use axum::response::{IntoResponse, Json, Response};
 use forge_core::format::Format;
 use forge_core::net::ssrf::validate_url;
 use forge_db::model::{
-    DeploymentPolicy, RepoKind, Repository, CONTENT_DISPOSITION_KEY, DEPLOYMENT_POLICY_KEY,
-    DOCKER_HOST_KEY, FORMAT_OPTIONS_KEY, IMMUTABLE_TAGS_KEY, LATEST_MUTABLE_KEY,
-    MAX_AGE_SECONDS_KEY, MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT, PREFER_HOSTED_KEY,
-    RESERVED_PREFIXES_KEY, WRITABLE_MEMBER_ID_KEY,
+    DeploymentPolicy, PackageDelayOverride, RepoKind, Repository, CONTENT_DISPOSITION_KEY,
+    DEPLOYMENT_POLICY_KEY, DOCKER_HOST_KEY, FORMAT_OPTIONS_KEY, IMMUTABLE_TAGS_KEY,
+    LATEST_MUTABLE_KEY, MAX_AGE_SECONDS_KEY, MAX_UPLOAD_BYTES_KEY, NUGET_FORMAT,
+    PACKAGE_DELAY_OVERRIDES_KEY, PREFER_HOSTED_KEY, RESERVED_PREFIXES_KEY, WRITABLE_MEMBER_ID_KEY,
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{component_dao, oci_dao, raw_dao};
@@ -48,6 +48,9 @@ pub struct RepoView {
     pub online: bool,
     pub remote_url: Option<String>,
     pub package_delay_seconds: i32,
+    /// Proxy: the packages with another delay than `package_delay_seconds`,
+    /// in order (the first that matches decides). Empty for other kinds.
+    pub package_delay_overrides: Vec<PackageDelayOverride>,
     pub upstream_username: Option<String>,
     /// `true` when an `upstream_password` is stored; the value itself is never
     /// returned.
@@ -104,6 +107,7 @@ impl RepoView {
             online: r.online,
             remote_url: r.remote_url.clone(),
             package_delay_seconds: r.package_delay_seconds,
+            package_delay_overrides: r.package_delay_overrides(),
             upstream_username: r.upstream_username.clone(),
             has_upstream_password: r.has_upstream_password(),
             metadata_ttl_seconds: r.metadata_ttl_seconds,
@@ -165,6 +169,9 @@ pub struct CreateRepo {
     pub remote_url: Option<String>,
     #[serde(default)]
     pub package_delay_seconds: i32,
+    /// Proxy only: packages with another delay, the first match deciding.
+    #[serde(default)]
+    pub package_delay_overrides: Option<Vec<DelayOverrideBody>>,
     #[serde(default)]
     pub upstream_username: Option<String>,
     #[serde(default)]
@@ -225,6 +232,8 @@ pub struct CreateRepo {
 /// * `name`, `anonymous_read`, `online`, `remote_url`, `package_delay_seconds`,
 ///   `allow_redeploy`, `prefer_hosted`: absent (or `null`) = keep, value = set.
 ///   A new `name` is validated like on create.
+/// * `package_delay_overrides` (proxy only): absent = keep, a list replaces
+///   the whole list (`[]` clears it).
 /// * `upstream_username`, `upstream_password`, `metadata_ttl_seconds`,
 ///   `not_found_ttl_seconds`: **absent = keep, JSON `null` = clear, value =
 ///   set.** A cleared TTL falls back to the server default. A password is
@@ -257,6 +266,8 @@ pub struct UpdateRepo {
     pub online: Option<bool>,
     pub remote_url: Option<String>,
     pub package_delay_seconds: Option<i32>,
+    /// Proxy only; replaces the whole list (`[]` clears it).
+    pub package_delay_overrides: Option<Vec<DelayOverrideBody>>,
     #[serde(default, deserialize_with = "double_option")]
     pub upstream_username: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
@@ -394,6 +405,115 @@ const MAX_PROXY_TTL_SECONDS: i32 = 7 * 24 * 60 * 60;
 
 /// Longest accepted `package_delay_seconds`: a year.
 const MAX_PACKAGE_DELAY_SECONDS: i32 = 365 * 24 * 60 * 60;
+
+/// Most package-delay overrides a proxy may carry.
+const MAX_DELAY_OVERRIDES: usize = 100;
+
+/// Longest accepted package-delay override `pattern`, in bytes.
+const MAX_DELAY_PATTERN_LEN: usize = 200;
+
+/// One entry of `package_delay_overrides` as a request gives it: exactly one
+/// of `selector` (a content selector's name) and `pattern` (a glob on the
+/// lowercased package id), and the delay of the packages it matches. The
+/// delay is read wide, so a value out of range is refused with a message
+/// rather than as an unreadable body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelayOverrideBody {
+    #[serde(default)]
+    pub selector: Option<String>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    pub delay_seconds: i64,
+}
+
+/// Validate a proxy's `package_delay_overrides`: at most
+/// [`MAX_DELAY_OVERRIDES`], each naming an existing content selector or a
+/// glob that compiles (exactly one of the two), with a delay from 0 to
+/// [`MAX_PACKAGE_DELAY_SECONDS`]. Returns them as stored (trimmed).
+async fn validate_delay_overrides(
+    state: &AppState,
+    given: &[DelayOverrideBody],
+) -> Result<Vec<PackageDelayOverride>, Response> {
+    if given.len() > MAX_DELAY_OVERRIDES {
+        return Err(bad_request(format!(
+            "at most {MAX_DELAY_OVERRIDES} package_delay_overrides are allowed"
+        )));
+    }
+    let mut selectors: Option<Vec<String>> = None;
+    let mut out = Vec::with_capacity(given.len());
+    for (i, entry) in given.iter().enumerate() {
+        let at = format!("package_delay_overrides[{i}]");
+        let delay_seconds = match i32::try_from(entry.delay_seconds) {
+            Ok(d) if (0..=MAX_PACKAGE_DELAY_SECONDS).contains(&d) => d,
+            _ => {
+                return Err(bad_request(format!(
+                    "{at}: delay_seconds must be between 0 and {MAX_PACKAGE_DELAY_SECONDS}"
+                )))
+            }
+        };
+        let selector = entry.selector.as_deref().map(str::trim);
+        let pattern = entry.pattern.as_deref().map(str::trim);
+        let stored = match (selector, pattern) {
+            (Some(name), None) => {
+                if name.is_empty() {
+                    return Err(bad_request(format!("{at}: selector must not be empty")));
+                }
+                if selectors.is_none() {
+                    let names = forge_db::authz_dao::list_content_selectors(&state.pool)
+                        .await
+                        .map_err(db_error)?
+                        .into_iter()
+                        .map(|s| s.name)
+                        .collect();
+                    selectors = Some(names);
+                }
+                if !selectors
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|s| s == name)
+                {
+                    return Err(bad_request(format!(
+                        "{at}: content selector {name:?} does not exist"
+                    )));
+                }
+                PackageDelayOverride {
+                    selector: Some(name.to_string()),
+                    pattern: None,
+                    delay_seconds,
+                }
+            }
+            (None, Some(pattern)) => {
+                if pattern.is_empty() || pattern.len() > MAX_DELAY_PATTERN_LEN {
+                    return Err(bad_request(format!(
+                        "{at}: pattern must be 1-{MAX_DELAY_PATTERN_LEN} bytes long"
+                    )));
+                }
+                let compiles = forge_core::authz::SelectorPatterns {
+                    includes: vec![pattern.to_string()],
+                    excludes: Vec::new(),
+                }
+                .compile_check();
+                if let Err(e) = compiles {
+                    return Err(bad_request(format!("{at}: invalid pattern: {e}")));
+                }
+                PackageDelayOverride {
+                    selector: None,
+                    pattern: Some(pattern.to_string()),
+                    delay_seconds,
+                }
+            }
+            _ => {
+                return Err(bad_request(format!(
+                    "{at}: give either a selector or a pattern"
+                )))
+            }
+        };
+        out.push(stored);
+    }
+    Ok(out)
+}
 
 /// Most reserved prefixes a group may carry.
 const MAX_RESERVED_PREFIXES: usize = 100;
@@ -740,7 +860,21 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     ) {
         return resp;
     }
+    let delay_overrides = match delay_overrides_for(
+        &state,
+        &body.format,
+        parsed_kind,
+        body.package_delay_overrides.as_deref().unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(overrides) => overrides,
+        Err(resp) => return resp,
+    };
     let mut config = serde_json::Value::Object(docker_config);
+    if !delay_overrides.is_empty() {
+        config[PACKAGE_DELAY_OVERRIDES_KEY] = json!(delay_overrides);
+    }
     if let Some(bytes) = body.max_upload_bytes {
         match validate_upload_limit(&state, parsed_kind, bytes) {
             Ok(bytes) => config[MAX_UPLOAD_BYTES_KEY] = json!(bytes),
@@ -851,6 +985,46 @@ fn keeps_signed_indexes(state: &AppState, format: &str) -> bool {
         .formats
         .plugin(format)
         .is_some_and(|plugin| plugin.descriptor().indexes)
+}
+
+/// The repositories of `format` when they have no package delay (docker,
+/// raw and apt repositories), for the message refusing one; `None` when they
+/// have one (NuGet, npm).
+pub(crate) fn without_package_delay(state: &AppState, format: &str) -> Option<&'static str> {
+    if state.formats.stores_images(format) {
+        Some("docker repositories")
+    } else if state.formats.stores_files(format) {
+        Some("repositories of files (raw)")
+    } else if keeps_signed_indexes(state, format) {
+        Some("apt repositories: a proxy passes its upstream's signed indexes on as they are")
+    } else {
+        None
+    }
+}
+
+/// The validated `package_delay_overrides` of a repository of `format` and
+/// `kind`: refused (400) unless it is a proxy with a package delay, when
+/// there are any.
+async fn delay_overrides_for(
+    state: &AppState,
+    format: &str,
+    kind: RepoKind,
+    given: &[DelayOverrideBody],
+) -> Result<Vec<PackageDelayOverride>, Response> {
+    if given.is_empty() {
+        return Ok(Vec::new());
+    }
+    if kind != RepoKind::Proxy {
+        return Err(bad_request(
+            "package_delay_overrides is only valid for proxy repositories",
+        ));
+    }
+    if let Some(what) = without_package_delay(state, format) {
+        return Err(bad_request(format!(
+            "package_delay_overrides is not supported for {what}"
+        )));
+    }
+    validate_delay_overrides(state, given).await
 }
 
 /// The settings of a format's own of a repository of `format` and `kind`
@@ -1360,6 +1534,24 @@ pub async fn update(
             }
         }
         None => {}
+    }
+
+    if let Some(given) = body.package_delay_overrides.as_deref() {
+        let overrides =
+            match delay_overrides_for(&state, &existing.format, existing.kind(), given).await {
+                Ok(overrides) => overrides,
+                Err(resp) => return resp,
+            };
+        if !config.is_object() {
+            config = json!({});
+        }
+        if let Some(map) = config.as_object_mut() {
+            if overrides.is_empty() {
+                map.remove(PACKAGE_DELAY_OVERRIDES_KEY);
+            } else {
+                map.insert(PACKAGE_DELAY_OVERRIDES_KEY.into(), json!(overrides));
+            }
+        }
     }
 
     if let Some(given) = body.options.clone() {

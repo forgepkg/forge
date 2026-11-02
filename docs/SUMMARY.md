@@ -9,6 +9,7 @@
 - [Kubernetes manifests](../deploy/kubernetes/README.md)
 - [Monitoring](../deploy/monitoring/README.md)
 - [Retention](retention.md)
+- [Package delay](package-delay.md)
 - [Importing repositories](import.md)
   - [Importing from Nexus](nexus-import.md)
 

@@ -385,11 +385,20 @@ where
 /// fresh rows and its versions wait out the package delay from their own first
 /// sighting. Downloaded versions stay cached, with their not-found and
 /// missing-upstream flags cleared and their metadata due for a refresh from
-/// the new upstream. Returns the number of deleted rows.
+/// the new upstream. The versions released from the package delay early are
+/// forgotten too: they were decisions about the previous upstream's packages,
+/// and the new upstream's package of the same name may be another one.
+/// Returns the number of deleted cached-version rows.
 pub async fn reset_for_new_upstream(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
 ) -> sqlx::Result<u64> {
+    sqlx::query!(
+        "DELETE FROM package_delay_release WHERE repository_id = $1",
+        repository_id,
+    )
+    .execute(&mut **tx)
+    .await?;
     let deleted = sqlx::query!(
         r#"
         DELETE FROM proxy_cached_version

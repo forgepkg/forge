@@ -119,8 +119,33 @@ export interface DetailVersion {
   delay_status: DelayStatus | null
   /** When a delayed proxy version becomes available (`first_seen + delay`). */
   delayed_until?: string | null
+  /**
+   * When an administrator released this proxy version from the package delay
+   * early, if one did.
+   */
+  delay_released_at?: string | null
   /** Retention status — reserved; always `null`. */
   retention_status: string | null
+}
+
+/** Where a proxy package's delay comes from (`DelaySource`). */
+export type DelaySource =
+  | { kind: 'default' }
+  | { kind: 'selector'; name: string }
+  | { kind: 'pattern'; pattern: string }
+
+/** A proxy package's delay, and what decides it (`AppliedDelay`). */
+export interface AppliedDelay {
+  /** Seconds new versions are held back (0: none). */
+  delay_seconds: number
+  /** An override (a content selector or a pattern), or the repository's default. */
+  source: DelaySource
+}
+
+/** The override an applied delay comes from, as the UI names it; `null` for the default. */
+export function delaySourceLabel(source: DelaySource | undefined): string | null {
+  if (!source || source.kind === 'default') return null
+  return source.kind === 'selector' ? source.name : source.pattern
 }
 
 /** One dependency within a dependency group. */
@@ -156,6 +181,11 @@ export interface PackageDetail {
   description?: string
   /** The latest version's README (Markdown), when its format reads one. */
   readme?: string
+  /**
+   * A proxy's package delay of this package; absent for other kinds and for
+   * proxies of formats without one.
+   */
+  package_delay?: AppliedDelay
 }
 
 /** Search parameters for the browse list (mirrors `BrowseQuery`). */

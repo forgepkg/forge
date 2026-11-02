@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
 import { useCreateRepository, useFormats } from '~/queries/useRepositories'
+import { useSelectors } from '~/queries/useRbac'
 import { Page, PageHeader } from '~/components/ui'
 import {
   RepositoryForm,
@@ -23,6 +24,8 @@ function CreateRepository() {
   const create = useCreateRepository()
   // Without the list (loading, or an older server) the form offers NuGet.
   const formats = useFormats()
+  // The content selectors a proxy's package-delay override may name.
+  const selectors = useSelectors()
 
   function handleSubmit(values: RepoFormValues) {
     create.mutate(toCreateBody(values), {
@@ -48,6 +51,7 @@ function CreateRepository() {
       <RepositoryForm
         mode="create"
         formats={formats.data}
+        selectors={selectors.data?.map((s) => s.name).sort()}
         submitting={create.isPending}
         serverError={
           create.isError ? create.error.body || create.error.message : null

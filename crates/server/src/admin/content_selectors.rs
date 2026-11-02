@@ -9,7 +9,8 @@
 //! * `PATCH  /admin/content-selectors/{id}`   — update description/includes/excludes
 //!   (true PATCH: an omitted field keeps its stored value).
 //! * `DELETE /admin/content-selectors/{id}`   — delete (cascades scoped grants);
-//!   refused (409) while a repository's retention policy names it in a rule.
+//!   refused (409) while a repository's retention policy names it in a rule,
+//!   or a proxy's package-delay overrides name it.
 //! * `GET    /admin/content-selectors/{id}/grants` — the grants the selector
 //!   scopes, in every role: what a delete removes.
 //! * `POST   /admin/content-selectors/match`  — test a package name against
@@ -19,6 +20,8 @@
 //! **400**, never persisted (a selector that can't compile would fail-closed at
 //! evaluation, so we reject it early). Every mutation blanket-invalidates the
 //! authz cache (a selector edit changes which packages a scoped grant exposes).
+//! An edit also touches the proxy repositories whose package-delay overrides
+//! name the selector, so every instance resolves their delays again at once.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -201,11 +204,27 @@ pub async fn update(
     {
         Ok(Some(s)) => {
             invalidate_all(&state.cache).await;
+            if let Err(e) = touch_delayed_proxies(&state, &s.name).await {
+                return db_error(e);
+            }
             Json(SelectorView::from(s)).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "content selector not found").into_response(),
         Err(e) => db_error(e),
     }
+}
+
+/// Touch the proxy repositories whose package-delay overrides name selector
+/// `name`: a proxy resolves its delays again when its row changes, and the
+/// listings it cached are fetched again, so a package the edit moves into or
+/// out of an override gets its new delay at once.
+async fn touch_delayed_proxies(state: &AppState, name: &str) -> sqlx::Result<()> {
+    for (id, _) in
+        forge_db::delay_release_dao::repositories_using_selector(&state.pool, name).await?
+    {
+        forge_db::repository_dao::touch_repository(&state.pool, id).await?;
+    }
+    Ok(())
 }
 
 /// `GET /admin/content-selectors/{id}/grants` — the grants the selector
@@ -243,9 +262,10 @@ pub async fn test_match(Json(body): Json<MatchRequest>) -> Response {
     }
 }
 
-/// `DELETE /admin/content-selectors/{id}`. A selector a retention rule
-/// names (`"selector": "<name>"`) is not deleted (409, naming the
-/// repositories): the rule would no longer know which packages it covers.
+/// `DELETE /admin/content-selectors/{id}`. A selector a retention rule or a
+/// package-delay override names (`"selector": "<name>"`) is not deleted (409,
+/// naming the repositories): the rule would no longer know which packages it
+/// covers.
 pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
     let selector = match authz_dao::find_content_selector_by_id(&state.pool, id).await {
         Ok(Some(selector)) => selector,
@@ -261,6 +281,25 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
                      remove it from their rules first",
                     selector.name,
                     repositories.join(", ")
+                ),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return db_error(e),
+    }
+    match forge_db::delay_release_dao::repositories_using_selector(&state.pool, &selector.name)
+        .await
+    {
+        Ok(repositories) if !repositories.is_empty() => {
+            let names: Vec<String> = repositories.into_iter().map(|(_, name)| name).collect();
+            return (
+                StatusCode::CONFLICT,
+                format!(
+                    "content selector {:?} is used by the package-delay overrides of {}; \
+                     remove it from their overrides first",
+                    selector.name,
+                    names.join(", ")
                 ),
             )
                 .into_response();

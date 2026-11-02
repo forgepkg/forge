@@ -1394,6 +1394,98 @@ async fn a_proxy_holds_back_versions_inside_the_publication_delay() {
     assert_eq!(upstream.tarball_hits.load(Ordering::SeqCst), 0);
 }
 
+/// The package-delay overrides (#184): the first that matches a package
+/// decides its delay (none, or a longer one), and an administrator releases
+/// one version early, which is then served while the others wait.
+#[tokio::test]
+async fn a_proxys_delay_overrides_and_early_releases() {
+    let srv = common::start().await;
+    let upstream = Arc::new(Upstream::default());
+    let base = serve_upstream(upstream.clone()).await;
+    let recent = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let two_days = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+    upstream.publish(
+        &base,
+        "acme-tool",
+        &[("1.0.0", "2020-01-01T00:00:00.000Z"), ("2.0.0", &recent)],
+        "2.0.0",
+    );
+    upstream.publish(
+        &base,
+        "fresh",
+        &[("1.0.0", "2020-01-01T00:00:00.000Z"), ("2.0.0", &recent)],
+        "2.0.0",
+    );
+    upstream.publish(
+        &base,
+        "slow",
+        &[("1.0.0", "2020-01-01T00:00:00.000Z"), ("1.1.0", &two_days)],
+        "1.1.0",
+    );
+    let repo = format!("proxy{}", unique());
+    create(
+        &srv,
+        json!({
+            "name": repo,
+            "kind": "proxy",
+            "format": "npm",
+            "remote_url": base,
+            "package_delay_seconds": 86400,
+            "package_delay_overrides": [
+                {"pattern": "acme-*", "delay_seconds": 0},
+                {"pattern": "slow", "delay_seconds": 2_592_000},
+            ],
+        }),
+    )
+    .await;
+    let npm = Npm::new(&srv, &repo, Some(srv.admin_token().await));
+    let versions = |packument: &Value| -> Vec<String> {
+        packument["versions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let tarball = |name: &str, version: &str| {
+        npm.req(
+            reqwest::Method::GET,
+            &format!("{name}/-/{name}-{version}.tgz"),
+        )
+        .send()
+    };
+
+    // Exempted: every version, at once.
+    assert_eq!(
+        versions(&npm.ok_packument("acme-tool", true).await),
+        ["1.0.0", "2.0.0"]
+    );
+    assert_eq!(tarball("acme-tool", "2.0.0").await.unwrap().status(), 200);
+    // The default: a day.
+    assert_eq!(versions(&npm.ok_packument("fresh", true).await), ["1.0.0"]);
+    assert_eq!(tarball("fresh", "2.0.0").await.unwrap().status(), 404);
+    // Lengthened: a month, so two days are not enough.
+    assert_eq!(versions(&npm.ok_packument("slow", true).await), ["1.0.0"]);
+    assert_eq!(tarball("slow", "1.1.0").await.unwrap().status(), 404);
+
+    // Released early: that version is served now, the package's others keep
+    // their delay.
+    let resp = admin(
+        &srv,
+        reqwest::Method::POST,
+        &format!("/admin/repositories/{repo}/packages/fresh/versions/2.0.0/release-delay"),
+        json!({"reason": "security fix"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(
+        versions(&npm.ok_packument("fresh", true).await),
+        ["1.0.0", "2.0.0"]
+    );
+    assert_eq!(tarball("fresh", "2.0.0").await.unwrap().status(), 200);
+    assert_eq!(versions(&npm.ok_packument("slow", true).await), ["1.0.0"]);
+}
+
 #[tokio::test]
 async fn a_proxy_sends_its_token_to_its_upstream_only() {
     let srv = common::start().await;

@@ -12,6 +12,7 @@ import { makeQueryClient } from '~/lib/queryClient'
 import { clearSession, setSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type {
+  DelayRelease,
   MemberView,
   RepoView,
   TrustedPublisherBody,
@@ -33,6 +34,9 @@ import { searchOptions } from '~/lib/search'
  *    other groups (of the same format) as (nested) members;
  *  - a proxy's edit screen invalidates its cache, of one package or of all,
  *    and a hosted one offers no such thing;
+ *  - a proxy's package-delay overrides are edited in order (by content
+ *    selector or by pattern), and a version is released from the delay
+ *    early by name, with a reason;
  *  - a repository change refreshes the repositories Browse lists.
  */
 
@@ -97,6 +101,11 @@ interface ApiHandlers {
   onPatchMember?: (member: string, body: unknown) => Response
   onRemoveMember?: (member: string) => Response
   onInvalidate?: (name: string, body: unknown) => Response
+  /** `GET /admin/content-selectors`. */
+  selectors?: { id: number; name: string }[]
+  /** `GET /admin/repositories/{name}/delay-releases`. */
+  delayReleases?: DelayRelease[]
+  onRelease?: (name: string, id: string, version: string, body: unknown) => Response
 }
 
 /** Route the mock by method + pathname against the admin API. */
@@ -194,6 +203,22 @@ function mockApi(h: ApiHandlers) {
         const body = init?.body ? JSON.parse(init.body as string) : {}
         return Promise.resolve(
           h.onInvalidate(decodeURIComponent(invalidateMatch[1]), body),
+        )
+      }
+      if (path.endsWith('/admin/content-selectors') && method === 'GET') {
+        return Promise.resolve(json(h.selectors ?? []))
+      }
+      if (path.match(/\/admin\/repositories\/[^/]+\/delay-releases$/) && method === 'GET') {
+        return Promise.resolve(json(h.delayReleases ?? []))
+      }
+      const releaseMatch = path.match(
+        /\/admin\/repositories\/([^/]+)\/packages\/([^/]+)\/versions\/([^/]+)\/release-delay$/,
+      )
+      if (releaseMatch && method === 'POST') {
+        const body = init?.body ? JSON.parse(init.body as string) : {}
+        const [, name, id, version] = releaseMatch.map(decodeURIComponent)
+        return Promise.resolve(
+          h.onRelease ? h.onRelease(name, id, version, body) : json(body, 201),
         )
       }
       // A single repo GET (edit screen) — return the first repo.
@@ -601,6 +626,111 @@ describe('admin repositories', () => {
     expect(posts).toEqual([
       ['nuget-org', { package: 'Late.Pkg' }],
       ['nuget-org', {}],
+    ])
+  })
+
+  it("edits a proxy's package-delay overrides, in order", async () => {
+    const puts: unknown[] = []
+    const proxy = repo({
+      name: 'nuget-org',
+      kind: 'proxy',
+      remote_url: 'https://api.nuget.org/v3/index.json',
+      package_delay_seconds: 3600,
+      package_delay_overrides: [{ selector: 'trusted-vendors', delay_seconds: 0 }],
+    })
+    mockApi({
+      repositories: [proxy],
+      selectors: [
+        { id: 1, name: 'trusted-vendors' },
+        { id: 2, name: 'internal' },
+      ],
+      onUpdate: (_name, body) => {
+        puts.push(body)
+        return json({ ...proxy, ...(body as object) })
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/nuget-org')
+
+    expect(await screen.findByLabelText('Override 1 selector')).toHaveValue('trusted-vendors')
+    await user.click(screen.getByRole('button', { name: 'Add override' }))
+    await user.selectOptions(screen.getByLabelText('Override 2 matches by'), 'pattern')
+    // An empty pattern is refused before any request.
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    expect(await screen.findByText(/Enter a pattern/)).toBeInTheDocument()
+    expect(puts).toEqual([])
+
+    await user.type(screen.getByLabelText('Override 2 pattern'), 'Risky.*')
+    const delay = screen.getByLabelText('Override 2 delay (seconds)')
+    await user.clear(delay)
+    await user.type(delay, '1209600')
+    await user.click(screen.getByRole('button', { name: 'Move override 2 up' }))
+    await user.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(puts).toHaveLength(1))
+    expect(puts[0]).toEqual({
+      package_delay_overrides: [
+        { pattern: 'Risky.*', delay_seconds: 1209600 },
+        { selector: 'trusted-vendors', delay_seconds: 0 },
+      ],
+    })
+  })
+
+  it('releases a version of a proxy from the package delay early, by name', async () => {
+    const posts: [string, string, string, unknown][] = []
+    mockApi({
+      repositories: [
+        repo({
+          name: 'nuget-org',
+          kind: 'proxy',
+          remote_url: 'https://api.nuget.org/v3/index.json',
+          package_delay_seconds: 86400,
+        }),
+      ],
+      delayReleases: [
+        {
+          package: 'contoso.lib',
+          version: '2.0.0',
+          reason: 'vendor hotfix',
+          released_by: 'user:1 session',
+          released_at: '2026-11-02T10:00:00Z',
+          seen: false,
+        },
+      ],
+      onRelease: (name, id, version, body) => {
+        posts.push([name, id, version, body])
+        return json(
+          {
+            package: id.toLowerCase(),
+            version,
+            reason: (body as { reason: string }).reason,
+            released_by: 'user:1 session',
+            released_at: '2026-11-02T11:00:00Z',
+            seen: true,
+          },
+          201,
+        )
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/nuget-org')
+
+    const list = await screen.findByRole('list', { name: 'Versions released early' })
+    expect(within(list).getByText('contoso.lib 2.0.0')).toBeInTheDocument()
+    expect(within(list).getByText('pending')).toBeInTheDocument()
+
+    const release = screen.getByRole('button', { name: 'Release now' })
+    expect(release).toBeDisabled()
+    await user.type(screen.getByLabelText('Package'), 'Newtonsoft.Json')
+    await user.type(screen.getByLabelText('Version'), '13.0.4')
+    await user.type(screen.getByLabelText('Reason'), 'CVE-2026-1234')
+    await user.click(release)
+    expect(
+      await screen.findByText(/Released newtonsoft\.json 13\.0\.4: it is served now/),
+    ).toBeInTheDocument()
+    expect(posts).toEqual([
+      ['nuget-org', 'Newtonsoft.Json', '13.0.4', { reason: 'CVE-2026-1234' }],
     ])
   })
 

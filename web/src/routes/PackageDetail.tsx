@@ -2,11 +2,18 @@ import { useState } from 'react'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 
 import { ApiError } from '~/lib/httpClient'
-import { isRepositoryOffline, type DetailVersion } from '~/api/packages'
+import {
+  delaySourceLabel,
+  isRepositoryOffline,
+  type AppliedDelay,
+  type DetailVersion,
+} from '~/api/packages'
 import { useBrowseRepos } from '~/queries/useBrowseRepos'
 import { useDeletePackageVersion, usePackageDetail } from '~/queries/usePackageDetail'
 import { useMe } from '~/queries/useMe'
+import { useReleaseFromDelay } from '~/queries/useRepositories'
 import { VersionTable } from '~/components/VersionTable'
+import { formatDelay } from '~/components/DelayBadge'
 import { DependencyGroups } from '~/components/DependencyGroups'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
@@ -22,7 +29,9 @@ import {
   Panel,
   SelectField,
   Skeleton,
+  TextareaField,
   formatIcon,
+  useToast,
 } from '~/components/ui'
 
 export const Route = createFileRoute('/_app/packages/$repo/$id')({
@@ -48,6 +57,10 @@ function PackageDetailPage() {
   const detail = usePackageDetail(repo, id)
   const del = useDeletePackageVersion(repo, id)
   const [pendingDelete, setPendingDelete] = useState<DetailVersion | null>(null)
+  const release = useReleaseFromDelay(repo)
+  const [pendingRelease, setPendingRelease] = useState<DetailVersion | null>(null)
+  const [reason, setReason] = useState('')
+  const toast = useToast()
   // The repository's format, from the (cached) list the rail shows too.
   const repos = useBrowseRepos()
   const format = Array.isArray(repos.data)
@@ -135,6 +148,9 @@ function PackageDetailPage() {
                   { term: 'Repository', value: pkg.repo, mono: true },
                   { term: 'Kind', value: pkg.repo_kind },
                   { term: 'Versions', value: pkg.versions.length },
+                  ...(pkg.package_delay
+                    ? [{ term: 'Package delay', value: describeDelay(pkg.package_delay) }]
+                    : []),
                   ...(pkg.description ? [{ term: 'Description', value: pkg.description }] : []),
                 ]}
               />
@@ -190,6 +206,17 @@ function PackageDetailPage() {
                   : undefined
               }
               deletePending={del.isPending}
+              onRelease={
+                me.data?.is_admin && pkg.repo_kind === 'proxy' && pkg.package_delay
+                  ? (version) => {
+                      release.reset()
+                      setReason('')
+                      setPendingRelease(version)
+                    }
+                  : undefined
+              }
+              releasePending={release.isPending}
+              delay={pkg.package_delay}
               distTags={pkg.tags}
               deprecated={pkg.deprecated}
             />
@@ -268,8 +295,61 @@ function PackageDetailPage() {
           <ErrorState title="Could not delete version" message={del.error.body || del.error.message} />
         )}
       </Dialog>
+      <Dialog
+        open={pendingRelease !== null}
+        onClose={() => {
+          if (!release.isPending) setPendingRelease(null)
+        }}
+        title={`Release ${pkg.original_id} ${pendingRelease?.version_original ?? ''} now?`}
+        description={
+          <>
+            Serve version <Code>{pendingRelease?.version_original}</Code> of{' '}
+            <Code>{pkg.original_id}</Code> from <Code>{pkg.repo}</Code> now, before its
+            package delay is over. The package&apos;s other versions keep their delay. The
+            release and its reason are recorded in the audit log.
+          </>
+        }
+        icon="Clock"
+        confirmLabel={release.isPending ? 'Releasing…' : 'Release now'}
+        confirmDisabled={release.isPending || reason.trim() === ''}
+        onConfirm={() =>
+          pendingRelease &&
+          release.mutate(
+            { id: pkg.id, version: pendingRelease.version, reason: reason.trim() },
+            {
+              onSuccess: (released) => {
+                setPendingRelease(null)
+                toast({ tone: 'ok', title: `Released ${pkg.original_id} ${released.version}` })
+                void detail.refetch()
+              },
+            },
+          )
+        }
+      >
+        <TextareaField
+          label="Reason"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          rows={3}
+          maxLength={1000}
+          placeholder="e.g. CVE-2026-1234: the fix must ship today"
+          description="Why this version cannot wait. Required."
+        />
+        {release.isError && (
+          <ErrorState
+            title="Could not release the version"
+            message={release.error.body || release.error.message}
+          />
+        )}
+      </Dialog>
     </Page>
   )
+}
+
+/** "1 h (repository default)", "none (trusted-vendors)", "14 d (risky.*)". */
+function describeDelay(delay: AppliedDelay): string {
+  const length = delay.delay_seconds > 0 ? formatDelay(delay.delay_seconds) : 'none'
+  return `${length} (${delaySourceLabel(delay.source) ?? 'repository default'})`
 }
 
 /**
