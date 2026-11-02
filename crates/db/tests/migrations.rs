@@ -1107,6 +1107,64 @@ async fn readers_before_the_upgrade_get_the_reader_role() {
         .await
         .expect("an administrator's role named reader");
     assign(service, "reader").await;
+    // Workload-identity realms name their rules' roles: one names the
+    // administrator's `reader` (twice, between other rules), one does not.
+    let realm = |name: &'static str, issuer: &'static str, rules: serde_json::Value| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO auth_realm (kind, name, priority, config, updated_at) \
+                 VALUES ('workload_identity', $1, \
+                         (SELECT coalesce(max(priority), 0) + 10 FROM auth_realm), $2, \
+                         '2026-01-01T00:00:00Z') \
+                 RETURNING id",
+            )
+            .bind(name)
+            .bind(serde_json::json!({
+                "issuer": issuer,
+                "allowed_audiences": ["forge"],
+                "rules": rules,
+            }))
+            .fetch_one(&pool)
+            .await
+            .expect("insert a workload-identity realm")
+        }
+    };
+    let rule = |role: &str, project: &str| {
+        serde_json::json!({
+            "role": role,
+            "conditions": [{ "claim": "project_path", "equals": project }],
+        })
+    };
+    let naming = realm(
+        "gitlab",
+        "https://gitlab.example.com",
+        serde_json::json!([
+            rule("reader", "group/a"),
+            rule("ci-pub", "group/b"),
+            rule(" reader ", "group/c"),
+        ]),
+    )
+    .await;
+    let other = realm(
+        "github",
+        "https://token.actions.githubusercontent.com",
+        serde_json::json!([rule("ci-pub", "org/repo")]),
+    )
+    .await;
+    let config = |realm_id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (serde_json::Value, chrono::DateTime<chrono::Utc>)>(
+                "SELECT config, updated_at FROM auth_realm WHERE id = $1",
+            )
+            .bind(realm_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read a realm")
+        }
+    };
+    let (other_before, other_updated) = config(other).await;
 
     forge_db::migrate(&pool).await.expect("migrate the rest");
 
@@ -1144,6 +1202,35 @@ async fn readers_before_the_upgrade_get_the_reader_role() {
         .await
         .expect("the built-in reader role");
     assert!(builtin);
+
+    // The rules that named the administrator's role name it still, under
+    // its new name, in their order; the other rules and realms are unchanged.
+    let (rewritten, updated) = config(naming).await;
+    let roles: Vec<&str> = rewritten["rules"]
+        .as_array()
+        .expect("the rules")
+        .iter()
+        .map(|rule| rule["role"].as_str().expect("a rule's role"))
+        .collect();
+    assert_eq!(roles, [renamed.as_str(), "ci-pub", renamed.as_str()]);
+    assert_eq!(
+        rewritten["rules"][1],
+        rule("ci-pub", "group/b"),
+        "a rule naming another role is kept as it was"
+    );
+    assert_eq!(
+        rewritten["rules"][0]["conditions"],
+        rule("reader", "group/a")["conditions"],
+        "a rewritten rule keeps its conditions"
+    );
+    assert_eq!(rewritten["issuer"], "https://gitlab.example.com");
+    let before = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+    assert!(updated > before, "the rewritten realm records the change");
+    assert_eq!(
+        config(other).await,
+        (other_before, other_updated),
+        "a realm whose rules name no `reader` is untouched"
+    );
 }
 
 /// A Postgres server for one test: a throwaway Postgres 18 container matching
