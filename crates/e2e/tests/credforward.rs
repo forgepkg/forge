@@ -75,14 +75,25 @@ async fn start_credforward_stack(
 }
 
 /// Create the forwarded account `username` of the stack's realm as its
-/// bootstrap admin, returning its id.
+/// bootstrap admin, returning its id. It gets `POST /admin/users`' default
+/// access level, Reader (the built-in `reader` role).
 async fn create_account(srv: &TestServer, username: &str) -> i64 {
+    create_account_as(srv, username, None).await
+}
+
+/// [`create_account`] at the access level `role` (`"roles_only"`, `"reader"`,
+/// `"writer"`, `"admin"`), or the default one when `None`.
+async fn create_account_as(srv: &TestServer, username: &str, role: Option<&str>) -> i64 {
     let (admin_u, admin_p) = srv.admin_basic();
+    let mut body = serde_json::json!({ "username": username, "realm": REALM });
+    if let Some(role) = role {
+        body["role"] = serde_json::json!(role);
+    }
     let resp = srv
         .client()
         .post(format!("{}/admin/users", srv.base_url))
         .basic_auth(&admin_u, Some(&admin_p))
-        .json(&serde_json::json!({ "username": username, "realm": REALM }))
+        .json(&body)
         .send()
         .await
         .unwrap();
@@ -801,7 +812,10 @@ async fn upstream_demotion_drops_admin_and_ends_sessions_at_once() {
         .cache_ttl_seconds(300)
         .start()
         .await;
-    create_account(&srv, "up-admin@example.com").await;
+    // Roles only: the account reads `locked` only while it is an admin. A
+    // reader (`POST /admin/users`' default) reads every repository, so the
+    // read below could not tell whether `admin` was dropped.
+    create_account_as(&srv, "up-admin@example.com", Some("roles_only")).await;
     assert_eq!(
         srv.create_repo(serde_json::json!({
             "name": "locked", "kind": "hosted", "anonymous_read": false
