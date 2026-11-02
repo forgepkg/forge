@@ -834,10 +834,11 @@ pub async fn append_realm_with_secrets(
 
 /// [`append_realm_with_secrets`] for the enabled realm a legacy config block
 /// is imported into: it goes in at `priority`, or after the last realm when
-/// `None`, and only while no realm of `kind` and none named `name` exists.
-/// Both are checked under the lock the insert takes, so an import waits for
-/// a realm create instead of taking its priority, and of instances importing
-/// the block at once only the first inserts the realm. The others get `None`.
+/// `None` or when another realm holds `priority`, and only while no realm of
+/// `kind` and none named `name` exists. All of it is checked under the lock
+/// the insert takes, so an import waits for a realm create instead of taking
+/// its priority, and of instances importing the block at once only the first
+/// inserts the realm. The others get `None`.
 pub async fn seed_realm_with_secrets(
     pool: &PgPool,
     envelope: &EnvelopeService,
@@ -857,11 +858,29 @@ pub async fn seed_realm_with_secrets(
         tx.rollback().await?;
         return Ok(None);
     }
+    let priority = match priority {
+        Some(slot) => match auth_realm_dao::find_realm_by_priority(&mut *tx, slot).await? {
+            None => slot,
+            Some(holder) => {
+                tracing::warn!(
+                    realm = %name,
+                    %kind,
+                    slot,
+                    held_by = %holder.name,
+                    priority = next,
+                    "the imported realm's slot in the configured order is taken; \
+                     it goes after the last realm (reorder under Admin → Authentication)"
+                );
+                next
+            }
+        },
+        None => next,
+    };
     let new = NewAuthRealm {
         kind: kind.to_string(),
         name: name.to_string(),
         enabled: true,
-        priority: priority.unwrap_or(next),
+        priority,
         config: realm.config,
     };
     let row =

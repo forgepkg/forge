@@ -1274,10 +1274,15 @@ pub async fn forget_seed(pool: &PgPool, realm: &forge_db::model::AuthRealm) -> s
 /// * A renamed/deleted seeded row is left alone (the operator took over).
 /// * No block sets an `oidc` realm's `auto_provision` (#313): the seed creates
 ///   the realm with it on, the default, and a re-apply keeps the stored value.
+/// * An `[auth.upstream_basic]` realm goes in at its slot in `[auth]
+///   providers`, an `[oidc]` one after the last realm. When another realm
+///   holds the slot, say one created through the admin API, it goes after the
+///   last realm too, and a warning names the realm holding the slot.
 ///
 /// The one-shot `forge_setting` marker [`REALMS_SEEDED_KEY`] gates only the
 /// initial `local`-realm priority adjustment (which must not fight later
-/// manual reorders).
+/// manual reorders). When another realm holds `local`'s slot, `local` stays
+/// where it is.
 ///
 /// Seeded secrets are sealed with `envelope` like admin writes, and the
 /// drift fingerprint is taken over the *logical* config.
@@ -1296,22 +1301,8 @@ pub async fn seed_auth_realms(
     if first_import {
         // The schema seeds the built-in local row at priority 10;
         // move it to its configured slot when the order says otherwise.
-        if let Some(local) = auth_realm_dao::find_realm_by_name(pool, "local").await? {
-            let desired = provider_idx("local-password").map(slot).unwrap_or(10);
-            if local.priority != desired {
-                auth_realm_dao::update_realm(
-                    pool,
-                    local.id,
-                    forge_db::auth_realm_dao::AuthRealmUpdate {
-                        name: local.name.clone(),
-                        enabled: local.enabled,
-                        priority: desired,
-                        config: local.config.clone(),
-                    },
-                )
-                .await?;
-            }
-        }
+        let desired = provider_idx("local-password").map(slot).unwrap_or(10);
+        move_local_realm(pool, desired).await?;
     }
 
     if let Some(ub) = config.auth.upstream_basic.as_ref().filter(|u| u.enabled) {
@@ -1394,6 +1385,43 @@ pub async fn seed_auth_realms(
     if first_import {
         authz_dao::set_setting(pool, REALMS_SEEDED_KEY, "true").await?;
     }
+    Ok(())
+}
+
+/// Move the built-in `local` realm to `priority`, its slot in the configured
+/// order, unless another realm holds that slot: then `local` stays where it
+/// is. The slot is checked under the lock realm creates take, so none takes it
+/// before the move.
+async fn move_local_realm(pool: &PgPool, priority: i32) -> anyhow::Result<()> {
+    let mut tx = forge_db::begin(pool).await?;
+    auth_realm_dao::lock_priorities(&mut tx).await?;
+    let local = auth_realm_dao::find_realm_by_name(&mut *tx, "local").await?;
+    if let Some(local) = local.filter(|local| local.priority != priority) {
+        match auth_realm_dao::find_realm_by_priority(&mut *tx, priority).await? {
+            Some(holder) => tracing::warn!(
+                realm = %local.name,
+                slot = priority,
+                held_by = %holder.name,
+                priority = local.priority,
+                "the local realm's slot in the configured order is taken; \
+                 it stays where it is (reorder under Admin → Authentication)"
+            ),
+            None => {
+                auth_realm_dao::update_realm(
+                    &mut *tx,
+                    local.id,
+                    forge_db::auth_realm_dao::AuthRealmUpdate {
+                        name: local.name,
+                        enabled: local.enabled,
+                        priority,
+                        config: local.config,
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
