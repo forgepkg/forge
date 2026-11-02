@@ -9,8 +9,8 @@ content.
 
 An import reads the source through the format's own protocol, the one
 clients speak, so the source can be any server that speaks it: Nexus,
-Artifactory, ProGet, BaGet, Verdaccio, Harbor, a `distribution` registry or
-another Forge. Raw files have no protocol beyond a `GET` of a path: an import
+Artifactory, ProGet, BaGet, Verdaccio, Harbor, a `distribution` registry, a
+web server that serves a static apt repository, or another Forge. Raw files have no protocol beyond a `GET` of a path: an import
 reads Nexus' asset listing, another Forge's listing, or the paths it names
 ([below](#raw-files)). [Importing from Nexus](nexus-import.md) says where
 Nexus serves them, and what to know of its searches.
@@ -21,9 +21,9 @@ Nexus serves them, and what to know of its searches.
 | npm | An npm registry: the URL clients use as `--registry` | the tarball of every version, prereleases included, with its publish time and deprecation; the dist-tags |
 | Docker | A registry API | every tag with everything it references: config and layers, the child manifests of a multi-platform index; signatures and SBOMs (cosign's `sha256-<digest>.sig` tags, the referrers the registry's referrers API lists, and those an OCI 1.1 client stored under the referrers tag schema's `sha256-<digest>` tag) |
 | Raw | A raw repository: Nexus' `<nexus>/repository/<name>`, another Forge's `<forge>/repository/<name>`, or a directory of a web server | every file, with its content type, upload time and last download |
+| apt | An apt repository's base URL, as `sources.list` names it, and one of its distributions | the `.deb` of every binary package its `Release` lists, in the component the source lists it in ([below](#apt)) |
 
-apt ([#644](https://github.com/forgepkg/forge/issues/644)) follows. Proxy
-repositories are not imported (they refill from their upstream), nor are
+Proxy repositories are not imported (they refill from their upstream), nor are
 groups (recreate them as configuration), users, roles and privileges
 (credential forwarding covers sign-in) or cleanup policies (see retention).
 
@@ -46,8 +46,10 @@ curl -u admin@example.com:<admin-scoped token> -X POST \
 
 | Field | |
 | --- | --- |
-| `url` | The source: a NuGet feed's service index (`…/index.json`), an npm registry (`https://nexus.example.com/repository/npm-hosted`, `https://verdaccio.example.com`), a registry (`https://registry.example.com`, or a path below which a server serves the registry API, as Nexus' `…/repository/<name>`), or a raw repository (`https://nexus.example.com/repository/raw-hosted`, `https://forge.example.com/repository/binaries`, a directory of a web server). |
-| `names` | The package ids or images to copy (up to 10,000), instead of every package the feed's search finds or every image the registry's catalog lists. npm: package names (`left-pad`, `@acme/ui`) or scopes (`@acme`, every package of the scope). Raw: the paths of the files, below `url` (`pdfium/7350/pdfium-linux-x64.tgz`), instead of every file the source lists. |
+| `url` | The source: a NuGet feed's service index (`…/index.json`), an npm registry (`https://nexus.example.com/repository/npm-hosted`, `https://verdaccio.example.com`), a registry (`https://registry.example.com`, or a path below which a server serves the registry API, as Nexus' `…/repository/<name>`), a raw repository (`https://nexus.example.com/repository/raw-hosted`, `https://forge.example.com/repository/binaries`, a directory of a web server), or an apt repository's base URL (`https://nexus.example.com/repository/apt-hosted`, `https://apt.example.com/debian`). |
+| `names` | The package ids or images to copy (up to 10,000), instead of every package the feed's search finds or every image the registry's catalog lists. npm: package names (`left-pad`, `@acme/ui`) or scopes (`@acme`, every package of the scope). Raw: the paths of the files, below `url` (`pdfium/7350/pdfium-linux-x64.tgz`), instead of every file the source lists. Not for apt: its `Release` lists every package. |
+| `distribution` | apt: the source's distribution (`bookworm`), the one `sources.list` names. By default, the hosted repository's own. |
+| `public_key` | apt: the source's OpenPGP public keys, ASCII-armored (`gpg --export --armor`). Given them, the import reads only a `Release` one of them signed ([below](#apt)). |
 | `username`, `password` | A user of the source that may read the repository; both, or neither for anonymous access. |
 | `on_conflict` | A version (raw: a file) Forge already has with other bytes: `skip` it and report it (default), `overwrite` it with the source's bytes, or `fail` the import. npm: likewise a dist-tag Forge points at another version, or a deprecation Forge gives otherwise ([below](#npm-dist-tags-and-deprecations)). |
 | `concurrency` | Items copied at a time, 1–16 (default 4), so the source is not overwhelmed. |
@@ -79,6 +81,11 @@ Before an import is accepted, Forge checks the source (the **preflight**):
   asset listing. The import records which (`listing`: `directories` or
   `assets`). A source that serves neither is refused: name the paths to
   import. A raw repository that is read-only takes no import.
+- apt: the source serves the distribution's `dists/<distribution>/InRelease`
+  (or `Release`), signed by one of the keys given in `public_key`, if any,
+  and it lists SHA-256 checksums. The import records the `Server` header
+  (`source_server`), and walks the indexes `Release` names (`listing`:
+  `release`).
 
 An import that names its packages, scopes, images or paths needs no search,
 catalog or listing (raw: the first named file is asked for, so wrong
@@ -98,14 +105,16 @@ version Forge has is compared through the SHA-512 the feed or registry
 lists, and where it lists none it is planned with a note saying so. A raw
 dry run reports the files with their size (`planned_size`), the conflicts,
 compared through the SHA-256 the source lists, and the paths that would
-fail.
+fail. An apt dry run reads `Release` and the indexes, and decides every
+package through the SHA-256 its index lists.
 
 ## What an import does
 
 1. **Scan.** The source's listing is walked page by page: a feed's search
    (with an empty query, prerelease and SemVer 2.0.0 versions included), an
    npm registry's search or `/-/all`, a registry's catalog, a raw
-   repository's listing, or the names the import gives. For each package id,
+   repository's listing, the `Packages` indexes an apt `Release` names, or
+   the names the import gives. For each package id,
    the feed's package base address lists its versions, unlisted ones
    included; for each npm package, its full packument lists its versions and
    dist-tags (a named scope's packages come from `/-/all`, or else from the
@@ -149,6 +158,10 @@ fail.
      manifest is refused as on a push (its tag fails).
    - A raw file is downloaded from the import's URL and its path, checked,
      and stored through the same rules as an upload ([below](#raw-files)).
+   - A `.deb` is downloaded from the import's URL and the `Filename` its
+     index lists, checked against the index's `Size` and `SHA256`, and
+     written through the same path as an upload, in the component the
+     source lists it in ([below](#apt)).
 3. **Metadata.** What the protocols carry is kept, and what they do not is
    set so that retention does not take an import for an old, unused version:
    - A NuGet version's `published` time in the feed's registration becomes
@@ -167,6 +180,8 @@ fail.
      time, which reproducible builds set to the epoch.)
    - A raw file keeps the source's upload time and last download, where the
      source names them ([below](#raw-files)).
+   - apt's indexes carry no publish time: an imported `.deb` is created at
+     its import.
 
 Every imported version and file is audited as an import: a `forge::audit`
 log line with `action = "import"`, the administrator and the source (raw:
@@ -255,6 +270,57 @@ repository set: then it follows the source. So a final import before a
 cutover moves `latest` to the version the source published since, and takes
 a deprecation the source added, without `overwrite`; a tag or deprecation
 changed in Forge since stays, and is reported.
+
+## apt
+
+An apt repository lists everything a client installs, with checksums:
+`dists/<distribution>/InRelease` names the indexes, and each index every
+`.deb` with its size and SHA-256. An import of an apt repository reads them
+as `apt-get` does, and copies every binary package of the distribution:
+
+- **`Release`.** `dists/<distribution>/InRelease`, else `Release`, below
+  `url`. It gives the components (`Components`) and each index file with its
+  size and SHA-256 (`SHA256`; a `Release` without one is refused). Given
+  `public_key`, the import reads only a `Release` one of those keys signed:
+  `InRelease`'s cleartext signature, or `Release.gpg`'s detached one; a
+  primary key and its subkeys count. Without one, `Release` is read as it
+  is: the import then trusts the connection to the source, as `apt-get`
+  with `trusted=yes` would. Either way the indexes and packages are checked
+  against what `Release` lists, and Forge signs its indexes with the hosted
+  repository's own keys ([apt.md](apt.md#signing-keys)).
+- **Indexes.** For each component and architecture `Release` lists one for,
+  `<component>/binary-<arch>/Packages.xz`, else `.gz`, else the plain
+  `Packages` (Debian lists the plain one but does not serve it); where
+  `Release` says `Acquire-By-Hash: yes`, its `by-hash/SHA256/<sha256>` copy
+  first, so an index and a `Release` of two generations never meet. An index
+  that does not match the size and SHA-256 `Release` lists fails the scan:
+  the import fails, and can be resumed once the source is consistent again.
+  The scan records an index's packages 500 at a time; its cursor is the
+  index and how far into it the scan got.
+- **Packages.** Each `.deb` is downloaded from `<url>/<Filename>`, checked
+  against the `Size` and `SHA256` (and `SHA512`, where listed) of its index
+  entry, must be the package, version and architecture the entry names, and
+  is written through the same path as an upload: the package selectors of
+  the administrator who started the import, the repository's upload limit,
+  deduplication in the content-addressed store, and the audit trail. An
+  entry whose `.deb` does not match fails as its item, as does one the
+  source does not have; one whose `Filename` is no path below the
+  repository, or that names no `.deb`, no `Size` or no `SHA256`, fails
+  without a download. The import goes on either way. A package of
+  architecture `all`, listed under every architecture, is copied once.
+- **Components.** A package goes to the component the source lists it in,
+  whatever its `Section` says (an upload takes its component from
+  `Section`): a Nexus apt repository lists every package in `main`, and
+  clients that read `main` from it find them there in Forge too. A component
+  Forge cannot publish (`updates/main`, with a `/`) fails as an item, and
+  nothing of it is copied.
+- **Packages Forge already has.** A version with the SHA-256 the index
+  lists is `identical` and is not downloaded, so a second run copies only
+  what is new. One with another SHA-256 follows `on_conflict`, decided
+  without a download.
+- **Not copied:** source packages (`Sources`) and `debian-installer` udebs.
+  The packages come in as the hosted repository's: its own distribution,
+  its own signing keys.
 
 ## Progress, cancel, resume, retry
 

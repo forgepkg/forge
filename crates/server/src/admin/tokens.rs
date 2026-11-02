@@ -107,6 +107,32 @@ pub(crate) async fn store_scope(
     Ok(Some(value))
 }
 
+/// The audit line of a token a user minted for themselves from a signed-in
+/// session (`/admin/me/tokens`, `/auth/tokens`), like the tokens a client
+/// login mints (`crate::cli_auth`). The admin API's own mints are logged by
+/// its audit trail (`crate::admin::require_admin`). Never the secret, nor the
+/// name the user chose: the token's id names it.
+pub(crate) fn audit_self_service_mint(token: &Token, scope: Option<&JsonValue>) {
+    tracing::info!(
+        target: "forge::audit",
+        user_id = token.user_id,
+        token_id = token.id,
+        expires_at = ?token.expires_at,
+        scope = %scope.map(JsonValue::to_string).unwrap_or_default(),
+        "token minted in the web UI"
+    );
+}
+
+/// The audit line of a token a user revoked from a signed-in session.
+pub(crate) fn audit_self_service_revoke(user_id: i64, token_id: i64) {
+    tracing::info!(
+        target: "forge::audit",
+        user_id,
+        token_id,
+        "token revoked in the web UI"
+    );
+}
+
 /// Issue-token response — the only time the plaintext `token` is ever returned.
 #[derive(Debug, Serialize)]
 pub struct CreatedToken {
@@ -187,5 +213,74 @@ pub async fn revoke(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
             (StatusCode::NOT_FOUND, "token not found or already revoked").into_response()
         }
         Err(e) => db_error(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// Collects what a `fmt` subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The lines `log` writes under `forge::audit`.
+    fn audit_lines(log: impl FnOnce()) -> String {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_env_filter("off,forge::audit=info")
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_self_service_mint_and_revoke_are_audited_without_the_token_name() {
+        let now = Utc::now();
+        let token = Token {
+            id: 41,
+            user_id: 7,
+            name: "laptop-of-alice".into(),
+            token_hash: "hash-never-logged".into(),
+            expires_at: Some(now),
+            revoked_at: None,
+            last_used_at: None,
+            created_at: now,
+            scope: None,
+        };
+        let scope = serde_json::json!({"level": "read", "repositories": [3]});
+        let minted = audit_lines(|| audit_self_service_mint(&token, Some(&scope)));
+        assert!(minted.contains("token minted in the web UI"), "{minted}");
+        assert!(minted.contains("user_id=7"), "{minted}");
+        assert!(minted.contains("token_id=41"), "{minted}");
+        assert!(minted.contains(r#""repositories":[3]"#), "{minted}");
+        assert!(!minted.contains("laptop-of-alice"), "{minted}");
+        assert!(!minted.contains("hash-never-logged"), "{minted}");
+
+        let revoked = audit_lines(|| audit_self_service_revoke(7, 41));
+        assert!(revoked.contains("token revoked in the web UI"), "{revoked}");
+        assert!(revoked.contains("user_id=7 token_id=41"), "{revoked}");
     }
 }

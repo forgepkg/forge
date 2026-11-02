@@ -6,6 +6,8 @@
 #      of the browser page it opens) and with the legacy login of Yarn
 #      (`yarn npm login`: npm's own legacy login refuses a username with an
 #      `@`, which every Forge account has), checks whoami, and logs out;
+#      and uses a token minted like the web UI's Your tokens with the
+#      `npm config set …:_authToken` line that page shows;
 #   2. publishes a scoped and an unscoped package with npm, one with pnpm,
 #      and one through the group (to its writable member); a republish is
 #      refused; publishes with npm's OIDC token exchange, without a saved
@@ -364,6 +366,17 @@ throwaway=$(sed -n 's#^//127.0.0.1:'"$port"'/repository/npm-all/:_authToken=##p'
 npm logout --registry "$(reg npm-all)" --userconfig "$work/throwaway-npmrc" >/dev/null
 code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $throwaway" "$base/repository/npm-all/-/whoami")
 [ "$code" = 401 ] || fail "a logged-out token answered $code"
+
+step "a token from the web UI's Your tokens"
+# The tokens page mints through /admin/me/tokens and shows `npm config set
+# //<host>/<path>/:_authToken <token>`: npm then needs no login at all.
+ui_token=$(admin POST /admin/me/tokens '{"name":"npm-e2e (Your tokens)"}' | jq -r .token)
+[ -n "$ui_token" ] && [ "$ui_token" != null ] || fail "/admin/me/tokens minted no token"
+npm config set --userconfig "$work/ui-npmrc" \
+  "//127.0.0.1:$port/repository/npm-all/:_authToken" "$ui_token"
+who=$(npm whoami --registry "$(reg npm-all)" --userconfig "$work/ui-npmrc") \
+  || fail "npm whoami with the web UI's token: $who"
+[ "$who" = "$admin_user" ] || fail "npm whoami with the web UI's token: $who"
 
 step "the group keeps the internal scope internal"
 [ "$(npm view @acme/ui version --registry "$(reg npm-proxy)")" = 9.9.9 ] \

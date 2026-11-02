@@ -155,9 +155,10 @@ fn registry_host(state: &AppState) -> String {
     crate::images::registry_origin(&state.config.public_base_url()).1
 }
 
-/// Where `repo`'s images are pulled from: its own host, or
+/// The registry `repo`'s clients log in to and where its images are pulled
+/// from: its own host for both, or the server's registry host and
 /// `<registry>/<repo>`.
-fn pull_prefix(state: &AppState, repo: &Repository) -> (String, String) {
+pub(crate) fn pull_prefix(state: &AppState, repo: &Repository) -> (String, String) {
     match repo.docker_host() {
         Some(host) => (host.to_string(), host.to_string()),
         None => {

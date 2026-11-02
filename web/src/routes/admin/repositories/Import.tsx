@@ -74,10 +74,11 @@ const ITEM_TONES: Record<ItemState, Tone> = {
 /**
  * Import a repository from another server into this hosted repository (the
  * admin API under `/admin/repositories/{name}/imports`): a NuGet feed, an npm
- * registry or a registry API, read through the format's own protocol, so
- * Nexus, Artifactory, ProGet, BaGet, Verdaccio, Harbor, a `distribution`
- * registry or another Forge alike; or a raw repository, through Nexus' asset
- * listing, another Forge's listing, or the paths the import names.
+ * registry, an apt repository or a registry API, read through the format's
+ * own protocol, so Nexus, Artifactory, ProGet, BaGet, Verdaccio, Harbor, a
+ * `distribution` registry, a static apt repository or another Forge alike; or
+ * a raw repository, through Nexus' asset listing, another Forge's listing, or
+ * the paths the import names.
  * The form starts an import (or a dry run); the server checks the source
  * before it accepts one and says what is wrong. Below, the repository's imports with their progress,
  * re-read every two seconds while one runs: cancel, resume, retry the failed
@@ -127,12 +128,12 @@ function ImportRepository() {
         crumbs={crumbs}
         kind={repo.data.kind}
         format={repo.data.format}
-        description="Copy the packages of a NuGet feed or an npm registry, the images of a registry, or the files of a raw repository into this repository: from Nexus, Artifactory, ProGet, BaGet, Verdaccio, Harbor, a distribution registry, a web server or another Forge. Versions and files Forge already has with the same bytes are skipped, so running an import again copies only what is new: import once, then again just before clients switch to Forge."
+        description="Copy the packages of a NuGet feed, an npm registry or an apt repository, the images of a registry, or the files of a raw repository into this repository: from Nexus, Artifactory, ProGet, BaGet, Verdaccio, Harbor, a distribution registry, a web server or another Forge. Versions and files Forge already has with the same bytes are skipped, so running an import again copies only what is new: import once, then again just before clients switch to Forge."
       />
 
       {!supported ? (
         <Notice tone="info">
-          Imports go to a hosted NuGet, npm, Docker or raw repository; this is a{' '}
+          Imports go to a hosted NuGet, npm, Docker, raw or apt repository; this is a{' '}
           {repo.data.format} {repo.data.kind} repository.
         </Notice>
       ) : active ? (
@@ -144,6 +145,7 @@ function ImportRepository() {
           key={imports.data[0]?.id ?? 'first'}
           repo={name}
           format={repo.data.format}
+          distribution={repo.data.options?.distribution}
           previous={imports.data[0]}
         />
       ) : null}
@@ -181,18 +183,26 @@ function ImportRepository() {
 function StartImportForm({
   repo,
   format,
+  distribution: own,
   previous,
 }: {
   repo: string
   format: string
+  /** apt: the repository's own distribution, the source's by default. */
+  distribution?: string
   previous?: ImportView
 }) {
   const docker = format === 'docker'
   const npm = format === 'npm'
   const raw = format === 'raw'
+  const apt = format === 'apt'
   const create = useCreateImport(repo)
   const [url, setUrl] = useState(previous?.url ?? '')
   const [names, setNames] = useState((previous?.names ?? []).join('\n'))
+  const [distribution, setDistribution] = useState(
+    previous?.distribution ?? own ?? '',
+  )
+  const [publicKey, setPublicKey] = useState(previous?.public_key ?? '')
   const [username, setUsername] = useState(previous?.username ?? '')
   const [password, setPassword] = useState('')
   const [onConflict, setOnConflict] = useState<OnConflict>(
@@ -213,7 +223,7 @@ function StartImportForm({
       setFormError(
         docker || npm
           ? 'Enter the URL of the registry to import from.'
-          : raw
+          : raw || apt
             ? 'Enter the URL of the repository to import from.'
             : 'Enter the URL of the feed to import from.',
       )
@@ -234,9 +244,14 @@ function StartImportForm({
       concurrency: n,
       dry_run: dryRun,
     }
-    const named = raw ? parsePaths(names) : parseNames(names)
-    if (named.length > 0) {
-      body.names = named
+    if (apt) {
+      if (distribution.trim() !== '') body.distribution = distribution.trim()
+      if (publicKey.trim() !== '') body.public_key = publicKey.trim()
+    } else {
+      const named = raw ? parsePaths(names) : parseNames(names)
+      if (named.length > 0) {
+        body.names = named
+      }
     }
     if (username.trim() !== '') {
       body.username = username.trim()
@@ -267,7 +282,9 @@ function StartImportForm({
     >
       <div className="fg-form">
         <TextField
-          label={docker || npm ? 'Registry URL' : raw ? 'Repository URL' : 'Feed URL'}
+          label={
+            docker || npm ? 'Registry URL' : raw || apt ? 'Repository URL' : 'Feed URL'
+          }
           mono
           value={url}
           onChange={(e) => setUrl(e.target.value)}
@@ -278,7 +295,9 @@ function StartImportForm({
                 ? 'https://nexus.example.com/repository/npm-hosted'
                 : raw
                   ? 'https://nexus.example.com/repository/raw-hosted'
-                  : 'https://nexus.example.com/repository/nuget-hosted/index.json'
+                  : apt
+                    ? 'https://nexus.example.com/repository/apt-hosted'
+                    : 'https://nexus.example.com/repository/nuget-hosted/index.json'
           }
           description={
             npm ? (
@@ -289,6 +308,14 @@ function StartImportForm({
                 downloaded from this URL, whatever host the registry&rsquo;s metadata
                 names. Point it at a hosted repository: a group or a proxy lists its
                 upstream&rsquo;s packages too.
+              </>
+            ) : apt ? (
+              <>
+                The apt repository&rsquo;s base URL, as <Code>sources.list</Code> names
+                it. Nexus: <Code>&lt;Nexus URL&gt;/repository/&lt;name&gt;</Code>. Its{' '}
+                <Code>dists/&lt;distribution&gt;/InRelease</Code> (or{' '}
+                <Code>Release</Code>) names the indexes, which list every package with
+                its size and SHA-256; packages are downloaded from this URL.
               </>
             ) : raw ? (
               <>
@@ -315,25 +342,48 @@ function StartImportForm({
             )
           }
         />
-        <TextareaField
-          label={
-            docker ? 'Images' : npm ? 'Packages or scopes' : raw ? 'Paths' : 'Package IDs'
-          }
-          optional
-          mono
-          rows={3}
-          value={names}
-          onChange={(e) => setNames(e.target.value)}
-          description={
-            docker
-              ? 'One per line. Empty: every image the registry’s catalog lists. Name them for a registry without a catalog (Docker Hub, GHCR, ECR).'
-              : npm
-                ? 'One per line: a package (left-pad, @acme/ui) or a scope (@acme, every package of it). Empty: every package the registry’s search lists, or else its /-/all. Name them for a registry that serves neither.'
-                : raw
-                  ? 'One file per line, below the URL (pdfium/7350/pdfium-linux-x64.tgz). Empty: every file the source lists. Name them for a server without a listing; a file is checked against its .sha256 sidecar where the server serves one.'
-                : 'One per line. Empty: every package the feed’s search finds. Name them for a feed without a search, or for packages a search misses (Nexus stops at 10,000; a package whose versions are all unlisted is in no search result).'
-          }
-        />
+        {apt ? (
+          <>
+            <TextField
+              label="Distribution"
+              mono
+              value={distribution}
+              onChange={(e) => setDistribution(e.target.value)}
+              placeholder="bookworm"
+              description="The source’s distribution, as sources.list names it (Nexus: the one its apt repository is configured with). Its packages are copied into this repository, under the components the source lists them in."
+            />
+            <TextareaField
+              label="Public key"
+              optional
+              mono
+              rows={4}
+              value={publicKey}
+              onChange={(e) => setPublicKey(e.target.value)}
+              placeholder="-----BEGIN PGP PUBLIC KEY BLOCK-----"
+              description="The source’s signing key, ASCII-armored (gpg --export --armor; Nexus: the public half of the key its apt repository signs with). Given it, the import reads only a Release that key signed. Forge signs its indexes with this repository’s own keys."
+            />
+          </>
+        ) : (
+          <TextareaField
+            label={
+              docker ? 'Images' : npm ? 'Packages or scopes' : raw ? 'Paths' : 'Package IDs'
+            }
+            optional
+            mono
+            rows={3}
+            value={names}
+            onChange={(e) => setNames(e.target.value)}
+            description={
+              docker
+                ? 'One per line. Empty: every image the registry’s catalog lists. Name them for a registry without a catalog (Docker Hub, GHCR, ECR).'
+                : npm
+                  ? 'One per line: a package (left-pad, @acme/ui) or a scope (@acme, every package of it). Empty: every package the registry’s search lists, or else its /-/all. Name them for a registry that serves neither.'
+                  : raw
+                    ? 'One file per line, below the URL (pdfium/7350/pdfium-linux-x64.tgz). Empty: every file the source lists. Name them for a server without a listing; a file is checked against its .sha256 sidecar where the server serves one.'
+                    : 'One per line. Empty: every package the feed’s search finds. Name them for a feed without a search, or for packages a search misses (Nexus stops at 10,000; a package whose versions are all unlisted is in no search result).'
+            }
+          />
+        )}
         <div className="fg-fieldrow">
           <TextField
             label="Username"
@@ -417,6 +467,10 @@ function listingText(imp: ImportView): string | null {
       return "Nexus' asset listing names the files."
     case 'directories':
       return "The source's listing names the files."
+    case 'release':
+      return imp.distribution
+        ? `The Release of ${imp.distribution} names the packages${imp.public_key ? ', checked against its public key' : ''}.`
+        : null
     default:
       return null
   }

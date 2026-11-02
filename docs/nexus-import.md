@@ -12,6 +12,9 @@ serves for its hosted repositories:
   reads on Nexus' own port.
 - **Raw:** the repository, `<nexus>/repository/<name>`; its files are listed
   through Nexus' REST API ([below](#raw)).
+- **apt:** the repository, `<nexus>/repository/<name>`, the URL
+  `sources.list` names, and the distribution it is configured with
+  ([below](#apt)).
 
 The user the import reads with needs the privileges
 `nx-repository-view-<format>-<name>-browse` and `-read` on the repository.
@@ -38,7 +41,7 @@ reaches under another name imports all the same.
 The request of Forge before 2.2, a Nexus server and repository, is still
 accepted: `url` the Nexus server, `repository` the Nexus repository, and for
 Docker `registry_url` its connector (default: its path route). The import
-reads that repository's feed or registry (npm and raw:
+reads that repository's feed or registry (npm, raw and apt:
 `<url>/repository/<name>`).
 
 An import stored by Forge before 2.2 read Nexus' REST API. It still lists,
@@ -76,3 +79,34 @@ Forge holds with Nexus' SHA-256.
 
 The user the import reads with needs `nx-repository-view-raw-<name>-browse`
 (the asset listing) and `-read` (the downloads) on the repository.
+
+## apt
+
+A Nexus apt hosted repository serves one distribution (its **Distribution**
+setting), signed with the key pair it was created with (**APT Settings →
+Signing Key**): `dists/<distribution>/InRelease`, `Release` and
+`Release.gpg`, and for each architecture `main/binary-<arch>/Packages`
+(also `.gz` and `.bz2`; the import reads the `.gz`). Give the import the
+key's public half as `public_key` (`gpg --export --armor <key id>`, from
+where the key pair was made), and the distribution as `distribution` when
+it is not the Forge repository's own:
+
+```bash
+curl -u admin@example.com:<admin-scoped token> -X POST \
+  https://forge.example.com/admin/repositories/apt-internal/imports \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://nexus.example.com/repository/apt-hosted",
+       "distribution": "bookworm",
+       "public_key": "-----BEGIN PGP PUBLIC KEY BLOCK-----\n…",
+       "username": "migrator", "password": "…"}'
+```
+
+Nexus puts every package in `main`, whatever its `Section` says, and lists
+a package of architecture `all` in `binary-all` alone; the import keeps
+them in `main`, so a `sources.list` that names `main` finds them in Forge
+too. Its indexes list each package's SHA-256: a second run downloads
+nothing Forge has. Nexus' indexes carry no upload time: an imported package
+is created at its import.
+
+The user the import reads with needs `nx-repository-view-apt-<name>-read`
+on the repository.

@@ -82,7 +82,8 @@ npmAuthToken: "<token>"
 ```
 
 The token is an API token: one `npm login` mints (below), or one you create
-under **Your tokens** in the web UI. An API token of yours works for every
+under **Your tokens** in the web UI, which then shows these lines with the
+token filled in. An API token of yours works for every
 repository you may read, unless its scope limits it; Forge sees whose it
 is, not which repository it was minted for. A repository that allows anonymous reads needs no token to
 install from.

@@ -21,6 +21,12 @@
 //! * **Raw:** a raw repository ([`raw::RawSource`]), which has no protocol
 //!   beyond a `GET` of a path: Nexus' asset listing, or another Forge's JSON
 //!   listing, names its files with their checksums and times.
+//! * **apt:** an apt repository and one of its distributions
+//!   ([`apt::AptSource`]): its `Release` (`InRelease`, checked against the
+//!   source's public keys where the import was given them) names a
+//!   `Packages` index per component and architecture, each checked against
+//!   the SHA-256 `Release` lists, which lists every `.deb` with its
+//!   `Filename`, `Size` and SHA-256.
 //!
 //! An import can name its package ids, images or paths instead (`names`): a
 //! feed's search may miss some (Nexus stops at 10,000 packages; a package
@@ -64,6 +70,13 @@
 //!      is no publish time). The protocols carry no last download, so an
 //!      imported version counts as downloaded at its import, and no push
 //!      time for a tag, so a tag is created at its import;
+//!    * a `.deb` (apt) is downloaded from the import's URL and its
+//!      `Filename`, verified against the size and SHA-256 its index lists,
+//!      and written through the hosted write path under the component the
+//!      source lists it in. One Forge holds with that SHA-256 is skipped
+//!      without a download, and one it holds with another is a conflict
+//!      decided without one. apt's indexes carry no publish time: a package
+//!      is created at its import;
 //!    * a raw file is downloaded from the import's URL and its path,
 //!      verified against its size and the checksums the source lists, and
 //!      stored through the file store ([`crate::files::store::import`]):
@@ -98,6 +111,7 @@
 //! password is sealed with the secret encryption and deleted when the
 //! import completes.
 
+pub mod apt;
 pub mod feed;
 pub mod npm;
 pub mod raw;
@@ -135,13 +149,14 @@ use crate::files::Files;
 use crate::images::import::{ImageImportOptions, ImageOutcome, ImportSource};
 use crate::images::{Failure, Registry};
 use crate::state::AppState;
+use apt::{AptSource, Keyring};
 use feed::Feed;
 use npm::NpmRegistry;
 use raw::RawSource;
 
-/// The formats an import copies: NuGet and npm packages, Docker images into
-/// the image store, and raw files into the file store.
-pub const FORMATS: &[&str] = &["nuget", "npm", "docker", "raw"];
+/// The formats an import copies: NuGet, npm and apt packages, Docker images
+/// into the image store, and raw files into the file store.
+pub const FORMATS: &[&str] = &["nuget", "npm", "docker", "raw", "apt"];
 
 /// How often an idle instance looks for an import to run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -177,6 +192,9 @@ const TAGS_PAGE: u32 = 1000;
 
 /// Named package ids or images a scan page reads.
 const NAMES_PAGE: usize = 20;
+
+/// Entries of an apt `Packages` index a scan page records.
+const APT_PAGE: usize = 500;
 
 /// The most package ids or images an import names.
 pub const MAX_NAMES: usize = 10_000;
@@ -239,6 +257,8 @@ pub enum Listing {
     Assets,
     /// Raw: another Forge's JSON listing, a directory at a time.
     Directories,
+    /// apt: the `Packages` indexes the distribution's `Release` names.
+    Release,
     /// The package ids, images or paths the import names.
     Names,
 }
@@ -260,6 +280,7 @@ impl Listing {
             Listing::All => "all",
             Listing::Assets => "assets",
             Listing::Directories => "directories",
+            Listing::Release => "release",
             Listing::Names => "names",
         }
     }
@@ -270,6 +291,7 @@ impl Listing {
             "all" => Listing::All,
             "assets" => Listing::Assets,
             "directories" => Listing::Directories,
+            "release" => Listing::Release,
             "names" => Listing::Names,
             _ => Listing::Search,
         }
@@ -287,6 +309,9 @@ pub enum Protocol {
     Images,
     /// A raw repository: its files at their paths, and a listing of them.
     Raw,
+    /// An apt repository: a distribution's `Release` and `Packages`
+    /// indexes, and the pool.
+    Apt,
 }
 
 impl Protocol {
@@ -297,6 +322,7 @@ impl Protocol {
             _ if images => Protocol::Images,
             "npm" => Protocol::Npm,
             "raw" => Protocol::Raw,
+            "apt" => Protocol::Apt,
             _ => Protocol::NuGet,
         }
     }
@@ -304,7 +330,8 @@ impl Protocol {
 
 /// Where in a Nexus server a repository is: `<url>/repository/<name>`.
 /// Nexus serves a NuGet repository's service index below it, an npm
-/// repository's registry and a raw repository's files at it, and a Docker
+/// repository's registry, an apt repository and a raw repository's files at
+/// it, and a Docker
 /// repository's registry API at it (for reads, on its own port), unless the
 /// repository has a connector of its own (`registry_url`).
 pub fn nexus_source_url(
@@ -316,7 +343,7 @@ pub fn nexus_source_url(
     let path = format!("{}/repository/{repository}", url.trim_end_matches('/'));
     match (protocol, registry_url) {
         (Protocol::Images, Some(registry_url)) => registry_url.to_string(),
-        (Protocol::Images | Protocol::Npm | Protocol::Raw, _) => path,
+        (Protocol::Images | Protocol::Npm | Protocol::Raw | Protocol::Apt, _) => path,
         (Protocol::NuGet, _) => format!("{path}/index.json"),
     }
 }
@@ -402,6 +429,8 @@ impl ImportWorker {
             stopping: AtomicBool::new(false),
             last_search: std::sync::Mutex::new(Vec::new()),
             npm_all: tokio::sync::Mutex::new(None),
+            apt_release: tokio::sync::Mutex::new(None),
+            apt_index: tokio::sync::Mutex::new(None),
         };
         let end = AssertUnwindSafe(run.execute())
             .catch_unwind()
@@ -467,6 +496,11 @@ enum Target {
     },
     /// Raw: from a raw repository, through the file store.
     Files { source: Box<RawSource> },
+    /// apt: from an apt repository's pool, through the hosted write path.
+    Apt {
+        source: Box<AptSource>,
+        writer: Box<HostedWrite>,
+    },
 }
 
 /// What a run works with.
@@ -504,6 +538,8 @@ struct ItemSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target: Option<String>,
     /// Raw: the file's SHA-256 and SHA-1 (hex), where the source lists them.
+    /// apt: the package's SHA-256 (hex), its SHA-512 (in `sha512`, base64)
+    /// where its index lists one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -514,10 +550,17 @@ struct ItemSource {
     /// Raw: the content type the source lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
-    /// Raw: why the item fails without being copied (a path Forge
-    /// refuses).
+    /// Raw and apt: why the item fails without being copied (a path Forge
+    /// refuses; an index entry that names no `.deb` below the repository, a
+    /// component Forge does not publish).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// apt: where the package is, below the import's URL (its index's
+    /// `Filename`), and the component its index is of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    component: Option<String>,
     /// Raw: a named file the source did not have when it was scanned.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     missing: bool,
@@ -614,6 +657,10 @@ struct Run<'a> {
     /// npm: the names `/-/all` lists, once read (`Some(None)`: the registry
     /// does not serve it).
     npm_all: tokio::sync::Mutex<Option<Option<Arc<Vec<String>>>>>,
+    /// apt: the distribution's `Release`, once read.
+    apt_release: tokio::sync::Mutex<Option<Arc<forge_format_apt::import::Release>>>,
+    /// apt: the entries of the index the scan is in, by its key, once read.
+    apt_index: tokio::sync::Mutex<Option<(String, Arc<Vec<forge_format_apt::import::Entry>>)>>,
 }
 
 impl Run<'_> {
@@ -644,7 +691,7 @@ impl Run<'_> {
             .ok_or_else(|| End::Failed("the repository was deleted".into()))?;
         if repo.kind() != RepoKind::Hosted || !FORMATS.contains(&repo.format.as_str()) {
             return Err(End::Failed(format!(
-                "imports go to a hosted NuGet, npm, Docker or raw repository; {} is a {} {} repository",
+                "imports go to a hosted NuGet, npm, Docker, raw or apt repository; {} is a {} {} repository",
                 repo.name, repo.format, repo.kind
             )));
         }
@@ -706,10 +753,10 @@ impl Run<'_> {
                 .formats
                 .for_repository(&repo)
                 .map_err(|e| End::Failed(e.to_string()))?;
-            // An npm registry needs nothing resolved: its documents are at
-            // fixed URLs.
+            // An npm registry and an apt repository need nothing resolved:
+            // their documents are at fixed URLs.
             let feed = match protocol {
-                Protocol::Npm => None,
+                Protocol::Npm | Protocol::Apt => None,
                 _ => Some(
                     self.retrying("reading the feed's service index", || {
                         let (http, format, url) =
@@ -750,6 +797,29 @@ impl Run<'_> {
                     feed: Box::new(feed),
                     writer,
                 },
+                None if protocol == Protocol::Apt => {
+                    let distribution = import.distribution.clone().ok_or_else(|| {
+                        End::Failed("the import names no distribution of the source".into())
+                    })?;
+                    let keys =
+                        match import.public_key.as_deref() {
+                            Some(armored) => Some(Keyring::parse(armored).map_err(|e| {
+                                End::Failed(format!("the import's public key: {e}"))
+                            })?),
+                            None => None,
+                        };
+                    Target::Apt {
+                        source: Box::new(AptSource::new(
+                            self.state.upstream.clone(),
+                            &url,
+                            &distribution,
+                            import.username.clone(),
+                            password,
+                            keys,
+                        )),
+                        writer,
+                    }
+                }
                 None => Target::Npm {
                     registry: Box::new(NpmRegistry::new(
                         self.state.upstream.clone(),
@@ -1040,12 +1110,115 @@ impl Run<'_> {
                     walked: None,
                 })
             }
+            (Target::Apt { source, .. }, Listing::Release) => self.apt_page(source, cursor).await,
             _ => Err(SourceError::Invalid(format!(
                 "a {} repository's import does not walk a {}",
                 ctx.repo.format,
                 listing.as_str()
             ))),
         }
+    }
+
+    /// apt: the page after `cursor` of the indexes the distribution's
+    /// `Release` names, by component and architecture: [`APT_PAGE`] entries
+    /// of an index at a time, its cursor `<component>/<architecture>
+    /// <entries recorded>`. The `Release` is read once a run, and so is
+    /// each index; an index of a component Forge does not publish is an
+    /// item that fails.
+    async fn apt_page(
+        &self,
+        source: &AptSource,
+        cursor: Option<&str>,
+    ) -> Result<Page, SourceError> {
+        use forge_format_apt::import as apt;
+        let release = {
+            let mut cached = self.apt_release.lock().await;
+            match &*cached {
+                Some(release) => release.clone(),
+                None => {
+                    let release = Arc::new(source.release().await?);
+                    *cached = Some(release.clone());
+                    release
+                }
+            }
+        };
+        let indexes = release.indexes();
+        let (key, offset) = match cursor.and_then(|c| c.rsplit_once(' ')) {
+            Some((key, offset)) => (Some(key), offset.parse::<usize>().unwrap_or(0)),
+            None => (None, 0),
+        };
+        // The cursor's index, or (the source's `Release` changed since) the
+        // first after where it would be.
+        let position = match key.and_then(|key| key.rsplit_once('/')) {
+            None => 0,
+            Some(at) => indexes
+                .iter()
+                .position(|i| (i.component.as_str(), i.architecture.as_str()) >= at)
+                .unwrap_or(indexes.len()),
+        };
+        let Some(index) = indexes.get(position) else {
+            return Ok(Page {
+                found: Vec::new(),
+                next: None,
+                walked: None,
+            });
+        };
+        let offset = if Some(index.key().as_str()) == key {
+            offset
+        } else {
+            0
+        };
+        let after = |position: usize| {
+            indexes
+                .get(position + 1)
+                .map(|next| format!("{} 0", next.key()))
+        };
+        if let Some(problem) = apt::component_problem(&index.component) {
+            return Ok(Page {
+                found: vec![Found {
+                    kind: "component",
+                    name: format!("{}/binary-{}", index.component, index.architecture),
+                    version: String::new(),
+                    size: None,
+                    published_at: None,
+                    downloaded_at: None,
+                    uploader: None,
+                    source: ItemSource {
+                        error: Some(problem),
+                        ..ItemSource::default()
+                    },
+                }],
+                next: after(position),
+                walked: None,
+            });
+        }
+        let entries = {
+            let mut cached = self.apt_index.lock().await;
+            match &*cached {
+                Some((cached_key, entries)) if *cached_key == index.key() => entries.clone(),
+                _ => {
+                    let entries = Arc::new(source.packages(&release, index).await?);
+                    *cached = Some((index.key(), entries.clone()));
+                    entries
+                }
+            }
+        };
+        let start = offset.min(entries.len());
+        let end = (start + APT_PAGE).min(entries.len());
+        let found = entries[start..end]
+            .iter()
+            .map(|entry| deb_item(&index.component, entry))
+            .collect();
+        let next = if end < entries.len() {
+            Some(format!("{} {end}", index.key()))
+        } else {
+            after(position)
+        };
+        Ok(Page {
+            found,
+            next,
+            walked: None,
+        })
     }
 
     /// The versions of the package ids `names`, or the tags of the images
@@ -1085,6 +1258,10 @@ impl Run<'_> {
             Target::Packages { feed, .. } => package_versions(feed, name, named).await,
             Target::Images { registry, source } => image_tags(registry, source, name, named).await,
             Target::Files { source } => Ok(vec![named_file(source, name).await?]),
+            // An apt import names nothing: `Release` lists every package.
+            Target::Apt { .. } => Err(SourceError::Invalid(
+                "an apt import copies what the source's Release lists; it names no packages".into(),
+            )),
             Target::Npm { registry, .. } => {
                 let Some(scope) = forge_format_npm::import::parse_scope(name) else {
                     return npm_package(registry, name, named).await;
@@ -1210,6 +1387,10 @@ impl Run<'_> {
         let copied = match &ctx.target {
             // A file's item has no version.
             Target::Files { source } => self.copy_file(ctx, source, &item).await,
+            Target::Apt {
+                source: from,
+                writer,
+            } => self.copy_deb(ctx, from, writer, &item, &source).await,
             Target::Packages { .. } if item.version.is_empty() => {
                 Err("the source has no package of this id".to_string())
             }
@@ -1371,6 +1552,7 @@ impl Run<'_> {
             // must be that package.
             expected: matches!(from, PackageSource::Npm(_))
                 .then(|| (item.name.clone(), item.version.clone())),
+            summary_fields: None,
         };
         let outcome = writer
             .import_staged(&ctx.repo.name, staged, ctx.limit, &options)
@@ -1580,6 +1762,129 @@ impl Run<'_> {
                 0,
             ),
             None => copied("imported", Some(format!("points at {target}")), 0),
+        })
+    }
+
+    /// apt: copy a `.deb` through the hosted write path, under the component
+    /// its index is of. A version Forge holds with the SHA-256 the index
+    /// lists is `identical` without a download, and one it holds with
+    /// another SHA-256 a conflict (unless the import overwrites); a dry run
+    /// decides from the index alone. Otherwise the package is downloaded
+    /// from the import's URL and its `Filename`, checked against the size
+    /// and digests the index lists, and must be the package and version the
+    /// index names.
+    async fn copy_deb(
+        &self,
+        ctx: &Ctx,
+        from: &AptSource,
+        writer: &HostedWrite,
+        item: &ImportItem,
+        listed: &ItemSource,
+    ) -> Result<Copied, String> {
+        // An entry Forge cannot copy says nothing of the source: it fails
+        // as its item, and does not count towards the failures in a row.
+        if let Some(error) = &listed.error {
+            return Ok(copied("failed", Some(error.clone()), 0));
+        }
+        let (Some(filename), Some(expected)) = (&listed.filename, &listed.sha256) else {
+            return Err("the index names no Filename or SHA256 for this package".into());
+        };
+        if let Some(size) = item.size.filter(|&size| size as u64 > ctx.limit) {
+            return Err(format!(
+                "the package is {size} bytes, more than the repository's upload limit of {} bytes",
+                ctx.limit
+            ));
+        }
+        let overwrite = self.import.on_conflict == "overwrite";
+        let stored = writer
+            .package_sha256(ctx.repo.id, &item.name, &item.version)
+            .await
+            .map_err(|e| e.to_string())?;
+        match &stored {
+            Some(stored) if stored == expected => return Ok(copied("identical", None, 0)),
+            Some(_) if !overwrite => return Ok(conflict_item()),
+            _ => {}
+        }
+        if self.import.dry_run {
+            return Ok(copied(
+                "planned",
+                stored
+                    .is_some()
+                    .then(|| "would replace the version Forge has with other bytes".into()),
+                0,
+            ));
+        }
+
+        let url = from.file_url(filename).unwrap_or_else(|| filename.clone());
+        let Some(response) = from.download(filename).await.map_err(|e| e.to_string())? else {
+            return Err(format!("the source has no package at {url}"));
+        };
+        if response.content_length().is_some_and(|l| l > ctx.limit) {
+            return Err(WriteError::TooLarge { limit: ctx.limit }.to_string());
+        }
+        let body = response.bytes_stream().map_err(std::io::Error::other);
+        let staged = self
+            .state
+            .cas
+            .stage(tokio_util::io::StreamReader::new(body), ctx.limit)
+            .await
+            .map_err(|e| WriteError::from(e).to_string())?;
+        if let Some(size) = item
+            .size
+            .filter(|&size| u64::try_from(size).ok() != Some(staged.size))
+        {
+            return Err(format!(
+                "the download of {url} is {} bytes; the index lists {size}",
+                staged.size
+            ));
+        }
+        if staged.sha256 != *expected {
+            return Err(format!(
+                "the download of {url} does not match the SHA-256 the index lists for it"
+            ));
+        }
+        if listed
+            .sha512
+            .as_ref()
+            .is_some_and(|sha512| *sha512 != staged.sha512_base64)
+        {
+            return Err(format!(
+                "the download of {url} does not match the SHA-512 the index lists for it"
+            ));
+        }
+        let bytes = staged.size;
+        let summary_fields = listed.component.as_ref().map(|component| {
+            serde_json::Map::from_iter([(
+                "component".to_string(),
+                serde_json::Value::String(component.clone()),
+            )])
+        });
+        let options = ImportOptions {
+            overwrite,
+            dry_run: false,
+            published_at: item.published_at,
+            downloaded_at: Some(item.downloaded_at.unwrap_or_else(Utc::now)),
+            uploader: item.uploader.clone(),
+            source: ctx.source.clone(),
+            // The index names the package at its Filename: it must be that
+            // package.
+            expected: Some((item.name.clone(), item.version.clone())),
+            summary_fields,
+        };
+        let outcome = writer
+            .import_staged(&ctx.repo.name, staged, ctx.limit, &options)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(match outcome {
+            ImportOutcome::Created { .. } => copied("imported", None, bytes),
+            ImportOutcome::Replaced { .. } => copied(
+                "replaced",
+                Some("replaced the version Forge had with other bytes".into()),
+                bytes,
+            ),
+            ImportOutcome::Identical { .. } => copied("identical", None, bytes),
+            ImportOutcome::Conflict { .. } => conflict_item(),
+            ImportOutcome::Planned { .. } => copied("planned", None, bytes),
         })
     }
 
@@ -1881,6 +2186,34 @@ fn file_item(path: &str, source: ItemSource) -> Found {
         downloaded_at: None,
         uploader: None,
         source,
+    }
+}
+
+/// An entry of an apt `Packages` index of `component`, as an item: the
+/// package id and version Forge stores it under, its size, `Filename` and
+/// digests, and why it cannot be copied, if it cannot. apt's indexes carry
+/// no publish time.
+fn deb_item(component: &str, entry: &forge_format_apt::import::Entry) -> Found {
+    Found {
+        kind: "component",
+        name: entry.id(),
+        version: entry.normalized_version(),
+        size: entry.size.and_then(|s| i64::try_from(s).ok()),
+        published_at: None,
+        downloaded_at: None,
+        uploader: None,
+        source: ItemSource {
+            sha256: entry.sha256.clone(),
+            sha512: entry
+                .sha512
+                .as_ref()
+                .and_then(|hex| hex::decode(hex).ok())
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            filename: Some(entry.filename.clone()),
+            component: Some(component.to_string()),
+            error: entry.problem(),
+            ..ItemSource::default()
+        },
     }
 }
 
@@ -2293,6 +2626,16 @@ mod tests {
         assert_eq!(Protocol::of("nuget", false), Protocol::NuGet);
         assert_eq!(Protocol::of("docker", true), Protocol::Images);
         assert_eq!(Protocol::of("raw", false), Protocol::Raw);
+        assert_eq!(Protocol::of("apt", false), Protocol::Apt);
+        assert_eq!(
+            nexus_source_url(
+                "https://nexus.example.com",
+                "apt-hosted",
+                None,
+                Protocol::Apt
+            ),
+            "https://nexus.example.com/repository/apt-hosted"
+        );
         assert_eq!(
             nexus_source_url(
                 "https://nexus.example.com/",
@@ -2315,6 +2658,7 @@ mod tests {
             Listing::All,
             Listing::Assets,
             Listing::Directories,
+            Listing::Release,
             Listing::Names,
         ] {
             assert_eq!(Listing::parse(listing.as_str()), listing);
@@ -2374,6 +2718,45 @@ mod tests {
             assert!(error.starts_with("Forge refuses the path: "), "{error}");
             assert!(error.contains(reason), "{path}: {error}");
         }
+    }
+
+    #[test]
+    fn an_index_entry_is_an_item_with_its_component_and_digests() {
+        let entry = forge_format_apt::import::Entry {
+            package: "hello".into(),
+            version: "0:2.10-3".into(),
+            architecture: "amd64".into(),
+            filename: "pool/main/h/hello/hello_2.10-3_amd64.deb".into(),
+            size: Some(42),
+            sha256: Some("ab".repeat(32)),
+            sha512: Some("cd".repeat(64)),
+        };
+        let found = deb_item("contrib", &entry);
+        assert_eq!(found.kind, "component");
+        assert_eq!(found.name, "hello:amd64");
+        // As Forge stores it: an epoch of 0 dropped.
+        assert_eq!(found.version, "2.10-3");
+        assert_eq!(found.size, Some(42));
+        assert_eq!(found.published_at, None);
+        let stored = serde_json::to_value(&found.source).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::json!({
+                "sha256": "ab".repeat(32),
+                "sha512": base64::engine::general_purpose::STANDARD
+                    .encode(hex::decode("cd".repeat(64)).unwrap()),
+                "filename": "pool/main/h/hello/hello_2.10-3_amd64.deb",
+                "component": "contrib",
+            })
+        );
+        let outside = forge_format_apt::import::Entry {
+            filename: "../hello.deb".into(),
+            ..entry
+        };
+        assert!(deb_item("main", &outside)
+            .source
+            .error
+            .is_some_and(|e| e.contains("no path below")));
     }
 
     #[test]

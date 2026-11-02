@@ -751,6 +751,35 @@ impl HostedWrite {
         id: &str,
         version: &str,
     ) -> Result<Option<String>, WriteError> {
+        Ok(self
+            .package_asset(repository_id, id, version)
+            .await?
+            .and_then(|asset| asset.sha512_base64))
+    }
+
+    /// The SHA-256 (hex) of the package file of `id` `version`, if the
+    /// repository holds that version: an import compares it with what the
+    /// source lists (apt's indexes list a SHA-256).
+    pub async fn package_sha256(
+        &self,
+        repository_id: i64,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<String>, WriteError> {
+        Ok(self
+            .package_asset(repository_id, id, version)
+            .await?
+            .map(|asset| asset.blob_sha256))
+    }
+
+    /// The package file of `id` `version`, if the repository holds that
+    /// version.
+    async fn package_asset(
+        &self,
+        repository_id: i64,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<forge_db::model::Asset>, WriteError> {
         let Ok(version) = self.format.normalize_version(version) else {
             return Ok(None);
         };
@@ -764,8 +793,7 @@ impl HostedWrite {
         Ok(
             asset_dao::find_asset(&self.pool, comp.id, self.format.package_asset_path())
                 .await
-                .map_err(RepoError::from)?
-                .and_then(|asset| asset.sha512_base64),
+                .map_err(RepoError::from)?,
         )
     }
 
@@ -1036,6 +1064,13 @@ impl HostedWrite {
             }
         };
 
+        let mut manifest_summary = manifest_summary;
+        if let (Some(serde_json::Value::Object(summary)), Some(fields)) = (
+            manifest_summary.as_mut(),
+            import.and_then(|options| options.summary_fields.as_ref()),
+        ) {
+            summary.extend(fields.clone());
+        }
         if let (Some(id), Some(summary)) = (component_id, manifest_summary.as_ref()) {
             component_dao::set_manifest_summary(&mut *tx, id, summary)
                 .await

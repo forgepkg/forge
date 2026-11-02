@@ -85,6 +85,132 @@ describe('self-service tokens', () => {
     expect(api.requests.some((r) => /^\/admin\/(roles|repositories)/.test(r.path))).toBe(false)
   })
 
+  it('shows the clients’ snippets with the new token filled in', async () => {
+    api = new FakeRbacApi({
+      me: readerMe,
+      browseRepos: [
+        {
+          id: 10,
+          name: 'internal',
+          kind: 'hosted',
+          online: true,
+          format: 'nuget',
+          url: 'https://forge.example.com/repository/internal',
+        },
+        {
+          id: 11,
+          name: 'npm-all',
+          kind: 'group',
+          online: true,
+          format: 'npm',
+          url: 'https://forge.example.com/repository/npm-all',
+        },
+        {
+          id: 12,
+          name: 'images',
+          kind: 'hosted',
+          online: true,
+          format: 'docker',
+          registry: 'forge.example.com',
+          pull_prefix: 'forge.example.com/images',
+        },
+      ],
+    })
+    vi.stubGlobal('fetch', vi.fn(api.fetch))
+    const u = userEvent.setup()
+    await renderApp('/tokens')
+
+    expect(screen.queryByRole('heading', { name: 'Use this token' })).not.toBeInTheDocument()
+    await u.type(await screen.findByLabelText('Token name'), 'laptop')
+    await u.click(screen.getByRole('button', { name: 'Create token' }))
+
+    const panel = (await screen.findByRole('heading', { name: 'Use this token' })).closest(
+      'section',
+    )!
+    const tabs = within(panel).getByRole('tablist', { name: 'Client' })
+    expect(within(tabs).getAllByRole('tab').map((t) => t.textContent)).toEqual([
+      'NuGet',
+      'npm',
+      'Docker',
+    ])
+    expect(
+      within(panel).getByText(
+        'dotnet nuget add source https://forge.example.com/repository/internal/index.json --name internal --username alice --password my-plaintext-secret --store-password-in-clear-text',
+      ),
+    ).toBeInTheDocument()
+    expect(within(panel).getByText('NuGet.config')).toBeInTheDocument()
+
+    await u.click(within(tabs).getByRole('tab', { name: 'npm' }))
+    expect(
+      within(panel).getByText(
+        'npm config set //forge.example.com/repository/npm-all/:_authToken my-plaintext-secret',
+      ),
+    ).toBeInTheDocument()
+
+    await u.click(within(tabs).getByRole('tab', { name: 'Docker' }))
+    expect(
+      within(panel).getByText(
+        'echo my-plaintext-secret | docker login forge.example.com --username alice --password-stdin',
+      ),
+    ).toBeInTheDocument()
+    // A hosted repository and an unscoped token: pushing is offered.
+    expect(within(panel).getByRole('button', { name: 'Copy push command' })).toBeInTheDocument()
+
+    // Dismissing the secret takes its snippets along.
+    await u.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByRole('heading', { name: 'Use this token' })).not.toBeInTheDocument()
+  })
+
+  it('names only the repositories of a scoped token, without pushes for a read token', async () => {
+    api = new FakeRbacApi({
+      me: readerMe,
+      browseRepos: [
+        {
+          id: 10,
+          name: 'internal',
+          kind: 'hosted',
+          online: true,
+          format: 'nuget',
+          url: 'https://forge.example.com/repository/internal',
+        },
+        {
+          id: 12,
+          name: 'images',
+          kind: 'hosted',
+          online: true,
+          format: 'docker',
+          registry: 'forge.example.com',
+          pull_prefix: 'forge.example.com/images',
+        },
+      ],
+    })
+    vi.stubGlobal('fetch', vi.fn(api.fetch))
+    const u = userEvent.setup()
+    await renderApp('/tokens')
+
+    await u.type(await screen.findByLabelText('Token name'), 'pull-only')
+    await u.click(screen.getByRole('radio', { name: 'At most this level' }))
+    await u.click(screen.getByRole('radio', { name: /^Only these repositories/ }))
+    await u.click(await screen.findByRole('checkbox', { name: 'images' }))
+    await u.click(screen.getByRole('button', { name: 'Create token' }))
+
+    const panel = (await screen.findByRole('heading', { name: 'Use this token' })).closest(
+      'section',
+    )!
+    expect(
+      within(within(panel).getByRole('tablist', { name: 'Client' }))
+        .getAllByRole('tab')
+        .map((t) => t.textContent),
+    ).toEqual(['Docker'])
+    expect(
+      within(panel).getByText(
+        'echo my-plaintext-secret | docker login forge.example.com --username alice --password-stdin',
+      ),
+    ).toBeInTheDocument()
+    expect(within(panel).getByRole('button', { name: 'Copy pull command' })).toBeInTheDocument()
+    expect(within(panel).queryByRole('button', { name: 'Copy push command' })).not.toBeInTheDocument()
+  })
+
   it('refuses a scope without repositories', async () => {
     const u = userEvent.setup()
     await renderApp('/tokens')

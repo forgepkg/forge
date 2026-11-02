@@ -94,7 +94,11 @@ function ServiceAccountPage() {
       <Columns asideLabel="Access" aside={<UserAccess userId={id} serviceAccount />}>
         <UserRoles userId={id} legacyAdmin={false} serviceAccount />
         <EffectiveAccess userId={id} />
-        <UserTokens userId={id} inactive={account?.active === false} />
+        <UserTokens
+          userId={id}
+          username={account?.username}
+          inactive={account?.active === false}
+        />
       </Columns>
     </Page>
   )

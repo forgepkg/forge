@@ -57,6 +57,11 @@ package of `Section: contrib/net` is in `contrib`, any other in `main`. Its
 **architectures** are those of its packages; an `all` package is listed
 under every one of them (and under `binary-all`).
 
+An [import](import.md#apt) fills a hosted repository from another apt
+repository (Nexus, a static repository, another Forge): every `.deb` its
+`Release` lists, checked against the size and SHA-256 its index gives, in
+the component the source lists it in.
+
 ## Connecting apt
 
 Each repository's page in the web UI shows these lines with its name, URL
@@ -85,6 +90,13 @@ apt sends credentials over plain HTTP only to a machine written with its
 scheme (`machine http://forge.internal:8421/repository/apt-internal`).
 Anonymous reads follow the repository's *Allow anonymous read*, as for
 every format.
+
+Create the token under **Your tokens** in the web UI: the page then shows
+this entry with the token and your username filled in. A user of a realm
+that accepts passwords from clients ([Admin →
+Authentication](deployment.md#passwords-from-clients)), such as a
+credential-forwarding realm in front of a Nexus, may put the password there
+instead; uploads still take a token.
 
 Then `apt-get update` and `apt-get install` as usual.
 

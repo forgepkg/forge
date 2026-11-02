@@ -209,7 +209,7 @@ jobs:
       # sqlx cache drift guard (A1). SQLX_OFFLINE is unset so the check talks
       # to the database.
       - name: Install sqlx-cli (prebuilt, no source compile)
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: sqlx-cli@0.9.0
       - name: Run migrations
@@ -235,7 +235,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install cargo-audit (prebuilt, pinned)
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-audit@0.22.2
       - name: cargo audit
@@ -786,6 +786,7 @@ jobs:
           docker pull mirror.gcr.io/sonatype/nexus3:3.70.1
           docker pull mirror.gcr.io/verdaccio/verdaccio:6.11.1
           docker pull mirror.gcr.io/library/nginx:1.27.5-alpine
+          docker pull mirror.gcr.io/library/debian:bookworm
 
       - name: Run e2e tests (forge-e2e feature)
         id: tests

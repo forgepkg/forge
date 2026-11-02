@@ -28,16 +28,14 @@ its [quickstart](../README.md#quickstart);
   selector or pattern), and releasing one version early.
 - **[Importing repositories](import.md)**: copy a hosted repository of
   another server (a NuGet feed, an npm registry, a registry, a raw
-  repository: Nexus, Artifactory, Verdaccio, a web server, another Forge)
-  into Forge, with its publish dates.
+  repository, an apt repository: Nexus, Artifactory, Verdaccio, a web
+  server, another Forge) into Forge, with its publish dates.
 - **[Importing from Nexus](nexus-import.md)**: where Nexus serves its feeds,
-  registries and raw files, its search's limits, and imports stored before
-  2.2.
+  registries, apt repositories and raw files, its search's limits, and
+  imports stored before 2.2.
 
 ## Formats
 
-- **NuGet**: the README's [quickstart](../README.md#quickstart) points a
-  `dotnet` client at a feed, and the CI guides below publish to one.
 - **[apt repositories](apt.md)**: Debian and Ubuntu packages for `apt`:
   `.deb` uploads, signed indexes and key rotation, `sources.list` and
   `auth.conf.d`, proxies of Debian and Ubuntu mirrors.
@@ -46,7 +44,10 @@ its [quickstart](../README.md#quickstart);
 - **[npm registries](npm.md)**: npm packages for npm, pnpm, Yarn and Bun:
   `.npmrc`, logins, publishing, dist-tags, proxies of `registry.npmjs.org`
   and audits.
-- **[Raw file repositories](raw.md)**: files under arbitrary paths: uploads
+- **[NuGet feeds](nuget.md)**: `dotnet`, `nuget.exe` and Visual Studio:
+  `dotnet nuget add source`, `NuGet.config` credentials, logins, pushes
+  with an API key, unlisting. The CI guides below publish to a feed.
+- **[Raw file repositories](raw.md)**: files under arbitrary paths: logins, uploads
   with curl, ranges and checksum sidecars, listings, and proxies of release
   downloads.
 - **[Format plugins](format-plugins.md)**: further package formats, built

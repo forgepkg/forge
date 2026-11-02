@@ -1023,7 +1023,7 @@ export function RealmForm({
           <ClientPasswordsPanel
             checked={values.accept_client_passwords}
             onChange={(c) => set('accept_client_passwords', c)}
-            description="Lets a client (NuGet, raw and Helm feeds, docker login, npm login --auth-type=legacy) send a local user's password over HTTP Basic. Off, local users sign their clients in with tokens: an API token from their tokens page, or npm login --auth-type=web. The browser login takes their passwords either way, and a password a client sends while this is off is refused, never passed on to a credential-forwarding realm."
+            description="Lets a client (NuGet, npm, raw and apt repositories, docker and helm registry login, npm login --auth-type=legacy) send a local user's password over HTTP Basic. Off, local users sign their clients in with tokens: an API token from their tokens page, or npm login --auth-type=web. The browser login takes their passwords either way, and a password a client sends while this is off is refused, never passed on to a credential-forwarding realm."
           />
         )}
 
@@ -1313,7 +1313,7 @@ export function RealmForm({
             <ClientPasswordsPanel
               checked={values.accept_client_passwords}
               onChange={(c) => set('accept_client_passwords', c)}
-              description="Lets the realm's users sign a client (NuGet, raw and Helm feeds, docker login, npm login --auth-type=legacy) in with the password the upstream checks, as they did against a Nexus. Off, they sign their clients in with tokens, which the browser login gets them; the browser login takes their passwords either way."
+              description="Lets the realm's users sign a client (NuGet, npm, raw and apt repositories, docker and helm registry login, npm login --auth-type=legacy) in with the password the upstream checks, as they did against a Nexus. Off, they sign their clients in with tokens, which the browser login gets them; the browser login takes their passwords either way."
             />
 
             <Panel

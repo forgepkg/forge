@@ -35,6 +35,7 @@ import {
   useTokens,
 } from '~/queries/useTokens'
 import { useRepositories } from '~/queries/useRepositories'
+import { useBrowseRepos } from '~/queries/useBrowseRepos'
 import {
   useAssignRole,
   useRoles,
@@ -79,6 +80,7 @@ import {
 } from '~/components/RbacLabels'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
 import { TokenCreateForm } from '~/components/TokenCreateForm'
+import { TokenUsage } from '~/components/TokenUsage'
 import {
   formatTokenExpiry,
   TokenScopeBadges,
@@ -199,7 +201,7 @@ function UserPage() {
           trustedHeader={trustedHeader}
         />
         <EffectiveAccess userId={id} />
-        <UserTokens userId={id} inactive={user?.active === false} />
+        <UserTokens userId={id} username={user?.username} inactive={user?.active === false} />
       </Columns>
     </Page>
   )
@@ -534,11 +536,22 @@ export function EffectiveAccess({ userId }: { userId: number }) {
  * revoke, after a confirmation dialog). While the account is inactive its
  * tokens are refused but not revoked, which the table says.
  */
-export function UserTokens({ userId, inactive }: { userId: number; inactive: boolean }) {
+export function UserTokens({
+  userId,
+  username,
+  inactive,
+}: {
+  userId: number
+  /** The account's username, for the new token's client snippets. */
+  username?: string
+  inactive: boolean
+}) {
   const tokens = useTokens(userId)
   const create = useCreateToken(userId)
   const revoke = useRevokeToken(userId)
   const repos = useRepositories()
+  // The client addresses of the snippets under a new token.
+  const browse = useBrowseRepos()
 
   const [created, setCreated] = useState<CreatedToken | null>(null)
   const [pendingRevoke, setPendingRevoke] = useState<number | null>(null)
@@ -563,6 +576,12 @@ export function UserTokens({ userId, inactive }: { userId: number; inactive: boo
               ? 'This token never expires; it stays valid until revoked.'
               : `This token expires ${formatTokenExpiry(created.expires_at)}.`}
           </p>
+          <TokenUsage
+            token={created.token}
+            username={username ?? '<username>'}
+            scope={created.scope}
+            repositories={browse.data ?? []}
+          />
         </>
       )}
 
