@@ -858,3 +858,89 @@ async fn proxies_serve_the_upstream_unchanged() {
         1
     );
 }
+
+/// The Debian security archive keeps its packages under `pool/updates/…`
+/// (`Filename: pool/updates/main/o/openssl/…`), listed in the component's
+/// own `dists/<distribution>/main/binary-<arch>/Packages` (#750). A hosted
+/// repository's packages are only at their own path.
+#[tokio::test]
+async fn proxies_serve_the_security_archives_pool() {
+    let srv = common::start().await;
+    let state = Arc::new(Mirror::default());
+    let url = mirror(state.clone()).await;
+    let libssl = deb("libssl3", "3.0.17-1~deb12u3", "amd64", "libs");
+    let bad = deb("bad", "1.0", "amd64", "devel");
+    let packages = format!(
+        "Package: libssl3\nVersion: 3.0.17-1~deb12u3\n\
+         Filename: pool/updates/main/o/openssl/libssl3_3.0.17-1~deb12u3_amd64.deb\nSize: {}\nSHA256: {}\n\n\
+         Package: bad\nVersion: 1.0\nFilename: pool/updates/main/b/bad/bad_1.0_amd64.deb\nSize: {}\nSHA256: {}\n",
+        libssl.len(),
+        sha256(&libssl),
+        bad.len(),
+        "0".repeat(64)
+    );
+    {
+        let mut files = state.files.lock().unwrap();
+        files.insert(
+            "debian-security/dists/bookworm-security/main/binary-amd64/Packages".into(),
+            packages.into_bytes(),
+        );
+        files.insert(
+            "debian-security/pool/updates/main/o/openssl/libssl3_3.0.17-1~deb12u3_amd64.deb"
+                .into(),
+            libssl.clone(),
+        );
+        files.insert(
+            "debian-security/pool/updates/main/b/bad/bad_1.0_amd64.deb".into(),
+            bad,
+        );
+    }
+    let name = format!("aptsecurity{}", unique());
+    create(
+        &srv,
+        json!({"name": name, "kind": "proxy", "format": "apt",
+               "remote_url": format!("{url}/debian-security"),
+               "options": {"distribution": "bookworm-security"}}),
+    )
+    .await;
+    let apt = Apt::new(&srv, &name).await;
+
+    let (status, body) = apt
+        .get("pool/updates/main/o/openssl/libssl3_3.0.17-1~deb12u3_amd64.deb")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, libssl);
+    // Checked against the index of `main`, the component under `updates/`.
+    assert_eq!(
+        apt.get("pool/updates/main/b/bad/bad_1.0_amd64.deb").await.0,
+        StatusCode::BAD_GATEWAY
+    );
+    assert!(state
+        .seen
+        .lock()
+        .unwrap()
+        .contains_key("debian-security/dists/bookworm-security/main/binary-amd64/Packages"));
+
+    // A hosted package is not found below an area of the pool, and is not
+    // deleted through one.
+    let hosted = format!("apt{}", unique());
+    create(
+        &srv,
+        json!({"name": hosted, "kind": "hosted", "format": "apt", "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let apt = Apt::new(&srv, &hosted).await;
+    let hello = deb("hello", "1.0-1", "amd64", "utils");
+    assert_eq!(apt.post(&hello).await.0, StatusCode::CREATED);
+    let elsewhere = "pool/updates/main/h/hello/hello_1.0-1_amd64.deb";
+    assert_eq!(apt.get(elsewhere).await.0, StatusCode::NOT_FOUND);
+    let resp = apt
+        .req(reqwest::Method::DELETE, elsewhere)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let (status, body) = apt.get("pool/main/h/hello/hello_1.0-1_amd64.deb").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, hello);
+}

@@ -298,8 +298,12 @@ impl FormatPlugin for Apt {
     }
 }
 
-/// The version a pool path names, at the path a hosted package of it has.
+/// The version a pool path names, at the path a hosted package of it has:
+/// directly under `pool/<component>/`, never below an area of the pool.
 fn pool_ref(pool: &PoolPath) -> Option<PackageRef> {
+    if !pool.area.is_empty() {
+        return None;
+    }
     let deb = layout::deb_name(&pool.file)?;
     if !pool.file.ends_with(".deb") {
         return None;
