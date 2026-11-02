@@ -5,7 +5,9 @@
 //!   `.xz`), and their `by-hash/SHA256/<sha256>` copies;
 //! * `pool/<component>/<prefix>/<name>/<name>_<version>_<arch>.deb`, the
 //!   prefix being the name's first letter (`lib` and the next letter for a
-//!   `lib` name), the version the normalized one (an epoch keeps its `:`);
+//!   `lib` name), the version the normalized one (an epoch keeps its `:`).
+//!   An upstream may put more before the component: the Debian security
+//!   archive's pool is `pool/updates/main/…`, which proxies serve;
 //! * `key.asc` and `key.gpg`, the repository's signing keys (hosted).
 //!
 //! Request paths are parsed with [`forge_plugin_api::files`]: a path that
@@ -42,10 +44,16 @@ pub enum Target {
     Other(String),
 }
 
-/// A file under `pool/`: `pool/<component>/<prefix>/<directory>/<file>`.
+/// A file under `pool/`:
+/// `pool/[<area>/]<component>/<prefix>/<directory>/<file>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolPath {
     pub path: String,
+    /// What comes between `pool/` and the component: nothing in the layout
+    /// hosted repositories and `dpkg`'s tools write, `updates` in the Debian
+    /// security archive's (`pool/updates/main/o/openssl/…`, listed in
+    /// `dists/<distribution>/main/binary-<arch>/Packages`).
+    pub area: String,
     pub component: String,
     pub prefix: String,
     pub directory: String,
@@ -80,7 +88,8 @@ fn classify(path: String) -> Target {
             rest: rest.join("/"),
             path: path.clone(),
         },
-        ["pool", component, prefix, directory, file] => Target::Pool(PoolPath {
+        ["pool", area @ .., component, prefix, directory, file] => Target::Pool(PoolPath {
+            area: area.join("/"),
             component: (*component).to_string(),
             prefix: (*prefix).to_string(),
             directory: (*directory).to_string(),
@@ -190,9 +199,10 @@ pub fn by_hash_sha256(rest: &str) -> Option<String> {
 }
 
 /// Whether a pool path is where a hosted package of `component` and `name`
-/// lives (its prefix and directory).
+/// lives (its prefix and directory, directly under `pool/<component>/`).
 pub fn pool_matches(pool: &PoolPath, component: &str, name: &str) -> bool {
-    valid_component(&pool.component)
+    pool.area.is_empty()
+        && valid_component(&pool.component)
         && pool.component == component
         && pool.prefix == prefix(name)
         && pool.directory == name
@@ -222,11 +232,28 @@ mod tests {
             parse("/pool/main/h/hello/hello_1%3a2.0-1_amd64.deb").unwrap(),
             Target::Pool(PoolPath {
                 path: "pool/main/h/hello/hello_1:2.0-1_amd64.deb".into(),
+                area: String::new(),
                 component: "main".into(),
                 prefix: "h".into(),
                 directory: "hello".into(),
                 file: "hello_1:2.0-1_amd64.deb".into(),
             })
+        );
+        // The Debian security archive's pool: `updates` before the component.
+        assert_eq!(
+            parse("/pool/updates/main/o/openssl/libssl3_3.0.17-1~deb12u3_amd64.deb").unwrap(),
+            Target::Pool(PoolPath {
+                path: "pool/updates/main/o/openssl/libssl3_3.0.17-1~deb12u3_amd64.deb".into(),
+                area: "updates".into(),
+                component: "main".into(),
+                prefix: "o".into(),
+                directory: "openssl".into(),
+                file: "libssl3_3.0.17-1~deb12u3_amd64.deb".into(),
+            })
+        );
+        assert_eq!(
+            parse("/pool/main/h/hello").unwrap(),
+            Target::Other("pool/main/h/hello".into())
         );
         assert_eq!(parse("/dists/").unwrap(), Target::Other("dists/".into()));
         assert_eq!(parse("/dists/x").unwrap(), Target::Other("dists/x".into()));
@@ -297,6 +324,13 @@ mod tests {
             panic!()
         };
         assert_eq!(pool_package(&pool).as_deref(), Some("hello:source"));
+        // Below an area of the pool: a package's file, never a hosted one's.
+        let Target::Pool(pool) = parse("/pool/updates/main/h/hello/hello_1.0_amd64.deb").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(pool_package(&pool).as_deref(), Some("hello:amd64"));
+        assert!(!pool_matches(&pool, "main", "hello"));
         assert_eq!(split_id("hello:amd64"), Some(("hello", "amd64")));
         assert_eq!(split_id("hello"), None);
     }

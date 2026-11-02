@@ -12,7 +12,8 @@
 #      verify with either key alone, and apt-get update trusting only the
 #      old key still has no warning; the old key is then deleted;
 #   3. proxy: a mock Debian mirror (dpkg-scanpackages, signed with its own
-#      key, by-hash copies) behind a proxy repository; apt-get installs
+#      key, by-hash copies, a package below pool/updates/ as in the security
+#      archive) behind a proxy repository; apt-get installs
 #      through it, then installs again in a fresh container while the mirror
 #      is down.
 #
@@ -274,8 +275,13 @@ gpg --batch --passphrase '' --quick-gen-key 'Mock Mirror <mirror@example.com>' e
 gpg --export > "$work/client/mirror.gpg"
 mirror="$work/mirror/debian"
 deb mirror-pkg 3.0-1 amd64
-mkdir -p "$mirror/pool/main/m/mirror-pkg" "$mirror/dists/bookworm/main/binary-amd64"
+# A second package where the Debian security archive keeps its packages,
+# below `pool/updates/` and listed in `main`'s Packages.
+deb security-pkg 1.0-1+deb12u1 amd64
+mkdir -p "$mirror/pool/main/m/mirror-pkg" "$mirror/pool/updates/main/s/security-pkg" \
+  "$mirror/dists/bookworm/main/binary-amd64"
 cp "$work/debs/mirror-pkg_3.0-1_amd64.deb" "$mirror/pool/main/m/mirror-pkg/"
+cp "$work/debs/security-pkg_1.0-1+deb12u1_amd64.deb" "$mirror/pool/updates/main/s/security-pkg/"
 (cd "$mirror" && dpkg-scanpackages --arch amd64 pool > dists/bookworm/main/binary-amd64/Packages 2>/dev/null)
 gzip -9kn "$mirror/dists/bookworm/main/binary-amd64/Packages"
 {
@@ -310,8 +316,9 @@ proxy_auth="machine $base/repository/debian-proxy\nlogin admin@example.com\npass
 proxy_source=$(apt_source "deb [signed-by=/client/mirror.gpg] $proxy/ bookworm main" "$proxy_auth")
 apt_container proxy-install "$proxy_source
 apt-get update
-apt-get install -y mirror-pkg
-mirror-pkg | grep -qx 'mirror-pkg 3.0-1'"
+apt-get install -y mirror-pkg security-pkg
+mirror-pkg | grep -qx 'mirror-pkg 3.0-1'
+security-pkg | grep -qx 'security-pkg 1.0-1+deb12u1'"
 
 step "proxy: installs again while the mirror is down"
 kill "$mirror_pid"

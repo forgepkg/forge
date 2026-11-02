@@ -9,7 +9,10 @@
 //!   package is cached the host checks it against the size and SHA-256 the
 //!   upstream's `Packages` index of its component and architecture gives it
 //!   (`Packages.gz`, else `.xz`, else the plain one), when there is such an
-//!   index and it lists the file.
+//!   index and it lists the file. The component is the pool directory's
+//!   last before the name's prefix: `main` for the Debian security
+//!   archive's `pool/updates/main/o/openssl/…`, which
+//!   `dists/<distribution>/main/binary-<arch>/Packages` lists.
 
 use std::io::{BufRead, BufReader, Read};
 
@@ -267,6 +270,43 @@ mod tests {
             panic!()
         };
         assert_eq!((at.size, at.sha256), (None, None));
+    }
+
+    #[test]
+    fn security_archive_packages_are_checked_against_their_components_index() {
+        // security.debian.org: `Filename: pool/updates/main/…`, listed in
+        // `dists/bookworm-security/main/binary-amd64/Packages`.
+        let mut remote = Remote::new("http://security.example.test/debian-security");
+        remote
+            .options
+            .push(("distribution".into(), "bookworm-security".into()));
+        let path = "pool/updates/main/o/openssl/libssl3_3.0.17-1~deb12u3_amd64.deb";
+        let UpstreamStep::Fetch(fetches) = file(&remote, path, &[]) else {
+            panic!()
+        };
+        assert_eq!(
+            fetches[0].url,
+            "http://security.example.test/debian-security/dists/bookworm-security/main/binary-amd64/Packages.gz"
+        );
+        let index = format!(
+            "Package: libssl3\nFilename: {path}\nSize: 7\nSHA256: {}\n",
+            "d".repeat(64)
+        );
+        let found = FetchResult {
+            fetch: Fetch::new(&fetches[0].url, Freshness::Metadata),
+            outcome: Fetched::Found(index.into_bytes()),
+            status: None,
+            headers: Vec::new(),
+        };
+        let UpstreamStep::Done(UpstreamAnswer::FileAt(at)) = file(&remote, path, &[found]) else {
+            panic!()
+        };
+        assert_eq!(
+            at.url,
+            format!("http://security.example.test/debian-security/{path}")
+        );
+        assert!(at.immutable);
+        assert_eq!((at.size, at.sha256), (Some(7), Some("d".repeat(64))));
     }
 
     #[test]
