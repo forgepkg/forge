@@ -302,12 +302,14 @@ hooks of the format contract
 
 NuGet and npm use the generic rules: a version with a `-` is a prerelease,
 any other a release, and a package is one partition. Helm charts are stored
-in Docker repositories and follow the [image rules](#image-rules). Maven and
-apt bring their own when they arrive: Maven's `-SNAPSHOT` builds are
+in Docker repositories and follow the [image rules](#image-rules). apt
+([apt.md](apt.md)) has no prereleases (a `-` starts the Debian revision, so
+every version is a release), orders versions as dpkg does, and counts per
+package and architecture: its package ids are `<name>:<architecture>`.
+Maven brings its own rules when it arrives: its `-SNAPSHOT` builds are
 snapshots counted per snapshot version (the newest N builds of each), its
 releases per `groupId:artifactId`, and `prerelease_superseded_for_days`
-removes a version's snapshots once its release exists; apt counts per
-package and architecture.
+removes a version's snapshots once its release exists.
 
 ## Raw file rules
 

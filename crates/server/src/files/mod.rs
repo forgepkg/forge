@@ -192,6 +192,36 @@ impl Files<'_> {
         })
     }
 
+    /// A file the host keeps for a repository of a package format (apt): a
+    /// hosted repository's index file, or a proxy's copy of an upstream
+    /// file (re-validated once it is due, else with `fetch` fetched). The
+    /// caller's package selector decides on `package`, the package the file
+    /// belongs to; a file of no package (an index) is every reader's. A
+    /// group keeps no files.
+    pub async fn locate_kept(
+        &self,
+        repo: &Repository,
+        path: &str,
+        package: Option<&str>,
+        fetch: bool,
+    ) -> Result<Option<RawFile>, FileError> {
+        if let Some(package) = package {
+            let filter = self.state.authz.package_filter(&self.principal, repo).await;
+            if !filter.allows(package) {
+                return Ok(None);
+            }
+        }
+        match repo.kind() {
+            RepoKind::Hosted => Ok(raw_dao::find(&self.state.pool, repo.id, path).await?),
+            RepoKind::Proxy => match raw_dao::find(&self.state.pool, repo.id, path).await? {
+                Some(file) => Ok(Some(self.fresh(repo, file).await)),
+                None if fetch => self.fetch(repo, path).await,
+                None => Ok(None),
+            },
+            RepoKind::Group => Ok(None),
+        }
+    }
+
     /// The members of `group` that may serve the caller, highest priority
     /// first: repositories of the group's format the caller may read itself
     /// (reading a group grants nothing on its members), without offline hosted or group

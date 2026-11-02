@@ -11,6 +11,9 @@ import { pkgKeys } from '~/api/packages'
 import { rawKeys } from '~/api/raw'
 import {
   addMember,
+  addSigningKey,
+  deleteSigningKey,
+  fetchSigningKeys,
   createTrustedPublisher,
   createRepository,
   deleteTrustedPublisher,
@@ -28,12 +31,14 @@ import {
   updateRepository,
   updateTrustedPublisher,
   type AddMember,
+  type AddSigningKey,
   type CreateRepo,
   type FormatView,
   type InvalidateProxyCache,
   type MemberView,
   type ProxyCacheInvalidated,
   type RepoView,
+  type SigningKey,
   type UpdateRepo,
   type TrustedPublisherBody,
   type TrustedPublisherView,
@@ -235,4 +240,34 @@ export function useDeleteTrustedPublisher(name: string) {
   return useTrustedPublisherMutation(name, (id: number) =>
     deleteTrustedPublisher(name, id),
   )
+}
+
+/** The keys that sign a repository's indexes (`GET …/signing-keys`, apt). */
+export function useSigningKeys(name: string) {
+  return useQuery<SigningKey[], ApiError>({
+    queryKey: repoKeys.signingKeys(name),
+    queryFn: ({ signal }) => fetchSigningKeys(name, signal),
+  })
+}
+
+/** Generate or import a signing key; refreshes the repository's keys. */
+export function useAddSigningKey(name: string) {
+  const queryClient = useQueryClient()
+  return useMutation<SigningKey, ApiError, AddSigningKey>({
+    mutationFn: (body) => addSigningKey(name, body),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: repoKeys.signingKeys(name) })
+    },
+  })
+}
+
+/** Delete a signing key (not the last); refreshes the repository's keys. */
+export function useDeleteSigningKey(name: string) {
+  const queryClient = useQueryClient()
+  return useMutation<void, ApiError, string>({
+    mutationFn: (fingerprint) => deleteSigningKey(name, fingerprint),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: repoKeys.signingKeys(name) })
+    },
+  })
 }

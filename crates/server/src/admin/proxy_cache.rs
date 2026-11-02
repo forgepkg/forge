@@ -19,7 +19,9 @@
 //!   service index) due for a refresh. The previous index stays the fallback
 //!   while the upstream is unreachable;
 //! * a docker proxy's cached tags are re-validated on their next pull;
-//! * a raw proxy's cached files are re-validated on their next download.
+//! * a raw proxy's cached files are re-validated on their next download, and
+//!   so are the upstream's indexes an apt proxy keeps (its packages and
+//!   `by-hash` copies never change).
 //!
 //! What stays: downloaded packages, blobs and digest-addressed manifests
 //! (removing those is retention's job), the versions the upstream listed and
@@ -61,7 +63,7 @@ pub struct Invalidated {
     pub not_found_cleared: u64,
     /// Tags due for re-validation (docker proxies).
     pub tags_expired: u64,
-    /// Cached files due for re-validation (raw proxies only).
+    /// Cached files due for re-validation (raw proxies, and apt's indexes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files_expired: Option<u64>,
 }
@@ -178,6 +180,12 @@ async fn forget(
             proxy_dao::clear_not_found(&mut tx, repo.id, package).await?;
         if package.is_none() {
             proxy_dao::expire_upstream_index(&mut tx, repo.id).await?;
+            // The upstream's files a package format's proxy keeps (apt's
+            // indexes); the ones that never change stay as they are.
+            let expired = raw_dao::expire_checks(&mut *tx, repo.id, "").await?;
+            if expired > 0 {
+                invalidated.files_expired = Some(expired);
+            }
         }
     }
     if !repository_dao::touch_repository(&mut *tx, repo.id).await? {

@@ -1,0 +1,31 @@
+[package]
+name = "forge-format-apt"
+# The plugin's own version, its descriptor's.
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "apt (Debian/Ubuntu) repositories for Forge, as a format plugin"
+
+[dependencies]
+forge-plugin-api = { path = "../../plugin-api" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+# A .deb is an ar archive whose control member is a tar, compressed with
+# gzip, xz or zstd (or not at all); indexes are published as gzip and xz.
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# Pure Rust xz, both ways (Apache-2.0).
+lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
+# Pure Rust zstd decoding (MIT): Ubuntu builds its packages with zstd.
+ruzstd = "0.9"
+
+[dev-dependencies]
+forge-plugin-api = { path = "../../plugin-api", features = ["testing"] }

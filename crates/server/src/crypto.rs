@@ -234,6 +234,7 @@ async fn reseal_all(
     resealed += secret_dao::reseal_secret_settings(pool, envelope).await?;
     resealed += secret_dao::reseal_import_passwords(pool, envelope).await?;
     resealed += secret_dao::reseal_email_secrets(pool, envelope).await?;
+    resealed += forge_db::signing_key_dao::reseal(pool, envelope).await?;
     Ok(resealed)
 }
 

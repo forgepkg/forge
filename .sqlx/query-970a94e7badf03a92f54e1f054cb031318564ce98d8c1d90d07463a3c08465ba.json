@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH dek AS (\n                SELECT 1 FROM encryption_key\n                WHERE layer = 'dek' AND scope = $4 AND version = $5 AND state <> 'revoked'\n                FOR SHARE\n            )\n            UPDATE repository_signing_key SET secret_key_enc = $2\n            WHERE id = $1 AND secret_key_enc = $3 AND EXISTS (SELECT 1 FROM dek)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bytea",
+        "Bytea",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "970a94e7badf03a92f54e1f054cb031318564ce98d8c1d90d07463a3c08465ba"
+}

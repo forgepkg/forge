@@ -60,6 +60,9 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     assets: Assets::DEFAULT,
     // The host's image store answers an upstream's Bearer challenge itself.
     upstream_token: UpstreamToken::None,
+    options: &[],
+    prereleases: forge_plugin_api::Prereleases::Dash,
+    indexes: false,
 };
 
 /// The Docker / OCI format.

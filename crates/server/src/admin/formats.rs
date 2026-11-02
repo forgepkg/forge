@@ -1,5 +1,6 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: the format plugins (Docker / OCI, NuGet, raw files),
+//! repositories of: the format plugins (Docker / OCI, NuGet, npm, raw files,
+//! apt),
 //! each as its descriptor describes it.
 
 use axum::extract::State;
@@ -33,6 +34,25 @@ pub struct FormatView {
     /// The largest upload limit a repository may be given (what a push can
     /// stage); `None` when it is unbounded.
     pub max_upload_bytes_limit: Option<u64>,
+    /// The settings of the format's own its repositories carry
+    /// (`options` of a repository).
+    pub options: Vec<OptionView>,
+    /// Its hosted repositories keep indexes signed with keys of their own
+    /// (`/admin/repositories/{name}/signing-keys`): apt.
+    pub signed_indexes: bool,
+}
+
+/// A setting of a format's own.
+#[derive(Debug, Serialize)]
+pub struct OptionView {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    /// The repository kinds that take it.
+    pub kinds: Vec<&'static str>,
+    /// Whether every repository of those kinds sets it.
+    pub required: bool,
+    pub example: &'static str,
 }
 
 /// `GET /admin/formats`: NuGet first, then the images formats (Docker),
@@ -51,6 +71,19 @@ pub async fn list(State(state): State<AppState>) -> Response {
             description: Some(descriptor.description.to_string()),
             default_max_upload_bytes: state.config.default_upload_limit(descriptor.storage),
             max_upload_bytes_limit: ceiling,
+            options: descriptor
+                .options
+                .iter()
+                .map(|option| OptionView {
+                    name: option.name,
+                    label: option.label,
+                    description: option.description,
+                    kinds: option.kinds.iter().map(|k| k.as_str()).collect(),
+                    required: option.required,
+                    example: option.example,
+                })
+                .collect(),
+            signed_indexes: descriptor.indexes,
         }
     };
     let mut plugins: Vec<_> = state.formats.plugins().collect();

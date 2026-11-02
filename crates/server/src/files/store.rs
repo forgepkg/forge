@@ -354,6 +354,7 @@ async fn record_all(
             upstream_etag: None,
             upstream_last_modified: None,
             checked: false,
+            immutable: false,
         };
         let redeploy = if replaceable {
             Redeploy::Allow
@@ -692,6 +693,7 @@ pub async fn import(
         upstream_etag: None,
         upstream_last_modified: None,
         checked: false,
+        immutable: false,
     };
     let redeploy = if file.overwrite && may_replace {
         Redeploy::Allow

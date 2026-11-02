@@ -297,7 +297,7 @@ pub async fn get_upstream_credential(
 /// The re-sealed blob for a sweep, or `None` when `blob` is already sealed
 /// under `binding` with the active DEK. A blob that does not decrypt under
 /// `binding` is logged and skipped.
-async fn reseal_if_due(
+pub(crate) async fn reseal_if_due(
     envelope: &EnvelopeService,
     blob: &[u8],
     binding: AeadBinding<'_>,
@@ -497,6 +497,21 @@ async fn scan_referenced_dek_versions(
             }
             Err(e) => {
                 tracing::warn!(realm_id = row.id, error = %e, "unreadable realm secrets envelope; skipped");
+            }
+        }
+    }
+    let signing_keys = sqlx::query!(
+        r#"SELECT id, secret_key_enc AS "secret_key_enc!" FROM repository_signing_key WHERE secret_key_enc IS NOT NULL"#,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in &signing_keys {
+        match EnvelopeService::blob_dek_version(&row.secret_key_enc) {
+            Ok(version) => {
+                versions.insert(version);
+            }
+            Err(e) => {
+                tracing::warn!(signing_key_id = row.id, error = %e, "unreadable signing key envelope; skipped");
             }
         }
     }

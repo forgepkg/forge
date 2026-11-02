@@ -80,6 +80,14 @@ pub trait Format: Send + Sync {
     /// Order two **normalized** version strings.
     fn compare_versions(&self, a: &str, b: &str) -> Ordering;
 
+    /// Whether the database's prerelease filter (a `-` in the version)
+    /// applies to the format's searches. A format without prereleases (apt,
+    /// whose `-` starts the Debian revision) has every version shown where
+    /// prereleases are hidden. Retention asks [`Self::version_class`].
+    fn has_prereleases(&self) -> bool {
+        true
+    }
+
     /// Lowercase / canonicalize a package id for case-insensitive lookups.
     fn lower_id(&self, id: &str) -> String;
 
