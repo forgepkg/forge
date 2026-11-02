@@ -161,6 +161,34 @@ pub struct CredForwardRealmConfig {
     pub key_pepper: String,
 }
 
+/// The built-in role of an account a realm creates on its own (an `oidc`
+/// realm's first login, a `trusted_header` realm's first request), its
+/// `new_account_access`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewAccountAccess {
+    /// The built-in `reader` role: the account reads every repository.
+    #[default]
+    Reader,
+    /// No built-in role: the account reads only what the roles an
+    /// administrator assigns it grant.
+    RolesOnly,
+}
+
+impl NewAccountAccess {
+    pub(crate) fn is_reader(&self) -> bool {
+        *self == Self::Reader
+    }
+
+    /// The name of the built-in role a new account gets, if any.
+    pub fn role_name(self) -> Option<&'static str> {
+        match self {
+            Self::Reader => Some(authz_dao::READER_ROLE),
+            Self::RolesOnly => None,
+        }
+    }
+}
+
 /// `config` shape for the built-in `local` realm.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,6 +279,9 @@ pub struct OidcRealmConfig {
     /// Create an `app_user` on first successful login when no link exists.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
+    /// The built-in role of an account a login creates (`auto_provision`).
+    #[serde(default, skip_serializing_if = "NewAccountAccess::is_reader")]
+    pub new_account_access: NewAccountAccess,
     /// Link a new OIDC identity to an existing user by username. Off by
     /// default; password accounts and admins are never linked by name.
     #[serde(default)]
@@ -1162,6 +1193,7 @@ impl RealmAuth {
         let runtime = OidcRuntime::build(
             &oidc_config,
             cfg.auto_provision,
+            cfg.new_account_access.role_name(),
             auth,
             self.settings.sessions().clone(),
             &base,
@@ -1372,6 +1404,7 @@ pub async fn seed_auth_realms(
             display_name_claim: o.display_name_claim.clone(),
             // The realm's own: a re-apply keeps the stored value (`apply_seed`).
             auto_provision: true,
+            new_account_access: NewAccountAccess::default(),
             link_existing_by_username: o.link_existing_by_username,
             admin_groups: o.admin_groups.clone(),
             admin_claim: o.admin_claim.clone(),
@@ -1460,14 +1493,16 @@ async fn apply_seed(
                 return Ok(());
             }
             let marker = last_seed;
-            // The block does not set `auto_provision`: the realm keeps its own.
+            // The block sets neither `auto_provision` nor
+            // `new_account_access`: the realm keeps its own.
             let mut config = config;
             if kind == KIND_OIDC {
-                if let (Some(map), Some(kept)) = (
-                    config.as_object_mut(),
-                    existing_config.get("auto_provision"),
-                ) {
-                    map.insert("auto_provision".to_string(), kept.clone());
+                for key in ["auto_provision", "new_account_access"] {
+                    if let (Some(map), Some(kept)) =
+                        (config.as_object_mut(), existing_config.get(key))
+                    {
+                        map.insert(key.to_string(), kept.clone());
+                    }
                 }
             }
             if existing_config == config {

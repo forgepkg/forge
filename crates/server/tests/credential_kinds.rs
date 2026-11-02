@@ -68,7 +68,7 @@ async fn tokens_are_minted_only_from_a_session() {
     let srv = common::start().await;
     let client = srv.client();
     let username = format!("minter{}@example.com", common::unique());
-    srv.create_user(&username, "pw123456-minter", "reader")
+    srv.create_user(&username, "pw123456-minter", "roles_only")
         .await;
 
     let resp = client

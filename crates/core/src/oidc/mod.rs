@@ -93,6 +93,9 @@ pub struct ResolvePolicy {
     /// with a local password, admin rights, a credential-forwarding origin or
     /// an existing IdP link (see [`resolve_user`]).
     pub link_existing_by_username: bool,
+    /// The built-in role a provisioned account gets (the realm's
+    /// `new_account_access`), or none.
+    pub new_account_role: Option<&'static str>,
 }
 
 impl Default for ResolvePolicy {
@@ -100,6 +103,7 @@ impl Default for ResolvePolicy {
         Self {
             auto_provision: true,
             link_existing_by_username: false,
+            new_account_role: None,
         }
     }
 }
@@ -122,8 +126,9 @@ impl Default for ResolvePolicy {
 ///    Otherwise fall through (a fresh, suffixed user is provisioned
 ///    instead).
 /// 3. **No link, no linkable match** + `auto_provision` → create a no-password
-///    user, link. A new account is named by a UPN: a username that is none
-///    refuses the login ([`ResolveError::NotUpn`]).
+///    user with the policy's `new_account_role`, link. A new account is
+///    named by a UPN: a username that is none refuses the login
+///    ([`ResolveError::NotUpn`]).
 /// 4. **Else** → [`ResolveError::NotProvisioned`].
 ///
 /// In every path the resolved user's `active` flag is enforced
@@ -199,7 +204,7 @@ pub async fn resolve_user(
                 claim: mapped.username_claim.clone(),
             });
         }
-        return match provision_oidc_user(pool, login, mapped).await? {
+        return match provision_oidc_user(pool, login, mapped, policy.new_account_role).await? {
             Provisioned::New(user) => {
                 finalize(pool, user, login, &identity_claims, mapped, true).await
             }
@@ -228,7 +233,8 @@ enum Provisioned {
 /// to exceed the number of first logins for one identity racing at once.
 const PROVISION_ATTEMPTS: u32 = 16;
 
-/// Insert the auto-provisioned, password-less OIDC user. A username collision
+/// Insert the auto-provisioned, password-less OIDC user with the built-in
+/// role `new_account_role`, in one transaction. A username collision
 /// with a concurrent insert (several first logins picking the same free name
 /// at once) is retried: if a concurrent login has meanwhile linked this very
 /// identity, its account is adopted instead of provisioning another one;
@@ -238,12 +244,13 @@ async fn provision_oidc_user(
     pool: &PgPool,
     login: &ValidatedLogin,
     mapped: &MappedClaims,
+    new_account_role: Option<&str>,
 ) -> Result<Provisioned, ResolveError> {
     let base = mapped.username.clone();
     let mut attempt = 0;
     loop {
         let username = unique_username(pool, &base).await?;
-        let inserted = user_dao::insert_user(
+        let inserted = insert_with_role(
             pool,
             NewUser {
                 username,
@@ -257,6 +264,7 @@ async fn provision_oidc_user(
                 auth_source: "oidc".to_string(),
                 external_subject: Some(login.subject.clone()),
             },
+            new_account_role,
         )
         .await;
         match inserted {
@@ -276,6 +284,24 @@ async fn provision_oidc_user(
             Err(e) => return Err(ResolveError::Db(e.to_string())),
         }
     }
+}
+
+/// Insert `new` and give it the built-in role `role`, in one transaction.
+async fn insert_with_role(
+    pool: &PgPool,
+    new: NewUser,
+    role: Option<&str>,
+) -> sqlx::Result<AppUser> {
+    let mut tx = forge_db::begin(pool).await?;
+    let user = user_dao::insert_user(&mut *tx, new).await?;
+    if let Some(name) = role {
+        let role_id = authz_dao::role_id_by_name(&mut *tx, name)
+            .await?
+            .ok_or_else(|| sqlx::Error::Protocol(format!("the built-in {name} role is missing")))?;
+        authz_dao::assign_role(&mut *tx, user.id, role_id).await?;
+    }
+    tx.commit().await?;
+    Ok(user)
 }
 
 /// Common tail for every resolution branch: enforce `active`, upsert the

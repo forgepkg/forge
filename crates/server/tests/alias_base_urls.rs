@@ -608,7 +608,7 @@ async fn an_alias_is_one_of_the_servers_own_names_for_trusted_headers() {
         &srv,
         Method::POST,
         "/admin/users",
-        json!({"username": alice, "realm": realm, "role": "reader"}),
+        json!({"username": alice, "realm": realm, "role": "roles_only"}),
     )
     .await;
     assert_eq!(status, 201, "{body}");

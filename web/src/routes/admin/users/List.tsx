@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 
-import { accessLevel, ADMIN_ROLE, WRITER_ROLE } from '~/api/rbac'
+import { accessLevel, ADMIN_ROLE, LEVEL_ROLES } from '~/api/rbac'
 import {
   authSourceLabel,
   isServiceAccount,
@@ -41,8 +41,8 @@ export const Route = createFileRoute('/_app/manage/users')({
  * Admin users screen. Lists every user with how they sign in (password,
  * identity provider, credential forwarding: look-alike usernames from
  * different sources are different accounts), their built-in access level
- * (admin, writer or reader, from their role assignments), the other roles
- * they hold and their status (active, inactive, or invited: their user has
+ * (admin, writer, reader or roles only, from their role assignments), the
+ * other roles they hold and their status (active, inactive, or invited: their user has
  * not chosen a password yet), links to the create page
  * (`/manage/users/new`) and each user's page (where an account is
  * deactivated, reactivated or signed out everywhere), and deletes after a
@@ -221,7 +221,8 @@ function UserRow({
 }
 
 /**
- * The roles a user holds besides the access level's (`admin`, `writer`),
+ * The roles a user holds besides the access level's (`admin`, `writer`,
+ * `reader`),
  * each linked to its role page. A user with the legacy `is_admin` flag but
  * without the `admin` role is still an administrator (the server reads
  * both), so that shows too.
@@ -234,9 +235,7 @@ function RoleBadges({
   roleIds: ReadonlyMap<string, number>
 }) {
   const legacyAdmin = user.is_admin && !user.roles.includes(ADMIN_ROLE)
-  const others = user.roles.filter(
-    (name) => name !== ADMIN_ROLE && name !== WRITER_ROLE,
-  )
+  const others = user.roles.filter((name) => !LEVEL_ROLES.includes(name))
   if (others.length === 0 && !legacyAdmin) {
     return <span className="text-ink-faint">—</span>
   }

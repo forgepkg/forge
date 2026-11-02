@@ -457,7 +457,7 @@ async fn refuses_publishes_that_do_not_hold_up() {
         401
     );
     let reader = format!("reader{}@example.com", unique());
-    srv.create_user(&reader, "reader-password-1", "reader")
+    srv.create_user(&reader, "reader-password-1", "roles_only")
         .await;
     let reader_npm = Npm::new(
         &srv,
@@ -792,7 +792,7 @@ async fn a_selector_on_a_write_grant_scopes_publishes_and_reads() {
     // A user whose one grant is `write` on `@acme/*` of this repository.
     let username = format!("acme{}@example.com", unique());
     let user_id = srv
-        .create_user(&username, "acme-password-1", "reader")
+        .create_user(&username, "acme-password-1", "roles_only")
         .await;
     let selector: Value = admin(
         &srv,

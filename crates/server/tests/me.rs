@@ -47,7 +47,8 @@ async fn me_reachable_by_non_admin() {
     let client = srv.client();
     let username = format!("plain{}@example.com", common::unique());
 
-    srv.create_user(&username, "pw123456-me12", "reader").await;
+    srv.create_user(&username, "pw123456-me12", "roles_only")
+        .await;
 
     // The non-admin is forbidden from the admin API but CAN read /admin/me.
     let resp = client
@@ -87,7 +88,9 @@ async fn me_reflects_the_admin_role() {
     let client = srv.client();
     let username = format!("rbacadmin{}@example.com", common::unique());
 
-    let id = srv.create_user(&username, "pw123456-me12", "reader").await;
+    let id = srv
+        .create_user(&username, "pw123456-me12", "roles_only")
+        .await;
     let resp = client
         .put(format!("{}/admin/users/{id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))
@@ -123,7 +126,9 @@ async fn me_shows_repo_write_to_a_writer() {
     let client = srv.client();
     let username = format!("writer{}@example.com", common::unique());
 
-    let id = srv.create_user(&username, "pw123456-me12", "reader").await;
+    let id = srv
+        .create_user(&username, "pw123456-me12", "roles_only")
+        .await;
     let resp = client
         .put(format!("{}/admin/users/{id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))

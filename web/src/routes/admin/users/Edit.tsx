@@ -6,7 +6,7 @@ import {
   ACCESS_ROLES,
   accessLevel,
   ADMIN_ROLE,
-  WRITER_ROLE,
+  LEVEL_ROLES,
   type AccessLevel,
 } from '~/api/rbac'
 import { ApiError } from '~/lib/httpClient'
@@ -104,7 +104,8 @@ export const Route = createFileRoute('/_app/manage/users/$userId')({
 const ADD_STRIP = 'grid gap-4 border-b border-line px-5 py-4'
 
 /**
- * One user: their built-in access level (reader, writer or admin), which
+ * One user: their built-in access level (roles only, reader, writer or
+ * admin), which
  * admins switch here (in the side column); the roles they hold, which admins
  * assign and remove here (taking `admin` from the last active administrator
  * is refused with the server's reason); their effective access, the union of
@@ -205,14 +206,14 @@ function UserPage() {
 }
 
 /**
- * The user's built-in access level: reader (no built-in role), writer (the
- * `writer` role) or admin (the `admin` role), switched through
- * `/admin/users/{id}/roles`. A switch assigns the new level's role first and
- * then takes the other one, so a refused step (the last active
- * administrator keeps `admin`: 409, with the server's reason) never leaves
- * the user with less access than before. A service account
+ * The user's built-in access level: roles only (no built-in role), reader
+ * (the `reader` role), writer (the `writer` role) or admin (the `admin`
+ * role), switched through `/admin/users/{id}/roles`. A switch assigns the new
+ * level's role first and then takes the others, so a refused step (the last
+ * active administrator keeps `admin`: 409, with the server's reason) never
+ * leaves the user with less access than before. A service account
  * (`serviceAccount`) or an account of a trusted-header realm
- * (`trustedHeader`) is a reader or a writer, never an admin.
+ * (`trustedHeader`) is never an admin.
  */
 export function UserAccess({
   userId,
@@ -238,15 +239,14 @@ export function UserAccess({
     setSaving(true)
     setError(null)
     try {
-      if (chosen !== 'reader') {
-        const name = ACCESS_ROLES[chosen]
-        const role = (roles.data ?? []).find((r) => r.name === name)
-        if (!role) throw new Error(`The built-in role ${name} is missing.`)
+      const keep = chosen === 'roles_only' ? null : ACCESS_ROLES[chosen]
+      if (keep) {
+        const role = (roles.data ?? []).find((r) => r.name === keep)
+        if (!role) throw new Error(`The built-in role ${keep} is missing.`)
         await assign.mutateAsync({ userId, roleId: role.id })
       }
       for (const role of held.data ?? []) {
-        const level = role.name === ADMIN_ROLE || role.name === WRITER_ROLE
-        if (level && (chosen === 'reader' || role.name !== ACCESS_ROLES[chosen])) {
+        if (LEVEL_ROLES.includes(role.name) && role.name !== keep) {
           await unassign.mutateAsync({ userId, roleId: role.id })
         }
       }

@@ -118,7 +118,7 @@ async fn retention_admin_gated() {
 
     // Non-admin user → 403.
     let username = format!("plain{s}@example.com");
-    srv.create_user(&username, "pw123456-retention", "reader")
+    srv.create_user(&username, "pw123456-retention", "roles_only")
         .await;
 
     let resp = client

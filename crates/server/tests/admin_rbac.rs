@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 async fn make_user(srv: &common::TestServer) -> (i64, String, String) {
     let username = format!("rbac{}@example.com", common::unique());
     let password = "pw12345678-rbac".to_string();
-    let id = srv.create_user(&username, &password, "reader").await;
+    let id = srv.create_user(&username, &password, "roles_only").await;
     (id, username, password)
 }
 
@@ -1000,6 +1000,79 @@ async fn the_writer_role_publishes_everywhere_but_deletes_and_administers_nothin
     }
 }
 
+/// The built-in `reader` role reads every repository, ones created after it
+/// was assigned too, and publishes nothing; an account without a built-in
+/// role (`roles_only`) reads nothing it holds no role for. A new user is a
+/// reader unless the request says otherwise, a new service account is not.
+#[tokio::test]
+async fn the_reader_role_reads_everywhere_and_publishes_nothing() {
+    let srv = common::start().await;
+    let (au, ap) = srv.admin_basic();
+    let client = srv.client();
+    let token_of = |username: String, password: String| {
+        let srv = &srv;
+        let client = client.clone();
+        async move {
+            let session = srv.login(&username, &password).await;
+            let created: Value = session
+                .apply(client.post(format!("{}/admin/me/tokens", srv.base_url)))
+                .json(&json!({"name": "ci"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            created["token"].as_str().expect("token").to_string()
+        }
+    };
+    let reader = format!("reader{}@example.com", common::unique());
+    let password = "pw12345678-reader".to_string();
+    srv.create_user(&reader, &password, "reader").await;
+    let reader_token = token_of(reader, password).await;
+    let (_, nobody, password) = make_user(&srv).await;
+    let nobody_token = token_of(nobody, password).await;
+    let repo = make_repo(&srv).await;
+
+    let read = |token: &str| {
+        client
+            .get(format!("{}/repository/{repo}/index.json", srv.base_url))
+            .header("X-NuGet-ApiKey", token)
+            .send()
+    };
+    assert_eq!(read(&reader_token).await.unwrap().status(), 200);
+    assert_eq!(read(&nobody_token).await.unwrap().status(), 403);
+    let id = format!("Reader.Pkg{}", common::unique());
+    assert_eq!(
+        publish_with_token(&srv, &repo, &reader_token, &id, "1.0.0").await,
+        403,
+        "a reader publishes nothing"
+    );
+
+    for (body, roles) in [
+        (
+            json!({"username": format!("new{}@example.com", common::unique())}),
+            json!(["reader"]),
+        ),
+        (
+            json!({"username": format!("svc{}@example.com", common::unique()), "kind": "service"}),
+            json!([]),
+        ),
+    ] {
+        let created: Value = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .basic_auth(&au, Some(&ap))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(created["roles"], roles, "{created}");
+    }
+}
+
 /// A read-only scoped token cannot write even though its owner can.
 #[tokio::test]
 async fn token_scope_narrows_to_read_only() {
@@ -1371,7 +1444,9 @@ async fn anonymous_read_off_applies_at_once_to_users_holding_the_anonymous_role(
         .unwrap();
     assert_eq!(resp.status(), 201);
     let username = format!("anonuser{s}@example.com");
-    let user_id = srv.create_user(&username, "pw-anon-role-1", "reader").await;
+    let user_id = srv
+        .create_user(&username, "pw-anon-role-1", "roles_only")
+        .await;
     let resp = client
         .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
         .basic_auth(&au, Some(&ap))

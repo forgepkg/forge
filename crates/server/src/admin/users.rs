@@ -20,9 +20,11 @@
 //! (forwarding the local part of the name to its upstream). Or of that
 //! trusted-header realm: the headers of the proxy in front then name it (a
 //! realm without `auto_provision` names only the accounts created here).
-//! `role` makes the account a reader (the default), a writer or an
-//! administrator; an account of a trusted-header realm is never an
-//! administrator (**400**, #547): its headers never make it one.
+//! `role` gives the account its built-in role: `reader` (the default; reads
+//! every repository), `writer` or `admin`, or `roles_only` for none, so that
+//! only the roles assigned to it later count. An account of a trusted-header
+//! realm is never an administrator (**400**, #547): its headers never make it
+//! one.
 //!
 //! An invited account signs in by no path until its user has chosen the
 //! password. `POST /admin/users/{id}/invitation` makes a new invitation
@@ -42,7 +44,8 @@
 //! machine or a network (a CI pipeline, a build agent, a network the load
 //! balancer admits) that nobody signs in to. It has a description (what it
 //! is for, who owns it) and no password, invitation or email, and never holds
-//! the built-in `admin` role. It authenticates with the API tokens an
+//! the built-in `admin` role; without a `role` it holds none (`roles_only`),
+//! only the roles assigned to it for its pipeline or network. It authenticates with the API tokens an
 //! administrator issues for it (`POST /admin/users/{id}/tokens`), or through
 //! the trusted-header realm named `realm`, which alone may name it. Roles,
 //! grants, tokens and deactivation work as for a user;
@@ -310,11 +313,13 @@ async fn service_account_realm(state: &AppState, name: &str) -> Result<i64, Resp
 }
 
 /// What a new account may do: its built-in role.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessRole {
-    /// Reads what every signed-in user reads: no built-in role.
-    #[default]
+    /// No built-in role: what the account's other roles grant, and what
+    /// every signed-in user reads.
+    RolesOnly,
+    /// The built-in `reader` role: reads every repository.
     Reader,
     /// The built-in `writer` role: publishes to every repository.
     Writer,
@@ -325,7 +330,8 @@ pub enum AccessRole {
 impl AccessRole {
     fn role_name(self) -> Option<&'static str> {
         match self {
-            AccessRole::Reader => None,
+            AccessRole::RolesOnly => None,
+            AccessRole::Reader => Some(authz_dao::READER_ROLE),
             AccessRole::Writer => Some(authz_dao::WRITER_ROLE),
             AccessRole::Admin => Some(authz_dao::ADMIN_ROLE),
         }
@@ -351,9 +357,10 @@ pub struct CreateUser {
     /// account has none.
     #[serde(default)]
     pub email: Option<String>,
-    /// `admin` is refused for a service account.
+    /// `admin` is refused for a service account. Unset: `reader` for a
+    /// user, `roles_only` for a service account.
     #[serde(default)]
-    pub role: AccessRole,
+    pub role: Option<AccessRole>,
     /// The name of a `credential_forwarding` or `trusted_header` realm; for
     /// a service account, of a `trusted_header` one.
     #[serde(default)]
@@ -522,6 +529,10 @@ pub async fn create(
         },
         None => None,
     };
+    let role = body.role.unwrap_or(match body.kind {
+        AccountKind::User => AccessRole::Reader,
+        AccountKind::Service => AccessRole::RolesOnly,
+    });
     let account = match (body.kind, body.realm.as_deref()) {
         (AccountKind::Service, realm) => {
             if email.is_some() {
@@ -531,7 +542,7 @@ pub async fn create(
                 )
                     .into_response();
             }
-            if body.role == AccessRole::Admin {
+            if role == AccessRole::Admin {
                 return service_account_admin_refused();
             }
             let description = match parse_description(body.description.as_deref()) {
@@ -563,7 +574,7 @@ pub async fn create(
                     NewAccount::Forwarded { realm_id: r.id }
                 }
                 Ok(Some(r)) if r.kind == crate::auth::KIND_TRUSTED_HEADER => {
-                    if body.role == AccessRole::Admin {
+                    if role == AccessRole::Admin {
                         return trusted_header_admin_refused();
                     }
                     NewAccount::TrustedHeader { realm_id: r.id }
@@ -600,7 +611,7 @@ pub async fn create(
         }
     };
 
-    let u = match insert_with_role(&state, &username, &account, email.as_deref(), body.role).await {
+    let u = match insert_with_role(&state, &username, &account, email.as_deref(), role).await {
         Ok(u) => u,
         Err(e) if is_unique_violation(&e) => {
             return (StatusCode::CONFLICT, "username already exists").into_response();

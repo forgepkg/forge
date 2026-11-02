@@ -50,7 +50,8 @@ async fn non_admin_forbidden() {
     let username = format!("plain{suffix}@example.com");
 
     // Admin creates a non-admin user, who chooses a password.
-    srv.create_user(&username, "pw123456-plain", "reader").await;
+    srv.create_user(&username, "pw123456-plain", "roles_only")
+        .await;
 
     // That user authenticates (password basic) but is forbidden from admin.
     let resp = client
@@ -317,7 +318,7 @@ async fn reauth_endpoint_admin_only_and_idempotent() {
 
     // Admin creates a non-admin user and discovers its id.
     let user_id = srv
-        .create_user(&username, "pw123456-reauth", "reader")
+        .create_user(&username, "pw123456-reauth", "roles_only")
         .await;
 
     // Admin reauth → 204 (no cached verdicts, but still succeeds idempotently).
@@ -1865,7 +1866,7 @@ async fn create_and_login(
     password: &str,
 ) -> (i64, String, String) {
     let client = srv.client();
-    let user_id = srv.create_user(username, password, "reader").await;
+    let user_id = srv.create_user(username, password, "roles_only").await;
     let resp = client
         .post(format!("{}/auth/login", srv.base_url))
         .json(&json!({"username": username, "password": password}))
