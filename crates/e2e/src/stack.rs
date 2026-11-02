@@ -981,13 +981,18 @@ impl TestServer {
     /// do (#322): the admin invites it and, with no email service
     /// configured, gets the invitation link; the user then chooses
     /// `password` (at least 12 characters) from it. Returns its numeric id.
+    ///
+    /// The account is Roles only (`"role": "roles_only"`): it holds the roles
+    /// a test assigns and nothing else. `POST /admin/users`' default, Reader,
+    /// would give it the built-in `reader` role, an unscoped read of every
+    /// repository that lifts any selector-scoped or missing grant (#785).
     pub async fn create_user(&self, username: &str, password: &str) -> i64 {
         let (u, p) = self.admin_basic();
         let body: serde_json::Value = self
             .client()
             .post(format!("{}/admin/users", self.base_url))
             .basic_auth(&u, Some(&p))
-            .json(&serde_json::json!({"username": username}))
+            .json(&serde_json::json!({"username": username, "role": "roles_only"}))
             .send()
             .await
             .unwrap()
