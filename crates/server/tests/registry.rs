@@ -278,7 +278,9 @@ fn repo_name(prefix: &str) -> String {
 /// A user and an API token for it.
 async fn user_with_token(srv: &TestServer) -> (String, String, i64) {
     let username = format!("dev{}x{}@example.com", std::process::id(), unique());
-    let id = srv.create_user(&username, "pw-pw-pw-pw-pw", "reader").await;
+    let id = srv
+        .create_user(&username, "pw-pw-pw-pw-pw", "roles_only")
+        .await;
     let token: Value = admin_post(
         srv,
         &format!("/admin/users/{id}/tokens"),

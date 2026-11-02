@@ -817,7 +817,9 @@ async fn selectors_scope_paths() {
 
     // A user who may read `pdfium/**` and `**/*.tgz` outside `secret/`.
     let username = format!("reader{}@example.com", unique());
-    let user_id = srv.create_user(&username, "pw12345678-raw", "reader").await;
+    let user_id = srv
+        .create_user(&username, "pw12345678-raw", "roles_only")
+        .await;
     let selector: Value = client
         .post(format!("{}/admin/content-selectors", srv.base_url))
         .basic_auth(&au, Some(&ap))

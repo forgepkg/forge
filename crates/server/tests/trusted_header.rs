@@ -62,8 +62,26 @@ impl Realm {
 
 /// Create a trusted-header realm through the admin API.
 async fn create_realm(srv: &TestServer, auto_provision: bool) -> Realm {
+    create_realm_with(srv, auto_provision, None).await
+}
+
+/// [`create_realm`] with the realm's `new_account_access`, when given.
+async fn create_realm_with(
+    srv: &TestServer,
+    auto_provision: bool,
+    new_account_access: Option<&str>,
+) -> Realm {
     let n = common::unique();
     let (user_header, secret_header) = (format!("X-User-{n}"), format!("X-Proxy-Secret-{n}"));
+    let mut config = json!({
+        "username_header": user_header,
+        "secret_header": secret_header,
+        "secret": SECRET,
+        "auto_provision": auto_provision,
+    });
+    if let Some(access) = new_account_access {
+        config["new_account_access"] = json!(access);
+    }
     let (u, p) = srv.admin_basic();
     let resp = srv
         .client()
@@ -72,12 +90,7 @@ async fn create_realm(srv: &TestServer, auto_provision: bool) -> Realm {
         .json(&json!({
             "kind": "trusted_header",
             "name": format!("proxy-{n}"),
-            "config": {
-                "username_header": user_header,
-                "secret_header": secret_header,
-                "secret": SECRET,
-                "auto_provision": auto_provision,
-            },
+            "config": config,
         }))
         .send()
         .await
@@ -138,7 +151,7 @@ async fn the_headers_authenticate_an_account_of_the_realm() {
     let srv = proxied().await;
     let realm = create_realm(&srv, false).await;
     let alice = format!("alice{}@example.com", common::unique());
-    let id = create_account(&srv, &realm, &alice, "reader").await;
+    let id = create_account(&srv, &realm, &alice, "roles_only").await;
 
     let (status, body) = me(realm.named(me_request(&srv), &alice)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -187,6 +200,16 @@ async fn the_headers_authenticate_an_account_of_the_realm() {
     );
 }
 
+/// The names of the roles `user_id` holds.
+async fn roles_of(srv: &TestServer, user_id: i64) -> Vec<String> {
+    forge_db::authz_dao::list_roles_for_user(&srv.pool, user_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|role| role.name)
+        .collect()
+}
+
 #[tokio::test]
 async fn auto_provision_creates_a_users_account() {
     let srv = proxied().await;
@@ -196,7 +219,8 @@ async fn auto_provision_creates_a_users_account() {
     let (status, first) = me(realm.named(me_request(&srv), &carol)).await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(first["user"]["username"], json!(carol));
-    // The account it created gets no administrator, and no role at all.
+    // The account it created gets no administrator, and the built-in
+    // `reader` role alone (the realm's `new_account_access`, by default).
     assert_eq!(first["is_admin"], json!(false));
     assert_eq!(first["capabilities"], json!(["repo.read"]));
     let (status, again) = me(realm.named(me_request(&srv), &carol)).await;
@@ -215,6 +239,15 @@ async fn auto_provision_creates_a_users_account() {
         .await
         .unwrap();
     assert_eq!(realm_id, Some(realm.id));
+    assert_eq!(roles_of(&srv, user.id).await, ["reader"]);
+
+    // A realm whose new accounts get no built-in role.
+    let narrow = create_realm_with(&srv, true, Some("roles_only")).await;
+    let erin = format!("erin{}@example.com", common::unique());
+    let (status, body) = me(narrow.named(me_request(&srv), &erin)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let erin_id = body["user"]["id"].as_i64().unwrap();
+    assert!(roles_of(&srv, erin_id).await.is_empty());
 
     // Every account is named by a UPN; so is every account a realm creates.
     assert_eq!(
@@ -232,7 +265,7 @@ async fn refused_headers_name_nobody_never_anonymous() {
     let other = create_realm(&srv, true).await;
     let n = common::unique();
     let dave = format!("dave{n}@example.com");
-    create_account(&srv, &other, &dave, "reader").await;
+    create_account(&srv, &other, &dave, "roles_only").await;
     let oidc = format!("olga{n}@example.com");
     forge_db::user_dao::insert_user(
         &srv.pool,
@@ -320,7 +353,7 @@ async fn headers_from_an_untrusted_peer_or_a_foreign_host_are_ignored() {
     let srv = common::start().await;
     let realm = create_realm(&srv, false).await;
     let alice = format!("alice{}@example.com", common::unique());
-    create_account(&srv, &realm, &alice, "reader").await;
+    create_account(&srv, &realm, &alice, "roles_only").await;
     for rb in [
         realm.named(me_request(&srv), &alice),
         me_request(&srv)
@@ -335,7 +368,7 @@ async fn headers_from_an_untrusted_peer_or_a_foreign_host_are_ignored() {
     let srv = proxied().await;
     let realm = create_realm(&srv, false).await;
     let bob = format!("bob{}@example.com", common::unique());
-    create_account(&srv, &realm, &bob, "reader").await;
+    create_account(&srv, &realm, &bob, "roles_only").await;
     let (status, _) = me(realm.named(me_request(&srv), &bob)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -352,7 +385,7 @@ async fn a_cross_site_mutation_is_refused_and_the_headers_mint_no_tokens() {
     let srv = proxied().await;
     let realm = create_realm(&srv, false).await;
     let alice = format!("alice{}@example.com", common::unique());
-    create_account(&srv, &realm, &alice, "reader").await;
+    create_account(&srv, &realm, &alice, "roles_only").await;
     let mint = |site: &'static str| {
         realm
             .named(
@@ -428,7 +461,7 @@ async fn the_headers_never_make_an_administrator_and_own_credentials_win() {
 
     // A token of the request's own wins over the headers…
     let other = format!("frank{n}@example.com");
-    let other_id = create_account(&srv, &realm, &other, "reader").await;
+    let other_id = create_account(&srv, &realm, &other, "roles_only").await;
     let token: Value = srv
         .client()
         .post(format!("{}/admin/users/{other_id}/tokens", srv.base_url))
@@ -469,7 +502,7 @@ async fn a_bearer_token_of_the_requests_own_wins_over_the_headers() {
     let realm = create_realm(&srv, false).await;
     let n = common::unique();
     let office = format!("office{n}@example.com");
-    create_account(&srv, &realm, &office, "reader").await;
+    create_account(&srv, &realm, &office, "roles_only").await;
     let ci = format!("ci{n}@example.com");
     let ci_id = create_account(&srv, &realm, &ci, "writer").await;
     let (u, p) = srv.admin_basic();
@@ -548,9 +581,9 @@ async fn refused_headers_leave_the_requests_own_credentials_and_sign_in() {
     let realm = create_realm(&srv, false).await;
     let n = common::unique();
     let office = format!("office{n}@example.com");
-    let office_id = create_account(&srv, &realm, &office, "reader").await;
+    let office_id = create_account(&srv, &realm, &office, "roles_only").await;
     let ci = format!("ci{n}@example.com");
-    let ci_id = create_account(&srv, &realm, &ci, "reader").await;
+    let ci_id = create_account(&srv, &realm, &ci, "roles_only").await;
     let (u, p) = srv.admin_basic();
     let repo = format!("npm{n}");
     let resp = srv
@@ -747,7 +780,7 @@ async fn a_denied_request_the_headers_name_is_challenged() {
     let realm = create_realm(&srv, false).await;
     let n = common::unique();
     let office = format!("office{n}@example.com");
-    create_account(&srv, &realm, &office, "reader").await;
+    create_account(&srv, &realm, &office, "roles_only").await;
     let (u, p) = srv.admin_basic();
     let feed = format!("private{n}");
     let resp = srv

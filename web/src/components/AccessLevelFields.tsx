@@ -8,10 +8,16 @@ export const ACCESS_LEVEL_OPTIONS: ReadonlyArray<{
   description: string
 }> = [
   {
+    level: 'roles_only',
+    label: 'Roles only',
+    description:
+      'No built-in role: reads and publishes only what the user’s other roles and anonymous access allow.',
+  },
+  {
     level: 'reader',
     label: 'Reader',
     description:
-      'No built-in role: reads what the user’s other roles and anonymous access allow, and publishes nothing.',
+      'Reads packages on every repository, ones created later too. Publishes nothing.',
   },
   {
     level: 'writer',
@@ -32,7 +38,7 @@ export const ACCESS_LEVEL_OPTIONS: ReadonlyArray<{
  * account of a trusted-header realm, whose headers never make anyone an
  * administrator (#547).
  */
-export const SERVICE_ACCOUNT_LEVELS: readonly AccessLevel[] = ['reader', 'writer']
+export const SERVICE_ACCOUNT_LEVELS: readonly AccessLevel[] = ['roles_only', 'reader', 'writer']
 
 /**
  * A radio group of the built-in access levels (`ACCESS_LEVEL_OPTIONS`): the

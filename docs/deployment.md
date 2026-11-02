@@ -367,17 +367,20 @@ narrow what its owner may do.
 
 ### Built-in roles
 
-Every install has three built-in roles, which cannot be deleted or renamed:
+Every install has four built-in roles, which cannot be deleted or renamed:
 
 | Role | Grants | For |
 | --- | --- | --- |
 | `admin` | Everything: every repository at every level, and administering the instance (repositories, users, roles, authentication, settings). It holds no grant; membership is the administration. | Administrators. |
 | `writer` | `write` on every repository, ones created later included. No `delete`, no administration. | People and CI that publish packages: a NuGet push, an npm publish, a container image push, a Helm chart upload, a raw file upload, of a package or image the repository does not have yet too. |
+| `reader` | `read` on every repository, ones created later included. No publishing, no administration. | People and CI that install packages: a NuGet restore, an `npm install`, an image pull, through groups too. |
 | `anonymous` | What unauthenticated callers may read (`anonymous_read` repositories add to it). Its grants reach signed-in users too, as `read`, under the anonymous mode `all`. | Anonymous access. |
 
-A user who holds neither `admin` nor `writer` is a **reader**: they read what
-their other roles and anonymous access allow. **Admin → Users** shows each
-user's level (admin, writer or reader), and the user's page switches it.
+A user's **access level** is the highest of these roles they hold: admin,
+writer or reader. A user who holds none of them is **roles only**: they read
+and publish what their other roles and anonymous access allow, and nothing
+else. **Admin → Users** shows each user's level, and the user's page switches
+it; their other roles add to it either way.
 
 A writer cannot unlist or delete package versions, delete image tags, or
 delete or replace raw files: deleting stays with administrators and custom
@@ -393,7 +396,8 @@ An administrator sets another person's password only by accepting their
 invitation for them (below). **Admin → Users →
 New user** (`/manage/users/new`) takes the [username](#usernames), the email
 address the invitation goes to (the username unless entered: a UPN is not
-always a mailbox) and the access level (reader, writer or admin). Forge
+always a mailbox) and the access level (reader, the default, writer, admin
+or roles only). Forge
 creates the account without a password and emails its user a link,
 `<server.public_base_url>/invite#<token>`, with which they choose their own
 password, at least 12 characters, and then sign in.
@@ -435,7 +439,7 @@ password, at least 12 characters, and then sign in.
   bootstrap admin keeps its configured password.
 
 The admin API is `POST /admin/users` with `{"username", "email", "role"}`
-(`role` is `reader`, `writer` or `admin`), or `"realm"` for a
+(`role` is `reader`, the default, `writer`, `admin` or `roles_only`), or `"realm"` for a
 credential-forwarding account. It takes no password: the answer carries
 `invitation` (`email_sent`, `error`, `expires_at`, and the `link` when no
 email went out). `POST /admin/users/{id}/invitation` (`{"send_email": true |
@@ -483,7 +487,8 @@ network that nobody signs in to.
 - **It has** a [username](#usernames) (a UPN, in the name space every
   account shares, so a name always means one account), a description of
   what it is for and who owns it, roles and grants like a user's, and an
-  access level of reader or writer.
+  access level of roles only (the default: the roles chosen for its
+  pipeline or network), reader or writer.
 - **It never has** a password, an invitation or an email address, and
   nobody signs in to it: the login screen, a password over HTTP Basic,
   credential forwarding and OIDC (no identity is linked to it by name) all
@@ -529,8 +534,9 @@ balancer name it for the network's clients (see the examples under
 [Trusted-header realms](#trusted-header-realms)).
 
 The admin API is the users API: `POST /admin/users` with `"kind":
-"service"`, the `username`, an optional `description` and `role` (`reader`
-or `writer`), and the optional `realm` (the name of a trusted-header realm).
+"service"`, the `username`, an optional `description` and `role`
+(`roles_only`, the default, `reader` or `writer`), and the optional `realm`
+(the name of a trusted-header realm).
 `GET /admin/users?kind=service` lists the service accounts; every user view
 carries `kind`, `description`, `realm` and `last_used_at`. `PATCH
 /admin/users/{id}` sets a service account's `description` and `realm`
@@ -566,8 +572,11 @@ The rule applies wherever an account is created:
   one, such as `email`. A name that is taken gets `-2`, `-3`, … on its local
   part. Whether a realm creates the account at all is set for each realm:
   **Auto-provision users on first login** on its page under **Admin →
-  Authentication** (`auto_provision` in its config). The `[oidc]` block does
-  not set it; the realm it seeds starts with it on.
+  Authentication** (`auto_provision` in its config), and so is the access
+  level of the accounts it creates: **Access level of new accounts**,
+  reader (the default) or roles only (`new_account_access`: `reader` or
+  `roles_only`). The `[oidc]` block sets neither; the realm it seeds starts
+  creating readers.
 - **Credential-forwarding realms create no accounts.** Create each one under
   **Admin → Users** with the realm as its sign-in (`POST /admin/users` with
   `"realm": "<name>"` and no password), named by a UPN whose local part is the
@@ -577,7 +586,8 @@ The rule applies wherever an account is created:
   realm config that sets `auto_provision: true` is refused by the admin API.
 - **Trusted-header realms** ([below](#trusted-header-realms)) name an account
   by the UPN in their username header. With **Create a user's account on its
-  first request** (`auto_provision`) the realm creates a missing one;
+  first request** (`auto_provision`) the realm creates a missing one, with
+  the realm's **Access level of new accounts** (`new_account_access`);
   otherwise create each account under **Admin → Users** with the realm as its
   sign-in. A name that is no UPN is refused.
 - **[Service accounts](#service-accounts)**, under **Admin → Service
@@ -1168,6 +1178,7 @@ balancer or reverse proxy in front of Forge names, in the style of
 | `secret_header` | The header the proxy proves itself with, e.g. `X-Forge-Proxy-Secret`. |
 | `secret` | Its value, 16 to 1024 printable characters without spaces (`openssl rand -hex 32`, or **Generate a secret** in the form). Write-only and sealed at rest like the other realms' secrets; compared in constant time. |
 | `auto_provision` | Create a user's account on its first request when the realm has none of the name (off by default). It never creates a service account, nor takes over the name of one. |
+| `new_account_access` | The access level of the accounts `auto_provision` creates: `reader` (the default, the built-in `reader` role) or `roles_only` (no built-in role). |
 
 What Forge believes, and when:
 

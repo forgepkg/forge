@@ -53,6 +53,8 @@ export interface OidcRealmConfig {
   email_claim?: string
   display_name_claim?: string
   auto_provision?: boolean
+  /** The built-in role of an account a login creates; absent: `reader`. */
+  new_account_access?: NewAccountAccess
   link_existing_by_username?: boolean
   admin_groups?: string[]
   admin_claim?: string
@@ -156,7 +158,17 @@ export interface TrustedHeaderConfig {
   secret_set?: boolean
   /** Create a user's account on its first request. */
   auto_provision?: boolean
+  /** The built-in role of an account the realm creates; absent: `reader`. */
+  new_account_access?: NewAccountAccess
 }
+
+/**
+ * The built-in access level of an account a realm creates on its own (an
+ * OIDC realm's first login, a trusted-header realm's first request):
+ * `reader` (the `reader` role: reads every repository) or `roles_only` (no
+ * built-in role: an administrator assigns its roles).
+ */
+export type NewAccountAccess = 'reader' | 'roles_only'
 
 /** The built-in `local` realm's config. */
 export interface LocalRealmConfig {

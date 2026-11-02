@@ -586,6 +586,66 @@ async fn resolve_user_auto_provisions_then_relinks_same_user() {
     );
 }
 
+/// A provisioned account gets the policy's built-in role (the realm's
+/// `new_account_access`), only when it is created: a later login leaves an
+/// account's roles to its administrators.
+#[tokio::test]
+async fn resolve_user_gives_a_provisioned_account_the_new_account_role() {
+    let pool = pool().await;
+    let idp = MockIdp::start().await;
+    let n = unique();
+    let sub = format!("sub-{n}");
+    let username = format!("reader-{n}@example.com");
+    let policy = ResolvePolicy {
+        new_account_role: Some(forge_db::authz_dao::READER_ROLE),
+        ..ResolvePolicy::default()
+    };
+    let holds_reader = |user_id: i64| {
+        let pool = pool.clone();
+        async move {
+            forge_db::authz_dao::user_has_role(&pool, user_id, forge_db::authz_dao::READER_ROLE)
+                .await
+                .unwrap()
+        }
+    };
+
+    let validated = run_login(&pool, &idp, &sub, &username, json!(["user"])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    let user = oidc::resolve_user(&pool, &validated, &mapped, &policy)
+        .await
+        .expect("provision");
+    assert!(holds_reader(user.id).await);
+
+    // An administrator takes the role away; the next login does not give it
+    // back.
+    let role = forge_db::authz_dao::role_id_by_name(&pool, forge_db::authz_dao::READER_ROLE)
+        .await
+        .unwrap()
+        .expect("the built-in reader role");
+    forge_db::authz_dao::unassign_role(&pool, user.id, role)
+        .await
+        .unwrap();
+    let validated = run_login(&pool, &idp, &sub, &username, json!(["user"])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    let again = oidc::resolve_user(&pool, &validated, &mapped, &policy)
+        .await
+        .expect("relink");
+    assert_eq!(again.id, user.id);
+    assert!(!holds_reader(user.id).await);
+
+    // Without a role in the policy, a new account holds none.
+    let other = format!("nobody-{n}@example.com");
+    let validated = run_login(&pool, &idp, &format!("sub2-{n}"), &other, json!(["user"])).await;
+    let mapped = map_claims(&validated.claims, &admin_mapping());
+    let user = oidc::resolve_user(&pool, &validated, &mapped, &ResolvePolicy::default())
+        .await
+        .expect("provision");
+    assert!(forge_db::authz_dao::list_roles_for_user(&pool, user.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 #[tokio::test]
 async fn resolve_user_never_links_password_or_admin_account_by_username() {
     let pool = pool().await;
@@ -619,6 +679,7 @@ async fn resolve_user_never_links_password_or_admin_account_by_username() {
         let policy = ResolvePolicy {
             auto_provision: true,
             link_existing_by_username: link,
+            new_account_role: None,
         };
         let user = oidc::resolve_user(&pool, &validated, &mapped, &policy)
             .await
@@ -740,6 +801,7 @@ async fn resolve_user_links_passwordless_non_admin_when_enabled() {
         &ResolvePolicy {
             auto_provision: true,
             link_existing_by_username: true,
+            new_account_role: None,
         },
     )
     .await
@@ -771,6 +833,7 @@ async fn resolve_user_never_links_an_invited_account() {
         &ResolvePolicy {
             auto_provision: true,
             link_existing_by_username: true,
+            new_account_role: None,
         },
     )
     .await
@@ -807,6 +870,7 @@ async fn resolve_user_never_links_a_service_account() {
         &ResolvePolicy {
             auto_provision: true,
             link_existing_by_username: true,
+            new_account_role: None,
         },
     )
     .await
@@ -834,6 +898,7 @@ async fn resolve_user_never_links_upstream_or_already_linked_accounts() {
     let link = ResolvePolicy {
         auto_provision: true,
         link_existing_by_username: true,
+        new_account_role: None,
     };
 
     let upstream_name = format!("directory-{n}@example.com");
@@ -949,6 +1014,7 @@ async fn resolve_user_rejects_when_no_provision_and_no_match() {
         &ResolvePolicy {
             auto_provision: false,
             link_existing_by_username: false,
+            new_account_role: None,
         },
     )
     .await;

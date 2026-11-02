@@ -785,7 +785,7 @@ impl TestServer {
     pub async fn caller(&self) -> Caller {
         let username = format!("caller{}x{}@example.com", std::process::id(), unique());
         let id = self
-            .create_user(&username, "caller-password-1", "reader")
+            .create_user(&username, "caller-password-1", "roles_only")
             .await;
         let token = self
             .admin_call(

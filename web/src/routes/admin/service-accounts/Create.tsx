@@ -26,8 +26,10 @@ export const Route = createFileRoute('/_app/manage/service-accounts/new')({
 /**
  * Create a service account (#508): its name (a UPN, like every account's),
  * what it is for and who owns it, optionally the trusted-header realm whose
- * proxy names it, and its built-in access level (reader or writer: a service
- * account is never an admin). It gets no password, invitation or email; its
+ * proxy names it, and its built-in access level (roles only, the default:
+ * the roles assigned to it for its pipeline or network; reader or writer: a
+ * service account is never an admin). It gets no password, invitation or
+ * email; its
  * API tokens are issued on its page, where the create leads.
  */
 function CreateServiceAccountPage() {
@@ -39,7 +41,7 @@ function CreateServiceAccountPage() {
   const [description, setDescription] = useState('')
   // '' = no realm: only its tokens authenticate it.
   const [realm, setRealm] = useState('')
-  const [level, setLevel] = useState<AccessLevel>('reader')
+  const [level, setLevel] = useState<AccessLevel>('roles_only')
   const [created, setCreated] = useState<CreatedUser | null>(null)
 
   const usernameError = username.trim() ? upnError(username) : null
@@ -69,7 +71,7 @@ function CreateServiceAccountPage() {
     setUsernameTouched(false)
     setDescription('')
     setRealm('')
-    setLevel('reader')
+    setLevel('roles_only')
     create.reset()
   }
 
