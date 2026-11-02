@@ -43,8 +43,9 @@
 //! An account of another source (local, OIDC, credential forwarding) or of
 //! another realm is never mapped onto, whatever its name. With
 //! `auto_provision` the realm creates a missing user's account on its first
-//! request; otherwise an administrator creates it (`POST /admin/users` with
-//! the realm). The realm never creates service accounts: an administrator
+//! request, with the built-in role its `new_account_access` names (`reader`,
+//! the default, or none with `roles_only`); otherwise an administrator
+//! creates it (`POST /admin/users` with the realm). The realm never creates service accounts: an administrator
 //! creates each one with its realm (`"kind": "service"`). The built-in
 //! `anonymous` principal is never one of them. When the realm last
 //! authenticated an account is kept (`app_user.last_auth_source_at`, written
@@ -67,13 +68,14 @@ use forge_core::auth::login_throttle::username_for_log;
 use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::auth::token::{PrincipalSource, SourceOutcome};
 use forge_db::model::{AppUser, AuthRealm};
-use forge_db::user_dao;
+use forge_db::{authz_dao, user_dao};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 
+use super::realms::NewAccountAccess;
 use super::RealmAuth;
 
 /// Shortest accepted `secret`, in bytes.
@@ -122,6 +124,9 @@ pub struct TrustedHeaderRealmConfig {
     /// has the name. Off: an administrator creates the accounts.
     #[serde(default)]
     pub auto_provision: bool,
+    /// The built-in role of an account the realm creates (`auto_provision`).
+    #[serde(default, skip_serializing_if = "NewAccountAccess::is_reader")]
+    pub new_account_access: NewAccountAccess,
 }
 
 impl std::fmt::Debug for TrustedHeaderRealmConfig {
@@ -131,6 +136,7 @@ impl std::fmt::Debug for TrustedHeaderRealmConfig {
             .field("secret_header", &self.secret_header)
             .field("secret", &"<redacted>")
             .field("auto_provision", &self.auto_provision)
+            .field("new_account_access", &self.new_account_access)
             .finish()
     }
 }
@@ -185,6 +191,8 @@ pub struct TrustedHeaderRealm {
     /// value's, whatever its length.
     secret_sha256: [u8; 32],
     auto_provision: bool,
+    /// The built-in role of the accounts it creates.
+    new_account_role: Option<&'static str>,
 }
 
 /// What a realm makes of a request's headers.
@@ -212,6 +220,7 @@ impl TrustedHeaderRealm {
             secret_header: HeaderName::from_bytes(cfg.secret_header.as_bytes())?,
             secret_sha256: Sha256::digest(cfg.secret.as_bytes()).into(),
             auto_provision: cfg.auto_provision,
+            new_account_role: cfg.new_account_access.role_name(),
         })
     }
 
@@ -303,7 +312,7 @@ impl TrustedHeaderSource {
             );
             SourceOutcome::Invalid
         };
-        match user_dao::insert_trusted_header_user(&self.pool, username, realm.realm_id).await {
+        match self.insert_account(realm, username).await {
             Ok(user) => {
                 tracing::info!(
                     target: "forge::audit",
@@ -332,6 +341,27 @@ impl TrustedHeaderSource {
                 SourceOutcome::Unavailable
             }
         }
+    }
+
+    /// Insert the account `username` of `realm` with the realm's built-in
+    /// role for new accounts, in one transaction.
+    async fn insert_account(
+        &self,
+        realm: &TrustedHeaderRealm,
+        username: &str,
+    ) -> sqlx::Result<AppUser> {
+        let mut tx = forge_db::begin(&self.pool).await?;
+        let user = user_dao::insert_trusted_header_user(&mut *tx, username, realm.realm_id).await?;
+        if let Some(name) = realm.new_account_role {
+            let role_id = authz_dao::role_id_by_name(&mut *tx, name)
+                .await?
+                .ok_or_else(|| {
+                    sqlx::Error::Protocol(format!("the built-in {name} role is missing"))
+                })?;
+            authz_dao::assign_role(&mut *tx, user.id, role_id).await?;
+        }
+        tx.commit().await?;
+        Ok(user)
     }
 
     async fn signed_in(&self, realm: &TrustedHeaderRealm, user: &AppUser) -> SourceOutcome {

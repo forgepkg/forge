@@ -26,7 +26,8 @@ pub struct NewAuthRealm {
     /// Unique slug/display name (DB CHECK enforces the shape).
     pub name: String,
     pub enabled: bool,
-    /// Unique order; lower tries first. Use [`next_priority`] for "append".
+    /// Unique order; lower tries first. Use [`lock_next_priority`] for
+    /// "append".
     pub priority: i32,
     pub config: JsonValue,
 }
@@ -87,7 +88,10 @@ pub async fn find_realm_by_id(pool: &PgPool, id: i64) -> sqlx::Result<Option<Aut
 }
 
 /// Find a realm by its unique name.
-pub async fn find_realm_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Option<AuthRealm>> {
+pub async fn find_realm_by_name<'e, E>(executor: E, name: &str) -> sqlx::Result<Option<AuthRealm>>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         AuthRealm,
         r#"
@@ -97,28 +101,79 @@ pub async fn find_realm_by_name(pool: &PgPool, name: &str) -> sqlx::Result<Optio
         "#,
         name,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Find the realm at `priority` in the try-order (unique, like the name).
+pub async fn find_realm_by_priority<'e, E>(
+    executor: E,
+    priority: i32,
+) -> sqlx::Result<Option<AuthRealm>>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        SELECT id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
+        FROM auth_realm
+        WHERE priority = $1
+        "#,
+        priority,
+    )
+    .fetch_optional(executor)
     .await
 }
 
 /// Whether any realm of `kind` exists (enabled or not). Used by the one-shot
 /// legacy-config import to avoid re-seeding a kind the operator already
 /// manages.
-pub async fn kind_exists(pool: &PgPool, kind: &str) -> sqlx::Result<bool> {
+pub async fn kind_exists<'e, E>(executor: E, kind: &str) -> sqlx::Result<bool>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_scalar!(
         r#"SELECT EXISTS(SELECT 1 FROM auth_realm WHERE kind = $1) AS "exists!""#,
         kind,
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// The next free priority slot (max + 10, so manual inserts between rows stay
 /// possible). `10` on an empty table — though the table is never empty in
-/// practice (the schema seeds the `local` row).
+/// practice (the schema seeds the `local` row). Read without a lock, so a
+/// concurrent insert can take the same slot; [`lock_next_priority`] cannot.
 pub async fn next_priority(pool: &PgPool) -> sqlx::Result<i32> {
     let max: Option<i32> = sqlx::query_scalar!(r#"SELECT max(priority) FROM auth_realm"#)
         .fetch_one(pool)
+        .await?;
+    Ok(max.map_or(10, |m| m.saturating_add(10)))
+}
+
+/// Take a `SHARE ROW EXCLUSIVE` lock on the table that `tx` holds until it
+/// ends. The lock conflicts with itself and with every write to the table
+/// (reads go on), so a priority found free under it stays free until `tx`
+/// takes it.
+pub async fn lock_priorities(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> sqlx::Result<()> {
+    sqlx::query!(r#"LOCK TABLE auth_realm IN SHARE ROW EXCLUSIVE MODE"#)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// [`next_priority`] for an insert in the transaction `tx`, read under the
+/// lock of [`lock_priorities`]. Concurrent appends take turns on it: each
+/// reads the maximum after the one before it committed its row, where reading
+/// it unlocked let both pick the same priority and the second fail on its
+/// unique key.
+pub async fn lock_next_priority(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> sqlx::Result<i32> {
+    lock_priorities(tx).await?;
+    let max: Option<i32> = sqlx::query_scalar!(r#"SELECT max(priority) FROM auth_realm"#)
+        .fetch_one(&mut **tx)
         .await?;
     Ok(max.map_or(10, |m| m.saturating_add(10)))
 }
@@ -148,13 +203,55 @@ where
     .await
 }
 
+/// Reserve the id of a realm to insert with [`insert_realm_with_id`]: its
+/// secrets are sealed for the row id, here before the insert.
+pub async fn reserve_realm_id(pool: &PgPool) -> sqlx::Result<i64> {
+    sqlx::query_scalar!(r#"SELECT nextval(pg_get_serial_sequence('auth_realm', 'id')) AS "id!""#)
+        .fetch_one(pool)
+        .await
+}
+
+/// [`insert_realm`] under the id [`reserve_realm_id`] reserved, with the
+/// secrets sealed for it (`secrets_enc`) in the same row.
+pub async fn insert_realm_with_id<'e, E>(
+    executor: E,
+    id: i64,
+    new: NewAuthRealm,
+    secrets_enc: Option<&[u8]>,
+) -> sqlx::Result<AuthRealm>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        INSERT INTO auth_realm (id, kind, name, enabled, priority, config, secrets_enc)
+        OVERRIDING SYSTEM VALUE
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
+        "#,
+        id,
+        new.kind,
+        new.name,
+        new.enabled,
+        new.priority,
+        new.config,
+        secrets_enc,
+    )
+    .fetch_one(executor)
+    .await
+}
+
 /// Update a realm's mutable fields by id. Returns the updated row, or `None`
 /// when the id does not exist. Bumps `updated_at`.
-pub async fn update_realm(
-    pool: &PgPool,
+pub async fn update_realm<'e, E>(
+    executor: E,
     id: i64,
     upd: AuthRealmUpdate,
-) -> sqlx::Result<Option<AuthRealm>> {
+) -> sqlx::Result<Option<AuthRealm>>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_as!(
         AuthRealm,
         r#"
@@ -173,7 +270,7 @@ pub async fn update_realm(
         upd.priority,
         upd.config,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 

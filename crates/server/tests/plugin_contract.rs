@@ -34,6 +34,9 @@ const PROBE: Descriptor = Descriptor {
         manifest_type: "text/plain",
     },
     upstream_token: UpstreamToken::None,
+    options: &[],
+    prereleases: forge_plugin::api::Prereleases::Dash,
+    indexes: false,
 };
 
 /// A package is text whose first line is `<id> <version>`.
@@ -649,7 +652,9 @@ async fn mutations_outside_the_selector_are_unknown() {
             .send()
     };
     let username = format!("deleter{}@example.com", unique());
-    let user_id = srv.create_user(&username, "pw-0123456789", "reader").await;
+    let user_id = srv
+        .create_user(&username, "pw-0123456789", "roles_only")
+        .await;
     let selector: Value = admin(
         reqwest::Method::POST,
         "/admin/content-selectors",

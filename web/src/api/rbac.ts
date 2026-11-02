@@ -7,8 +7,8 @@ import { httpClient } from '~/lib/httpClient'
  * Types mirror the Rust DTOs in `crates/server/src/admin/`:
  *
  *  - `RoleView` (`roles.rs`) counts the role's grants and users. The built-in
- *    roles (`admin`, `writer`, `anonymous`) cannot be deleted; only a
- *    role's description can change.
+ *    roles (`admin`, `writer`, `reader`, `anonymous`) cannot be deleted; only
+ *    a role's description can change.
  *  - `GrantView` (`grants.rs`) is `(repository or every repository, level,
  *    selector?)`: `repository_id: null` means every repository. A role holds
  *    one grant per repository and selector; adding one again sets its level.
@@ -49,31 +49,39 @@ export function levelLabel(level: Level): string {
 /** The built-in role names. */
 export const ADMIN_ROLE = 'admin'
 export const WRITER_ROLE = 'writer'
+export const READER_ROLE = 'reader'
 export const ANONYMOUS_ROLE = 'anonymous'
 
 /**
  * A user's built-in access level: `admin` (the `admin` role), `writer` (the
  * `writer` role: read and publish packages on every repository, no
- * administration) or `reader` (neither; what they may read follows from
- * their other roles and the anonymous reach). The levels are the built-in
- * roles an admin switches between on the user page.
+ * administration), `reader` (the `reader` role: read every repository) or
+ * `roles_only` (none of them; what they may read follows from their other
+ * roles and the anonymous reach). The levels are the built-in roles an admin
+ * switches between on the user page.
  */
-export type AccessLevel = 'reader' | 'writer' | 'admin'
+export type AccessLevel = 'roles_only' | 'reader' | 'writer' | 'admin'
 
-/** The built-in role behind each access level above `reader`. */
-export const ACCESS_ROLES: Record<Exclude<AccessLevel, 'reader'>, string> = {
+/** The built-in role behind each access level but `roles_only`. */
+export const ACCESS_ROLES: Record<Exclude<AccessLevel, 'roles_only'>, string> = {
   admin: ADMIN_ROLE,
   writer: WRITER_ROLE,
+  reader: READER_ROLE,
 }
 
+/** The roles that make an access level, which the level shows instead. */
+export const LEVEL_ROLES: readonly string[] = Object.values(ACCESS_ROLES)
+
 /**
- * The access level of a user holding `roles` (role names). An administrator
- * by the legacy `is_admin` flag counts as `admin`.
+ * The access level of a user holding `roles` (role names): the highest
+ * built-in role they hold. An administrator by the legacy `is_admin` flag
+ * counts as `admin`.
  */
 export function accessLevel(roles: readonly string[], isAdmin = false): AccessLevel {
   if (isAdmin || roles.includes(ADMIN_ROLE)) return 'admin'
   if (roles.includes(WRITER_ROLE)) return 'writer'
-  return 'reader'
+  if (roles.includes(READER_ROLE)) return 'reader'
+  return 'roles_only'
 }
 
 /** A role (`RoleView`). */

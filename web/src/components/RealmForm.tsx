@@ -4,6 +4,7 @@ import type {
   ClientAuthentication,
   CredentialForwardingConfig,
   LocalRealmConfig,
+  NewAccountAccess,
   OidcRealmConfig,
   RealmConfig,
   RealmKind,
@@ -87,6 +88,7 @@ export interface RealmFormValues {
   enabled: boolean
   // oidc
   auto_provision: boolean
+  new_account_access: NewAccountAccess
   // oidc
   issuer: string
   client_id: string
@@ -165,6 +167,7 @@ export interface RealmFormValues {
   secret: string
   /** Trusted header: create a user's account on its first request (off by default). */
   header_auto_provision: boolean
+  header_new_account_access: NewAccountAccess
 }
 
 export interface RealmFormProps {
@@ -235,6 +238,38 @@ function ClientPasswordsPanel({
   )
 }
 
+/**
+ * The built-in access level of the accounts a realm creates on its own
+ * (`new_account_access`): Reader, or Roles only. Off while the realm creates
+ * none.
+ */
+function NewAccountAccessField({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: NewAccountAccess
+  onChange: (value: NewAccountAccess) => void
+  disabled: boolean
+}) {
+  return (
+    <SelectField
+      label="Access level of new accounts"
+      value={value}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.value as NewAccountAccess)}
+      description={
+        value === 'reader'
+          ? 'Reads packages on every repository, ones created later too. An administrator changes it on the user’s page.'
+          : 'No built-in role: the account reads only what the roles an administrator assigns it allow.'
+      }
+    >
+      <option value="reader">Reader</option>
+      <option value="roles_only">Roles only</option>
+    </SelectField>
+  )
+}
+
 /** A string list as one entry per line (entries may contain commas). */
 function joinLines(list?: string[]): string {
   return (list ?? []).join('\n')
@@ -289,6 +324,7 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
     name: existing?.name ?? '',
     enabled: existing?.enabled ?? true,
     auto_provision: oidc.auto_provision ?? true,
+    new_account_access: oidc.new_account_access ?? 'reader',
     issuer: (existing?.kind === 'workload_identity' ? wif.issuer : oidc.issuer) ?? '',
     client_id: oidc.client_id ?? '',
     // Never seed secrets — they are write-only and redacted on read.
@@ -353,6 +389,7 @@ export function seedRealmFormValues(existing?: RealmView): RealmFormValues {
     secret_header: header.secret_header ?? '',
     secret: '',
     header_auto_provision: header.auto_provision ?? false,
+    header_new_account_access: header.new_account_access ?? 'reader',
   }
 }
 
@@ -1186,6 +1223,11 @@ export function RealmForm({
                   checked={values.auto_provision}
                   onChange={(c) => set('auto_provision', c)}
                 />
+                <NewAccountAccessField
+                  value={values.new_account_access}
+                  onChange={(v) => set('new_account_access', v)}
+                  disabled={!values.auto_provision}
+                />
                 <Checkbox
                   label="Link existing users by username"
                   checked={values.link_existing_by_username}
@@ -1725,9 +1767,14 @@ export function RealmForm({
                 <Checkbox
                   label="Create a user's account on its first request"
                   aria-label="Create a user's account on its first request"
-                  description="For an SSO proxy whose users all may use Forge. The new accounts hold no role."
+                  description="For an SSO proxy whose users all may use Forge."
                   checked={values.header_auto_provision}
                   onChange={(c) => set('header_auto_provision', c)}
+                />
+                <NewAccountAccessField
+                  value={values.header_new_account_access}
+                  onChange={(v) => set('header_new_account_access', v)}
+                  disabled={!values.header_auto_provision}
                 />
               </div>
             </Panel>
@@ -2226,6 +2273,10 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
     const requiredClaims = parseClaimRules(values.required_claims)
     if (Object.keys(requiredClaims).length > 0) config.required_claims = requiredClaims
     if (values.button_label.trim() !== '') config.button_label = values.button_label.trim()
+    // Absent is `reader`, as the server stores it.
+    if (values.new_account_access !== 'reader') {
+      config.new_account_access = values.new_account_access
+    }
     return config
   }
   if (values.kind === 'credential_forwarding') {
@@ -2288,6 +2339,10 @@ export function toRealmConfig(values: RealmFormValues): RealmConfig {
       username_header: values.username_header.trim(),
       secret_header: values.secret_header.trim(),
       auto_provision: values.header_auto_provision,
+    }
+    // Absent is `reader`, as the server stores it.
+    if (values.header_new_account_access !== 'reader') {
+      config.new_account_access = values.header_new_account_access
     }
     if (values.secret !== '') config.secret = values.secret
     return config

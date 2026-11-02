@@ -122,7 +122,8 @@ pub struct OidcRuntime {
 impl OidcRuntime {
     /// Build the runtime from the validated `[oidc]` config + whether a login
     /// creates an unknown user's account (`auto_provision`, the realm's own
-    /// setting: the `[oidc]` block has none) + how the client authenticates
+    /// setting: the `[oidc]` block has none) and the built-in role it gets
+    /// (`new_account_role`, the realm's `new_account_access`) + how the client authenticates
     /// at the token endpoint (`auth`; the config's `client_secret` is not
     /// read) + the session service a login signs in with + the public base
     /// URL (which decides the cookie `Secure` attribute) + the shared cache.
@@ -133,6 +134,7 @@ impl OidcRuntime {
     pub fn build(
         oidc: &OidcConfig,
         auto_provision: bool,
+        new_account_role: Option<&'static str>,
         auth: ClientAuth,
         sessions: SessionService,
         public_base_url: &str,
@@ -161,6 +163,7 @@ impl OidcRuntime {
         let policy = ResolvePolicy {
             auto_provision,
             link_existing_by_username: oidc.link_existing_by_username,
+            new_account_role,
         };
         let cookie_secure = public_base_url.trim().starts_with("https://");
 

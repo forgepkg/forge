@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO repository_signing_key\n            (repository_id, fingerprint, algorithm, user_id, public_key)\n        VALUES ($1, $2, $3, $4, $5)\n        ON CONFLICT (repository_id, fingerprint) DO NOTHING\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "repository_signing_key",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "da9d18c9d644ad6e08b43a5461257a4d8b826dd348b737c3c11942efff3d4682"
+}

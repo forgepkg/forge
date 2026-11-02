@@ -30,6 +30,9 @@ pub const ANONYMOUS_ROLE: &str = "anonymous";
 /// `write` on every repository, to read and publish packages without deleting
 /// them or any right to administer the instance.
 pub const WRITER_ROLE: &str = "writer";
+/// The fixed slug of the built-in `reader` role: level `read` on every
+/// repository, to read packages without publishing any.
+pub const READER_ROLE: &str = "reader";
 
 /// Shared shape of the effective-set query rows (user + anonymous variants).
 /// The two `sqlx::query!` calls generate distinct anonymous structs with the

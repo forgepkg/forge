@@ -438,6 +438,7 @@ mod tests {
         Remote {
             url: "https://registry.example.com/".into(),
             index: Some("{}".into()),
+            options: Vec::new(),
         }
     }
 

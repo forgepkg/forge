@@ -10,13 +10,15 @@ streaming of package bytes.
 
 Every plugin is built in: a crate under `crates/formats/<id>/` linked into
 the server and called directly, like any other Rust code. Plugins need no
-configuration. Forge ships four: **Docker / OCI**
+configuration. Forge ships five: **Docker / OCI**
 ([`crates/formats/docker`](../crates/formats/docker),
 [Images formats](#images-formats), [docker.md](docker.md)), **NuGet**
 ([`crates/formats/nuget`](../crates/formats/nuget)), **npm**
-([`crates/formats/npm`](../crates/formats/npm), [npm.md](npm.md)) and **raw
+([`crates/formats/npm`](../crates/formats/npm), [npm.md](npm.md)), **raw
 files** ([`crates/formats/raw`](../crates/formats/raw),
-[Files formats](#files-formats)). Helm charts are pushed to Docker
+[Files formats](#files-formats)) and **apt**
+([`crates/formats/apt`](../crates/formats/apt),
+[Signed indexes](#signed-indexes), [apt.md](apt.md)). Helm charts are pushed to Docker
 repositories ([docker.md](docker.md#helm-charts)).
 
 > **Status: preview.** The plugin contract may change in any release. The
@@ -25,7 +27,9 @@ repositories ([docker.md](docker.md#helm-charts)).
 > ([Files formats](#files-formats)), and `render` returns an action, like
 > `handle`; for npm, request bodies, document uploads, changes (tags,
 > deprecations), logins and forwards followed ([npm as a plugin](#npm-as-a-plugin)),
-> and images formats ([Images formats](#images-formats)).
+> and images formats ([Images formats](#images-formats)); for apt, signed
+> indexes ([Signed indexes](#signed-indexes)) and format options
+> ([Format options](#format-options)).
 
 ## Contents
 
@@ -33,6 +37,8 @@ repositories ([docker.md](docker.md#helm-charts)).
 - [How it fits together](#how-it-fits-together)
 - [Files formats](#files-formats)
 - [Images formats](#images-formats)
+- [Signed indexes](#signed-indexes)
+- [Format options](#format-options)
 - [Retention](#retention)
 - [Proxy repositories](#proxy-repositories)
 - [Using a plugin](#using-a-plugin)
@@ -70,6 +76,16 @@ crates/formats/npm/
 ├── src/publish.rs # the tarball inside a publish document, as it streams
 ├── src/proxy.rs   # proxies: reading another registry (upstream)
 └── tests/         # the protocol against canned answers
+
+crates/formats/apt/
+├── Cargo.toml
+├── src/lib.rs     # DESCRIPTOR (kinds hosted/proxy, the distribution option,
+│                  # signed indexes) and impl FormatPlugin for Apt
+├── src/version.rs # Debian versions, ordered as dpkg orders them
+├── src/deb.rs, control.rs, manifest.rs  # a .deb's control file, deb822
+├── src/layout.rs  # dists/ and pool/ paths
+├── src/index.rs   # Packages and Release of a hosted repository's packages
+└── src/proxy.rs   # proxies: the upstream's files, packages checked against its index
 
 crates/formats/docker/
 ├── Cargo.toml
@@ -352,6 +368,63 @@ requires; the token is the host's, cached for its lifetime.
 `testing::converse_answered` runs `upstream` against canned answers with
 their status and headers, as the Docker plugin's tests do.
 
+## Signed indexes
+
+A package format whose clients read indexes rather than ask for each
+package (apt's `Release` and `Packages`) says `indexes: true` in its
+descriptor. The host then keeps the indexes of its hosted repositories:
+
+- **Made of the packages.** `index` gets every listed version of the
+  repository (its id, version, stored summary, size and digests, by id,
+  then version) and returns the index files: paths, content, content types.
+  The plugin makes them as a pure function of its input (apt's
+  [`index.rs`](../crates/formats/apt/src/index.rs)), so the summary a
+  package format stores at publish should hold what its index lists of a
+  version: making an index reads no package and no manifest.
+- **Signed by the host.** A file names its signed copies, each a cleartext
+  signature or an ASCII-armored detached one (apt's `InRelease` and
+  `Release.gpg` of `Release`). The host signs them with every OpenPGP key of
+  the repository: Ed25519 keys, generated when the repository is created or
+  imported, sealed with the secret encryption, managed under
+  `/admin/repositories/{name}/signing-keys`. The plugin never sees a key;
+  it gets the public keys, as a binary keyring and armored, to publish
+  (apt's `key.gpg` and `key.asc`).
+- **Made when needed.** A request asks for an index file with
+  `index(path)`, answered as `file`. When the repository's listed versions,
+  options or keys, or the format's version, changed since the index was
+  made (a fingerprint the host keeps), the host makes a new one first:
+  no write path needs a hook, and a burst of publishes makes one index.
+- **Replaced at once.** A new index's files are stored, and the previous
+  one's other files deleted, in one transaction, which checks that the
+  packages and keys it was made of are still the repository's. A file
+  marked `immutable` (apt's `by-hash` copies) stays a day after the last
+  index that named it, for clients that read the previous `Release`.
+- **Served as files.** The index files are files of the repository in the
+  host's file store, served with `serve-file` (validators, ranges,
+  conditional requests). A package format may ask `file`, `fetch-file` and
+  `index` and answer `serve-file`: a hosted repository's index files, and
+  a proxy's copies of its upstream's files (apt's proxies pass the
+  upstream's signed indexes and packages on unchanged). `file_package`
+  names the package a file belongs to (apt's pool files), which package
+  selectors decide on; a file of no package (an index) is every reader's.
+
+## Format options
+
+A format's repositories may carry settings of its own (apt's
+`distribution`): the descriptor lists them (`options`: a name, a label, a
+description, the kinds that take one, whether it is required, an example),
+`GET /admin/formats` names them, and the web UI's repository form offers
+them. An administrator sets them in the admin API's `options` (`null` on an
+update clears one that is not required); the plugin checks and normalizes
+each value (`check_option`), and gets the repository's in
+`Repository::options` and a proxy's in `Remote::options`.
+
+Which versions the host's search filter takes for prereleases is the
+descriptor's too (`prereleases`): those with a `-` in the normalized version
+(SemVer: NuGet, npm), or none (apt, whose `-` starts the Debian revision), so
+the web UI lists every version. Retention asks the plugin instead
+(`version_class`, [Retention](#retention)).
+
 ## Retention
 
 The host runs every retention rule ([retention.md](retention.md)) for a
@@ -375,8 +448,9 @@ them; these are the hooks the formats planned next need:
   before its release, so `prerelease_superseded_for_days` deletes them once
   the release exists, and `release_type: snapshots` with `older_than_days`
   deletes builds older than N days.
-- **apt:** `retention_partition` returns a version's architecture, so keep-N
-  counts per package and architecture.
+- **apt:** every version is a release (`version_class`: a `-` starts the
+  Debian revision). A package id is `<name>:<architecture>`, so keep-N already
+  counts per package and architecture, without a `retention_partition`.
 
 Both run inline for every version and rule a run evaluates: keep them quick
 and free of I/O.
@@ -401,7 +475,7 @@ what they say:
 | `manifest(id, version)` | The manifest, verified to be that version's, without downloading the package |
 | `metadata(versions)`, `dating(versions)` | Per version: listing state, publish time, a manifest summary for a version not downloaded yet, and (`dating`) when it was created upstream, which the package delay counts from |
 | `search(query)` | A page of the upstream's search results |
-| `file(path)` | A files format: the file's URL, or none when the upstream cannot have it. The host downloads it (following redirects; credentials go to `remote_url`'s origin only), caches it, and re-validates it with a conditional GET once the repository's `max_age_seconds` has passed (raw: `<remote_url>/<path>`) |
+| `file(path)` | The file's URL, or none when the upstream cannot have it. The host downloads it (following redirects; credentials go to `remote_url`'s origin only), caches it, and re-validates it with a conditional GET once the repository's `max_age_seconds` (a package format: its metadata TTL) has passed (raw: `<remote_url>/<path>`). Answered `file-at`, it says more: that the file never changes (`immutable`: never re-validated, as apt's packages and `by-hash` copies), and the size and SHA-256 the upstream's index gives it, which the host checks before it caches the file (502 when it does not match) |
 | `tags(id)` | The tags the upstream gives the package. The host keeps the last ones read, for when the upstream is down |
 
 Each operation is a conversation: `upstream` either answers or asks for
@@ -463,12 +537,13 @@ cached.
 ## Using a plugin
 
 `GET /admin/formats` lists every format the server can create repositories
-of: the plugins (Docker, NuGet, npm, raw files), each from its descriptor, with
-the repository kinds it supports, what its repositories hold (`storage`:
-`packages`, `files` or `images`) and where its repositories are served. The
-web UI's *New repository* form offers them. Plugins serve **hosted** and
-**group** repositories, and **proxies** when they implement the upstream
-side (all four do).
+of: the plugins (Docker, NuGet, npm, raw files, apt), each from its
+descriptor, with the repository kinds it supports, what its repositories hold
+(`storage`: `packages`, `files` or `images`), its options and whether it keeps
+signed indexes, and where its repositories are served. The web UI's *New
+repository* form offers them. Plugins serve **hosted** and **group**
+repositories (apt: hosted only), and **proxies** when they implement the
+upstream side (all five do).
 
 A repository of a plugin's format is created like any other, with the
 plugin's format id, and served under `/repository`:
@@ -655,10 +730,11 @@ to lift them:
 - **One package file per version.** Formats that publish several files per
   version (PyPI wheels per platform, Maven's jar, pom and sources) need
   multi-asset versions.
-- **Prerelease is "contains a `-`" for searches.** This is right for SemVer
-  formats. Retention asks the plugin (`version_class`, [Retention](#retention)),
-  but the host's search filter (`prerelease`) still reads the `-`; a format
-  with another rule (PEP 440's `1.0a1`) needs the search to ask it too.
+- **Prerelease is "contains a `-`", or nothing is, for searches.** This is
+  right for SemVer formats and apt ([Format options](#format-options)).
+  Retention asks the plugin (`version_class`, [Retention](#retention)), but
+  the host's search filter (`prerelease`) still reads the `-`; a format with
+  another rule (PEP 440's `1.0a1`) needs the search to ask it too.
 - **Listings are bounded.** A response may load at most 2,048 answers, so
   a listing of every package of a repository covers at most about 2,000
   packages.

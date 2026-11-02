@@ -161,6 +161,34 @@ pub struct CredForwardRealmConfig {
     pub key_pepper: String,
 }
 
+/// The built-in role of an account a realm creates on its own (an `oidc`
+/// realm's first login, a `trusted_header` realm's first request), its
+/// `new_account_access`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewAccountAccess {
+    /// The built-in `reader` role: the account reads every repository.
+    #[default]
+    Reader,
+    /// No built-in role: the account reads only what the roles an
+    /// administrator assigns it grant.
+    RolesOnly,
+}
+
+impl NewAccountAccess {
+    pub(crate) fn is_reader(&self) -> bool {
+        *self == Self::Reader
+    }
+
+    /// The name of the built-in role a new account gets, if any.
+    pub fn role_name(self) -> Option<&'static str> {
+        match self {
+            Self::Reader => Some(authz_dao::READER_ROLE),
+            Self::RolesOnly => None,
+        }
+    }
+}
+
 /// `config` shape for the built-in `local` realm.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -251,6 +279,9 @@ pub struct OidcRealmConfig {
     /// Create an `app_user` on first successful login when no link exists.
     #[serde(default = "default_true")]
     pub auto_provision: bool,
+    /// The built-in role of an account a login creates (`auto_provision`).
+    #[serde(default, skip_serializing_if = "NewAccountAccess::is_reader")]
+    pub new_account_access: NewAccountAccess,
     /// Link a new OIDC identity to an existing user by username. Off by
     /// default; password accounts and admins are never linked by name.
     #[serde(default)]
@@ -1162,6 +1193,7 @@ impl RealmAuth {
         let runtime = OidcRuntime::build(
             &oidc_config,
             cfg.auto_provision,
+            cfg.new_account_access.role_name(),
             auth,
             self.settings.sessions().clone(),
             &base,
@@ -1274,10 +1306,15 @@ pub async fn forget_seed(pool: &PgPool, realm: &forge_db::model::AuthRealm) -> s
 /// * A renamed/deleted seeded row is left alone (the operator took over).
 /// * No block sets an `oidc` realm's `auto_provision` (#313): the seed creates
 ///   the realm with it on, the default, and a re-apply keeps the stored value.
+/// * An `[auth.upstream_basic]` realm goes in at its slot in `[auth]
+///   providers`, an `[oidc]` one after the last realm. When another realm
+///   holds the slot, say one created through the admin API, it goes after the
+///   last realm too, and a warning names the realm holding the slot.
 ///
 /// The one-shot `forge_setting` marker [`REALMS_SEEDED_KEY`] gates only the
 /// initial `local`-realm priority adjustment (which must not fight later
-/// manual reorders).
+/// manual reorders). When another realm holds `local`'s slot, `local` stays
+/// where it is.
 ///
 /// Seeded secrets are sealed with `envelope` like admin writes, and the
 /// drift fingerprint is taken over the *logical* config.
@@ -1296,22 +1333,8 @@ pub async fn seed_auth_realms(
     if first_import {
         // The schema seeds the built-in local row at priority 10;
         // move it to its configured slot when the order says otherwise.
-        if let Some(local) = auth_realm_dao::find_realm_by_name(pool, "local").await? {
-            let desired = provider_idx("local-password").map(slot).unwrap_or(10);
-            if local.priority != desired {
-                auth_realm_dao::update_realm(
-                    pool,
-                    local.id,
-                    forge_db::auth_realm_dao::AuthRealmUpdate {
-                        name: local.name.clone(),
-                        enabled: local.enabled,
-                        priority: desired,
-                        config: local.config.clone(),
-                    },
-                )
-                .await?;
-            }
-        }
+        let desired = provider_idx("local-password").map(slot).unwrap_or(10);
+        move_local_realm(pool, desired).await?;
     }
 
     if let Some(ub) = config.auth.upstream_basic.as_ref().filter(|u| u.enabled) {
@@ -1340,7 +1363,7 @@ pub async fn seed_auth_realms(
             pool,
             envelope,
             KIND_CRED_FORWARD,
-            priority,
+            Some(priority),
             serde_json::to_value(&cfg).expect("serializable"),
         )
         .await?;
@@ -1372,6 +1395,7 @@ pub async fn seed_auth_realms(
             display_name_claim: o.display_name_claim.clone(),
             // The realm's own: a re-apply keeps the stored value (`apply_seed`).
             auto_provision: true,
+            new_account_access: NewAccountAccess::default(),
             link_existing_by_username: o.link_existing_by_username,
             admin_groups: o.admin_groups.clone(),
             admin_claim: o.admin_claim.clone(),
@@ -1381,12 +1405,11 @@ pub async fn seed_auth_realms(
             endpoint_hosts: normalize_endpoint_hosts(&o.endpoint_hosts)
                 .map_err(anyhow::Error::msg)?,
         };
-        let priority = auth_realm_dao::next_priority(pool).await?;
         apply_seed(
             pool,
             envelope,
             KIND_OIDC,
-            priority,
+            None,
             serde_json::to_value(&cfg).expect("serializable"),
         )
         .await?;
@@ -1398,13 +1421,51 @@ pub async fn seed_auth_realms(
     Ok(())
 }
 
+/// Move the built-in `local` realm to `priority`, its slot in the configured
+/// order, unless another realm holds that slot: then `local` stays where it
+/// is. The slot is checked under the lock realm creates take, so none takes it
+/// before the move.
+async fn move_local_realm(pool: &PgPool, priority: i32) -> anyhow::Result<()> {
+    let mut tx = forge_db::begin(pool).await?;
+    auth_realm_dao::lock_priorities(&mut tx).await?;
+    let local = auth_realm_dao::find_realm_by_name(&mut *tx, "local").await?;
+    if let Some(local) = local.filter(|local| local.priority != priority) {
+        match auth_realm_dao::find_realm_by_priority(&mut *tx, priority).await? {
+            Some(holder) => tracing::warn!(
+                realm = %local.name,
+                slot = priority,
+                held_by = %holder.name,
+                priority = local.priority,
+                "the local realm's slot in the configured order is taken; \
+                 it stays where it is (reorder under Admin → Authentication)"
+            ),
+            None => {
+                auth_realm_dao::update_realm(
+                    &mut *tx,
+                    local.id,
+                    forge_db::auth_realm_dao::AuthRealmUpdate {
+                        name: local.name,
+                        enabled: local.enabled,
+                        priority,
+                        config: local.config,
+                    },
+                )
+                .await?;
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Insert or fingerprint-refresh one seeded realm row (see
-/// [`seed_auth_realms`] for the drift-detection contract).
+/// [`seed_auth_realms`] for the drift-detection contract). A missing row
+/// goes in at `priority`, or after the last realm when `None`.
 async fn apply_seed(
     pool: &PgPool,
     envelope: &EnvelopeService,
     kind: &str,
-    priority: i32,
+    priority: Option<i32>,
     config: JsonValue,
 ) -> anyhow::Result<()> {
     let name = seed_name(kind).expect("a seeded realm kind");
@@ -1418,21 +1479,23 @@ async fn apply_seed(
             // taken over and the TOML block is ignored.
             if !auth_realm_dao::kind_exists(pool, kind).await? {
                 let fingerprint = seed_fingerprint(kind, &config);
-                secret_dao::insert_realm_with_secrets(
+                // Checked again under the lock the insert takes: an instance
+                // booting at the same time may have imported the block in the
+                // meantime. That instance records the marker.
+                let seeded = secret_dao::seed_realm_with_secrets(
                     pool,
                     envelope,
-                    forge_db::auth_realm_dao::NewAuthRealm {
-                        kind: kind.to_string(),
-                        name: name.to_string(),
-                        enabled: true,
-                        priority,
-                        config,
-                    },
+                    kind,
+                    name,
+                    priority,
+                    &config,
                     secret_keys(kind),
                 )
                 .await?;
-                authz_dao::set_setting(pool, &key, &fingerprint).await?;
-                tracing::info!(realm = %name, %kind, "imported legacy config into auth_realm");
+                if seeded.is_some() {
+                    authz_dao::set_setting(pool, &key, &fingerprint).await?;
+                    tracing::info!(realm = %name, %kind, "imported legacy config into auth_realm");
+                }
             }
         }
         Some(existing) if existing.kind == kind => {
@@ -1460,14 +1523,16 @@ async fn apply_seed(
                 return Ok(());
             }
             let marker = last_seed;
-            // The block does not set `auto_provision`: the realm keeps its own.
+            // The block sets neither `auto_provision` nor
+            // `new_account_access`: the realm keeps its own.
             let mut config = config;
             if kind == KIND_OIDC {
-                if let (Some(map), Some(kept)) = (
-                    config.as_object_mut(),
-                    existing_config.get("auto_provision"),
-                ) {
-                    map.insert("auto_provision".to_string(), kept.clone());
+                for key in ["auto_provision", "new_account_access"] {
+                    if let (Some(map), Some(kept)) =
+                        (config.as_object_mut(), existing_config.get(key))
+                    {
+                        map.insert(key.to_string(), kept.clone());
+                    }
                 }
             }
             if existing_config == config {

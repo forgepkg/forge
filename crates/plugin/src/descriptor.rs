@@ -48,7 +48,43 @@ pub fn check_one(descriptor: &Descriptor) -> Result<(), String> {
     if let Some(kind) = twice {
         return Err(format!("format {id:?}: kind {kind:?} is listed twice"));
     }
+    if descriptor.indexes && descriptor.storage != Storage::Packages {
+        return Err(format!(
+            "format {id:?}: only a package format keeps indexes"
+        ));
+    }
+    validate_options(descriptor).map_err(|e| format!("format {id:?}: {e}"))?;
     validate_assets(&descriptor.assets).map_err(|e| format!("format {id:?}: {e}"))
+}
+
+/// Options have names of 1–32 lowercase letters, digits and `_` (starting
+/// with a letter), each once, and kinds the format serves.
+fn validate_options(descriptor: &Descriptor) -> Result<(), String> {
+    for (i, option) in descriptor.options.iter().enumerate() {
+        let name = option.name;
+        let well_formed = (1..=32).contains(&name.len())
+            && name.starts_with(|c: char| c.is_ascii_lowercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !well_formed {
+            return Err(format!(
+                "option {name:?} must be 1-32 lowercase letters, digits or '_', starting with a letter"
+            ));
+        }
+        if descriptor.options[..i].iter().any(|o| o.name == name) {
+            return Err(format!("option {name:?} is listed twice"));
+        }
+        if option.kinds.is_empty() || option.kinds.iter().any(|k| !descriptor.kinds.contains(k)) {
+            return Err(format!(
+                "option {name:?} must name kinds of repositories the format serves"
+            ));
+        }
+        if option.label.trim().is_empty() {
+            return Err(format!("option {name:?} needs a label"));
+        }
+    }
+    Ok(())
 }
 
 /// A format id: 2–32 characters of lowercase ASCII letters, digits and `-`,
@@ -122,6 +158,9 @@ mod tests {
         storage: Storage::Packages,
         assets: Assets::DEFAULT,
         upstream_token: UpstreamToken::None,
+        options: &[],
+        prereleases: forge_plugin_api::Prereleases::Dash,
+        indexes: false,
     };
 
     #[test]
@@ -155,6 +194,54 @@ mod tests {
         }
         let unnamed = Descriptor { name: " ", ..GOOD };
         assert!(check(&[&unnamed]).is_err());
+    }
+
+    #[test]
+    fn checks_options_and_indexes() {
+        use forge_plugin_api::FormatOption;
+        const OPTION: FormatOption = FormatOption {
+            name: "distribution",
+            label: "Distribution",
+            description: "",
+            kinds: &[RepositoryKind::Hosted],
+            required: true,
+            example: "bookworm",
+        };
+        let good = Descriptor {
+            options: &[OPTION],
+            indexes: true,
+            ..GOOD
+        };
+        assert_eq!(check(&[&good]), Ok(()));
+        for options in [
+            &[OPTION, OPTION][..],
+            &[FormatOption {
+                name: "Dist",
+                ..OPTION
+            }][..],
+            &[FormatOption { name: "", ..OPTION }][..],
+            &[FormatOption {
+                kinds: &[RepositoryKind::Proxy],
+                ..OPTION
+            }][..],
+            &[FormatOption {
+                kinds: &[],
+                ..OPTION
+            }][..],
+            &[FormatOption {
+                label: "",
+                ..OPTION
+            }][..],
+        ] {
+            let bad = Descriptor { options, ..GOOD };
+            assert!(check(&[&bad]).is_err(), "{options:?} accepted");
+        }
+        let files_with_indexes = Descriptor {
+            storage: Storage::Files,
+            indexes: true,
+            ..GOOD
+        };
+        assert!(check(&[&files_with_indexes]).is_err());
     }
 
     #[test]

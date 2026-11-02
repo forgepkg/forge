@@ -738,6 +738,7 @@ impl Conversation<'_> {
                 forge_plugin::api::IMAGES_MOUNT
             ),
             inline: false,
+            options: Vec::new(),
         }
     }
 

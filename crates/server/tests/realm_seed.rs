@@ -1,7 +1,8 @@
 //! Importing a legacy `[auth.upstream_basic]` or `[oidc]` block into its
 //! `auth_realm` row ("config as seed"): drift detection whose marker holds
-//! nothing derived from the realm's secrets, and an `oidc` realm's
-//! `auto_provision`, which no block sets.
+//! nothing derived from the realm's secrets, an `oidc` realm's
+//! `auto_provision`, which no block sets, imports that race a realm create or
+//! each other, and imports whose slot in the try-order another realm holds.
 //!
 //! Every test seeds into its own database: a seeded, enabled
 //! credential-forwarding realm in the shared one would change how every other
@@ -17,6 +18,7 @@ use sqlx::PgPool;
 
 const MARKER_KEY: &str = "auth_realm_seed_credential_forwarding";
 const OIDC_MARKER_KEY: &str = "auth_realm_seed_oidc";
+const REALMS_SEEDED_KEY: &str = "auth_realms_seeded";
 
 /// A configuration with `blocks` appended.
 fn load(blocks: &str) -> Config {
@@ -283,4 +285,203 @@ async fn an_oidc_seed_leaves_auto_provision_to_the_realm() {
     let (_, stored) = seeded_oidc(&pool).await;
     assert_eq!(stored["admin_claim"], "roles");
     assert_eq!(stored["auto_provision"], false);
+}
+
+/// Start the import of `config`'s blocks, as an instance does at boot, in the
+/// background.
+async fn spawn_seed(pool: &PgPool, config: Config) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let envelope = envelope(pool).await;
+    let pool = pool.clone();
+    tokio::spawn(
+        async move { forge_server::app::ensure_auth_realms(&config, &pool, &envelope).await },
+    )
+}
+
+/// A realm insert that has not committed yet, under the lock a realm create
+/// takes: `kind` and `name` go after the last realm.
+async fn uncommitted_realm(
+    pool: &PgPool,
+    kind: &str,
+    name: &str,
+    config: JsonValue,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE auth_realm IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let priority: i32 = sqlx::query_scalar(
+        "INSERT INTO auth_realm (kind, name, enabled, priority, config) \
+         SELECT $1, $2, false, max(priority) + 10, $3 FROM auth_realm \
+         RETURNING priority",
+    )
+    .bind(kind)
+    .bind(name)
+    .bind(config)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    (tx, priority)
+}
+
+/// The import of a block, once it read that its realm is missing, waits for
+/// the realm table: on the lock appends take, or on the insert's.
+async fn wait_for_the_import(pool: &PgPool) {
+    common::wait_for_lock_wait(
+        pool,
+        &["%LOCK TABLE auth_realm%", "%INSERT INTO auth_realm%"],
+    )
+    .await;
+}
+
+/// A realm created through the admin API while an instance booted could take
+/// the priority the import of an `[oidc]` block had read for its realm, and
+/// the import then failed on the order's unique key: the instance did not
+/// start. The import now waits for the create and appends after it.
+#[tokio::test]
+async fn an_import_racing_a_realm_create_appends_after_it() {
+    let pool = common::fresh_pool().await;
+    let (create, created) = uncommitted_realm(
+        &pool,
+        KIND_CRED_FORWARD,
+        "created",
+        json!({"url": "https://nexus.invalid/status"}),
+    )
+    .await;
+    let import = spawn_seed(&pool, oidc_config("roles")).await;
+    wait_for_the_import(&pool).await;
+    create.commit().await.unwrap();
+
+    import.await.unwrap().expect("the import");
+    let (realm, stored) = seeded_oidc(&pool).await;
+    assert!(
+        realm.priority > created,
+        "{} after {created}",
+        realm.priority
+    );
+    assert_eq!(stored["client_secret"], "shh-secret");
+}
+
+/// Instances that boot at once all import a block whose realm is missing. The
+/// realm went in once, and the others failed on its name or its priority
+/// (their unique keys) and did not start. An import now waits for the one
+/// before it and then leaves the realm it inserted alone.
+#[tokio::test]
+async fn instances_importing_a_block_at_once_insert_its_realm_once() {
+    let pool = common::fresh_pool().await;
+    let (other, _) = uncommitted_realm(
+        &pool,
+        KIND_CRED_FORWARD,
+        "upstream-basic",
+        json!({"url": "https://nexus.invalid/status"}),
+    )
+    .await;
+    let import = spawn_seed(&pool, config("pepper-one", 5000)).await;
+    wait_for_the_import(&pool).await;
+    other.commit().await.unwrap();
+
+    import.await.unwrap().expect("the import");
+    let realms: i64 = sqlx::query_scalar("SELECT count(*) FROM auth_realm WHERE kind = $1")
+        .bind(KIND_CRED_FORWARD)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(realms, 1);
+    assert_eq!(marker(&pool).await, None, "the other instance's to record");
+}
+
+/// An `[auth.upstream_basic]` block with `providers` as the configured order.
+fn ordered_config(providers: &str) -> Config {
+    load(&format!(
+        r#"
+        [auth]
+        providers = {providers}
+
+        [auth.upstream_basic]
+        url = "https://nexus.invalid/service/rest/v1/status"
+
+        [auth.upstream_basic.cache]
+        key_pepper = "pepper-one"
+        "#
+    ))
+}
+
+async fn realm(pool: &PgPool, name: &str) -> forge_db::model::AuthRealm {
+    forge_db::auth_realm_dao::find_realm_by_name(pool, name)
+        .await
+        .unwrap()
+        .expect(name)
+}
+
+/// The `[auth.upstream_basic]` realm goes in at its slot in the configured
+/// order, 20 here. A realm created through the admin API could hold it: one
+/// created before the block was added, or after the seeded realm was deleted.
+/// The import then failed on the order's unique key, on every boot, and the
+/// instance did not start. It now goes after the last realm.
+#[tokio::test]
+async fn an_import_whose_slot_is_taken_goes_after_the_last_realm() {
+    let pool = common::fresh_pool().await;
+    let envelope = envelope(&pool).await;
+    let created = forge_db::secret_dao::append_realm_with_secrets(
+        &pool,
+        &envelope,
+        KIND_OIDC,
+        "corp-sso",
+        false,
+        &json!({"issuer": "https://idp.invalid/v2.0", "client_id": "corp"}),
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.priority, 20, "the block's slot");
+
+    seed(&pool, &config("pepper-one", 5000)).await;
+    let (_, stored) = seeded_config(&pool).await;
+    assert_eq!(stored["key_pepper"], "pepper-one");
+    let seeded = realm(&pool, "upstream-basic").await;
+    assert!(
+        seeded.priority > created.priority,
+        "{} after {}",
+        seeded.priority,
+        created.priority
+    );
+    assert_eq!(realm(&pool, "corp-sso").await.priority, created.priority);
+    assert!(marker(&pool).await.is_some());
+}
+
+/// The first import also moves the built-in `local` realm to its slot in the
+/// configured order. The import repeats on every boot until one completes, and
+/// a realm can hold that slot by then: here the one a block was imported into
+/// before the order changed. The move failed on the order's unique key, on
+/// every boot. `local` now stays where it is.
+#[tokio::test]
+async fn a_first_import_leaves_local_in_place_when_its_slot_is_taken() {
+    let pool = common::fresh_pool().await;
+    seed(
+        &pool,
+        &ordered_config(r#"["upstream-basic", "local-password"]"#),
+    )
+    .await;
+    assert_eq!(realm(&pool, "local").await.priority, 20);
+    assert_eq!(realm(&pool, "upstream-basic").await.priority, 10);
+    // A first import that did not complete.
+    forge_db::authz_dao::delete_setting(&pool, REALMS_SEEDED_KEY)
+        .await
+        .unwrap();
+
+    seed(
+        &pool,
+        &ordered_config(r#"["local-password", "upstream-basic"]"#),
+    )
+    .await;
+    assert_eq!(realm(&pool, "local").await.priority, 20);
+    assert_eq!(realm(&pool, "upstream-basic").await.priority, 10);
+    assert_eq!(
+        forge_db::authz_dao::get_setting(&pool, REALMS_SEEDED_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("true"),
+        "the first import completed"
+    );
 }

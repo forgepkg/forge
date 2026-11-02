@@ -12,6 +12,7 @@ import {
   bytesToMib,
   mibToBytes,
   toCreateBody,
+  toFormValues,
   toUpdateBody,
   validateDockerHost,
   validateRepoName,
@@ -106,6 +107,86 @@ describe('RepositoryForm', () => {
       name: 'pkgs',
       kind: 'hosted',
       format: 'example',
+    })
+  })
+
+  it('asks for the options of a format, and sends them', async () => {
+    const apt: FormatView = {
+      id: 'apt',
+      name: 'apt (Debian/Ubuntu)',
+      kinds: ['hosted', 'proxy'],
+      signed_indexes: true,
+      options: [
+        {
+          name: 'distribution',
+          label: 'Distribution',
+          description: 'The distribution clients name in sources.list.',
+          kinds: ['hosted', 'proxy'],
+          required: true,
+          example: 'bookworm',
+        },
+      ],
+    }
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[NUGET_FORMAT, apt]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    // NuGet has no options.
+    expect(screen.queryByLabelText(/Distribution/)).not.toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('Format'), 'apt')
+    await user.type(screen.getByLabelText('Name'), 'apt-internal')
+    // Required: the form refuses to submit without it.
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(screen.getByText('Distribution is required.')).toBeInTheDocument()
+    await user.type(screen.getByLabelText(/Distribution/), ' bookworm ')
+    await user.click(screen.getByRole('button', { name: 'Create repository' }))
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      name: 'apt-internal',
+      format: 'apt',
+      options: { distribution: 'bookworm' },
+    })
+  })
+
+  it('sends a changed option on edit, and nothing for an unchanged one', () => {
+    const stored: RepoView = {
+      id: 7,
+      name: 'apt-internal',
+      format: 'apt',
+      kind: 'hosted',
+      anonymous_read: false,
+      online: true,
+      remote_url: null,
+      package_delay_seconds: 0,
+      upstream_username: null,
+      has_upstream_password: false,
+      metadata_ttl_seconds: null,
+      not_found_ttl_seconds: null,
+      allow_redeploy: false,
+      prefer_hosted: false,
+      reserved_prefixes: [],
+      host: null,
+      immutable_tags: false,
+      latest_mutable: false,
+      writable_member: null,
+      max_upload_bytes: null,
+      deployment_policy: 'disable_redeploy',
+      options: { distribution: 'bookworm' },
+    }
+    const values = (options: Record<string, string>): RepoFormValues => ({
+      ...toFormValues(stored),
+      options,
+    })
+    expect(toUpdateBody(values({ distribution: 'bookworm' }), stored)).toEqual({})
+    expect(toUpdateBody(values({ distribution: 'trixie' }), stored)).toEqual({
+      options: { distribution: 'trixie' },
     })
   })
 

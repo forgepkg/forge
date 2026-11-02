@@ -114,6 +114,12 @@ export const BUILTIN_ROLES: Role[] = [
   { id: 1, name: 'admin', description: 'Full administrative access.', builtin: true },
   { id: 2, name: 'anonymous', description: 'Unauthenticated callers.', builtin: true },
   {
+    id: 3,
+    name: 'reader',
+    description: 'Read packages on every repository; publish nothing, no administration.',
+    builtin: true,
+  },
+  {
     id: 4,
     name: 'writer',
     description: 'Read and publish packages on every repository; no administration.',
@@ -319,7 +325,11 @@ export class FakeRbacApi {
       }
       s.users.push(u)
       if (u.is_admin) s.assignments.push([u.id, this.roleNamed('admin')!.id])
-      if (body.role === 'writer') s.assignments.push([u.id, this.roleNamed('writer')!.id])
+      // Unset: `reader` for a user, `roles_only` for a service account.
+      const level = body.role ?? (service ? 'roles_only' : 'reader')
+      if (level === 'writer' || level === 'reader') {
+        s.assignments.push([u.id, this.roleNamed(level)!.id])
+      }
       return json({ ...this.userView(u), invitation: null }, 201)
     }
     if ((m = path.match(/^\/admin\/users\/(\d+)\/roles$/))) {

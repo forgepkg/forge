@@ -71,7 +71,7 @@ async fn create_repo(srv: &TestServer, anonymous_read: bool) -> String {
 async fn make_user(srv: &TestServer) -> (i64, String, String) {
     let username = format!("plain{}@example.com", common::unique());
     let password = "pw123456-plain".to_string();
-    let id = srv.create_user(&username, &password, "reader").await;
+    let id = srv.create_user(&username, &password, "roles_only").await;
     (id, username, password)
 }
 

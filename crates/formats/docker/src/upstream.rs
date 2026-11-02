@@ -431,6 +431,7 @@ mod tests {
         Remote {
             url: url.into(),
             index: None,
+            options: Vec::new(),
         }
     }
 

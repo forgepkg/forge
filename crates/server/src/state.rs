@@ -713,8 +713,12 @@ mod tests {
         let registry = FormatRegistry::new(Default::default(), Default::default());
         assert_eq!(
             registry.ids().collect::<Vec<_>>(),
-            ["docker", "npm", "nuget", "raw"]
+            ["apt", "docker", "npm", "nuget", "raw"]
         );
+        // apt is a package format whose hosted repositories keep signed
+        // indexes; it has no groups.
+        assert!(!registry.stores_files("apt"));
+        assert_eq!(registry.kinds("apt"), Some(vec!["hosted", "proxy"]));
         // Raw is a built-in plugin whose repositories hold files, Docker one
         // whose repositories hold images, served by the registry.
         assert!(registry.get("raw").is_some());

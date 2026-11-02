@@ -55,6 +55,9 @@ const EXPECTED_TABLES: &[&str] = &[
     "workload_api_key_trusted_publisher",
     // device authorization grant (RFC 8628)
     "device_authorization",
+    // signed indexes (apt)
+    "repository_signing_key",
+    "repository_index",
 ];
 
 /// The credential-forwarding provenance columns of `app_user`: (table, column).
@@ -620,9 +623,9 @@ async fn migrations_create_all_expected_tables() {
         );
     }
 
-    // The three built-in roles exist and are flagged builtin = true, and
+    // The four built-in roles exist and are flagged builtin = true, and
     // the pre-RBAC `authenticated` role is gone (#499).
-    for name in ["admin", "anonymous", "writer"] {
+    for name in ["admin", "anonymous", "writer", "reader"] {
         let builtin: bool = sqlx::query_scalar("SELECT builtin FROM role WHERE name = $1")
             .bind(name)
             .fetch_one(&pool)
@@ -634,7 +637,7 @@ async fn migrations_create_all_expected_tables() {
         .fetch_one(&pool)
         .await
         .expect("count roles");
-    assert_eq!(roles, 3, "no other role is seeded");
+    assert_eq!(roles, 4, "no other role is seeded");
 
     // role.name is UNIQUE.
     let dup_role = sqlx::query("INSERT INTO role (name) VALUES ('admin')")
@@ -667,6 +670,21 @@ async fn migrations_create_all_expected_tables() {
         writer_grants,
         vec![(None, None, "write".to_string())],
         "writer role holds (ANY, write) only"
+    );
+
+    // reader: `read` on every repository and nothing else.
+    let reader_grants: Vec<(Option<i64>, Option<i64>, String)> = sqlx::query_as(
+        "SELECT rp.repository_id, rp.selector_id, rp.level \
+         FROM repository_privilege rp JOIN role r ON r.id = rp.role_id \
+         WHERE r.name = 'reader'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read reader grants");
+    assert_eq!(
+        reader_grants,
+        vec![(None, None, "read".to_string())],
+        "reader role holds (ANY, read) only"
     );
 
     let anon_grant_count: i64 = sqlx::query_scalar(
@@ -1028,6 +1046,101 @@ async fn versions_unlisted_before_the_upgrade_count_from_their_last_change() {
     let (now_unlisted, _) = row(listed).await;
     let age = chrono::Utc::now() - now_unlisted.expect("unlisting records the time");
     assert!(age < chrono::Duration::minutes(5), "{age}");
+}
+
+/// The built-in `reader` role (0013): every user that was a reader (neither
+/// an administrator nor a writer) holds it after the upgrade; administrators,
+/// writers and service accounts do not, and a role an administrator had named
+/// `reader` keeps its grants and members under another name.
+#[tokio::test]
+async fn readers_before_the_upgrade_get_the_reader_role() {
+    let (server, _container) = server().await;
+    let url = fresh_database(&server, "reader_role").await;
+    let pool = forge_db::connect(&url).await.expect("connect");
+    sqlx::migrate!("../../migrations")
+        .run_to(12, &pool)
+        .await
+        .expect("migrate to 0012");
+
+    let user = |username: &'static str, kind: &'static str| {
+        let pool = pool.clone();
+        async move {
+            // A user of an identity provider: no password to make up.
+            let source = if kind == "service" { "service" } else { "oidc" };
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO app_user (username, kind, auth_source) VALUES ($1, $2, $3) \
+                 RETURNING id",
+            )
+            .bind(username)
+            .bind(kind)
+            .bind(source)
+            .fetch_one(&pool)
+            .await
+            .expect("insert an account")
+        }
+    };
+    let assign = |user_id: i64, role: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO user_role (user_id, role_id) \
+                 SELECT $1, id FROM role WHERE name = $2",
+            )
+            .bind(user_id)
+            .bind(role)
+            .execute(&pool)
+            .await
+            .expect("assign a role");
+        }
+    };
+    let reader = user("reader@example.com", "user").await;
+    let writer = user("writer@example.com", "user").await;
+    assign(writer, "writer").await;
+    let admin = user("admin@example.com", "user").await;
+    assign(admin, "admin").await;
+    let service = user("ci@example.com", "service").await;
+    let custom: i64 = sqlx::query_scalar("INSERT INTO role (name) VALUES ('reader') RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .expect("an administrator's role named reader");
+    assign(service, "reader").await;
+
+    forge_db::migrate(&pool).await.expect("migrate the rest");
+
+    let roles = |user_id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT r.name FROM user_role ur JOIN role r ON r.id = ur.role_id \
+                 WHERE ur.user_id = $1 ORDER BY r.name",
+            )
+            .bind(user_id)
+            .fetch_all(&pool)
+            .await
+            .expect("read roles")
+        }
+    };
+    assert_eq!(roles(reader).await, ["reader"]);
+    assert_eq!(roles(writer).await, ["writer"]);
+    assert_eq!(roles(admin).await, ["admin"]);
+    let renamed = format!("reader-{custom}");
+    assert_eq!(
+        roles(service).await,
+        [renamed.as_str()],
+        "the service account keeps the renamed role alone"
+    );
+    let (name, builtin): (String, bool) =
+        sqlx::query_as("SELECT name, builtin FROM role WHERE id = $1")
+            .bind(custom)
+            .fetch_one(&pool)
+            .await
+            .expect("the custom role is kept");
+    assert_eq!((name.as_str(), builtin), (renamed.as_str(), false));
+    let builtin: bool = sqlx::query_scalar("SELECT builtin FROM role WHERE name = 'reader'")
+        .fetch_one(&pool)
+        .await
+        .expect("the built-in reader role");
+    assert!(builtin);
 }
 
 /// A Postgres server for one test: a throwaway Postgres 18 container matching

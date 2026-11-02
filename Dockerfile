@@ -32,7 +32,7 @@
 # the lockfile install is reproducible.
 # Base images are pinned by digest (tag kept for readability); Dependabot
 # (.github/dependabot.yml) proposes tag + digest bumps.
-FROM node:26-bookworm-slim@sha256:298992629d69bbd5b2b03ad57094d8e4fcb3a8eeb7c4e25d29de656519568913 AS web
+FROM node:26-bookworm-slim@sha256:bc0a2afd3b74ce12222fc8bab99271e66257f021078f5f4a5d687a77d280c1d9 AS web
 # BuildKit scans only the final stage for the SBOM unless a stage declares
 # this: the npm packages are in node_modules here, but only minified into the
 # bundle the runtime image ships.
@@ -63,7 +63,7 @@ RUN pnpm run build
 # ── Stage 2a: cargo-chef base ─────────────────────────────────────────────────
 # Pin the Rust toolchain to match rust-toolchain.toml (1.99.1). cargo-chef lets
 # us cache the dependency compile separately from the workspace sources.
-FROM rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS chef
+FROM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS chef
 # Use the image's preinstalled 1.99.1 as-is; the copied rust-toolchain.toml
 # would otherwise make rustup download its dev components (rustfmt, clippy).
 ENV RUSTUP_TOOLCHAIN=1.99.1
@@ -134,7 +134,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ── Stage 3: slim runtime ─────────────────────────────────────────────────────
 # debian:bookworm-slim (glibc + libgcc that aws-lc-rs needs) plus ca-certificates
 # for outbound HTTPS (S3, OIDC discovery, credential-forwarding upstreams).
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

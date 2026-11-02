@@ -169,6 +169,10 @@ async fn rotate_locked(
                 Ok(n) => resealed += n,
                 Err(e) => return crypto_error(e),
             }
+            match forge_db::signing_key_dao::reseal(&state.pool, envelope).await {
+                Ok(n) => resealed += n,
+                Err(e) => return crypto_error(e),
+            }
             match secret_dao::reseal_import_passwords(&state.pool, envelope).await {
                 Ok(n) => resealed += n,
                 Err(e) => return crypto_error(e),

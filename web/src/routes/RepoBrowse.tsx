@@ -18,6 +18,7 @@ import { EmptyState } from '~/components/EmptyState'
 import { DockerConnect } from '~/components/DockerConnect'
 import { PackageConnect } from '~/components/PackageConnect'
 import { RawBrowser } from '~/components/RawBrowser'
+import { AptIndex } from '~/components/AptIndex'
 import {
   Button,
   Checkbox,
@@ -261,12 +262,22 @@ function RepoBrowse() {
                 format={info.format}
                 repo={repo}
                 url={info.url}
+                kind={info.kind}
+                options={info.options}
                 canPush={info.kind === 'hosted'}
               />
             )
           }
           asideLabel="Connect"
         >
+          {info?.format === 'apt' && info.options?.distribution && (
+            <AptIndex
+              key={`${repo}:${info.options.distribution}`}
+              repo={repo}
+              kind={info.kind}
+              distribution={info.options.distribution}
+            />
+          )}
           <PackageBrowse
             repo={repo}
             q={q}
@@ -280,11 +291,14 @@ function RepoBrowse() {
                   onChange={setInput}
                   className="min-w-0 flex-[1_1_280px]"
                 />
-                <Checkbox
-                  label="Include prerelease versions"
-                  checked={prerelease}
-                  onChange={(checked) => togglePrerelease(checked)}
-                />
+                {/* apt has no prereleases: a `-` starts the Debian revision. */}
+                {info?.format !== 'apt' && (
+                  <Checkbox
+                    label="Include prerelease versions"
+                    checked={prerelease}
+                    onChange={(checked) => togglePrerelease(checked)}
+                  />
+                )}
               </>
             }
           />

@@ -30,7 +30,7 @@ export const Route = createFileRoute('/_app/manage/service-accounts/$userId')({
 /**
  * One service account (#508): what it is for and the trusted-header realm
  * whose proxy names it (both edited here), deactivating and reactivating it,
- * its built-in access level (reader or writer, never admin), the roles it
+ * its built-in access level (roles only, reader or writer, never admin), the roles it
  * holds and its effective access, and its API tokens: issued here (the
  * secret shown once), re-scoped and revoked. Nobody signs in to it, so there
  * is no invitation and no "sign out everywhere".

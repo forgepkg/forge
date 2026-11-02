@@ -9,7 +9,8 @@ import { renderApp } from '~/test/renderApp'
 /**
  * Roles, effective access and token scopes on the admin user screens,
  * against the real route tree and a stateful fake of the RBAC API:
- *  - the user list shows each user's access level (admin, writer or reader)
+ *  - the user list shows each user's access level (admin, writer, reader or
+ *    roles only)
  *    from their role assignments and their other roles, and the create page
  *    gives a new user its access level;
  *  - the user page switches the access level, assigns and removes roles,
@@ -29,6 +30,7 @@ describe('admin user roles', () => {
         user({ id: 3, username: 'legacy', is_admin: true }),
         user({ id: 4, username: 'publisher' }),
         user({ id: 5, username: 'office@example.com', auth_source: 'trusted-header' }),
+        user({ id: 6, username: 'bob' }),
       ],
       repos: [repo({ id: 10, name: 'internal' }), repo({ id: 11, name: 'public' })],
       selectors: [
@@ -39,7 +41,7 @@ describe('admin user roles', () => {
       { id: 7, name: 'ci-pushers', description: 'CI pushes', builtin: false },
       { id: 8, name: 'auditors', description: 'Read everything', builtin: false },
     )
-    api.state.assignments.push([1, 1], [2, 7], [4, 4])
+    api.state.assignments.push([1, 1], [2, 7], [4, 4], [6, 3])
     api.state.grants.push(
       { id: 30, role_id: 7, repository_id: 10, level: 'write', selector_id: null },
       { id: 31, role_id: 7, repository_id: null, level: 'read', selector_id: 20 },
@@ -64,7 +66,8 @@ describe('admin user roles', () => {
 
     await waitFor(() => expect(cells('publisher')[2]).toHaveTextContent('writer'))
     expect(cells('root')[2]).toHaveTextContent('admin')
-    expect(cells('alice')[2]).toHaveTextContent('reader')
+    expect(cells('alice')[2]).toHaveTextContent('roles only')
+    expect(cells('bob')[2]).toHaveTextContent('reader')
     // The legacy flag without the role still makes an administrator.
     expect(cells('legacy')[2]).toHaveTextContent('admin')
     expect(within(row('legacy')).getByText('admin (flag)')).toBeInTheDocument()
@@ -79,14 +82,15 @@ describe('admin user roles', () => {
     )
     expect(cells('root')[3]).toHaveTextContent('—')
     expect(cells('publisher')[3]).toHaveTextContent('—')
+    expect(cells('bob')[3]).toHaveTextContent('—')
   })
 
-  it('switches a user between reader, writer and admin', async () => {
+  it('switches a user between roles only, reader, writer and admin', async () => {
     const u = userEvent.setup()
     await renderApp('/manage/users/2')
 
     const form = await screen.findByRole('form', { name: 'Change access' })
-    expect(within(form).getByRole('radio', { name: /^Reader/ })).toBeChecked()
+    expect(within(form).getByRole('radio', { name: /^Roles only/ })).toBeChecked()
     expect(within(form).getByRole('button', { name: 'Change access' })).toBeDisabled()
 
     await u.click(within(form).getByRole('radio', { name: /^Writer/ }))
@@ -110,12 +114,22 @@ describe('admin user roles', () => {
     // The custom role stays.
     expect(api.state.assignments).toContainEqual([2, 7])
 
-    // Back to reader takes the admin role.
+    // Admin → reader: the reader role first, then admin goes.
     await u.click(within(form).getByRole('radio', { name: /^Reader/ }))
     await u.click(within(form).getByRole('button', { name: 'Change access' }))
     await waitFor(() =>
       expect(api.sent('DELETE', /^\/admin\/users\/2\/roles\/1$/)).toHaveLength(1),
     )
+    expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)[2]?.body).toEqual({ role_id: 3 })
+    expect(api.state.assignments).toContainEqual([2, 3])
+
+    // Back to roles only takes the reader role and keeps the custom one.
+    await u.click(within(form).getByRole('radio', { name: /^Roles only/ }))
+    await u.click(within(form).getByRole('button', { name: 'Change access' }))
+    await waitFor(() =>
+      expect(api.sent('DELETE', /^\/admin\/users\/2\/roles\/3$/)).toHaveLength(1),
+    )
+    expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)).toHaveLength(3)
     expect(api.state.assignments).toContainEqual([2, 7])
   })
 

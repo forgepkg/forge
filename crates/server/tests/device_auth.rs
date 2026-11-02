@@ -244,7 +244,7 @@ async fn an_approved_login_collects_its_token_once() {
     assert_eq!(stored_interval(&srv, &user_code).await, 15);
 
     // The /device page: a signed-in user looks the code up, in any spelling.
-    let (_, username, session) = signed_in(&srv, "reader").await;
+    let (_, username, session) = signed_in(&srv, "roles_only").await;
     let typed = user_code.replace('-', "").to_lowercase();
     let resp = lookup(&srv, &session, &typed, "198.51.100.7").await;
     assert_eq!(resp.status(), 200);
@@ -367,7 +367,7 @@ async fn a_denied_login_is_access_denied() {
     let started = start_login(&srv, "forge-cli", None).await;
     let device_code = started["device_code"].as_str().unwrap();
     let user_code = started["user_code"].as_str().unwrap();
-    let (_, _, session) = signed_in(&srv, "reader").await;
+    let (_, _, session) = signed_in(&srv, "roles_only").await;
     let resp = decide(&srv, &session, user_code, false, "198.51.100.8").await;
     assert_eq!(resp.status(), 204);
     for _ in 0..2 {
@@ -403,7 +403,7 @@ async fn an_expired_login_is_expired_and_reaped() {
         poll(&srv, "nuget-plugin-forge", device_code).await,
         "expired_token",
     );
-    let (_, _, session) = signed_in(&srv, "reader").await;
+    let (_, _, session) = signed_in(&srv, "roles_only").await;
     assert_eq!(
         lookup(&srv, &session, user_code, "198.51.100.9")
             .await
@@ -609,8 +609,8 @@ async fn guessing_a_code_is_cut_off_by_the_rate_limit() {
     let srv = start().await;
     let started = start_login(&srv, "forge-cli", None).await;
     let user_code = started["user_code"].as_str().unwrap().to_string();
-    let (_, _, guesser) = signed_in(&srv, "reader").await;
-    let (_, _, other) = signed_in(&srv, "reader").await;
+    let (_, _, guesser) = signed_in(&srv, "roles_only").await;
+    let (_, _, other) = signed_in(&srv, "roles_only").await;
     let wrong = if user_code == "BBBB-BBBB" {
         "CCCC-CCCC"
     } else {
