@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
 use forge_crypto::CryptoError;
-use forge_db::auth_realm_dao::{self, AuthRealmUpdate, NewAuthRealm, ReorderOutcome};
+use forge_db::auth_realm_dao::{self, AuthRealmUpdate, ReorderOutcome};
 use forge_db::model::AuthRealm;
 use forge_db::secret_dao::{self, SecretDbError};
 use forge_db::{user_dao, workload_api_key_dao};
@@ -154,8 +154,12 @@ fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, msg.into()).into_response()
 }
 
-fn is_unique_violation(e: &sqlx::Error) -> bool {
-    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+/// A unique violation of the realm name, as opposed to the order or the
+/// workload identity issuer.
+fn is_name_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db)
+        if db.code().as_deref() == Some("23505")
+            && db.constraint() == Some("auth_realm_name_key"))
 }
 
 fn is_wif_issuer_unique_violation(e: &sqlx::Error) -> bool {
@@ -267,36 +271,24 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRealm>
         }
     }
 
-    // Appended after the last realm. A concurrent create or reorder can take
-    // that priority first: then take the next one (a few times at most).
-    let mut attempt = 0;
-    let inserted = loop {
-        let priority = match auth_realm_dao::next_priority(&state.pool).await {
-            Ok(p) => p,
-            Err(e) => return db_error(e),
-        };
-        let new = NewAuthRealm {
-            kind: body.kind.clone(),
-            name: body.name.trim().to_string(),
-            enabled: body.enabled,
-            priority,
-            config: config.clone(),
-        };
-        match secret_dao::insert_realm_with_secrets(
-            &state.pool,
-            &state.envelope,
-            new,
-            secret_keys(&body.kind),
-        )
-        .await
-        {
-            Ok(r) => break Ok(r),
-            Err(e) => match secret_db_error(e) {
-                Ok(db) if is_priority_violation(&db) && attempt < 3 => attempt += 1,
-                Ok(db) => break Err(db),
-                Err(resp) => return resp,
-            },
-        }
+    // Appended after the last realm, under a lock that concurrent creates
+    // (and reorders) take turns on.
+    let inserted = match secret_dao::append_realm_with_secrets(
+        &state.pool,
+        &state.envelope,
+        &body.kind,
+        body.name.trim(),
+        body.enabled,
+        &config,
+        secret_keys(&body.kind),
+    )
+    .await
+    {
+        Ok(r) => Ok(r),
+        Err(e) => match secret_db_error(e) {
+            Ok(db) => Err(db),
+            Err(resp) => return resp,
+        },
     };
     match inserted {
         Ok(r) => {
@@ -314,7 +306,7 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRealm>
             "an enabled workload identity realm already uses this issuer",
         )
             .into_response(),
-        Err(e) if is_unique_violation(&e) => {
+        Err(e) if is_name_violation(&e) => {
             (StatusCode::CONFLICT, "realm name already exists").into_response()
         }
         // The DB CHECK constraints (kind set, name shape) surface as 23514.
@@ -452,7 +444,7 @@ pub async fn update(
             "an enabled workload identity realm already uses this issuer",
         )
             .into_response(),
-        Err(e) if is_unique_violation(&e) => {
+        Err(e) if is_name_violation(&e) => {
             (StatusCode::CONFLICT, "realm name already exists").into_response()
         }
         Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23514") => {

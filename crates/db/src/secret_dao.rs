@@ -737,6 +737,47 @@ pub async fn insert_realm_with_secrets(
     Ok(row)
 }
 
+/// [`insert_realm_with_secrets`] for a realm appended after the last one in
+/// the try-order. Its priority is read under the lock of
+/// [`auth_realm_dao::lock_next_priority`], held until the insert commits, so
+/// concurrent appends take turns instead of taking one priority twice.
+///
+/// The secrets are sealed before that lock, for a row id reserved first:
+/// sealing reads the active DEK on another connection of the pool, which the
+/// appends queued on the lock, each holding a connection, could leave empty.
+pub async fn append_realm_with_secrets(
+    pool: &PgPool,
+    envelope: &EnvelopeService,
+    kind: &str,
+    name: &str,
+    enabled: bool,
+    config: &JsonValue,
+    secret_keys: &[&str],
+) -> Result<AuthRealm, SecretDbError> {
+    let (config, secrets) = split_realm_secrets(config, secret_keys);
+    let id = auth_realm_dao::reserve_realm_id(pool).await?;
+    let blob = if secrets.is_empty() {
+        None
+    } else {
+        Some(seal_realm_secrets(envelope, id, kind, &config, &secrets).await?)
+    };
+    let mut tx = crate::begin(pool).await?;
+    if let Some(blob) = &blob {
+        lock_sealing_dek(&mut tx, envelope, blob).await?;
+    }
+    let priority = auth_realm_dao::lock_next_priority(&mut tx).await?;
+    let new = NewAuthRealm {
+        kind: kind.to_string(),
+        name: name.to_string(),
+        enabled,
+        priority,
+        config,
+    };
+    let row = auth_realm_dao::insert_realm_with_id(&mut *tx, id, new, blob.as_deref()).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 /// Update a realm whose `upd.config` is the full logical document: the
 /// secrets are (re-)encrypted into `secrets_enc` and stripped from `config`,
 /// and `secrets_enc` is cleared when there are none. Returns `None` when the
