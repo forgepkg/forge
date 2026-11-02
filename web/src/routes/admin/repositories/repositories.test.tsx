@@ -599,7 +599,11 @@ describe('admin repositories', () => {
       ],
       onInvalidate: (name, body) => {
         posts.push([name, body])
-        return json({ not_found_cleared: posts.length, tags_expired: 0 })
+        return json({
+          not_found_cleared: posts.length,
+          tags_expired: 0,
+          documents_dropped: 3,
+        })
       },
     })
 
@@ -609,7 +613,9 @@ describe('admin repositories', () => {
     await user.type(await screen.findByLabelText(/Package id/), ' Late.Pkg ')
     await user.click(screen.getByRole('button', { name: 'Invalidate cache' }))
     expect(
-      await screen.findByText(/Invalidated Late\.Pkg: 1 “not found” answer forgotten/),
+      await screen.findByText(
+        /Invalidated Late\.Pkg: 1 “not found” answer forgotten, 3 stored upstream documents deleted/,
+      ),
     ).toBeInTheDocument()
 
     await user.clear(screen.getByLabelText(/Package id/))

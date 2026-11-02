@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO proxy_document (repository_id, key, url, accept, blob_sha256, size,\n                                        named_origins, etag, last_modified, remote_url,\n                                        repository_updated_at)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)\n            ON CONFLICT (repository_id, key) DO NOTHING\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "proxy_document",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "TextArray",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2f5506dcf2454eed1c0b20797fb4aedfe5c2b94991bc7cd89d7a1a2d5cfd0edd"
+}

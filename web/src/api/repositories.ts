@@ -317,6 +317,11 @@ export interface ProxyCacheInvalidated {
   tags_expired: number
   /** Cached files due for re-validation against the upstream (raw). */
   files_expired?: number
+  /**
+   * Upstream documents the proxy stored for every instance (npm packuments,
+   * NuGet registrations and listings) that were deleted.
+   */
+  documents_dropped: number
 }
 
 /** A group member view (`MemberView`). */

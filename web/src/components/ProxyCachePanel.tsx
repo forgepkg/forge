@@ -11,10 +11,11 @@ function plural(n: number, one: string, many: string): string {
 /**
  * A proxy repository's cache invalidation (`POST …/proxy-cache/invalidate`).
  * The proxy remembers the upstream's "not found" answers for the not-found
- * TTL and its listings (a docker proxy: its tags) for the metadata TTL; this
- * makes it ask the upstream again, for one package (an image) or for the
- * whole repository. Downloaded packages stay cached. A raw proxy re-validates
- * its cached files (of a file or a directory, or all of them) on their next
+ * TTL and its listings and documents (a docker proxy: its tags) for the
+ * metadata TTL; this makes it ask the upstream again, for one package (an
+ * image) or for the whole repository, and deletes the upstream documents it
+ * stored. Downloaded packages stay cached. A raw proxy re-validates its
+ * cached files (of a file or a directory, or all of them) on their next
  * download. A panel of the edit screen's side column.
  */
 export function ProxyCachePanel({ repo }: { repo: RepoView }) {
@@ -42,7 +43,7 @@ export function ProxyCachePanel({ repo }: { repo: RepoView }) {
             ? 'The proxy serves a cached tag without asking the upstream for the metadata TTL, and remembers an image or tag the upstream did not have for the not-found TTL.'
             : raw
               ? 'The proxy serves a cached file without asking the upstream for its maximum age, and remembers a file the upstream did not have for the not-found TTL.'
-              : 'The proxy remembers the upstream’s listings for the metadata TTL, and a package the upstream did not have for the not-found TTL.'}{' '}
+              : 'The proxy keeps the upstream’s listings and documents for every instance and serves them without asking for the metadata TTL, and remembers a package the upstream did not have for the not-found TTL.'}{' '}
           {raw
             ? 'Invalidate the cache to ask the upstream again, for example after a file changed there. Cached files stay, and are re-validated on their next download.'
             : 'Invalidate the cache to ask the upstream again, for example after a package was published there. Downloaded packages stay cached.'}
@@ -72,7 +73,7 @@ export function ProxyCachePanel({ repo }: { repo: RepoView }) {
             ? `${plural(done.tags_expired, 'tag is', 'tags are')} re-validated on the next pull.`
             : raw
               ? `${plural(done.files_expired ?? 0, 'cached file is', 'cached files are')} re-validated on the next download; “not found” answers are forgotten.`
-              : `${plural(done.not_found_cleared, '“not found” answer', '“not found” answers')} forgotten; listings are fetched again.`}
+              : `${plural(done.not_found_cleared, '“not found” answer', '“not found” answers')} forgotten, ${plural(done.documents_dropped, 'stored upstream document', 'stored upstream documents')} deleted; listings are fetched again.`}
         </Notice>
       )}
       {invalidate.isError && (

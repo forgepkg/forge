@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE proxy_document\n            SET blob_sha256 = $2, size = $3, named_origins = $4, etag = $5,\n                last_modified = $6, remote_url = $7, repository_updated_at = $8,\n                fetched_at = now(), used_at = now()\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Int8",
+        "TextArray",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "77e5308fc941200f2113244dfce5472dd3bd59f47c095b75bbcb71f03f98f995"
+}

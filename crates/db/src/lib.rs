@@ -30,6 +30,7 @@ pub mod oci_dao;
 pub mod oidc_flow_dao;
 pub mod outbox_dao;
 pub mod proxy_dao;
+pub mod proxy_document_dao;
 pub mod raw_dao;
 pub mod repository_dao;
 pub mod retention_dao;
