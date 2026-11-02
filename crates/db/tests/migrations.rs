@@ -948,6 +948,8 @@ async fn an_import_of_a_nexus_repository_survives_the_rename() {
         repository_id: nuget.id,
         url: "https://feed.example.com/v3/index.json",
         names: None,
+        distribution: None,
+        public_key: None,
         username: None,
         on_conflict: "skip",
         concurrency: 4,

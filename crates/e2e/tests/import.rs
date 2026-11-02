@@ -9,6 +9,13 @@
 //! * a `distribution` registry (`registry:2`): Docker through its catalog;
 //! * another Forge: NuGet from a Forge NuGet repository, whose registration
 //!   lists each package's SHA-512, so a second run downloads nothing;
+//! * apt from Nexus' apt hosted repository (`InRelease` checked against
+//!   the public half of the key Nexus signs with) and from a static
+//!   repository nginx serves, made with `dpkg-scanpackages` and
+//!   `apt-ftparchive` and signed with `gpg`: packages for amd64 and arm64
+//!   and one for every architecture arrive in the component the source
+//!   lists them in, `apt-get install` from Forge in a `debian:bookworm`
+//!   container installs them, and a second run downloads nothing;
 //! * npm from Nexus' npm hosted repository and from Verdaccio
 //!   (`verdaccio/verdaccio`), both through their `/-/all`: scoped and
 //!   unscoped packages, a prerelease, dist-tags and a deprecated version
@@ -1249,4 +1256,353 @@ async fn npm_import_from_verdaccio() {
     assert_eq!(done["state"], "completed", "{done}");
     assert_eq!(done["progress"]["identical"], 6, "{done}");
     assert_eq!(done["progress"]["bytes_copied"], 0, "{done}");
+}
+
+// ── apt ─────────────────────────────────────────────────────────────────────
+
+const DEBIAN_IMAGE: &str = "mirror.gcr.io/library/debian";
+const DEBIAN_TAG: &str = "bookworm";
+const NGINX_IMAGE: &str = "mirror.gcr.io/library/nginx";
+const NGINX_TAG: &str = "1.27.5-alpine";
+
+/// The packages the apt e2e copies: `greeter` for amd64 and arm64, and
+/// `greeter-data` for every architecture, whose `Section` names `contrib`.
+const APT_PACKAGES: &[(&str, &str, &str)] = &[
+    ("greeter", "1.0-1", "amd64"),
+    ("greeter", "1.0-1", "arm64"),
+    ("greeter-data", "1.0", "all"),
+];
+
+/// Builds, in `/work` of a debian:bookworm container: the packages
+/// (`debs/`, with dpkg-deb); a static repository of them (`static/`, its
+/// `Packages` made with dpkg-scanpackages, its `Release` with apt-ftparchive,
+/// signed with gpg as `InRelease` and `Release.gpg`, the key in
+/// `static.asc`); and an RSA key pair for Nexus (`nexus.key`, its
+/// passphrase `nexus-passphrase`, and `nexus.asc`).
+const APT_FIXTURES: &str = r#"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends dpkg-dev apt-utils gnupg xz-utils >/dev/null 2>&1
+cd /work
+mkdir -p debs
+mkpkg() {
+  d=$(mktemp -d)
+  mkdir -p "$d/DEBIAN" "$d/usr/share/$1"
+  printf 'Package: %s\nVersion: %s\nArchitecture: %s\nMaintainer: Forge <forge@example.com>\nSection: %s\nPriority: optional\nDescription: %s for the import e2e\n It is installed from Forge.\n' \
+    "$1" "$2" "$3" "$4" "$1" > "$d/DEBIAN/control"
+  echo "$1 $2 $3" > "$d/usr/share/$1/version"
+  dpkg-deb --build --root-owner-group "$d" "debs/${1}_${2}_${3}.deb" >/dev/null
+}
+mkpkg greeter 1.0-1 amd64 utils
+mkpkg greeter 1.0-1 arm64 utils
+mkpkg greeter-data 1.0 all contrib/misc
+
+export GNUPGHOME=$(mktemp -d)
+gpg --batch --quiet --passphrase '' --quick-gen-key 'Static <static@example.com>' ed25519 sign never
+mkdir -p static/pool/main
+cp debs/*.deb static/pool/main/
+cd static
+for a in amd64 arm64; do
+  mkdir -p "dists/bookworm/main/binary-$a"
+  dpkg-scanpackages --arch "$a" pool/ > "dists/bookworm/main/binary-$a/Packages" 2>/dev/null
+  gzip -9kn "dists/bookworm/main/binary-$a/Packages"
+  xz -k "dists/bookworm/main/binary-$a/Packages"
+done
+apt-ftparchive -o APT::FTPArchive::Release::Codename=bookworm \
+  -o APT::FTPArchive::Release::Suite=stable -o APT::FTPArchive::Release::Components=main \
+  -o 'APT::FTPArchive::Release::Architectures=amd64 arm64' release dists/bookworm > /tmp/Release
+mv /tmp/Release dists/bookworm/Release
+gpg --batch --yes --clearsign -o dists/bookworm/InRelease dists/bookworm/Release
+gpg --batch --yes -abs -o dists/bookworm/Release.gpg dists/bookworm/Release
+gpg --export --armor > /work/static.asc
+
+export GNUPGHOME=$(mktemp -d)
+gpg --batch --quiet --passphrase 'nexus-passphrase' --quick-gen-key 'Nexus <nexus@example.com>' rsa3072 sign never
+gpg --batch --pinentry-mode loopback --passphrase 'nexus-passphrase' --export-secret-keys --armor > /work/nexus.key
+gpg --export --armor > /work/nexus.asc
+chmod -R a+rX /work
+"#;
+
+/// Run `script` with `sh -eu` in a fresh debian:bookworm container on the
+/// host's network (so it reaches Forge on the loopback), `dir` at `/work`.
+/// Its output; it must succeed.
+fn debian(dir: &std::path::Path, script: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args(["run", "--rm", "--network", "host", "-v"])
+        .arg(format!("{}:/work", dir.display()))
+        .arg(format!("{DEBIAN_IMAGE}:{DEBIAN_TAG}"))
+        .args(["sh", "-euc", script])
+        .output()
+        .expect("run docker (is Docker running?)");
+    assert!(
+        out.status.success(),
+        "debian:bookworm: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The apt e2e's packages, static repository and Nexus key, in a new
+/// directory ([`APT_FIXTURES`]).
+fn apt_fixtures() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    debian(dir.path(), APT_FIXTURES);
+    dir
+}
+
+/// The bytes of the fixture `name` (below the fixtures' directory).
+fn fixture(dir: &tempfile::TempDir, name: &str) -> Vec<u8> {
+    std::fs::read(dir.path().join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+fn fixture_text(dir: &tempfile::TempDir, name: &str) -> String {
+    String::from_utf8(fixture(dir, name)).unwrap()
+}
+
+/// `apt-get update` and `apt-get install` of `packages` from Forge's apt
+/// repository `repo` in a debian:bookworm container, the way a client is
+/// set up for Forge: its key with `signed-by`, its credentials in
+/// `auth.conf.d`, Debian's own sources removed. What `dpkg-query` then
+/// says is installed, by package, and the output of `apt-get update`.
+async fn apt_install(
+    srv: &TestServer,
+    repo: &str,
+    packages: &[&str],
+) -> (BTreeMap<String, String>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let key = download(srv, &format!("/repository/{repo}/key.asc")).await;
+    std::fs::write(dir.path().join("forge.asc"), key).unwrap();
+    let base = format!("{}/repository/{repo}", srv.base_url);
+    std::fs::write(
+        dir.path().join("forge.list"),
+        format!("deb [signed-by=/etc/apt/keyrings/forge.asc] {base}/ bookworm main\n"),
+    )
+    .unwrap();
+    let (user, token) = srv.admin_basic();
+    std::fs::write(
+        dir.path().join("forge.conf"),
+        format!("machine {base}\nlogin {user}\npassword {token}\n"),
+    )
+    .unwrap();
+    let script = format!(
+        "rm -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list
+mkdir -p /etc/apt/keyrings
+cp /work/forge.asc /etc/apt/keyrings/forge.asc
+cp /work/forge.list /etc/apt/sources.list.d/forge.list
+cp /work/forge.conf /etc/apt/auth.conf.d/forge.conf
+chmod 600 /etc/apt/auth.conf.d/forge.conf
+apt-get update 2>&1
+echo ===
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends {} >/dev/null
+echo ===
+dpkg-query -W -f '${{Package}} ${{Version}}\\n' {}",
+        packages.join(" "),
+        packages.join(" ")
+    );
+    let out = debian(dir.path(), &script);
+    let mut parts = out.split("===\n");
+    let update = parts.next().unwrap_or_default().to_string();
+    let installed = parts
+        .nth(1)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(name, version)| (name.to_string(), version.to_string()))
+        .collect();
+    (installed, update)
+}
+
+/// After an import into `repo` of the fixtures' packages: their bytes, in
+/// `main` (where the source lists them, though `greeter-data`'s `Section`
+/// names `contrib`), under their architectures; and `apt-get install` from
+/// Forge installs them, with an `apt-get update` that warns of nothing.
+async fn assert_apt_copied(srv: &TestServer, repo: &str, fixtures: &tempfile::TempDir) {
+    for (name, version, arch) in APT_PACKAGES {
+        let file = format!("{name}_{version}_{arch}.deb");
+        let prefix = &name[..1];
+        assert_eq!(
+            download(
+                srv,
+                &format!("/repository/{repo}/pool/main/{prefix}/{name}/{file}")
+            )
+            .await,
+            fixture(fixtures, &format!("debs/{file}")),
+            "{file}"
+        );
+    }
+    for arch in ["amd64", "arm64"] {
+        let index = String::from_utf8(
+            download(
+                srv,
+                &format!("/repository/{repo}/dists/bookworm/main/binary-{arch}/Packages"),
+            )
+            .await,
+        )
+        .unwrap();
+        for package in ["greeter", "greeter-data"] {
+            assert!(
+                index.contains(&format!("Package: {package}\n")),
+                "{arch}: {index}"
+            );
+        }
+    }
+    let (installed, update) = apt_install(srv, repo, &["greeter", "greeter-data"]).await;
+    assert!(
+        !update
+            .lines()
+            .any(|l| l.starts_with("W:") || l.starts_with("E:")),
+        "apt-get update: {update}"
+    );
+    assert_eq!(
+        installed,
+        BTreeMap::from([
+            ("greeter".to_string(), "1.0-1".to_string()),
+            ("greeter-data".to_string(), "1.0".to_string()),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apt_import_from_a_real_nexus() {
+    let fixtures = tokio::task::spawn_blocking(apt_fixtures).await.unwrap();
+    let _turn = NEXUS.lock().await;
+    let (nexus, _container) = Nexus::start().await;
+    let hosted = json!({
+        "name": "apt-hosted", "online": true,
+        "storage": {"blobStoreName": "default", "strictContentTypeValidation": true, "writePolicy": "allow_once"},
+        "apt": {"distribution": "bookworm"},
+        "aptSigning": {"keypair": fixture_text(&fixtures, "nexus.key"), "passphrase": "nexus-passphrase"},
+    });
+    let resp = nexus
+        .api(reqwest::Method::POST, "repositories/apt/hosted")
+        .json(&hosted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    // Nexus' upload: the package as the body of a POST to the repository.
+    for (name, version, arch) in APT_PACKAGES {
+        let resp = nexus
+            .client
+            .post(format!("{}/repository/apt-hosted/", nexus.url))
+            .basic_auth(ADMIN.0, Some(ADMIN.1))
+            .header("content-type", "multipart/form-data")
+            .body(fixture(
+                &fixtures,
+                &format!("debs/{name}_{version}_{arch}.deb"),
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "upload {name}: {}",
+            resp.status()
+        );
+    }
+
+    let srv = StackBuilder::default().start().await;
+    create_repo(
+        &srv,
+        json!({"name": "apt", "kind": "hosted", "format": "apt", "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    // Nexus signs its Release with the key it was given: the import checks
+    // InRelease against the public half.
+    let body = json!({
+        "url": format!("{}/repository/apt-hosted", nexus.url),
+        "public_key": fixture_text(&fixtures, "nexus.asc"),
+        "username": ADMIN.0, "password": ADMIN.1,
+    });
+    let done = import(&srv, "apt", body.clone()).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["listing"], "release", "{done}");
+    assert!(
+        done["source_server"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("Nexus/")),
+        "{done}"
+    );
+    // Nexus lists an `all` package in binary-all alone.
+    assert_eq!(done["progress"]["imported"], 3, "{done}");
+    assert_eq!(done["progress"]["failed"], 0, "{done}");
+    assert_apt_copied(&srv, "apt", &fixtures).await;
+
+    // A second run downloads nothing.
+    let again = import(&srv, "apt", body).await;
+    assert_eq!(again["state"], "completed", "{again}");
+    assert_eq!(again["progress"]["identical"], 3, "{again}");
+    assert_eq!(again["progress"]["bytes_copied"], 0, "{again}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apt_import_from_a_static_repository() {
+    let fixtures = tokio::task::spawn_blocking(apt_fixtures).await.unwrap();
+    // nginx serves the files dpkg-scanpackages and apt-ftparchive made, as
+    // they are.
+    let root = fixtures.path().join("static");
+    let mut files = Vec::new();
+    let mut dirs = vec![root.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let rel = path.strip_prefix(&root).unwrap().display().to_string();
+                files.push((rel, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut nginx: testcontainers::core::ContainerRequest<GenericImage> =
+        GenericImage::new(NGINX_IMAGE, NGINX_TAG)
+            .with_exposed_port(80.tcp())
+            .with_wait_for(WaitFor::Nothing)
+            .into();
+    for (rel, bytes) in files {
+        nginx = nginx.with_copy_to(format!("/usr/share/nginx/html/debian/{rel}"), bytes);
+    }
+    let nginx = nginx
+        .start()
+        .await
+        .expect("start nginx (is Docker running?)");
+    let host = nginx.get_host().await.unwrap();
+    let port = nginx.get_host_port_ipv4(80).await.unwrap();
+    let url = format!("http://{host}:{port}/debian");
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        let up = client
+            .get(format!("{url}/dists/bookworm/InRelease"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status() == 200);
+        if up {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let srv = StackBuilder::default().start().await;
+    create_repo(
+        &srv,
+        json!({"name": "apt", "kind": "hosted", "format": "apt", "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let body = json!({
+        "url": url,
+        "distribution": "bookworm",
+        "public_key": fixture_text(&fixtures, "static.asc"),
+    });
+    let done = import(&srv, "apt", body.clone()).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["listing"], "release", "{done}");
+    // greeter-data is listed under amd64 and arm64, and copied once.
+    assert_eq!(done["progress"]["imported"], 3, "{done}");
+    assert_eq!(done["progress"]["failed"], 0, "{done}");
+    assert_apt_copied(&srv, "apt", &fixtures).await;
+
+    let again = import(&srv, "apt", body).await;
+    assert_eq!(again["progress"]["identical"], 3, "{again}");
+    assert_eq!(again["progress"]["bytes_copied"], 0, "{again}");
 }

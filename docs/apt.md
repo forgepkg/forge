@@ -57,6 +57,11 @@ package of `Section: contrib/net` is in `contrib`, any other in `main`. Its
 **architectures** are those of its packages; an `all` package is listed
 under every one of them (and under `binary-all`).
 
+An [import](import.md#apt) fills a hosted repository from another apt
+repository (Nexus, a static repository, another Forge): every `.deb` its
+`Release` lists, checked against the size and SHA-256 its index gives, in
+the component the source lists it in.
+
 ## Connecting apt
 
 Each repository's page in the web UI shows these lines with its name, URL

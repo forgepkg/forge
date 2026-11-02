@@ -28,7 +28,10 @@ import { searchOptions } from '~/lib/search'
  *  - an npm hosted repository offers the import of a registry, with named
  *    packages and scopes, and shows its dist-tag conflicts;
  *  - a raw hosted repository offers the import of a raw repository, with
- *    paths one per line (spaces and commas kept), and names the listing.
+ *    paths one per line (spaces and commas kept), and names the listing;
+ *  - an apt hosted repository offers the import of an apt repository, with
+ *    its distribution (the repository's own by default) and public key
+ *    instead of names, and says what its Release was checked against.
  */
 
 const adminMe: Me = {
@@ -465,6 +468,108 @@ describe('import', () => {
       expect(created).toEqual({
         url: 'https://nexus.example.com/repository/raw-hosted',
         names: ['pdfium/7350/a b, c.tgz', 'docs/ü.txt'],
+        on_conflict: 'skip',
+        concurrency: 4,
+        dry_run: false,
+      }),
+    )
+  })
+
+  it('offers the import on an apt hosted repository, with its distribution and public key', async () => {
+    let created: unknown
+    mockApi({
+      repositories: [
+        repo({ name: 'apt-internal', format: 'apt', options: { distribution: 'bookworm' } }),
+      ],
+      onCreate: (body) => {
+        created = body
+        return json(imp({ state: 'queued' }), 201)
+      },
+    })
+    const router = await renderAt('/manage/repositories/apt-internal')
+    await userEvent.click(await screen.findByRole('link', { name: 'Import' }))
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe(
+        '/manage/repositories/apt-internal/import',
+      ),
+    )
+    // The repository's own distribution, by default; no names.
+    expect(await screen.findByLabelText('Distribution')).toHaveValue('bookworm')
+    expect(screen.queryByLabelText(/Package IDs/)).not.toBeInTheDocument()
+    await userEvent.type(
+      screen.getByLabelText('Repository URL'),
+      'https://nexus.example.com/repository/apt-hosted',
+    )
+    await userEvent.clear(screen.getByLabelText('Distribution'))
+    await userEvent.type(screen.getByLabelText('Distribution'), 'stable')
+    await userEvent.type(
+      screen.getByLabelText(/Public key/),
+      '-----BEGIN PGP PUBLIC KEY BLOCK-----\nmDMEZ\n-----END PGP PUBLIC KEY BLOCK-----\n',
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Start dry run' }))
+    await waitFor(() =>
+      expect(created).toEqual({
+        url: 'https://nexus.example.com/repository/apt-hosted',
+        distribution: 'stable',
+        public_key:
+          '-----BEGIN PGP PUBLIC KEY BLOCK-----\nmDMEZ\n-----END PGP PUBLIC KEY BLOCK-----',
+        on_conflict: 'skip',
+        concurrency: 4,
+        dry_run: true,
+      }),
+    )
+  })
+
+  it('starts the next apt import from the last one and names its Release', async () => {
+    let created: unknown
+    const key = '-----BEGIN PGP PUBLIC KEY BLOCK-----\nmDMEZ\n-----END PGP PUBLIC KEY BLOCK-----'
+    mockApi({
+      repositories: [
+        repo({ name: 'apt-internal', format: 'apt', options: { distribution: 'bookworm' } }),
+      ],
+      imports: [
+        imp({
+          repository: 'apt-internal',
+          url: 'https://nexus.example.com/repository/apt-hosted',
+          username: null,
+          listing: 'release',
+          source_total: null,
+          distribution: 'jammy',
+          public_key: key,
+        }),
+      ],
+      items: [
+        item({
+          name: 'greeter:amd64',
+          version: '1.0-1',
+          state: 'failed',
+          detail: 'the download of … does not match the SHA-256 the index lists for it',
+        }),
+      ],
+      onCreate: (body) => {
+        created = body
+        return json(imp({ state: 'queued' }), 201)
+      },
+    })
+    await renderAt('/manage/repositories/apt-internal/import')
+    const card = await screen.findByRole('article', { name: 'Import 7' })
+    expect(
+      within(card).getByText(
+        /The Release of jammy names the packages, checked against its public key/,
+        { exact: false },
+      ),
+    ).toBeInTheDocument()
+    await userEvent.click(within(card).getByRole('button', { name: 'Show failed' }))
+    expect(await within(card).findByText('greeter:amd64 1.0-1')).toBeInTheDocument()
+
+    expect(screen.getByLabelText('Distribution')).toHaveValue('jammy')
+    expect(screen.getByLabelText(/Public key/)).toHaveValue(key)
+    await userEvent.click(screen.getByRole('button', { name: 'Start import' }))
+    await waitFor(() =>
+      expect(created).toEqual({
+        url: 'https://nexus.example.com/repository/apt-hosted',
+        distribution: 'jammy',
+        public_key: key,
         on_conflict: 'skip',
         concurrency: 4,
         dry_run: false,

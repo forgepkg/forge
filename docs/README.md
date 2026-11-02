@@ -25,11 +25,11 @@ its [quickstart](../README.md#quickstart);
   run, and size budgets.
 - **[Importing repositories](import.md)**: copy a hosted repository of
   another server (a NuGet feed, an npm registry, a registry, a raw
-  repository: Nexus, Artifactory, Verdaccio, a web server, another Forge)
-  into Forge, with its publish dates.
+  repository, an apt repository: Nexus, Artifactory, Verdaccio, a web
+  server, another Forge) into Forge, with its publish dates.
 - **[Importing from Nexus](nexus-import.md)**: where Nexus serves its feeds,
-  registries and raw files, its search's limits, and imports stored before
-  2.2.
+  registries, apt repositories and raw files, its search's limits, and
+  imports stored before 2.2.
 
 ## Formats
 

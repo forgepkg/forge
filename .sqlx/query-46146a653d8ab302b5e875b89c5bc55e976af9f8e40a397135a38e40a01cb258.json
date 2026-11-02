@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, repository_id, url, source_repository, registry_url, names, username,\n               (password_enc IS NOT NULL) AS \"has_password!\",\n               on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,\n               cancel_requested, source_server, source_total,\n               last_error, created_by, created_at, started_at, finished_at, updated_at\n        FROM repository_import\n        WHERE repository_id = $1\n        ORDER BY id DESC\n        LIMIT $2\n        ",
+  "query": "\n        SELECT id, repository_id, url, source_repository, registry_url, names, distribution,\n               public_key, username,\n               (password_enc IS NOT NULL) AS \"has_password!\",\n               on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,\n               cancel_requested, source_server, source_total,\n               last_error, created_by, created_at, started_at, finished_at, updated_at\n        FROM repository_import\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,28 @@
       },
       {
         "ordinal": 6,
+        "name": "distribution",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "distribution"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "public_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "repository_import",
+            "name": "public_key"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "username",
         "type_info": "Text",
         "origin": {
@@ -81,13 +103,13 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "has_password!",
         "type_info": "Bool",
         "origin": "Expression"
       },
       {
-        "ordinal": 8,
+        "ordinal": 10,
         "name": "on_conflict",
         "type_info": "Text",
         "origin": {
@@ -98,7 +120,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "concurrency",
         "type_info": "Int4",
         "origin": {
@@ -109,7 +131,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "dry_run",
         "type_info": "Bool",
         "origin": {
@@ -120,7 +142,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 13,
         "name": "state",
         "type_info": "Text",
         "origin": {
@@ -131,7 +153,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
         "name": "phase",
         "type_info": "Text",
         "origin": {
@@ -142,7 +164,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "scan_listing",
         "type_info": "Text",
         "origin": {
@@ -153,7 +175,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 16,
         "name": "cursor",
         "type_info": "Text",
         "origin": {
@@ -164,7 +186,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 17,
         "name": "cancel_requested",
         "type_info": "Bool",
         "origin": {
@@ -175,7 +197,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 18,
         "name": "source_server",
         "type_info": "Text",
         "origin": {
@@ -186,7 +208,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 19,
         "name": "source_total",
         "type_info": "Int8",
         "origin": {
@@ -197,7 +219,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 20,
         "name": "last_error",
         "type_info": "Text",
         "origin": {
@@ -208,7 +230,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 21,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -219,7 +241,7 @@
         }
       },
       {
-        "ordinal": 20,
+        "ordinal": 22,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -230,7 +252,7 @@
         }
       },
       {
-        "ordinal": 21,
+        "ordinal": 23,
         "name": "started_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -241,7 +263,7 @@
         }
       },
       {
-        "ordinal": 22,
+        "ordinal": 24,
         "name": "finished_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -252,7 +274,7 @@
         }
       },
       {
-        "ordinal": 23,
+        "ordinal": 25,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -265,7 +287,6 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
         "Int8"
       ]
     },
@@ -273,6 +294,8 @@
       false,
       false,
       false,
+      true,
+      true,
       true,
       true,
       true,
@@ -296,5 +319,5 @@
       false
     ]
   },
-  "hash": "90727fe56ec79034408235b7f1319d93622dc0f39c69883e5f375d08dbd6b728"
+  "hash": "46146a653d8ab302b5e875b89c5bc55e976af9f8e40a397135a38e40a01cb258"
 }

@@ -21,6 +21,7 @@
 
 pub mod control;
 pub mod deb;
+pub mod import;
 pub mod index;
 pub mod layout;
 pub mod manifest;
