@@ -1340,7 +1340,7 @@ pub async fn seed_auth_realms(
             pool,
             envelope,
             KIND_CRED_FORWARD,
-            priority,
+            Some(priority),
             serde_json::to_value(&cfg).expect("serializable"),
         )
         .await?;
@@ -1381,12 +1381,11 @@ pub async fn seed_auth_realms(
             endpoint_hosts: normalize_endpoint_hosts(&o.endpoint_hosts)
                 .map_err(anyhow::Error::msg)?,
         };
-        let priority = auth_realm_dao::next_priority(pool).await?;
         apply_seed(
             pool,
             envelope,
             KIND_OIDC,
-            priority,
+            None,
             serde_json::to_value(&cfg).expect("serializable"),
         )
         .await?;
@@ -1399,12 +1398,13 @@ pub async fn seed_auth_realms(
 }
 
 /// Insert or fingerprint-refresh one seeded realm row (see
-/// [`seed_auth_realms`] for the drift-detection contract).
+/// [`seed_auth_realms`] for the drift-detection contract). A missing row
+/// goes in at `priority`, or after the last realm when `None`.
 async fn apply_seed(
     pool: &PgPool,
     envelope: &EnvelopeService,
     kind: &str,
-    priority: i32,
+    priority: Option<i32>,
     config: JsonValue,
 ) -> anyhow::Result<()> {
     let name = seed_name(kind).expect("a seeded realm kind");
@@ -1418,21 +1418,23 @@ async fn apply_seed(
             // taken over and the TOML block is ignored.
             if !auth_realm_dao::kind_exists(pool, kind).await? {
                 let fingerprint = seed_fingerprint(kind, &config);
-                secret_dao::insert_realm_with_secrets(
+                // Checked again under the lock the insert takes: an instance
+                // booting at the same time may have imported the block in the
+                // meantime. That instance records the marker.
+                let seeded = secret_dao::seed_realm_with_secrets(
                     pool,
                     envelope,
-                    forge_db::auth_realm_dao::NewAuthRealm {
-                        kind: kind.to_string(),
-                        name: name.to_string(),
-                        enabled: true,
-                        priority,
-                        config,
-                    },
+                    kind,
+                    name,
+                    priority,
+                    &config,
                     secret_keys(kind),
                 )
                 .await?;
-                authz_dao::set_setting(pool, &key, &fingerprint).await?;
-                tracing::info!(realm = %name, %kind, "imported legacy config into auth_realm");
+                if seeded.is_some() {
+                    authz_dao::set_setting(pool, &key, &fingerprint).await?;
+                    tracing::info!(realm = %name, %kind, "imported legacy config into auth_realm");
+                }
             }
         }
         Some(existing) if existing.kind == kind => {
