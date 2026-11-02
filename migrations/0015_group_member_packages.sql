@@ -1,0 +1,13 @@
+-- ---------------------------------------------------------------------------
+-- group_member.packages: the package ids a group asks a member about (#743)
+--
+-- Glob patterns, the syntax of a content selector's includes, matched
+-- case-insensitively against the package id (an image name in a Docker /
+-- OCI group): `@fortawesome/*`, `Envisia.*`. A group asks a member with
+-- patterns only about the ids one of them matches, and nothing about any
+-- other id; a nested group's patterns hold for everything below it. Empty
+-- (the default) is every id, as before. The patterns only narrow: the
+-- groups' prefer_hosted, reserved prefixes and owners are decided as
+-- without them. Groups of files (raw) have none.
+-- ---------------------------------------------------------------------------
+ALTER TABLE group_member ADD COLUMN packages text[] NOT NULL DEFAULT '{}';

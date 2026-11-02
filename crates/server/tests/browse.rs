@@ -417,9 +417,19 @@ async fn browse_repos_by_format_with_client_urls() {
         raw["url"],
         format!("http://test.local/repository/{}", created[1].0)
     );
+    assert!(nuget.get("registry").is_none(), "{nuget}");
+    assert!(nuget.get("pull_prefix").is_none(), "{nuget}");
     let docker = entry(&created[2].0);
     assert_eq!(docker["format"], "docker");
     assert!(docker.get("url").is_none(), "{docker}");
+    // A docker repository names the registry `docker login` takes and the
+    // image prefix, for the web UI's token snippets.
+    assert_eq!(docker["registry"], "test.local", "{docker}");
+    assert_eq!(
+        docker["pull_prefix"],
+        format!("test.local/{}", created[2].0),
+        "{docker}"
+    );
 
     let files = list("?format=raw").await;
     let files = files.as_array().unwrap();

@@ -76,8 +76,10 @@ docker pull forge.example.com/docker-hosted/team/app:1.2
 docker push forge.example.com/docker-hosted/team/app:1.3
 ```
 
-- **API tokens** (created on the Tokens page, or `POST /admin/me/tokens`) are
-  the password to use. A token's repository scope applies.
+- **API tokens** (created under **Your tokens** in the web UI, or `POST
+  /admin/me/tokens`) are the password to use. A token's repository scope
+  applies. Once a token is created, the page shows the `docker login` and
+  `helm registry login` commands with it and your username filled in.
 - **Browser sign-in** (OIDC or Entra included): the Docker CLI has none for
   a registry other than Docker Hub. A client gets an API token through
   Forge's [device login](deployment.md#device-login) instead (the coming
@@ -280,6 +282,13 @@ docker pull forge.example.com/docker/nginx:1.27
   proxy member, and with `prefer_hosted` (on by default) neither is an image
   a hosted member already has. Flag trusted members as `owner` when hosted
   members have different writers, as for NuGet groups.
+- **Scoped members**: `"packages": ["bitnami/*"]` when adding a member, or
+  `PATCH /admin/repositories/docker/members/<member>` later, makes the group
+  ask it only about the images those patterns match (globs of image names,
+  matched case-insensitively; empty: every image). For any other image the
+  member is not asked at all, its upstream included. A scope on a nested
+  group's membership holds for every member below it, and it only narrows:
+  the guard above is decided as without it.
 
 ## Browsing
 

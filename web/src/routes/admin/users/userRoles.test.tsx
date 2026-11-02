@@ -36,6 +36,24 @@ describe('admin user roles', () => {
       selectors: [
         { id: 20, name: 'acme', description: '', includes: ['acme.*'], excludes: [] },
       ],
+      browseRepos: [
+        {
+          id: 10,
+          name: 'internal',
+          kind: 'hosted',
+          online: true,
+          format: 'nuget',
+          url: 'https://forge.example.com/repository/internal',
+        },
+        {
+          id: 11,
+          name: 'public',
+          kind: 'hosted',
+          online: true,
+          format: 'nuget',
+          url: 'https://forge.example.com/repository/public',
+        },
+      ],
     })
     api.state.roles.push(
       { id: 7, name: 'ci-pushers', description: 'CI pushes', builtin: false },
@@ -277,6 +295,17 @@ describe('admin user roles', () => {
       ),
     ).toBeGreaterThan(Date.now())
     expect(await screen.findByText('plaintext-secret')).toBeInTheDocument()
+    // The snippets name the account the token is for, not the administrator,
+    // and only the repository the token is scoped to.
+    const usage = (await screen.findByRole('heading', { name: 'Use this token' })).closest(
+      'section',
+    )!
+    expect(
+      within(usage).getByText(
+        'dotnet nuget add source https://forge.example.com/repository/internal/index.json --name internal --username alice --password plaintext-secret --store-password-in-clear-text',
+      ),
+    ).toBeInTheDocument()
+    expect(within(usage).queryByRole('combobox', { name: 'Repository' })).not.toBeInTheDocument()
     const row = (await screen.findByText('ci', { selector: 'td' })).closest('tr')!
     expect(within(row).getByText('write')).toBeInTheDocument()
     expect(within(row).getByText('1 repository')).toBeInTheDocument()

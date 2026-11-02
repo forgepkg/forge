@@ -221,6 +221,11 @@ pub struct ImportOptions {
     /// registry names a tarball in a package's packument, and the tarball's
     /// `package.json` must agree.
     pub expected: Option<(String, String)>,
+    /// Fields of the stored manifest summary that the source decides rather
+    /// than the package, set over the format's when the version is written:
+    /// apt's `component`, the one the source lists the package in, where
+    /// an upload takes it from the package's `Section`.
+    pub summary_fields: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// What an import did with one package version.

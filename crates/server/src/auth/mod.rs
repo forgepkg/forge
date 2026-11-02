@@ -422,6 +422,18 @@ fn login_failed(failure: LoginFailure) -> Response {
         .into_response()
 }
 
+/// The audit line of an OIDC sign-in the IdP vouched for but Forge refused
+/// (the realm's claim gate, an account it may not create or sign in). A
+/// callback the IdP itself failed is not one: anyone can call the callback.
+fn audit_oidc_refusal(realm: &str, outcome: &'static str) {
+    tracing::info!(
+        target: "forge::audit",
+        realm,
+        outcome,
+        "browser login refused"
+    );
+}
+
 /// The callback proper; [`oidc_callback`] wraps it to clear the flow cookie.
 async fn oidc_callback_inner(
     state: &AppState,
@@ -463,6 +475,7 @@ async fn oidc_callback_inner(
             issuer = %validated.issuer,
             "oidc login refused: the token does not carry the realm's required claims"
         );
+        audit_oidc_refusal(&orr.realm_name, LoginFailure::NotPermitted.code());
         return login_failed(LoginFailure::NotPermitted);
     }
 
@@ -474,10 +487,13 @@ async fn oidc_callback_inner(
                 %claim,
                 "oidc login refused: a new account needs a UPN, and the claim does not hold one"
             );
-            return login_failed(LoginFailure::UsernameNotUpn { claim });
+            let failure = LoginFailure::UsernameNotUpn { claim };
+            audit_oidc_refusal(&orr.realm_name, failure.code());
+            return login_failed(failure);
         }
         Err(e) => {
             tracing::warn!(error = %e, "oidc user resolution failed");
+            audit_oidc_refusal(&orr.realm_name, LoginFailure::NotPermitted.code());
             return login_failed(LoginFailure::NotPermitted);
         }
     };
@@ -513,6 +529,14 @@ async fn oidc_callback_inner(
             return auth_unavailable();
         }
     };
+
+    tracing::info!(
+        target: "forge::audit",
+        user_id = user.id,
+        realm = %orr.realm_name,
+        how = "oidc",
+        "browser login"
+    );
 
     // Re-validate the post-login target (it came from the flow row, which the
     // login endpoint already sanitized, but defense in depth).
@@ -858,14 +882,17 @@ async fn create_token(
         minted_with_forwarded_credential: user.auth_source == "upstream-basic",
     };
     match token_dao::insert_token(&state.pool, new).await {
-        Ok(t) => (
-            StatusCode::CREATED,
-            Json(CreatedToken {
-                view: TokenView::from(&t),
-                token: secret,
-            }),
-        )
-            .into_response(),
+        Ok(t) => {
+            crate::admin::tokens::audit_self_service_mint(&t, None);
+            (
+                StatusCode::CREATED,
+                Json(CreatedToken {
+                    view: TokenView::from(&t),
+                    token: secret,
+                }),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "auth/tokens create failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
@@ -898,7 +925,10 @@ async fn revoke_token(
     }
 
     match token_dao::revoke_token(&state.pool, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            crate::admin::tokens::audit_self_service_revoke(user.id, id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, "token not found or already revoked").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "auth/tokens revoke failed");
@@ -1220,7 +1250,17 @@ async fn password_login(
     .await
     {
         Ok(verified) => verified,
-        Err(refusal) => return refusal.into_response(),
+        Err(refusal) => {
+            // Never the username: a password typed into its field would
+            // land in the audit log.
+            tracing::info!(
+                target: "forge::audit",
+                ip = %client_ip,
+                outcome = ?refusal,
+                "browser login refused"
+            );
+            return refusal.into_response();
+        }
     };
 
     // Fresh session per login (fixation-proof), same as the OIDC callback.
@@ -1235,6 +1275,13 @@ async fn password_login(
             return auth_unavailable();
         }
     };
+    tracing::info!(
+        target: "forge::audit",
+        user_id = principal.user_id,
+        ip = %client_ip,
+        how = "password",
+        "browser login"
+    );
 
     (
         StatusCode::OK,

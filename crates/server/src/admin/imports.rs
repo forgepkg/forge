@@ -1,6 +1,6 @@
 //! Imports into a hosted repository from another server ([`crate::import`]):
-//! a NuGet feed, an npm registry or a registry API, read through the
-//! format's own protocol, or a raw repository. **Admin-only.**
+//! a NuGet feed, an npm registry, an apt repository or a registry API, read
+//! through the format's own protocol, or a raw repository. **Admin-only.**
 //!
 //! * `GET    /admin/repositories/{name}/imports` — the repository's imports,
 //!   newest first ([`ImportView`]).
@@ -8,7 +8,9 @@
 //!   ([`CreateImport`]). The source is checked first (the **preflight**):
 //!   a feed's service index resolves and its search answers (with how many
 //!   packages it finds), an npm registry lists its packages (its search,
-//!   or `/-/all`), a registry answers its API and serves a catalog, or a
+//!   or `/-/all`), an apt repository serves its distribution's `Release`
+//!   (signed by the public key the import was given, if it was given one),
+//!   a registry answers its API and serves a catalog, or a
 //!   raw repository serves a listing (another Forge's JSON listing, or
 //!   Nexus' asset listing); an import that names its package ids, npm
 //!   packages or scopes, images or paths needs no search, catalog or
@@ -52,6 +54,7 @@ use serde::{Deserialize, Serialize};
 
 use super::db_error;
 use crate::images::import::ImportSource;
+use crate::import::apt::{AptSource, Keyring};
 use crate::import::feed::Feed;
 use crate::import::npm::NpmRegistry;
 use crate::import::raw::RawSource;
@@ -104,8 +107,10 @@ pub struct CreateImport {
     /// npm registry (`https://nexus.example.com/repository/npm-hosted`), a
     /// registry (`https://registry.example.com`), or a raw repository
     /// (`https://nexus.example.com/repository/raw-hosted`, a directory of a
-    /// web server). With `repository`, a Nexus server instead (the request
-    /// before imports read the format's protocol).
+    /// web server), or an apt repository's base URL, as `sources.list` names
+    /// it (`https://nexus.example.com/repository/apt-hosted`). With
+    /// `repository`, a Nexus server instead (the request before imports
+    /// read the format's protocol).
     pub url: String,
     /// The Nexus repository at `url` to read (with `url` naming the Nexus
     /// server): its service index, `<url>/repository/<name>/index.json`, its
@@ -125,6 +130,14 @@ pub struct CreateImport {
     /// the source's listing names.
     #[serde(default)]
     pub names: Option<Vec<String>>,
+    /// apt: the source's distribution (`bookworm`), the one `sources.list`
+    /// names; by default the repository's own.
+    #[serde(default)]
+    pub distribution: Option<String>,
+    /// apt: the source's OpenPGP public keys, ASCII-armored. Given them, the
+    /// import reads only a `Release` one of them signed.
+    #[serde(default)]
+    pub public_key: Option<String>,
     /// The source's credentials (both, or neither for anonymous access).
     #[serde(default)]
     pub username: Option<String>,
@@ -203,6 +216,11 @@ pub struct ImportView {
     /// The package ids or images it copies; `null`: every one the source's
     /// search or catalog lists.
     pub names: Option<Vec<String>>,
+    /// apt: the source's distribution.
+    pub distribution: Option<String>,
+    /// apt: the public keys the source's `Release` must be signed with,
+    /// ASCII-armored; `null`: it is read unchecked.
+    pub public_key: Option<String>,
     pub username: Option<String>,
     pub has_password: bool,
     pub on_conflict: String,
@@ -221,7 +239,7 @@ pub struct ImportView {
     pub source_total: Option<i64>,
     /// What the scan walks: `search`, `catalog`, `all` (npm's `/-/all`),
     /// `assets` (Nexus' asset listing), `directories` (another Forge's raw
-    /// listing) or `names`.
+    /// listing), `release` (the indexes an apt `Release` names) or `names`.
     pub listing: String,
     pub last_error: Option<String>,
     pub created_by: Option<i64>,
@@ -259,6 +277,8 @@ async fn view(
             Protocol::of(&repo.format, state.formats.stores_images(&repo.format)),
         ),
         names: import.names,
+        distribution: import.distribution,
+        public_key: import.public_key,
         username: import.username,
         has_password: import.has_password,
         on_conflict: import.on_conflict,
@@ -372,6 +392,7 @@ pub async fn create(
     let images = state.formats.stores_images(&repo.format);
     let protocol = Protocol::of(&repo.format, images);
     let raw = protocol == Protocol::Raw;
+    let apt = protocol == Protocol::Apt;
     let Some(format) = state.formats.get(&repo.format) else {
         return bad_request(format!("the {} format is not loaded", repo.format));
     };
@@ -412,6 +433,11 @@ pub async fn create(
     };
     let names = match body.names {
         None => None,
+        Some(_) if apt => {
+            return bad_request(
+                "names: an apt import copies every package the source's Release lists; leave names out",
+            );
+        }
         Some(names) => {
             let mut seen = std::collections::HashSet::new();
             let mut kept = Vec::new();
@@ -466,6 +492,44 @@ pub async fn create(
             Some(kept)
         }
     };
+    // apt: the distribution, and the keys its Release is checked against.
+    let distribution = body
+        .distribution
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    let public_key = body
+        .public_key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    let (distribution, keys) = if apt {
+        let own = || {
+            repo.format_options()
+                .into_iter()
+                .find(|(name, _)| name == forge_format_apt::DISTRIBUTION)
+                .map(|(_, value)| value)
+        };
+        let Some(distribution) = distribution.or_else(own) else {
+            return bad_request("give the source's distribution");
+        };
+        if !forge_format_apt::layout::valid_distribution(&distribution) {
+            return bad_request(format!(
+                "{distribution:?} is not a distribution name (letters, digits, '.', '_', '-', '+', '~')"
+            ));
+        }
+        let keys = match &public_key {
+            Some(armored) => match Keyring::parse(armored) {
+                Ok(keys) => Some(keys),
+                Err(e) => return bad_request(format!("public_key: {e}")),
+            },
+            None => None,
+        };
+        (Some(distribution), keys)
+    } else {
+        if distribution.is_some() || public_key.is_some() {
+            return bad_request("distribution and public_key apply to apt repositories only");
+        }
+        (None, None)
+    };
     let username = body.username.filter(|u| !u.is_empty());
     let password = password_secret(body.password);
     if username.is_some() != password.is_some() {
@@ -481,7 +545,21 @@ pub async fn create(
     // The preflight: does the source speak the format's protocol, and list
     // what to copy?
     let mut listing = Listing::of(images, names.is_some());
-    let (server, total) = if raw {
+    let (server, total) = if let (true, Some(distribution)) = (apt, &distribution) {
+        let from = AptSource::new(
+            state.upstream.clone(),
+            &source,
+            distribution,
+            username.clone(),
+            password.clone(),
+            keys,
+        );
+        if let Err(e) = from.release().await {
+            return preflight_error(&format!("the apt repository at {source}"), e);
+        }
+        listing = Listing::Release;
+        (from.server(), None)
+    } else if raw {
         let mut from = RawSource::new(
             state.upstream.clone(),
             &source,
@@ -627,6 +705,8 @@ pub async fn create(
                 repository_id: repo.id,
                 url: &source,
                 names: names.as_deref(),
+                distribution: distribution.as_deref(),
+                public_key: public_key.as_deref(),
                 username: username.as_deref(),
                 on_conflict: &body.on_conflict,
                 concurrency: body.concurrency,

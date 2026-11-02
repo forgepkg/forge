@@ -36,6 +36,11 @@ pub struct RepositoryImport {
     /// The package ids or images the import copies; `None`: whatever the
     /// source's search (or catalog) finds.
     pub names: Option<Vec<String>>,
+    /// apt: the source's distribution.
+    pub distribution: Option<String>,
+    /// apt: the source's OpenPGP public keys, ASCII-armored, that its
+    /// `Release` must be signed with; `None`: it is read unchecked.
+    pub public_key: Option<String>,
     pub username: Option<String>,
     /// Whether a password is stored.
     pub has_password: bool,
@@ -49,7 +54,7 @@ pub struct RepositoryImport {
     pub phase: String,
     /// What the scan walks: `search`, `catalog`, `all` (npm's `/-/all`),
     /// `assets` (Nexus' asset listing), `directories` (another Forge's raw
-    /// listing) or `names`.
+    /// listing), `release` (the indexes an apt `Release` names) or `names`.
     pub scan_listing: String,
     #[serde(skip)]
     pub cursor: Option<String>,
@@ -79,12 +84,14 @@ pub struct NewImport<'a> {
     pub repository_id: i64,
     pub url: &'a str,
     pub names: Option<&'a [String]>,
+    pub distribution: Option<&'a str>,
+    pub public_key: Option<&'a str>,
     pub username: Option<&'a str>,
     pub on_conflict: &'a str,
     pub concurrency: i32,
     pub dry_run: bool,
     /// Where the scan starts: `search`, `catalog`, `all`, `assets`,
-    /// `directories` or `names`.
+    /// `directories`, `release` or `names`.
     pub scan_listing: &'a str,
     pub source_server: Option<&'a str>,
     pub source_total: Option<i64>,
@@ -100,14 +107,16 @@ where
     sqlx::query_scalar!(
         r#"
         INSERT INTO repository_import
-            (repository_id, url, names, username, on_conflict, concurrency, dry_run,
-             scan_listing, source_server, source_total, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            (repository_id, url, names, distribution, public_key, username, on_conflict,
+             concurrency, dry_run, scan_listing, source_server, source_total, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         RETURNING id
         "#,
         new.repository_id,
         new.url,
         new.names,
+        new.distribution,
+        new.public_key,
         new.username,
         new.on_conflict,
         new.concurrency,
@@ -129,7 +138,8 @@ where
     sqlx::query_as!(
         RepositoryImport,
         r#"
-        SELECT id, repository_id, url, source_repository, registry_url, names, username,
+        SELECT id, repository_id, url, source_repository, registry_url, names, distribution,
+               public_key, username,
                (password_enc IS NOT NULL) AS "has_password!",
                on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,
                cancel_requested, source_server, source_total,
@@ -152,7 +162,8 @@ pub async fn list(
     sqlx::query_as!(
         RepositoryImport,
         r#"
-        SELECT id, repository_id, url, source_repository, registry_url, names, username,
+        SELECT id, repository_id, url, source_repository, registry_url, names, distribution,
+               public_key, username,
                (password_enc IS NOT NULL) AS "has_password!",
                on_conflict, concurrency, dry_run, state, phase, scan_listing, cursor,
                cancel_requested, source_server, source_total,

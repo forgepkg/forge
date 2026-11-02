@@ -122,9 +122,13 @@ export function connectSnippets(
  * registry at `url`, with an API token: `npm login` writes the same
  * `_authToken` line.
  */
-export function npmrc(url: string): string {
-  const path = url.replace(/^[a-z]+:/i, '')
-  return `registry=${url}/\n${path}/:_authToken=<token>`
+export function npmrc(url: string, token = '<token>'): string {
+  return `registry=${url}/\n${npmAuthKey(url)}:_authToken=${token}`
+}
+
+/** The `.npmrc` key prefix npm keys a registry's credentials by: `//host/path/`. */
+export function npmAuthKey(url: string): string {
+  return `${url.replace(/^[a-z]+:/i, '')}/`
 }
 
 /** The `sources.list` line of a hosted apt repository, its keys at `/etc/apt/keyrings/<repo>.asc`. */
@@ -136,7 +140,7 @@ export function aptSource(repo: string, url: string, distribution: string): stri
  * The `/etc/apt/auth.conf.d/` entry of the repository at `url`: apt sends
  * credentials over plain HTTP only to a machine written with `http://`.
  */
-export function aptAuth(url: string): string {
+export function aptAuth(url: string, username = '<username>', token = '<token>'): string {
   let machine = url
   try {
     const parsed = new URL(url)
@@ -144,12 +148,12 @@ export function aptAuth(url: string): string {
   } catch {
     // Not a URL: shown as it is.
   }
-  return `machine ${machine}\nlogin <username>\npassword <token>`
+  return `machine ${machine}\nlogin ${username}\npassword ${token}`
 }
 
 /** The `.yarnrc.yml` settings of Yarn 2 and later for the registry at `url`. */
-export function yarnrc(url: string): string {
-  return `npmRegistryServer: "${url}/"\nnpmAlwaysAuth: true\nnpmAuthToken: "<token>"`
+export function yarnrc(url: string, token = '<token>'): string {
+  return `npmRegistryServer: "${url}/"\nnpmAlwaysAuth: true\nnpmAuthToken: "${token}"`
 }
 
 /**

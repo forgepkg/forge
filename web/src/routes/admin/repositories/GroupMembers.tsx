@@ -10,6 +10,7 @@ import {
 } from '~/queries/useRepositories'
 import {
   Button,
+  Code,
   FormActions,
   Notice,
   Page,
@@ -21,6 +22,12 @@ import {
 } from '~/components/ui'
 import { PriorityList } from '~/components/PriorityList'
 import { ErrorState } from '~/components/ErrorState'
+import {
+  DOCKER_FORMAT,
+  NPM_FORMAT,
+  RAW_FORMAT,
+  parsePrefixes,
+} from '~/components/RepositoryForm'
 
 export const Route = createFileRoute(
   '/_app/manage/repositories/$repo/members',
@@ -42,6 +49,12 @@ export const Route = createFileRoute(
  * An owner cannot be removed until it is unflagged. Removing a member, and
  * unflagging the last owner (the group then trusts every hosted member
  * equally), wait for a confirmation in a dialog.
+ *
+ * A member can be scoped to package ids (`packages`, glob patterns such as
+ * `@fortawesome/*`): the group then asks it about those ids alone, which
+ * keeps a proxy that passes a public registry through from being asked
+ * about every public package. The scope is set in the add form or in a
+ * row's Packages dialog; groups of files (raw) have none.
  */
 function GroupMembers() {
   const { repo: name } = Route.useParams()
@@ -68,7 +81,18 @@ function GroupMembers() {
 
   const [member, setMember] = useState('')
   const [priority, setPriority] = useState('100')
+  const [packages, setPackages] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
+
+  // Groups of files serve a path from the first member that has it: no
+  // scopes. The examples follow the format's ids.
+  const scoped = groupFormat !== undefined && groupFormat !== RAW_FORMAT.id
+  const packagesPlaceholder =
+    groupFormat === NPM_FORMAT.id
+      ? '@fortawesome/*'
+      : groupFormat === DOCKER_FORMAT.id
+        ? 'bitnami/*'
+        : 'Contoso.*'
 
   function handleAdd(e: React.FormEvent) {
     e.preventDefault()
@@ -86,11 +110,13 @@ function GroupMembers() {
       setFormError(`Priority ${p} is already used in this group.`)
       return
     }
+    const scope = scoped ? parsePrefixes(packages) : []
     add.mutate(
-      { member, priority: p },
+      { member, priority: p, ...(scope.length > 0 ? { packages: scope } : {}) },
       {
         onSuccess: () => {
           setMember('')
+          setPackages('')
         },
       },
     )
@@ -146,6 +172,8 @@ function GroupMembers() {
             more than one member. Once any member is an owner, only owners claim
             package ids under &ldquo;Prefer hosted packages&rdquo; and serve the
             reserved prefixes.
+            {scoped &&
+              ' A member with packages is asked only about the ids they match.'}
           </>
         }
       >
@@ -163,13 +191,23 @@ function GroupMembers() {
               remove.reset()
               update.mutate({ member, owner })
             }}
+            onSetPackages={
+              scoped
+                ? (member, packages) => {
+                    remove.reset()
+                    update.mutate({ member, packages })
+                  }
+                : undefined
+            }
+            packagesPlaceholder={packagesPlaceholder}
           />
         )}
 
         {update.isError && (
           <Notice tone="danger">
-            Could not {update.variables?.owner ? 'flag' : 'unflag'}{' '}
-            {update.variables?.member} as owner:{' '}
+            {update.variables?.packages !== undefined
+              ? `Could not change the packages of ${update.variables.member}: `
+              : `Could not ${update.variables?.owner ? 'flag' : 'unflag'} ${update.variables?.member} as owner: `}
             {update.error.body || update.error.message}
           </Notice>
         )}
@@ -212,6 +250,17 @@ function GroupMembers() {
             value={priority}
             onChange={(e) => setPriority(e.target.value)}
           />
+          {scoped && (
+            <TextField
+              label="Packages"
+              optional
+              mono
+              className="min-w-0 flex-[1_1_220px]"
+              value={packages}
+              onChange={(e) => setPackages(e.target.value)}
+              placeholder={packagesPlaceholder}
+            />
+          )}
           <Button
             type="submit"
             variant="primary"
@@ -221,6 +270,15 @@ function GroupMembers() {
             {add.isPending ? 'Adding…' : 'Add member'}
           </Button>
         </div>
+        {scoped && (
+          <p className="fg-field-desc">
+            Packages: patterns of the package ids the group asks this member
+            about, comma separated (<Code>*</Code> matches any characters).
+            Empty: every package. Scope a proxy that passes a public registry
+            through to its own packages, so the group does not ask it about
+            every public one.
+          </p>
+        )}
         {candidates.length === 0 && !allRepos.isLoading && (
           <p className="fg-field-desc">
             No eligible repositories to add (every other repository of this

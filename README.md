@@ -222,8 +222,12 @@ The guides below are also a site, with navigation and search:
   for npm, pnpm, Yarn and Bun: `.npmrc`, logins, publishing, dist-tags,
   deprecations, unpublishing, proxies of `registry.npmjs.org`, internal
   scopes, audits and retention.
+- **[NuGet feeds](./docs/nuget.md)** — NuGet packages (hosted, proxy,
+  group) for `dotnet`, `nuget.exe` and Visual Studio: `dotnet nuget add
+  source`, `NuGet.config` credentials, logins, pushes with an API key and
+  unlisting.
 - **[Raw file repositories](./docs/raw.md)** — files under arbitrary paths
-  (hosted, proxy, group): uploads with curl, ranges and checksum sidecars,
+  (hosted, proxy, group): logins, uploads with curl, ranges and checksum sidecars,
   listings, the deployment policy, proxies of release downloads (the pdfium
   example) and retention.
 - **[Retention](./docs/retention.md)** — the retention rules of each kind
@@ -246,7 +250,7 @@ The guides below are also a site, with navigation and search:
   built into the server: design, operation, and writing one.
 - **[Importing repositories](./docs/import.md)** — copy a hosted repository
   of Nexus, Artifactory, Verdaccio, a registry or another Forge (NuGet, npm,
-  Docker, raw) into Forge through the format's own protocol: dry run,
+  Docker, raw, apt) into Forge through the format's own protocol: dry run,
   conflicts, resuming, and the cutover.
 
 Run `cargo xtask help` for the complete command list.

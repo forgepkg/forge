@@ -2,13 +2,15 @@ import { httpClient } from '~/lib/httpClient'
 
 /**
  * Imports into a hosted repository from another server, read through the
- * format's own protocol: a NuGet feed, an npm registry or a registry API,
- * or a raw repository (`crates/server/src/admin/imports.rs`).
+ * format's own protocol: a NuGet feed, an npm registry, an apt repository or
+ * a registry API, or a raw repository (`crates/server/src/admin/imports.rs`).
  *
  *  - `POST /admin/repositories/{name}/imports` checks the source first (the
  *    preflight: a feed's service index resolves and its search answers, an
- *    npm registry lists its packages through its search or `/-/all`, a
- *    registry answers its API and serves a catalog, or a raw repository
+ *    npm registry lists its packages through its search or `/-/all`, an apt
+ *    repository serves its distribution's `Release` (signed by the public
+ *    key the import is given, if any), a registry answers its API and serves
+ *    a catalog, or a raw repository
  *    serves a listing, another Forge's or Nexus' asset listing; an import
  *    that names its packages, scopes, images or paths needs none of it) and
  *    answers 400/502 with the reason, or 409 while the repository has an
@@ -21,7 +23,7 @@ import { httpClient } from '~/lib/httpClient'
  */
 
 /** Formats an import copies (`crates/server/src/import/mod.rs`). */
-export const IMPORT_FORMATS = ['nuget', 'npm', 'docker', 'raw']
+export const IMPORT_FORMATS = ['nuget', 'npm', 'docker', 'raw', 'apt']
 
 /** `queued` → `running` → `completed` | `failed` | `cancelled`. */
 export type ImportState =
@@ -51,7 +53,8 @@ export type OnConflict = 'skip' | 'overwrite' | 'fail'
  * What the scan walks: a feed's or an npm registry's `search`, a registry's
  * `catalog`, an npm registry's legacy `/-/all`, Nexus' asset listing
  * (`assets`) or another Forge's JSON listing (`directories`) of a raw
- * repository, or the `names` the import gives.
+ * repository, the indexes an apt `Release` names (`release`), or the `names`
+ * the import gives.
  */
 export type ImportListing =
   | 'search'
@@ -59,6 +62,7 @@ export type ImportListing =
   | 'all'
   | 'assets'
   | 'directories'
+  | 'release'
   | 'names'
 
 export interface ImportProgress {
@@ -84,6 +88,10 @@ export interface ImportView {
   url: string
   /** The package ids or images it copies; `null`: every one the source lists. */
   names: string[] | null
+  /** apt: the source's distribution. */
+  distribution?: string | null
+  /** apt: the public keys the source's `Release` must be signed with (ASCII-armored). */
+  public_key?: string | null
   username: string | null
   has_password: boolean
   on_conflict: OnConflict
@@ -130,8 +138,8 @@ export interface ImportItem {
 /** `POST /admin/repositories/{name}/imports` (unknown fields are refused). */
 export interface CreateImport {
   /**
-   * A feed's service index (`…/index.json`), an npm registry, a registry, or
-   * a raw repository.
+   * A feed's service index (`…/index.json`), an npm registry, a registry, a
+   * raw repository, or an apt repository's base URL.
    */
   url: string
   /**
@@ -140,6 +148,10 @@ export interface CreateImport {
    * files, below `url`).
    */
   names?: string[]
+  /** apt: the source's distribution (by default the repository's own). */
+  distribution?: string
+  /** apt: the source's public keys, ASCII-armored; its `Release` must be signed by one. */
+  public_key?: string
   username?: string
   password?: string
   on_conflict?: OnConflict

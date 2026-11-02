@@ -8,6 +8,7 @@ import {
   useRevokeMyToken,
 } from '~/queries/useTokens'
 import { useBrowseRepos } from '~/queries/useBrowseRepos'
+import { useMe } from '~/queries/useMe'
 import {
   Button,
   CellActions,
@@ -29,6 +30,7 @@ import { ErrorState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import { ShowOnceSecret } from '~/components/ShowOnceSecret'
 import { TokenCreateForm } from '~/components/TokenCreateForm'
+import { TokenUsage } from '~/components/TokenUsage'
 import {
   formatTokenExpiry,
   TokenScopeBadges,
@@ -42,18 +44,20 @@ export const Route = createFileRoute('/_app/tokens')({
 /**
  * Self-service token management: every signed-in user can mint, list, and
  * revoke their **own** registry tokens here (`/admin/me/tokens` — not
- * admin-gated). Tokens authenticate NuGet clients against the feed and Docker
- * clients against the registry (`docker login`, the token as the password);
- * they cannot be used to sign in to this UI. A token can be scoped to a level
- * and to some of the repositories the user can read. The plaintext is
- * shown **once** via `ShowOnceSecret`, held in transient component state, and
- * never written into a query cache.
+ * admin-gated). Tokens authenticate every client against the repositories
+ * (NuGet, npm, apt, curl) and the registry (`docker login`, the token as the
+ * password); they cannot be used to sign in to this UI. A token can be scoped
+ * to a level and to some of the repositories the user can read. The plaintext
+ * is shown **once** via `ShowOnceSecret`, with `TokenUsage`'s client snippets
+ * that carry it, held in transient component state, and never written into a
+ * query cache.
  */
 function MyTokens() {
   const tokens = useMyTokens()
   const create = useCreateMyToken()
   const revoke = useRevokeMyToken()
   const repos = useBrowseRepos()
+  const me = useMe()
 
   const [created, setCreated] = useState<CreatedToken | null>(null)
   const [pendingRevoke, setPendingRevoke] = useState<TokenView | null>(null)
@@ -68,12 +72,14 @@ function MyTokens() {
         title="Your tokens"
         description={
           <>
-            Registry tokens authenticate NuGet clients (<Code>dotnet restore</Code>,{' '}
-            <Code>push</Code>), Docker and Helm clients as you: use one as the
-            password of <Code>docker login</Code> or{' '}
-            <Code>helm registry login</Code> with your username. They
-            cannot be used to sign in here. The secret is shown only at
-            creation time.
+            API tokens authenticate your clients as you: NuGet (
+            <Code>dotnet restore</Code>, <Code>push</Code>), npm, pnpm and Yarn,
+            Docker and Helm (the password of <Code>docker login</Code> or{' '}
+            <Code>helm registry login</Code>, with your username), apt and{' '}
+            <Code>curl</Code>. Once a token is created, this page shows the
+            commands and configuration files with it filled in. A token cannot
+            be used to sign in here, and its secret is shown only at creation
+            time.
           </>
         }
       />
@@ -90,6 +96,12 @@ function MyTokens() {
               ? 'This token never expires; it stays valid until revoked.'
               : `This token expires ${formatTokenExpiry(created.expires_at)}.`}
           </p>
+          <TokenUsage
+            token={created.token}
+            username={me.data?.user.username ?? '<username>'}
+            scope={created.scope}
+            repositories={repos.data ?? []}
+          />
         </>
       )}
 
@@ -131,7 +143,7 @@ function MyTokens() {
             <Skeleton variant="table" label="Loading tokens…" />
           ) : (tokens.data?.length ?? 0) === 0 ? (
             <EmptyState title="No tokens yet" icon="Key" bordered={false}>
-              Create a token above to authenticate your NuGet, Helm or Docker client.
+              Create a token above to authenticate your NuGet, npm, Docker, Helm, apt or curl client.
             </EmptyState>
           ) : (
             <Table caption="Your registry tokens">

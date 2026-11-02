@@ -2187,6 +2187,61 @@ async fn groups_resolve_by_priority_and_push_to_the_writable_member() {
     assert_eq!(resp.status(), 400);
 }
 
+/// A member scoped to image names (#743) serves a group those images alone:
+/// for any other image the group passes it over, also for its tags, and the
+/// next member serves it.
+#[tokio::test]
+async fn a_scoped_member_serves_a_group_only_its_images() {
+    let srv = common::start().await;
+    let team = repo_name("dock");
+    let other = repo_name("dock");
+    let group = repo_name("group");
+    for r in [&team, &other] {
+        create_repo(
+            &srv,
+            json!({"name": r, "kind": "hosted", "format": "docker"}),
+        )
+        .await;
+    }
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker"}),
+    )
+    .await;
+    for (member, priority, packages) in [(&team, 10, json!(["team/*"])), (&other, 5, json!([]))] {
+        let resp = admin_post(
+            &srv,
+            &format!("/admin/repositories/{group}/members"),
+            json!({"member": member, "priority": priority, "packages": packages}),
+        )
+        .await;
+        assert_eq!(resp.status(), 201);
+    }
+    let oci = admin_oci(&srv).await;
+    oci.push_image(&format!("{team}/app"), "1", "amd64", b"team app")
+        .await;
+    oci.push_image(&format!("{team}/app"), "2", "amd64", b"team app two")
+        .await;
+    let other_app = oci
+        .push_image(&format!("{other}/app"), "1", "amd64", b"other app")
+        .await;
+    let team_svc = oci
+        .push_image(&format!("{team}/team/svc"), "1", "amd64", b"team svc")
+        .await;
+
+    // `app` is outside the scope of the higher-priority member.
+    let via = format!("{group}/app");
+    let resp = oci.get(&via, "manifests/1").await;
+    assert_eq!(resp.headers()["docker-content-digest"], other_app.as_str());
+    assert_eq!(oci.get(&via, "manifests/2").await.status(), 404);
+    let body: Value = oci.get(&via, "tags/list").await.json().await.unwrap();
+    assert_eq!(body["tags"], json!(["1"]));
+
+    // `team/svc` is inside it.
+    let resp = oci.get(&format!("{group}/team/svc"), "manifests/1").await;
+    assert_eq!(resp.headers()["docker-content-digest"], team_svc.as_str());
+}
+
 /// A docker group names its writable member by id (#219): renaming the
 /// member keeps group pushes going to it, and a repository created later
 /// under its old name does not become the push target.

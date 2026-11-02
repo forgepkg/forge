@@ -43,6 +43,7 @@ import {
   type ProxyCacheInvalidated,
   type RepoView,
   type SigningKey,
+  type UpdateMember,
   type UpdateRepo,
   type TrustedPublisherBody,
   type TrustedPublisherView,
@@ -230,13 +231,14 @@ export function useRemoveMember(name: string) {
 }
 
 /**
- * Flag or unflag a member as owner (which decides what the group serves);
- * invalidates that group's member list and Browse.
+ * Flag or unflag a member as owner, or change the package ids the group asks
+ * it about (both decide what the group serves); invalidates that group's
+ * member list and Browse.
  */
 export function useUpdateMember(name: string) {
   const queryClient = useQueryClient()
-  return useMutation<void, ApiError, { member: string; owner: boolean }>({
-    mutationFn: ({ member, owner }) => updateMember(name, member, { owner }),
+  return useMutation<void, ApiError, { member: string } & UpdateMember>({
+    mutationFn: ({ member, ...body }) => updateMember(name, member, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: repoKeys.members(name) })
       invalidateBrowse(queryClient)
