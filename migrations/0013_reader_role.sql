@@ -13,7 +13,10 @@
 -- named that role would grant the built-in `reader`, every repository, from
 -- now on, so it names `reader-<id>` too (#749). The realm's policy digest
 -- changes with it, which ends the keys its jobs exchanged; they kept the
--- renamed role's id and exchange again.
+-- renamed role's id and exchange again. A rule that names `reader` while no
+-- role of that name exists (a deleted one) refused its jobs and grants the
+-- built-in `reader` from now on: there is no role to point it at, so the
+-- upgrade notes ask administrators to check their rules first.
 --
 -- Every user that is neither an administrator nor a writer was a reader and
 -- gets the role, so they read every repository from now on. Service accounts
