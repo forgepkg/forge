@@ -44,8 +44,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use forge_core::auth::principal::Principal;
+use forge_core::repo::delay::{AppliedDelay, PackageDelay, PackageGate};
 use forge_core::repo::SearchParams;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{component_dao, repository_dao};
@@ -370,6 +371,10 @@ pub struct DetailVersion {
     /// When a delayed proxy version becomes available (`first_seen_at + delay`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delayed_until: Option<DateTime<Utc>>,
+    /// When an administrator released this proxy version from the package
+    /// delay early, if one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_released_at: Option<DateTime<Utc>>,
     /// Retention status — reserved; always `null`.
     pub retention_status: Option<String>,
 }
@@ -411,6 +416,12 @@ pub struct PackageDetail {
     /// The latest version's README, when its format reads one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readme: Option<String>,
+    /// A proxy's package delay of this package: how long its new versions
+    /// are held back, and whether an override (`source`: a content selector
+    /// or a pattern) or the repository's default decides it. Absent for
+    /// other kinds, and for proxies of formats without a package delay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_delay: Option<AppliedDelay>,
 }
 
 /// `GET /browse/packages/{repo}/{id}` — package detail.
@@ -479,13 +490,20 @@ pub async fn package_detail(
     // downloadable. A package whose *only* versions are delayed is still a real
     // package, so we must not 404 it just because `versions` is empty.
     let is_proxy = repo.kind() == RepoKind::Proxy;
-    let delayed = if is_proxy {
-        match delayed_proxy_versions(&state, &repo, &lower).await {
-            Ok(d) => d,
+    let gate = if is_proxy {
+        match package_gate(&state, &repo, &lower).await {
+            Ok(gate) => Some(gate),
             Err(e) => return db_error(e),
         }
     } else {
-        Vec::new()
+        None
+    };
+    let delayed = match &gate {
+        Some(gate) => match delayed_proxy_versions(&state, &repo, &lower, gate).await {
+            Ok(d) => d,
+            Err(e) => return db_error(e),
+        },
+        None => Vec::new(),
     };
 
     if versions.is_empty() && delayed.is_empty() {
@@ -579,6 +597,9 @@ pub async fn package_detail(
             published_at,
             delay_status,
             delayed_until: None,
+            delay_released_at: gate
+                .as_ref()
+                .and_then(|g| g.released.get(&v.version).copied()),
             retention_status: None,
         });
     }
@@ -642,8 +663,24 @@ pub async fn package_detail(
         deprecated,
         description,
         readme,
+        package_delay: gate
+            .filter(|_| {
+                crate::admin::repositories::without_package_delay(&state, &repo.format).is_none()
+            })
+            .map(|g| g.applied),
     })
     .into_response()
+}
+
+/// The package delay of proxy package `lower_id` and its versions released
+/// early. A failure to resolve the delay is a database error.
+async fn package_gate(
+    state: &AppState,
+    repo: &Repository,
+    lower_id: &str,
+) -> Result<PackageGate, sqlx::Error> {
+    let delay = PackageDelay::load(&state.pool, repo).await?;
+    PackageGate::load(&state.pool, repo.id, &delay, lower_id).await
 }
 
 /// Proxy versions still inside the package-delay window: discovered upstream but
@@ -653,6 +690,7 @@ async fn delayed_proxy_versions(
     state: &AppState,
     repo: &Repository,
     lower_id: &str,
+    gate: &PackageGate,
 ) -> Result<Vec<DetailVersion>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
@@ -669,12 +707,14 @@ async fn delayed_proxy_versions(
 
     // `first_seen_at` is on the database's clock.
     let now = forge_db::db_now(&state.pool).await?;
-    let delay = Duration::seconds(i64::from(repo.package_delay_seconds));
+    // The package's own delay: an override may apply.
+    let delay = gate.applied.duration();
     let mut out = Vec::new();
     for row in rows {
         let available_at = row.first_seen_at + delay;
-        if available_at <= now {
-            // Already available — surfaced by `list_versions`, skip here.
+        if available_at <= now || gate.released.contains_key(&row.version) {
+            // Already available (past the delay, or released early) —
+            // surfaced by `list_versions`, skip here.
             continue;
         }
         out.push(DetailVersion {
@@ -685,6 +725,7 @@ async fn delayed_proxy_versions(
             published_at: Some(row.first_seen_at),
             delay_status: Some(DelayStatus::DelayedUntil),
             delayed_until: Some(available_at),
+            delay_released_at: None,
             retention_status: None,
         });
     }

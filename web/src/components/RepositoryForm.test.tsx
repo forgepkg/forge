@@ -477,6 +477,67 @@ describe('repository names (M18)', () => {
   })
 })
 
+describe('package-delay overrides (#184)', () => {
+  const withOverrides: RepoView = {
+    ...storedProxy,
+    package_delay_seconds: 3600,
+    package_delay_overrides: [
+      { selector: 'trusted-vendors', delay_seconds: 0 },
+      { pattern: 'Risky.*', delay_seconds: 1209600 },
+    ],
+  }
+
+  it('sends the overrides in order on create, trimmed', () => {
+    const values: RepoFormValues = {
+      ...toFormValues(),
+      name: 'nuget-org',
+      kind: 'proxy',
+      remote_url: 'https://api.nuget.org/v3/index.json',
+      package_delay_seconds: '3600',
+      package_delay_overrides: [
+        { by: 'selector', value: ' trusted-vendors ', delay_seconds: '0' },
+        { by: 'pattern', value: 'Risky.*', delay_seconds: '1209600' },
+      ],
+    }
+    expect(toCreateBody(values).package_delay_overrides).toEqual(
+      withOverrides.package_delay_overrides,
+    )
+    // None: not sent.
+    expect(
+      toCreateBody({ ...values, package_delay_overrides: [] }),
+    ).not.toHaveProperty('package_delay_overrides')
+  })
+
+  it('sends the whole list on update only when it changed', () => {
+    const seeded = toFormValues(withOverrides)
+    expect(toUpdateBody(seeded, withOverrides)).toEqual({})
+    const swapped = {
+      ...seeded,
+      package_delay_overrides: [...seeded.package_delay_overrides].reverse(),
+    }
+    expect(toUpdateBody(swapped, withOverrides)).toEqual({
+      package_delay_overrides: [
+        { pattern: 'Risky.*', delay_seconds: 1209600 },
+        { selector: 'trusted-vendors', delay_seconds: 0 },
+      ],
+    })
+    expect(
+      toUpdateBody({ ...seeded, package_delay_overrides: [] }, withOverrides),
+    ).toEqual({ package_delay_overrides: [] })
+  })
+
+  it('refuses an override delay out of range before any request', async () => {
+    const user = userEvent.setup()
+    const onSubmit = renderEdit(withOverrides)
+    const delay = screen.getByLabelText('Override 2 delay (seconds)')
+    await user.clear(delay)
+    await user.type(delay, '99999999999')
+    await save(user)
+    expect(await screen.findByText(/A whole number of seconds from 0/)).toBeInTheDocument()
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+})
+
 describe('repository update body (M2)', () => {
   it('omits every untouched field — no nulls that would clear stored values', async () => {
     const user = userEvent.setup()

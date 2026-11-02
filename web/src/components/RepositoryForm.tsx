@@ -5,6 +5,7 @@ import {
   type CreateRepo,
   type DeploymentPolicy,
   type FormatView,
+  type PackageDelayOverride,
   type RepoKind,
   type RepoView,
   type UpdateRepo,
@@ -12,6 +13,7 @@ import {
 import {
   Button,
   Code,
+  Fieldset,
   FormActions,
   Notice,
   Panel,
@@ -28,7 +30,9 @@ import {
  *                 + `latest_mutable` (docker), and the upload limit
  *                 (`max_upload_bytes`, entered in MiB; empty = the format's
  *                 default)
- *  - **proxy**  → `remote_url`, `package_delay_seconds` (not docker),
+ *  - **proxy**  → `remote_url`, `package_delay_seconds` and its ordered
+ *                 `package_delay_overrides` (by content selector or by
+ *                 pattern; not docker, raw or apt),
  *                 metadata/not-found TTLs, and **write-only** upstream creds
  *                 (the password is never populated from a GET; the form
  *                 offers a "set new password" affordance and only sends it
@@ -192,6 +196,8 @@ export interface RepoFormValues {
   reserved_prefixes: string
   remote_url: string
   package_delay_seconds: string
+  /** Proxy with a package delay: packages with another delay, in order. */
+  package_delay_overrides: DelayOverrideDraft[]
   upstream_username: string
   /** Newly-typed password; blank ⇒ "leave unchanged" on edit / "none" on create. */
   upstream_password: string
@@ -219,6 +225,38 @@ export interface RepoFormValues {
   options: Record<string, string>
 }
 
+/** A package-delay override as the form edits it. */
+export interface DelayOverrideDraft {
+  /** Whether it matches by a content selector or by a pattern of its own. */
+  by: 'selector' | 'pattern'
+  /** The selector's name, or the glob. */
+  value: string
+  /** The delay of the packages it matches, in seconds, as typed. */
+  delay_seconds: string
+}
+
+/** The longest package delay the server accepts: a year. */
+export const MAX_PACKAGE_DELAY_SECONDS = 365 * 24 * 60 * 60
+
+/** The overrides of a stored repository as drafts. */
+function overrideDrafts(overrides: PackageDelayOverride[] | undefined): DelayOverrideDraft[] {
+  return (overrides ?? []).map((o) => ({
+    by: o.selector != null ? 'selector' : 'pattern',
+    value: o.selector ?? o.pattern ?? '',
+    delay_seconds: String(o.delay_seconds),
+  }))
+}
+
+/** The drafts as the API takes them. */
+export function toOverrides(drafts: DelayOverrideDraft[]): PackageDelayOverride[] {
+  return drafts.map((d) => {
+    const delay_seconds = Number(d.delay_seconds) || 0
+    return d.by === 'selector'
+      ? { selector: d.value.trim(), delay_seconds }
+      : { pattern: d.value.trim(), delay_seconds }
+  })
+}
+
 export interface RepositoryFormProps {
   /** Edit mode locks the format + kind; create mode is open. */
   mode: 'create' | 'edit'
@@ -229,6 +267,11 @@ export interface RepositoryFormProps {
    * (e.g. while they load, or when the request failed).
    */
   formats?: FormatView[]
+  /**
+   * The content selectors a package-delay override may name, by name;
+   * absent while they load (an override's selector is then typed).
+   */
+  selectors?: string[]
   /** Disabled while a mutation is in flight. */
   submitting: boolean
   /** Server-side error to surface above the submit button. */
@@ -250,6 +293,7 @@ function seed(existing?: RepoView): RepoFormValues {
     reserved_prefixes: (existing?.reserved_prefixes ?? []).join(', '),
     remote_url: existing?.remote_url ?? '',
     package_delay_seconds: String(existing?.package_delay_seconds ?? 0),
+    package_delay_overrides: overrideDrafts(existing?.package_delay_overrides),
     upstream_username: existing?.upstream_username ?? '',
     // Never seed the password — it is write-only and redacted on read.
     upstream_password: '',
@@ -342,6 +386,7 @@ export function RepositoryForm({
   mode,
   existing,
   formats,
+  selectors,
   submitting,
   serverError,
   onSubmit,
@@ -393,6 +438,22 @@ export function RepositoryForm({
       if (!Number.isFinite(delay) || delay < 0) {
         next.package_delay_seconds = 'Delay must be a non-negative number.'
       }
+      values.package_delay_overrides.forEach((o, i) => {
+        if (o.value.trim() === '') {
+          next[`override:${i}`] =
+            o.by === 'selector' ? 'Choose a content selector.' : 'Enter a pattern, e.g. Microsoft.*'
+        }
+        const seconds = Number(o.delay_seconds)
+        if (
+          o.delay_seconds.trim() === '' ||
+          !Number.isInteger(seconds) ||
+          seconds < 0 ||
+          seconds > MAX_PACKAGE_DELAY_SECONDS
+        ) {
+          next[`override-delay:${i}`] =
+            `A whole number of seconds from 0 (no delay) to ${MAX_PACKAGE_DELAY_SECONDS} (a year).`
+        }
+      })
     }
     if (values.format === DOCKER_FORMAT.id) {
       const hostError = validateDockerHost(values.host)
@@ -446,6 +507,45 @@ export function RepositoryForm({
 
   function setOption(name: string, value: string) {
     setValues((v) => ({ ...v, options: { ...v.options, [name]: value } }))
+  }
+
+  function setOverride(index: number, change: Partial<DelayOverrideDraft>) {
+    setValues((v) => ({
+      ...v,
+      package_delay_overrides: v.package_delay_overrides.map((o, i) =>
+        i === index ? { ...o, ...change } : o,
+      ),
+    }))
+  }
+
+  function moveOverride(index: number, by: -1 | 1) {
+    setValues((v) => {
+      const next = [...v.package_delay_overrides]
+      const [moved] = next.splice(index, 1)
+      next.splice(index + by, 0, moved)
+      return { ...v, package_delay_overrides: next }
+    })
+  }
+
+  function removeOverride(index: number) {
+    setValues((v) => ({
+      ...v,
+      package_delay_overrides: v.package_delay_overrides.filter((_, i) => i !== index),
+    }))
+  }
+
+  function addOverride() {
+    setValues((v) => ({
+      ...v,
+      package_delay_overrides: [
+        ...v.package_delay_overrides,
+        {
+          by: selectors && selectors.length > 0 ? 'selector' : 'pattern',
+          value: '',
+          delay_seconds: '0',
+        },
+      ],
+    }))
   }
 
   const formatOptions = optionsFor(format, values.kind)
@@ -771,19 +871,6 @@ export function RepositoryForm({
               />
             )}
 
-            {!isDocker && !isRaw && !format.signed_indexes && (
-              <TextField
-                label="Package delay (seconds)"
-                type="number"
-                mono
-                min={0}
-                value={values.package_delay_seconds}
-                onChange={(e) => set('package_delay_seconds', e.target.value)}
-                error={announced(errors.package_delay_seconds)}
-                description="New upstream releases stay hidden for this long after the upstream published them (or, when the upstream does not say when, after this proxy first saw them). Older versions are served at once."
-              />
-            )}
-
             <div className="fg-fieldrow">
               {!isRaw && (
                 <TextField
@@ -884,6 +971,138 @@ export function RepositoryForm({
                   </Button>
                 </div>
               ))}
+          </div>
+        </Panel>
+      )}
+
+      {isProxy && !isDocker && !isRaw && !format.signed_indexes && (
+        <Panel
+          title="Package delay"
+          description="A dependency cooldown: new upstream releases are held back for a while, so a compromised release is noticed before your builds take it."
+        >
+          <div className="fg-form">
+            <TextField
+              label="Package delay (seconds)"
+              type="number"
+              mono
+              min={0}
+              value={values.package_delay_seconds}
+              onChange={(e) => set('package_delay_seconds', e.target.value)}
+              error={announced(errors.package_delay_seconds)}
+              description="New upstream releases stay hidden for this long after the upstream published them (or, when the upstream does not say when, after this proxy first saw them). Older versions are served at once. A package an override below matches has its delay instead."
+            />
+            <Fieldset
+              legend="Overrides"
+              description="Packages with another delay: none for trusted publishers (0), or a longer one. The first override that matches a package decides; a package no override matches keeps the delay above. A single version can also be released early, from its package's page."
+            >
+              {values.package_delay_overrides.length === 0 && (
+                <p className="fg-text">No overrides: every package has the delay above.</p>
+              )}
+              {values.package_delay_overrides.map((o, i) => {
+                const n = i + 1
+                const count = values.package_delay_overrides.length
+                return (
+                  <div key={i} className="flex flex-wrap items-start gap-4">
+                    <div className="fg-fieldrow min-w-0 flex-1">
+                      <SelectField
+                        label={`Override ${n} matches by`}
+                        value={o.by}
+                        onChange={(e) =>
+                          setOverride(i, {
+                            by: e.target.value as DelayOverrideDraft['by'],
+                            value: '',
+                          })
+                        }
+                      >
+                        <option value="selector">Content selector</option>
+                        <option value="pattern">Pattern</option>
+                      </SelectField>
+                      {o.by === 'selector' && selectors ? (
+                        <SelectField
+                          label={`Override ${n} selector`}
+                          value={o.value}
+                          onChange={(e) => setOverride(i, { value: e.target.value })}
+                          error={announced(errors[`override:${i}`])}
+                        >
+                          <option value="">Choose a selector</option>
+                          {selectors.map((name) => (
+                            <option key={name} value={name}>
+                              {name}
+                            </option>
+                          ))}
+                          {/* A selector deleted since stays as loaded; the server refuses it. */}
+                          {o.value && !selectors.includes(o.value) && (
+                            <option value={o.value}>{o.value}</option>
+                          )}
+                        </SelectField>
+                      ) : (
+                        <TextField
+                          label={
+                            o.by === 'selector' ? `Override ${n} selector` : `Override ${n} pattern`
+                          }
+                          mono
+                          value={o.value}
+                          onChange={(e) => setOverride(i, { value: e.target.value })}
+                          placeholder={
+                            o.by === 'selector'
+                              ? 'trusted-vendors'
+                              : isNpm
+                                ? '@acme/*'
+                                : 'Microsoft.*'
+                          }
+                          error={announced(errors[`override:${i}`])}
+                        />
+                      )}
+                      <TextField
+                        label={`Override ${n} delay (seconds)`}
+                        type="number"
+                        mono
+                        min={0}
+                        value={o.delay_seconds}
+                        onChange={(e) => setOverride(i, { delay_seconds: e.target.value })}
+                        error={announced(errors[`override-delay:${i}`])}
+                      />
+                    </div>
+                    <div className="flex gap-1 pt-6">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        icon="ArrowUp"
+                        iconOnly
+                        disabled={i === 0}
+                        onClick={() => moveOverride(i, -1)}
+                      >
+                        {`Move override ${n} up`}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        icon="ArrowDown"
+                        iconOnly
+                        disabled={i === count - 1}
+                        onClick={() => moveOverride(i, 1)}
+                      >
+                        {`Move override ${n} down`}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        icon="Trash"
+                        iconOnly
+                        onClick={() => removeOverride(i)}
+                      >
+                        {`Remove override ${n}`}
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })}
+              <div>
+                <Button size="sm" icon="Plus" onClick={addOverride}>
+                  Add override
+                </Button>
+              </div>
+            </Fieldset>
           </div>
         </Panel>
       )}
@@ -1059,6 +1278,10 @@ export function repositoryFacts(repo: RepoView): string[] {
     if (!docker && !raw && repo.package_delay_seconds > 0) {
       facts.push(`${shortDuration(repo.package_delay_seconds)} package delay`)
     }
+    const overrides = repo.package_delay_overrides?.length ?? 0
+    if (!docker && !raw && overrides > 0) {
+      facts.push(`${overrides} delay ${overrides === 1 ? 'override' : 'overrides'}`)
+    }
   }
   if (repo.kind === 'hosted') {
     if (docker && repo.immutable_tags) {
@@ -1143,6 +1366,9 @@ export function toCreateBody(values: RepoFormValues): CreateRepo {
     body.remote_url = values.remote_url.trim()
     if (!docker && !raw) {
       body.package_delay_seconds = Number(values.package_delay_seconds) || 0
+      if (values.package_delay_overrides.length > 0) {
+        body.package_delay_overrides = toOverrides(values.package_delay_overrides)
+      }
     }
     if (raw) {
       const maxAge = parseTtl(values.max_age_seconds)
@@ -1272,6 +1498,14 @@ export function toUpdateBody(
     const delay = Number(values.package_delay_seconds) || 0
     if (!docker && !raw && delay !== existing.package_delay_seconds) {
       body.package_delay_seconds = delay
+    }
+    const overrides = toOverrides(values.package_delay_overrides)
+    if (
+      !docker &&
+      !raw &&
+      JSON.stringify(overrides) !== JSON.stringify(toOverrides(before.package_delay_overrides))
+    ) {
+      body.package_delay_overrides = overrides
     }
     const ttls = raw
       ? (['not_found_ttl_seconds'] as const)

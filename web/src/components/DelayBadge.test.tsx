@@ -31,4 +31,38 @@ describe('DelayBadge', () => {
     render(<DelayBadge status="delayed_until" />)
     expect(screen.getByText('delayed')).toBeInTheDocument()
   })
+
+  it('names the override that exempts the package', () => {
+    render(
+      <DelayBadge
+        status="available"
+        delay={{ delay_seconds: 0, source: { kind: 'selector', name: 'trusted-vendors' } }}
+      />,
+    )
+    expect(screen.getByText('no delay: trusted-vendors')).toBeInTheDocument()
+  })
+
+  it('says when a version was released early', () => {
+    render(
+      <DelayBadge
+        status="available"
+        releasedAt="2026-11-02T10:00:00Z"
+        delay={{ delay_seconds: 3600, source: { kind: 'default' } }}
+      />,
+    )
+    expect(screen.getByText('released early')).toBeInTheDocument()
+  })
+
+  it('names the override that holds a delayed version back in its title', () => {
+    render(
+      <DelayBadge
+        status="delayed_until"
+        delay={{ delay_seconds: 1_209_600, source: { kind: 'pattern', pattern: 'risky.*' } }}
+      />,
+    )
+    expect(screen.getByText('delayed')).toHaveAttribute(
+      'title',
+      expect.stringContaining('14 d delay: risky.*'),
+    )
+  })
 })

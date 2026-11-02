@@ -49,8 +49,12 @@
 //!   per-instance cache coalesces concurrent refreshes.
 //! * **Package delay** — a version discovered from upstream is recorded with
 //!   `first_seen_at = now()` but is **not** served until
-//!   `now − first_seen_at ≥ package_delay_seconds`. Inside the window it is
-//!   omitted from enumeration/registration/search and direct download 404s. A
+//!   `now − first_seen_at ≥` its package's delay: `package_delay_seconds`,
+//!   or the first of the repository's `package_delay_overrides` that matches
+//!   the package ([`crate::repo::delay`]). Inside the window it is
+//!   omitted from enumeration/registration/search and direct download 404s,
+//!   unless an administrator released that version early
+//!   (`package_delay_release`), which serves it at once. A
 //!   delay-gated 404 is **never** written to the not-found negative cache.
 //!   The delay quarantines new releases: when a listing refresh finds
 //!   versions inside it, `first_seen_at` is moved back to the upstream
@@ -137,6 +141,7 @@ use crate::net::origins::{named_origins, UpstreamOrigins};
 use crate::net::upstream::{
     status_is_unavailable, Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp,
 };
+use crate::repo::delay::{AppliedDelay, PackageDelay, PackageGate};
 use crate::repo::downloads::DownloadTally;
 use crate::repo::hosted::BlobFetch;
 use crate::repo::{
@@ -1019,11 +1024,54 @@ impl ProxyRepo {
         Ok(forge_db::db_now(&self.pool).await?)
     }
 
-    /// Whether a version with the given `first_seen_at` has cleared the proxy's
-    /// package-delay window and may now be served/enumerated.
-    fn delay_cleared(repo: &Repository, first_seen_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-        let delay = Duration::seconds(i64::from(repo.package_delay_seconds));
-        now - first_seen_at >= delay
+    /// The package delay of `repo`: its default and its overrides, resolved
+    /// ([`PackageDelay::load`], cached per repository row).
+    async fn package_delay(&self, repo: &Repository) -> Result<Arc<PackageDelay>, RepoError> {
+        Ok(PackageDelay::load(&self.pool, repo).await?)
+    }
+
+    /// The delay of package `lower_id` and its versions released early.
+    async fn package_gate(
+        &self,
+        repo: &Repository,
+        lower_id: &str,
+    ) -> Result<PackageGate, RepoError> {
+        let delay = self.package_delay(repo).await?;
+        Ok(PackageGate::load(&self.pool, repo.id, &delay, lower_id).await?)
+    }
+
+    /// Whether an administrator released `(lower_id, version)` from the
+    /// package delay early.
+    async fn released(
+        &self,
+        repo: &Repository,
+        lower_id: &str,
+        version: &str,
+    ) -> Result<bool, RepoError> {
+        Ok(
+            forge_db::delay_release_dao::find(&self.pool, repo.id, lower_id, version)
+                .await?
+                .is_some(),
+        )
+    }
+
+    /// Whether `(lower_id, version)`, first seen at `first_seen_at`, has
+    /// cleared its package's delay (`applied`) and may now be served: it
+    /// waited it out, or was released early. The releases are read only for
+    /// a version still inside the delay.
+    async fn version_cleared(
+        &self,
+        repo: &Repository,
+        applied: &AppliedDelay,
+        lower_id: &str,
+        version: &str,
+        first_seen_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RepoError> {
+        if applied.cleared(first_seen_at, now) {
+            return Ok(true);
+        }
+        self.released(repo, lower_id, version).await
     }
 
     /// Whether `row` carries a genuine-404 marker that is still within
@@ -1039,15 +1087,17 @@ impl ProxyRepo {
                 .is_some_and(|at| now - at < Self::not_found_ttl(repo))
     }
 
-    /// Whether a (confirmed) cached-version row may be enumerated by the flat
-    /// index, registration and search: past the package delay and not hidden
-    /// by a live not-found marker. Unconfirmed rows are filtered out in SQL.
+    /// Whether a (confirmed) cached-version row of the package `gate` is of
+    /// may be enumerated by the flat index, registration and search: past
+    /// the package's delay (or released from it early) and not hidden by a
+    /// live not-found marker. Unconfirmed rows are filtered out in SQL.
     fn listable(
         repo: &Repository,
+        gate: &PackageGate,
         row: &forge_db::model::ProxyCachedVersion,
         now: DateTime<Utc>,
     ) -> bool {
-        !Self::not_found_live(repo, row, now) && Self::delay_cleared(repo, row.first_seen_at, now)
+        !Self::not_found_live(repo, row, now) && gate.cleared(&row.version, row.first_seen_at, now)
     }
 
     // ── Upstream index (Task 8.1) ────────────────────────────────────────────
@@ -1405,8 +1455,10 @@ impl ProxyRepo {
                     )
                     .await?;
                 }
-                if repo.package_delay_seconds > 0 {
-                    self.date_delay_from_upstream(repo, lower_id).await;
+                let applied = self.package_delay(repo).await?.for_package(lower_id);
+                if applied.delay_seconds > 0 {
+                    self.date_delay_from_upstream(repo, &applied, lower_id)
+                        .await;
                 }
                 Ok(true)
             }
@@ -1532,13 +1584,20 @@ impl ProxyRepo {
         version: &str,
         lookup: &mut Lookup,
     ) -> Result<Option<NupkgLocation>, RepoError> {
+        // The package's delay: the repository's default, or the first
+        // override that matches it.
+        let applied = self.package_delay(repo).await?.for_package(lower_id);
+
         // Already cached + downloaded + delay-cleared? Serve immediately.
         if let Some(row) =
             proxy_dao::get_cached_version(&self.pool, repo.id, lower_id, version).await?
         {
             let now = self.db_now().await?;
             if row.downloaded {
-                if !Self::delay_cleared(repo, row.first_seen_at, now) {
+                if !self
+                    .version_cleared(repo, &applied, lower_id, version, row.first_seen_at, now)
+                    .await?
+                {
                     lookup.mark(Outcome::DelayGated);
                     return Ok(None);
                 }
@@ -1564,9 +1623,13 @@ impl ProxyRepo {
         // served without asking the upstream again — so a release pulled
         // during the quarantine (the point of the delay) would still be
         // served afterwards. A version not confirmed yet is looked up in the
-        // upstream listing first: that starts its delay clock.
-        if repo.package_delay_seconds > 0
-            && !self.delay_cleared_upstream(repo, lower_id, version).await?
+        // upstream listing first: that starts its delay clock. A version an
+        // administrator released early is fetched like one without a delay.
+        if applied.delay_seconds > 0
+            && !self.released(repo, lower_id, version).await?
+            && !self
+                .delay_cleared_upstream(repo, &applied, lower_id, version)
+                .await?
         {
             lookup.mark(Outcome::DelayGated);
             return Ok(None);
@@ -1608,7 +1671,10 @@ impl ProxyRepo {
             // further query.
             tx.commit().await?;
             if locked.downloaded {
-                if !Self::delay_cleared(repo, locked.first_seen_at, now) {
+                if !self
+                    .version_cleared(repo, &applied, lower_id, version, locked.first_seen_at, now)
+                    .await?
+                {
                     lookup.mark(Outcome::DelayGated);
                     return Ok(None);
                 }
@@ -1884,7 +1950,10 @@ impl ProxyRepo {
         if locked.downloaded {
             let now = forge_db::db_now(&mut *tx).await?;
             tx.rollback().await?;
-            if !Self::delay_cleared(repo, locked.first_seen_at, now) {
+            if !self
+                .version_cleared(repo, &applied, lower_id, version, locked.first_seen_at, now)
+                .await?
+            {
                 lookup.mark(Outcome::DelayGated);
                 return Ok(None);
             }
@@ -1973,16 +2042,20 @@ impl ProxyRepo {
         }
 
         // Delay gate on the recorded first sighting.
-        if !Self::delay_cleared(repo, first_seen_at, self.db_now().await?) {
+        let now = self.db_now().await?;
+        if !self
+            .version_cleared(repo, &applied, lower_id, version, first_seen_at, now)
+            .await?
+        {
             return Ok(None);
         }
         self.local_nupkg(repo.id, lower_id, version).await
     }
 
     /// Whether `(lower_id, version)` is confirmed upstream and past its
-    /// package delay. A version without a confirmed row is looked up in the
-    /// upstream listing first (refreshing it when stale), which confirms it
-    /// and starts its delay clock.
+    /// package's delay (`applied`). A version without a confirmed row is
+    /// looked up in the upstream listing first (refreshing it when stale),
+    /// which confirms it and starts its delay clock.
     ///
     /// Returns a type-erased future: it is awaited inside
     /// [`Self::ensure_downloaded`], which the listing paths reach in turn, and
@@ -1990,6 +2063,7 @@ impl ProxyRepo {
     fn delay_cleared_upstream<'a>(
         &'a self,
         repo: &'a Repository,
+        applied: &'a AppliedDelay,
         lower_id: &'a str,
         version: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, RepoError>> + Send + 'a>>
@@ -2005,7 +2079,7 @@ impl ProxyRepo {
                 None => confirmed(&self.discover_versions(repo, lower_id).await?),
             };
             Ok(match first_seen {
-                Some(at) => Self::delay_cleared(repo, at, self.db_now().await?),
+                Some(at) => applied.cleared(at, self.db_now().await?),
                 None => false,
             })
         })
@@ -2292,10 +2366,13 @@ impl ProxyRepo {
     /// The `listable` conditions of a cache search, as of now
     /// ([`ListableBounds`]).
     async fn listable_bounds(&self, repo_row: &Repository) -> Result<ListableBounds, RepoError> {
+        let delay = self.package_delay(repo_row).await?;
         let now = self.db_now().await?;
         Ok(ListableBounds {
-            seen_before: now - Duration::seconds(i64::from(repo_row.package_delay_seconds)),
+            now,
+            seen_before: now - delay.shortest(),
             marked_after: now - Self::not_found_ttl(repo_row),
+            delay,
         })
     }
 
@@ -2314,17 +2391,28 @@ impl ProxyRepo {
         // normalized form, which never holds build metadata, so a version whose
         // only SemVer 2.0.0 feature is `+metadata` is shown as its normalized
         // form, which those clients read (hosted filters `version_original`).
-        let names = sqlx::query_scalar!(
+        //
+        // A package's delay is its own (an override may apply), so SQL keeps
+        // the versions past the shortest delay any package has, or released
+        // early, and returns each id's earliest one: the id has a listable
+        // version when that one is past the id's own delay, or one of them
+        // was released.
+        let rows = sqlx::query!(
             r#"
-            SELECT DISTINCT name AS "name!"
-            FROM proxy_cached_version
-            WHERE repository_id = $1 AND version <> '*' AND confirmed AND NOT upstream_missing
-              AND listed AND ($2 = '' OR strpos(name, $2) > 0)
-              AND first_seen_at <= $3
-              AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
-              AND ($5 OR strpos(version, '-') = 0)
-              AND ($6 OR version !~ '-.*[.]')
-            ORDER BY name
+            SELECT v.name AS "name!",
+                   MIN(v.first_seen_at) AS "earliest!",
+                   bool_or(r.version IS NOT NULL) AS "released!"
+            FROM proxy_cached_version v
+            LEFT JOIN package_delay_release r
+              ON r.repository_id = v.repository_id AND r.name = v.name AND r.version = v.version
+            WHERE v.repository_id = $1 AND v.version <> '*' AND v.confirmed
+              AND NOT v.upstream_missing
+              AND v.listed AND ($2 = '' OR strpos(v.name, $2) > 0)
+              AND (v.first_seen_at <= $3 OR r.version IS NOT NULL)
+              AND NOT (v.not_found AND v.not_found_at IS NOT NULL AND v.not_found_at > $4)
+              AND ($5 OR strpos(v.version, '-') = 0)
+              AND ($6 OR v.version !~ '-.*[.]')
+            GROUP BY v.name
             "#,
             repo_row.id,
             q,
@@ -2335,8 +2423,10 @@ impl ProxyRepo {
         )
         .fetch_all(&self.pool)
         .await?;
-        let mut names: Vec<String> = names
+        let mut names: Vec<String> = rows
             .into_iter()
+            .filter(|row| row.released || bounds.cleared(&row.name, row.earliest))
+            .map(|row| row.name)
             .filter(|name| filter.allows(name) && query.matches(name))
             .collect();
         // Byte order, as hosted and group results are ordered (SQL orders by
@@ -2355,18 +2445,21 @@ impl ProxyRepo {
         params: &SearchParams,
         page: &[String],
     ) -> Result<Vec<SearchHit>, RepoError> {
-        let rows = sqlx::query_as!(
-            forge_db::model::ProxyCachedVersion,
+        // As in `search_names`: SQL keeps the versions past the shortest
+        // delay or released early, each id's own delay decides.
+        let rows = sqlx::query!(
             r#"
-            SELECT id, repository_id, name, version, listed, first_seen_at,
-                   downloaded, metadata_refreshed_at, not_found, not_found_at
-            FROM proxy_cached_version
-            WHERE repository_id = $1 AND name = ANY($2::text[])
-              AND version <> '*' AND confirmed AND NOT upstream_missing AND listed
-              AND first_seen_at <= $3
-              AND NOT (not_found AND not_found_at IS NOT NULL AND not_found_at > $4)
-              AND ($5 OR strpos(version, '-') = 0)
-              AND ($6 OR version !~ '-.*[.]')
+            SELECT v.name, v.version, v.listed, v.first_seen_at,
+                   (r.version IS NOT NULL) AS "released!"
+            FROM proxy_cached_version v
+            LEFT JOIN package_delay_release r
+              ON r.repository_id = v.repository_id AND r.name = v.name AND r.version = v.version
+            WHERE v.repository_id = $1 AND v.name = ANY($2::text[])
+              AND v.version <> '*' AND v.confirmed AND NOT v.upstream_missing AND v.listed
+              AND (v.first_seen_at <= $3 OR r.version IS NOT NULL)
+              AND NOT (v.not_found AND v.not_found_at IS NOT NULL AND v.not_found_at > $4)
+              AND ($5 OR strpos(v.version, '-') = 0)
+              AND ($6 OR v.version !~ '-.*[.]')
             "#,
             repo_row.id,
             page,
@@ -2379,6 +2472,9 @@ impl ProxyRepo {
         .await?;
         let mut by_id: HashMap<String, Vec<VersionEntry>> = HashMap::new();
         for r in rows {
+            if !r.released && !bounds.cleared(&r.name, r.first_seen_at) {
+                continue;
+            }
             by_id.entry(r.name.clone()).or_default().push(VersionEntry {
                 original_id: r.name,
                 version: r.version.clone(),
@@ -2475,10 +2571,11 @@ impl ProxyRepo {
         }
 
         let rows = self.discover_versions(&repo_row, &lower).await?;
+        let gate = self.package_gate(&repo_row, &lower).await?;
         let now = self.db_now().await?;
         let mut visible: Vec<forge_db::model::ProxyCachedVersion> = rows
             .into_iter()
-            .filter(|r| Self::listable(&repo_row, r, now))
+            .filter(|r| Self::listable(&repo_row, &gate, r, now))
             .filter(|r| {
                 only.is_none_or(|only| only.iter().any(|v| v.eq_ignore_ascii_case(&r.version)))
             })
@@ -2621,14 +2718,19 @@ impl ProxyRepo {
     /// published in 1900). Only a plausible time counts (not before 2010, not
     /// in the future), and it only ever moves the clock back. Best effort:
     /// when the upstream cannot say, the first sighting stands.
-    async fn date_delay_from_upstream(&self, repo: &Repository, lower_id: &str) {
+    async fn date_delay_from_upstream(
+        &self,
+        repo: &Repository,
+        applied: &AppliedDelay,
+        lower_id: &str,
+    ) {
         let result: Result<(), RepoError> = async {
             let now = self.db_now().await?;
             let pending: Vec<forge_db::model::ProxyCachedVersion> = self
                 .cached_rows(repo.id, lower_id)
                 .await?
                 .into_iter()
-                .filter(|r| !Self::delay_cleared(repo, r.first_seen_at, now))
+                .filter(|r| !applied.cleared(r.first_seen_at, now))
                 .collect();
             if pending.is_empty() {
                 return Ok(());
@@ -2731,10 +2833,11 @@ impl RepoReadOps for ProxyRepo {
         }
 
         let rows = self.discover_versions(&repo_row, &lower).await?;
+        let gate = self.package_gate(&repo_row, &lower).await?;
         let now = self.db_now().await?;
         let mut versions: Vec<VersionEntry> = rows
             .into_iter()
-            .filter(|r| Self::listable(&repo_row, r, now))
+            .filter(|r| Self::listable(&repo_row, &gate, r, now))
             .map(|r| VersionEntry {
                 original_id: r.name.clone(),
                 version: r.version.clone(),
@@ -2812,8 +2915,12 @@ impl RepoReadOps for ProxyRepo {
         if let Some(row) =
             proxy_dao::get_cached_version(&self.pool, repo_row.id, &lower, &norm).await?
         {
+            let applied = self.package_delay(&repo_row).await?.for_package(&lower);
+            let now = self.db_now().await?;
             if !row.not_found
-                && !Self::delay_cleared(&repo_row, row.first_seen_at, self.db_now().await?)
+                && !self
+                    .version_cleared(&repo_row, &applied, &lower, &norm, row.first_seen_at, now)
+                    .await?
             {
                 return Ok(None);
             }
@@ -2829,10 +2936,11 @@ impl RepoReadOps for ProxyRepo {
         }
         // The version must be known upstream (and past its delay window).
         let rows = Box::pin(self.discover_versions(&repo_row, &lower)).await?;
+        let gate = self.package_gate(&repo_row, &lower).await?;
         let now = self.db_now().await?;
         let known = rows
             .into_iter()
-            .any(|r| r.version == norm && Self::listable(&repo_row, &r, now));
+            .any(|r| r.version == norm && Self::listable(&repo_row, &gate, &r, now));
         if !known {
             return Ok(None);
         }
@@ -2884,10 +2992,11 @@ impl RepoReadOps for ProxyRepo {
             return Ok(Vec::new());
         }
         let rows = self.discover_versions(&repo_row, &lower).await?;
+        let gate = self.package_gate(&repo_row, &lower).await?;
         let now = self.db_now().await?;
         let mut versions: Vec<String> = rows
             .into_iter()
-            .filter(|r| Self::listable(&repo_row, r, now))
+            .filter(|r| Self::listable(&repo_row, &gate, r, now))
             .map(|r| r.version)
             .collect();
         versions.sort_by(|a, b| self.format.compare_versions(a, b));
@@ -2983,12 +3092,26 @@ impl RepoReadOps for ProxyRepo {
 }
 
 /// The `listable` conditions of a search of a proxy's cache as bounds, taken
-/// at one instant: a version is listed once first seen at or before
-/// `seen_before` (past the package delay), unless a not-found marker set
-/// after `marked_after` (younger than the TTL) hides it.
+/// at one instant (`now`): a version is listed once it is past its package's
+/// delay ([`ListableBounds::cleared`]) or was released from it early, unless
+/// a not-found marker set after `marked_after` (younger than the TTL) hides
+/// it. No version first seen after `seen_before` (inside the shortest delay
+/// any package has) is past its package's delay.
 struct ListableBounds {
+    now: DateTime<Utc>,
     seen_before: DateTime<Utc>,
     marked_after: DateTime<Utc>,
+    delay: Arc<PackageDelay>,
+}
+
+impl ListableBounds {
+    /// Whether a version of package `name` first seen at `first_seen_at`
+    /// is past the package's delay.
+    fn cleared(&self, name: &str, first_seen_at: DateTime<Utc>) -> bool {
+        self.delay
+            .for_package(name)
+            .cleared(first_seen_at, self.now)
+    }
 }
 
 /// One page of an upstream's search results, reduced to what a search hit
@@ -3142,9 +3265,11 @@ impl ProxyRepo {
     /// state of each version applied:
     ///
     /// * a version, or an id, under a live not-found marker is hidden;
-    /// * with a package delay, a version is shown only once the proxy has
-    ///   recorded it and it has cleared the delay. An upstream search names
-    ///   no publish times, so a version the proxy has not seen yet counts as
+    /// * with a package delay (the package's own, see
+    ///   [`PackageDelay::for_package`]), a version is shown only once the
+    ///   proxy has recorded it and it has cleared the delay, or once an
+    ///   administrator released it early. An upstream search names no
+    ///   publish times, so a version the proxy has not seen yet counts as
     ///   inside the window.
     ///
     /// An id left without versions is dropped, and the upstream's total is
@@ -3178,27 +3303,35 @@ impl ProxyRepo {
         )
         .fetch_all(&self.pool)
         .await?;
+        let delay = self.package_delay(repo).await?;
         let now = self.db_now().await?;
         let not_found_ttl = Self::not_found_ttl(repo);
         // `(name, version)` under a live marker; version `*` marks the id.
         let mut marked: HashSet<(String, String)> = HashSet::new();
-        // `(name, version)` recorded and past the package delay.
+        // `(name, version)` recorded and past its package's delay, or
+        // released from it early (recorded or not).
         let mut cleared: HashSet<(String, String)> = HashSet::new();
         for row in rows {
             if row.not_found && row.not_found_at.is_some_and(|at| now - at < not_found_ttl) {
                 marked.insert((row.name.clone(), row.version.clone()));
             }
-            if row.confirmed && Self::delay_cleared(repo, row.first_seen_at, now) {
+            if row.confirmed && delay.for_package(&row.name).cleared(row.first_seen_at, now) {
                 cleared.insert((row.name, row.version));
             }
         }
-        let delayed = repo.package_delay_seconds > 0;
+        if delay.is_active() {
+            cleared.extend(
+                forge_db::delay_release_dao::released_of_packages(&self.pool, repo.id, &names)
+                    .await?,
+            );
+        }
 
         let mut out: Vec<SearchHit> = Vec::with_capacity(hits.len());
         for (hit, name) in hits.into_iter().zip(names) {
             if marked.contains(&(name.clone(), "*".to_string())) {
                 continue;
             }
+            let delayed = delay.for_package(&name).delay_seconds > 0;
             let versions: Vec<VersionEntry> = hit
                 .versions
                 .into_iter()

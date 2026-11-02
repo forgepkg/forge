@@ -26,6 +26,8 @@ import {
 } from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { ProxyCachePanel } from '~/components/ProxyCachePanel'
+import { DelayReleasesPanel } from '~/components/DelayReleasesPanel'
+import { useSelectors } from '~/queries/useRbac'
 import { SigningKeysPanel } from '~/components/SigningKeysPanel'
 import { AnonymousAccessPanel } from '~/components/AnonymousAccessPanel'
 import { IMPORT_FORMATS } from '~/api/imports'
@@ -45,7 +47,8 @@ export const Route = createFileRoute('/_app/manage/repositories/$repo')({
  * header links group repos to the Members editor, hosted NuGet and Docker
  * repositories to their import, and every other repository to its
  * retention policy. Beside the form: for proxies,
- * their cache invalidation, and the repository's anonymous access (the flag
+ * their cache invalidation and (with a package delay) the versions released
+ * from it early, and the repository's anonymous access (the flag
  * together with the anonymous role's grants that cover it, read-only, linking
  * to the role).
  */
@@ -55,6 +58,8 @@ function EditRepository() {
   const toast = useToast()
   const repo = useRepository(name)
   const formats = useFormats()
+  // The content selectors a proxy's package-delay override may name.
+  const selectors = useSelectors()
   const update = useUpdateRepository(name)
   // The view the server returned for the last save: the form is re-seeded
   // from it, so a typed password or a "remove credentials" choice is not
@@ -91,6 +96,13 @@ function EditRepository() {
 
   // (Only while it is still this repository: the route can switch params.)
   const current = saved?.view.name === name ? saved.view : repo.data
+  // A proxy of NuGet, npm, … holds new versions back; docker, raw and apt
+  // proxies have no package delay.
+  const delayed =
+    current.kind === 'proxy' &&
+    current.format !== 'docker' &&
+    current.format !== 'raw' &&
+    !formats.data?.find((f) => f.id === current.format)?.signed_indexes
 
   function handleSubmit(values: RepoFormValues) {
     update.mutate(toUpdateBody(values, current), {
@@ -163,6 +175,7 @@ function EditRepository() {
             {current.kind === 'proxy' && (
               <ProxyCachePanel key={current.name} repo={current} />
             )}
+            {delayed && <DelayReleasesPanel key={current.name} repo={current} />}
             <AnonymousAccessPanel repo={current} />
           </>
         }
@@ -172,6 +185,7 @@ function EditRepository() {
           mode="edit"
           existing={current}
           formats={formats.data}
+          selectors={selectors.data?.map((s) => s.name).sort()}
           submitting={update.isPending}
           serverError={
             update.isError ? update.error.body || update.error.message : null

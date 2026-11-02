@@ -205,7 +205,8 @@ password supplied to NuGet should be a **token**.
 ## Repository types
 
 - **hosted** — `{"name":"nuget","kind":"hosted"}`; push/restore your own packages.
-- **proxy** — `{"name":"nuget-proxy","kind":"proxy","remote_url":"https://api.nuget.org/v3/index.json","package_delay_seconds":0}`; caches on demand, with an optional package delay.
+- **proxy** — `{"name":"nuget-proxy","kind":"proxy","remote_url":"https://api.nuget.org/v3/index.json","package_delay_seconds":0}`; caches on demand, with an optional package delay
+  (per-package overrides and early releases of one version: [docs/package-delay.md](docs/package-delay.md)).
   Private / custom **NuGet V3** feeds (Azure Artifacts, GitHub Packages,
   Artifactory, Nexus, ProGet, MyGet, …) work too: set `upstream_username` and
   `upstream_password` (typically a PAT). The credentials are sent with every

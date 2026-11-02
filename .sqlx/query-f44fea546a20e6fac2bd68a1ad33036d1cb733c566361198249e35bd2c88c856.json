@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT v.name AS \"name!\",\n                   MIN(v.first_seen_at) AS \"earliest!\",\n                   bool_or(r.version IS NOT NULL) AS \"released!\"\n            FROM proxy_cached_version v\n            LEFT JOIN package_delay_release r\n              ON r.repository_id = v.repository_id AND r.name = v.name AND r.version = v.version\n            WHERE v.repository_id = $1 AND v.version <> '*' AND v.confirmed\n              AND NOT v.upstream_missing\n              AND v.listed AND ($2 = '' OR strpos(v.name, $2) > 0)\n              AND (v.first_seen_at <= $3 OR r.version IS NOT NULL)\n              AND NOT (v.not_found AND v.not_found_at IS NOT NULL AND v.not_found_at > $4)\n              AND ($5 OR strpos(v.version, '-') = 0)\n              AND ($6 OR v.version !~ '-.*[.]')\n            GROUP BY v.name\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_cached_version",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "earliest!",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "released!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "f44fea546a20e6fac2bd68a1ad33036d1cb733c566361198249e35bd2c88c856"
+}

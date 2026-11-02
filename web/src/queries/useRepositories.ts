@@ -18,6 +18,7 @@ import {
   createRepository,
   deleteTrustedPublisher,
   deleteRepository,
+  fetchDelayReleases,
   fetchFormats,
   fetchMembers,
   fetchRepositories,
@@ -25,14 +26,17 @@ import {
   fetchTrustedPublishers,
   formatKeys,
   invalidateProxyCache,
+  releaseFromDelay,
   removeMember,
   repoKeys,
   updateMember,
   updateRepository,
   updateTrustedPublisher,
+  withdrawDelayRelease,
   type AddMember,
   type AddSigningKey,
   type CreateRepo,
+  type DelayRelease,
   type FormatView,
   type InvalidateProxyCache,
   type MemberView,
@@ -147,6 +151,46 @@ export function useDeleteRepository() {
 export function useInvalidateProxyCache(name: string) {
   return useMutation<ProxyCacheInvalidated, ApiError, InvalidateProxyCache>({
     mutationFn: (body) => invalidateProxyCache(name, body),
+  })
+}
+
+/** A proxy's versions released from the package delay early. */
+export function useDelayReleases(name: string, enabled = true) {
+  return useQuery<DelayRelease[], ApiError>({
+    queryKey: repoKeys.delayReleases(name),
+    queryFn: ({ signal }) => fetchDelayReleases(name, signal),
+    enabled,
+  })
+}
+
+/**
+ * Release one version of a proxy from its package delay now. The release
+ * list and every package view (the version is served now) are re-fetched.
+ */
+export function useReleaseFromDelay(name: string) {
+  const queryClient = useQueryClient()
+  return useMutation<
+    DelayRelease,
+    ApiError,
+    { id: string; version: string; reason: string }
+  >({
+    mutationFn: ({ id, version, reason }) => releaseFromDelay(name, id, version, reason),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: repoKeys.delayReleases(name) })
+      void queryClient.invalidateQueries({ queryKey: pkgKeys.all() })
+    },
+  })
+}
+
+/** Withdraw an early release: the version waits out its delay again. */
+export function useWithdrawDelayRelease(name: string) {
+  const queryClient = useQueryClient()
+  return useMutation<void, ApiError, { id: string; version: string }>({
+    mutationFn: ({ id, version }) => withdrawDelayRelease(name, id, version),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: repoKeys.delayReleases(name) })
+      void queryClient.invalidateQueries({ queryKey: pkgKeys.all() })
+    },
   })
 }
 

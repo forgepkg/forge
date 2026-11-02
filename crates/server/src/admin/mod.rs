@@ -27,6 +27,8 @@
 //!   under (read-only: `forge.toml`).
 //! * [`proxy_cache`] — invalidating what a proxy repository cached from its
 //!   upstream (its "not found" answers, listings and documents).
+//! * [`package_delay`] — releasing a version of a proxy from the package delay
+//!   early (with a reason), and withdrawing such a release.
 //! * [`imports`] — importing a repository from another server (a NuGet feed,
 //!   a registry) into a hosted repository (start with a preflight, progress,
 //!   cancel, resume, retry).
@@ -66,6 +68,7 @@ pub mod grants;
 pub mod images;
 pub mod imports;
 pub mod members;
+pub mod package_delay;
 pub mod proxy_cache;
 pub mod realms;
 pub mod repositories;
@@ -230,6 +233,14 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/repositories/{name}/proxy-cache/invalidate",
             axum::routing::post(proxy_cache::invalidate),
+        )
+        .route(
+            "/repositories/{name}/packages/{id}/versions/{version}/release-delay",
+            axum::routing::post(package_delay::release).delete(package_delay::withdraw),
+        )
+        .route(
+            "/repositories/{name}/delay-releases",
+            get(package_delay::list),
         )
         .route(
             "/repositories/{name}/signing-keys",
