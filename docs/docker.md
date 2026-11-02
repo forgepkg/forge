@@ -282,6 +282,13 @@ docker pull forge.example.com/docker/nginx:1.27
   proxy member, and with `prefer_hosted` (on by default) neither is an image
   a hosted member already has. Flag trusted members as `owner` when hosted
   members have different writers, as for NuGet groups.
+- **Scoped members**: `"packages": ["bitnami/*"]` when adding a member, or
+  `PATCH /admin/repositories/docker/members/<member>` later, makes the group
+  ask it only about the images those patterns match (globs of image names,
+  matched case-insensitively; empty: every image). For any other image the
+  member is not asked at all, its upstream included. A scope on a nested
+  group's membership holds for every member below it, and it only narrows:
+  the guard above is decided as without it.
 
 ## Browsing
 

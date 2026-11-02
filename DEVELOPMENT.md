@@ -238,6 +238,20 @@ password supplied to NuGet should be a **token**.
   is served by the owners alone (no proxy or other hosted member adds
   versions to it), and only owners serve reserved ids. Unflag an owner (`{"owner": false}`) before removing it from
   the group or deleting it; both are refused with 409 otherwise.
+  A member that passes a public feed through (a Nexus proxying nuget.org
+  next to its internal packages) is asked about every id the group is
+  asked for; scope it to its own ids with `"packages": ["Acme.*"]` when
+  adding it, or `PATCH /admin/repositories/all/members/nexus`
+  `{"packages": ["Acme.*"]}` (`[]`: every id again), and the group asks it
+  about those ids alone: no upstream request, no cached not-found for any
+  other. Patterns are globs, a content selector's syntax, matched
+  case-insensitively; a pattern without `*` is one package id, so `Acme.`
+  is refused. A scope on a nested group's membership holds for every member
+  below it, and it holds for search. It only narrows: the guards above are
+  decided as without it, so an id an owner has outside the owner's scope is
+  served by no member rather than by a proxy. The web UI's group
+  **Members** screen sets it too ([npm](docs/npm.md#scoping-a-member-to-its-packages)
+  has the full story).
   Reading a group grants no read on its members: a caller is served from
   the members it may read itself. The same holds for a token whose `scope`
   lists repositories: scoped to the group alone it sees an empty feed, so

@@ -49,6 +49,16 @@
 //!   the same group) can then neither publish an internal name the group
 //!   serves, nor add a version to an owner's package, nor take a public id
 //!   away from its proxy.
+//! * **Member scopes** (`group_member.packages`, see [`member_scope`]): a
+//!   membership with package patterns (`@fortawesome/*`, `Envisia.*`)
+//!   admits only the ids one of them matches. The walk below leaves the
+//!   member out for every other id before its ops are called, so the group
+//!   never asks it about them: no upstream request, no negative-cache entry.
+//!   A scope on a nested group's membership holds for every member below it,
+//!   and a scoped member's search hits for other ids are dropped. Scopes only
+//!   narrow: the guards above are decided as without them (an owner's ids
+//!   outside its scope still keep the proxies out), so a scope never lets a
+//!   member serve an id it would not serve without one.
 //! * **Nested groups keep their guards**: every group on the way from the
 //!   requested group to a leaf applies its own prefer-hosted setting,
 //!   reserved prefixes and owners to what its members serve. Reading an inner
@@ -146,17 +156,41 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use forge_db::model::{RepoKind, Repository};
+use forge_db::repository_dao::GroupMembership;
 use forge_db::{component_dao, repository_dao};
 use sqlx::PgPool;
 
 use crate::auth::authz::Authz;
 use crate::auth::principal::Principal;
-use crate::authz::PackageFilter;
+use crate::authz::{PackageFilter, SelectorPatterns};
 use crate::format::Format;
 use crate::repo::{
     NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
     SearchResult, VersionEntry,
 };
+
+/// What a group asks a member about: the filter of the membership's package
+/// patterns (`group_member.packages`). Without patterns, every id; with
+/// them, the ids one of them matches, as a content selector's includes
+/// match them (globs, case-insensitive). Patterns that do not compile (a
+/// database write past the admin API) match nothing: the group then asks
+/// the member about no id (fail closed).
+pub fn member_scope(packages: &[String]) -> PackageFilter {
+    if packages.is_empty() {
+        return PackageFilter::AllowAll;
+    }
+    let patterns = SelectorPatterns {
+        includes: packages.to_vec(),
+        excludes: Vec::new(),
+    };
+    match patterns.compile() {
+        Ok(compiled) => PackageFilter::Selectors(vec![Arc::new(compiled)]),
+        Err(e) => {
+            tracing::error!(error = %e, "group member package patterns do not compile; the group asks the member about no id");
+            PackageFilter::DenyAll
+        }
+    }
+}
 
 /// Builds the [`RepoReadOps`] for one member repository of a group.
 ///
@@ -197,8 +231,9 @@ struct VisibleMember {
     ops: Arc<dyn RepoReadOps>,
 }
 
-/// One readable edge in the compact group graph. The filter belongs to the
-/// member repository itself; a package is reachable along a path only when
+/// One readable edge in the compact group graph. The filter is what the
+/// caller may read of the member repository, narrowed to the membership's
+/// scope ([`member_scope`]); a package is reachable along a path only when
 /// every edge filter on that path allows it.
 #[derive(Debug, Clone)]
 struct GraphMember {
@@ -220,6 +255,9 @@ struct GroupGraph {
     leaves: Vec<Repository>,
     /// No edge carries a package filter: every leaf is visible for every id.
     unfiltered: bool,
+    /// The leaves visible for every id: reached along a path none of whose
+    /// edges carries a package filter ([`open_leaves`]).
+    open_leaves: HashSet<i64>,
     /// The dependency-confusion guard of every group reachable from the root
     /// within the depth bound, decided **regardless of the principal**.
     guards: HashMap<i64, GroupGuard>,
@@ -489,9 +527,11 @@ impl GroupGraph {
     }
 
     fn filter_for_leaf(self: &Arc<Self>, leaf_id: i64) -> PackageFilter {
-        // With no selectors, every discovered leaf is visible for every id.
-        // Preserve AllowAll so proxies can retain their upstream hit counts.
-        if self.unfiltered {
+        // A leaf no selector or scope narrows on some way is visible for
+        // every id. Preserve AllowAll so proxies can retain their upstream
+        // hit counts and are asked for a window of them, also when another
+        // member of the group is scoped.
+        if self.open_leaves.contains(&leaf_id) {
             return PackageFilter::AllowAll;
         }
         let graph = self.clone();
@@ -565,16 +605,17 @@ impl GroupRepo {
     /// 1. **Structure**, independent of the principal: every group's adjacency
     ///    list is fetched once, following *every* edge, which also yields the
     ///    hosted leaves the prefer-hosted guard consults. A caller's grants
-    ///    must not decide whether an internal id is shielded from the proxies.
+    ///    must not decide whether an internal id is shielded from the proxies,
+    ///    and neither do the members' scopes.
     /// 2. **Visibility**: the same walk over the loaded adjacency lists, keeping
-    ///    only edges whose member the principal may read.
+    ///    only edges whose member the principal may read, each narrowed to
+    ///    the membership's scope.
     async fn group_graph(&self, group: &str) -> Result<Arc<GroupGraph>, RepoError> {
         let group_row = self.group_row(group).await?;
 
         // Pass 1. A group past the depth bound is not expanded: no caller can
         // be served from below it, so its leaves own nothing here either.
-        let mut adjacency: HashMap<i64, Vec<Repository>> = HashMap::new();
-        let mut flagged: HashMap<i64, HashSet<i64>> = HashMap::new();
+        let mut adjacency: HashMap<i64, Vec<GroupMembership>> = HashMap::new();
         let mut group_rows: HashMap<i64, Repository> =
             HashMap::from([(group_row.id, group_row.clone())]);
         let mut queue = VecDeque::from([(group_row.id, 0_u32)]);
@@ -582,18 +623,15 @@ impl GroupRepo {
             if depth >= self.max_depth {
                 continue;
             }
-            let rows = repository_dao::group_members(&self.pool, group_id).await?;
-            let mut members = Vec::with_capacity(rows.len());
-            for (member, _priority) in rows {
+            let memberships = repository_dao::group_memberships(&self.pool, group_id).await?;
+            for membership in &memberships {
+                let member = &membership.repo;
                 if member.kind() == RepoKind::Group && !group_rows.contains_key(&member.id) {
                     group_rows.insert(member.id, member.clone());
                     queue.push_back((member.id, depth + 1));
                 }
-                members.push(member);
             }
-            adjacency.insert(group_id, members);
-            let owners = repository_dao::group_owner_ids(&self.pool, group_id).await?;
-            flagged.insert(group_id, owners.into_iter().collect());
+            adjacency.insert(group_id, memberships);
         }
 
         // Every group's own guard. Its owners are decided over the whole
@@ -604,13 +642,8 @@ impl GroupRepo {
             .iter()
             .filter(|(group_id, _)| adjacency.contains_key(group_id))
             .map(|(group_id, row)| {
-                let owners = group_owners(
-                    *group_id,
-                    &adjacency,
-                    &flagged,
-                    &mut owner_sets,
-                    &mut HashSet::new(),
-                );
+                let owners =
+                    group_owners(*group_id, &adjacency, &mut owner_sets, &mut HashSet::new());
                 (
                     *group_id,
                     GroupGuard {
@@ -647,14 +680,21 @@ impl GroupRepo {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             let mut members = Vec::with_capacity(rows.len());
-            for member in rows {
+            for membership in rows {
+                let member = &membership.repo;
                 // Reading an outer group grants no transitive read. An edge is
                 // absent from this principal's graph unless the member itself
                 // passes the repo-level gate.
                 if !self.authz.can_read(&self.principal, member).await {
                     continue;
                 }
-                let filter = self.authz.package_filter(&self.principal, member).await;
+                // What the caller may read of the member, of what the group
+                // asks it about.
+                let filter = self
+                    .authz
+                    .package_filter(&self.principal, member)
+                    .await
+                    .intersect(member_scope(&membership.packages));
 
                 // An offline nested group is not descended into: it stands
                 // in the graph as one failing member, like an offline hosted
@@ -678,12 +718,14 @@ impl GroupRepo {
             .values()
             .flatten()
             .all(|member| matches!(member.filter, PackageFilter::AllowAll));
+        let open_leaves = open_leaves(group_row.id, &groups, self.max_depth);
         Ok(Arc::new(GroupGraph {
             root_id: group_row.id,
             max_depth: self.max_depth,
             groups,
             leaves,
             unfiltered,
+            open_leaves,
             guards,
             visible_leaf_cache: Mutex::new(HashMap::new()),
             cycle_logged: AtomicBool::new(false),
@@ -1517,11 +1559,11 @@ impl RepoReadOps for OfflineMember {
 /// those of its flagged members, or of all its members when it flags none. A
 /// nested group contributes its own owners, so its flags still count when it
 /// is read through an outer group. A group already on the current descent
-/// (a cycle a raw database write could create) contributes nothing.
+/// (a cycle a raw database write could create) contributes nothing. The
+/// members' scopes play no part: they only narrow what a member serves.
 fn group_owners(
     group_id: i64,
-    adjacency: &HashMap<i64, Vec<Repository>>,
-    flagged: &HashMap<i64, HashSet<i64>>,
+    adjacency: &HashMap<i64, Vec<GroupMembership>>,
     memo: &mut HashMap<i64, HashSet<i64>>,
     descent: &mut HashSet<i64>,
 ) -> HashSet<i64> {
@@ -1531,22 +1573,23 @@ fn group_owners(
     if !descent.insert(group_id) {
         return HashSet::new();
     }
-    let flags = flagged.get(&group_id);
-    let mut owners = HashSet::new();
-    for member in adjacency
+    let memberships = adjacency
         .get(&group_id)
         .map(Vec::as_slice)
-        .unwrap_or_default()
-    {
-        if flags.is_some_and(|flags| !flags.is_empty() && !flags.contains(&member.id)) {
+        .unwrap_or_default();
+    let flags = memberships.iter().any(|membership| membership.owner);
+    let mut owners = HashSet::new();
+    for membership in memberships {
+        if flags && !membership.owner {
             continue;
         }
+        let member = &membership.repo;
         match member.kind() {
             RepoKind::Hosted => {
                 owners.insert(member.id);
             }
             RepoKind::Group => {
-                owners.extend(group_owners(member.id, adjacency, flagged, memo, descent));
+                owners.extend(group_owners(member.id, adjacency, memo, descent));
             }
             RepoKind::Proxy => {}
         }
@@ -1554,6 +1597,38 @@ fn group_owners(
     descent.remove(&group_id);
     memo.insert(group_id, owners.clone());
     owners
+}
+
+/// The leaves of the readable graph visible for every id
+/// ([`GroupGraph::open_leaves`]): those reached from `root_id` within
+/// `max_depth` along edges that carry no package filter (no selector of the
+/// caller's, no member scope). Every package-specific walk reaches them.
+fn open_leaves(
+    root_id: i64,
+    groups: &HashMap<i64, Vec<GraphMember>>,
+    max_depth: u32,
+) -> HashSet<i64> {
+    let mut open = HashSet::new();
+    let mut reached = HashSet::from([root_id]);
+    let mut queue = VecDeque::from([(root_id, 0_u32)]);
+    while let Some((group_id, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        for member in groups.get(&group_id).map(Vec::as_slice).unwrap_or_default() {
+            if !matches!(member.filter, PackageFilter::AllowAll) {
+                continue;
+            }
+            if is_descended_group(&member.repo) {
+                if reached.insert(member.repo.id) {
+                    queue.push_back((member.repo.id, depth + 1));
+                }
+            } else {
+                open.insert(member.repo.id);
+            }
+        }
+    }
+    open
 }
 
 /// A merged search hit and the index into [`GroupGraph::leaves`] of the
@@ -1783,5 +1858,36 @@ impl MemberFailures {
         } else {
             self.into_result()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_member_scope_admits_the_ids_its_patterns_match() {
+        assert!(matches!(member_scope(&[]), PackageFilter::AllowAll));
+
+        let npm = member_scope(&["@fortawesome/*".into(), "left-pad".into()]);
+        assert!(npm.allows("@fortawesome/fontawesome-free"));
+        assert!(npm.allows("@fortawesome/react-fontawesome"));
+        assert!(npm.allows("left-pad"));
+        assert!(!npm.allows("@fortawesome"));
+        assert!(!npm.allows("react"));
+        assert!(!npm.allows("left-pad-2"));
+
+        // NuGet ids are case-insensitive: so is the match, both ways.
+        let nuget = member_scope(&["Envisia.*".into()]);
+        assert!(nuget.allows("envisia.lib"));
+        assert!(nuget.allows("ENVISIA.Tools.Cli"));
+        assert!(!nuget.allows("Newtonsoft.Json"));
+    }
+
+    #[test]
+    fn a_member_scope_that_does_not_compile_admits_nothing() {
+        let broken = member_scope(&["Envisia.[x".into()]);
+        assert!(matches!(broken, PackageFilter::DenyAll));
+        assert!(!broken.allows("envisia.lib"));
     }
 }

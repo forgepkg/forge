@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO group_member (group_id, member_id, priority, owner, packages)\n        VALUES ($1, $2, $3, $4, $5)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int4",
+        "Bool",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a0006fb6f5376ab797cb80e69c89f82c0e98b9c3ee04e9fef32bc1a2630e87be"
+}

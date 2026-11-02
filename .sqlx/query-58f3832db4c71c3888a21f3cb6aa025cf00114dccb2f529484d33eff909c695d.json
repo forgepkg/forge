@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            r.id, r.name, r.format, r.kind, r.anonymous_read, r.online, r.config,\n            r.remote_url, r.package_delay_seconds, r.upstream_username, r.upstream_password_enc,\n            r.metadata_ttl_seconds, r.not_found_ttl_seconds,\n            r.allow_redeploy, r.created_at, r.updated_at,\n            gm.priority\n        FROM group_member gm\n        JOIN repository r ON r.id = gm.member_id\n        WHERE gm.group_id = $1\n        ORDER BY gm.priority DESC\n        ",
+  "query": "\n        SELECT\n            r.id, r.name, r.format, r.kind, r.anonymous_read, r.online, r.config,\n            r.remote_url, r.package_delay_seconds, r.upstream_username, r.upstream_password_enc,\n            r.metadata_ttl_seconds, r.not_found_ttl_seconds,\n            r.allow_redeploy, r.created_at, r.updated_at,\n            gm.priority, gm.owner, gm.packages\n        FROM group_member gm\n        JOIN repository r ON r.id = gm.member_id\n        WHERE gm.group_id = $1\n        ORDER BY gm.priority DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -189,6 +189,28 @@
             "name": "priority"
           }
         }
+      },
+      {
+        "ordinal": 17,
+        "name": "owner",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "group_member",
+            "name": "owner"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "packages",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "group_member",
+            "name": "packages"
+          }
+        }
       }
     ],
     "parameters": {
@@ -213,8 +235,10 @@
       false,
       false,
       false,
+      false,
+      false,
       false
     ]
   },
-  "hash": "85fdfd7da51de3387bca170ad3d0b5277577d7cbdef9662b41339380516633de"
+  "hash": "58f3832db4c71c3888a21f3cb6aa025cf00114dccb2f529484d33eff909c695d"
 }

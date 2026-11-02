@@ -289,17 +289,31 @@ export interface MemberView {
    * it can be removed (409).
    */
   owner: boolean
+  /**
+   * The package ids the group asks this member about: glob patterns
+   * (`@fortawesome/*`, `Envisia.*`), a content selector's syntax, matched
+   * case-insensitively. Empty: every id. A pattern without a wildcard must be
+   * a package id of the group's format, and groups of files (raw) take none
+   * (400 both).
+   */
+  packages: string[]
 }
 
 /** `POST /admin/repositories/{name}/members` request body (`AddMember`). */
 export interface AddMember {
   member: string
   priority: number
+  owner?: boolean
+  packages?: string[]
 }
 
-/** `PATCH /admin/repositories/{name}/members/{member}` body (`UpdateMember`). */
+/**
+ * `PATCH /admin/repositories/{name}/members/{member}` body (`UpdateMember`):
+ * each field given is changed, an absent one kept.
+ */
 export interface UpdateMember {
-  owner: boolean
+  owner?: boolean
+  packages?: string[]
 }
 
 export interface TrustedPublisherCondition {
@@ -427,7 +441,10 @@ export function removeMember(name: string, member: string): Promise<void> {
   )
 }
 
-/** `PATCH /admin/repositories/{name}/members/{member}` — set `owner` (204). */
+/**
+ * `PATCH /admin/repositories/{name}/members/{member}` — set `owner` and/or
+ * `packages` (204).
+ */
 export function updateMember(
   name: string,
   member: string,

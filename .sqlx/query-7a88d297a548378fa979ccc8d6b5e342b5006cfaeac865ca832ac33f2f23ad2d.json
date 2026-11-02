@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE group_member\n        SET owner = COALESCE($3, owner), packages = COALESCE($4, packages)\n        WHERE group_id = $1 AND member_id = $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Bool",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7a88d297a548378fa979ccc8d6b5e342b5006cfaeac865ca832ac33f2f23ad2d"
+}

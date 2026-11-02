@@ -3347,3 +3347,424 @@ async fn a_guard_takes_ids_past_the_first_thousand_off_the_total() {
         "the owned ids are left out"
     );
 }
+
+// ── Member scopes (#743) ─────────────────────────────────────────────────────
+
+/// A proxy whose upstream passes every package through, as GitLab's npm
+/// registry forwards unknown packages to npmjs and a Nexus proxies
+/// nuget.org: it serves `1.0.0` of any id it is asked about, and records
+/// the id. Its search returns `hits`, and records the `take` asked.
+struct PassThrough {
+    hits: Vec<&'static str>,
+    asked: std::sync::Mutex<Vec<String>>,
+    takes: std::sync::Mutex<Vec<usize>>,
+}
+
+impl PassThrough {
+    fn new(hits: &[&'static str]) -> Arc<Self> {
+        Arc::new(PassThrough {
+            hits: hits.to_vec(),
+            asked: Default::default(),
+            takes: Default::default(),
+        })
+    }
+
+    fn ask(&self, id: &str) {
+        self.asked.lock().unwrap().push(id.to_string());
+    }
+
+    /// The ids asked about so far, each once, in order.
+    fn asked(&self) -> Vec<String> {
+        let mut asked: Vec<String> = Vec::new();
+        for id in self.asked.lock().unwrap().iter() {
+            if !asked.contains(id) {
+                asked.push(id.clone());
+            }
+        }
+        asked
+    }
+
+    fn takes(&self) -> Vec<usize> {
+        self.takes.lock().unwrap().clone()
+    }
+
+    fn entry(id: &str) -> forge_core::repo::RegistrationEntry {
+        forge_core::repo::RegistrationEntry {
+            original_id: id.into(),
+            version: "1.0.0".into(),
+            version_original: "1.0.0".into(),
+            listed: true,
+            package_hash_sha512_base64: None,
+            package_sha256: None,
+            package_size: None,
+            nuspec_bytes: None,
+            manifest_summary: None,
+            published: None,
+            deprecation: None,
+        }
+    }
+}
+
+#[async_trait]
+impl RepoReadOps for PassThrough {
+    async fn list_versions(
+        &self,
+        _repo: &str,
+        id: &str,
+    ) -> Result<Vec<forge_core::repo::VersionEntry>, RepoError> {
+        self.ask(id);
+        Ok(vec![forge_core::repo::VersionEntry {
+            original_id: id.into(),
+            version: "1.0.0".into(),
+            version_original: "1.0.0".into(),
+            listed: true,
+        }])
+    }
+
+    async fn resolve_nupkg(
+        &self,
+        _repo: &str,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<NupkgLocation>, RepoError> {
+        self.ask(id);
+        Ok((version == "1.0.0").then(|| NupkgLocation {
+            blob_sha256: format!("upstream-{id}"),
+            blob_s3_key: format!("upstream/{id}"),
+            size: 1,
+            content_type: "application/octet-stream".into(),
+        }))
+    }
+
+    async fn resolve_nuspec(
+        &self,
+        _repo: &str,
+        id: &str,
+        _version: &str,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        self.ask(id);
+        Ok(Some(b"<package/>".to_vec()))
+    }
+
+    async fn registration(
+        &self,
+        _repo: &str,
+        id: &str,
+    ) -> Result<Vec<forge_core::repo::RegistrationEntry>, RepoError> {
+        self.ask(id);
+        Ok(vec![Self::entry(id)])
+    }
+
+    async fn tags(
+        &self,
+        _repo: &str,
+        id: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, RepoError> {
+        self.ask(id);
+        Ok([("latest".to_string(), "1.0.0".to_string())].into())
+    }
+
+    async fn search(
+        &self,
+        _repo: &str,
+        params: &SearchParams,
+    ) -> Result<forge_core::repo::SearchResult, RepoError> {
+        self.takes.lock().unwrap().push(params.take);
+        Ok(forge_core::repo::SearchResult {
+            total_hits: self.hits.len(),
+            hits: self
+                .hits
+                .iter()
+                .skip(params.skip)
+                .take(params.effective_take())
+                .map(|id| forge_core::repo::SearchHit {
+                    original_id: (*id).into(),
+                    latest_version: "1.0.0".into(),
+                    versions: vec![forge_core::repo::VersionEntry {
+                        original_id: (*id).into(),
+                        version: "1.0.0".into(),
+                        version_original: "1.0.0".into(),
+                        listed: true,
+                    }],
+                    ..Default::default()
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Hosted members are real; proxy-kind members are [`PassThrough`]s by id.
+struct PassThroughFactory {
+    hosted: HostedFactory,
+    proxies: HashMap<i64, Arc<PassThrough>>,
+}
+
+impl MemberOpsFactory for PassThroughFactory {
+    fn ops_for(&self, member: &Repository) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        match self.proxies.get(&member.id) {
+            Some(proxy) => Ok(proxy.clone()),
+            None => self.hosted.ops_for(member),
+        }
+    }
+}
+
+fn pass_through_group_repo(
+    pool: &PgPool,
+    blobs: StubBlobs,
+    principal: Principal,
+    proxies: &[(&Repository, &Arc<PassThrough>)],
+) -> GroupRepo {
+    let factory = Arc::new(PassThroughFactory {
+        hosted: HostedFactory {
+            pool: pool.clone(),
+            blobs,
+        },
+        proxies: proxies
+            .iter()
+            .map(|(proxy, ops)| (proxy.id, Arc::clone(ops)))
+            .collect(),
+    });
+    let authz = Authz::new(pool.clone(), Cache::l1_only(16));
+    GroupRepo::new(pool.clone(), principal, factory, authz, TEST_MAX_DEPTH)
+        .with_format(Arc::new(nuget()))
+}
+
+/// Scope `member` of `group` to `packages` (`[]`: every id).
+async fn scope(pool: &PgPool, group: &Repository, member: &Repository, packages: &[&str]) {
+    let packages: Vec<String> = packages.iter().map(|p| p.to_string()).collect();
+    assert!(
+        repository_dao::update_group_member(pool, group.id, member.id, None, Some(&packages))
+            .await
+            .unwrap(),
+        "membership exists"
+    );
+}
+
+/// Every read of one id through `group`, as a client restoring it makes them.
+async fn read_everything(g: &GroupRepo, group: &str, id: &str) {
+    g.list_versions(group, id).await.unwrap();
+    g.resolve_nupkg(group, id, "1.0.0").await.unwrap();
+    g.resolve_nupkg_head(group, id, "1.0.0").await.unwrap();
+    g.resolve_nuspec(group, id, "1.0.0").await.unwrap();
+    g.registration(group, id).await.unwrap();
+    g.dated_registration(group, id).await.unwrap();
+    g.registration_versions(group, id).await.unwrap();
+    g.registration_entries(group, id, &["1.0.0".to_string()])
+        .await
+        .unwrap();
+    g.registration_entry(group, id, "1.0.0").await.unwrap();
+    g.tags(group, id).await.unwrap();
+}
+
+/// The lowercase ids of a search through `group` for everything.
+async fn searched_ids(g: &GroupRepo, group: &str) -> Vec<String> {
+    let mut ids: Vec<String> = g
+        .search(group, &SearchParams::default())
+        .await
+        .unwrap()
+        .hits
+        .into_iter()
+        .map(|hit| hit.original_id.to_lowercase())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// A member scoped to package ids is never asked about any other id, by any
+/// read: the group leaves it out before calling it, so its upstream sees no
+/// request for the id. Patterns match case-insensitively; a search drops the
+/// scoped member's hits outside its scope, and still asks an unscoped proxy
+/// for a window of its hits only.
+#[tokio::test]
+async fn a_scoped_member_is_never_asked_about_other_ids() {
+    let pool = common::pool().await;
+    // A Nexus holding the internal packages that also passes nuget.org
+    // through, and nuget.org itself.
+    let internal = seed_proxy_member(&pool).await;
+    let public = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, internal.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, public.id, 10)
+        .await
+        .unwrap();
+    scope(&pool, &group, &internal, &["Envisia.*"]).await;
+    let internal_ops = PassThrough::new(&["Envisia.Lib", "Internal.Other"]);
+    let public_ops = PassThrough::new(&["Newtonsoft.Json", "Serilog"]);
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&internal, &internal_ops), (&public, &public_ops)],
+    );
+
+    // Public ids: the public proxy alone is asked, and serves them.
+    for id in ["Newtonsoft.Json", "Internal.Other"] {
+        read_everything(&g, &group.name, id).await;
+        assert_eq!(
+            g.list_versions(&group.name, id).await.unwrap().len(),
+            1,
+            "{id} is served"
+        );
+    }
+    assert_eq!(internal_ops.asked(), Vec::<String>::new());
+    assert_eq!(public_ops.asked(), ["Newtonsoft.Json", "Internal.Other"]);
+
+    // An id in its scope, in any case, is asked of both, by priority.
+    read_everything(&g, &group.name, "ENVISIA.Lib").await;
+    assert_eq!(internal_ops.asked(), ["ENVISIA.Lib"]);
+    assert!(public_ops.asked().contains(&"ENVISIA.Lib".to_string()));
+    let loc = g
+        .resolve_nupkg(&group.name, "Envisia.Lib", "1.0.0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loc.blob_s3_key, "upstream/Envisia.Lib");
+
+    // Search: the scoped member's hit outside its scope is dropped. The
+    // unscoped proxy is asked for a window of its hits, not for them all.
+    assert_eq!(
+        searched_ids(&g, &group.name).await,
+        ["envisia.lib", "newtonsoft.json", "serilog"]
+    );
+    assert!(
+        public_ops
+            .takes()
+            .iter()
+            .all(|take| *take < SearchParams::MAX_TAKE),
+        "an unscoped proxy keeps its upstream window: {:?}",
+        public_ops.takes()
+    );
+
+    // Without patterns the member is asked about every id again.
+    scope(&pool, &group, &internal, &[]).await;
+    g.list_versions(&group.name, "Serilog").await.unwrap();
+    assert!(internal_ops.asked().contains(&"Serilog".to_string()));
+}
+
+/// A scope on a nested group's membership holds for every member below it,
+/// together with the scopes inside the nested group. Reading the nested
+/// group directly is not narrowed by the outer group's scope.
+#[tokio::test]
+async fn a_scope_on_a_nested_group_holds_for_every_member_below_it() {
+    let pool = common::pool().await;
+    let internal = seed_proxy_member(&pool).await;
+    let public = seed_proxy_member(&pool).await;
+    let inner = seed_group(&pool).await;
+    let outer = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, inner.id, internal.id, 10)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, inner.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, outer.id, public.id, 10)
+        .await
+        .unwrap();
+    scope(&pool, &outer, &inner, &["Envisia.*"]).await;
+    let internal_ops = PassThrough::new(&["Envisia.Lib", "Internal.Other"]);
+    let public_ops = PassThrough::new(&["Newtonsoft.Json"]);
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&internal, &internal_ops), (&public, &public_ops)],
+    );
+
+    read_everything(&g, &outer.name, "Newtonsoft.Json").await;
+    assert_eq!(internal_ops.asked(), Vec::<String>::new());
+    assert_eq!(
+        searched_ids(&g, &outer.name).await,
+        ["envisia.lib", "newtonsoft.json"],
+        "the nested group's hit outside the scope is dropped"
+    );
+    read_everything(&g, &outer.name, "Envisia.Lib").await;
+    assert_eq!(internal_ops.asked(), ["Envisia.Lib"]);
+
+    // The inner group read directly asks its member about every id.
+    g.list_versions(&inner.name, "Newtonsoft.Json")
+        .await
+        .unwrap();
+    assert_eq!(internal_ops.asked(), ["Envisia.Lib", "Newtonsoft.Json"]);
+
+    // A scope inside the nested group narrows further: an id must match
+    // the scope of every membership on the way.
+    scope(&pool, &inner, &internal, &["Envisia.Tools.*"]).await;
+    g.list_versions(&outer.name, "Envisia.Data").await.unwrap();
+    g.list_versions(&outer.name, "Envisia.Tools.Cli")
+        .await
+        .unwrap();
+    assert_eq!(
+        internal_ops.asked(),
+        ["Envisia.Lib", "Newtonsoft.Json", "Envisia.Tools.Cli"]
+    );
+}
+
+/// Scopes only narrow: the dependency-confusion guards are decided as
+/// without them. A proxy scoped to a reserved prefix still serves nothing
+/// under it, and an id an owner has outside the owner's scope still keeps
+/// the proxies out under prefer-hosted (the group serves it from no member)
+/// rather than falling through to the public feed.
+#[tokio::test]
+async fn a_scope_never_widens_what_the_guards_allow() {
+    let pool = common::pool().await;
+    let mut blobs = StubBlobs::default();
+    let hosted = seed_member(&pool, false).await;
+    let public = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    seed_version(&pool, &mut blobs, hosted.id, "Envisia.Lib", "2.0.0", "h").await;
+    seed_version(&pool, &mut blobs, hosted.id, "Sample", "2.0.0", "h").await;
+    repository_dao::add_group_member(&pool, group.id, hosted.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, public.id, 10)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE repository SET config = jsonb_build_object('reserved_prefixes', jsonb_build_array('envisia.')) WHERE id = $1",
+    )
+    .bind(group.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    scope(&pool, &group, &hosted, &["Envisia.*"]).await;
+    scope(&pool, &group, &public, &["Envisia.*", "Sample", "Serilog"]).await;
+    let public_ops = PassThrough::new(&["Envisia.Fake", "Sample", "Serilog"]);
+    let g = pass_through_group_repo(&pool, blobs, user(&pool).await, &[(&public, &public_ops)]);
+
+    // The ids as NuGet clients ask for them: lowercase.
+    // A reserved id: served by the owner alone, the proxy is not asked
+    // although its scope matches.
+    assert_eq!(
+        sorted_versions(&g, &group.name, "envisia.lib").await,
+        ["2.0.0"]
+    );
+    read_everything(&g, &group.name, "envisia.fake").await;
+    assert!(g
+        .list_versions(&group.name, "envisia.fake")
+        .await
+        .unwrap()
+        .is_empty());
+    // An id the owner has, outside its scope: no member serves it.
+    read_everything(&g, &group.name, "sample").await;
+    assert!(g
+        .list_versions(&group.name, "sample")
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(public_ops.asked(), Vec::<String>::new());
+    assert_eq!(
+        searched_ids(&g, &group.name).await,
+        ["envisia.lib", "serilog"],
+        "search applies the same guards"
+    );
+
+    // A public id in the proxy's scope still comes from the proxy.
+    assert_eq!(sorted_versions(&g, &group.name, "serilog").await, ["1.0.0"]);
+    assert_eq!(public_ops.asked(), ["serilog"]);
+
+    // With the owner's scope gone, it serves its id again.
+    scope(&pool, &group, &hosted, &[]).await;
+    assert_eq!(sorted_versions(&g, &group.name, "sample").await, ["2.0.0"]);
+}
