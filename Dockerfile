@@ -134,7 +134,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ── Stage 3: slim runtime ─────────────────────────────────────────────────────
 # debian:bookworm-slim (glibc + libgcc that aws-lc-rs needs) plus ca-certificates
 # for outbound HTTPS (S3, OIDC discovery, credential-forwarding upstreams).
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
