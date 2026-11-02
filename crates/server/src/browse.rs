@@ -18,8 +18,8 @@
 //!
 //! ## Endpoints
 //! * `GET /browse/repos` — the repositories the caller may read (the SPA's
-//!   folder-view root), with their format and client URL; `format` keeps
-//!   one format's.
+//!   folder-view root), with their format and client URL (a docker
+//!   repository's registry and image prefix); `format` keeps one format's.
 //! * `GET /browse/packages` — package search, paginated
 //!   (`q`, `repo`, `prerelease`, `skip`, `take`) → `{ total, items }`. The SPA
 //!   always passes `repo` (search is per repository); the merged cross-repo
@@ -97,6 +97,16 @@ pub struct BrowseRepo {
     /// registry `/browse/images` names, and for a format not installed here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The registry host an images format's (Docker's) repository is logged
+    /// in to (`docker login <registry>`): the repository's own host, or the
+    /// server's. Absent for every other repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+    /// What the image names of an images format's repository start with
+    /// (`<registry>/<repo>`, or the repository's own host). Absent for every
+    /// other repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_prefix: Option<String>,
     /// What the repository holds: `packages`, `files` (a files format: raw,
     /// browsed through its listings) or `images` (docker).
     pub storage: &'static str,
@@ -140,6 +150,13 @@ pub async fn list_repos(
             continue;
         }
         if state.authz.can_read(&principal, repo).await {
+            let images = state.formats.stores_images(&repo.format);
+            let (registry, pull_prefix) = if images {
+                let (registry, prefix) = crate::browse_images::pull_prefix(&state, repo);
+                (Some(registry), Some(prefix))
+            } else {
+                (None, None)
+            };
             out.push(BrowseRepo {
                 id: repo.id,
                 name: repo.name.clone(),
@@ -151,6 +168,8 @@ pub async fn list_repos(
                     .plugin(&repo.format)
                     .filter(|plugin| plugin.descriptor().storage != Storage::Images)
                     .map(|_| crate::plugins::repository_url(&state, &repo.name)),
+                registry,
+                pull_prefix,
                 storage: state.storage(&repo.format).as_str(),
                 options: repo.format_options().into_iter().collect(),
             });

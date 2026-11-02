@@ -17,6 +17,7 @@
 - [apt repositories](apt.md)
 - [Docker / OCI registry](docker.md)
 - [npm registries](npm.md)
+- [NuGet feeds](nuget.md)
 - [Raw file repositories](raw.md)
 - [Format plugins](format-plugins.md)
 
