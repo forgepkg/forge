@@ -186,6 +186,26 @@ impl Repository {
     }
 }
 
+/// `repository.config` key of [`Repository::format_options`].
+pub const FORMAT_OPTIONS_KEY: &str = "options";
+
+impl Repository {
+    /// The repository's settings of its format's own (`config.options`, a
+    /// JSON object of strings), as `(name, value)`: apt's `distribution`.
+    pub fn format_options(&self) -> Vec<(String, String)> {
+        self.config
+            .get(FORMAT_OPTIONS_KEY)
+            .and_then(|v| v.as_object())
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// `repository.format` of NuGet repositories (the column default).
 pub const NUGET_FORMAT: &str = "nuget";
 

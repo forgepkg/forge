@@ -115,7 +115,7 @@ impl RepositoryKind {
 /// `'static` value next to its `impl FormatPlugin`.
 ///
 /// ```no_run
-/// use forge_plugin_api::{Assets, Descriptor, RepositoryKind, Storage, UpstreamToken};
+/// use forge_plugin_api::{Assets, Descriptor, Prereleases, RepositoryKind, Storage, UpstreamToken};
 ///
 /// pub const DESCRIPTOR: Descriptor = Descriptor {
 ///     id: "example",
@@ -126,6 +126,9 @@ impl RepositoryKind {
 ///     storage: Storage::Packages,
 ///     assets: Assets::DEFAULT,
 ///     upstream_token: UpstreamToken::None,
+///     options: &[],
+///     prereleases: Prereleases::Dash,
+///     indexes: false,
 /// };
 /// ```
 ///
@@ -152,6 +155,56 @@ pub struct Descriptor {
     pub assets: Assets,
     /// What a proxy given a password and no username does with it.
     pub upstream_token: UpstreamToken,
+    /// Settings of the format's own that its repositories carry (apt's
+    /// distribution), each name once.
+    pub options: &'static [FormatOption],
+    /// Which versions the host's search filter takes for prereleases (hidden
+    /// unless a search asks for them). Retention asks
+    /// [`FormatPlugin::version_class`].
+    ///
+    /// [`FormatPlugin::version_class`]: crate::FormatPlugin::version_class
+    pub prereleases: Prereleases,
+    /// The host keeps signed indexes of the format's hosted repositories
+    /// ([`FormatPlugin::index`]), and an OpenPGP key per repository to sign
+    /// them with (apt). A package format only.
+    ///
+    /// [`FormatPlugin::index`]: crate::FormatPlugin::index
+    pub indexes: bool,
+}
+
+/// Which versions of a format are prereleases ([`Descriptor::prereleases`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Prereleases {
+    /// A normalized version with a `-` (SemVer's prerelease label: NuGet,
+    /// npm).
+    #[default]
+    Dash,
+    /// None: every version is a release (apt, where a `-` starts the
+    /// Debian revision).
+    None,
+}
+
+/// A setting of the format's own that a repository carries
+/// ([`Descriptor::options`]): a line of text an administrator sets when
+/// creating or editing the repository, checked by
+/// [`FormatPlugin::check_option`] and handed to the plugin with every
+/// request ([`Repository::options`]).
+///
+/// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatOption {
+    /// 1–32 lowercase letters, digits and `_`, starting with a letter.
+    pub name: &'static str,
+    /// What a form calls it.
+    pub label: &'static str,
+    /// One line on what it does.
+    pub description: &'static str,
+    /// The repository kinds that take it.
+    pub kinds: &'static [RepositoryKind],
+    /// Whether every repository of those kinds sets it.
+    pub required: bool,
+    /// An example value, for forms.
+    pub example: &'static str,
 }
 
 /// What a proxy given a password and no username sends its upstream
@@ -244,6 +297,22 @@ pub struct Repository {
     /// [`Action::ServeFile`] serves them. Always `false` for a package
     /// format.
     pub inline: bool,
+    /// The repository's settings of the format's own
+    /// ([`Descriptor::options`]), as [`FormatPlugin::check_option`] made
+    /// them: `(name, value)`, the ones it sets only.
+    ///
+    /// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
+    pub options: Vec<(String, String)>,
+}
+
+impl Repository {
+    /// The value of option `name`, if the repository sets it.
+    pub fn option(&self, name: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// An HTTP request from a package client.
@@ -581,7 +650,10 @@ pub struct StoredFile {
 ///
 /// A package format asks for packages ([`Query::Versions`] …
 /// [`Query::Search`]), a files format for files ([`Query::File`] …
-/// [`Query::Remove`]): a query of the other kind fails the request.
+/// [`Query::Remove`]): a query of the other kind fails the request. A
+/// package format may read the files the host keeps for its repositories
+/// too ([`Query::File`], [`Query::FetchFile`], [`Query::Index`]): a hosted
+/// repository's indexes, a proxy's copies of its upstream's files.
 /// [`Query::Form`], [`Query::Store`] and [`Query::Remove`] change the
 /// repository: each is asked alone in its round, at most once per request
 /// for `Form` and `Store`, and only by a request authorized for them (write
@@ -637,6 +709,13 @@ pub enum Query {
     Store(Vec<NewFile>),
     /// Delete the file at a path.
     Remove(String),
+    /// A file of the repository's indexes (a format with
+    /// [`Descriptor::indexes`]), answered as [`Query::File`] once the host
+    /// has brought the indexes up to date with the repository's packages
+    /// and signing keys ([`FormatPlugin::index`]).
+    ///
+    /// [`FormatPlugin::index`]: crate::FormatPlugin::index
+    Index(String),
     /// What an images format asks of the image store ([`crate::images`]).
     Image(ImageQuery),
 }
@@ -667,7 +746,16 @@ impl Query {
                 | Query::Form
                 | Query::Store(_)
                 | Query::Remove(_)
+                | Query::Index(_)
         )
+    }
+
+    /// Whether a package format may ask it: a package query, or reading a
+    /// file the host keeps for the repository.
+    pub fn is_for_packages(&self) -> bool {
+        !self.is_images()
+            && (!self.is_files()
+                || matches!(self, Query::File(_) | Query::FetchFile(_) | Query::Index(_)))
     }
 }
 
@@ -744,7 +832,8 @@ pub enum Answer {
     Search(SearchResult),
     /// The answer to [`Query::Tags`], by name.
     Tags(Vec<Tag>),
-    /// The answer to [`Query::File`] and to [`Query::FetchFile`].
+    /// The answer to [`Query::File`], [`Query::FetchFile`] and
+    /// [`Query::Index`].
     File(Option<FileInfo>),
     /// `None`: the directory does not exist (a directory other than the root
     /// without an entry the caller may see, asked for without `after`).
@@ -1023,6 +1112,27 @@ pub struct Remote {
     /// What [`UpstreamOp::Index`] answered for it (a JSON object of the
     /// plugin's own making); `None` while the index is being resolved.
     pub index: Option<String>,
+    /// The proxy repository's options ([`Repository::options`]).
+    pub options: Vec<(String, String)>,
+}
+
+impl Remote {
+    /// A remote at `url`, without an index or options.
+    pub fn new(url: impl Into<String>) -> Self {
+        Remote {
+            url: url.into(),
+            index: None,
+            options: Vec::new(),
+        }
+    }
+
+    /// The value of option `name`, if the repository sets it.
+    pub fn option(&self, name: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// What the host wants to know about the upstream.
@@ -1272,6 +1382,8 @@ pub enum UpstreamAnswer {
     /// The file's URL, on an origin a [`Fetch`] may reach; `None`: the
     /// upstream cannot have the path.
     File(Option<String>),
+    /// [`UpstreamAnswer::File`] with what the plugin knows of the file.
+    FileAt(FileLocation),
     /// The answer to [`UpstreamOp::ImageName`].
     ImageName(String),
     /// The answer to [`UpstreamOp::ImageManifest`] and
@@ -1288,6 +1400,108 @@ pub enum UpstreamAnswer {
     /// The upstream answered something unusable: the host serves what it
     /// has cached.
     Failed(String),
+}
+
+/// Where an upstream keeps a file ([`UpstreamAnswer::FileAt`]), and what the
+/// plugin knows of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileLocation {
+    /// On an origin a [`Fetch`] may reach.
+    pub url: String,
+    /// The file never changes at its path (a package, a content-addressed
+    /// copy): the host keeps its copy without re-validating it.
+    pub immutable: bool,
+    /// The size the upstream's index gives the file: the host caches no
+    /// content of another size, and answers 502.
+    pub size: Option<u64>,
+    /// The SHA-256 (lowercase hex) the upstream's index gives the file:
+    /// the host caches no content of another digest, and answers 502.
+    pub sha256: Option<String>,
+}
+
+impl FileLocation {
+    /// A file at `url` the plugin knows nothing more of.
+    pub fn at(url: impl Into<String>) -> Self {
+        FileLocation {
+            url: url.into(),
+            immutable: false,
+            size: None,
+            sha256: None,
+        }
+    }
+}
+
+/// What a repository's indexes are made of ([`FormatPlugin::index`]).
+///
+/// [`FormatPlugin::index`]: crate::FormatPlugin::index
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexInput {
+    /// Every listed version the repository holds (a group's: of its
+    /// members, the first member by priority for a version two hold), by
+    /// id, then version ascending.
+    pub packages: Vec<IndexedPackage>,
+    /// When the index is made: RFC 3339 in UTC.
+    pub generated: String,
+    /// The public keys that sign the index, as a binary OpenPGP keyring.
+    pub keyring: Vec<u8>,
+    /// The same keys, ASCII-armored in one block.
+    pub keyring_armored: String,
+}
+
+/// One version of an [`IndexInput`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedPackage {
+    /// Canonical.
+    pub id: String,
+    /// Normalized.
+    pub version: String,
+    pub version_original: String,
+    /// What [`FormatPlugin::manifest_summary`] returned at publish.
+    ///
+    /// [`FormatPlugin::manifest_summary`]: crate::FormatPlugin::manifest_summary
+    pub summary: Option<String>,
+    /// The package's size in bytes.
+    pub size: u64,
+    /// The package's SHA-256, lowercase hex.
+    pub sha256: String,
+    /// The package's SHA-512, base64.
+    pub sha512: Option<String>,
+    /// RFC 3339 in UTC.
+    pub published: Option<String>,
+}
+
+/// A file of a repository's indexes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexFile {
+    /// A path as [`crate::files`] requires.
+    pub path: String,
+    pub content: Vec<u8>,
+    /// `type/subtype`.
+    pub content_type: String,
+    /// Content-addressed (apt's `by-hash` copies): kept for a day after a
+    /// newer index stops naming it, for a client that read the older one.
+    /// Every other file of an older index is gone once a newer one is made.
+    pub immutable: bool,
+    /// The copies of this file the host signs with the repository's keys.
+    pub signed: Vec<SignedCopy>,
+}
+
+/// A signed copy of an [`IndexFile`], at its own path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedCopy {
+    pub path: String,
+    pub signature: SignatureKind,
+}
+
+/// How a [`SignedCopy`] is signed: with every signing key of the
+/// repository, so that a client trusting any one of them accepts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureKind {
+    /// The file inside an OpenPGP cleartext signature (apt's `InRelease`).
+    Cleartext,
+    /// An ASCII-armored detached OpenPGP signature of the file (apt's
+    /// `Release.gpg`).
+    Detached,
 }
 
 /// What a round of [`FormatPlugin::upstream`] produced.

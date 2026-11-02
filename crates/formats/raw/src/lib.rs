@@ -53,6 +53,9 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     storage: Storage::Files,
     assets: Assets::DEFAULT,
     upstream_token: UpstreamToken::None,
+    options: &[],
+    prereleases: forge_plugin_api::Prereleases::Dash,
+    indexes: false,
 };
 
 /// The raw format.

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT f.id, f.repository_id, f.path, f.blob_sha256, b.s3_key, f.size,\n               f.content_type, f.sha512_base64, f.sha1, f.md5, f.created_at,\n               f.updated_at, f.last_downloaded_at, f.upstream_etag,\n               f.upstream_last_modified, f.checked_at\n        FROM raw_file f\n        JOIN blob b ON b.sha256 = f.blob_sha256\n        WHERE f.repository_id = $1 AND f.path = $2\n        ",
+  "query": "\n        SELECT f.id, f.repository_id, f.path, f.blob_sha256, b.s3_key, f.size,\n               f.content_type, f.sha512_base64, f.sha1, f.md5, f.created_at,\n               f.updated_at, f.last_downloaded_at, f.upstream_etag,\n               f.upstream_last_modified, f.checked_at, f.immutable\n        FROM raw_file f\n        JOIN blob b ON b.sha256 = f.blob_sha256\n        WHERE f.repository_id = $1 AND f.path = $2\n        ",
   "describe": {
     "columns": [
       {
@@ -178,6 +178,17 @@
             "name": "checked_at"
           }
         }
+      },
+      {
+        "ordinal": 16,
+        "name": "immutable",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "raw_file",
+            "name": "immutable"
+          }
+        }
       }
     ],
     "parameters": {
@@ -202,8 +213,9 @@
       true,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "22abc387b0e4e8f6a15b06634ca8c4361fe031cda1a2247530cdf863d234a5c3"
+  "hash": "9434ba17b934138df78f5e0f94da7a04a1e81a99d0e8218c8d047d5c17be4095"
 }

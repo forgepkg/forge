@@ -223,6 +223,7 @@ mod tests {
             upstream_etag: None,
             upstream_last_modified: None,
             checked_at: None,
+            immutable: false,
         }
     }
 

@@ -12,6 +12,7 @@ members = [
     "crates/plugin",
     "crates/server",
     "crates/e2e",
+    "crates/formats/apt",
     "crates/formats/docker",
     "crates/formats/nuget",
     "crates/formats/npm",

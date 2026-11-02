@@ -26,6 +26,7 @@ import {
 } from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { ProxyCachePanel } from '~/components/ProxyCachePanel'
+import { SigningKeysPanel } from '~/components/SigningKeysPanel'
 import { AnonymousAccessPanel } from '~/components/AnonymousAccessPanel'
 import { IMPORT_FORMATS } from '~/api/imports'
 import { TrustedPublishers } from './TrustedPublishers'
@@ -178,6 +179,10 @@ function EditRepository() {
           onSubmit={handleSubmit}
           onCancel={() => void navigate({ to: '/manage/repositories' })}
         />
+        {current.kind === 'hosted' &&
+          formats.data?.find((f) => f.id === current.format)?.signed_indexes && (
+            <SigningKeysPanel key={current.name} repo={current} />
+          )}
         {current.kind === 'hosted' && (
           <TrustedPublishers key={current.name} repository={current.name} />
         )}

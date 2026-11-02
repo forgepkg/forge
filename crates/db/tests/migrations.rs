@@ -55,6 +55,9 @@ const EXPECTED_TABLES: &[&str] = &[
     "workload_api_key_trusted_publisher",
     // device authorization grant (RFC 8628)
     "device_authorization",
+    // signed indexes (apt)
+    "repository_signing_key",
+    "repository_index",
 ];
 
 /// The credential-forwarding provenance columns of `app_user`: (table, column).

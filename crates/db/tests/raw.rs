@@ -55,6 +55,7 @@ fn file<'a>(path: &'a str, sha: &'a str) -> NewRawFile<'a> {
         upstream_etag: None,
         upstream_last_modified: None,
         checked: false,
+        immutable: false,
     }
 }
 

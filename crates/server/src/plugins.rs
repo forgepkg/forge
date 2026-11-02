@@ -122,14 +122,15 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
 ];
 
 /// The format plugins built into this server: crates under
-/// `crates/formats/<id>/`, linked in and always installed (Docker / OCI,
-/// NuGet, npm, raw). NuGet reads archives under `nuget_limits` (`[nuget]`),
+/// `crates/formats/<id>/`, linked in and always installed (apt, Docker /
+/// OCI, NuGet, npm, raw). NuGet reads archives under `nuget_limits` (`[nuget]`),
 /// npm requests under `npm_limits` (`[npm]`).
 pub fn builtin(
     nuget_limits: forge_format_nuget::NupkgLimits,
     npm_limits: forge_format_npm::NpmLimits,
 ) -> Vec<Arc<Plugin>> {
     vec![
+        Plugin::builtin(forge_format_apt::Apt),
         Plugin::builtin(forge_format_docker::Docker),
         Plugin::builtin(forge_format_nuget::Nuget::with_limits(nuget_limits)),
         Plugin::builtin(forge_format_npm::Npm::with_limits(npm_limits)),
@@ -369,6 +370,7 @@ async fn serve(
         // plugin renders, and the redirects it may return, stay there.
         base_url: repository_url_for(state, crate::base_urls::request_authority(&req), &repo.name),
         inline: stores_files && repo.inline_content(),
+        options: repo.format_options(),
     };
     let request = protocol::Request {
         method: method.as_str().to_string(),
@@ -597,7 +599,17 @@ impl Ctx<'_> {
             Action::ReadBody(_) | Action::Publish(_) => {
                 plugin_failed(self.repo, &"a body was asked for twice")
             }
-            Action::ServeFile(_) => self.plugin_misused("an action of the other storage"),
+            // A file the host keeps for the repository: an index, a
+            // proxy's copy of an upstream file.
+            Action::ServeFile(path) => {
+                if self.mutating() {
+                    return refused("serving a file");
+                }
+                match self.require_read().await {
+                    Ok(()) => self.serve_file(&path).await,
+                    Err(denied) => denied,
+                }
+            }
             // Images are the registry's (`crate::images`).
             Action::ServeBlob { .. } | Action::ServeManifest { .. } => {
                 self.plugin_misused("an image action")
@@ -680,8 +692,20 @@ impl Ctx<'_> {
         if queries.iter().any(Query::is_images) {
             return Err(self.plugin_misused("an image query"));
         }
-        if queries.iter().any(|q| q.is_files() != self.stores_files) {
+        let other_storage = |q: &Query| {
+            if self.stores_files {
+                !q.is_files() || matches!(q, Query::Index(_))
+            } else {
+                !q.is_for_packages()
+            }
+        };
+        if queries.iter().any(other_storage) {
             return Err(self.plugin_misused("a query of the other storage"));
+        }
+        if queries.iter().any(|q| matches!(q, Query::Index(_)))
+            && !crate::indexes::keeps_indexes(self.state, self.repo)
+        {
+            return Err(self.plugin_misused("an index of a repository that keeps none"));
         }
         if queries.len() > 1 && queries.iter().any(Query::is_change) {
             return Err(self.plugin_misused("a change with other queries in its round"));
@@ -692,6 +716,9 @@ impl Ctx<'_> {
     /// The answer to one query, or the response that ends the request
     /// instead.
     async fn answer(&self, query: &Query) -> Result<Answer, Response> {
+        if query.is_files() && !self.stores_files {
+            return self.answer_kept_files(query).await;
+        }
         if query.is_files() {
             return self.answer_files(query).await;
         }
@@ -846,6 +873,45 @@ impl Ctx<'_> {
         }
     }
 
+    /// The answer to a query of a package format about a file the host
+    /// keeps for the repository: a hosted repository's index (brought up to
+    /// date first for `index`), a proxy's copy of an upstream file (fetched
+    /// for `fetch-file`). The caller's package selector decides on the
+    /// package the plugin says the file belongs to.
+    async fn answer_kept_files(&self, query: &Query) -> Result<Answer, Response> {
+        let (path, fetch) = match query {
+            Query::File(path) => (path, false),
+            Query::FetchFile(path) => (path, true),
+            Query::Index(path) => (path, false),
+            _ => return Err(self.plugin_misused("a files query of a package format")),
+        };
+        if forge_plugin::api::files::validate_path(path).is_err() {
+            return Err(self.plugin_misused("a file at an invalid path"));
+        }
+        let found = if let Query::Index(_) = query {
+            crate::indexes::file(self.state, self.repo, path)
+                .await
+                .map_err(|e| index_error(self.repo, e))?
+        } else {
+            let files = Files {
+                state: self.state,
+                principal: self.principal.clone(),
+            };
+            let package = self.implementation().file_package(path);
+            files
+                .locate_kept(self.repo, path, package.as_deref(), fetch)
+                .await
+                .map_err(IntoResponse::into_response)?
+        };
+        if let Some(file) = &found {
+            self.located
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(path.clone(), file.clone());
+        }
+        Ok(Answer::File(found.as_ref().map(file_info)))
+    }
+
     /// The staged file part `index` of the form the plugin had received,
     /// taken (a part is stored once).
     fn take_part(&self, index: u32) -> Option<Ingested> {
@@ -876,7 +942,15 @@ impl Ctx<'_> {
                     state: self.state,
                     principal: self.principal.clone(),
                 };
-                match files.locate(self.repo, path, true, Vec::new(), 0).await {
+                let located = if self.stores_files {
+                    files.locate(self.repo, path, true, Vec::new(), 0).await
+                } else {
+                    let package = self.implementation().file_package(path);
+                    files
+                        .locate_kept(self.repo, path, package.as_deref(), true)
+                        .await
+                };
+                match located {
                     Ok(Some(file)) => file,
                     Ok(None) => return FileError::NotFound.into_response(),
                     Err(e) => return e.into_response(),
@@ -1007,6 +1081,7 @@ impl Ctx<'_> {
             }
             // Answered by `answer_files`.
             Query::File(_)
+            | Query::Index(_)
             | Query::FetchFile(_)
             | Query::Directory(_)
             | Query::Form
@@ -2186,6 +2261,22 @@ fn plugin_failed(repo: &Repository, e: &dyn std::fmt::Display) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, "format plugin failed").into_response()
 }
 
+/// An index that could not be made, as the answer to the request.
+fn index_error(repo: &Repository, e: crate::indexes::IndexError) -> Response {
+    match e {
+        crate::indexes::IndexError::Unavailable(m) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "30")],
+            m,
+        )
+            .into_response(),
+        crate::indexes::IndexError::Internal(m) => {
+            tracing::error!(repo = %repo.name, error = %m, "index failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
 pub(crate) fn repo_error(e: RepoError) -> Response {
     match e {
         RepoError::RepoNotFound(_) => {
@@ -2270,7 +2361,7 @@ mod tests {
         let descriptors: Vec<_> = plugins.iter().map(|p| p.descriptor()).collect();
         assert_eq!(forge_plugin::descriptor::check(&descriptors), Ok(()));
         let ids: Vec<_> = plugins.iter().map(|p| p.id()).collect();
-        assert_eq!(ids, ["docker", "nuget", "npm", "raw"]);
+        assert_eq!(ids, ["apt", "docker", "nuget", "npm", "raw"]);
         for plugin in &plugins {
             assert_eq!(plugin.descriptor().version, "1.0.0", "{}", plugin.id());
         }
