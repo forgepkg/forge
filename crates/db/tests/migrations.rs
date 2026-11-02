@@ -1048,7 +1048,7 @@ async fn versions_unlisted_before_the_upgrade_count_from_their_last_change() {
     assert!(age < chrono::Duration::minutes(5), "{age}");
 }
 
-/// The built-in `reader` role (0012): every user that was a reader (neither
+/// The built-in `reader` role (0013): every user that was a reader (neither
 /// an administrator nor a writer) holds it after the upgrade; administrators,
 /// writers and service accounts do not, and a role an administrator had named
 /// `reader` keeps its grants and members under another name.
@@ -1058,9 +1058,9 @@ async fn readers_before_the_upgrade_get_the_reader_role() {
     let url = fresh_database(&server, "reader_role").await;
     let pool = forge_db::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations")
-        .run_to(11, &pool)
+        .run_to(12, &pool)
         .await
-        .expect("migrate to 0011");
+        .expect("migrate to 0012");
 
     let user = |username: &'static str, kind: &'static str| {
         let pool = pool.clone();
