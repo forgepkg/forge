@@ -15,6 +15,9 @@
 //!   repository and on every instance: those are keyed by the repository's
 //!   `updated_at`, which this bumps. Each package's listing is therefore
 //!   fetched again on its next request, as when the metadata TTL lapses;
+//! * the upstream documents stored for every instance (packuments,
+//!   registrations, listings: `proxy_document`), for the whole repository
+//!   whether a package is named or not, as the cached ones above are;
 //! * a whole-repository invalidation also makes the upstream index (NuGet's
 //!   service index) due for a refresh. The previous index stays the fallback
 //!   while the upstream is unreachable;
@@ -31,7 +34,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use forge_db::model::RepoKind;
-use forge_db::{oci_dao, proxy_dao, raw_dao, repository_dao};
+use forge_db::{oci_dao, proxy_dao, proxy_document_dao, raw_dao, repository_dao};
 use serde::{Deserialize, Serialize};
 
 use super::{db_error, format_unavailable};
@@ -66,6 +69,9 @@ pub struct Invalidated {
     /// Cached files due for re-validation (raw proxies, and apt's indexes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files_expired: Option<u64>,
+    /// Stored upstream documents deleted (package formats' proxies: npm
+    /// packuments, NuGet registrations and listings).
+    pub documents_dropped: u64,
 }
 
 /// `POST /admin/repositories/{name}/proxy-cache/invalidate`
@@ -140,6 +146,7 @@ pub async fn invalidate(
                 not_found_cleared = invalidated.not_found_cleared,
                 tags_expired = invalidated.tags_expired,
                 files_expired = invalidated.files_expired.unwrap_or(0),
+                documents_dropped = invalidated.documents_dropped,
                 "proxy cache invalidated"
             );
             Json(invalidated).into_response()
@@ -164,6 +171,7 @@ async fn forget(
         not_found_cleared: 0,
         tags_expired: 0,
         files_expired: None,
+        documents_dropped: 0,
     };
     if stores_files {
         // A file is the range of its own path; a directory, of its files.
@@ -191,6 +199,9 @@ async fn forget(
     if !repository_dao::touch_repository(&mut *tx, repo.id).await? {
         return Ok(None);
     }
+    // After the repository row, the order its delete takes them in.
+    invalidated.documents_dropped =
+        proxy_document_dao::purge_repository(&mut tx, repo.id, state.config.outbox.grace()).await?;
     tx.commit().await?;
     Ok(Some(invalidated))
 }

@@ -1479,6 +1479,16 @@ pub async fn update(
         if let Err(e) = forge_db::tag_dao::delete_repository_tags(&mut *tx, updated.id).await {
             return db_error(e);
         }
+        // So were the upstream documents it stored.
+        if let Err(e) = forge_db::proxy_document_dao::purge_repository(
+            &mut tx,
+            updated.id,
+            state.config.outbox.grace(),
+        )
+        .await
+        {
+            return db_error(e);
+        }
         // A docker proxy's tags name what the previous upstream served:
         // the repointed proxy starts with an empty cache. Locked first, as
         // the purge requires: a fetch from the previous upstream still
@@ -1717,10 +1727,11 @@ async fn delete_repository_once(
         component_dao::hard_delete_all_components(&mut tx, repo_id, grace).await?;
     }
     // Image rows (a proxy's cache; a hosted repository's leftover blobs and
-    // upload sessions) and a raw proxy's files release their blob references
-    // before the cascade.
+    // upload sessions), a raw proxy's files and a proxy's stored upstream
+    // documents release their blob references before the cascade.
     oci_dao::purge_repository(&mut tx, repo_id, grace).await?;
     raw_dao::purge_repository(&mut tx, repo_id, grace).await?;
+    forge_db::proxy_document_dao::purge_repository(&mut tx, repo_id, grace).await?;
 
     let deleted = repository_dao::delete_repository(&mut *tx, repo_id).await?;
     tx.commit().await?;

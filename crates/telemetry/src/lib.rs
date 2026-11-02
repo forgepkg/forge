@@ -48,6 +48,7 @@ pub const ATTRIBUTE_KEYS: &[&str] = &[
     "forge.cache.result",
     "forge.cache.tier",
     "forge.gc.source",
+    "forge.proxy.document.source",
     "forge.proxy.kind",
     "forge.proxy.outcome",
     "forge.repository",
@@ -149,6 +150,7 @@ struct Instruments {
     proxy_lookups: Counter<u64>,
     upstream_duration: Histogram<f64>,
     upstream_fetched: Counter<u64>,
+    upstream_documents: Counter<u64>,
     s3_duration: Histogram<f64>,
     gc_deleted: Counter<u64>,
     cache_lookups: Counter<u64>,
@@ -249,6 +251,11 @@ pub fn init(meter: &Meter) {
             "forge.proxy.upstream.fetched",
             "By",
             "Bytes proxy repositories fetched from their upstreams",
+        ),
+        upstream_documents: counter(
+            "forge.proxy.upstream.documents",
+            "{document}",
+            "Upstream documents proxy repositories read past their in-process cache, by where from",
         ),
         s3_duration: duration(
             "forge.s3.operation.duration",
@@ -618,6 +625,37 @@ pub mod proxy {
     pub fn upstream_bytes(repository: &str, bytes: u64) {
         if let Some(i) = instruments() {
             i.upstream_fetched.add(bytes, &with_repo(repository, []));
+        }
+    }
+
+    value_enum! {
+        /// Where a proxy read an upstream document (a packument, a
+        /// registration page, a listing) its in-process cache did not have.
+        pub enum DocumentSource {
+            /// Its stored copy, within the metadata TTL: the upstream was
+            /// not asked.
+            Stored => "stored",
+            /// Its stored copy, which the upstream confirmed
+            /// (`304 Not Modified`): nothing was downloaded.
+            Revalidated => "revalidated",
+            /// The upstream, which sent it.
+            Downloaded => "downloaded",
+        }
+    }
+
+    /// Count an upstream document proxy `repository` read from `source`.
+    pub fn upstream_document(repository: &str, source: DocumentSource) {
+        if let Some(i) = instruments() {
+            i.upstream_documents.add(
+                1,
+                &with_repo(
+                    repository,
+                    [KeyValue::new(
+                        "forge.proxy.document.source",
+                        source.as_str(),
+                    )],
+                ),
+            );
         }
     }
 }
@@ -1551,6 +1589,9 @@ mod tests {
         proxy::upstream_request("proxy-repo", "GET", Some(429), Duration::from_millis(5));
         proxy::upstream_request("proxy-repo", "HEAD", None, Duration::from_millis(5));
         proxy::upstream_bytes("proxy-repo", 100);
+        for &source in proxy::DocumentSource::ALL {
+            proxy::upstream_document("proxy-repo", source);
+        }
         for &op in storage::S3Op::ALL {
             for &outcome in storage::S3Outcome::ALL {
                 storage::S3Call::start(op, "bucket").finish(outcome);
@@ -1612,6 +1653,7 @@ mod tests {
             "http.server.response.body.size",
             "http.client.request.duration",
             "forge.proxy.lookups",
+            "forge.proxy.upstream.documents",
             "forge.s3.operation.duration",
             "forge.outbox.oldest_due.age",
             "db.client.connection.count",

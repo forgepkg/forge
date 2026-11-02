@@ -85,25 +85,44 @@
 //!   to the flat-container view (listed, no dependencies).
 //! * **Metadata TTL** — the upstream service index *and* each package's
 //!   version listing are re-fetched at most once per `metadata_ttl_seconds`.
+//! * **Stored upstream documents** — every document a format fetches (a
+//!   packument, a registration page, a version listing) is kept for every
+//!   instance and across restarts: its bytes content-addressed in the
+//!   [`Cas`], and in `proxy_document` per repository, URL and `Accept`, when
+//!   the upstream last sent or confirmed it and its validators (`ETag`,
+//!   `Last-Modified`). Within the metadata TTL (a day for an immutable
+//!   document) the stored copy is served without asking the upstream; past
+//!   it, the upstream is asked conditionally, and a `304 Not Modified`
+//!   restarts the TTL without a download. Each instance keeps a document it
+//!   read in its local cache in front, for what is left of its TTL. Postgres
+//!   and the CAS are trusted (Redis is not, and holds none of it). A search's
+//!   pages and an import's walk are not stored. A stored document nobody read
+//!   for a week is removed by the reconciler.
 //! * **Repointing** — the service index, version listings, manifests and
 //!   registrations cached from the upstream are tied to the `remote_url` they
 //!   came from: once it changes, nothing more is requested from the previous
 //!   upstream, and a failing new one is an error, never a fallback to the
-//!   previous upstream's index. Packages already downloaded stay cached.
+//!   previous upstream's index; its stored documents are deleted with the
+//!   repoint, and one fetched from the previous upstream meanwhile is never
+//!   used. Packages already downloaded stay cached.
 //! * **Invalidation** — an administrator makes a proxy ask its upstream again
 //!   (`POST /admin/repositories/{name}/proxy-cache/invalidate`): the
 //!   not-found markers of one package, or of all, are removed and
 //!   `updated_at` is bumped, which drops every cached listing, document and
-//!   verdict on every instance ([`ProxyRepo::upstream_scope`]); invalidating
-//!   the whole repository also makes the upstream index due for a refresh.
-//!   Downloaded packages and the package-delay clock are kept.
+//!   verdict on every instance ([`ProxyRepo::upstream_scope`]), and the
+//!   stored upstream documents are deleted; invalidating the whole
+//!   repository also makes the upstream index due for a refresh. Downloaded
+//!   packages and the package-delay clock are kept. Any other edit of the
+//!   repository bumps `updated_at` too: its stored documents are then
+//!   revalidated before they are served again.
 //! * **Search** — forwarded to the upstream's `SearchQueryService` (cached
 //!   for the metadata TTL), so packages nobody has restored yet are found.
 //!   The caller's package filter, live not-found markers and the package
 //!   delay apply to the upstream's hits; when the upstream has no search
 //!   service or its search fails, the locally cached packages are searched.
 //! * **Offline** — `repository.online == false` serves only already-cached data;
-//!   no upstream requests are made.
+//!   no upstream requests are made, not even to revalidate a stored
+//!   document (a conversation that reaches one serves it whatever its age).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
@@ -119,15 +138,16 @@ use forge_db::asset_dao::{self, NewAsset};
 use forge_db::component_dao::{self, NewComponent};
 use forge_db::model::Repository;
 use forge_db::proxy_dao;
+use forge_db::proxy_document_dao::{self, NewProxyDocument, ProxyDocument};
 use forge_db::{blob_dao, repository_dao};
-use forge_storage::{Cas, CasError};
+use forge_storage::{BlobRef, Cas, CasError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use forge_plugin_api as api;
-use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
+use forge_telemetry::proxy::{DocumentSource, Kind as LookupKind, Lookup, Outcome};
 use tracing::Instrument;
 
 use crate::authz::PackageFilter;
@@ -135,7 +155,8 @@ use crate::format::Format;
 use crate::net::budget::Held;
 use crate::net::origins::{named_origins, UpstreamOrigins};
 use crate::net::upstream::{
-    status_is_unavailable, Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp,
+    status_is_unavailable, Origin, RequestClass, Revalidated, UpstreamAuth, UpstreamError,
+    UpstreamHttp, Validators,
 };
 use crate::repo::downloads::DownloadTally;
 use crate::repo::hosted::BlobFetch;
@@ -156,7 +177,8 @@ pub const NS_UPSTREAM_INDEX: &str = "proxy_index";
 pub const NS_UPSTREAM_VERSIONS: &str = "proxy_versions";
 /// Cache namespace for the documents the format's upstream protocol fetched
 /// ([`api::Fetch`]), keyed by `"{scope}/{url}"`, for as long as its
-/// [`api::Freshness`] says.
+/// [`api::Freshness`] says: the in-process copy, in front of the one stored
+/// for every instance (`proxy_document`).
 pub const NS_UPSTREAM_FETCH: &str = "proxy_fetch";
 /// Cache namespace marking a proxy whose upstream search failed, keyed by
 /// `"{scope}"`; see [`UPSTREAM_SEARCH_BACKOFF`].
@@ -193,6 +215,13 @@ pub const DEFAULT_NOT_FOUND_TTL_SECONDS: i64 = 600;
 /// ([`api::Freshness::Immutable`]: a version's manifest, a catalog entry) is
 /// reused.
 const IMMUTABLE_FETCH_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// How long a stored upstream document nobody reads is kept
+/// (`proxy_document.used_at`): the reconciler removes it after a week.
+pub const UNUSED_DOCUMENT_SECONDS: i64 = 7 * 24 * 60 * 60;
+/// The outbox grace a blob a stored document no longer names waits out
+/// before it is deleted, unless [`ProxyRepo::with_delete_grace`] says
+/// otherwise (`outbox.grace_seconds`' default).
+const DEFAULT_DELETE_GRACE_SECONDS: i64 = 3600;
 /// Rounds of one upstream conversation ([`ProxyRepo::converse`]).
 const MAX_UPSTREAM_ROUNDS: usize = 4;
 /// Fetches of one upstream conversation, all rounds together.
@@ -251,6 +280,32 @@ enum CachedFetch {
     Found { body: String, named: Vec<Origin> },
     NotFound,
     TooLarge { reason: String },
+}
+
+impl CachedFetch {
+    /// A document's `bytes`, naming `named`, as cached.
+    fn found(bytes: &[u8], named: Vec<Origin>) -> Self {
+        CachedFetch::Found {
+            body: base64::engine::general_purpose::STANDARD.encode(bytes),
+            named,
+        }
+    }
+}
+
+/// What the upstream answered one GET of a document ([`ProxyRepo::request`]).
+enum Answer {
+    /// The document, with the origins it names and its validators.
+    Sent {
+        bytes: Vec<u8>,
+        named: Vec<Origin>,
+        validators: Validators,
+    },
+    /// `304 Not Modified`, with the validators the answer carried.
+    NotModified(Validators),
+    /// A 404.
+    NotFound,
+    /// A document larger than `proxy.max_metadata_bytes`, and why.
+    TooLarge(String),
 }
 
 /// The outcome of a proxy lookup that failed with `e`: the upstream's fault
@@ -485,6 +540,7 @@ fn inflight_gate(repository_id: i64, lower_id: &str, version: &str) -> Arc<tokio
 /// Constructed per request (cheap: clones of shared handles) with the resolved
 /// repository row already in hand, or via [`ProxyRepo::new`] which resolves the
 /// row by name on each call.
+#[derive(Clone)]
 pub struct ProxyRepo {
     pool: PgPool,
     format: Arc<dyn Format>,
@@ -499,6 +555,9 @@ pub struct ProxyRepo {
     envelope: Arc<forge_crypto::service::EnvelopeService>,
     /// Counts `.nupkg` downloads and writes them in batches.
     downloads: Arc<DownloadTally>,
+    /// How long a blob a replaced or deleted stored document named is kept
+    /// before it is deleted (`outbox.grace_seconds`).
+    delete_grace: Duration,
 }
 
 impl ProxyRepo {
@@ -532,6 +591,7 @@ impl ProxyRepo {
             http: UpstreamHttp::shared_default(),
             blobs: None,
             envelope,
+            delete_grace: Duration::seconds(DEFAULT_DELETE_GRACE_SECONDS),
         }
     }
 
@@ -551,6 +611,14 @@ impl ProxyRepo {
     /// Attach blob byte access so cached manifests can be served locally.
     pub fn with_blob_fetch(mut self, blobs: Arc<dyn BlobFetch>) -> Self {
         self.blobs = Some(blobs);
+        self
+    }
+
+    /// Keep the blob a replaced or deleted stored document named for `grace`
+    /// before it is deleted (`outbox.grace_seconds`), so that a read of it
+    /// already under way completes.
+    pub fn with_delete_grace(mut self, grace: Duration) -> Self {
+        self.delete_grace = grace;
         self
     }
 
@@ -617,6 +685,13 @@ impl ProxyRepo {
         // for the budget (then nothing more is sent).
         let held = AtomicU64::new(0);
         let exhausted = AtomicBool::new(false);
+        // A search's pages and an import's walk of the upstream are
+        // documents of the client's query or the walk's offset, read once:
+        // they are not stored for the other instances ([`Self::fetch`]).
+        let keep = !matches!(
+            op,
+            api::UpstreamOp::Search(_) | api::UpstreamOp::Packages { .. }
+        );
         // The documents' bytes in the instance's budget ([`Self::fetch_held`]),
         // given back when the conversation ends. They go into the format's
         // task with the documents: a request dropped while the format reads
@@ -702,7 +777,7 @@ impl ProxyRepo {
                             } else if exhausted.load(Ordering::Relaxed) {
                                 (Self::over_budget(&fetch.url, budget), Vec::new(), Trouble::None, None)
                             } else {
-                                match self.fetch_held(repo, &fetch).await {
+                                match self.fetch_held(repo, &fetch, keep).await {
                                     (api::Fetched::Found(body), named, down, hold) => {
                                         let size = body.len() as u64;
                                         let kept = held
@@ -750,17 +825,19 @@ impl ProxyRepo {
     /// budget ([`DocumentBudget`](crate::net::budget::DocumentBudget),
     /// `proxy.max_metadata_memory_bytes`). When they are not free, the
     /// document is let go while the conversation waits for them, up to the
-    /// metadata timeout, then read again (from the local cache, unless it
-    /// expired meanwhile): a waiting conversation holds no document. When
+    /// metadata timeout, then read again (from the local cache, or the
+    /// stored copy, unless it expired meanwhile): a waiting conversation
+    /// holds no document. When
     /// they do not come free, the fetch fails as an unavailable upstream
     /// does, and the request answers 503.
     async fn fetch_held(
         &self,
         repo: &Repository,
         fetch: &api::Fetch,
+        keep: bool,
     ) -> (api::Fetched, Vec<Origin>, Trouble, Option<Held>) {
         let budget = self.http.document_budget();
-        let (outcome, named, down) = self.fetch(repo, fetch).await;
+        let (outcome, named, down) = self.fetch(repo, fetch, keep).await;
         let size = match &outcome {
             api::Fetched::Found(body) => body.len() as u64,
             _ => return (outcome, named, down, None),
@@ -784,7 +861,7 @@ impl ProxyRepo {
                 None,
             );
         };
-        let (outcome, named, down) = self.fetch(repo, fetch).await;
+        let (outcome, named, down) = self.fetch(repo, fetch, keep).await;
         // Read again after it expired, it may have grown: hold the rest too
         // when it is free, else read it anyway.
         if let api::Fetched::Found(body) = &outcome {
@@ -819,10 +896,12 @@ impl ProxyRepo {
         ))
     }
 
-    /// GET one upstream document with the proxy's credentials, through the
-    /// local cache for as long as its freshness allows (never Redis: what an
-    /// upstream answered decides what is downloaded and served). Returns it
-    /// with the origins its URLs name ([`named_origins`]).
+    /// GET one upstream document with the proxy's credentials, for as long
+    /// as its freshness allows: through the local cache (never Redis: what
+    /// an upstream answered decides what is downloaded and served) and, when
+    /// the conversation `keep`s its documents, the copy stored for every
+    /// instance ([`Self::fetch_stored`]). Returns it with the origins its
+    /// URLs name ([`named_origins`]).
     ///
     /// A 404 is cached only for an immutable document: a metadata 404 (a
     /// package the upstream does not know yet) is what the not-found
@@ -834,6 +913,7 @@ impl ProxyRepo {
         &self,
         repo: &Repository,
         fetch: &api::Fetch,
+        keep: bool,
     ) -> (api::Fetched, Vec<Origin>, Trouble) {
         let ttl = match fetch.freshness {
             api::Freshness::Metadata => Self::metadata_ttl(repo).to_std().unwrap_or_default(),
@@ -847,49 +927,34 @@ impl ProxyRepo {
         };
         let cached: Result<CachedFetch, Option<FetchFailure>> = self
             .cache
-            .get_or_try_insert_local(NS_UPSTREAM_FETCH, &key, ttl, || async {
-                let creds = self
-                    .credentials(repo)
-                    .await
-                    .map_err(|e| Some(FetchFailure::local(e.to_string())))?;
-                let auth = creds.as_ref().map(Credentials::auth);
-                match self
-                    .http
-                    .for_repository(&repo.name)
-                    .get_bytes_accepting(&fetch.url, auth.as_ref(), fetch.accept.as_deref())
-                    .await
-                {
-                    Ok(Some(bytes)) => {
-                        // A document may be megabytes: read off the async
-                        // workers.
-                        let (bytes, named) = tokio::task::spawn_blocking(move || {
-                            let named = named_origins(&bytes);
-                            (bytes, named)
-                        })
+            .get_or_try_insert_local_with_tags_expiring(NS_UPSTREAM_FETCH, &key, &[], ttl, || {
+                // On the heap: up to four of these are in flight per round
+                // of a conversation, each deep in the request's future.
+                Box::pin(async move {
+                    if keep {
+                        // In a task of its own, from a fresh stack: the
+                        // stored copy's reads and writes (the database, the
+                        // object store) would add their depth to the
+                        // request's, deep already at this point.
+                        let (this, repo, fetch) = (self.clone(), repo.clone(), fetch.clone());
+                        let url = fetch.url.clone();
+                        return tokio::spawn(
+                            async move { this.fetch_stored(&repo, &fetch, ttl).await }
+                                .instrument(tracing::Span::current()),
+                        )
                         .await
-                        .map_err(|e| {
-                            Some(FetchFailure::local(format!("read {}: {e}", fetch.url)))
-                        })?;
-                        Ok(CachedFetch::Found {
-                            body: base64::engine::general_purpose::STANDARD.encode(bytes),
-                            named: named.into_iter().collect(),
-                        })
+                        .unwrap_or_else(|e| {
+                            Err(Some(FetchFailure::local(format!("fetch {url}: {e}"))))
+                        });
                     }
-                    Ok(None) if fetch.freshness == api::Freshness::Immutable => {
-                        Ok(CachedFetch::NotFound)
-                    }
-                    Ok(None) => Err(None),
-                    // It will not have shrunk by the next read: remembered
-                    // like a document, so that every read does not download
-                    // up to the limit again before it fails.
-                    Err(e @ UpstreamError::TooLarge { .. }) => Ok(CachedFetch::TooLarge {
-                        reason: e.to_string(),
-                    }),
-                    Err(e) => Err(Some(FetchFailure {
-                        trouble: Trouble::of(&e),
-                        reason: e.to_string(),
-                    })),
-                }
+                    let cached = match self.request(repo, fetch, None).await? {
+                        Answer::Sent { bytes, named, .. } => CachedFetch::found(&bytes, named),
+                        Answer::NotFound => Self::not_found(fetch)?,
+                        Answer::TooLarge(reason) => CachedFetch::TooLarge { reason },
+                        Answer::NotModified(_) => return Err(Some(Self::unasked_304(fetch))),
+                    };
+                    Ok((cached, ttl))
+                })
             })
             .await;
         match cached {
@@ -914,6 +979,293 @@ impl ProxyRepo {
                 Vec::new(),
                 failure.trouble,
             ),
+        }
+    }
+
+    /// How a 404 of `fetch` is cached: as such for an immutable document,
+    /// not at all (`Err(None)`) for metadata.
+    fn not_found(fetch: &api::Fetch) -> Result<CachedFetch, Option<FetchFailure>> {
+        match fetch.freshness {
+            api::Freshness::Immutable => Ok(CachedFetch::NotFound),
+            api::Freshness::Metadata => Err(None),
+        }
+    }
+
+    /// The failure of an upstream that answered `304 Not Modified` to a
+    /// request that asked nothing of the kind.
+    fn unasked_304(fetch: &api::Fetch) -> FetchFailure {
+        FetchFailure::local(format!(
+            "{}: the upstream answered 304 Not Modified to an unconditional request",
+            fetch.url
+        ))
+    }
+
+    /// [`Self::fetch`] past the local cache, through the document stored for
+    /// every instance (`proxy_document`, its bytes in the CAS): within the
+    /// metadata TTL of when the upstream last sent or confirmed it (`ttl`),
+    /// the stored copy is served without asking the upstream; past it, the
+    /// upstream is asked with its validators (`If-None-Match`,
+    /// `If-Modified-Since`), and a `304 Not Modified` serves it again and
+    /// restarts its TTL, without a download. A document the upstream sends
+    /// is stored (best effort: one that cannot be stored is served all the
+    /// same), and one it no longer has, or no longer serves within the size
+    /// limit, is deleted.
+    ///
+    /// The stored copy stands only for the upstream it came from: it is
+    /// served without asking only while the repository still has the
+    /// `remote_url` and `updated_at` it was fetched or confirmed under (an
+    /// edit of the repository has it revalidated), and its validators are
+    /// sent only to that `remote_url`. A copy larger than
+    /// `proxy.max_metadata_bytes` is not used. An offline proxy serves its
+    /// stored copy whatever its age, and asks nothing. Returns the document
+    /// with how long the local cache may keep it: what is left of its TTL.
+    async fn fetch_stored(
+        &self,
+        repo: &Repository,
+        fetch: &api::Fetch,
+        ttl: std::time::Duration,
+    ) -> Result<(CachedFetch, std::time::Duration), Option<FetchFailure>> {
+        let key = proxy_document_dao::key(&fetch.url, fetch.accept.as_deref());
+        let limit = self.http.config().max_metadata_bytes;
+        let stored = match proxy_document_dao::read(&self.pool, repo.id, &key).await {
+            Ok(stored) => stored.filter(|doc| {
+                Some(doc.remote_url.as_str()) == repo.remote_url.as_deref()
+                    && u64::try_from(doc.size).is_ok_and(|size| size <= limit)
+            }),
+            Err(e) => {
+                tracing::warn!(repo = %repo.name, url = %fetch.url, error = %e, "the stored upstream document could not be looked up; asking the upstream");
+                None
+            }
+        };
+        if let Some(doc) = &stored {
+            let age = std::time::Duration::try_from_secs_f64(doc.age_seconds.max(0.0))
+                .unwrap_or(std::time::Duration::MAX);
+            let fresh = doc.repository_updated_at == repo.updated_at && age < ttl;
+            if fresh || !repo.online {
+                if let Some(found) = self.read_stored(repo, doc).await {
+                    forge_telemetry::proxy::upstream_document(&repo.name, DocumentSource::Stored);
+                    let left = if fresh { ttl - age } else { ttl };
+                    return Ok((found, left));
+                }
+            }
+        }
+        if !repo.online {
+            return Err(Some(FetchFailure::local(format!(
+                "{}: not fetched, the proxy is offline",
+                fetch.url
+            ))));
+        }
+        // What the upstream is asked whether it changed.
+        let mut basis = stored.as_ref().and_then(|doc| {
+            let validators = Validators {
+                etag: doc.etag.clone(),
+                last_modified: doc.last_modified.clone(),
+            };
+            (!validators.is_empty()).then_some((doc, validators))
+        });
+        loop {
+            let asked = basis.as_ref().map(|(_, validators)| validators);
+            match self.request(repo, fetch, asked).await? {
+                Answer::NotModified(sent) => {
+                    let Some((doc, _)) = basis.take() else {
+                        return Err(Some(Self::unasked_304(fetch)));
+                    };
+                    let Some(found) = self.read_stored(repo, doc).await else {
+                        // Unreadable after all: ask for the document itself.
+                        continue;
+                    };
+                    if let Err(e) = proxy_document_dao::confirm(
+                        &self.pool,
+                        doc.id,
+                        &doc.blob_sha256,
+                        sent.etag.as_deref(),
+                        sent.last_modified.as_deref(),
+                        repo.updated_at,
+                    )
+                    .await
+                    {
+                        tracing::warn!(repo = %repo.name, url = %fetch.url, error = %e, "the upstream's confirmation of a stored document could not be recorded");
+                    }
+                    forge_telemetry::proxy::upstream_document(
+                        &repo.name,
+                        DocumentSource::Revalidated,
+                    );
+                    return Ok((found, ttl));
+                }
+                Answer::Sent {
+                    bytes,
+                    named,
+                    validators,
+                } => {
+                    forge_telemetry::proxy::upstream_document(
+                        &repo.name,
+                        DocumentSource::Downloaded,
+                    );
+                    self.store_document(repo, fetch, &bytes, &named, &validators)
+                        .await;
+                    return Ok((CachedFetch::found(&bytes, named), ttl));
+                }
+                Answer::NotFound => {
+                    if let Some(doc) = &stored {
+                        self.drop_document(repo, fetch, doc).await;
+                    }
+                    return Self::not_found(fetch).map(|cached| (cached, ttl));
+                }
+                // It will not have shrunk by the next read: remembered like
+                // a document, so that every read does not download up to
+                // the limit again before it fails.
+                Answer::TooLarge(reason) => {
+                    if let Some(doc) = &stored {
+                        self.drop_document(repo, fetch, doc).await;
+                    }
+                    return Ok((CachedFetch::TooLarge { reason }, ttl));
+                }
+            }
+        }
+    }
+
+    /// GET `fetch` from the upstream with the proxy's credentials,
+    /// conditionally on `validators` when there are some.
+    async fn request(
+        &self,
+        repo: &Repository,
+        fetch: &api::Fetch,
+        validators: Option<&Validators>,
+    ) -> Result<Answer, FetchFailure> {
+        let creds = self
+            .credentials(repo)
+            .await
+            .map_err(|e| FetchFailure::local(e.to_string()))?;
+        let auth = creds.as_ref().map(Credentials::auth);
+        let failure = |e: UpstreamError| FetchFailure {
+            trouble: Trouble::of(&e),
+            reason: e.to_string(),
+        };
+        match self
+            .http
+            .for_repository(&repo.name)
+            .get_metadata_if_changed(
+                &fetch.url,
+                auth.as_ref(),
+                fetch.accept.as_deref(),
+                validators,
+            )
+            .await
+        {
+            Ok(Revalidated::Modified(body, validators)) => {
+                let bytes = body.into_bytes().await.map_err(failure)?;
+                // A document may be megabytes: read off the async workers.
+                let (bytes, named) = tokio::task::spawn_blocking(move || {
+                    let named = named_origins(&bytes);
+                    (bytes, named)
+                })
+                .await
+                .map_err(|e| FetchFailure::local(format!("read {}: {e}", fetch.url)))?;
+                Ok(Answer::Sent {
+                    bytes,
+                    named: named.into_iter().collect(),
+                    validators,
+                })
+            }
+            Ok(Revalidated::NotModified(validators)) => Ok(Answer::NotModified(validators)),
+            Ok(Revalidated::NotFound) => Ok(Answer::NotFound),
+            Err(e @ UpstreamError::TooLarge { .. }) => Ok(Answer::TooLarge(e.to_string())),
+            Err(e) => Err(failure(e)),
+        }
+    }
+
+    /// The bytes of stored document `doc`, as cached; `None` when they
+    /// cannot be read (the object store is down and the local blob cache
+    /// does not have them, the object is gone).
+    async fn read_stored(&self, repo: &Repository, doc: &ProxyDocument) -> Option<CachedFetch> {
+        let size = u64::try_from(doc.size).ok()?;
+        let blob = BlobRef {
+            sha256: &doc.blob_sha256,
+            s3_key: &doc.s3_key,
+            size,
+        };
+        match self.cas.read_all(blob).await {
+            Ok(bytes) if bytes.len() as u64 == size => {
+                // Written from an `Origin` when it was stored.
+                let named = doc
+                    .named_origins
+                    .iter()
+                    .filter_map(|origin| Origin::try_from(origin.clone()).ok())
+                    .collect();
+                Some(CachedFetch::found(&bytes, named))
+            }
+            Ok(bytes) => {
+                tracing::warn!(repo = %repo.name, sha256 = %doc.blob_sha256, size, read = bytes.len(), "a stored upstream document is not the size recorded; asking the upstream");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(repo = %repo.name, sha256 = %doc.blob_sha256, error = %e, "a stored upstream document could not be read; asking the upstream");
+                None
+            }
+        }
+    }
+
+    /// Store the document the upstream sent for `fetch` (`bytes`, naming
+    /// `named`, with its `validators`) for every instance, replacing what
+    /// was stored for it. Best effort: a document that cannot be stored (the
+    /// object store is down, the temp space is full) is still served, and
+    /// fetched again by the next instance that needs it.
+    async fn store_document(
+        &self,
+        repo: &Repository,
+        fetch: &api::Fetch,
+        bytes: &[u8],
+        named: &[Origin],
+        validators: &Validators,
+    ) {
+        let Some(remote_url) = repo.remote_url.as_deref() else {
+            return;
+        };
+        let limit = self.http.config().max_metadata_bytes;
+        let stored = match self.cas.store(bytes, limit).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!(repo = %repo.name, url = %fetch.url, error = %e, "an upstream document could not be stored; serving it unstored");
+                return;
+            }
+        };
+        let named: Vec<String> = named.iter().cloned().map(String::from).collect();
+        let doc = NewProxyDocument {
+            repository_id: repo.id,
+            url: &fetch.url,
+            accept: fetch.accept.as_deref(),
+            sha256: &stored.sha256,
+            size: stored.size as i64,
+            named_origins: &named,
+            etag: validators.etag.as_deref(),
+            last_modified: validators.last_modified.as_deref(),
+            remote_url,
+            repository_updated_at: repo.updated_at,
+        };
+        let recorded = async {
+            let mut tx = forge_db::begin(&self.pool).await?;
+            proxy_document_dao::store(&mut tx, &doc, stored.ingest_token, self.delete_grace)
+                .await?;
+            tx.commit().await
+        }
+        .await;
+        if let Err(e) = recorded {
+            tracing::warn!(repo = %repo.name, url = %fetch.url, error = %e, "an upstream document could not be recorded; serving it unstored");
+        }
+    }
+
+    /// Delete stored document `doc` of `fetch`, which the upstream no longer
+    /// has (or no longer serves within the size limit). Best effort.
+    async fn drop_document(&self, repo: &Repository, fetch: &api::Fetch, doc: &ProxyDocument) {
+        let dropped = async {
+            let mut tx = forge_db::begin(&self.pool).await?;
+            proxy_document_dao::delete(&mut tx, doc.id, &doc.blob_sha256, self.delete_grace)
+                .await?;
+            tx.commit().await
+        }
+        .await;
+        if let Err(e) = dropped {
+            tracing::warn!(repo = %repo.name, url = %fetch.url, error = %e, "a stored upstream document the upstream no longer serves could not be deleted");
         }
     }
 

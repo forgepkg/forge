@@ -328,6 +328,51 @@ pub enum RequestClass {
     Download,
 }
 
+/// The validators an upstream gave a document (`ETag`, `Last-Modified`): a
+/// conditional request ([`UpstreamHttp::get_metadata_if_changed`]) sends them
+/// back to ask whether it changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Validators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+impl Validators {
+    /// The validators among a response's `headers`. A value longer than
+    /// 1 KiB, or not visible ASCII, is not kept: it is stored and sent back.
+    pub fn of(headers: &reqwest::header::HeaderMap) -> Validators {
+        let text = |name| {
+            headers
+                .get(name)
+                .and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && v.len() <= 1024)
+                .map(str::to_string)
+        };
+        Validators {
+            etag: text(reqwest::header::ETAG),
+            last_modified: text(reqwest::header::LAST_MODIFIED),
+        }
+    }
+
+    /// Whether there is none to send.
+    pub fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+}
+
+/// What a conditional metadata GET ([`UpstreamHttp::get_metadata_if_changed`])
+/// found.
+pub enum Revalidated {
+    /// `304 Not Modified`: the document has not changed. With the validators
+    /// the answer carried (none, mostly).
+    NotModified(Validators),
+    /// A 2xx: the document as it is now, with its validators.
+    Modified(SpooledBody, Validators),
+    /// A 404.
+    NotFound,
+}
+
 /// Credentials for an upstream, scoped to the `remote_url` host.
 pub struct UpstreamAuth<'a> {
     /// Host (and port) of the configured `remote_url`.
@@ -775,14 +820,7 @@ impl UpstreamHttp {
         let Some(spool) = self.get_metadata_body(url, auth, accept).await? else {
             return Ok(None);
         };
-        let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-            let mut out = Vec::new();
-            spool.into_reader()?.read_to_end(&mut out)?;
-            Ok(out)
-        })
-        .await
-        .map_err(|e| UpstreamError::Io(std::io::Error::other(e)))??;
-        Ok(Some(bytes))
+        Ok(Some(spool.into_bytes().await?))
     }
 
     /// GET a metadata body, size-capped and spooled; a gzip-encoded body is
@@ -796,9 +834,53 @@ impl UpstreamHttp {
         auth: Option<&UpstreamAuth<'_>>,
         accept: Option<&str>,
     ) -> Result<Option<SpooledBody>, UpstreamError> {
+        match self
+            .get_metadata_if_changed(url, auth, accept, None)
+            .await?
+        {
+            Revalidated::Modified(body, _) => Ok(Some(body)),
+            Revalidated::NotFound => Ok(None),
+            // Not asked conditionally, so never answered so.
+            Revalidated::NotModified(_) => Err(UpstreamError::Status {
+                url: url.to_string(),
+                status: reqwest::StatusCode::NOT_MODIFIED,
+            }),
+        }
+    }
+
+    /// [`Self::get_metadata_body`], asked conditionally when `validators`
+    /// has one (`If-None-Match` with the `ETag`, `If-Modified-Since` with
+    /// the `Last-Modified`): a `304 Not Modified` downloads nothing and
+    /// counts no bytes. A 304 to a request that sent no validator is an
+    /// error, like any other unexpected status.
+    pub async fn get_metadata_if_changed(
+        &self,
+        url: &str,
+        auth: Option<&UpstreamAuth<'_>>,
+        accept: Option<&str>,
+        validators: Option<&Validators>,
+    ) -> Result<Revalidated, UpstreamError> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(accept) = accept.and_then(|a| reqwest::header::HeaderValue::from_str(a).ok()) {
             headers.insert(reqwest::header::ACCEPT, accept);
+        }
+        let mut conditional = false;
+        if let Some(validators) = validators {
+            for (name, value) in [
+                (reqwest::header::IF_NONE_MATCH, &validators.etag),
+                (
+                    reqwest::header::IF_MODIFIED_SINCE,
+                    &validators.last_modified,
+                ),
+            ] {
+                if let Some(value) = value
+                    .as_deref()
+                    .and_then(|v| reqwest::header::HeaderValue::from_str(v).ok())
+                {
+                    headers.insert(name, value);
+                    conditional = true;
+                }
+            }
         }
         let resp = self
             .send(
@@ -810,7 +892,10 @@ impl UpstreamHttp {
             )
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+            return Ok(Revalidated::NotFound);
+        }
+        if conditional && resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(Revalidated::NotModified(Validators::of(resp.headers())));
         }
         if !resp.status().is_success() {
             return Err(UpstreamError::Status {
@@ -818,6 +903,7 @@ impl UpstreamHttp {
                 status: resp.status(),
             });
         }
+        let validators = Validators::of(resp.headers());
         let gzip = resp
             .headers()
             .get(reqwest::header::CONTENT_ENCODING)
@@ -827,14 +913,14 @@ impl UpstreamHttp {
         let body = SpooledBody::read(resp, url, limit, threshold).await?;
         self.count_bytes(body.len());
         if !gzip {
-            return Ok(Some(body));
+            return Ok(Revalidated::Modified(body, validators));
         }
         let url_owned = url.to_string();
         let inflated =
             tokio::task::spawn_blocking(move || body.gunzip(&url_owned, limit, threshold))
                 .await
                 .map_err(|e| UpstreamError::Io(std::io::Error::other(e)))??;
-        Ok(Some(inflated))
+        Ok(Revalidated::Modified(inflated, validators))
     }
 }
 
@@ -920,6 +1006,18 @@ impl SpooledBody {
     pub fn into_reader(mut self) -> std::io::Result<impl Read + Seek> {
         self.inner.seek(SeekFrom::Start(0))?;
         Ok(self.inner)
+    }
+
+    /// The whole body in memory, read on the blocking pool.
+    pub async fn into_bytes(self) -> Result<Vec<u8>, UpstreamError> {
+        let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            let mut out = Vec::new();
+            self.into_reader()?.read_to_end(&mut out)?;
+            Ok(out)
+        })
+        .await
+        .map_err(|e| UpstreamError::Io(std::io::Error::other(e)))??;
+        Ok(bytes)
     }
 
     /// Inflate a gzip-encoded body into a new spool, failing as soon as the

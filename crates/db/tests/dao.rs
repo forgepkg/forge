@@ -326,6 +326,71 @@ async fn blob_upsert_pending_returns_true_then_false() {
     assert_eq!(blob.size, 123);
 }
 
+/// A proxy's stored upstream document holds a reference to its blob: a blob
+/// whose `ref_count` drifted to 0 while one names it is repaired, never
+/// reserved for deletion; once the document is deleted, it may go.
+#[tokio::test]
+async fn a_stored_proxy_document_keeps_its_blob() {
+    let pool = pool().await;
+    let n = unique();
+    let sha = format!("sha-proxy-document-{n}");
+    sqlx::query(
+        "INSERT INTO blob (sha256, size, s3_key, ref_count, state, created_at) \
+         VALUES ($1, 10, $2, 0, 'committed', now() - interval '2 hours')",
+    )
+    .bind(&sha)
+    .bind(format!("blobs/{sha}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut proxy = NewRepository::proxy(format!("docs{n}"));
+    proxy.remote_url = Some("https://registry.example.com/".into());
+    let repo = repository_dao::insert_repository(&pool, proxy)
+        .await
+        .unwrap();
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO proxy_document (repository_id, key, url, blob_sha256, size, remote_url, \
+         repository_updated_at) VALUES ($1, 'k', 'https://registry.example.com/left-pad', $2, \
+         10, 'https://registry.example.com/', now()) RETURNING id",
+    )
+    .bind(repo.id)
+    .bind(&sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let stale_before = Utc::now() - Duration::minutes(2);
+    let outcome = blob_dao::reserve_dangling_delete(
+        &pool,
+        &sha,
+        Utc::now() - Duration::hours(1),
+        stale_before,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, blob_dao::ReserveDeleteOutcome::Referenced);
+    let blob = blob_dao::get_blob(&pool, &sha).await.unwrap().unwrap();
+    assert_eq!(blob.ref_count, 1, "repaired to the document's reference");
+
+    let mut tx = pool.begin().await.unwrap();
+    assert!(
+        forge_db::proxy_document_dao::delete(&mut tx, id, &sha, Duration::zero())
+            .await
+            .unwrap()
+    );
+    tx.commit().await.unwrap();
+    let blob = blob_dao::get_blob(&pool, &sha).await.unwrap().unwrap();
+    assert_eq!(blob.ref_count, 0, "released with the document");
+    let enqueued: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM blob_outbox WHERE sha256 = $1 AND processed_at IS NULL)",
+    )
+    .bind(&sha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(enqueued, "its object is deleted after the grace");
+}
+
 /// The aftermath of the pre-release concurrent hard-delete race: a blob left
 /// `deleting` with `ref_count` 0 that an asset still names. Neither the outbox
 /// nor a re-push of the same bytes may delete its object (a re-push used to

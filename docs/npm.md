@@ -224,8 +224,12 @@ any registry that speaks npm's protocol:
   automation token or a GitHub Packages token), `Authorization: Bearer`.
   They go to the origin of the remote URL only, never to a tarball host
   elsewhere.
-- **Caching.** A packument is read again after the repository's metadata
-  TTL; installs read the abbreviated one, `npm view` and clients that want
+- **Caching.** A packument is kept for every Forge instance (in the
+  database and the object store) and served without asking the upstream for
+  the repository's metadata TTL; after it, the upstream is asked whether it
+  changed, and one it confirms unchanged (`304 Not Modified`) is not
+  downloaded again ([deployment](./deployment.md#running-more-than-one-instance)).
+  Installs read the abbreviated one, `npm view` and clients that want
   publish times (pnpm's `minimumReleaseAge`, `npm install --before`) the
   full one. A package the upstream does not know is remembered for the
   not-found TTL. A tarball is downloaded once, checked against the
@@ -253,8 +257,8 @@ any registry that speaks npm's protocol:
   never downloaded answers 503 with `Retry-After`. An upstream that refuses
   the proxy's credentials answers 502.
 - **Invalidate cache** on the repository's page (or
-  `POST /admin/repositories/<name>/proxy-cache/invalidate`) makes it read
-  the upstream again now.
+  `POST /admin/repositories/<name>/proxy-cache/invalidate`) deletes the
+  packuments it kept and makes it read the upstream again now.
 
 Publishing, dist-tag changes and unpublishing are refused on a proxy.
 

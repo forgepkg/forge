@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH unused AS (\n            SELECT id FROM proxy_document\n            WHERE used_at < now() - make_interval(secs => $1)\n            ORDER BY used_at\n            LIMIT $2\n            FOR UPDATE SKIP LOCKED\n        )\n        DELETE FROM proxy_document d\n        USING unused\n        WHERE d.id = unused.id\n        RETURNING d.blob_sha256\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "blob_sha256",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "proxy_document",
+            "name": "blob_sha256"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "30894911df5f43ee4ed0f047446ab03638705bfea61773e90ec65237c6ef5890"
+}

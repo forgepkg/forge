@@ -1037,6 +1037,12 @@ impl Cas {
         })
     }
 
+    /// Read a whole (small) stored blob into memory, through the local blob
+    /// cache when there is one: a proxy's stored upstream document.
+    pub async fn read_all(&self, blob: crate::read::BlobRef<'_>) -> Result<Vec<u8>, S3Error> {
+        self.store.read_all(blob).await
+    }
+
     /// Stage and immediately promote bytes. Callers that need to parse and
     /// authorize package identity before mutation should call [`Self::stage`]
     /// and [`Self::commit`] separately.
