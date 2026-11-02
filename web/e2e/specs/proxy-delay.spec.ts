@@ -49,7 +49,7 @@ test('a delayed proxy version shows the delay badge and is absent from browse', 
   await page.getByLabel(/^kind$/i).selectOption('proxy')
   await page.getByLabel(/allow anonymous read/i).check()
   await page.getByLabel(/remote url/i).fill(f.upstreamIndexUrl)
-  await page.getByLabel(/package delay/i).fill('3600')
+  await page.getByLabel('Package delay (seconds)').fill('3600')
   await page.getByRole('button', { name: /create repository/i }).click()
   await expect(page).toHaveURL(new RegExp(`/manage/repositories/${proxy}`))
 
