@@ -1246,6 +1246,45 @@ async fn a_reorder_waits_for_a_realm_change_instead_of_deadlocking() {
     assert_eq!(realm_order(&srv).await, order);
 }
 
+/// Realms created at once all read the same last priority; the creates that
+/// lost the insert retried a few times and then answered 409 "realm name
+/// already exists", though every name was free. Creates now take turns on a
+/// lock, and each one is appended after the realms before it. Its own
+/// database: it counts the realms, and it locks the realm table.
+#[tokio::test]
+async fn concurrent_realm_creates_all_succeed() {
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let before = realm_order(&srv).await;
+    let (admin, password) = srv.admin_basic();
+    let n = common::unique();
+    let creates: Vec<_> = (0..10)
+        .map(|i| {
+            let client = srv.client();
+            let url = format!("{}/admin/realms", srv.base_url);
+            let (admin, password) = (admin.clone(), password.clone());
+            tokio::spawn(async move {
+                let resp = client
+                    .post(url)
+                    .basic_auth(&admin, Some(&password))
+                    .json(&json!({"kind": "credential_forwarding", "name": format!("fwd{n}-{i}"),
+                                  "enabled": false,
+                                  "config": {"url": "https://nexus.invalid/status", "key_pepper": "p"}}))
+                    .send()
+                    .await
+                    .unwrap();
+                (resp.status(), resp.text().await.unwrap())
+            })
+        })
+        .collect();
+    for create in creates {
+        let (status, body) = create.await.unwrap();
+        assert_eq!(status, 201, "{body}");
+    }
+    let after = realm_order(&srv).await;
+    assert_eq!(after.len(), before.len() + 10);
+    assert_eq!(after[..before.len()], before[..]);
+}
+
 /// A credential-forwarding realm that keeps password hashes
 /// (`capture_password_hash`): an accepted login keeps one,
 /// turning the option off deletes them, `captured_password_only` signs the

@@ -26,7 +26,8 @@ pub struct NewAuthRealm {
     /// Unique slug/display name (DB CHECK enforces the shape).
     pub name: String,
     pub enabled: bool,
-    /// Unique order; lower tries first. Use [`next_priority`] for "append".
+    /// Unique order; lower tries first. Use [`lock_next_priority`] for
+    /// "append".
     pub priority: i32,
     pub config: JsonValue,
 }
@@ -115,10 +116,29 @@ pub async fn kind_exists(pool: &PgPool, kind: &str) -> sqlx::Result<bool> {
 
 /// The next free priority slot (max + 10, so manual inserts between rows stay
 /// possible). `10` on an empty table — though the table is never empty in
-/// practice (the schema seeds the `local` row).
+/// practice (the schema seeds the `local` row). Read without a lock, so a
+/// concurrent insert can take the same slot; [`lock_next_priority`] cannot.
 pub async fn next_priority(pool: &PgPool) -> sqlx::Result<i32> {
     let max: Option<i32> = sqlx::query_scalar!(r#"SELECT max(priority) FROM auth_realm"#)
         .fetch_one(pool)
+        .await?;
+    Ok(max.map_or(10, |m| m.saturating_add(10)))
+}
+
+/// [`next_priority`] for an insert in the transaction `tx`, read under a
+/// `SHARE ROW EXCLUSIVE` lock on the table that `tx` holds until it ends.
+/// The lock conflicts with itself and with every write to the table (reads go
+/// on), so concurrent appends take turns: each reads the maximum after the
+/// one before it committed its row, where reading it unlocked let both pick
+/// the same priority and the second fail on its unique key.
+pub async fn lock_next_priority(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> sqlx::Result<i32> {
+    sqlx::query!(r#"LOCK TABLE auth_realm IN SHARE ROW EXCLUSIVE MODE"#)
+        .execute(&mut **tx)
+        .await?;
+    let max: Option<i32> = sqlx::query_scalar!(r#"SELECT max(priority) FROM auth_realm"#)
+        .fetch_one(&mut **tx)
         .await?;
     Ok(max.map_or(10, |m| m.saturating_add(10)))
 }
@@ -143,6 +163,45 @@ where
         new.enabled,
         new.priority,
         new.config,
+    )
+    .fetch_one(executor)
+    .await
+}
+
+/// Reserve the id of a realm to insert with [`insert_realm_with_id`]: its
+/// secrets are sealed for the row id, here before the insert.
+pub async fn reserve_realm_id(pool: &PgPool) -> sqlx::Result<i64> {
+    sqlx::query_scalar!(r#"SELECT nextval(pg_get_serial_sequence('auth_realm', 'id')) AS "id!""#)
+        .fetch_one(pool)
+        .await
+}
+
+/// [`insert_realm`] under the id [`reserve_realm_id`] reserved, with the
+/// secrets sealed for it (`secrets_enc`) in the same row.
+pub async fn insert_realm_with_id<'e, E>(
+    executor: E,
+    id: i64,
+    new: NewAuthRealm,
+    secrets_enc: Option<&[u8]>,
+) -> sqlx::Result<AuthRealm>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as!(
+        AuthRealm,
+        r#"
+        INSERT INTO auth_realm (id, kind, name, enabled, priority, config, secrets_enc)
+        OVERRIDING SYSTEM VALUE
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, kind, name, enabled, priority, config, secrets_enc, created_at, updated_at
+        "#,
+        id,
+        new.kind,
+        new.name,
+        new.enabled,
+        new.priority,
+        new.config,
+        secrets_enc,
     )
     .fetch_one(executor)
     .await
