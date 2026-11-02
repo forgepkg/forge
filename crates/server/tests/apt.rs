@@ -886,8 +886,7 @@ async fn proxies_serve_the_security_archives_pool() {
             packages.into_bytes(),
         );
         files.insert(
-            "debian-security/pool/updates/main/o/openssl/libssl3_3.0.17-1~deb12u3_amd64.deb"
-                .into(),
+            "debian-security/pool/updates/main/o/openssl/libssl3_3.0.17-1~deb12u3_amd64.deb".into(),
             libssl.clone(),
         );
         files.insert(
