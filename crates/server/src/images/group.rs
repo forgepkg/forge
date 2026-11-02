@@ -10,6 +10,11 @@
 //! over the whole group whatever the caller may read: a caller without read
 //! on the owner gets nothing, never a proxy's image of the same name.
 //!
+//! A member scoped to image names (`group_member.packages`, such as
+//! `bitnami/*`) is asked only about the images one of its patterns matches,
+//! through every group on the way; owners are decided without the scopes,
+//! which only narrow what a member serves.
+//!
 //! A failing member (an unreachable proxy upstream) does not fail the pull
 //! while another member answers it.
 
@@ -17,6 +22,7 @@ use std::collections::HashSet;
 
 use forge_core::auth::principal::Principal;
 use forge_core::authz::{Level, PackageFilter};
+use forge_core::repo::group::member_scope;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
 
@@ -178,17 +184,16 @@ impl Registry {
             }
             let pool = &self.inner.pool;
             let authz = &self.inner.authz;
-            let group_members = repository_dao::group_members(pool, group.id).await?;
-            let flagged: HashSet<i64> = repository_dao::group_owner_ids(pool, group.id)
-                .await?
-                .into_iter()
-                .collect();
-            for (member, _priority) in group_members {
+            let memberships = repository_dao::group_memberships(pool, group.id).await?;
+            let flags = memberships.iter().any(|membership| membership.owner);
+            for membership in memberships {
+                let member = membership.repo;
                 if !self.serves(&member) || path.contains(&member.id) {
                     continue;
                 }
                 let serving = walk.serving && authz.can_read(principal, &member).await;
-                // What the caller may read of it, on this way.
+                // What the caller may read of it, on this way, of the images
+                // the group asks it about (its scope).
                 let filters: Vec<PackageFilter> = if serving {
                     let mut way = filters.to_vec();
                     way.push(
@@ -196,13 +201,15 @@ impl Registry {
                             .package_filter_for(principal, &member, Level::Read)
                             .await,
                     );
+                    way.push(member_scope(&membership.packages));
                     way
                 } else {
                     Vec::new()
                 };
                 // Without flags every hosted member owns; with flags only
-                // the flagged ones (and what flagged groups own).
-                let owning = walk.owning && (flagged.is_empty() || flagged.contains(&member.id));
+                // the flagged ones (and what flagged groups own). Scopes
+                // play no part: they only narrow what a member serves.
+                let owning = walk.owning && (!flags || membership.owner);
                 match member.kind() {
                     RepoKind::Group => {
                         if !serving && !owning {

@@ -160,17 +160,6 @@ pub async fn list_repositories(pool: &PgPool) -> sqlx::Result<Vec<Repository>> {
     .await
 }
 
-/// The members of `group_id` flagged as owners of its package ids
-/// (`group_member.owner`); empty when none is (every hosted member owns).
-pub async fn group_owner_ids(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<i64>> {
-    sqlx::query_scalar!(
-        r#"SELECT member_id FROM group_member WHERE group_id = $1 AND owner ORDER BY member_id"#,
-        group_id,
-    )
-    .fetch_all(pool)
-    .await
-}
-
 /// Lock every membership of `member_id` (`FOR UPDATE`) and return the names
 /// of the groups it is flagged as an owner in. Run it in the transaction that
 /// deletes the repository, after [`lock_repository`]: a concurrent owner flag
@@ -211,21 +200,66 @@ pub async fn set_group_member_owner(
     member_id: i64,
     owner: bool,
 ) -> sqlx::Result<bool> {
+    update_group_member(pool, group_id, member_id, Some(owner), None).await
+}
+
+/// Change a membership in one `UPDATE`: its owner flag
+/// ([`set_group_member_owner`]) and its package patterns
+/// ([`GroupMembership::packages`]); `None` keeps what it has. Returns whether
+/// that membership exists.
+pub async fn update_group_member(
+    pool: &PgPool,
+    group_id: i64,
+    member_id: i64,
+    owner: Option<bool>,
+    packages: Option<&[String]>,
+) -> sqlx::Result<bool> {
     let result = sqlx::query!(
-        r#"UPDATE group_member SET owner = $3 WHERE group_id = $1 AND member_id = $2"#,
+        r#"
+        UPDATE group_member
+        SET owner = COALESCE($3, owner), packages = COALESCE($4, packages)
+        WHERE group_id = $1 AND member_id = $2
+        "#,
         group_id,
         member_id,
         owner,
+        packages as Option<&[String]>,
     )
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
 }
 
+/// One member of a group ([`group_memberships`]).
+#[derive(Debug, Clone)]
+pub struct GroupMembership {
+    /// The member's repository row.
+    pub repo: Repository,
+    /// Its priority within the group (higher wins ties).
+    pub priority: i32,
+    /// Flagged as an owner of the group's package ids (`group_member.owner`):
+    /// once any member of a group is, only the flagged ones own its ids;
+    /// while none is, every hosted member does.
+    pub owner: bool,
+    /// The package id patterns the group asks the member about
+    /// (`group_member.packages`, globs); empty: every id.
+    pub packages: Vec<String>,
+}
+
 /// Return the members of a group joined to their repository rows, ordered by
 /// `priority` **descending** so the highest-priority member (which wins ties)
 /// comes first.
 pub async fn group_members(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<(Repository, i32)>> {
+    Ok(group_memberships(pool, group_id)
+        .await?
+        .into_iter()
+        .map(|membership| (membership.repo, membership.priority))
+        .collect())
+}
+
+/// The memberships of a group, as [`group_members`] orders them, with each
+/// one's owner flag and package patterns.
+pub async fn group_memberships(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<GroupMembership>> {
     let rows = sqlx::query!(
         r#"
         SELECT
@@ -233,7 +267,7 @@ pub async fn group_members(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<(Re
             r.remote_url, r.package_delay_seconds, r.upstream_username, r.upstream_password_enc,
             r.metadata_ttl_seconds, r.not_found_ttl_seconds,
             r.allow_redeploy, r.created_at, r.updated_at,
-            gm.priority
+            gm.priority, gm.owner, gm.packages
         FROM group_member gm
         JOIN repository r ON r.id = gm.member_id
         WHERE gm.group_id = $1
@@ -246,28 +280,28 @@ pub async fn group_members(pool: &PgPool, group_id: i64) -> sqlx::Result<Vec<(Re
 
     Ok(rows
         .into_iter()
-        .map(|row| {
-            (
-                Repository {
-                    id: row.id,
-                    name: row.name,
-                    format: row.format,
-                    kind: row.kind,
-                    anonymous_read: row.anonymous_read,
-                    online: row.online,
-                    config: row.config,
-                    remote_url: row.remote_url,
-                    package_delay_seconds: row.package_delay_seconds,
-                    upstream_username: row.upstream_username,
-                    upstream_password_enc: row.upstream_password_enc,
-                    metadata_ttl_seconds: row.metadata_ttl_seconds,
-                    not_found_ttl_seconds: row.not_found_ttl_seconds,
-                    allow_redeploy: row.allow_redeploy,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                },
-                row.priority,
-            )
+        .map(|row| GroupMembership {
+            repo: Repository {
+                id: row.id,
+                name: row.name,
+                format: row.format,
+                kind: row.kind,
+                anonymous_read: row.anonymous_read,
+                online: row.online,
+                config: row.config,
+                remote_url: row.remote_url,
+                package_delay_seconds: row.package_delay_seconds,
+                upstream_username: row.upstream_username,
+                upstream_password_enc: row.upstream_password_enc,
+                metadata_ttl_seconds: row.metadata_ttl_seconds,
+                not_found_ttl_seconds: row.not_found_ttl_seconds,
+                allow_redeploy: row.allow_redeploy,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            },
+            priority: row.priority,
+            owner: row.owner,
+            packages: row.packages,
         })
         .collect())
 }
@@ -340,14 +374,17 @@ pub enum AddMemberOutcome {
 /// Returns the [`AddMemberOutcome`]; a unique-constraint violation surfaces as
 /// [`AddMemberOutcome::Duplicate`] rather than a raw `sqlx::Error`.
 ///
-/// `owner` sets [`group_member.owner`](group_owner_ids) in the same insert, so
-/// the member never serves the group's ids unflagged.
+/// `owner` sets [`group_member.owner`](GroupMembership::owner) in the same insert, so
+/// the member never serves the group's ids unflagged, and `packages` its
+/// [package patterns](GroupMembership::packages), so the group never asks it
+/// about other ids.
 pub async fn add_group_member_checked(
     pool: &PgPool,
     group_id: i64,
     member_id: i64,
     priority: i32,
     owner: bool,
+    packages: &[String],
     max_depth: i32,
 ) -> sqlx::Result<AddMemberOutcome> {
     let mut tx = crate::begin(pool).await?;
@@ -418,13 +455,14 @@ pub async fn add_group_member_checked(
 
     let insert = sqlx::query!(
         r#"
-        INSERT INTO group_member (group_id, member_id, priority, owner)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO group_member (group_id, member_id, priority, owner, packages)
+        VALUES ($1, $2, $3, $4, $5)
         "#,
         group_id,
         member_id,
         priority,
         owner,
+        packages,
     )
     .execute(&mut *conn)
     .await;

@@ -20,25 +20,38 @@
 //!   silently return the group to trusting every hosted member. The flag is
 //!   set in the insert that adds the member, and the remove's owner check is
 //!   part of its `DELETE`, so concurrent edits cannot slip between them.
+//! * `packages` scopes the member to package ids (see
+//!   `forge_core::repo::group::member_scope`): glob patterns, a content
+//!   selector's syntax, such as `@fortawesome/*` or `Envisia.*`; the group
+//!   then asks the member only about the ids one of them matches. Empty (the
+//!   default) is every id. Set it when adding the member (in the same
+//!   insert, so the group never asks it about other ids), or later with
+//!   `PATCH … {"packages": [...]}`. A pattern without a wildcard must be a
+//!   package id of the group's format, so `@fortawesome` (an npm scope, not
+//!   a package) is refused (**400**). Groups of files (raw) have none
+//!   (**400**).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use forge_db::model::RepoKind;
+use forge_core::authz::SelectorPatterns;
+use forge_db::model::{RepoKind, Repository};
 use forge_db::repository_dao::{self, AddMemberOutcome, RemoveMemberOutcome};
 use serde::{Deserialize, Serialize};
 
 use super::db_error;
 use crate::state::AppState;
 
-/// A group member view (member name, its priority, and whether it owns the
-/// group's package ids).
+/// A group member view (member name, its priority, whether it owns the
+/// group's package ids, and the package ids the group asks it about).
 #[derive(Debug, Serialize)]
 pub struct MemberView {
     pub name: String,
     pub kind: String,
     pub priority: i32,
     pub owner: bool,
+    /// Glob patterns; empty: every id.
+    pub packages: Vec<String>,
 }
 
 /// Add-member request.
@@ -53,14 +66,90 @@ pub struct AddMember {
     /// `false`; see the module docs).
     #[serde(default)]
     pub owner: bool,
+    /// The package id patterns the group asks the member about (default
+    /// empty: every id; see the module docs).
+    #[serde(default)]
+    pub packages: Vec<String>,
 }
 
-/// Update-member request.
+/// Update-member request: each field present is changed, an absent one
+/// kept.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateMember {
     /// Whether the member owns the group's package ids.
-    pub owner: bool,
+    #[serde(default)]
+    pub owner: Option<bool>,
+    /// The package id patterns the group asks the member about; `[]`: every
+    /// id.
+    #[serde(default)]
+    pub packages: Option<Vec<String>>,
+}
+
+/// Most package patterns one membership may carry.
+const MAX_MEMBER_PACKAGES: usize = 100;
+
+/// Longest accepted package pattern, in bytes.
+const MAX_MEMBER_PACKAGE_LEN: usize = 200;
+
+/// Validate and normalize a membership's package patterns for `group`: each
+/// trimmed, 1-200 bytes, a glob that compiles (a content selector's syntax,
+/// matched case-insensitively), deduplicated in the order given. A pattern
+/// without a wildcard matches one id alone, so it must be a package id of
+/// the group's format: an npm scope typed without `/*` would otherwise
+/// match nothing. A group of files (raw) takes none.
+fn normalize_packages(
+    state: &AppState,
+    group: &Repository,
+    raw: &[String],
+) -> Result<Vec<String>, Response> {
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, msg).into_response();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    if state.formats.stores_files(&group.format) {
+        return Err(bad(
+            "groups of files (raw) have no package scopes: a path is served by the first member that has it"
+                .into(),
+        ));
+    }
+    if raw.len() > MAX_MEMBER_PACKAGES {
+        return Err(bad(format!(
+            "at most {MAX_MEMBER_PACKAGES} packages patterns are allowed"
+        )));
+    }
+    let format = state.formats.get(&group.format);
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for pattern in raw {
+        let pattern = pattern.trim();
+        if pattern.is_empty() || pattern.len() > MAX_MEMBER_PACKAGE_LEN {
+            return Err(bad(format!(
+                "packages: {pattern:?} must be 1-{MAX_MEMBER_PACKAGE_LEN} bytes long"
+            )));
+        }
+        let patterns = SelectorPatterns {
+            includes: vec![pattern.to_string()],
+            excludes: Vec::new(),
+        };
+        if let Err(e) = patterns.compile_check() {
+            return Err(bad(format!(
+                "packages: {pattern:?} is no valid pattern: {}",
+                e.source
+            )));
+        }
+        let literal = !pattern.contains(['*', '?', '[', ']', '{', '}', '\\']);
+        if let (true, Some(format)) = (literal, format.as_deref()) {
+            if let Err(e) = format.validate_id(pattern) {
+                return Err(bad(format!(
+                    "packages: {pattern:?} has no wildcard and is no package id, so it matches nothing ({e}); `@scope/*` or `Prefix.*` matches the ids under it"
+                )));
+            }
+        }
+        if !out.iter().any(|p| p == pattern) {
+            out.push(pattern.to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// Refuse to flag a proxy as an owner: it would never own anything, and a
@@ -107,19 +196,16 @@ pub async fn list(State(state): State<AppState>, Path(name): Path<String>) -> Re
         Ok(g) => g,
         Err(resp) => return resp,
     };
-    let owners = match repository_dao::group_owner_ids(&state.pool, group.id).await {
-        Ok(owners) => owners,
-        Err(e) => return db_error(e),
-    };
-    match repository_dao::group_members(&state.pool, group.id).await {
+    match repository_dao::group_memberships(&state.pool, group.id).await {
         Ok(members) => {
             let views: Vec<MemberView> = members
-                .iter()
-                .map(|(repo, priority)| MemberView {
-                    name: repo.name.clone(),
-                    kind: repo.kind.clone(),
-                    priority: *priority,
-                    owner: owners.contains(&repo.id),
+                .into_iter()
+                .map(|membership| MemberView {
+                    name: membership.repo.name,
+                    kind: membership.repo.kind,
+                    priority: membership.priority,
+                    owner: membership.owner,
+                    packages: membership.packages,
                 })
                 .collect();
             Json(views).into_response()
@@ -165,6 +251,10 @@ pub async fn add(
             return resp;
         }
     }
+    let packages = match normalize_packages(&state, &group, &body.packages) {
+        Ok(packages) => packages,
+        Err(resp) => return resp,
+    };
     // Nested groups are allowed; the checked insert runs the cycle + depth
     // guard in the same transaction.
     let max_depth = state.config.groups.max_nesting_depth;
@@ -175,6 +265,7 @@ pub async fn add(
         member.id,
         body.priority,
         body.owner,
+        &packages,
         max_depth,
     )
     .await
@@ -199,12 +290,20 @@ pub async fn add(
     }
 }
 
-/// `PATCH /admin/repositories/{name}/members/{member}` — set `owner`.
+/// `PATCH /admin/repositories/{name}/members/{member}` — set `owner` and/or
+/// `packages`.
 pub async fn update(
     State(state): State<AppState>,
     Path((name, member_name)): Path<(String, String)>,
     Json(body): Json<UpdateMember>,
 ) -> Response {
+    if body.owner.is_none() && body.packages.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "nothing to change: give owner or packages",
+        )
+            .into_response();
+    }
     let group = match group_or_err(&state, &name).await {
         Ok(g) => g,
         Err(resp) => return resp,
@@ -214,12 +313,28 @@ pub async fn update(
         Ok(None) => return (StatusCode::NOT_FOUND, "member repository not found").into_response(),
         Err(e) => return db_error(e),
     };
-    if body.owner {
+    if body.owner == Some(true) {
         if let Some(resp) = owner_kind_error(&state, &member) {
             return resp;
         }
     }
-    match repository_dao::set_group_member_owner(&state.pool, group.id, member.id, body.owner).await
+    let packages = match body
+        .packages
+        .as_deref()
+        .map(|packages| normalize_packages(&state, &group, packages))
+        .transpose()
+    {
+        Ok(packages) => packages,
+        Err(resp) => return resp,
+    };
+    match repository_dao::update_group_member(
+        &state.pool,
+        group.id,
+        member.id,
+        body.owner,
+        packages.as_deref(),
+    )
+    .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "membership not found").into_response(),
