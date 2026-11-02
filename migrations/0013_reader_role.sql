@@ -19,9 +19,15 @@
 -- upgrade notes ask administrators to check their rules first.
 --
 -- Every user that is neither an administrator nor a writer was a reader and
--- gets the role, so they read every repository from now on. Service accounts
--- do not: each stands for one pipeline or network, whose roles were chosen
--- for it, and they become Roles only.
+-- gets the role, so they read every repository from now on. Administrators
+-- get it too (#792): an identity provider or upstream that manages their
+-- admin rights (OIDC `admin_groups`, a credential-forwarding `admin_group`)
+-- takes only `admin` away when it demotes them, and they are then readers,
+-- as an account created after the upgrade is, instead of Roles only. While
+-- they are administrators it adds nothing. Writers do not need it, since
+-- `writer` reads every repository. Service accounts do not get it: each
+-- stands for one pipeline or network, whose roles were chosen for it, and
+-- they become Roles only.
 -- ---------------------------------------------------------------------------
 UPDATE auth_realm realm
 SET config = jsonb_set(
@@ -64,5 +70,5 @@ WHERE r.name = 'reader'
       SELECT 1
       FROM user_role held
       JOIN role held_role ON held_role.id = held.role_id
-      WHERE held.user_id = u.id AND held_role.name IN ('admin', 'writer')
+      WHERE held.user_id = u.id AND held_role.name = 'writer'
   );

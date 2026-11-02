@@ -1052,9 +1052,11 @@ async fn versions_unlisted_before_the_upgrade_count_from_their_last_change() {
 }
 
 /// The built-in `reader` role (0013): every user that was a reader (neither
-/// an administrator nor a writer) holds it after the upgrade; administrators,
-/// writers and service accounts do not, and a role an administrator had named
-/// `reader` keeps its grants and members under another name.
+/// an administrator nor a writer) holds it after the upgrade, and so does an
+/// administrator, who stays a reader when an identity provider later takes
+/// `admin` away (#792); writers and service accounts do not, and a role an
+/// administrator had named `reader` keeps its grants and members under
+/// another name.
 #[tokio::test]
 async fn readers_before_the_upgrade_get_the_reader_role() {
     let (server, _container) = server().await;
@@ -1183,7 +1185,12 @@ async fn readers_before_the_upgrade_get_the_reader_role() {
     };
     assert_eq!(roles(reader).await, ["reader"]);
     assert_eq!(roles(writer).await, ["writer"]);
-    assert_eq!(roles(admin).await, ["admin"]);
+    assert_eq!(roles(admin).await, ["admin", "reader"]);
+    // An identity provider's demotion takes `admin` alone: a reader remains.
+    assert!(forge_db::authz_dao::sync_admin_role(&pool, admin, false)
+        .await
+        .expect("demote the administrator"));
+    assert_eq!(roles(admin).await, ["reader"]);
     let renamed = format!("reader-{custom}");
     assert_eq!(
         roles(service).await,
