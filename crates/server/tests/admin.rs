@@ -1259,6 +1259,186 @@ async fn group_member_owner_flag() {
     assert_eq!(remove.status(), 204);
 }
 
+/// A member's package scope (#743): set when it is added or later, shown in
+/// the member list, patterns trimmed and deduplicated; a pattern that does
+/// not compile, or names no package id of the group's format without a
+/// wildcard (an npm scope without `/*`, a NuGet prefix without `*`), is
+/// refused, and so is any scope in a group of files.
+#[tokio::test]
+async fn group_member_packages() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let base = srv.base_url.clone();
+    for body in [
+        json!({"name": format!("sgrp{s}"), "kind": "group"}),
+        json!({"name": format!("shst{s}"), "kind": "hosted"}),
+        json!({"name": format!("sprx{s}"), "kind": "proxy", "remote_url": "https://api.nuget.org/v3/index.json"}),
+        json!({"name": format!("snpm{s}"), "kind": "group", "format": "npm"}),
+        json!({"name": format!("sfa{s}"), "kind": "proxy", "format": "npm", "remote_url": "https://npm.fontawesome.com"}),
+        json!({"name": format!("sraw{s}"), "kind": "group", "format": "raw"}),
+        json!({"name": format!("srawh{s}"), "kind": "hosted", "format": "raw"}),
+    ] {
+        let resp = client
+            .post(format!("{base}/admin/repositories"))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    }
+    let send = |method: reqwest::Method, url: String, body: serde_json::Value| {
+        let (client, u, p) = (client.clone(), u.clone(), p.clone());
+        async move {
+            let resp = client
+                .request(method, url)
+                .basic_auth(&u, Some(&p))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+    let members = |group: String| format!("{base}/admin/repositories/{group}/members");
+    let scopes = |group: String| {
+        let (client, u, p, url) = (client.clone(), u.clone(), p.clone(), members(group));
+        async move {
+            let list: Vec<serde_json::Value> = client
+                .get(url)
+                .basic_auth(&u, Some(&p))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            list.into_iter()
+                .map(|m| {
+                    (
+                        m["name"].as_str().unwrap().to_string(),
+                        m["packages"].clone(),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        }
+    };
+    let nuget = format!("sgrp{s}");
+    let post = reqwest::Method::POST;
+    let patch = reqwest::Method::PATCH;
+
+    // Added with a scope, trimmed and deduplicated; without one, every id.
+    let (status, body) = send(
+        post.clone(),
+        members(nuget.clone()),
+        json!({"member": format!("sprx{s}"), "priority": 10, "packages": [" Envisia.* ", "Envisia.*", "Contoso.Tools"]}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = send(
+        post.clone(),
+        members(nuget.clone()),
+        json!({"member": format!("shst{s}"), "priority": 20}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let listed = scopes(nuget.clone()).await;
+    assert_eq!(
+        listed[&format!("sprx{s}")],
+        json!(["Envisia.*", "Contoso.Tools"])
+    );
+    assert_eq!(listed[&format!("shst{s}")], json!([]));
+
+    // Changed later, together with the owner flag or alone; `[]` clears it.
+    let member = |name: &str| format!("{}/{name}{s}", members(nuget.clone()));
+    let (status, body) = send(
+        patch.clone(),
+        member("shst"),
+        json!({"owner": true, "packages": ["Envisia.*"]}),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    let (status, _) = send(patch.clone(), member("sprx"), json!({"packages": []})).await;
+    assert_eq!(status, 204);
+    let listed = scopes(nuget.clone()).await;
+    assert_eq!(listed[&format!("shst{s}")], json!(["Envisia.*"]));
+    assert_eq!(listed[&format!("sprx{s}")], json!([]));
+    let (status, body) = send(patch.clone(), member("shst"), json!({"owner": false})).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(
+        scopes(nuget.clone()).await[&format!("shst{s}")],
+        json!(["Envisia.*"]),
+        "changing the owner flag keeps the scope"
+    );
+
+    // Refused: nothing to change, a pattern that does not compile, one too
+    // long, an id prefix without its wildcard.
+    for (body, why) in [
+        (json!({}), "nothing to change"),
+        (json!({"packages": ["Envisia.[x"]}), "unclosed"),
+        (json!({"packages": [""]}), "1-200 bytes"),
+        (json!({"packages": ["Envisia."]}), "no wildcard"),
+    ] {
+        let (status, text) = send(patch.clone(), member("sprx"), body.clone()).await;
+        assert_eq!(status, 400, "{body}: {text}");
+        assert!(text.contains(why), "{body}: {text}");
+    }
+    assert_eq!(
+        scopes(nuget.clone()).await[&format!("sprx{s}")],
+        json!([]),
+        "a refused change changes nothing"
+    );
+
+    // npm: a scope's packages are `@scope/*`; the scope alone is no package.
+    let npm = format!("snpm{s}");
+    let (status, text) = send(
+        post.clone(),
+        members(npm.clone()),
+        json!({"member": format!("sfa{s}"), "priority": 10, "packages": ["@fortawesome"]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("@scope/*"), "{text}");
+    let (status, text) = send(
+        post.clone(),
+        members(npm.clone()),
+        json!({"member": format!("sfa{s}"), "priority": 10, "packages": ["@fortawesome/*", "@awesome.me/*"]}),
+    )
+    .await;
+    assert_eq!(status, 201, "{text}");
+    assert_eq!(
+        scopes(npm).await[&format!("sfa{s}")],
+        json!(["@fortawesome/*", "@awesome.me/*"])
+    );
+
+    // A group of files serves a path from its first member that has it.
+    let raw = format!("sraw{s}");
+    let (status, text) = send(
+        post.clone(),
+        members(raw.clone()),
+        json!({"member": format!("srawh{s}"), "priority": 10, "packages": ["tools/*"]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("groups of files"), "{text}");
+    let (status, text) = send(
+        post,
+        members(raw.clone()),
+        json!({"member": format!("srawh{s}"), "priority": 10}),
+    )
+    .await;
+    assert_eq!(status, 201, "{text}");
+    let (status, _) = send(
+        patch,
+        format!("{}/srawh{s}", members(raw)),
+        json!({"packages": ["tools/*"]}),
+    )
+    .await;
+    assert_eq!(status, 400);
+}
+
 // ── secret encryption at rest ───────────────────────────────────────────────
 
 /// Serializes the key-rotation tests of this binary: they share the

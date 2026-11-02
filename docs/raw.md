@@ -258,7 +258,8 @@ an offline hosted or group member is skipped. A member that fails (an
 unreachable upstream) is skipped while another has the path. As for every
 format, reading a group grants nothing on its members: the caller is served
 from the members it may read itself. A raw group has no owners, preferred
-hosted members or reserved prefixes: paths have no namespaces to confuse.
+hosted members, reserved prefixes or member package scopes: paths have no
+namespaces to confuse.
 
 A group takes no uploads; upload to a hosted member.
 

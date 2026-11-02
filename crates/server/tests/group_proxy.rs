@@ -263,3 +263,168 @@ async fn a_proxy_of_an_unreachable_upstream_answers_503() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// Two stand-in NuGet feeds on one loopback port, `/internal/…` (a Nexus
+/// that holds the internal packages and passes nuget.org through) and
+/// `/public/…`: each serves `1.0.0` of any id but `no.such.package`, and
+/// records every path it is asked for, as `<feed><path>`.
+struct PassThroughFeeds {
+    base: String,
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+impl PassThroughFeeds {
+    /// The paths `feed` was asked for.
+    fn asked(&self, feed: &str) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.strip_prefix(&format!("/{feed}/")).map(str::to_string))
+            .collect()
+    }
+}
+
+async fn start_pass_through_feeds() -> Arc<PassThroughFeeds> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind feeds");
+    let feeds = Arc::new(PassThroughFeeds {
+        base: format!("http://{}", listener.local_addr().unwrap()),
+        asked: Default::default(),
+    });
+    let app = Router::new()
+        .route("/{feed}/index.json", get(pass_through_index))
+        .route("/{feed}/flat/{id}/index.json", get(pass_through_versions))
+        .with_state(feeds.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve feeds");
+    });
+    feeds
+}
+
+async fn pass_through_index(
+    State(feeds): State<Arc<PassThroughFeeds>>,
+    Path(feed): Path<String>,
+) -> Response {
+    feeds
+        .asked
+        .lock()
+        .unwrap()
+        .push(format!("/{feed}/index.json"));
+    Json(json!({
+        "version": "3.0.0",
+        "resources": [
+            {"@id": format!("{}/{feed}/flat/", feeds.base), "@type": "PackageBaseAddress/3.0.0"},
+        ],
+    }))
+    .into_response()
+}
+
+async fn pass_through_versions(
+    State(feeds): State<Arc<PassThroughFeeds>>,
+    Path((feed, id)): Path<(String, String)>,
+) -> Response {
+    feeds
+        .asked
+        .lock()
+        .unwrap()
+        .push(format!("/{feed}/flat/{id}/index.json"));
+    match id.as_str() {
+        "no.such.package" => StatusCode::NOT_FOUND.into_response(),
+        _ => Json(json!({"versions": ["1.0.0"]})).into_response(),
+    }
+}
+
+/// #743: a group asks a proxy member scoped to package ids about those ids
+/// alone. For any other id its upstream gets no request at all, not even
+/// for its service index, and the proxy remembers nothing of the id, a
+/// not-found included; an id in its scope still goes to it.
+#[tokio::test]
+async fn a_scoped_proxy_member_is_never_asked_about_other_ids() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let client = srv.client();
+    let s = common::unique();
+    let (internal, public, group) = (format!("sint{s}"), format!("spub{s}"), format!("sgrp{s}"));
+    let feeds = start_pass_through_feeds().await;
+    for body in [
+        json!({"name": internal, "kind": "proxy", "remote_url": format!("{}/internal/index.json", feeds.base), "package_delay_seconds": 0}),
+        json!({"name": public, "kind": "proxy", "remote_url": format!("{}/public/index.json", feeds.base), "package_delay_seconds": 0}),
+        json!({"name": group, "kind": "group"}),
+    ] {
+        let resp = client
+            .post(format!("{}/admin/repositories", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    }
+    for body in [
+        json!({"member": internal, "priority": 20, "packages": ["Envisia.*"]}),
+        json!({"member": public, "priority": 10}),
+    ] {
+        let resp = client
+            .post(format!(
+                "{}/admin/repositories/{group}/members",
+                srv.base_url
+            ))
+            .basic_auth(&u, Some(&p))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    }
+    let get = |path: String| {
+        client
+            .get(format!("{}/repository/{group}/{path}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .send()
+    };
+    let remembered = |name: String| {
+        let pool = srv.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT (SELECT count(*) FROM proxy_cached_version c WHERE c.repository_id = r.id)
+                      + (SELECT count(*) FROM proxy_upstream_index i WHERE i.repository_id = r.id)
+                 FROM repository r WHERE r.name = $1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    // Public ids, one found and one not: the public feed alone is asked.
+    let resp = get("flat/newtonsoft.json/index.json".into()).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["versions"], json!(["1.0.0"]));
+    let resp = get("flat/no.such.package/index.json".into()).await.unwrap();
+    assert_eq!(resp.status(), 404);
+    assert_eq!(feeds.asked("internal"), Vec::<String>::new());
+    assert!(feeds
+        .asked("public")
+        .contains(&"flat/no.such.package/index.json".to_string()));
+    assert_eq!(remembered(internal.clone()).await, 0);
+    assert!(remembered(public.clone()).await > 0);
+
+    // An id in the scope is asked of the scoped member too.
+    let resp = get("flat/envisia.lib/index.json".into()).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        feeds
+            .asked("internal")
+            .contains(&"flat/envisia.lib/index.json".to_string()),
+        "{:?}",
+        feeds.asked("internal")
+    );
+    assert!(!feeds
+        .asked("internal")
+        .iter()
+        .any(|path| path.contains("newtonsoft") || path.contains("no.such")));
+}

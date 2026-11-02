@@ -272,7 +272,44 @@ A group serves its members, by priority:
   hosted member has;
 - the **writable member**, a hosted npm repository that is also a member,
   takes publishes, dist-tag changes, deprecations and unpublishing through
-  the group; without one they are refused.
+  the group; without one they are refused;
+- a member's **packages** scope what the group asks it about (below).
+
+### Scoping a member to its packages
+
+A group asks every member about every package. A registry that passes
+public packages through answers for all of them: GitLab's npm registry
+forwards the packages it does not have to npmjs, and npm.fontawesome.com
+serves public packages next to its own. In a group of npmjs, GitLab and
+Font Awesome, each public package is then downloaded from all three. Scope
+such a member to the packages it is there for, and the group asks it about
+those alone:
+
+```bash
+api https://forge.example.com/admin/repositories/npm-all/members \
+  -d '{"member": "fontawesome", "priority": 20, "packages": ["@fortawesome/*", "@awesome.me/*"]}'
+api -X PATCH https://forge.example.com/admin/repositories/npm-all/members/npm-gitlab \
+  -d '{"packages": ["@acme/*"]}'
+```
+
+`packages` lists glob patterns of package names, the syntax of a content
+selector's includes, matched case-insensitively: `*` matches any
+characters, `/` included, so `@acme/*` is every package of the scope. A
+pattern without a wildcard is one package name (`left-pad`); `@acme` alone
+names no package and is refused. An empty list, the default, is every
+package. For any other package the group leaves the member out before it
+asks: its upstream gets no request, and the proxy caches nothing of it, not
+even a not-found. The scope also holds for the group's search (the member's
+results for other packages are dropped) and, set on a nested group's
+membership, for every member below it.
+
+A scope only narrows what a member serves; reserved prefixes, prefer hosted
+and owners are decided as without it. A proxy scoped to `@acme/*` still
+serves nothing under a reserved `@acme`, and a package an owner has outside
+the owner's scope is still kept from the proxies, so the group serves it
+from no member: widen the owner's scope rather than letting a proxy have it.
+In the web UI, the group's **Members** screen sets the scope when you add a
+member, and changes it with **Packages** on the member's row.
 
 ## Importing another registry
 
@@ -298,8 +335,10 @@ dist-tags the source moved. See [Importing repositories](import.md#npm-dist-tags
 
 `npm audit` (and `pnpm audit`) asks the registry for advisories. A proxy
 passes the request on to its upstream with its credentials, and a group to
-its first proxy member the caller may read, through nested groups. A hosted
-repository has no upstream to ask (404). Auditing needs `read`.
+its first proxy member the caller may read, through nested groups, passing
+over a member [scoped to some packages](#scoping-a-member-to-its-packages):
+an audit asks about all of them. A hosted repository has no upstream to ask
+(404). Auditing needs `read`.
 
 Through a group, the request leaves out the packages under the reserved
 prefixes of every group on the way to that proxy: the group's own, and a

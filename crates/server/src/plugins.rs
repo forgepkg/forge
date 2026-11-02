@@ -1710,11 +1710,14 @@ impl Ctx<'_> {
 
     /// The proxy whose upstream a forward from `repo` goes to: the
     /// repository itself, or a group's first proxy member (by priority)
-    /// the caller may read, through nested groups. With it, what the
-    /// forward leaves out ([`Withheld`]): the reserved prefixes of every
-    /// group on the way, so that reading through an outer group keeps an
-    /// inner group's packages inside as reading it directly does, and the
-    /// packages the caller's selectors hide on any repository on the way.
+    /// the caller may read, through nested groups. A member the group is
+    /// scoped to some package ids for (`group_member.packages`) is passed
+    /// over: a forward (an audit) asks about every package it names. With
+    /// it, what the forward leaves out ([`Withheld`]): the reserved prefixes
+    /// of every group on the way, so that reading through an outer group
+    /// keeps an inner group's packages inside as reading it directly does,
+    /// and the packages the caller's selectors hide on any repository on the
+    /// way.
     async fn forward_source(
         &self,
         repo: &Repository,
@@ -1734,8 +1737,14 @@ impl Ctx<'_> {
                 if depth >= max {
                     return Ok(None);
                 }
-                for (member, _) in repository_dao::group_members(&self.state.pool, repo.id).await? {
-                    if member.format != repo.format || !self.may(Level::Read, &member).await {
+                for membership in
+                    repository_dao::group_memberships(&self.state.pool, repo.id).await?
+                {
+                    let member = membership.repo;
+                    if member.format != repo.format
+                        || !membership.packages.is_empty()
+                        || !self.may(Level::Read, &member).await
+                    {
                         continue;
                     }
                     if let Some((proxy, mut withheld)) =

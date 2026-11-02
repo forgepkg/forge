@@ -764,8 +764,8 @@ describe('admin repositories', () => {
         repo({ id: 2, name: 'inner', kind: 'hosted' }),
       ],
       members: [
-        { name: 'existing', kind: 'hosted', priority: 100, owner: false },
-        { name: 'releases', kind: 'hosted', priority: 50, owner: true },
+        { name: 'existing', kind: 'hosted', priority: 100, owner: false, packages: [] },
+        { name: 'releases', kind: 'hosted', priority: 50, owner: true, packages: [] },
       ],
       onAddMember: () => {
         addCalled = true
@@ -801,7 +801,7 @@ describe('admin repositories', () => {
         repo({ id: 1, name: 'grp', kind: 'group' }),
         repo({ id: 2, name: 'inner', kind: 'hosted' }),
       ],
-      members: [{ name: 'existing', kind: 'hosted', priority: 100, owner: false }],
+      members: [{ name: 'existing', kind: 'hosted', priority: 100, owner: false, packages: [] }],
       onAddMember: (body) => {
         posted = body
         return json(null, 201)
@@ -824,12 +824,144 @@ describe('admin repositories', () => {
     expect(posted).toEqual({ member: 'inner', priority: 50 })
   })
 
+  it('the add form scopes a new member to the package patterns typed', async () => {
+    let posted: unknown = null
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'grp', kind: 'group' }),
+        repo({ id: 2, name: 'nexus-proxy', kind: 'proxy' }),
+      ],
+      members: [],
+      onAddMember: (body) => {
+        posted = body
+        return json(null, 201)
+      },
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    await user.selectOptions(await screen.findByLabelText('Repository'), 'nexus-proxy')
+    await user.type(screen.getByLabelText(/^Packages/), 'Envisia.*, Envisia.Tools')
+    await user.click(screen.getByRole('button', { name: 'Add member' }))
+
+    await waitFor(() => expect(posted).not.toBeNull())
+    expect(posted).toEqual({
+      member: 'nexus-proxy',
+      priority: 100,
+      packages: ['Envisia.*', 'Envisia.Tools'],
+    })
+  })
+
+  it("a member's packages are shown and changed in a dialog", async () => {
+    const patches: Array<{ member: string; body: unknown }> = []
+    const members: MemberView[] = [
+      { name: 'npmjs', kind: 'proxy', priority: 100, owner: false, packages: [] },
+      {
+        name: 'fontawesome',
+        kind: 'proxy',
+        priority: 50,
+        owner: false,
+        packages: ['@fortawesome/*'],
+      },
+    ]
+    const handlers: ApiHandlers = {
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group', format: 'npm' })],
+      members,
+      onPatchMember: (member, body) => {
+        patches.push({ member, body })
+        mockApi({
+          ...handlers,
+          members: members.map((m) =>
+            m.name === member ? { ...m, ...(body as { packages: string[] }) } : m,
+          ),
+        })
+        return new Response(null, { status: 204 })
+      },
+    }
+    mockApi(handlers)
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const scopedRow = (await screen.findByText('fontawesome')).closest('li')!
+    expect(scopedRow).toHaveTextContent('Asked only about @fortawesome/*')
+    const openRow = screen.getByText('npmjs').closest('li')!
+    expect(openRow).not.toHaveTextContent('Asked only about')
+
+    // Scope the other proxy to its own packages.
+    await user.click(within(openRow).getByRole('button', { name: 'Packages' }))
+    const dialog = screen.getByRole('dialog')
+    await user.type(within(dialog).getByLabelText('Patterns'), '@envisia/*{enter}@envisia-internal/*')
+    await user.click(within(dialog).getByRole('button', { name: 'Save packages' }))
+    await waitFor(() =>
+      expect(patches).toEqual([
+        { member: 'npmjs', body: { packages: ['@envisia/*', '@envisia-internal/*'] } },
+      ]),
+    )
+    await waitFor(() =>
+      expect(screen.getByText('npmjs').closest('li')!).toHaveTextContent(
+        'Asked only about @envisia/*, @envisia-internal/*',
+      ),
+    )
+
+    // Emptying the patterns asks the member about every package again.
+    await user.click(within(scopedRow).getByRole('button', { name: 'Packages' }))
+    const again = screen.getByRole('dialog')
+    expect(within(again).getByLabelText('Patterns')).toHaveValue('@fortawesome/*')
+    await user.clear(within(again).getByLabelText('Patterns'))
+    await user.click(within(again).getByRole('button', { name: 'Save packages' }))
+    await waitFor(() =>
+      expect(patches[1]).toEqual({ member: 'fontawesome', body: { packages: [] } }),
+    )
+  })
+
+  it('shows the server error when the packages are refused', async () => {
+    mockApi({
+      repositories: [repo({ id: 1, name: 'grp', kind: 'group', format: 'npm' })],
+      members: [{ name: 'fontawesome', kind: 'proxy', priority: 50, owner: false, packages: [] }],
+      onPatchMember: () =>
+        new Response('packages: "@fortawesome" has no wildcard and is no package id', {
+          status: 400,
+        }),
+    })
+
+    const user = userEvent.setup()
+    await renderAt('/manage/repositories/grp/members')
+
+    const row = (await screen.findByText('fontawesome')).closest('li')!
+    await user.click(within(row).getByRole('button', { name: 'Packages' }))
+    const dialog = screen.getByRole('dialog')
+    await user.type(within(dialog).getByLabelText('Patterns'), '@fortawesome')
+    await user.click(within(dialog).getByRole('button', { name: 'Save packages' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not change the packages of fontawesome: packages: "@fortawesome" has no wildcard',
+    )
+  })
+
+  it('a group of files offers no package scopes', async () => {
+    mockApi({
+      repositories: [
+        repo({ id: 1, name: 'files', kind: 'group', format: 'raw' }),
+        repo({ id: 2, name: 'github', kind: 'proxy', format: 'raw' }),
+      ],
+      members: [{ name: 'mirror', kind: 'proxy', priority: 50, owner: false, packages: [] }],
+    })
+
+    await renderAt('/manage/repositories/files/members')
+
+    const row = (await screen.findByText('mirror')).closest('li')!
+    expect(within(row).queryByRole('button', { name: 'Packages' })).toBeNull()
+    expect(screen.queryByLabelText(/^Packages/)).toBeNull()
+  })
+
   it('the owner toggle PATCHes the member and re-fetches the list', async () => {
     const patches: Array<{ member: string; body: unknown }> = []
     const members: MemberView[] = [
-      { name: 'existing', kind: 'hosted', priority: 100, owner: false },
-      { name: 'releases', kind: 'hosted', priority: 50, owner: true },
-      { name: 'nuget-org', kind: 'proxy', priority: 10, owner: false },
+      { name: 'existing', kind: 'hosted', priority: 100, owner: false, packages: [] },
+      { name: 'releases', kind: 'hosted', priority: 50, owner: true, packages: [] },
+      { name: 'nuget-org', kind: 'proxy', priority: 10, owner: false, packages: [] },
     ]
     const handlers: ApiHandlers = {
       repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
@@ -869,7 +1001,7 @@ describe('admin repositories', () => {
   it('shows the server error when the owner toggle is refused', async () => {
     mockApi({
       repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
-      members: [{ name: 'existing', kind: 'hosted', priority: 100, owner: false }],
+      members: [{ name: 'existing', kind: 'hosted', priority: 100, owner: false, packages: [] }],
       onPatchMember: () => new Response('membership not found', { status: 404 }),
     })
 
@@ -889,7 +1021,7 @@ describe('admin repositories', () => {
     let removed: string | null = null
     mockApi({
       repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
-      members: [{ name: 'releases', kind: 'hosted', priority: 50, owner: true }],
+      members: [{ name: 'releases', kind: 'hosted', priority: 50, owner: true, packages: [] }],
       onRemoveMember: (member) => {
         removed = member
         return new Response(
@@ -919,8 +1051,8 @@ describe('admin repositories', () => {
     mockApi({
       repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
       members: [
-        { name: 'existing', kind: 'hosted', priority: 100, owner: false },
-        { name: 'releases', kind: 'hosted', priority: 50, owner: true },
+        { name: 'existing', kind: 'hosted', priority: 100, owner: false, packages: [] },
+        { name: 'releases', kind: 'hosted', priority: 50, owner: true, packages: [] },
       ],
       onPatchMember: (member, body) => {
         patches.push({ member, body })
@@ -962,8 +1094,8 @@ describe('admin repositories', () => {
     mockApi({
       repositories: [repo({ id: 1, name: 'grp', kind: 'group' })],
       members: [
-        { name: 'existing', kind: 'hosted', priority: 100, owner: false },
-        { name: 'nuget-org', kind: 'proxy', priority: 10, owner: false },
+        { name: 'existing', kind: 'hosted', priority: 100, owner: false, packages: [] },
+        { name: 'nuget-org', kind: 'proxy', priority: 10, owner: false, packages: [] },
       ],
       onRemoveMember: (member) => {
         removed.push(member)
@@ -1063,7 +1195,7 @@ describe('admin repositories', () => {
         repo({ id: 1, name: 'grp', kind: 'group' }),
         repo({ id: 2, name: 'inner', kind: 'hosted' }),
       ],
-      members: [{ name: 'inner', kind: 'hosted', priority: 100, owner: false }],
+      members: [{ name: 'inner', kind: 'hosted', priority: 100, owner: false, packages: [] }],
     })
 
     await renderAt('/manage/repositories/grp/members')
