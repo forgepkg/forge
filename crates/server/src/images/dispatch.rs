@@ -1064,12 +1064,7 @@ fn strip_port(host: &str) -> &str {
 
 /// The `Authorization: Bearer` value, if any.
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (scheme, token) = value.split_once(' ')?;
-    scheme
-        .eq_ignore_ascii_case("bearer")
-        .then(|| token.trim())
-        .filter(|t| !t.is_empty())
+    forge_core::auth::scheme::header_credentials(headers, "Bearer")
 }
 
 /// Whether the principal is a credential a push may come from: an API
@@ -1224,6 +1219,11 @@ mod tests {
             HeaderValue::from_static("Bearer abc"),
         );
         assert_eq!(bearer_token(&h), Some("abc"));
+        // The scheme is case-insensitive (RFC 9110 §11.1, #584).
+        for value in ["bearer abc", "BEARER abc", "bEaReR abc"] {
+            h.insert(header::AUTHORIZATION, HeaderValue::from_static(value));
+            assert_eq!(bearer_token(&h), Some("abc"), "{value}");
+        }
         h.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic abc"));
         assert_eq!(bearer_token(&h), None);
     }

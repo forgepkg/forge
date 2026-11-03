@@ -18,6 +18,7 @@
 //!   fail-closed.
 //! * [`login_throttle`] — per `(client IP, username)` password-failure lockout
 //!   shared by the browser login and the wire Basic password path.
+//! * [`scheme`] — the case-insensitive scheme of an `Authorization` header.
 //! * [`workload_key`] — the short-lived API keys the trusted-publishing token
 //!   exchange issues for CI workloads.
 
@@ -30,6 +31,7 @@ pub mod local_password;
 pub mod login_throttle;
 pub mod principal;
 pub mod provider;
+pub mod scheme;
 pub mod session_source;
 pub mod token;
 pub mod upstream_basic;

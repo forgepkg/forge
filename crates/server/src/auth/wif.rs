@@ -30,6 +30,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine;
 use forge_cache::Cache;
+use forge_core::auth::scheme::credentials;
 use forge_core::auth::token::{PrincipalSource, SourceOutcome};
 use forge_core::auth::{is_workload_key, WORKLOAD_USERNAME};
 use forge_core::auth::{Principal, TrustedPublisherMatch};
@@ -993,13 +994,12 @@ impl PrincipalSource for WorkloadIdentitySource {
 fn candidate_secrets(headers: &HeaderMap) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(auth) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if let Some(bearer) = strip_prefix_ci(auth, "Bearer ") {
-            let t = bearer.trim();
-            if !t.is_empty() {
-                out.push(t.to_string());
+        if let Some(bearer) = credentials(auth, "Bearer") {
+            if !bearer.is_empty() {
+                out.push(bearer.to_string());
             }
-        } else if let Some(basic) = strip_prefix_ci(auth, "Basic ") {
-            if let Some((_, pw)) = basic_credentials(basic.trim()) {
+        } else if let Some(basic) = credentials(auth, "Basic") {
+            if let Some((_, pw)) = basic_credentials(basic) {
                 if !pw.is_empty() {
                     out.push(pw);
                 }
@@ -1018,17 +1018,8 @@ fn candidate_secrets(headers: &HeaderMap) -> Vec<String> {
 /// The username of an HTTP Basic `Authorization` header, if one is present.
 fn basic_username(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let basic = strip_prefix_ci(auth, "Basic ")?;
-    basic_credentials(basic.trim()).map(|(username, _)| username)
-}
-
-/// Case-insensitive prefix strip (HTTP auth schemes are case-insensitive).
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    let basic = credentials(auth, "Basic")?;
+    basic_credentials(basic).map(|(username, _)| username)
 }
 
 /// Decode a Base64 `user:password` HTTP Basic credential into its halves.

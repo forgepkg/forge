@@ -236,15 +236,7 @@ async fn with_bearer(
     ) {
         return Ok(principal);
     }
-    let Some(token) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let (scheme, token) = v.split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
-        })
-        .filter(|token| !token.is_empty())
-    else {
+    let Some(token) = forge_core::auth::scheme::header_credentials(headers, "Bearer") else {
         return Ok(principal);
     };
     match check_token(&state.pool, token).await {
