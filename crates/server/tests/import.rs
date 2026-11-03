@@ -21,6 +21,9 @@
 //!   cancelling and resuming; the preflight's refusals;
 //! * an import that names its packages or images, from a source without a
 //!   search or a catalog;
+//! * a package or image the source lists but refuses or fails on (a 403 for
+//!   a feed's versions, a 500 for a packument, a 401 for an image's tags) is
+//!   a failed item, and the scan goes on with the other names;
 //! * Docker: the catalog paged, a multi-platform index with its children, a
 //!   cosign signature tag, and a referrer from the referrers API or, without
 //!   it, through the referrers tag schema, digests kept;
@@ -124,6 +127,10 @@ struct SourceState {
     delay: Duration,
     /// npm registries, by repository.
     npm: HashMap<String, NpmSource>,
+    /// Paths (`/repository/...`) answered with this status instead, to the
+    /// import's own credentials: a resource they may not read, or one the
+    /// source fails on.
+    refused: HashMap<String, StatusCode>,
 }
 
 /// A version of an npm package at a mock registry.
@@ -343,6 +350,9 @@ async fn answer(state: &Mutex<SourceState>, base: &str, req: Request) -> Respons
             .into_response();
     }
     let path = req.uri().path().to_string();
+    if let Some(status) = state.lock().unwrap().refused.get(&path) {
+        return status.into_response();
+    }
     let query: HashMap<String, String> =
         url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes())
             .into_owned()
@@ -1902,6 +1912,160 @@ async fn named_packages_and_images_come_from_a_source_without_search_or_catalog(
     assert_eq!(done["state"], "completed", "{done}");
     assert_eq!(done["progress"]["imported"], 1, "{done}");
     assert_eq!(done["progress"]["failed"], 1, "{done}");
+}
+
+/// The items of the import `id` by `name@version` (`name` alone without a
+/// version), and their state.
+async fn item_states(srv: &TestServer, repo: &str, id: i64) -> BTreeMap<String, String> {
+    items(srv, repo, id, None)
+        .await
+        .iter()
+        .map(|item| {
+            let name = item["name"].as_str().unwrap();
+            let version = item["version"].as_str().unwrap_or_default();
+            let key = if version.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}@{version}")
+            };
+            (key, item["state"].as_str().unwrap().to_string())
+        })
+        .collect()
+}
+
+/// The detail of the failed item `name`.
+async fn failure_of(srv: &TestServer, repo: &str, id: i64, name: &str) -> String {
+    let failed = items(srv, repo, id, Some("failed")).await;
+    let item = failed
+        .iter()
+        .find(|item| item["name"] == name)
+        .unwrap_or_else(|| panic!("{name} is no failed item: {failed:?}"));
+    item["detail"].as_str().unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn a_package_the_feed_refuses_is_a_failed_item_and_the_search_goes_on() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    let feed = "nuget-refusing";
+    for id in ["Acme.A", "Acme.B", "Acme.C"] {
+        source.nuget(
+            feed,
+            id,
+            "1.0.0",
+            make_nupkg(id, "1.0.0"),
+            "2021-01-01T00:00:00.000+00:00",
+        );
+    }
+    // The search lists Acme.B, but its versions are forbidden to the
+    // import's user.
+    source.with(|s| {
+        s.refused.insert(
+            format!("/repository/{feed}/flat/acme.b/index.json"),
+            StatusCode::FORBIDDEN,
+        );
+    });
+
+    let repo = repo_name("nuget-refused");
+    create_repo(&srv, json!({"name": repo, "kind": "hosted"})).await;
+    let id = start(&srv, &repo, from(source.feed_url(feed))).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["imported"], 2, "{done}");
+    assert_eq!(done["progress"]["failed"], 1, "{done}");
+    let states = item_states(&srv, &repo, id).await;
+    assert_eq!(states["Acme.A@1.0.0"], "imported", "{states:?}");
+    assert_eq!(states["Acme.B"], "failed", "{states:?}");
+    assert_eq!(states["Acme.C@1.0.0"], "imported", "{states:?}");
+    let detail = failure_of(&srv, &repo, id, "Acme.B").await;
+    assert!(detail.contains("403"), "{detail}");
+    assert!(nupkg(&srv, &repo, "Acme.A", "1.0.0").await.is_some());
+    assert!(nupkg(&srv, &repo, "Acme.C", "1.0.0").await.is_some());
+}
+
+#[tokio::test]
+async fn a_package_the_npm_registry_fails_on_is_a_failed_item_and_the_names_go_on() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    let reg = "npm-failing";
+    for name in ["alpha", "beta", "gamma"] {
+        source.npm_version(
+            reg,
+            name,
+            "1.0.0",
+            tgz(name, "1.0.0", name),
+            "2022-02-02T00:00:00.000Z",
+        );
+        source.npm_tag(reg, name, "latest", "1.0.0");
+    }
+    // The registry fails on beta's packument, every time.
+    source.with(|s| {
+        s.refused.insert(
+            format!("/repository/{reg}/beta"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+    });
+
+    let repo = repo_name("npm-failing");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let mut body = from(source.npm_url(reg));
+    body["names"] = json!(["alpha", "beta", "gamma"]);
+    let id = start(&srv, &repo, body).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["failed"], 1, "{done}");
+    let states = item_states(&srv, &repo, id).await;
+    assert_eq!(states["alpha@1.0.0"], "imported", "{states:?}");
+    assert_eq!(states["beta"], "failed", "{states:?}");
+    assert_eq!(states["gamma@1.0.0"], "imported", "{states:?}");
+    assert!(!states.keys().any(|k| k.starts_with("beta@")), "{states:?}");
+    let detail = failure_of(&srv, &repo, id, "beta").await;
+    assert!(detail.contains("500"), "{detail}");
+    assert!(npm_tarball(&srv, &repo, "gamma", "1.0.0").await.is_some());
+}
+
+#[tokio::test]
+async fn an_image_whose_tags_are_refused_is_a_failed_item_and_the_catalog_goes_on() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    let reg = "docker-rules";
+    // More images than a catalog page holds; team-b/app is listed, but its
+    // tags are not the import's user's to read.
+    for name in ["team-a/app", "team-b/app", "tools/cli"] {
+        let cfg = config("amd64");
+        let layer = format!("layer of {name}").into_bytes();
+        source.blob(reg, name, &cfg);
+        source.blob(reg, name, &layer);
+        source.tag(reg, name, "1.0", OCI_MANIFEST, &image(&cfg, &layer));
+    }
+    source.with(|s| {
+        s.refused.insert(
+            format!("/repository/{reg}/v2/team-b/app/tags/list"),
+            StatusCode::UNAUTHORIZED,
+        );
+    });
+
+    let repo = repo_name("docker-refused");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let id = start(&srv, &repo, from(source.registry_url(reg))).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["imported"], 2, "{done}");
+    assert_eq!(done["progress"]["failed"], 1, "{done}");
+    let states = item_states(&srv, &repo, id).await;
+    assert_eq!(states["team-a/app@1.0"], "imported", "{states:?}");
+    assert_eq!(states["team-b/app"], "failed", "{states:?}");
+    assert_eq!(states["tools/cli@1.0"], "imported", "{states:?}");
+    let detail = failure_of(&srv, &repo, id, "team-b/app").await;
+    assert!(detail.contains("refused"), "{detail}");
 }
 
 // ── Docker ──────────────────────────────────────────────────────────────────
