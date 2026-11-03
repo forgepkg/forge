@@ -318,6 +318,78 @@ async fn a_forwarding_realm_takes_client_passwords_and_a_closed_local_realm_none
     srv.login(&setup.forwarded, UPSTREAM_PASSWORD).await;
 }
 
+/// #795: a closed local realm's password sent by a client was never checked,
+/// so it is no guess: refused like a wrong one, but not counted towards the
+/// (network, username) lockout the browser login shares. An old client still
+/// sending it does not lock its owner out of the sign-in that gets them a
+/// token. A wrong password through a realm that checks it still counts.
+#[tokio::test]
+async fn a_closed_local_realms_password_from_clients_does_not_lock_the_browser_login() {
+    let setup = Setup::new().await;
+    let srv = &setup.srv;
+    let (admin_user, admin_password) = srv.admin_password_basic();
+    let settings = srv.state.auth_settings.current().await.settings.clone();
+    let attempts = 15;
+    assert!(attempts > settings.login_max_failures);
+
+    let raw = format!("{}/repository/{}/{RAW_FILE}", srv.base_url, setup.raw);
+    for _ in 0..attempts {
+        let resp = srv
+            .client()
+            .get(&raw)
+            .basic_auth(&admin_user, Some(&admin_password))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "Basic with a closed realm's password");
+    }
+    // `npm login --auth-type=legacy` refuses it the same way.
+    let npm_login = format!(
+        "{}/repository/{}/-/user/org.couchdb.user:{}",
+        srv.base_url,
+        setup.npm,
+        admin_user.replace('@', "%40")
+    );
+    for _ in 0..attempts {
+        let resp = srv
+            .client()
+            .put(&npm_login)
+            .json(&json!({"name": admin_user, "password": admin_password, "type": "user"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "npm login with a closed realm's password"
+        );
+    }
+    // From the same address, the browser login still takes the password.
+    srv.login(&admin_user, &admin_password).await;
+
+    // Wrong passwords still count: the browser login checks them, and so
+    // locks the pair once the budget is spent.
+    let login = format!("{}/auth/login", srv.base_url);
+    for _ in 0..settings.login_max_failures {
+        let resp = srv
+            .client()
+            .post(&login)
+            .json(&json!({"username": admin_user, "password": "not-the-password"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+    let resp = srv
+        .client()
+        .post(&login)
+        .json(&json!({"username": admin_user, "password": admin_password}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429, "wrong passwords still lock the pair");
+}
+
 /// Each realm's flag follows its admin edits at once: the local realm opened
 /// takes its users' passwords from clients, the forwarding realm closed
 /// takes none (its users then sign their clients in with tokens, which the

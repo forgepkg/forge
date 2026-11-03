@@ -489,6 +489,14 @@ impl PrincipalSource for BasicAuthSource {
                     attempt.failed();
                     return SourceOutcome::Invalid;
                 }
+                // A local account whose realm takes no password from clients:
+                // denied like a wrong password, but nothing was checked, so it
+                // does not count towards the lockout (an old client still
+                // sending it must not lock its owner out of the browser login).
+                ChainOutcome::NotAccepted => {
+                    attempt.released();
+                    return SourceOutcome::Invalid;
+                }
                 // A fail-closed outage (or an argon2 overload) also denies, but
                 // is not the caller's fault, so it does not count towards the
                 // lockout.
