@@ -50,7 +50,7 @@ curl -u admin@example.com:<admin-scoped token> -X POST \
 | `names` | The package ids or images to copy (up to 10,000), instead of every package the feed's search finds or every image the registry's catalog lists. npm: package names (`left-pad`, `@acme/ui`) or scopes (`@acme`, every package of the scope). Raw: the paths of the files, below `url` (`pdfium/7350/pdfium-linux-x64.tgz`), instead of every file the source lists. Not for apt: its `Release` lists every package. |
 | `distribution` | apt: the source's distribution (`bookworm`), the one `sources.list` names. By default, the hosted repository's own. |
 | `public_key` | apt: the source's OpenPGP public keys, ASCII-armored (`gpg --export --armor`). Given them, the import reads only a `Release` one of them signed ([below](#apt)). |
-| `username`, `password` | A user of the source that may read the repository; both, or neither for anonymous access. |
+| `username`, `password` | A user of the source that may read the repository; both, or neither for anonymous access. The only way to give the import credentials: a `url` (or `registry_url`) with credentials in it (`https://user:pw@…`, as `sources.list` may write it) is refused with 400, since they would be stored, shown and logged in plaintext. |
 | `on_conflict` | A version (raw: a file) Forge already has with other bytes: `skip` it and report it (default), `overwrite` it with the source's bytes, or `fail` the import. npm: likewise a dist-tag Forge points at another version, or a deprecation Forge gives otherwise ([below](#npm-dist-tags-and-deprecations)). |
 | `concurrency` | Items copied at a time, 1–16 (default 4), so the source is not overwhelmed. |
 | `dry_run` | Decide every item and write nothing. |

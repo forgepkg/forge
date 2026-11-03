@@ -383,15 +383,15 @@ fn bad_request(msg: impl Into<String>) -> Response {
 #[allow(clippy::result_large_err)] // the Err is a ready-made axum Response
 fn validate_remote_url(url: &str) -> Result<(), Response> {
     validate_url(url).map_err(|e| bad_request(format!("invalid remote_url: {e}")))?;
+    // Credentials embedded in the URL would be stored, logged and returned
+    // in plaintext; they belong in the write-only upstream_username /
+    // upstream_password fields.
+    if super::embeds_credentials(url) {
+        return Err(bad_request(
+            "remote_url must not embed credentials; use upstream_username / upstream_password",
+        ));
+    }
     if let Ok(parsed) = url::Url::parse(url) {
-        // Credentials embedded in the URL would be stored, logged and returned
-        // in plaintext; they belong in the write-only upstream_username /
-        // upstream_password fields.
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(bad_request(
-                "remote_url must not embed credentials; use upstream_username / upstream_password",
-            ));
-        }
         tracing::info!(
             host = parsed.host_str().unwrap_or(""),
             "proxy remote_url configured"

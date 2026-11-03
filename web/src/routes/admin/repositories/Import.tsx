@@ -229,6 +229,12 @@ function StartImportForm({
       )
       return
     }
+    if (embedsCredentials(url.trim())) {
+      setFormError(
+        'Leave the credentials out of the URL; enter them as username and password.',
+      )
+      return
+    }
     if (username.trim() !== '' && password === '') {
       setFormError('Enter the password of the user.')
       return
@@ -442,6 +448,19 @@ function StartImportForm({
       </div>
     </Panel>
   )
+}
+
+/**
+ * Whether a URL carries credentials (`https://user:pw@host/…`). The server
+ * refuses them: they would be stored, shown and logged in plaintext.
+ */
+function embedsCredentials(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    return parsed.username !== '' || parsed.password !== ''
+  } catch {
+    return false
+  }
 }
 
 /** The names of a names field: one per line (or separated by commas or spaces). */

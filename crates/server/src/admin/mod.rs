@@ -452,6 +452,15 @@ pub(crate) async fn hash_password(password: String) -> Result<String, Response> 
     })
 }
 
+/// Whether `url` carries userinfo (`https://user:pw@host/…`). Credentials
+/// embedded in a URL would be stored, logged and returned in plaintext, so
+/// the admin API refuses them and takes them in its write-only username /
+/// password fields instead (a proxy's `remote_url`, an import's `url` and
+/// `registry_url`). A URL that does not parse has none.
+pub(crate) fn embeds_credentials(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
+}
+
 /// Helper used by handlers to turn a `sqlx::Error` into a 500 response.
 pub(crate) fn db_error(e: sqlx::Error) -> Response {
     forge_db::observe_error(&e);
@@ -514,4 +523,19 @@ pub(crate) fn json_rejection(rejection: axum::extract::rejection::JsonRejection)
         other => other.status(),
     };
     (status, rejection.body_text()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embeds_credentials;
+
+    #[test]
+    fn userinfo_is_credentials() {
+        assert!(embeds_credentials("https://user:pw@apt.example.com/debian"));
+        assert!(embeds_credentials("https://user@apt.example.com/debian"));
+        assert!(embeds_credentials("https://:pw@apt.example.com/debian"));
+        assert!(!embeds_credentials("https://apt.example.com/debian"));
+        assert!(!embeds_credentials("https://apt.example.com/a@b"));
+        assert!(!embeds_credentials("not a url"));
+    }
 }
