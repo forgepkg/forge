@@ -663,6 +663,14 @@ registry's token service, `npm login --auth-type=legacy`) is set **per realm**: 
   sends for a local account is refused with the 401 of a wrong password (the
   lockout counts it), and is never forwarded to a credential-forwarding
   realm behind it.
+- **So does a closed credential-forwarding realm.** A password a client
+  sends for one of its accounts is refused with the 401 of a wrong password
+  (without counting towards the lockout: nothing is checked), is not sent
+  to the realm's own upstream, and is never forwarded to a
+  credential-forwarding realm behind it. A name that is no account of the
+  realm goes on to the realms after it. An account the realm has not
+  created yet (a user who never signed in) is not known to it, so its
+  password goes on like any other name's.
 
 Before 2.2 this was one setting, `allow_password_basic` under **Admin →
 Settings**, and an enabled credential-forwarding realm turned it on for every
