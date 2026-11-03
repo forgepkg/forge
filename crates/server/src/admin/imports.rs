@@ -405,10 +405,22 @@ pub async fn create(
     if let Err(e) = validate_url(&url) {
         return bad_request(format!("invalid url: {e}"));
     }
+    // Credentials in the URL would be stored in the import, returned by
+    // every view of it and logged in plaintext (reqwest would send them as
+    // Basic auth): they go in the write-only username / password.
+    if super::embeds_credentials(&url) {
+        return bad_request("url must not embed credentials; use username / password");
+    }
     let registry_url = body
         .registry_url
         .map(|u| u.trim().trim_end_matches('/').to_string())
         .filter(|u| !u.is_empty());
+    if registry_url
+        .as_deref()
+        .is_some_and(super::embeds_credentials)
+    {
+        return bad_request("registry_url must not embed credentials; use username / password");
+    }
     let source = match body.repository.map(|r| r.trim().to_string()) {
         Some(repository) => {
             if repository.is_empty() || repository.contains('/') {

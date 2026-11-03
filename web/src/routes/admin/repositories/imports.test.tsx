@@ -285,6 +285,23 @@ describe('import', () => {
     })
   })
 
+  it('refuses a URL with credentials in it before sending it', async () => {
+    mockApi({ repositories: [repo({})] })
+    await renderAt('/manage/repositories/nuget-internal/import')
+    await screen.findByText('No imports yet')
+
+    await userEvent.type(
+      screen.getByLabelText('Feed URL'),
+      'https://migrator:S3cret@feed.example.com/v3/index.json',
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Start dry run' }))
+
+    expect(
+      await screen.findByText(/Leave the credentials out of the URL/),
+    ).toBeInTheDocument()
+    expect(requests('POST', '/imports')).toHaveLength(0)
+  })
+
   it('shows progress and conflicts, and retries failed items with the password again', async () => {
     let resumed: unknown
     mockApi({

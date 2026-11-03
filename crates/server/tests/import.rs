@@ -2072,6 +2072,103 @@ async fn the_password_is_sealed_at_rest() {
     assert_eq!(done["progress"]["imported"], 1);
 }
 
+#[tokio::test]
+async fn a_url_with_credentials_in_it_is_refused_and_nothing_is_stored() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    source.nuget(
+        "nuget-hosted",
+        "Acme.Core",
+        "1.0.0",
+        make_nupkg("Acme.Core", "1.0.0"),
+        "2021-01-01T00:00:00.000+00:00",
+    );
+    let repo = repo_name("nuget-userinfo");
+    create_repo(&srv, json!({"name": repo, "kind": "hosted"})).await;
+    let images = repo_name("docker-userinfo");
+    create_repo(
+        &srv,
+        json!({"name": images, "kind": "hosted", "format": "docker"}),
+    )
+    .await;
+    let with_userinfo = |url: &str| url.replacen("://", &format!("://{USER}:{PASSWORD}@"), 1);
+
+    let attempt = |target: String, body: Value| {
+        let srv = &srv;
+        async move {
+            let resp = admin(
+                srv,
+                reqwest::Method::POST,
+                &format!("/admin/repositories/{target}/imports"),
+                Some(body),
+            )
+            .await;
+            (resp.status().as_u16(), resp.text().await.unwrap())
+        }
+    };
+    let listed = |target: String| {
+        let srv = &srv;
+        async move {
+            let resp = admin(
+                srv,
+                reqwest::Method::GET,
+                &format!("/admin/repositories/{target}/imports"),
+                None,
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            resp.json::<Vec<Value>>().await.unwrap()
+        }
+    };
+
+    // The source's URL, as sources.list would write it.
+    let (status, text) = attempt(
+        repo.clone(),
+        json!({"url": with_userinfo(&source.feed_url("nuget-hosted"))}),
+    )
+    .await;
+    assert_eq!(status, 400, "{text}");
+    assert!(
+        text.contains("url must not embed credentials; use username / password"),
+        "{text}"
+    );
+    assert!(!text.contains(PASSWORD), "{text}");
+    // A username alone is credentials too, also beside username / password.
+    let mut user_only = from(
+        source
+            .feed_url("nuget-hosted")
+            .replacen("://", "://someone@", 1),
+    );
+    user_only["dry_run"] = json!(true);
+    let (status, text) = attempt(repo.clone(), user_only).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("must not embed credentials"), "{text}");
+
+    // A Nexus Docker repository's connector.
+    let mut nexus = from(source.url.clone());
+    nexus["repository"] = json!("docker-hosted");
+    nexus["registry_url"] = json!(with_userinfo(&source.url));
+    let (status, text) = attempt(images.clone(), nexus).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(
+        text.contains("registry_url must not embed credentials; use username / password"),
+        "{text}"
+    );
+
+    assert!(listed(repo.clone()).await.is_empty());
+    assert!(listed(images.clone()).await.is_empty());
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM repository_import")
+        .fetch_one(&srv.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0, "the refused requests stored no import");
+
+    // The same source, with the credentials in username / password.
+    let id = start(&srv, &repo, from(source.feed_url("nuget-hosted"))).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+}
+
 // ── npm ─────────────────────────────────────────────────────────────────────
 
 /// A path of an npm repository of Forge, read as the administrator.
