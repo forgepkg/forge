@@ -891,7 +891,7 @@ impl Ctx<'_> {
             };
             let package = self.implementation().file_package(path);
             files
-                .locate_kept(self.repo, path, package.as_deref(), fetch)
+                .locate_kept(self.repo, path, &package, fetch)
                 .await
                 .map_err(IntoResponse::into_response)?
         };
@@ -938,9 +938,7 @@ impl Ctx<'_> {
                     files.locate(self.repo, path, true, Vec::new(), 0).await
                 } else {
                     let package = self.implementation().file_package(path);
-                    files
-                        .locate_kept(self.repo, path, package.as_deref(), true)
-                        .await
+                    files.locate_kept(self.repo, path, &package, true).await
                 };
                 match located {
                     Ok(Some(file)) => file,

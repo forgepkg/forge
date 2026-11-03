@@ -3622,8 +3622,9 @@ async fn a_scoped_member_is_never_asked_about_other_ids() {
         .unwrap();
     assert_eq!(loc.blob_s3_key, "upstream/Envisia.Lib");
 
-    // Search: the scoped member's hit outside its scope is dropped. The
-    // unscoped proxy is asked for a window of its hits, not for them all.
+    // Search: the scoped member's hit outside its scope is dropped. Both
+    // proxies are asked for a window of their hits, not for them all: the
+    // scope does not cost the scoped member its window (#796).
     assert_eq!(
         searched_ids(&g, &group.name).await,
         ["envisia.lib", "newtonsoft.json", "serilog"]
@@ -3636,11 +3637,168 @@ async fn a_scoped_member_is_never_asked_about_other_ids() {
         "an unscoped proxy keeps its upstream window: {:?}",
         public_ops.takes()
     );
+    assert!(
+        !internal_ops.takes().is_empty()
+            && internal_ops
+                .takes()
+                .iter()
+                .all(|take| *take < SearchParams::MAX_TAKE),
+        "a scoped proxy keeps its upstream window: {:?}",
+        internal_ops.takes()
+    );
+
+    // A query no pattern can match does not reach the scoped member.
+    let searched = internal_ops.takes().len();
+    let result = g
+        .search(
+            &group.name,
+            &SearchParams {
+                q: "packageid:Newtonsoft.Json".into(),
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result
+        .hits
+        .iter()
+        .all(|hit| !hit.original_id.eq_ignore_ascii_case("envisia.lib")));
+    assert_eq!(
+        internal_ops.takes().len(),
+        searched,
+        "packageid:Newtonsoft.Json is outside Envisia.*"
+    );
+    // One that a pattern matches does, in any case.
+    let result = g
+        .search(
+            &group.name,
+            &SearchParams {
+                q: "packageid:ENVISIA.Lib".into(),
+                ..SearchParams::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result
+        .hits
+        .iter()
+        .any(|hit| hit.original_id == "Envisia.Lib"));
+    assert_eq!(internal_ops.takes().len(), searched + 1);
 
     // Without patterns the member is asked about every id again.
     scope(&pool, &group, &internal, &[]).await;
     g.list_versions(&group.name, "Serilog").await.unwrap();
     assert!(internal_ops.asked().contains(&"Serilog".to_string()));
+}
+
+/// `count` ids, `prefix` followed by a zero-padded number, as the
+/// `'static` hits a [`PassThrough`] returns.
+fn numbered(prefix: &str, count: usize) -> Vec<&'static str> {
+    (0..count)
+        .map(|n| &*Box::leak(format!("{prefix}{n:03}").into_boxed_str()))
+        .collect()
+}
+
+/// A scoped proxy's search is windowed like an unscoped one's (#796): it is
+/// asked for the first hits the page needs, its count is estimated from the
+/// share of them its scope admits, and a window its scope admits none of
+/// grows like any other, never to every hit at once.
+#[tokio::test]
+async fn a_scoped_members_search_is_windowed_and_its_count_estimated() {
+    let pool = common::pool().await;
+    let internal = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, internal.id, 100)
+        .await
+        .unwrap();
+    scope(&pool, &group, &internal, &["Envisia.*"]).await;
+
+    // Every other hit in the scope: half of its 200.
+    let interleaved: Vec<&'static str> = numbered("Envisia.P", 100)
+        .into_iter()
+        .zip(numbered("Other.P", 100))
+        .flat_map(|(inside, outside)| [inside, outside])
+        .collect();
+    let internal_ops = PassThrough::new(&interleaved);
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&internal, &internal_ops)],
+    );
+    let result = g
+        .search(&group.name, &SearchParams::default())
+        .await
+        .unwrap();
+    // The first window of 32 serves 16 ids, short of the page's 20; the
+    // next, 128, serves 64, and the 72 hits past it count half.
+    assert_eq!(internal_ops.takes(), [32, 128]);
+    assert_eq!(result.total_hits, 64 + 36);
+    assert_eq!(
+        result
+            .hits
+            .iter()
+            .map(|hit| hit.original_id.as_str())
+            .collect::<Vec<_>>(),
+        numbered("Envisia.P", 20),
+        "only the ids in the scope, in the upstream's order"
+    );
+
+    // The scope admits none of the first window: the next is four times
+    // as large, not every hit.
+    let late: Vec<&'static str> = numbered("Other.P", 40)
+        .into_iter()
+        .chain(numbered("Envisia.P", 60))
+        .collect();
+    let internal_ops = PassThrough::new(&late);
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&internal, &internal_ops)],
+    );
+    let result = g
+        .search(&group.name, &SearchParams::default())
+        .await
+        .unwrap();
+    assert_eq!(internal_ops.takes(), [32, 128]);
+    assert_eq!(
+        result.total_hits, 60,
+        "the second window returned every hit"
+    );
+    assert_eq!(result.hits.len(), 20);
+    assert!(result
+        .hits
+        .iter()
+        .all(|hit| hit.original_id.starts_with("Envisia.")));
+}
+
+/// A member whose patterns do not compile admits no id: a group search does
+/// not ask its upstream at all (#796).
+#[tokio::test]
+async fn a_member_whose_scope_admits_nothing_is_not_searched() {
+    let pool = common::pool().await;
+    let broken = seed_proxy_member(&pool).await;
+    let public = seed_proxy_member(&pool).await;
+    let group = seed_group(&pool).await;
+    repository_dao::add_group_member(&pool, group.id, broken.id, 100)
+        .await
+        .unwrap();
+    repository_dao::add_group_member(&pool, group.id, public.id, 10)
+        .await
+        .unwrap();
+    // A database write past the admin API, which validates the patterns.
+    scope(&pool, &group, &broken, &["Envisia.[x"]).await;
+    let broken_ops = PassThrough::new(&["Envisia.Lib"]);
+    let public_ops = PassThrough::new(&["Serilog"]);
+    let g = pass_through_group_repo(
+        &pool,
+        StubBlobs::default(),
+        user(&pool).await,
+        &[(&broken, &broken_ops), (&public, &public_ops)],
+    );
+    assert_eq!(searched_ids(&g, &group.name).await, ["serilog"]);
+    assert_eq!(broken_ops.takes(), Vec::<usize>::new());
 }
 
 /// A scope on a nested group's membership holds for every member below it,

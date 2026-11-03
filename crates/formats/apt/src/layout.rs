@@ -12,7 +12,7 @@
 //!
 //! Request paths are parsed with [`forge_plugin_api::files`]: a path that
 //! needs normalizing (`..`, `//`, an encoded `/`, a backslash) is refused,
-//! never resolved.
+//! never resolved. A pool path with a `;` names no pool file.
 
 use forge_plugin_api::files::{self, PathError};
 
@@ -88,6 +88,11 @@ fn classify(path: String) -> Target {
             rest: rest.join("/"),
             path: path.clone(),
         },
+        // Debian names no file or directory of a pool with a `;`; an
+        // upstream servlet container (Jetty, Tomcat) would drop what
+        // follows one as path parameters, serving another file than the
+        // path names.
+        ["pool", ..] if path.contains(';') => Target::Other(path),
         ["pool", area @ .., component, prefix, directory, file] => Target::Pool(PoolPath {
             area: area.join("/"),
             component: (*component).to_string(),
@@ -331,6 +336,20 @@ mod tests {
         };
         assert_eq!(pool_package(&pool).as_deref(), Some("hello:amd64"));
         assert!(!pool_matches(&pool, "main", "hello"));
+        // A file of no package name, in a directory of none: no package.
+        let Target::Pool(pool) = parse("/pool/main/H/Hello/README").unwrap() else {
+            panic!()
+        };
+        assert_eq!(pool_package(&pool), None);
+        // A `;` (path parameters to a servlet container) is no pool path.
+        for path in [
+            "/pool/main/o/openssh;x/openssh-server_9.2p1-2+deb12u3_amd64.deb;x",
+            "/pool/main/o/openssh/openssh-server_9.2p1-2+deb12u3_amd64.deb;x",
+            "/pool/main/o/openssh/openssh-server_9.2p1-2+deb12u3_amd64.deb%3Bx",
+            "/pool;x/main/o/openssh/openssh-server_9.2p1-2+deb12u3_amd64.deb",
+        ] {
+            assert!(matches!(parse(path).unwrap(), Target::Other(_)), "{path}");
+        }
         assert_eq!(split_id("hello:amd64"), Some(("hello", "amd64")));
         assert_eq!(split_id("hello"), None);
     }

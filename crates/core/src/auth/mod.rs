@@ -12,6 +12,9 @@
 //!   upstream-basic providers plug in here; OIDC stays its own interactive
 //!   path. [`captured_password`] stands in for upstream-basic once a realm
 //!   stops forwarding and signs its accounts in with the hashes it kept.
+//!   [`realm_guard`] holds the place of a credential-forwarding realm that
+//!   accepts no passwords from clients in their chain, as a guard of its
+//!   accounts' names.
 //! * [`cred_cache`] — the validated-credential cache: an HMAC-keyed
 //!   in-process + Postgres cache of upstream verdicts so NuGet's per-request
 //!   Basic auth does not hammer the upstream. Plaintext is never stored;
@@ -31,6 +34,7 @@ pub mod local_password;
 pub mod login_throttle;
 pub mod principal;
 pub mod provider;
+pub mod realm_guard;
 pub mod scheme;
 pub mod session_source;
 pub mod token;
@@ -58,6 +62,7 @@ pub use principal::{AuthMethod, Principal, TrustedPublisherMatch, UserPrincipal}
 pub use provider::{
     AuthOutcome, AuthProvider, AuthSource, CapturedPasswordHash, PasswordCredential, ProvenIdentity,
 };
+pub use realm_guard::ForwardingRealmGuard;
 pub use session_source::{
     cookie_value, session_cookie_name, unique_cookie_value, DuplicateCookie, SessionCookieSource,
     SECURE_SESSION_COOKIE, SESSION_COOKIE,

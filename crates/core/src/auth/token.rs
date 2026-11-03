@@ -495,8 +495,9 @@ impl PrincipalSource for BasicAuthSource {
                     attempt.failed();
                     return SourceOutcome::Invalid;
                 }
-                // A local account whose realm takes no password from clients:
-                // denied like a wrong password, but nothing was checked, so it
+                // An account whose realm (local or credential-forwarding)
+                // takes no password from clients: denied like a wrong
+                // password, but nothing was checked, so it
                 // does not count towards the lockout (an old client still
                 // sending it must not lock its owner out of the browser login).
                 ChainOutcome::NotAccepted => {

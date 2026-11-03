@@ -14,6 +14,9 @@
 //!   duplicating anything, through a search that pages like Nexus' (its
 //!   total is the page's);
 //! * every conflict policy (skip, overwrite, fail) and the dry run;
+//! * a version the feed unlists is unlisted in Forge, also when the feed
+//!   unlists it after a first import; a listing changed in Forge is a
+//!   conflict;
 //! * a failed item is retried on its own (with the password again);
 //!   cancelling and resuming; the preflight's refusals;
 //! * an import that names its packages or images, from a source without a
@@ -1294,6 +1297,219 @@ async fn conflict_policies_and_the_dry_run() {
         nupkg(&srv, &repo, "Acme.Core", "1.0.0").await.unwrap(),
         theirs
     );
+}
+
+/// Whether Forge lists version `version` of `lower`.
+async fn is_listed(srv: &TestServer, repo: &str, lower: &str, version: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT c.listed
+         FROM component c JOIN repository r ON r.id = c.repository_id
+         WHERE r.name = $1 AND c.name = $2 AND c.version = $3",
+    )
+    .bind(repo)
+    .bind(lower)
+    .bind(version)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap()
+}
+
+/// Unlist or relist a version in Forge, as an administrator would.
+async fn set_listed(srv: &TestServer, repo: &str, lower: &str, version: &str, listed: bool) {
+    sqlx::query(
+        "UPDATE component SET listed = $4
+         WHERE repository_id = (SELECT id FROM repository WHERE name = $1)
+           AND name = $2 AND version = $3",
+    )
+    .bind(repo)
+    .bind(lower)
+    .bind(version)
+    .bind(listed)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+}
+
+/// Set whether the feed lists a version (keeping its bytes), with nuget.org's
+/// placeholder publish time while it is unlisted.
+fn list_at_source(source: &Source, id: &str, version: &str, listed: bool) {
+    source.with(|s| {
+        let package = s
+            .feeds
+            .get_mut("nuget-hosted")
+            .unwrap()
+            .iter_mut()
+            .find(|p| p.id == id && p.version == version)
+            .unwrap();
+        package.listed = listed;
+        if !listed {
+            package.published = "1900-01-01T00:00:00+00:00".into();
+        }
+    });
+}
+
+#[tokio::test]
+async fn nuget_versions_unlisted_at_the_source_are_unlisted_in_forge() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    source.nuget(
+        "nuget-hosted",
+        "Acme.Lib",
+        "1.0.0",
+        make_nupkg("Acme.Lib", "1.0.0"),
+        "2021-01-01T00:00:00.000+00:00",
+    );
+    // Retracted at the source, with nuget.org's placeholder date.
+    source.package(
+        "nuget-hosted",
+        Package {
+            id: "Acme.Lib".into(),
+            version: "2.0.0".into(),
+            bytes: make_nupkg("Acme.Lib", "2.0.0"),
+            published: "1900-01-01T00:00:00+00:00".into(),
+            listed: false,
+            hash_listed: true,
+        },
+    );
+    // Listed with no checksum (Nexus): compared after a download.
+    source.package(
+        "nuget-hosted",
+        Package {
+            id: "Acme.Lib".into(),
+            version: "3.0.0".into(),
+            bytes: make_nupkg("Acme.Lib", "3.0.0"),
+            published: "2022-01-01T00:00:00.000+00:00".into(),
+            listed: true,
+            hash_listed: false,
+        },
+    );
+
+    let repo = repo_name("nuget-unlisted");
+    create_repo(&srv, json!({"name": repo, "kind": "hosted"})).await;
+    let id = start(&srv, &repo, from(source.feed_url("nuget-hosted"))).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["imported"], 3, "{done}");
+    // The version the source unlists comes in unlisted; it is still served.
+    assert!(is_listed(&srv, &repo, "acme.lib", "1.0.0").await);
+    assert!(!is_listed(&srv, &repo, "acme.lib", "2.0.0").await);
+    assert!(is_listed(&srv, &repo, "acme.lib", "3.0.0").await);
+    assert!(nupkg(&srv, &repo, "Acme.Lib", "2.0.0").await.is_some());
+    let unlisted = item_of(&srv, &repo, id, "Acme.Lib", "2.0.0").await;
+    assert_eq!(unlisted["detail"], "unlisted", "{unlisted}");
+
+    // The source unlists 1.0.0 (its SHA-512 listed) and 3.0.0 (none) after
+    // the first import, and relists 2.0.0: a later run follows it.
+    list_at_source(&source, "Acme.Lib", "1.0.0", false);
+    list_at_source(&source, "Acme.Lib", "3.0.0", false);
+    list_at_source(&source, "Acme.Lib", "2.0.0", true);
+    let id = start(&srv, &repo, from(source.feed_url("nuget-hosted"))).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["identical"], 3, "{done}");
+    assert!(!is_listed(&srv, &repo, "acme.lib", "1.0.0").await);
+    assert!(is_listed(&srv, &repo, "acme.lib", "2.0.0").await);
+    assert!(!is_listed(&srv, &repo, "acme.lib", "3.0.0").await);
+    for (version, said) in [
+        ("1.0.0", "unlisted"),
+        ("2.0.0", "relisted"),
+        ("3.0.0", "unlisted"),
+    ] {
+        let item = item_of(&srv, &repo, id, "Acme.Lib", version).await;
+        assert_eq!(item["detail"], said, "{item}");
+    }
+
+    // Nothing changed at the source: a third run changes nothing.
+    let id = start(&srv, &repo, from(source.feed_url("nuget-hosted"))).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["progress"]["identical"], 3, "{done}");
+    assert!(items(&srv, &repo, id, None)
+        .await
+        .iter()
+        .all(|i| i["detail"].is_null()));
+}
+
+#[tokio::test]
+async fn a_listing_changed_in_forge_is_a_conflict_on_conflict_decides() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    source.nuget(
+        "nuget-hosted",
+        "Acme.Pin",
+        "1.0.0",
+        make_nupkg("Acme.Pin", "1.0.0"),
+        "2021-01-01T00:00:00.000+00:00",
+    );
+    source.package(
+        "nuget-hosted",
+        Package {
+            id: "Acme.Pin".into(),
+            version: "2.0.0".into(),
+            bytes: make_nupkg("Acme.Pin", "2.0.0"),
+            published: "1900-01-01T00:00:00+00:00".into(),
+            listed: false,
+            hash_listed: true,
+        },
+    );
+    let repo = repo_name("nuget-listing");
+    create_repo(&srv, json!({"name": repo, "kind": "hosted"})).await;
+    let id = start(&srv, &repo, from(source.feed_url("nuget-hosted"))).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert!(!is_listed(&srv, &repo, "acme.pin", "2.0.0").await);
+
+    // An administrator unlists 1.0.0 and relists 2.0.0 in Forge, otherwise
+    // than the source (and the import) has them.
+    set_listed(&srv, &repo, "acme.pin", "1.0.0", false).await;
+    set_listed(&srv, &repo, "acme.pin", "2.0.0", true).await;
+
+    // The dry run reports the conflicts and changes nothing.
+    let mut body = from(source.feed_url("nuget-hosted"));
+    body["dry_run"] = json!(true);
+    let id = start(&srv, &repo, body).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["progress"]["conflict"], 2, "{done}");
+
+    // skip: reported, Forge keeps its listing.
+    let id = start(&srv, &repo, from(source.feed_url("nuget-hosted"))).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["conflict"], 2, "{done}");
+    let pin = item_of(&srv, &repo, id, "Acme.Pin", "1.0.0").await;
+    assert_eq!(
+        pin["detail"], "Forge unlists this version; the source lists it",
+        "{pin}"
+    );
+    let pin = item_of(&srv, &repo, id, "Acme.Pin", "2.0.0").await;
+    assert_eq!(
+        pin["detail"], "Forge lists this version; the source unlists it",
+        "{pin}"
+    );
+    assert!(!is_listed(&srv, &repo, "acme.pin", "1.0.0").await);
+    assert!(is_listed(&srv, &repo, "acme.pin", "2.0.0").await);
+
+    // fail: the import fails on the conflict, and says which.
+    let mut body = from(source.feed_url("nuget-hosted"));
+    body["on_conflict"] = json!("fail");
+    let id = start(&srv, &repo, body).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(
+        done["last_error"].as_str().unwrap().contains("Acme.Pin"),
+        "{done}"
+    );
+    assert!(!is_listed(&srv, &repo, "acme.pin", "1.0.0").await);
+    assert!(is_listed(&srv, &repo, "acme.pin", "2.0.0").await);
+
+    // overwrite: the source's listing replaces Forge's.
+    let mut body = from(source.feed_url("nuget-hosted"));
+    body["on_conflict"] = json!("overwrite");
+    let id = start(&srv, &repo, body).await;
+    let done = run(&srv, &repo, id).await;
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["identical"], 2, "{done}");
+    assert!(is_listed(&srv, &repo, "acme.pin", "1.0.0").await);
+    assert!(!is_listed(&srv, &repo, "acme.pin", "2.0.0").await);
 }
 
 #[tokio::test]

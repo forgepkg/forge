@@ -18,10 +18,12 @@
 //!    user's typed password would leak upstream. A rejection
 //!    from a non-local provider is remembered but does **not** stop the chain
 //!    (a username may exist in a later provider). On its own it never grants.
-//!    [`AuthOutcome::NotAccepted`] (a local account whose realm takes no
-//!    password on this chain) is terminal the same way, and folds into
-//!    [`ChainOutcome::NotAccepted`]: denied like a rejection, but not counted
-//!    towards the sign-in lockout.
+//!    [`AuthOutcome::NotAccepted`] (an account whose realm, local or
+//!    credential-forwarding, takes no password on this chain) is terminal
+//!    from **any** provider, and folds into [`ChainOutcome::NotAccepted`]:
+//!    denied like a rejection, but not counted towards the sign-in lockout.
+//!    The account's password then never reaches the upstream of a realm
+//!    behind its own.
 //! 4. [`AuthOutcome::Unavailable`] is remembered but does **not** grant.
 //!    **Fail closed:** an unreachable upstream can never open a hole — if no
 //!    provider authenticates and an `Unavailable` was seen, the chain reports
@@ -65,9 +67,10 @@ pub enum ChainOutcome {
     /// No provider authenticated and at least one definitively **rejected** the
     /// credential. The caller returns 401 (bad credentials), never anonymous.
     Rejected,
-    /// A local provider owns the username but takes no password for it on
-    /// this chain ([`AuthOutcome::NotAccepted`]): the chain stopped there. The
-    /// caller denies exactly as for [`ChainOutcome::Rejected`] (same status,
+    /// A provider (a local or credential-forwarding realm) owns the username
+    /// but takes no password for it on this chain
+    /// ([`AuthOutcome::NotAccepted`]): the chain stopped there. The caller
+    /// denies exactly as for [`ChainOutcome::Rejected`] (same status,
     /// body and timing), but no password was checked, so the attempt does not
     /// count towards the sign-in lockout.
     NotAccepted,
@@ -155,12 +158,11 @@ impl Chain {
                 AuthOutcome::Rejected if provider.source() == AuthSource::Local => {
                     return (ChainOutcome::Rejected, source);
                 }
-                // A local account whose realm takes no password here: final
-                // like a wrong password (never forwarded), but nothing was
-                // checked.
-                AuthOutcome::NotAccepted if provider.source() == AuthSource::Local => {
-                    return (ChainOutcome::NotAccepted, source);
-                }
+                // An account whose realm (local or credential-forwarding)
+                // takes no password here: final like a local wrong password,
+                // so it is never forwarded to another realm's upstream, but
+                // nothing was checked.
+                AuthOutcome::NotAccepted => return (ChainOutcome::NotAccepted, source),
                 // The local store could not decide (DB error, argon2 overload):
                 // it may still own this username, so do not forward (rule 4).
                 AuthOutcome::Unavailable if provider.source() == AuthSource::Local => {
@@ -168,9 +170,7 @@ impl Chain {
                 }
                 // The database failed: no later provider can decide either.
                 AuthOutcome::Failed => return (ChainOutcome::Failed, source),
-                AuthOutcome::Rejected | AuthOutcome::NotAccepted => {
-                    saw_rejected = saw_rejected.or(source)
-                }
+                AuthOutcome::Rejected => saw_rejected = saw_rejected.or(source),
                 AuthOutcome::Unavailable => saw_unavailable = saw_unavailable.or(source),
                 AuthOutcome::Skip => {}
             }
@@ -627,6 +627,35 @@ mod tests {
         );
         assert_eq!(c1.load(Ordering::SeqCst), 1);
         assert_eq!(c2.load(Ordering::SeqCst), 0, "upstream never consulted");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_realms_not_accepted_is_terminal_and_never_forwarded() {
+        // #756: a credential-forwarding realm that takes no password from
+        // clients owns the name: its account's password stops at its guard
+        // and never reaches the next realm's upstream.
+        let (guard, c1) = StubProvider::new(
+            "realm:b",
+            AuthSource::UpstreamBasic,
+            AuthOutcome::NotAccepted,
+        );
+        let (next, c2) = StubProvider::new(
+            "realm:a",
+            AuthSource::UpstreamBasic,
+            authed("bob", AuthSource::UpstreamBasic),
+        );
+        let chain = Chain::new(vec![Box::new(guard), Box::new(next)]);
+
+        assert_eq!(
+            chain.authenticate(&cred("bob", "pw")).await,
+            ChainOutcome::NotAccepted
+        );
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            c2.load(Ordering::SeqCst),
+            0,
+            "next upstream never consulted"
+        );
     }
 
     #[tokio::test]
