@@ -143,7 +143,9 @@ package through the SHA-256 its index lists.
      with (Nexus' base URL), which need not be one Forge reaches it on. It is
      checked against `dist.integrity` (its SHA-512), or, for an old package
      listed without one, against `dist.shasum`, and must be the package and
-     version the packument names. Then it is written through the same path
+     version the packument names. A version the registry lists with neither
+     fails as its item ("the registry lists no checksum for it"), and the
+     rest of the import goes on. Then it is written through the same path
      as a publish. A version Forge has with the SHA-512 the registry lists is
      skipped without downloading it.
    - A Docker tag is copied like `crane copy`: digests are kept, and the
