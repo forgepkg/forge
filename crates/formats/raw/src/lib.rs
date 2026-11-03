@@ -38,7 +38,6 @@ use forge_plugin_api::{
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "raw",
     name: "Raw files",
-    version: env!("CARGO_PKG_VERSION"),
     description: "Arbitrary files under arbitrary paths, like Nexus' raw repositories: uploads \
                   with PUT or a form, downloads with ranges and checksum sidecars, directory \
                   listings; proxies of any HTTP(S) base URL.",

@@ -120,7 +120,6 @@ impl RepositoryKind {
 /// pub const DESCRIPTOR: Descriptor = Descriptor {
 ///     id: "example",
 ///     name: "Example packages",
-///     version: env!("CARGO_PKG_VERSION"),
 ///     description: "Example packages: push and pull with the example client.",
 ///     kinds: &[RepositoryKind::Hosted, RepositoryKind::Group],
 ///     storage: Storage::Packages,
@@ -140,8 +139,6 @@ pub struct Descriptor {
     pub id: &'static str,
     /// Display name.
     pub name: &'static str,
-    /// The format's own version, its crate's (`env!("CARGO_PKG_VERSION")`).
-    pub version: &'static str,
     /// One line on what the format serves.
     pub description: &'static str,
     /// The repository kinds it supports, each once. `Proxy` only when the

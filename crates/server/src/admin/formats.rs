@@ -5,12 +5,15 @@
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};
+use std::sync::Arc;
+
 use forge_plugin::api::Storage;
+use forge_plugin::FormatPlugin;
 use serde::Serialize;
 
 use crate::state::AppState;
 
-/// One installed format.
+/// One format.
 #[derive(Debug, Serialize)]
 pub struct FormatView {
     /// The format id (`repository.format`).
@@ -22,12 +25,8 @@ pub struct FormatView {
     /// What its repositories hold: `packages` (versions of packages),
     /// `files` (files under paths: raw) or `images` (Docker).
     pub storage: &'static str,
-    /// The plugin's version.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    /// The plugin's description.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    /// One line on what the format serves.
+    pub description: String,
     /// The upload limit of its hosted repositories without one of their own
     /// (for docker, per blob).
     pub default_max_upload_bytes: u64,
@@ -63,15 +62,14 @@ pub struct OptionView {
 pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
     let ceiling = state.config.max_repository_upload_bytes();
-    let view = |plugin: &forge_plugin::Plugin| {
+    let view = |plugin: &Arc<dyn FormatPlugin>| {
         let descriptor = plugin.descriptor();
         FormatView {
             id: plugin.id().to_string(),
             name: descriptor.name.to_string(),
             kinds: kinds(plugin.id()),
             storage: descriptor.storage.as_str(),
-            version: Some(descriptor.version.to_string()),
-            description: Some(descriptor.description.to_string()),
+            description: descriptor.description.to_string(),
             default_max_upload_bytes: state.config.default_upload_limit(descriptor.storage),
             max_upload_bytes_limit: ceiling,
             options: descriptor
@@ -99,6 +97,6 @@ pub async fn list(State(state): State<AppState>) -> Response {
         };
         (group, p.id())
     });
-    let formats: Vec<FormatView> = plugins.into_iter().map(|p| view(p)).collect();
+    let formats: Vec<FormatView> = plugins.into_iter().map(view).collect();
     Json(formats).into_response()
 }

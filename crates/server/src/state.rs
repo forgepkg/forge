@@ -34,6 +34,7 @@ use forge_core::repo::{
 use forge_core::retention::FormatResolver;
 use forge_core::session::SessionService;
 use forge_db::model::{RepoKind, Repository};
+use forge_plugin::FormatPlugin;
 use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
@@ -154,8 +155,8 @@ impl Instance {
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
-/// [`Format`] and its plugin: the built-in format plugins
-/// ([`crate::plugins::builtin`]: Docker / OCI, NuGet, npm, raw).
+/// plugin and the plugin's [`Format`]: the built-in format plugins
+/// ([`crate::plugins::builtin`]: apt, Docker / OCI, NuGet, npm, raw).
 ///
 /// A files format (raw) has a [`Format`] whose [`Format::stores_files`] says
 /// so: its repositories hold files in the file store ([`crate::files`]). An
@@ -165,9 +166,10 @@ impl Instance {
 /// registry, so none of the package seams (parsing, version order, the read
 /// ops) apply to them.
 pub struct FormatRegistry {
+    /// Every format's [`Format`], by format id.
     formats: BTreeMap<String, Arc<dyn Format>>,
     /// Every format's plugin, by format id: its client protocol.
-    plugins: BTreeMap<String, Arc<forge_plugin::Plugin>>,
+    plugins: BTreeMap<String, Arc<dyn FormatPlugin>>,
 }
 
 impl FormatRegistry {
@@ -190,29 +192,16 @@ impl FormatRegistry {
         registry
     }
 
-    /// Add `format` under its [`Format::id`]. An id that is already taken
-    /// (a built-in format's included) is refused: a plugin never shadows
-    /// another format.
-    pub fn with_format(mut self, format: Arc<dyn Format>) -> Result<Self, String> {
-        let id = format.id().to_string();
-        if self.is_installed(&id) {
-            let built_in = self.plugins.contains_key(&id);
-            return Err(if built_in {
-                format!("format {id:?} is built into this server")
-            } else {
-                format!("format {id:?} is already registered")
-            });
-        }
-        self.formats.insert(id, format);
-        Ok(self)
-    }
-
     /// Add a format plugin: its [`Format`] and its client protocol. Its id
     /// must be free: a plugin never replaces another format.
-    pub fn with_plugin(mut self, plugin: Arc<forge_plugin::Plugin>) -> Result<Self, String> {
-        let format = Arc::new(forge_plugin::PluginFormat::new(&plugin));
-        self = self.with_format(format)?;
-        self.plugins.insert(plugin.id().to_string(), plugin);
+    pub fn with_plugin(mut self, plugin: Arc<dyn FormatPlugin>) -> Result<Self, String> {
+        let id = plugin.id();
+        if self.is_installed(id) {
+            return Err(format!("format {id:?} is built into this server"));
+        }
+        let format = Arc::new(forge_plugin::PluginFormat::new(plugin.clone()));
+        self.formats.insert(id.to_string(), format);
+        self.plugins.insert(id.to_string(), plugin);
         Ok(self)
     }
 
@@ -221,13 +210,13 @@ impl FormatRegistry {
         self.formats.get(id).cloned()
     }
 
-    /// The plugin serving format `id`, if it is a plugin format.
-    pub fn plugin(&self, id: &str) -> Option<Arc<forge_plugin::Plugin>> {
+    /// The plugin serving format `id`, if installed.
+    pub fn plugin(&self, id: &str) -> Option<Arc<dyn FormatPlugin>> {
         self.plugins.get(id).cloned()
     }
 
-    /// The plugin formats, by format id.
-    pub fn plugins(&self) -> impl Iterator<Item = &Arc<forge_plugin::Plugin>> {
+    /// The format plugins, by format id.
+    pub fn plugins(&self) -> impl Iterator<Item = &Arc<dyn FormatPlugin>> {
         self.plugins.values()
     }
 
@@ -251,7 +240,7 @@ impl FormatRegistry {
     /// The images format, served under its mount by the registry
     /// ([`crate::images`]): the first, by id, whose repositories hold
     /// images. The built-in formats have one, Docker.
-    pub fn images_plugin(&self) -> Option<Arc<forge_plugin::Plugin>> {
+    pub fn images_plugin(&self) -> Option<Arc<dyn FormatPlugin>> {
         self.plugins
             .values()
             .find(|p| p.descriptor().storage == forge_plugin::api::Storage::Images)
@@ -265,7 +254,7 @@ impl FormatRegistry {
 
     /// The repository kinds format `id` supports, `None` when it is not
     /// installed: what its descriptor names (all three for every built-in
-    /// format: Docker's, NuGet's, npm's and raw's).
+    /// format but apt, which has no groups).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
         let plugin = self.plugins.get(id)?;
         Some(
@@ -468,14 +457,14 @@ impl AppState {
                 realms: self.realms.clone(),
                 pool: self.pool.clone(),
             })),
-            plugin: plugin.implementation().clone(),
+            plugin,
         })
     }
 
     /// Install further format plugins next to the built-in formats (the
     /// tests' own). A plugin whose format id is taken (a built-in plugin, or
     /// another plugin) is an error.
-    pub fn with_plugins(mut self, plugins: Vec<Arc<forge_plugin::Plugin>>) -> Result<Self, String> {
+    pub fn with_plugins(mut self, plugins: Vec<Arc<dyn FormatPlugin>>) -> Result<Self, String> {
         let mut registry =
             FormatRegistry::new(self.config.nuget.limits(), self.config.npm.limits());
         for plugin in plugins {
@@ -736,27 +725,28 @@ impl MemberOpsFactory for MemberFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_core::domain::{FormatError, ParsedUpload};
-    use forge_core::format::ReadSeek;
 
-    /// A format that only has an id.
-    struct Named(&'static str);
+    /// A plugin that takes the id of another format.
+    struct Twin(&'static forge_plugin::Descriptor);
 
-    impl Format for Named {
-        fn id(&self) -> &'static str {
+    impl FormatPlugin for Twin {
+        fn descriptor(&self) -> &'static forge_plugin::Descriptor {
             self.0
         }
-        fn parse_upload(&self, _: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
-            Err(FormatError::InvalidPackage("none".into()))
+        fn handle(
+            &self,
+            _: &forge_plugin::api::Repository,
+            _: &forge_plugin::api::Request,
+        ) -> forge_plugin::api::Action {
+            forge_plugin::api::Action::Respond(forge_plugin::api::Response::text(404, "none"))
         }
-        fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
-            Ok(raw.to_string())
-        }
-        fn compare_versions(&self, a: &str, b: &str) -> std::cmp::Ordering {
-            a.cmp(b)
-        }
-        fn lower_id(&self, id: &str) -> String {
-            id.to_lowercase()
+        fn render(
+            &self,
+            _: &forge_plugin::api::Repository,
+            _: &forge_plugin::api::Request,
+            _: &[forge_plugin::api::Loaded],
+        ) -> forge_plugin::api::Action {
+            forge_plugin::api::Action::Respond(forge_plugin::api::Response::text(404, "none"))
         }
     }
 
@@ -806,10 +796,14 @@ mod tests {
 
     #[test]
     fn a_plugin_cannot_take_dockers_or_a_builtin_plugins_id() {
-        for id in ["docker", "nuget", "npm", "raw"] {
+        for id in ["apt", "docker", "nuget", "npm", "raw"] {
             let registry = FormatRegistry::new(Default::default(), Default::default());
+            let descriptor = Box::leak(Box::new(forge_plugin::Descriptor {
+                id,
+                ..forge_format_nuget::DESCRIPTOR
+            }));
             let err = registry
-                .with_format(Arc::new(Named(id)))
+                .with_plugin(Arc::new(Twin(descriptor)))
                 .err()
                 .expect("refused");
             assert!(err.contains("built into this server"), "{err}");

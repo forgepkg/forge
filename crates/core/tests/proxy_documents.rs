@@ -38,8 +38,7 @@ use sqlx::PgPool;
 use tokio::net::TcpListener;
 
 fn nuget() -> forge_plugin::PluginFormat {
-    let plugin = forge_plugin::Plugin::builtin(forge_format_nuget::Nuget::default());
-    forge_plugin::PluginFormat::new(&plugin)
+    forge_plugin::PluginFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
 }
 
 // ── An upstream feed with conditional listings ──────────────────────────────

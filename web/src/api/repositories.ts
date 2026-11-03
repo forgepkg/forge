@@ -236,19 +236,17 @@ export interface UpdateRepo {
 }
 
 /**
- * An installed package format (`FormatView` of `GET /admin/formats`): the
- * format plugins (NuGet), Docker and raw.
+ * A package format (`FormatView` of `GET /admin/formats`): apt, Docker / OCI,
+ * NuGet, npm and raw, each as its plugin describes it.
  */
 export interface FormatView {
   /** The format id (`RepoView.format`). */
   id: string
   /** Display name. */
   name: string
-  /** The repository kinds it supports (proxy only with a host-side upstream, e.g. NuGet). */
+  /** The repository kinds it supports (apt has no groups). */
   kinds: RepoKind[]
-  /** Plugin version. */
-  version?: string
-  /** Plugin description. */
+  /** One line on what the format serves. */
   description?: string
   /** The upload limit of its hosted repositories without one of their own. */
   default_max_upload_bytes?: number

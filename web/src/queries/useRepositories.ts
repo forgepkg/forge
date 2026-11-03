@@ -85,7 +85,7 @@ export function useFormats() {
   return useQuery<FormatView[], ApiError>({
     queryKey: formatKeys.list(),
     queryFn: ({ signal }) => fetchFormats(signal),
-    // Formats change only when the server restarts with other plugins.
+    // Formats change only with another version of the server.
     staleTime: 5 * 60 * 1000,
   })
 }

@@ -48,7 +48,6 @@ pub const DISTRIBUTION: &str = "distribution";
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "apt",
     name: "apt (Debian/Ubuntu)",
-    version: env!("CARGO_PKG_VERSION"),
     description: "apt repositories for Debian and Ubuntu: upload .deb packages, signed indexes, \
                   installs and upgrades with apt-get; proxies of Debian and Ubuntu mirrors.",
     kinds: &[RepositoryKind::Hosted, RepositoryKind::Proxy],
