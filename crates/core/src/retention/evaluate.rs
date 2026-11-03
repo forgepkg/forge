@@ -32,7 +32,8 @@
 //!    it was published — so a fresh push is not cold on its first run),
 //!    `prerelease_superseded_for_days` (a prerelease or snapshot, once the
 //!    first listed release of its package that orders after it has been
-//!    published that long), `unlisted_for_days` (unlisted that long, by
+//!    published that long, counted from the prerelease's own publication
+//!    when that came later), `unlisted_for_days` (unlisted that long, by
 //!    `unlisted_at`) and `max_versions_per_package` (not among the newest N
 //!    of its partition of the pool, listed or not).
 //! 5. Protection overrides selection. Otherwise the highest-severity action
@@ -445,7 +446,10 @@ fn triggers_match(
         any_trigger = true;
         // A release is never superseded; a prerelease only by a release.
         let release = inputs.superseded_by?;
-        if days_since(now, release.created_at) < days as i64 {
+        // The clock starts when both exist: a prerelease published after its
+        // release (a lagging CI bump, a maintenance line) has its N days too.
+        let since = release.created_at.max(cand.created_at);
+        if days_since(now, since) < days as i64 {
             return None;
         }
         reason.prerelease_superseded_for_days = Some(days);
@@ -2452,6 +2456,43 @@ mod tests {
             &cands,
         );
         assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn a_prerelease_published_after_its_release_has_its_days_too() {
+        // 2.3.0 has been out for 30 days; CI's lagging bump published
+        // 2.3.0-ci.500 today and 2.3.0-ci.499 20 days ago. A maintenance
+        // line's 1.9.1-rc.1 came out 3 days ago, months after 2.0.0.
+        let cands = vec![
+            comp(1, "lib", "1.9.1-rc.1", 3, None),
+            comp(2, "lib", "2.0.0", 200, None),
+            comp(3, "lib", "2.3.0-ci.1", 60, None),
+            comp(4, "lib", "2.3.0", 30, None),
+            comp(5, "lib", "2.3.0-ci.499", 20, None),
+            comp(6, "lib", "2.3.0-ci.500", 0, None),
+        ];
+        let d = evaluate(
+            &fmt(),
+            now(),
+            &hard_delete(superseded(14)),
+            &Selectors::none(),
+            &cands,
+        );
+        // ci.1 counts from 2.3.0 (30 days), ci.499 from itself (20 days);
+        // ci.500 and rc.1 are younger than 14 days.
+        assert_eq!(deleted_versions(&d), vec!["2.3.0-ci.1", "2.3.0-ci.499"]);
+        let late = d.iter().find(|d| d.version == "2.3.0-ci.499").unwrap();
+        assert_eq!(late.reason.superseded_by.as_deref(), Some("2.3.0"));
+
+        // 25 days: ci.1 still goes, ci.499 (20 days old) stays.
+        let d = evaluate(
+            &fmt(),
+            now(),
+            &hard_delete(superseded(25)),
+            &Selectors::none(),
+            &cands,
+        );
+        assert_eq!(deleted_versions(&d), vec!["2.3.0-ci.1"]);
     }
 
     #[test]

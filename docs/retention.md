@@ -188,7 +188,7 @@ needs a trigger; a rule with protections only is refused.
 | --- | --- |
 | `older_than_days` | published at least N days ago. |
 | `not_downloaded_for_days` | not downloaded for N days; a version never downloaded counts from its publication. |
-| `prerelease_superseded_for_days` | that is a prerelease (or a snapshot) once its package has had, for N days, a **listed release that comes after it**: for SemVer, a release of the same or a higher version, so `2.3.0-ci.417` goes 14 days after `2.3.0` (or `2.4.0`) was published. The clock starts at the first such release's publication. A release is never selected. |
+| `prerelease_superseded_for_days` | that is a prerelease (or a snapshot) once its package has had, for N days, a **listed release that comes after it**: for SemVer, a release of the same or a higher version, so `2.3.0-ci.417` goes 14 days after `2.3.0` (or `2.4.0`) was published. The clock starts at the first such release's publication, or at the prerelease's own when it was published later (a lagging CI bump, a maintenance line's `1.9.1-rc.1` after `2.0.0`): a prerelease always has its N days. A release is never selected. |
 | `unlisted_for_days` | that has been unlisted for N days (a listed version never). Only on `hard_delete` rules: the second step of "unlist, then delete later". |
 | `max_versions_per_package` | that is not among the N newest versions of its package (listed or not) the rule's filters admit. A pure count: no age needed. |
 
