@@ -195,9 +195,8 @@ pub struct AsnShare {
 /// A client network's requests.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct ClientShare {
+    /// The address, or an IPv6 address's /64: no address is kept whole.
     pub network: String,
-    /// The last address of the network seen.
-    pub address: String,
     pub country: String,
     pub asn: u32,
     pub as_org: String,
@@ -354,9 +353,6 @@ pub async fn overview(
             tally.days.insert(row.day);
             if tally.latest.is_none_or(|latest| row.day >= latest) {
                 tally.latest = Some(row.day);
-                if !row.address.is_empty() {
-                    client.address.clone_from(&row.address);
-                }
                 if !row.country.is_empty() || row.asn != 0 {
                     client.country.clone_from(&row.country);
                     client.asn = u32::try_from(row.asn).unwrap_or(0);

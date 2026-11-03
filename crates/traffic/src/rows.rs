@@ -26,7 +26,9 @@ pub(crate) struct DayRow {
     /// The client network: the address, or an IPv6 address's /64; `""` with
     /// client addresses switched off, `other` past the day's bound.
     pub network: String,
-    /// The last address of the network seen; `""` with addresses off.
+    /// The address the network was located by: the IPv4 address, the first
+    /// address of an IPv6 /64 (an IPv6 address is never kept whole); `""`
+    /// with addresses off.
     pub address: String,
     /// The ISO 3166-1 code of the country the network is in; `""` unknown.
     pub country: String,

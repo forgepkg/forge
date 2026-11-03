@@ -1,18 +1,48 @@
 //! Reading a binary package (`.deb`, deb(5)): an `ar` archive holding
 //! `debian-binary`, then `control.tar[.gz|.xz|.zst]`, then the data. Only
 //! the `control` file of the control member is read; the data is never
-//! touched, and every member is read within bounds, so a package that
-//! inflates without end fails fast.
+//! touched, and every member is read within bounds, in time and in memory:
+//! a package that inflates without end fails fast, and what it holds while
+//! it does follows [`MAX_CONTROL_TAR_BYTES`], not what it inflates to
+//! (#815).
 
 use std::io::{self, Read, Seek, SeekFrom};
+
+use ruzstd::decoding::errors::FrameDecoderError;
 
 use crate::control::MAX_CONTROL_BYTES;
 
 /// The largest control member read (compressed).
 pub const MAX_CONTROL_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The most the control member may inflate to.
-pub const MAX_CONTROL_TAR_BYTES: u64 = 256 * 1024 * 1024;
+/// The most the control member may inflate to up to the end of its
+/// `control` file; what follows is not read. The `control` file is at most
+/// [`MAX_CONTROL_BYTES`]. dpkg-deb sorts the member, so little comes before
+/// it (`conffiles`, `config`); a builder that puts `md5sums` first stays
+/// below the bound up to some 70,000 files.
+///
+/// It also bounds what the xz decoder holds: its window grows with what it
+/// decodes, up to the dictionary the stream declares.
+pub const MAX_CONTROL_TAR_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The largest dictionary an xz control member may declare: `xz -9`'s.
+/// dpkg-deb compresses the control member like the data, so `-Zxz -z9`
+/// declares it. The window is filled only as far as the member inflates
+/// ([`MAX_CONTROL_TAR_BYTES`]); the bound refuses a stream that asks for
+/// more (up to 4 GiB).
+pub const MAX_XZ_DICTIONARY_BYTES: u32 = 64 * 1024 * 1024;
+
+/// The largest window a zstd control member may declare: level 19's, which
+/// dpkg-deb `-Zzstd -z19` declares for a control member it streams (levels
+/// 20 to 22 declare 32 to 128 MiB). The decoder hands out nothing of a
+/// frame until it has decoded a window more, so it holds the whole window:
+/// the bound is what the member may inflate to.
+pub const MAX_ZSTD_WINDOW_BYTES: u64 = MAX_CONTROL_TAR_BYTES;
+
+/// The largest GNU long name or long link, or PAX extended header, read
+/// from the control member. They give a path or a link target, a few
+/// hundred bytes; the cap is the npm tarball reader's.
+pub const MAX_EXTENSION_BYTES: u64 = 64 * 1024;
 
 /// The most members looked at before the control member.
 const MAX_MEMBERS: usize = 16;
@@ -127,19 +157,38 @@ pub fn control_file<R: Read + Seek + ?Sized>(reader: &mut R) -> Result<Vec<u8>, 
                 let tar: Box<dyn Read + '_> = match &name["control.tar".len()..] {
                     "" => Box::new(compressed),
                     ".gz" => Box::new(flate2::read::GzDecoder::new(compressed)),
-                    ".xz" => Box::new(lzma_rust2::XzReader::new(compressed, true)),
-                    ".zst" => {
-                        Box::new(ruzstd::decoding::StreamingDecoder::new(compressed).map_err(
-                            |e| DebError::Invalid(format!("the control member is not zstd: {e}")),
-                        )?)
-                    }
+                    ".xz" => Box::new(lzma_rust2::XzReader::new_mem_limit(
+                        compressed,
+                        true,
+                        lzma_rust2::lzma2_get_memory_usage(MAX_XZ_DICTIONARY_BYTES),
+                    )),
+                    ".zst" => Box::new(
+                        ruzstd::decoding::StreamingDecoder::new_with_max_window_size(
+                            compressed,
+                            MAX_ZSTD_WINDOW_BYTES,
+                        )
+                        .map_err(|e| match e {
+                            FrameDecoderError::WindowSizeTooBig { .. } => {
+                                window_too_large("zstd window", MAX_ZSTD_WINDOW_BYTES)
+                            }
+                            e => DebError::Invalid(format!("the control member is not zstd: {e}")),
+                        })?,
+                    ),
                     other => {
                         return invalid(format!(
                             "the control member is compressed with an unsupported method ({other})"
                         ))
                     }
                 };
-                return control_in_tar(tar.take(MAX_CONTROL_TAR_BYTES));
+                let mut tar = tar.take(MAX_CONTROL_TAR_BYTES);
+                // Whatever failed once the bound is reached failed for it.
+                return control_in_tar(&mut tar).map_err(|e| match tar.limit() {
+                    0 => DebError::Invalid(format!(
+                        "the control member inflates to more than {} MiB before its control file",
+                        MAX_CONTROL_TAR_BYTES >> 20
+                    )),
+                    _ => e,
+                });
             }
             other => {
                 return invalid(format!(
@@ -152,17 +201,111 @@ pub fn control_file<R: Read + Seek + ?Sized>(reader: &mut R) -> Result<Vec<u8>, 
     invalid("not a Debian package: no control member")
 }
 
+fn window_too_large(what: &str, max: u64) -> DebError {
+    DebError::Invalid(format!(
+        "the control member's {what} is larger than {} MiB",
+        max >> 20
+    ))
+}
+
+/// A read of the inflated control member failed. The xz decoder fails with
+/// `OutOfMemory` on a dictionary over [`MAX_XZ_DICTIONARY_BYTES`], before
+/// it allocates any of it.
+fn unreadable(e: io::Error) -> DebError {
+    if e.kind() == io::ErrorKind::OutOfMemory {
+        return window_too_large("xz dictionary", MAX_XZ_DICTIONARY_BYTES.into());
+    }
+    DebError::Invalid(format!("the control member is not a tar archive: {e}"))
+}
+
+/// The data of `entry`, a GNU long name or long link or a PAX extended
+/// header of `size` bytes: one larger than [`MAX_EXTENSION_BYTES`] is
+/// refused before any of it is read.
+fn extension(entry: &mut impl Read, size: u64, what: &str) -> Result<Vec<u8>, DebError> {
+    if size > MAX_EXTENSION_BYTES {
+        return invalid(format!(
+            "the control member has a {what} larger than {MAX_EXTENSION_BYTES} bytes"
+        ));
+    }
+    let mut data = Vec::with_capacity(size as usize);
+    entry.read_to_end(&mut data).map_err(unreadable)?;
+    Ok(data)
+}
+
 /// The `control` file inside a control tarball.
+///
+/// The entries are read raw: `tar` would read a GNU long name or long link,
+/// or a PAX extended header, whole before it hands back the entry it
+/// describes, however large its header says it is (#815). They are read
+/// here instead, bounded ([`extension`]), and applied as `tar` applies
+/// them: at most one of each kind before an entry, its path the long name's,
+/// else the PAX `path`, else the header's own. A PAX `size` other than the
+/// header's (it would lay the archive out otherwise than `tar` reads it
+/// raw) and a GNU sparse entry (its map follows the header) are refused; a
+/// control member has neither.
 fn control_in_tar(tar: impl Read) -> Result<Vec<u8>, DebError> {
     let mut archive = tar::Archive::new(tar);
-    let entries = archive
-        .entries()
-        .map_err(|e| DebError::Invalid(format!("the control member is not a tar archive: {e}")))?;
+    let entries = archive.entries().map_err(unreadable)?.raw(true);
+    // What the extension entries before the next entry say of it.
+    let mut long_name: Option<Vec<u8>> = None;
+    let mut long_link = false;
+    let mut pax: Option<Vec<u8>> = None;
     for entry in entries {
-        let mut entry = entry.map_err(|e| {
-            DebError::Invalid(format!("the control member is not a tar archive: {e}"))
-        })?;
-        let path = entry.path_bytes().into_owned();
+        let mut entry = entry.map_err(unreadable)?;
+        let kind = entry.header().entry_type();
+        let size = entry.size();
+        if kind.is_gnu_longname() {
+            if long_name.is_some() {
+                return invalid("the control member has two GNU long names for one entry");
+            }
+            long_name = Some(extension(&mut entry, size, "GNU long name")?);
+            continue;
+        }
+        if kind.is_gnu_longlink() {
+            if long_link {
+                return invalid("the control member has two GNU long links for one entry");
+            }
+            extension(&mut entry, size, "GNU long link")?;
+            long_link = true;
+            continue;
+        }
+        if kind.is_pax_local_extensions() {
+            if pax.is_some() {
+                return invalid("the control member has two PAX headers for one entry");
+            }
+            pax = Some(extension(&mut entry, size, "PAX header")?);
+            continue;
+        }
+        if kind.is_gnu_sparse() {
+            return invalid("the control member holds a sparse file");
+        }
+        let mut pax_path = None;
+        for record in tar::PaxExtensions::new(pax.as_deref().unwrap_or_default()) {
+            let record = record.map_err(|e| {
+                DebError::Invalid(format!("the control member has a damaged PAX header: {e}"))
+            })?;
+            match record.key_bytes() {
+                b"path" => pax_path = Some(record.value_bytes().to_vec()),
+                b"size" if record.value().ok().and_then(|v| v.parse().ok()) != Some(size) => {
+                    return invalid(
+                        "the control member's PAX header gives an entry another size than its own",
+                    );
+                }
+                _ => {}
+            }
+        }
+        let path = match long_name.take() {
+            // A GNU long name ends with a NUL.
+            Some(mut name) => {
+                if name.last() == Some(&0) {
+                    name.pop();
+                }
+                name
+            }
+            None => pax_path.unwrap_or_else(|| entry.path_bytes().into_owned()),
+        };
+        long_link = false;
+        pax = None;
         let path = path.strip_prefix(b"./").unwrap_or(&path);
         if path != b"control" {
             continue;
@@ -179,6 +322,10 @@ fn control_in_tar(tar: impl Read) -> Result<Vec<u8>, DebError> {
             .take(MAX_CONTROL_BYTES as u64)
             .read_to_end(&mut control)
             .map_err(|e| DebError::Invalid(format!("the control file could not be read: {e}")))?;
+        // `tar` ends an entry quietly where the member ends.
+        if control.len() as u64 != entry.size() {
+            return invalid("the package's control file is cut short");
+        }
         return Ok(control);
     }
     invalid("the package has no control file")
@@ -189,39 +336,60 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Cursor, Write};
 
+    /// The compressions a control member comes in.
+    const METHODS: [&str; 4] = ["", "gz", "xz", "zst"];
+
     /// A `.deb` of `control`, its control member compressed by `method`
-    /// (`""`, `gz`, `xz`), with a small data member.
+    /// (one of [`METHODS`]), with a small data member.
     pub(crate) fn deb(control: &str, method: &str) -> Vec<u8> {
         let mut tar = tar::Builder::new(Vec::new());
+        append(&mut tar, "./control", control.as_bytes());
+        package(&tar.into_inner().unwrap(), method)
+    }
+
+    /// Append a file of `data` at `path` to `tar`.
+    fn append(tar: &mut tar::Builder<Vec<u8>>, path: &str, data: &[u8]) {
         let mut header = tar::Header::new_gnu();
-        header.set_size(control.len() as u64);
+        header.set_size(data.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        tar.append_data(&mut header, "./control", control.as_bytes())
-            .unwrap();
-        let tar = tar.into_inner().unwrap();
-        let (name, member) = match method {
-            "" => ("control.tar".to_string(), tar),
+        tar.append_data(&mut header, path, data).unwrap();
+    }
+
+    /// A `.deb` whose control member is `tar`, compressed by `method`.
+    fn package(tar: &[u8], method: &str) -> Vec<u8> {
+        let name = match method {
+            "" => "control.tar".to_string(),
+            method => format!("control.tar.{method}"),
+        };
+        ar(&[
+            ("debian-binary", b"2.0\n".to_vec()),
+            (&name, compress(tar, method)),
+            ("data.tar", vec![0u8; 1024]),
+        ])
+    }
+
+    fn compress(tar: &[u8], method: &str) -> Vec<u8> {
+        match method {
+            "" => tar.to_vec(),
             "gz" => {
                 let mut gz =
                     flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-                gz.write_all(&tar).unwrap();
-                ("control.tar.gz".to_string(), gz.finish().unwrap())
+                gz.write_all(tar).unwrap();
+                gz.finish().unwrap()
             }
             "xz" => {
                 let mut xz =
                     lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(6))
                         .unwrap();
-                xz.write_all(&tar).unwrap();
-                ("control.tar.xz".to_string(), xz.finish().unwrap())
+                xz.write_all(tar).unwrap();
+                xz.finish().unwrap()
+            }
+            "zst" => {
+                ruzstd::encoding::compress_to_vec(tar, ruzstd::encoding::CompressionLevel::Fastest)
             }
             other => panic!("{other}"),
-        };
-        ar(&[
-            ("debian-binary", b"2.0\n".to_vec()),
-            (&name, member),
-            ("data.tar", vec![0u8; 1024]),
-        ])
+        }
     }
 
     pub(crate) fn ar(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
@@ -251,7 +419,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_the_control_file_of_every_compression() {
-        for method in ["", "gz", "xz"] {
+        for method in METHODS {
             let deb = deb(CONTROL, method);
             assert_eq!(
                 control_file(&mut Cursor::new(deb)).unwrap(),
@@ -308,5 +476,248 @@ pub(crate) mod tests {
         ]);
         let err = control_file(&mut Cursor::new(deb)).unwrap_err();
         assert!(err.to_string().contains("no control file"), "{err}");
+    }
+
+    /// A raw tar header of `kind` and `size` named `path`.
+    fn raw_header(path: &str, kind: tar::EntryType, size: u64) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(kind);
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        header.as_bytes().to_vec()
+    }
+
+    /// A raw tar entry of `kind` holding `data`.
+    fn raw_entry(path: &str, kind: tar::EntryType, data: &[u8]) -> Vec<u8> {
+        let mut entry = raw_header(path, kind, data.len() as u64);
+        entry.extend_from_slice(data);
+        entry.resize(entry.len().next_multiple_of(512), 0);
+        entry
+    }
+
+    /// The entries `tar` holds, without the end of the archive.
+    fn entries(tar: tar::Builder<Vec<u8>>) -> Vec<u8> {
+        tar.get_ref().clone()
+    }
+
+    /// `prefix` (entries), then a `./control` file of [`CONTROL`].
+    fn with_control(prefix: Vec<u8>) -> Vec<u8> {
+        let mut tar = tar::Builder::new(prefix);
+        append(&mut tar, "./control", CONTROL.as_bytes());
+        tar.into_inner().unwrap()
+    }
+
+    fn refusal(tar: &[u8], method: &str) -> String {
+        match control_file(&mut Cursor::new(package(tar, method))) {
+            Err(DebError::Invalid(m)) => m,
+            other => panic!("{method:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_names_long_links_and_pax_headers_are_refused_before_they_are_read() {
+        // The header says 256 MiB; the member does not hold them, and the
+        // header alone is refused (#815).
+        for (kind, what) in [
+            (tar::EntryType::GNULongName, "GNU long name"),
+            (tar::EntryType::GNULongLink, "GNU long link"),
+            (tar::EntryType::XHeader, "PAX header"),
+        ] {
+            let mut tar = raw_header("././@LongLink", kind, 256 << 20);
+            tar.extend_from_slice(&[b'a'; 4096]);
+            for method in METHODS {
+                let refusal = refusal(&tar, method);
+                assert!(
+                    refusal.contains(&format!("{what} larger than {MAX_EXTENSION_BYTES} bytes")),
+                    "{method:?}: {refusal}"
+                );
+            }
+        }
+        // Up to the bound they are read.
+        let name = format!("./{}\0", "d/".repeat(MAX_EXTENSION_BYTES as usize / 2 - 2));
+        assert_eq!(name.len() as u64, MAX_EXTENSION_BYTES - 1);
+        let mut tar = raw_entry(
+            "././@LongLink",
+            tar::EntryType::GNULongName,
+            name.as_bytes(),
+        );
+        tar.extend(raw_entry("./d", tar::EntryType::Directory, b""));
+        let deb = package(&with_control(tar), "gz");
+        assert_eq!(
+            control_file(&mut Cursor::new(deb)).unwrap(),
+            CONTROL.as_bytes()
+        );
+    }
+
+    #[test]
+    fn long_names_and_pax_paths_name_the_next_entry() {
+        let pax = |records: &[(&str, &str)]| {
+            let mut tar = tar::Builder::new(Vec::new());
+            tar.append_pax_extensions(records.iter().map(|(k, v)| (*k, v.as_bytes())))
+                .unwrap();
+            entries(tar)
+        };
+        let named = |prefix: Vec<u8>, path: &str| {
+            let mut tar = tar::Builder::new(prefix);
+            append(&mut tar, path, CONTROL.as_bytes());
+            tar.into_inner().unwrap()
+        };
+        let long_name = |name: &str| {
+            raw_entry(
+                "././@LongLink",
+                tar::EntryType::GNULongName,
+                name.as_bytes(),
+            )
+        };
+        let size = CONTROL.len().to_string();
+        // What `tar` writes for a path over 100 bytes, before the control file.
+        let mut tar = tar::Builder::new(Vec::new());
+        append(&mut tar, &format!("./{}/md5sums", "d".repeat(150)), b"abc");
+        let read = [
+            with_control(entries(tar)),
+            named(long_name("./control\0"), "./other"),
+            named(pax(&[("path", "./control")]), "./other"),
+            named(pax(&[("path", "./control"), ("size", &size)]), "./other"),
+            // The long name comes first, as `tar` reads them.
+            named(
+                [long_name("control"), pax(&[("path", "other")])].concat(),
+                "x",
+            ),
+        ];
+        for tar in read {
+            for method in METHODS {
+                let deb = package(&tar, method);
+                assert_eq!(
+                    control_file(&mut Cursor::new(deb)).unwrap(),
+                    CONTROL.as_bytes()
+                );
+            }
+        }
+        let refused = [
+            (
+                named(long_name("./other\0"), "./control"),
+                "no control file",
+            ),
+            (
+                named(pax(&[("path", "./other")]), "./control"),
+                "no control file",
+            ),
+            (named(pax(&[("size", "1")]), "./control"), "another size"),
+            (named(pax(&[("size", "lots")]), "./control"), "another size"),
+            (
+                named([long_name("a"), long_name("control")].concat(), "x"),
+                "two GNU long names",
+            ),
+            (
+                named(
+                    [pax(&[("mtime", "1")]), pax(&[("path", "control")])].concat(),
+                    "x",
+                ),
+                "two PAX headers",
+            ),
+            (
+                with_control(raw_entry("./sparse", tar::EntryType::GNUSparse, b"")),
+                "sparse",
+            ),
+        ];
+        for (tar, why) in refused {
+            let refusal = refusal(&tar, "");
+            assert!(refusal.contains(why), "{why}: {refusal}");
+        }
+    }
+
+    #[test]
+    fn a_control_member_is_read_up_to_its_bound() {
+        let bound = MAX_CONTROL_TAR_BYTES as usize;
+        // What comes before the control file, and the control file itself.
+        let before = |size: usize| {
+            let mut tar = tar::Builder::new(Vec::new());
+            append(&mut tar, "./md5sums", &vec![b'0'; size]);
+            with_control(entries(tar))
+        };
+        // The md5sums header and data, the control file's header, then its
+        // data in the last block below the bound.
+        let fits = before(bound - 3 * 512);
+        assert_eq!(
+            fits.len(),
+            bound + 2 * 512,
+            "the end of the archive follows"
+        );
+        for method in ["", "zst"] {
+            let deb = package(&fits, method);
+            assert_eq!(
+                control_file(&mut Cursor::new(deb)).unwrap(),
+                CONTROL.as_bytes()
+            );
+            // The control file's data starts at the bound, which cuts it
+            // short; the md5sums run past it.
+            for size in [bound - 2 * 512, bound] {
+                let refusal = refusal(&before(size), method);
+                assert!(refusal.contains("inflates to more than 8 MiB"), "{refusal}");
+            }
+        }
+    }
+
+    /// `xz` (one block) with its LZMA2 dictionary property set to `prop`.
+    fn declare_xz_dictionary(xz: &mut [u8], prop: u8) {
+        // The block header follows the 12-byte stream header: its size,
+        // flags without sizes, one filter (LZMA2, one property byte), its
+        // padding and CRC32.
+        let size = (xz[12] as usize + 1) * 4;
+        assert_eq!(&xz[13..16], [0x00, 0x21, 0x01]);
+        xz[16] = prop;
+        let mut crc = flate2::Crc::new();
+        crc.update(&xz[12..12 + size - 4]);
+        xz[12 + size - 4..12 + size].copy_from_slice(&crc.sum().to_le_bytes());
+    }
+
+    /// A zstd frame of `data` in raw blocks, declaring a window of
+    /// `2^log` bytes.
+    fn zstd_with_window(data: &[u8], log: u8) -> Vec<u8> {
+        // Magic, no content size, checksum or dictionary, the window.
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, (log - 10) << 3];
+        let mut blocks = data.chunks(64 * 1024).peekable();
+        while let Some(block) = blocks.next() {
+            // Last_Block, Block_Type 0 (raw), Block_Size.
+            let header = u32::from(blocks.peek().is_none()) | (block.len() as u32) << 3;
+            frame.extend_from_slice(&header.to_le_bytes()[..3]);
+            frame.extend_from_slice(block);
+        }
+        frame
+    }
+
+    #[test]
+    fn a_compression_window_over_the_bound_is_refused() {
+        let tar = with_control(Vec::new());
+        let deb = |name: &str, member: Vec<u8>| {
+            ar(&[("debian-binary", b"2.0\n".to_vec()), (name, member)])
+        };
+        // xz: `-6`'s 8 MiB, `-9`'s 64 MiB; 96 MiB, 4 GiB.
+        for (prop, fits) in [(22, true), (28, true), (29, false), (40, false)] {
+            let mut xz = compress(&tar, "xz");
+            declare_xz_dictionary(&mut xz, prop);
+            let read = control_file(&mut Cursor::new(deb("control.tar.xz", xz)));
+            match read {
+                Ok(control) if fits => assert_eq!(control, CONTROL.as_bytes()),
+                Err(DebError::Invalid(m)) if !fits => {
+                    assert!(m.contains("xz dictionary is larger than 64 MiB"), "{m}")
+                }
+                other => panic!("{prop}: {other:?}"),
+            }
+        }
+        // zstd: level 19's 8 MiB; level 20's 32 MiB, level 22's 128 MiB.
+        for (log, fits) in [(23, true), (24, false), (25, false), (27, false)] {
+            let zst = zstd_with_window(&tar, log);
+            let read = control_file(&mut Cursor::new(deb("control.tar.zst", zst)));
+            match read {
+                Ok(control) if fits => assert_eq!(control, CONTROL.as_bytes()),
+                Err(DebError::Invalid(m)) if !fits => {
+                    assert!(m.contains("zstd window is larger than 8 MiB"), "{m}")
+                }
+                other => panic!("{log}: {other:?}"),
+            }
+        }
     }
 }

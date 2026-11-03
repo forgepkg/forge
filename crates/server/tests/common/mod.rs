@@ -126,19 +126,19 @@ pub async fn pool() -> PgPool {
     pool
 }
 
-/// A pool on the shared database with at most `max_connections` connections,
-/// which gives up on a connection after `acquire_timeout`: for a server
-/// whose pool a test means to run short (`database.max_connections`).
-pub async fn small_pool(max_connections: u32, acquire_timeout: Duration) -> PgPool {
+/// A pool on the shared database the way `main` builds the server's
+/// ([`forge_db::connect_with`]): at most `max_connections`
+/// (`database.max_connections`), giving up on a free one after
+/// `acquire_timeout` (`database.acquire_timeout_seconds`). For a test of what
+/// a server does with a pool that small.
+pub async fn sized_pool(max_connections: u32, acquire_timeout: Duration) -> PgPool {
+    // Migrates the shared database first.
     pool().await.close().await;
     let url = match std::env::var("FORGE_TEST_DATABASE_URL") {
         Ok(url) => url,
         Err(_) => format!("postgres://forge:forge@{}/forge", pg_endpoint().await),
     };
-    PgPoolOptions::new()
-        .max_connections(max_connections)
-        .acquire_timeout(acquire_timeout)
-        .connect(&url)
+    forge_db::connect_with(&url, max_connections, acquire_timeout)
         .await
         .expect("connect")
 }

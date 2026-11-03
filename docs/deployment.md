@@ -698,7 +698,7 @@ authorization server metadata ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414
 | --- | --- | --- |
 | `GET` | `/.well-known/oauth-authorization-server` | `issuer` (`server.public_base_url`), `device_authorization_endpoint`, `token_endpoint`, `grant_types_supported` (`urn:ietf:params:oauth:grant-type:device_code`). |
 | `POST` | `/auth/device/code` | Start a login (RFC 8628 §3.1): `client_id` and an optional `scope`, form-encoded. Answers `device_code`, `user_code`, `verification_uri` (`<base>/device`), `verification_uri_complete` (`<base>/device?code=BCDF-GHJK`), `expires_in` and `interval`. |
-| `POST` | `/auth/device/token` | Poll it (§3.4): `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Answers `authorization_pending` until the user decides, `slow_down` when polled sooner than the interval (which then grows by five seconds) or too often ([polling](#device-login), below), `access_denied`, `expired_token`, or the token: `access_token`, `token_type` `Bearer`, `expires_in`, `scope` when one was asked for, and `username`, whose token it is. |
+| `POST` | `/auth/device/token` | Poll it (§3.4): `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Answers `authorization_pending` until the user decides, `slow_down` when polled sooner than the interval (which then grows by five seconds), while another poll of the same code is answered, or too often ([polling](#device-login), below), `access_denied`, `expired_token`, or the token: `access_token`, `token_type` `Bearer`, `expires_in`, `scope` when one was asked for, and `username`, whose token it is. |
 
 ```bash
 curl -s https://forge.example.com/auth/device/code \
@@ -745,11 +745,9 @@ sign-ins) or polls too often (`auth.device_polls_per_minute`).
   `auth.device_polls_per_minute` a minute (600; `0`: no limit), past which a
   poll is answered `429` `slow_down` with `Retry-After: 60`; and per device
   code, ten every ten seconds (one a second, the shortest interval), past
-  which it is answered `slow_down`. Polls of one code are answered one at a
-  time: a poll that comes while another poll of the code is being answered
-  is told `slow_down` at once, rather than waiting for it with a database
-  connection. Raise `auth.device_polls_per_minute` when many users sign in
-  at once from behind one address, or set `auth.trusted_proxy_cidrs` when
+  which it is answered `slow_down`. Raise `auth.device_polls_per_minute`
+  when many users sign in at once from behind one address, or set
+  `auth.trusted_proxy_cidrs` when
   every client seems to come from Forge's reverse proxy.
 
   ```toml
@@ -1529,17 +1527,24 @@ them from the bucket and sums them: it needs no Redis and no call between
 instances. The files are plain Parquet, so DuckDB, pandas or Spark read them
 too.
 
-What is recorded and how long it is kept (90 days by default) is set under
-**Admin → Traffic → Settings** (`/admin/settings/traffic`), for every
-instance at once. Each instance deletes the days past the retention about
-once an hour, whichever instance wrote them.
+Requests and client addresses are recorded unless an administrator turns
+them off. What is recorded and how long it is kept (14 days by default) is
+set under **Admin → Traffic → Settings** (`/admin/settings/traffic`), for
+every instance at once. Each instance deletes the days past the retention,
+and the client addresses they hold, about once an hour, whichever instance
+wrote them. A longer retention keeps the addresses as long: to keep the
+counts for months, consider turning **Client addresses** off.
 
 - **Client addresses are personal data.** The address is the one Forge
   resolves for the login lockout: the socket peer, or the `X-Forwarded-For`
   of a [trusted proxy](#reverse-proxy). An IPv6 client is counted by its
-  /64. With **Client addresses** off, requests are still counted by
-  repository, country and autonomous system: the address is looked up in
-  memory and dropped before anything is written.
+  /64, and only the /64 is kept: the rest of the address is dropped before
+  the request is counted. The files' `network` column holds the IPv4
+  address or the IPv6 /64, and their `address` column the address the
+  network was located by (the IPv4 address, the first address of the /64).
+  With **Client addresses** off, requests are still counted by repository,
+  country and autonomous system: the address is looked up in memory and
+  dropped before anything is written, and both columns stay empty.
 - **Accuracy.** Today fills in as the instances write it, once a minute. An
   instance that stops writes what it counted on a graceful shutdown; one
   that is killed loses its last minute. Past 500,000 clients a day on one
