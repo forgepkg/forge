@@ -2969,6 +2969,98 @@ async fn a_downloading_layer_that_does_not_match_its_digest_is_cut_short() {
     assert!(linked_soon(&srv, &proxy).await, "cached");
 }
 
+/// A group of two proxies whose first member's upstream breaks off in the
+/// middle of a layer, or sends bytes that do not match its digest: the pull
+/// that reaches it is cut short (the layer is served while it downloads),
+/// and the client's retry is served by the second member, which caches the
+/// layer. The first member is not asked again (#791).
+#[tokio::test]
+async fn a_group_retries_a_layer_from_the_next_member_after_a_failed_download() {
+    group_falls_back_after_a_failed_download(Failing::Reset).await;
+}
+
+#[tokio::test]
+async fn a_group_retries_a_layer_from_the_next_member_after_a_wrong_download() {
+    group_falls_back_after_a_failed_download(Failing::WrongBytes).await;
+}
+
+/// How the first member's upstream fails a layer.
+enum Failing {
+    Reset,
+    WrongBytes,
+}
+
+async fn group_falls_back_after_a_failed_download(failing: Failing) {
+    let srv = common::start().await;
+    let layer = big_layer(2);
+    let (a, b) = (MockRegistry::start().await, MockRegistry::start().await);
+    a.put_blob(&layer);
+    b.put_blob(&layer);
+    match failing {
+        Failing::Reset => a.cut_blobs.store(true, Ordering::SeqCst),
+        Failing::WrongBytes => a.corrupt.store(true, Ordering::SeqCst),
+    }
+    let (proxy_a, proxy_b) = (repo_name("proxy-a"), repo_name("proxy-b"));
+    for (proxy, mock) in [(&proxy_a, &a), (&proxy_b, &b)] {
+        create_repo(
+            &srv,
+            json!({
+                "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+                "upstream_username": "upstream", "upstream_password": "secret",
+            }),
+        )
+        .await;
+    }
+    let group = repo_name("image-group");
+    create_repo(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "docker"}),
+    )
+    .await;
+    for (member, priority) in [(&proxy_a, 20), (&proxy_b, 10)] {
+        assert_eq!(
+            admin_post(
+                &srv,
+                &format!("/admin/repositories/{group}/members"),
+                json!({"member": member, "priority": priority}),
+            )
+            .await
+            .status(),
+            201
+        );
+    }
+    let oci = admin_oci(&srv).await;
+    let name = format!("{group}/library/fallback");
+    let digest = sha(&layer);
+    let path = format!("blobs/{digest}");
+
+    // From the first member, served while it downloads: cut short.
+    let resp = oci.get(&name, &path).await;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.bytes().await.is_err(), "cut short");
+    assert_eq!(a.blob_gets.load(Ordering::SeqCst), 1);
+    assert_eq!(b.blob_gets.load(Ordering::SeqCst), 0);
+
+    // The client's retry: from the second member.
+    let resp = oci.get(&name, &path).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.content_length(), Some(layer.len() as u64));
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), layer.as_slice());
+    assert_eq!(a.blob_gets.load(Ordering::SeqCst), 1, "not asked again");
+    assert_eq!(b.blob_gets.load(Ordering::SeqCst), 1);
+    assert!(linked_soon(&srv, &proxy_b).await, "cached from the second");
+    assert_eq!(
+        links(&srv, &proxy_a).await,
+        0,
+        "nothing cached from the first"
+    );
+
+    // And served from that cache.
+    let resp = oci.get(&name, &path).await;
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), layer.as_slice());
+    assert_eq!(b.blob_gets.load(Ordering::SeqCst), 1, "from the cache");
+}
+
 /// An upstream that loses the connection in the middle of a small blob (one
 /// Forge stages before it answers) is the upstream's failure: 503, not 500,
 /// and nothing is cached (#689).
