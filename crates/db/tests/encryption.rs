@@ -97,6 +97,40 @@ fn envelope_with_scope(pool: &PgPool, scope: &str) -> EnvelopeService {
     )
 }
 
+/// The backend pid of `conn`, to find the backends blocked behind its locks.
+async fn backend_pid(conn: &mut sqlx::PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(conn)
+        .await
+        .unwrap()
+}
+
+/// Wait until a backend is blocked behind the locks held by `holder_pid`.
+/// A fixed sleep cannot tell a blocked task from one that has not reached the
+/// lock yet (still acquiring a connection, say), and the latter would run
+/// only after the holder committed.
+async fn wait_blocked_behind(pool: &PgPool, holder_pid: i32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(holder_pid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no backend ever blocked behind pid {holder_pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn secret(s: &str) -> PlaintextSecret {
     PlaintextSecret::from(s.to_string())
 }
@@ -523,6 +557,7 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
     // The writer's transaction (the protocol every secret_dao write follows):
     // FOR SHARE on its DEK, then the ciphertext write — not committed yet.
     let mut writer = pool.begin().await.unwrap();
+    let writer_pid = backend_pid(&mut writer).await;
     sqlx::query(
         "SELECT 1 FROM encryption_key WHERE layer = 'dek' AND scope = $1 AND version = 1 \
          AND state <> 'revoked' FOR SHARE",
@@ -545,7 +580,7 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
         let envelope = envelope.clone();
         tokio::spawn(async move { secret_dao::revoke_unreferenced_deks(&pool, &envelope).await })
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_blocked_behind(&pool, writer_pid).await;
     assert!(
         !revoker.is_finished(),
         "revocation must wait for the in-flight ciphertext writer"
@@ -567,6 +602,7 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
     // Writer side: set_upstream_password seals under the active DEK v2; if v2
     // is revoked while the write waits for its row lock, nothing is written.
     let mut revoker_tx = pool.begin().await.unwrap();
+    let revoker_pid = backend_pid(&mut revoker_tx).await;
     sqlx::query(
         "SELECT 1 FROM encryption_key WHERE layer = 'dek' AND scope = $1 AND version = 2 \
          FOR UPDATE",
@@ -589,7 +625,9 @@ async fn dek_revocation_is_checked_at_commit_time_against_writers() {
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Revoke only once the write is blocked on the lock: a write that starts
+    // after the revocation commits seals under a fresh DEK v3 and succeeds.
+    wait_blocked_behind(&pool, revoker_pid).await;
     assert!(
         !write.is_finished(),
         "the write must wait for the DEK row lock"
