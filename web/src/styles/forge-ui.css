@@ -52,9 +52,7 @@
 
   /* ---------- Menu ---------- */
   .fg-menu { position: relative; display: inline-flex; }
-  .fg-menu-pop { position: absolute; top: calc(100% + 4px); z-index: 20; min-width: 240px; padding: 4px; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface); box-shadow: var(--shadow-md); }
-  .fg-menu--end .fg-menu-pop { right: 0; }
-  .fg-menu--start .fg-menu-pop { left: 0; }
+  .fg-menu-pop { position: fixed; z-index: 55; min-width: 240px; padding: 4px; box-sizing: border-box; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface); box-shadow: var(--shadow-md); }
   .fg-menu-item { display: flex; align-items: center; gap: 10px; width: 100%; box-sizing: border-box; min-height: 34px; padding: 6px 10px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--ink); font-family: var(--font-sans); font-size: 13px; line-height: 20px; text-align: left; text-decoration: none; cursor: pointer; }
   .fg-menu-item:hover { background: var(--surface-hover); }
   .fg-menu-item .fg-icon { color: var(--ink-muted); }
@@ -401,8 +399,6 @@
   }
 
   /* The rail's theme switch: a menu that opens upwards from the footer. */
-  .fg-menu--up .fg-menu-pop { top: auto; bottom: calc(100% + 4px); }
-  .fg-rail .fg-menu-pop { color: var(--ink); }
   .fg-menu-item[aria-checked='true'] { font-weight: 600; }
   .fg-menu-item[aria-checked='true'] .fg-icon { color: var(--heat); }
 

@@ -1,11 +1,13 @@
 import {
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent,
   type ReactNode,
 } from 'react'
+import { createPortal } from 'react-dom'
 import { Link } from '@tanstack/react-router'
 import clsx from 'clsx'
 
@@ -258,6 +260,34 @@ export type MenuItem =
       checked?: boolean
     }
 
+/** The gap between a menu's button and its list, and the list and the viewport's edge. */
+const MENU_GAP = 4
+const MENU_EDGE = 8
+
+/**
+ * Whether a menu's list opens below or above its button: the preferred side
+ * when the list fits there in the viewport, otherwise the side with more room.
+ */
+export function menuDirection({
+  preferred,
+  anchorTop,
+  anchorBottom,
+  menuHeight,
+  viewportHeight,
+}: {
+  preferred: 'down' | 'up'
+  anchorTop: number
+  anchorBottom: number
+  menuHeight: number
+  viewportHeight: number
+}): 'down' | 'up' {
+  const need = menuHeight + MENU_GAP + MENU_EDGE
+  const below = viewportHeight - anchorBottom
+  const above = anchorTop
+  if (preferred === 'down') return below >= need || below >= above ? 'down' : 'up'
+  return above >= need || above >= below ? 'up' : 'down'
+}
+
 /**
  * A button that opens a short list of actions (row actions, the "more" of a
  * page header, the theme switch). The destructive item goes last, after a
@@ -265,6 +295,11 @@ export type MenuItem =
  *
  * Keyboard: Enter, Space or ArrowDown open it on the first item; the arrow
  * keys, Home and End move; Escape closes and returns focus to the button.
+ *
+ * The list is rendered into `document.body` with `position: fixed`, placed
+ * from the button's rectangle, so a scrolling ancestor (a table's
+ * `overflow-x: auto` wrapper, the rail) never clips it. `direction` is the
+ * preferred side: the list opens on the other one when it does not fit.
  */
 export function Menu({
   items,
@@ -296,14 +331,57 @@ export function Menu({
   const menuId = useId()
 
   // Close on a click outside (an external system: the document's events).
+  // The list lives in a portal, so a click in it is inside too.
   useEffect(() => {
     if (!open) return
     function onDown(e: MouseEvent) {
-      if (root.current && !root.current.contains(e.target as Node)) setOpen(false)
+      const target = e.target as Node
+      if (root.current?.contains(target) || pop.current?.contains(target)) return
+      setOpen(false)
     }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [open])
+
+  // Place the list next to the button before it is painted, and keep it there
+  // while the page or an ancestor scrolls, or the window resizes.
+  useLayoutEffect(() => {
+    if (!open) return
+    function place() {
+      const list = pop.current
+      const anchor = button.current
+      if (!list || !anchor) return
+      const rect = anchor.getBoundingClientRect()
+      const viewportWidth = document.documentElement.clientWidth || window.innerWidth
+      const viewportHeight = window.innerHeight
+      const side = menuDirection({
+        preferred: direction,
+        anchorTop: rect.top,
+        anchorBottom: rect.bottom,
+        menuHeight: list.offsetHeight,
+        viewportHeight,
+      })
+      list.dataset.direction = side
+      if (side === 'down') {
+        list.style.top = `${rect.bottom + MENU_GAP}px`
+        list.style.bottom = ''
+      } else {
+        list.style.top = ''
+        list.style.bottom = `${viewportHeight - rect.top + MENU_GAP}px`
+      }
+      const width = list.offsetWidth
+      const left = align === 'end' ? rect.right - width : rect.left
+      const max = viewportWidth - width - MENU_EDGE
+      list.style.left = `${Math.max(MENU_EDGE, Math.min(left, max))}px`
+    }
+    place()
+    window.addEventListener('resize', place)
+    window.addEventListener('scroll', place, true)
+    return () => {
+      window.removeEventListener('resize', place)
+      window.removeEventListener('scroll', place, true)
+    }
+  }, [open, direction, align])
 
   // Focus the first item once the list is open.
   useEffect(() => {
@@ -332,7 +410,10 @@ export function Menu({
       close(true)
       return
     } else if (e.key === 'Tab') {
-      close(false)
+      // The list sits at the end of the page, so Tab continues from the
+      // button: Shift+Tab lands on it, Tab on what follows it.
+      close(true)
+      if (e.shiftKey) e.preventDefault()
       return
     }
     if (next >= 0) {
@@ -342,15 +423,7 @@ export function Menu({
   }
 
   return (
-    <div
-      ref={root}
-      className={clsx(
-        'fg-menu',
-        align === 'start' ? 'fg-menu--start' : 'fg-menu--end',
-        direction === 'up' && 'fg-menu--up',
-        className,
-      )}
-    >
+    <div ref={root} className={clsx('fg-menu', className)}>
       <Button
         ref={button}
         variant={variant ?? (iconOnly ? 'ghost' : 'secondary')}
@@ -372,64 +445,66 @@ export function Menu({
       >
         {label}
       </Button>
-      {open && (
-        <div
-          ref={pop}
-          id={menuId}
-          role="menu"
-          aria-label={label}
-          className="fg-menu-pop"
-          onKeyDown={onListKey}
-        >
-          {items.map((it, i) => {
-            if (it.divider) {
-              return <div key={i} role="separator" className="fg-menu-sep" />
-            }
-            const role = it.checked === undefined ? 'menuitem' : 'menuitemradio'
-            const body = (
-              <>
-                {it.icon ? (
-                  <Icon name={it.icon} size={16} />
-                ) : (
-                  <span className="fg-menu-noicon" />
-                )}
-                <span className="fg-menu-label">
-                  {it.label}
-                  {it.description && <span className="fg-menu-desc">{it.description}</span>}
-                </span>
-              </>
-            )
-            const common = {
-              role,
-              tabIndex: -1,
-              'aria-checked': it.checked,
-              'aria-disabled': it.disabled || undefined,
-              className: clsx('fg-menu-item', it.danger && 'is-danger'),
-              onClick: () => {
-                if (it.disabled) return
-                close(!it.href)
-                it.onSelect?.()
-              },
-            }
-            if (it.href && !it.disabled) {
-              return isAppPath(it.href) ? (
-                <RouterAnchor key={i} to={it.href} {...common}>
-                  {body}
-                </RouterAnchor>
-              ) : (
-                <a key={i} href={it.href} {...common}>
-                  {body}
-                </a>
+      {open &&
+        createPortal(
+          <div
+            ref={pop}
+            id={menuId}
+            role="menu"
+            aria-label={label}
+            className="fg-menu-pop"
+            onKeyDown={onListKey}
+          >
+            {items.map((it, i) => {
+              if (it.divider) {
+                return <div key={i} role="separator" className="fg-menu-sep" />
+              }
+              const role = it.checked === undefined ? 'menuitem' : 'menuitemradio'
+              const body = (
+                <>
+                  {it.icon ? (
+                    <Icon name={it.icon} size={16} />
+                  ) : (
+                    <span className="fg-menu-noicon" />
+                  )}
+                  <span className="fg-menu-label">
+                    {it.label}
+                    {it.description && <span className="fg-menu-desc">{it.description}</span>}
+                  </span>
+                </>
               )
-            }
-            return (
-              <button key={i} type="button" {...common}>
-                {body}
-              </button>
-            )
-          })}
-        </div>
-      )}
+              const common = {
+                role,
+                tabIndex: -1,
+                'aria-checked': it.checked,
+                'aria-disabled': it.disabled || undefined,
+                className: clsx('fg-menu-item', it.danger && 'is-danger'),
+                onClick: () => {
+                  if (it.disabled) return
+                  close(!it.href)
+                  it.onSelect?.()
+                },
+              }
+              if (it.href && !it.disabled) {
+                return isAppPath(it.href) ? (
+                  <RouterAnchor key={i} to={it.href} {...common}>
+                    {body}
+                  </RouterAnchor>
+                ) : (
+                  <a key={i} href={it.href} {...common}>
+                    {body}
+                  </a>
+                )
+              }
+              return (
+                <button key={i} type="button" {...common}>
+                  {body}
+                </button>
+              )
+            })}
+          </div>,
+          document.body,
+        )}
     </div>
   )
 }
