@@ -127,6 +127,12 @@
 //! * **Offline** — `repository.online == false` serves only already-cached data;
 //!   no upstream requests are made, not even to revalidate a stored
 //!   document (a conversation that reaches one serves it whatever its age).
+//! * **Cached only** — the web UI's package page reads a proxy as it is
+//!   offline ([`ProxyRepo::cached_only`]), and its upstream metadata and
+//!   manifests from the stored documents alone: no upstream request on the
+//!   page, and nothing discovered by looking. Each upstream listing records
+//!   when it was answered (`proxy_package_listing`), which the page shows
+//!   and refreshes by, off the request.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
@@ -563,6 +569,8 @@ pub struct ProxyRepo {
     /// How long a blob a replaced or deleted stored document named is kept
     /// before it is deleted (`outbox.grace_seconds`).
     delete_grace: Duration,
+    /// Read only what Forge holds ([`Self::cached_only`]).
+    cached_only: bool,
 }
 
 impl ProxyRepo {
@@ -597,7 +605,21 @@ impl ProxyRepo {
             blobs: None,
             envelope,
             delete_grace: Duration::seconds(DEFAULT_DELETE_GRACE_SECONDS),
+            cached_only: false,
         }
+    }
+
+    /// Read only what Forge holds, as the web UI's package page does (#836):
+    /// the cached version rows, the stored upstream documents whatever their
+    /// age, the stored tags and the downloaded packages, as an offline proxy
+    /// serves them. Nothing is asked of the upstream and nothing is
+    /// discovered: a package the proxy holds nothing of has no versions.
+    /// Unlike an offline proxy, the upstream's metadata and manifests are
+    /// read from the stored documents, so the page has what a client's last
+    /// request fetched.
+    pub fn cached_only(mut self) -> Self {
+        self.cached_only = true;
+        self
     }
 
     /// Use `http` (built from the server's `[proxy]` config) for upstream
@@ -905,8 +927,9 @@ impl ProxyRepo {
     /// as its freshness allows: through the local cache (never Redis: what
     /// an upstream answered decides what is downloaded and served) and, when
     /// the conversation `keep`s its documents, the copy stored for every
-    /// instance ([`Self::fetch_stored`]). Returns it with the origins its
-    /// URLs name ([`named_origins`]).
+    /// instance ([`Self::fetch_stored`]). Read
+    /// [cached only](Self::cached_only), the stored copy alone, as it is.
+    /// Returns it with the origins its URLs name ([`named_origins`]).
     ///
     /// A 404 is cached only for an immutable document: a metadata 404 (a
     /// package the upstream does not know yet) is what the not-found
@@ -930,38 +953,52 @@ impl ProxyRepo {
             Some(accept) => format!("{}/{}\n{accept}", Self::upstream_scope(repo), fetch.url),
             None => format!("{}/{}", Self::upstream_scope(repo), fetch.url),
         };
-        let cached: Result<CachedFetch, Option<FetchFailure>> = self
-            .cache
-            .get_or_try_insert_local_with_tags_expiring(NS_UPSTREAM_FETCH, &key, &[], ttl, || {
-                // On the heap: up to four of these are in flight per round
-                // of a conversation, each deep in the request's future.
-                Box::pin(async move {
-                    if keep {
-                        // In a task of its own, from a fresh stack: the
-                        // stored copy's reads and writes (the database, the
-                        // object store) would add their depth to the
-                        // request's, deep already at this point.
-                        let (this, repo, fetch) = (self.clone(), repo.clone(), fetch.clone());
-                        let url = fetch.url.clone();
-                        return tokio::spawn(
-                            async move { this.fetch_stored(&repo, &fetch, ttl).await }
-                                .instrument(tracing::Span::current()),
-                        )
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(Some(FetchFailure::local(format!("fetch {url}: {e}"))))
-                        });
-                    }
-                    let cached = match self.request(repo, fetch, None).await? {
-                        Answer::Sent { bytes, named, .. } => CachedFetch::found(&bytes, named),
-                        Answer::NotFound => Self::not_found(fetch)?,
-                        Answer::TooLarge(reason) => CachedFetch::TooLarge { reason },
-                        Answer::NotModified(_) => return Err(Some(Self::unasked_304(fetch))),
-                    };
-                    Ok((cached, ttl))
-                })
-            })
-            .await;
+        let cached: Result<CachedFetch, Option<FetchFailure>> = if self.cached_only {
+            // Read cached only, the stored copy is read as it is, past the
+            // local cache: a stale copy must not be kept there for the
+            // reads that ask the upstream, which share its key, and a fetch
+            // from the upstream under way there is not waited for. A
+            // document that is not stored is not fetched.
+            if keep {
+                Box::pin(self.fetch_stored_apart(repo, fetch, ttl))
+                    .await
+                    .map(|(found, _)| found)
+            } else {
+                Err(Some(FetchFailure::local(format!(
+                    "{}: not fetched, only what Forge holds is read",
+                    fetch.url
+                ))))
+            }
+        } else {
+            self.cache
+                .get_or_try_insert_local_with_tags_expiring(
+                    NS_UPSTREAM_FETCH,
+                    &key,
+                    &[],
+                    ttl,
+                    || {
+                        // On the heap: up to four of these are in flight per round
+                        // of a conversation, each deep in the request's future.
+                        Box::pin(async move {
+                            if keep {
+                                return self.fetch_stored_apart(repo, fetch, ttl).await;
+                            }
+                            let cached = match self.request(repo, fetch, None).await? {
+                                Answer::Sent { bytes, named, .. } => {
+                                    CachedFetch::found(&bytes, named)
+                                }
+                                Answer::NotFound => Self::not_found(fetch)?,
+                                Answer::TooLarge(reason) => CachedFetch::TooLarge { reason },
+                                Answer::NotModified(_) => {
+                                    return Err(Some(Self::unasked_304(fetch)));
+                                }
+                            };
+                            Ok((cached, ttl))
+                        })
+                    },
+                )
+                .await
+        };
         match cached {
             Ok(CachedFetch::Found { body, named }) => {
                 match base64::engine::general_purpose::STANDARD.decode(body) {
@@ -1003,6 +1040,25 @@ impl ProxyRepo {
             "{}: the upstream answered 304 Not Modified to an unconditional request",
             fetch.url
         ))
+    }
+
+    /// [`Self::fetch_stored`] in a task of its own, from a fresh stack: the
+    /// stored copy's reads and writes (the database, the object store) would
+    /// add their depth to the request's, deep already at this point.
+    async fn fetch_stored_apart(
+        &self,
+        repo: &Repository,
+        fetch: &api::Fetch,
+        ttl: std::time::Duration,
+    ) -> Result<(CachedFetch, std::time::Duration), Option<FetchFailure>> {
+        let (this, repo, fetch) = (self.clone(), repo.clone(), fetch.clone());
+        let url = fetch.url.clone();
+        tokio::spawn(
+            async move { this.fetch_stored(&repo, &fetch, ttl).await }
+                .instrument(tracing::Span::current()),
+        )
+        .await
+        .unwrap_or_else(|e| Err(Some(FetchFailure::local(format!("fetch {url}: {e}")))))
     }
 
     /// [`Self::fetch`] past the local cache, through the document stored for
@@ -1308,8 +1364,11 @@ impl ProxyRepo {
     }
 
     /// Resolve the repository row by name, erroring if missing or not a proxy.
+    /// Read [cached only](Self::cached_only), the row is taken for an offline
+    /// one's: everything that would reach the upstream (its index, a stored
+    /// document's revalidation, a download) serves what is stored instead.
     async fn proxy_repo(&self, repo: &str) -> Result<Repository, RepoError> {
-        let row = repository_dao::find_repository_by_name(&self.pool, repo)
+        let mut row = repository_dao::find_repository_by_name(&self.pool, repo)
             .await?
             .ok_or_else(|| RepoError::RepoNotFound(repo.to_string()))?;
         if row.kind() != forge_db::model::RepoKind::Proxy {
@@ -1317,6 +1376,9 @@ impl ProxyRepo {
                 name: repo.to_string(),
                 kind: row.kind.clone(),
             });
+        }
+        if self.cached_only {
+            row.online = false;
         }
         Ok(row)
     }
@@ -1351,7 +1413,10 @@ impl ProxyRepo {
         format!("{}/{lower_id}", Self::upstream_scope(repo))
     }
 
-    fn metadata_ttl(repo: &Repository) -> Duration {
+    /// How long `repo` serves what its upstream last listed or sent before
+    /// asking again (`metadata_ttl_seconds`, default
+    /// [`DEFAULT_METADATA_TTL_SECONDS`]).
+    pub fn metadata_ttl(repo: &Repository) -> Duration {
         Duration::seconds(
             repo.metadata_ttl_seconds
                 .map(i64::from)
@@ -1489,6 +1554,12 @@ impl ProxyRepo {
             .clone()
             .ok_or_else(|| RepoError::Storage("proxy repository has no remote_url".into()))?;
         let key = Self::upstream_scope(repo);
+        // Read cached only, the persisted index as it is, past the local
+        // cache: a stale one must not be kept there for the reads that ask
+        // the upstream.
+        if self.cached_only {
+            return self.resolve_index_uncached(repo, ttl, &remote_url).await;
+        }
 
         // The cache factory error must be `Clone` (moka coalescing shares an
         // `Arc<E>` across waiters); `RepoError` wraps non-`Clone` `sqlx::Error`,
@@ -1630,6 +1701,11 @@ impl ProxyRepo {
         repo: &Repository,
         lower_id: &str,
     ) -> Result<Vec<forge_db::model::ProxyCachedVersion>, RepoError> {
+        // What is held, as it is: a look at the cache is no lookup of the
+        // upstream to count.
+        if self.cached_only {
+            return self.cached_rows(repo.id, lower_id).await;
+        }
         let mut lookup = Lookup::start(&repo.name, LookupKind::Metadata);
         let span = lookup.span();
         let result = self
@@ -1806,6 +1882,11 @@ impl ProxyRepo {
                         Self::metadata_ttl(repo).num_seconds(),
                     )
                     .await?;
+                }
+                // When, for the web UI's package page (best effort: it only
+                // decides how old the page says it is, and when it refreshes).
+                if let Err(e) = proxy_dao::record_listing(&self.pool, repo.id, lower_id).await {
+                    tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "recording when the upstream listed the package failed");
                 }
                 let applied = self.package_delay(repo).await?.for_package(lower_id);
                 if applied.delay_seconds > 0 {
@@ -2627,7 +2708,9 @@ impl ProxyRepo {
     /// failure yield nothing, and the caller falls back to the listing's
     /// view (listed, no dependencies). Records the package id's upstream
     /// casing for search (best effort): the newest version's, the one the
-    /// upstream shows, as the format reports it.
+    /// upstream shows, as the format reports it. Read
+    /// [cached only](Self::cached_only), the metadata comes from the stored
+    /// documents alone, and a document not stored is no failure to report.
     async fn upstream_metadata(
         &self,
         repo: &Repository,
@@ -2635,9 +2718,16 @@ impl ProxyRepo {
         wanted: &[String],
         dating: bool,
     ) -> HashMap<String, api::VersionMetadata> {
-        if !repo.online || wanted.is_empty() {
+        if (!repo.online && !self.cached_only) || wanted.is_empty() {
             return HashMap::new();
         }
+        let unavailable = |reason: &dyn std::fmt::Display| {
+            if self.cached_only {
+                tracing::debug!(repo = %repo.name, id = %lower_id, %reason, "no stored upstream metadata; serving the listing's");
+            } else {
+                tracing::warn!(repo = %repo.name, id = %lower_id, %reason, "upstream metadata unavailable; serving the listing's");
+            }
+        };
         let versions = api::PackageVersions {
             id: lower_id.to_string(),
             versions: wanted.to_vec(),
@@ -2650,7 +2740,7 @@ impl ProxyRepo {
         let metadata = match Box::pin(self.converse_resolved(repo, op)).await {
             Ok(api::UpstreamAnswer::Metadata(metadata)) => metadata,
             Ok(api::UpstreamAnswer::Failed(reason)) => {
-                tracing::warn!(repo = %repo.name, id = %lower_id, %reason, "upstream metadata unavailable; serving the listing's");
+                unavailable(&reason);
                 return HashMap::new();
             }
             Ok(_) => {
@@ -2658,7 +2748,7 @@ impl ProxyRepo {
                 return HashMap::new();
             }
             Err(e) => {
-                tracing::warn!(repo = %repo.name, id = %lower_id, error = %e, "upstream metadata unavailable; serving the listing's");
+                unavailable(&e);
                 return HashMap::new();
             }
         };
@@ -3295,6 +3385,16 @@ impl RepoReadOps for ProxyRepo {
             .any(|r| r.version == norm && Self::listable(&repo_row, &gate, &r, now));
         if !known {
             return Ok(None);
+        }
+        if self.cached_only {
+            // The upstream's manifest as it is stored, when a client's
+            // request fetched it; nothing is downloaded.
+            return Ok(Box::pin(self.upstream_manifest(&repo_row, &lower, &norm))
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::debug!(repo = %repo_row.name, id = %lower, version = %norm, error = %e, "no stored upstream manifest");
+                    None
+                }));
         }
         if repo_row.online {
             if let Some(bytes) = Box::pin(self.upstream_manifest(&repo_row, &lower, &norm)).await? {

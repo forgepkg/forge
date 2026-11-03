@@ -17,6 +17,12 @@ import { ApiError, httpClient } from '~/lib/httpClient'
  * `_app` layout's login gate ensures these are only called with a session.
  * An offline hosted or group repository answers its package detail and its
  * per-repository search with 503 (see {@link isRepositoryOffline}).
+ *
+ * A proxy's and a group's package detail is what Forge has cached: the
+ * request asks no upstream, says when the upstream last listed the package
+ * (`cached_at`), and refreshes a stale listing in the background
+ * (`refreshing`). A package the proxy holds nothing of is a 404 until a
+ * client installs it or a reader refreshes it ({@link refreshPackage}).
  */
 
 /** One readable repository (`GET /browse/repos` item) — a folder-view root. */
@@ -186,6 +192,27 @@ export interface PackageDetail {
    * proxies of formats without one.
    */
   package_delay?: AppliedDelay
+  /**
+   * When the upstream last listed the package's versions: a proxy's, or the
+   * oldest among the proxies a group serves it from. The page shows what
+   * Forge held then, and what clients fetched since. Absent for a hosted
+   * repository and when no time was recorded.
+   */
+  cached_at?: string
+  /**
+   * A refresh from the upstream is under way in the background: looking
+   * again shortly shows what it found.
+   */
+  refreshing?: boolean
+}
+
+/**
+ * Whether a repository of `kind` shows what Forge has cached of an upstream
+ * (a proxy, or a group, through its proxies): its package page can be
+ * refreshed from the upstream.
+ */
+export function showsCache(kind: string | undefined): boolean {
+  return kind === 'proxy' || kind === 'group'
 }
 
 /** Search parameters for the browse list (mirrors `BrowseQuery`). */
@@ -267,6 +294,17 @@ export function fetchPackageDetail(
   return httpClient.get<PackageDetail>(
     `/browse/packages/${encodeURIComponent(repo)}/${encodeURIComponent(id)}`,
     { signal },
+  )
+}
+
+/**
+ * **Refresh from upstream**: ask the upstream for the package now (a group:
+ * its proxies' upstreams), as a client's install does, and get the refreshed
+ * detail. Any reader may. A 404 means the upstream does not have it either.
+ */
+export function refreshPackage(repo: string, id: string): Promise<PackageDetail> {
+  return httpClient.post<PackageDetail>(
+    `/browse/packages/${encodeURIComponent(repo)}/${encodeURIComponent(id)}/refresh`,
   )
 }
 

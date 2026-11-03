@@ -12,9 +12,10 @@
 //!   evaluated against the request's [`Principal`];
 //! * version visibility, group member resolution, listed/prerelease filtering,
 //!   and proxy **package-delay** gating all come for free from
-//!   [`AppState::read_ops_for`] + [`RepoReadOps`] — the same ops the repository
-//!   dispatcher uses, so browse can never surface a version the protocol would
-//!   hide.
+//!   [`AppState::read_ops_for`] (the package detail's
+//!   [`AppState::cached_read_ops_for`]) + [`RepoReadOps`] — the same ops the
+//!   repository dispatcher uses, so browse can never surface a version the
+//!   protocol would hide.
 //!
 //! ## Endpoints
 //! * `GET /browse/repos` — the repositories the caller may read (the SPA's
@@ -26,6 +27,12 @@
 //!   mode remains for API callers.
 //! * `GET /browse/packages/{repo}/{id}` — package detail: visible versions with
 //!   per-version metadata + dependency groups parsed from the stored `.nuspec`.
+//!   It reads what Forge holds: a proxy (a group's proxy members) asks its
+//!   upstream nothing on the request, says when the upstream last listed the
+//!   package, and refreshes it off the request once that is stale (#836).
+//! * `POST /browse/packages/{repo}/{id}/refresh` — **Refresh from upstream**:
+//!   the package asked of the upstream now, as a client's request does, then
+//!   its detail.
 //!
 //! An offline hosted or group repository serves nothing here either: its
 //! package search and detail answer 503 with `Retry-After`, as its feed does,
@@ -39,6 +46,9 @@
 //! no `/stats` endpoint. The DTOs keep room for them to be added without
 //! breaking the SPA. `published_at` maps to `component.created_at`.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
@@ -46,10 +56,12 @@ use axum::routing::get;
 use axum::Router;
 use chrono::{DateTime, Utc};
 use forge_core::auth::principal::Principal;
+use forge_core::format::Format;
 use forge_core::repo::delay::{AppliedDelay, PackageDelay, PackageGate};
-use forge_core::repo::SearchParams;
+use forge_core::repo::proxy::ProxyRepo;
+use forge_core::repo::{RegistrationEntry, SearchParams};
 use forge_db::model::{RepoKind, Repository};
-use forge_db::{component_dao, repository_dao};
+use forge_db::{component_dao, proxy_dao, repository_dao};
 use forge_plugin::api::Storage;
 use serde::{Deserialize, Serialize};
 
@@ -441,63 +453,160 @@ pub struct PackageDetail {
     /// other kinds, and for proxies of formats without a package delay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub package_delay: Option<AppliedDelay>,
+    /// When the upstream last listed the package's versions, for a proxy;
+    /// for a group, the oldest such time among the proxies serving it. What
+    /// the page shows is what Forge held then (and what clients fetched
+    /// since). Absent for a hosted repository, and when no time was
+    /// recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_at: Option<DateTime<Utc>>,
+    /// Whether a refresh from the upstream is under way off the request: a
+    /// look again shortly shows what it found.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refreshing: bool,
 }
 
-/// `GET /browse/packages/{repo}/{id}` — package detail.
+/// The package a detail or refresh request names, once the caller may read
+/// it: its repository, format and lowered id; else the response to send.
+async fn package_target(
+    state: &AppState,
+    principal: &Principal,
+    repo_name: &str,
+    id: &str,
+) -> Result<(Repository, Arc<dyn Format>, String), Response> {
+    if let Some(denied) = require_user(principal) {
+        return Err(denied);
+    }
+
+    let repo = match repository_dao::find_repository_by_name(&state.pool, repo_name).await {
+        // An images (Docker) repository holds images (`/browse/images`) and
+        // a files (raw) one files (its listings), not packages.
+        Ok(Some(r)) if state.storage(&r.format) == Storage::Packages => r,
+        // An unknown name answers like an unreadable repository (no name
+        // enumeration), except to a global admin.
+        Ok(_) if state.authz.is_global_admin(principal).await => {
+            return Err((StatusCode::NOT_FOUND, "repository not found").into_response());
+        }
+        Ok(_) => return Err((StatusCode::FORBIDDEN, "forbidden").into_response()),
+        Err(e) => return Err(db_error(e)),
+    };
+
+    // Per-repo read authz; the caller is a signed-in user at this point, so a
+    // denial is 403 (401 for anonymous callers was already returned above).
+    if !state.authz.can_read(principal, &repo).await {
+        return Err((StatusCode::FORBIDDEN, "forbidden").into_response());
+    }
+    // An offline hosted or group repository serves nothing, as on its feed.
+    if offline_serves_nothing(&repo) {
+        return Err(offline_response());
+    }
+
+    let format = state.formats.for_repository(&repo).map_err(read_err)?;
+    let lower = format.lower_id(id);
+    if !state
+        .authz
+        .package_filter(principal, &repo)
+        .await
+        .allows(&lower)
+    {
+        return Err((StatusCode::NOT_FOUND, "package not found").into_response());
+    }
+    Ok((repo, format, lower))
+}
+
+/// `GET /browse/packages/{repo}/{id}` — package detail, from what Forge holds
+/// (#836).
+///
+/// A proxy, and a group's proxy members, are read
+/// [cached only](forge_core::repo::proxy::ProxyRepo::cached_only): the request
+/// asks no upstream, whatever the age of what is cached, and a package the
+/// proxy holds nothing of is not found (and not discovered by looking). The
+/// detail says when the upstream last listed the package (`cached_at`). Once
+/// that is past the proxy's metadata TTL, or older than its last edit or
+/// cache invalidation, the page starts a refresh off the request
+/// ([`BackgroundRefreshes`]), and says so (`refreshing`): the next look shows
+/// what the upstream answered.
 pub async fn package_detail(
     State(state): State<AppState>,
     Path((repo_name, id)): Path<(String, String)>,
     req: axum::extract::Request,
 ) -> Response {
     let principal = principal_of(&req);
-    if let Some(denied) = require_user(&principal) {
-        return denied;
-    }
-
-    let repo = match repository_dao::find_repository_by_name(&state.pool, &repo_name).await {
-        // An images (Docker) repository holds images (`/browse/images`) and
-        // a files (raw) one files (its listings), not packages.
-        Ok(Some(r)) if state.storage(&r.format) == Storage::Packages => r,
-        // An unknown name answers like an unreadable repository (no name
-        // enumeration), except to a global admin.
-        Ok(_) if state.authz.is_global_admin(&principal).await => {
-            return (StatusCode::NOT_FOUND, "repository not found").into_response();
-        }
-        Ok(_) => return (StatusCode::FORBIDDEN, "forbidden").into_response(),
-        Err(e) => return db_error(e),
+    let (repo, format, lower) = match package_target(&state, &principal, &repo_name, &id).await {
+        Ok(target) => target,
+        Err(response) => return response,
     };
+    let listing = listing_of(&state, &repo, &format, &principal, &lower).await;
+    let refreshing = state
+        .browse_refreshes
+        .start(&state, listing.due, &principal, &lower);
+    cached_detail(
+        &state,
+        &repo,
+        &format,
+        principal,
+        &id,
+        &lower,
+        listing.cached_at,
+        refreshing,
+    )
+    .await
+}
 
-    // Per-repo read authz; the caller is a signed-in user at this point, so a
-    // denial is 403 (401 for anonymous callers was already returned above).
-    if !state.authz.can_read(&principal, &repo).await {
-        return (StatusCode::FORBIDDEN, "forbidden").into_response();
-    }
-    // An offline hosted or group repository serves nothing, as on its feed.
-    if offline_serves_nothing(&repo) {
-        return offline_response();
-    }
-
-    let format = match state.formats.for_repository(&repo) {
-        Ok(format) => format,
-        Err(e) => return read_err(e),
+/// `POST /browse/packages/{repo}/{id}/refresh` — **Refresh from upstream**:
+/// ask the upstream for the package now, as a client's request does
+/// ([`refresh_from_upstream`]), then answer its detail as
+/// [`package_detail`] does. Every reader of the repository may: it costs
+/// the upstream what a client's install does, and what is still within the
+/// metadata TTL is not asked again. A package the proxy held nothing of is
+/// discovered this way, when the upstream has it.
+pub async fn refresh_package(
+    State(state): State<AppState>,
+    Path((repo_name, id)): Path<(String, String)>,
+    req: axum::extract::Request,
+) -> Response {
+    let principal = principal_of(&req);
+    let (repo, format, lower) = match package_target(&state, &principal, &repo_name, &id).await {
+        Ok(target) => target,
+        Err(response) => return response,
     };
-    let lower = format.lower_id(&id);
-    if !state
-        .authz
-        .package_filter(&principal, &repo)
-        .await
-        .allows(&lower)
-    {
-        return (StatusCode::NOT_FOUND, "package not found").into_response();
+    if let Err(e) = refresh_from_upstream(&state, &repo, &format, principal.clone(), &lower).await {
+        return read_err(e);
     }
+    let listing = listing_of(&state, &repo, &format, &principal, &lower).await;
+    cached_detail(
+        &state,
+        &repo,
+        &format,
+        principal,
+        &id,
+        &lower,
+        listing.cached_at,
+        false,
+    )
+    .await
+}
 
-    let ops = match state.read_ops_for(&repo, principal).await {
+/// The detail of package `lower` (`id` as requested) of `repo`, read from
+/// what Forge holds ([`AppState::cached_read_ops_for`]).
+#[allow(clippy::too_many_arguments)]
+async fn cached_detail(
+    state: &AppState,
+    repo: &Repository,
+    format: &Arc<dyn Format>,
+    principal: Principal,
+    id: &str,
+    lower: &str,
+    cached_at: Option<DateTime<Utc>>,
+    refreshing: bool,
+) -> Response {
+    let ops = match state.cached_read_ops_for(repo, principal).await {
         Ok(o) => o,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response(),
     };
 
     // Visible versions (delay-gated + group-resolved by the read ops).
-    let versions = match ops.list_versions(&repo.name, &lower).await {
+    let versions = match ops.list_versions(&repo.name, lower).await {
         Ok(v) => v,
         Err(e) => return read_err(e),
     };
@@ -510,7 +619,7 @@ pub async fn package_detail(
     // package, so we must not 404 it just because `versions` is empty.
     let is_proxy = repo.kind() == RepoKind::Proxy;
     let gate = if is_proxy {
-        match package_gate(&state, &repo, &lower).await {
+        match package_gate(state, repo, lower).await {
             Ok(gate) => Some(gate),
             Err(e) => return db_error(e),
         }
@@ -518,7 +627,7 @@ pub async fn package_detail(
         None
     };
     let delayed = match &gate {
-        Some(gate) => match delayed_proxy_versions(&state, &repo, &lower, gate).await {
+        Some(gate) => match delayed_proxy_versions(state, repo, lower, gate).await {
             Ok(d) => d,
             Err(e) => return db_error(e),
         },
@@ -531,7 +640,7 @@ pub async fn package_detail(
 
     // Registration entries carry the stored manifest summary (or, for older
     // versions, the `.nuspec` bytes) for deps.
-    let registration = match ops.registration(&repo.name, &lower).await {
+    let registration = match ops.registration(&repo.name, lower).await {
         Ok(r) => r,
         Err(e) => return read_err(e),
     };
@@ -542,7 +651,7 @@ pub async fn package_detail(
     let original_id = versions
         .first()
         .map(|v| v.original_id.clone())
-        .unwrap_or_else(|| id.clone());
+        .unwrap_or_else(|| id.to_string());
 
     let mut dependency_groups_by_version = std::collections::BTreeMap::new();
     let mut deprecated = std::collections::BTreeMap::new();
@@ -582,7 +691,7 @@ pub async fn package_detail(
     // Per-version size / published_at from the local component rows when
     // present (one query for every version, not two per version).
     let local: std::collections::HashMap<String, (DateTime<Utc>, Option<i64>)> =
-        component_dao::version_sizes(&state.pool, repo.id, &lower, format.package_asset_path())
+        component_dao::version_sizes(&state.pool, repo.id, lower, format.package_asset_path())
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "browse: version sizes lookup failed");
@@ -627,19 +736,11 @@ pub async fn package_detail(
     // the UI can render a delay badge alongside any downloadable versions.
     detail_versions.extend(delayed);
 
-    let tags = ops.tags(&repo.name, &lower).await.unwrap_or_else(|e| {
+    let tags = ops.tags(&repo.name, lower).await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "browse: tags lookup failed");
         Default::default()
     });
-    // The latest version: the one tagged so, else the highest.
-    let latest = tags
-        .get("latest")
-        .and_then(|l| registration.iter().find(|e| &e.version == l))
-        .or_else(|| {
-            registration
-                .iter()
-                .max_by(|a, b| format.compare_versions(&a.version, &b.version))
-        });
+    let latest = latest_entry(format.as_ref(), &tags, &registration);
     let description = latest.and_then(|entry| {
         let summary = entry.manifest_summary.as_ref();
         summary
@@ -654,7 +755,7 @@ pub async fn package_detail(
             .filter(|d| !d.trim().is_empty())
     });
     let readme = match latest {
-        Some(entry) => match ops.resolve_nuspec(&repo.name, &lower, &entry.version).await {
+        Some(entry) => match ops.resolve_nuspec(&repo.name, lower, &entry.version).await {
             Ok(Some(manifest)) => {
                 let format = format.clone();
                 tokio::task::spawn_blocking(move || format.readme(&manifest))
@@ -674,7 +775,7 @@ pub async fn package_detail(
     Json(PackageDetail {
         repo: repo.name.clone(),
         repo_kind: repo.kind.clone(),
-        id: lower,
+        id: lower.to_string(),
         original_id,
         versions: detail_versions,
         dependency_groups_by_version,
@@ -684,11 +785,253 @@ pub async fn package_detail(
         readme,
         package_delay: gate
             .filter(|_| {
-                crate::admin::repositories::without_package_delay(&state, &repo.format).is_none()
+                crate::admin::repositories::without_package_delay(state, &repo.format).is_none()
             })
             .map(|g| g.applied),
+        cached_at,
+        refreshing,
     })
     .into_response()
+}
+
+/// The latest of a package's `registration` entries: the one its `latest`
+/// tag names, else the highest version.
+fn latest_entry<'a>(
+    format: &dyn Format,
+    tags: &std::collections::BTreeMap<String, String>,
+    registration: &'a [RegistrationEntry],
+) -> Option<&'a RegistrationEntry> {
+    tags.get("latest")
+        .and_then(|l| registration.iter().find(|e| &e.version == l))
+        .or_else(|| {
+            registration
+                .iter()
+                .max_by(|a, b| format.compare_versions(&a.version, &b.version))
+        })
+}
+
+/// Ask `repo`'s upstream (a group's: its serving members') for package
+/// `lower`, through the read path a client's request takes, and keep what it
+/// answers for the package page: the version listing, the versions'
+/// metadata, the tags and the latest version's manifest (npm's README). What
+/// is still within the metadata TTL is served from the cache, not asked
+/// again, as for a client. Only the listing's failure is one: the rest is
+/// best effort, as on the page.
+async fn refresh_from_upstream(
+    state: &AppState,
+    repo: &Repository,
+    format: &Arc<dyn Format>,
+    principal: Principal,
+    lower: &str,
+) -> Result<(), forge_core::repo::RepoError> {
+    let ops = state.read_ops_for(repo, principal).await?;
+    ops.list_versions(&repo.name, lower).await?;
+    let registration = ops
+        .registration(&repo.name, lower)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(repo = %repo.name, id = %lower, error = %e, "browse: refreshing the registration failed");
+            Vec::new()
+        });
+    let tags = ops.tags(&repo.name, lower).await.unwrap_or_else(|e| {
+        tracing::warn!(repo = %repo.name, id = %lower, error = %e, "browse: refreshing the tags failed");
+        Default::default()
+    });
+    if let Some(latest) = latest_entry(format.as_ref(), &tags, &registration) {
+        if let Err(e) = ops.resolve_nuspec(&repo.name, lower, &latest.version).await {
+            tracing::warn!(repo = %repo.name, id = %lower, error = %e, "browse: refreshing the latest manifest failed");
+        }
+    }
+    Ok(())
+}
+
+/// How old what a proxy, or a group's serving proxies, hold of a package is
+/// ([`listing_of`]).
+#[derive(Default)]
+struct Listing {
+    /// When the upstream last listed the package's versions; for a group,
+    /// the oldest such time among its serving proxies that hold the package.
+    /// `None` when none of them recorded one.
+    cached_at: Option<DateTime<Utc>>,
+    /// The online proxies holding the package whose listing is due for a
+    /// refresh: never recorded, past the proxy's metadata TTL, or older than
+    /// its last edit or cache invalidation (`updated_at`).
+    due: Vec<Repository>,
+}
+
+/// The [`Listing`] of package `lower` of `repo`: a proxy's own, a group's
+/// over the proxies serving the package to `principal`, nothing for a hosted
+/// repository. A proxy that holds nothing of the package counts for neither:
+/// looking at a page discovers nothing. Best effort: a failure to tell
+/// leaves the page without an age, and refreshes nothing.
+async fn listing_of(
+    state: &AppState,
+    repo: &Repository,
+    format: &Arc<dyn Format>,
+    principal: &Principal,
+    lower: &str,
+) -> Listing {
+    let proxies: Vec<Repository> = match repo.kind() {
+        RepoKind::Hosted => return Listing::default(),
+        RepoKind::Proxy => vec![repo.clone()],
+        RepoKind::Group => match state
+            .group_repo(principal.clone(), true)
+            .with_format(format.clone())
+            .serving_leaves(&repo.name, lower)
+            .await
+        {
+            Ok(leaves) => leaves
+                .into_iter()
+                .filter(|leaf| leaf.kind() == RepoKind::Proxy)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(repo = %repo.name, id = %lower, error = %e, "browse: the group's serving members could not be resolved");
+                return Listing::default();
+            }
+        },
+    };
+    if proxies.is_empty() {
+        return Listing::default();
+    }
+    let ids: Vec<i64> = proxies.iter().map(|proxy| proxy.id).collect();
+    let (states, now) = match tokio::try_join!(
+        proxy_dao::listing_states(&state.pool, &ids, lower),
+        forge_db::db_now(&state.pool),
+    ) {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(repo = %repo.name, id = %lower, error = %e, "browse: when the upstream listed the package could not be read");
+            return Listing::default();
+        }
+    };
+    let mut listing = Listing::default();
+    for (proxy, held) in proxies.into_iter().zip(states) {
+        if !held.holds {
+            continue;
+        }
+        if let Some(at) = held.listed_at {
+            listing.cached_at = Some(listing.cached_at.map_or(at, |oldest| oldest.min(at)));
+        }
+        let due = held
+            .listed_at
+            .is_none_or(|at| at + ProxyRepo::metadata_ttl(&proxy) <= now || at < proxy.updated_at);
+        if due && proxy.online {
+            listing.due.push(proxy);
+        }
+    }
+    listing
+}
+
+/// At most this many package-page refreshes run off their requests at once
+/// on an instance; a page that finds none free refreshes nothing.
+const MAX_BACKGROUND_REFRESHES: usize = 4;
+/// A proxy's package is refreshed off a page's request at most once within
+/// this long, whatever the refresh found: a page left open, or an upstream
+/// that keeps failing, costs one refresh a minute at most.
+const BACKGROUND_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+/// The refreshes remembered before those past their cooldown are let go.
+const BACKGROUND_REFRESH_MEMORY: usize = 10_000;
+
+/// The package pages' refreshes from the upstream off their requests
+/// (#836), on one instance: one at a time per proxy and package, at most
+/// [`MAX_BACKGROUND_REFRESHES`] at once, and none again within
+/// [`BACKGROUND_REFRESH_COOLDOWN`] of the last one.
+pub struct BackgroundRefreshes {
+    /// Per (proxy id, package): `None` while its refresh runs, else when the
+    /// last one ended.
+    seen: std::sync::Mutex<HashMap<(i64, String), Option<std::time::Instant>>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for BackgroundRefreshes {
+    fn default() -> Self {
+        BackgroundRefreshes {
+            seen: Default::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_BACKGROUND_REFRESHES)),
+        }
+    }
+}
+
+impl BackgroundRefreshes {
+    /// Refresh package `lower` of each of the `due` proxies off the request
+    /// ([`refresh_from_upstream`], for `principal`), unless its refresh is
+    /// under way, one ended within the cooldown, or the instance runs as
+    /// many as it may. Whether one of them is under way now.
+    pub fn start(
+        self: &Arc<Self>,
+        state: &AppState,
+        due: Vec<Repository>,
+        principal: &Principal,
+        lower: &str,
+    ) -> bool {
+        let mut refreshing = false;
+        for proxy in due {
+            let key = (proxy.id, lower.to_string());
+            let permit = {
+                let mut seen = self.seen();
+                match seen.get(&key) {
+                    Some(None) => {
+                        refreshing = true;
+                        continue;
+                    }
+                    Some(Some(ended)) if ended.elapsed() < BACKGROUND_REFRESH_COOLDOWN => continue,
+                    _ => {}
+                }
+                let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+                    continue;
+                };
+                if seen.len() >= BACKGROUND_REFRESH_MEMORY {
+                    seen.retain(|_, ended| {
+                        ended.is_none_or(|ended| ended.elapsed() < BACKGROUND_REFRESH_COOLDOWN)
+                    });
+                }
+                seen.insert(key.clone(), None);
+                permit
+            };
+            refreshing = true;
+            let ended = RefreshEnded {
+                refreshes: self.clone(),
+                key,
+            };
+            let (state, principal, lower) = (state.clone(), principal.clone(), lower.to_string());
+            tokio::spawn(async move {
+                let (_permit, _ended) = (permit, ended);
+                let refreshed = match state.formats.for_repository(&proxy) {
+                    Ok(format) => {
+                        refresh_from_upstream(&state, &proxy, &format, principal, &lower).await
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = refreshed {
+                    tracing::warn!(repo = %proxy.name, id = %lower, error = %e, "browse: refreshing the package from the upstream failed");
+                }
+            });
+        }
+        refreshing
+    }
+
+    fn seen(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<(i64, String), Option<std::time::Instant>>> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Marks a background refresh ended when its task does, however it ends.
+struct RefreshEnded {
+    refreshes: Arc<BackgroundRefreshes>,
+    key: (i64, String),
+}
+
+impl Drop for RefreshEnded {
+    fn drop(&mut self) {
+        self.refreshes.seen().insert(
+            std::mem::take(&mut self.key),
+            Some(std::time::Instant::now()),
+        );
+    }
 }
 
 /// The package delay of proxy package `lower_id` and its versions released
@@ -798,6 +1141,10 @@ pub fn browse_router() -> Router<AppState> {
         .route("/browse/repos", get(list_repos))
         .route("/browse/packages", get(search_packages))
         .route("/browse/packages/{repo}/{id}", get(package_detail))
+        .route(
+            "/browse/packages/{repo}/{id}/refresh",
+            axum::routing::post(refresh_package),
+        )
         .route("/browse/images", get(crate::browse_images::list_images))
         .route("/browse/chart", get(crate::browse_images::chart_detail))
         .route(

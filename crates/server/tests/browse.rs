@@ -4,11 +4,21 @@
 //! the signed-in-users-only rule (anonymous browse is 401 even for
 //! `anonymous_read` repos — those stay readable on their repository feed only);
 //! the `/browse/repos` folder root; group-repo merge; dependency-group
-//! rendering; and that mounting `/browse` + `/admin/me` did not shadow the
-//! admin-only `/admin/*` API.
+//! rendering; a proxy's and a group's package page read from the cache,
+//! refreshed off the request and on Refresh (#836); and that mounting
+//! `/browse` + `/admin/me` did not shadow the admin-only `/admin/*` API.
 
 mod common;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
 use common::ServerOpts;
 use serde_json::{json, Value};
 
@@ -283,6 +293,17 @@ async fn browse_requires_login() {
         let resp = srv.client().get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 401, "anonymous {url} must be 401");
     }
+    // Refresh from upstream too (#836).
+    let resp = srv
+        .client()
+        .post(format!(
+            "{}/browse/packages/{pub_repo}/{pub_id}/refresh",
+            srv.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "anonymous refresh must be 401");
 
     // The same anonymous caller can still read the repo through the NuGet feed.
     let resp = srv
@@ -868,4 +889,529 @@ async fn admin_api_not_shadowed_by_new_routes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+/// A NuGet upstream for the package page's tests (#836): a flat container, a
+/// registration with each version's dependency on `Dep.Lib`, and the `.nuspec` and
+/// `.nupkg` of its versions. It records the path of every request, and holds
+/// them all while it is closed.
+struct Upstream {
+    base: String,
+    /// Package id as published → its versions.
+    packages: Mutex<HashMap<String, Vec<String>>>,
+    requests: Mutex<Vec<String>>,
+    open: tokio::sync::watch::Sender<bool>,
+}
+
+impl Upstream {
+    async fn start(packages: &[(&str, &str)]) -> Arc<Upstream> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let upstream = Arc::new(Upstream {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            packages: Mutex::new(HashMap::new()),
+            requests: Mutex::new(Vec::new()),
+            open: tokio::sync::watch::channel(true).0,
+        });
+        for (id, version) in packages {
+            upstream.publish(id, version);
+        }
+        let app = Router::new()
+            .route("/index.json", get(upstream_index))
+            .route("/flat/{id}/index.json", get(upstream_versions))
+            .route("/flat/{id}/{version}/{file}", get(upstream_file))
+            .route("/registration/{id}/index.json", get(upstream_registration))
+            .with_state(upstream.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve upstream");
+        });
+        upstream
+    }
+
+    fn publish(&self, id: &str, version: &str) {
+        self.packages
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_default()
+            .push(version.to_string());
+    }
+
+    /// The package published as `lower` (any casing), with its versions.
+    fn package(&self, lower: &str) -> Option<(String, Vec<String>)> {
+        self.packages
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| id.to_lowercase() == lower)
+            .map(|(id, versions)| (id.clone(), versions.clone()))
+    }
+
+    /// Hold every request until [`Self::open`] (`false`), or let them through.
+    fn set_open(&self, open: bool) {
+        self.open.send_replace(open);
+    }
+
+    /// Every request so far.
+    fn total(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    /// Wait (ten seconds at most) until it has had more than `seen` requests.
+    async fn asked_beyond(&self, seen: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.total() <= seen {
+            assert!(tokio::time::Instant::now() < deadline, "never asked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The requests that named package `lower`.
+    fn requests_for(&self, lower: &str) -> usize {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.contains(&format!("/{lower}/")))
+            .count()
+    }
+
+    async fn record(&self, path: String) {
+        self.requests.lock().unwrap().push(path);
+        let mut open = self.open.subscribe();
+        let _ = open.wait_for(|open| *open).await;
+    }
+}
+
+async fn upstream_index(State(up): State<Arc<Upstream>>) -> Json<Value> {
+    up.record("/index.json".into()).await;
+    Json(json!({
+        "version": "3.0.0",
+        "resources": [
+            {"@id": format!("{}/flat/", up.base), "@type": "PackageBaseAddress/3.0.0"},
+            {"@id": format!("{}/registration/", up.base), "@type": "RegistrationsBaseUrl/3.6.0"},
+        ],
+    }))
+}
+
+async fn upstream_versions(State(up): State<Arc<Upstream>>, Path(id): Path<String>) -> Response {
+    up.record(format!("/flat/{id}/index.json")).await;
+    match up.package(&id) {
+        Some((_, versions)) => Json(json!({"versions": versions})).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn upstream_registration(
+    State(up): State<Arc<Upstream>>,
+    Path(id): Path<String>,
+) -> Response {
+    up.record(format!("/registration/{id}/index.json")).await;
+    let Some((original, versions)) = up.package(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let leaves: Vec<Value> = versions
+        .iter()
+        .map(|v| {
+            json!({
+                "@id": format!("{}/registration/{id}/{v}.json", up.base),
+                "catalogEntry": {
+                    "id": original,
+                    "version": v,
+                    "listed": true,
+                    "dependencyGroups": [{
+                        "targetFramework": "net8.0",
+                        "dependencies": [{"id": "Dep.Lib", "range": "[1.0.0, )"}],
+                    }],
+                },
+                "packageContent": format!("{}/flat/{id}/{v}/{id}.{v}.nupkg", up.base),
+            })
+        })
+        .collect();
+    Json(json!({
+        "count": 1,
+        "items": [{
+            "@id": format!("{}/registration/{id}/index.json#page", up.base),
+            "lower": versions.first(),
+            "upper": versions.last(),
+            "count": leaves.len(),
+            "items": leaves,
+        }],
+    }))
+    .into_response()
+}
+
+async fn upstream_file(
+    State(up): State<Arc<Upstream>>,
+    Path((id, version, file)): Path<(String, String, String)>,
+) -> Response {
+    up.record(format!("/flat/{id}/{version}/{file}")).await;
+    let Some((original, versions)) = up.package(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !versions.contains(&version) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if file.ends_with(".nupkg") {
+        common::make_nupkg(&original, &version).into_response()
+    } else if file.ends_with(".nuspec") {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>{original}</id>
+    <version>{version}</version>
+    <authors>test</authors>
+    <description>{original} from upstream</description>
+  </metadata>
+</package>"#
+        )
+        .into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+/// Create proxy `name` of `upstream` (no package delay, an hour's metadata
+/// TTL) as the bootstrap admin.
+async fn create_proxy(srv: &common::TestServer, name: &str, upstream: &Upstream) {
+    let (u, p) = srv.admin_basic();
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({
+            "name": name,
+            "kind": "proxy",
+            "remote_url": format!("{}/index.json", upstream.base),
+            "package_delay_seconds": 0,
+            "metadata_ttl_seconds": 3600,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create proxy {name}");
+}
+
+/// `GET` (or `POST`, for a refresh) `path` as the bootstrap admin; the
+/// status and the JSON body (`null` when there is none). Fails the test if
+/// it takes ten seconds.
+async fn admin_send(srv: &common::TestServer, method: reqwest::Method, path: &str) -> (u16, Value) {
+    let (u, p) = srv.admin_basic();
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        srv.client()
+            .request(method, format!("{}{path}", srv.base_url))
+            .basic_auth(&u, Some(&p))
+            .send(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{path} took ten seconds"))
+    .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// The dependency ids of `version` on a package detail.
+fn dependencies_of(detail: &Value, version: &str) -> Vec<String> {
+    detail["dependency_groups_by_version"][version]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|group| {
+            group["dependencies"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|dep| dep["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The versions of a package detail.
+fn versions_of(detail: &Value) -> Vec<String> {
+    detail["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["version"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Ask `path` (a package page) until its versions are `want`, for ten seconds.
+async fn page_until(srv: &common::TestServer, path: &str, want: &[&str]) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, detail) = admin_send(srv, reqwest::Method::GET, path).await;
+        if status == 200 && versions_of(&detail) == want {
+            return detail;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{path} never listed {want:?}: {status} {detail}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The cached-version rows a proxy holds of a package.
+async fn cached_rows(srv: &common::TestServer, proxy: &str, lower: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM proxy_cached_version v JOIN repository r ON r.id = v.repository_id
+         WHERE r.name = $1 AND v.name = $2",
+    )
+    .bind(proxy)
+    .bind(lower)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap()
+}
+
+/// A proxy's package page answers from what Forge holds (#836): with the
+/// dependencies of the registration a client fetched, and when the upstream
+/// listed the package, but without asking the upstream on the request, also
+/// once the listing is stale (here: older than a cache invalidation), and
+/// without discovering a package it holds nothing of. A stale page starts a
+/// refresh off the request, once, and the next look shows what it found.
+#[tokio::test]
+async fn a_proxy_package_page_answers_from_the_cache_and_refreshes_off_the_request() {
+    let srv = common::start().await;
+    let upstream = Upstream::start(&[("Cached.Lib", "1.0.0"), ("Uncached.Lib", "1.0.0")]).await;
+    let proxy = format!("cachep{}", common::unique());
+    create_proxy(&srv, &proxy, &upstream).await;
+
+    // A client restores Cached.Lib: its listing and registration are cached.
+    for path in [
+        format!("/repository/{proxy}/flat/cached.lib/index.json"),
+        format!("/repository/{proxy}/registration/cached.lib/index.json"),
+    ] {
+        let (status, body) = admin_send(&srv, reqwest::Method::GET, &path).await;
+        assert_eq!(status, 200, "{path}: {body}");
+    }
+    let asked = upstream.requests_for("cached.lib");
+    assert!(asked > 0);
+
+    let page = format!("/browse/packages/{proxy}/Cached.Lib");
+    let (status, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(versions_of(&detail), ["1.0.0"]);
+    assert_eq!(dependencies_of(&detail, "1.0.0"), ["Dep.Lib"], "{detail}");
+    let cached_at = detail["cached_at"].as_str().expect("cached_at").to_string();
+    assert!(detail.get("refreshing").is_none(), "fresh: {detail}");
+    assert_eq!(
+        upstream.requests_for("cached.lib"),
+        asked,
+        "the page asked the upstream"
+    );
+
+    // A version published since shows once the listing is refreshed, not
+    // before: the page asks nothing within the TTL.
+    upstream.publish("Cached.Lib", "2.0.0");
+    let (_, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+    assert_eq!(versions_of(&detail), ["1.0.0"]);
+    assert_eq!(upstream.requests_for("cached.lib"), asked);
+
+    // A package the proxy holds nothing of is not found, and looking at its
+    // page neither asks the upstream nor records it.
+    let (status, _) = admin_send(
+        &srv,
+        reqwest::Method::GET,
+        &format!("/browse/packages/{proxy}/Uncached.Lib"),
+    )
+    .await;
+    assert_eq!(status, 404);
+    assert_eq!(upstream.requests_for("uncached.lib"), 0);
+    assert_eq!(cached_rows(&srv, &proxy, "uncached.lib").await, 0);
+
+    // Past an invalidation the listing is stale: the page answers from the
+    // cache and starts a refresh off the request. While the upstream holds
+    // that refresh's request, the page still answers at once, and starts no
+    // other.
+    let (status, _) = admin_send(
+        &srv,
+        reqwest::Method::POST,
+        &format!("/admin/repositories/{proxy}/proxy-cache/invalidate"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    upstream.set_open(false);
+    let seen = upstream.total();
+    let (status, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(versions_of(&detail), ["1.0.0"]);
+    assert_eq!(detail["refreshing"], true, "{detail}");
+    upstream.asked_beyond(seen).await;
+    let held = upstream.total();
+    let (status, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(versions_of(&detail), ["1.0.0"]);
+    assert_eq!(detail["refreshing"], true, "{detail}");
+    assert_eq!(upstream.total(), held, "a second refresh");
+
+    // Once the upstream answers, the page shows the new version.
+    upstream.set_open(true);
+    page_until(&srv, &page, &["1.0.0", "2.0.0"]).await;
+    // Once the refresh is done (it fetches the registration and tags after
+    // the listing), the page is fresh again: no other refresh starts.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+        if detail.get("refreshing").is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "still refreshing: {detail}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let done = upstream.total();
+    let (_, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+    assert!(detail.get("refreshing").is_none(), "{detail}");
+    assert!(
+        detail["cached_at"].as_str().unwrap() > cached_at.as_str(),
+        "{detail}"
+    );
+    assert_eq!(dependencies_of(&detail, "2.0.0"), ["Dep.Lib"], "{detail}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(upstream.total(), done, "a refresh of a fresh page");
+}
+
+/// **Refresh from upstream** asks the upstream now, and answers the
+/// refreshed page: any reader of the proxy may, and it finds a package the
+/// proxy held nothing of (#836). A caller who may not read the proxy may not,
+/// and a package the upstream does not have stays not found.
+#[tokio::test]
+async fn refresh_from_upstream_needs_only_read_access() {
+    let srv = common::start().await;
+    let upstream = Upstream::start(&[("Fresh.Lib", "1.0.0")]).await;
+    let proxy = format!("refrp{}", common::unique());
+    create_proxy(&srv, &proxy, &upstream).await;
+    let reader = srv.caller().await;
+    srv.grant_role(reader.id, &[(proxy.as_str(), "read", None)])
+        .await;
+    let stranger = srv.caller().await;
+
+    let refresh = |caller: &common::Caller, id: &str| {
+        caller
+            .apply(srv.client().post(format!(
+                "{}/browse/packages/{proxy}/{id}/refresh",
+                srv.base_url
+            )))
+            .send()
+    };
+    let resp = refresh(&stranger, "Fresh.Lib").await.unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(upstream.requests_for("fresh.lib"), 0);
+
+    let resp = refresh(&reader, "Fresh.Lib").await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let detail: Value = resp.json().await.unwrap();
+    assert_eq!(versions_of(&detail), ["1.0.0"], "{detail}");
+    assert_eq!(dependencies_of(&detail, "1.0.0"), ["Dep.Lib"], "{detail}");
+    assert!(detail["cached_at"].is_string(), "{detail}");
+    assert!(upstream.requests_for("fresh.lib") > 0);
+
+    // The page has it now, from the cache.
+    let resp = reader
+        .apply(srv.client().get(format!(
+            "{}/browse/packages/{proxy}/fresh.lib",
+            srv.base_url
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = refresh(&reader, "Missing.Lib").await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// A group's package page reads its proxy member from the cache too (#836):
+/// a package the proxy holds nothing of is not found through the group and
+/// is not asked for, the age of the page is the member's listing, a stale
+/// member is refreshed off the request, and Refresh on the group asks the
+/// members.
+#[tokio::test]
+async fn a_group_package_page_reads_its_proxy_members_from_the_cache() {
+    let srv = common::start().await;
+    let (u, p) = srv.admin_basic();
+    let upstream = Upstream::start(&[("Group.Lib", "1.0.0"), ("Later.Lib", "1.0.0")]).await;
+    let suffix = common::unique();
+    let proxy = format!("cgp{suffix}");
+    let group = format!("cgg{suffix}");
+    create_proxy(&srv, &proxy, &upstream).await;
+    let client = srv.client();
+    let resp = client
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"name": group, "kind": "group"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = client
+        .post(format!(
+            "{}/admin/repositories/{group}/members",
+            srv.base_url
+        ))
+        .basic_auth(&u, Some(&p))
+        .json(&json!({"member": proxy, "priority": 10}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // A client restores Group.Lib through the group.
+    let (status, _) = admin_send(
+        &srv,
+        reqwest::Method::GET,
+        &format!("/repository/{group}/flat/group.lib/index.json"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let asked = upstream.requests_for("group.lib");
+
+    let page = format!("/browse/packages/{group}/Group.Lib");
+    let (status, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(versions_of(&detail), ["1.0.0"]);
+    assert!(detail["cached_at"].is_string(), "{detail}");
+    assert!(detail.get("refreshing").is_none(), "{detail}");
+    assert_eq!(upstream.requests_for("group.lib"), asked);
+
+    let later = format!("/browse/packages/{group}/Later.Lib");
+    let (status, _) = admin_send(&srv, reqwest::Method::GET, &later).await;
+    assert_eq!(status, 404);
+    assert_eq!(upstream.requests_for("later.lib"), 0);
+    assert_eq!(cached_rows(&srv, &proxy, "later.lib").await, 0);
+
+    // A stale member is refreshed off the group page's request.
+    upstream.publish("Group.Lib", "2.0.0");
+    let (status, _) = admin_send(
+        &srv,
+        reqwest::Method::POST,
+        &format!("/admin/repositories/{proxy}/proxy-cache/invalidate"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    upstream.set_open(false);
+    let seen = upstream.total();
+    let (status, detail) = admin_send(&srv, reqwest::Method::GET, &page).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(versions_of(&detail), ["1.0.0"]);
+    assert_eq!(detail["refreshing"], true, "{detail}");
+    upstream.asked_beyond(seen).await;
+    let (status, _) = admin_send(&srv, reqwest::Method::GET, &page).await;
+    assert_eq!(status, 200);
+    upstream.set_open(true);
+    page_until(&srv, &page, &["1.0.0", "2.0.0"]).await;
+
+    // Refresh on the group asks its members for a package they lacked.
+    let (status, detail) =
+        admin_send(&srv, reqwest::Method::POST, &format!("{later}/refresh")).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(versions_of(&detail), ["1.0.0"]);
+    assert!(upstream.requests_for("later.lib") > 0);
 }
