@@ -605,6 +605,14 @@ pub struct AuthConfig {
     /// row. `0` disables the limit.
     #[serde(default = "default_oidc_login_starts_per_minute")]
     pub oidc_login_starts_per_minute: u32,
+    /// Polls of the device login's token endpoint (`POST /auth/device/token`)
+    /// allowed per client network (IPv6: per /64) and minute, per instance.
+    /// Anyone may poll, without an account; a poll past the limit is answered
+    /// `429` (`slow_down`) without asking the database. Each device code is
+    /// also held to ten polls per ten seconds. `0` disables the limit per
+    /// network.
+    #[serde(default = "default_device_polls_per_minute")]
+    pub device_polls_per_minute: u32,
     /// Maximum concurrent upstream credential forwards **per
     /// credential-forwarding realm, per instance** (verdict-cache misses
     /// only; cache hits never forward). A miss beyond the bound fails closed
@@ -695,6 +703,12 @@ fn default_credential_forward_max_concurrent() -> usize {
 
 fn default_oidc_login_starts_per_minute() -> u32 {
     30
+}
+
+/// Ten device logins polling at once from one network at the shortest
+/// interval (1 s), or fifty at the default one (5 s).
+fn default_device_polls_per_minute() -> u32 {
+    600
 }
 
 fn default_realm_cache_ttl() -> u64 {

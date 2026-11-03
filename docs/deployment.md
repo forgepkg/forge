@@ -698,7 +698,7 @@ authorization server metadata ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414
 | --- | --- | --- |
 | `GET` | `/.well-known/oauth-authorization-server` | `issuer` (`server.public_base_url`), `device_authorization_endpoint`, `token_endpoint`, `grant_types_supported` (`urn:ietf:params:oauth:grant-type:device_code`). |
 | `POST` | `/auth/device/code` | Start a login (RFC 8628 §3.1): `client_id` and an optional `scope`, form-encoded. Answers `device_code`, `user_code`, `verification_uri` (`<base>/device`), `verification_uri_complete` (`<base>/device?code=BCDF-GHJK`), `expires_in` and `interval`. |
-| `POST` | `/auth/device/token` | Poll it (§3.4): `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Answers `authorization_pending` until the user decides, `slow_down` when polled sooner than the interval (which then grows by five seconds), `access_denied`, `expired_token`, or the token: `access_token`, `token_type` `Bearer`, `expires_in`, `scope` when one was asked for, and `username`, whose token it is. |
+| `POST` | `/auth/device/token` | Poll it (§3.4): `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Answers `authorization_pending` until the user decides, `slow_down` when polled sooner than the interval (which then grows by five seconds) or too often ([polling](#device-login), below), `access_denied`, `expired_token`, or the token: `access_token`, `token_type` `Bearer`, `expires_in`, `scope` when one was asked for, and `username`, whose token it is. |
 
 ```bash
 curl -s https://forge.example.com/auth/device/code \
@@ -711,8 +711,9 @@ curl -s https://forge.example.com/auth/device/token \
 Every refusal of these two endpoints is an RFC 6749 §5.2 JSON object
 (`{"error": "…", "error_description": "…"}`, `400`), never an HTML page,
 whatever credentials the request carries; `503` with `Retry-After` when
-Forge's database does not answer, `429` when a network starts too many
-logins (`auth.oidc_login_starts_per_minute`, as for OIDC sign-ins).
+Forge's database does not answer, `429` with `Retry-After` when a network
+starts too many logins (`auth.oidc_login_starts_per_minute`, as for OIDC
+sign-ins) or polls too often (`auth.device_polls_per_minute`).
 
 - **Clients.** Forge has no client registration: it accepts its helpers'
   fixed client ids, `forge-cli`, `docker-credential-forge` and
@@ -739,6 +740,22 @@ logins (`auth.oidc_login_starts_per_minute`, as for OIDC sign-ins).
   waits for its approval for `cli_login.web_login_ttl_seconds` (10
   minutes); its token is answered to one poll, and a second poll gets
   `expired_token`. The auth reaper deletes the requests past their lifetime.
+- **Polling.** Anyone may poll, without an account, so each instance counts
+  the polls before it asks the database: per client network (IPv6 by /64),
+  `auth.device_polls_per_minute` a minute (600; `0`: no limit), past which a
+  poll is answered `429` `slow_down` with `Retry-After: 60`; and per device
+  code, ten every ten seconds (one a second, the shortest interval), past
+  which it is answered `slow_down`. Polls of one code are answered one at a
+  time: a poll that comes while another poll of the code is being answered
+  is told `slow_down` at once, rather than waiting for it with a database
+  connection. Raise `auth.device_polls_per_minute` when many users sign in
+  at once from behind one address, or set `auth.trusted_proxy_cidrs` when
+  every client seems to come from Forge's reverse proxy.
+
+  ```toml
+  [auth]
+  device_polls_per_minute = 600
+  ```
 - **The `/device` page.** A signed-in user types the code, or arrives with it
   filled in from `verification_uri_complete`; a visitor is sent through the
   sign-in and back, with the code. The page shows which client asks, for

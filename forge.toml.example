@@ -169,6 +169,11 @@ realm_cache_ttl_seconds = 10    # (default: 10)
 # Concurrent upstream credential forwards (verdict-cache misses) allowed per
 # credential-forwarding realm, per instance; excess logins fail closed (401).
 credential_forward_max_concurrent = 32  # (default: 32)
+# Device login polls (POST /auth/device/token) allowed per client network
+# (IPv6: per /64) and minute, per instance; more are answered 429 slow_down.
+# Raise it when many users sign in at once from behind one address. 0 = no
+# limit.
+device_polls_per_minute = 600   # (default: 600)
 
 # Optional: bootstrap admin, created once on the first start with a password.
 # Omit the section, or leave the password empty/unset, for no bootstrap admin

@@ -49,8 +49,8 @@ pub use cred_cache::{
 };
 pub use local_password::{LimiterSaturated, LocalPasswordProvider, PasswordHashLimiter};
 pub use login_throttle::{
-    client_network, username_for_log, AttemptRefused, KnownNetworkStore, LoginAttempt,
-    LoginThrottle, PgKnownNetworks, WindowLimiter, MAX_USERNAME_BYTES,
+    client_network, username_for_log, AttemptRefused, KeyedWindowLimiter, KnownNetworkStore,
+    LoginAttempt, LoginThrottle, PgKnownNetworks, WindowLimiter, MAX_USERNAME_BYTES,
 };
 pub use principal::{AuthMethod, Principal, TrustedPublisherMatch, UserPrincipal};
 pub use provider::{

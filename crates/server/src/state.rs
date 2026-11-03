@@ -90,6 +90,9 @@ pub struct AppState {
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
     pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
+    /// Rate limits on polling a device login (`POST /auth/device/token`), per
+    /// client network (`auth.device_polls_per_minute`) and per device code.
+    pub device_polls: Arc<crate::auth::DevicePollLimits>,
     /// Secret encryption at rest: seals and opens every secret Forge keeps.
     /// Built fallibly by [`crate::crypto::build_envelope`] **before**
     /// [`AppState::new`] (a missing or broken root key must abort startup).
@@ -367,6 +370,9 @@ impl AppState {
             config.auth.oidc_login_starts_per_minute,
             std::time::Duration::from_secs(60),
         ));
+        let device_polls = Arc::new(crate::auth::DevicePollLimits::new(
+            config.auth.device_polls_per_minute,
+        ));
 
         let (pool_for_mailer, config_for_mailer) = (pool.clone(), config.clone());
         let instance = Arc::new(Instance::current());
@@ -395,6 +401,7 @@ impl AppState {
             invitation_throttle,
             device_code_throttle,
             oidc_login_starts,
+            device_polls,
             upstream,
             registry_keys: crate::images::token::TokenKeys::new(vec![{
                 use rand::Rng;

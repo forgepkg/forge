@@ -77,7 +77,8 @@ mod trusted_header;
 mod wif;
 
 pub use device::{
-    AUTHORIZATION_SERVER_METADATA_PATH, DEVICE_CODE_GRANT, DEVICE_CODE_PATH, DEVICE_TOKEN_PATH,
+    DevicePollLimits, AUTHORIZATION_SERVER_METADATA_PATH, DEVICE_CODE_GRANT, DEVICE_CODE_PATH,
+    DEVICE_TOKEN_PATH,
 };
 pub use issuer::{
     issuer_router, spawn_issuer_refresh, AssertionIssuer, DISCOVERY_PATH, ISSUER_KEYS_SETTING,

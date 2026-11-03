@@ -65,6 +65,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
@@ -789,14 +790,58 @@ impl Default for LoginThrottle {
 /// full of live windows refuses networks it does not track yet.
 #[derive(Debug)]
 pub struct WindowLimiter {
-    max: u32,
-    window: Duration,
-    state: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    windows: Windows<IpAddr>,
 }
 
 impl WindowLimiter {
     /// Allow `max` calls per `window` per network; `0` disables the limit.
     pub fn new(max: u32, window: Duration) -> Self {
+        Self {
+            windows: Windows::new(max, window),
+        }
+    }
+
+    /// Count a call from `ip`; `false` when its network is over the limit.
+    pub fn allow(&self, ip: IpAddr) -> bool {
+        self.windows.allow(client_network(ip)).unwrap_or(false)
+    }
+}
+
+/// A fixed-window rate limit per key of the caller's choosing (e.g. a secret
+/// the call names), next to a [`WindowLimiter`] that bounds the caller's
+/// network. Bounded memory like it, but a map still full of live windows
+/// lets a key it does not track yet through uncounted: whoever fills the map
+/// would otherwise have every other key refused, and the network's limit
+/// still applies.
+#[derive(Debug)]
+pub struct KeyedWindowLimiter<K> {
+    windows: Windows<K>,
+}
+
+impl<K: Eq + Hash> KeyedWindowLimiter<K> {
+    /// Allow `max` calls per `window` per key; `0` disables the limit.
+    pub fn new(max: u32, window: Duration) -> Self {
+        Self {
+            windows: Windows::new(max, window),
+        }
+    }
+
+    /// Count a call under `key`; `false` when the key is over the limit.
+    pub fn allow(&self, key: K) -> bool {
+        self.windows.allow(key).unwrap_or(true)
+    }
+}
+
+/// The fixed windows of a [`WindowLimiter`] or [`KeyedWindowLimiter`].
+#[derive(Debug)]
+struct Windows<K> {
+    max: u32,
+    window: Duration,
+    state: Mutex<HashMap<K, (Instant, u32)>>,
+}
+
+impl<K: Eq + Hash> Windows<K> {
+    fn new(max: u32, window: Duration) -> Self {
         Self {
             max,
             window,
@@ -804,31 +849,32 @@ impl WindowLimiter {
         }
     }
 
-    /// Count a call from `ip`; `false` when its network is over the limit.
-    pub fn allow(&self, ip: IpAddr) -> bool {
+    /// Count a call under `key`: whether it is within the limit, `None` when
+    /// the key is not tracked and the map is full of live windows (nothing
+    /// counted).
+    fn allow(&self, key: K) -> Option<bool> {
         if self.max == 0 {
-            return true;
+            return Some(true);
         }
         let now = Instant::now();
-        let net = client_network(ip);
         let mut state = self.state.lock().expect("window limiter mutex poisoned");
-        if !state.contains_key(&net) && state.len() >= MAX_TRACKED {
+        if !state.contains_key(&key) && state.len() >= MAX_TRACKED {
             let window = self.window;
             state.retain(|_, (start, _)| now.duration_since(*start) < window);
             if state.len() >= MAX_TRACKED {
-                return false;
+                return None;
             }
         }
-        let (start, count) = state.entry(net).or_insert((now, 0));
+        let (start, count) = state.entry(key).or_insert((now, 0));
         if now.duration_since(*start) >= self.window {
             *start = now;
             *count = 0;
         }
         if *count >= self.max {
-            return false;
+            return Some(false);
         }
         *count += 1;
-        true
+        Some(true)
     }
 }
 
@@ -1090,6 +1136,38 @@ mod tests {
         assert!(!l.allow(ip("2001:db8::3")), "same /64");
         assert!(l.allow(ip("2001:db8:0:1::1")), "another /64");
         assert!(WindowLimiter::new(0, Duration::ZERO).allow(ip("192.0.2.1")));
+    }
+
+    #[test]
+    fn keyed_window_limiter_counts_per_key_and_window() {
+        let l = KeyedWindowLimiter::new(2, Duration::from_millis(50));
+        assert!(l.allow("a"));
+        assert!(l.allow("a"));
+        assert!(!l.allow("a"), "over the limit");
+        assert!(l.allow("b"), "another key has its own budget");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(l.allow("a"), "a new window");
+        assert!(KeyedWindowLimiter::new(0, Duration::ZERO).allow("a"));
+    }
+
+    #[test]
+    fn a_full_map_refuses_new_networks_but_lets_new_keys_through() {
+        let networks = WindowLimiter::new(1, Duration::from_secs(60));
+        let keys = KeyedWindowLimiter::new(1, Duration::from_secs(60));
+        for n in 0..MAX_TRACKED as u32 {
+            assert!(networks.allow(IpAddr::from(n.to_be_bytes())));
+            assert!(keys.allow(n));
+        }
+        let new = MAX_TRACKED as u32;
+        assert!(
+            !networks.allow(IpAddr::from(new.to_be_bytes())),
+            "a network the full map has no room for is refused"
+        );
+        assert!(
+            keys.allow(new) && keys.allow(new),
+            "a key the full map has no room for is let through, uncounted"
+        );
+        assert!(!keys.allow(0), "a tracked key keeps its limit");
     }
 
     #[tokio::test]
