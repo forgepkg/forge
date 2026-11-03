@@ -27,6 +27,7 @@ describe('connectSnippets', () => {
     expect(snippets.map((s) => s.command)).toEqual([
       'npm config set registry https://f.example/repository/npm-all/',
       'npm config set @<scope>:registry https://f.example/repository/npm-all/',
+      'npm config set replace-registry-host <package-lock.json-host>',
       'npm login --registry https://f.example/repository/npm-all/',
     ])
     expect(
