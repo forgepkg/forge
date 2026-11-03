@@ -1358,6 +1358,92 @@ async fn a_failed_item_is_retried_on_its_own() {
     );
 }
 
+/// A feed whose flat container serves another package's .nupkg for a
+/// version it lists plants nothing, whatever the registration's SHA-512
+/// says: not a version Forge lacks, and not over one it has, even with
+/// `overwrite`.
+#[tokio::test]
+async fn a_feed_cannot_plant_another_package_under_a_listed_version() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    let repo = repo_name("nuget-planted");
+    create_repo(&srv, json!({"name": repo, "kind": "hosted"})).await;
+    // Forge holds Acme.Victim 2.0.0.
+    let ours = make_nupkg("Acme.Victim", "2.0.0");
+    let token = srv.admin_token().await;
+    let resp = srv
+        .client()
+        .put(format!("{}/repository/{repo}/package", srv.base_url))
+        .header("X-NuGet-ApiKey", &token)
+        .multipart(reqwest::multipart::Form::new().part(
+            "package",
+            reqwest::multipart::Part::bytes(ours.clone()).file_name("p.nupkg"),
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // The feed lists Acme.Foo 1.0.0 and Acme.Bar 1.0.0, and its
+    // registration lists the SHA-512 of the files it serves for them: other
+    // bytes of Acme.Victim 2.0.0, and Acme.Fresh 3.0.0 (which Forge lacks).
+    source.nuget(
+        "nuget-hosted",
+        "Acme.Foo",
+        "1.0.0",
+        make_nupkg_with_payload("Acme.Victim", "2.0.0", 64),
+        "2021-01-01T00:00:00.000+00:00",
+    );
+    source.nuget(
+        "nuget-hosted",
+        "Acme.Bar",
+        "1.0.0",
+        make_nupkg("Acme.Fresh", "3.0.0"),
+        "2021-01-01T00:00:00.000+00:00",
+    );
+
+    for on_conflict in ["skip", "overwrite"] {
+        let mut body = from(source.feed_url("nuget-hosted"));
+        body["on_conflict"] = json!(on_conflict);
+        let id = start(&srv, &repo, body).await;
+        let done = run(&srv, &repo, id).await;
+        assert_eq!(done["state"], "completed", "{on_conflict}: {done}");
+        let p = &done["progress"];
+        assert_eq!(
+            (
+                p["failed"].as_i64(),
+                p["imported"].as_i64(),
+                p["replaced"].as_i64()
+            ),
+            (Some(2), Some(0), Some(0)),
+            "{on_conflict}: {p}"
+        );
+        for (name, planted) in [
+            ("Acme.Foo", "Acme.Victim 2.0.0"),
+            ("Acme.Bar", "Acme.Fresh 3.0.0"),
+        ] {
+            let failed = item_of(&srv, &repo, id, name, "1.0.0").await;
+            assert_eq!(failed["state"], "failed", "{on_conflict}: {failed}");
+            assert!(
+                failed["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("the package is {planted}, not {name} 1.0.0")),
+                "{on_conflict}: {failed}"
+            );
+        }
+        // Nothing stored, neither under the listed ids nor the planted ones.
+        assert!(nupkg(&srv, &repo, "Acme.Foo", "1.0.0").await.is_none());
+        assert!(nupkg(&srv, &repo, "Acme.Bar", "1.0.0").await.is_none());
+        assert!(nupkg(&srv, &repo, "Acme.Fresh", "3.0.0").await.is_none());
+        assert_eq!(
+            nupkg(&srv, &repo, "Acme.Victim", "2.0.0").await.unwrap(),
+            ours,
+            "{on_conflict}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cancel_resume_delete_and_one_import_at_a_time() {
     let srv = forge().await;
