@@ -19,7 +19,8 @@ import { describeScope } from './Device'
  * code a command-line client shows (or arrives with it filled in from the
  * client's link), sees which client asks for what, and approves or denies it
  * (`POST /auth/device/lookup`, `POST /auth/device/decide`). A filled-in code
- * is looked up but never approved without the click; a visitor is sent
+ * is looked up only on the click on Continue (#803), and never approved
+ * without the click on Approve; a visitor is sent
  * through the sign-in and back with the code; a code no request waits for
  * (mistyped, expired, answered) and too many wrong codes are said so.
  */
@@ -156,11 +157,32 @@ describe('Device', () => {
     expect(sent('/auth/device/decide')).toEqual([{ user_code: 'BCDF-GHJK', approve: true }])
   })
 
+  it('looks up a filled-in code only on the click, so an opened link spends no budget', async () => {
+    const user = userEvent.setup()
+    mockApi({})
+    await renderPage('/device?code=bcdf-ghjk')
+
+    // Filled in, not looked up: a page opening the link for a signed-in
+    // victim counts no wrong code against the session or the network.
+    expect(await screen.findByRole('textbox', { name: 'Code' })).toHaveValue('bcdf-ghjk')
+    expect(
+      screen.getByText('Check that this is the code your terminal shows, then continue.'),
+    ).toBeInTheDocument()
+    await new Promise((r) => setTimeout(r, 50))
+    expect(sent('/auth/device/lookup')).toEqual([])
+    expect(screen.queryByText('Docker credential helper asks to sign in')).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(await screen.findByText('Docker credential helper asks to sign in')).toBeInTheDocument()
+    expect(sent('/auth/device/lookup')).toEqual([{ user_code: 'BCDF-GHJK' }])
+  })
+
   it('looks up a filled-in code but never approves it without the click, and denies', async () => {
     const user = userEvent.setup()
     mockApi({})
     await renderPage('/device?code=bcdf-ghjk')
 
+    await user.click(await screen.findByRole('button', { name: 'Continue' }))
     expect(await screen.findByText('Docker credential helper asks to sign in')).toBeInTheDocument()
     expect(sent('/auth/device/lookup')).toEqual([{ user_code: 'BCDF-GHJK' }])
     // Shown, not decided.
@@ -187,16 +209,21 @@ describe('Device', () => {
 
     await waitFor(() => expect(router.state.location.pathname).toBe('/device'))
     expect(router.state.location.search).toMatchObject({ code: 'bcdf-ghjk' })
+    expect(await screen.findByRole('textbox', { name: 'Code' })).toHaveValue('bcdf-ghjk')
+    expect(sent('/auth/device/lookup')).toEqual([])
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
     expect(await screen.findByText('Docker credential helper asks to sign in')).toBeInTheDocument()
     expect(sent('/auth/device/lookup')).toEqual([{ user_code: 'BCDF-GHJK' }])
     expect(sent('/auth/device/decide')).toEqual([])
   })
 
   it('says when no sign-in waits for the code (an expired one), offering no approval', async () => {
+    const user = userEvent.setup()
     mockApi({
       lookup: () => new Response('no login is waiting for this code', { status: 404 }),
     })
     await renderPage('/device?code=BCDF-GHJK')
+    await user.click(await screen.findByRole('button', { name: 'Continue' }))
 
     expect(await screen.findByText('No sign-in is waiting for this code')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull()
@@ -211,6 +238,7 @@ describe('Device', () => {
     })
     await renderPage('/device?code=BCDF-GHJK')
 
+    await user.click(await screen.findByRole('button', { name: 'Continue' }))
     await user.click(await screen.findByRole('button', { name: 'Approve' }))
     expect(await screen.findByText('This sign-in is no longer pending')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled()

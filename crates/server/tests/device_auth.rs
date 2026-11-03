@@ -712,9 +712,9 @@ async fn a_scope_narrows_the_token() {
     );
 }
 
-/// Guessing codes is cut off: ten wrong codes per network and per session,
-/// after which even the right code is refused, from that network with any
-/// session and in that session from any network.
+/// Guessing codes is cut off: ten wrong codes per session, after which even
+/// the right code is refused in that session from any network, while the
+/// network's other sessions keep theirs (#803).
 #[tokio::test]
 async fn guessing_a_code_is_cut_off_by_the_rate_limit() {
     let srv = start().await;
@@ -754,16 +754,9 @@ async fn guessing_a_code_is_cut_off_by_the_rate_limit() {
             .status(),
         429
     );
-    // The network with another session: cut off too.
+    // Another session from the same network finds the code.
     assert_eq!(
         lookup(&srv, &other, &user_code, "203.0.113.1")
-            .await
-            .status(),
-        429
-    );
-    // Another session from another network finds the code.
-    assert_eq!(
-        lookup(&srv, &other, &user_code, "203.0.113.2")
             .await
             .status(),
         200
@@ -774,6 +767,86 @@ async fn guessing_a_code_is_cut_off_by_the_rate_limit() {
             .await
             .status(),
         429
+    );
+}
+
+/// #803: ten wrong codes in one session do not lock the other users of its
+/// network out of `/device` (a user's typos, or a page opening
+/// `/device?code=…` for a signed-in victim ten times): the other session from
+/// the same address still looks the code up and approves it.
+#[tokio::test]
+async fn wrong_codes_in_one_session_leave_the_network_its_other_sessions() {
+    let srv = start().await;
+    let started = start_login(&srv, "forge-cli", None).await;
+    let user_code = started["user_code"].as_str().unwrap().to_string();
+    let (_, _, mistyper) = signed_in(&srv, "roles_only").await;
+    let (_, _, colleague) = signed_in(&srv, "roles_only").await;
+    let wrong = if user_code == "BBBB-BBBB" {
+        "CCCC-CCCC"
+    } else {
+        "BBBB-BBBB"
+    };
+
+    for _ in 0..10 {
+        let resp = lookup(&srv, &mistyper, wrong, "198.51.100.7").await;
+        assert_eq!(resp.status(), 404);
+    }
+    assert_eq!(
+        lookup(&srv, &mistyper, &user_code, "198.51.100.7")
+            .await
+            .status(),
+        429,
+        "the session that typed them is cut off"
+    );
+    assert_eq!(
+        lookup(&srv, &colleague, &user_code, "198.51.100.7")
+            .await
+            .status(),
+        200,
+        "the network's other session is not"
+    );
+    assert_eq!(
+        decide(&srv, &colleague, &user_code, true, "198.51.100.7")
+            .await
+            .status(),
+        204
+    );
+}
+
+/// A network still has a budget of its own, far larger than a session's:
+/// a hundred wrong codes per five minutes across all its sessions, past
+/// which every session of the network is refused, while other networks are
+/// not.
+#[tokio::test]
+async fn a_network_is_cut_off_after_a_hundred_wrong_codes() {
+    let srv = start().await;
+    let started = start_login(&srv, "forge-cli", None).await;
+    let user_code = started["user_code"].as_str().unwrap().to_string();
+    let wrong = if user_code == "BBBB-BBBB" {
+        "CCCC-CCCC"
+    } else {
+        "BBBB-BBBB"
+    };
+
+    // Ten sessions of ten wrong codes each: each session's budget, and the
+    // network's.
+    for _ in 0..10 {
+        let (_, _, guesser) = signed_in(&srv, "roles_only").await;
+        for _ in 0..10 {
+            let resp = lookup(&srv, &guesser, wrong, "192.0.2.50").await;
+            assert_eq!(resp.status(), 404);
+        }
+    }
+    let (_, _, fresh) = signed_in(&srv, "roles_only").await;
+    let refused = lookup(&srv, &fresh, &user_code, "192.0.2.50").await;
+    assert_eq!(refused.status(), 429, "a fresh session of the network");
+    assert!(refused.headers().contains_key("retry-after"));
+    assert_eq!(
+        lookup(&srv, &fresh, &user_code, "192.0.2.51")
+            .await
+            .status(),
+        200,
+        "another network keeps its budget"
     );
 }
 

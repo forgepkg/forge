@@ -755,17 +755,22 @@ sign-ins) or polls too often (`auth.device_polls_per_minute`).
   device_polls_per_minute = 600
   ```
 - **The `/device` page.** A signed-in user types the code, or arrives with it
-  filled in from `verification_uri_complete`; a visitor is sent through the
-  sign-in and back, with the code. The page shows which client asks, for
+  filled in from `verification_uri_complete`, which is looked up only once
+  the user clicks **Continue**, so a page opening the link spends no one's
+  [guessing](#device-login) budget; a visitor is sent through the sign-in
+  and back, with the code. The page shows which client asks, for
   what, from which address and since when, and the code to compare with the
   terminal, and signs the client in only on **Approve**: a filled-in code is
   never approved without that click, against remote phishing (RFC 8628
   §5.4). **Deny** refuses it (`access_denied`).
 - **Guessing.** Each instance counts the wrong codes entered on the page
-  per client network (IPv6 by /64) and per browser session: after ten within
-  five minutes, every code from that network or session is refused with
-  `429` until the five minutes are over, so a pending code cannot be guessed
-  within its lifetime. Finding a code clears no failure.
+  per browser session and per client network (IPv6 by /64): after ten
+  within five minutes in one session, or a hundred from one network, every
+  code from that session or network is refused with `429` until the five
+  minutes are over, so a pending code cannot be guessed within its
+  lifetime. The network's budget is the larger, so that one user's wrong
+  codes do not lock the network's other users out. Finding a code clears
+  no failure.
 - **Settings.** **Admin → Settings → Device login** turns the device login
   off (`device_login`, see [above](#access-and-sign-in-settings)) and sets
   the polling interval (`device_poll_interval_seconds`, 5 s). The lifetimes

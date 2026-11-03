@@ -83,10 +83,15 @@ pub struct AppState {
     /// [`Self::auth_settings`].
     pub invitation_throttle: Arc<forge_core::auth::LoginThrottle>,
     /// Wrong codes entered on the `/device` page (the device login, RFC
-    /// 8628), per client network and per browser session: ten per five
-    /// minutes each, whatever the login lockout says, so a pending code
-    /// cannot be guessed within its lifetime.
+    /// 8628) per browser session: ten per five minutes, whatever the login
+    /// lockout says, so a pending code cannot be guessed within its
+    /// lifetime.
     pub device_code_throttle: Arc<forge_core::auth::LoginThrottle>,
+    /// Wrong codes entered on the `/device` page per client network: a
+    /// hundred per five minutes, so that one user's (or one malicious
+    /// page's) wrong codes do not lock the other users of the network out
+    /// (#803), while a code of 20^8 still cannot be guessed.
+    pub device_network_throttle: Arc<forge_core::auth::LoginThrottle>,
     /// Rate limit on starting OIDC logins, per client network
     /// (`auth.oidc_login_starts_per_minute`).
     pub oidc_login_starts: Arc<forge_core::auth::WindowLimiter>,
@@ -344,6 +349,17 @@ impl AppState {
                 std::time::Duration::from_secs(1),
             ),
         );
+        let device_network_throttle = Arc::new(
+            forge_core::auth::LoginThrottle::new(
+                crate::auth::DEVICE_CODES_PER_NETWORK,
+                std::time::Duration::from_secs(300),
+            )
+            .with_user_backoff(
+                0,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+            ),
+        );
         let auth_settings = Arc::new(
             AuthSettingsCache::new(
                 pool.clone(),
@@ -403,6 +419,7 @@ impl AppState {
             login_throttle,
             invitation_throttle,
             device_code_throttle,
+            device_network_throttle,
             oidc_login_starts,
             device_polls,
             upstream,
