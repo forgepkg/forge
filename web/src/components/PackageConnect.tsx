@@ -92,6 +92,13 @@ export function connectSnippets(
           copyLabel: 'Copy scope-registry command',
         },
         {
+          // npm rewrites a lockfile's registry.npmjs.org URLs onto `registry`
+          // by itself; another registry's host it has to be told.
+          label: 'Install a package-lock.json written against another registry',
+          command: 'npm config set replace-registry-host <package-lock.json-host>',
+          copyLabel: 'Copy replace-registry-host command',
+        },
+        {
           label: 'Sign in',
           command: `npm login --registry ${url}/`,
           copyLabel: 'Copy login command',
