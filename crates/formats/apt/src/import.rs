@@ -283,7 +283,8 @@ pub struct Entry {
     pub package: String,
     pub version: String,
     pub architecture: String,
-    /// Where the package is, below the repository's base URL.
+    /// Where the package is, below the repository's base URL, its `.`
+    /// segments dropped ([`resolve_filename`]).
     pub filename: String,
     pub size: Option<u64>,
     /// Lowercase hex digests.
@@ -337,6 +338,18 @@ impl Entry {
         }
         None
     }
+}
+
+/// A `Filename` as apt resolves it against the base URL: its `.` segments
+/// (the leading `./` of `dpkg-scanpackages ./pool`) dropped. Everything else
+/// stays, a `..`, an empty segment or a leading `/` among it, for
+/// [`Entry::problem`] to refuse.
+pub fn resolve_filename(filename: &str) -> String {
+    filename
+        .split('/')
+        .filter(|segment| *segment != ".")
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// A lowercase hex digest of `len` digits, if `value` is one.
@@ -422,7 +435,7 @@ pub fn read_packages(index: impl Read) -> Result<Vec<Entry>, String> {
             }
             "version" => entry.version = value.to_string(),
             "architecture" => entry.architecture = value.to_string(),
-            "filename" => entry.filename = value.to_string(),
+            "filename" => entry.filename = resolve_filename(value),
             "size" => entry.size = value.parse().ok(),
             "sha256" => entry.sha256 = hex_digest(value, 64),
             "sha512" => entry.sha512 = hex_digest(value, 128),
@@ -683,6 +696,43 @@ mod tests {
         }
         assert!(component_problem("main").is_none());
         assert!(component_problem("updates/main").is_some());
+    }
+
+    #[test]
+    fn a_filename_is_resolved_as_apt_resolves_it() {
+        // `dpkg-scanpackages ./pool` and `apt-ftparchive packages ./pool`
+        // write a leading `./`.
+        let index = b"Package: hello\nVersion: 1.0\nArchitecture: amd64\n\
+            Filename: ./pool/main/h/hello/./hello_1.0_amd64.deb\nSize: 42\n\
+            SHA256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        let entries = read_packages(&index[..]).unwrap();
+        assert_eq!(entries[0].filename, "pool/main/h/hello/hello_1.0_amd64.deb");
+        assert_eq!(entries[0].problem(), None);
+        for (listed, resolved) in [
+            ("pool/x.deb", "pool/x.deb"),
+            ("./pool/x.deb", "pool/x.deb"),
+            ("././pool/./x.deb", "pool/x.deb"),
+            // A `..`, an empty segment and a leading `/` stay, refused.
+            ("./../x.deb", "../x.deb"),
+            ("pool/../../x.deb", "pool/../../x.deb"),
+            ("pool//x.deb", "pool//x.deb"),
+            ("/./pool/x.deb", "/pool/x.deb"),
+        ] {
+            assert_eq!(resolve_filename(listed), resolved, "{listed}");
+        }
+        for refused in ["./../x.deb", "pool/./../x.deb", "/./pool/x.deb", "./"] {
+            let entry = read_packages(
+                format!(
+                    "Package: a\nVersion: 1\nArchitecture: all\nFilename: {refused}\n\
+                     Size: 1\nSHA256: {}\n",
+                    "0".repeat(64)
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+            .remove(0);
+            assert!(entry.problem().is_some(), "{refused}");
+        }
     }
 
     #[test]

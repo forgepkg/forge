@@ -13,7 +13,8 @@
 //!   it in, whatever its `Section` says; a `Packages` entry whose size or
 //!   SHA-256 does not match its `.deb` fails that item, as do one the
 //!   source does not have and one whose `Filename` is outside the
-//!   repository, and the import completes; an index that does not match
+//!   repository, and the import completes; a `Filename` that starts with
+//!   `./` (`dpkg-scanpackages ./pool`) is resolved below the repository; an index that does not match
 //!   `Release` fails the scan; a version Forge holds with other bytes
 //!   follows `on_conflict`, decided without a download; a dry run writes
 //!   nothing;
@@ -554,15 +555,13 @@ async fn apt_import_from_a_static_repository_checks_every_package_and_index() {
             ),
         ],
     );
+    // `fine`'s Filename starts with `./`, as `dpkg-scanpackages ./pool`
+    // writes it: apt resolves it below the repository.
+    let dotted = format!("./{}", pool["fine"]);
     mirror.index(
         "main",
         "arm64",
-        &[stanza(
-            &fine_control,
-            pool["fine"],
-            fine.len(),
-            &sha256(&fine),
-        )],
+        &[stanza(&fine_control, &dotted, fine.len(), &sha256(&fine))],
     );
     mirror.release(Some(&key));
 
@@ -601,6 +600,8 @@ async fn apt_import_from_a_static_repository_checks_every_package_and_index() {
         "{found:?}"
     );
     assert_eq!(item(&found, "fine:arm64")["version"], "1:2.0-1");
+    assert_eq!(item(&found, "fine:arm64")["state"], "imported", "{found:?}");
+    assert_eq!(mirror.gets(pool["fine"]), 1);
 
     // `moved` stays in main, where the source lists it.
     assert_eq!(listed(&srv, &dst, "main", "amd64").await, ["moved"]);
