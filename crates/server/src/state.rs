@@ -121,6 +121,9 @@ pub struct AppState {
     /// The email service (`/admin/settings/email`): sends invitations and
     /// test messages with the settings stored in the database.
     pub mailer: Arc<crate::email::Mailer>,
+    /// The package pages' refreshes from the upstream under way off their
+    /// requests, on this instance (#836).
+    pub browse_refreshes: Arc<crate::browse::BackgroundRefreshes>,
 }
 
 /// One instance of Forge: each replica of an install has state of its own
@@ -419,6 +422,7 @@ impl AppState {
             )),
             assertion_issuer,
             envelope,
+            browse_refreshes: Arc::default(),
         }
     }
 
@@ -531,18 +535,44 @@ impl AppState {
                     .with_download_tally(self.downloads.clone()),
             ),
             RepoKind::Proxy => Arc::new(self.proxy_repo(format)),
-            RepoKind::Group => Arc::new(
-                GroupRepo::new(
-                    self.pool.clone(),
-                    principal,
-                    Arc::new(self.member_factory()),
-                    self.authz.clone(),
-                    self.config.groups.max_nesting_depth.max(0) as u32,
-                )
-                .with_format(format),
-            ),
+            RepoKind::Group => Arc::new(self.group_repo(principal, false).with_format(format)),
         };
         Ok(Arc::new(PackageFilteredReadOps::new(inner, filter)))
+    }
+
+    /// [`Self::read_ops_for`] reading only what Forge holds, as the web UI's
+    /// package page does (#836): a proxy, and a group's proxy members, are
+    /// read [cached only](ProxyRepo::cached_only), without a request to
+    /// their upstream. A hosted repository reads as it always does.
+    pub async fn cached_read_ops_for(
+        &self,
+        repo: &Repository,
+        principal: Principal,
+    ) -> Result<Arc<dyn RepoReadOps>, RepoError> {
+        let format = self.formats.for_repository(repo)?;
+        let inner: Arc<dyn RepoReadOps> = match repo.kind() {
+            RepoKind::Hosted => return self.read_ops_for(repo, principal).await,
+            RepoKind::Proxy => Arc::new(self.proxy_repo(format).cached_only()),
+            RepoKind::Group => {
+                Arc::new(self.group_repo(principal.clone(), true).with_format(format))
+            }
+        };
+        let filter = self.authz.package_filter(&principal, repo).await;
+        Ok(Arc::new(PackageFilteredReadOps::new(inner, filter)))
+    }
+
+    /// A group resolver for `principal`, its proxy members read
+    /// [cached only](ProxyRepo::cached_only) when `cached_only` is set.
+    pub fn group_repo(&self, principal: Principal, cached_only: bool) -> GroupRepo {
+        let mut factory = self.member_factory();
+        factory.cached_only = cached_only;
+        GroupRepo::new(
+            self.pool.clone(),
+            principal,
+            Arc::new(factory),
+            self.authz.clone(),
+            self.config.groups.max_nesting_depth.max(0) as u32,
+        )
     }
 
     /// A fully wired proxy read facade: shared upstream client, local blob
@@ -573,6 +603,7 @@ impl AppState {
             upstream: self.upstream.clone(),
             downloads: self.downloads.clone(),
             delete_grace: self.config.outbox.grace(),
+            cached_only: false,
         }
     }
 }
@@ -655,6 +686,9 @@ pub struct MemberFactory {
     /// `outbox.grace_seconds`, for the blobs of the proxies' replaced
     /// upstream documents.
     delete_grace: chrono::Duration,
+    /// Proxy members read only what Forge holds
+    /// ([`ProxyRepo::cached_only`]).
+    cached_only: bool,
 }
 
 impl MemberOpsFactory for MemberFactory {
@@ -671,8 +705,8 @@ impl MemberOpsFactory for MemberFactory {
                 )
                 .with_download_tally(self.downloads.clone()),
             )),
-            RepoKind::Proxy => Ok(Arc::new(
-                ProxyRepo::new(
+            RepoKind::Proxy => {
+                let proxy = ProxyRepo::new(
                     self.pool.clone(),
                     format,
                     self.cas.clone(),
@@ -684,8 +718,13 @@ impl MemberOpsFactory for MemberFactory {
                     store: self.blob_store.clone(),
                 }))
                 .with_download_tally(self.downloads.clone())
-                .with_delete_grace(self.delete_grace),
-            )),
+                .with_delete_grace(self.delete_grace);
+                Ok(Arc::new(if self.cached_only {
+                    proxy.cached_only()
+                } else {
+                    proxy
+                }))
+            }
             RepoKind::Group => Err(RepoError::WrongKind {
                 name: member.name.clone(),
                 kind: member.kind.clone(),

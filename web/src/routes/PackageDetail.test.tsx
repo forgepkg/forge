@@ -22,7 +22,9 @@ import { searchOptions } from '~/lib/search'
  * a reason; a proxy labels the time column "Cached" (when
  * Forge downloaded it), a hosted repository "Published"; a 404 renders the
  * not-found empty state; an offline repository's 503 says so (without
- * retrying). Drives the real route tree + `usePackageDetail`.
+ * retrying); a proxy's page says how old its cache is, follows a background
+ * refresh, and is refreshed from the upstream on request, also when the
+ * package is not cached yet. Drives the real route tree + `usePackageDetail`.
  */
 
 const anonMe: Me = {
@@ -116,6 +118,7 @@ function mockApi(
     format = 'nuget',
     deleteVersion,
     release,
+    refresh,
     repos = [{ name: 'internal', format }],
   }: {
     me?: Me
@@ -123,7 +126,9 @@ function mockApi(
     deleteVersion?: () => Response | Promise<Response>
     /** `POST …/release-delay`: the path and the body. */
     release?: (path: string, body: unknown) => Response
-    repos?: { name: string; format: string }[]
+    /** `POST /browse/packages/{repo}/{id}/refresh`. */
+    refresh?: (repo: string, id: string) => Response
+    repos?: { name: string; format: string; kind?: string; online?: boolean }[]
   } = {},
 ) {
   fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -147,6 +152,10 @@ function mockApi(
     }
     if (init?.method === 'POST' && release && url.pathname.endsWith('/release-delay')) {
       return Promise.resolve(release(url.pathname, JSON.parse(init.body as string)))
+    }
+    const refreshed = url.pathname.match(/\/browse\/packages\/([^/]+)\/([^/]+)\/refresh$/)
+    if (init?.method === 'POST' && refresh && refreshed) {
+      return Promise.resolve(refresh(refreshed[1], refreshed[2]))
     }
     if (url.pathname.endsWith('/browse/packages')) {
       return Promise.resolve(jsonResponse({ total: 0, items: [] }))
@@ -494,6 +503,89 @@ describe('PackageDetail', () => {
       screen.getByRole('columnheader', { name: 'Published' }),
     ).toBeInTheDocument()
     expect(screen.queryByRole('columnheader', { name: 'Cached' })).toBeNull()
+  })
+
+  it("says how old a proxy's page is and refreshes it from the upstream", async () => {
+    const cachedAt = new Date(Date.now() - 3 * 3600_000).toISOString()
+    const newer: PackageDetail = {
+      ...proxyDetail,
+      versions: [
+        ...proxyDetail.versions,
+        { ...proxyDetail.versions[0], version: '13.0.4', version_original: '13.0.4' },
+      ],
+      cached_at: new Date().toISOString(),
+    }
+    const refresh = vi.fn(() => jsonResponse(newer))
+    mockApi(() => jsonResponse({ ...proxyDetail, cached_at: cachedAt }), {
+      repos: [{ name: 'proxy', format: 'nuget', kind: 'proxy' }],
+      refresh,
+    })
+
+    await renderDetail('/packages/proxy/newtonsoft.json')
+
+    await screen.findByRole('heading', { name: 'Newtonsoft.Json' })
+    expect(screen.getByText('Cached 3 h ago')).toBeInTheDocument()
+    expect(screen.queryByRole('cell', { name: '13.0.4' })).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh from upstream' }))
+
+    expect(await screen.findByText('Cached just now')).toBeInTheDocument()
+    expect(refresh).toHaveBeenCalledWith('proxy', 'newtonsoft.json')
+    expect(screen.getAllByText('13.0.4').length).toBeGreaterThan(0)
+  })
+
+  it('looks again while the server refreshes the package in the background', async () => {
+    let calls = 0
+    mockApi(
+      () => {
+        calls += 1
+        return jsonResponse(
+          calls === 1
+            ? { ...proxyDetail, cached_at: '2026-01-01T00:00:00Z', refreshing: true }
+            : { ...proxyDetail, cached_at: new Date().toISOString() },
+        )
+      },
+      { repos: [{ name: 'proxy', format: 'nuget', kind: 'proxy' }] },
+    )
+
+    await renderDetail('/packages/proxy/newtonsoft.json')
+
+    expect(await screen.findByText(/refreshing from the upstream/)).toBeInTheDocument()
+    expect(await screen.findByText('Cached just now', {}, { timeout: 5000 })).toBeInTheDocument()
+    expect(screen.queryByText(/refreshing from the upstream/)).toBeNull()
+  })
+
+  it("offers to refresh a package a proxy has not cached, and says when the upstream lacks it", async () => {
+    const refresh = vi
+      .fn<(repo: string, id: string) => Response>()
+      .mockReturnValueOnce(new Response('package not found', { status: 404 }))
+      .mockReturnValueOnce(jsonResponse(proxyDetail))
+    mockApi(() => new Response('package not found', { status: 404 }), {
+      repos: [{ name: 'proxy', format: 'nuget', kind: 'proxy' }],
+      refresh,
+    })
+
+    await renderDetail('/packages/proxy/newtonsoft.json')
+
+    expect(await screen.findByText('Package not cached')).toBeInTheDocument()
+    expect(screen.queryByText('Package not found')).toBeNull()
+    const button = screen.getByRole('button', { name: 'Refresh from upstream' })
+    await userEvent.click(button)
+    expect(await screen.findByText('Not found upstream either')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Refresh from upstream' }))
+    expect(await screen.findByRole('heading', { name: 'Newtonsoft.Json' })).toBeInTheDocument()
+    expect(refresh).toHaveBeenCalledTimes(2)
+  })
+
+  it('offers no refresh on a hosted repository, nor on an offline proxy', async () => {
+    mockApi(() => new Response('package not found', { status: 404 }), {
+      repos: [{ name: 'proxy', format: 'nuget', kind: 'proxy', online: false }],
+    })
+
+    await renderDetail('/packages/proxy/missing')
+
+    expect(await screen.findByText('Package not found')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Refresh from upstream' })).toBeNull()
   })
 
   it('renders a not-found empty state on 404', async () => {

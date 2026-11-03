@@ -5,11 +5,19 @@ import { ApiError } from '~/lib/httpClient'
 import {
   delaySourceLabel,
   isRepositoryOffline,
+  showsCache,
   type AppliedDelay,
   type DetailVersion,
+  type PackageDetail,
 } from '~/api/packages'
+import { formatAge } from '~/lib/age'
+import { formatDateTime } from '~/lib/oci'
 import { useBrowseRepos } from '~/queries/useBrowseRepos'
-import { useDeletePackageVersion, usePackageDetail } from '~/queries/usePackageDetail'
+import {
+  useDeletePackageVersion,
+  usePackageDetail,
+  useRefreshPackage,
+} from '~/queries/usePackageDetail'
 import { useMe } from '~/queries/useMe'
 import { useReleaseFromDelay } from '~/queries/useRepositories'
 import { VersionTable } from '~/components/VersionTable'
@@ -18,6 +26,7 @@ import { DependencyGroups } from '~/components/DependencyGroups'
 import { ErrorState, RepositoryOfflineState } from '~/components/ErrorState'
 import { EmptyState } from '~/components/EmptyState'
 import {
+  Button,
   Code,
   CodeBlock,
   Columns,
@@ -49,6 +58,10 @@ function PackageDetailRoute() {
  * dist-tags), deprecations and README when its format has them. Loading /
  * empty / not-found / repository-offline / error states are all handled.
  * Reachable by any reader.
+ *
+ * A proxy's or group's page is what Forge has cached: it says how old that
+ * is, follows a refresh the server runs in the background, and offers
+ * **Refresh from upstream**, also for a package not cached yet.
  */
 function PackageDetailPage() {
   const { repo, id } = Route.useParams()
@@ -61,11 +74,21 @@ function PackageDetailPage() {
   const [pendingRelease, setPendingRelease] = useState<DetailVersion | null>(null)
   const [reason, setReason] = useState('')
   const toast = useToast()
-  // The repository's format, from the (cached) list the rail shows too.
+  const refresh = useRefreshPackage(repo, id)
+  // The repository's format and kind, from the (cached) list the rail shows too.
   const repos = useBrowseRepos()
-  const format = Array.isArray(repos.data)
-    ? repos.data.find((r) => r.name === repo)?.format
+  const repoInfo = Array.isArray(repos.data)
+    ? repos.data.find((r) => r.name === repo)
     : undefined
+  const format = repoInfo?.format
+  // Refreshing asks an upstream: an offline proxy asks none.
+  const refreshable =
+    showsCache(detail.data?.repo_kind ?? repoInfo?.kind) && repoInfo?.online !== false
+  const askRefresh = () =>
+    refresh.mutate(undefined, {
+      onSuccess: (refreshed) =>
+        toast({ tone: 'ok', title: `Refreshed ${refreshed.original_id} from the upstream` }),
+    })
   const crumbs = [
     { label: 'Repositories', to: '/' },
     { label: repo, to: '/repos/$repo', params: { repo } },
@@ -88,7 +111,16 @@ function PackageDetailPage() {
     return (
       <Page>
         <PageHeader title={id} crumbs={[...crumbs, { label: id }]} />
-        {notFound ? (
+        {notFound && refreshable ? (
+          <NotCached
+            repo={repo}
+            id={id}
+            group={repoInfo?.kind === 'group'}
+            onRefresh={askRefresh}
+            pending={refresh.isPending}
+            error={refresh.error}
+          />
+        ) : notFound ? (
           <EmptyState title="Package not found">
             No readable package <Code>{id}</Code> in repository <Code>{repo}</Code>.
           </EmptyState>
@@ -127,8 +159,28 @@ function PackageDetailPage() {
         meta={[
           pkg.versions.length === 1 ? '1 version' : `${pkg.versions.length} versions`,
           ...(latest ? [`latest ${latest}`] : []),
+          cacheAge(pkg),
         ]}
+        actions={
+          refreshable && (
+            <Button
+              size="sm"
+              icon="Refresh"
+              disabled={refresh.isPending}
+              onClick={askRefresh}
+              title="Ask the upstream for this package now, as a client's install does"
+            >
+              {refresh.isPending ? 'Refreshing…' : 'Refresh from upstream'}
+            </Button>
+          )
+        }
       />
+      {refresh.isError && (
+        <ErrorState
+          title="Could not refresh from the upstream"
+          message={refresh.error.body || refresh.error.message}
+        />
+      )}
       <Columns
         aside={
           <>
@@ -343,6 +395,85 @@ function PackageDetailPage() {
         )}
       </Dialog>
     </Page>
+  )
+}
+
+/**
+ * How old a proxy's or group's page is ("Cached 3 h ago", the time itself
+ * on hover), and whether a refresh runs in the background; nothing for a
+ * hosted repository.
+ */
+function cacheAge(pkg: PackageDetail) {
+  const age = pkg.cached_at ? formatAge(pkg.cached_at) : null
+  if (!age && !pkg.refreshing) return null
+  return (
+    <span
+      title={pkg.cached_at ? `Listed by the upstream ${formatDateTime(pkg.cached_at)}` : undefined}
+    >
+      {age && `Cached ${age}`}
+      {age && pkg.refreshing && ' · '}
+      {pkg.refreshing && 'refreshing from the upstream…'}
+    </span>
+  )
+}
+
+/**
+ * A proxy's or group's 404: Forge holds nothing of the package there (the
+ * page shows only what is cached), with **Refresh from upstream**. A refresh
+ * that finds nothing either says so.
+ */
+function NotCached({
+  repo,
+  id,
+  group,
+  onRefresh,
+  pending,
+  error,
+}: {
+  repo: string
+  id: string
+  group: boolean
+  onRefresh: () => void
+  pending: boolean
+  error: ApiError | null
+}) {
+  return (
+    <>
+      <EmptyState
+        title="Package not cached"
+        icon="Package"
+        action={
+          <Button variant="primary" icon="Refresh" disabled={pending} onClick={onRefresh}>
+            {pending ? 'Refreshing…' : 'Refresh from upstream'}
+          </Button>
+        }
+      >
+        {group ? (
+          <>
+            No member of <Code>{repo}</Code> holds <Code>{id}</Code>.
+          </>
+        ) : (
+          <>
+            <Code>{repo}</Code> has not cached <Code>{id}</Code>.
+          </>
+        )}{' '}
+        Browsing shows what Forge has cached; a package is cached once a client installs it.
+        Refresh asks the upstream for it now.
+      </EmptyState>
+      {error?.status === 404 ? (
+        <EmptyState title="Not found upstream either" icon="Search">
+          {group ? "The group's upstreams do not have " : 'The upstream does not have '}
+          <Code>{id}</Code>, or this account may not read it.
+        </EmptyState>
+      ) : (
+        error && (
+          <ErrorState
+            title="Could not refresh from the upstream"
+            message={error.body || error.message}
+          />
+        )
+      )}
+    </>
   )
 }
 

@@ -1,4 +1,5 @@
-//! Data access for `proxy_cached_version` and `proxy_upstream_index`.
+//! Data access for `proxy_cached_version`, `proxy_package_listing` and
+//! `proxy_upstream_index`.
 
 use serde_json::Value as JsonValue;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
@@ -387,8 +388,10 @@ where
 /// missing-upstream flags cleared and their metadata due for a refresh from
 /// the new upstream. The versions released from the package delay early are
 /// forgotten too: they were decisions about the previous upstream's packages,
-/// and the new upstream's package of the same name may be another one.
-/// Returns the number of deleted cached-version rows.
+/// and the new upstream's package of the same name may be another one. So
+/// are the times the previous upstream listed each package
+/// (`proxy_package_listing`). Returns the number of deleted cached-version
+/// rows.
 pub async fn reset_for_new_upstream(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
@@ -423,7 +426,81 @@ pub async fn reset_for_new_upstream(
     )
     .execute(&mut **tx)
     .await?;
+    sqlx::query!(
+        "DELETE FROM proxy_package_listing WHERE repository_id = $1",
+        repository_id,
+    )
+    .execute(&mut **tx)
+    .await?;
     Ok(deleted)
+}
+
+/// Record that the upstream answered the version listing of package `name`
+/// now (`proxy_package_listing`).
+pub async fn record_listing(pool: &PgPool, repository_id: i64, name: &str) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO proxy_package_listing (repository_id, name, listed_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (repository_id, name) DO UPDATE SET listed_at = EXCLUDED.listed_at
+        "#,
+        repository_id,
+        name,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// What one proxy holds of a package ([`listing_states`]).
+#[derive(Debug, Clone)]
+pub struct ListingState {
+    pub repository_id: i64,
+    /// When the upstream last answered the package's version listing, if it
+    /// ever did since it was recorded.
+    pub listed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether the proxy holds an upstream-confirmed version of the package
+    /// that the upstream still lists (what its read path enumerates, before
+    /// the package delay and the not-found markers).
+    pub holds: bool,
+}
+
+/// For each of the proxies `repository_ids`, when its upstream last listed
+/// package `name` and whether it holds any version of it, in the order
+/// given.
+pub async fn listing_states(
+    pool: &PgPool,
+    repository_ids: &[i64],
+    name: &str,
+) -> sqlx::Result<Vec<ListingState>> {
+    if repository_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query!(
+        r#"
+        SELECT r.id AS "repository_id!", l.listed_at AS "listed_at?",
+               EXISTS (
+                   SELECT 1 FROM proxy_cached_version v
+                   WHERE v.repository_id = r.id AND v.name = $2 AND v.version <> '*'
+                     AND v.confirmed AND NOT v.upstream_missing
+               ) AS "holds!"
+        FROM unnest($1::bigint[]) WITH ORDINALITY AS r(id, ord)
+        LEFT JOIN proxy_package_listing l ON l.repository_id = r.id AND l.name = $2
+        ORDER BY r.ord
+        "#,
+        repository_ids,
+        name,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ListingState {
+            repository_id: row.repository_id,
+            listed_at: row.listed_at,
+            holds: row.holds,
+        })
+        .collect())
 }
 
 /// Forget the upstream 404s a proxy remembers of package `name`, or of every
