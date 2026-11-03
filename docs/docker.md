@@ -326,7 +326,8 @@ curl -u admin@example.com:<admin-token> -X DELETE \
   'https://forge.example.com/admin/repositories/docker-hosted/images?image=team/app&reference=1.0'
 # {"manifests": 0, "tags": 1}
 # A manifest, with its tags: reference=sha256:<hex>. The whole image: no
-# reference (an empty `reference=` is refused with 400).
+# reference (an empty `reference=` is refused with 400, and so is any other
+# key, such as a misspelt `tag=`, `digest=` or `ref=`).
 ```
 
 A manifest goes with its tags and with what only it kept: the manifests an
