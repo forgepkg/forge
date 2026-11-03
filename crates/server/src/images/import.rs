@@ -42,7 +42,6 @@ use forge_plugin::api::images::{
     MAX_MANIFEST_BYTES,
 };
 use forge_plugin::api::{UpstreamAnswer, UpstreamOp};
-use futures_util::TryStreamExt;
 use reqwest::Method;
 
 use super::digest::ContentDigest;

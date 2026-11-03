@@ -37,7 +37,7 @@ use forge_plugin::api::{
 };
 use forge_storage::{BlobRef, StagedBlob};
 use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 use reqwest::Method;
 use tracing::Instrument;
