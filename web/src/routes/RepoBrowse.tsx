@@ -571,13 +571,22 @@ function ImageBrowseResults({
           <TableHeader align="right" width="110px">
             Manifests
           </TableHeader>
-          {/* A proxy's images carry their cache time, not a push (#248). */}
+          {/* A proxy's images carry their cache time, not a push (#248).
+              A group's merge its members' and name none of them, so its
+              column says both (#562). */}
           {repoKind === 'proxy' ? (
             <TableHeader
               width="170px"
               hint="When Forge last cached a manifest of the image from the upstream"
             >
               Last cached
+            </TableHeader>
+          ) : repoKind === 'group' ? (
+            <TableHeader
+              width="170px"
+              hint="When a manifest of the image was last pushed to a hosted member, or cached from the upstream by a proxy member"
+            >
+              Last pushed / cached
             </TableHeader>
           ) : (
             <TableHeader width="170px">Last pushed</TableHeader>

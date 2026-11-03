@@ -11,6 +11,7 @@ import {
 import { clearSession } from '~/lib/auth'
 import type { Me } from '~/api/me'
 import type { ChartDetail, ImageDetail } from '~/api/images'
+import type { BrowseRepo } from '~/api/packages'
 import { textContent } from '~/test/text'
 import { routeTree } from '~/routeTree.gen'
 import { searchOptions } from '~/lib/search'
@@ -121,6 +122,7 @@ const fetchMock = vi.fn()
 
 /**
  * Route the mock: `/admin/me` -> identity (`me`, a reader by default),
+ * `/browse/repos` -> `repos`,
  * `/browse/images/{repo}/{image…}`, `/browse/chart` -> `chart` (404 without
  * one), and a `DELETE /admin/repositories/{repo}/images` -> `deleteImage`.
  */
@@ -130,9 +132,12 @@ function mockApi(
   {
     me = readerMe,
     deleteImage,
+    repos,
   }: {
     me?: Me
     deleteImage?: (repo: string, query: URLSearchParams) => Response | Promise<Response>
+    /** `/browse/repos` (404 without). */
+    repos?: BrowseRepo[]
   } = {},
 ) {
   fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
@@ -144,6 +149,9 @@ function mockApi(
     const del = url.pathname.match(/^\/admin\/repositories\/([^/]+)\/images$/)
     if (del && init?.method === 'DELETE' && deleteImage) {
       return Promise.resolve(deleteImage(decodeURIComponent(del[1]), url.searchParams))
+    }
+    if (url.pathname.endsWith('/browse/repos') && repos) {
+      return Promise.resolve(jsonResponse(repos))
     }
     if (url.pathname.endsWith('/browse/chart')) {
       return Promise.resolve(
@@ -481,6 +489,106 @@ describe('ImageDetail', () => {
       within(manifests).getByRole('columnheader', { name: 'Source' }),
     ).toBeInTheDocument()
     expect(within(manifests).getAllByText('docker-hosted')).toHaveLength(4)
+  })
+
+  describe('labels a group\'s manifest times by the member they come from (#562)', () => {
+    const members: BrowseRepo[] = [
+      { id: 1, name: 'docker-hosted', kind: 'hosted', online: true, format: 'docker' },
+      { id: 2, name: 'docker-hub', kind: 'proxy', online: true, format: 'docker' },
+      { id: 3, name: 'docker-group', kind: 'group', online: true, format: 'docker' },
+    ]
+    const groupDetail = (sources: string[]) => ({
+      ...hostedDetail,
+      repo: 'docker-group',
+      repo_kind: 'group',
+      pull_name: 'forge.example.com/docker-group/team/app',
+      manifests: hostedDetail.manifests.map((m, i) => ({ ...m, source: sources[i] })),
+    })
+    /** The time cell of the manifest row whose digest starts `short`. */
+    const timeOf = (manifests: HTMLElement, short: string) => {
+      const header = within(manifests).getByRole('columnheader', { name: /Pushed|Cached/ })
+      const column = Array.from(header.parentElement!.children).indexOf(header)
+      const row = within(manifests)
+        .getByText(short, { selector: '.fg-digest-short' })
+        .closest('tr') as HTMLElement
+      return within(row).getAllByRole('cell')[column]
+    }
+
+    it('says per row whether a mixed group\'s time is a push or a cache', async () => {
+      // The index and its amd64 image from the proxy, the rest pushed.
+      mockApi(
+        () =>
+          jsonResponse(
+            groupDetail(['docker-hub', 'docker-hub', 'docker-hosted', 'docker-hosted']),
+          ),
+        undefined,
+        { repos: members },
+      )
+
+      await renderDetail('/images/docker-group/team/app')
+
+      const manifests = await screen.findByRole('region', { name: 'Manifests' })
+      await waitFor(() =>
+        expect(within(manifests).getAllByText('Cached', { selector: '.fg-cell-sub' })).toHaveLength(2),
+      )
+      expect(
+        within(manifests).getByRole('columnheader', { name: 'Pushed / cached' }),
+      ).toHaveAttribute(
+        'title',
+        'When the manifest was pushed to a hosted member, or first cached from the upstream by a proxy member',
+      )
+      expect(within(manifests).queryByRole('columnheader', { name: 'Pushed' })).toBeNull()
+      expect(within(manifests).queryByRole('columnheader', { name: 'Cached' })).toBeNull()
+      expect(timeOf(manifests, '1111111111aa')).toHaveTextContent(/Cached$/)
+      expect(timeOf(manifests, '2222222222bb')).toHaveTextContent(/Cached$/)
+      expect(timeOf(manifests, '4444444444dd')).toHaveTextContent(/Pushed$/)
+      expect(
+        within(manifests).getAllByText('Pushed', { selector: '.fg-cell-sub' }),
+      ).toHaveLength(2)
+    })
+
+    it('labels the column "Cached" when every manifest comes from a proxy member', async () => {
+      mockApi(() => jsonResponse(groupDetail(Array(4).fill('docker-hub'))), undefined, {
+        repos: members,
+      })
+
+      await renderDetail('/images/docker-group/team/app')
+
+      const manifests = await screen.findByRole('region', { name: 'Manifests' })
+      expect(
+        await within(manifests).findByRole('columnheader', { name: 'Cached' }),
+      ).toHaveAttribute('title', 'When Forge first cached this manifest from the upstream')
+      expect(within(manifests).queryByRole('columnheader', { name: /Pushed/ })).toBeNull()
+      // One kind for the column: no per-row label.
+      expect(within(manifests).queryByText('Cached', { selector: '.fg-cell-sub' })).toBeNull()
+    })
+
+    it('labels the column "Pushed" when every manifest comes from a hosted member', async () => {
+      mockApi(() => jsonResponse(groupDetail(Array(4).fill('docker-hosted'))), undefined, {
+        repos: members,
+      })
+
+      await renderDetail('/images/docker-group/team/app')
+
+      const manifests = await screen.findByRole('region', { name: 'Manifests' })
+      expect(
+        await within(manifests).findByRole('columnheader', { name: 'Pushed' }),
+      ).toBeInTheDocument()
+      expect(within(manifests).queryByRole('columnheader', { name: /Cached/ })).toBeNull()
+    })
+
+    it('keeps the neutral heading while a member\'s kind is not known', async () => {
+      // No `/browse/repos`: the members' kinds are unknown.
+      mockApi(() => jsonResponse(groupDetail(Array(4).fill('docker-hub'))))
+
+      await renderDetail('/images/docker-group/team/app')
+
+      const manifests = await screen.findByRole('region', { name: 'Manifests' })
+      expect(
+        within(manifests).getByRole('columnheader', { name: 'Pushed / cached' }),
+      ).toBeInTheDocument()
+      expect(within(manifests).queryByText(/^(Pushed|Cached)$/, { selector: '.fg-cell-sub' })).toBeNull()
+    })
   })
 
   it('pulls an untagged image by the digest of its top-level manifest', async () => {

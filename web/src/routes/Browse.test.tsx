@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
@@ -115,6 +115,7 @@ function rowOf(element: HTMLElement): HTMLElement {
 function mockApi(
   browse: (url: URL) => Response,
   images: (url: URL) => Response = () => jsonResponse(imagePage(0, [])),
+  repoList: BrowseRepo[] = repos,
 ) {
   fetchMock.mockImplementation((input: RequestInfo | URL) => {
     const raw = typeof input === 'string' ? input : input.toString()
@@ -123,7 +124,7 @@ function mockApi(
       return Promise.resolve(jsonResponse(readerMe))
     }
     if (url.pathname.endsWith('/browse/repos')) {
-      return Promise.resolve(jsonResponse(repos))
+      return Promise.resolve(jsonResponse(repoList))
     }
     if (url.pathname.endsWith('/browse/packages')) {
       return Promise.resolve(browse(url))
@@ -604,6 +605,37 @@ describe('RepoBrowse of a docker repository (images)', () => {
     for (const u of imageCalls) {
       expect(u.searchParams.get('repo')).toBe('docker-hosted')
     }
+  })
+
+  it('labels a proxy\'s and a group\'s image times by what they are (#248, #562)', async () => {
+    const dockerRepos: BrowseRepo[] = [
+      ...repos,
+      { id: 6, name: 'docker-hub', kind: 'proxy', online: true, format: 'docker' },
+      { id: 7, name: 'docker-all', kind: 'group', online: true, format: 'docker' },
+    ]
+    const images = () => jsonResponse(imagePage(1, ['team/app']))
+    mockApi(() => jsonResponse(page(0, [])), images, dockerRepos)
+
+    await renderBrowse('/repos/docker-hub')
+
+    await screen.findByRole('link', { name: /team\/app/ })
+    expect(screen.getByRole('columnheader', { name: 'Last cached' })).toBeInTheDocument()
+    expect(screen.queryByRole('columnheader', { name: /pushed/i })).toBeNull()
+
+    cleanup()
+    await renderBrowse('/repos/docker-all')
+
+    // A group's image rows merge its hosted and proxy members' and name
+    // none of them: the column says both.
+    await screen.findByRole('link', { name: /team\/app/ })
+    expect(
+      screen.getByRole('columnheader', { name: 'Last pushed / cached' }),
+    ).toHaveAttribute(
+      'title',
+      'When a manifest of the image was last pushed to a hosted member, or cached from the upstream by a proxy member',
+    )
+    expect(screen.queryByRole('columnheader', { name: 'Last pushed' })).toBeNull()
+    expect(screen.queryByRole('columnheader', { name: 'Last cached' })).toBeNull()
   })
 
   it('says a docker repository is offline on its 503', async () => {
