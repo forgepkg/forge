@@ -413,6 +413,12 @@ descriptor. The host then keeps the indexes of its hosted repositories:
   and a package's file whose package the path does not name
   (`FilePackage::Unknown`) only a reader's whom every package is visible
   to.
+  `file_releases` names the files a proxy's cached file is published
+  together with and listed in (an apt distribution's `InRelease` and
+  `Release`), and `file_listed` reads the size and SHA-256 one of them
+  lists for it: the host re-validates the file once one of them was
+  replaced after it was last checked, or when the one it serves lists the
+  file as another one.
 
 ## Format options
 

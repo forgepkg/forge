@@ -246,6 +246,13 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://forge.exa
 - `InRelease`, `Release` and the other indexes are re-validated with the
   upstream once the repository's metadata TTL (`metadata_ttl_seconds`, 10
   minutes by default) has passed.
+- The indexes are served consistent with the `InRelease` served with them
+  (else `Release`), for an upstream without `Acquire-By-Hash` (reprepro's
+  and aptly's default), whose indexes apt fetches at their own path: an
+  index that `InRelease` lists with another size or SHA-256 is
+  re-validated before it is served, and once `InRelease` or `Release` is
+  replaced, the distribution's other indexes (`Release.gpg` too) are
+  re-validated on their next download.
 - A pool file is checked against the size and SHA-256 the upstream's
   `Packages` index of its component and architecture gives it (the
   distribution's `Packages.gz`, else `.xz`, else the plain one), when the

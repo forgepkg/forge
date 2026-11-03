@@ -19,6 +19,16 @@
 //!   by the repository's `updated_at`, which *Invalidate cache* bumps).
 //! * Concurrent first fetches of one file share one upstream request per
 //!   instance.
+//! * A file the format publishes together with others that list it (apt's
+//!   indexes, which a distribution's `InRelease` lists with their sizes and
+//!   digests: `FormatPlugin::file_releases`) is served consistent with the
+//!   first of those the proxy holds, the one clients read: it is due too
+//!   once one of them was replaced after it was last checked, and when the
+//!   one served lists it as another file and was checked after it. When
+//!   the file was stored after that one was last checked, that one is
+//!   re-validated first. Each re-validation that leaves the two apart
+//!   (the upstream itself is) is not repeated until one of them changes or
+//!   is checked again.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
@@ -32,7 +42,9 @@ use forge_core::repo::proxy::{
 use forge_db::model::Repository;
 use forge_db::oci_dao;
 use forge_db::raw_dao::{self, NewRawFile, RawFile, Redeploy};
-use forge_plugin::api::FileLocation;
+use forge_plugin::api::{FileLocation, ListedFile};
+use forge_plugin::FormatPlugin;
+use forge_storage::BlobRef;
 use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
 use futures_util::TryStreamExt;
 use reqwest::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
@@ -293,25 +305,200 @@ impl Files<'_> {
     /// [`Self::fresh`], marking what it does on `lookup`.
     async fn fresh_file(&self, repo: &Repository, file: RawFile, lookup: &mut Lookup) -> RawFile {
         let max_age = self.max_age(repo);
-        if file.immutable || max_age == 0 || !repo.online || !is_due(&file, max_age) {
+        if file.immutable || max_age == 0 || !repo.online {
+            return file;
+        }
+        let releases = Box::pin(self.releases_in_step(repo, &file)).await;
+        if !is_due(&file, max_age) && !releases.file_due(&file) {
             return file;
         }
         let gate = gate(repo.id, &file.path);
-        let _held = gate.lock().await;
+        let held = gate.lock().await;
         // Another request may have re-validated it meanwhile.
         let file = match raw_dao::find(&self.state.pool, repo.id, &file.path).await {
-            Ok(Some(current)) if !is_due(&current, max_age) => return current,
-            Ok(Some(current)) => current,
+            Ok(Some(current)) => {
+                if !is_due(&current, max_age)
+                    && !Box::pin(self.releases(repo, &current))
+                        .await
+                        .file_due(&current)
+                {
+                    return current;
+                }
+                current
+            }
             _ => file,
         };
-        match self.revalidate(repo, &file, lookup).await {
+        let current = match self.revalidate(repo, &file, lookup).await {
             Ok(current) => current,
             Err(error) => {
                 lookup.mark(Outcome::StaleServed);
                 tracing::warn!(repo = %repo.name, path = %file.path, error = %error.message(), "file proxy: re-validation failed; serving the cached copy");
-                file
+                return file;
+            }
+        };
+        drop(held);
+        if current.blob_sha256 != file.blob_sha256 {
+            // New content may be newer than the release served with it.
+            Box::pin(self.releases_in_step(repo, &current)).await;
+        }
+        current
+    }
+
+    /// The release files of the cached `file` ([`Releases`]), the one served
+    /// re-validated first when `file` was stored after it was last checked
+    /// and it lists `file` as another file.
+    async fn releases_in_step(&self, repo: &Repository, file: &RawFile) -> Releases {
+        let releases = Box::pin(self.releases(repo, file)).await;
+        let Some(release) = releases.release_due(file) else {
+            return releases;
+        };
+        // In a task of its own, from a fresh stack: the request is deep
+        // already, and a re-validation as deep again.
+        let (state, principal, repo_owned, release, since) = (
+            self.state.clone(),
+            self.principal.clone(),
+            repo.clone(),
+            release.clone(),
+            file.updated_at,
+        );
+        let refreshed = tokio::spawn(
+            async move {
+                let files = Files {
+                    state: &state,
+                    principal,
+                };
+                let mut lookup = Lookup::start(&repo_owned.name, LookupKind::File);
+                let span = lookup.span();
+                files
+                    .refresh_release(&repo_owned, release, since, &mut lookup)
+                    .instrument(span)
+                    .await;
+                let outcome = lookup.marked().unwrap_or(Outcome::Hit);
+                lookup.finish(outcome);
+            }
+            .instrument(tracing::Span::current()),
+        )
+        .await;
+        if let Err(error) = refreshed {
+            tracing::warn!(repo = %repo.name, %error, "file proxy: re-validation of a release failed");
+        }
+        Box::pin(self.releases(repo, file)).await
+    }
+
+    /// Re-validate the cached `release`, unless it was checked at or after
+    /// `since` meanwhile.
+    async fn refresh_release(
+        &self,
+        repo: &Repository,
+        release: RawFile,
+        since: chrono::DateTime<chrono::Utc>,
+        lookup: &mut Lookup,
+    ) {
+        let gate = gate(repo.id, &release.path);
+        let _held = gate.lock().await;
+        let release = match raw_dao::find(&self.state.pool, repo.id, &release.path).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(_) => release,
+        };
+        if release.checked_at.is_some_and(|checked| checked >= since) {
+            return;
+        }
+        if let Err(error) = self.revalidate(repo, &release, lookup).await {
+            lookup.mark(Outcome::StaleServed);
+            tracing::warn!(repo = %repo.name, path = %release.path, error = %error.message(), "file proxy: re-validation of a release failed; serving the cached copy");
+        }
+    }
+
+    /// The release files of `file` the proxy holds, and what the first of
+    /// them lists for it ([`FormatPlugin::file_releases`]).
+    async fn releases(&self, repo: &Repository, file: &RawFile) -> Releases {
+        let none = Releases {
+            held: Vec::new(),
+            listed: None,
+        };
+        let Some(plugin) = self.state.formats.plugin(&repo.format) else {
+            return none;
+        };
+        let paths = plugin.file_releases(&file.path);
+        if paths.is_empty() {
+            return none;
+        }
+        let mut held = Vec::new();
+        for path in paths {
+            match raw_dao::find(&self.state.pool, repo.id, &path).await {
+                Ok(Some(release)) => held.push(release),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(repo = %repo.name, %path, %error, "file proxy: a release file could not be looked up");
+                }
             }
         }
+        let listed = match held.first() {
+            Some(release) => Box::pin(self.listed(repo, &plugin, release, &file.path)).await,
+            None => None,
+        };
+        Releases { held, listed }
+    }
+
+    /// What `release` lists for the file at `path`, read once per content.
+    async fn listed(
+        &self,
+        repo: &Repository,
+        plugin: &Arc<dyn FormatPlugin>,
+        release: &RawFile,
+        path: &str,
+    ) -> Option<ListedFile> {
+        let size = u64::try_from(release.size).ok()?;
+        if size > self.state.upstream.config().max_metadata_bytes {
+            return None;
+        }
+        let key = format!(
+            "{}:{}:{}:{path}",
+            repo.format, release.blob_sha256, release.path
+        );
+        let found: Result<Option<(u64, String)>, ()> = self
+            .state
+            .cache
+            .get_or_try_insert_local(
+                "files:release-listed",
+                &key,
+                Duration::from_secs(3600),
+                || {
+                    let (store, plugin) = (self.state.blob_store.clone(), plugin.clone());
+                    let (blob_sha256, s3_key) = (release.blob_sha256.clone(), release.s3_key.clone());
+                    let (release_path, path) = (release.path.clone(), path.to_string());
+                    let repo = repo.name.clone();
+                    // In a task of its own, from a fresh stack: the object
+                    // store's reads are deep, and the request is already.
+                    async move {
+                        let read = tokio::spawn(
+                            async move {
+                                let blob = BlobRef {
+                                    sha256: &blob_sha256,
+                                    s3_key: &s3_key,
+                                    size,
+                                };
+                                let bytes = store.read_all(blob).await.map_err(|error| {
+                                    tracing::warn!(%repo, path = %release_path, %error, "file proxy: a release file could not be read");
+                                })?;
+                                tokio::task::spawn_blocking(move || {
+                                    plugin
+                                        .file_listed(&release_path, &bytes, &path)
+                                        .map(|listed| (listed.size, listed.sha256))
+                                })
+                                .await
+                                .map_err(|_| ())
+                            }
+                            .instrument(tracing::Span::current()),
+                        );
+                        read.await.map_err(|_| ())?
+                    }
+                },
+            )
+            .await;
+        let (size, sha256) = found.ok().flatten()?;
+        Some(ListedFile { size, sha256 })
     }
 
     /// How long a proxy's cached copy is served before it is re-validated:
@@ -409,7 +596,7 @@ impl Files<'_> {
             return Ok(None);
         }
         let gate = gate(repo.id, path);
-        let _held = gate.lock().await;
+        let held = gate.lock().await;
         if let Some(file) = raw_dao::find(&self.state.pool, repo.id, path).await? {
             return Ok(Some(file));
         }
@@ -434,9 +621,60 @@ impl Files<'_> {
             )));
         }
         lookup.mark(Outcome::Fetched);
-        self.store_response(repo, path, &location, response)
-            .await
-            .map(Some)
+        let file = self.store_response(repo, path, &location, response).await?;
+        drop(held);
+        // The release served may be older than the file.
+        if self.max_age(repo) > 0 {
+            Box::pin(self.releases_in_step(repo, &file)).await;
+        }
+        Ok(Some(file))
+    }
+}
+
+/// The files a cached file is published together with
+/// ([`FormatPlugin::file_releases`]), as the proxy holds them.
+struct Releases {
+    /// The ones cached, the one clients read first first.
+    held: Vec<RawFile>,
+    /// What the first of them lists for the file, when it lists it.
+    listed: Option<ListedFile>,
+}
+
+impl Releases {
+    /// Whether the one served lists `file` as another file.
+    fn apart(&self, file: &RawFile) -> bool {
+        self.listed.as_ref().is_some_and(|listed| {
+            u64::try_from(file.size).ok() != Some(listed.size)
+                || !listed.sha256.eq_ignore_ascii_case(&file.blob_sha256)
+        })
+    }
+
+    /// Whether `file` is due to be consistent with them: one of them was
+    /// replaced after it was last checked, or the one served lists it as
+    /// another file and was checked after it.
+    fn file_due(&self, file: &RawFile) -> bool {
+        let Some(checked) = file.checked_at else {
+            return true;
+        };
+        self.held.iter().any(|release| release.updated_at > checked)
+            || (self.apart(file)
+                && self
+                    .held
+                    .first()
+                    .and_then(|release| release.checked_at)
+                    .is_some_and(|release| release > checked))
+    }
+
+    /// The one served, when it is due to be consistent with `file`: it
+    /// lists `file` as another file, and was last checked before `file`'s
+    /// content was stored.
+    fn release_due(&self, file: &RawFile) -> Option<&RawFile> {
+        let served = self.held.first()?;
+        (self.apart(file)
+            && served
+                .checked_at
+                .is_none_or(|checked| checked < file.updated_at))
+        .then_some(served)
     }
 }
 

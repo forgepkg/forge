@@ -32,7 +32,7 @@ use std::cmp::Ordering;
 
 use forge_plugin_api::{
     Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FilePackage, FormatError,
-    FormatOption, FormatPlugin, IndexFile, IndexInput, Loaded, OptionInput, PackageRef,
+    FormatOption, FormatPlugin, IndexFile, IndexInput, ListedFile, Loaded, OptionInput, PackageRef,
     PackageSource, ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository,
     RepositoryKind, Request, Response, Storage, SummaryCap, Upload, UpstreamAnswer, UpstreamOp,
     UpstreamStep, UpstreamToken, VersionClass,
@@ -182,6 +182,14 @@ impl FormatPlugin for Apt {
             }
             _ => FilePackage::None,
         }
+    }
+
+    fn file_releases(&self, path: &str) -> Vec<String> {
+        proxy::releases(path)
+    }
+
+    fn file_listed(&self, release_path: &str, release: &[u8], path: &str) -> Option<ListedFile> {
+        proxy::listed_in(release_path, release, path)
     }
 
     fn handle(&self, repo: &Repository, req: &Request) -> Action {

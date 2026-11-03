@@ -1382,3 +1382,158 @@ async fn invalidate_cache_and_deletes_evict_checked_packages() {
     assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello2));
     assert_eq!(seen(), 3);
 }
+
+/// A generation of a mirror without `Acquire-By-Hash` (reprepro's and
+/// aptly's default): its `InRelease`, `Release`, `Release.gpg` and
+/// `Packages.gz`, the indexes listing `Packages.gz` as it is.
+fn generation(version: &str) -> [(&'static str, Vec<u8>); 4] {
+    let packages = format!(
+        "Package: hello\nVersion: {version}\nFilename: pool/main/h/hello/hello_{version}_amd64.deb\n\
+         Size: 1\nSHA256: {}\n",
+        "0".repeat(64)
+    );
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(packages.as_bytes()).unwrap();
+    let packages_gz = gz.finish().unwrap();
+    let release = format!(
+        "Origin: Vendor\nSuite: bookworm\nVersion: {version}\nComponents: main\nArchitectures: amd64\n\
+         SHA256:\n {} {} main/binary-amd64/Packages.gz\n",
+        sha256(&packages_gz),
+        packages_gz.len()
+    );
+    let in_release = format!(
+        "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n{release}\
+         -----BEGIN PGP SIGNATURE-----\n\nsigned {version}\n-----END PGP SIGNATURE-----\n"
+    );
+    [
+        ("dists/bookworm/InRelease", in_release.into_bytes()),
+        ("dists/bookworm/Release", release.into_bytes()),
+        (
+            "dists/bookworm/Release.gpg",
+            format!("detached {version}").into_bytes(),
+        ),
+        ("dists/bookworm/main/binary-amd64/Packages.gz", packages_gz),
+    ]
+}
+
+/// An upstream without `by-hash` has apt fetch `Packages` at its own path
+/// and check it against the `InRelease` it was served: the proxy serves the
+/// two from one generation, though apt re-validates only `InRelease` while
+/// its lists are current, and each file has its own clock (#798).
+#[tokio::test]
+async fn proxies_serve_indexes_consistent_with_the_release() {
+    let srv = common::start().await;
+    let state = Arc::new(Mirror::default());
+    let url = mirror(state.clone()).await;
+    let publish = |version: &str| {
+        let mut files = state.files.lock().unwrap();
+        for (path, body) in generation(version) {
+            files.insert(format!("vendor/{path}"), body);
+        }
+    };
+    publish("1");
+    let name = format!("aptvendor{}", unique());
+    create(
+        &srv,
+        json!({"name": name, "kind": "proxy", "format": "apt", "remote_url": format!("{url}/vendor"),
+               "metadata_ttl_seconds": 3600, "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let apt = Apt::new(&srv, &name).await;
+    // Only the file at `path` is due; the TTL keeps every other one.
+    let expire = |path: &'static str| {
+        let pool = srv.pool.clone();
+        let name = name.clone();
+        async move {
+            sqlx::query(
+                "UPDATE raw_file SET checked_at = NULL WHERE path = $2 \
+                 AND repository_id = (SELECT id FROM repository WHERE name = $1)",
+            )
+            .bind(&name)
+            .bind(path)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    let current = |version: &str, path: &str| {
+        generation(version)
+            .into_iter()
+            .find(|(p, _)| *p == path)
+            .unwrap()
+            .1
+    };
+    let packages = "dists/bookworm/main/binary-amd64/Packages.gz";
+    // What `Packages.gz` the `InRelease` served lists.
+    let listed = |in_release: &[u8]| {
+        let text = String::from_utf8(in_release.to_vec()).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.ends_with(" main/binary-amd64/Packages.gz"))
+            .unwrap()
+            .to_string();
+        let mut words = line.split_whitespace();
+        (
+            words.next().unwrap().to_string(),
+            words.next().unwrap().parse::<usize>().unwrap(),
+        )
+    };
+
+    for path in [
+        "dists/bookworm/InRelease",
+        "dists/bookworm/Release",
+        "dists/bookworm/Release.gpg",
+        packages,
+    ] {
+        assert_eq!(apt.get(path).await, (StatusCode::OK, current("1", path)));
+    }
+
+    // The upstream publishes; a client re-validates only `InRelease`.
+    publish("2");
+    expire("dists/bookworm/InRelease").await;
+    let (status, in_release) = apt.get("dists/bookworm/InRelease").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(in_release, current("2", "dists/bookworm/InRelease"));
+    // The `Packages.gz` served then is the one it lists.
+    let (status, body) = apt.get(packages).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((sha256(&body), body.len()), listed(&in_release));
+    assert_eq!(body, current("2", packages));
+    // `Release` and `Release.gpg` are due once `InRelease` was replaced.
+    assert_eq!(
+        apt.get("dists/bookworm/Release").await.1,
+        current("2", "dists/bookworm/Release")
+    );
+    assert_eq!(
+        apt.get("dists/bookworm/Release.gpg").await.1,
+        current("2", "dists/bookworm/Release.gpg")
+    );
+    // Consistent again. Each replacement made the others due once more (a
+    // conditional GET each); then nothing more is asked of the upstream.
+    let all = [
+        "dists/bookworm/InRelease",
+        "dists/bookworm/Release",
+        "dists/bookworm/Release.gpg",
+        packages,
+    ];
+    for path in all {
+        assert_eq!(apt.get(path).await.1, current("2", path));
+    }
+    let before = state.requests.load(Ordering::SeqCst);
+    for path in all {
+        assert_eq!(apt.get(path).await.1, current("2", path));
+    }
+    assert_eq!(state.requests.load(Ordering::SeqCst), before);
+
+    // The other way round: `Packages.gz` is re-validated first, and the
+    // `InRelease` served is then the one that lists it.
+    publish("3");
+    expire(packages).await;
+    let (status, body) = apt.get(packages).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, current("3", packages));
+    let (status, in_release) = apt.get("dists/bookworm/InRelease").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(in_release, current("3", "dists/bookworm/InRelease"));
+    assert_eq!((sha256(&body), body.len()), listed(&in_release));
+}
