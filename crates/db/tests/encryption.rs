@@ -29,7 +29,8 @@ static URL: OnceLock<String> = OnceLock::new();
 static INIT_LOCK: Mutex<()> = Mutex::const_new(());
 static MIGRATED: OnceLock<()> = OnceLock::new();
 /// Serializes the tests whose helpers scan secret columns table-wide (the DEK
-/// reference scan spans `repository` AND `auth_realm`).
+/// reference scan spans `repository` AND `auth_realm`), and the tests that
+/// keep a `repository` row the table-wide ones would delete under them.
 static TABLE_WIDE: Mutex<()> = Mutex::const_new(());
 
 async fn database_url() -> &'static str {
@@ -1145,6 +1146,9 @@ async fn secret_settings_follow_dek_rotation() {
 /// did) does not decrypt either, and the sweep leaves it.
 #[tokio::test]
 async fn upstream_password_is_bound_to_the_remote_origin() {
+    // Its repository row must outlive the table-wide tests' `DELETE FROM
+    // repository` (#779).
+    let _serial = TABLE_WIDE.lock().await;
     let pool = pool().await;
     let scope = format!("origin-{}", uuid::Uuid::new_v4());
     let root = KeyBytes::generate();
