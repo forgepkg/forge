@@ -236,7 +236,9 @@ docker pull forge.example.com/docker-hub/nginx:1.27
   on the same instance meanwhile are served from that one download. Its last
   byte is sent once the whole layer matches its digest; a layer that does
   not ends the response short, an error the client retries, and is not
-  cached. The download is cached even when its client goes away. Blobs of at
+  cached. The download is cached even when its client goes away. Once the
+  layer is stored, its temp space is given back and the clients still
+  reading it go on from the store. Blobs of at
   most 1 MiB (image configs), and layers whose upstream sends no
   `Content-Length`, are downloaded and verified before they are served.
 - Multi-arch indexes are cached as they are; each platform's manifest and

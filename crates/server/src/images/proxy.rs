@@ -1022,14 +1022,15 @@ impl Registry {
     }
 
     /// Store a blob `repo`'s upstream served for `image`, verified against
-    /// its digest, and link it into the image.
+    /// its digest, and link it into the image. Returns the S3 key it is
+    /// stored under.
     pub(crate) async fn store_fetched(
         &self,
         repo: &Repository,
         image: &str,
         digest: &ContentDigest,
         staged: StagedBlob,
-    ) -> ImgResult<()> {
+    ) -> ImgResult<String> {
         let stored = self.inner.cas.commit(staged).await?;
         let mut tx = forge_db::begin(&self.inner.pool).await?;
         still_upstream(&mut tx, repo).await?;
@@ -1046,7 +1047,7 @@ impl Registry {
         .map_err(Failure::from)
         .and_then(require_linked)?;
         tx.commit().await?;
-        Ok(())
+        Ok(stored.s3_key)
     }
 
     /// A proxy caches a manifest before its config: once the config blob

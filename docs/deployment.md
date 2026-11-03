@@ -1632,7 +1632,9 @@ notices within about 15 s, drops its in-memory cache and resubscribes.
   `0` removes the limit); past it, pushes and downloads are answered `503`
   with `Retry-After` until space frees up. A layer a docker proxy serves
   while it downloads it reserves its whole size when the download starts,
-  until the download is stored and the last response reading it has ended.
+  until the layer is stored or the download fails; the responses still
+  reading it then go on from the stored layer (or end short), so a client
+  that reads slowly, or stops reading, holds none of it.
   A repository's upload limit may not exceed the budget (less
   `nuget.max_nuspec_bytes`), so raise the budget before giving a repository
   a larger limit. An explicit budget below
