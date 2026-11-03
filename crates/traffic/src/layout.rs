@@ -5,7 +5,8 @@
 //! * `days/{date}/{instance}.parquet`: one instance's requests of a day
 //!   (UTC), a row per repository and client network with their country and
 //!   autonomous system; rewritten every minute while the day lasts. Kept as
-//!   long as the settings say ([`TrafficSettings::retention_days`]).
+//!   long as the settings say ([`TrafficSettings::retention_days`], two
+//!   weeks by default).
 //! * `geoip/{country,asn}.mmdb`: the geolocation databases
 //!   ([`crate::geo`]).
 //!
@@ -132,7 +133,8 @@ struct RowKey {
 struct RowCounts {
     requests: u64,
     bytes: u64,
-    /// The last address seen; `""` without addresses.
+    /// The last address seen (an IPv6 address's /64 alone, as noted); `""`
+    /// without addresses.
     address: String,
     /// The autonomous system's organisation, for a row without a network.
     as_org: String,
@@ -509,6 +511,8 @@ mod tests {
             day_key(day("2026-07-31"), "a"),
             day_key(day("2026-08-01"), "a"),
             day_key(day("2026-08-01"), "b"),
+            day_key(day("2026-10-15"), "a"),
+            day_key(day("2026-10-16"), "a"),
             day_key(day("2026-10-30"), "a"),
             "traffic/v1/days/not-a-date/x.parquet".to_string(),
             "traffic/v1/geoip/country.mmdb".to_string(),
@@ -516,6 +520,27 @@ mod tests {
             objects.put(&key, vec![1]).await.unwrap();
         }
         // 90 days up to 2026-10-29: from 2026-08-01 on.
+        let ninety = TrafficSettings {
+            retention_days: 90,
+            ..TrafficSettings::default()
+        };
+        let deleted = prune(&objects, &ninety, t("2026-10-29T12:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            objects.keys(),
+            vec![
+                "traffic/v1/days/2026-08-01/a.parquet",
+                "traffic/v1/days/2026-08-01/b.parquet",
+                "traffic/v1/days/2026-10-15/a.parquet",
+                "traffic/v1/days/2026-10-16/a.parquet",
+                "traffic/v1/days/2026-10-30/a.parquet",
+                "traffic/v1/days/not-a-date/x.parquet",
+                "traffic/v1/geoip/country.mmdb",
+            ]
+        );
+        // The default, two weeks up to 2026-10-29: from 2026-10-16 on.
         let deleted = prune(
             &objects,
             &TrafficSettings::default(),
@@ -523,12 +548,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(deleted, 1);
+        assert_eq!(deleted, 3);
         assert_eq!(
             objects.keys(),
             vec![
-                "traffic/v1/days/2026-08-01/a.parquet",
-                "traffic/v1/days/2026-08-01/b.parquet",
+                "traffic/v1/days/2026-10-16/a.parquet",
                 "traffic/v1/days/2026-10-30/a.parquet",
                 "traffic/v1/days/not-a-date/x.parquet",
                 "traffic/v1/geoip/country.mmdb",

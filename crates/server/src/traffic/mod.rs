@@ -6,7 +6,8 @@
 //! * The client address is the one the principal layer resolves (the socket
 //!   peer, or what a trusted proxy forwarded), counted under its network as
 //!   the login lockout counts it: an IPv6 address by its /64
-//!   ([`client_network`]).
+//!   ([`client_network`]), the rest of the address dropped before it is
+//!   noted, so that it is neither written nor shown.
 //! * The settings ([`TrafficSettings`]) are kept in `forge_setting` under
 //!   [`SETTINGS_KEY`]; every instance follows a change with its next flush.
 //! * The worker flushes once a minute, a couple of seconds after the minute
@@ -53,9 +54,9 @@ pub fn network_label(ip: IpAddr) -> String {
     }
 }
 
-/// Note the request's client address.
+/// Note the request's client address: an IPv6 address by its /64 alone.
 pub fn note_client(ip: IpAddr) {
-    forge_traffic::note_client(ip.to_canonical(), network_label(ip));
+    forge_traffic::note_client(client_network(ip), network_label(ip));
 }
 
 /// The stored [`TrafficSettings`], or the defaults when never saved.
@@ -198,6 +199,22 @@ mod tests {
             network_label("2001:db8:1:2:3:4:5:6".parse().unwrap()),
             "2001:db8:1:2::/64"
         );
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_client_is_noted_by_its_64_alone() {
+        let slot = forge_traffic::Slot::new();
+        slot.scope(async { note_client("2001:db8:1:2:3:4:5:6".parse().unwrap()) })
+            .await;
+        let noted = slot.take();
+        assert_eq!(noted.client, "2001:db8:1:2::".parse().ok());
+        assert_eq!(noted.network.as_deref(), Some("2001:db8:1:2::/64"));
+
+        slot.scope(async { note_client("::ffff:192.0.2.7".parse().unwrap()) })
+            .await;
+        let noted = slot.take();
+        assert_eq!(noted.client, "192.0.2.7".parse().ok());
+        assert_eq!(noted.network.as_deref(), Some("192.0.2.7"));
     }
 
     #[test]

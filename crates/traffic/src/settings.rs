@@ -3,6 +3,10 @@
 /// The longest retention accepted, in days (100 years).
 pub const MAX_RETENTION_DAYS: u32 = 36_500;
 
+/// The retention of an install that never set one, in days: two weeks, so
+/// that the client addresses recorded by default are not kept longer.
+pub const DEFAULT_RETENTION_DAYS: u32 = 14;
+
 /// The traffic settings of every instance, set in the web UI (Admin →
 /// Traffic → Settings) or through `/admin/settings/traffic` and kept in the
 /// database. An install that never saved them uses
@@ -19,7 +23,8 @@ pub struct TrafficSettings {
     /// Whether client addresses are recorded. Off, requests are still
     /// counted by repository, country and autonomous system.
     pub client_addresses: bool,
-    /// How long the day files are kept, in days.
+    /// How long the day files are kept, in days; with them the client
+    /// addresses they hold.
     pub retention_days: u32,
 }
 
@@ -28,7 +33,7 @@ impl Default for TrafficSettings {
         TrafficSettings {
             enabled: true,
             client_addresses: true,
-            retention_days: 90,
+            retention_days: DEFAULT_RETENTION_DAYS,
         }
     }
 }

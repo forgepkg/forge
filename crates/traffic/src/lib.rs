@@ -20,9 +20,11 @@
 //! * **Pruning** ([`layout::prune`]) deletes the days past their retention
 //!   ([`TrafficSettings`]); it is idempotent and runs on every instance.
 //!
-//! Client addresses are personal data: they can be switched off, and then
-//! requests are still counted by repository, country and autonomous system,
-//! the address only looked up in memory before it is dropped.
+//! Client addresses are personal data: an IPv6 address is cut to its /64
+//! before it is noted, and the files are kept two weeks by default
+//! ([`DEFAULT_RETENTION_DAYS`]). The addresses can be switched off: requests
+//! are then still counted by repository, country and autonomous system, the
+//! address only looked up in memory before it is dropped.
 
 pub mod geo;
 pub mod layout;
@@ -41,7 +43,7 @@ pub use geo::{DbInfo, Geo, GeoKind, Location};
 pub use layout::{instance_id, FlushReport, Flusher};
 pub use objects::{Listed, MemoryObjects, Objects};
 pub use record::{Drained, Event, PendingCounts, PendingKey, Recorder, OTHER};
-pub use settings::{TrafficSettings, MAX_RETENTION_DAYS};
+pub use settings::{TrafficSettings, DEFAULT_RETENTION_DAYS, MAX_RETENTION_DAYS};
 pub use slot::{note_client, note_repository, Noted, Slot};
 
 /// What the server holds of the traffic statistics: this instance's

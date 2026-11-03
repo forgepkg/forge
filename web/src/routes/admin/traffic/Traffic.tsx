@@ -381,9 +381,6 @@ function Body({ data }: { data: TrafficOverview }) {
                     <NarrowLink narrow={{ network: c.network }} mono>
                       {c.network}
                     </NarrowLink>
-                    {c.address && c.address !== c.network && (
-                      <div className="fg-text fg-text--small fg-mono">{c.address}</div>
-                    )}
                   </TableCell>
                   <TableCell align="right">{count.format(c.requests)}</TableCell>
                   <TableCell align="right">{formatBytes(c.bytes)}</TableCell>
