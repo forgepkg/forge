@@ -12,6 +12,9 @@ The fixtures intentionally cover:
   * two different nuspec `xmlns` schema versions (the parser must be
     namespace-insensitive);
   * grouped and flat dependency declarations;
+  * a manifest in UTF-16 LE with a byte-order mark and `encoding="utf-16"`,
+    as older nuget.org packages hold it (`Microsoft.Web.Infrastructure`
+    1.0.0); NuGet reads it, so the parser must too;
   * a "zip bomb" archive with a hugely compressible payload entry next to a
     valid manifest. Only the .nuspec is ever decompressed, so the parser must
     ACCEPT it under the default limits (large native packages look like this)
@@ -81,6 +84,23 @@ OTHER_PKG_NUSPEC = """<?xml version="1.0" encoding="utf-8"?>
 </package>
 """
 
+# A manifest in UTF-16 LE with a byte-order mark, the way older nuget.org
+# packages (Microsoft.Web.Infrastructure 1.0.0) hold it. The non-ASCII
+# description checks that the text is decoded, not just stripped of zeros.
+UTF16_PKG_NUSPEC = """<?xml version="1.0" encoding="utf-16"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+  <metadata>
+    <id>Utf16.Package</id>
+    <version>1.0.0.0</version>
+    <authors>forge</authors>
+    <description>A manifest in UTF-16 \u00a9 Forge \U0001f4e6</description>
+    <dependencies>
+      <dependency id="Newtonsoft.Json" version="13.0.1" />
+    </dependencies>
+  </metadata>
+</package>
+"""
+
 
 def write_nupkg(path, nuspec_name, nuspec_body, extra=None):
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -128,6 +148,11 @@ def main():
         os.path.join(HERE, "other.package.2.0.0-beta.1.nupkg"),
         "Other.Package.nuspec",
         OTHER_PKG_NUSPEC,
+    )
+    write_nupkg(
+        os.path.join(HERE, "utf16.package.1.0.0.nupkg"),
+        "Utf16.Package.nuspec",
+        b"\xff\xfe" + UTF16_PKG_NUSPEC.encode("utf-16-le"),
     )
     write_zip_bomb(os.path.join(HERE, "zip-bomb.nupkg"))
     print("fixtures written to", HERE)

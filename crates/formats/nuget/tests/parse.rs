@@ -72,6 +72,32 @@ fn parses_second_namespace_with_flat_deps_and_prerelease() {
     );
 }
 
+/// A manifest in UTF-16 LE with a byte-order mark (`encoding="utf-16"`), as
+/// `Microsoft.Web.Infrastructure` 1.0.0 on nuget.org holds it, is read the way
+/// NuGet reads it, and stored as it came (#597).
+#[test]
+fn parses_a_utf16_manifest_with_a_byte_order_mark() {
+    let fmt = Nuget::default();
+    let mut f = fixture("utf16.package.1.0.0.nupkg");
+    let parsed = fmt.parse_package(&mut f).expect("parse utf16.package");
+
+    assert_eq!(parsed.original_id, "Utf16.Package");
+    assert_eq!(parsed.id, "utf16.package");
+    assert_eq!(parsed.version_original, "1.0.0.0");
+    assert_eq!(parsed.version, "1.0.0");
+    assert_eq!(parsed.dependencies.len(), 1);
+    assert_eq!(parsed.dependencies[0].dependencies[0].id, "Newtonsoft.Json");
+    // The stored manifest is the package's own bytes, still UTF-16.
+    assert_eq!(&parsed.manifest[..4], b"\xff\xfe<\x00");
+
+    let metadata = forge_format_nuget::nuspec::metadata_from_nuspec(&parsed.manifest)
+        .expect("metadata of the stored manifest");
+    assert_eq!(
+        metadata.description.as_deref(),
+        Some("A manifest in UTF-16 \u{a9} Forge \u{1f4e6}")
+    );
+}
+
 /// The `zip-bomb.nupkg` fixture holds a 64 MiB + 1 entry of zeros (ratio ~1000)
 /// next to a valid manifest. Only the `.nuspec` is ever decompressed, so that
 /// payload is harmless and must not fail the package — large native packages
