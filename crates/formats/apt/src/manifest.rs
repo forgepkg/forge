@@ -85,6 +85,12 @@ impl Control {
                 "{architecture:?} is not an architecture"
             )));
         }
+        for field in control::RELATIONSHIP_FIELDS {
+            if let Some(value) = paragraph.get(field) {
+                control::check_relations(field, value)
+                    .map_err(|e| FormatError::MalformedManifest(format!("control file: {e}")))?;
+            }
+        }
         let component = control::component_of(paragraph.first_line("Section"))
             .map_err(|e| FormatError::MalformedManifest(e.to_string()))?;
         Ok(Control {
@@ -245,5 +251,37 @@ mod tests {
             let err = Control::parse(bad).unwrap_err().to_string();
             assert!(err.contains(why), "{err} should say {why}");
         }
+    }
+
+    #[test]
+    fn a_control_file_with_malformed_relations_is_refused() {
+        for field in control::RELATIONSHIP_FIELDS {
+            for value in [
+                "libc6 libssl3",
+                "a,,b",
+                "foo (<< 1",
+                "foo bar",
+                "foo:am$d64",
+            ] {
+                let text =
+                    format!("Package: hello\nVersion: 1\nArchitecture: amd64\n{field}: {value}\n");
+                let err = Control::parse(text.as_bytes()).unwrap_err();
+                assert!(
+                    matches!(&err, FormatError::MalformedManifest(m) if m.contains(field)),
+                    "{field}: {value}: {err}"
+                );
+            }
+        }
+        // A folded field is read across its lines; so is a lowercase name.
+        Control::parse(
+            b"Package: hello\nVersion: 1\nArchitecture: amd64\n\
+              depends: libc6 (>= 2.34),\n libssl3 (>= 3.0.0) | libssl1.1,\n python3:any\n",
+        )
+        .unwrap();
+        let err = Control::parse(
+            b"Package: hello\nVersion: 1\nArchitecture: amd64\ndepends: libc6,\n libssl3 zlib1g\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("comma missing"), "{err}");
     }
 }
