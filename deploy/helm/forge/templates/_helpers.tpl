@@ -157,6 +157,7 @@ the block (2.0.0) has no .Values.telemetry (#548). */}}
 {{- if or $telemetry.metrics $telemetry.traces $telemetry.logs }}
 {{- $_ := set $derived "telemetry" (dict "metrics" $telemetry.metrics "traces" $telemetry.traces "logs" $telemetry.logs) }}
 {{- end }}
+{{- /* config.telemetry, merged over this below, wins (forge.telemetryEnabled). */}}
 {{- if .Values.versitygw.enabled }}
 {{- $_ := set $derived "s3" (dict
       "endpoint" (printf "http://%s:%d" (include "forge.versitygw.fullname" .) (int .Values.versitygw.service.port))
@@ -328,6 +329,24 @@ with the dependency's name and values): dict "ctx" $ "name" <chart name>. */}}
 {{- include "forge.dependencyFullname" (dict "ctx" . "name" "versitygw") }}
 {{- end }}
 
+{{/* "true" when forge.toml turns an OpenTelemetry signal on, so the
+container gets the OTEL_* environment: for each of metrics, traces and logs,
+config.telemetry.<signal> when set (it wins in forge.toml), else
+telemetry.<signal> (#579). */}}
+{{- define "forge.telemetryEnabled" -}}
+{{- $telemetry := .Values.telemetry | default dict }}
+{{- $config := default dict (default dict .Values.config).telemetry }}
+{{- $on := false }}
+{{- range $signal := list "metrics" "traces" "logs" }}
+{{- $value := index $telemetry $signal }}
+{{- if and (hasKey $config $signal) (not (kindIs "invalid" (index $config $signal))) }}
+{{- $value = eq (toString (index $config $signal)) "true" }}
+{{- end }}
+{{- if $value }}{{ $on = true }}{{ end }}
+{{- end }}
+{{- if $on }}true{{ end }}
+{{- end }}
+
 {{/* The container's env: the chart's variables, then .Values.env. A chart
 variable that .Values.env also names is left out, so the value set there
 wins without a duplicate entry. */}}
@@ -366,7 +385,7 @@ wins without a duplicate entry. */}}
 {{- end }}
 {{- /* `| default dict`: as in forge.config (#548). */}}
 {{- $telemetry := .Values.telemetry | default dict }}
-{{- if or $telemetry.metrics $telemetry.traces $telemetry.logs }}
+{{- if include "forge.telemetryEnabled" . }}
 {{- /* The pod's identity, for the resource attributes, and the node's address,
 for an endpoint on the node ($(HOST_IP)): defined before what expands them. */}}
 {{- range $name, $path := dict "HOST_IP" "status.hostIP" "K8S_POD_NAME" "metadata.name" "K8S_NAMESPACE_NAME" "metadata.namespace" "K8S_NODE_NAME" "spec.nodeName" }}
