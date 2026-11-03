@@ -2359,6 +2359,8 @@ struct MockRegistry {
     /// Send the first half of every blob `GET`, then wait for a permit of
     /// this before the rest.
     blob_hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Send the first half of every blob `GET`, then drop the connection.
+    cut_blobs: AtomicBool,
 }
 
 impl MockRegistry {
@@ -2483,6 +2485,19 @@ impl MockRegistry {
                 tokio::time::sleep(delay).await;
                 if self.corrupt.load(Ordering::SeqCst) {
                     body.push(0);
+                }
+                if self.cut_blobs.load(Ordering::SeqCst) {
+                    let length = body.len();
+                    body.truncate(length / 2);
+                    let cut = futures_util::stream::iter([
+                        Ok::<_, std::io::Error>(body),
+                        Err(std::io::Error::other("connection lost")),
+                    ]);
+                    return (
+                        [(header::CONTENT_LENGTH, length.to_string())],
+                        Body::from_stream(cut),
+                    )
+                        .into_response();
                 }
                 let Some(hold) = self.blob_hold.lock().unwrap().clone() else {
                     return body.into_response();
@@ -2952,6 +2967,45 @@ async fn a_downloading_layer_that_does_not_match_its_digest_is_cut_short() {
     assert_eq!(resp.bytes().await.unwrap().as_ref(), layer.as_slice());
     assert_eq!(mock.blob_gets.load(Ordering::SeqCst), 2, "downloaded again");
     assert!(linked_soon(&srv, &proxy).await, "cached");
+}
+
+/// An upstream that loses the connection in the middle of a small blob (one
+/// Forge stages before it answers) is the upstream's failure: 503, not 500,
+/// and nothing is cached (#689).
+#[tokio::test]
+async fn an_upstream_cut_short_mid_blob_is_unreachable() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    let config = br#"{"architecture":"amd64","os":"linux"}"#.repeat(64);
+    mock.put_blob(&config);
+    mock.cut_blobs.store(true, Ordering::SeqCst);
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{proxy}/library/cut");
+    let path = format!("blobs/{}", sha(&config));
+
+    let resp = oci.get(&name, &path).await;
+    assert_eq!(resp.status(), 503);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.to_string()
+            .contains("the upstream registry is unreachable"),
+        "{body}"
+    );
+    assert_eq!(links(&srv, &proxy).await, 0, "not cached");
+
+    mock.cut_blobs.store(false, Ordering::SeqCst);
+    let resp = oci.get(&name, &path).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), config.as_slice());
 }
 
 /// A client that stops reading a layer a proxy serves while it downloads it

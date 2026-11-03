@@ -332,6 +332,40 @@ impl std::fmt::Display for RequestBodyError {
 
 impl std::error::Error for RequestBodyError {}
 
+/// An upstream response body that could not be read: the connection was
+/// lost, or it stalled past the idle timeout or the download deadline.
+/// Travels inside the I/O error staging the body fails with, and is the
+/// upstream's fault, not storage's.
+#[derive(Debug)]
+pub(crate) struct UpstreamBodyError(pub reqwest::Error);
+
+impl std::fmt::Display for UpstreamBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reading the upstream response: {}", self.0)
+    }
+}
+
+impl std::error::Error for UpstreamBodyError {}
+
+/// An upstream response body as an `AsyncRead`. A body that cannot be read
+/// fails with an [`UpstreamBodyError`] inside the I/O error.
+pub(crate) fn upstream_body_reader(
+    response: reqwest::Response,
+) -> impl tokio::io::AsyncRead + Unpin + Send {
+    use futures_util::TryStreamExt;
+    tokio_util::io::StreamReader::new(
+        response
+            .bytes_stream()
+            .map_err(|e| std::io::Error::other(UpstreamBodyError(e))),
+    )
+}
+
+/// Whether staging failed because the upstream body could not be read.
+pub(crate) fn is_upstream_read_error(e: &forge_storage::CasError) -> bool {
+    matches!(e, forge_storage::CasError::Io(io)
+        if io.get_ref().is_some_and(|inner| inner.is::<UpstreamBodyError>()))
+}
+
 impl From<forge_storage::CasError> for Failure {
     fn from(e: forge_storage::CasError) -> Self {
         match e {
@@ -352,6 +386,7 @@ impl From<forge_storage::CasError> for Failure {
                 tracing::debug!(error = %e, "registry: the upload body could not be read");
                 Failure::new(ImageError::BodyUnreadable)
             }
+            e if is_upstream_read_error(&e) => proxy::upstream_unreachable(&e),
             other => Failure::internal("storage error", other),
         }
     }
@@ -398,5 +433,37 @@ mod tests {
         // Staging's own I/O errors stay server errors.
         let e = Failure::from(CasError::Io(std::io::Error::other("disk full")));
         assert_eq!(e.error, ImageError::Internal);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_upstream_body_is_the_upstreams_error() {
+        // A body cut short: its `Content-Length` promises more than it sends.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await;
+        });
+        let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
+        let mut body = Vec::new();
+        let read =
+            tokio::io::AsyncReadExt::read_to_end(&mut upstream_body_reader(response), &mut body)
+                .await
+                .unwrap_err();
+        let e = CasError::Io(read);
+        assert!(is_upstream_read_error(&e));
+        assert_eq!(
+            Failure::from(e).error,
+            ImageError::Unavailable("the upstream registry is unreachable".into())
+        );
+        // Staging's own I/O errors stay server errors.
+        let e = CasError::Io(std::io::Error::other("disk full"));
+        assert!(!is_upstream_read_error(&e));
+        assert_eq!(Failure::from(e).error, ImageError::Internal);
     }
 }
