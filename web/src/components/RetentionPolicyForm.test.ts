@@ -10,6 +10,7 @@ import {
   newRule,
   policyDeletes,
   policyShape,
+  splitTags,
   validateDraft,
 } from './RetentionPolicyForm'
 
@@ -145,6 +146,32 @@ describe('retention policy model', () => {
         target_bytes: bytes,
       })
     }
+  })
+
+  it('keeps a protected tag glob with braces whole through a load and save', () => {
+    const stored = {
+      version: 1,
+      enabled: true,
+      dry_run_only: false,
+      rules: [
+        {
+          id: 'keep',
+          keep_last_n_tags: 5,
+          protected_tags: ['{latest,stable}', 'release-[0-9]*', 'v1.*'],
+        },
+      ],
+    } as unknown as RetentionPolicy
+    const draft = draftFromPolicy('image', stored)
+    expect(validateDraft('image', draft)).toBeNull()
+    expect(buildPolicy('image', draft).rules).toEqual(stored.rules)
+  })
+
+  it('splits tag globs at commas and spaces outside braces and classes', () => {
+    expect(splitTags(' latest, release-*  pr-? ')).toEqual(['latest', 'release-*', 'pr-?'])
+    expect(splitTags('{latest,stable},v{1, 2}')).toEqual(['{latest,stable}', 'v{1, 2}'])
+    expect(splitTags('[, ]x [],]y [!]]z')).toEqual(['[, ]x', '[],]y', '[!]]z'])
+    expect(splitTags('a\\,b, c')).toEqual(['a\\,b', 'c'])
+    expect(splitTags('')).toEqual([])
   })
 
   it('refuses empty and duplicate ids, bad numbers and no rules', () => {

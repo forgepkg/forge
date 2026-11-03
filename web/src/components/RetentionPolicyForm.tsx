@@ -723,6 +723,44 @@ function toBytes(amount: string, unit: SizeUnit): number {
   return Math.round(Number(amount) * UNIT_BYTES[unit])
 }
 
+/**
+ * The globs of a tags field: split at commas and whitespace, but not inside
+ * a `{a,b}` alternate group or a `[…]` class, so `{latest,stable}` stays one
+ * glob (the syntax of `tag_glob` in `crates/core/src/retention/images.rs`).
+ */
+export function splitTags(raw: string): string[] {
+  const tags: string[] = []
+  let tag = ''
+  let braces = 0
+  // Where the open `[…]` class starts in `tag`, or -1 outside one.
+  let classStart = -1
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]
+    if (c === '\\' && i + 1 < raw.length) {
+      tag += c + raw[++i]
+      continue
+    }
+    if (classStart >= 0) {
+      // A `]` right after `[` (or `[!`, `[^`) is a member, not the end.
+      const opened = tag.slice(classStart + 1)
+      if (c === ']' && opened !== '' && opened !== '!' && opened !== '^') classStart = -1
+      tag += c
+      continue
+    }
+    if (c === '[') classStart = tag.length
+    else if (c === '{') braces += 1
+    else if (c === '}' && braces > 0) braces -= 1
+    else if (braces === 0 && (c === ',' || /\s/.test(c))) {
+      if (tag !== '') tags.push(tag)
+      tag = ''
+      continue
+    }
+    tag += c
+  }
+  if (tag !== '') tags.push(tag)
+  return tags
+}
+
 /** The policy the form says, for a form `validateDraft` accepted. */
 export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPolicy {
   const rules = draft.rules.map((rule) => {
@@ -733,7 +771,7 @@ export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPo
       if (field.kind === 'count' || field.kind === 'days') {
         value = raw === '' ? undefined : Number(raw)
       } else if (field.kind === 'tags') {
-        const tags = raw.split(/[\s,]+/).filter((t) => t !== '')
+        const tags = splitTags(raw)
         value = tags.length > 0 ? tags : undefined
       } else if ((field.kind === 'text' || field.kind === 'selector') && raw === '' && field !== RULE_ID) {
         value = undefined
