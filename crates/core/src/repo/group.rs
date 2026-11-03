@@ -124,7 +124,14 @@
 //! search that fails, or that answers other hits first (a proxy whose
 //! upstream failed answers from its cache), keeps the hits it returned
 //! before. A caller or a selector whose filter hides packages has it asked
-//! for `MAX_TAKE` at once.
+//! for `MAX_TAKE` at once. A member narrowed by its scope alone (no
+//! selector of the caller's on the way) is asked for a window like an
+//! unscoped one, without the scope, so its upstream's total stands; the
+//! merge then drops its hits outside the scope, and a window none of whose
+//! hits the scope admits grows four times like any other, rather than to
+//! `MAX_TAKE` at once. A member none of whose scopes can match the query
+//! (a `packageid:` query for ids outside them, or patterns that do not
+//! compile) has no upstream search at all.
 //!
 //! The merge serves each id once, from the highest-priority member whose
 //! hits include it. The local members' ids come first, ordered by id (all
@@ -165,7 +172,7 @@ use crate::auth::principal::Principal;
 use crate::authz::{PackageFilter, SelectorPatterns};
 use crate::format::Format;
 use crate::repo::{
-    NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams,
+    NupkgLocation, RegistrationEntry, RepoError, RepoReadOps, SearchHit, SearchParams, SearchQuery,
     SearchResult, VersionEntry,
 };
 
@@ -239,6 +246,9 @@ struct VisibleMember {
 struct GraphMember {
     repo: Repository,
     filter: PackageFilter,
+    /// The caller's own selectors narrow the edge: its filter is more than
+    /// the membership's scope.
+    selected: bool,
 }
 
 /// Readable group DAG for one request principal.
@@ -258,6 +268,12 @@ struct GroupGraph {
     /// The leaves visible for every id: reached along a path none of whose
     /// edges carries a package filter ([`open_leaves`]).
     open_leaves: HashSet<i64>,
+    /// The leaves reached along a path none of whose edges admits nothing
+    /// ([`search_reach`]): every other leaf serves no id.
+    live_leaves: HashSet<i64>,
+    /// The leaves reached along a path one of whose edges the caller's own
+    /// selectors narrow ([`search_reach`]).
+    selected_leaves: HashSet<i64>,
     /// The dependency-confusion guard of every group reachable from the root
     /// within the depth bound, decided **regardless of the principal**.
     guards: HashMap<i64, GroupGuard>,
@@ -526,6 +542,26 @@ impl GroupGraph {
         self.visible_leaves(package_id).ranks.get(&leaf_id).copied()
     }
 
+    /// Whether no selector of the caller's narrows `leaf` on any way to it:
+    /// only the memberships' scopes do, if anything. The group then applies
+    /// them to the leaf's search hits itself ([`Self::leaf_rank`]).
+    fn scope_only(&self, leaf_id: i64) -> bool {
+        !self.selected_leaves.contains(&leaf_id)
+    }
+
+    /// Whether `leaf` may serve a hit of `query`: it is reached along a path
+    /// that admits some id and, for a query naming exact ids, one of them is
+    /// visible through it. Free-text terms may match an upstream package's
+    /// description as well as its id, so they rule out no scope.
+    fn may_match(&self, leaf_id: i64, query: &SearchQuery) -> bool {
+        self.live_leaves.contains(&leaf_id)
+            && (query.exact_ids.is_empty()
+                || query
+                    .exact_ids
+                    .iter()
+                    .any(|id| self.leaf_rank(id, leaf_id).is_some()))
+    }
+
     fn filter_for_leaf(self: &Arc<Self>, leaf_id: i64) -> PackageFilter {
         // A leaf no selector or scope narrows on some way is visible for
         // every id. Preserve AllowAll so proxies can retain their upstream
@@ -690,11 +726,9 @@ impl GroupRepo {
                 }
                 // What the caller may read of the member, of what the group
                 // asks it about.
-                let filter = self
-                    .authz
-                    .package_filter(&self.principal, member)
-                    .await
-                    .intersect(member_scope(&membership.packages));
+                let access = self.authz.package_filter(&self.principal, member).await;
+                let selected = !matches!(access, PackageFilter::AllowAll);
+                let filter = access.intersect(member_scope(&membership.packages));
 
                 // An offline nested group is not descended into: it stands
                 // in the graph as one failing member, like an offline hosted
@@ -709,6 +743,7 @@ impl GroupRepo {
                 members.push(GraphMember {
                     repo: member.clone(),
                     filter,
+                    selected,
                 });
             }
             groups.insert(group_id, members);
@@ -719,6 +754,7 @@ impl GroupRepo {
             .flatten()
             .all(|member| matches!(member.filter, PackageFilter::AllowAll));
         let open_leaves = open_leaves(group_row.id, &groups, self.max_depth);
+        let (live_leaves, selected_leaves) = search_reach(group_row.id, &groups, self.max_depth);
         Ok(Arc::new(GroupGraph {
             root_id: group_row.id,
             max_depth: self.max_depth,
@@ -726,6 +762,8 @@ impl GroupRepo {
             leaves,
             unfiltered,
             open_leaves,
+            live_leaves,
+            selected_leaves,
             guards,
             visible_leaf_cache: Mutex::new(HashMap::new()),
             cycle_logged: AtomicBool::new(false),
@@ -936,21 +974,43 @@ impl GroupRepo {
 
         let graph = self.group_graph(repo).await?;
         let wanted = params.skip.saturating_add(params.effective_take());
+        let query = SearchQuery::parse(&params.q);
 
-        // `member_ops[i]`, `filters[i]` and `searches[i]` are for
-        // `graph.leaves[i]`.
+        // `member_ops[i]`, `filters[i]`, `scoped[i]`, `matching[i]` and
+        // `searches[i]` are for `graph.leaves[i]`.
         let mut member_ops: Vec<Arc<dyn RepoReadOps>> = Vec::with_capacity(graph.leaves.len());
         let mut filters: Vec<PackageFilter> = Vec::with_capacity(graph.leaves.len());
+        let mut scoped: Vec<bool> = Vec::with_capacity(graph.leaves.len());
+        let mut matching: Vec<bool> = Vec::with_capacity(graph.leaves.len());
         for leaf in &graph.leaves {
             member_ops.push(self.member_ops(leaf)?);
-            filters.push(graph.filter_for_leaf(leaf.id).intersect(filter.clone()));
+            let leaf_filter = graph.filter_for_leaf(leaf.id).intersect(filter.clone());
+            // An upstream search narrowed by scopes alone is asked without
+            // them, for a window, so that the proxy reports its upstream's
+            // total; the merge keeps only the hits the scopes admit
+            // ([`GroupGraph::leaf_rank`]). The caller's own filter is not
+            // the graph's, so it keeps the search asking for every hit.
+            let scope_only = matches!(filter, PackageFilter::AllowAll)
+                && !matches!(leaf_filter, PackageFilter::AllowAll)
+                && searches_upstream(params, leaf)
+                && graph.scope_only(leaf.id);
+            filters.push(if scope_only {
+                PackageFilter::AllowAll
+            } else {
+                leaf_filter
+            });
+            scoped.push(scope_only);
+            matching.push(graph.may_match(leaf.id, &query));
         }
         // The members' reads are independent: a few at a time.
         let reads: Vec<_> = graph
             .leaves
             .iter()
             .zip(member_ops.iter().zip(&filters))
-            .map(|(leaf, (ops, leaf_filter))| first_search(ops, leaf, params, leaf_filter, wanted))
+            .zip(&matching)
+            .map(|((leaf, (ops, leaf_filter)), matches)| {
+                first_search(ops, leaf, params, leaf_filter, wanted, *matches)
+            })
             .collect();
         let outcomes: Vec<Result<MemberSearch, RepoError>> = futures_util::stream::iter(reads)
             .buffered(MEMBER_SEARCHES)
@@ -984,6 +1044,10 @@ impl GroupRepo {
                     continue;
                 }
                 for id in &search.ids {
+                    // A hit outside the leaf's scope is never served.
+                    if graph.leaf_rank(id, leaf.id).is_none() {
+                        continue;
+                    }
                     let lower = self.lower_id(id);
                     if looked_up.insert(lower.clone()) {
                         lookup.push(lower);
@@ -1011,8 +1075,10 @@ impl GroupRepo {
                     continue;
                 };
                 // A window the group serves none of (a reserved prefix's
-                // hits, say) is likely followed by more such hits.
-                let window = if merged.served[member] == 0 {
+                // hits, say) is likely followed by more such hits. Not so a
+                // scoped member's: its scope drops most of its hits, and
+                // asking it for all of them is what its window avoids.
+                let window = if merged.served[member] == 0 && !scoped[member] {
                     SearchParams::MAX_TAKE
                 } else {
                     upstream_window(window.saturating_mul(4))
@@ -1631,6 +1697,48 @@ fn open_leaves(
     open
 }
 
+/// What a group search needs to know of how its leaves are reached, along
+/// the edges of the readable graph from `root_id` within `max_depth`:
+///
+/// * the **live** leaves, reached along a path none of whose edges admits
+///   nothing (patterns that do not compile, a caller who may see no package
+///   of the member); every other leaf serves no id;
+/// * the **selected** leaves, reached along a live path one of whose edges
+///   the caller's own selectors narrow ([`GraphMember::selected`]).
+fn search_reach(
+    root_id: i64,
+    groups: &HashMap<i64, Vec<GraphMember>>,
+    max_depth: u32,
+) -> (HashSet<i64>, HashSet<i64>) {
+    let mut live = HashSet::new();
+    let mut selected = HashSet::new();
+    // A group is walked once per selection state, at its least depth.
+    let mut reached = HashSet::from([(root_id, false)]);
+    let mut queue = VecDeque::from([(root_id, false, 0_u32)]);
+    while let Some((group_id, on_selected, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        for member in groups.get(&group_id).map(Vec::as_slice).unwrap_or_default() {
+            if matches!(member.filter, PackageFilter::DenyAll) {
+                continue;
+            }
+            let on_selected = on_selected || member.selected;
+            if is_descended_group(&member.repo) {
+                if reached.insert((member.repo.id, on_selected)) {
+                    queue.push_back((member.repo.id, on_selected, depth + 1));
+                }
+            } else {
+                live.insert(member.repo.id);
+                if on_selected {
+                    selected.insert(member.repo.id);
+                }
+            }
+        }
+    }
+    (live, selected)
+}
+
 /// A merged search hit and the index into [`GroupGraph::leaves`] of the
 /// `member` that produced it, which later enriches it.
 struct RankedHit {
@@ -1666,20 +1774,27 @@ fn searches_upstream(params: &SearchParams, leaf: &Repository) -> bool {
 }
 
 /// A group's first search of one member: a local member's ids, all of them;
-/// a proxy searching its upstream for the window `wanted` hits need.
+/// a proxy searching its upstream for the window `wanted` hits need, unless
+/// the member serves no hit of the query (`matches` is false,
+/// [`GroupGraph::may_match`]): then its upstream is not asked.
 async fn first_search(
     ops: &Arc<dyn RepoReadOps>,
     leaf: &Repository,
     params: &SearchParams,
     filter: &PackageFilter,
     wanted: usize,
+    matches: bool,
 ) -> Result<MemberSearch, RepoError> {
     if !searches_upstream(params, leaf) {
         let ids = ops.search_ids(&leaf.name, params, filter).await?;
         return Ok(MemberSearch::local(ids));
     }
+    if !matches {
+        return Ok(MemberSearch::failed(true));
+    }
     // A filter may hide most of the upstream's hits, and the proxy then
-    // counts only those it returns: it is asked for them all.
+    // counts only those it returns: it is asked for them all. A member
+    // narrowed by its scopes alone comes here without them.
     let window = matches!(filter, PackageFilter::AllowAll).then(|| upstream_window(wanted));
     let result = search_member(ops, leaf, params, window, filter).await?;
     Ok(MemberSearch::upstream(window, result))
