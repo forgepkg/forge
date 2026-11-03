@@ -21,6 +21,8 @@
 //!
 //! An empty `reference` (`reference=`, as a script with an unset variable
 //! sends it) is refused (**400**): only its absence deletes the whole image.
+//! So is a query key other than `image` and `reference` (`tag=`, `digest=`,
+//! `ref=`): a misspelt reference is never taken for its absence.
 //! Answers `{"manifests": <n>, "tags": <n>}`, what was deleted; **404** when
 //! nothing matched. Each delete is in the audit log (`forge::audit`, "image
 //! delete") with the image and reference, which the admin change log's path
@@ -43,7 +45,10 @@ use super::db_error;
 use crate::images::digest::ContentDigest;
 use crate::state::AppState;
 
+/// Unknown keys are refused (**400**): `?image=app&tag=v1` names no
+/// `reference`, and must not delete the whole image.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteQuery {
     #[serde(default)]
     image: String,
