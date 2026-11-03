@@ -124,6 +124,14 @@ unless the repository's deployment policy allows redeploying, a file that is
 not a binary package `400`. Trusted publishing works as for every format
 ([trusted-publishing.md](trusted-publishing.md)).
 
+However a package is made, reading its `control` file holds some 16 MiB at
+most (zstd), far less for gzip and xz, so that uploads at once cannot
+exhaust the server's memory. A package is refused with `400` when its
+control member inflates to more than 8 MiB before the `control` file ends,
+or when its compression declares more than dpkg-deb's levels up to `-z19`
+do: an xz dictionary over 64 MiB, a zstd window over 8 MiB
+([zstd levels 20 to 22](#limitations)). Imports read packages the same way.
+
 `DELETE` of a package's pool file deletes the version (delete permission):
 
 ```bash
@@ -267,3 +275,9 @@ ordered by Debian version; the indexes follow on their next request.
   library's code for them is not constant-time.
 - **Source packages** (`.dsc`, `Sources`) are not hosted; a proxy serves its
   upstream's.
+- **zstd levels 20 to 22.** dpkg-deb compresses the control member like the
+  data; with `-Zzstd -z20` or higher, a control member of more than about
+  128 KiB (an `md5sums` of some 1,500 files) declares a window of 32 MiB or
+  more, which the zstd decoder holds whole, and the package is refused.
+  Levels up to 19 declare at most 8 MiB, and xz (`-Zxz`, any level) is
+  read.
