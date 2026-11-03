@@ -131,8 +131,9 @@ pub async fn set(
 
 /// Delete the files of `repository_id` that the generation of `paths` does
 /// not name: at once, except a content-addressed file (`immutable`), which
-/// goes once no generation has named it for `keep`. Releases their blob
-/// references; returns how many were deleted.
+/// goes once `keep` has passed since a generation replaced the last one that
+/// named it (`superseded_at`). Releases their blob references; returns how
+/// many were deleted.
 pub async fn prune(
     tx: &mut Transaction<'_, Postgres>,
     repository_id: i64,
@@ -140,6 +141,33 @@ pub async fn prune(
     keep: chrono::Duration,
     grace: chrono::Duration,
 ) -> sqlx::Result<u64> {
+    // A file the generation names again is no longer superseded.
+    sqlx::query!(
+        r#"
+        UPDATE raw_file SET superseded_at = NULL
+        WHERE repository_id = $1
+          AND path = ANY($2)
+          AND superseded_at IS NOT NULL
+        "#,
+        repository_id,
+        paths,
+    )
+    .execute(&mut **tx)
+    .await?;
+    // One that has just left the generation is superseded from now.
+    sqlx::query!(
+        r#"
+        UPDATE raw_file SET superseded_at = now()
+        WHERE repository_id = $1
+          AND NOT (path = ANY($2))
+          AND immutable
+          AND superseded_at IS NULL
+        "#,
+        repository_id,
+        paths,
+    )
+    .execute(&mut **tx)
+    .await?;
     let keep_seconds = keep.num_seconds() as f64;
     let mut shas = sqlx::query_scalar!(
         r#"
@@ -147,8 +175,7 @@ pub async fn prune(
         WHERE repository_id = $1
           AND NOT (path = ANY($2))
           AND (NOT immutable
-               OR checked_at IS NULL
-               OR checked_at < now() - make_interval(secs => $3))
+               OR superseded_at < now() - make_interval(secs => $3))
         RETURNING blob_sha256
         "#,
         repository_id,

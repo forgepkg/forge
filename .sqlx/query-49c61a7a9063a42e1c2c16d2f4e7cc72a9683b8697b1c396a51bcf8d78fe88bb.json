@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE raw_file SET superseded_at = NULL\n        WHERE repository_id = $1\n          AND path = ANY($2)\n          AND superseded_at IS NOT NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "49c61a7a9063a42e1c2c16d2f4e7cc72a9683b8697b1c396a51bcf8d78fe88bb"
+}

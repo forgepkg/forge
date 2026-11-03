@@ -485,6 +485,101 @@ async fn hosted_repositories_publish_signed_indexes() {
     assert!(ids.contains(&"hello:amd64"), "{browse}");
 }
 
+/// The by-hash copies of an index stay a day after a newer index replaces
+/// it, counted from the replacement, however old the index was (#762).
+#[tokio::test]
+async fn by_hash_copies_stay_a_day_after_the_index_is_replaced() {
+    let srv = common::start().await;
+    let name = format!("aptbyhash{}", unique());
+    let repo = create(
+        &srv,
+        json!({"name": name, "kind": "hosted", "format": "apt", "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let repo_id = repo["id"].as_i64().expect("repository id");
+    let apt = Apt::new(&srv, &name).await;
+    let by_hash = |packages: &str| {
+        format!(
+            "dists/bookworm/main/binary-amd64/by-hash/SHA256/{}",
+            sha256(packages.as_bytes())
+        )
+    };
+    // Move every file and the generation of the repository back by `days`.
+    let age = |days: i32| {
+        let pool = srv.pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE raw_file SET checked_at = checked_at - make_interval(days => $2),
+                     superseded_at = superseded_at - make_interval(days => $2)
+                 WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .bind(days)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE repository_index SET generated_at = generated_at - make_interval(days => $2)
+                 WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .bind(days)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // The first index, made two days before the next one.
+    assert_eq!(
+        apt.post(&deb("hello", "1.0-1", "amd64", "utils")).await.0,
+        StatusCode::CREATED
+    );
+    let first = apt.text("dists/bookworm/main/binary-amd64/Packages").await;
+    assert_eq!(apt.get(&by_hash(&first)).await.0, StatusCode::OK);
+    age(2).await;
+
+    // A publish replaces it; its by-hash copy is still served.
+    assert_eq!(
+        apt.post(&deb("hello", "1.1-1", "amd64", "utils")).await.0,
+        StatusCode::CREATED
+    );
+    let second = apt.text("dists/bookworm/main/binary-amd64/Packages").await;
+    assert_ne!(second, first);
+    let (status, body) = apt.get(&by_hash(&first)).await;
+    assert_eq!(status, StatusCode::OK, "the replaced index's by-hash copy");
+    assert_eq!(body, first.as_bytes());
+
+    // Less than a day after the replacement, the next index keeps it.
+    assert_eq!(
+        apt.post(&deb("hello", "1.2-1", "amd64", "utils")).await.0,
+        StatusCode::CREATED
+    );
+    let third = apt.text("dists/bookworm/main/binary-amd64/Packages").await;
+    assert_eq!(apt.get(&by_hash(&first)).await.0, StatusCode::OK);
+    assert_eq!(apt.get(&by_hash(&second)).await.0, StatusCode::OK);
+
+    // A day after it was replaced, the next index prunes it; the copy of the
+    // index replaced just now stays.
+    sqlx::query(
+        "UPDATE raw_file SET superseded_at = now() - interval '25 hours'
+         WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(repo_id)
+    .bind(by_hash(&first))
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        apt.post(&deb("hello", "1.3-1", "amd64", "utils")).await.0,
+        StatusCode::CREATED
+    );
+    apt.text("dists/bookworm/main/binary-amd64/Packages").await;
+    assert_eq!(apt.get(&by_hash(&first)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(apt.get(&by_hash(&second)).await.0, StatusCode::OK);
+    assert_eq!(apt.get(&by_hash(&third)).await.0, StatusCode::OK);
+}
+
 /// Send `method path` as it is (no client-side normalization).
 async fn raw_status(srv: &TestServer, method: &str, path: &str, auth: &str) -> u16 {
     let addr = srv.base_url.trim_start_matches("http://");
