@@ -162,10 +162,13 @@ pub struct ChartFiles {
     pub values: Option<ChartFile>,
 }
 
-/// The README and default values of a packaged chart (`.tgz`). Paths are
-/// read the way Helm's loader reads them: the archive's first directory is
-/// the chart, so `<chart>/README.md` is the chart's README and
-/// `<chart>/charts/<sub>/README.md` a subchart's. At most
+/// The README and default values of a packaged chart (`.tgz`). The archive
+/// is read as Helm reads it with Go's `archive/tar`: a header-only entry (a
+/// directory, a link, a device or a FIFO) has no body, whatever size its
+/// header says, and every entry but a directory is a file, a link's or a
+/// device's empty. Paths are read the way Helm's loader reads them: the
+/// archive's first directory is the chart, so `<chart>/README.md` is the
+/// chart's README and `<chart>/charts/<sub>/README.md` a subchart's. At most
 /// [`MAX_UNPACKED_BYTES`] are decompressed; an archive that is not gzip or
 /// tar, or ends early, yields what was found before.
 pub fn read_files(archive: impl Read) -> ChartFiles {
@@ -200,51 +203,77 @@ pub fn read_files(archive: impl Read) -> ChartFiles {
                 }
                 continue;
             }
-            b'0' | b'\0' | b'7' => {
-                let name = long_name.take().unwrap_or(header.name);
-                let wanted = match chart_path(&name) {
-                    Some(path) if is_readme(&path) && found.readme.is_none() => Some(path),
-                    Some(path) if path == "values.yaml" => Some(path),
-                    _ => None,
-                };
-                let Some(path) = wanted else {
-                    if !tar.skip(size) {
-                        break;
-                    }
-                    continue;
-                };
-                let Some(data) = tar.data(size, MAX_FILE_TEXT as u64) else {
-                    break;
-                };
-                let truncated = size > MAX_FILE_TEXT as u64;
-                let text = String::from_utf8_lossy(&data);
-                let text = if truncated {
-                    // The cut may split a character the lossy decoding
-                    // replaced: keep only whole characters.
-                    cut(&text, MAX_FILE_TEXT)
-                } else {
-                    text.into_owned()
-                };
-                let file = ChartFile {
-                    name: path.clone(),
-                    text,
-                    truncated,
-                };
-                if path == "values.yaml" {
-                    found.values = Some(file);
-                } else {
-                    found.readme = Some(file);
-                }
+            _ => {}
+        }
+        let name = long_name.take().unwrap_or(header.name);
+        let kind = go_kind(header.kind, &name);
+        // Go gives a header-only entry no body, whatever size its header
+        // says: the next header follows its own.
+        let size = if is_header_only(kind) { 0 } else { size };
+        // Helm loads every entry but a directory as a file, an extension
+        // header aside; a link, a device or a FIFO has no data. An entry of
+        // another type is not read here.
+        if !matches!(kind, b'0' | b'7' | b'1' | b'2' | b'3' | b'4' | b'6') {
+            if !tar.skip(size) {
+                break;
             }
-            _ => {
-                long_name = None;
-                if !tar.skip(size) {
-                    break;
-                }
+            continue;
+        }
+        let wanted = match chart_path(&name) {
+            Some(path) if is_readme(&path) && found.readme.is_none() => Some(path),
+            Some(path) if path == "values.yaml" => Some(path),
+            _ => None,
+        };
+        let Some(path) = wanted else {
+            if !tar.skip(size) {
+                break;
             }
+            continue;
+        };
+        let Some(data) = tar.data(size, MAX_FILE_TEXT as u64) else {
+            break;
+        };
+        let truncated = size > MAX_FILE_TEXT as u64;
+        let text = String::from_utf8_lossy(&data);
+        let text = if truncated {
+            // The cut may split a character the lossy decoding replaced:
+            // keep only whole characters.
+            cut(&text, MAX_FILE_TEXT)
+        } else {
+            text.into_owned()
+        };
+        let file = ChartFile {
+            name: path.clone(),
+            text,
+            truncated,
+        };
+        if path == "values.yaml" {
+            found.values = Some(file);
+        } else {
+            found.readme = Some(file);
         }
     }
     found
+}
+
+/// An entry's type as Go's `archive/tar` reads it: an old-style regular
+/// file (NUL) is a directory when its path (a GNU long name or pax path,
+/// else the header's) ends in `/`, a regular file (`0`) otherwise. A `0`
+/// entry stays a file, whatever its path.
+fn go_kind(kind: u8, name: &str) -> u8 {
+    match kind {
+        b'\0' if name.ends_with('/') => b'5',
+        b'\0' => b'0',
+        kind => kind,
+    }
+}
+
+/// Whether Go's `archive/tar` reads an entry of `kind` with no body, whatever
+/// size its header says (`isHeaderOnlyType`): a hard link (`1`), a symlink
+/// (`2`), a character (`3`) or block device (`4`), a directory (`5`) or a
+/// FIFO (`6`).
+fn is_header_only(kind: u8) -> bool {
+    matches!(kind, b'1'..=b'6')
 }
 
 /// Whether a chart path is the chart's README (`helm show readme`).
@@ -305,7 +334,8 @@ struct Header {
 }
 
 /// A minimal reader of a tar stream: ustar and GNU headers, entries read or
-/// skipped in order.
+/// skipped in order. The caller says how much of an entry is data
+/// ([`is_header_only`]).
 struct TarReader<R> {
     inner: R,
 }
@@ -425,6 +455,14 @@ mod tests {
     fn entry(tar: &mut Vec<u8>, path: &str, data: &[u8], kind: u8) {
         tar.extend_from_slice(&header(path, data.len(), kind));
         tar.extend_from_slice(data);
+        tar.resize(tar.len().div_ceil(512) * 512, 0);
+    }
+
+    /// An entry whose header says `size`, followed by `body` (which may be
+    /// longer or shorter), padded.
+    fn raw_entry(tar: &mut Vec<u8>, path: &str, kind: u8, size: usize, body: &[u8]) {
+        tar.extend_from_slice(&header(path, size, kind));
+        tar.extend_from_slice(body);
         tar.resize(tar.len().div_ceil(512) * 512, 0);
     }
 
@@ -554,6 +592,93 @@ mod tests {
         let files = read_files(&archive[..archive.len() / 2]);
         assert_eq!(files.readme.unwrap().text, "kept");
         assert_eq!(files.values, None);
+    }
+
+    #[test]
+    fn header_only_entries_have_no_body_as_in_helm() {
+        // Inside a header-only entry's declared body, a README and values
+        // Helm reads (Go gives the entry no body, so the next header
+        // follows its own), then an entry of an unknown type whose data
+        // covers the README and values that follow the declared body.
+        let mut after = Vec::new();
+        entry(&mut after, "demo/README.md", b"# Hidden from Helm\n", b'0');
+        entry(&mut after, "demo/values.yaml", b"hidden: true\n", b'0');
+        let mut body = Vec::new();
+        entry(&mut body, "demo/README.md", b"# What Helm shows\n", b'0');
+        entry(&mut body, "demo/values.yaml", b"helm: true\n", b'0');
+        raw_entry(&mut body, "demo/skipped", b'V', after.len(), &[]);
+        let headers: [&[(&str, u8)]; 8] = [
+            &[("demo/templates", b'5')],
+            &[("demo/link", b'1')],
+            &[("demo/symlink", b'2')],
+            &[("demo/chardev", b'3')],
+            &[("demo/blockdev", b'4')],
+            &[("demo/fifo", b'6')],
+            // An old-style regular file whose path ends in `/` is a
+            // directory, the path its own or a GNU long name's.
+            &[("demo/templates/", b'\0')],
+            &[("././@LongLink", b'L'), ("demo/templates-short", b'\0')],
+        ];
+        for entries in headers {
+            let mut tar = Vec::new();
+            entry(&mut tar, "demo/Chart.yaml", b"name: demo\n", b'0');
+            for (path, kind) in entries {
+                if *kind == b'L' {
+                    entry(&mut tar, path, b"demo/templates/\0", b'L');
+                } else {
+                    raw_entry(&mut tar, path, *kind, body.len(), &body);
+                }
+            }
+            tar.extend_from_slice(&after);
+            let files = read_files(&gzip(tar)[..]);
+            assert_eq!(
+                files.readme.map(|f| f.text).as_deref(),
+                Some("# What Helm shows\n"),
+                "{entries:?}"
+            );
+            assert_eq!(
+                files.values.map(|f| f.text).as_deref(),
+                Some("helm: true\n"),
+                "{entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entries_are_files_as_helm_loads_them() {
+        // A normal chart, its directories in the archive, reads as before.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "demo/", b'5', 0, &[]);
+        entry(&mut tar, "demo/Chart.yaml", b"name: demo\n", b'0');
+        raw_entry(&mut tar, "demo/templates/", b'5', 0, &[]);
+        entry(&mut tar, "demo/README.md", b"# Demo\n", b'0');
+        entry(&mut tar, "demo/values.yaml", b"replicas: 1\n", b'\0');
+        let files = read_files(&gzip(tar.clone())[..]);
+        assert_eq!(files.readme.unwrap().text, "# Demo\n");
+        assert_eq!(files.values.unwrap().text, "replicas: 1\n");
+
+        // Helm loads a link or a device as a file with no data: a later
+        // one named `values.yaml` empties the values.
+        for kind in *b"12346" {
+            let mut tar = tar.clone();
+            raw_entry(&mut tar, "demo/values.yaml", kind, 0, &[]);
+            let values = read_files(&gzip(tar)[..]).values.unwrap();
+            assert_eq!(values.text, "", "{}", kind as char);
+        }
+
+        // A `0` entry stays a file whatever its path; an old-style one whose
+        // path ends in `/` is a directory, neither read nor shown.
+        let mut tar = Vec::new();
+        entry(&mut tar, "demo/README.md/", b"a file", b'0');
+        assert_eq!(read_files(&gzip(tar)[..]).readme.unwrap().text, "a file");
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "demo/README.md/", b'\0', 0, &[]);
+        entry(&mut tar, "demo/README", b"the readme", b'0');
+        let readme = read_files(&gzip(tar)[..]).readme.unwrap();
+        assert_eq!(
+            (readme.name.as_str(), readme.text.as_str()),
+            ("README", "the readme")
+        );
     }
 
     #[test]
