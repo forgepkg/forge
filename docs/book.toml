@@ -8,7 +8,7 @@
 
 [book]
 title = "Forge"
-description = "A self-hosted NuGet, npm, Docker / OCI and raw file registry"
+description = "A self-hosted NuGet, npm, Docker / OCI, apt and raw file registry"
 language = "en"
 src = "src"
 

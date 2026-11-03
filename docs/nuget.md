@@ -88,22 +88,30 @@ NuGet sends its credentials as HTTP Basic, after the feed answers `401`.
   guide](gitlab-ci.md) and [CI with service accounts](ci-service-accounts.md)
   set up a pipeline step by step.
 
-Every failed password counts toward the sign-in lockout (**Admin →
-Settings**), the same lockout as the web UI's login.
+Every wrong password a realm checks counts toward the sign-in lockout
+(**Admin → Settings**), the same lockout as the web UI's login. A password
+sent for a user whose realm does not accept passwords from clients is
+refused without counting.
 
 ## Pushing
 
 `dotnet nuget push` sends the API key as `X-NuGet-ApiKey`, as for
 nuget.org and Nexus. Any API token of yours with the **write** level on the
-repository is a key:
+repository is a key.
+
+A push goes to a hosted repository: a NuGet group or proxy takes none (its
+service index offers no `PackagePublish`). So add the hosted repository as
+a source of its own, as its page in the web UI shows, and push to it:
 
 ```bash
-dotnet nuget push MyLib.1.2.3.nupkg --source forge --api-key <token>
+dotnet nuget add source https://forge.example.com/repository/nuget-hosted/index.json \
+  --name nuget-hosted --username <username> --password <token> --store-password-in-clear-text
+dotnet nuget push MyLib.1.2.3.nupkg --source nuget-hosted --api-key <token>
 ```
 
-A push goes to a hosted repository. The repository's upload limit (512 MiB
-unless set) applies, and a version it already holds is refused with `409
-Conflict` unless the repository allows redeploys.
+The repository's upload limit (512 MiB unless set) applies, and a version it
+already holds is refused with `409 Conflict` unless the repository allows
+redeploys.
 
 ## Unlisting and deleting
 
@@ -112,7 +120,7 @@ nuget.org: it stays restorable, but search and floating version ranges no
 longer find it. A `POST` to the same URL lists it again:
 
 ```bash
-dotnet nuget delete MyLib 1.2.3 --source forge --api-key <token> --non-interactive
+dotnet nuget delete MyLib 1.2.3 --source nuget-hosted --api-key <token> --non-interactive
 curl -X POST -H 'X-NuGet-ApiKey: <token>' \
   https://forge.example.com/repository/nuget-hosted/package/MyLib/1.2.3
 ```

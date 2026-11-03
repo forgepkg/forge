@@ -205,7 +205,8 @@ npm unpublish @acme/ui --force             # every version
 
 - A **dist-tag** names one version. `latest` is always there: it cannot be
   removed, and when the version it named is gone it moves to the highest
-  version left. Deleting a version drops its tags.
+  release left (the highest version when no release is). Deleting a version
+  drops its tags.
 - A **deprecated** version still installs; clients warn with its message.
 - **Unpublishing** deletes the version (or every version) and needs the
   level **delete**. Unlike on the public registry there is no time
@@ -222,7 +223,7 @@ abbreviated packuments (`application/vnd.npm.install-v1+json`) for clients
 that ask for them, full ones (with each version's publish time and the
 README of `latest`) for the others, tarballs, `npm view`, `npm search`
 (`GET /-/v1/search`, over the repository's packages; a proxy searches its
-upstream too) and `npm ping`. Tarballs are served from the store with
+upstream too) and `npm ping`. Tarballs are served from the store and
 counted as downloads. Tarball URLs in a packument point at the
 repository it was read from, so a lockfile written through the group keeps
 resolving through it.
@@ -263,7 +264,9 @@ any registry that speaks npm's protocol:
   them, and the last dist-tags read are kept for when it is down.
 - **Publication delay.** `package_delay_seconds` holds back versions
   published upstream less than that long ago (counted from the upstream's
-  publish time, not from when Forge first saw them): a new release, possibly
+  publish time, not from when Forge first saw them; for a package whose full
+  packument is over `proxy.max_metadata_bytes`, which then has no publish
+  times, from when Forge first saw them): a new release, possibly
   a compromised one, reaches your builds only after the delay. Overrides
   give some packages another delay (none for `@acme/*`, a longer one for a
   package you watch), and an administrator can release one version early;

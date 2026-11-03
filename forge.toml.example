@@ -229,8 +229,8 @@ max_nuspec_bytes             = 1048576      # (default: 1 MiB) also caps an upst
 max_nuspec_compression_ratio = 200          # (default: 200)
 
 [npm]
-# What the npm registries (/npm, see docs/npm.md) read of a request. A
-# tarball itself is bounded by its repository's upload limit.
+# What the npm registries (/repository/<name>/, see docs/npm.md) read of a
+# request. A tarball itself is bounded by its repository's upload limit.
 max_document_bytes = 33554432    # (default: 32 MiB) a publish document without its tarball, an unpublish, an audit
 max_unpacked_bytes = 1073741824  # (default: 1 GiB) the most a published or proxied tarball may unpack to
 
