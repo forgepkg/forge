@@ -17,8 +17,8 @@ use forge_crypto::service::EnvelopeService;
 use forge_crypto::{ExposeSecret, PlaintextSecret};
 use forge_db::model::Repository;
 use forge_db::{authz_dao, secret_dao, workload_api_key_dao};
-use forge_plugin::api::images::ImageError;
-use forge_plugin::FormatPlugin;
+use forge_format_api::images::ImageError;
+use forge_format_api::FormatSpec;
 use sha2::Digest;
 use sqlx::PgPool;
 
@@ -97,7 +97,7 @@ impl crate::images::WorkloadCheck for WorkloadLiveness {
 /// invalid credentials.
 pub(crate) fn amend_registry_rejection(
     base_url: &str,
-    images: &dyn FormatPlugin,
+    images: &dyn FormatSpec,
     response: Response,
 ) -> Response {
     if response.status() != StatusCode::UNAUTHORIZED

@@ -545,7 +545,7 @@ describe('RepoBrowse connect snippets of package repositories', () => {
     expect(within(connect).queryByText(/dotnet nuget push/)).toBeNull()
   })
 
-  it('shows the URL of a plugin format repository', async () => {
+  it('shows the URL of a repository of another format', async () => {
     mockApi(() => jsonResponse(page(0, [])))
 
     await renderBrowse('/repos/pkgs')

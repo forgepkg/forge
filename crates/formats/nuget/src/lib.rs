@@ -1,4 +1,4 @@
-//! NuGet V3 feeds for Forge, as a format plugin.
+//! NuGet V3 feeds for Forge, as a format.
 //!
 //! Served under `/repository/{repository}`:
 //!
@@ -17,7 +17,7 @@
 //! Ids are matched case-insensitively (`ToLowerInvariant`); versions are
 //! NuGet versions, normalized (`1.0` → `1.0.0`).
 //!
-//! Forge links this plugin in ([`Nuget`], [`DESCRIPTOR`]).
+//! Forge links this crate in ([`Nuget`], [`DESCRIPTOR`]).
 
 pub mod model;
 pub mod nuspec;
@@ -27,8 +27,8 @@ pub mod version;
 
 use std::cmp::Ordering;
 
-use forge_plugin_api::{
-    Action, Assets, Descriptor, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource,
+use forge_format_api::{
+    Action, Assets, Descriptor, FetchResult, FormatError, FormatSpec, Loaded, PackageSource,
     ParsedPackage, Remote, Repository, RepositoryKind, Request, Storage, UpstreamOp, UpstreamStep,
     UpstreamToken,
 };
@@ -41,7 +41,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     name: "NuGet",
     description: "NuGet V3 feeds: push, restore and search with dotnet, nuget.exe and Visual \
                   Studio; proxies of nuget.org and other V3 feeds.",
-    // Proxies mirror another V3 feed through the plugin's upstream side.
+    // Proxies mirror another V3 feed through the format's upstream side.
     kinds: &[
         RepositoryKind::Hosted,
         RepositoryKind::Proxy,
@@ -57,7 +57,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     },
     upstream_token: UpstreamToken::None,
     options: &[],
-    prereleases: forge_plugin_api::Prereleases::Dash,
+    prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
 };
 
@@ -74,7 +74,7 @@ impl Nuget {
     }
 }
 
-impl FormatPlugin for Nuget {
+impl FormatSpec for Nuget {
     fn descriptor(&self) -> &'static Descriptor {
         &DESCRIPTOR
     }

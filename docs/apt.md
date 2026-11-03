@@ -4,7 +4,7 @@ Forge serves Debian packages to `apt`, the way Nexus' apt-hosted and
 apt-proxy repositories do: hosts and container builds install your internal
 `.deb` packages from Forge, and pull Debian or Ubuntu through a cache.
 
-Packages live in repositories of `format: "apt"`, a format plugin built into
+Packages live in repositories of `format: "apt"`, a format crate built into
 Forge ([`crates/formats/apt`](../crates/formats/apt); `GET /admin/formats`
 lists it), served at `https://<host>/repository/<repository>/`, the path
 Nexus uses: a migrated `sources.list` only changes the host. They come in

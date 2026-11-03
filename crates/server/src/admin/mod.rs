@@ -469,8 +469,8 @@ pub(crate) fn db_error(e: sqlx::Error) -> Response {
 }
 
 /// The **503** answer for a repository whose format is not installed (a
-/// format plugin missing from the configuration): it cannot be read or
-/// changed until the format is back.
+/// format missing from this server): it cannot be read or changed until the
+/// format is back.
 pub(crate) fn format_unavailable(e: forge_core::repo::RepoError) -> Response {
     tracing::warn!(error = %e, "repository format unavailable");
     (

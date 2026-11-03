@@ -1,8 +1,8 @@
 //! The indexes the host keeps for the repositories of a format whose
 //! descriptor says `indexes` (apt): files made of a repository's packages
-//! by the format's plugin ([`FormatPlugin::index`]), signed with the
-//! repository's OpenPGP keys ([`signing`]), and stored as the repository's
-//! files in the file store.
+//! by the format ([`FormatSpec::index`]), signed with the repository's
+//! OpenPGP keys ([`signing`]), and stored as the repository's files in the
+//! file store.
 //!
 //! An index is made when a client asks for one of its files
 //! ([`Query::Index`]) and what it is made of changed since the generation
@@ -24,8 +24,8 @@
 //! index is signed once for every client, so a selector limits what a
 //! reader may download, not what the index names.
 //!
-//! [`FormatPlugin::index`]: forge_plugin::api::FormatPlugin::index
-//! [`Query::Index`]: forge_plugin::api::Query::Index
+//! [`FormatSpec::index`]: forge_format_api::FormatSpec::index
+//! [`Query::Index`]: forge_format_api::Query::Index
 
 pub mod signing;
 
@@ -37,8 +37,8 @@ use forge_db::model::{RepoKind, Repository};
 use forge_db::raw_dao::{self, NewRawFile, RawFile, Redeploy};
 use forge_db::signing_key_dao::{self, NewSigningKey, SigningKeyRow};
 use forge_db::{index_dao, repository_dao};
-use forge_plugin::api::{self as protocol, files, SignatureKind};
-use forge_plugin::FormatPlugin;
+use forge_format_api::FormatSpec;
+use forge_format_api::{self as protocol, files, SignatureKind};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 
@@ -69,7 +69,7 @@ pub enum IndexError {
     /// The database or the object store is unavailable.
     #[error("{0}")]
     Unavailable(String),
-    /// A failure of Forge or of the plugin.
+    /// A failure of Forge or of the format.
     #[error("{0}")]
     Internal(String),
 }
@@ -120,8 +120,8 @@ pub fn keeps_indexes(state: &AppState, repo: &Repository) -> bool {
     repo.kind() == RepoKind::Hosted
         && state
             .formats
-            .plugin(&repo.format)
-            .is_some_and(|plugin| plugin.descriptor().indexes)
+            .spec(&repo.format)
+            .is_some_and(|spec| spec.descriptor().indexes)
 }
 
 /// The user id of a key Forge makes for `repo`.
@@ -238,17 +238,17 @@ fn fingerprint(repo: &Repository, versions: &str, keys: &[SigningKeyRow]) -> Str
 
 /// Make `repo`'s index again if what it is made of changed.
 pub async fn ensure_current(state: &AppState, repo: &Repository) -> Result<(), IndexError> {
-    let plugin = state
+    let spec = state
         .formats
-        .plugin(&repo.format)
-        .filter(|plugin| plugin.descriptor().indexes)
+        .spec(&repo.format)
+        .filter(|spec| spec.descriptor().indexes)
         .ok_or_else(|| IndexError::Internal(format!("format {} keeps no indexes", repo.format)))?;
     if repo.kind() != RepoKind::Hosted {
         return Err(IndexError::Internal(
             "only hosted repositories keep indexes".into(),
         ));
     }
-    let package_path = plugin.descriptor().assets.package;
+    let package_path = spec.descriptor().assets.package;
     let gate = gate(repo.id);
     let _held = gate.lock().await;
     for _ in 0..3 {
@@ -258,7 +258,7 @@ pub async fn ensure_current(state: &AppState, repo: &Repository) -> Result<(), I
         if index_dao::current(&state.pool, repo.id).await?.as_deref() == Some(&fingerprint) {
             return Ok(());
         }
-        if generate(state, repo, &plugin, &keys, &versions, &fingerprint).await? {
+        if generate(state, repo, &spec, &keys, &versions, &fingerprint).await? {
             return Ok(());
         }
     }
@@ -307,13 +307,13 @@ async fn ingest(cas: &forge_storage::Cas, file: Stored) -> Result<Ingested, Inde
 async fn generate(
     state: &AppState,
     repo: &Repository,
-    plugin: &Arc<dyn FormatPlugin>,
+    spec: &Arc<dyn FormatSpec>,
     rows: &[SigningKeyRow],
     versions_digest: &str,
     fingerprint: &str,
 ) -> Result<bool, IndexError> {
     let started = std::time::Instant::now();
-    let descriptor = plugin.descriptor();
+    let descriptor = spec.descriptor();
     let format = state
         .formats
         .for_repository(repo)
@@ -358,11 +358,11 @@ async fn generate(
     let target = protocol::Repository {
         name: repo.name.clone(),
         kind: protocol::RepositoryKind::Hosted,
-        base_url: crate::plugins::repository_url(state, &repo.name),
+        base_url: crate::formats::repository_url(state, &repo.name),
         inline: false,
         options: repo.format_options(),
     };
-    let implementation = plugin.clone();
+    let implementation = spec.clone();
     let cas = state.cas.clone();
     let runtime = tokio::runtime::Handle::current();
     // Each file is signed, checked and stored as the format hands it over,
@@ -465,7 +465,7 @@ fn bad(what: String) -> IndexError {
     IndexError::Internal(format!("the format's index: {what}"))
 }
 
-/// A file the plugin made and the signed copies it names, the copies first.
+/// A file the format made and the signed copies it names, the copies first.
 fn sign(file: protocol::IndexFile, keys: &[Key]) -> Result<Vec<Stored>, IndexError> {
     let mut out = Vec::with_capacity(file.signed.len() + 1);
     for copy in &file.signed {

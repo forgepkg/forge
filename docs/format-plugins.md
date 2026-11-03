@@ -1,16 +1,16 @@
-# Format plugins
+# Format crates
 
-Every format Forge serves comes from a **format plugin**: a Rust crate that
+Every format Forge serves comes from a **format crate**: a Rust crate that
 teaches Forge the format's rules, its client protocol and, for proxies, how
 to read an upstream, by implementing one trait,
-[`FormatPlugin`](../crates/plugin-api/src/lib.rs). The repository machinery
+[`FormatSpec`](../crates/format-api/src/lib.rs). The repository machinery
 stays Forge's own. That covers storage, metadata, authentication, RBAC and
 package selectors, hosted, proxy and group repositories, retention, and the
 streaming of package bytes.
 
-Every plugin is built in: a crate under `crates/formats/<id>/` linked into
-the server and called directly, like any other Rust code. Plugins need no
-configuration. Forge ships five: **Docker / OCI**
+Every format is built in: a crate under `crates/formats/<id>/` linked into
+the server and called directly, like any other Rust code. The format crates
+need no configuration. Forge ships five: **Docker / OCI**
 ([`crates/formats/docker`](../crates/formats/docker),
 [Images formats](#images-formats), [docker.md](docker.md)), **NuGet**
 ([`crates/formats/nuget`](../crates/formats/nuget)), **npm**
@@ -22,9 +22,9 @@ files** ([`crates/formats/raw`](../crates/formats/raw),
 repositories ([docker.md](docker.md#helm-charts)).
 
 > **The contract is internal.** It has no version of its own and may change
-> in any release: the plugins build with the server, so the compiler checks
-> each of them against the contract it is linked with. Forge loads no
-> plugins at run time; a new format is a new crate in this repository.
+> in any release: the format crates build with the server, so the compiler
+> checks each of them against the contract it is linked with. Forge loads no
+> formats at run time; a new format is a new crate in this repository.
 
 ## Contents
 
@@ -36,28 +36,28 @@ repositories ([docker.md](docker.md#helm-charts)).
 - [Format options](#format-options)
 - [Retention](#retention)
 - [Proxy repositories](#proxy-repositories)
-- [Using a plugin](#using-a-plugin)
+- [Using a format](#using-a-format)
 - [Security model](#security-model)
-- [Writing a plugin](#writing-a-plugin)
+- [Writing a format](#writing-a-format)
 - [Limitations and roadmap](#limitations-and-roadmap)
 
 ## Layout
 
-A plugin is a workspace crate that describes itself in Rust:
+A format is a workspace crate that describes itself in Rust:
 
 ```
 crates/formats/nuget/
 ├── Cargo.toml     # a member of the workspace, at Forge's version
 ├── src/lib.rs     # DESCRIPTOR (id, name, kinds hosted/proxy/group)
-│                  # and impl FormatPlugin for Nuget
+│                  # and impl FormatSpec for Nuget
 ├── src/protocol.rs  # the V3 protocol: handle and render
 ├── src/upstream.rs  # proxies: reading another V3 feed (upstream)
-└── tests/         # the protocol against canned answers (forge-plugin-api `testing`)
+└── tests/         # the protocol against canned answers (forge-format-api `testing`)
 
 crates/formats/raw/
 ├── Cargo.toml
 ├── src/lib.rs     # DESCRIPTOR (storage files, kinds hosted/proxy/group)
-│                  # and impl FormatPlugin for Raw: paths, methods, upstream URLs
+│                  # and impl FormatSpec for Raw: paths, methods, upstream URLs
 ├── src/listing.rs # directory listings as HTML or JSON
 ├── src/sidecar.rs # .sha256/.sha512/.sha1/.md5 from the stored digests
 ├── src/form.rs    # multipart uploads, Nexus' field names
@@ -66,7 +66,7 @@ crates/formats/raw/
 crates/formats/npm/
 ├── Cargo.toml
 ├── src/lib.rs     # DESCRIPTOR (kinds hosted/proxy/group, Bearer
-│                  # upstream tokens) and impl FormatPlugin for Npm
+│                  # upstream tokens) and impl FormatSpec for Npm
 ├── src/protocol.rs  # the registry API: packuments, publishes, dist-tags, logins
 ├── src/publish.rs # the tarball inside a publish document, as it streams
 ├── src/proxy.rs   # proxies: reading another registry (upstream)
@@ -75,7 +75,7 @@ crates/formats/npm/
 crates/formats/apt/
 ├── Cargo.toml
 ├── src/lib.rs     # DESCRIPTOR (kinds hosted/proxy, the distribution option,
-│                  # signed indexes) and impl FormatPlugin for Apt
+│                  # signed indexes) and impl FormatSpec for Apt
 ├── src/version.rs # Debian versions, ordered as dpkg orders them
 ├── src/deb.rs, control.rs, manifest.rs  # a .deb's control file, deb822
 ├── src/layout.rs  # dists/ and pool/ paths
@@ -85,7 +85,7 @@ crates/formats/apt/
 crates/formats/docker/
 ├── Cargo.toml
 ├── src/lib.rs     # DESCRIPTOR (storage images, kinds hosted/proxy/group)
-│                  # and impl FormatPlugin for Docker: paths, manifests, charts
+│                  # and impl FormatSpec for Docker: paths, manifests, charts
 ├── src/protocol.rs  # the distribution-spec API: handle and render
 ├── src/upstream.rs  # proxies: URLs, tag pages and referrers of an upstream registry
 ├── src/error.rs   # the distribution-spec error answers
@@ -96,32 +96,32 @@ The pieces:
 
 | Crate | What it holds |
 | --- | --- |
-| [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, and, behind its `testing` feature, helpers that run a plugin's protocol against canned answers. Depends on nothing but `std`. |
-| [`crates/formats/<id>`](../crates/formats) | One crate per plugin, implementing `FormatPlugin`. |
-| [`forge-plugin`](../crates/plugin) | The host side: `PluginFormat`, which adapts a plugin to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
-| [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `/repository/{repo}/...` dispatcher, the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)), and the image store and token service of images formats, under `/v2` ([`crates/server/src/images`](../crates/server/src/images)). |
+| [`forge-format-api`](../crates/format-api) | The contract: the `FormatSpec` trait and its types, and, behind its `testing` feature, helpers that run a format's protocol against canned answers. Depends on nothing but `std`. |
+| [`crates/formats/<id>`](../crates/formats) | One crate per format, implementing `FormatSpec`. |
+| [`forge-core`](../crates/core/src/format) | The host side, in `forge_core::format`: `SpecFormat`, which adapts a format to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
+| [`forge-server`](../crates/server/src/formats.rs) | The formats it links in (`formats::builtin`), the `/repository/{repo}/...` dispatcher, the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)), and the image store and token service of images formats, under `/v2` ([`crates/server/src/images`](../crates/server/src/images)). |
 
 ## How it fits together
 
-| | Forge (the host) | The plugin |
+| | Forge (the host) | The format |
 | --- | --- | --- |
 | Identity | Calls the format for every id and version it sees | `canonical_id`, `validate_id`, `normalize_version`, `compare_versions` |
 | Publishing | Streams the upload to a staging file, enforces the format's upload limit, authorizes against the package selector, stores the blob content-addressed, writes the version in one transaction, records trusted-publishing provenance | `parse_package`: reads the staged file, returns id, version, manifest, dependencies. For a package that comes inside a document (npm's JSON with a base64 tarball), `unpack_upload` takes the package out while the body streams by, and `parse_upload` reads it with the rest of the document |
-| Reads | Runs the queries the plugin asks for through the repository read path (hosted, proxy or group). Package selectors, group membership, prefer-hosted and reserved prefixes all apply | `handle` decides what a request is; `render` turns the loaded data into the response body |
+| Reads | Runs the queries the format asks for through the repository read path (hosted, proxy or group). Package selectors, group membership, prefer-hosted and reserved prefixes all apply | `handle` decides what a request is; `render` turns the loaded data into the response body |
 | Downloads | Streams the blob from S3, counts the download, answers `HEAD` without touching S3, and a single `Range` when the local blob cache is on | Names the version (`download`) |
 | Unlist, relist, delete | Hosted write path, with the repository's permissions and selectors; a package outside the caller's selector answers 404, like an unknown one | Names the version and the success response |
 | Tags and deprecations | Keeps a package's tags (npm's dist-tags: a name for one version) and each version's deprecation, drops a version's tags with the version, and never lets retention delete a tagged version | Names the changes (`tag`, `untag`, `deprecate`); `published` names those a publish document carries |
 | Logins | Checks a password through the realm chain, or runs a login approved in the browser, and mints, lists and revokes the API tokens; accepts `Authorization: Bearer` API tokens | Says what a request asks (`auth`) and renders the outcome (`auth_response`) |
 | Proxies | Sends every upstream request (credentials only to the upstream's origin, bounded, cached), downloads and verifies packages, keeps the package delay, the not-found markers and the offline mode | `upstream`: which documents an operation needs, and what they say ([Proxy repositories](#proxy-repositories)) |
-| Groups | Merges members by priority; the dependency-confusion guards apply | Nothing: a group of plugin repositories just works |
-| Retention | Evaluates policies on a schedule, ordering versions with the plugin's `compare_versions` ([Retention](#retention)) | Optionally, a version's class (`version_class`) and the partition keep-N counts within (`retention_partition`) |
+| Groups | Merges members by priority; the dependency-confusion guards apply | Nothing: a group of the format's repositories just works |
+| Retention | Evaluates policies on a schedule, ordering versions with the format's `compare_versions` ([Retention](#retention)) | Optionally, a version's class (`version_class`) and the partition keep-N counts within (`retention_partition`) |
 | Files (a files format) | Keeps files under paths, content-addressed with their digests: serving, ranges and validators, uploads under the deployment policy, listings, proxies and groups, selectors on paths, retention by path ([Files formats](#files-formats)) | Which path a request names, which file or directory it needs, what the response looks like |
 
 A request to every non-Docker repository is served under
 `/repository/{repo}/...`; the repository name selects its format. Docker
 repositories are served only through the registry under `/v2`.
 The dispatcher
-([`crates/server/src/plugins.rs`](../crates/server/src/plugins.rs)) handles it
+([`crates/server/src/formats.rs`](../crates/server/src/formats.rs)) handles it
 in this order:
 
 1. Resolve the repository and the caller (a session, Basic credentials, or
@@ -130,12 +130,12 @@ in this order:
    format's request is authorized by its method first: GET and HEAD need
    read, PUT and POST write, DELETE delete; a package format's actions are
    checked one by one (below).
-2. Call the plugin's `handle` with the repository (name, kind, base URL, a
+2. Call the format's `handle` with the repository (name, kind, base URL, a
    group's reserved prefixes) and the request: method, path, query, and a
-   short allowlist of headers. The plugin never sees credentials or
+   short allowlist of headers. The format never sees credentials or
    cookies. Protocol calls run on a blocking thread, never on the async
    workers.
-3. Act on the plugin's answer, checked against what the caller may do:
+3. Act on the format's answer, checked against what the caller may do:
    - `respond`: send the response as given, keeping only the allowed
      headers. Needs read.
    - `load(queries)`: run the queries, then call `render` with every query
@@ -156,7 +156,7 @@ in this order:
      be read-only, and the caller must present an API token or a workload
      identity.
    - `auth`: a login, a logout or a `whoami`, performed by the host; the
-     plugin renders the outcome (`auth_response`).
+     format renders the outcome (`auth_response`).
    - `forward`: a POST to the repository's upstream (a proxy's, or a
      group's first proxy member's), with the proxy's credentials; its answer
      is passed back. npm's audits go so. Needs read. The body goes without
@@ -164,10 +164,10 @@ in this order:
      selectors keep inside (`forward_body`), or not at all (400).
 
    A host error (a refusal, a conflict, a missing package) is rendered by
-   the plugin's `error_response` when it has one: npm clients print
+   the format's `error_response` when it has one: npm clients print
    `{"error": "..."}`, NuGet's plain text.
 
-The contract is [`crates/plugin-api/src/lib.rs`](../crates/plugin-api/src/lib.rs).
+The contract is [`crates/format-api/src/lib.rs`](../crates/format-api/src/lib.rs).
 Its queries are targeted:
 
 | Query | Answer |
@@ -191,21 +191,21 @@ with milliseconds. A `take` of 0 is the default page (20).
 
 ### Manifest summaries and the web UI
 
-At publish, Forge stores the JSON object the plugin's `manifest_summary`
+At publish, Forge stores the JSON object the format's `manifest_summary`
 returns with the version. `render` gets it back as `summary`, so a listing
 never re-reads manifests (for a version stored before summaries were, the
 host asks `manifest_summary` of its stored manifest). The web UI's package detail reads three keys from it,
 if present: `description`, `deprecated` (a proxy's upstream deprecation),
 and `dependency_groups` (the same shape as NuGet's). It shows the latest
-version's README, which the plugin's `readme` reads from the stored
+version's README, which the format's `readme` reads from the stored
 manifest, and the package's tags.
 
-Every listing hands each version's summary to the plugin, so a summary
+Every listing hands each version's summary to the format, so a summary
 should stay small.
 
 A plugin bounds how many distinct values of a string field of its
 summaries a hosted repository holds with `summary_caps` (a list of
-[`SummaryCap`](../crates/plugin-api/src/types.rs): the field, the most
+[`SummaryCap`](../crates/format-api/src/types.rs): the field, the most
 values, what they are called). A publish or an import whose summary would
 add a value past a cap is refused with `400` naming it; a value the
 repository holds already passes. apt caps its `component` at 8, since each
@@ -228,12 +228,12 @@ on paths; retention by path prefix, age, downloads and the newest N per
 directory; and the web UI's upload, delete and the admin API's directory
 delete.
 
-The plugin decides what a request is, in the vocabulary of paths. A path is
+The format decides what a request is, in the vocabulary of paths. A path is
 segments joined by `/`, without a leading or trailing `/`, none of them
 empty, `.` or `..`, nor holding a backslash or a control character
-([`forge_plugin_api::files`](../crates/plugin-api/src/files.rs) parses
+([`forge_format_api::files`](../crates/format-api/src/files.rs) parses
 request paths by these rules); a directory is empty (the root) or a path
-ending in `/`. The host refuses any other path a plugin names.
+ending in `/`. The host refuses any other path a format names.
 
 | Query | Answer |
 | --- | --- |
@@ -250,7 +250,7 @@ hosted repository and a package-client credential, and when one fails (403,
 405, 409, 413) the host answers with its own status. The action
 `serve-file(path)` serves a file as `fetch-file` finds it. The `repository`
 a request is for says whether its files are shown inline (`inline`), for
-responses the plugin renders itself.
+responses the format renders itself.
 
 Raw maps its URLs onto these: `GET /repository/<repo>/<path>` is `file(path)`
 (and `file` of the file a checksum sidecar names), then `serve-file` or
@@ -296,7 +296,7 @@ everything else:
 - serving a blob or a manifest, with one `Range`, `Docker-Content-Digest`
   and `ETag`, and the registry's response hardening on every answer.
 
-The plugin never sees credentials, never touches storage and never holds a
+The format never sees credentials, never touches storage and never holds a
 blob in memory. A request goes through three steps:
 
 1. `image_path` splits the path below the mount into the name the client
@@ -353,7 +353,7 @@ host lends it (at most 16 MiB).
 A proxy's upstream operations name where things are, and the host fetches
 them:
 
-| Operation | The plugin answers |
+| Operation | The format answers |
 | --- | --- |
 | `image-name(image)` | The name the upstream knows the image by, which the proxy caches it under (Docker Hub's `library/` namespace) |
 | `image-manifest(image, reference)` | The manifest's URL, the `Accept` header to send and the scope of a token for it. The host re-validates a cached tag with a `HEAD`, downloads the manifest, checks it against its digest and reads it with `parse_manifest` |
@@ -362,14 +362,14 @@ them:
 | `image-referrers(image, digest)` | The upstream's referrers of a manifest |
 
 An images format's fetches go to the origin of `remote_url` only, carry the
-`Accept` header the plugin names, and come back with their status and `Link`
+`Accept` header the format names, and come back with their status and `Link`
 headers. When the upstream answers 401 with a Bearer challenge, the host asks
 the realm the challenge names for a token (with the repository's
 credentials, if it has any) and sends the request again, as Docker Hub
 requires; the token is the host's, cached for its lifetime.
 
 `testing::converse_answered` runs `upstream` against canned answers with
-their status and headers, as the Docker plugin's tests do.
+their status and headers, as the Docker format's tests do.
 
 ## Signed indexes
 
@@ -381,9 +381,9 @@ descriptor. The host then keeps the indexes of its hosted repositories:
   repository (its id, version, stored summary, size and digests, by id,
   then version) and hands the index files to the host one at a time (paths,
   content, content types), which signs and stores each as it comes: a
-  plugin holds one file, not the whole index. It checks what its files will
+  format holds one file, not the whole index. It checks what its files will
   hold against the most an index may hold (`max_bytes`) before it makes
-  any. The plugin makes them as a pure function of its input (apt's
+  any. The format makes them as a pure function of its input (apt's
   [`index.rs`](../crates/formats/apt/src/index.rs)), so the summary a
   package format stores at publish should hold what its index lists of a
   version: making an index reads no package and no manifest.
@@ -392,7 +392,7 @@ descriptor. The host then keeps the indexes of its hosted repositories:
   `Release.gpg` of `Release`). The host signs them with every OpenPGP key of
   the repository: Ed25519 keys, generated when the repository is created or
   imported, sealed with the secret encryption, managed under
-  `/admin/repositories/{name}/signing-keys`. The plugin never sees a key;
+  `/admin/repositories/{name}/signing-keys`. The format never sees a key;
   it gets the public keys, as a binary keyring and armored, to publish
   (apt's `key.gpg` and `key.asc`).
 - **Made when needed.** A request asks for an index file with
@@ -430,7 +430,7 @@ A format's repositories may carry settings of its own (apt's
 description, the kinds that take one, whether it is required, an example,
 and the `input`), `GET /admin/formats` names them, and the web UI's
 repository form offers them. An administrator sets them in the admin API's
-`options` (`null` on an update clears one that is not required); the plugin
+`options` (`null` on an update clears one that is not required); the format
 checks and normalizes each value (`check_option`), and gets the
 repository's in `Repository::options` and a proxy's in `Remote::options`.
 
@@ -443,18 +443,18 @@ An option's `input` is `OptionInput::Text`, a line of text, or
 Which versions the host's search filter takes for prereleases is the
 descriptor's too (`prereleases`): those with a `-` in the normalized version
 (SemVer: NuGet, npm), or none (apt, whose `-` starts the Debian revision), so
-the web UI lists every version. Retention asks the plugin instead
+the web UI lists every version. Retention asks the format instead
 (`version_class`, [Retention](#retention)).
 
 ## Retention
 
 The host runs every retention rule ([retention.md](retention.md)) for a
-package format; the plugin only says what its versions mean. Ordering is
+package format; the format only says what its versions mean. Ordering is
 `compare_versions`, and two hooks, both with defaults, say the rest:
 
 | Hook | Says | Default |
 | --- | --- | --- |
-| `version_class(version)` | Whether a normalized version is a `Release`, a `Prerelease` or a `Snapshot` ([`VersionClass`](../crates/plugin-api/src/types.rs)). A rule's `release_type` filters on it, and `prerelease_superseded_for_days` deletes what is not a release once a listed release that `compare_versions` orders after it has been out long enough. | SemVer's: a `-` makes a prerelease |
+| `version_class(version)` | Whether a normalized version is a `Release`, a `Prerelease` or a `Snapshot` ([`VersionClass`](../crates/format-api/src/types.rs)). A rule's `release_type` filters on it, and `prerelease_superseded_for_days` deletes what is not a release once a listed release that `compare_versions` orders after it has been out long enough. | SemVer's: a `-` makes a prerelease |
 | `retention_partition(id, version)` | The partition of a package's versions keep-N counts within (`keep_last_n`, `keep_n_most_downloaded`, `max_versions_per_package`): versions with the same key are counted together. | `None`: the package is one partition |
 
 NuGet and npm keep the defaults. A format whose versions differ overrides
@@ -480,17 +480,17 @@ and free of I/O.
 
 ## Proxy repositories
 
-A plugin that lists `proxy` among its kinds implements the upstream side of
+A format that lists `proxy` among its kinds implements the upstream side of
 the contract, `upstream`. The host keeps everything a proxy is, whatever the
 format: the `proxy_cached_version` rows, the package delay, the not-found
 markers and their TTL, the download singleflight, the content-addressed
 store, credentials (decrypted per request, sent only to the origin of the
 repository's `remote_url`), where requests may go (below), the SSRF and
 cloud-metadata guards, the size and time bounds of every request, and the
-offline mode. What the plugin knows is which documents an operation needs and
+offline mode. What the format knows is which documents an operation needs and
 what they say:
 
-| Operation | The plugin answers |
+| Operation | The format answers |
 | --- | --- |
 | `index` | A JSON object of its own making, from `remote_url` (NuGet: the service index's resources). The host persists it, refreshes it once per metadata TTL, falls back to the last good one when a refresh fails, and hands it to every other operation |
 | `versions(id)` | The versions the upstream lists, or none when it does not know the package |
@@ -503,14 +503,14 @@ what they say:
 
 Each operation is a conversation: `upstream` either answers or asks for
 GETs (`fetch`), and is called again with every fetch so far and how it went
-(a body, a 404, or a failure), so a plugin keeps no state between calls. A
+(a body, a 404, or a failure), so a format keeps no state between calls. A
 fetch says how long its document may be reused: for the repository's
 metadata TTL, or for a day when it never changes once published, and may
 name the `Accept` it sends (npm's abbreviated and full packuments share a
 URL). The host keeps the documents it fetched for every instance (in the
 database and the object store) and, once that time has passed, asks the
 upstream whether one changed (`If-None-Match`, `If-Modified-Since`): the
-plugin is handed the same bytes either way. A search's pages and an
+format is handed the same bytes either way. A search's pages and an
 import's walk are not kept. One conversation gets at most 4 rounds and 256 fetches, 4 at a time,
 and keeps at most 4 × `proxy.max_metadata_bytes` of documents, all rounds
 together: a document past that comes back as a failure, and so does every
@@ -527,15 +527,15 @@ on such a member. An upstream that refuses the proxy (a 401 or 403 for its
 credentials), or serves a package the proxy does not take (too large,
 unreadable, not the version asked for, not matching its published digest),
 answers **502**: retrying does not help until the upstream or the proxy
-changes. Any other failure answers 500: an answer the plugin cannot use, a
+changes. Any other failure answers 500: an answer the format cannot use, a
 document over its size bound.
 
 The conversations of an instance hold their documents in one budget,
-`proxy.max_metadata_memory_bytes`, until the plugin has answered. A document
+`proxy.max_metadata_memory_bytes`, until the format has answered. A document
 that does not fit is let go while its conversation waits for room, up to the
 metadata timeout, and is then read again. A conversation that waited in vain
 gets the fetch back as a failure, as from an unavailable upstream: the
-request answers 503 with `Retry-After`, unless the plugin answers from a
+request answers 503 with `Retry-After`, unless the format answers from a
 smaller document instead (npm: the abbreviated packument for the full one).
 
 The host sends a fetch only where the upstream points: to the origin (scheme,
@@ -544,12 +544,12 @@ host and port) of `remote_url`, or to an origin that an absolute `http` or
 earlier round), or while resolving `index`. The URLs `package` and `file`
 answer are held to the same rule. Anything else is not sent: the fetch comes back as a
 failure, a package URL fails the download like an upstream error, and the host
-logs a warning naming the format and the repository. What the plugin answers
+logs a warning naming the format and the repository. What the format answers
 names no origin: its index is its own making (and the host keeps fields of its
 own beside it, so an index may not use the keys `remote_url` and
 `named_origins`). So a NuGet service index can put its resources on other
 hosts (nuget.org's search service is on `azuresearch-*.nuget.org`), but a
-plugin cannot make Forge request a host its upstream does not point at. Redirects are the
+format cannot make Forge request a host its upstream does not point at. Redirects are the
 upstream's to choose, and are followed under the cloud-metadata guard.
 
 An administrator makes a proxy of any format ask its upstream again before
@@ -560,19 +560,19 @@ all) and every document it fetched, on every instance, and invalidating the
 whole repository also refreshes its `index`. Downloaded packages stay
 cached.
 
-## Using a plugin
+## Using a format
 
 `GET /admin/formats` lists every format the server can create repositories
-of: the plugins (Docker, NuGet, npm, raw files, apt), each from its
+of: the built-in ones (Docker, NuGet, npm, raw files, apt), each from its
 descriptor, with the repository kinds it supports, what its repositories hold
 (`storage`: `packages`, `files` or `images`), its options and whether it keeps
 signed indexes, and where its repositories are served. The web UI's *New
-repository* form offers them. Each plugin serves the kinds its descriptor
+repository* form offers them. Each format serves the kinds its descriptor
 lists: all five serve **hosted** repositories and **proxies** (they
 implement the upstream side), and all but apt **groups**.
 
-A repository of a plugin's format is created like any other, with the
-plugin's format id, and served under `/repository`:
+A repository of a format is created like any other, with the format's id,
+and served under `/repository`:
 
 ```bash
 # Create a hosted repository of the format `nuget` (or use the web UI).
@@ -606,9 +606,9 @@ a limit may be at most what a push can stage, `server.max_staging_bytes` less
 
 ## Security model
 
-The host enforces these for every plugin:
+The host enforces these for every format:
 
-- **No data beyond the caller's.** The plugin reads only through host
+- **No data beyond the caller's.** The format reads only through host
   queries, and those run with the caller's package selector and group
   visibility. An id the format does not validate is unknown, not an
   error.
@@ -616,24 +616,24 @@ The host enforces these for every plugin:
   action against the request's method, the permission it needs, the
   repository kind and the credential type, before the hosted write path
   applies its own selector and redeploy checks.
-- **No credentials.** The plugin never sees a password or a token: a
+- **No credentials.** The format never sees a password or a token: a
   login's body goes to the host's login (`auth`), which checks it and mints
-  the token the plugin renders. A body is read only when the plugin asks,
+  the token the format renders. A body is read only when the format asks,
   bounded, and for a caller with the permission its use needs.
-- **Bounded ids and versions.** Whatever the plugin's own rules, an id
+- **Bounded ids and versions.** Whatever the format's own rules, an id
   longer than 512 bytes or a version longer than 256 bytes, as given or as
-  the plugin normalizes it, is not one: a push of a package carrying one
+  the format normalizes it, is not one: a push of a package carrying one
   answers 400, a request naming one answers like one naming an unknown
   package (404), and a proxy leaves such versions of an upstream listing
   out. Ids and versions are keys of database indexes, whose entries
   PostgreSQL limits to about 2,700 bytes. NuGet allows less: 100 characters
   for an id and 64 for a version.
-- **Upstream requests go where the upstream points.** A proxy's plugin
+- **Upstream requests go where the upstream points.** A proxy's format
   reaches the network only through the GETs the host sends for it, and the
   host sends them, and downloads packages, only from the origin of the
   repository's `remote_url` and from origins that the documents it fetched
   from that upstream name ([Proxy repositories](#proxy-repositories)). A
-  plugin cannot have Forge read `http://localhost:8421/admin/…` or an internal
+  format cannot have Forge read `http://localhost:8421/admin/…` or an internal
   search cluster that its upstream does not point at, and pass the answers on
   through the proxy's metadata.
 - **Responses cannot attack the origin.** Only `allow`, `cache-control`,
@@ -641,39 +641,38 @@ The host enforces these for every plugin:
   `last-modified`, `link`, `location`, `retry-after` and `vary` survive;
   `location` and `link` survive only when they stay inside the repository. Every response gets the feed's hardening
   headers (`Content-Security-Policy: sandbox`, `nosniff`,
-  `Content-Disposition: attachment`). A plugin cannot set cookies, CORS
+  `Content-Disposition: attachment`). A format cannot set cookies, CORS
   headers, or redirect a client elsewhere.
 
-A plugin is part of the server: it is reviewed, tested and released with
-it, and runs in-process like the rest of Forge's code.
+A format crate is part of the server: it is reviewed, tested and released
+with it, and runs in-process like the rest of Forge's code.
 
-The documents an upstream serves decide which hosts a proxy's plugin can
+The documents an upstream serves decide which hosts a proxy's format can
 reach. A public feed whose package metadata names an internal URL (a
 project URL pointing at `http://10.0.0.5:9200/`) makes
-that host reachable for a proxy of that feed, and the plugin reads what it
-answers back into what the proxy serves. The rule bounds a plugin to the
+that host reachable for a proxy of that feed, and the format reads what it
+answers back into what the proxy serves. The rule bounds a format to the
 hosts its upstream points at, public or internal; where internal services
 must stay out of Forge's reach altogether, confine its egress with network
 policy (an outbound proxy, a Kubernetes `NetworkPolicy`).
 
-## Writing a plugin
+## Writing a format
 
-A plugin is a crate in `crates/formats/<id>/`, a member of the workspace,
-depending on `forge-plugin-api` and implementing its trait
+A format is a crate in `crates/formats/<id>/`, a member of the workspace,
+depending on `forge-format-api` and implementing its trait
 ([`crates/formats/nuget`](../crates/formats/nuget) is a complete one). It
-describes itself with a `'static` [`Descriptor`](../crates/plugin-api/src/types.rs)
+describes itself with a `'static` [`Descriptor`](../crates/format-api/src/types.rs)
 that `descriptor()` returns:
 
 ```rust
-use forge_plugin_api::{
-    Action, Assets, Descriptor, FormatPlugin, Loaded, Prereleases, Repository, RepositoryKind,
+use forge_format_api::{
+    Action, Assets, Descriptor, FormatSpec, Loaded, Prereleases, Repository, RepositoryKind,
     Request, Storage, UpstreamToken, /* … */
 };
 
 pub const DESCRIPTOR: Descriptor = Descriptor {
     id: "example",                     // the format id repositories are created with
     name: "Example packages",
-    version: env!("CARGO_PKG_VERSION"),
     description: "Example packages: push and pull with the example client.",
     // The repository kinds it serves (`Proxy` too when it implements
     // `upstream`).
@@ -699,7 +698,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
 #[derive(Default)]
 pub struct MyFormat;
 
-impl FormatPlugin for MyFormat {
+impl FormatSpec for MyFormat {
     fn descriptor(&self) -> &'static Descriptor {
         &DESCRIPTOR
     }
@@ -716,12 +715,12 @@ An id is 2–32 lowercase letters, digits and `-`, starting with a letter,
 and no other format's. Every non-images format is served under
 `/repository/{repo}/…`; only one format of a server may store images, which
 the registry serves at `/v2`. List `Proxy` among the kinds only
-when the plugin implements `upstream`. Asset names are plain file names, and
+when the format implements `upstream`. Asset names are plain file names, and
 their content types `type/subtype`.
 
 Then build it in: add the crate to `forge-server`'s dependencies and to
-`plugins::builtin()` in
-[`crates/server/src/plugins.rs`](../crates/server/src/plugins.rs), whose
+`formats::builtin()` in
+[`crates/server/src/formats.rs`](../crates/server/src/formats.rs), whose
 tests check every built-in format's descriptor against these rules. A few
 rules hold:
 
@@ -737,7 +736,7 @@ rules hold:
   named when that is an [alias](deployment.md#further-host-names-aliases),
   so the client stays there. Groups and kinds are already
   resolved by the time data reaches you.
-- **Test the protocol without a server.** `forge-plugin-api`'s `testing`
+- **Test the protocol without a server.** `forge-format-api`'s `testing`
   feature runs `handle` and `render` against canned answers to the queries
   (`testing::serve`), as
   [`crates/formats/nuget/tests/protocol.rs`](../crates/formats/nuget/tests/protocol.rs)
@@ -745,9 +744,9 @@ rules hold:
   documents
   ([`crates/formats/nuget/tests/upstream.rs`](../crates/formats/nuget/tests/upstream.rs)).
 - **Test it in a server.** The crate's unit tests run with the workspace.
-  [`crates/server/tests/plugin_contract.rs`](../crates/server/tests/plugin_contract.rs)
-  runs a server with a small plugin of its own installed; copy it for a new
-  plugin.
+  [`crates/server/tests/format_contract.rs`](../crates/server/tests/format_contract.rs)
+  runs a server with a small format of its own installed; copy it for a new
+  format.
 
 ## Limitations and roadmap
 
@@ -757,7 +756,7 @@ to lift them:
 - **Proxies fetch whole documents with GET.** A package or files format's
   upstream request carries no headers but the repository's credentials
   (Basic, or a Bearer token) and the `Accept` the fetch names, and its body
-  is read whole up to `proxy.max_metadata_bytes` before the plugin sees it;
+  is read whole up to `proxy.max_metadata_bytes` before the format sees it;
   only a `forward` POSTs. An upstream that streams a listing too large to
   hold needs more from the contract. (An images format's fetches get a
   Bearer token exchange, and the host streams the blobs and manifests they
@@ -767,7 +766,7 @@ to lift them:
   multi-asset versions.
 - **Prerelease is "contains a `-`", or nothing is, for searches.** This is
   right for SemVer formats and apt ([Format options](#format-options)).
-  Retention asks the plugin (`version_class`, [Retention](#retention)), but
+  Retention asks the format (`version_class`, [Retention](#retention)), but
   the host's search filter (`prerelease`) still reads the `-`; a format with
   another rule (PEP 440's `1.0a1`) needs the search to ask it too.
 - **Listings are bounded.** A response may load at most 2,048 answers, so
@@ -778,31 +777,31 @@ to lift them:
   `proxy.max_metadata_bytes`, 32 MiB by default); the contract has no ranged
   or streamed reads of an upstream document.
 
-### NuGet as a plugin
+### NuGet
 
-NuGet is a built-in plugin: [`crates/formats/nuget`](../crates/formats/nuget)
-implements `FormatPlugin`, and the dispatcher serves it at
+NuGet is built in: [`crates/formats/nuget`](../crates/formats/nuget)
+implements `FormatSpec`, and the dispatcher serves it at
 `/repository/{repo}/...`. The pieces it needed from the contract are general
 ones: its own asset names,
 ranged downloads, paged registrations (`packages-of`), the search options of
 the V3 search service, and publishing the first file of a multipart body.
 
-Its proxies read another V3 feed through the plugin's upstream side
+Its proxies read another V3 feed through the format's upstream side
 ([`src/upstream.rs`](../crates/formats/nuget/src/upstream.rs)): the service
 index's resources, the flat container, the registration (bounded to the
 newest pages a request needs), catalog entries for the package delay of
 unlisted versions, and the search service.
 
-### npm as a plugin
+### npm
 
-npm is a built-in plugin too: [`crates/formats/npm`](../crates/formats/npm) serves
+npm is built in too: [`crates/formats/npm`](../crates/formats/npm) serves
 registries at `/repository/{repo}/...` for npm, pnpm, Yarn and Bun ([npm.md](npm.md)).
-Contract 0.4.0 grew for it too, and every piece is general:
+The contract grew for it too, and every piece is general:
 
 - **Bodies on demand** (`read body`): logins, audits, dist-tag changes and
-  packument updates are small JSON bodies the plugin reads.
+  packument updates are small JSON bodies the format reads.
 - **Packages inside a document** (`Upload::Document`): `npm publish` sends
-  the tarball base64-encoded inside a JSON document. The plugin's
+  the tarball base64-encoded inside a JSON document. The format's
   `unpack_upload` decodes it while the body streams into the store, and the
   rest of the document (its `dist-tags`, its integrity claims) comes back
   to `parse_upload` and `published`.

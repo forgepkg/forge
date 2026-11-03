@@ -365,7 +365,7 @@ pub mod http {
             Oci => "oci",
             /// `/repository/…` of a NuGet repository.
             Nuget => "nuget",
-            /// `/repository/…` of a repository of another format plugin
+            /// `/repository/…` of a repository of another format
             /// ([`plugin_surface`]).
             PluginNpm => "plugin_npm",
             PluginRaw => "plugin_raw",
@@ -385,9 +385,11 @@ pub mod http {
         }
     }
 
-    /// The surface of a repository of format `format` (a format plugin's
-    /// id): `nuget`, else `plugin_<format>` for the built-in formats and
-    /// `plugin_other` for any other, so the attribute stays bounded.
+    /// The surface of a repository of format `format` (a format's id):
+    /// `nuget`, `oci` for docker, `plugin_npm` and `plugin_raw`, and
+    /// `plugin_other` for any other (apt), so the attribute stays bounded.
+    /// The `plugin_` values are kept as they were named when formats were
+    /// plugins: dashboards and alerts select on them.
     pub fn plugin_surface(format: &str) -> Surface {
         match format {
             "nuget" => Surface::Nuget,
@@ -1161,7 +1163,7 @@ pub mod inventory {
     /// One repository's numbers.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct RepositoryCount {
-        /// Its format (a format plugin's id).
+        /// Its format (a format's id).
         pub format: String,
         /// `hosted`, `proxy` or `group`.
         pub kind: String,

@@ -14,23 +14,23 @@
 //!   included ([`form`]);
 //! * `DELETE /<path>` — delete a file.
 //!
-//! Paths follow [`forge_plugin_api::files`]: a path that needs normalizing
+//! Paths follow [`forge_format_api::files`]: a path that needs normalizing
 //! (`..`, `//`, an encoded `/`) is refused, never resolved. Everything else
 //! a repository is, the host's file store keeps: the content-addressed
 //! files and their digests, the deployment policy, package selectors on
 //! paths, groups, and proxies, whose file `<path>` is the upstream's
 //! `<remote_url>/<path>` ([`upstream_url`]).
 //!
-//! Forge links this plugin in ([`Raw`], [`DESCRIPTOR`]), like NuGet.
+//! Forge links this crate in ([`Raw`], [`DESCRIPTOR`]), like NuGet.
 
 pub mod form;
 pub mod listing;
 pub mod sidecar;
 
-use forge_plugin_api::files::{self, Target};
-use forge_plugin_api::{
+use forge_format_api::files::{self, Target};
+use forge_format_api::{
     Action, Answer, Assets, Descriptor, DirectoryQuery, FetchResult, FileSource, FormatError,
-    FormatPlugin, Loaded, NewFile, Query, Remote, Repository, RepositoryKind, Request, Response,
+    FormatSpec, Loaded, NewFile, Query, Remote, Repository, RepositoryKind, Request, Response,
     Storage, StoreStatus, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken,
 };
 
@@ -42,7 +42,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
                   with PUT or a form, downloads with ranges and checksum sidecars, directory \
                   listings; proxies of any HTTP(S) base URL.",
     // Proxies cache the files under an HTTP(S) base URL through the
-    // plugin's upstream side.
+    // format's upstream side.
     kinds: &[
         RepositoryKind::Hosted,
         RepositoryKind::Proxy,
@@ -53,7 +53,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     assets: Assets::DEFAULT,
     upstream_token: UpstreamToken::None,
     options: &[],
-    prereleases: forge_plugin_api::Prereleases::Dash,
+    prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
 };
 
@@ -61,7 +61,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Raw;
 
-impl FormatPlugin for Raw {
+impl FormatSpec for Raw {
     fn descriptor(&self) -> &'static Descriptor {
         &DESCRIPTOR
     }
@@ -186,7 +186,7 @@ fn redirect(location: &str) -> Action {
 }
 
 /// A response for a conversation the host should not have started: the
-/// plugin and the host disagree, which is a bug.
+/// format and the host disagree, which is a bug.
 fn unexpected(what: &str) -> Action {
     respond(Response::text(
         500,
@@ -195,7 +195,7 @@ fn unexpected(what: &str) -> Action {
 }
 
 /// The answer of the store a request asked for.
-fn stored(data: &[Loaded]) -> Option<&[forge_plugin_api::StoredFile]> {
+fn stored(data: &[Loaded]) -> Option<&[forge_format_api::StoredFile]> {
     data.iter().rev().find_map(|loaded| match &loaded.answer {
         Answer::Stored(files) => Some(files.as_slice()),
         _ => None,
@@ -211,7 +211,7 @@ fn answer<'a>(data: &'a [Loaded], query: &Query) -> Option<&'a Answer> {
 
 /// The file a `file` or `fetch-file` query found: `None` when it was not
 /// asked, `Some(None)` when there is no such file.
-fn found<'a>(data: &'a [Loaded], query: &Query) -> Option<Option<&'a forge_plugin_api::FileInfo>> {
+fn found<'a>(data: &'a [Loaded], query: &Query) -> Option<Option<&'a forge_format_api::FileInfo>> {
     match answer(data, query)? {
         Answer::File(file) => Some(file.as_ref()),
         _ => None,

@@ -1,4 +1,4 @@
-//! Logins of command-line clients, as format plugins ask for them
+//! Logins of command-line clients, as formats ask for them
 //! ([`AuthRequest`]): npm's `npm login`, `npm logout` and `npm whoami`.
 //!
 //! * A **password** login is checked through the realm chain like the web
@@ -35,7 +35,7 @@ use forge_db::cli_login_dao::{self, CliLoginState};
 use forge_db::model::{AppUser, Repository};
 use forge_db::token_dao::{self, NewToken};
 use forge_db::user_dao;
-use forge_plugin::api::{AuthOutcome, AuthRequest};
+use forge_format_api::{AuthOutcome, AuthRequest};
 
 use crate::auth::{verify_password_login, LoginRefusal, PasswordFrom};
 use crate::state::AppState;
@@ -67,7 +67,7 @@ fn db_error(e: sqlx::Error) -> Response {
 }
 
 /// Perform `request` for `principal` on `repo`, asked from `client_ip`:
-/// what the format plugin renders, or the refusal to answer with.
+/// what the format renders, or the refusal to answer with.
 pub async fn perform(
     state: &AppState,
     repo: &Repository,

@@ -22,7 +22,7 @@
 //!   is never replaced by the account the headers name. That includes an API
 //!   token sent as `Authorization: Bearer` to `/repository`, as npm sends
 //!   its `_authToken`, which the feed resolves after the middleware
-//!   (`plugins::with_bearer`, #555). A registry token on `/v2` is the
+//!   (`formats::with_bearer`, #555). A registry token on `/v2` is the
 //!   registry's: an anonymous one stands for the request's principal, the
 //!   account the headers name included.
 //! * The headers present but no realm's secret among them, or the right

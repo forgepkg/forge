@@ -12,21 +12,21 @@
 //!
 //! A request reaches an images format in three steps:
 //!
-//! 1. [`FormatPlugin::image_path`] splits the request's path below the
+//! 1. [`FormatSpec::image_path`] splits the request's path below the
 //!    format's mount into the name the client wrote and the endpoint, and
 //!    says what the request needs ([`Permission`]).
 //! 2. The host resolves the name to a repository and an image (by path:
 //!    `<repository>/<image>`; on a repository's own host: the whole name),
 //!    authorizes the request, picks where a change lands (a group's writable
 //!    member) and refuses what it must, as an [`ImageError`] the format
-//!    renders ([`FormatPlugin::image_error`]).
-//! 3. [`FormatPlugin::handle`] gets the request with the endpoint as its
+//!    renders ([`FormatSpec::image_error`]).
+//! 3. [`FormatSpec::handle`] gets the request with the endpoint as its
 //!    path and the resolved [`ImageName`] as [`Request::image`], and answers
 //!    as for any format: a response, queries to load ([`ImageQuery`]), or an
 //!    action ([`Action::ServeBlob`], [`Action::ServeManifest`]).
 //!
 //! Every answer to an image query is a result: a query that failed comes
-//! back to [`FormatPlugin::render`] as its [`ImageError`], for the format to
+//! back to [`FormatSpec::render`] as its [`ImageError`], for the format to
 //! answer in its protocol's words.
 //!
 //! Digests cross the contract in their canonical text form,
@@ -34,10 +34,10 @@
 //! format validated them; the host verifies content against them and
 //! refuses any other form a format names.
 //!
-//! [`FormatPlugin::image_path`]: crate::FormatPlugin::image_path
-//! [`FormatPlugin::image_error`]: crate::FormatPlugin::image_error
-//! [`FormatPlugin::handle`]: crate::FormatPlugin::handle
-//! [`FormatPlugin::render`]: crate::FormatPlugin::render
+//! [`FormatSpec::image_path`]: crate::FormatSpec::image_path
+//! [`FormatSpec::image_error`]: crate::FormatSpec::image_error
+//! [`FormatSpec::handle`]: crate::FormatSpec::handle
+//! [`FormatSpec::render`]: crate::FormatSpec::render
 //! [`Request::image`]: crate::Request::image
 //! [`Action::ServeBlob`]: crate::Action::ServeBlob
 //! [`Action::ServeManifest`]: crate::Action::ServeManifest
@@ -55,18 +55,18 @@ pub enum Permission {
     Delete,
 }
 
-/// A request path an images format split ([`FormatPlugin::image_path`]).
+/// A request path an images format split ([`FormatSpec::image_path`]).
 ///
-/// [`FormatPlugin::image_path`]: crate::FormatPlugin::image_path
+/// [`FormatSpec::image_path`]: crate::FormatSpec::image_path
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImagePath {
     /// The name the client wrote (`docker-hosted/team/app`, or `team/app`
     /// on a repository's own host), in the format's name grammar.
     pub name: String,
     /// The rest of the path (`/manifests/latest`): the endpoint, which
-    /// [`FormatPlugin::handle`] gets as the request's path.
+    /// [`FormatSpec::handle`] gets as the request's path.
     ///
-    /// [`FormatPlugin::handle`]: crate::FormatPlugin::handle
+    /// [`FormatSpec::handle`]: crate::FormatSpec::handle
     pub endpoint: String,
     /// What the request needs.
     pub permission: Permission,
@@ -183,11 +183,11 @@ pub enum ImageQuery {
     /// Store the request body as a manifest of the image, under `reference`
     /// and `tags` ([`ImageAnswer::Stored`]). The host stages it (at most
     /// [`MAX_MANIFEST_BYTES`]), reads it with
-    /// [`FormatPlugin::parse_manifest`], checks that what it names is in
+    /// [`FormatSpec::parse_manifest`], checks that what it names is in
     /// the image and that it matches a digest reference, and points the
     /// tags at it as the repository's tag immutability allows.
     ///
-    /// [`FormatPlugin::parse_manifest`]: crate::FormatPlugin::parse_manifest
+    /// [`FormatSpec::parse_manifest`]: crate::FormatSpec::parse_manifest
     PutManifest {
         image: String,
         reference: Reference,
@@ -236,7 +236,7 @@ impl ImageQuery {
 pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
 /// The largest blob the host lends to
-/// [`FormatPlugin::artifact_files`](crate::FormatPlugin::artifact_files),
+/// [`FormatSpec::artifact_files`](crate::FormatSpec::artifact_files),
 /// as stored.
 pub const MAX_FILES_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -251,9 +251,9 @@ pub struct ManifestInfo {
     /// The digest of the manifest it refers to.
     pub subject: Option<String>,
     /// What [`ParsedManifest::summary`] said, completed with the config's
-    /// part ([`FormatPlugin::config_summary`]) once the host held the config.
+    /// part ([`FormatSpec::config_summary`]) once the host held the config.
     ///
-    /// [`FormatPlugin::config_summary`]: crate::FormatPlugin::config_summary
+    /// [`FormatSpec::config_summary`]: crate::FormatSpec::config_summary
     pub summary: Option<String>,
 }
 
@@ -329,10 +329,10 @@ pub enum ImageAnswer {
 
 /// Why the host refused a request to an images format, or a query failed:
 /// what the format answers in its own words
-/// ([`FormatPlugin::image_error`]). The text some carry is the host's,
+/// ([`FormatSpec::image_error`]). The text some carry is the host's,
 /// for the client.
 ///
-/// [`FormatPlugin::image_error`]: crate::FormatPlugin::image_error
+/// [`FormatSpec::image_error`]: crate::FormatSpec::image_error
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageError {
     // ── The request ────────────────────────────────────────────────────────
@@ -379,9 +379,9 @@ pub enum ImageError {
     TooLarge { limit: u64 },
     /// The request body could not be read (the client aborted, or stalled).
     BodyUnreadable,
-    /// [`FormatPlugin::parse_manifest`] refused the manifest: its text.
+    /// [`FormatSpec::parse_manifest`] refused the manifest: its text.
     ///
-    /// [`FormatPlugin::parse_manifest`]: crate::FormatPlugin::parse_manifest
+    /// [`FormatSpec::parse_manifest`]: crate::FormatSpec::parse_manifest
     ManifestInvalid(String),
     /// A manifest names a blob (or, `manifest`, a child manifest) the image
     /// does not hold.
@@ -402,9 +402,9 @@ pub enum ImageError {
     Internal,
 }
 
-/// What a manifest names and says ([`FormatPlugin::parse_manifest`]).
+/// What a manifest names and says ([`FormatSpec::parse_manifest`]).
 ///
-/// [`FormatPlugin::parse_manifest`]: crate::FormatPlugin::parse_manifest
+/// [`FormatSpec::parse_manifest`]: crate::FormatSpec::parse_manifest
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedManifest {
     /// Its media type: what it is served as.
@@ -421,17 +421,17 @@ pub struct ParsedManifest {
     /// The blob whose content completes the summary (an image's config, for
     /// its platform; a chart's, for its metadata), when it is small enough
     /// to read: the host reads it once the image holds it and merges what
-    /// [`FormatPlugin::config_summary`] makes of it into the summary.
+    /// [`FormatSpec::config_summary`] makes of it into the summary.
     ///
-    /// [`FormatPlugin::config_summary`]: crate::FormatPlugin::config_summary
+    /// [`FormatSpec::config_summary`]: crate::FormatSpec::config_summary
     pub config: Option<ConfigBlob>,
     /// The blob holding the files the web UI shows of the artifact (a Helm
     /// chart's archive), whatever its size: the host lends it to
-    /// [`FormatPlugin::artifact_files`] when it holds it and it is at most
+    /// [`FormatSpec::artifact_files`] when it holds it and it is at most
     /// [`MAX_FILES_BYTES`]. A manifest that names one is a chart to the web
     /// UI, whose metadata is the summary's `chart` object.
     ///
-    /// [`FormatPlugin::artifact_files`]: crate::FormatPlugin::artifact_files
+    /// [`FormatSpec::artifact_files`]: crate::FormatSpec::artifact_files
     pub files: Option<BlobInfo>,
     /// A JSON object for display (platforms, sizes, annotations), stored
     /// with the manifest and handed back with it ([`ManifestInfo::summary`]).
@@ -473,9 +473,9 @@ pub struct TextFile {
     pub truncated: bool,
 }
 
-/// What [`FormatPlugin::artifact_files`] read from an artifact.
+/// What [`FormatSpec::artifact_files`] read from an artifact.
 ///
-/// [`FormatPlugin::artifact_files`]: crate::FormatPlugin::artifact_files
+/// [`FormatSpec::artifact_files`]: crate::FormatSpec::artifact_files
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ArtifactFiles {
     /// Its README.

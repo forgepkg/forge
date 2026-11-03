@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use forge_plugin_api::{
+use forge_format_api::{
     Action, Answer, AuthOutcome, AuthRequest, BodyRequest, BodyUse, Change, ChangeSet, Forward,
     Loaded, PackageInfo, PackageRef, PublishRequest, Query, Repository, Request, Response,
     SearchQuery, Upload,
@@ -691,8 +691,8 @@ pub fn render(npm: &Npm, repo: &Repository, req: &Request, data: &[Loaded]) -> A
                     match loaded_manifest(data, &target) {
                         None => return Action::Load(vec![Query::Manifest(target)]),
                         Some(manifest) => {
-                            packument.readme = manifest
-                                .and_then(|m| forge_plugin_api::FormatPlugin::readme(npm, m))
+                            packument.readme =
+                                manifest.and_then(|m| forge_format_api::FormatSpec::readme(npm, m))
                         }
                     }
                 }
@@ -1018,7 +1018,7 @@ mod tests {
         assert!(!wants_abbreviated(&Request::new("GET", "/x")));
     }
 
-    /// An audit to `kind` with `body`, as the plugin forwards it.
+    /// An audit to `kind` with `body`, as the format forwards it.
     fn forwarded(kind: &str, body: &Value) -> Forward {
         Forward {
             path: format!("{SECURITY}{kind}"),

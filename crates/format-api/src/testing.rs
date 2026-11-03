@@ -1,14 +1,14 @@
-//! Running a plugin's protocol without a server (feature `testing`).
+//! Running a format's protocol without a server (feature `testing`).
 //!
 //! [`serve`] does what the host's dispatcher does with a request: it calls
-//! [`FormatPlugin::handle`], answers the queries the plugin asks for with
-//! `answer`, and calls [`FormatPlugin::render`] round by round, under the
+//! [`FormatSpec::handle`], answers the queries the format asks for with
+//! `answer`, and calls [`FormatSpec::render`] round by round, under the
 //! host's bounds. What only the host can do (a download, a publish, a
 //! change, serving a file) comes back as the action, for the test to
 //! inspect.
 //!
 //! [`converse`] does the same for the upstream side of a proxy
-//! ([`FormatPlugin::upstream`]): it answers every fetch the plugin asks for
+//! ([`FormatSpec::upstream`]): it answers every fetch the format asks for
 //! with `fetch`, as the host's proxy read path would.
 //!
 //! ```ignore
@@ -19,7 +19,7 @@
 //! assert_eq!(served.response().status, 200);
 //! ```
 
-use crate::{Action, Answer, FormatPlugin, Loaded, Query, Repository, RepositoryKind};
+use crate::{Action, Answer, FormatSpec, Loaded, Query, Repository, RepositoryKind};
 use crate::{Fetch, FetchResult, Fetched, FormatError, Remote, UpstreamAnswer, UpstreamOp};
 use crate::{Request, Response, UpstreamStep};
 
@@ -44,14 +44,14 @@ pub fn repository(kind: RepositoryKind) -> Repository {
 /// What came of a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Served {
-    /// The plugin's response, or the host action it asked for.
+    /// The format's response, or the host action it asked for.
     pub outcome: Action,
-    /// Every query the plugin asked for, in order.
+    /// Every query the format asked for, in order.
     pub queries: Vec<Query>,
 }
 
 impl Served {
-    /// The response; panics when the plugin asked for a host action.
+    /// The response; panics when the format asked for a host action.
     pub fn response(&self) -> &Response {
         match &self.outcome {
             Action::Respond(response) => response,
@@ -74,31 +74,31 @@ impl Served {
     }
 }
 
-/// Serve `req` to `plugin` for `repo`, answering its queries with `answer`.
+/// Serve `req` to `spec` for `repo`, answering its queries with `answer`.
 pub fn serve(
-    plugin: &dyn FormatPlugin,
+    spec: &dyn FormatSpec,
     repo: &Repository,
     req: &Request,
     mut answer: impl FnMut(&Query) -> Answer,
 ) -> Served {
     let queries = Vec::new();
-    let pending = match plugin.handle(repo, req) {
+    let pending = match spec.handle(repo, req) {
         Action::Load(pending) => pending,
         outcome => return Served { outcome, queries },
     };
-    serve_loads(plugin, repo, req, &mut answer, pending, queries)
+    serve_loads(spec, repo, req, &mut answer, pending, queries)
 }
 
-/// [`serve`] for a request with a body ([`Action::ReadBody`]): the plugin is
+/// [`serve`] for a request with a body ([`Action::ReadBody`]): the format is
 /// asked again with `body`, as the host does once it read it.
 pub fn serve_with_body(
-    plugin: &dyn FormatPlugin,
+    spec: &dyn FormatSpec,
     repo: &Repository,
     req: &Request,
     body: &[u8],
     answer: impl FnMut(&Query) -> Answer,
 ) -> Served {
-    match plugin.handle(repo, req) {
+    match spec.handle(repo, req) {
         Action::ReadBody(_) => {}
         outcome => {
             return Served {
@@ -107,11 +107,11 @@ pub fn serve_with_body(
             }
         }
     }
-    serve(plugin, repo, &req.clone().with_body(body.to_vec()), answer)
+    serve(spec, repo, &req.clone().with_body(body.to_vec()), answer)
 }
 
 fn serve_loads(
-    plugin: &dyn FormatPlugin,
+    spec: &dyn FormatSpec,
     repo: &Repository,
     req: &Request,
     answer: &mut impl FnMut(&Query) -> Answer,
@@ -131,7 +131,7 @@ fn serve_loads(
                 answer: answered,
             });
         }
-        match plugin.render(repo, req, &data) {
+        match spec.render(repo, req, &data) {
             Action::Load(more) => pending = more,
             outcome => return Served { outcome, queries },
         }
@@ -158,25 +158,25 @@ pub const MAX_IMAGE_UPSTREAM_ROUNDS: usize = 12;
 /// What came of an upstream conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversed {
-    /// The plugin's answer.
+    /// The format's answer.
     pub answer: UpstreamAnswer,
-    /// Every fetch the plugin asked for, in order.
+    /// Every fetch the format asked for, in order.
     pub fetches: Vec<Fetch>,
 }
 
-/// Run `op` against `remote` through `plugin`'s upstream side, answering
-/// its fetches with `fetch`. Errs with what the plugin returned, or when it
+/// Run `op` against `remote` through `spec`'s upstream side, answering
+/// its fetches with `fetch`. Errs with what the format returned, or when it
 /// needs more rounds or fetches than the host allows. Every fetch reaches
 /// `fetch`: the host also refuses the ones on origins its upstream does not
 /// point at ([`Fetch`]), which a test checks by the URLs in
 /// [`Conversed::fetches`].
 pub fn converse(
-    plugin: &dyn FormatPlugin,
+    spec: &dyn FormatSpec,
     remote: &Remote,
     op: &UpstreamOp,
     mut fetch: impl FnMut(&Fetch) -> Fetched,
 ) -> Result<Conversed, FormatError> {
-    converse_answered(plugin, remote, op, |want| FetchResult {
+    converse_answered(spec, remote, op, |want| FetchResult {
         fetch: want.clone(),
         outcome: fetch(want),
         status: None,
@@ -189,19 +189,19 @@ pub fn converse(
 /// answer. An images format's conversation may take
 /// [`MAX_IMAGE_UPSTREAM_ROUNDS`] rounds.
 pub fn converse_answered(
-    plugin: &dyn FormatPlugin,
+    spec: &dyn FormatSpec,
     remote: &Remote,
     op: &UpstreamOp,
     mut fetch: impl FnMut(&Fetch) -> FetchResult,
 ) -> Result<Conversed, FormatError> {
-    let rounds = if plugin.descriptor().storage == crate::Storage::Images {
+    let rounds = if spec.descriptor().storage == crate::Storage::Images {
         MAX_IMAGE_UPSTREAM_ROUNDS
     } else {
         MAX_UPSTREAM_ROUNDS
     };
     let mut fetched: Vec<FetchResult> = Vec::new();
     for _ in 0..rounds {
-        match plugin.upstream(remote, op, &fetched)? {
+        match spec.upstream(remote, op, &fetched)? {
             UpstreamStep::Done(answer) => {
                 return Ok(Conversed {
                     answer,

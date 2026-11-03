@@ -17,8 +17,8 @@
 
 use std::collections::BTreeSet;
 
-use forge_plugin_api::images::{CatalogPage, ImageUrl, ManifestInfo, Reference, TagPage};
-use forge_plugin_api::{
+use forge_format_api::images::{CatalogPage, ImageUrl, ManifestInfo, Reference, TagPage};
+use forge_format_api::{
     Fetch, FetchResult, Fetched, FormatError, Freshness, Remote, UpstreamAnswer, UpstreamOp,
     UpstreamStep,
 };
@@ -422,7 +422,7 @@ fn referrers(
 
 #[cfg(test)]
 mod tests {
-    use forge_plugin_api::testing::converse_answered;
+    use forge_format_api::testing::converse_answered;
 
     use super::*;
     use crate::Docker;

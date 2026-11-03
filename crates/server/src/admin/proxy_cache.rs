@@ -65,8 +65,8 @@ pub struct InvalidateBody {
 /// What an invalidation removed.
 #[derive(Debug, Serialize)]
 pub struct Invalidated {
-    /// Not-found answers removed (NuGet and plugin proxies; a docker proxy
-    /// keeps its own in memory, forgotten too but not counted).
+    /// Not-found answers removed (NuGet's and the other formats' proxies; a
+    /// docker proxy keeps its own in memory, forgotten too but not counted).
     pub not_found_cleared: u64,
     /// Tags due for re-validation (docker proxies).
     pub tags_expired: u64,
@@ -102,9 +102,9 @@ pub async fn invalidate(
         None => None,
         Some(p) if stores_files => {
             let normalized = if p.ends_with('/') {
-                forge_plugin::api::files::normalize_directory(&p)
+                forge_format_api::files::normalize_directory(&p)
             } else {
-                forge_plugin::api::files::normalize(&p)
+                forge_format_api::files::normalize(&p)
             };
             match normalized {
                 Ok(path) => Some(path),

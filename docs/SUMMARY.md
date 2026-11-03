@@ -20,7 +20,7 @@
 - [npm registries](npm.md)
 - [NuGet feeds](nuget.md)
 - [Raw file repositories](raw.md)
-- [Format plugins](format-plugins.md)
+- [Format crates](format-plugins.md)
 
 # CI and publishing
 

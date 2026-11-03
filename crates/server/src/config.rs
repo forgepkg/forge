@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use figment::providers::{Env, Format, Serialized, Toml};
 use figment::Figment;
-use forge_plugin::api::Storage;
+use forge_format_api::Storage;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
@@ -68,7 +68,7 @@ pub struct Config {
     /// and blob-link expiry.
     #[serde(default)]
     pub docker: DockerConfig,
-    /// npm registries (`/repository/<name>/`): what the npm plugin reads of a request.
+    /// npm registries (`/repository/<name>/`): what the npm format reads of a request.
     #[serde(default)]
     pub npm: NpmConfig,
     /// Logins of command-line clients (`npm login`): their tokens and the
@@ -1611,7 +1611,7 @@ impl DockerConfig {
     }
 }
 
-/// `[npm]`: what the npm plugin reads of a request.
+/// `[npm]`: what the npm format reads of a request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NpmConfig {
     /// The largest publish document, without its tarball (the tarball

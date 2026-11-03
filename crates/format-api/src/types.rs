@@ -1,4 +1,4 @@
-//! The data a plugin and the host exchange.
+//! The data a format and the host exchange.
 
 use std::fmt;
 
@@ -32,7 +32,7 @@ pub enum FormatError {
     MalformedManifest(String),
     InvalidVersion(String),
     InvalidId(String),
-    /// The plugin itself failed (a bug, an exhausted resource): the client
+    /// The format itself failed (a bug, an exhausted resource): the client
     /// gets a server error, not this text.
     Internal(String),
 }
@@ -45,7 +45,7 @@ impl fmt::Display for FormatError {
             FormatError::MalformedManifest(m) => write!(f, "malformed manifest: {m}"),
             FormatError::InvalidVersion(m) => write!(f, "invalid version: {m}"),
             FormatError::InvalidId(m) => write!(f, "invalid id: {m}"),
-            FormatError::Internal(m) => write!(f, "format plugin failed: {m}"),
+            FormatError::Internal(m) => write!(f, "format failed: {m}"),
         }
     }
 }
@@ -55,10 +55,10 @@ impl std::error::Error for FormatError {}
 /// What a package declares about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPackage {
-    /// The canonical id: what [`FormatPlugin::canonical_id`] returns for
+    /// The canonical id: what [`FormatSpec::canonical_id`] returns for
     /// `original_id`.
     ///
-    /// [`FormatPlugin::canonical_id`]: crate::FormatPlugin::canonical_id
+    /// [`FormatSpec::canonical_id`]: crate::FormatSpec::canonical_id
     pub id: String,
     /// The id exactly as the package writes it.
     pub original_id: String,
@@ -76,11 +76,11 @@ pub struct ParsedPackage {
 }
 
 /// What kind of version a normalized version is, as retention rules see it
-/// ([`FormatPlugin::version_class`]): a rule's `release_type` picks one of
+/// ([`FormatSpec::version_class`]): a rule's `release_type` picks one of
 /// them, and `prerelease_superseded_for_days` deletes what is not a release
 /// once a release orders after it.
 ///
-/// [`FormatPlugin::version_class`]: crate::FormatPlugin::version_class
+/// [`FormatSpec::version_class`]: crate::FormatSpec::version_class
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VersionClass {
     /// A stable release (`1.2.0`; Maven's `33.0.0-jre`).
@@ -111,11 +111,11 @@ impl RepositoryKind {
     }
 }
 
-/// What a format says about itself ([`FormatPlugin::descriptor`]): a
-/// `'static` value next to its `impl FormatPlugin`.
+/// What a format says about itself ([`FormatSpec::descriptor`]): a
+/// `'static` value next to its `impl FormatSpec`.
 ///
 /// ```no_run
-/// use forge_plugin_api::{Assets, Descriptor, Prereleases, RepositoryKind, Storage, UpstreamToken};
+/// use forge_format_api::{Assets, Descriptor, Prereleases, RepositoryKind, Storage, UpstreamToken};
 ///
 /// pub const DESCRIPTOR: Descriptor = Descriptor {
 ///     id: "example",
@@ -131,7 +131,7 @@ impl RepositoryKind {
 /// };
 /// ```
 ///
-/// [`FormatPlugin::descriptor`]: crate::FormatPlugin::descriptor
+/// [`FormatSpec::descriptor`]: crate::FormatSpec::descriptor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Descriptor {
     /// The format id repositories are created with (`repository.format`):
@@ -142,9 +142,9 @@ pub struct Descriptor {
     /// One line on what the format serves.
     pub description: &'static str,
     /// The repository kinds it supports, each once. `Proxy` only when the
-    /// format implements [`FormatPlugin::upstream`].
+    /// format implements [`FormatSpec::upstream`].
     ///
-    /// [`FormatPlugin::upstream`]: crate::FormatPlugin::upstream
+    /// [`FormatSpec::upstream`]: crate::FormatSpec::upstream
     pub kinds: &'static [RepositoryKind],
     /// What its repositories hold.
     pub storage: Storage,
@@ -157,15 +157,15 @@ pub struct Descriptor {
     pub options: &'static [FormatOption],
     /// Which versions the host's search filter takes for prereleases (hidden
     /// unless a search asks for them). Retention asks
-    /// [`FormatPlugin::version_class`].
+    /// [`FormatSpec::version_class`].
     ///
-    /// [`FormatPlugin::version_class`]: crate::FormatPlugin::version_class
+    /// [`FormatSpec::version_class`]: crate::FormatSpec::version_class
     pub prereleases: Prereleases,
     /// The host keeps signed indexes of the format's hosted repositories
-    /// ([`FormatPlugin::index`]), and an OpenPGP key per repository to sign
+    /// ([`FormatSpec::index`]), and an OpenPGP key per repository to sign
     /// them with (apt). A package format only.
     ///
-    /// [`FormatPlugin::index`]: crate::FormatPlugin::index
+    /// [`FormatSpec::index`]: crate::FormatSpec::index
     pub indexes: bool,
 }
 
@@ -184,10 +184,10 @@ pub enum Prereleases {
 /// A setting of the format's own that a repository carries
 /// ([`Descriptor::options`]): a line of text an administrator sets when
 /// creating or editing the repository, checked by
-/// [`FormatPlugin::check_option`], or a switch ([`OptionInput::Switch`]);
-/// handed to the plugin with every request ([`Repository::options`]).
+/// [`FormatSpec::check_option`], or a switch ([`OptionInput::Switch`]);
+/// handed to the format with every request ([`Repository::options`]).
 ///
-/// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
+/// [`FormatSpec::check_option`]: crate::FormatSpec::check_option
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatOption {
     /// 1–32 lowercase letters, digits and `_`, starting with a letter.
@@ -209,16 +209,16 @@ pub struct FormatOption {
 /// How an administrator sets a format option ([`FormatOption::input`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OptionInput {
-    /// A line of text, checked by [`FormatPlugin::check_option`].
+    /// A line of text, checked by [`FormatSpec::check_option`].
     ///
-    /// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
+    /// [`FormatSpec::check_option`]: crate::FormatSpec::check_option
     #[default]
     Text,
     /// On or off: forms show a switch. The host keeps [`SWITCH_ON`] when it
     /// is on and nothing when it is off, and asks no
-    /// [`FormatPlugin::check_option`]. A switch is never required.
+    /// [`FormatSpec::check_option`]. A switch is never required.
     ///
-    /// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
+    /// [`FormatSpec::check_option`]: crate::FormatSpec::check_option
     Switch,
 }
 
@@ -249,7 +249,7 @@ pub enum UpstreamToken {
 }
 
 /// The package a file the host keeps for a package format belongs to
-/// ([`FormatPlugin::file_package`](crate::FormatPlugin::file_package)),
+/// ([`FormatSpec::file_package`](crate::FormatSpec::file_package)),
 /// which the caller's package selector decides on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum FilePackage {
@@ -342,10 +342,10 @@ pub struct Repository {
     /// format.
     pub inline: bool,
     /// The repository's settings of the format's own
-    /// ([`Descriptor::options`]), as [`FormatPlugin::check_option`] made
+    /// ([`Descriptor::options`]), as [`FormatSpec::check_option`] made
     /// them: `(name, value)`, the ones it sets only.
     ///
-    /// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
+    /// [`FormatSpec::check_option`]: crate::FormatSpec::check_option
     pub options: Vec<(String, String)>,
 }
 
@@ -375,14 +375,14 @@ pub struct Request {
     /// if-none-match, user-agent, and to an images format content-range.
     /// Never credentials or cookies.
     pub headers: Vec<(String, String)>,
-    /// The request body, once the plugin asked for it ([`Action::ReadBody`]);
+    /// The request body, once the format asked for it ([`Action::ReadBody`]);
     /// `None` before. A `Content-Encoding: gzip` body is inflated.
     pub body: Option<Vec<u8>>,
     /// Images formats: the image the request is for, as the host resolved
-    /// the name [`FormatPlugin::image_path`] split off the path; the path
+    /// the name [`FormatSpec::image_path`] split off the path; the path
     /// is then the endpoint. `None` for every other format.
     ///
-    /// [`FormatPlugin::image_path`]: crate::FormatPlugin::image_path
+    /// [`FormatSpec::image_path`]: crate::FormatSpec::image_path
     pub image: Option<ImageName>,
 }
 
@@ -568,7 +568,7 @@ pub struct SearchQuery {
 ///
 /// A file path is a list of segments joined by `/`, without a leading or
 /// trailing `/` (see [`crate::files`]). A directory is `""` (the root) or a
-/// path ending in `/`. The host refuses any other path a plugin names.
+/// path ending in `/`. The host refuses any other path a format names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryQuery {
     pub directory: String,
@@ -687,7 +687,7 @@ pub struct StoredFile {
     pub status: StoreStatus,
 }
 
-/// What a plugin can ask of the host: data, and in a files repository
+/// What a format can ask of the host: data, and in a files repository
 /// changes to its files. Package ids are canonical, versions normalized.
 /// Everything the caller may not read (package selectors, group members it
 /// cannot see) is left out, exactly as for an unknown package or file.
@@ -756,9 +756,9 @@ pub enum Query {
     /// A file of the repository's indexes (a format with
     /// [`Descriptor::indexes`]), answered as [`Query::File`] once the host
     /// has brought the indexes up to date with the repository's packages
-    /// and signing keys ([`FormatPlugin::index`]).
+    /// and signing keys ([`FormatSpec::index`]).
     ///
-    /// [`FormatPlugin::index`]: crate::FormatPlugin::index
+    /// [`FormatSpec::index`]: crate::FormatSpec::index
     Index(String),
     /// What an images format asks of the image store ([`crate::images`]).
     Image(ImageQuery),
@@ -836,9 +836,9 @@ pub struct PackageInfo {
     pub sha512: Option<String>,
     /// The package's size in bytes.
     pub size: Option<u64>,
-    /// What [`FormatPlugin::manifest_summary`] returned at publish.
+    /// What [`FormatSpec::manifest_summary`] returned at publish.
     ///
-    /// [`FormatPlugin::manifest_summary`]: crate::FormatPlugin::manifest_summary
+    /// [`FormatSpec::manifest_summary`]: crate::FormatSpec::manifest_summary
     pub summary: Option<String>,
     /// Why the version should not be used any more, when it was deprecated
     /// ([`Change::Deprecate`]).
@@ -910,13 +910,13 @@ pub enum Upload {
     FirstPart,
     /// The body is a document carrying the package (npm's publish: a JSON
     /// document with the tarball in base64): the host streams it through
-    /// [`FormatPlugin::unpack_upload`], parses the package with
-    /// [`FormatPlugin::parse_upload`] and, once it is stored, applies
-    /// [`FormatPlugin::published`]'s changes.
+    /// [`FormatSpec::unpack_upload`], parses the package with
+    /// [`FormatSpec::parse_upload`] and, once it is stored, applies
+    /// [`FormatSpec::published`]'s changes.
     ///
-    /// [`FormatPlugin::unpack_upload`]: crate::FormatPlugin::unpack_upload
-    /// [`FormatPlugin::parse_upload`]: crate::FormatPlugin::parse_upload
-    /// [`FormatPlugin::published`]: crate::FormatPlugin::published
+    /// [`FormatSpec::unpack_upload`]: crate::FormatSpec::unpack_upload
+    /// [`FormatSpec::parse_upload`]: crate::FormatSpec::parse_upload
+    /// [`FormatSpec::published`]: crate::FormatSpec::published
     Document,
 }
 
@@ -932,23 +932,23 @@ pub struct PublishRequest {
     pub done: Response,
 }
 
-/// What [`FormatPlugin::unpack_upload`] found in an [`Upload::Document`].
+/// What [`FormatSpec::unpack_upload`] found in an [`Upload::Document`].
 ///
-/// [`FormatPlugin::unpack_upload`]: crate::FormatPlugin::unpack_upload
+/// [`FormatSpec::unpack_upload`]: crate::FormatSpec::unpack_upload
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unpacked {
     /// A package, written out; `document` is the rest of the body, handed
-    /// to [`FormatPlugin::parse_upload`] and [`FormatPlugin::published`].
+    /// to [`FormatSpec::parse_upload`] and [`FormatSpec::published`].
     ///
-    /// [`FormatPlugin::parse_upload`]: crate::FormatPlugin::parse_upload
-    /// [`FormatPlugin::published`]: crate::FormatPlugin::published
+    /// [`FormatSpec::parse_upload`]: crate::FormatSpec::parse_upload
+    /// [`FormatSpec::published`]: crate::FormatSpec::published
     Package { document: Vec<u8> },
     /// No package: the body is a document of another kind (npm's
     /// deprecations and dist-tag edits are the same request). The host
-    /// drops what was staged and asks [`FormatPlugin::handle`] again, with
+    /// drops what was staged and asks [`FormatSpec::handle`] again, with
     /// the body as [`Request::body`].
     ///
-    /// [`FormatPlugin::handle`]: crate::FormatPlugin::handle
+    /// [`FormatSpec::handle`]: crate::FormatSpec::handle
     Document(Vec<u8>),
 }
 
@@ -957,7 +957,7 @@ pub enum Unpacked {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyUse {
     /// A login's ([`AuthRequest::Password`], [`AuthRequest::StartWebLogin`]):
-    /// read for any caller, at most 64 KiB, and what the plugin answers then
+    /// read for any caller, at most 64 KiB, and what the format answers then
     /// must be [`Action::Auth`].
     Login,
     /// A query sent as a body (npm's audits): the caller needs read.
@@ -967,7 +967,7 @@ pub enum BodyUse {
     Change,
 }
 
-/// A request whose body the plugin needs to decide what it is.
+/// A request whose body the format needs to decide what it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyRequest {
     /// The largest body accepted: a larger one is answered 413. The host
@@ -976,9 +976,9 @@ pub struct BodyRequest {
     pub used_for: BodyUse,
 }
 
-/// A package [`FormatPlugin::unpack_upload`] wrote, with what came with it.
+/// A package [`FormatSpec::unpack_upload`] wrote, with what came with it.
 ///
-/// [`FormatPlugin::unpack_upload`]: crate::FormatPlugin::unpack_upload
+/// [`FormatSpec::unpack_upload`]: crate::FormatSpec::unpack_upload
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Uploaded<'a> {
     /// The rest of the document ([`Unpacked::Package`]).
@@ -1025,10 +1025,10 @@ pub struct ChangeSet {
 
 /// What only the host can do about who the caller is: log a client in,
 /// out, or tell it who it is. Its outcome comes back through
-/// [`FormatPlugin::auth_response`]; refusals the host answers itself (401,
+/// [`FormatSpec::auth_response`]; refusals the host answers itself (401,
 /// 429, 503).
 ///
-/// [`FormatPlugin::auth_response`]: crate::FormatPlugin::auth_response
+/// [`FormatSpec::auth_response`]: crate::FormatSpec::auth_response
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthRequest {
     /// Sign in with a password; the outcome is a new API token
@@ -1074,9 +1074,9 @@ pub enum AuthOutcome {
 /// or of a group's first proxy member the caller may read: npm's audits.
 /// The upstream's status, content type and body are the response. A hosted
 /// repository has no upstream: 404. Through a group, the host sends the body
-/// [`FormatPlugin::forward_body`] leaves of it.
+/// [`FormatSpec::forward_body`] leaves of it.
 ///
-/// [`FormatPlugin::forward_body`]: crate::FormatPlugin::forward_body
+/// [`FormatSpec::forward_body`]: crate::FormatSpec::forward_body
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forward {
     /// The path below the upstream's `remote_url`, starting with `/`
@@ -1095,11 +1095,11 @@ pub struct ChangeRequest {
     pub done: Response,
 }
 
-/// What a request is ([`FormatPlugin::handle`]), or what to do once the data
-/// it asked for is loaded ([`FormatPlugin::render`]).
+/// What a request is ([`FormatSpec::handle`]), or what to do once the data
+/// it asked for is loaded ([`FormatSpec::render`]).
 ///
-/// [`FormatPlugin::handle`]: crate::FormatPlugin::handle
-/// [`FormatPlugin::render`]: crate::FormatPlugin::render
+/// [`FormatSpec::handle`]: crate::FormatSpec::handle
+/// [`FormatSpec::render`]: crate::FormatSpec::render
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Answer with this response.
@@ -1146,15 +1146,15 @@ pub enum Action {
     ServeManifest { image: String, reference: Reference },
 }
 
-/// The upstream a proxy repository mirrors ([`FormatPlugin::upstream`]).
+/// The upstream a proxy repository mirrors ([`FormatSpec::upstream`]).
 ///
-/// [`FormatPlugin::upstream`]: crate::FormatPlugin::upstream
+/// [`FormatSpec::upstream`]: crate::FormatSpec::upstream
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
     /// The upstream's URL as the repository is configured with it.
     pub url: String,
     /// What [`UpstreamOp::Index`] answered for it (a JSON object of the
-    /// plugin's own making); `None` while the index is being resolved.
+    /// format's own making); `None` while the index is being resolved.
     pub index: Option<String>,
     /// The proxy repository's options ([`Repository::options`]).
     pub options: Vec<(String, String)>,
@@ -1260,16 +1260,16 @@ pub enum Freshness {
     Immutable,
 }
 
-/// A GET the plugin asks the host to send to the upstream.
+/// A GET the format asks the host to send to the upstream.
 ///
 /// The host sends it only where the upstream points: to the origin (scheme,
 /// host and port) of [`Remote::url`], or to an origin that an absolute
 /// `http`/`https` URL names in a document the host fetched for the same
 /// operation (in an earlier round), or while resolving [`UpstreamOp::Index`].
-/// What the plugin answers names no origin, its index included. A fetch
+/// What the format answers names no origin, its index included. A fetch
 /// anywhere else is not sent, and comes back [`Fetched::Failed`]. So a
 /// NuGet service index may put its resources on other hosts, and a Helm
-/// index its charts, but a plugin reaches no host its upstream does not
+/// index its charts, but a format reaches no host its upstream does not
 /// point at. A host the upstream's documents name is reachable, though,
 /// whatever names it (a project URL in a package's metadata included).
 ///
@@ -1347,10 +1347,10 @@ pub struct VersionMetadata {
     /// When the version was created upstream, RFC 3339 ([`UpstreamOp::Dating`]
     /// only): the package delay of a version first seen now counts from it.
     pub created: Option<String>,
-    /// A manifest summary (as [`FormatPlugin::manifest_summary`] returns
+    /// A manifest summary (as [`FormatSpec::manifest_summary`] returns
     /// one) for a version the proxy has not downloaded yet.
     ///
-    /// [`FormatPlugin::manifest_summary`]: crate::FormatPlugin::manifest_summary
+    /// [`FormatSpec::manifest_summary`]: crate::FormatSpec::manifest_summary
     pub summary: Option<String>,
     /// The SHA-512 of the version's package, base64, where the upstream's
     /// metadata lists it: an import verifies the package against it, and
@@ -1404,7 +1404,7 @@ pub struct UpstreamSearch {
 pub enum UpstreamAnswer {
     /// The answer to [`UpstreamOp::Index`]: a JSON object. The host keeps
     /// its own fields beside it, so the keys `remote_url` and
-    /// `named_origins` are not the plugin's: an index using them is refused
+    /// `named_origins` are not the format's: an index using them is refused
     /// like one that is not an object.
     Index(String),
     /// `None`: the upstream does not know the package.
@@ -1426,7 +1426,7 @@ pub enum UpstreamAnswer {
     /// The file's URL, on an origin a [`Fetch`] may reach; `None`: the
     /// upstream cannot have the path.
     File(Option<String>),
-    /// [`UpstreamAnswer::File`] with what the plugin knows of the file.
+    /// [`UpstreamAnswer::File`] with what the format knows of the file.
     FileAt(FileLocation),
     /// The answer to [`UpstreamOp::ImageName`].
     ImageName(String),
@@ -1447,9 +1447,9 @@ pub enum UpstreamAnswer {
 }
 
 /// A file's size and SHA-256 as another file of the upstream lists it
-/// ([`FormatPlugin::file_listed`]: an index file in apt's `Release`).
+/// ([`FormatSpec::file_listed`]: an index file in apt's `Release`).
 ///
-/// [`FormatPlugin::file_listed`]: crate::FormatPlugin::file_listed
+/// [`FormatSpec::file_listed`]: crate::FormatSpec::file_listed
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedFile {
     pub size: u64,
@@ -1458,13 +1458,13 @@ pub struct ListedFile {
 }
 
 /// Where an upstream keeps a file ([`UpstreamAnswer::FileAt`]), and what the
-/// plugin knows of it.
+/// format knows of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileLocation {
     /// On an origin a [`Fetch`] may reach.
     pub url: String,
     /// The file never changes at its path (a package, a content-addressed
-    /// copy): the host keeps its copy without re-validating it. A plugin
+    /// copy): the host keeps its copy without re-validating it. A format
     /// sets it only with a digest below that the content must match, so
     /// what is kept is the file the upstream's index (or the path) names.
     pub immutable: bool,
@@ -1483,7 +1483,7 @@ pub struct FileLocation {
 }
 
 impl FileLocation {
-    /// A file at `url` the plugin knows nothing more of.
+    /// A file at `url` the format knows nothing more of.
     pub fn at(url: impl Into<String>) -> Self {
         FileLocation {
             url: url.into(),
@@ -1502,9 +1502,9 @@ impl FileLocation {
     }
 }
 
-/// What a repository's indexes are made of ([`FormatPlugin::index`]).
+/// What a repository's indexes are made of ([`FormatSpec::index`]).
 ///
-/// [`FormatPlugin::index`]: crate::FormatPlugin::index
+/// [`FormatSpec::index`]: crate::FormatSpec::index
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexInput {
     /// Every listed version the repository holds (a group's: of its
@@ -1530,9 +1530,9 @@ pub struct IndexedPackage {
     /// Normalized.
     pub version: String,
     pub version_original: String,
-    /// What [`FormatPlugin::manifest_summary`] returned at publish.
+    /// What [`FormatSpec::manifest_summary`] returned at publish.
     ///
-    /// [`FormatPlugin::manifest_summary`]: crate::FormatPlugin::manifest_summary
+    /// [`FormatSpec::manifest_summary`]: crate::FormatSpec::manifest_summary
     pub summary: Option<String>,
     /// The package's size in bytes.
     pub size: u64,
@@ -1578,9 +1578,9 @@ pub enum SignatureKind {
     Detached,
 }
 
-/// What a round of [`FormatPlugin::upstream`] produced.
+/// What a round of [`FormatSpec::upstream`] produced.
 ///
-/// [`FormatPlugin::upstream`]: crate::FormatPlugin::upstream
+/// [`FormatSpec::upstream`]: crate::FormatSpec::upstream
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamStep {
     /// Fetch these, then call `upstream` again with everything fetched so
@@ -1591,10 +1591,10 @@ pub enum UpstreamStep {
 
 /// A bound on the distinct values of one string field of the stored
 /// summaries of a hosted repository's versions
-/// ([`FormatPlugin::summary_caps`]): apt's components, each of which adds
+/// ([`FormatSpec::summary_caps`]): apt's components, each of which adds
 /// its indexes to the repository's.
 ///
-/// [`FormatPlugin::summary_caps`]: crate::FormatPlugin::summary_caps
+/// [`FormatSpec::summary_caps`]: crate::FormatSpec::summary_caps
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SummaryCap {
     /// The field of the summary's JSON object (`component`).

@@ -23,7 +23,7 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 
-use forge_plugin_api::{
+use forge_format_api::{
     FormatError, IndexFile, IndexInput, IndexedPackage, SignatureKind, SignedCopy,
 };
 use sha2::{Digest, Sha256};

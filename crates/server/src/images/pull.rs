@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, ManifestRow};
-use forge_plugin::api::images::{BlobInfo, ManifestInfo, Reference, TagPage, MAX_MANIFEST_BYTES};
+use forge_format_api::images::{BlobInfo, ManifestInfo, Reference, TagPage, MAX_MANIFEST_BYTES};
 use forge_storage::BlobRef;
 use futures_util::future::BoxFuture;
 

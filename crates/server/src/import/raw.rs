@@ -27,7 +27,7 @@
 use chrono::{DateTime, Utc};
 use forge_core::net::upstream::{Origin, RequestClass, SpooledBody, UpstreamAuth, UpstreamHttp};
 use forge_crypto::{ExposeSecret, PlaintextSecret};
-use forge_plugin::api::files;
+use forge_format_api::files;
 use reqwest::StatusCode;
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};

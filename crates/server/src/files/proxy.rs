@@ -2,8 +2,8 @@
 //! first request, cached content-addressed, and re-validated against the
 //! upstream once they are older than the repository's `max_age_seconds`.
 //!
-//! * The format's plugin names the upstream URL of a path (its upstream
-//!   side's `file` operation; raw's is `<remote_url>/<path>`, each segment
+//! * The format names the upstream URL of a path (its upstream side's
+//!   `file` operation; raw's is `<remote_url>/<path>`, each segment
 //!   percent-encoded), on an origin the upstream points at. Redirects are
 //!   followed (GitHub release assets redirect to
 //!   `objects.githubusercontent.com`), every hop through the upstream
@@ -21,7 +21,7 @@
 //!   instance.
 //! * A file the format publishes together with others that list it (apt's
 //!   indexes, which a distribution's `InRelease` lists with their sizes and
-//!   digests: `FormatPlugin::file_releases`) is served consistent with the
+//!   digests: `FormatSpec::file_releases`) is served consistent with the
 //!   first of those the proxy holds, the one clients read: it is due too
 //!   once one of them was replaced after it was last checked, and when the
 //!   one served lists it as another file and was checked after it. When
@@ -42,8 +42,8 @@ use forge_core::repo::proxy::{
 use forge_db::model::Repository;
 use forge_db::oci_dao;
 use forge_db::raw_dao::{self, NewRawFile, RawFile, Redeploy};
-use forge_plugin::api::{FileLocation, ListedFile};
-use forge_plugin::FormatPlugin;
+use forge_format_api::FormatSpec;
+use forge_format_api::{FileLocation, ListedFile};
 use forge_storage::BlobRef;
 use forge_telemetry::proxy::{Kind as LookupKind, Lookup, Outcome};
 use futures_util::TryStreamExt;
@@ -137,7 +137,7 @@ impl Files<'_> {
             .map_err(|e| FileError::Internal(format!("proxy credentials: {e}")))
     }
 
-    /// Where the upstream keeps `path`, as the format's plugin names it;
+    /// Where the upstream keeps `path`, as the format names it;
     /// `None` when the upstream cannot have it.
     async fn upstream_location(
         &self,
@@ -411,16 +411,16 @@ impl Files<'_> {
     }
 
     /// The release files of `file` the proxy holds, and what the first of
-    /// them lists for it ([`FormatPlugin::file_releases`]).
+    /// them lists for it ([`FormatSpec::file_releases`]).
     async fn releases(&self, repo: &Repository, file: &RawFile) -> Releases {
         let none = Releases {
             held: Vec::new(),
             listed: None,
         };
-        let Some(plugin) = self.state.formats.plugin(&repo.format) else {
+        let Some(spec) = self.state.formats.spec(&repo.format) else {
             return none;
         };
-        let paths = plugin.file_releases(&file.path);
+        let paths = spec.file_releases(&file.path);
         if paths.is_empty() {
             return none;
         }
@@ -435,7 +435,7 @@ impl Files<'_> {
             }
         }
         let listed = match held.first() {
-            Some(release) => Box::pin(self.listed(repo, &plugin, release, &file.path)).await,
+            Some(release) => Box::pin(self.listed(repo, &spec, release, &file.path)).await,
             None => None,
         };
         Releases { held, listed }
@@ -445,7 +445,7 @@ impl Files<'_> {
     async fn listed(
         &self,
         repo: &Repository,
-        plugin: &Arc<dyn FormatPlugin>,
+        spec: &Arc<dyn FormatSpec>,
         release: &RawFile,
         path: &str,
     ) -> Option<ListedFile> {
@@ -465,7 +465,7 @@ impl Files<'_> {
                 &key,
                 Duration::from_secs(3600),
                 || {
-                    let (store, plugin) = (self.state.blob_store.clone(), plugin.clone());
+                    let (store, spec) = (self.state.blob_store.clone(), spec.clone());
                     let (blob_sha256, s3_key) = (release.blob_sha256.clone(), release.s3_key.clone());
                     let (release_path, path) = (release.path.clone(), path.to_string());
                     let repo = repo.name.clone();
@@ -483,7 +483,7 @@ impl Files<'_> {
                                     tracing::warn!(%repo, path = %release_path, %error, "file proxy: a release file could not be read");
                                 })?;
                                 tokio::task::spawn_blocking(move || {
-                                    plugin
+                                    spec
                                         .file_listed(&release_path, &bytes, &path)
                                         .map(|listed| (listed.size, listed.sha256))
                                 })
@@ -632,7 +632,7 @@ impl Files<'_> {
 }
 
 /// The files a cached file is published together with
-/// ([`FormatPlugin::file_releases`]), as the proxy holds them.
+/// ([`FormatSpec::file_releases`]), as the proxy holds them.
 struct Releases {
     /// The ones cached, the one clients read first first.
     held: Vec<RawFile>,

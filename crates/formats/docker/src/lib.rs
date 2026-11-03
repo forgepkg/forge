@@ -1,5 +1,5 @@
-//! Docker / OCI registries for Forge, as a format plugin: the
-//! distribution-spec v1.1 API under `/v2`, over the host's image store.
+//! Docker / OCI registries for Forge, as a format: the distribution-spec
+//! v1.1 API under `/v2`, over the host's image store.
 //!
 //! * [`path`], [`digest`], [`reference`](mod@reference): the protocol's paths and the
 //!   grammar of its names, references and digests;
@@ -12,7 +12,7 @@
 //! * [`upstream`]: the URLs of an upstream registry, and its tag lists and
 //!   referrers.
 //!
-//! Forge links this plugin in ([`Docker`], [`DESCRIPTOR`]). The host keeps
+//! Forge links this crate in ([`Docker`], [`DESCRIPTOR`]). The host keeps
 //! everything else: the image store (blobs and manifests by digest, tags,
 //! upload sessions, groups, proxies' caching, garbage collection), the
 //! token service at `/v2/token`, resolving a `<name>` (by path,
@@ -28,12 +28,12 @@ mod protocol;
 pub mod reference;
 pub mod upstream;
 
-use forge_plugin_api::images::{
+use forge_format_api::images::{
     ArtifactFiles, BlobInfo, ConfigBlob, ImageError, ImagePath, ManifestBlob, ParsedManifest,
     Permission, TextFile,
 };
-use forge_plugin_api::{
-    Action, Assets, Descriptor, FetchResult, FormatError, FormatPlugin, Loaded, PackageSource,
+use forge_format_api::{
+    Action, Assets, Descriptor, FetchResult, FormatError, FormatSpec, Loaded, PackageSource,
     Remote, Repository, RepositoryKind, Request, Response, Storage, UpstreamOp, UpstreamStep,
     UpstreamToken,
 };
@@ -60,7 +60,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // The host's image store answers an upstream's Bearer challenge itself.
     upstream_token: UpstreamToken::None,
     options: &[],
-    prereleases: forge_plugin_api::Prereleases::Dash,
+    prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
 };
 
@@ -68,7 +68,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Docker;
 
-impl FormatPlugin for Docker {
+impl FormatSpec for Docker {
     fn descriptor(&self) -> &'static Descriptor {
         &DESCRIPTOR
     }
@@ -179,7 +179,7 @@ fn permission(endpoint: &Endpoint, method: &str) -> Permission {
     }
 }
 
-/// A parsed manifest as the plugin contract carries it.
+/// A parsed manifest as the format contract carries it.
 fn contract(parsed: &manifest::ParsedManifest) -> ParsedManifest {
     ParsedManifest {
         media_type: parsed.media_type.clone(),

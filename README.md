@@ -43,11 +43,11 @@ token for a short-lived API key
 ([docs/trusted-publishing.md](docs/trusted-publishing.md), which also covers
 its limitations).
 A **retention** engine reaps cold versions and garbage-collects dereferenced
-blobs. Every format is a **format plugin**: a crate built into the server
-that speaks the format's protocol, while the server keeps all of the above
-the same for every format ([docs/format-plugins.md](docs/format-plugins.md)).
-The admin + browse UI is a **TanStack Router SPA** served by the same Rust
-process on a single origin — there is no Node server in production.
+blobs. Every format is a **format crate** built into the server: it speaks
+the format's protocol, while the server keeps all of the above the same for
+every format ([docs/format-plugins.md](docs/format-plugins.md)). The admin +
+browse UI is a **TanStack Router SPA** served by the same Rust process on a
+single origin — there is no Node server in production.
 
 ## Architecture
 
@@ -61,22 +61,21 @@ A Cargo workspace of small crates plus the web SPA:
 | `crypto` | `forge-crypto` | Secret encryption at rest: the envelope encryption of stored secrets (proxy passwords, realm secrets, signing keys) under a root key. |
 | `telemetry` | `forge-telemetry` | OpenTelemetry metrics and the `tracing` spans that become traces. |
 | `traffic` | `forge-traffic` | Traffic statistics: requests per repository and client network per day, kept as Parquet files in the object store. |
-| `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
-| `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
-| `plugin` | `forge-plugin` | The host side of format plugins: the adapter of a plugin to the repository machinery, and the checks of its descriptor. |
-| `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `apt`, `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
-| `server` | `forge-server` | Axum HTTP server: the format plugins' feeds under `/repository/{repo}` (except Docker at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
+| `core` | `forge-core` | Domain logic: repo dispatch, the formats' adapter to it (`SpecFormat`), auth chain, authz/RBAC, sessions, OIDC, retention. |
+| `format-api` | `forge-format-api` | The format contract: the `FormatSpec` trait every format implements, and its types. |
+| `formats/<id>` | `forge-format-*` | The formats, built into the server: `apt`, `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
+| `server` | `forge-server` | Axum HTTP server: the formats' feeds under `/repository/{repo}` (except Docker at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
 | `xtask` | — | The task runner (`cargo xtask …`); replaces Make/Just. |
 | `web/` | — | TanStack Router SPA (pnpm + Vite), built into `web/dist/`. |
 
-**Every format is a plugin in `crates/formats/`.** A format is a crate in
-`crates/formats/<id>/` implementing `FormatPlugin`, linked into the server.
-Docker / OCI is one too, an images format: the plugin speaks the protocol,
+**Every format is a crate in `crates/formats/`.** A format is a crate in
+`crates/formats/<id>/` implementing `FormatSpec`, linked into the server.
+Docker / OCI is one too, an images format: the crate speaks the protocol,
 and the server's image store (`crates/server/src/images`) keeps the
 images.
 
-**Single-origin serving.** `forge-server` serves every non-Docker format plugin
+**Single-origin serving.** `forge-server` serves every non-Docker format
 at `/repository/{repo}`, the Docker / OCI registry at `/v2`,
 the admin/browse APIs (`/admin`, `/browse`, `/auth`) and then serves the built SPA
 from `web/dist/` via a `ServeDir` SPA fallback. The browser talks to the API on
@@ -257,9 +256,9 @@ The guides below are also a site, with navigation and search:
   pipelines that cannot use workload identity: a read token and a release
   token of service accounts in GitLab's CI/CD variables, and how both
   methods run side by side.
-- **[Format plugins](./docs/format-plugins.md)** — how every format is
-  built: the `FormatPlugin` contract, what the server does for each format,
-  and adding a new one.
+- **[Format crates](./docs/format-plugins.md)** — how every format is built:
+  the `FormatSpec` contract, what the server does for each format, and
+  adding a new one.
 - **[Importing repositories](./docs/import.md)** — copy a hosted repository
   of Nexus, Artifactory, Verdaccio, a registry or another Forge (NuGet, npm,
   Docker, raw, apt) into Forge through the format's own protocol: dry run,

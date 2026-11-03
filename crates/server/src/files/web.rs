@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Json, Response};
 use forge_core::auth::principal::Principal;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{raw_dao, repository_dao};
-use forge_plugin::api::files;
+use forge_format_api::files;
 use serde::Deserialize;
 
 use super::store::{self, Content, Part, Upload, Via};

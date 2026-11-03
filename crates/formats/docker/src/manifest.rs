@@ -65,7 +65,7 @@ pub const EMPTY_JSON_DIGEST: &str =
 
 /// Largest manifest Forge accepts or proxies. The spec asks registries to
 /// accept at least 4 MiB.
-pub const MAX_MANIFEST_BYTES: usize = forge_plugin_api::images::MAX_MANIFEST_BYTES;
+pub const MAX_MANIFEST_BYTES: usize = forge_format_api::images::MAX_MANIFEST_BYTES;
 
 /// Config blobs larger than this are not read for the summary.
 pub const MAX_CONFIG_SUMMARY_BYTES: i64 = 1024 * 1024;

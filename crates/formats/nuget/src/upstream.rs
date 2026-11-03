@@ -1,5 +1,5 @@
 //! The upstream side of NuGet proxies: a NuGet V3 feed, read through the
-//! host ([`FormatPlugin::upstream`](forge_plugin_api::FormatPlugin::upstream)).
+//! host ([`FormatSpec::upstream`](forge_format_api::FormatSpec::upstream)).
 //!
 //! The upstream's index is its service index's resources: the flat
 //! container (`PackageBaseAddress`), the registration (`RegistrationsBaseUrl`,
@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use forge_plugin_api::{
+use forge_format_api::{
     Fetch, FetchResult, Fetched, FormatError, Freshness, PackageMetadata, PackageRef,
     PackageVersions, Remote, SearchQuery, UpstreamAnswer, UpstreamHit, UpstreamOp, UpstreamSearch,
     UpstreamStep, VersionMetadata,
@@ -109,7 +109,7 @@ fn with_trailing_slash(s: &str) -> String {
 }
 
 /// One step of the conversation for `op` ([`crate::Nuget`]'s
-/// `FormatPlugin::upstream`).
+/// `FormatSpec::upstream`).
 pub(crate) fn step(
     remote: &Remote,
     op: &UpstreamOp,
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn the_index_keeps_the_persisted_shape() {
         // What the host stored before the upstream protocol moved into the
-        // plugin reads back as the same resources.
+        // format crate reads back as the same resources.
         let resources = Resources {
             package_base_address: Some("https://up/flat/".into()),
             registrations_base_url: None,

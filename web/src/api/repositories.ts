@@ -237,7 +237,7 @@ export interface UpdateRepo {
 
 /**
  * A package format (`FormatView` of `GET /admin/formats`): apt, Docker / OCI,
- * NuGet, npm and raw, each as its plugin describes it.
+ * NuGet, npm and raw, each as its crate describes it.
  */
 export interface FormatView {
   /** The format id (`RepoView.format`). */

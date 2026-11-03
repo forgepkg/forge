@@ -2176,9 +2176,8 @@ dependencies = [
  "forge-cache",
  "forge-crypto",
  "forge-db",
+ "forge-format-api",
  "forge-format-nuget",
- "forge-plugin",
- "forge-plugin-api",
  "forge-storage",
  "forge-telemetry",
  "futures-util",
@@ -2294,12 +2293,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-format-api"
+version = "2.1.0"
+
+[[package]]
 name = "forge-format-apt"
 version = "2.1.0"
 dependencies = [
  "chrono",
  "flate2",
- "forge-plugin-api",
+ "forge-format-api",
  "hex",
  "lzma-rust2",
  "ruzstd",
@@ -2315,7 +2318,7 @@ name = "forge-format-docker"
 version = "2.1.0"
 dependencies = [
  "flate2",
- "forge-plugin-api",
+ "forge-format-api",
  "hex",
  "serde",
  "serde_json",
@@ -2331,7 +2334,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "flate2",
- "forge-plugin-api",
+ "forge-format-api",
  "hex",
  "semver",
  "serde",
@@ -2347,7 +2350,7 @@ version = "2.1.0"
 dependencies = [
  "crc32fast",
  "flate2",
- "forge-plugin-api",
+ "forge-format-api",
  "quick-xml",
  "serde",
  "serde_json",
@@ -2360,27 +2363,13 @@ name = "forge-format-raw"
 version = "2.1.0"
 dependencies = [
  "base64 0.23.1",
- "forge-plugin-api",
+ "forge-format-api",
  "httpdate",
  "percent-encoding",
  "serde",
  "serde_json",
  "url",
 ]
-
-[[package]]
-name = "forge-plugin"
-version = "2.1.0"
-dependencies = [
- "forge-core",
- "forge-plugin-api",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "forge-plugin-api"
-version = "2.1.0"
 
 [[package]]
 name = "forge-server"
@@ -2401,12 +2390,12 @@ dependencies = [
  "forge-core",
  "forge-crypto",
  "forge-db",
+ "forge-format-api",
  "forge-format-apt",
  "forge-format-docker",
  "forge-format-npm",
  "forge-format-nuget",
  "forge-format-raw",
- "forge-plugin",
  "forge-storage",
  "forge-telemetry",
  "forge-traffic",

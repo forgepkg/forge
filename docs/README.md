@@ -50,8 +50,8 @@ its [quickstart](../README.md#quickstart);
 - **[Raw file repositories](raw.md)**: files under arbitrary paths: logins, uploads
   with curl, ranges and checksum sidecars, listings, and proxies of release
   downloads.
-- **[Format plugins](format-plugins.md)**: how every format is built: the
-  `FormatPlugin` contract, what the server does for each format, and adding
+- **[Format crates](format-plugins.md)**: how every format is built: the
+  `FormatSpec` contract, what the server does for each format, and adding
   a new one.
 
 ## CI and publishing

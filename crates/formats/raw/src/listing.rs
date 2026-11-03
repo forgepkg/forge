@@ -5,11 +5,11 @@
 //! the entry named by `after`, in byte order of their names, a
 //! subdirectory's name ending in `/`; `next` (and a `Link: rel="next"`
 //! header) names where the following page starts. The host walks its file
-//! store for the page ([`forge_plugin_api::Query::Directory`]): package
+//! store for the page ([`forge_format_api::Query::Directory`]): package
 //! selectors, group members and a proxy's cache are its business.
 
-use forge_plugin_api::files;
-use forge_plugin_api::{Action, Answer, DirectoryEntry, Loaded, Repository, Request, Response};
+use forge_format_api::files;
+use forge_format_api::{Action, Answer, DirectoryEntry, Loaded, Repository, Request, Response};
 use serde::Serialize;
 
 /// Largest page size.
@@ -343,7 +343,7 @@ pub fn http_date(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_plugin_api::RepositoryKind;
+    use forge_format_api::RepositoryKind;
 
     fn repo() -> Repository {
         Repository {
@@ -437,7 +437,7 @@ mod tests {
                 Entry::of("", &DirectoryEntry::Directory("d/".into())),
                 Entry::of(
                     "",
-                    &DirectoryEntry::File(forge_plugin_api::FileInfo {
+                    &DirectoryEntry::File(forge_format_api::FileInfo {
                         path: "f.txt".into(),
                         size: 3,
                         content_type: "text/plain".into(),

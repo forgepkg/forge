@@ -3,7 +3,7 @@
 //! Both registered algorithms of the image spec are supported, `sha256` and
 //! `sha512`: the host hashes everything it stores with both, and verifies
 //! content against either. Any other algorithm is refused as unsupported.
-//! A digest crosses the plugin contract in the canonical form [`Digest`]
+//! A digest crosses the format contract in the canonical form [`Digest`]
 //! keeps.
 
 use std::fmt;
@@ -92,7 +92,7 @@ impl Digest {
         &self.0
     }
 
-    /// The canonical text, as the plugin contract carries digests.
+    /// The canonical text, as the format contract carries digests.
     pub fn into_string(self) -> String {
         self.0
     }

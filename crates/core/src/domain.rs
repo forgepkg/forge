@@ -76,8 +76,8 @@ pub enum FormatError {
     Io(#[from] std::io::Error),
 }
 
-/// The text of [`FormatError::InvalidVersion`]: a format plugin's reason
-/// names the version itself, so it comes without the value.
+/// The text of [`FormatError::InvalidVersion`]: a format's reason names the
+/// version itself, so it comes without the value.
 fn invalid_version(value: &str, reason: &str) -> String {
     if value.is_empty() {
         format!("invalid version: {reason}")

@@ -1,12 +1,12 @@
 //! What a format's [`Descriptor`] may say: a well-formed id that no other
 //! format and none of the server's names takes, its repository kinds once
-//! each, plain asset names and content types. A test over the server's built-in formats
-//! (`plugins::builtin`) checks them, so a bad descriptor fails `cargo test`.
+//! each, plain asset names and content types. A test over the server's
+//! formats (`formats::builtin`) checks them, so a bad descriptor fails
+//! `cargo test`.
 
-use forge_plugin_api::{Assets, Descriptor, OptionInput, Storage};
+use forge_format_api::{Assets, Descriptor, OptionInput, Storage};
 
-/// Format ids a plugin can never take: names the server routes or
-/// reserves.
+/// Ids a format can never take: names the server routes or reserves.
 const RESERVED_IDS: &[&str] = &["v2", "admin", "browse", "auth", "repository"];
 
 /// Check the descriptors of the formats one server holds: each on its own
@@ -151,7 +151,7 @@ fn validate_assets(assets: &Assets) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use forge_plugin_api::{RepositoryKind, Storage, UpstreamToken};
+    use forge_format_api::{RepositoryKind, Storage, UpstreamToken};
 
     use super::*;
 
@@ -164,7 +164,7 @@ mod tests {
         assets: Assets::DEFAULT,
         upstream_token: UpstreamToken::None,
         options: &[],
-        prereleases: forge_plugin_api::Prereleases::Dash,
+        prereleases: forge_format_api::Prereleases::Dash,
         indexes: false,
     };
 
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn checks_options_and_indexes() {
-        use forge_plugin_api::FormatOption;
+        use forge_format_api::FormatOption;
         const OPTION: FormatOption = FormatOption {
             name: "distribution",
             label: "Distribution",

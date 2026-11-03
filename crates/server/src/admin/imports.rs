@@ -49,7 +49,7 @@ use forge_core::repo::proxy::Credentials;
 use forge_db::import_dao::{self, NewImport, RepositoryImport};
 use forge_db::model::{DeploymentPolicy, RepoKind, Repository};
 use forge_db::{repository_dao, secret_dao};
-use forge_plugin::api::files;
+use forge_format_api::files;
 use serde::{Deserialize, Serialize};
 
 use super::db_error;

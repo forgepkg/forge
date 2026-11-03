@@ -1,7 +1,7 @@
-//! npm registries for Forge, as a built-in format plugin: what npm, pnpm,
-//! Yarn and Bun read and write under `/repository/<repository>/`.
+//! npm registries for Forge, as a format: what npm, pnpm, Yarn and Bun read
+//! and write under `/repository/<repository>/`.
 //!
-//! [`Npm`] implements [`FormatPlugin`]: the rules of package names and
+//! [`Npm`] implements [`FormatSpec`]: the rules of package names and
 //! versions, reading a tarball, and the registry protocol
 //! ([`protocol`]): packuments (full and abbreviated), versions, tarballs,
 //! search, publishing (the tarball comes inside a JSON document,
@@ -32,11 +32,11 @@ pub mod version;
 use std::cmp::Ordering;
 use std::io::{Read, SeekFrom, Write};
 
-use forge_plugin_api::{
+use forge_format_api::{
     Action, Assets, AuthOutcome, Change, Dependency, DependencyGroup, Descriptor, FetchResult,
-    FormatError, FormatOption, FormatPlugin, Forward, Loaded, OptionInput, PackageRef,
-    PackageSource, ParsedPackage, Remote, Repository, RepositoryKind, Request, Response, Storage,
-    Unpacked, Uploaded, UpstreamOp, UpstreamStep, UpstreamToken,
+    FormatError, FormatOption, FormatSpec, Forward, Loaded, OptionInput, PackageRef, PackageSource,
+    ParsedPackage, Remote, Repository, RepositoryKind, Request, Response, Storage, Unpacked,
+    Uploaded, UpstreamOp, UpstreamStep, UpstreamToken,
 };
 use serde_json::Value;
 
@@ -55,7 +55,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     description: "npm registries: publish, install and log in with npm, pnpm, Yarn and Bun; \
                   dist-tags, deprecations and audits; proxies of registry.npmjs.org and other \
                   registries.",
-    // Proxies mirror another registry through the plugin's upstream side.
+    // Proxies mirror another registry through the format's upstream side.
     kinds: &[
         RepositoryKind::Hosted,
         RepositoryKind::Proxy,
@@ -82,11 +82,11 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
         example: "",
         input: OptionInput::Switch,
     }],
-    prereleases: forge_plugin_api::Prereleases::Dash,
+    prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
 };
 
-/// What the plugin reads of a request, beyond the package the repository's
+/// What the format reads of a request, beyond the package the repository's
 /// upload limit bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NpmLimits {
@@ -106,7 +106,7 @@ impl Default for NpmLimits {
     }
 }
 
-/// The npm format plugin.
+/// The npm format.
 ///
 /// Package ids are names as npm writes them (`left-pad`, `@acme/ui`), case
 /// and all: the registry keeps names that differ only in case apart
@@ -151,7 +151,7 @@ fn dependency_groups(manifest: &serde_json::Map<String, Value>) -> Vec<Dependenc
         .collect()
 }
 
-impl FormatPlugin for Npm {
+impl FormatSpec for Npm {
     fn descriptor(&self) -> &'static Descriptor {
         &DESCRIPTOR
     }

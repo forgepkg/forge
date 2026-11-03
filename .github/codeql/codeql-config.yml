@@ -15,8 +15,7 @@ paths-ignore:
   # instead, as a release build compiles it.
   - "**/tests"
   - crates/e2e
-  - crates/plugin/src/testing.rs
-  - crates/plugin-api/src/testing.rs
+  - crates/format-api/src/testing.rs
   # The web UI: unit tests next to the code, the Playwright suite with its
   # mock upstream, and the test runners' configuration.
   - "**/*.test.ts"

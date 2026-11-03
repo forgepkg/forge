@@ -10,11 +10,11 @@
 //!   archive's pool is `pool/updates/main/…`, which proxies serve;
 //! * `key.asc` and `key.gpg`, the repository's signing keys (hosted).
 //!
-//! Request paths are parsed with [`forge_plugin_api::files`]: a path that
+//! Request paths are parsed with [`forge_format_api::files`]: a path that
 //! needs normalizing (`..`, `//`, an encoded `/`, a backslash) is refused,
 //! never resolved. A pool path with a `;` names no pool file.
 
-use forge_plugin_api::files::{self, PathError};
+use forge_format_api::files::{self, PathError};
 
 use crate::control::{valid_architecture, valid_component, valid_package_name};
 use crate::version;

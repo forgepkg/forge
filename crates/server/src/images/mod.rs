@@ -4,7 +4,7 @@
 //! owns the client protocol under `/v2`; this module is everything else:
 //!
 //! * [`dispatch`]: the `/v2` request, routed and authorized here, then a
-//!   conversation with the format ([`forge_plugin::api::images`]): the
+//!   conversation with the format ([`forge_format_api::images`]): the
 //!   site (by path, or a repository's own host, `config.host`), the caller
 //!   (registry Bearer tokens), RBAC, package selectors and token scopes on
 //!   the image, where a change lands (a group's writable member), the
@@ -45,8 +45,8 @@ use forge_core::authz::PackageFilter;
 use forge_core::net::upstream::UpstreamHttp;
 use forge_core::repo::PublishPolicy;
 use forge_db::model::Repository;
-use forge_plugin::api::images::ImageError;
-use forge_plugin::FormatPlugin;
+use forge_format_api::images::ImageError;
+use forge_format_api::FormatSpec;
 use forge_storage::{BlobStore, Cas};
 use sqlx::PgPool;
 
@@ -128,7 +128,7 @@ pub(crate) struct Inner {
     pub recorder: Option<Arc<dyn PublishRecorder>>,
     pub workloads: Option<Arc<dyn WorkloadCheck>>,
     /// The images format: the protocol.
-    pub plugin: Arc<dyn FormatPlugin>,
+    pub spec: Arc<dyn FormatSpec>,
 }
 
 /// Parts the registry is built from.
@@ -144,7 +144,7 @@ pub struct RegistryParts {
     pub keys: TokenKeys,
     pub recorder: Option<Arc<dyn PublishRecorder>>,
     pub workloads: Option<Arc<dyn WorkloadCheck>>,
-    pub plugin: Arc<dyn FormatPlugin>,
+    pub spec: Arc<dyn FormatSpec>,
 }
 
 impl Registry {
@@ -162,7 +162,7 @@ impl Registry {
                 keys: parts.keys,
                 recorder: parts.recorder,
                 workloads: parts.workloads,
-                plugin: parts.plugin,
+                spec: parts.spec,
             }),
         }
     }
@@ -172,13 +172,13 @@ impl Registry {
     }
 
     /// The images format.
-    pub(crate) fn plugin(&self) -> &dyn FormatPlugin {
-        self.inner.plugin.as_ref()
+    pub(crate) fn spec(&self) -> &dyn FormatSpec {
+        self.inner.spec.as_ref()
     }
 
     /// The images format's id: `repository.format` of its repositories.
     pub(crate) fn format(&self) -> &'static str {
-        self.inner.plugin.descriptor().id
+        self.inner.spec.descriptor().id
     }
 
     /// Whether `repo` is a repository of the images format.
@@ -188,7 +188,7 @@ impl Registry {
 }
 
 /// What went wrong serving an image request: what the format answers
-/// ([`ImageError`], [`FormatPlugin::image_error`]), the headers the host
+/// ([`ImageError`], [`FormatSpec::image_error`]), the headers the host
 /// adds to it (a Bearer challenge), and what to tell an administrator (an
 /// import's report, the log).
 #[derive(Debug, Clone)]

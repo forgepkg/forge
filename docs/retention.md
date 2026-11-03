@@ -293,7 +293,7 @@ package and evicts any other one nobody pulled for 30 days.
 Versions are ordered by the repository's format, never as text: NuGet orders
 `1.10.0` after `1.9.0` and a prerelease before its release. Two retention
 hooks of the format contract
-([format plugins](format-plugins.md#retention)) say the rest:
+([format crates](format-plugins.md#retention)) say the rest:
 
 - **The version class**: release, prerelease or snapshot. `release_type`
   filters on it, and `prerelease_superseded_for_days` deletes what is not a

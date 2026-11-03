@@ -63,7 +63,7 @@ use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::{RegistrationEntry, SearchParams};
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{component_dao, proxy_dao, repository_dao};
-use forge_plugin::api::Storage;
+use forge_format_api::Storage;
 use serde::{Deserialize, Serialize};
 
 use crate::admin::db_error;
@@ -102,7 +102,7 @@ pub struct BrowseRepo {
     /// repository is listed, but its packages answer 503 like its feed; an
     /// offline proxy still shows what it cached.
     pub online: bool,
-    /// Repository format (`nuget`, `docker`, or a plugin format's id): docker repositories are
+    /// Repository format (`nuget`, `docker`, or another format's id): docker repositories are
     /// browsed through `/browse/images`.
     pub format: String,
     /// The address clients use for the repository (`{public_base_url}/repository/{name}`),
@@ -132,7 +132,7 @@ pub struct BrowseRepo {
 /// Query parameters for `GET /browse/repos`.
 #[derive(Debug, Deserialize)]
 pub struct ReposQuery {
-    /// Only repositories of this format (`nuget`, `docker`, a plugin
+    /// Only repositories of this format (`nuget`, `docker`, another
     /// format's id).
     #[serde(default)]
     pub format: Option<String>,
@@ -179,9 +179,9 @@ pub async fn list_repos(
                 format: repo.format.clone(),
                 url: state
                     .formats
-                    .plugin(&repo.format)
-                    .filter(|plugin| plugin.descriptor().storage != Storage::Images)
-                    .map(|_| crate::plugins::repository_url(&state, &repo.name)),
+                    .spec(&repo.format)
+                    .filter(|spec| spec.descriptor().storage != Storage::Images)
+                    .map(|_| crate::formats::repository_url(&state, &repo.name)),
                 registry,
                 pull_prefix,
                 storage: state.storage(&repo.format).as_str(),

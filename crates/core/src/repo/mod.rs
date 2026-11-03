@@ -2,7 +2,7 @@
 //!
 //! The [`hosted`], [`proxy`] and [`group`] read paths live in their submodules.
 //! The neutral DTOs in this module are the contract between the storage-backed
-//! implementations and the format plugins (served by the server's plugin
+//! implementations and the formats (served by the server's format
 //! dispatcher): they are format-agnostic and carry exactly what a feed needs
 //! to render its JSON responses, **plus** the raw
 //! manifest bytes so the format layer can extract dependency groups itself
@@ -75,9 +75,9 @@ pub enum RepoError {
     /// upstream or the proxy changes → 502.
     #[error("bad upstream: {0}")]
     BadUpstream(String),
-    /// The repository's format is not installed on this server (a format
-    /// plugin missing from the configuration) → 503: nothing of it is served
-    /// until the format is back, and it is never read as another format.
+    /// The repository's format is not one this server has (a format a
+    /// later build no longer links) → 503: nothing of it is served until the
+    /// format is back, and it is never read as another format.
     #[error("format {0:?} is not installed")]
     FormatUnavailable(String),
 }
@@ -571,7 +571,7 @@ pub trait RepoReadOps: Send + Sync {
 
     /// [`Self::registration`] with every version's publish time, even where
     /// that costs more: a proxy asks its upstream with
-    /// [`forge_plugin_api::UpstreamOp::Dating`] (npm: the full packument,
+    /// [`forge_format_api::UpstreamOp::Dating`] (npm: the full packument,
     /// not the abbreviated one installs read). The default is
     /// [`Self::registration`], whose times hosted repositories know.
     async fn dated_registration(

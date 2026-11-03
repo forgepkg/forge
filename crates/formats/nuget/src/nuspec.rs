@@ -12,7 +12,7 @@
 
 use std::io::{BufReader, Read, SeekFrom};
 
-use forge_plugin_api::PackageSource as ReadSeek;
+use forge_format_api::PackageSource as ReadSeek;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 

@@ -1,5 +1,5 @@
-//! NuGet's publish endpoints end to end, now that the NuGet plugin
-//! (`crates/formats/nuget`) routes them and the host's plugin dispatcher
+//! NuGet's publish endpoints end to end, now that the NuGet format
+//! (`crates/formats/nuget`) routes them and the host's format dispatcher
 //! streams the upload: multipart framing, the upload limit, unlist and
 //! relist, and the answers for a method a path does not take.
 

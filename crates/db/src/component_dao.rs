@@ -579,7 +579,7 @@ where
 /// summaries of `repository_id`'s versions, leaving out version `name`
 /// `version` (one a redeploy replaces): whether `value` is among them, and
 /// how many there are. A publish checks a format's caps on them
-/// (`forge_plugin_api::SummaryCap`).
+/// (`forge_format_api::SummaryCap`).
 pub async fn summary_values<'e, E>(
     executor: E,
     repository_id: i64,

@@ -37,10 +37,9 @@ use forge_db::repository_dao::{self, NewRepository};
 use forge_db::user_dao::{self, NewUser};
 use sqlx::PgPool;
 
-/// NuGet, the built-in format plugin, as the `Format` the repository code
-/// works with.
-fn nuget() -> forge_plugin::PluginFormat {
-    forge_plugin::PluginFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
+/// The NuGet format, as the `Format` the repository code works with.
+fn nuget() -> forge_core::format::SpecFormat {
+    forge_core::format::SpecFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
 }
 
 /// In-memory blob byte store: maps `s3_key -> bytes`.

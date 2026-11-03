@@ -1,5 +1,5 @@
-//! The npm registry protocol as the plugin speaks it, driven through
-//! `forge_plugin_api::testing::serve` against an in-memory repository: the
+//! The npm registry protocol as the format speaks it, driven through
+//! `forge_format_api::testing::serve` against an in-memory repository: the
 //! packuments (abbreviated for installs, full with publish times and the
 //! README), the host actions it asks for (downloads, publishes, changes,
 //! logins, forwards), the bodies it reads first, and its errors. What the
@@ -8,13 +8,12 @@
 
 use std::collections::HashMap;
 
-use forge_format_npm::Npm;
-use forge_plugin_api::testing::{serve, serve_with_body, Served};
-use forge_plugin_api::{
-    Action, Answer, AuthOutcome, AuthRequest, BodyUse, Change, FormatPlugin, PackageInfo,
-    PackageRef, Query, Repository, RepositoryKind, Request, SearchHit, SearchResult, Tag, Upload,
-    VersionInfo,
+use forge_format_api::testing::{serve, serve_with_body, Served};
+use forge_format_api::{
+    Action, Answer, AuthOutcome, AuthRequest, BodyUse, Change, FormatSpec, PackageInfo, PackageRef,
+    Query, Repository, RepositoryKind, Request, SearchHit, SearchResult, Tag, Upload, VersionInfo,
 };
+use forge_format_npm::Npm;
 use serde_json::{json, Value};
 
 const BASE: &str = "https://forge.example.com/repository/main";
@@ -35,7 +34,7 @@ fn hosted() -> Repository {
     repo(RepositoryKind::Hosted)
 }
 
-/// An in-memory repository answering the plugin's queries as the host does.
+/// An in-memory repository answering the format's queries as the host does.
 #[derive(Default, Clone)]
 struct MockRepo {
     packages: HashMap<String, Vec<PackageInfo>>,
@@ -560,7 +559,7 @@ fn audits_go_upstream_without_internal_names() {
     };
     assert_eq!(forward.path, "/-/npm/v1/security/advisories/bulk");
     assert_eq!(forward.body, body);
-    // Through a group, the host sends what the plugin leaves of the body.
+    // Through a group, the host sends what the format leaves of the body.
     let hidden = |name: &str| name.starts_with("@acme/");
     let sent = Npm::default().forward_body(&forward, &hidden).unwrap();
     let sent: Value = serde_json::from_slice(&sent).unwrap();

@@ -305,7 +305,7 @@ describe('admin repositories', () => {
     expect(posted).not.toHaveProperty('remote_url')
   })
 
-  it('creates a repository of a format plugin', async () => {
+  it('creates a repository of another format', async () => {
     let posted: unknown = null
     mockApi({
       repositories: [],
@@ -481,7 +481,7 @@ describe('admin repositories', () => {
     )
   })
 
-  it('edit loads a plugin format name and shared feed prefix', async () => {
+  it('edit loads another format\'s name and shared feed prefix', async () => {
     mockApi({
       repositories: [repo({ format: 'helm' })],
       formats: [{

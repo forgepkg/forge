@@ -1,9 +1,8 @@
 //! The file store: the repositories of a format whose descriptor says
 //! `Storage::Files` (raw) hold files under paths, like Nexus' raw-hosted,
-//! raw-proxy and raw-group repositories. The format's plugin owns the
-//! protocol (`crates/formats/raw`, served under `/repository` by
-//! [`crate::plugins`]); this module answers the file queries and actions it
-//! asks for:
+//! raw-proxy and raw-group repositories. The format owns the protocol
+//! (`crates/formats/raw`, served under `/repository` by [`crate::formats`]);
+//! this module answers the file queries and actions it asks for:
 //!
 //! * `file` and `fetch-file`: [`Files::locate`] — the stored file; a proxy's
 //!   copy, re-validated with its upstream once it is due, or fetched from it
@@ -17,9 +16,9 @@
 //! The web UI's upload and delete and the admin API's directory delete are
 //! here too ([`web`]).
 //!
-//! Paths follow [`forge_plugin::api::files`]: `..`, `.`, empty segments,
+//! Paths follow [`forge_format_api::files`]: `..`, `.`, empty segments,
 //! backslashes and encoded slashes are refused, never resolved, and so is any
-//! other path a plugin names. Package selectors match paths (`pdfium/**`).
+//! other path a format names. Package selectors match paths (`pdfium/**`).
 //! Files are CAS blobs, so the same content under several paths or
 //! repositories is stored once (one `raw_file` row, one reference each).
 
@@ -37,7 +36,7 @@ use forge_core::auth::principal::Principal;
 use forge_core::authz::PackageFilter;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{raw_dao, repository_dao};
-use forge_plugin::api::FilePackage;
+use forge_format_api::FilePackage;
 
 use crate::dispatch::offline_serves_nothing;
 use crate::state::AppState;

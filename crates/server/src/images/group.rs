@@ -31,7 +31,7 @@ use forge_core::repo::group::member_scope;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
 
-use forge_plugin::api::images::{ManifestInfo, Reference, TagPage};
+use forge_format_api::images::{ManifestInfo, Reference, TagPage};
 
 use super::digest::ContentDigest;
 use super::dispatch::Caller;

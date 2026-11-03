@@ -29,11 +29,11 @@
 
 use std::io::{BufRead, BufReader, Read};
 
-use forge_plugin_api::{
+use forge_format_api::{
     Fetch, FetchResult, Fetched, FileLocation, Freshness, Remote, UpstreamAnswer, UpstreamStep,
 };
 
-use forge_plugin_api::ListedFile;
+use forge_format_api::ListedFile;
 
 use crate::import::{cleartext, Release};
 use crate::layout::{self, HashType, Target};
@@ -102,7 +102,7 @@ pub fn file(remote: &Remote, path: &str, fetched: &[FetchResult]) -> UpstreamSte
                 }
             }
         }
-        // The plugin asks for nothing else.
+        // The format asks for nothing else.
         _ => return UpstreamStep::Done(UpstreamAnswer::File(None)),
     }
     UpstreamStep::Done(UpstreamAnswer::FileAt(location))
@@ -518,7 +518,7 @@ mod tests {
             panic!()
         };
         assert!(!at.immutable);
-        // A package the plugin cannot place in an index.
+        // A package the format cannot place in an index.
         let UpstreamStep::Done(UpstreamAnswer::FileAt(at)) =
             file(&remote(), "pool/main/h/hello/README", &[])
         else {

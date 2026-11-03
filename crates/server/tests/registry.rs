@@ -4199,7 +4199,7 @@ async fn admin_validates_docker_repositories() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
-    // Nor a format-plugin repository: docker has its own mount.
+    // Nor another format's repository: docker has its own mount.
     let resp = srv
         .client()
         .get(format!("{}/repository/a{n}/index.yaml", srv.base_url))

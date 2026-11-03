@@ -508,7 +508,7 @@ async fn fetch(srv: &TestServer, repo: &str, path: &str) -> (u16, String, Vec<u8
         .get(format!(
             "{}/repository/{repo}/{}",
             srv.base_url,
-            forge_plugin::api::files::encode(path)
+            forge_format_api::files::encode(path)
         ))
         .basic_auth(u, Some(p))
         .send()
@@ -531,7 +531,7 @@ async fn put(srv: &TestServer, repo: &str, path: &str, bytes: &[u8]) {
         .put(format!(
             "{}/repository/{repo}/{}",
             srv.base_url,
-            forge_plugin::api::files::encode(path)
+            forge_format_api::files::encode(path)
         ))
         .basic_auth(u, Some(p))
         .body(bytes.to_vec())

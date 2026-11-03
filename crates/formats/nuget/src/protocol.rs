@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use forge_plugin_api::{
+use forge_format_api::{
     Action, Answer, ChangeRequest, Loaded, PackageInfo, PackageRef, PackageVersions,
     PublishRequest, Query, Repository, RepositoryKind, Request, Response, SearchQuery,
     SearchResult, Upload, VersionInfo,

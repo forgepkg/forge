@@ -5,10 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "npm registries for Forge, as a format plugin"
+description = "npm registries for Forge, a format crate built into the server"
 
 [dependencies]
-forge-plugin-api = { path = "../../plugin-api" }
+forge-format-api = { path = "../../format-api" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,4 +25,4 @@ tar = { version = "0.4", default-features = false }
 semver = "1"
 
 [dev-dependencies]
-forge-plugin-api = { path = "../../plugin-api", features = ["testing"] }
+forge-format-api = { path = "../../format-api", features = ["testing"] }

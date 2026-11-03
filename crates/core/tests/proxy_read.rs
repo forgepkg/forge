@@ -27,8 +27,8 @@
 //!   versions not downloaded yet, bounded page fetches, flat-view fallback.
 //! * **where requests go** — a format's fetches and package URLs reach the
 //!   `remote_url`'s origin and the origins the upstream's documents name,
-//!   nothing else (#233): a scripted format plays a plugin that wants to read
-//!   an internal service.
+//!   nothing else (#233): a scripted format plays one that wants to read an
+//!   internal service.
 
 mod common;
 
@@ -47,17 +47,16 @@ use forge_core::repo::proxy::ProxyRepo;
 use forge_core::repo::{RepoError, RepoReadOps};
 use forge_core::{Format, FormatError, ParsedUpload, ReadSeek};
 use forge_db::repository_dao::{self, NewRepository};
-use forge_plugin_api::{
+use forge_format_api::{
     Fetch, FetchResult, Fetched, Freshness, Remote, UpstreamAnswer, UpstreamOp, UpstreamStep,
 };
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-/// NuGet, the built-in format plugin, as the `Format` the repository code
-/// works with.
-fn nuget() -> forge_plugin::PluginFormat {
-    forge_plugin::PluginFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
+/// The NuGet format, as the `Format` the repository code works with.
+fn nuget() -> forge_core::format::SpecFormat {
+    forge_core::format::SpecFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
 }
 
 // ── Mock upstream NuGet V3 feed ─────────────────────────────────────────────
@@ -3834,10 +3833,10 @@ type Script = dyn Fn(&dyn Format, &Remote, &UpstreamOp, &[FetchResult]) -> Resul
     + Send
     + Sync;
 
-/// NuGet with a scripted upstream side: a format plugin that wants to read
-/// what Forge's network position reaches.
+/// NuGet with a scripted upstream side: a format that wants to read what
+/// Forge's network position reaches.
 struct Scripted {
-    nuget: forge_plugin::PluginFormat,
+    nuget: forge_core::format::SpecFormat,
     script: Box<Script>,
 }
 
@@ -3933,8 +3932,8 @@ async fn requests_to(server: &wiremock::MockServer) -> usize {
         .len()
 }
 
-/// #233: a format plugin's requests reach only the upstream's origin and the
-/// origins its documents name. A plugin asking for an internal service's URL
+/// #233: a format's requests reach only the upstream's origin and the
+/// origins its documents name. A format asking for an internal service's URL
 /// gets a failure, and nothing is sent; a package URL there is not
 /// downloaded.
 #[tokio::test]
@@ -4065,7 +4064,7 @@ async fn an_upstream_conversation_keeps_at_most_its_byte_budget() {
 }
 
 /// #233: a format's index is its own making, so a URL in it names no origin.
-/// A plugin cannot point its index at an internal service, nor write the
+/// A format cannot point its index at an internal service, nor write the
 /// origins the host records beside it.
 #[tokio::test]
 async fn a_formats_index_names_no_origin() {

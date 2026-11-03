@@ -319,8 +319,8 @@ impl RetentionWorker {
             .map_err(|e| WorkerError::Policy(format!("parse retention_policy: {e}")))?;
         validate_policy(&policy, kind)
             .map_err(|e| WorkerError::Policy(format!("invalid retention_policy: {e}")))?;
-        // A repository of a format that is not installed (a plugin removed
-        // from the configuration) cannot order its versions: fail the run
+        // A repository of a format this server does not have (one a later
+        // build no longer links) cannot order its versions: fail the run
         // without mutating anything until the format is back.
         let format = self.formats.resolve(&repo.format).ok_or_else(|| {
             WorkerError::Policy(format!("format {:?} is not installed", repo.format))

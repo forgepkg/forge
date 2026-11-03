@@ -34,10 +34,9 @@ use sqlx::PgPool;
 
 use common::{pool, unique};
 
-/// NuGet, the built-in format plugin, as the `Format` the repository code
-/// works with.
-fn nuget() -> forge_plugin::PluginFormat {
-    forge_plugin::PluginFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
+/// The NuGet format, as the `Format` the repository code works with.
+fn nuget() -> forge_core::format::SpecFormat {
+    forge_core::format::SpecFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
 }
 
 fn config() -> RetentionConfig {

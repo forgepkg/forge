@@ -5,10 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "apt (Debian/Ubuntu) repositories for Forge, as a format plugin"
+description = "apt (Debian/Ubuntu) repositories for Forge, a format crate built into the server"
 
 [dependencies]
-forge-plugin-api = { path = "../../plugin-api" }
+forge-format-api = { path = "../../format-api" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,4 +26,4 @@ lzma-rust2 = { version = "0.24", default-features = false, features = ["std", "e
 ruzstd = "0.9"
 
 [dev-dependencies]
-forge-plugin-api = { path = "../../plugin-api", features = ["testing"] }
+forge-format-api = { path = "../../format-api", features = ["testing"] }

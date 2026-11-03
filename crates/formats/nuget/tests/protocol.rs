@@ -1,5 +1,5 @@
-//! The NuGet V3 protocol as the plugin speaks it,
-//! driven through `forge_plugin_api::testing::serve` against an in-memory
+//! The NuGet V3 protocol as the format speaks it,
+//! driven through `forge_format_api::testing::serve` against an in-memory
 //! repository: the exact JSON shapes, absolute `@id`s, hosted-only
 //! `PackagePublish`, `GET` + `HEAD`, content types, lowercasing, 404s before
 //! any data is loaded, and the host actions it asks for. What the host does
@@ -8,12 +8,12 @@
 
 use std::collections::HashMap;
 
-use forge_format_nuget::Nuget;
-use forge_plugin_api::testing::{serve, Served};
-use forge_plugin_api::{
-    Action, Answer, FormatPlugin, PackageInfo, PackageRef, Query, Repository, RepositoryKind,
+use forge_format_api::testing::{serve, Served};
+use forge_format_api::{
+    Action, Answer, FormatSpec, PackageInfo, PackageRef, Query, Repository, RepositoryKind,
     Request, SearchHit, SearchResult, Upload, VersionInfo,
 };
+use forge_format_nuget::Nuget;
 use serde_json::{json, Value};
 
 const BASE: &str = "https://forge.example.com";
@@ -28,7 +28,7 @@ fn repo(kind: RepositoryKind) -> Repository {
     }
 }
 
-/// An in-memory repository answering the plugin's queries as the host does.
+/// An in-memory repository answering the format's queries as the host does.
 #[derive(Default, Clone)]
 struct MockRepo {
     /// lower id → versions (ascending).
@@ -133,7 +133,7 @@ fn version(id: &str, v: &str, listed: bool) -> VersionInfo {
 }
 
 /// A version's metadata as the host hands it over: the summary is what the
-/// plugin's `manifest_summary` made of its manifest.
+/// format's `manifest_summary` made of its manifest.
 fn package(id: &str, v: &str, nuspec: Option<&[u8]>) -> PackageInfo {
     PackageInfo {
         original_id: id.into(),

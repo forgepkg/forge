@@ -55,8 +55,9 @@ its pull request's description says why.
 A package format is a crate in `crates/formats/<id>/`, the directory named
 after its format id, linked into the server like `crates/formats/nuget`
 (Forge loads no WebAssembly plugins). Never add a format as a crate elsewhere
-under `crates/` (no `crates/format-<id>`) or as a module of the server: it
-implements `FormatPlugin` with the layout
+under `crates/` (no `crates/format-<id>`: `crates/format-api` is the contract
+the formats implement, not a format) or as a module of the server: it
+implements `FormatSpec` with the layout
 [crates/formats/README.md](crates/formats/README.md) describes. Docker / OCI
 (`crates/formats/docker`) is one too, an images format: it speaks the
 registry protocol, and the server's image store (`crates/server/src/images`)

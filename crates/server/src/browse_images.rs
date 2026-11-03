@@ -19,8 +19,8 @@
 //! * `GET /browse/chart?repo=<name>&image=<image>&digest=<manifest digest>`
 //!   → a Helm chart pushed as an artifact (`helm push`): its `Chart.yaml`
 //!   metadata, README and default values, read from the blobs Forge holds
-//!   with the format ([`FormatPlugin::parse_manifest`],
-//!   [`FormatPlugin::config_summary`], [`FormatPlugin::artifact_files`]).
+//!   with the format ([`FormatSpec::parse_manifest`],
+//!   [`FormatSpec::config_summary`], [`FormatSpec::artifact_files`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -33,8 +33,8 @@ use forge_core::auth::principal::Principal;
 use forge_core::authz::PackageFilter;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
-use forge_plugin::api::images::{ArtifactFiles, TextFile, MAX_FILES_BYTES, MAX_MANIFEST_BYTES};
-use forge_plugin::FormatPlugin;
+use forge_format_api::images::{ArtifactFiles, TextFile, MAX_FILES_BYTES, MAX_MANIFEST_BYTES};
+use forge_format_api::FormatSpec;
 use forge_storage::BlobRef;
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +50,7 @@ use crate::state::AppState;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// The summary key under which the format keeps a chart's metadata
-/// ([`FormatPlugin::config_summary`]).
+/// ([`FormatSpec::config_summary`]).
 const CHART_KEY: &str = "chart";
 
 /// Rows read at a time when visibility filtering or merging needs every image.
@@ -174,7 +174,7 @@ async fn readable_images_repo(
     state: &AppState,
     principal: &Principal,
     name: &str,
-) -> Result<(Repository, Arc<dyn FormatPlugin>), Response> {
+) -> Result<(Repository, Arc<dyn FormatSpec>), Response> {
     if !matches!(principal, Principal::User { .. }) {
         return Err((StatusCode::UNAUTHORIZED, "authentication required").into_response());
     }
@@ -194,10 +194,10 @@ async fn readable_images_repo(
     if offline_serves_nothing(&repo) {
         return Err(offline_response());
     }
-    let Some(plugin) = state.formats.plugin(&repo.format) else {
+    let Some(spec) = state.formats.spec(&repo.format) else {
         return Err((StatusCode::NOT_FOUND, "repository not found").into_response());
     };
-    Ok((repo, plugin))
+    Ok((repo, spec))
 }
 
 /// The repositories whose `image` the caller sees through `repo`, highest
