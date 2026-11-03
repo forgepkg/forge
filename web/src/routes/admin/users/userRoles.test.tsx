@@ -120,25 +120,36 @@ describe('admin user roles', () => {
       expect(within(form).getByRole('radio', { name: /^Writer/ })).toBeChecked(),
     )
 
-    // Writer → admin: the admin role first, then writer goes.
+    // Writer → admin: the admin role and the reader role next to it first
+    // (#812: a demotion by the identity provider leaves a reader), then
+    // writer goes.
     await u.click(within(form).getByRole('radio', { name: /^Admin/ }))
     await u.click(within(form).getByRole('button', { name: 'Change access' }))
     await waitFor(() =>
       expect(api.sent('DELETE', /^\/admin\/users\/2\/roles\/4$/)).toHaveLength(1),
     )
-    expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)[1]?.body).toEqual({ role_id: 1 })
+    expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/).map((r) => r.body)).toEqual([
+      { role_id: 4 },
+      { role_id: 1 },
+      { role_id: 3 },
+    ])
     expect(api.state.assignments).toContainEqual([2, 1])
+    expect(api.state.assignments).toContainEqual([2, 3])
     expect(api.state.assignments).not.toContainEqual([2, 4])
     // The custom role stays.
     expect(api.state.assignments).toContainEqual([2, 7])
+    await waitFor(() =>
+      expect(within(form).getByRole('radio', { name: /^Admin/ })).toBeChecked(),
+    )
 
-    // Admin → reader: the reader role first, then admin goes.
+    // Admin → reader: the reader role is held already, so only admin goes.
     await u.click(within(form).getByRole('radio', { name: /^Reader/ }))
     await u.click(within(form).getByRole('button', { name: 'Change access' }))
     await waitFor(() =>
       expect(api.sent('DELETE', /^\/admin\/users\/2\/roles\/1$/)).toHaveLength(1),
     )
-    expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)[2]?.body).toEqual({ role_id: 3 })
+    expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)).toHaveLength(3)
+    expect(api.sent('DELETE', /^\/admin\/users\/2\/roles\/3$/)).toHaveLength(0)
     expect(api.state.assignments).toContainEqual([2, 3])
 
     // Back to roles only takes the reader role and keeps the custom one.
@@ -149,6 +160,35 @@ describe('admin user roles', () => {
     )
     expect(api.sent('PUT', /^\/admin\/users\/2\/roles$/)).toHaveLength(3)
     expect(api.state.assignments).toContainEqual([2, 7])
+  })
+
+  it('keeps the reader role of a reader made an admin, and lists them as admin', async () => {
+    const u = userEvent.setup()
+    const router = await renderApp('/manage/users/6')
+
+    const form = await screen.findByRole('form', { name: 'Change access' })
+    await waitFor(() =>
+      expect(within(form).getByRole('radio', { name: /^Reader/ })).toBeChecked(),
+    )
+    await u.click(within(form).getByRole('radio', { name: /^Admin/ }))
+    await u.click(within(form).getByRole('button', { name: 'Change access' }))
+    await waitFor(() =>
+      expect(within(form).getByRole('radio', { name: /^Admin/ })).toBeChecked(),
+    )
+    expect(api.sent('PUT', /^\/admin\/users\/6\/roles$/).map((r) => r.body)).toEqual([
+      { role_id: 1 },
+    ])
+    expect(api.sent('DELETE', /^\/admin\/users\/6\/roles\//)).toHaveLength(0)
+    expect(api.state.assignments).toContainEqual([6, 1])
+    expect(api.state.assignments).toContainEqual([6, 3])
+
+    // The list shows the admin level alone: reader is not listed as another
+    // role.
+    await router.navigate({ to: '/manage/users' })
+    const row = (await screen.findByRole('link', { name: 'bob' })).closest('tr')!
+    const cells = within(row).getAllByRole('cell')
+    await waitFor(() => expect(cells[2]).toHaveTextContent('admin'))
+    expect(cells[3]).toHaveTextContent('—')
   })
 
   it('keeps the last administrator an admin, with the server’s reason', async () => {

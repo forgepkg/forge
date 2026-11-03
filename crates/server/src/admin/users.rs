@@ -22,7 +22,9 @@
 //! realm without `auto_provision` names only the accounts created here).
 //! `role` gives the account its built-in role: `reader` (the default; reads
 //! every repository), `writer` or `admin`, or `roles_only` for none, so that
-//! only the roles assigned to it later count. An account of a trusted-header
+//! only the roles assigned to it later count. An `admin` holds `reader` too,
+//! so that one whose identity provider or upstream takes `admin` away stays a
+//! reader (#812). An account of a trusted-header
 //! realm is never an administrator (**400**, #547): its headers never make it
 //! one.
 //!
@@ -693,7 +695,11 @@ pub(crate) fn trusted_header_admin_refused() -> Response {
 }
 
 /// Insert the user (with `email` as its address) and assign it `role`'s
-/// built-in role in the same transaction.
+/// built-in role in the same transaction. An administrator gets `reader` as
+/// well (#812): an identity provider or upstream that later takes `admin`
+/// away (`authz_dao::sync_admin_role`) removes that role alone, so they stay a
+/// reader, as the administrators migration 0013 found do. A service account
+/// never holds `admin` and gets no `reader` it was not asked for.
 async fn insert_with_role(
     state: &AppState,
     username: &str,
@@ -728,7 +734,12 @@ async fn insert_with_role(
                 .await?
         }
     };
-    if let Some(name) = role.role_name() {
+    let also_reader = role == AccessRole::Admin && !matches!(account, NewAccount::Service { .. });
+    let names = role
+        .role_name()
+        .into_iter()
+        .chain(also_reader.then_some(authz_dao::READER_ROLE));
+    for name in names {
         let role_id = authz_dao::role_id_by_name(&mut *tx, name)
             .await?
             .ok_or_else(|| sqlx::Error::Protocol(format!("the built-in {name} role is missing")))?;
