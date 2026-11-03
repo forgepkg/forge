@@ -89,7 +89,7 @@ pub struct RepoView {
     /// or `images` (Docker).
     pub storage: &'static str,
     /// The settings of its format's own (`GET /admin/formats` lists them):
-    /// apt's `distribution`.
+    /// apt's `distribution`, npm's `show_replace_registry_host`.
     pub options: BTreeMap<String, String>,
 }
 
@@ -1028,9 +1028,10 @@ async fn delay_overrides_for(
 }
 
 /// The settings of a format's own of a repository of `format` and `kind`
-/// (`config.options`): `given` checked by the format's plugin and merged into
-/// `existing` (a `None` value clears one), every option the kind requires
-/// set. Returns the options to store.
+/// (`config.options`): `given` checked by the format's plugin (a switch:
+/// `true` or `false`, which clears it) and merged into `existing` (a `None`
+/// value clears one), every option the kind requires set. Returns the
+/// options to store.
 #[allow(clippy::result_large_err)]
 fn format_options(
     state: &AppState,
@@ -1065,6 +1066,26 @@ fn format_options(
         match value {
             None => {
                 options.remove(&name);
+            }
+            // A switch is on (`true`) or off (not kept); its plugin is not asked.
+            Some(value) if option.input == forge_plugin::api::OptionInput::Switch => {
+                match value.trim() {
+                    forge_plugin::api::SWITCH_ON => {
+                        options.insert(
+                            name,
+                            serde_json::Value::String(forge_plugin::api::SWITCH_ON.into()),
+                        );
+                    }
+                    "false" => {
+                        options.remove(&name);
+                    }
+                    _ => {
+                        return Err(bad_request(format!(
+                            "{}: a switch is \"true\" or \"false\"",
+                            option.label
+                        )))
+                    }
+                }
             }
             Some(value) => {
                 let implementation = plugin.as_ref().map(|p| p.implementation().clone());

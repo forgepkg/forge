@@ -509,6 +509,19 @@ export function RepositoryForm({
     setValues((v) => ({ ...v, options: { ...v.options, [name]: value } }))
   }
 
+  function setKind(kind: RepoKind) {
+    // An option the new kind does not take (npm's switch of proxies and
+    // groups) is not sent: the server refuses it.
+    const takes = new Set(optionsFor(format, kind).map((o) => o.name))
+    setValues((v) => ({
+      ...v,
+      kind,
+      options: format.options
+        ? Object.fromEntries(Object.entries(v.options).filter(([name]) => takes.has(name)))
+        : v.options,
+    }))
+  }
+
   function setOverride(index: number, change: Partial<DelayOverrideDraft>) {
     setValues((v) => ({
       ...v,
@@ -631,7 +644,7 @@ export function RepositoryForm({
               <SelectField
                 label="Kind"
                 value={values.kind}
-                onChange={(e) => set('kind', e.target.value as RepoKind)}
+                onChange={(e) => setKind(e.target.value as RepoKind)}
                 description={kindHelp(values.kind, things)}
               >
                 {(['hosted', 'proxy', 'group'] as const)
@@ -654,20 +667,30 @@ export function RepositoryForm({
             )}
           </div>
 
-          {formatOptions.map((option) => (
-            <TextField
-              key={option.name}
-              label={option.label}
-              type="text"
-              mono
-              optional={!option.required}
-              placeholder={option.example}
-              value={values.options[option.name] ?? ''}
-              onChange={(e) => setOption(option.name, e.target.value)}
-              error={announced(errors[`option:${option.name}`])}
-              description={option.description}
-            />
-          ))}
+          {formatOptions.map((option) =>
+            option.input === 'switch' ? (
+              <Switch
+                key={option.name}
+                label={option.label}
+                checked={values.options[option.name] === 'true'}
+                onChange={(on) => setOption(option.name, on ? 'true' : '')}
+                description={option.description}
+              />
+            ) : (
+              <TextField
+                key={option.name}
+                label={option.label}
+                type="text"
+                mono
+                optional={!option.required}
+                placeholder={option.example}
+                value={values.options[option.name] ?? ''}
+                onChange={(e) => setOption(option.name, e.target.value)}
+                error={announced(errors[`option:${option.name}`])}
+                description={option.description}
+              />
+            ),
+          )}
 
           <Switch
             label="Online"

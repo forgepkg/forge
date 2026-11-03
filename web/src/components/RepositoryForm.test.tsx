@@ -1305,4 +1305,72 @@ describe('npm repositories', () => {
       writable_member: null,
     })
   })
+
+  // The server's npm format declares its replace-registry-host switch.
+  const npmWithSwitch: FormatView = {
+    ...NPM_FORMAT,
+    options: [
+      {
+        name: 'show_replace_registry_host',
+        label: "Show npm's replace-registry-host setting",
+        description: 'The Connect panel also offers npm config set replace-registry-host.',
+        kinds: ['proxy', 'group'],
+        required: false,
+        example: '',
+        input: 'switch',
+      },
+    ],
+  }
+
+  it('offers the replace-registry-host switch to proxies and groups, off by default', async () => {
+    const user = userEvent.setup()
+    const onSubmit = vi.fn()
+    render(
+      <RepositoryForm
+        mode="create"
+        formats={[NUGET_FORMAT, npmWithSwitch]}
+        submitting={false}
+        onSubmit={onSubmit}
+        onCancel={() => {}}
+      />,
+    )
+    const label = /replace-registry-host setting/
+    await user.selectOptions(screen.getByLabelText('Format'), 'npm')
+    // Hosted repositories do not take it.
+    expect(screen.queryByLabelText(label)).toBeNull()
+    await user.selectOptions(screen.getByLabelText('Kind'), 'group')
+    expect(screen.getByLabelText(label)).not.toBeChecked()
+    await user.click(screen.getByLabelText(label))
+    await user.type(screen.getByLabelText('Name'), 'npm-all')
+    await create(user)
+    expect(toCreateBody(lastValues(onSubmit))).toMatchObject({
+      kind: 'group',
+      options: { show_replace_registry_host: 'true' },
+    })
+
+    // Back to hosted, the switch is not sent: the server refuses it there.
+    await user.selectOptions(screen.getByLabelText('Kind'), 'hosted')
+    await create(user)
+    expect(toCreateBody(lastValues(onSubmit)).options).toBeUndefined()
+  })
+
+  it('on edit, sends the switch turned on as true and turned off as null', () => {
+    const group: RepoView = {
+      ...storedProxy,
+      name: 'npm-all',
+      format: 'npm',
+      kind: 'group',
+      remote_url: null,
+    }
+    const off = lastValuesOf(group)
+    expect(toUpdateBody(off, group)).toEqual({})
+    expect(
+      toUpdateBody({ ...off, options: { show_replace_registry_host: 'true' } }, group),
+    ).toEqual({ options: { show_replace_registry_host: 'true' } })
+
+    const on: RepoView = { ...group, options: { show_replace_registry_host: 'true' } }
+    expect(
+      toUpdateBody({ ...lastValuesOf(on), options: { show_replace_registry_host: '' } }, on),
+    ).toEqual({ options: { show_replace_registry_host: null } })
+  })
 })

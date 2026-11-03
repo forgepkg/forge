@@ -3,7 +3,7 @@
 //! each, plain asset names and content types. A test over the server's built-in formats
 //! (`plugins::builtin`) checks them, so a bad descriptor fails `cargo test`.
 
-use forge_plugin_api::{Assets, Descriptor, Storage};
+use forge_plugin_api::{Assets, Descriptor, OptionInput, Storage};
 
 /// Format ids a plugin can never take: names the server routes or
 /// reserves.
@@ -58,7 +58,8 @@ pub fn check_one(descriptor: &Descriptor) -> Result<(), String> {
 }
 
 /// Options have names of 1–32 lowercase letters, digits and `_` (starting
-/// with a letter), each once, and kinds the format serves.
+/// with a letter), each once, and kinds the format serves; a switch is not
+/// required.
 fn validate_options(descriptor: &Descriptor) -> Result<(), String> {
     for (i, option) in descriptor.options.iter().enumerate() {
         let name = option.name;
@@ -82,6 +83,11 @@ fn validate_options(descriptor: &Descriptor) -> Result<(), String> {
         }
         if option.label.trim().is_empty() {
             return Err(format!("option {name:?} needs a label"));
+        }
+        if option.required && option.input == OptionInput::Switch {
+            return Err(format!(
+                "option {name:?} is a switch, which is never required"
+            ));
         }
     }
     Ok(())
@@ -206,6 +212,7 @@ mod tests {
             kinds: &[RepositoryKind::Hosted],
             required: true,
             example: "bookworm",
+            input: OptionInput::Text,
         };
         let good = Descriptor {
             options: &[OPTION],
@@ -230,6 +237,10 @@ mod tests {
             }][..],
             &[FormatOption {
                 label: "",
+                ..OPTION
+            }][..],
+            &[FormatOption {
+                input: OptionInput::Switch,
                 ..OPTION
             }][..],
         ] {

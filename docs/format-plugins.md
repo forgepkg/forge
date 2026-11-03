@@ -412,12 +412,18 @@ descriptor. The host then keeps the indexes of its hosted repositories:
 
 A format's repositories may carry settings of its own (apt's
 `distribution`): the descriptor lists them (`options`: a name, a label, a
-description, the kinds that take one, whether it is required, an example),
-`GET /admin/formats` names them, and the web UI's repository form offers
-them. An administrator sets them in the admin API's `options` (`null` on an
-update clears one that is not required); the plugin checks and normalizes
-each value (`check_option`), and gets the repository's in
-`Repository::options` and a proxy's in `Remote::options`.
+description, the kinds that take one, whether it is required, an example,
+and the `input`), `GET /admin/formats` names them, and the web UI's
+repository form offers them. An administrator sets them in the admin API's
+`options` (`null` on an update clears one that is not required); the plugin
+checks and normalizes each value (`check_option`), and gets the
+repository's in `Repository::options` and a proxy's in `Remote::options`.
+
+An option's `input` is `OptionInput::Text`, a line of text, or
+`OptionInput::Switch`, which the form shows as a switch (npm's
+`show_replace_registry_host`). A switch is never required; the host takes
+`"true"` (kept as `SWITCH_ON`) or `"false"` (which clears it) without asking
+`check_option`.
 
 Which versions the host's search filter takes for prereleases is the
 descriptor's too (`prereleases`): those with a `-` in the normalized version

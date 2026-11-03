@@ -81,6 +81,19 @@ npmAlwaysAuth: true
 npmAuthToken: "<token>"
 ```
 
+A proxy or a group can also offer
+`npm config set replace-registry-host <package-lock.json-host>` there, for
+clients whose `package-lock.json` was written against another registry (npm
+rewrites `registry.npmjs.org` by itself). It is off by default: switch on
+**Show npm's replace-registry-host setting** in the repository's settings
+(**Admin → Repositories**), or set it through the admin API:
+
+```bash
+curl … -X PUT /admin/repositories/npm-all -d '{"options":{"show_replace_registry_host":"true"}}'
+```
+
+`"false"` switches it off again.
+
 The token is an API token: one `npm login` mints (below), or one you create
 under **Your tokens** in the web UI, which then shows these lines with the
 token filled in. An API token of yours works for every

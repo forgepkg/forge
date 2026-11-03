@@ -32,9 +32,10 @@ use std::cmp::Ordering;
 
 use forge_plugin_api::{
     Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FormatError, FormatOption,
-    FormatPlugin, IndexFile, IndexInput, Loaded, PackageRef, PackageSource, ParsedPackage,
-    Prereleases, PublishRequest, Query, Remote, Repository, RepositoryKind, Request, Response,
-    Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken, VersionClass,
+    FormatPlugin, IndexFile, IndexInput, Loaded, OptionInput, PackageRef, PackageSource,
+    ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository, RepositoryKind, Request,
+    Response, Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken,
+    VersionClass,
 };
 
 use crate::layout::{PoolPath, Target, KEY_ASC, KEY_GPG};
@@ -68,6 +69,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
         kinds: &[RepositoryKind::Hosted, RepositoryKind::Proxy],
         required: true,
         example: "bookworm",
+        input: OptionInput::Text,
     }],
     // A `-` starts the Debian revision (`1.0-1`), it marks no prerelease.
     prereleases: Prereleases::None,

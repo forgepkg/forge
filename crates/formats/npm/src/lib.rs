@@ -34,13 +34,19 @@ use std::io::{Read, SeekFrom, Write};
 
 use forge_plugin_api::{
     Action, Assets, AuthOutcome, Change, Dependency, DependencyGroup, Descriptor, FetchResult,
-    FormatError, FormatPlugin, Forward, Loaded, PackageRef, PackageSource, ParsedPackage, Remote,
-    Repository, RepositoryKind, Request, Response, Storage, Unpacked, Uploaded, UpstreamOp,
-    UpstreamStep, UpstreamToken,
+    FormatError, FormatOption, FormatPlugin, Forward, Loaded, OptionInput, PackageRef,
+    PackageSource, ParsedPackage, Remote, Repository, RepositoryKind, Request, Response, Storage,
+    Unpacked, Uploaded, UpstreamOp, UpstreamStep, UpstreamToken,
 };
 use serde_json::Value;
 
 pub use name::PackageName;
+
+/// The switch that has the web UI's Connect panel of a proxy or a group
+/// show `npm config set replace-registry-host`, for clients whose
+/// `package-lock.json` was written against another registry. Nothing else
+/// reads it.
+pub const SHOW_REPLACE_REGISTRY_HOST: &str = "show_replace_registry_host";
 
 /// What npm says about itself: its format id, name and version.
 pub const DESCRIPTOR: Descriptor = Descriptor {
@@ -66,7 +72,17 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
     // A proxy given only a password (a registry token) sends it as a Bearer
     // token, as npm clients do with `_authToken`.
     upstream_token: UpstreamToken::Bearer,
-    options: &[],
+    options: &[FormatOption {
+        name: SHOW_REPLACE_REGISTRY_HOST,
+        label: "Show npm's replace-registry-host setting",
+        description: "The Connect panel also offers npm config set replace-registry-host, for \
+                      clients whose package-lock.json was written against another registry \
+                      (npm rewrites registry.npmjs.org by itself).",
+        kinds: &[RepositoryKind::Proxy, RepositoryKind::Group],
+        required: false,
+        example: "",
+        input: OptionInput::Switch,
+    }],
     prereleases: forge_plugin_api::Prereleases::Dash,
     indexes: false,
 };

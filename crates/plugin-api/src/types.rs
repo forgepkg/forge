@@ -187,8 +187,8 @@ pub enum Prereleases {
 /// A setting of the format's own that a repository carries
 /// ([`Descriptor::options`]): a line of text an administrator sets when
 /// creating or editing the repository, checked by
-/// [`FormatPlugin::check_option`] and handed to the plugin with every
-/// request ([`Repository::options`]).
+/// [`FormatPlugin::check_option`], or a switch ([`OptionInput::Switch`]);
+/// handed to the plugin with every request ([`Repository::options`]).
 ///
 /// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +205,37 @@ pub struct FormatOption {
     pub required: bool,
     /// An example value, for forms.
     pub example: &'static str,
+    /// How a form takes it: a line of text, or a switch.
+    pub input: OptionInput,
+}
+
+/// How an administrator sets a format option ([`FormatOption::input`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OptionInput {
+    /// A line of text, checked by [`FormatPlugin::check_option`].
+    ///
+    /// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
+    #[default]
+    Text,
+    /// On or off: forms show a switch. The host keeps [`SWITCH_ON`] when it
+    /// is on and nothing when it is off, and asks no
+    /// [`FormatPlugin::check_option`]. A switch is never required.
+    ///
+    /// [`FormatPlugin::check_option`]: crate::FormatPlugin::check_option
+    Switch,
+}
+
+/// The value of a switch option that is on ([`OptionInput::Switch`]).
+pub const SWITCH_ON: &str = "true";
+
+impl OptionInput {
+    /// Its name in the admin API (`GET /admin/formats`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OptionInput::Text => "text",
+            OptionInput::Switch => "switch",
+        }
+    }
 }
 
 /// What a proxy given a password and no username sends its upstream

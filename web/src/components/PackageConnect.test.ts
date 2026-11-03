@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { aptAuth, aptSource, connectSnippets, npmrc, yarnrc } from './PackageConnect'
+import {
+  SHOW_REPLACE_REGISTRY_HOST,
+  aptAuth,
+  aptSource,
+  connectSnippets,
+  npmrc,
+  yarnrc,
+} from './PackageConnect'
 
 describe('connectSnippets', () => {
   it('gives a format without commands of its own its URL', () => {
@@ -27,13 +34,29 @@ describe('connectSnippets', () => {
     expect(snippets.map((s) => s.command)).toEqual([
       'npm config set registry https://f.example/repository/npm-all/',
       'npm config set @<scope>:registry https://f.example/repository/npm-all/',
-      'npm config set replace-registry-host <package-lock.json-host>',
       'npm login --registry https://f.example/repository/npm-all/',
     ])
     expect(
       connectSnippets('npm', 'npm-hosted', 'https://f.example/repository/npm-hosted', true).at(-1)
         ?.command,
     ).toBe('npm publish --registry https://f.example/repository/npm-hosted/')
+  })
+
+  it("offers replace-registry-host only where the repository's switch is on", () => {
+    const commands = (options: Record<string, string>) =>
+      connectSnippets('npm', 'npm-all', 'https://f.example/repository/npm-all', false, {
+        kind: 'group',
+        options,
+      }).map((s) => s.command)
+    expect(commands({})).not.toContain(
+      'npm config set replace-registry-host <package-lock.json-host>',
+    )
+    expect(commands({ [SHOW_REPLACE_REGISTRY_HOST]: 'true' })).toEqual([
+      'npm config set registry https://f.example/repository/npm-all/',
+      'npm config set @<scope>:registry https://f.example/repository/npm-all/',
+      'npm config set replace-registry-host <package-lock.json-host>',
+      'npm login --registry https://f.example/repository/npm-all/',
+    ])
   })
 })
 

@@ -2189,3 +2189,81 @@ async fn routes_only_npm_repositories() {
     assert!(npm_format.get("mount").is_none());
     assert_eq!(npm_format["kinds"], json!(["hosted", "proxy", "group"]));
 }
+
+#[tokio::test]
+async fn proxies_and_groups_switch_the_replace_registry_host_command_on() {
+    let srv = common::start().await;
+    const SWITCH: &str = "show_replace_registry_host";
+    // Off unless switched on: a group without it has no options.
+    let group = format!("npmall{}", unique());
+    let repo = create(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "npm"}),
+    )
+    .await;
+    assert_eq!(repo["options"], json!({}));
+
+    // Switched on: kept as "true", whatever the spacing.
+    let on = format!("npmon{}", unique());
+    let repo = create(
+        &srv,
+        json!({"name": on, "kind": "group", "format": "npm", "options": {SWITCH: " true "}}),
+    )
+    .await;
+    assert_eq!(repo["options"], json!({SWITCH: "true"}));
+
+    // Hosted repositories do not take it, and a switch is true or false.
+    let hosted = format!("npmhosted{}", unique());
+    let resp = admin(
+        &srv,
+        reqwest::Method::POST,
+        "/admin/repositories",
+        json!({"name": hosted, "kind": "hosted", "format": "npm", "options": {SWITCH: "true"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(resp.text().await.unwrap().contains("not valid for hosted"));
+    let resp = admin(
+        &srv,
+        reqwest::Method::PUT,
+        &format!("/admin/repositories/{group}"),
+        json!({"options": {SWITCH: "yes"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // An update switches it on, "false" or null off again.
+    for (value, options) in [
+        (json!("true"), json!({SWITCH: "true"})),
+        (json!("false"), json!({})),
+        (json!("true"), json!({SWITCH: "true"})),
+        (Value::Null, json!({})),
+    ] {
+        let resp = admin(
+            &srv,
+            reqwest::Method::PUT,
+            &format!("/admin/repositories/{group}"),
+            json!({"options": {SWITCH: value}}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let repo: Value = resp.json().await.unwrap();
+        assert_eq!(repo["options"], options, "{value}");
+    }
+
+    // The formats listing names it a switch of proxies and groups.
+    let formats: Value = admin(&srv, reqwest::Method::GET, "/admin/formats", json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let npm_format = formats
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "npm")
+        .expect("npm listed");
+    assert_eq!(npm_format["options"][0]["name"], SWITCH);
+    assert_eq!(npm_format["options"][0]["input"], "switch");
+    assert_eq!(npm_format["options"][0]["kinds"], json!(["proxy", "group"]));
+}

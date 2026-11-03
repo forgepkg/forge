@@ -271,6 +271,11 @@ export interface FormatOption {
   required: boolean
   /** An example value, for the form's placeholder. */
   example: string
+  /**
+   * How the form takes it: a line of `text` (the default), or a `switch`,
+   * whose value is `"true"` when it is on and absent when it is off.
+   */
+  input?: 'text' | 'switch'
 }
 
 /** The options of `format` a repository of `kind` takes. */
