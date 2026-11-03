@@ -5,8 +5,9 @@
 //! an image, a tag, a username or a path; a request joins the trace its
 //! `traceparent` names, with the proxy lookup, the upstream request (which
 //! carries the trace on) and the S3 operations beneath it; no span holds the
-//! secrets of an npm web login; and a log record written while handling a
-//! request carries its trace. Requires Docker
+//! secrets of an npm web login; health probes export no span, nor does
+//! what they do, under a sampler that samples every span; and a log record
+//! written while handling a request carries its trace. Requires Docker
 //! (Postgres + versitygw via the shared harness), or
 //! `FORGE_TEST_DATABASE_URL` / `FORGE_TEST_S3_ENDPOINT`.
 //!
@@ -32,7 +33,7 @@ use opentelemetry::KeyValue;
 use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
-use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
+use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use sha2::Digest as _;
@@ -68,7 +69,11 @@ fn export() -> &'static Export {
         let telemetry = Telemetry::from_providers(
             Some(meter.clone()),
             Some(
+                // Every span sampled, whatever its parent
+                // (`OTEL_TRACES_SAMPLER=always_on`): nothing is left out
+                // only because a parent-based sampler would drop it.
                 SdkTracerProvider::builder()
+                    .with_sampler(Sampler::AlwaysOn)
                     .with_simple_exporter(spans.clone())
                     .build(),
             ),
@@ -916,6 +921,77 @@ async fn a_request_joins_the_callers_trace_down_to_the_upstream_and_s3() {
         })
         .count();
     assert_eq!(probes, 0);
+}
+
+/// Under a sampler that samples every span (`always_on`), `/healthz` and
+/// `/readyz` still export no span, nor do the readiness check's S3 call
+/// beneath them, with or without the caller's trace; an ordinary request
+/// still does.
+#[tokio::test]
+async fn health_probes_export_no_span_whatever_the_sampler() {
+    let srv = start().await;
+    let is_probe = |s: &SpanData| {
+        s.name == "health probe"
+            || attribute(s, "url.path").is_some_and(|p| p == "/healthz" || p == "/readyz")
+    };
+    let head_buckets = || {
+        export()
+            .spans
+            .get_finished_spans()
+            .unwrap()
+            .iter()
+            .filter(|s| s.name == "S3.HeadBucket")
+            .count()
+    };
+    // No server starts (and checks its bucket) while they are counted.
+    let no_starts = STARTS.write().await;
+    let before = head_buckets();
+    let (probe_parent, trace, _) = traceparent();
+    for probe in ["healthz", "readyz"] {
+        for traced in [false, true] {
+            let mut req = srv.client().get(format!("{}/{probe}", srv.base_url));
+            if traced {
+                req = req.header("traceparent", &probe_parent);
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200, "/{probe}");
+            resp.bytes().await.unwrap();
+        }
+    }
+
+    // An ordinary request after them, whose span ends after theirs.
+    let (ordinary, ordinary_trace, _) = traceparent();
+    let resp = srv
+        .client()
+        .get(format!("{}/browse/repos", srv.base_url))
+        .header("traceparent", &ordinary)
+        .send()
+        .await
+        .unwrap();
+    resp.bytes().await.unwrap();
+    let server = eventually("the ordinary request's span", || {
+        spans_of(ordinary_trace)
+            .into_iter()
+            .find(|s| s.span_kind == SpanKind::Server)
+    })
+    .await;
+    assert_eq!(
+        attribute(&server, "url.path").as_deref(),
+        Some("/browse/repos")
+    );
+
+    // The readiness checks' S3 calls made no span.
+    assert_eq!(head_buckets(), before);
+    drop(no_starts);
+    assert!(spans_of(trace).is_empty(), "{:#?}", spans_of(trace));
+    let probes: Vec<SpanData> = export()
+        .spans
+        .get_finished_spans()
+        .unwrap()
+        .into_iter()
+        .filter(|s| is_probe(s))
+        .collect();
+    assert!(probes.is_empty(), "{probes:#?}");
 }
 
 /// An npm web login's secrets travel in paths: the login's page and the API
