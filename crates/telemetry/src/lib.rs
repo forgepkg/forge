@@ -160,7 +160,6 @@ struct Instruments {
     worker_runs: Counter<u64>,
     worker_duration: Histogram<f64>,
     worker_last_success: Gauge<f64>,
-    worker_interval: Gauge<f64>,
     worker_restarts: Counter<u64>,
     retention_runs: Counter<u64>,
     retention_versions: Counter<u64>,
@@ -303,11 +302,6 @@ pub fn init(meter: &Meter) {
             .with_unit("s")
             .with_description("Unix time of a background worker's last successful pass")
             .build(),
-        worker_interval: meter
-            .f64_gauge("forge.worker.interval")
-            .with_unit("s")
-            .with_description("How often a background worker runs a pass")
-            .build(),
         worker_restarts: counter(
             "forge.worker.restarts",
             "{restart}",
@@ -359,6 +353,7 @@ pub fn init(meter: &Meter) {
     };
     live::register(meter);
     storage::register_outbox(meter);
+    workers::register(meter);
     inventory::register(meter);
     let _ = INSTRUMENTS.set(instruments);
 }
@@ -905,6 +900,7 @@ pub mod db {
 
 /// The background workers.
 pub mod workers {
+    use std::collections::BTreeMap;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -917,14 +913,34 @@ pub mod workers {
         }
     }
 
-    /// Record that worker `worker` runs a pass every `interval`.
+    /// Each running worker's interval, in seconds.
+    static INTERVALS: Mutex<BTreeMap<&'static str, f64>> = Mutex::new(BTreeMap::new());
+
+    /// Record that worker `worker` runs a pass every `interval`. The value is
+    /// reported on every collection (an observable gauge), so it stays
+    /// there under delta temporality too, next to the last success.
     pub fn set_interval(worker: &'static str, interval: Duration) {
-        if let Some(i) = instruments() {
-            i.worker_interval.record(
-                interval.as_secs_f64(),
-                &[KeyValue::new("forge.worker", worker)],
-            );
-        }
+        INTERVALS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(worker, interval.as_secs_f64());
+    }
+
+    pub(super) fn register(meter: &Meter) {
+        meter
+            .f64_observable_gauge("forge.worker.interval")
+            .with_unit("s")
+            .with_description("How often a background worker runs a pass")
+            .with_callback(|o| {
+                for (&worker, &seconds) in INTERVALS
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                {
+                    o.observe(seconds, &[KeyValue::new("forge.worker", worker)]);
+                }
+            })
+            .build();
     }
 
     /// One pass of a worker, with its span (a trace of its own, `worker
@@ -1659,6 +1675,7 @@ mod tests {
             "db.client.connection.count",
             "db.client.connection.wait_time",
             "forge.worker.last_success.time",
+            "forge.worker.interval",
             "forge.repository.size",
             "forge.repositories",
             "forge.blob_cache.hits",
