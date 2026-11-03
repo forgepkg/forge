@@ -7,10 +7,19 @@
 //! strictly and written back in one canonical spelling, so that what a
 //! package's control file says cannot add lines (or paragraphs) to an index.
 
+use std::collections::HashSet;
 use std::fmt;
 
 /// The longest control file read from a package, in bytes.
 pub const MAX_CONTROL_BYTES: usize = 1024 * 1024;
+
+/// The most fields a paragraph may hold. Real paragraphs hold a few dozen:
+/// a binary package's control file has the 20-odd fields of Debian Policy
+/// 5.3 and a handful of `X-`/`XB-` ones, an index's `Packages` paragraph
+/// adds its 5 or so, and a `Release` holds about 20. Ten times that leaves
+/// room for any tool's extra fields and bounds what a paragraph costs to
+/// read and to index.
+pub const MAX_FIELDS: usize = 256;
 
 /// The longest package name (Debian has no limit; the host bounds ids).
 pub const MAX_NAME_BYTES: usize = 128;
@@ -63,6 +72,9 @@ impl Paragraph {
     pub fn parse_all(text: &str) -> Result<Vec<Paragraph>, ControlError> {
         let mut paragraphs = Vec::new();
         let mut current = Paragraph::default();
+        // The names of `current`'s fields, ASCII-lowercased: each duplicate
+        // check takes constant time.
+        let mut names = HashSet::new();
         for (number, line) in text.split('\n').enumerate() {
             let line = line.strip_suffix('\r').unwrap_or(line);
             if line.chars().any(|c| c.is_control() && c != '\t') {
@@ -71,6 +83,7 @@ impl Paragraph {
             if line.trim().is_empty() {
                 if !current.fields.is_empty() {
                     paragraphs.push(std::mem::take(&mut current));
+                    names.clear();
                 }
                 continue;
             }
@@ -91,8 +104,14 @@ impl Paragraph {
             if !valid_field_name(name) {
                 return error(format!("line {}: {name:?} is not a field name", number + 1));
             }
-            if current.get(name).is_some() {
+            if !names.insert(name.to_ascii_lowercase()) {
                 return error(format!("field {name} appears twice"));
+            }
+            if current.fields.len() == MAX_FIELDS {
+                return error(format!(
+                    "line {}: a paragraph holds more than {MAX_FIELDS} fields",
+                    number + 1
+                ));
             }
             current.fields.push(Field {
                 name: name.to_string(),
@@ -307,6 +326,86 @@ mod tests {
             }],
         };
         assert_eq!(p.to_text(), "Description: short\n not indented\n .\n end\n");
+    }
+
+    /// A paragraph of `n` distinct fields, `F0: x` to `F{n-1}: x`.
+    fn fields(n: usize) -> String {
+        (0..n).map(|i| format!("F{i}: x\n")).collect()
+    }
+
+    #[test]
+    fn a_duplicate_field_is_refused_in_any_case() {
+        for bad in [
+            "Package: a\nPACKAGE: b\n",
+            "Package: a\nVersion: 1\npackage: b\n",
+            "X-Custom: a\nx-cUSTOM: b\n",
+        ] {
+            let err = Paragraph::parse_one(bad).unwrap_err().to_string();
+            assert!(err.contains("appears twice"), "{bad:?}: {err}");
+        }
+        // The same field may appear once in each paragraph.
+        let all = Paragraph::parse_all("Package: a\n\npackage: b\n").unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].get("Package"), Some("b"));
+    }
+
+    #[test]
+    fn a_paragraph_holds_at_most_max_fields() {
+        let p = Paragraph::parse_one(&fields(MAX_FIELDS)).unwrap();
+        assert_eq!(p.fields.len(), MAX_FIELDS);
+        let err = Paragraph::parse_one(&fields(MAX_FIELDS + 1)).unwrap_err();
+        assert!(err.to_string().contains("more than 256 fields"), "{err}");
+        // The bound is per paragraph: an index holds many.
+        let index = [fields(MAX_FIELDS), fields(MAX_FIELDS)].join("\n");
+        assert_eq!(Paragraph::parse_all(&index).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_control_file_of_many_fields_is_refused_quickly() {
+        // A whole control file (1 MiB) of distinct short fields: about
+        // 100,000 of them, which took ~20 s when each field was compared
+        // with every earlier one.
+        let mut text = String::new();
+        let mut i = 0;
+        while text.len() < MAX_CONTROL_BYTES - 16 {
+            text.push_str(&format!("a{i}:\n"));
+            i += 1;
+        }
+        let start = std::time::Instant::now();
+        let err = Paragraph::parse_one(&text).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("more than"), "{err}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+        // Distinct fields spread over paragraphs under the bound are read
+        // in linear time too.
+        let mut text = String::new();
+        while text.len() < MAX_CONTROL_BYTES - 8192 {
+            text.push_str(&fields(MAX_FIELDS));
+            text.push('\n');
+        }
+        let start = std::time::Instant::now();
+        let all = Paragraph::parse_all(&text).unwrap();
+        let elapsed = start.elapsed();
+        assert!(all.len() > 100);
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_release_parses() {
+        let release = "Origin: Debian\nLabel: Debian\nSuite: stable\nVersion: 12.7\n\
+            Codename: bookworm\nChangelogs: https://metadata.ftp-master.debian.org/changelogs/@CHANGEPATH@_changelog\n\
+            Date: Sat, 31 Aug 2024 10:49:36 UTC\nAcquire-By-Hash: yes\n\
+            No-Support-for-Architecture-all: Packages\nArchitectures: all amd64 arm64\n\
+            Components: main contrib non-free-firmware non-free\n\
+            Description: Debian 12.7 Released 31 August 2024\n\
+            MD5Sum:\n 0ed6d4c8891eb86358b94bb35d9e4da4  1484322 contrib/Contents-all\n\
+            SHA256:\n 6eb3b4e2a8a0f1ce5c6a7a8b0c0b7f6e4a4e1c1d2b2c3d4e5f60718293a4b5c6  1484322 contrib/Contents-all\n";
+        let p = Paragraph::parse_one(release).unwrap();
+        assert_eq!(p.get("Codename"), Some("bookworm"));
+        assert_eq!(p.fields.len(), 14);
     }
 
     #[test]
