@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-import type { RepoView } from '~/api/repositories'
+import type { RepoView, SigningKey } from '~/api/repositories'
 import {
   useAddSigningKey,
   useDeleteSigningKey,
@@ -9,6 +9,7 @@ import {
 import {
   Button,
   CodeBlock,
+  Dialog,
   Notice,
   Panel,
   Skeleton,
@@ -26,8 +27,9 @@ export function groupedFingerprint(fingerprint: string): string {
  * (`/admin/repositories/{name}/signing-keys`). Every key signs, so a key is
  * rotated by adding the new one (generated, or imported with its
  * passphrase), letting clients trust it, then deleting the old one; the
- * last key cannot be deleted. Secret keys are never shown. A panel of the
- * edit screen.
+ * last key cannot be deleted. Delete asks first, in a dialog naming the key
+ * and the key clients must trust instead. Secret keys are never shown. A
+ * panel of the edit screen.
  */
 export function SigningKeysPanel({ repo }: { repo: RepoView }) {
   const keys = useSigningKeys(repo.name)
@@ -36,6 +38,7 @@ export function SigningKeysPanel({ repo }: { repo: RepoView }) {
   const [importing, setImporting] = useState(false)
   const [secretKey, setSecretKey] = useState('')
   const [passphrase, setPassphrase] = useState('')
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const keyUrl = `/repository/${encodeURIComponent(repo.name)}/key.asc`
 
   function generate() {
@@ -57,6 +60,13 @@ export function SigningKeysPanel({ repo }: { repo: RepoView }) {
   }
 
   const list = keys.data ?? []
+  const target = list.find((k) => k.fingerprint === pendingDelete)
+  const remaining = list.filter((k) => k.fingerprint !== pendingDelete)
+
+  function confirmDelete(fingerprint: string) {
+    remove.mutate(fingerprint, { onSettled: () => setPendingDelete(null) })
+  }
+
   return (
     <Panel
       title="Signing keys"
@@ -93,13 +103,26 @@ export function SigningKeysPanel({ repo }: { repo: RepoView }) {
               icon="Trash"
               disabled={list.length < 2 || remove.isPending}
               title={list.length < 2 ? 'A repository keeps at least one signing key.' : undefined}
-              onClick={() => remove.mutate(key.fingerprint)}
+              onClick={() => setPendingDelete(key.fingerprint)}
             >
               Delete key
             </Button>
           </div>
         </div>
       ))}
+      <Dialog
+        open={target !== undefined}
+        onClose={() => setPendingDelete(null)}
+        title="Delete this signing key?"
+        icon="Trash"
+        tone="danger"
+        description={target && deleteConsequence(target, remaining)}
+        confirmLabel={remove.isPending ? 'Deleting…' : 'Delete key'}
+        confirmVariant="danger-solid"
+        confirmIcon="Trash"
+        confirmDisabled={remove.isPending}
+        onConfirm={() => target && confirmDelete(target.fingerprint)}
+      />
       {remove.isError && (
         <Notice tone="danger" title="Could not delete the key">
           {remove.error.body || remove.error.message}
@@ -151,4 +174,18 @@ export function SigningKeysPanel({ repo }: { repo: RepoView }) {
       )}
     </Panel>
   )
+}
+
+/**
+ * What deleting a signing key means, for the confirmation: its secret never
+ * leaves the server, and clients that trust only it fail `apt-get update`.
+ */
+function deleteConsequence(key: SigningKey, remaining: SigningKey[]): string {
+  const trust =
+    remaining.length === 1
+      ? `the remaining key ${groupedFingerprint(remaining[0].fingerprint)}`
+      : remaining.length > 1
+        ? `one of the remaining keys (${remaining.map((k) => groupedFingerprint(k.fingerprint)).join(', ')})`
+        : 'another key'
+  return `The key ${groupedFingerprint(key.fingerprint)} stops signing the repository. Clients must trust ${trust} first (download key.asc again), or apt-get update fails with NO_PUBKEY. This cannot be undone.`
 }
