@@ -1439,11 +1439,20 @@ async fn preview_shows_the_new_triggers_decisions_and_the_next_runs() {
         ],
     )
     .await;
-    // 1.0.0 was published 20 days ago, the CI builds before it; 1.1.0 has
-    // been unlisted for 100 days.
+    // 1.0.0 was published 20 days ago, the CI builds 30 days ago, before it
+    // (a prerelease published after its release keeps its days, #757);
+    // 1.1.0 has been unlisted for 100 days.
     sqlx::query(
         "UPDATE component SET created_at = now() - interval '20 days' \
          WHERE repository_id = $1 AND version = '1.0.0'",
+    )
+    .bind(repo_id)
+    .execute(&srv.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE component SET created_at = now() - interval '30 days' \
+         WHERE repository_id = $1 AND version LIKE '1.0.0-ci.%'",
     )
     .bind(repo_id)
     .execute(&srv.pool)
