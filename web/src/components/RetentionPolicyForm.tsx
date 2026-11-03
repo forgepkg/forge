@@ -651,8 +651,10 @@ const MAX_MAX_RUN = 7 * 86400
 export function validateDraft(shape: PolicyShape, draft: PolicyDraft): DraftErrors | null {
   const errors: DraftErrors = { fields: {} }
   let failed = false
+  // The interval field shows only in interval mode; with a schedule the
+  // server ignores the interval, and a stored 0 is kept (`buildPolicy`).
   const interval = draft.interval.trim()
-  if (!WHOLE.test(interval) || Number(interval) < 1) {
+  if (draft.scheduleMode === 'interval' && (!WHOLE.test(interval) || Number(interval) < 1)) {
     errors.interval = 'Enter a whole number of at least 1.'
     failed = true
   }
@@ -770,10 +772,25 @@ export function buildPolicy(shape: PolicyShape, draft: PolicyDraft): RetentionPo
     version: (draft.base.version as number | undefined) ?? 1,
     enabled: draft.enabled,
     dry_run_only: draft.dryRunOnly,
-    min_run_interval_seconds:
-      Number(draft.interval.trim()) * UNIT_SECONDS[draft.intervalUnit],
+    ...minRunInterval(draft),
     rules,
   }
+}
+
+/**
+ * The `min_run_interval_seconds` the form says. In interval mode it is the
+ * field's. In cron mode the field is hidden and the server ignores the
+ * interval: its value (the stored one, 0 included, unless the field was
+ * changed before switching) is sent when it is a whole number; otherwise the
+ * stored value is kept, or none is sent.
+ */
+function minRunInterval(draft: PolicyDraft): { min_run_interval_seconds?: number } {
+  const interval = draft.interval.trim()
+  if (draft.scheduleMode === 'interval' || WHOLE.test(interval)) {
+    return { min_run_interval_seconds: Number(interval) * UNIT_SECONDS[draft.intervalUnit] }
+  }
+  // `base`, spread before this, holds the stored value, if any.
+  return {}
 }
 
 /** Whether runs of `policy` delete anything (rather than only unlist). */

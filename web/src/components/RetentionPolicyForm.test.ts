@@ -245,6 +245,31 @@ describe('retention policy model', () => {
     expect('selector' in plain.rules[0]).toBe(false)
   })
 
+  it('keeps a stored interval of 0 with a schedule, and refuses 0 without one', () => {
+    const stored = {
+      version: 1,
+      enabled: true,
+      dry_run_only: false,
+      min_run_interval_seconds: 0,
+      schedule: '0 3 * * *',
+      rules: [
+        { id: 'old', action: 'hard_delete', release_type: 'any', criteria: { older_than_days: 30 } },
+      ],
+    } as unknown as RetentionPolicy
+    const draft = draftFromPolicy('package', stored)
+    expect([draft.scheduleMode, draft.interval]).toEqual(['cron', '0'])
+    expect(validateDraft('package', draft)).toBeNull()
+    expect(buildPolicy('package', draft)).toEqual(stored)
+    // A hidden field that is not a whole number keeps the stored value too.
+    expect(
+      buildPolicy('package', { ...draft, interval: '' }).min_run_interval_seconds,
+    ).toBe(0)
+
+    const interval = { ...draft, scheduleMode: 'interval' as const }
+    expect(validateDraft('package', interval)?.interval).toMatch(/at least 1/)
+    expect(validateDraft('package', { ...interval, interval: '1' })).toBeNull()
+  })
+
   it('checks a cron pattern and a time limit', () => {
     const draft = { ...draftFromPolicy('image', null), scheduleMode: 'cron' as const }
     expect(validateDraft('image', draft)?.schedule).toMatch(/5 fields/)
