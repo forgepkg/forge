@@ -232,7 +232,7 @@ pub async fn put_settings(
         if let Err(e) = write_settings(&state.pool, &next).await {
             return super::db_error(e);
         }
-        state.traffic.recorder.set_enabled(next.enabled);
+        state.traffic.apply(&next);
         tracing::info!(
             target: "forge::audit",
             settings = ?next,

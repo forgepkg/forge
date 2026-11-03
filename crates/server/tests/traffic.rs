@@ -379,3 +379,28 @@ async fn maxmind_databases_are_downloaded_and_locate_clients() {
     assert_eq!(view["country"], Value::Null);
     assert_eq!(view["maxmind"]["license_key_set"], false);
 }
+
+#[tokio::test]
+async fn a_download_recorded_over_a_state_it_cannot_read_keeps_the_account_id() {
+    let srv = server(None).await;
+    // A state this version cannot read, with the account ID in it.
+    let unreadable = r#"{"account_id":"1234","last_success":"not a time"}"#;
+    forge_db::authz_dao::set_setting(&srv.pool, "traffic_maxmind", unreadable)
+        .await
+        .unwrap();
+    assert!(forge_server::traffic::maxmind::read_state(&srv.pool)
+        .await
+        .is_err());
+
+    assert!(forge_server::traffic::maxmind::update(&srv.state)
+        .await
+        .is_err());
+    assert_eq!(
+        forge_db::authz_dao::get_setting(&srv.pool, "traffic_maxmind")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(unreadable),
+        "nothing is written over the state"
+    );
+}

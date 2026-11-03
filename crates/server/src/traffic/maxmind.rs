@@ -250,7 +250,19 @@ pub async fn update(state: &AppState) -> anyhow::Result<()> {
         anyhow::Ok(())
     }
     .await;
-    let (mut recorded, _) = read_state(&state.pool).await.unwrap_or_default();
+    // Recorded over the state read again; nothing is written over a state
+    // that cannot be read, which would lose the account ID.
+    let mut recorded = match read_state(&state.pool).await {
+        Ok((recorded, _)) => recorded,
+        Err(e) => {
+            forge_db::observe_error(&e);
+            tracing::warn!(error = %e, "cannot record the MaxMind download: the state cannot be read");
+            if let Err(e) = &result {
+                tracing::warn!(error = %format!("{e:#}"), "cannot download the MaxMind databases");
+            }
+            return result;
+        }
+    };
     match &result {
         Ok(()) => {
             recorded.last_success = Some(Utc::now());
