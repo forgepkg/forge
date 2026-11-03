@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Read};
 use forge_plugin_api::files;
 use sha2::{Digest, Sha256};
 
-use crate::control::{valid_architecture, valid_component, valid_package_name, Paragraph};
+use crate::control::{known_architecture, valid_component, valid_package_name, Paragraph};
 use crate::version;
 
 /// The most a `Packages` index may inflate to.
@@ -315,8 +315,11 @@ impl Entry {
         if let Err(e) = version::Version::parse(&self.version) {
             return Some(format!("{:?} is not a Debian version: {e}", self.version));
         }
-        if !valid_architecture(&self.architecture) {
-            return Some(format!("{:?} is not an architecture", self.architecture));
+        if !known_architecture(&self.architecture) {
+            return Some(format!(
+                "{:?} is not an architecture dpkg knows",
+                self.architecture
+            ));
         }
         if self.filename.is_empty() {
             return Some("the index names no Filename for it".into());

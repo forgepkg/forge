@@ -57,6 +57,13 @@ package of `Section: contrib/net` is in `contrib`, any other in `main`. Its
 **architectures** are those of its packages; an `all` package is listed
 under every one of them (and under `binary-all`).
 
+Every component adds a `Packages` list of every architecture to the
+indexes, so both are bounded: an `Architecture` is `all` or one dpkg
+knows (`dpkg-architecture -L`: `amd64`, `arm64`, `musl-linux-amd64`, …),
+and a repository holds at most **8 components**. A package of another
+architecture, or of a ninth component, is refused with `400` (an import
+reports it as failed); the repository's indexes stay as they are.
+
 An [import](import.md#apt) fills a hosted repository from another apt
 repository (Nexus, a static repository, another Forge): every `.deb` its
 `Release` lists, checked against the size and SHA-256 its index gives, in
@@ -273,6 +280,10 @@ ordered by Debian version; the indexes follow on their next request.
   downloaded until it is deleted.
 - **Ed25519 keys only.** RSA and NIST-curve keys are refused: the OpenPGP
   library's code for them is not constant-time.
+- **8 components, dpkg's architectures.** A hosted repository holds at
+  most 8 components, and packages of `all` and of the architectures dpkg
+  knows ([Hosted repositories](#hosted-repositories)), so that its indexes
+  stay within the 10,000 files an index may hold.
 - **Source packages** (`.dsc`, `Sources`) are not hosted; a proxy serves its
   upstream's.
 - **zstd levels 20 to 22.** dpkg-deb compresses the control member like the

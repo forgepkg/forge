@@ -143,6 +143,14 @@ pub trait Format: Send + Sync {
         None
     }
 
+    /// The fields of [`Self::manifest_summary`] of which a hosted repository
+    /// holds a bounded number of distinct values
+    /// ([`forge_plugin_api::FormatPlugin::summary_caps`]): a publish or an
+    /// import that would add a value past one is refused. None by default.
+    fn summary_caps(&self) -> &'static [forge_plugin_api::SummaryCap] {
+        &[]
+    }
+
     /// Whether `id` is a well-formed package id of this format. Read routes
     /// answer 404 for anything else, and a proxy never puts such an id into
     /// an upstream URL: an id is pasted into URL paths, so `/`, `..`, `?`,

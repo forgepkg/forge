@@ -162,6 +162,10 @@ impl Format for UploadFormat {
     fn manifest_summary(&self, manifest: &[u8]) -> Option<serde_json::Value> {
         self.format.manifest_summary(manifest)
     }
+
+    fn summary_caps(&self) -> &'static [api::SummaryCap] {
+        self.format.summary_caps()
+    }
 }
 
 fn format_error(e: api::FormatError) -> FormatError {
@@ -356,6 +360,10 @@ impl Format for PluginFormat {
                 None
             }
         }
+    }
+
+    fn summary_caps(&self) -> &'static [api::SummaryCap] {
+        self.plugin.summary_caps()
     }
 }
 
