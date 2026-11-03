@@ -353,11 +353,9 @@ impl BasicAuthSource {
 /// A username over [`MAX_USERNAME_BYTES`] is refused (`None` → invalid
 /// credentials) before it reaches any lookup or the login throttle.
 fn parse_basic(value: &str) -> Option<(String, String)> {
-    let rest = value
-        .strip_prefix("Basic ")
-        .or_else(|| value.strip_prefix("basic "))?;
+    let rest = super::scheme::credentials(value, "Basic")?;
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(rest.trim())
+        .decode(rest)
         .ok()?;
     let text = String::from_utf8(decoded).ok()?;
     // NuGet sends `username:apikey`; the colon splits user from secret. A secret
@@ -378,8 +376,9 @@ impl PrincipalSource for BasicAuthSource {
         let Ok(text) = value.to_str() else {
             return SourceOutcome::Invalid;
         };
-        // Only handle the Basic scheme; other schemes are "no credentials" for us.
-        if !(text.starts_with("Basic ") || text.starts_with("basic ")) {
+        // Only handle the Basic scheme, in any case (RFC 9110 §11.1); other
+        // schemes are "no credentials" for us.
+        if super::scheme::credentials(text, "Basic").is_none() {
             return SourceOutcome::NoCredentials;
         }
         let Some((username, secret)) = parse_basic(text) else {
@@ -725,6 +724,51 @@ mod tests {
         let (u, s) = parse_basic(&format!("Basic {enc}")).unwrap();
         assert_eq!(u, "bob");
         assert_eq!(s, "a:b:c");
+    }
+
+    #[test]
+    fn parse_basic_reads_the_scheme_in_any_case() {
+        // RFC 9110 §11.1: the scheme is case-insensitive (#584).
+        let enc = base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t");
+        for scheme in ["Basic", "basic", "BASIC", "bAsIc"] {
+            let (u, s) = parse_basic(&format!("{scheme} {enc}")).unwrap();
+            assert_eq!((u.as_str(), s.as_str()), ("alice", "s3cr3t"), "{scheme}");
+        }
+        assert_eq!(parse_basic(&format!("Bearer {enc}")), None);
+    }
+
+    /// `BASIC` is a credential of the Basic source, never "no credentials"
+    /// (#584): one it cannot read is invalid (→ 401), not left for a
+    /// trusted-header realm to name the caller. Neither reaches the database.
+    #[tokio::test]
+    async fn basic_source_reads_the_scheme_in_any_case() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://forge:forge@localhost:1/forge")
+            .unwrap();
+        let source = BasicAuthSource::with_chain(pool, None);
+        let enc = base64::engine::general_purpose::STANDARD.encode("alice:");
+        for value in [
+            "BASIC !!!".to_string(),
+            "bAsIc !!!".to_string(),
+            format!("BASIC {enc}"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::AUTHORIZATION, value.parse().unwrap());
+            assert_eq!(
+                source.resolve(&headers, ip()).await,
+                SourceOutcome::Invalid,
+                "{value}"
+            );
+        }
+        for value in ["Bearer abc", "BEARER abc", "Basic"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(http::header::AUTHORIZATION, value.parse().unwrap());
+            assert_eq!(
+                source.resolve(&headers, ip()).await,
+                SourceOutcome::NoCredentials,
+                "{value}"
+            );
+        }
     }
 
     // ── downgrade-prevention: pure unit tests with stub sources ──────────────

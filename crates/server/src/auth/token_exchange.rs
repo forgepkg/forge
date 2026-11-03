@@ -137,10 +137,7 @@ fn refused(status: StatusCode, message: &'static str) -> Response {
 
 /// The Bearer token of `headers`, if the request carries one.
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (scheme, token) = value.split_once(' ')?;
-    let token = token.trim();
-    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+    forge_core::auth::scheme::header_credentials(headers, "Bearer")
 }
 
 async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {

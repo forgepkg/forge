@@ -808,3 +808,48 @@ async fn a_denied_request_the_headers_name_is_challenged() {
     let resp = index().basic_auth(&u, Some(&p)).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// The Basic scheme in another case (`BASIC`) is the request's own
+/// credential too (#584, RFC 9110 §11.1): with the right password it names
+/// its own account over the headers, and with a wrong one it is a 401 —
+/// never the account the headers name.
+#[tokio::test]
+async fn basic_in_another_case_is_the_requests_own_credential() {
+    use base64::Engine;
+
+    let srv = proxied().await;
+    let realm = create_realm(&srv, false).await;
+    let n = common::unique();
+    let office = format!("office{n}@example.com");
+    let office_id = create_account(&srv, &realm, &office, "roles_only").await;
+    let (u, p) = srv.admin_basic();
+    let basic = |scheme: &str, password: &str| {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{password}"));
+        format!("{scheme} {encoded}")
+    };
+
+    // The headers alone name the network's account.
+    let (status, body) = me(realm.named(me_request(&srv), &office)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["user"]["id"], json!(office_id));
+
+    for scheme in ["BASIC", "bAsIc"] {
+        // A wrong password is a 401, not the account the headers name…
+        assert_eq!(
+            me(realm
+                .named(me_request(&srv), &office)
+                .header("Authorization", basic(scheme, "wrong-password")))
+            .await,
+            (StatusCode::UNAUTHORIZED, json!(INVALID)),
+            "{scheme}"
+        );
+        // …and the right one names the request's own account.
+        let (status, body) = me(realm
+            .named(me_request(&srv), &office)
+            .header("Authorization", basic(scheme, &p)))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{scheme}: {body}");
+        assert_ne!(body["user"]["id"], json!(office_id), "{scheme}: {body}");
+        assert_eq!(body["is_admin"], json!(true), "{scheme}: {body}");
+    }
+}
