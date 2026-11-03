@@ -1548,10 +1548,10 @@ impl Run<'_> {
             downloaded_at: Some(item.downloaded_at.unwrap_or_else(Utc::now)),
             uploader: item.uploader.clone(),
             source: ctx.source.clone(),
-            // A registry names the tarball in the package's packument: it
-            // must be that package.
-            expected: matches!(from, PackageSource::Npm(_))
-                .then(|| (item.name.clone(), item.version.clone())),
+            // The source listed this id and version and named the file: it
+            // must be that package, or a feed could plant (and, with
+            // overwrite, replace) another one.
+            expected: Some((item.name.clone(), item.version.clone())),
             summary_fields: None,
         };
         let outcome = writer
