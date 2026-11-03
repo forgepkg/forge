@@ -2944,6 +2944,68 @@ async fn a_downloading_layer_that_does_not_match_its_digest_is_cut_short() {
     assert!(linked_soon(&srv, &proxy).await, "cached");
 }
 
+/// A client that stops reading a layer a proxy serves while it downloads it
+/// holds none of the staging space once the layer is stored, and reads the
+/// rest from the store when it goes on (#763).
+#[tokio::test]
+async fn a_stalled_pull_of_a_downloading_layer_releases_its_staging_space_once_stored() {
+    let srv = common::start().await;
+    let mock = MockRegistry::start().await;
+    // Far more than the sockets between the server and the client buffer:
+    // the server cannot end its response to a client that stops reading.
+    let layer = big_layer(32);
+    mock.put_blob(&layer);
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *mock.blob_hold.lock().unwrap() = Some(hold.clone());
+    let proxy = repo_name("proxy");
+    create_repo(
+        &srv,
+        json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": mock.base(),
+            "upstream_username": "upstream", "upstream_password": "secret",
+        }),
+    )
+    .await;
+    let oci = admin_oci(&srv).await;
+    let name = format!("{proxy}/library/stalled");
+    let path = format!("blobs/{}", sha(&layer));
+    let staged = || srv.state.cas.staging().usage().expect("a staging budget").0;
+
+    let mut stalled = oci.get(&name, &path).await;
+    assert_eq!(stalled.status(), 200);
+    let mut got = read_some(&mut stalled, 1024 * 1024).await;
+    assert!(
+        staged() >= layer.len() as u64,
+        "the layer's size is reserved while it downloads"
+    );
+
+    // The client stops reading; the upstream sends the rest, and the layer
+    // is verified and stored.
+    hold.add_permits(1);
+    assert!(linked_soon(&srv, &proxy).await, "cached");
+    let mut released = false;
+    for _ in 0..500 {
+        if staged() == 0 {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        released,
+        "the staging space is released while the client has not read the layer: {} bytes held",
+        staged()
+    );
+
+    // The client reads on, from the stored layer.
+    got.extend_from_slice(&stalled.bytes().await.expect("the whole layer"));
+    assert!(
+        got == layer,
+        "the layer the client receives is the upstream's"
+    );
+    assert_eq!(mock.blob_gets.load(Ordering::SeqCst), 1, "one download");
+}
+
 #[tokio::test]
 async fn proxies_cache_verify_and_serve_stale_tags() {
     let srv = common::start().await;
