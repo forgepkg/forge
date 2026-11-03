@@ -12,7 +12,6 @@
 //! through [`crate::secret_dao`]'s realm helpers, which call
 //! [`update_realm_and_secrets`] here.
 
-use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sqlx::{PgExecutor, PgPool};
 
@@ -437,17 +436,4 @@ pub async fn reorder_realms(pool: &PgPool, order: &[i64]) -> sqlx::Result<Reorde
     }
     tx.commit().await?;
     Ok(ReorderOutcome::Reordered)
-}
-
-/// A cheap change marker for the per-instance snapshot cache: `(row count,
-/// max(updated_at))`. Two reads with the same marker saw the same realm set
-/// (updates bump `updated_at`; inserts/deletes change the count — a delete
-/// alone could collide with an old max, hence the count too).
-pub async fn change_marker(pool: &PgPool) -> sqlx::Result<(i64, Option<DateTime<Utc>>)> {
-    let row = sqlx::query!(
-        r#"SELECT count(*) AS "count!", max(updated_at) AS "max_updated" FROM auth_realm"#
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok((row.count, row.max_updated))
 }

@@ -27,4 +27,3 @@ semver = "1"
 
 [dev-dependencies]
 forge-plugin-api = { path = "../../plugin-api", features = ["testing"] }
-tempfile = { workspace = true }

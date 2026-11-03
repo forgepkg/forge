@@ -90,8 +90,9 @@ fn parses_a_utf16_manifest_with_a_byte_order_mark() {
     // The stored manifest is the package's own bytes, still UTF-16.
     assert_eq!(&parsed.manifest[..4], b"\xff\xfe<\x00");
 
-    let metadata = forge_format_nuget::nuspec::metadata_from_nuspec(&parsed.manifest)
-        .expect("metadata of the stored manifest");
+    let metadata = forge_format_nuget::nuspec::manifest_summary(&parsed.manifest)
+        .expect("metadata of the stored manifest")
+        .metadata;
     assert_eq!(
         metadata.description.as_deref(),
         Some("A manifest in UTF-16 \u{a9} Forge \u{1f4e6}")

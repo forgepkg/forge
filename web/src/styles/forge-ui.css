@@ -19,7 +19,7 @@
   /* Focus: one ring everywhere, 2px solid heat, 2px out; rail-heat inside the rail. */
   .fg-btn:focus-visible, .fg-input:focus-visible, .fg-select:focus-visible, .fg-tab:focus-visible, .fg-copy:focus-visible, .fg-copyfield-btn:focus-visible,
   .fg-link:focus-visible, .fg-link-strong:focus-visible, .fg-crumbs a:focus-visible, .fg-notice-action:focus-visible, .fg-seg-item:focus-visible,
-  .fg-menu-item:focus-visible, .fg-toast-close:focus-visible, .fg-toast-action:focus-visible, .fg-dialog-close:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .fg-menu-item:focus-visible, .fg-toast-close:focus-visible, .fg-dialog-close:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   .fg-check-input:focus-visible + .fg-check-box, .fg-check-input:focus-visible + .fg-switch-track, .fg-choice-input:focus-visible ~ .fg-choice-top { outline: 2px solid var(--focus); outline-offset: 2px; }
   .fg-rail :focus-visible { outline: 2px solid var(--rail-heat); outline-offset: 2px; }
 
@@ -92,9 +92,7 @@
   .fg-version--unlisted .fg-version-core { color: var(--ink-faint); }
   .fg-version-latest { margin-left: 8px; padding: 0 6px; border-radius: var(--radius-xs); background: var(--heat-soft); color: var(--heat); font-family: var(--font-sans); font-size: 11px; line-height: 18px; font-weight: 600; }
   .fg-digest { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 12px; line-height: 16px; white-space: nowrap; }
-  .fg-digest-algo { color: var(--ink-faint); }
   .fg-digest-short { color: var(--ink); }
-  .fg-digest-rest { color: var(--ink-faint); white-space: normal; word-break: break-all; }
   .fg-copy { display: inline-flex; align-items: center; justify-content: center; gap: 4px; box-sizing: border-box; min-width: 24px; height: 24px; padding: 0 5px; border: 0; border-radius: var(--radius-xs); background: transparent; color: var(--ink-faint); font-family: var(--font-sans); font-size: 12px; line-height: 16px; font-weight: 500; cursor: pointer; }
   .fg-copy:hover { background: var(--surface-hover); color: var(--ink); }
   .fg-copy-done { color: var(--ok); }
@@ -107,7 +105,6 @@
   .fg-snippet-label { color: var(--ink-muted); font-size: 12px; line-height: 16px; font-weight: 500; }
   .fg-snippet-box { display: flex; align-items: flex-start; gap: var(--space-2); padding: 7px 6px 7px 12px; border: 1px solid var(--code-line); border-radius: var(--radius-sm); background: var(--code); }
   .fg-snippet-code { flex: 1; min-width: 0; padding-top: 2px; color: var(--code-ink); font-family: var(--font-mono); font-size: 13px; line-height: 20px; font-weight: 450; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .fg-snippet-prompt { margin-right: 1ch; color: var(--code-muted); user-select: none; }
   .fg-code-ph { color: var(--code-accent); }
   .fg-codeblock { margin: 0; min-width: 0; overflow: hidden; border: 1px solid var(--code-line); border-radius: var(--radius-md); background: var(--code); }
   .fg-codeblock-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); padding: 6px 6px 6px 12px; border-bottom: 1px solid var(--code-line); background: var(--code-raised); }
@@ -209,10 +206,6 @@
   .fg-rail .fg-logo-mark { fill: var(--rail-heat); }
   .fg-rail-brand { display: flex; align-items: center; height: 32px; padding: 0 6px; }
   .fg-rail-home { display: inline-flex; border-radius: var(--radius-sm); }
-  .fg-rail-jump { display: flex; align-items: center; gap: 8px; box-sizing: border-box; width: 100%; height: 34px; padding: 0 8px 0 10px; border: 1px solid var(--rail-line); border-radius: var(--radius-sm); background: transparent; color: var(--rail-muted); font-family: var(--font-sans); font-size: 13px; line-height: 20px; text-align: left; cursor: pointer; }
-  .fg-rail-jump:hover { background: var(--rail-raised); color: var(--rail-ink); }
-  .fg-rail-jump span { flex: 1; }
-  .fg-kbd--rail { border-color: var(--rail-line); background: var(--rail-raised); color: var(--rail-muted); }
   .fg-rail-sections { display: grid; gap: 20px; }
   .fg-rail-section { display: grid; gap: 4px; }
   .fg-rail-title { padding: 0 10px 2px; color: var(--rail-muted); font-size: 11px; line-height: 16px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
@@ -318,13 +311,11 @@
   .fg-toast-text { display: grid; flex: 1; gap: 2px; min-width: 0; padding-top: 2px; }
   .fg-toast-title { margin: 0; color: var(--ink); font-size: 14px; line-height: 20px; font-weight: 600; }
   .fg-toast-body { color: var(--ink-muted); font-size: 13px; line-height: 20px; }
-  .fg-toast-action { justify-self: start; margin-top: 4px; padding: 0; border: 0; background: transparent; color: var(--link); font-family: var(--font-sans); font-size: 13px; font-weight: 600; cursor: pointer; }
   .fg-toast-close { flex: none; display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--ink-faint); cursor: pointer; }
   .fg-toast-close:hover { background: var(--surface-hover); color: var(--ink); }
 
   /* ---------- Dialog ---------- */
   .fg-dialog-layer { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: var(--space-4); }
-  .fg-dialog-layer--inline { position: relative; inset: auto; min-height: 100%; padding: var(--space-8) var(--space-4); }
   .fg-dialog-scrim { position: absolute; inset: 0; background: var(--scrim); }
   .fg-dialog { position: relative; display: grid; box-sizing: border-box; width: 480px; max-width: 100%; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-lg); }
   .fg-dialog--wide { width: min(720px, calc(100vw - 2 * var(--space-4))); }
@@ -357,7 +348,6 @@
   .fg-cell-badges { display: inline-flex; flex-wrap: wrap; gap: 6px; vertical-align: middle; }
   .fg-chip { padding: 1px 6px; border-radius: var(--radius-xs); background: var(--surface-sunken); color: var(--ink-muted); font-family: var(--font-mono); font-size: 12px; line-height: 18px; white-space: nowrap; }
   .fg-cell-link { display: flex; flex-direction: column; min-width: 0; }
-  .fg-cell-name { color: var(--ink); font-weight: 600; }
   .fg-cell-user { display: inline-flex; align-items: center; gap: 10px; }
   .fg-link-strong { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 600; text-decoration: none; }
   .fg-link-strong .fg-icon { color: var(--ink-faint); }

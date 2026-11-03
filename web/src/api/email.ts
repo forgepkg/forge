@@ -233,9 +233,6 @@ export async function sendTestEmail(to?: string): Promise<TestEmailResult> {
 /** An OAuth answer that carries the settings, and why Forge's old registration was not deleted. */
 export type EmailSettingsWithWarning = EmailSettingsView & { warning?: string | null }
 
-/** How the mailbox authorizes Forge. */
-export type OauthAuthorizeMethod = 'authorization_code' | 'device' | 'client_credentials'
-
 /** A started device authorization: the code to enter, and where. */
 export interface DeviceAuthorization {
   flow_id: string

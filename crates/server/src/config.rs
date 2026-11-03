@@ -805,28 +805,6 @@ impl std::fmt::Debug for UpstreamBasicAuthConfig {
     }
 }
 
-impl UpstreamBasicAuthConfig {
-    /// Build the `forge-core` provider config from this block.
-    pub fn to_core(&self) -> forge_core::auth::UpstreamBasicConfig {
-        forge_core::auth::UpstreamBasicConfig {
-            url: self.url.clone(),
-            method: self.method.to_ascii_uppercase(),
-            success_status: self.success_status.clone(),
-            reject_status: self.reject_status.clone(),
-            connect_timeout: Duration::from_millis(self.connect_timeout_ms),
-            request_timeout: Duration::from_millis(self.request_timeout_ms),
-            required_groups: self.required_groups.clone(),
-            groups_path: self.groups_path.clone(),
-            identity_path: self.identity_path.clone(),
-            admin_group: self.admin_group.clone(),
-            provider_id: forge_core::auth::UPSTREAM_BASIC_ID.to_string(),
-            realm_id: None,
-            // Kept hashes are bound to a realm row; the legacy block has none.
-            capture_password_hash: false,
-        }
-    }
-}
-
 /// `auth.upstream_basic.cache.*` — the validated-credential cache tuning.
 /// Unknown keys are refused (see [`UpstreamBasicAuthConfig`]).
 #[derive(Clone, Deserialize)]
@@ -1970,10 +1948,6 @@ impl std::fmt::Debug for OidcConfig {
 }
 
 impl OidcConfig {
-    /// Clock-skew leeway as a [`Duration`].
-    pub fn clock_skew(&self) -> Duration {
-        Duration::from_secs(self.clock_skew_seconds)
-    }
     /// Scopes with `openid` guaranteed present (added first if missing).
     pub fn effective_scopes(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.scopes.len() + 1);
@@ -4688,11 +4662,6 @@ mod tests {
         assert_eq!(ub.request_timeout_ms, 5000);
         assert_eq!(ub.cache.positive_ttl_secs, 300);
         assert_eq!(ub.cache.negative_ttl_secs, 30);
-        // to_core mirrors the block.
-        let core = ub.to_core();
-        assert_eq!(core.url, ub.url);
-        assert_eq!(core.method, "GET");
-        assert_eq!(core.connect_timeout, Duration::from_millis(2000));
     }
 
     #[test]

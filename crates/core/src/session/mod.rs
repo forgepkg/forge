@@ -105,12 +105,6 @@ impl SessionService {
         (lifetimes.idle, lifetimes.absolute)
     }
 
-    /// Override the `last_seen_at` touch throttle (mainly for tests).
-    pub fn with_touch_throttle_secs(mut self, secs: i64) -> Self {
-        self.touch_throttle_secs = secs;
-        self
-    }
-
     /// Create a fresh session for `user_id`, returning the row + the one-time
     /// cookie secret. A new CSRF secret is generated and stored on the row for
     /// the double-submit defense.

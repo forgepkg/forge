@@ -122,21 +122,14 @@ tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 [dev-dependencies]
 # Small MaxMind databases for the traffic statistics' tests.
 forge-traffic = { path = "../traffic", features = ["testing"] }
-tar = { version = "0.4", default-features = false }
-# Builds Helm chart archives for the registry tests.
-flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "test-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 reqwest = { workspace = true, features = ["multipart", "query"] }
-forge-format-nuget = { path = "../formats/nuget" }
 http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
 figment = { version = "0.10", features = ["toml", "env", "test"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
-serde_json = { workspace = true }
 tempfile = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
 # Retention schedules' local times in the admin API tests.
 chrono-tz = { workspace = true }
 # Mock OIDC IdP for the /auth route integration tests: serve
@@ -144,10 +137,6 @@ chrono-tz = { workspace = true }
 # Mirrors the forge-core OIDC test harness.
 wiremock = "0.6"
 rsa = { version = "0.9", features = ["sha2", "getrandom"] }
-jsonwebtoken = { workspace = true }
-base64 = { workspace = true }
-rand = { workspace = true }
-sqlx = { workspace = true }
 # The OpenTelemetry tests: in-memory exporters (tests/telemetry.rs), and a
 # mock OTLP/HTTP receiver decoding what is exported (tests/otlp_export.rs).
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

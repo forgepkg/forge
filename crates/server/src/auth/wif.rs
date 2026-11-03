@@ -1033,7 +1033,7 @@ fn basic_credentials(b64: &str) -> Option<(String, String)> {
 /// If `secret` structurally parses as a JWT (three segments; header decodes with
 /// a real, non-`none` `alg`), return its **unverified** `iss` claim — used only
 /// to route to a realm; the cryptographic verification happens in
-/// [`OidcMetadataClient::verify_jwt`]. Returns `None` for anything that is not a
+/// [`OidcMetadataClient::verify_workload_jwt`]. Returns `None` for anything that is not a
 /// well-formed JWT carrying a string `iss`.
 fn jwt_issuer(secret: &str) -> Option<String> {
     let mut parts = secret.split('.');

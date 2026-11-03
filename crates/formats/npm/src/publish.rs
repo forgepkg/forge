@@ -143,11 +143,6 @@ impl Extractor {
         }
     }
 
-    /// Whether the extractor is inside the attachment's data, or past it.
-    pub fn found_attachment(&self) -> bool {
-        self.attachment.is_some()
-    }
-
     fn malformed(&self, what: &str) -> ExtractError {
         ExtractError::Malformed(format!("{what} at byte {}", self.offset))
     }

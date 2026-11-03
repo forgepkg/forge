@@ -410,14 +410,6 @@ pub const PREFER_HOSTED_KEY: &str = "prefer_hosted";
 /// `repository.config` key of [`Repository::reserved_prefixes`].
 pub const RESERVED_PREFIXES_KEY: &str = "reserved_prefixes";
 
-/// A row of `group_member`.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct GroupMember {
-    pub group_id: i64,
-    pub member_id: i64,
-    pub priority: i32,
-}
-
 /// A row of `blob`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Blob {

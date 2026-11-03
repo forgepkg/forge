@@ -245,13 +245,6 @@ impl OidcMetadataClient {
         self
     }
 
-    /// Override the discovery/JWKS TTLs (mainly for tests).
-    pub fn with_ttls(mut self, discovery_ttl: Duration, jwks_ttl: Duration) -> Self {
-        self.discovery_ttl = discovery_ttl;
-        self.jwks_ttl = jwks_ttl;
-        self
-    }
-
     /// The configured issuer.
     pub fn issuer(&self) -> &str {
         &self.issuer
@@ -424,33 +417,6 @@ impl OidcMetadataClient {
         .await
     }
 
-    /// Verify a JWT against this issuer, accepting **any** of `audiences`
-    /// (WIF: a workload realm trusts a set of allowed audiences and
-    /// presents no nonce). This is the shared core of [`verify_id_token`]:
-    /// signature against the cached JWKS (one kid-miss refetch), the RSA-only
-    /// algorithm allowlist, `iss` = configured issuer, `aud` ∈ `audiences`,
-    /// `exp`/`nbf` with leeway, and an optional `nonce` equality check.
-    ///
-    /// `audiences` must be non-empty; an empty slice would make `jsonwebtoken`
-    /// skip the audience check, so callers must pass at least one.
-    pub async fn verify_jwt(
-        &self,
-        token: &str,
-        audiences: &[&str],
-        nonce: Option<&str>,
-        leeway_seconds: u64,
-    ) -> Result<Verified, OidcError> {
-        self.verify_jwt_inner(
-            token,
-            audiences,
-            nonce,
-            leeway_seconds,
-            DiscoveryKind::Interactive,
-            false,
-        )
-        .await
-    }
-
     /// Verify a non-interactive workload JWT.
     ///
     /// This differs deliberately from browser-login ID-token verification:
@@ -485,6 +451,14 @@ impl OidcMetadataClient {
         Ok(verified)
     }
 
+    /// The shared core of [`Self::verify_id_token`] and
+    /// [`Self::verify_workload_jwt`]: signature against the cached JWKS (one
+    /// kid-miss refetch), the RSA-only algorithm allowlist, `iss` = configured
+    /// issuer, `aud` ∈ `audiences`, `exp`/`nbf` with leeway, and an optional
+    /// `nonce` equality check.
+    ///
+    /// `audiences` must be non-empty; an empty slice would make `jsonwebtoken`
+    /// skip the audience check, so callers must pass at least one.
     async fn verify_jwt_inner(
         &self,
         token: &str,

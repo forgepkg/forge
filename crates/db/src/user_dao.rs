@@ -475,25 +475,6 @@ where
     Ok(res.rows_affected() > 0)
 }
 
-/// Record which auth realm vouches for this user. For credential-forwarding
-/// accounts this is an authorization input: only that realm may sign the
-/// account in (see [`find_upstream_user`]). A no-op write when the value
-/// is unchanged.
-pub async fn set_user_realm(pool: &PgPool, user_id: i64, realm_id: i64) -> sqlx::Result<()> {
-    sqlx::query!(
-        r#"
-        UPDATE app_user
-        SET realm_id = $2
-        WHERE id = $1 AND realm_id IS DISTINCT FROM $2
-        "#,
-        user_id,
-        realm_id,
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// The `credential_forwarding` realm config key that opts the realm in to
 /// keeping a password hash of the logins its upstream accepts.
 pub const CAPTURE_PASSWORD_HASH_KEY: &str = "capture_password_hash";

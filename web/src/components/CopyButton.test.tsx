@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen } from '@testing-library/react'
 
-import { CommandSnippet, CopyButton } from './CopyButton'
+import { CommandSnippet, CopyButton } from './ui'
 
 /**
  * Copy affordances: the command snippet and the compact digest button write

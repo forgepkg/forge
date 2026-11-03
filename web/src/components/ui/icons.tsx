@@ -115,9 +115,6 @@ const ICONS = {
 
 export type IconName = keyof typeof ICONS
 
-/** The names of every icon, for previews and tests. */
-export const ICON_NAMES = Object.keys(ICONS) as IconName[]
-
 /**
  * One icon. Decorative by default (`aria-hidden`); pass `title` only when the
  * icon carries meaning alone, and prefer a visible word.

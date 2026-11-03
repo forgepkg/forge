@@ -10,7 +10,6 @@
 //! secret belongs to changed ([`merge_secrets`]).
 
 use std::net::IpAddr;
-use std::time::Duration;
 
 use lettre::message::Mailbox;
 use lettre::Address;
@@ -488,11 +487,6 @@ impl EmailConfig {
             .as_deref()
             .map(|a| parse_address("reply_to", a).map(|a| Mailbox::new(None, a)))
             .transpose()
-    }
-
-    /// How long an invitation stays valid.
-    pub fn invitation_ttl(&self) -> Duration {
-        Duration::from_secs(u64::from(self.invitation_ttl_hours) * 3600)
     }
 
     /// The document without its secrets, as the API returns it: each secret

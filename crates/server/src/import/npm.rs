@@ -91,7 +91,7 @@ impl NpmRegistry {
             .http
             .get(&url, RequestClass::Metadata, self.auth().as_ref())
             .await
-            .map_err(|e| SourceError::of(e, &url))?;
+            .map_err(SourceError::of)?;
         self.server = response
             .headers()
             .get(reqwest::header::SERVER)
@@ -120,7 +120,7 @@ impl NpmRegistry {
         {
             Ok(body) => Ok(body),
             Err(UpstreamError::Status { status, .. }) if not_served(status) => Ok(None),
-            Err(e) => Err(SourceError::of(e, url)),
+            Err(e) => Err(SourceError::of(e)),
         }
     }
 
@@ -204,9 +204,9 @@ impl NpmRegistry {
                 self.http
                     .get_metadata_body(&url, self.auth().as_ref(), Some(ABBREVIATED_ACCEPT))
                     .await
-                    .map_err(|e| SourceError::of(e, &url))?
+                    .map_err(SourceError::of)?
             }
-            Err(e) => return Err(SourceError::of(e, &url)),
+            Err(e) => return Err(SourceError::of(e)),
         };
         let Some(body) = body else {
             return Ok(None);
@@ -233,7 +233,7 @@ impl NpmRegistry {
             .http
             .get(url, RequestClass::Download, self.auth().as_ref())
             .await
-            .map_err(|e| SourceError::of(e, url))?;
+            .map_err(SourceError::of)?;
         if !response.status().is_success() {
             return Err(SourceError::status(response.status(), url));
         }

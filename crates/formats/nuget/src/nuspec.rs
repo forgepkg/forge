@@ -190,11 +190,6 @@ impl NuspecMetadata {
     }
 }
 
-/// Extract the display metadata from raw `.nuspec` bytes.
-pub fn metadata_from_nuspec(bytes: &[u8]) -> Result<NuspecMetadata, FormatError> {
-    Ok(parse_nuspec(bytes).map_err(FormatError::from)?.metadata)
-}
-
 /// What the feed renders from a `.nuspec`: its display metadata and
 /// dependency groups. Computed once at publish and stored with the version
 /// (`component.manifest_summary`), so registration pages and search results

@@ -9,3 +9,6 @@ dist/
 /blob-report/
 /.last-run.json
 e2e/.harness-facts.json
+
+# TypeScript incremental build state
+*.tsbuildinfo

@@ -2,7 +2,6 @@ import type { ReactNode } from 'react'
 import clsx from 'clsx'
 
 import { Icon, type IconName } from './icons'
-import { CopyButton } from './code'
 
 const KINDS = new Set(['hosted', 'proxy', 'group'])
 
@@ -134,39 +133,3 @@ export function Version({
   )
 }
 
-/**
- * A content digest the Docker way (algorithm plus 12 hex characters), the
- * full value as tooltip, with a copy button. `full` shows the whole digest
- * with a faint tail.
- */
-export function Digest({
-  value,
-  length = 12,
-  full = false,
-  showAlgorithm = true,
-  copy = true,
-  copyLabel = 'Copy digest',
-  className,
-}: {
-  value: string
-  length?: number
-  full?: boolean
-  showAlgorithm?: boolean
-  copy?: boolean
-  copyLabel?: string
-  className?: string
-}) {
-  const i = value.indexOf(':')
-  const algo = i >= 0 ? value.slice(0, i + 1) : ''
-  const hex = i >= 0 ? value.slice(i + 1) : value
-  return (
-    <span className={clsx('fg-digest', className)}>
-      <span className="fg-digest-text" title={value}>
-        {showAlgorithm && algo && <span className="fg-digest-algo">{algo}</span>}
-        <span className="fg-digest-short">{hex.slice(0, length)}</span>
-        {full && <span className="fg-digest-rest">{hex.slice(length)}</span>}
-      </span>
-      {copy && <CopyButton value={value} label={copyLabel} />}
-    </span>
-  )
-}

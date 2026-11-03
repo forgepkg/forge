@@ -513,20 +513,6 @@ fn deny_all_scope() -> TokenScope {
 mod tests {
     use super::*;
 
-    fn user() -> Principal {
-        Principal::User {
-            user_id: 42,
-            token_id: None,
-            method: crate::auth::AuthMethod::Password,
-        }
-    }
-
-    fn anon() -> Principal {
-        Principal::Anonymous {
-            ip: "127.0.0.1".parse().unwrap(),
-        }
-    }
-
     /// A pool that is never actually queried in the pure tests below (they cover
     /// only paths that short-circuit before any DB access).
     fn authz() -> Authz {
@@ -582,11 +568,5 @@ mod tests {
             assert!(!eff.allows_repo(level, 1));
         }
         assert!(!eff.is_admin());
-    }
-
-    #[test]
-    fn principals_distinguish_user_anon() {
-        assert!(user().is_user());
-        assert!(!anon().is_user());
     }
 }

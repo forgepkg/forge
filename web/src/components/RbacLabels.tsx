@@ -5,7 +5,6 @@ import {
   LEVEL_COVERS,
   type GrantView,
   type Level,
-  type RoleView,
   type SelectorView,
 } from '~/api/rbac'
 import { Notice, StatusBadge, type Tone } from '~/components/ui'
@@ -111,22 +110,6 @@ export function SelectorLabel({
       className="fg-link"
     >
       {selector.name}
-    </Link>
-  )
-}
-
-/** A role linked by name (or its id when not in the list). */
-export function RoleLabel({
-  id,
-  roles,
-}: {
-  id: number
-  roles: ReadonlyMap<number, RoleView>
-}) {
-  const role = roles.get(id)
-  return (
-    <Link to="/manage/roles/$roleId" params={{ roleId: String(id) }} className="fg-link">
-      {role?.name ?? `role #${id}`}
     </Link>
   )
 }

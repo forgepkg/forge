@@ -32,11 +32,6 @@ pub const NUPKG_ASSET_PATH: &str = "package.nupkg";
 /// (NuGet's [`crate::format::Format::manifest_asset_path`]).
 pub const NUSPEC_ASSET_PATH: &str = "package.nuspec";
 
-/// Content type stored/served for the `.nupkg` asset.
-pub const NUPKG_CONTENT_TYPE: &str = "application/octet-stream";
-/// Content type stored/served for the derived `.nuspec` asset.
-pub const NUSPEC_CONTENT_TYPE: &str = "application/xml";
-
 /// Errors the read/write ops surface to callers.
 #[derive(Debug, thiserror::Error)]
 pub enum RepoError {

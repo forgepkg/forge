@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlx::{PgConnection, PgPool, Row, Transaction};
 
-use crate::model::Repository;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustedPublisherMatch {
     pub id: i64,
@@ -91,26 +89,6 @@ pub async fn list_for_repository(
     .fetch_all(pool)
     .await?;
     rows.iter().map(from_row).collect()
-}
-
-pub async fn find_for_repository(
-    pool: &PgPool,
-    repository_id: i64,
-    id: i64,
-) -> sqlx::Result<Option<TrustedPublisher>> {
-    let row = sqlx::query(
-        r#"
-        SELECT id, repository_id, realm_id, name, description, includes,
-               excludes, conditions, actions
-        FROM trusted_publisher
-        WHERE repository_id = $1 AND id = $2
-        "#,
-    )
-    .bind(repository_id)
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
-    row.as_ref().map(from_row).transpose()
 }
 
 pub async fn list_for_realm(pool: &PgPool, realm_id: i64) -> sqlx::Result<Vec<TrustedPublisher>> {
@@ -331,8 +309,4 @@ pub async fn hosted_repository(pool: &PgPool, repository_id: i64) -> sqlx::Resul
         .bind(repository_id)
         .fetch_one(pool)
         .await
-}
-
-pub fn validate_repository(repository: &Repository) -> bool {
-    repository.kind() == crate::model::RepoKind::Hosted
 }
