@@ -53,6 +53,9 @@ pub struct OptionView {
     /// Whether every repository of those kinds sets it.
     pub required: bool,
     pub example: &'static str,
+    /// How a form takes it: `text` (a line), or `switch` (on is `"true"`,
+    /// off is no value).
+    pub input: &'static str,
 }
 
 /// `GET /admin/formats`: NuGet first, then the images formats (Docker),
@@ -81,6 +84,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
                     kinds: option.kinds.iter().map(|k| k.as_str()).collect(),
                     required: option.required,
                     example: option.example,
+                    input: option.input.as_str(),
                 })
                 .collect(),
             signed_indexes: descriptor.indexes,

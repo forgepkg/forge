@@ -9,7 +9,16 @@ interface Snippet {
   copyLabel: string
 }
 
-/** What else the snippets of some formats need: apt's kind and distribution. */
+/**
+ * The npm option (a switch of proxies and groups) that has the panel offer
+ * `npm config set replace-registry-host`.
+ */
+export const SHOW_REPLACE_REGISTRY_HOST = 'show_replace_registry_host'
+
+/**
+ * What else the snippets of some formats need: apt's kind and distribution,
+ * npm's replace-registry-host switch.
+ */
 export interface ConnectContext {
   kind?: string
   options?: Record<string, string>
@@ -91,13 +100,18 @@ export function connectSnippets(
           command: `npm config set @<scope>:registry ${url}/`,
           copyLabel: 'Copy scope-registry command',
         },
-        {
-          // npm rewrites a lockfile's registry.npmjs.org URLs onto `registry`
-          // by itself; another registry's host it has to be told.
-          label: 'Install a package-lock.json written against another registry',
-          command: 'npm config set replace-registry-host <package-lock.json-host>',
-          copyLabel: 'Copy replace-registry-host command',
-        },
+        // npm rewrites a lockfile's registry.npmjs.org URLs onto `registry`
+        // by itself; another registry's host it has to be told. Offered where
+        // an administrator switched it on (a proxy's or a group's option).
+        ...(context.options?.[SHOW_REPLACE_REGISTRY_HOST] === 'true'
+          ? [
+              {
+                label: 'Install a package-lock.json written against another registry',
+                command: 'npm config set replace-registry-host <package-lock.json-host>',
+                copyLabel: 'Copy replace-registry-host command',
+              },
+            ]
+          : []),
         {
           label: 'Sign in',
           command: `npm login --registry ${url}/`,
@@ -183,7 +197,7 @@ export function PackageConnect({
   url: string
   /** The repository's kind (apt's snippets differ for a proxy). */
   kind?: string
-  /** The settings of its format's own (apt's distribution). */
+  /** The settings of its format's own (apt's distribution, npm's switches). */
   options?: Record<string, string>
   canPush?: boolean
 }) {

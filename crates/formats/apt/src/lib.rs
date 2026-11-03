@@ -32,6 +32,7 @@ use std::cmp::Ordering;
 
 use forge_plugin_api::{
     Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FormatError, FormatOption,
+    OptionInput,
     FormatPlugin, IndexFile, IndexInput, Loaded, PackageRef, PackageSource, ParsedPackage,
     Prereleases, PublishRequest, Query, Remote, Repository, RepositoryKind, Request, Response,
     Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken, VersionClass,
@@ -68,6 +69,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
         kinds: &[RepositoryKind::Hosted, RepositoryKind::Proxy],
         required: true,
         example: "bookworm",
+        input: OptionInput::Text,
     }],
     // A `-` starts the Debian revision (`1.0-1`), it marks no prerelease.
     prereleases: Prereleases::None,
