@@ -197,3 +197,66 @@ async fn cached_blobs_garbage_collection_deleted_are_dropped() {
     assert!(!cache.contains(&blobs[2]), "a deleted blob goes");
     assert_eq!(cache.stats().evictions, 2);
 }
+
+/// A proxy-refresh pass skips the proxies of an images format: a Docker proxy
+/// keeps no upstream index (it revalidates per tag at pull time), so the pass
+/// neither talks to its upstream nor warns about it (#664).
+#[tokio::test]
+async fn proxy_refresh_skips_docker_proxies() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Counts the WARN-or-worse events the server logs.
+    struct Warnings(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if *meta.level() <= tracing::Level::WARN && meta.target().starts_with("forge_server") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    // Its own database: the pass walks every proxy repository there is.
+    let srv = common::start_with(common::fresh_pool().await, ServerOpts::default()).await;
+    let upstream = wiremock::MockServer::start().await;
+    let (u, p) = srv.admin_basic();
+    let proxy = format!("dockerproxy{}", common::unique());
+    let resp = srv
+        .client()
+        .post(format!("{}/admin/repositories", srv.base_url))
+        .basic_auth(&u, Some(&p))
+        .json(&serde_json::json!({
+            "name": proxy, "kind": "proxy", "format": "docker", "remote_url": upstream.uri(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "create the Docker proxy: {}",
+        resp.status()
+    );
+    let before = upstream.received_requests().await.unwrap_or_default().len();
+
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Warnings(warnings.clone()));
+    let pass = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        forge_server::workers::refresh_proxies_once(&srv.state).await
+    };
+
+    pass.expect("the refresh pass succeeds");
+    let after = upstream.received_requests().await.unwrap_or_default().len();
+    assert_eq!(after, before, "the pass sends the Docker upstream nothing");
+    assert_eq!(
+        warnings.load(Ordering::SeqCst),
+        0,
+        "the pass warns about nothing"
+    );
+}

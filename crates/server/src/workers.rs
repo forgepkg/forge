@@ -717,17 +717,21 @@ fn spawn_proxy_refresh(state: AppState, interval: Duration) -> JoinHandle<()> {
 
 /// One proxy-refresh pass: re-resolve every online proxy repository's upstream
 /// index (best-effort; a single proxy's failure does not abort the pass).
-async fn refresh_proxies_once(state: &AppState) -> anyhow::Result<()> {
+pub async fn refresh_proxies_once(state: &AppState) -> anyhow::Result<()> {
     let repos = repository_dao::list_repositories(&state.pool).await?;
     for repo in repos {
         if repo.kind() != RepoKind::Proxy || !repo.online {
             continue;
         }
-        // Proxies of package formats keep an upstream index; docker
-        // proxies revalidate per tag (and have no package format).
+        // Proxies of package formats keep an upstream index; the proxies of
+        // an images format (Docker) have none: they revalidate per tag at
+        // pull time, and their format refuses an index operation.
         let Ok(format) = state.formats.for_repository(&repo) else {
             continue;
         };
+        if format.stores_images() {
+            continue;
+        }
         // Same wiring as request-time reads: shared upstream client and the
         // envelope service, so credentialed upstreams refresh too.
         let proxy = state.proxy_repo(format);
