@@ -1395,3 +1395,88 @@ async fn idp_demotion_ends_sessions_opened_as_admin() {
     let body: Value = me(demoted).await.json().await.unwrap();
     assert_eq!(body["is_admin"], json!(false));
 }
+
+/// #812: a user an administrator switched to Admin on the user page holds
+/// `reader` next to `admin`, so that the IdP taking `admin` away (the realm
+/// maps `admin_groups`) leaves a reader, not an account with no built-in
+/// role.
+#[tokio::test]
+async fn a_user_made_admin_on_the_user_page_stays_a_reader_after_an_idp_demotion() {
+    let _serial = SERIAL.lock().await;
+    let idp = MockIdp::start().await;
+    let srv = start_with(
+        common::pool().await,
+        ServerOpts {
+            bootstrap_admin: Some((
+                format!("admin{}@example.com", common::unique()),
+                "adminpw".into(),
+            )),
+            oidc_block: Some(idp.oidc_block()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let n = common::unique();
+    let (sub, username) = (format!("sub-{n}"), format!("promoted-{n}@example.com"));
+    let roles_of = |id: i64| {
+        let req = client
+            .get(format!("{}/admin/users/{id}/roles", srv.base_url))
+            .basic_auth(&admin, Some(&password));
+        async move {
+            let held: Vec<Value> = req.send().await.unwrap().json().await.unwrap();
+            let mut roles: Vec<String> = held
+                .iter()
+                .map(|r| r["name"].as_str().unwrap().to_string())
+                .collect();
+            roles.sort();
+            roles
+        }
+    };
+
+    // The IdP creates a reader.
+    let (cookie, _) = login_and_get_cookie(&idp, &srv, &sub, &username, json!([])).await;
+    let me: Value = no_redirect_client()
+        .get(format!("{}/auth/me", srv.base_url))
+        .header("cookie", format!("forge_session={cookie}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let user_id = me["user_id"].as_i64().unwrap_or_else(|| panic!("{me}"));
+    assert_eq!(roles_of(user_id).await, ["reader"]);
+
+    // Switched to Admin on the user page: it assigns `admin` and, holding
+    // `reader` already, unassigns nothing.
+    let roles: Vec<Value> = client
+        .get(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let admin_role = roles
+        .iter()
+        .find(|r| r["name"] == json!("admin"))
+        .and_then(|r| r["id"].as_i64())
+        .expect("the admin role");
+    let resp = client
+        .put(format!("{}/admin/users/{user_id}/roles", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({ "role_id": admin_role }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(roles_of(user_id).await, ["admin", "reader"]);
+
+    // The IdP does not list the admin group: the next login takes `admin`
+    // away and leaves a reader.
+    login_and_get_cookie(&idp, &srv, &sub, &username, json!([])).await;
+    assert_eq!(roles_of(user_id).await, ["reader"]);
+}

@@ -1565,3 +1565,153 @@ async fn kept_password_hashes_carry_a_realm_past_its_upstream() {
         assert_eq!(account.auth_source, "local");
     }
 }
+
+/// #812: an administrator made through the admin API or the user page holds
+/// `reader` next to `admin`, so that a credential-forwarding realm whose
+/// upstream drops them from its `admin_group` leaves a reader, not an
+/// account with no built-in role. A service account is never an admin and
+/// stays roles only.
+#[tokio::test]
+async fn an_admin_demoted_by_the_upstream_stays_a_reader() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The upstream accepts every password and lists no admin group: every
+    // login it answers takes `admin` away.
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "groups": [] })))
+        .mount(&upstream)
+        .await;
+
+    // Its own database: an enabled forwarding realm would join the login
+    // chains of every other test sharing one.
+    let srv = common::start_with(common::fresh_pool().await, common::ServerOpts::default()).await;
+    let (admin, password) = srv.admin_basic();
+    let client = srv.client();
+    let resp = client
+        .post(format!("{}/admin/realms", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .json(&json!({
+            "kind": "credential_forwarding",
+            "name": "nexus",
+            "config": {
+                "url": format!("{}/status", upstream.uri()),
+                "key_pepper": "pepper",
+                "groups_path": "groups",
+                "admin_group": "nexus-admins",
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+
+    let create = |body: Value| {
+        let req = client
+            .post(format!("{}/admin/users", srv.base_url))
+            .basic_auth(&admin, Some(&password))
+            .json(&body);
+        async move {
+            let resp = req.send().await.unwrap();
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            (status, body)
+        }
+    };
+    let roles_of = |id: i64| {
+        let req = client
+            .get(format!("{}/admin/users/{id}/roles", srv.base_url))
+            .basic_auth(&admin, Some(&password));
+        async move {
+            let held: Vec<Value> = req.send().await.unwrap().json().await.unwrap();
+            let mut roles: Vec<String> = held
+                .iter()
+                .map(|r| r["name"].as_str().unwrap().to_string())
+                .collect();
+            roles.sort();
+            roles
+        }
+    };
+    let sign_in = |username: String| {
+        let req = client
+            .post(format!("{}/auth/login", srv.base_url))
+            .json(&json!({ "username": username, "password": "upstream-pw" }));
+        async move {
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+        }
+    };
+
+    // Created with `"role": "admin"`: admin and reader.
+    let created = format!("created{}@example.com", common::unique());
+    let (status, body) =
+        create(json!({ "username": created, "realm": "nexus", "role": "admin" })).await;
+    assert_eq!(status, 201, "{body}");
+    let created_id = body["id"].as_i64().unwrap();
+    assert_eq!(roles_of(created_id).await, ["admin", "reader"]);
+
+    // Switched to Admin on the user page: a writer gets admin and reader
+    // (`PUT /admin/users/{id}/roles` for each), then loses writer.
+    let switched = format!("switched{}@example.com", common::unique());
+    let (status, body) =
+        create(json!({ "username": switched, "realm": "nexus", "role": "writer" })).await;
+    assert_eq!(status, 201, "{body}");
+    let switched_id = body["id"].as_i64().unwrap();
+    let roles: Vec<Value> = client
+        .get(format!("{}/admin/roles", srv.base_url))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let role_id = |name: &str| {
+        roles
+            .iter()
+            .find(|r| r["name"] == json!(name))
+            .and_then(|r| r["id"].as_i64())
+            .unwrap_or_else(|| panic!("no {name} role"))
+    };
+    for name in ["admin", "reader"] {
+        let resp = client
+            .put(format!("{}/admin/users/{switched_id}/roles", srv.base_url))
+            .basic_auth(&admin, Some(&password))
+            .json(&json!({ "role_id": role_id(name) }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+    }
+    let resp = client
+        .delete(format!(
+            "{}/admin/users/{switched_id}/roles/{}",
+            srv.base_url,
+            role_id("writer")
+        ))
+        .basic_auth(&admin, Some(&password))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert_eq!(roles_of(switched_id).await, ["admin", "reader"]);
+
+    // The upstream no longer lists them in its admin group: the next login
+    // takes `admin` away and leaves a reader.
+    sign_in(created).await;
+    sign_in(switched).await;
+    assert_eq!(roles_of(created_id).await, ["reader"]);
+    assert_eq!(roles_of(switched_id).await, ["reader"]);
+
+    // A service account is never an admin, and gets no reader it was not
+    // asked for.
+    let service = format!("ci{}@example.com", common::unique());
+    let (status, _) =
+        create(json!({ "username": service, "kind": "service", "role": "admin" })).await;
+    assert_eq!(status, 400);
+    let (status, body) = create(json!({ "username": service, "kind": "service" })).await;
+    assert_eq!(status, 201, "{body}");
+    assert!(roles_of(body["id"].as_i64().unwrap()).await.is_empty());
+}

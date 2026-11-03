@@ -208,14 +208,25 @@ function UserPage() {
 }
 
 /**
+ * The built-in roles a user at `level` holds: an admin holds `reader` next to
+ * `admin` (#812), so that an identity provider or upstream that takes `admin`
+ * away leaves a reader, as `POST /admin/users` with `role: admin` does.
+ */
+function levelRoles(level: AccessLevel): readonly string[] {
+  if (level === 'roles_only') return []
+  if (level === 'admin') return [ACCESS_ROLES.admin, ACCESS_ROLES.reader]
+  return [ACCESS_ROLES[level]]
+}
+
+/**
  * The user's built-in access level: roles only (no built-in role), reader
  * (the `reader` role), writer (the `writer` role) or admin (the `admin`
- * role), switched through `/admin/users/{id}/roles`. A switch assigns the new
- * level's role first and then takes the others, so a refused step (the last
- * active administrator keeps `admin`: 409, with the server's reason) never
- * leaves the user with less access than before. A service account
- * (`serviceAccount`) or an account of a trusted-header realm
- * (`trustedHeader`) is never an admin.
+ * role, with `reader` kept next to it), switched through
+ * `/admin/users/{id}/roles`. A switch assigns the new level's roles first and
+ * then takes the others, so a refused step (the last active administrator
+ * keeps `admin`: 409, with the server's reason) never leaves the user with
+ * less access than before. A service account (`serviceAccount`) or an
+ * account of a trusted-header realm (`trustedHeader`) is never an admin.
  */
 export function UserAccess({
   userId,
@@ -241,14 +252,15 @@ export function UserAccess({
     setSaving(true)
     setError(null)
     try {
-      const keep = chosen === 'roles_only' ? null : ACCESS_ROLES[chosen]
-      if (keep) {
-        const role = (roles.data ?? []).find((r) => r.name === keep)
-        if (!role) throw new Error(`The built-in role ${keep} is missing.`)
+      const keep = levelRoles(chosen)
+      for (const name of keep) {
+        const role = (roles.data ?? []).find((r) => r.name === name)
+        if (!role) throw new Error(`The built-in role ${name} is missing.`)
+        if ((held.data ?? []).some((r) => r.id === role.id)) continue
         await assign.mutateAsync({ userId, roleId: role.id })
       }
       for (const role of held.data ?? []) {
-        if (LEVEL_ROLES.includes(role.name) && role.name !== keep) {
+        if (LEVEL_ROLES.includes(role.name) && !keep.includes(role.name)) {
           await unassign.mutateAsync({ userId, roleId: role.id })
         }
       }
