@@ -2189,6 +2189,8 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "jsonwebtoken",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "rand 0.10.3",
  "reqwest",
  "rsa",
