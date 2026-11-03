@@ -9,6 +9,7 @@ mod changelog;
 mod docs;
 mod proc;
 mod release;
+mod unused;
 
 use proc::{Cmd, RunningCmd};
 use std::env;
@@ -77,6 +78,7 @@ fn main() -> ExitCode {
         "check" => check(),
         "fmt" => fmt(),
         "clippy" => clippy(),
+        "doc-check" => doc_check(),
         "test" => test(),
         "e2e" => e2e(),
         "migrate" => migrate(),
@@ -90,6 +92,7 @@ fn main() -> ExitCode {
         "docs" => docs::docs(rest),
         "changelog" => changelog::changelog(rest),
         "release" => release::release(rest),
+        "unused" => unused::unused(rest),
         other => {
             eprintln!("xtask: unknown command `{other}`\n");
             print_help();
@@ -146,11 +149,16 @@ Rust build & quality:
   check         fmt --check + clippy -D warnings.
   fmt           Verify formatting (cargo fmt --all --check).
   clippy        Lint with warnings denied.
+  doc-check     Build the crates' API docs with rustdoc's warnings denied, so a doc
+                link to a renamed or removed item fails (CI).
   test          Run unit + integration tests (needs Docker for testcontainers).
   e2e           Run the end-to-end suite (forge-e2e feature; needs Docker).
   migrate       Apply all migrations against the live DB (sqlx migrate run).
   prepare       Migrate, then regenerate the sqlx offline cache (needs `up` + sqlx-cli).
   prepare-check Migrate, then verify the committed .sqlx/ cache is in sync (CI's drift guard).
+  unused        Fail on what rustc and clippy cannot see is unused: a pub item nothing
+                else names, a dependency its crate never imports, a dev-dependency
+                repeating a dependency, a workspace dependency no member inherits (CI).
   clean         Remove build artifacts (cargo clean).
 
 Docker image (single container: web SPA + Rust server):
@@ -709,6 +717,26 @@ fn clippy() -> Result<(), String> {
         "-D",
         "warnings",
     ])
+    .run()
+}
+
+/// The crates' API docs, built with rustdoc's warnings denied: a doc link to
+/// an item that was renamed or removed fails. The private items are
+/// documented too, since most links are between them, so a link from a
+/// public item to a private one is fine. `--all-features` takes in forge-e2e,
+/// which is all behind its feature.
+fn doc_check() -> Result<(), String> {
+    cargo(&[
+        "doc",
+        "--workspace",
+        "--all-features",
+        "--no-deps",
+        "--document-private-items",
+    ])
+    .env(
+        "RUSTDOCFLAGS",
+        "-D warnings -A rustdoc::private_intra_doc_links",
+    )
     .run()
 }
 

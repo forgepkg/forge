@@ -290,10 +290,10 @@ admin_claim = "roles"
         claims
     }
 
-    /// Rotate the signing key: snapshot the **old** signer (so a test can still
-    /// sign a token with the now-retired key), publish only the **new** key in
-    /// the JWKS, and make it the active signer. Returns the retired signer's
-    /// behaviour through [`Self::set_next_id_token_with_retired_key`].
+    /// Rotate the signing key: publish only the **new** key in the JWKS and make
+    /// it the active signer, so the old `kid` is a miss in the JWKS from now on.
+    /// A token signed by a key the JWKS does not hold is
+    /// [`Self::set_next_id_token_with_unknown_key`]'s.
     pub async fn rotate_key(&self, new_kid: &str) {
         let new_signer = Signer::new(new_kid);
         let mut inner = self.inner.lock().await;

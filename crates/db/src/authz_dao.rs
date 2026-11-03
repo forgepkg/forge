@@ -36,7 +36,7 @@ pub const READER_ROLE: &str = "reader";
 
 /// Shared shape of the effective-set query rows (user + anonymous variants).
 /// The two `sqlx::query!` calls generate distinct anonymous structs with the
-/// same columns; [`into_query_row!`] converts each into this adapter so
+/// same columns; `into_query_row!` converts each into this adapter so
 /// [`map_grant_row`] is reused across both call sites.
 struct EffectiveQueryRow {
     level: String,

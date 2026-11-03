@@ -4,7 +4,7 @@
 //! rationale. Everything here is parameterised over an injected
 //! [`reqwest::Client`] (so callers pass the no-redirect, https-only client from
 //! [`crate::net::ssrf::outbound_metadata_client`]) and a [`forge_cache::Cache`], which is
-//! what makes the whole module unit-testable with a [`wiremock`] HTTP server and
+//! what makes the whole module unit-testable with a `wiremock` HTTP server and
 //! a self-signed token — no real IdP, no real network.
 //!
 //! Discovery documents and key sets decide which tokens verify, so they are

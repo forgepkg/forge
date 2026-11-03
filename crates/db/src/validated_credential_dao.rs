@@ -480,8 +480,9 @@ pub async fn list_auth_successes(pool: &PgPool, username: &str) -> sqlx::Result<
 /// Revoke every cached verdict for a username (optionally scoped to one
 /// provider): the admin "force re-auth user X" / deactivate-user path. Returns
 /// the number of rows deleted (verdicts plus any in-flight singleflight
-/// claims, whose winners are thereby fenced — see [`finalize_claim`]). The caller must also drop the matching cache
-/// entries via the [`forge_cache`] invalidation backplane.
+/// claims, whose winners are thereby fenced — see [`finalize_claim`]). The
+/// caller must also drop the matching cache entries via the `forge-cache`
+/// invalidation backplane.
 pub async fn revoke_by_username(
     pool: &PgPool,
     username: &str,

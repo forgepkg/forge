@@ -32,7 +32,7 @@
 //!   [`ProvenIdentity::local`].
 //!
 //! The provider only *vouches for* the username; mapping that identity back to
-//! a concrete [`UserPrincipal`] (user id, admin flag) is the chain caller's job
+//! a concrete [`UserPrincipal`](super::UserPrincipal) (user id, admin flag) is the chain caller's job
 //! (see [`super::chain`] mapping helpers). This keeps providers free of the
 //! `UserPrincipal` shape, so authorization can change without touching them.
 //!

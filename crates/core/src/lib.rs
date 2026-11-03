@@ -6,7 +6,7 @@
 //! * [`domain`] — neutral types ([`domain::ParsedUpload`]) produced by parsing
 //!   an uploaded package, the boundary between a concrete format and the rest
 //!   of the system.
-//! * [`format`] — the object-safe [`format::Format`] seam every package format
+//! * [`format`](mod@format) — the object-safe [`format::Format`] seam every package format
 //!   implements (parse, version normalize/compare, id lowercasing).
 //! * [`auth`] — principal extraction (token/password/anonymous), client-IP
 //!   resolution behind trusted proxies, and the authorization seam over the

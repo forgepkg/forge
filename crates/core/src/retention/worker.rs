@@ -11,7 +11,8 @@
 //! 1. parses + validates the claimed repo's `retention_policy`;
 //! 2. snapshots its candidate components (and, for proxy repos, cached
 //!    versions);
-//! 3. runs the **pure** [`evaluate`] / [`evaluate_proxy`];
+//! 3. runs the **pure** [`evaluate`](super::evaluate()) /
+//!    [`evaluate_proxy`](super::evaluate_proxy);
 //! 4. [`apply`]s the decisions — each in its own tx, decref + `blob_outbox`
 //!    only (no direct S3 delete);
 //! 5. records the run summary + schedules the next run on the ledger: at the

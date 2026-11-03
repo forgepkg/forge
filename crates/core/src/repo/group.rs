@@ -4,7 +4,7 @@
 //! an ordered list of **member** repositories (hosted or proxy). Members carry a
 //! per-group `priority` (unique within the group); the highest priority wins
 //! ties. Resolution is **identity-aware**: for a calling [`Principal`] `P`, only
-//! members `P` may read (per [`authz::can_read`]) are visible. In particular a
+//! members `P` may read (per [`Authz::can_read`]) are visible. In particular a
 //! mixed-anonymity group serves an anonymous caller only its `anonymous_read`
 //! members, while an authenticated caller sees them all.
 //!
@@ -90,7 +90,7 @@
 //!   past it stops (fail-closed).
 //!
 //! Identity-aware filtering is applied at **every** level: a member (group or
-//! leaf) is descended-into / included only if the principal [`can_read`] it
+//! leaf) is descended-into / included only if the principal can read it
 //! ([`Authz::can_read`]). The prefer-hosted ownership check above is the one
 //! deliberate exception: it only ever *removes* proxy candidates, so it
 //! consults every hosted leaf. Being able to read an outer group grants **no**
