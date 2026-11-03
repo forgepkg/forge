@@ -309,7 +309,10 @@ impl AptSource {
     /// Every entry of `index`: the first of its files the source serves
     /// (its `by-hash` copy first, where `release` says `Acquire-By-Hash`),
     /// checked against the size and SHA-256 `Release` lists for it, then
-    /// inflated and read. A file that does not match fails the scan.
+    /// inflated and read. A file that does not match fails the scan, and so
+    /// does an index whose entries take more than
+    /// [`apt::MAX_ENTRIES_BYTES`] of memory: the scan keeps them while it
+    /// is in the index.
     pub async fn packages(
         &self,
         release: &Release,
