@@ -170,7 +170,7 @@ Forge checks what it stores:
   lowercase for new names) and the version valid SemVer;
 - the tarball is a gzip'd tar that unpacks to at most `npm.max_unpacked_bytes`,
   read as npm unpacks it: one that npm would read otherwise than its headers
-  say (a header npm rejects, data after the end of the archive, a PAX record
+  say (a header npm rejects, data after a lone zero block, a PAX record
   npm reads otherwise, a file some client may unpack to `package.json` other
   than `<first>/package.json`) is refused, whether published or fetched
   through a proxy. `npm pack` writes none of these;
