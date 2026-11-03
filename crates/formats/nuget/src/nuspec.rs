@@ -967,9 +967,39 @@ struct RawNuspec {
 /// bounds the parser's path bookkeeping on hostile input.
 pub const MAX_NUSPEC_DEPTH: usize = 32;
 
+/// The manifest's text as UTF-8, decoded the way NuGet's `XDocument.Load`
+/// reads it when it starts with a byte-order mark: UTF-16 LE (`FF FE`) or BE
+/// (`FE FF`) is decoded, and a UTF-8 mark (`EF BB BF`) is dropped. Older
+/// manifests on nuget.org are UTF-16 (`Microsoft.Web.Infrastructure` 1.0.0).
+/// Without a mark the bytes are returned as they are, read as UTF-8.
+fn decode_manifest(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, NupkgError> {
+    use std::borrow::Cow;
+
+    let (body, little_endian) = match bytes {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => return Ok(Cow::Borrowed(rest)),
+        [0xFF, 0xFE, rest @ ..] => (rest, true),
+        [0xFE, 0xFF, rest @ ..] => (rest, false),
+        _ => return Ok(Cow::Borrowed(bytes)),
+    };
+    let malformed = |what: &str| {
+        NupkgError::MalformedNuspec(format!("cannot decode input using UTF-16: {what}"))
+    };
+    let units = body.chunks(2).map(|pair| match *pair {
+        [a, b] if little_endian => Ok(u16::from_le_bytes([a, b])),
+        [a, b] => Ok(u16::from_be_bytes([a, b])),
+        _ => Err(malformed("odd number of bytes")),
+    });
+    let mut text = String::with_capacity(body.len());
+    for unit in char::decode_utf16(units.collect::<Result<Vec<u16>, _>>()?) {
+        text.push(unit.map_err(|_| malformed("unpaired surrogate"))?);
+    }
+    Ok(Cow::Owned(text.into_bytes()))
+}
+
 /// Parse the `.nuspec` XML namespace-insensitively (by local name).
 fn parse_nuspec(bytes: &[u8]) -> Result<RawNuspec, NupkgError> {
-    let mut reader = Reader::from_reader(bytes);
+    let text = decode_manifest(bytes)?;
+    let mut reader = Reader::from_reader(text.as_ref());
     // Text is kept verbatim (entity references split it into several
     // events, so trimming per event would eat inner spaces); values are
     // trimmed once parsing is complete.
@@ -2123,6 +2153,62 @@ mod tests {
         let xml = br#"<?xml version="1.0"?><!DOCTYPE package [<!ENTITY x "Victim">]>
             <package><metadata><id>A.B</id><version>1.0.0</version></metadata></package>"#;
         let err = parse_nuspec(xml).unwrap_err();
+        assert!(err.to_string().contains("DOCTYPE"), "{err}");
+    }
+
+    /// `<package><metadata>` with id `A.B` and a non-ASCII description.
+    const BOM_MANIFEST: &str = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\
+        <package><metadata><id>A.B</id><version>1.0.0</version>\
+        <description>\u{e9}t\u{e9} \u{1f4e6}</description></metadata></package>";
+
+    #[test]
+    fn manifests_with_a_byte_order_mark_are_decoded_as_nuget_does() {
+        let le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(BOM_MANIFEST.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let be: Vec<u8> = [0xFE, 0xFF]
+            .into_iter()
+            .chain(BOM_MANIFEST.encode_utf16().flat_map(u16::to_be_bytes))
+            .collect();
+        let utf8: Vec<u8> = [0xEF, 0xBB, 0xBF]
+            .into_iter()
+            .chain(BOM_MANIFEST.bytes())
+            .collect();
+        for (name, bytes) in [("utf-16 le", le), ("utf-16 be", be), ("utf-8", utf8)] {
+            let raw = parse_nuspec(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!((raw.id.as_str(), raw.version.as_str()), ("A.B", "1.0.0"));
+            assert_eq!(
+                raw.metadata.description.as_deref(),
+                Some("\u{e9}t\u{e9} \u{1f4e6}"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_utf16_manifests_are_refused() {
+        let mut odd: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(BOM_MANIFEST.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        odd.push(b'x');
+        let err = parse_nuspec(&odd).unwrap_err();
+        assert!(err.to_string().contains("odd number of bytes"), "{err}");
+
+        // A high surrogate (U+D83D) with no low one after it.
+        let unpaired: Vec<u8> = [0xFF, 0xFE, b'<', 0, 0x3D, 0xD8, b'a', 0].to_vec();
+        let err = parse_nuspec(&unpaired).unwrap_err();
+        assert!(err.to_string().contains("unpaired surrogate"), "{err}");
+
+        // The checks on the decoded text still apply.
+        let doctype = "<?xml version=\"1.0\"?><!DOCTYPE package []>\
+            <package><metadata><id>A.B</id><version>1.0.0</version></metadata></package>";
+        let bytes: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(doctype.encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let err = parse_nuspec(&bytes).unwrap_err();
         assert!(err.to_string().contains("DOCTYPE"), "{err}");
     }
 
