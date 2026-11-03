@@ -86,6 +86,9 @@ testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 axum = { workspace = true }
 forge-cache = { path = "../cache" }
+# Read back the metrics recorded (tests/auth_pool_timeout.rs).
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Mock HTTP server for discovery/JWKS unit tests (no real network).
 wiremock = "0.6"
 # Generate a throwaway RSA keypair in-test: sign a self-signed ID token and

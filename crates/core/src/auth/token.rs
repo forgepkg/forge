@@ -92,7 +92,10 @@ pub async fn check_token(pool: &PgPool, secret: &str) -> sqlx::Result<TokenCheck
 
     let Some(token) = forge_db::token_dao::find_token_by_hash(pool, &hash)
         .await
-        .inspect_err(|e| tracing::warn!(error = %e, "token lookup failed"))?
+        .inspect_err(|e| {
+            forge_db::observe_error(e);
+            tracing::warn!(error = %e, "token lookup failed");
+        })?
     else {
         return Ok(TokenCheck::Unknown);
     };
@@ -122,7 +125,10 @@ pub async fn check_token(pool: &PgPool, secret: &str) -> sqlx::Result<TokenCheck
 
     let Some(user) = forge_db::user_dao::find_user_by_id(pool, token.user_id)
         .await
-        .inspect_err(|e| tracing::warn!(error = %e, "token user lookup failed"))?
+        .inspect_err(|e| {
+            forge_db::observe_error(e);
+            tracing::warn!(error = %e, "token user lookup failed");
+        })?
     else {
         return Ok(TokenCheck::Unusable);
     };
@@ -476,6 +482,7 @@ impl PrincipalSource for BasicAuthSource {
                         // A DB error during mapping: denied too, but as
                         // temporarily unavailable (503), so clients retry.
                         Err(e) => {
+                            forge_db::observe_error(&e);
                             tracing::warn!(error = %e, "principal mapping failed");
                             attempt.released();
                             return SourceOutcome::Unavailable;
