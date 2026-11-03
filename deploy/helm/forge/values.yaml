@@ -85,7 +85,8 @@ config:
 logLevel: info
 
 # OpenTelemetry (docs/deployment.md → Telemetry): Forge exports metrics,
-# traces and logs over OTLP/HTTP, each once enabled here, to an
+# traces and logs over OTLP/HTTP, each once enabled here (or in
+# config.telemetry, which wins; the settings below apply either way), to an
 # OpenTelemetry Collector (or any OTLP/HTTP endpoint), which sends them on to
 # your backends. The resource attributes name the pod, its namespace, node
 # and Deployment. With networkPolicy.egress set, allow the Collector's port.

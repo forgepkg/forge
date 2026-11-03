@@ -46,7 +46,51 @@ done
 # Numbers given with --set arrive as integers, not as YAML's floats.
 render set-flags --set config.server.max_staging_bytes=8589934592 --set replicaCount=2 \
   "${root_key[@]}"
+# A signal turned on through the config pass-through gets the OTEL_*
+# environment of the telemetry block, as one turned on there does (#579);
+# config.telemetry wins in forge.toml, so a signal turned off there has none.
+otel_settings=(--set telemetry.endpoint=http://collector.obs:4318
+  --set telemetry.headersSecret.name=otlp-auth --set telemetry.headersSecret.key=headers
+  --set 'telemetry.resourceAttributes.service\.namespace=packages'
+  --set telemetry.sampler=parentbased_traceidratio --set-string telemetry.samplerArg=0.25)
+render config-telemetry --set config.telemetry.metrics=true "${otel_settings[@]}" "${root_key[@]}"
+render config-telemetry-off --set telemetry.traces=true --set config.telemetry.traces=false \
+  "${otel_settings[@]}" "${root_key[@]}"
 rm -f "$work/lint.log"
+python3 - "$work" <<'EOF'
+import re
+import sys
+
+work = sys.argv[1]
+otel = ["OTEL_RESOURCE_ATTRIBUTES", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"]
+expected = {  # rendering: (the OTEL_* variables it sets, the ones it does not)
+    "default": ([], otel),
+    "telemetry-values": (otel, []),
+    "config-telemetry": (otel, []),
+    "config-telemetry-off": ([], otel),
+}
+failed = False
+for name, (present, absent) in expected.items():
+    documents = open(f"{work}/{name}.yaml", encoding="utf-8").read().split("\n---\n")
+    deployment = next(d for d in documents
+                      if re.search(r"^kind: Deployment$", d, re.M) and re.search(r"^  name: forge$", d, re.M))
+    names = set(re.findall(r"^ +- name: (\S+)$", deployment, re.M))
+    for var in present:
+        if var not in names:
+            print(f"{name}: the Deployment has no {var}")
+            failed = True
+    for var in absent:
+        if var in names:
+            print(f"{name}: the Deployment sets {var}")
+            failed = True
+    if name == "config-telemetry" and not re.search(
+            r"- name: OTEL_EXPORTER_OTLP_ENDPOINT\n +value: http://collector\.obs:4318\n", deployment):
+        print(f"{name}: OTEL_EXPORTER_OTLP_ENDPOINT is not telemetry.endpoint")
+        failed = True
+sys.exit(1 if failed else 0)
+EOF
+echo "telemetry: the OTEL_* environment follows telemetry and config.telemetry" >&2
 
 # `helm upgrade --reuse-values` renders the new chart with the values of the
 # release it upgrades instead of the chart's defaults, so a value block added

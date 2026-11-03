@@ -332,7 +332,10 @@ holding the `OTEL_EXPORTER_OTLP_HEADERS` value (`api-key=...`):
 `telemetry.headersSecret: {name: otlp-auth, key: headers}`. Any other
 `OTEL_*` variable goes in `env`. With `networkPolicy.egress` set, allow the
 Collector's port. `config.telemetry.per_repository: false` takes the
-repository names off the metrics.
+repository names off the metrics. A signal turned on through the `config`
+pass-through instead (`config.telemetry.metrics: true`) gets the same
+`OTEL_*` variables from the `telemetry` settings; a signal set in both
+places takes the value of `config.telemetry`, as `forge.toml` does.
 
 ## Checking changes
 
