@@ -374,7 +374,7 @@ async fn generate(
         // unavailable object store stays one).
         let mut failed: Option<IndexError> = None;
         let made = implementation.index(&target, &input, &mut |file| {
-            let mut store = || -> Result<(), IndexError> {
+            let store = || -> Result<(), IndexError> {
                 for file in sign(file, &keys)? {
                     bounds.add(&file)?;
                     ingested.push(runtime.block_on(ingest(&cas, file))?);
