@@ -126,6 +126,23 @@ pub async fn pool() -> PgPool {
     pool
 }
 
+/// A pool on the shared database the way `main` builds the server's
+/// ([`forge_db::connect_with`]): at most `max_connections`
+/// (`database.max_connections`), giving up on a free one after
+/// `acquire_timeout` (`database.acquire_timeout_seconds`). For a test of what
+/// a server does with a pool that small.
+pub async fn sized_pool(max_connections: u32, acquire_timeout: Duration) -> PgPool {
+    // Migrates the shared database first.
+    pool().await.close().await;
+    let url = match std::env::var("FORGE_TEST_DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => format!("postgres://forge:forge@{}/forge", pg_endpoint().await),
+    };
+    forge_db::connect_with(&url, max_connections, acquire_timeout)
+        .await
+        .expect("connect")
+}
+
 /// Every test database starts with its local realm accepting passwords from
 /// clients (tests sign in over Basic), and the auth settings at their
 /// defaults (anonymous access off). A test that needs others changes them on
