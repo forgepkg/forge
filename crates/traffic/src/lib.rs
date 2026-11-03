@@ -65,6 +65,10 @@ pub struct Traffic {
     /// of the worker and the last flush on shutdown adds to what the worker
     /// wrote instead of replacing it.
     flusher: Arc<tokio::sync::Mutex<Flusher>>,
+    /// The settings last read and applied ([`Self::apply`]); `None` until a
+    /// read succeeded. Shared, so that a restarted worker and the last flush
+    /// on shutdown keep to them when the settings cannot be read.
+    applied: Arc<std::sync::Mutex<Option<TrafficSettings>>>,
 }
 
 impl Traffic {
@@ -81,7 +85,24 @@ impl Traffic {
             objects,
             instance,
             cache: query::FileCache::new(),
+            applied: Arc::default(),
         }
+    }
+
+    /// Apply the settings just read: the recorder follows
+    /// [`TrafficSettings::enabled`], and they are kept as [`Self::applied`].
+    pub fn apply(&self, settings: &TrafficSettings) {
+        self.recorder.set_enabled(settings.enabled);
+        *self.applied.lock().unwrap_or_else(|e| e.into_inner()) = Some(settings.clone());
+    }
+
+    /// The settings last applied ([`Self::apply`]); `None` before the first
+    /// read succeeded, when no defaults may stand in for them.
+    pub fn applied(&self) -> Option<TrafficSettings> {
+        self.applied
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Write what was counted since the last flush.
