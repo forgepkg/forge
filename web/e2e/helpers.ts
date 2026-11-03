@@ -90,9 +90,10 @@ export async function addGroupMember(
 
 /**
  * Fetch a package's browse detail (the read endpoint the SPA's detail page
- * uses). For a proxy this also drives upstream **discovery** (it runs the
- * proxy read ops), so calling it stamps `first_seen_at` and surfaces a
- * still-delayed version with `delay_status = "delayed_until"`.
+ * uses). For a proxy it answers from what the proxy has cached and asks no
+ * upstream (#836): a package the proxy holds nothing of is a 404 until a
+ * client installs it or **Refresh from upstream** discovers it. A
+ * still-delayed version carries `delay_status = "delayed_until"`.
  */
 export async function fetchPackageDetail(
   repo: string,
