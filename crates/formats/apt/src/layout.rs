@@ -194,13 +194,49 @@ pub fn is_by_hash(rest: &str) -> bool {
         && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The SHA-256 a `by-hash/SHA256/<hex>` path names.
-pub fn by_hash_sha256(rest: &str) -> Option<String> {
-    let hash = rest
-        .strip_prefix("by-hash/SHA256/")
-        .or_else(|| rest.rsplit_once("/by-hash/SHA256/").map(|(_, hash)| hash))?;
-    (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| hash.to_ascii_lowercase())
+/// A hash type of `by-hash` paths, as apt names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashType {
+    Md5,
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+impl HashType {
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "MD5Sum" => Some(HashType::Md5),
+            "SHA1" => Some(HashType::Sha1),
+            "SHA256" => Some(HashType::Sha256),
+            "SHA512" => Some(HashType::Sha512),
+            _ => None,
+        }
+    }
+
+    /// The length of its digest in hex digits.
+    fn hex_len(self) -> usize {
+        match self {
+            HashType::Md5 => 32,
+            HashType::Sha1 => 40,
+            HashType::Sha256 => 64,
+            HashType::Sha512 => 128,
+        }
+    }
+}
+
+/// The hash type and digest (lowercase hex) a `by-hash/<type>/<hex>` path
+/// names; `None` when the digest is not one of its type.
+pub fn by_hash_digest(rest: &str) -> Option<(HashType, String)> {
+    let mut segments = rest.rsplit('/');
+    let (Some(hash), Some(algorithm), Some("by-hash")) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return None;
+    };
+    let kind = HashType::named(algorithm)?;
+    (hash.len() == kind.hex_len() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| (kind, hash.to_ascii_lowercase()))
 }
 
 /// Whether a pool path is where a hosted package of `component` and `name`
@@ -361,12 +397,36 @@ mod tests {
             "main/binary-amd64/by-hash/SHA256/{hash}"
         )));
         assert_eq!(
-            by_hash_sha256(&format!("main/binary-amd64/by-hash/SHA256/{hash}")),
-            Some(hash.clone())
+            by_hash_digest(&format!("main/binary-amd64/by-hash/SHA256/{hash}")),
+            Some((HashType::Sha256, hash.clone()))
         );
         assert!(!is_by_hash("main/binary-amd64/Packages"));
         assert!(!is_by_hash("by-hash/SHA256/xyz"));
-        assert_eq!(by_hash_sha256("main/by-hash/SHA256/abc"), None);
+        assert_eq!(by_hash_digest("main/by-hash/SHA256/abc"), None);
+        // Every hash type apt asks for, each with its digest's length.
+        for (name, kind, len) in [
+            ("MD5Sum", HashType::Md5, 32),
+            ("SHA1", HashType::Sha1, 40),
+            ("SHA512", HashType::Sha512, 128),
+        ] {
+            let hex = "AB".repeat(len / 2);
+            assert_eq!(
+                by_hash_digest(&format!("main/i18n/by-hash/{name}/{hex}")),
+                Some((kind, hex.to_ascii_lowercase()))
+            );
+            assert_eq!(
+                by_hash_digest(&format!("main/i18n/by-hash/{name}/{}", "a".repeat(len - 2))),
+                None
+            );
+        }
+        assert_eq!(
+            by_hash_digest(&format!("by-hash/SHA384/{}", "a".repeat(96))),
+            None
+        );
+        assert_eq!(
+            by_hash_digest(&format!("by-hash/SHA256/{hash}")).unwrap().0,
+            HashType::Sha256
+        );
     }
 
     #[test]

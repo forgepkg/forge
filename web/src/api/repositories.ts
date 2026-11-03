@@ -467,6 +467,22 @@ export function invalidateProxyCache(
   )
 }
 
+/**
+ * `DELETE /admin/repositories/{name}/files?path=<path>` — evict a file a
+ * proxy cached from its upstream (a path ending in `/`: a directory and
+ * every file below it). The next download fetches it from the upstream
+ * again.
+ */
+export function deleteCachedFiles(
+  name: string,
+  path: string,
+): Promise<{ deleted: number }> {
+  return httpClient.delete<{ deleted: number }>(
+    `/admin/repositories/${encodeURIComponent(name)}/files`,
+    { query: { path } },
+  )
+}
+
 /** `GET /admin/repositories/{name}/delay-releases` — a proxy's early releases, newest first. */
 export function fetchDelayReleases(
   name: string,

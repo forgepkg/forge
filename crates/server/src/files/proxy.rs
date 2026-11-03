@@ -219,12 +219,14 @@ impl Files<'_> {
         })?;
         let stored = &ingested.stored;
         forge_telemetry::proxy::upstream_bytes(&repo.name, stored.size);
-        let wrong_size = location.size.is_some_and(|size| size != stored.size);
-        let wrong_digest = location
-            .sha256
-            .as_deref()
-            .is_some_and(|sha256| !sha256.eq_ignore_ascii_case(&stored.sha256));
-        if wrong_size || wrong_digest {
+        let digests = Digests {
+            size: stored.size,
+            sha256: &stored.sha256,
+            sha512_base64: &stored.sha512_base64,
+            sha1: &ingested.sha1,
+            md5: &ingested.md5,
+        };
+        if !digests.match_location(location) {
             tracing::warn!(
                 repo = %repo.name,
                 %path,
@@ -232,6 +234,9 @@ impl Files<'_> {
                 sha256 = %stored.sha256,
                 expected_size = ?location.size,
                 expected_sha256 = ?location.sha256,
+                expected_sha512 = ?location.sha512,
+                expected_sha1 = ?location.sha1,
+                expected_md5 = ?location.md5,
                 "file proxy: the upstream's file is not the one its index names; not cached"
             );
             return Err(FileError::BadGateway(
@@ -333,8 +338,11 @@ impl Files<'_> {
             raw_dao::mark_checked(&self.state.pool, file.id, None, None).await?;
             return Ok(file.clone());
         };
+        // A copy that is not the file the upstream's index names now is
+        // fetched again whatever its validators say.
+        let conditional = Digests::of(file).is_some_and(|d| d.match_location(&location));
         let response = self
-            .upstream_get(repo, &file.path, &location.url, Some(file))
+            .upstream_get(repo, &file.path, &location.url, conditional.then_some(file))
             .await?;
         let status = response.status();
         if status == StatusCode::NOT_MODIFIED {
@@ -429,6 +437,50 @@ impl Files<'_> {
         self.store_response(repo, path, &location, response)
             .await
             .map(Some)
+    }
+}
+
+/// What content is: its size and digests (hex, SHA-512 in base64 as the
+/// store keeps it).
+struct Digests<'a> {
+    size: u64,
+    sha256: &'a str,
+    sha512_base64: &'a str,
+    sha1: &'a str,
+    md5: &'a str,
+}
+
+impl<'a> Digests<'a> {
+    /// A cached file's.
+    fn of(file: &'a RawFile) -> Option<Self> {
+        Some(Digests {
+            size: u64::try_from(file.size).ok()?,
+            sha256: &file.blob_sha256,
+            sha512_base64: &file.sha512_base64,
+            sha1: &file.sha1,
+            md5: &file.md5,
+        })
+    }
+
+    /// Whether the content is the size and has every digest `location`
+    /// gives it.
+    fn match_location(&self, location: &FileLocation) -> bool {
+        let hex = |expected: &Option<String>, actual: &str| {
+            expected
+                .as_deref()
+                .is_none_or(|expected| expected.eq_ignore_ascii_case(actual))
+        };
+        let sha512 = location.sha512.as_deref().is_none_or(|expected| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(self.sha512_base64)
+                .is_ok_and(|bytes| expected.eq_ignore_ascii_case(&hex::encode(bytes)))
+        });
+        location.size.is_none_or(|size| size == self.size)
+            && hex(&location.sha256, self.sha256)
+            && hex(&location.sha1, self.sha1)
+            && hex(&location.md5, self.md5)
+            && sha512
     }
 }
 

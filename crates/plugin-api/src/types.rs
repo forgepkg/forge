@@ -1453,7 +1453,9 @@ pub struct FileLocation {
     /// On an origin a [`Fetch`] may reach.
     pub url: String,
     /// The file never changes at its path (a package, a content-addressed
-    /// copy): the host keeps its copy without re-validating it.
+    /// copy): the host keeps its copy without re-validating it. A plugin
+    /// sets it only with a digest below that the content must match, so
+    /// what is kept is the file the upstream's index (or the path) names.
     pub immutable: bool,
     /// The size the upstream's index gives the file: the host caches no
     /// content of another size, and answers 502.
@@ -1461,6 +1463,12 @@ pub struct FileLocation {
     /// The SHA-256 (lowercase hex) the upstream's index gives the file:
     /// the host caches no content of another digest, and answers 502.
     pub sha256: Option<String>,
+    /// The SHA-512 (lowercase hex), checked as [`Self::sha256`] is.
+    pub sha512: Option<String>,
+    /// The SHA-1 (lowercase hex), checked as [`Self::sha256`] is.
+    pub sha1: Option<String>,
+    /// The MD5 (lowercase hex), checked as [`Self::sha256`] is.
+    pub md5: Option<String>,
 }
 
 impl FileLocation {
@@ -1471,7 +1479,15 @@ impl FileLocation {
             immutable: false,
             size: None,
             sha256: None,
+            sha512: None,
+            sha1: None,
+            md5: None,
         }
+    }
+
+    /// Whether the location names a digest the content must match.
+    pub fn has_digest(&self) -> bool {
+        self.sha256.is_some() || self.sha512.is_some() || self.sha1.is_some() || self.md5.is_some()
     }
 }
 

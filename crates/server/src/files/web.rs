@@ -18,7 +18,8 @@
 //! * `DELETE /admin/repositories/{name}/files?path=<path>` (admin API) —
 //!   delete a file, or with a path ending in `/` (or empty: everything) a
 //!   directory and all files below it, in hosted and proxy repositories
-//!   (a proxy's cached copies). Answers `{"deleted": <n>}`.
+//!   (a proxy's cached copies; for a package format's proxy, the upstream's
+//!   files it keeps, as an apt proxy's). Answers `{"deleted": <n>}`.
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -197,10 +198,13 @@ pub async fn admin_delete(
         Ok(None) => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
         Err(e) => return crate::admin::db_error(e),
     };
-    if !state.formats.stores_files(&repo.format) {
+    // A package format's proxy may keep the upstream's files (apt's), which
+    // an administrator evicts here; a hosted repository's are its indexes.
+    let proxy_files = repo.kind() == RepoKind::Proxy && !state.formats.stores_images(&repo.format);
+    if !state.formats.stores_files(&repo.format) && !proxy_files {
         return (
             StatusCode::BAD_REQUEST,
-            "files are deleted from repositories of files (raw)",
+            "files are deleted from repositories of files (raw) and from proxies",
         )
             .into_response();
     }
