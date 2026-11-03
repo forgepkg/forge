@@ -1,0 +1,16 @@
+-- ---------------------------------------------------------------------------
+-- When an index generation stopped naming a file (#762)
+--
+-- A hosted repository's content-addressed index file (apt's `by-hash/`
+-- copies) outlives the index that named it by a day, so that a client which
+-- fetched the previous `Release` can still fetch the files it names. The day
+-- was counted from `checked_at`, which is when a generation last named the
+-- file: a generation made more than a day before the next one had its
+-- copies deleted the moment that next one replaced it.
+--
+-- `superseded_at` is when the generation that replaced the last one naming
+-- the file was made: NULL while the repository's generation names it. The
+-- day is counted from then. Files no generation names at this migration get
+-- it from the next generation, which keeps them a day longer.
+-- ---------------------------------------------------------------------------
+ALTER TABLE raw_file ADD COLUMN superseded_at timestamptz NULL;
