@@ -11,9 +11,9 @@
 //! * `POST /auth/device/token` (§3.4–3.5), with `grant_type
 //!   urn:ietf:params:oauth:grant-type:device_code`, answers
 //!   `authorization_pending` until the user decides, `slow_down` (and five
-//!   more seconds of interval) when polled sooner than the interval,
-//!   `access_denied`, `expired_token`, or, once, the token. Errors are RFC
-//!   6749 §5.2 JSON.
+//!   more seconds of interval) when polled sooner than the interval or
+//!   while another poll of the same code is answered, `access_denied`,
+//!   `expired_token`, or, once, the token. Errors are RFC 6749 §5.2 JSON.
 //! * `GET /.well-known/oauth-authorization-server` (RFC 8414) names both
 //!   endpoints, so a client finds everything from the server URL alone.
 //! * `POST /auth/device/lookup` and `/auth/device/decide` serve the `/device`
@@ -58,7 +58,7 @@ use forge_core::auth::token::{generate_token_secret, hash_token};
 use forge_core::auth::{AttemptRefused, LoginAttempt, LoginThrottle};
 use forge_core::authz::{Level, TokenScope};
 use forge_db::device_auth_dao::{
-    self, DeviceAuthorization, NewDeviceAuthorization, PollState, PolledRequest,
+    self, DeviceAuthorization, NewDeviceAuthorization, PollLock, PollState, PolledRequest,
 };
 use forge_db::{repository_dao, token_dao, user_dao};
 use serde::{Deserialize, Serialize};
@@ -235,15 +235,15 @@ impl DeviceScope {
         }))
     }
 
-    /// The token scope: the repositories by id. A name no repository has
-    /// reaches nothing (a scope only ever narrows).
-    async fn token_scope(&self, state: &AppState) -> sqlx::Result<TokenScope> {
+    /// The token scope: the repositories by id, read on `conn`. A name no
+    /// repository has reaches nothing (a scope only ever narrows).
+    async fn token_scope(&self, conn: &mut sqlx::PgConnection) -> sqlx::Result<TokenScope> {
         let repositories = if self.repositories.is_empty() {
             None
         } else {
             let mut ids = Vec::with_capacity(self.repositories.len());
             for name in &self.repositories {
-                match repository_dao::find_repository_by_name(&state.pool, name).await? {
+                match repository_dao::find_repository_by_name(&mut *conn, name).await? {
                     Some(repo) => ids.push(repo.id),
                     None => tracing::info!(
                         repository = %name,
@@ -554,18 +554,32 @@ async fn device_token(
 }
 
 /// Answer a poll of `device_code` by `client_id`. The request's row is
-/// locked for the answer, so two polls of one code are answered one after
-/// the other, and the token is minted in the transaction that marks the
-/// request collected: it is answered once, and a failure leaves the
-/// approval to collect on the next poll.
+/// locked for the answer, and the token is minted in the transaction that
+/// marks the request collected: it is answered once, and a failure leaves
+/// the approval to collect on the next poll.
+///
+/// A poll never waits for a database connection or a lock while it holds
+/// one (#794): everything it reads runs on its transaction's connection,
+/// and a poll that finds the request locked by another poll of the same
+/// code answers `slow_down` at once, rather than wait for it with a
+/// connection taken from the pool.
 async fn poll(state: &AppState, client_id: &str, device_code: &str) -> Response {
     let mut tx = match forge_db::begin(&state.pool).await {
         Ok(tx) => tx,
         Err(e) => return oauth_unavailable(&e),
     };
     let request = match device_auth_dao::lock_for_poll(&mut tx, &hash_token(device_code)).await {
-        Ok(Some(request)) => request,
-        Ok(None) => return bad_request("invalid_grant", "unknown device_code"),
+        Ok(PollLock::Locked(request)) => request,
+        Ok(PollLock::Unknown) => return bad_request("invalid_grant", "unknown device_code"),
+        // A client polls once at a time: a second poll while the first is
+        // answered came sooner than the interval.
+        Ok(PollLock::Busy) => {
+            return bad_request(
+                "slow_down",
+                "polled again while a poll of this device_code is answered; wait five \
+                 seconds longer from now on",
+            )
+        }
         Err(e) => return oauth_unavailable(&e),
     };
     if request.client_id != client_id {
@@ -611,13 +625,16 @@ async fn poll(state: &AppState, client_id: &str, device_code: &str) -> Response 
 }
 
 /// Mint the token of an approved request, in its poll's transaction `tx`.
+/// Everything is read on the transaction's connection: the poll holds the
+/// request's lock, and waiting for a second connection meanwhile could wait
+/// on the polls that hold the rest of the pool (#794).
 async fn collect(
     state: &AppState,
     mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
     request: &PolledRequest,
     user_id: i64,
 ) -> Response {
-    let user = match user_dao::find_user_by_id(&state.pool, user_id).await {
+    let user = match user_dao::find_user_by_id(&mut *tx, user_id).await {
         Ok(user) => user.filter(|u| u.active),
         Err(e) => return oauth_unavailable(&e),
     };
@@ -658,7 +675,7 @@ async fn collect(
     };
     let token_scope = match &scope {
         None => None,
-        Some(scope) => match scope.token_scope(state).await {
+        Some(scope) => match scope.token_scope(&mut tx).await {
             Ok(token_scope) => Some(token_scope),
             Err(e) => return oauth_unavailable(&e),
         },

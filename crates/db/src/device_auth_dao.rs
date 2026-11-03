@@ -125,13 +125,34 @@ pub struct PolledRequest {
     pub too_fast: bool,
 }
 
+/// What a poll finds when it locks its request ([`lock_for_poll`]).
+#[derive(Debug, Clone)]
+pub enum PollLock {
+    /// The request, locked for the poll's transaction.
+    Locked(PolledRequest),
+    /// Another transaction holds the request: a poll of the same code is
+    /// being answered (or the user is deciding it right now).
+    Busy,
+    /// No request has the device code.
+    Unknown,
+}
+
+/// SQLSTATE `lock_not_available`: `FOR UPDATE NOWAIT` found the row locked.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
 /// Find and lock the request whose device code hashes to `device_code_hash`
-/// in the transaction on `conn` (`SELECT … FOR UPDATE`, so two polls of one
-/// code are answered one after the other). The clock is the database's.
+/// in the transaction on `conn` (`SELECT … FOR UPDATE NOWAIT`). A request
+/// another transaction holds is [`PollLock::Busy`] at once, never waited
+/// for: a poll waiting on the lock would hold its connection meanwhile, and
+/// enough of them would take the whole pool (#794). The clock is the
+/// database's.
+///
+/// A `Busy` answer leaves the transaction aborted (Postgres refused the
+/// statement): the caller drops it.
 pub async fn lock_for_poll(
     conn: &mut PgConnection,
     device_code_hash: &str,
-) -> sqlx::Result<Option<PolledRequest>> {
+) -> sqlx::Result<PollLock> {
     let row = sqlx::query!(
         r#"
         SELECT id, client_id, scope, status, user_id, interval_seconds,
@@ -142,29 +163,35 @@ pub async fn lock_for_poll(
                ) AS "too_fast!"
         FROM device_authorization
         WHERE device_code_hash = $1
-        FOR UPDATE
+        FOR UPDATE NOWAIT
         "#,
         device_code_hash,
     )
     .fetch_optional(&mut *conn)
-    .await?;
-    Ok(row.map(|row| {
-        let state = match (row.status.as_str(), row.user_id) {
-            _ if row.expired => PollState::Expired,
-            ("pending", _) => PollState::Pending,
-            ("approved", Some(user_id)) => PollState::Approved { user_id },
-            ("denied", _) => PollState::Denied,
-            // `collected`, or an approval without its user (deleted).
-            _ => PollState::Expired,
-        };
-        PolledRequest {
-            id: row.id,
-            client_id: row.client_id,
-            scope: row.scope,
-            state,
-            interval_seconds: row.interval_seconds,
-            too_fast: row.too_fast,
+    .await;
+    let row = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => return Ok(PollLock::Unknown),
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some(LOCK_NOT_AVAILABLE) => {
+            return Ok(PollLock::Busy)
         }
+        Err(e) => return Err(e),
+    };
+    let state = match (row.status.as_str(), row.user_id) {
+        _ if row.expired => PollState::Expired,
+        ("pending", _) => PollState::Pending,
+        ("approved", Some(user_id)) => PollState::Approved { user_id },
+        ("denied", _) => PollState::Denied,
+        // `collected`, or an approval without its user (deleted).
+        _ => PollState::Expired,
+    };
+    Ok(PollLock::Locked(PolledRequest {
+        id: row.id,
+        client_id: row.client_id,
+        scope: row.scope,
+        state,
+        interval_seconds: row.interval_seconds,
+        too_fast: row.too_fast,
     }))
 }
 

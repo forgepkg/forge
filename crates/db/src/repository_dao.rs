@@ -101,11 +101,15 @@ where
     .await
 }
 
-/// Find a repository by its unique name.
-pub async fn find_repository_by_name(
-    pool: &PgPool,
+/// Find a repository by its unique name, on a pool or on a connection (in a
+/// transaction).
+pub async fn find_repository_by_name<'e, E>(
+    executor: E,
     name: &str,
-) -> sqlx::Result<Option<Repository>> {
+) -> sqlx::Result<Option<Repository>>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     sqlx::query_as!(
         Repository,
         r#"
@@ -119,7 +123,7 @@ pub async fn find_repository_by_name(
         "#,
         name,
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 

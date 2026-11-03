@@ -4,7 +4,8 @@
 //! web UI's `/device` page (`/auth/device/lookup`, `/auth/device/decide`).
 //!
 //! Covers a pending request, `slow_down`, expiry, denial and approval, a
-//! token collected once (and what it is), the scope, unknown clients and
+//! token collected once (and what it is), concurrent polls of one code on a
+//! small connection pool, the scope, unknown clients and
 //! malformed requests (always RFC 6749 JSON), the rate limit on guessing
 //! codes per network and per session, and the settings that turn the
 //! device login off and set its interval. Requires Docker (Postgres +
@@ -12,6 +13,9 @@
 //! `FORGE_TEST_S3_ENDPOINT`.
 
 mod common;
+
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 use common::{fresh_pool, start_with, unique, BrowserSession, ServerOpts, TestServer};
 use reqwest::StatusCode;
@@ -358,6 +362,83 @@ async fn an_approved_login_collects_its_token_once() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+/// `fut`'s output and how long it took.
+async fn timed<F: Future>(fut: F) -> (F::Output, Duration) {
+    let started = Instant::now();
+    let out = fut.await;
+    (out, started.elapsed())
+}
+
+/// Concurrent polls of an approved code neither wait for one another nor
+/// take the pool (#794). On a server of two database connections
+/// (`database.max_connections = 2`, the default acquire timeout of 10 s),
+/// six polls at once: one gets the token, every other answers at once
+/// (`slow_down` while it is minted, `expired_token` after), and a request
+/// of the signed-in user is served meanwhile. Before, the poll minting the
+/// token held the request's lock and waited for a second connection, which
+/// the polls waiting for the lock held: each answered 503 after the acquire
+/// timeout, and so did every other request.
+#[tokio::test]
+async fn concurrent_polls_of_an_approved_code_leave_the_pool_alone() {
+    let srv = start_on(common::sized_pool(2, Duration::from_secs(10)).await).await;
+    // A scope naming a repository: minting the token looks it up.
+    let scope = format!("read repository:dev-raw-{}", unique());
+    let started = start_login(&srv, "forge-cli", Some(&scope)).await;
+    let device_code = started["device_code"].as_str().unwrap();
+    let user_code = started["user_code"].as_str().unwrap();
+    let (user_id, username, session) = signed_in(&srv, "writer").await;
+    assert_eq!(
+        decide(&srv, &session, user_code, true, "198.51.100.20")
+            .await
+            .status(),
+        204
+    );
+
+    // Well below the acquire timeout, with slack for a loaded machine.
+    let bound = Duration::from_secs(5);
+    let polls =
+        futures_util::future::join_all((0..6).map(|_| timed(poll(&srv, "forge-cli", device_code))));
+    let unrelated = timed(async {
+        session
+            .apply(
+                srv.client()
+                    .get(format!("{}/admin/me/tokens", srv.base_url)),
+            )
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+    let (polls, (status, took)) = tokio::join!(polls, unrelated);
+    assert_eq!(status, 200, "a request beside the polls");
+    assert!(took < bound, "a request beside the polls took {took:?}");
+    let mut collected = 0;
+    for ((status, body), took) in polls {
+        assert!(took < bound, "a poll took {took:?}: {status} {body}");
+        if status == 200 {
+            collected += 1;
+            assert_eq!(body["username"], username.as_str(), "{body}");
+            assert_eq!(body["scope"], scope.as_str(), "{body}");
+        } else {
+            assert_eq!(status, 400, "{body}");
+            assert!(
+                matches!(body["error"].as_str(), Some("slow_down" | "expired_token")),
+                "{body}"
+            );
+        }
+    }
+    assert_eq!(collected, 1, "exactly one poll gets the token");
+    assert_error(poll(&srv, "forge-cli", device_code).await, "expired_token");
+    let minted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM token WHERE user_id = $1 AND name = 'forge-cli login (test.local)'",
+    )
+    .bind(user_id)
+    .fetch_one(&srv.pool)
+    .await
+    .unwrap();
+    assert_eq!(minted, 1);
 }
 
 /// A denied login answers `access_denied`, and mints nothing.

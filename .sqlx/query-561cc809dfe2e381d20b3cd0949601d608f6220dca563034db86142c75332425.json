@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, client_id, scope, status, user_id, interval_seconds,\n               expires_at <= now() AS \"expired!\",\n               COALESCE(\n                   last_polled_at > now() - make_interval(secs => interval_seconds),\n                   false\n               ) AS \"too_fast!\"\n        FROM device_authorization\n        WHERE device_code_hash = $1\n        FOR UPDATE\n        ",
+  "query": "\n        SELECT id, client_id, scope, status, user_id, interval_seconds,\n               expires_at <= now() AS \"expired!\",\n               COALESCE(\n                   last_polled_at > now() - make_interval(secs => interval_seconds),\n                   false\n               ) AS \"too_fast!\"\n        FROM device_authorization\n        WHERE device_code_hash = $1\n        FOR UPDATE NOWAIT\n        ",
   "describe": {
     "columns": [
       {
@@ -98,5 +98,5 @@
       null
     ]
   },
-  "hash": "d308dc16d28a0e5a6629c141569ac745dc25768f6de2bc8c0b424993e3397dc8"
+  "hash": "561cc809dfe2e381d20b3cd0949601d608f6220dca563034db86142c75332425"
 }

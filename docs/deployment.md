@@ -698,7 +698,7 @@ authorization server metadata ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414
 | --- | --- | --- |
 | `GET` | `/.well-known/oauth-authorization-server` | `issuer` (`server.public_base_url`), `device_authorization_endpoint`, `token_endpoint`, `grant_types_supported` (`urn:ietf:params:oauth:grant-type:device_code`). |
 | `POST` | `/auth/device/code` | Start a login (RFC 8628 §3.1): `client_id` and an optional `scope`, form-encoded. Answers `device_code`, `user_code`, `verification_uri` (`<base>/device`), `verification_uri_complete` (`<base>/device?code=BCDF-GHJK`), `expires_in` and `interval`. |
-| `POST` | `/auth/device/token` | Poll it (§3.4): `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Answers `authorization_pending` until the user decides, `slow_down` when polled sooner than the interval (which then grows by five seconds), `access_denied`, `expired_token`, or the token: `access_token`, `token_type` `Bearer`, `expires_in`, `scope` when one was asked for, and `username`, whose token it is. |
+| `POST` | `/auth/device/token` | Poll it (§3.4): `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id` and `device_code`. Answers `authorization_pending` until the user decides, `slow_down` when polled sooner than the interval (which then grows by five seconds) or while another poll of the same code is answered, `access_denied`, `expired_token`, or the token: `access_token`, `token_type` `Bearer`, `expires_in`, `scope` when one was asked for, and `username`, whose token it is. |
 
 ```bash
 curl -s https://forge.example.com/auth/device/code \
