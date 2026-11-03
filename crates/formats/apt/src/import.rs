@@ -30,7 +30,7 @@ pub const MAX_INDEX_BYTES: u64 = 1024 * 1024 * 1024;
 /// An entry takes far more than its text (`Package:a` and a blank line, 11
 /// bytes, take about 160), so [`MAX_INDEX_BYTES`] alone does not bound it.
 /// Debian's largest index (main, amd64: about 65,000 entries) takes about
-/// 40 MiB.
+/// 30 MiB.
 pub const MAX_ENTRIES_BYTES: usize = 256 * 1024 * 1024;
 
 /// What a `Release` says.
