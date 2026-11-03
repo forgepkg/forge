@@ -14,10 +14,13 @@
 //! out, the tarball is refused rather than read one way (#554): a header
 //! node-tar rejects (it then reads the block after it as the next header, so
 //! the body `tar` skips holds entries only npm sees), a PAX record it would
-//! skip or read otherwise, data after the end of the archive (node-tar reads
-//! on after one zero block), and a file some client could unpack to
-//! `package.json` otherwise than by node-tar's strip on Linux (`\`, `.` or
-//! empty components, another case). `npm pack` writes none of these.
+//! skip or read otherwise, data after a lone zero block (node-tar reads on
+//! after one, and ends the archive at two in a row), and a file some client
+//! could unpack to `package.json` otherwise than by node-tar's strip on Linux
+//! (`\`, `.` or empty components, another case). `npm pack` writes none of
+//! these. What npm never reads is ignored, as npm ignores it (#599): data
+//! after the two zero blocks, and after the zero byte that ends the gzip
+//! stream.
 
 use std::io::{self, BufRead, Read};
 
@@ -51,8 +54,8 @@ pub struct Tarball {
 /// A gzip stream inflated as npm inflates it (minizlib, on Node's zlib):
 /// member after member, until the input ends or a member is followed by a
 /// zero byte, the padding old tarballs carry (`npm` once padded them to
-/// 10 KiB). Node's zlib ignores what follows that byte; here it must be zeros
-/// to the end.
+/// 10 KiB). Node's zlib ignores that byte and whatever follows it, zeros or
+/// not, and so does this reader: it never inflates the rest.
 struct Gunzip<R: BufRead> {
     member: Option<flate2::bufread::GzDecoder<R>>,
 }
@@ -69,21 +72,7 @@ impl<R: BufRead> Read for Gunzip<R> {
             }
             let mut input = self.member.take().expect("a member").into_inner();
             match input.fill_buf()?.first() {
-                None => return Ok(0),
-                Some(0) => loop {
-                    let padding = input.fill_buf()?;
-                    if padding.is_empty() {
-                        return Ok(0);
-                    }
-                    if padding.iter().any(|b| *b != 0) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "data after the gzip stream's padding",
-                        ));
-                    }
-                    let len = padding.len();
-                    input.consume(len);
-                },
+                None | Some(0) => return Ok(0),
                 Some(_) => self.member = Some(flate2::bufread::GzDecoder::new(input)),
             }
         }
@@ -606,7 +595,12 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
         // which still inflates it: what the size bound above is for.
     }
     // `tar` ends the archive at its first zero block, node-tar only at two
-    // in a row: what follows must be zeros alone, inflated within the bound
+    // in a row: it reads the block after a lone one as a header, so that
+    // block must be zeros alone, as must what remains of the stream when it
+    // ends before a whole block (which node-tar ignores; no writer ends a
+    // stream there). node-tar never reads what follows the
+    // second (old writers left junk in the record's padding), and neither
+    // does this reader; it is inflated, as npm inflates it, within the bound
     // (but no part of `dist.unpackedSize`).
     let mut rest = archive.into_inner();
     let mut block = [0u8; 8192];
@@ -618,14 +612,19 @@ pub fn read(tgz: impl Read, max_unpacked: u64) -> Result<Tarball, String> {
         if n == 0 {
             break;
         }
+        // The part of what was read that falls in the second zero block.
+        let second = usize::try_from(512u64.saturating_sub(trailing)).map_or(n, |left| left.min(n));
+        if block[..second].iter().any(|b| *b != 0) {
+            return Err(
+                "the tarball holds data after a lone zero block, which npm reads as a header"
+                    .into(),
+            );
+        }
         trailing = trailing.saturating_add(n as u64);
         if unpacked.saturating_add(trailing) > max_unpacked {
             return Err(format!(
                 "the tarball unpacks to more than {max_unpacked} bytes"
             ));
-        }
-        if block[..n].iter().any(|b| *b != 0) {
-            return Err("the tarball holds data after the end of its archive".into());
         }
     }
     let data = package_json.ok_or("the tarball holds no package/package.json")?;
@@ -1064,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_data_after_the_end_of_the_archive() {
+    fn refuses_data_after_a_lone_zero_block() {
         // `tar` ends the archive at a zero block, node-tar reads on after one.
         let mut tar = Vec::new();
         raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
@@ -1077,7 +1076,22 @@ mod tests {
             br#"{"name":"b","version":"2.0.0"}"#,
         );
         let err = read(&finish(tar)[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
-        assert!(err.contains("data after the end"), "{err}");
+        assert!(err.contains("data after a lone zero block"), "{err}");
+
+        // Whatever the block after a lone one holds, node-tar reads it as a
+        // header, so junk in it is refused. A stream that ends inside it
+        // (node-tar ignores the part block) is held to zeros as before.
+        for junk in [&[1u8; 512][..], &[0, 0, 7], b"junk"] {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+            tar.extend_from_slice(&[0; 512]);
+            tar.extend_from_slice(junk);
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut gz, &tar).expect("gzip");
+            let tgz = gz.finish().expect("finish gzip");
+            let err = read(&tgz[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+            assert!(err.contains("data after a lone zero block"), "{err}");
+        }
 
         // Zeros after it are counted against the bound, not in the size.
         let mut tar = Vec::new();
@@ -1092,6 +1106,43 @@ mod tests {
         );
         let err = read(&tgz[..], 1024).unwrap_err();
         assert!(err.contains("unpacks to more than"), "{err}");
+    }
+
+    #[test]
+    fn ignores_data_after_the_end_of_the_archive() {
+        // node-tar ends the archive at two zero blocks in a row and reads
+        // nothing after them: junk in the record's padding, or a whole entry.
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "package/package.json", b'0', 30, PACKAGE_JSON);
+        let mut later = Vec::new();
+        raw_entry(
+            &mut later,
+            "package/package.json",
+            b'0',
+            30,
+            br#"{"name":"b","version":"2.0.0"}"#,
+        );
+        for tail in [&b"junk"[..], &[0xff; 4096], &later] {
+            let tgz = finish([&tar[..], &[0; 1024], tail].concat());
+            let t = read(&tgz[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+            assert_eq!(
+                (t.name.as_str(), t.file_count, t.unpacked_size),
+                ("a", 1, 30)
+            );
+        }
+
+        // What follows is still inflated within the bound.
+        let tgz = finish([&tar[..], &[0; 1024], &[0xff; 4096]].concat());
+        let err = read(&tgz[..], 1024).unwrap_err();
+        assert!(err.contains("unpacks to more than"), "{err}");
+
+        // An entry npm reads after a lone zero block is still refused, as is
+        // junk where npm reads the second one.
+        for second in [&later[..], &[0xff; 512]] {
+            let tgz = finish([&tar[..], &[0; 512], second].concat());
+            let err = read(&tgz[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
+            assert!(err.contains("data after a lone zero block"), "{err}");
+        }
     }
 
     #[test]
@@ -1119,13 +1170,28 @@ mod tests {
         assert_eq!((t.name.as_str(), t.file_count), ("b", 2));
 
         // Zeros after the stream are padding, as old npm wrote it (grunt
-        // 0.1.0); anything else after the padding is refused.
+        // 0.1.0). Node's zlib reads nothing after the padding's first zero
+        // byte, junk or another member, and neither does Forge.
         let whole = [first, vec![0; 1024]].concat();
         let padded = [gz(&whole), vec![0; 3000]].concat();
         let t = read(&padded[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
         assert_eq!(t.name, "a");
-        let err = read(&[padded, vec![1]].concat()[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap_err();
-        assert!(err.contains("after the gzip stream's padding"), "{err}");
+        for tail in [vec![1], b"junk after the padding".to_vec(), gz(&second)] {
+            for padding in [1, 3000] {
+                let tgz = [gz(&whole), vec![0; padding], tail.clone()].concat();
+                let t = read(&tgz[..], DEFAULT_MAX_UNPACKED_BYTES).unwrap();
+                assert_eq!((t.name.as_str(), t.file_count), ("a", 1));
+            }
+        }
+
+        // Without a zero byte in between, Node's zlib reads what follows a
+        // member as the next one: junk there is refused, as npm fails on it.
+        let err = read(
+            &[gz(&whole), b"junk".to_vec()].concat()[..],
+            DEFAULT_MAX_UNPACKED_BYTES,
+        )
+        .unwrap_err();
+        assert!(err.contains("unreadable"), "{err}");
     }
 
     #[test]
