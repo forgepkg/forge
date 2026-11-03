@@ -251,6 +251,22 @@ pub enum UpstreamToken {
     Bearer,
 }
 
+/// The package a file the host keeps for a package format belongs to
+/// ([`FormatPlugin::file_package`](crate::FormatPlugin::file_package)),
+/// which the caller's package selector decides on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FilePackage {
+    /// A file of no package (an index): every reader of the repository's.
+    #[default]
+    None,
+    /// The package (canonical id) the file belongs to (apt's `hello:amd64`).
+    Package(String),
+    /// A package's file whose package the path does not name (an apt pool
+    /// file of no package name): only a reader every package is visible to
+    /// may read it.
+    Unknown,
+}
+
 /// The mount of an images format ([`Storage::Images`]): the registry API's
 /// root, where every distribution-spec client asks.
 pub const IMAGES_MOUNT: &str = "/v2";

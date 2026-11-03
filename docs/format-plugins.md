@@ -401,7 +401,10 @@ descriptor. The host then keeps the indexes of its hosted repositories:
   a proxy's copies of its upstream's files (apt's proxies pass the
   upstream's signed indexes and packages on unchanged). `file_package`
   names the package a file belongs to (apt's pool files), which package
-  selectors decide on; a file of no package (an index) is every reader's.
+  selectors decide on; a file of no package (an index) is every reader's,
+  and a package's file whose package the path does not name
+  (`FilePackage::Unknown`) only a reader's whom every package is visible
+  to.
 
 ## Format options
 

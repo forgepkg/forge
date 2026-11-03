@@ -31,11 +31,11 @@ pub mod version;
 use std::cmp::Ordering;
 
 use forge_plugin_api::{
-    Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FormatError, FormatOption,
-    FormatPlugin, IndexFile, IndexInput, Loaded, OptionInput, PackageRef, PackageSource,
-    ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository, RepositoryKind, Request,
-    Response, Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken,
-    VersionClass,
+    Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FilePackage, FormatError,
+    FormatOption, FormatPlugin, IndexFile, IndexInput, Loaded, OptionInput, PackageRef,
+    PackageSource, ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository,
+    RepositoryKind, Request, Response, Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep,
+    UpstreamToken, VersionClass,
 };
 
 use crate::layout::{PoolPath, Target, KEY_ASC, KEY_GPG};
@@ -166,10 +166,12 @@ impl FormatPlugin for Apt {
         )
     }
 
-    fn file_package(&self, path: &str) -> Option<String> {
+    fn file_package(&self, path: &str) -> FilePackage {
         match layout::parse(path) {
-            Ok(Target::Pool(pool)) => layout::pool_package(&pool),
-            _ => None,
+            Ok(Target::Pool(pool)) => {
+                layout::pool_package(&pool).map_or(FilePackage::Unknown, FilePackage::Package)
+            }
+            _ => FilePackage::None,
         }
     }
 

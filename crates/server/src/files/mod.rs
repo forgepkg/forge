@@ -37,6 +37,7 @@ use forge_core::auth::principal::Principal;
 use forge_core::authz::PackageFilter;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{raw_dao, repository_dao};
+use forge_plugin::api::FilePackage;
 
 use crate::dispatch::offline_serves_nothing;
 use crate::state::AppState;
@@ -196,20 +197,31 @@ impl Files<'_> {
     /// hosted repository's index file, or a proxy's copy of an upstream
     /// file (re-validated once it is due, else with `fetch` fetched). The
     /// caller's package selector decides on `package`, the package the file
-    /// belongs to; a file of no package (an index) is every reader's. A
-    /// group keeps no files.
+    /// belongs to; a file of no package (an index) is every reader's, and a
+    /// package's file whose package is unknown only a reader's whom every
+    /// package is visible to. A group keeps no files.
     pub async fn locate_kept(
         &self,
         repo: &Repository,
         path: &str,
-        package: Option<&str>,
+        package: &FilePackage,
         fetch: bool,
     ) -> Result<Option<RawFile>, FileError> {
-        if let Some(package) = package {
-            let filter = self.state.authz.package_filter(&self.principal, repo).await;
-            if !filter.allows(package) {
-                return Ok(None);
-            }
+        let allowed = match package {
+            FilePackage::None => true,
+            FilePackage::Package(package) => self
+                .state
+                .authz
+                .package_filter(&self.principal, repo)
+                .await
+                .allows(package),
+            FilePackage::Unknown => matches!(
+                self.state.authz.package_filter(&self.principal, repo).await,
+                PackageFilter::AllowAll
+            ),
+        };
+        if !allowed {
+            return Ok(None);
         }
         match repo.kind() {
             RepoKind::Hosted => Ok(raw_dao::find(&self.state.pool, repo.id, path).await?),
