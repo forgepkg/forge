@@ -742,6 +742,27 @@ impl HostedWrite {
         })
     }
 
+    /// Whether version `version` of `id` is listed: `None` when the
+    /// repository does not hold it. An import compares it with what the
+    /// source lists.
+    pub async fn package_listed(
+        &self,
+        repository_id: i64,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<bool>, WriteError> {
+        let Ok(version) = self.format.normalize_version(version) else {
+            return Ok(None);
+        };
+        let lower = self.format.lower_id(id);
+        Ok(
+            component_dao::find_component(&self.pool, repository_id, &lower, &version)
+                .await
+                .map_err(RepoError::from)?
+                .map(|comp| comp.listed),
+        )
+    }
+
     /// The SHA-512 (base64) of the package file of `id` `version`, if the
     /// repository holds that version and the digest was recorded: an import
     /// compares it with what the source lists.
