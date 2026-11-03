@@ -58,7 +58,7 @@ A Cargo workspace of small crates plus the web SPA:
 | `cache` | `forge-cache` | In-process L1 + optional Redis L2 with cross-instance invalidation (no Postgres advisory locks). |
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
-| `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
+| `plugin` | `forge-plugin` | The host side of format plugins: the adapter of a plugin to the repository machinery, and the checks of its descriptor. |
 | `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `apt`, `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
 | `server` | `forge-server` | Axum HTTP server: the format plugins' feeds under `/repository/{repo}` (except Docker at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |

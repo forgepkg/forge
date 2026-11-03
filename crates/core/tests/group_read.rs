@@ -40,8 +40,7 @@ use sqlx::PgPool;
 /// NuGet, the built-in format plugin, as the `Format` the repository code
 /// works with.
 fn nuget() -> forge_plugin::PluginFormat {
-    let plugin = forge_plugin::Plugin::builtin(forge_format_nuget::Nuget::default());
-    forge_plugin::PluginFormat::new(&plugin)
+    forge_plugin::PluginFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
 }
 
 /// In-memory blob byte store: maps `s3_key -> bytes`.

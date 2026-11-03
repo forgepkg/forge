@@ -36,9 +36,10 @@ const FORMATS: Record<string, { label: string; icon: IconName }> = {
   docker: { label: 'Docker', icon: 'Layers' },
   raw: { label: 'Raw', icon: 'Folder' },
   npm: { label: 'npm', icon: 'Package' },
+  apt: { label: 'apt', icon: 'Package' },
 }
 
-/** Display name of a repository format (`NuGet`, `Docker`, a plugin's id). */
+/** Display name of a repository format (`NuGet`, `Docker`, …; an unknown id as it is). */
 export function formatLabel(format: string): string {
   return FORMATS[format]?.label ?? format
 }

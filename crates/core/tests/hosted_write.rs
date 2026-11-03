@@ -27,8 +27,7 @@ use tokio::sync::Mutex;
 /// NuGet, the built-in format plugin, as the `Format` the repository code
 /// works with.
 fn nuget() -> forge_plugin::PluginFormat {
-    let plugin = forge_plugin::Plugin::builtin(forge_format_nuget::Nuget::default());
-    forge_plugin::PluginFormat::new(&plugin)
+    forge_plugin::PluginFormat::new(std::sync::Arc::new(forge_format_nuget::Nuget::default()))
 }
 
 const MAX_UPLOAD: u64 = 64 * 1024 * 1024;

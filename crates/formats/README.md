@@ -15,12 +15,11 @@ the design, the contract and how to write one.
 
 A plugin directory holds:
 
-- `Cargo.toml`: a member of the workspace; its `version` is the plugin's;
+- `Cargo.toml`: a member of the workspace, at the workspace's version;
 - `src/`: `impl FormatPlugin`, and the format's `pub const DESCRIPTOR:
   Descriptor` that its `descriptor()` returns: the format id (also the
-  directory's name), display name, version (`env!("CARGO_PKG_VERSION")`),
-  description, repository kinds (`Proxy` when it implements
-  `upstream`), its `storage` (`Packages`, `Files` for a files format such
+  directory's name), display name, description, repository kinds
+  (`Proxy` when it implements `upstream`), its `storage` (`Packages`, `Files` for a files format such
   as raw, or `Images` for an images format such as Docker), its asset
   names, how a proxy sends a token (`upstream_token`: `Bearer` for
   npm), its options (`options`: apt's `distribution`), which versions are

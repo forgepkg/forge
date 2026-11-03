@@ -48,7 +48,7 @@ import {
  *                 options and no writable member
  *
  * On **create** `format` and `kind` are selectable (the kinds the format
- * supports: format plugins have no proxies); on **edit** both are fixed
+ * supports: apt has no groups); on **edit** both are fixed
  * (identity columns, not updatable server-side) and shown read-only. The form
  * emits its values; `toCreateBody` / `toUpdateBody` turn them into the request
  * bodies, sending only the options that apply to the format and kind (the
@@ -139,6 +139,7 @@ export const NUGET_FORMAT: FormatView = {
   id: 'nuget',
   name: 'NuGet',
   kinds: ['hosted', 'proxy', 'group'],
+  description: 'NuGet packages, served as a NuGet V3 feed.',
 }
 
 /**
@@ -149,6 +150,7 @@ export const DOCKER_FORMAT: FormatView = {
   id: 'docker',
   name: 'Docker / OCI',
   kinds: ['hosted', 'proxy', 'group'],
+  description: 'Container images and other OCI artifacts, served by the registry under /v2.',
 }
 
 /**
@@ -160,6 +162,7 @@ export const RAW_FORMAT: FormatView = {
   id: 'raw',
   name: 'Raw files',
   kinds: ['hosted', 'proxy', 'group'],
+  description: 'Files under arbitrary paths (binaries, installers, fixtures).',
 }
 
 /**
@@ -171,6 +174,19 @@ export const NPM_FORMAT: FormatView = {
   id: 'npm',
   name: 'npm',
   kinds: ['hosted', 'proxy', 'group'],
+  description: 'npm packages, for npm, pnpm, Yarn and Bun.',
+}
+
+/**
+ * apt repositories for Debian and Ubuntu, served under `/repository/<name>/`:
+ * hosted ones sign their indexes, proxies cache a mirror. No groups; every
+ * repository names its distribution (an option).
+ */
+export const APT_FORMAT: FormatView = {
+  id: 'apt',
+  name: 'apt (Debian/Ubuntu)',
+  kinds: ['hosted', 'proxy'],
+  description: 'Debian and Ubuntu packages, for apt.',
 }
 
 /** Default maximum age of a raw proxy's cached files: a day. */
@@ -186,7 +202,7 @@ export function feedPath(format: FormatView, name: string): string {
 /** A draft mirrors the form fields; numbers are kept as strings while editing. */
 export interface RepoFormValues {
   name: string
-  /** The format id (`nuget` or a format plugin's). */
+  /** The format id (`nuget`, `docker`, `npm`, `raw` or `apt`). */
   format: string
   kind: RepoKind
   anonymous_read: boolean
@@ -352,16 +368,7 @@ function announced(message: string | undefined): ReactNode {
 
 /** What a format is, for the Format field on create. */
 function formatHelp(format: FormatView): string {
-  if (format.description) return format.description
-  if (format.id === NUGET_FORMAT.id) return 'NuGet packages, served as a NuGet V3 feed.'
-  if (format.id === DOCKER_FORMAT.id) {
-    return 'Container images and other OCI artifacts, served by the registry under /v2.'
-  }
-  if (format.id === RAW_FORMAT.id) {
-    return 'Files under arbitrary paths (binaries, installers, fixtures), served under /raw.'
-  }
-  if (format.id === NPM_FORMAT.id) return 'npm packages, for npm, pnpm, Yarn and Bun.'
-  return 'A format plugin.'
+  return format.description ?? format.name
 }
 
 /** What a kind does, for the Kind field on create. */
@@ -485,10 +492,12 @@ export function RepositoryForm({
 
   const available = formats && formats.length > 0 ? formats : [NUGET_FORMAT]
   // An edited repository's format may not be listed (the list failed to
-  // load, or a plugin is not installed any more): the built-in formats are
-  // known; any other one must have been a plugin format.
+  // load): the formats are known; any other id is one this server does not
+  // have.
   const format: FormatView = available.find((f) => f.id === values.format) ??
-    [NUGET_FORMAT, DOCKER_FORMAT, RAW_FORMAT, NPM_FORMAT].find((f) => f.id === values.format) ?? {
+    [NUGET_FORMAT, DOCKER_FORMAT, RAW_FORMAT, NPM_FORMAT, APT_FORMAT].find(
+      (f) => f.id === values.format,
+    ) ?? {
     id: values.format,
     name: values.format,
     kinds: ['hosted', 'group'],

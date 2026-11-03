@@ -52,7 +52,7 @@ A plugin is a workspace crate that describes itself in Rust:
 
 ```
 crates/formats/nuget/
-├── Cargo.toml     # the plugin's version
+├── Cargo.toml     # a member of the workspace, at Forge's version
 ├── src/lib.rs     # DESCRIPTOR (id, name, kinds hosted/proxy/group)
 │                  # and impl FormatPlugin for Nuget
 ├── src/protocol.rs  # the V3 protocol: handle and render
@@ -103,7 +103,7 @@ The pieces:
 | --- | --- |
 | [`forge-plugin-api`](../crates/plugin-api) | The contract: the `FormatPlugin` trait and its types, and, behind its `testing` feature, helpers that run a plugin's protocol against canned answers. Depends on nothing but `std`. |
 | [`crates/formats/<id>`](../crates/formats) | One crate per plugin, implementing `FormatPlugin`. |
-| [`forge-plugin`](../crates/plugin) | The host side: `Plugin` (an installed plugin, which describes itself), `PluginFormat`, which adapts it to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
+| [`forge-plugin`](../crates/plugin) | The host side: `PluginFormat`, which adapts a plugin to Forge's `Format` seam, and the checks of a descriptor (`descriptor::check`). |
 | [`forge-server`](../crates/server/src/plugins.rs) | The plugins it links in (`plugins::builtin`), the `/repository/{repo}/...` dispatcher, the file store files formats keep their files in ([`crates/server/src/files`](../crates/server/src/files)), and the image store and token service of images formats, under `/v2` ([`crates/server/src/images`](../crates/server/src/images)). |
 
 ## How it fits together
@@ -391,7 +391,7 @@ descriptor. The host then keeps the indexes of its hosted repositories:
   (apt's `key.gpg` and `key.asc`).
 - **Made when needed.** A request asks for an index file with
   `index(path)`, answered as `file`. When the repository's listed versions,
-  options or keys, or the format's version, changed since the index was
+  options or keys, or Forge's version, changed since the index was
   made (a fingerprint the host keeps), the host makes a new one first:
   no write path needs a hook, and a burst of publishes makes one index.
 - **Replaced at once.** A new index's files are stored, and the previous
