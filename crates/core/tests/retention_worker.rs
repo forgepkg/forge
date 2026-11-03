@@ -1437,7 +1437,8 @@ async fn a_scheduled_policy_runs_next_at_its_schedule() {
 
 /// #185: `unlisted_for_days` deletes versions unlisted long enough, by the
 /// time the unlisting recorded; `prerelease_superseded_for_days` deletes a
-/// prerelease once its release has been out long enough.
+/// prerelease once its release has been out long enough, and (#757) once it
+/// has itself been out that long when it was published after its release.
 #[tokio::test]
 async fn unlisted_and_superseded_versions_go_after_their_days() {
     let pool = pool().await;
@@ -1452,6 +1453,8 @@ async fn unlisted_and_superseded_versions_go_after_their_days() {
         ("old", "1.2.0", 400),
         ("app", "2.0.0-ci.1", 60),
         ("app", "2.0.0", 30),
+        // Published after 2.0.0 (a lagging CI bump): kept for its 14 days.
+        ("app", "2.0.0-ci.2", 2),
         ("app", "2.1.0-ci.1", 5),
     ]
     .into_iter()
@@ -1500,6 +1503,7 @@ async fn unlisted_and_superseded_versions_go_after_their_days() {
     assert!(component_exists(&pool, repo.id, "old", "1.2.0").await);
     assert!(!component_exists(&pool, repo.id, "app", "2.0.0-ci.1").await);
     assert!(component_exists(&pool, repo.id, "app", "2.0.0").await);
+    assert!(component_exists(&pool, repo.id, "app", "2.0.0-ci.2").await);
     assert!(component_exists(&pool, repo.id, "app", "2.1.0-ci.1").await);
     let reasons: Vec<(String, Value)> = sqlx::query_as(
         "SELECT rule_id, reason FROM retention_audit WHERE repository_id = $1 ORDER BY rule_id",
