@@ -813,7 +813,9 @@ async fn package_selectors_limit_downloads() {
 
 // ── Proxies ─────────────────────────────────────────────────────────────────
 
-/// A mock mirror: `/debian/dists/bookworm/...` and `/debian/pool/...`.
+/// A mock mirror: `/debian/dists/bookworm/...` and `/debian/pool/...`. Like
+/// Jetty and Tomcat (Nexus, Artifactory) it drops a segment's path
+/// parameters (`;x`) before it looks the file up.
 #[derive(Default)]
 struct Mirror {
     files: Mutex<std::collections::HashMap<String, Vec<u8>>>,
@@ -835,7 +837,12 @@ async fn mirror(state: Arc<Mirror>) -> String {
                     if state.down.load(Ordering::SeqCst) {
                         return StatusCode::SERVICE_UNAVAILABLE.into_response();
                     }
-                    match state.files.lock().unwrap().get(&path) {
+                    let file = path
+                        .split('/')
+                        .map(|segment| segment.split(';').next().unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    match state.files.lock().unwrap().get(&file) {
                         Some(body) => body.clone().into_response(),
                         None => StatusCode::NOT_FOUND.into_response(),
                     }
@@ -961,6 +968,68 @@ async fn proxies_serve_the_upstream_unchanged() {
         state.seen.lock().unwrap()["debian/pool/main/h/hello/hello_2.10-3_amd64.deb"],
         1
     );
+}
+
+/// A selector-scoped reader of a proxy reads no pool file whose package the
+/// path does not name, nor one under a path with path parameters (`;x`) an
+/// upstream servlet container drops (#799); a reader every package is
+/// visible to reads the former. The signed index stays everyone's.
+#[tokio::test]
+async fn proxies_keep_pool_files_of_no_package_from_selectors() {
+    let srv = common::start().await;
+    let state = Arc::new(Mirror::default());
+    let url = mirror(state.clone()).await;
+    let openssh = deb("openssh-server", "9.2p1-2+deb12u3", "amd64", "net");
+    let readme = b"no package's file".to_vec();
+    let in_release =
+        b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\nOrigin: Debian\n".to_vec();
+    {
+        let mut files = state.files.lock().unwrap();
+        files.insert("debian/dists/bookworm/InRelease".into(), in_release.clone());
+        files.insert(
+            "debian/pool/main/o/openssh/openssh-server_9.2p1-2+deb12u3_amd64.deb".into(),
+            openssh.clone(),
+        );
+        files.insert("debian/pool/main/I/Internal/README".into(), readme.clone());
+    }
+    let name = format!("aptproxysel{}", unique());
+    create(
+        &srv,
+        json!({"name": name, "kind": "proxy", "format": "apt", "remote_url": format!("{url}/debian/"),
+               "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let caller = srv.caller().await;
+    let selector = srv.create_selector(&["internal-*"]).await;
+    srv.grant_role(caller.id, &[(&name, "read", Some(selector))])
+        .await;
+    let get = |path: &str| {
+        let request = srv
+            .client()
+            .get(format!("{}/repository/{name}/{path}", srv.base_url))
+            .basic_auth(&caller.username, Some(&caller.token));
+        async move { request.send().await.unwrap().status() }
+    };
+    let smuggled = "pool/main/o/openssh;x/openssh-server_9.2p1-2+deb12u3_amd64.deb;x";
+    let unnamed = "pool/main/I/Internal/README";
+
+    assert_eq!(
+        get("pool/main/o/openssh/openssh-server_9.2p1-2+deb12u3_amd64.deb").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get(smuggled).await, StatusCode::NOT_FOUND);
+    assert_eq!(get(unnamed).await, StatusCode::NOT_FOUND);
+    assert_eq!(get("dists/bookworm/InRelease").await, StatusCode::OK);
+
+    // Every package is the administrator's: the file of no package is
+    // served, and then kept from the reader too. A `;` names no pool file.
+    let apt = Apt::new(&srv, &name).await;
+    let (status, body) = apt.get(unnamed).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, readme);
+    assert_eq!(get(unnamed).await, StatusCode::NOT_FOUND);
+    assert_eq!(apt.get(smuggled).await.0, StatusCode::NOT_FOUND);
+    assert!(state.seen.lock().unwrap().keys().all(|p| !p.contains(';')));
 }
 
 /// The Debian security archive keeps its packages under `pool/updates/…`

@@ -316,13 +316,16 @@ pub trait FormatPlugin: Send + Sync + 'static {
         Err(FormatError::Internal("this format keeps no indexes".into()))
     }
 
-    /// A package format: the package (canonical id) the file the host keeps
-    /// at `path` belongs to, which package selectors decide on (a proxy's
-    /// copy of a package); `None` for a file of no package (an index), which
-    /// every reader of the repository may read. The default: none.
-    fn file_package(&self, path: &str) -> Option<String> {
+    /// A package format: the package the file the host keeps at `path`
+    /// belongs to, which package selectors decide on: a proxy's copy of a
+    /// package names it ([`FilePackage::Package`], its canonical id); a
+    /// file of no package (an index) is every reader's
+    /// ([`FilePackage::None`]); a package's file whose package the path does
+    /// not name is only a reader's whom every package is visible to
+    /// ([`FilePackage::Unknown`]). The default: none.
+    fn file_package(&self, path: &str) -> FilePackage {
         let _ = path;
-        None
+        FilePackage::None
     }
 
     /// Images formats: the response to a request the host refused, or to
