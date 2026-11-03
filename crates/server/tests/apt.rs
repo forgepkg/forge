@@ -337,6 +337,15 @@ async fn hosted_repositories_publish_signed_indexes() {
         ))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // So is a control file of more fields than any real one holds.
+    let crowded: String = (0..300).map(|i| format!("X-Field-{i}: x\n")).collect();
+    let (status, text) = apt
+        .post(&deb_of(&format!(
+            "Package: crowded\nVersion: 1\nArchitecture: amd64\n{crowded}"
+        )))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("more than 256 fields"), "{text}");
 
     // InRelease is Release, signed with the repository's key.
     let keys = keys(&srv, &name).await;
