@@ -12,7 +12,10 @@ import {
  * Proxy delay status.
  *
  * An admin configures a proxy with a long package delay through the repository
- * form. A version freshly discovered upstream is inside the delay window, so:
+ * form. The package page shows what the proxy has cached and asks no upstream
+ * (#836), so the package is **not cached** until **Refresh from upstream**
+ * discovers it. A version freshly discovered upstream is inside the delay
+ * window, so:
  *
  *   - the package-detail view renders the `DelayBadge` as **delayed** (the
  *     version exists upstream but is not yet downloadable);
@@ -53,25 +56,32 @@ test('a delayed proxy version shows the delay badge and is absent from browse', 
   await page.getByRole('button', { name: /create repository/i }).click()
   await expect(page).toHaveURL(new RegExp(`/manage/repositories/${proxy}`))
 
-  // 2. Trigger upstream discovery: hitting the detail read path runs the proxy
-  //    read ops, which stamp `first_seen_at` and (because the delay has not
-  //    elapsed) surface the version as `delayed_until`.
-  const detail = await fetchPackageDetail(proxy, 'Sample.Lib')
-  const delayed = detail.versions.find((v) => v.delay_status === 'delayed_until')
-  expect(delayed, 'a delayed version should be surfaced').toBeTruthy()
-  expect(delayed?.delayed_until).toBeTruthy()
-
-  // 3. Package detail in the browser: the delay badge reads "delayed". (For a
-  //    delayed-only proxy package there is no cached original casing yet, so the
-  //    heading shows the requested lowercased id — match case-insensitively.)
+  // 2. The package page answers from the cache and asks no upstream: the proxy
+  //    holds nothing of the package yet, so the page says it is not cached
+  //    (looking does not discover it). The page shows that once its detail
+  //    query has given up on the 404, after two retries a few seconds apart.
   await page.goto(`/packages/${proxy}/sample.lib`)
-  await expect(page.getByRole('heading', { name: /sample\.lib/i })).toBeVisible()
+  await expect(page.getByText('Package not cached')).toBeVisible({ timeout: 15_000 })
+
+  // 3. Refresh from upstream asks the upstream, as a client's install does:
+  //    it stamps the version's `first_seen_at`, and as the delay has not
+  //    elapsed the page shows it delayed. (For a delayed-only proxy package
+  //    there is no cached original casing yet, so the heading shows the
+  //    requested lowercased id — match case-insensitively.)
+  await page.getByRole('button', { name: 'Refresh from upstream' }).click()
   // The version row carries the delayed badge.
   const row = page
     .getByRole('table', { name: /^Versions of / })
     .getByRole('row', { name: /1\.2\.3/ })
   await expect(row).toBeVisible()
   await expect(row.getByText(/delayed/)).toBeVisible()
+  await expect(page.getByRole('heading', { name: /sample\.lib/i })).toBeVisible()
+
+  // The detail API, from the cache now, surfaces the version as delayed.
+  const detail = await fetchPackageDetail(proxy, 'Sample.Lib')
+  const delayed = detail.versions.find((v) => v.delay_status === 'delayed_until')
+  expect(delayed, 'a delayed version should be surfaced').toBeTruthy()
+  expect(delayed?.delayed_until).toBeTruthy()
 
   // 4. The delay-gated version is absent from downloadable browse: search in
   //    THIS proxy's folder view never surfaces a delay-gated version, so the
