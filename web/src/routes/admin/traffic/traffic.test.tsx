@@ -50,7 +50,6 @@ const overview: TrafficOverview = {
   clients: [
     {
       network: '2001:db8:1:2::/64',
-      address: '2001:db8:1:2::7',
       country: 'DE',
       asn: 3320,
       as_org: 'Deutsche Telekom AG',
@@ -65,7 +64,7 @@ const overview: TrafficOverview = {
   recording,
 }
 
-const settings: TrafficSettings = { enabled: true, client_addresses: true, retention_days: 90 }
+const settings: TrafficSettings = { enabled: true, client_addresses: true, retention_days: 14 }
 
 const geoip = (over: Partial<GeoipStatus['maxmind']> = {}): GeoipStatus => ({
   country: { database_type: 'GeoLite2-Country', built_at: '2026-10-28T00:00:00Z', size: 9_000_000 },

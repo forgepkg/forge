@@ -125,7 +125,7 @@ function RecordingForm({ settings }: { settings: TrafficSettings }) {
           label="Client addresses"
           checked={addresses}
           onChange={setAddresses}
-          description="Addresses are personal data. Off, requests are still counted by repository, country and network: the address is looked up in memory and dropped."
+          description="Addresses are personal data, kept as long as the statistics; an IPv6 address by its /64 alone. Off, requests are still counted by repository, country and network: the address is looked up in memory and dropped."
         />
         <TextField
           label="Keep the statistics for (days)"

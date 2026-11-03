@@ -19,7 +19,7 @@ tokio::task_local! {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Noted {
     /// The client address: the socket peer, or the one a trusted proxy
-    /// forwarded.
+    /// forwarded. The server notes an IPv6 address cut to its /64.
     pub client: Option<IpAddr>,
     /// The network the address is counted under (the address itself, an
     /// IPv6 address's /64), as text.

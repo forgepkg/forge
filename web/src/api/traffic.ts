@@ -58,8 +58,8 @@ export interface TrafficShare {
 
 /** A client network's requests. */
 export interface TrafficClient {
+  /** The address, or an IPv6 address's /64. */
   network: string
-  address: string
   /** ISO 3166-1 alpha-2; `""` unknown. */
   country: string
   /** `0` unknown. */

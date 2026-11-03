@@ -1512,17 +1512,24 @@ them from the bucket and sums them: it needs no Redis and no call between
 instances. The files are plain Parquet, so DuckDB, pandas or Spark read them
 too.
 
-What is recorded and how long it is kept (90 days by default) is set under
-**Admin → Traffic → Settings** (`/admin/settings/traffic`), for every
-instance at once. Each instance deletes the days past the retention about
-once an hour, whichever instance wrote them.
+Requests and client addresses are recorded unless an administrator turns
+them off. What is recorded and how long it is kept (14 days by default) is
+set under **Admin → Traffic → Settings** (`/admin/settings/traffic`), for
+every instance at once. Each instance deletes the days past the retention,
+and the client addresses they hold, about once an hour, whichever instance
+wrote them. A longer retention keeps the addresses as long: to keep the
+counts for months, consider turning **Client addresses** off.
 
 - **Client addresses are personal data.** The address is the one Forge
   resolves for the login lockout: the socket peer, or the `X-Forwarded-For`
   of a [trusted proxy](#reverse-proxy). An IPv6 client is counted by its
-  /64. With **Client addresses** off, requests are still counted by
-  repository, country and autonomous system: the address is looked up in
-  memory and dropped before anything is written.
+  /64, and only the /64 is kept: the rest of the address is dropped before
+  the request is counted. The files' `network` column holds the IPv4
+  address or the IPv6 /64, and their `address` column the address the
+  network was located by (the IPv4 address, the first address of the /64).
+  With **Client addresses** off, requests are still counted by repository,
+  country and autonomous system: the address is looked up in memory and
+  dropped before anything is written, and both columns stay empty.
 - **Accuracy.** Today fills in as the instances write it, once a minute. An
   instance that stops writes what it counted on a graceful shutdown; one
   that is killed loses its last minute. Past 500,000 clients a day on one
