@@ -325,8 +325,20 @@ pub trait FormatPlugin: Send + Sync + 'static {
     /// and replaces the previous index with all the files at once. Must be
     /// deterministic but for [`IndexInput::generated`]. The default makes
     /// none.
-    fn index(&self, repo: &Repository, input: &IndexInput) -> Result<Vec<IndexFile>, FormatError> {
-        let _ = (repo, input);
+    ///
+    /// Each file goes to `sink` as soon as it is made, which stores it, so
+    /// that a format holds one file (an apt list and its copies) at a time,
+    /// not the whole index (#797). An error from `sink` (the index grew
+    /// past what the host stores) is returned as it is. A format checks
+    /// what its files will hold against [`IndexInput::max_bytes`] before it
+    /// makes any.
+    fn index(
+        &self,
+        repo: &Repository,
+        input: &IndexInput,
+        sink: &mut dyn FnMut(IndexFile) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
+        let _ = (repo, input, sink);
         Err(FormatError::Internal("this format keeps no indexes".into()))
     }
 

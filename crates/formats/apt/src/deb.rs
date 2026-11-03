@@ -337,7 +337,10 @@ fn control_in_tar(tar: impl Read) -> Result<Vec<u8>, DebError> {
             return invalid("the package's control is not a file");
         }
         if entry.size() > MAX_CONTROL_BYTES as u64 {
-            return invalid("the package's control file is too large");
+            return invalid(format!(
+                "the package's control file is larger than {} KiB",
+                MAX_CONTROL_BYTES >> 10
+            ));
         }
         let mut control = Vec::new();
         entry
@@ -517,6 +520,20 @@ pub(crate) mod tests {
         ]);
         let err = control_file(&mut Cursor::new(deb)).unwrap_err();
         assert!(err.to_string().contains("no control file"), "{err}");
+    }
+
+    #[test]
+    fn a_control_file_over_the_cap_is_refused() {
+        // A control file of exactly the cap is read; one byte more is
+        // refused (#797: it was 1 MiB).
+        let head = "Package: big\nVersion: 1\nArchitecture: all\nDescription: x\n ";
+        let at_cap = format!("{head}{}\n", "y".repeat(MAX_CONTROL_BYTES - head.len() - 1));
+        assert_eq!(at_cap.len(), MAX_CONTROL_BYTES);
+        let read = control_file(&mut Cursor::new(deb_of(&[("./control", &at_cap)]))).unwrap();
+        assert_eq!(read.len(), MAX_CONTROL_BYTES);
+        let over = format!("{at_cap}z");
+        let err = control_file(&mut Cursor::new(deb_of(&[("./control", &over)]))).unwrap_err();
+        assert!(err.to_string().contains("larger than 64 KiB"), "{err}");
     }
 
     /// A `.deb` whose control member holds a regular file of `data` at each

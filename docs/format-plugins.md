@@ -379,8 +379,11 @@ descriptor. The host then keeps the indexes of its hosted repositories:
 
 - **Made of the packages.** `index` gets every listed version of the
   repository (its id, version, stored summary, size and digests, by id,
-  then version) and returns the index files: paths, content, content types.
-  The plugin makes them as a pure function of its input (apt's
+  then version) and hands the index files to the host one at a time (paths,
+  content, content types), which signs and stores each as it comes: a
+  plugin holds one file, not the whole index. It checks what its files will
+  hold against the most an index may hold (`max_bytes`) before it makes
+  any. The plugin makes them as a pure function of its input (apt's
   [`index.rs`](../crates/formats/apt/src/index.rs)), so the summary a
   package format stores at publish should hold what its index lists of a
   version: making an index reads no package and no manifest.
