@@ -132,6 +132,8 @@ struct NpmVersion {
     /// The packument lists `dist.integrity` (old packages have only
     /// `dist.shasum`).
     integrity: bool,
+    /// The packument lists `dist.shasum`.
+    shasum: bool,
 }
 
 /// How a mock registry's search answers a search for every package (an
@@ -687,9 +689,11 @@ fn npm_registry(
     for (version, v) in versions {
         let digests = forge_format_npm::integrity::Digests::of(&v.bytes[..]).unwrap();
         let mut dist = json!({
-            "shasum": digests.sha1_hex,
             "tarball": format!("{NPM_TARBALL_HOST}/repository/{repo}/{name}/-/{unscoped}-{version}.tgz"),
         });
+        if v.shasum {
+            dist["shasum"] = json!(digests.sha1_hex);
+        }
         if v.integrity {
             dist["integrity"] = json!(digests.integrity());
         }
@@ -742,6 +746,7 @@ impl Source {
                     published: Some(published.into()),
                     deprecated: None,
                     integrity: true,
+                    shasum: true,
                 },
             );
         });
@@ -2550,6 +2555,60 @@ async fn npm_import_walks_all_where_the_search_lists_nothing_and_checks_every_ta
         packument(&srv, &repo, "zeta").await["dist-tags"]["latest"],
         "1.0.0"
     );
+}
+
+#[tokio::test]
+async fn npm_import_fails_a_version_the_registry_lists_no_checksum_for() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    let reg = "npm-unchecked";
+    for (name, version) in [("alpha", "1.0.0"), ("bare", "0.1.0")] {
+        source.npm_version(
+            reg,
+            name,
+            version,
+            tgz(name, version, name),
+            "2022-02-02T00:00:00.000Z",
+        );
+        source.npm_tag(reg, name, "latest", version);
+    }
+    // No SHA-512, no `dist.integrity`, no `dist.shasum`.
+    source.npm(reg, |r| {
+        let v = r
+            .packages
+            .get_mut("bare")
+            .unwrap()
+            .get_mut("0.1.0")
+            .unwrap();
+        v.integrity = false;
+        v.shasum = false;
+    });
+
+    let repo = repo_name("npm-unchecked");
+    create_repo(
+        &srv,
+        json!({"name": repo, "kind": "hosted", "format": "npm"}),
+    )
+    .await;
+    let id = start(&srv, &repo, from(source.npm_url(reg))).await;
+    let done = run(&srv, &repo, id).await;
+    // The rest of the import goes on: alpha's version and tag are imported;
+    // bare's version fails, and with it its tag.
+    assert_eq!(done["state"], "completed", "{done}");
+    assert_eq!(done["progress"]["found"], 4, "{done}");
+    assert_eq!(done["progress"]["imported"], 2, "{done}");
+    assert_eq!(done["progress"]["failed"], 2, "{done}");
+    let version = item_of(&srv, &repo, id, "bare", "0.1.0").await;
+    assert_eq!(version["state"], "failed", "{version}");
+    assert!(
+        version["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the registry lists no checksum for it"),
+        "{version}"
+    );
+    assert!(npm_tarball(&srv, &repo, "bare", "0.1.0").await.is_none());
+    assert!(npm_tarball(&srv, &repo, "alpha", "1.0.0").await.is_some());
 }
 
 #[tokio::test]

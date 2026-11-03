@@ -1539,7 +1539,7 @@ impl Run<'_> {
             .stage(tokio_util::io::StreamReader::new(body), ctx.limit)
             .await
             .map_err(|e| WriteError::from(e).to_string())?;
-        verify(&staged, &url, source, from.noun()).await?;
+        verify(&staged, &url, source, from).await?;
         let bytes = staged.size;
         let options = ImportOptions {
             overwrite,
@@ -2457,15 +2457,19 @@ fn verify_file(
     Ok(())
 }
 
-/// Check a staged download against the SHA-512 the source (a `lister`, the
-/// feed or the registry) lists for it, or, for an npm tarball listed without
-/// one, against its `dist.integrity` and `dist.shasum`.
+/// Check a staged download against the SHA-512 the source (`from`, the feed
+/// or the registry) lists for it, or, for an npm tarball listed without one,
+/// against its `dist.integrity` and `dist.shasum`. An npm tarball the
+/// registry lists no checksum for at all is refused, as
+/// [`Digests::verify`](forge_format_npm::integrity::Digests::verify) refuses
+/// it; a feed's package may come without one (Nexus lists none).
 async fn verify(
     staged: &StagedBlob,
     url: &str,
     source: &ItemSource,
-    lister: &str,
+    from: PackageSource<'_>,
 ) -> Result<(), String> {
+    let lister = from.noun();
     if let Some(expected) = &source.sha512 {
         if *expected != staged.sha512_base64 {
             return Err(format!(
@@ -2474,8 +2478,14 @@ async fn verify(
         }
         return Ok(());
     }
-    if source.integrity.is_none() && source.shasum.is_none() {
-        return Ok(());
+    let listed = |s: &Option<String>| s.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if !listed(&source.integrity) && !listed(&source.shasum) {
+        return match from {
+            PackageSource::Feed(_) => Ok(()),
+            PackageSource::Npm(_) => Err(format!(
+                "the {lister} lists no checksum for it (neither dist.integrity nor dist.shasum)"
+            )),
+        };
     }
     let path = staged.read_path();
     let digests = tokio::task::spawn_blocking(move || {
