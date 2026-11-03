@@ -14,6 +14,9 @@
 //!   more seconds of interval) when polled sooner than the interval or
 //!   while another poll of the same code is answered, `access_denied`,
 //!   `expired_token`, or, once, the token. Errors are RFC 6749 §5.2 JSON.
+//!   Anyone may poll, without an account, so polls are limited per client
+//!   network and per device code before the database is asked
+//!   ([`DevicePollLimits`], #819).
 //! * `GET /.well-known/oauth-authorization-server` (RFC 8414) names both
 //!   endpoints, so a client finds everything from the server URL alone.
 //! * `POST /auth/device/lookup` and `/auth/device/decide` serve the `/device`
@@ -45,6 +48,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -55,7 +59,9 @@ use axum::routing::{get, post};
 use axum::{Extension, Router};
 use chrono::{DateTime, Utc};
 use forge_core::auth::token::{generate_token_secret, hash_token};
-use forge_core::auth::{AttemptRefused, LoginAttempt, LoginThrottle};
+use forge_core::auth::{
+    AttemptRefused, KeyedWindowLimiter, LoginAttempt, LoginThrottle, WindowLimiter,
+};
 use forge_core::authz::{Level, TokenScope};
 use forge_db::device_auth_dao::{
     self, DeviceAuthorization, NewDeviceAuthorization, PollLock, PollState, PolledRequest,
@@ -108,6 +114,13 @@ const SLOW_DOWN_STEP_SECONDS: i32 = 5;
 
 /// The interval `slow_down` raises a request's to at most.
 const MAX_INTERVAL_SECONDS: i32 = 3600;
+
+/// Polls of one device code an instance answers per [`CODE_POLL_WINDOW`]:
+/// one a second, the shortest interval there is, in bursts of up to ten.
+const POLLS_PER_CODE: u32 = 10;
+
+/// The window [`POLLS_PER_CODE`] is counted in.
+const CODE_POLL_WINDOW: Duration = Duration::from_secs(10);
 
 /// The largest request body of these endpoints (a form or a JSON object of
 /// a few short fields).
@@ -522,6 +535,7 @@ struct TokenResponse {
 /// `POST /auth/device/token` — a client polls its device login.
 async fn device_token(
     State(state): State<AppState>,
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -550,25 +564,87 @@ async fn device_token(
     let Some(device_code) = params.get("device_code") else {
         return bad_request("invalid_request", "device_code is required");
     };
-    poll(&state, client_id, device_code).await
+    let client_ip = login_client_ip(&state, connect.map(|Extension(ci)| ci.0), &headers);
+    let device_code_hash = hash_token(device_code);
+    if let Err(resp) = state.device_polls.check(client_ip, &device_code_hash) {
+        return resp;
+    }
+    poll(&state, client_id, &device_code_hash).await
 }
 
-/// Answer a poll of `device_code` by `client_id`. The request's row is
-/// locked for the answer, and the token is minted in the transaction that
-/// marks the request collected: it is answered once, and a failure leaves
-/// the approval to collect on the next poll.
+/// The rate limits of the token endpoint, counted by each instance (#819):
+/// anyone may poll, without an account, and a device code is free to have.
+/// Polls are limited per client network (`auth.device_polls_per_minute`,
+/// IPv6 by /64) and per device code ([`POLLS_PER_CODE`] per
+/// [`CODE_POLL_WINDOW`]), before the database is asked.
+#[derive(Debug)]
+pub struct DevicePollLimits {
+    networks: WindowLimiter,
+    codes: KeyedWindowLimiter<u64>,
+}
+
+impl DevicePollLimits {
+    /// `per_network_per_minute` polls per client network and minute (`0`:
+    /// no limit per network), and [`POLLS_PER_CODE`] per device code.
+    pub fn new(per_network_per_minute: u32) -> Self {
+        DevicePollLimits {
+            networks: WindowLimiter::new(per_network_per_minute, Duration::from_secs(60)),
+            codes: KeyedWindowLimiter::new(POLLS_PER_CODE, CODE_POLL_WINDOW),
+        }
+    }
+
+    /// Count a poll from `client_ip` of the device code that hashes to
+    /// `device_code_hash`. The refusal when the network (`429`) or the code
+    /// (`400`) is over its limit; both are `slow_down`.
+    fn check(&self, client_ip: IpAddr, device_code_hash: &str) -> Result<(), Response> {
+        if !self.networks.allow(client_ip) {
+            let mut resp = oauth_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "slow_down",
+                "too many polls from this network; try again later",
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("60"));
+            return Err(resp);
+        }
+        if !self.codes.allow(code_key(device_code_hash)) {
+            return Err(bad_request(
+                "slow_down",
+                "the device_code is polled too often; wait five seconds longer from now on",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The key a device code's polls are counted under: the first 64 bits of
+/// its SHA-256 (hex), so an entry has a fixed size whatever is sent. Codes
+/// that share it share a budget, which nobody can aim at a code they do not
+/// know.
+fn code_key(device_code_hash: &str) -> u64 {
+    device_code_hash
+        .get(..16)
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .unwrap_or_default()
+}
+
+/// Answer a poll by `client_id` of the device code that hashes to
+/// `device_code_hash`. The request's row is locked for the answer, and the
+/// token is minted in the transaction that marks the request collected: it
+/// is answered once, and a failure leaves the approval to collect on the
+/// next poll.
 ///
 /// A poll never waits for a database connection or a lock while it holds
 /// one (#794): everything it reads runs on its transaction's connection,
 /// and a poll that finds the request locked by another poll of the same
 /// code answers `slow_down` at once, rather than wait for it with a
 /// connection taken from the pool.
-async fn poll(state: &AppState, client_id: &str, device_code: &str) -> Response {
+async fn poll(state: &AppState, client_id: &str, device_code_hash: &str) -> Response {
     let mut tx = match forge_db::begin(&state.pool).await {
         Ok(tx) => tx,
         Err(e) => return oauth_unavailable(&e),
     };
-    let request = match device_auth_dao::lock_for_poll(&mut tx, &hash_token(device_code)).await {
+    let request = match device_auth_dao::lock_for_poll(&mut tx, device_code_hash).await {
         Ok(PollLock::Locked(request)) => request,
         Ok(PollLock::Unknown) => return bad_request("invalid_grant", "unknown device_code"),
         // A client polls once at a time: a second poll while the first is
@@ -1114,6 +1190,52 @@ mod tests {
         );
         assert!(form("application/json", "{}").is_err());
         assert!(form("application/x-www-form-urlencoded", "a=1&a=2").is_err());
+    }
+
+    #[test]
+    fn a_device_code_is_counted_under_its_hash() {
+        let hash = hash_token("a device code");
+        assert_eq!(
+            code_key(&hash),
+            u64::from_str_radix(&hash[..16], 16).unwrap()
+        );
+        assert_ne!(
+            code_key(&hash),
+            code_key(&hash_token("another device code"))
+        );
+        assert_eq!(code_key("short"), 0);
+    }
+
+    #[test]
+    fn polls_are_limited_per_network_and_per_code() {
+        let limits = DevicePollLimits::new(15);
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        let (one, two) = (hash_token("one"), hash_token("two"));
+        for _ in 0..POLLS_PER_CODE {
+            assert!(limits.check(ip, &one).is_ok());
+        }
+        let refused = limits.check(ip, &one).unwrap_err();
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "the code's limit"
+        );
+        for _ in 0..4 {
+            assert!(limits.check(ip, &two).is_ok(), "another code's own budget");
+        }
+        let refused = limits.check(ip, &two).unwrap_err();
+        assert_eq!(
+            refused.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the network's limit"
+        );
+        assert!(refused.headers().contains_key(header::RETRY_AFTER));
+        let other: IpAddr = "198.51.100.5".parse().unwrap();
+        assert!(limits.check(other, &two).is_ok(), "another network");
+        assert!(
+            limits.check(other, &one).is_err(),
+            "the code's limit, from any network"
+        );
     }
 
     #[test]

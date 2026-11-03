@@ -7,8 +7,9 @@
 //! token collected once (and what it is), concurrent polls of one code on a
 //! small connection pool, the scope, unknown clients and
 //! malformed requests (always RFC 6749 JSON), the rate limit on guessing
-//! codes per network and per session, and the settings that turn the
-//! device login off and set its interval. Requires Docker (Postgres +
+//! codes per network and per session, the rate limit on polling per network
+//! and per code (#819), and the settings that turn the device login off and
+//! set its interval. Requires Docker (Postgres +
 //! versitygw via the shared harness), or `FORGE_TEST_DATABASE_URL` /
 //! `FORGE_TEST_S3_ENDPOINT`.
 
@@ -30,11 +31,18 @@ async fn start() -> TestServer {
 }
 
 async fn start_on(pool: sqlx::PgPool) -> TestServer {
+    start_configured(pool, "").await
+}
+
+/// [`start_on`], with more `[auth]` lines.
+async fn start_configured(pool: sqlx::PgPool, auth_extra: &str) -> TestServer {
     start_with(
         pool,
         ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
-            auth_extra: Some("trusted_proxy_cidrs = [\"127.0.0.1/32\", \"::1/128\"]".into()),
+            auth_extra: Some(format!(
+                "trusted_proxy_cidrs = [\"127.0.0.1/32\", \"::1/128\"]\n{auth_extra}"
+            )),
             ..Default::default()
         },
     )
@@ -104,6 +112,28 @@ async fn poll(srv: &TestServer, client_id: &str, device_code: &str) -> (StatusCo
         ],
     )
     .await
+}
+
+/// Poll the token endpoint once from `ip` (`X-Forwarded-For`).
+async fn poll_from(
+    srv: &TestServer,
+    client_id: &str,
+    device_code: &str,
+    ip: &str,
+) -> (StatusCode, Value) {
+    let resp = srv
+        .client()
+        .post(format!("{}/auth/device/token", srv.base_url))
+        .header("x-forwarded-for", ip)
+        .form(&[
+            ("grant_type", GRANT),
+            ("client_id", client_id),
+            ("device_code", device_code),
+        ])
+        .send()
+        .await
+        .unwrap();
+    answer(resp).await
 }
 
 /// Expect an RFC 6749 §5.2 error.
@@ -787,5 +817,145 @@ async fn the_settings_turn_the_device_login_off_and_set_its_interval() {
     assert_error(
         poll(&srv, "forge-cli", &device_code).await,
         "authorization_pending",
+    );
+}
+
+/// Poll `device_code` `n` times at once, and start an unrelated device login
+/// (a request that needs the database) meanwhile. Every poll must be answered
+/// within a second, `authorization_pending` or `slow_down`, and the other
+/// request served; returns how many polls were told to slow down.
+async fn poll_at_once(srv: &TestServer, device_code: &str, n: usize) -> usize {
+    let polls: Vec<_> = (0..n)
+        .map(|_| {
+            let client = srv.client();
+            let url = format!("{}/auth/device/token", srv.base_url);
+            let device_code = device_code.to_string();
+            tokio::spawn(async move {
+                let sent = Instant::now();
+                let resp = client
+                    .post(url)
+                    .timeout(Duration::from_secs(5))
+                    .form(&[
+                        ("grant_type", GRANT),
+                        ("client_id", "forge-cli"),
+                        ("device_code", device_code.as_str()),
+                    ])
+                    .send()
+                    .await
+                    .expect("the poll is answered");
+                let answer = answer(resp).await;
+                (sent.elapsed(), answer)
+            })
+        })
+        .collect();
+    let sent = Instant::now();
+    let (status, other) = post_form(srv, "/auth/device/code", &[("client_id", "forge-cli")]).await;
+    assert_eq!(status, 200, "an unrelated request is served: {other}");
+    assert!(
+        sent.elapsed() < Duration::from_secs(1),
+        "an unrelated request is served at once, not after {:?}",
+        sent.elapsed()
+    );
+    let mut slowed = 0;
+    for poll in polls {
+        let (took, (status, body)) = poll.await.unwrap();
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            took < Duration::from_secs(1),
+            "a poll is answered at once, not after {took:?}: {body}"
+        );
+        match body["error"].as_str() {
+            Some("slow_down") => slowed += 1,
+            Some("authorization_pending") => {}
+            _ => panic!("neither pending nor slow_down: {body}"),
+        }
+    }
+    slowed
+}
+
+/// Polls of a pending code never wait for its row while they hold a pool
+/// connection, and are limited per code (#819): on a pool of two
+/// connections, 50 concurrent polls are each answered at once, and an
+/// unrelated request is served meanwhile. Also while another transaction
+/// holds the row, which a poll used to wait for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_polls_of_a_pending_code_never_wait_for_its_row() {
+    let srv = start_on(common::sized_pool(2, Duration::from_secs(3)).await).await;
+
+    let device_code = start_login(&srv, "forge-cli", None).await["device_code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let slowed = poll_at_once(&srv, &device_code, 50).await;
+    assert!(
+        slowed >= 40,
+        "ten polls per code and ten seconds are answered from the database, \
+         the others told to slow down: {slowed} of 50"
+    );
+
+    // Another transaction holds the request's row (another poll, still
+    // working on its answer): every poll is told to slow down at once.
+    let started = start_login(&srv, "forge-cli", None).await;
+    let device_code = started["device_code"].as_str().unwrap().to_string();
+    let user_code = started["user_code"].as_str().unwrap().to_string();
+    let other = common::pool().await;
+    let mut holder = other.begin().await.unwrap();
+    sqlx::query("SELECT id FROM device_authorization WHERE user_code = $1 FOR UPDATE")
+        .bind(user_code.replace('-', ""))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    assert_eq!(poll_at_once(&srv, &device_code, 50).await, 50);
+    holder.rollback().await.unwrap();
+    assert_eq!(
+        stored_interval(&srv, &user_code).await,
+        5,
+        "a poll that found the row held recorded nothing"
+    );
+}
+
+/// Polls are limited per client network (`auth.device_polls_per_minute`,
+/// #819): past it, `429` `slow_down` with `Retry-After`, without asking the
+/// database; another network still polls.
+#[tokio::test]
+async fn polls_are_limited_per_network() {
+    let srv = start_configured(common::pool().await, "device_polls_per_minute = 3").await;
+    let device_code = start_login(&srv, "forge-cli", None).await["device_code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_error(
+        poll_from(&srv, "forge-cli", &device_code, "203.0.113.20").await,
+        "authorization_pending",
+    );
+    for _ in 0..2 {
+        assert_error(
+            poll_from(&srv, "forge-cli", &device_code, "203.0.113.20").await,
+            "slow_down",
+        );
+    }
+    let resp = srv
+        .client()
+        .post(format!("{}/auth/device/token", srv.base_url))
+        .header("x-forwarded-for", "203.0.113.20")
+        .form(&[
+            ("grant_type", GRANT),
+            ("client_id", "forge-cli"),
+            ("device_code", device_code.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()["retry-after"], "60");
+    let (status, body) = answer(resp).await;
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(body["error"], "slow_down", "{body}");
+    // Not even an unknown code reaches the database from that network.
+    let (status, body) = poll_from(&srv, "forge-cli", "unknown", "203.0.113.20").await;
+    assert_eq!(status, 429, "{body}");
+    // Another network polls on.
+    assert_error(
+        poll_from(&srv, "forge-cli", &device_code, "198.51.100.20").await,
+        "slow_down",
     );
 }
