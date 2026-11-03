@@ -2749,3 +2749,95 @@ async fn npm_import_names_a_nexus_repository_in_the_previous_request_form() {
     );
     assert_eq!(npm_get(&srv, &repo, "beta").await.status(), 404);
 }
+
+/// Set `repo`'s deployment policy.
+async fn set_policy(srv: &TestServer, repo: &str, policy: &str) {
+    let resp = admin(
+        srv,
+        reqwest::Method::PUT,
+        &format!("/admin/repositories/{repo}"),
+        Some(json!({"deployment_policy": policy})),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+}
+
+#[tokio::test]
+async fn an_import_into_a_read_only_repository_is_refused_and_one_queued_before_fails() {
+    let srv = forge().await;
+    let source = Source::start().await;
+    source.nuget(
+        "nuget-hosted",
+        "Acme.Core",
+        "1.0.0",
+        make_nupkg("Acme.Core", "1.0.0"),
+        "2021-01-01T00:00:00.000+00:00",
+    );
+    source.npm("npm-hosted", |r| {
+        r.search = NpmSearch::Nothing;
+        r.all = true;
+    });
+    source.npm_version(
+        "npm-hosted",
+        "alpha",
+        "1.0.0",
+        tgz("alpha", "1.0.0", "a"),
+        "2022-02-02T00:00:00.000Z",
+    );
+    source.npm_tag("npm-hosted", "alpha", "latest", "1.0.0");
+
+    for (format, url) in [
+        ("nuget", source.feed_url("nuget-hosted")),
+        ("npm", source.npm_url("npm-hosted")),
+    ] {
+        // Created read-only: the import is refused, and none is stored.
+        let frozen = repo_name(&format!("{format}-frozen"));
+        create_repo(
+            &srv,
+            json!({"name": frozen, "kind": "hosted", "format": format, "deployment_policy": "read_only"}),
+        )
+        .await;
+        let resp = admin(
+            &srv,
+            reqwest::Method::POST,
+            &format!("/admin/repositories/{frozen}/imports"),
+            Some(from(url.clone())),
+        )
+        .await;
+        assert_eq!(resp.status(), 409, "{format}");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("read_only"), "{format}: {text}");
+        let listed: Value = admin(
+            &srv,
+            reqwest::Method::GET,
+            &format!("/admin/repositories/{frozen}/imports"),
+            None,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(listed, json!([]), "{format}");
+
+        // Frozen after the import was queued: the run fails, writing nothing.
+        let repo = repo_name(&format!("{format}-freeze"));
+        create_repo(
+            &srv,
+            json!({"name": repo, "kind": "hosted", "format": format}),
+        )
+        .await;
+        let id = start(&srv, &repo, from(url)).await;
+        set_policy(&srv, &repo, "read_only").await;
+        let done = run(&srv, &repo, id).await;
+        assert_eq!(done["state"], "failed", "{format}: {done}");
+        assert!(
+            done["last_error"].as_str().unwrap().contains("read_only"),
+            "{format}: {done}"
+        );
+        assert!(items(&srv, &repo, id, None).await.is_empty(), "{format}");
+        match format {
+            "nuget" => assert!(nupkg(&srv, &repo, "Acme.Core", "1.0.0").await.is_none()),
+            _ => assert_eq!(npm_get(&srv, &repo, "alpha").await.status(), 404),
+        }
+    }
+}

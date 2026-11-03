@@ -1124,8 +1124,8 @@ async fn raw_import_preflight_refusals() {
     .await;
     refused(
         request(&srv, &read_only, from(source.repository("raw-hosted"))).await,
-        400,
-        "read-only",
+        409,
+        "read_only",
     )
     .await;
     let proxy = repo_name("rawproxy");

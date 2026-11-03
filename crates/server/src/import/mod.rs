@@ -131,7 +131,7 @@ use forge_core::repo::proxy::Credentials;
 use forge_core::repo::{ImportOptions, ImportOutcome, RepoKind, WriteError};
 use forge_crypto::PlaintextSecret;
 use forge_db::import_dao::{self, ImportItem, NewItem, RepositoryImport};
-use forge_db::model::Repository;
+use forge_db::model::{DeploymentPolicy, Repository};
 use forge_db::{component_dao, raw_dao, repository_dao, secret_dao, tag_dao, user_dao};
 use forge_plugin::api::files;
 use forge_plugin::api::images::ImageError;
@@ -157,6 +157,10 @@ use raw::RawSource;
 /// The formats an import copies: NuGet, npm and apt packages, Docker images
 /// into the image store, and raw files into the file store.
 pub const FORMATS: &[&str] = &["nuget", "npm", "docker", "raw", "apt"];
+
+/// Why an import into a read-only repository is refused, or fails.
+pub const READ_ONLY: &str =
+    "the repository's deployment policy is read_only: an import writes nothing into it";
 
 /// How often an idle instance looks for an import to run.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -694,6 +698,10 @@ impl Run<'_> {
                 "imports go to a hosted NuGet, npm, Docker, raw or apt repository; {} is a {} {} repository",
                 repo.name, repo.format, repo.kind
             )));
+        }
+        // Frozen after the import was queued: it writes nothing.
+        if repo.deployment_policy() == DeploymentPolicy::ReadOnly {
+            return Err(End::Failed(READ_ONLY.into()));
         }
 
         // The import runs with the authority of the administrator who

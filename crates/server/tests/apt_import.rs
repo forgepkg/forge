@@ -762,6 +762,28 @@ async fn apt_import_preflight_refusals() {
     // The repository's own distribution, whose Release is served: accepted.
     let resp = request(&srv, &dst, base.clone()).await;
     assert_eq!(resp.status(), 201, "{}", resp.text().await.unwrap());
+    let queued: Value = resp.json().await.unwrap();
+
+    // Frozen after the import was queued: the run fails, writing nothing,
+    // and a further import is refused.
+    let resp = admin(
+        &srv,
+        reqwest::Method::PUT,
+        &format!("/admin/repositories/{dst}"),
+        Some(json!({"deployment_policy": "read_only"})),
+    )
+    .await;
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let done = run(&srv, &dst, queued["id"].as_i64().unwrap()).await;
+    assert_eq!(done["state"], "failed", "{done}");
+    assert!(
+        done["last_error"].as_str().unwrap().contains("read_only"),
+        "{done}"
+    );
+    assert!(items(&srv, &dst, queued["id"].as_i64().unwrap())
+        .await
+        .is_empty());
+    refused(base.clone(), 409, "read_only").await;
 
     // distribution and public_key are apt's alone.
     let raw = format!("raw-{n}");

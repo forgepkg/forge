@@ -396,8 +396,10 @@ pub async fn create(
     let Some(format) = state.formats.get(&repo.format) else {
         return bad_request(format!("the {} format is not loaded", repo.format));
     };
-    if raw && repo.deployment_policy() == DeploymentPolicy::ReadOnly {
-        return bad_request("the repository is read-only: an import stores no file in it");
+    // A read-only repository takes no write, an import's neither (the run
+    // checks again, for an import queued before the repository was frozen).
+    if repo.deployment_policy() == DeploymentPolicy::ReadOnly {
+        return (StatusCode::CONFLICT, crate::import::READ_ONLY).into_response();
     }
 
     // The request itself.
