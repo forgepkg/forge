@@ -85,7 +85,9 @@ fn validate_options(descriptor: &Descriptor) -> Result<(), String> {
             return Err(format!("option {name:?} needs a label"));
         }
         if option.required && option.input == OptionInput::Switch {
-            return Err(format!("option {name:?} is a switch, which is never required"));
+            return Err(format!(
+                "option {name:?} is a switch, which is never required"
+            ));
         }
     }
     Ok(())

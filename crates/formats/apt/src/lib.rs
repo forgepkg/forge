@@ -32,10 +32,10 @@ use std::cmp::Ordering;
 
 use forge_plugin_api::{
     Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FormatError, FormatOption,
-    OptionInput,
-    FormatPlugin, IndexFile, IndexInput, Loaded, PackageRef, PackageSource, ParsedPackage,
-    Prereleases, PublishRequest, Query, Remote, Repository, RepositoryKind, Request, Response,
-    Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken, VersionClass,
+    FormatPlugin, IndexFile, IndexInput, Loaded, OptionInput, PackageRef, PackageSource,
+    ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository, RepositoryKind, Request,
+    Response, Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep, UpstreamToken,
+    VersionClass,
 };
 
 use crate::layout::{PoolPath, Target, KEY_ASC, KEY_GPG};

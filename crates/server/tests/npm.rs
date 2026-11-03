@@ -2196,7 +2196,11 @@ async fn proxies_and_groups_switch_the_replace_registry_host_command_on() {
     const SWITCH: &str = "show_replace_registry_host";
     // Off unless switched on: a group without it has no options.
     let group = format!("npmall{}", unique());
-    let repo = create(&srv, json!({"name": group, "kind": "group", "format": "npm"})).await;
+    let repo = create(
+        &srv,
+        json!({"name": group, "kind": "group", "format": "npm"}),
+    )
+    .await;
     assert_eq!(repo["options"], json!({}));
 
     // Switched on: kept as "true", whatever the spacing.
