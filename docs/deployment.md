@@ -1940,7 +1940,9 @@ Then sign in as a local administrator and fix or disable the broken realm.
 ## Upgrades
 
 - 2.0.0 does not upgrade a 1.x install: it is installed fresh, with an empty
-  database, as the 2.0.0 upgrade notes say. Upgrades are from 2.0.0 on.
+  database, as the 2.0.0 upgrade notes say.
+- Upgrades are from 2.1.0 on. A 2.0.0 install upgrades to the latest 2.1
+  release first.
 - Read the [changelog](../CHANGELOG.md) for each version you skip over. A
   release that needs something other than a rolling restart says so there.
 - Migrations run automatically on the first start of a new version and only
