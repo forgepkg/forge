@@ -15,11 +15,10 @@ use crate::control::MAX_CONTROL_BYTES;
 /// The largest control member read (compressed).
 pub const MAX_CONTROL_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The most the control member may inflate to up to the end of its
-/// `control` file; what follows is not read. The `control` file is at most
-/// [`MAX_CONTROL_BYTES`]. dpkg-deb sorts the member, so little comes before
-/// it (`conffiles`, `config`); a builder that puts `md5sums` first stays
-/// below the bound up to some 70,000 files.
+/// The most the control member may inflate to. It is read to its end, to
+/// make sure it holds one `control` file only (#807); the `control` file is
+/// at most [`MAX_CONTROL_BYTES`], and `md5sums` takes the most of the rest:
+/// a package stays below the bound up to some 70,000 files.
 ///
 /// It also bounds what the xz decoder holds: its window grows with what it
 /// decodes, up to the dictionary the stream declares.
@@ -181,14 +180,31 @@ pub fn control_file<R: Read + Seek + ?Sized>(reader: &mut R) -> Result<Vec<u8>, 
                     }
                 };
                 let mut tar = tar.take(MAX_CONTROL_TAR_BYTES);
-                // Whatever failed once the bound is reached failed for it.
-                return control_in_tar(&mut tar).map_err(|e| match tar.limit() {
-                    0 => DebError::Invalid(format!(
-                        "the control member inflates to more than {} MiB before its control file",
+                let too_large = || {
+                    DebError::Invalid(format!(
+                        "the control member inflates to more than {} MiB",
                         MAX_CONTROL_TAR_BYTES >> 20
-                    )),
+                    ))
+                };
+                // Whatever failed once the bound is reached failed for it.
+                let control = control_in_tar(&mut tar).map_err(|e| match tar.limit() {
+                    0 => too_large(),
                     _ => e,
-                });
+                })?;
+                // `tar` takes the end of the input for the end of the
+                // archive: one that reaches the bound must end there, with
+                // a zero block (or nothing) next.
+                if tar.limit() == 0 {
+                    let mut next = Vec::with_capacity(512);
+                    tar.into_inner()
+                        .take(512)
+                        .read_to_end(&mut next)
+                        .map_err(unreadable)?;
+                    if next.iter().any(|&b| b != 0) {
+                        return Err(too_large());
+                    }
+                }
+                return Ok(control);
             }
             other => {
                 return invalid(format!(
@@ -243,6 +259,10 @@ fn extension(entry: &mut impl Read, size: u64, what: &str) -> Result<Vec<u8>, De
 /// header's (it would lay the archive out otherwise than `tar` reads it
 /// raw) and a GNU sparse entry (its map follows the header) are refused; a
 /// control member has neither.
+///
+/// The whole archive is read: dpkg extracts it with GNU tar, where a later
+/// entry of a name overwrites an earlier one, so a member holding more than
+/// one entry that resolves to `control` ([`is_control`]) is refused (#807).
 fn control_in_tar(tar: impl Read) -> Result<Vec<u8>, DebError> {
     let mut archive = tar::Archive::new(tar);
     let entries = archive.entries().map_err(unreadable)?.raw(true);
@@ -250,6 +270,7 @@ fn control_in_tar(tar: impl Read) -> Result<Vec<u8>, DebError> {
     let mut long_name: Option<Vec<u8>> = None;
     let mut long_link = false;
     let mut pax: Option<Vec<u8>> = None;
+    let mut found: Option<Vec<u8>> = None;
     for entry in entries {
         let mut entry = entry.map_err(unreadable)?;
         let kind = entry.header().entry_type();
@@ -306,9 +327,11 @@ fn control_in_tar(tar: impl Read) -> Result<Vec<u8>, DebError> {
         };
         long_link = false;
         pax = None;
-        let path = path.strip_prefix(b"./").unwrap_or(&path);
-        if path != b"control" {
+        if !is_control(&path) {
             continue;
+        }
+        if found.is_some() {
+            return invalid("the package's control member holds more than one control file");
         }
         if !entry.header().entry_type().is_file() {
             return invalid("the package's control is not a file");
@@ -326,9 +349,27 @@ fn control_in_tar(tar: impl Read) -> Result<Vec<u8>, DebError> {
         if control.len() as u64 != entry.size() {
             return invalid("the package's control file is cut short");
         }
-        return Ok(control);
+        found = Some(control);
     }
-    invalid("the package has no control file")
+    match found {
+        Some(control) => Ok(control),
+        None => invalid("the package has no control file"),
+    }
+}
+
+/// Whether GNU tar extracts the entry `path` as `control`: it drops what
+/// comes up to the last `..` component and the leading `/`, and the
+/// directory it extracts into resolves empty and `.` components.
+fn is_control(path: &[u8]) -> bool {
+    let components: Vec<&[u8]> = path
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+        .collect();
+    let after = match components.iter().rposition(|c| *c == b"..") {
+        Some(i) => &components[i + 1..],
+        None => &components[..],
+    };
+    after == [b"control"]
 }
 
 #[cfg(test)]
@@ -476,6 +517,92 @@ pub(crate) mod tests {
         ]);
         let err = control_file(&mut Cursor::new(deb)).unwrap_err();
         assert!(err.to_string().contains("no control file"), "{err}");
+    }
+
+    /// A `.deb` whose control member holds a regular file of `data` at each
+    /// of `files`' paths, as written: a leading `/` is kept.
+    fn deb_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        for (path, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.extend_from_slice(header.as_bytes());
+            tar.extend_from_slice(data.as_bytes());
+            tar.resize(tar.len().next_multiple_of(512), 0);
+        }
+        tar.resize(tar.len() + 1024, 0);
+        package(&tar, "gz")
+    }
+
+    #[test]
+    fn a_control_tar_with_one_control_is_read() {
+        for path in ["control", "./control", "/control"] {
+            let deb = deb_of(&[(path, CONTROL), ("./md5sums", "abc")]);
+            assert_eq!(
+                control_file(&mut Cursor::new(deb)).unwrap(),
+                CONTROL.as_bytes(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_tar_with_two_controls_is_refused() {
+        let other = "Package: libc6\nVersion: 99\nArchitecture: amd64\nDescription: hi\n";
+        for second in [
+            "./control",
+            "/control",
+            "control",
+            "//control",
+            "././control",
+            "./debian/../control",
+        ] {
+            let deb = deb_of(&[
+                ("./control", CONTROL),
+                ("./md5sums", "abc"),
+                (second, other),
+            ]);
+            match control_file(&mut Cursor::new(deb)) {
+                Err(DebError::Invalid(m)) => {
+                    assert!(m.contains("more than one control file"), "{second}: {m}")
+                }
+                other => panic!("{second}: {other:?}"),
+            }
+        }
+        // Names that GNU tar extracts elsewhere are not the control file.
+        for path in ["./control.orig", "./debian/control", "./control/x"] {
+            let deb = deb_of(&[("./control", CONTROL), (path, other)]);
+            assert_eq!(
+                control_file(&mut Cursor::new(deb)).unwrap(),
+                CONTROL.as_bytes(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_member_reaching_its_bound_must_end_there() {
+        let bound = MAX_CONTROL_TAR_BYTES as usize;
+        // The control file, then md5sums whose data ends at the bound.
+        let mut tar = tar::Builder::new(Vec::new());
+        append(&mut tar, "./control", CONTROL.as_bytes());
+        append(&mut tar, "./md5sums", &vec![b'0'; bound - 3 * 512]);
+        let mut tar = entries(tar);
+        assert_eq!(tar.len(), bound);
+        let mut ended = tar.clone();
+        ended.resize(bound + 1024, 0);
+        assert_eq!(
+            control_file(&mut Cursor::new(package(&ended, "gz"))).unwrap(),
+            CONTROL.as_bytes()
+        );
+        // An entry past the bound is not looked at: the member is refused.
+        tar.extend(raw_entry("./control", tar::EntryType::Regular, b"x"));
+        let refusal = refusal(&tar, "gz");
+        assert!(refusal.contains("inflates to more than 8 MiB"), "{refusal}");
     }
 
     /// A raw tar header of `kind` and `size` named `path`.
