@@ -209,7 +209,7 @@ function Body({ data }: { data: TrafficOverview }) {
         <Stat
           label="Clients"
           icon="Users"
-          value={count.format(totals.clients)}
+          value={`${data.estimated ? '≈ ' : ''}${count.format(totals.clients)}`}
           sub={recording.client_addresses ? 'client networks (IPv6 by /64)' : 'addresses are not recorded'}
         />
         <Stat
@@ -360,6 +360,13 @@ function Body({ data }: { data: TrafficOverview }) {
             off. Requests are still counted by repository and country.
           </Notice>
         )}
+        {data.estimated && (
+          <Notice tone="info">
+            This range holds more client networks than one request sums exactly:
+            the counts of clients are estimates (off by about 1 %), and a network
+            with few requests a day can be missing from this list.
+          </Notice>
+        )}
         {data.clients.length === 0 ? (
           <EmptyState title="No clients in this range" icon="Users" bordered={false} />
         ) : (
@@ -391,6 +398,22 @@ function Body({ data }: { data: TrafficOverview }) {
                   <TableCell nowrap>{dayLabel(c.last_day)}</TableCell>
                 </TableRow>
               ))}
+              {data.other_clients.requests > 0 && (
+                <TableRow>
+                  <TableCell lead nowrap>
+                    {data.other_clients.clients > 0
+                      ? `Other networks (${count.format(data.other_clients.clients)})`
+                      : 'Other networks'}
+                  </TableCell>
+                  <TableCell align="right">{count.format(data.other_clients.requests)}</TableCell>
+                  <TableCell align="right">{formatBytes(data.other_clients.bytes)}</TableCell>
+                  {located && <TableCell />}
+                  {located && <TableCell />}
+                  <TableCell />
+                  <TableCell />
+                  <TableCell />
+                </TableRow>
+              )}
             </TableBody>
           </Table>
         )}

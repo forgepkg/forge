@@ -26,6 +26,7 @@
 //! are then still counted by repository, country and autonomous system, the
 //! address only looked up in memory before it is dropped.
 
+mod distinct;
 pub mod geo;
 pub mod layout;
 pub mod objects;
