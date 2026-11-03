@@ -25,6 +25,11 @@ use crate::layout::{self, Target};
 /// The most an index may inflate to while it is searched.
 const MAX_INDEX_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// The longest line of an index that is searched, its line break aside: far
+/// above any real `Packages` line (a long `Description` or `Depends` runs to
+/// a few KiB). An index with a longer line is not searched.
+const MAX_LINE_BYTES: usize = 256 * 1024;
+
 /// The upstream URL of `path`: `remote_url` (as a directory) with the path's
 /// segments appended, each percent-encoded.
 pub fn upstream_url(remote_url: &str, path: &str) -> Option<String> {
@@ -129,10 +134,52 @@ pub fn find(index: &[u8], path: &str) -> Option<(Option<u64>, Option<String>)> {
         Box::new(index)
     };
     let reader = BufReader::new(reader.take(MAX_INDEX_BYTES));
+    search(reader, path, &mut Vec::with_capacity(MAX_LINE_BYTES + 1))
+}
+
+/// What reading one line of an index gave.
+enum Line {
+    /// A line, in the buffer without its line break.
+    Read,
+    /// The index has ended.
+    End,
+    /// The line is longer than [`MAX_LINE_BYTES`] (or the index cannot be
+    /// read); what is in the buffer is no line.
+    Unusable,
+}
+
+/// Reads the next line of `reader` into `line`, holding at most
+/// [`MAX_LINE_BYTES`] and a byte more of it whatever its length.
+fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Line {
+    line.clear();
+    let limit = MAX_LINE_BYTES as u64 + 1;
+    match reader.by_ref().take(limit).read_until(b'\n', line) {
+        Ok(0) => Line::End,
+        Ok(_) if line.last() == Some(&b'\n') => {
+            line.pop();
+            Line::Read
+        }
+        // No line break within the bound: the index's last line, or one
+        // that is too long.
+        Ok(n) if n <= MAX_LINE_BYTES => Line::Read,
+        Ok(_) | Err(_) => Line::Unusable,
+    }
+}
+
+/// [`find`] in an inflated index, read a line at a time into `line`.
+fn search(
+    mut reader: impl BufRead,
+    path: &str,
+    line: &mut Vec<u8>,
+) -> Option<(Option<u64>, Option<String>)> {
     let (mut filename, mut size, mut sha256) = (None::<String>, None, None);
-    for line in reader.split(b'\n') {
-        let line = line.ok()?;
-        let line = line.strip_suffix(b"\r").unwrap_or(&line);
+    loop {
+        match read_line(&mut reader, line) {
+            Line::Read => {}
+            Line::End => break,
+            Line::Unusable => return None,
+        }
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.iter().all(u8::is_ascii_whitespace) {
             if filename.as_deref() == Some(path) {
                 return Some((size, sha256));
@@ -194,6 +241,82 @@ mod tests {
             );
             assert_eq!(find(&index, "pool/main/x/x/x_1_amd64.deb"), None);
         }
+    }
+
+    /// `len` bytes of `a`, without a line break, made as they are read.
+    struct Endless {
+        left: u64,
+        read: u64,
+    }
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left as usize);
+            buf[..n].fill(b'a');
+            self.left -= n as u64;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn an_index_with_a_line_past_the_bound_is_given_up_on() {
+        let mut index = Endless {
+            left: 64 * 1024 * 1024,
+            read: 0,
+        };
+        // As `find` gives it.
+        let mut line = Vec::with_capacity(MAX_LINE_BYTES + 1);
+        let reader = BufReader::new(&mut index);
+        let capacity = reader.capacity() as u64;
+        assert_eq!(
+            search(reader, "pool/main/h/hello/hello_1.0_amd64.deb", &mut line),
+            None
+        );
+        // No more than the bound was held, or read.
+        assert!(line.capacity() <= MAX_LINE_BYTES + 1, "{}", line.capacity());
+        assert!(
+            index.read <= MAX_LINE_BYTES as u64 + 1 + capacity,
+            "{}",
+            index.read
+        );
+
+        // A stanza after the long line is not searched either.
+        let long = format!("X-Long: {}\n\n{INDEX}", "a".repeat(MAX_LINE_BYTES));
+        assert_eq!(
+            find(long.as_bytes(), "pool/main/h/hello/hello_1.0_amd64.deb"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stanza_after_a_long_line_within_the_bound_is_found() {
+        // The line, its line break (`\r\n`) aside, is as long as may be.
+        let field = "X-Long: ";
+        let long = format!(
+            "Package: z\n{field}{}\r\n\n{INDEX}",
+            "a".repeat(MAX_LINE_BYTES - field.len() - 1)
+        );
+        assert_eq!(
+            find(long.as_bytes(), "pool/main/h/hello/hello_1.0_amd64.deb"),
+            Some((
+                Some(42),
+                Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+            ))
+        );
+        // A last line without a line break, as long as may be, is a line.
+        let last = format!(
+            "{}{field}{}",
+            INDEX.replace("Size: 42\n", ""),
+            "a".repeat(MAX_LINE_BYTES - field.len())
+        );
+        assert_eq!(
+            find(last.as_bytes(), "pool/main/h/hello/hello_1.0_amd64.deb"),
+            Some((
+                None,
+                Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+            ))
+        );
     }
 
     fn remote() -> Remote {
