@@ -179,6 +179,13 @@ pub enum AuthOutcome {
     /// wrong local password). Never grants; terminal when the provider's source
     /// is [`AuthSource::Local`], otherwise the chain continues.
     Rejected,
+    /// The provider owns this username but takes no password for it here
+    /// (a local realm that accepts no passwords from clients, see
+    /// `LocalPasswordProvider::reject_only`): refused like a wrong password,
+    /// but nothing was checked, so it is no guess and does not count towards
+    /// the sign-in lockout. Terminal when the provider's source is
+    /// [`AuthSource::Local`], otherwise treated like [`Self::Rejected`].
+    NotAccepted,
     /// The provider can't decide — typically "this username isn't mine".
     /// The chain advances to the next provider.
     Skip,

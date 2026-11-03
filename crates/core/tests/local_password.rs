@@ -174,7 +174,9 @@ async fn a_reject_only_provider_refuses_its_names_and_skips_the_others() {
     // #647: a local realm that accepts no passwords from clients keeps its
     // names in the clients' chain: the right password of an active local
     // account is refused like a wrong one (never Skip, which would forward it
-    // upstream), and only a name the local store does not own goes on.
+    // upstream), and only a name the local store does not own goes on. #795:
+    // nothing is checked, so the refusal is `NotAccepted`, not a `Rejected`
+    // guess.
     let pool = common::pool().await;
     let username = insert_local(&pool, "pw", true).await;
     let unknown = format!("nobody-{}@example.com", common::unique());
@@ -185,7 +187,7 @@ async fn a_reject_only_provider_refuses_its_names_and_skips_the_others() {
         for password in ["pw", "a-guess"] {
             assert_eq!(
                 provider.authenticate(&cred(&username, password)).await,
-                AuthOutcome::Rejected,
+                AuthOutcome::NotAccepted,
                 "{password} (forwarding follows: {forwarding_follows})"
             );
         }
@@ -202,6 +204,66 @@ async fn a_reject_only_provider_refuses_its_names_and_skips_the_others() {
             .await,
         AuthOutcome::Authenticated(_)
     ));
+}
+
+/// #795: a password a reject-only local provider refuses was never checked,
+/// so it is no guess. Over Basic it answers 401 like a wrong password, but it
+/// does not count towards the (network, username) lockout the browser login
+/// shares; a wrong password through a provider that checks still counts.
+#[tokio::test]
+async fn a_reject_only_refusal_is_not_counted_towards_the_lockout() {
+    let pool = common::pool().await;
+    let username = insert_local(&pool, "pw", true).await;
+    let (upstream, upstream_calls) = CountingProvider::new(
+        AuthSource::UpstreamBasic,
+        AuthOutcome::Rejected,
+        Duration::ZERO,
+    );
+    let chain = Arc::new(Chain::new(vec![
+        Box::new(
+            LocalPasswordProvider::new(pool.clone())
+                .forwarding_follows(true)
+                .reject_only(),
+        ),
+        Box::new(upstream),
+    ]));
+    assert_eq!(
+        chain.authenticate(&cred(&username, "pw")).await,
+        ChainOutcome::NotAccepted
+    );
+
+    let throttle = Arc::new(LoginThrottle::new(5, Duration::from_secs(60)));
+    let src =
+        BasicAuthSource::with_chain(pool.clone(), Some(chain)).with_throttle(throttle.clone());
+    for password in ["pw", "a-guess"] {
+        assert_eq!(
+            src.resolve(&basic_header(&username, password), ip()).await,
+            SourceOutcome::Invalid,
+            "{password}"
+        );
+    }
+    assert_eq!(
+        throttle.tracked(),
+        0,
+        "a refusal without a check is no failure"
+    );
+    assert_eq!(
+        upstream_calls.load(Ordering::SeqCst),
+        0,
+        "a local account's password never reaches the upstream"
+    );
+
+    // A provider that checks passwords still counts a wrong one.
+    let checking = Arc::new(Chain::new(vec![
+        Box::new(LocalPasswordProvider::new(pool.clone())) as Box<dyn AuthProvider>,
+    ]));
+    let src =
+        BasicAuthSource::with_chain(pool.clone(), Some(checking)).with_throttle(throttle.clone());
+    assert_eq!(
+        src.resolve(&basic_header(&username, "a-guess"), ip()).await,
+        SourceOutcome::Invalid
+    );
+    assert_eq!(throttle.tracked(), 1, "a wrong password is counted");
 }
 
 #[tokio::test]

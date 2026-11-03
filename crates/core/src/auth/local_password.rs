@@ -242,14 +242,30 @@ impl LocalPasswordProvider {
     }
 
     /// Check no password, but keep the local accounts' names: a name the
-    /// local store owns is refused (after a dummy verification, so it answers
-    /// like a wrong password), and only a foreign one goes on to the next
+    /// local store owns is refused as `NotAccepted` (after a dummy
+    /// verification, so it answers like a wrong password, but does not count
+    /// towards the sign-in lockout), and only a foreign one goes on to the next
     /// provider. The chain of a local realm that accepts no passwords from
     /// clients holds the provider this way, so that such a password is never
     /// forwarded to a credential-forwarding realm behind it.
     pub fn reject_only(mut self) -> Self {
         self.verifies = false;
         self
+    }
+
+    /// How a name the local store owns is refused without checking its
+    /// password: `Rejected`, or `NotAccepted` when this provider checks no
+    /// password at all ([`Self::reject_only`]). Nothing is verified then, so
+    /// the refusal is no guess and does not count towards the sign-in
+    /// lockout: a client still sending an account's password to a realm that
+    /// takes none from clients must not lock its owner out of the browser
+    /// login. It answers the same either way.
+    fn refused(&self) -> AuthOutcome {
+        if self.verifies {
+            AuthOutcome::Rejected
+        } else {
+            AuthOutcome::NotAccepted
+        }
     }
 
     /// `Skip` for a name that is not a local password account: at once when
@@ -332,9 +348,7 @@ impl AuthProvider for LocalPasswordProvider {
         // and no upstream realm is asked about it.
         let Some(stored) = user.password_hash.clone() else {
             if user.auth_source == "local" || user.is_service_account() {
-                return self
-                    .after_dummy_verify(cred.password, AuthOutcome::Rejected)
-                    .await;
+                return self.after_dummy_verify(cred.password, self.refused()).await;
             }
             return self.skip_foreign(cred.password).await;
         };
@@ -345,9 +359,7 @@ impl AuthProvider for LocalPasswordProvider {
         // (upstream) realm. It costs a (dummy) verification and answers like a
         // wrong password, so it does not show that the account is deactivated.
         if !user.active || !self.verifies {
-            return self
-                .after_dummy_verify(cred.password, AuthOutcome::Rejected)
-                .await;
+            return self.after_dummy_verify(cred.password, self.refused()).await;
         }
 
         match self.limiter.verify(stored, cred.password.to_string()).await {

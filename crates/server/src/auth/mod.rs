@@ -1189,6 +1189,12 @@ pub(crate) async fn verify_password_login(
             attempt.released();
             return Err(LoginRefusal::Invalid);
         }
+        // A local account whose realm takes no password from clients: no
+        // password was checked, so it is no guess and does not count either.
+        ChainOutcome::NotAccepted => {
+            attempt.released();
+            return Err(LoginRefusal::Invalid);
+        }
         // Forge's own database failed: not a verdict on the credentials.
         ChainOutcome::Failed => {
             attempt.released();
