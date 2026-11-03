@@ -59,6 +59,9 @@ The request of Forge before 2.2, a Nexus server (`url`) and repository
 (`repository`, and for Docker `registry_url`), is still accepted
 ([Importing from Nexus](nexus-import.md)).
 
+A repository whose deployment policy is read-only takes no import (`409
+Conflict`).
+
 Before an import is accepted, Forge checks the source (the **preflight**):
 
 - NuGet: the service index resolves, and its search answers. The import
@@ -80,7 +83,7 @@ Before an import is accepted, Forge checks the source (the **preflight**):
   or, for a URL of a Nexus repository (`<nexus>/repository/<name>`), Nexus'
   asset listing. The import records which (`listing`: `directories` or
   `assets`). A source that serves neither is refused: name the paths to
-  import. A raw repository that is read-only takes no import.
+  import.
 - apt: the source serves the distribution's `dists/<distribution>/InRelease`
   (or `Release`), signed by one of the keys given in `public_key`, if any,
   and it lists SHA-256 checksums. The import records the `Server` header

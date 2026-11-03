@@ -316,8 +316,8 @@ the versions and commands only. A README or `values.yaml` over 512 KiB is cut.
 ### Deleting from the web UI
 
 In a hosted repository, an administrator deletes from the image page: the
-whole image (*Delete image…*), a tag, a manifest, or a chart's version (its
-manifest). The admin API does the same with a session or an admin-scoped
+whole image (*Delete image…*, or *Delete chart…* for an image of Helm
+charts), a tag, a manifest, or a chart's version (its manifest). The admin API does the same with a session or an admin-scoped
 token:
 
 ```bash

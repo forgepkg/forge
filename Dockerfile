@@ -150,7 +150,7 @@ WORKDIR /app
 ARG FORGE_VERSION=0.0.0-dev
 ARG FORGE_GIT_SHA=unknown
 LABEL org.opencontainers.image.title="forge" \
-      org.opencontainers.image.description="Self-hosted NuGet, Docker / OCI and Helm registry (hosted, proxy and group repositories)" \
+      org.opencontainers.image.description="Self-hosted NuGet, npm, Docker / OCI (Helm charts included), apt and raw file registry (hosted, proxy and group repositories)" \
       org.opencontainers.image.version="${FORGE_VERSION}" \
       org.opencontainers.image.revision="${FORGE_GIT_SHA}"
 

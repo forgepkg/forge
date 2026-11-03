@@ -272,7 +272,7 @@ needs no access to Docker Hub. To pull the originals instead, set
 the pinned digest stays valid. They are pinned by digest: `image.tag` is
 `<tag>@sha256:…` (the multi-arch index), which Dependabot bumps together with
 the tag. A digest in `image.digest` replaces the pinned one; a plain
-`image.tag` such as `"16"` pulls by tag.
+`image.tag` such as `"18"` pulls by tag.
 
 Passwords are generated on install and kept across upgrades by looking up the
 existing Secret; the PostgreSQL and S3 Secrets also survive `helm uninstall`
@@ -299,7 +299,8 @@ kubectl -n forge-eval port-forward svc/forge 8421
 ```
 
 Open http://localhost:8421 and sign in as `admin@example.com` with that
-password. The bootstrap admin is named by a UPN and has no default name.
+password. The bootstrap admin is named by a UPN, `admin@example.com` unless
+`FORGE_AUTH__BOOTSTRAP_ADMIN__USERNAME` names another.
 
 ## Telemetry
 

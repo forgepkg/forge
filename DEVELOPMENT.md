@@ -1,7 +1,7 @@
 # Developing & running Forge locally
 
-Forge is a NuGet, Docker / OCI (Helm charts included) and raw file registry
-written in Rust.
+Forge is a NuGet, npm, Docker / OCI (Helm charts included), apt and raw file
+registry written in Rust.
 Locally it runs as a single `forge-server` process backed by **PostgreSQL**
 (metadata) and an **S3-compatible** object store (blobs) — both provided by
 `docker-compose.yml` (versitygw stands in for S3).
@@ -278,12 +278,12 @@ groups. See [docs/raw.md](docs/raw.md).
 
 Every format is a format plugin, a crate in
 [`crates/formats/`](./crates/formats) linked into the server (see
-[docs/format-plugins.md](./docs/format-plugins.md)): Docker / OCI, NuGet, npm
-and raw. A new format goes in `crates/formats/<id>` too, never in a
+[docs/format-plugins.md](./docs/format-plugins.md)): Docker / OCI, NuGet, npm,
+raw and apt. A new format goes in `crates/formats/<id>` too, never in a
 `crates/format-<id>` crate or the server. Docker / OCI is an images format,
 served under `/v2` over the server's image store. A repository of a plugin
-format is created with `"format": "<id>"` (hosted, proxy or group; a plugin
-format has proxies when it implements the upstream side) and served under
+format is created with `"format": "<id>"` (hosted, proxy or group, the kinds
+the format's descriptor lists: apt has no groups) and served under
 `/repository/<name>/`. Helm charts are pushed to docker repositories, see
 [docs/docker.md](docs/docker.md#helm-charts).
 
@@ -292,6 +292,12 @@ npm repositories (`"format":"npm"`) are served under `/repository/`: `npm publis
 `.npmrc` (`//localhost:8421/repository/<name>/:_authToken=<token>`), or after
 `npm login --registry …`, which opens the web UI's approval page. See
 [docs/npm.md](docs/npm.md).
+
+apt repositories (`"format":"apt"`, hosted or proxy) need the `distribution`
+option (`"options": {"distribution": "stable"}`) and are served under
+`/repository/<name>/`: a hosted one takes `.deb` uploads with `curl
+--upload-file` and signs its indexes with keys of its own. See
+[docs/apt.md](docs/apt.md).
 
 ## Configuration
 
@@ -812,8 +818,8 @@ server hashes its bootstrap admin password.
 ## Helper commands (`cargo xtask help`)
 
 `up` · `down` · `dev` · `run` · `seed` · `test` · `e2e` · `check` · `fmt` ·
-`clippy` · `build` · `prepare` (regenerate sqlx offline data) · `psql` · `logs` ·
-`ps` · `clean`.
+`clippy` · `build` · `migrate` · `prepare` (regenerate sqlx offline data) ·
+`prepare-check` · `psql` · `logs` · `ps` · `clean`.
 
 Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 (Vitest) · `web-e2e` (Playwright).
@@ -906,6 +912,8 @@ env vars (double-underscore nesting). Required at runtime (no safe default):
 | `FORGE_S3__BUCKET` | `forge` |
 | `FORGE_S3__ACCESS_KEY` | `…` (or short-lived credentials: `FORGE_S3__CREDENTIALS`, see docs/deployment.md) |
 | `FORGE_S3__SECRET_KEY` | `…` |
+| `FORGE_CRYPTO__ROOT__PROVIDER` | `env` (or `file`, with `FORGE_CRYPTO__ROOT__ROOT_KEY_PATH`), the root key of the secret encryption |
+| `FORGE_ROOT_KEY` | the base64 32-byte root key, with the provider `env`: `openssl rand -base64 32` |
 | `FORGE_AUTH__BOOTSTRAP_ADMIN__PASSWORD` | first start only: a real password (the placeholder is refused; without it no bootstrap admin is created) |
 
 Strongly recommended: `FORGE_SERVER__PUBLIC_BASE_URL` (absolute NuGet `@id`
@@ -918,8 +926,9 @@ CI (`.github/workflows/ci.yml`) has the jobs `fmt`, `clippy`, `audit`,
 `test`, `docker`, `kubernetes`, `web`, `oci-e2e`, `raw-e2e`, `apt-e2e` and `npm-e2e`, and the slow
 `e2e` and `web-e2e`, which pull requests skip: those two run in the merge
 queue and on every push to `main`. It runs on pull requests that target
-`main` only; a stacked one waits (see [Stacked pull
-requests](#stacked-pull-requests)).
+`main` or a maintenance branch (`release/*`, [Patch releases of an older
+line](#patch-releases-of-an-older-line)) only; a stacked one waits (see
+[Stacked pull requests](#stacked-pull-requests)).
 
 `docker` builds and smoke-tests the image of every platform the release
 publishes: the jobs `docker (amd64)` and `docker (arm64)` (`docker-platform`
@@ -947,7 +956,7 @@ It sorts the change into groups of paths:
 | Group | Paths | Jobs |
 |---|---|---|
 | Rust | `crates/`, `xtask/`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/` (but `audit.toml`), `migrations/`, `.sqlx/`, `fixtures/`; the files the code or its tests read from outside the crates: `web/index.html`, `docker/forge.docker.toml`; and the scripts the jobs run: `test-parallel.sh`, `test-timings-runner.sh`, `test-timings-summary.sh`, `oci-e2e.sh`, `raw-e2e.sh`, `apt-e2e.sh`, `npm-e2e.sh` | `fmt`, `clippy`, `test`, `oci-e2e`, `raw-e2e`, `apt-e2e`, `npm-e2e`, `e2e`, `web-e2e` |
-| Changelog | `docs/changes/` | `fmt` |
+| Changelog | `docs/`, `README.md`, `CHANGELOG.md`, `deploy/`: the changelog fragments and the documentation site's pages, whose links `fmt` checks | `fmt` |
 | Release | what xtask's tests read from outside `xtask/`: the version lines `cargo xtask release` sets (`web/package.json`, `deploy/kubernetes/base/kustomization.yaml`, `deploy/helm/forge/Chart.yaml`) and `release-channels.sh` | `fmt` (which runs xtask's tests) |
 | Audit | `Cargo.lock`, `.cargo/audit.toml` | `audit` |
 | Web | `web/` | `web`, `web-e2e` |
@@ -1048,9 +1057,9 @@ signatures:
   requirements to be met (bypass rules)**. A GitHub App pushing with its own
   token has to be added to the bypass list.
 
-CI runs only on pull requests that target `main`, so a stacked pull request
-runs none, and a fix merged up a stack does not run CI on every pull request
-above it. A retarget to `main` starts no CI run either: the next push to the
+CI runs only on pull requests that target `main` (or a maintenance branch),
+so a stacked pull request runs none, and a fix merged up a stack does not
+run CI on every pull request above it. A retarget to `main` starts no CI run either: the next push to the
 pull request's branch does, such as the merge of its **Update branch**
 button (a branch that already holds `main` has no such button and needs a
 push of its own). A manual run's checks would not count: GitHub shows a pull
