@@ -49,7 +49,7 @@ use super::digest::ContentDigest;
 use super::dispatch::Target;
 use super::proxy::{content_type, read_limited, Upstream};
 use super::push::require_linked;
-use super::{Failure, ImgResult, Registry};
+use super::{is_upstream_read_error, upstream_body_reader, Failure, ImgResult, Registry};
 
 /// How deep indexes may nest below the copied manifest.
 const MAX_DEPTH: usize = 4;
@@ -609,12 +609,20 @@ impl Registry {
         if response.content_length().is_some_and(|l| l > max) {
             return Err(Failure::new(ImageError::TooLarge { limit: max }));
         }
-        let body = response.bytes_stream().map_err(std::io::Error::other);
         let staged = self
             .inner
             .cas
-            .stage(tokio_util::io::StreamReader::new(body), max)
-            .await?;
+            .stage(upstream_body_reader(response), max)
+            .await
+            .map_err(|e| {
+                if is_upstream_read_error(&e) {
+                    Failure::from(e).with_text(format!(
+                        "the source registry is unreachable: reading {digest} failed"
+                    ))
+                } else {
+                    Failure::from(e)
+                }
+            })?;
         if !digest.matches(&staged.sha256, &staged.sha512_base64) {
             return Err(Failure::unavailable(format!(
                 "the source served a blob that does not match its digest {digest}"

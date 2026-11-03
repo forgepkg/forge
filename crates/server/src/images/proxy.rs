@@ -47,7 +47,7 @@ use super::dispatch::Target;
 use super::download::Download;
 use super::pull::{BlobHit, ManifestHit};
 use super::push::{merge, require_linked};
-use super::{Failure, ImgResult, Registry};
+use super::{upstream_body_reader, Failure, ImgResult, Registry};
 
 /// Record a proxy `lookup` that answered `result`: what its path marked,
 /// else a hit for something found and "not found" for nothing. A failure is
@@ -993,11 +993,10 @@ impl Registry {
                 self.start_download(repo, &local, digest, size, response, upstream.http.clone())?;
             return Ok(Some(BlobHit::downloading(repo, &local, digest, download)));
         }
-        let body = response.bytes_stream().map_err(std::io::Error::other);
         let staged = self
             .inner
             .cas
-            .stage(tokio_util::io::StreamReader::new(body), max)
+            .stage(upstream_body_reader(response), max)
             .await?;
         upstream.http.count_bytes(staged.size);
         if !digest.matches(&staged.sha256, &staged.sha512_base64) {
