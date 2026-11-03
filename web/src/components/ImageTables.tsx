@@ -1,4 +1,7 @@
+import { useQuery } from '@tanstack/react-query'
+
 import type { ImageManifest, ImageTag } from '~/api/images'
+import { browseReposQueryOptions } from '~/api/packages'
 import {
   formatBytes,
   formatDateTime,
@@ -37,6 +40,14 @@ import {
  * Forge first cached it from the upstream, not when it was pushed there, so
  * the column is labelled "Cached" for a proxy repository (as package
  * versions are, #110).
+ *
+ * A group's manifests come from its members (`source`), and each row's time
+ * is what its member's is: cached for a proxy member, pushed for a hosted one
+ * (#562). The members' kinds come from the readable repositories
+ * (`/browse/repos`), which list every member a group serves the reader. When
+ * every row has the same kind the column is labelled for it; when the rows
+ * mix kinds, or a row's member is not known, the column is "Pushed / cached"
+ * and each row of a known member says which its time is.
  */
 
 /** A short digest with its full value as tooltip, plus a copy button. */
@@ -136,6 +147,37 @@ export function TagTable({
   )
 }
 
+/** What a manifest's `created_at` is: when it was pushed, or first cached. */
+type TimeKind = 'pushed' | 'cached'
+
+/** The time kind of a repository (or a group's member) of `kind`. */
+function timeKindOf(kind: string | undefined): TimeKind | undefined {
+  if (kind === 'proxy') return 'cached'
+  if (kind === 'hosted') return 'pushed'
+  return undefined
+}
+
+const TIME_HEADERS: Record<TimeKind | 'mixed', { label: string; hint?: string }> = {
+  pushed: { label: 'Pushed' },
+  cached: {
+    label: 'Cached',
+    hint: 'When Forge first cached this manifest from the upstream',
+  },
+  mixed: {
+    label: 'Pushed / cached',
+    hint: 'When the manifest was pushed to a hosted member, or first cached from the upstream by a proxy member',
+  },
+}
+
+/**
+ * The kind of the member each manifest of a group comes from, by member
+ * name; empty for any other repository (no request is made).
+ */
+function useMemberKinds(repoKind: string): Map<string, string> {
+  const repos = useQuery({ ...browseReposQueryOptions, enabled: repoKind === 'group' })
+  return new Map((repoKind === 'group' ? (repos.data ?? []) : []).map((r) => [r.name, r.kind]))
+}
+
 const KIND_ICONS: Record<ManifestKind, IconName> = {
   Image: 'Package',
   Index: 'Layers',
@@ -160,6 +202,18 @@ export function ManifestTable({
   // Referrers name their subject by digest; show the subject's tags too.
   const tagsByDigest = new Map(manifests.map((m) => [m.digest, m.tags]))
   const showSource = repoKind === 'group'
+  const memberKinds = useMemberKinds(repoKind)
+  const rowTimeKind = (m: ImageManifest): TimeKind | undefined =>
+    timeKindOf(showSource ? m.source && memberKinds.get(m.source) : repoKind)
+  const rowKinds = new Set(manifests.map(rowTimeKind))
+  // One kind for every row labels the column for it; a mix (or a member of
+  // unknown kind) gets the neutral heading and a per-row label.
+  const single: TimeKind | undefined = showSource
+    ? rowKinds.size === 1
+      ? [...rowKinds][0]
+      : undefined
+    : (timeKindOf(repoKind) ?? 'pushed')
+  const timeHeader = TIME_HEADERS[single ?? 'mixed']
 
   return (
     <Table caption="Manifests">
@@ -169,13 +223,7 @@ export function ManifestTable({
         <TableHeader align="right">Size</TableHeader>
         <TableHeader>Platforms</TableHeader>
         <TableHeader>Tags</TableHeader>
-        {repoKind === 'proxy' ? (
-          <TableHeader hint="When Forge first cached this manifest from the upstream">
-            Cached
-          </TableHeader>
-        ) : (
-          <TableHeader>Pushed</TableHeader>
-        )}
+        <TableHeader hint={timeHeader.hint}>{timeHeader.label}</TableHeader>
         <TableHeader>Last pulled</TableHeader>
         {showSource && <TableHeader>Source</TableHeader>}
         {onDelete && <TableHeader align="right">Actions</TableHeader>}
@@ -199,7 +247,7 @@ export function ManifestTable({
               <Chips values={m.tags} />
             </TableCell>
             <TableCell nowrap title={m.created_at}>
-              {formatDateTime(m.created_at)}
+              <TimeCell manifest={m} label={single ? undefined : rowTimeKind(m)} />
             </TableCell>
             <TableCell nowrap title={m.last_pulled_at ?? undefined}>
               {formatDateTime(m.last_pulled_at)}
@@ -220,6 +268,20 @@ export function ManifestTable({
         ))}
       </TableBody>
     </Table>
+  )
+}
+
+/**
+ * A manifest's `created_at`; in a column of mixed kinds, with whether the
+ * row's time is a push or a cache.
+ */
+function TimeCell({ manifest, label }: { manifest: ImageManifest; label?: TimeKind }) {
+  if (!label) return <>{formatDateTime(manifest.created_at)}</>
+  return (
+    <span className="flex flex-col items-start gap-0.5">
+      <span>{formatDateTime(manifest.created_at)}</span>
+      <span className="fg-cell-sub">{label === 'cached' ? 'Cached' : 'Pushed'}</span>
+    </span>
   )
 }
 
