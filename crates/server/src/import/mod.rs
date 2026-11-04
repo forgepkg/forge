@@ -563,9 +563,10 @@ struct ItemSource {
     /// Raw: the content type the source lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
-    /// Raw and apt: why the item fails without being copied (a path Forge
-    /// refuses; an index entry that names no `.deb` below the repository, a
-    /// component Forge does not publish).
+    /// Why the item fails without being copied (raw: a path Forge refuses;
+    /// apt: an index entry that names no `.deb` below the repository, a
+    /// component Forge does not publish; any format: a name the source
+    /// failed on while the scan read it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     /// apt: where the package is, below the import's URL (its index's
@@ -651,6 +652,19 @@ impl Found {
     /// fails, so the import reports it.
     fn missing(name: &str) -> Found {
         Found::component(name, String::new(), None, ItemSource::default())
+    }
+
+    /// A name the source failed on while the scan read it: an item that
+    /// fails with `error`, so the import reports it and goes on.
+    fn failed(target: &Target, name: &str, error: String) -> Found {
+        let source = ItemSource {
+            error: Some(error),
+            ..ItemSource::default()
+        };
+        match target {
+            Target::Files { .. } => file_item(name, source),
+            _ => Found::component(name, String::new(), None, source),
+        }
     }
 }
 
@@ -906,8 +920,20 @@ impl Run<'_> {
     async fn retrying<'f, T>(
         &self,
         what: &str,
-        mut read: impl FnMut() -> BoxFuture<'f, Result<T, SourceError>> + Send,
+        read: impl FnMut() -> BoxFuture<'f, Result<T, SourceError>> + Send,
     ) -> Result<T, End> {
+        self.retried(what, read)
+            .await
+            .map_err(|e| End::Failed(format!("{what}: {e}")))
+    }
+
+    /// A read of the source, retried with a backoff while its failure may
+    /// pass; the last failure once it does not.
+    async fn retried<'f, T>(
+        &self,
+        what: &str,
+        mut read: impl FnMut() -> BoxFuture<'f, Result<T, SourceError>> + Send,
+    ) -> Result<T, SourceError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -917,7 +943,7 @@ impl Run<'_> {
                     tracing::warn!(import = self.import.id, error = %e, attempt, "{what} failed; retrying");
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                 }
-                Err(e) => return Err(End::Failed(format!("{what}: {e}"))),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -1270,7 +1296,11 @@ impl Run<'_> {
 
     /// The versions of the package ids `names`, or the tags of the images
     /// `names`, in their order. A name the source does not have is left
-    /// out, or, when the import `named` it, found as missing.
+    /// out, or, when the import `named` it, found as missing. A name the
+    /// source refuses or fails on (401, 403, 500, after the retries of a
+    /// failure that may pass) is found as an item that fails with the
+    /// reason, and the others are still read: one name does not fail the
+    /// scan. Only a source that cannot be reached at all fails the page.
     async fn expand(
         &self,
         ctx: &Ctx,
@@ -1281,13 +1311,48 @@ impl Run<'_> {
         // The reads are made up front: futures do nothing until polled.
         let reads: Vec<_> = names
             .iter()
-            .map(|name| self.expand_one(ctx, name, named, concurrency))
+            .map(|name| self.expand_read(ctx, name, named, concurrency))
             .collect();
         let pages: Vec<Vec<Found>> = futures_util::stream::iter(reads)
             .buffered(concurrency)
             .try_collect()
             .await?;
         Ok(pages.into_iter().flatten().collect())
+    }
+
+    /// [`Run::expand_one`], retried; a failure on `name` that is not the
+    /// source being unreachable is found as an item that fails.
+    async fn expand_read(
+        &self,
+        ctx: &Ctx,
+        name: &str,
+        named: bool,
+        concurrency: usize,
+    ) -> Result<Vec<Found>, SourceError> {
+        self.read_name(&ctx.target, name, || {
+            self.expand_one(ctx, name, named, concurrency).boxed()
+        })
+        .await
+    }
+
+    /// `read` of the name `name`, retried; a failure that is not the source
+    /// being unreachable is found as an item that fails.
+    async fn read_name<'f>(
+        &self,
+        target: &Target,
+        name: &str,
+        read: impl FnMut() -> BoxFuture<'f, Result<Vec<Found>, SourceError>> + Send,
+    ) -> Result<Vec<Found>, SourceError> {
+        let what = format!("reading {name:?} at the source");
+        match self.retried(&what, read).await {
+            Ok(found) => Ok(found),
+            Err(e @ SourceError::Unreachable(_)) => Err(e),
+            Err(e) => {
+                tracing::warn!(import = self.import.id, name, error = %e, "import: the source fails on a name");
+                let error = format!("reading it at the source failed: {e}");
+                Ok(vec![Found::failed(target, name, error)])
+            }
+        }
     }
 
     /// The versions of the package id `name`, the tags of the image `name`,
@@ -1319,7 +1384,11 @@ impl Run<'_> {
                 }
                 let reads: Vec<_> = packages
                     .iter()
-                    .map(|package| npm_package(registry, package, true))
+                    .map(|package| {
+                        self.read_name(&ctx.target, package, || {
+                            npm_package(registry, package, true).boxed()
+                        })
+                    })
                     .collect();
                 let found: Vec<Vec<Found>> = futures_util::stream::iter(reads)
                     .buffered(concurrency)
@@ -1434,6 +1503,14 @@ impl Run<'_> {
         let copied = match &ctx.target {
             // A file's item has no version.
             Target::Files { source } => self.copy_file(ctx, source, &item).await,
+            // A name the source failed on while the scan read it fails as
+            // its item, and does not count towards the failures in a row
+            // that stop an import.
+            Target::Packages { .. } | Target::Npm { .. } | Target::Images { .. }
+                if item.version.is_empty() && source.error.is_some() =>
+            {
+                Ok(copied("failed", source.error.clone(), 0))
+            }
             Target::Apt {
                 source: from,
                 writer,
