@@ -80,9 +80,10 @@ impl Control {
         version::Version::parse(&version)
             .map_err(|e| FormatError::InvalidVersion(e.to_string()))?;
         let architecture = field("Architecture")?;
-        if !control::valid_architecture(&architecture) {
+        if !control::known_architecture(&architecture) {
             return Err(FormatError::MalformedManifest(format!(
-                "{architecture:?} is not an architecture"
+                "{architecture:?} is not an architecture: dpkg's architectures \
+                 (`dpkg-architecture -L`) and `all` are"
             )));
         }
         let component = control::component_of(paragraph.first_line("Section"))
@@ -219,6 +220,19 @@ mod tests {
     }
 
     #[test]
+    fn the_component_is_capped() {
+        use forge_plugin_api::FormatPlugin;
+        // The host reads the capped field out of the stored summary.
+        let caps = crate::Apt.summary_caps();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].max, control::MAX_COMPONENTS);
+        let summary =
+            summarize(b"Package: a1\nVersion: 1\nArchitecture: all\nSection: c9/x\n").unwrap();
+        let json: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        assert_eq!(json[caps[0].field], "c9");
+    }
+
+    #[test]
     fn a_control_file_needs_its_identity() {
         for (bad, why) in [
             (&b"Version: 1\nArchitecture: amd64\n"[..], "no Package"),
@@ -234,6 +248,15 @@ mod tests {
             ),
             (
                 b"Package: hello\nVersion: 1\nArchitecture: any\n",
+                "not an architecture",
+            ),
+            // Spelled as one, but not an architecture dpkg knows (#761).
+            (
+                b"Package: hello\nVersion: 1\nArchitecture: a1\n",
+                "not an architecture",
+            ),
+            (
+                b"Package: hello\nVersion: 1\nArchitecture: linux-amd64\n",
                 "not an architecture",
             ),
             (

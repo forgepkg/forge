@@ -137,6 +137,15 @@ pub trait FormatPlugin: Send + Sync + 'static {
         self.parse_package(&mut file)
     }
 
+    /// The fields of [`Self::manifest_summary`] of which a hosted repository
+    /// holds a bounded number of distinct values ([`SummaryCap`]). The host
+    /// refuses (400) a publish or an import of a version whose summary would
+    /// add a value past a cap, so whatever the repository's indexes make of
+    /// those values stays bounded. The default has none.
+    fn summary_caps(&self) -> &'static [SummaryCap] {
+        &[]
+    }
+
     /// A JSON object summarizing `manifest`, stored with the version so that
     /// rendering never re-reads the manifest ([`PackageInfo::summary`]).
     /// `None` when there is nothing worth keeping. Every listing hands each

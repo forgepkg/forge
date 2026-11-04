@@ -1574,3 +1574,19 @@ pub enum UpstreamStep {
     Fetch(Vec<Fetch>),
     Done(UpstreamAnswer),
 }
+
+/// A bound on the distinct values of one string field of the stored
+/// summaries of a hosted repository's versions
+/// ([`FormatPlugin::summary_caps`]): apt's components, each of which adds
+/// its indexes to the repository's.
+///
+/// [`FormatPlugin::summary_caps`]: crate::FormatPlugin::summary_caps
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryCap {
+    /// The field of the summary's JSON object (`component`).
+    pub field: &'static str,
+    /// The most distinct values a repository may hold.
+    pub max: usize,
+    /// What the values are, plural, for the refusal (`components`).
+    pub what: &'static str,
+}

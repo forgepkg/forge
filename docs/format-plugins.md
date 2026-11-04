@@ -203,6 +203,14 @@ manifest, and the package's tags.
 Every listing hands each version's summary to the plugin, so a summary
 should stay small.
 
+A plugin bounds how many distinct values of a string field of its
+summaries a hosted repository holds with `summary_caps` (a list of
+[`SummaryCap`](../crates/plugin-api/src/types.rs): the field, the most
+values, what they are called). A publish or an import whose summary would
+add a value past a cap is refused with `400` naming it; a value the
+repository holds already passes. apt caps its `component` at 8, since each
+adds the indexes of every architecture. The default has no caps.
+
 ## Files formats
 
 A format whose descriptor says `storage: Storage::Files` holds files under

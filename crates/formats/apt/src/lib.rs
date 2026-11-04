@@ -34,8 +34,8 @@ use forge_plugin_api::{
     Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FilePackage, FormatError,
     FormatOption, FormatPlugin, IndexFile, IndexInput, Loaded, OptionInput, PackageRef,
     PackageSource, ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository,
-    RepositoryKind, Request, Response, Storage, Upload, UpstreamAnswer, UpstreamOp, UpstreamStep,
-    UpstreamToken, VersionClass,
+    RepositoryKind, Request, Response, Storage, SummaryCap, Upload, UpstreamAnswer, UpstreamOp,
+    UpstreamStep, UpstreamToken, VersionClass,
 };
 
 use crate::layout::{PoolPath, Target, KEY_ASC, KEY_GPG};
@@ -132,6 +132,16 @@ impl FormatPlugin for Apt {
 
     fn manifest_summary(&self, manifest: &[u8]) -> Option<String> {
         manifest::summarize(manifest)
+    }
+
+    // Every component adds the `Packages` lists of every architecture to
+    // the indexes (#761); the architectures are dpkg's.
+    fn summary_caps(&self) -> &'static [SummaryCap] {
+        &[SummaryCap {
+            field: "component",
+            max: control::MAX_COMPONENTS,
+            what: "components",
+        }]
     }
 
     fn check_option(

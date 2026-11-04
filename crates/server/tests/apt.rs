@@ -496,6 +496,77 @@ async fn hosted_repositories_publish_signed_indexes() {
 
 /// The by-hash copies of an index stay a day after a newer index replaces
 /// it, counted from the replacement, however old the index was (#762).
+/// A writer cannot take a repository's indexes past what they may hold
+/// (#761): an architecture dpkg does not know is refused, and so is a
+/// package of a component past the cap, while the indexes keep working.
+#[tokio::test]
+async fn architectures_and_components_are_bounded() {
+    let srv = common::start().await;
+    let name = format!("apt{}", unique());
+    create(
+        &srv,
+        json!({"name": name, "kind": "hosted", "format": "apt", "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let apt = Apt::new(&srv, &name).await;
+    let (status, text) = apt.post(&deb("hello", "1.0-1", "amd64", "utils")).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+
+    // An architecture of the right spelling that dpkg does not know.
+    let (status, text) = apt.post(&deb("odd", "1", "a1", "utils")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("not an architecture"), "{text}");
+    // dpkg's own, of any kind, are taken.
+    for arch in ["arm64", "musl-linux-riscv64", "all"] {
+        let (status, text) = apt.post(&deb("multi", "1", arch, "utils")).await;
+        assert_eq!(status, StatusCode::CREATED, "{arch}: {text}");
+    }
+
+    // `main` and 7 more components fill the repository.
+    for c in 1..8 {
+        let (status, text) = apt
+            .post(&deb(&format!("pkg{c}"), "1", "amd64", &format!("c{c}/x")))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "c{c}: {text}");
+    }
+    // A ninth is refused, naming the cap.
+    let (status, text) = apt.post(&deb("pkg8", "1", "amd64", "c8/x")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("8 components"), "{text}");
+    // A component the repository holds still takes packages.
+    let (status, text) = apt.post(&deb("more", "1", "i386", "c3/x")).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+
+    // The indexes still work: signed, listing the 8 components and the
+    // packages.
+    let keys = keys(&srv, &name).await;
+    let (message, signed) = in_release(&apt.text("dists/bookworm/InRelease").await);
+    message.verify(&public(&keys[0])).unwrap();
+    assert!(
+        signed.contains("Components: c1 c2 c3 c4 c5 c6 c7 main\n"),
+        "{signed}"
+    );
+    assert!(!signed.contains(" c8/"), "{signed}");
+    assert!(!signed.contains("binary-a1/"), "{signed}");
+    let packages = apt.text("dists/bookworm/main/binary-amd64/Packages").await;
+    assert!(packages.contains("Package: hello\n"), "{packages}");
+    let packages = apt.text("dists/bookworm/c3/binary-i386/Packages").await;
+    assert!(packages.contains("Package: more\n"), "{packages}");
+    assert!(apt.text("key.asc").await.contains("BEGIN PGP PUBLIC KEY"));
+
+    // Deleting the last package of a component frees its place.
+    let (status, _) = apt.get("pool/c7/p/pkg7/pkg7_1_amd64.deb").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp = apt
+        .req(reqwest::Method::DELETE, "pool/c7/p/pkg7/pkg7_1_amd64.deb")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let (status, text) = apt.post(&deb("pkg8", "1", "amd64", "c8/x")).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+}
+
 #[tokio::test]
 async fn by_hash_copies_stay_a_day_after_the_index_is_replaced() {
     let srv = common::start().await;

@@ -212,6 +212,235 @@ pub fn valid_package_name(name: &str) -> bool {
         })
 }
 
+/// The architectures dpkg knows, sorted: what `dpkg-architecture -L` lists
+/// (dpkg 1.22.6, from its `cputable`, `ostable` and `tupletable`). A hosted
+/// repository takes packages of these and of `all` alone
+/// ([`known_architecture`]): each architecture adds its indexes to every
+/// component's, so a writer must not add them at will (#761).
+pub const ARCHITECTURES: &[&str] = &[
+    "aix-powerpc",
+    "aix-ppc64",
+    "alpha",
+    "amd64",
+    "arc",
+    "arm",
+    "arm64",
+    "armeb",
+    "armel",
+    "armhf",
+    "darwin-amd64",
+    "darwin-arm",
+    "darwin-arm64",
+    "darwin-i386",
+    "darwin-powerpc",
+    "darwin-ppc64",
+    "dragonflybsd-amd64",
+    "freebsd-amd64",
+    "freebsd-arm",
+    "freebsd-arm64",
+    "freebsd-i386",
+    "freebsd-powerpc",
+    "freebsd-ppc64",
+    "hppa",
+    "hurd-amd64",
+    "hurd-i386",
+    "i386",
+    "ia64",
+    "kfreebsd-amd64",
+    "kfreebsd-i386",
+    "kopensolaris-amd64",
+    "kopensolaris-i386",
+    "loong64",
+    "m68k",
+    "mint-m68k",
+    "mips",
+    "mips64",
+    "mips64el",
+    "mips64r6",
+    "mips64r6el",
+    "mipsel",
+    "mipsn32",
+    "mipsn32el",
+    "mipsn32r6",
+    "mipsn32r6el",
+    "mipsr6",
+    "mipsr6el",
+    "musl-linux-alpha",
+    "musl-linux-amd64",
+    "musl-linux-arc",
+    "musl-linux-arm",
+    "musl-linux-arm64",
+    "musl-linux-armeb",
+    "musl-linux-armhf",
+    "musl-linux-hppa",
+    "musl-linux-i386",
+    "musl-linux-ia64",
+    "musl-linux-loong64",
+    "musl-linux-m68k",
+    "musl-linux-mips",
+    "musl-linux-mips64",
+    "musl-linux-mips64el",
+    "musl-linux-mips64r6",
+    "musl-linux-mips64r6el",
+    "musl-linux-mipsel",
+    "musl-linux-mipsr6",
+    "musl-linux-mipsr6el",
+    "musl-linux-nios2",
+    "musl-linux-or1k",
+    "musl-linux-powerpc",
+    "musl-linux-powerpcel",
+    "musl-linux-ppc64",
+    "musl-linux-ppc64el",
+    "musl-linux-riscv64",
+    "musl-linux-s390",
+    "musl-linux-s390x",
+    "musl-linux-sh3",
+    "musl-linux-sh3eb",
+    "musl-linux-sh4",
+    "musl-linux-sh4eb",
+    "musl-linux-sparc",
+    "musl-linux-sparc64",
+    "netbsd-alpha",
+    "netbsd-amd64",
+    "netbsd-arc",
+    "netbsd-arm",
+    "netbsd-arm64",
+    "netbsd-armeb",
+    "netbsd-hppa",
+    "netbsd-i386",
+    "netbsd-ia64",
+    "netbsd-loong64",
+    "netbsd-m68k",
+    "netbsd-mips",
+    "netbsd-mips64",
+    "netbsd-mips64el",
+    "netbsd-mips64r6",
+    "netbsd-mips64r6el",
+    "netbsd-mipsel",
+    "netbsd-mipsr6",
+    "netbsd-mipsr6el",
+    "netbsd-nios2",
+    "netbsd-or1k",
+    "netbsd-powerpc",
+    "netbsd-powerpcel",
+    "netbsd-ppc64",
+    "netbsd-ppc64el",
+    "netbsd-riscv64",
+    "netbsd-s390",
+    "netbsd-s390x",
+    "netbsd-sh3",
+    "netbsd-sh3eb",
+    "netbsd-sh4",
+    "netbsd-sh4eb",
+    "netbsd-sparc",
+    "netbsd-sparc64",
+    "nios2",
+    "openbsd-alpha",
+    "openbsd-amd64",
+    "openbsd-arc",
+    "openbsd-arm",
+    "openbsd-arm64",
+    "openbsd-armeb",
+    "openbsd-hppa",
+    "openbsd-i386",
+    "openbsd-ia64",
+    "openbsd-loong64",
+    "openbsd-m68k",
+    "openbsd-mips",
+    "openbsd-mips64",
+    "openbsd-mips64el",
+    "openbsd-mips64r6",
+    "openbsd-mips64r6el",
+    "openbsd-mipsel",
+    "openbsd-mipsr6",
+    "openbsd-mipsr6el",
+    "openbsd-nios2",
+    "openbsd-or1k",
+    "openbsd-powerpc",
+    "openbsd-powerpcel",
+    "openbsd-ppc64",
+    "openbsd-ppc64el",
+    "openbsd-riscv64",
+    "openbsd-s390",
+    "openbsd-s390x",
+    "openbsd-sh3",
+    "openbsd-sh3eb",
+    "openbsd-sh4",
+    "openbsd-sh4eb",
+    "openbsd-sparc",
+    "openbsd-sparc64",
+    "or1k",
+    "powerpc",
+    "powerpcel",
+    "powerpcspe",
+    "ppc64",
+    "ppc64el",
+    "riscv64",
+    "s390",
+    "s390x",
+    "sh3",
+    "sh3eb",
+    "sh4",
+    "sh4eb",
+    "solaris-amd64",
+    "solaris-i386",
+    "solaris-sparc",
+    "solaris-sparc64",
+    "sparc",
+    "sparc64",
+    "uclibc-linux-alpha",
+    "uclibc-linux-amd64",
+    "uclibc-linux-arc",
+    "uclibc-linux-arm",
+    "uclibc-linux-arm64",
+    "uclibc-linux-armeb",
+    "uclibc-linux-armel",
+    "uclibc-linux-hppa",
+    "uclibc-linux-i386",
+    "uclibc-linux-ia64",
+    "uclibc-linux-loong64",
+    "uclibc-linux-m68k",
+    "uclibc-linux-mips",
+    "uclibc-linux-mips64",
+    "uclibc-linux-mips64el",
+    "uclibc-linux-mips64r6",
+    "uclibc-linux-mips64r6el",
+    "uclibc-linux-mipsel",
+    "uclibc-linux-mipsr6",
+    "uclibc-linux-mipsr6el",
+    "uclibc-linux-nios2",
+    "uclibc-linux-or1k",
+    "uclibc-linux-powerpc",
+    "uclibc-linux-powerpcel",
+    "uclibc-linux-ppc64",
+    "uclibc-linux-ppc64el",
+    "uclibc-linux-riscv64",
+    "uclibc-linux-s390",
+    "uclibc-linux-s390x",
+    "uclibc-linux-sh3",
+    "uclibc-linux-sh3eb",
+    "uclibc-linux-sh4",
+    "uclibc-linux-sh4eb",
+    "uclibc-linux-sparc",
+    "uclibc-linux-sparc64",
+    "x32",
+];
+
+/// The most components a hosted repository holds. Each adds the indexes of
+/// every architecture: with all of [`ARCHITECTURES`] and `all`, 8
+/// components make 8 × 207 `Packages` lists of 6 files each (the list, its
+/// two compressions, and a by-hash copy of each), 9,936 files, below the
+/// host's 10,000 an index may hold (#761). Debian and Ubuntu publish 4.
+pub const MAX_COMPONENTS: usize = 8;
+
+/// Whether `arch` is an architecture a package may be built for: `all`, or
+/// one of dpkg's [`ARCHITECTURES`]. A package's control file and an
+/// import are checked against it; [`valid_architecture`] is the name's
+/// syntax, which paths and ids are read with.
+pub fn known_architecture(arch: &str) -> bool {
+    arch == "all" || ARCHITECTURES.binary_search(&arch).is_ok()
+}
+
 /// Whether `arch` is a binary package's architecture: `all`, or a Debian
 /// architecture name (lowercase letters, digits and `-`). `any` and
 /// `source` name none.
@@ -430,6 +659,53 @@ mod tests {
         for bad in ["any", "source", "AMD64", "x/y", "", "-x", "a_b"] {
             assert!(!valid_architecture(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn architectures_are_dpkgs() {
+        assert!(
+            ARCHITECTURES.windows(2).all(|w| w[0] < w[1]),
+            "ARCHITECTURES is sorted, without duplicates"
+        );
+        assert!(ARCHITECTURES.iter().all(|a| valid_architecture(a)));
+        for known in [
+            "all",
+            "amd64",
+            "arm64",
+            "armhf",
+            "i386",
+            "ppc64el",
+            "riscv64",
+            "s390x",
+            "hurd-i386",
+            "musl-linux-amd64",
+            "x32",
+            "loong64",
+        ] {
+            assert!(known_architecture(known), "{known}");
+        }
+        // Syntactically architecture names, but not dpkg's (#761).
+        for unknown in [
+            "a1",
+            "foo",
+            "amd65",
+            "linux-amd64",
+            "any",
+            "source",
+            "",
+            "AMD64",
+        ] {
+            assert!(!known_architecture(unknown), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn the_worst_case_index_fits_the_hosts_limit() {
+        // Every component of every architecture and `all`: 6 files each,
+        // plus Release, InRelease, Release.gpg, key.asc and key.gpg. The
+        // host refuses an index of more than 10,000 files.
+        let files = MAX_COMPONENTS * (ARCHITECTURES.len() + 1) * 6 + 5;
+        assert!(files <= 10_000, "{files}");
     }
 
     #[test]
