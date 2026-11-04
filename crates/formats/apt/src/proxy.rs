@@ -7,6 +7,11 @@
 //!   A `by-hash/<type>/<digest>` copy (`MD5Sum`, `SHA1`, `SHA256` or
 //!   `SHA512`) is checked against the digest its path names, and never
 //!   changes once it matched.
+//!   The indexes but those copies are kept consistent with the
+//!   distribution's `InRelease` and `Release` ([`releases`],
+//!   [`listed_in`]): an upstream without `Acquire-By-Hash` has apt fetch
+//!   them at their own path, and checks each against the `InRelease` it
+//!   was served.
 //! * `pool/…`: packages, which never change at their path. Before a
 //!   package is cached the host checks it against the size and SHA-256 the
 //!   upstream's `Packages` index of its component and architecture gives it
@@ -28,6 +33,9 @@ use forge_plugin_api::{
     Fetch, FetchResult, Fetched, FileLocation, Freshness, Remote, UpstreamAnswer, UpstreamStep,
 };
 
+use forge_plugin_api::ListedFile;
+
+use crate::import::{cleartext, Release};
 use crate::layout::{self, HashType, Target};
 
 /// The most an index may inflate to while it is searched.
@@ -98,6 +106,45 @@ pub fn file(remote: &Remote, path: &str, fetched: &[FetchResult]) -> UpstreamSte
         _ => return UpstreamStep::Done(UpstreamAnswer::File(None)),
     }
     UpstreamStep::Done(UpstreamAnswer::FileAt(location))
+}
+
+/// The files a cached file of the distribution is kept consistent with:
+/// for every file under `dists/<distribution>/` but its `by-hash` copies,
+/// the distribution's `InRelease` (what apt reads first) and `Release`,
+/// the file itself aside.
+pub fn releases(path: &str) -> Vec<String> {
+    let Ok(Target::Dists {
+        distribution, rest, ..
+    }) = layout::parse(path)
+    else {
+        return Vec::new();
+    };
+    if layout::is_by_hash(&rest) {
+        return Vec::new();
+    }
+    ["InRelease", "Release"]
+        .into_iter()
+        .filter(|name| rest != *name)
+        .map(|name| format!("dists/{distribution}/{name}"))
+        .collect()
+}
+
+/// The size and SHA-256 that `release` (the content of `release_path`, an
+/// `InRelease` or a `Release` of [`releases`]`(path)`) lists for `path`.
+pub fn listed_in(release_path: &str, release: &[u8], path: &str) -> Option<ListedFile> {
+    let (dir, name) = release_path.rsplit_once('/')?;
+    let rest = path.strip_prefix(dir)?.strip_prefix('/')?;
+    let text = std::str::from_utf8(release).ok()?;
+    let text = match name {
+        "InRelease" => cleartext(text).ok()?,
+        "Release" => text.to_string(),
+        _ => return None,
+    };
+    let listed = Release::parse(&text).ok()?.files.remove(rest)?;
+    Some(ListedFile {
+        size: listed.size,
+        sha256: listed.sha256,
+    })
 }
 
 enum Lookup {
@@ -515,6 +562,74 @@ mod tests {
         );
         assert!(at.immutable);
         assert_eq!((at.size, at.sha256), (Some(7), Some("d".repeat(64))));
+    }
+
+    #[test]
+    fn index_files_are_kept_consistent_with_the_release() {
+        assert_eq!(
+            releases("dists/bookworm/main/binary-amd64/Packages.gz"),
+            ["dists/bookworm/InRelease", "dists/bookworm/Release"]
+        );
+        assert_eq!(
+            releases("dists/bookworm/Release.gpg"),
+            ["dists/bookworm/InRelease", "dists/bookworm/Release"]
+        );
+        // Each of the two with the other.
+        assert_eq!(
+            releases("dists/bookworm/InRelease"),
+            ["dists/bookworm/Release"]
+        );
+        assert_eq!(
+            releases("dists/bookworm/Release"),
+            ["dists/bookworm/InRelease"]
+        );
+        // Content-addressed copies and packages never change.
+        let hash = "c".repeat(64);
+        assert!(releases(&format!(
+            "dists/bookworm/main/binary-amd64/by-hash/SHA256/{hash}"
+        ))
+        .is_empty());
+        assert!(releases("pool/main/h/hello/hello_1.0_amd64.deb").is_empty());
+
+        let release = format!(
+            "Origin: Acme\nSuite: bookworm\nSHA256:\n {} 42 main/binary-amd64/Packages.gz\n",
+            "A".repeat(64)
+        );
+        let path = "dists/bookworm/main/binary-amd64/Packages.gz";
+        let listed = ListedFile {
+            size: 42,
+            sha256: "a".repeat(64),
+        };
+        assert_eq!(
+            listed_in("dists/bookworm/Release", release.as_bytes(), path),
+            Some(listed.clone())
+        );
+        let in_release = format!(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n{release}\
+             -----BEGIN PGP SIGNATURE-----\n\nxyz\n-----END PGP SIGNATURE-----\n"
+        );
+        assert_eq!(
+            listed_in("dists/bookworm/InRelease", in_release.as_bytes(), path),
+            Some(listed)
+        );
+        // Not listed, another distribution's, or no InRelease.
+        let unlisted = "dists/bookworm/main/binary-arm64/Packages.gz";
+        assert_eq!(
+            listed_in("dists/bookworm/Release", release.as_bytes(), unlisted),
+            None
+        );
+        assert_eq!(
+            listed_in(
+                "dists/trixie/Release",
+                release.as_bytes(),
+                "dists/bookworm/main/binary-amd64/Packages.gz"
+            ),
+            None
+        );
+        assert_eq!(
+            listed_in("dists/bookworm/InRelease", release.as_bytes(), path),
+            None
+        );
     }
 
     #[test]

@@ -1446,6 +1446,17 @@ pub enum UpstreamAnswer {
     Failed(String),
 }
 
+/// A file's size and SHA-256 as another file of the upstream lists it
+/// ([`FormatPlugin::file_listed`]: an index file in apt's `Release`).
+///
+/// [`FormatPlugin::file_listed`]: crate::FormatPlugin::file_listed
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedFile {
+    pub size: u64,
+    /// Lowercase hex.
+    pub sha256: String,
+}
+
 /// Where an upstream keeps a file ([`UpstreamAnswer::FileAt`]), and what the
 /// plugin knows of it.
 #[derive(Debug, Clone, PartialEq, Eq)]

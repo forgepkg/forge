@@ -354,6 +354,29 @@ pub trait FormatPlugin: Send + Sync + 'static {
         FilePackage::None
     }
 
+    /// Proxies that keep the upstream's files: the paths of the files that
+    /// are published together with the file at `path` and list it, the one
+    /// clients read first first (an apt distribution's `InRelease`, then
+    /// `Release`), never `path` itself. The host serves the cached file
+    /// consistent with them: it re-validates the file once one of them was
+    /// replaced after the file was last checked, and when the first of them
+    /// it holds lists the file with another size or digest
+    /// ([`Self::file_listed`]). The default: none, every file is re-validated
+    /// on its own clock.
+    fn file_releases(&self, path: &str) -> Vec<String> {
+        let _ = path;
+        Vec::new()
+    }
+
+    /// The size and SHA-256 that `release`, the content of the file at
+    /// `release_path` (one of [`Self::file_releases`] of `path`), lists for
+    /// the file at `path`; `None` when it does not list it, or cannot be
+    /// read. The default: none.
+    fn file_listed(&self, release_path: &str, release: &[u8], path: &str) -> Option<ListedFile> {
+        let _ = (release_path, release, path);
+        None
+    }
+
     /// Images formats: the response to a request the host refused, or to
     /// what failed while it served it outside a query ([`ImageError`]).
     /// The host adds its own headers (a Bearer challenge). The default is
