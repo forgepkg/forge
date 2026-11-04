@@ -230,19 +230,30 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://forge.exa
 
 - `InRelease`, `Release` and the other indexes are re-validated with the
   upstream once the repository's metadata TTL (`metadata_ttl_seconds`, 10
-  minutes by default) has passed; `by-hash/` copies and pool files never
-  change, and are cached on their first download for good.
+  minutes by default) has passed.
 - A pool file is checked against the size and SHA-256 the upstream's
   `Packages` index of its component and architecture gives it (the
   distribution's `Packages.gz`, else `.xz`, else the plain one), when the
   index lists it: a file that does not match is not cached, and answers
-  `502`. A `by-hash` copy is checked against its hash.
+  `502`. A `by-hash` copy (`MD5Sum`, `SHA1`, `SHA256` or `SHA512`) is
+  checked against the digest its path names, the same way.
+- A file so checked never changes, and is cached on its first download for
+  good. One that could not be checked (no index lists it, as Ubuntu's
+  `_all` packages, which no `binary-all` index lists; or the index could
+  not be fetched) is re-validated once the metadata TTL has passed, as an
+  index is. The `Packages` index itself is not checked against `InRelease`;
+  apt checks every file against the signed indexes.
 - While the upstream is down, what is cached is served; a file the
   upstream did not have is remembered for the not-found TTL. Upstream
   credentials are optional (`upstream_username`, `upstream_password`).
 - *Invalidate cache* on the repository's page (or
-  `POST /admin/repositories/{name}/proxy-cache/invalidate`) has the cached
-  indexes re-validated on their next download.
+  `POST /admin/repositories/{name}/proxy-cache/invalidate`) has every
+  cached file re-validated on its next download. A file kept for good is
+  fetched from the upstream again and checked anew, and replaced when it is
+  not the file the upstream has; the cached copy is served while the
+  upstream is down. *Delete cached file* on the same page (or
+  `DELETE /admin/repositories/{name}/files?path=<path>`, a path ending in
+  `/` for a directory) evicts a file at once.
 
 There is no package delay for apt proxies: the indexes are the upstream's,
 signed, and cannot leave a version out.

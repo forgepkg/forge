@@ -3,8 +3,10 @@
 //! verify the upstream's signatures with the upstream's keys.
 //!
 //! * `dists/<distribution>/…` (the distribution the proxy is for): the
-//!   indexes, re-validated once the repository's metadata TTL has passed;
-//!   their `by-hash` copies never change.
+//!   indexes, re-validated once the repository's metadata TTL has passed.
+//!   A `by-hash/<type>/<digest>` copy (`MD5Sum`, `SHA1`, `SHA256` or
+//!   `SHA512`) is checked against the digest its path names, and never
+//!   changes once it matched.
 //! * `pool/…`: packages, which never change at their path. Before a
 //!   package is cached the host checks it against the size and SHA-256 the
 //!   upstream's `Packages` index of its component and architecture gives it
@@ -13,6 +15,12 @@
 //!   last before the name's prefix: `main` for the Debian security
 //!   archive's `pool/updates/main/o/openssl/…`, which
 //!   `dists/<distribution>/main/binary-<arch>/Packages` lists.
+//!
+//! Only a file so checked is kept as immutable. One the host could not
+//! check (no index lists it, the index could not be fetched, Ubuntu's
+//! `_all` packages without a `binary-all` index) is cached as an index is,
+//! and re-validated once the metadata TTL has passed: a wrong copy is not
+//! kept for good.
 
 use std::io::{BufRead, BufReader, Read};
 
@@ -20,7 +28,7 @@ use forge_plugin_api::{
     Fetch, FetchResult, Fetched, FileLocation, Freshness, Remote, UpstreamAnswer, UpstreamStep,
 };
 
-use crate::layout::{self, Target};
+use crate::layout::{self, HashType, Target};
 
 /// The most an index may inflate to while it is searched.
 const MAX_INDEX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -55,11 +63,18 @@ pub fn file(remote: &Remote, path: &str, fetched: &[FetchResult]) -> UpstreamSte
     let mut location = FileLocation::at(url);
     match layout::parse(path) {
         Ok(Target::Dists { rest, .. }) => {
-            location.immutable = layout::is_by_hash(&rest);
-            location.sha256 = layout::by_hash_sha256(&rest);
+            if let Some((kind, digest)) = layout::by_hash_digest(&rest) {
+                let field = match kind {
+                    HashType::Md5 => &mut location.md5,
+                    HashType::Sha1 => &mut location.sha1,
+                    HashType::Sha256 => &mut location.sha256,
+                    HashType::Sha512 => &mut location.sha512,
+                };
+                *field = Some(digest);
+                location.immutable = true;
+            }
         }
         Ok(Target::Pool(pool)) => {
-            location.immutable = true;
             if let (Some(deb), Some(distribution)) =
                 (layout::deb_name(&pool.file), remote.option("distribution"))
             {
@@ -70,6 +85,8 @@ pub fn file(remote: &Remote, path: &str, fetched: &[FetchResult]) -> UpstreamSte
                 match listed(remote, &dir, path, fetched) {
                     Lookup::Fetch(fetch) => return UpstreamStep::Fetch(vec![fetch]),
                     Lookup::Found { size, sha256 } => {
+                        // Kept for good only once both are checked.
+                        location.immutable = size.is_some() && sha256.is_some();
                         location.size = size;
                         location.sha256 = sha256;
                     }
@@ -349,6 +366,38 @@ mod tests {
         };
         assert!(at.immutable);
         assert_eq!(at.sha256, Some(hash));
+        // Every hash type apt asks for is checked against its digest (#760).
+        for (name, len) in [("MD5Sum", 32), ("SHA1", 40), ("SHA512", 128)] {
+            let hash = "e".repeat(len);
+            let UpstreamStep::Done(UpstreamAnswer::FileAt(at)) = file(
+                &remote(),
+                &format!("dists/bookworm/main/binary-amd64/by-hash/{name}/{hash}"),
+                &[],
+            ) else {
+                panic!()
+            };
+            assert!(at.immutable, "{name}");
+            let given = match name {
+                "MD5Sum" => &at.md5,
+                "SHA1" => &at.sha1,
+                _ => &at.sha512,
+            };
+            assert_eq!(given.as_deref(), Some(hash.as_str()), "{name}");
+            assert_eq!(at.sha256, None);
+        }
+        // A copy whose name is no digest of its type is not kept for good.
+        let UpstreamStep::Done(UpstreamAnswer::FileAt(at)) = file(
+            &remote(),
+            &format!(
+                "dists/bookworm/main/binary-amd64/by-hash/SHA512/{}",
+                "e".repeat(64)
+            ),
+            &[],
+        ) else {
+            panic!()
+        };
+        assert!(!at.immutable);
+        assert!(!at.has_digest());
     }
 
     #[test]
@@ -387,12 +436,48 @@ mod tests {
         assert!(at.immutable);
         assert_eq!(at.size, Some(42));
         assert!(at.sha256.is_some());
-        // An index that is down leaves the package to apt's own check.
+        // An index that is down leaves the package to apt's own check, and
+        // the copy is re-validated, not kept for good (#760).
         let down = result(&fetches[0].url, Fetched::Failed("503".into()));
         let UpstreamStep::Done(UpstreamAnswer::FileAt(at)) = file(&remote(), path, &[down]) else {
             panic!()
         };
         assert_eq!((at.size, at.sha256), (None, None));
+        assert!(!at.immutable);
+        // So does an index that does not list the package, or lists it
+        // without a usable digest.
+        let index = result(&fetches[0].url, Fetched::Found(INDEX.as_bytes().to_vec()));
+        for path in ["pool/main/x/x/x_1_amd64.deb", "pool/main/a/a/a_1_amd64.deb"] {
+            let UpstreamStep::Done(UpstreamAnswer::FileAt(at)) =
+                file(&remote(), path, std::slice::from_ref(&index))
+            else {
+                panic!()
+            };
+            assert!(!at.immutable, "{path}");
+        }
+        // No index anywhere (Ubuntu's `binary-all`).
+        let gone: Vec<_> = ["Packages.gz", "Packages.xz", "Packages"]
+            .iter()
+            .map(|name| {
+                result(
+                    &format!(
+                        "http://deb.example.test/debian/dists/bookworm/main/binary-amd64/{name}"
+                    ),
+                    Fetched::NotFound,
+                )
+            })
+            .collect();
+        let UpstreamStep::Done(UpstreamAnswer::FileAt(at)) = file(&remote(), path, &gone) else {
+            panic!()
+        };
+        assert!(!at.immutable);
+        // A package the plugin cannot place in an index.
+        let UpstreamStep::Done(UpstreamAnswer::FileAt(at)) =
+            file(&remote(), "pool/main/h/hello/README", &[])
+        else {
+            panic!()
+        };
+        assert!(!at.immutable);
     }
 
     #[test]

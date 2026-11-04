@@ -1116,3 +1116,174 @@ async fn proxies_serve_the_security_archives_pool() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, hello);
 }
+
+/// The `Packages` index of `bookworm/main/binary-amd64` listing `deb` as
+/// `hello` 2.10-3.
+fn hello_index(deb: &[u8]) -> Vec<u8> {
+    format!(
+        "Package: hello\nVersion: 2.10-3\nFilename: pool/main/h/hello/hello_2.10-3_amd64.deb\nSize: {}\nSHA256: {}\n",
+        deb.len(),
+        sha256(deb)
+    )
+    .into_bytes()
+}
+
+/// A mock mirror with `files` (paths below `/debian/`) and an apt proxy of
+/// it whose metadata TTL is a second.
+async fn proxy_of(srv: &TestServer, files: Vec<(String, Vec<u8>)>) -> (Arc<Mirror>, Apt, String) {
+    let state = Arc::new(Mirror::default());
+    let url = mirror(state.clone()).await;
+    state.files.lock().unwrap().extend(
+        files
+            .into_iter()
+            .map(|(path, body)| (format!("debian/{path}"), body)),
+    );
+    let name = format!("aptverified{}", unique());
+    create(
+        srv,
+        json!({"name": name, "kind": "proxy", "format": "apt", "remote_url": format!("{url}/debian/"),
+               "metadata_ttl_seconds": 1, "options": {"distribution": "bookworm"}}),
+    )
+    .await;
+    let apt = Apt::new(srv, &name).await;
+    (state, apt, name)
+}
+
+const HELLO: &str = "pool/main/h/hello/hello_2.10-3_amd64.deb";
+
+/// A `by-hash` copy is checked against its digest for every hash type apt
+/// asks for, not only `SHA256` (#760).
+#[tokio::test]
+async fn proxies_check_by_hash_copies_of_every_hash_type() {
+    let srv = common::start().await;
+    let content = b"Translation-en".to_vec();
+    let digests = [
+        ("MD5Sum", hex::encode(md5::Md5::digest(&content))),
+        ("SHA1", hex::encode(sha1::Sha1::digest(&content))),
+        ("SHA512", hex::encode(sha2::Sha512::digest(&content))),
+    ];
+    let mut files: Vec<_> = digests
+        .iter()
+        .map(|(kind, hex)| {
+            (
+                format!("dists/bookworm/main/i18n/by-hash/{kind}/{hex}"),
+                content.clone(),
+            )
+        })
+        .collect();
+    // Copies whose content is not their digest.
+    for (kind, hex) in &digests {
+        files.push((
+            format!(
+                "dists/bookworm/main/i18n/by-hash/{kind}/{}",
+                "1".repeat(hex.len())
+            ),
+            b"forged".to_vec(),
+        ));
+    }
+    let (_, apt, _) = proxy_of(&srv, files).await;
+    for (kind, hex) in &digests {
+        let path = format!("dists/bookworm/main/i18n/by-hash/{kind}/{hex}");
+        assert_eq!(
+            apt.get(&path).await,
+            (StatusCode::OK, content.clone()),
+            "{kind}"
+        );
+        let forged = format!(
+            "dists/bookworm/main/i18n/by-hash/{kind}/{}",
+            "1".repeat(hex.len())
+        );
+        assert_eq!(apt.get(&forged).await.0, StatusCode::BAD_GATEWAY, "{kind}");
+    }
+}
+
+/// A package the proxy could not check (no index lists it, as Ubuntu's
+/// `_all` packages) is not kept for good: a new copy at its path replaces it
+/// once the metadata TTL has passed (#760).
+#[tokio::test]
+async fn proxies_revalidate_packages_they_could_not_check() {
+    let srv = common::start().await;
+    let unlisted = "pool/main/h/hello/hello-doc_2.10-3_all.deb";
+    let doc = deb("hello-doc", "2.10-3", "all", "doc");
+    let (state, apt, _) = proxy_of(&srv, vec![(unlisted.into(), doc.clone())]).await;
+    assert_eq!(apt.get(unlisted).await, (StatusCode::OK, doc));
+    let doc2 = deb("hello-doc", "2.10-3", "all", "docs");
+    state
+        .files
+        .lock()
+        .unwrap()
+        .insert(format!("debian/{unlisted}"), doc2.clone());
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(apt.get(unlisted).await, (StatusCode::OK, doc2));
+}
+
+/// A checked package is kept for good, and an administrator evicts it:
+/// **Invalidate cache** has it fetched again and checked anew, and a delete
+/// of its path removes it (#760).
+#[tokio::test]
+async fn invalidate_cache_and_deletes_evict_checked_packages() {
+    let srv = common::start().await;
+    let hello = deb("hello", "2.10-3", "amd64", "devel");
+    let (state, apt, name) = proxy_of(
+        &srv,
+        vec![
+            (
+                "dists/bookworm/main/binary-amd64/Packages".into(),
+                hello_index(&hello),
+            ),
+            (HELLO.into(), hello.clone()),
+        ],
+    )
+    .await;
+    let upstream = format!("debian/{HELLO}");
+    let seen = || state.seen.lock().unwrap()[&upstream];
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello.clone()));
+    // The upstream re-uploads the package under its path, and its index
+    // names the new one.
+    let hello2 = deb("hello", "2.10-3", "amd64", "utils");
+    {
+        let mut files = state.files.lock().unwrap();
+        files.insert(upstream.clone(), hello2.clone());
+        files.insert(
+            "debian/dists/bookworm/main/binary-amd64/Packages".into(),
+            hello_index(&hello2),
+        );
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // Kept for good: not asked for again.
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello.clone()));
+    assert_eq!(seen(), 1);
+
+    let (status, text) = admin(
+        &srv,
+        reqwest::Method::POST,
+        &format!("/admin/repositories/{name}/proxy-cache/invalidate"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let invalidated: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        invalidated["files_expired"].as_u64().unwrap() >= 1,
+        "{text}"
+    );
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello2.clone()));
+    assert_eq!(seen(), 2);
+    // The new copy was checked, and is kept for good again.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello2.clone()));
+    assert_eq!(seen(), 2);
+
+    // A delete of the path evicts it at once.
+    let (status, text) = admin(
+        &srv,
+        reqwest::Method::DELETE,
+        &format!("/admin/repositories/{name}/files?path={HELLO}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["deleted"], 1);
+    assert_eq!(apt.get(HELLO).await, (StatusCode::OK, hello2));
+    assert_eq!(seen(), 3);
+}

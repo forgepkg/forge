@@ -488,6 +488,30 @@ where
     Ok(result.rows_affected())
 }
 
+/// Proxies: make the cached files of `repository_id` that were kept as
+/// immutable (an apt proxy's packages and `by-hash` copies) ordinary cached
+/// files again, due for re-validation and without the upstream's
+/// validators, so each is fetched from the upstream again on its next
+/// download and checked anew. The cached copy is served while the upstream
+/// cannot be reached. Returns how many there were.
+pub async fn release_immutable<'e, E>(executor: E, repository_id: i64) -> sqlx::Result<u64>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE raw_file
+        SET immutable = false, checked_at = NULL,
+            upstream_etag = NULL, upstream_last_modified = NULL
+        WHERE repository_id = $1 AND immutable
+        "#,
+    )
+    .bind(repository_id)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Proxies: make the cached file at `path` due for re-validation. Returns
 /// whether it was fresh.
 pub async fn expire_file_check<'e, E>(
