@@ -18,8 +18,6 @@ pub mod media {
     pub const CONFIG: &str = "application/vnd.cncf.helm.config.v1+json";
     /// The layer holding the packaged chart (`<name>-<version>.tgz`).
     pub const CONTENT: &str = "application/vnd.cncf.helm.chart.content.v1.tar+gzip";
-    /// The optional layer holding the chart's provenance file (`.prov`).
-    pub const PROVENANCE: &str = "application/vnd.cncf.helm.chart.provenance.v1.prov";
 }
 
 /// Whether a layer of a chart is its packaged archive: Helm's media type,

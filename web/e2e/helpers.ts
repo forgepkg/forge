@@ -74,20 +74,6 @@ export async function createRepo(body: Record<string, unknown>): Promise<Respons
   })
 }
 
-/** Add a member (a repo name + a unique priority) to a group via the admin API. */
-export async function addGroupMember(
-  group: string,
-  member: string,
-  priority: number,
-): Promise<Response> {
-  const f = facts()
-  return fetch(`${f.baseUrl}/admin/repositories/${group}/members`, {
-    method: 'POST',
-    headers: { authorization: adminBasic(), 'content-type': 'application/json' },
-    body: JSON.stringify({ member, priority }),
-  })
-}
-
 /**
  * Fetch a package's browse detail (the read endpoint the SPA's detail page
  * uses). For a proxy it answers from what the proxy has cached and asks no

@@ -71,29 +71,6 @@ pub async fn find(pool: &PgPool, repository_id: i64, path: &str) -> sqlx::Result
     .await
 }
 
-/// Whether repository `repository_id` has a file under directory `prefix`
-/// (`""`: any file).
-pub async fn directory_exists(
-    pool: &PgPool,
-    repository_id: i64,
-    prefix: &str,
-) -> sqlx::Result<bool> {
-    let (lower, upper) = prefix_range(prefix);
-    sqlx::query_scalar!(
-        r#"
-        SELECT EXISTS (
-            SELECT 1 FROM raw_file
-            WHERE repository_id = $1 AND path >= $2 AND ($3::text IS NULL OR path < $3)
-        ) AS "exists!"
-        "#,
-        repository_id,
-        lower,
-        upper,
-    )
-    .fetch_one(pool)
-    .await
-}
-
 /// Whether `repository_id` has any file. Pass the transaction that holds the
 /// repository row lock so the answer stays true until commit.
 pub async fn repository_has_files<'e, E>(executor: E, repository_id: i64) -> sqlx::Result<bool>

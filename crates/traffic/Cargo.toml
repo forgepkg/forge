@@ -28,7 +28,6 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-serde_json = { workspace = true }
 
 [features]
 # `testing`: a writer of small MaxMind databases, for the tests of the crates

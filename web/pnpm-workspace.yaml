@@ -17,6 +17,6 @@ overrides:
   seroval: ~1.6.11
 
 # pnpm blocks dependency install/build scripts by default. List only the
-# packages that legitimately need to run a build script during install.
-onlyBuiltDependencies:
-  - esbuild
+# packages that legitimately need to run a build script during install (none
+# do since Vite 8 replaced esbuild with Rolldown).
+onlyBuiltDependencies: []

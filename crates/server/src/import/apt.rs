@@ -210,7 +210,7 @@ impl AptSource {
             .http
             .get(url, RequestClass::Metadata, self.auth().as_ref())
             .await
-            .map_err(|e| SourceError::of(e, url))?;
+            .map_err(SourceError::of)?;
         let status = response.status();
         let server = response
             .headers()
@@ -230,7 +230,7 @@ impl AptSource {
             config.spool_memory_bytes,
         )
         .await
-        .map_err(|e| SourceError::of(e, url))?;
+        .map_err(SourceError::of)?;
         self.http.count_bytes(body.len());
         let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
             let mut out = Vec::new();
@@ -363,7 +363,7 @@ impl AptSource {
             .http
             .get(&url, RequestClass::Download, self.auth().as_ref())
             .await
-            .map_err(|e| SourceError::of(e, &url))?;
+            .map_err(SourceError::of)?;
         match response.status() {
             s if s.is_success() => Ok(Some(response)),
             StatusCode::NOT_FOUND | StatusCode::GONE => Ok(None),

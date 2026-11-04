@@ -13,12 +13,12 @@
 //!   still reads it and avoids re-forwarding (the no in-memory-only-authoritative
 //!   -state rule).
 //! * **Hot path:** [`forge_cache::Cache`], **in-process only**
-//!   ([`forge_cache::Cache::get_or_try_insert_local_with_tags`]) and keyed by
-//!   the credential HMAC, with the Postgres read as its factory. A verdict is
-//!   an authentication decision, so it never lives in Redis (anyone with
-//!   access to Redis could otherwise mark any password valid). Invalidation
-//!   broadcasts on the cache backplane so a revoke on one node drops the L1
-//!   entry on every node.
+//!   ([`forge_cache::Cache::get_or_try_insert_local_with_tags_expiring`])
+//!   and keyed by the credential HMAC, with the Postgres read as its factory.
+//!   A verdict is an authentication decision, so it never lives in Redis
+//!   (anyone with access to Redis could otherwise mark any password valid).
+//!   Invalidation broadcasts on the cache backplane so a revoke on one node
+//!   drops the L1 entry on every node.
 //! * **Success log:** every definitive upstream ACCEPT also records
 //!   `(username, provider_id)` in `auth_success`
 //!   ([`forge_db::validated_credential_dao::record_auth_success`]) — rejected
@@ -212,10 +212,11 @@ struct CachedVerdict {
 
 /// Errors from a credential-cache lookup.
 ///
-/// `Clone` because [`forge_cache::Cache::get_or_try_insert_with`] hands every
-/// coalesced waiter a shared error on a failing factory — and, crucially, does
-/// **not** cache it, which is exactly the fail-closed behavior we want for
-/// [`Self::Unavailable`].
+/// `Clone` because
+/// [`forge_cache::Cache::get_or_try_insert_local_with_tags_expiring`] hands
+/// every coalesced waiter a shared error on a failing factory — and,
+/// crucially, does **not** cache it, which is exactly the fail-closed behavior
+/// we want for [`Self::Unavailable`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredCacheError {
     /// The upstream was unavailable and there was no valid cached verdict.

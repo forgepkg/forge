@@ -49,7 +49,6 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use hyper_util::client::proxy::matcher::Matcher as ProxyMatcher;
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use tracing::Instrument;
 use url::Url;
 
@@ -131,15 +130,6 @@ pub enum UpstreamError {
     /// Local spool / temp-file I/O failure.
     #[error("spool upstream body: {0}")]
     Io(#[from] std::io::Error),
-    /// The body was not valid JSON.
-    #[error("parse upstream JSON from {url}: {source}")]
-    Json {
-        /// Requested URL.
-        url: String,
-        /// Parser error.
-        #[source]
-        source: serde_json::Error,
-    },
     /// The request, or a redirect hop, targets a link-local / cloud-metadata
     /// endpoint ([`is_metadata_target`], or a proxied name resolving to one).
     #[error("upstream GET {url}: refusing link-local / cloud-metadata target")]
@@ -777,32 +767,9 @@ impl UpstreamHttp {
             .is_ok_and(|uri| self.proxies.intercept(&uri).is_some())
     }
 
-    /// GET a JSON document. `Ok(None)` on a 404; any other non-2xx is an error.
-    /// The body is size-bounded while streaming and spooled to disk past the
-    /// in-memory threshold; parsing runs on the blocking pool.
-    pub async fn get_json(
-        &self,
-        url: &str,
-        auth: Option<&UpstreamAuth<'_>>,
-    ) -> Result<Option<JsonValue>, UpstreamError> {
-        let Some(spool) = self.get_metadata_body(url, auth, None).await? else {
-            return Ok(None);
-        };
-        let url_owned = url.to_string();
-        let parsed = tokio::task::spawn_blocking(move || {
-            serde_json::from_reader::<_, JsonValue>(std::io::BufReader::new(spool.into_reader()?))
-                .map_err(|source| UpstreamError::Json {
-                    url: url_owned,
-                    source,
-                })
-        })
-        .await
-        .map_err(|e| UpstreamError::Io(std::io::Error::other(e)))??;
-        Ok(Some(parsed))
-    }
-
-    /// GET a small metadata body as bytes (e.g. a `.nuspec`). `Ok(None)` on 404.
-    pub async fn get_bytes(
+    /// [`Self::get_bytes_accepting`] without an `Accept` header.
+    #[cfg(test)]
+    async fn get_bytes(
         &self,
         url: &str,
         auth: Option<&UpstreamAuth<'_>>,
@@ -810,7 +777,8 @@ impl UpstreamHttp {
         self.get_bytes_accepting(url, auth, None).await
     }
 
-    /// [`Self::get_bytes`] with an `Accept` header.
+    /// GET a small metadata body as bytes (e.g. a `.nuspec`), with an
+    /// optional `Accept` header. `Ok(None)` on 404.
     pub async fn get_bytes_accepting(
         &self,
         url: &str,
@@ -998,7 +966,8 @@ impl SpooledBody {
     }
 
     /// Whether the body spilled to disk.
-    pub fn is_on_disk(&self) -> bool {
+    #[cfg(test)]
+    fn is_on_disk(&self) -> bool {
         self.inner.is_rolled()
     }
 
@@ -1414,7 +1383,11 @@ mod tests {
         let url = serve_raw(resp.clone()).await;
 
         let http = UpstreamHttp::new(UpstreamHttpConfig::default()).unwrap();
-        assert_eq!(http.get_json(&url, None).await.unwrap().unwrap(), doc);
+        let inflated = http.get_bytes(&url, None).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&inflated).unwrap(),
+            doc
+        );
 
         // The cap applies to the decoded bytes, not just the compressed ones.
         let tight = UpstreamHttp::new(UpstreamHttpConfig {
@@ -1424,7 +1397,7 @@ mod tests {
         .unwrap();
         let url = serve_raw(resp).await;
         assert!(matches!(
-            tight.get_json(&url, None).await.unwrap_err(),
+            tight.get_bytes(&url, None).await.unwrap_err(),
             UpstreamError::TooLarge { limit: 8, .. }
         ));
     }

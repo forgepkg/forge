@@ -2262,7 +2262,6 @@ dependencies = [
 name = "forge-e2e"
 version = "2.1.0"
 dependencies = [
- "anyhow",
  "aws-credential-types",
  "aws-sigv4",
  "axum",
@@ -2276,7 +2275,6 @@ dependencies = [
  "forge-format-nuget",
  "forge-server",
  "forge-storage",
- "futures-util",
  "hex",
  "jsonwebtoken",
  "rand 0.10.3",
@@ -2299,7 +2297,6 @@ dependencies = [
 name = "forge-format-apt"
 version = "2.1.0"
 dependencies = [
- "base64 0.23.1",
  "chrono",
  "flate2",
  "forge-plugin-api",
@@ -2342,7 +2339,6 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.1",
  "tar",
- "tempfile",
 ]
 
 [[package]]
@@ -2520,7 +2516,6 @@ dependencies = [
  "parquet_derive",
  "rand 0.10.3",
  "serde",
- "serde_json",
  "tokio",
  "tracing",
 ]

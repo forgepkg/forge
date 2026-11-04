@@ -56,8 +56,8 @@
 //! authorization set, credential verdict, JWKS, workload-token verdict, or a
 //! proxy's upstream service index, manifest or registration would be accepted
 //! by every instance. Such values go through [`Cache::get_or_try_insert_local`] /
-//! [`Cache::get_or_try_insert_local_with_tags`]: they live in L1 only and
-//! are never read from or written to Redis. Redis still carries their
+//! [`Cache::get_or_try_insert_local_with_tags_expiring`]: they live in L1 only
+//! and are never read from or written to Redis. Redis still carries their
 //! **invalidations** (tag generations over the backplane), so an
 //! invalidation on one instance still evicts them everywhere — the worst a
 //! Redis writer can do to them is evict entries early.
@@ -535,26 +535,8 @@ impl Cache {
         self.load(ns, key, &[], ttl, factory, false).await
     }
 
-    /// [`Cache::get_or_try_insert_local`] with logical tags, like
-    /// [`Cache::get_or_try_insert_with_tags`].
-    pub async fn get_or_try_insert_local_with_tags<T, F, Fut, E>(
-        &self,
-        ns: &str,
-        key: &str,
-        tags: &[String],
-        ttl: Duration,
-        factory: F,
-    ) -> Result<T, E>
-    where
-        T: Serialize + DeserializeOwned + Send + Sync + 'static,
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-        E: Clone + Send + Sync + 'static,
-    {
-        self.load(ns, key, tags, ttl, factory, false).await
-    }
-
-    /// [`Cache::get_or_try_insert_local_with_tags`] for a value whose own
+    /// [`Cache::get_or_try_insert_local`] with logical tags (like
+    /// [`Cache::get_or_try_insert_with_tags`]), for a value whose own
     /// lifetime the factory knows: it returns the value with how long it may
     /// live, and the entry expires after the shorter of that and `ttl` (counted
     /// from the start of the fill). For a value copied from a record that

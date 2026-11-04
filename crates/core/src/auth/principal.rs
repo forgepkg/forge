@@ -173,11 +173,6 @@ impl Principal {
             _ => None,
         }
     }
-
-    /// Whether this principal is an authenticated user.
-    pub fn is_user(&self) -> bool {
-        matches!(self, Principal::User { .. })
-    }
 }
 
 #[cfg(test)]
@@ -237,20 +232,5 @@ mod tests {
                 method: AuthMethod::Token
             }
         );
-    }
-
-    #[test]
-    fn is_user_only_for_user_variant() {
-        assert!(Principal::User {
-            user_id: 1,
-            token_id: None,
-            method: AuthMethod::Password
-        }
-        .is_user());
-        assert!(!Principal::Unauthenticated.is_user());
-        assert!(!Principal::Anonymous {
-            ip: "127.0.0.1".parse().unwrap()
-        }
-        .is_user());
     }
 }

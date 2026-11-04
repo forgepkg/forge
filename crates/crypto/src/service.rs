@@ -434,7 +434,8 @@ impl EnvelopeService {
     /// references the key; the rotation paths use the commit-time checked
     /// [`Self::revoke_unreferenced_keks`] and `forge-db`'s
     /// `secret_dao::revoke_unreferenced_deks` instead.
-    pub async fn revoke_key(&self, layer: KeyLayer, version: i32) -> Result<(), CryptoError> {
+    #[cfg(test)]
+    async fn revoke_key(&self, layer: KeyLayer, version: i32) -> Result<(), CryptoError> {
         let rec = self
             .store
             .get_version(layer, self.scope(), version)
@@ -444,10 +445,6 @@ impl EnvelopeService {
                 scope: self.scope().to_string(),
                 version,
             })?;
-        self.revoke(&rec).await
-    }
-
-    async fn revoke(&self, rec: &KeyRecord) -> Result<(), CryptoError> {
         self.store.set_state(rec.id, KeyState::Revoked).await?;
         self.keys.invalidate(&(rec.layer, rec.version)).await;
         tracing::info!(layer = %rec.layer, version = rec.version, "revoked encryption key");

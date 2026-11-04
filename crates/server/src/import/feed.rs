@@ -78,7 +78,7 @@ impl Feed {
             .http
             .get(url, RequestClass::Metadata, feed.auth().as_ref())
             .await
-            .map_err(|e| SourceError::of(e, url))?;
+            .map_err(SourceError::of)?;
         if !response.status().is_success() {
             return Err(SourceError::status(response.status(), url));
         }
@@ -189,7 +189,7 @@ impl Feed {
             .http
             .get(url, RequestClass::Download, self.auth().as_ref())
             .await
-            .map_err(|e| SourceError::of(e, url))?;
+            .map_err(SourceError::of)?;
         if !response.status().is_success() {
             return Err(SourceError::status(response.status(), url));
         }
@@ -266,7 +266,7 @@ impl Feed {
                         }
                         Ok(None) => (Fetched::NotFound, Some(404)),
                         Err(e) => {
-                            let error = SourceError::of(e, &fetch.url);
+                            let error = SourceError::of(e);
                             let status = error.status_code();
                             let reason = error.to_string();
                             trouble.get_or_insert(error);
@@ -301,11 +301,10 @@ fn unexpected(what: &str, answer: &UpstreamAnswer) -> SourceError {
 }
 
 impl SourceError {
-    /// A transport or status error of the upstream client for `url`.
-    pub fn of(e: UpstreamError, url: &str) -> Self {
+    /// A transport or status error of the upstream client.
+    pub fn of(e: UpstreamError) -> Self {
         match e {
             UpstreamError::Status { status, url } => SourceError::status(status, &url),
-            UpstreamError::Json { source, .. } => SourceError::Invalid(format!("{url}: {source}")),
             other => SourceError::Unreachable(other.to_string()),
         }
     }

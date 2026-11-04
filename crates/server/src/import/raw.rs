@@ -288,7 +288,7 @@ impl RawSource {
                 self.auth().as_ref(),
             )
             .await
-            .map_err(|e| SourceError::of(e, url))?;
+            .map_err(SourceError::of)?;
         let status = response.status();
         let server = header(&response, reqwest::header::SERVER);
         if !status.is_success() {
@@ -310,7 +310,7 @@ impl RawSource {
             config.spool_memory_bytes,
         )
         .await
-        .map_err(|e| SourceError::of(e, url))?;
+        .map_err(SourceError::of)?;
         let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
             let mut out = Vec::new();
             std::io::Read::read_to_end(&mut body.into_reader()?, &mut out)?;
@@ -362,7 +362,7 @@ impl RawSource {
                 self.auth().as_ref(),
             )
             .await
-            .map_err(|e| SourceError::of(e, &url))?;
+            .map_err(SourceError::of)?;
         self.server = header(&response, reqwest::header::SERVER);
         let status = response.status();
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
@@ -427,7 +427,7 @@ impl RawSource {
                 self.auth().as_ref(),
             )
             .await
-            .map_err(|e| SourceError::of(e, &url))?;
+            .map_err(SourceError::of)?;
         let status = response.status();
         match status {
             StatusCode::NOT_FOUND | StatusCode::GONE => return Ok(None),
@@ -469,7 +469,7 @@ impl RawSource {
             .http
             .get(&url, RequestClass::Download, self.auth().as_ref())
             .await
-            .map_err(|e| SourceError::of(e, &url))?;
+            .map_err(SourceError::of)?;
         match response.status() {
             s if s.is_success() => Ok(Some(response)),
             StatusCode::NOT_FOUND | StatusCode::GONE => Ok(None),

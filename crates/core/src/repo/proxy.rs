@@ -460,17 +460,6 @@ async fn upstream_password(
         .map_err(|e| RepoError::Storage(format!("decrypt upstream password: {e}")))
 }
 
-/// The upstream secret of `repo` alone, with the `remote_url` it belongs
-/// to: what a proxy sends as a Bearer token when it has no username (npm
-/// registries take a token). Decrypted like [`upstream_credentials`].
-pub async fn upstream_secret(
-    pool: &PgPool,
-    envelope: &forge_crypto::service::EnvelopeService,
-    repo: &Repository,
-) -> Result<Option<(forge_crypto::PlaintextSecret, Option<String>)>, RepoError> {
-    upstream_password(pool, envelope, repo).await
-}
-
 /// The Basic credentials for `repo`'s upstream, if both a username and a
 /// password are configured. They are attached only to the origin of the
 /// `remote_url` the password was read (and, encrypted, bound) with, which

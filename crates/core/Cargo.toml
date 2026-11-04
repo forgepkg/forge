@@ -73,19 +73,15 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net", "test-util"] }
-forge-db = { path = "../db" }
 # NuGet, the format most integration tests use: the built-in plugin and its
 # Format (a dev-only cycle through forge-plugin, which Cargo permits).
 forge-format-nuget = { path = "../formats/nuget" }
 forge-plugin = { path = "../plugin" }
 argon2 = { workspace = true, features = ["password-hash"] }
-serde_json = { workspace = true }
-chrono = { workspace = true }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 axum = { workspace = true }
-forge-cache = { path = "../cache" }
 # Read back the metrics recorded (tests/auth_pool_timeout.rs).
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
@@ -95,4 +91,3 @@ wiremock = "0.6"
 # publish its public n/e in a static JWKS. Verifier is exercised end-to-end
 # without touching the network.
 rsa = { version = "0.9", features = ["sha2", "getrandom"] }
-rand = { workspace = true }

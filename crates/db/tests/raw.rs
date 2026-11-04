@@ -238,12 +238,6 @@ async fn listings_walk_entries_in_byte_order_and_page() {
         .unwrap();
     assert_eq!(names(&sub, "top/N/"), ["a", "b/", "z"]);
 
-    assert!(raw_dao::directory_exists(&pool, repo, "top/N/")
-        .await
-        .unwrap());
-    assert!(!raw_dao::directory_exists(&pool, repo, "top/M/")
-        .await
-        .unwrap());
     assert_eq!(
         raw_dao::paths_under(&pool, repo, "top/N/", "top/N/a", 10)
             .await
