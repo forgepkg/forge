@@ -10,8 +10,12 @@
 use std::collections::HashSet;
 use std::fmt;
 
-/// The longest control file read from a package, in bytes.
-pub const MAX_CONTROL_BYTES: usize = 1024 * 1024;
+/// The longest control file read from a package, in bytes. Debian's
+/// largest control files are a few KiB (a long `Description`, the
+/// `Provides` of a metapackage); 64 KiB leaves room for any real one. An
+/// index lists each package's control data once per architecture, so this
+/// bounds what a package costs every index it is in (#797).
+pub const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
 /// The most fields a paragraph may hold. Real paragraphs hold a few dozen:
 /// a binary package's control file has the 20-odd fields of Debian Policy
@@ -777,12 +781,14 @@ mod tests {
 
     #[test]
     fn a_control_file_of_many_fields_is_refused_quickly() {
-        // A whole control file (1 MiB) of distinct short fields: about
-        // 100,000 of them, which took ~20 s when each field was compared
-        // with every earlier one.
+        // 1 MiB of distinct short fields (what a control file could hold
+        // before #797; an index's text can hold more): about 100,000 of
+        // them, which took ~20 s when each field was compared with every
+        // earlier one.
+        const BYTES: usize = 1024 * 1024;
         let mut text = String::new();
         let mut i = 0;
-        while text.len() < MAX_CONTROL_BYTES - 16 {
+        while text.len() < BYTES - 16 {
             text.push_str(&format!("a{i}:\n"));
             i += 1;
         }
@@ -797,7 +803,7 @@ mod tests {
         // Distinct fields spread over paragraphs under the bound are read
         // in linear time too.
         let mut text = String::new();
-        while text.len() < MAX_CONTROL_BYTES - 8192 {
+        while text.len() < BYTES - 8192 {
             text.push_str(&fields(MAX_FIELDS));
             text.push('\n');
         }

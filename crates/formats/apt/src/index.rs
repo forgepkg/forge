@@ -14,8 +14,13 @@
 //!
 //! Everything but `Release`'s `Date` is a function of the packages: the
 //! same packages give the same `Packages`, byte for byte.
+//!
+//! The lists are made one at a time and handed to the host as they are
+//! made, after their size was checked (#797). A package whose stored
+//! control data is longer than any upload may give
+//! ([`MAX_LISTED_CONTROL_BYTES`]) is not listed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::Write;
 
 use forge_plugin_api::{
@@ -23,7 +28,7 @@ use forge_plugin_api::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::control::Paragraph;
+use crate::control::{Paragraph, MAX_CONTROL_BYTES};
 use crate::layout::{self, KEY_ASC, KEY_GPG};
 use crate::manifest::Summary;
 
@@ -40,6 +45,16 @@ pub struct ReleaseInfo<'a> {
     pub label: &'a str,
 }
 
+/// The longest stored control data a package may have to be listed. Every
+/// package uploaded or imported has a control file of at most
+/// [`MAX_CONTROL_BYTES`], which its stored control data spells canonically
+/// (a space after each `:`, ` .` for a blank line), a few bytes more at most;
+/// twice the cap leaves room for that. A package stored while the cap was
+/// 1 MiB (before #797) may have more: it is left out of the indexes, so that
+/// it neither costs every index generation its size per list nor fails
+/// them. It stays in the pool until it is deleted.
+pub const MAX_LISTED_CONTROL_BYTES: usize = 2 * MAX_CONTROL_BYTES;
+
 /// One package's entry, ready to be listed.
 struct Entry {
     component: String,
@@ -47,7 +62,9 @@ struct Entry {
     stanza: String,
 }
 
-fn entry(package: &IndexedPackage) -> Result<Entry, FormatError> {
+/// The entry of `package`; `None` when its control data is too long to be
+/// listed ([`MAX_LISTED_CONTROL_BYTES`]).
+fn entry(package: &IndexedPackage) -> Result<Option<Entry>, FormatError> {
     let summary = package
         .summary
         .as_deref()
@@ -58,6 +75,9 @@ fn entry(package: &IndexedPackage) -> Result<Entry, FormatError> {
                 package.id, package.version
             ))
         })?;
+    if summary.control.len() > MAX_LISTED_CONTROL_BYTES {
+        return Ok(None);
+    }
     let mut paragraph = Paragraph::parse_one(&summary.control)
         .map_err(|e| FormatError::Internal(format!("{} {}: {e}", package.id, package.version)))?;
     for field in INDEX_FIELDS {
@@ -72,20 +92,35 @@ fn entry(package: &IndexedPackage) -> Result<Entry, FormatError> {
     paragraph.set("Filename", &filename);
     paragraph.set("Size", &package.size.to_string());
     paragraph.set("SHA256", &package.sha256);
-    Ok(Entry {
+    Ok(Some(Entry {
         component: summary.component,
         architecture: summary.architecture,
         stanza: paragraph.to_text(),
-    })
+    }))
 }
 
-/// The index files of `input` (see the module's documentation).
-pub fn render(info: &ReleaseInfo<'_>, input: &IndexInput) -> Result<Vec<IndexFile>, FormatError> {
-    let entries = input
-        .packages
-        .iter()
-        .map(entry)
-        .collect::<Result<Vec<_>, _>>()?;
+/// Whether `entry` is listed in the `Packages` of `component` and `arch`:
+/// its own, and every architecture's for an `all` package.
+fn listed_in(entry: &Entry, component: &str, arch: &str) -> bool {
+    entry.component == component && (entry.architecture == arch || entry.architecture == "all")
+}
+
+/// The index files of `input` (see the module's documentation), each handed
+/// to `sink` as it is made. The `Packages` lists are made one at a time:
+/// what is held at once is the packages' stanzas, once each, and one list
+/// with its compressed copies (#797). Before any is made, their size is
+/// checked against [`IndexInput::max_bytes`]: each list is stored twice
+/// uncompressed (by name and by hash), and an index whose lists alone hold
+/// more is refused.
+pub fn render(
+    info: &ReleaseInfo<'_>,
+    input: &IndexInput,
+    sink: &mut dyn FnMut(IndexFile) -> Result<(), FormatError>,
+) -> Result<(), FormatError> {
+    let mut entries = Vec::with_capacity(input.packages.len());
+    for package in &input.packages {
+        entries.extend(entry(package)?);
+    }
 
     // Components and architectures: those of the packages; `main` and
     // `all` when there are none.
@@ -104,61 +139,66 @@ pub fn render(info: &ReleaseInfo<'_>, input: &IndexInput) -> Result<Vec<IndexFil
         architectures.insert("all".into());
     }
 
-    // Packages of each component and architecture, in input order (by id,
-    // then version).
-    let mut lists: BTreeMap<(String, String), String> = BTreeMap::new();
+    // What the lists will hold, before any is made: a stanza's bytes for
+    // each list it is in, and a blank line between two stanzas.
+    let mut plain_bytes: u64 = 0;
     for component in &components {
         for arch in &architectures {
-            lists.insert((component.clone(), arch.clone()), String::new());
+            let (count, bytes) = entries
+                .iter()
+                .filter(|e| listed_in(e, component, arch))
+                .fold((0u64, 0u64), |(n, b), e| (n + 1, b + e.stanza.len() as u64));
+            plain_bytes += bytes + count.saturating_sub(1);
         }
     }
-    for e in &entries {
-        let targets: Vec<&String> = if e.architecture == "all" {
-            architectures.iter().collect()
-        } else {
-            vec![&e.architecture]
-        };
-        for arch in targets {
-            let list = lists
-                .get_mut(&(e.component.clone(), arch.clone()))
-                .expect("every component and architecture has a list");
-            if !list.is_empty() {
-                list.push('\n');
-            }
-            list.push_str(&e.stanza);
-        }
+    let stored = plain_bytes.saturating_mul(2);
+    if stored > input.max_bytes {
+        return Err(FormatError::Internal(format!(
+            "the index's Packages lists would hold {stored} bytes, more than the {} an index may hold",
+            input.max_bytes
+        )));
     }
 
     let base = format!("dists/{}", info.distribution);
-    let mut files = Vec::new();
     // (path below dists/<distribution>/, size, sha256), for Release.
     let mut listed: Vec<(String, usize, String)> = Vec::new();
-    for ((component, arch), packages) in &lists {
-        let dir = format!("{component}/binary-{arch}");
-        let plain = packages.as_bytes().to_vec();
-        let gz = gzip(&plain)?;
-        let xz = xz(&plain)?;
-        for (name, content, content_type) in [
-            ("Packages", plain, "text/plain; charset=utf-8"),
-            ("Packages.gz", gz, "application/gzip"),
-            ("Packages.xz", xz, "application/x-xz"),
-        ] {
-            let sha256 = hex::encode(Sha256::digest(&content));
-            listed.push((format!("{dir}/{name}"), content.len(), sha256.clone()));
-            files.push(IndexFile {
-                path: format!("{base}/{dir}/by-hash/SHA256/{sha256}"),
-                content: content.clone(),
-                content_type: content_type.into(),
-                immutable: true,
-                signed: Vec::new(),
-            });
-            files.push(IndexFile {
-                path: format!("{base}/{dir}/{name}"),
-                content,
-                content_type: content_type.into(),
-                immutable: false,
-                signed: Vec::new(),
-            });
+    // Packages of each component and architecture, in input order (by id,
+    // then version), made, handed over and dropped one at a time.
+    for component in &components {
+        for arch in &architectures {
+            let mut packages = String::new();
+            for e in entries.iter().filter(|e| listed_in(e, component, arch)) {
+                if !packages.is_empty() {
+                    packages.push('\n');
+                }
+                packages.push_str(&e.stanza);
+            }
+            let dir = format!("{component}/binary-{arch}");
+            let plain = packages.into_bytes();
+            let gz = gzip(&plain)?;
+            let xz = xz(&plain)?;
+            for (name, content, content_type) in [
+                ("Packages", plain, "text/plain; charset=utf-8"),
+                ("Packages.gz", gz, "application/gzip"),
+                ("Packages.xz", xz, "application/x-xz"),
+            ] {
+                let sha256 = hex::encode(Sha256::digest(&content));
+                listed.push((format!("{dir}/{name}"), content.len(), sha256.clone()));
+                sink(IndexFile {
+                    path: format!("{base}/{dir}/by-hash/SHA256/{sha256}"),
+                    content: content.clone(),
+                    content_type: content_type.into(),
+                    immutable: true,
+                    signed: Vec::new(),
+                })?;
+                sink(IndexFile {
+                    path: format!("{base}/{dir}/{name}"),
+                    content,
+                    content_type: content_type.into(),
+                    immutable: false,
+                    signed: Vec::new(),
+                })?;
+            }
         }
     }
 
@@ -171,7 +211,7 @@ pub fn render(info: &ReleaseInfo<'_>, input: &IndexInput) -> Result<Vec<IndexFil
         has_all,
         &listed,
     )?;
-    files.push(IndexFile {
+    sink(IndexFile {
         path: format!("{base}/Release"),
         content: release.into_bytes(),
         content_type: "text/plain; charset=utf-8".into(),
@@ -186,22 +226,21 @@ pub fn render(info: &ReleaseInfo<'_>, input: &IndexInput) -> Result<Vec<IndexFil
                 signature: SignatureKind::Detached,
             },
         ],
-    });
-    files.push(IndexFile {
+    })?;
+    sink(IndexFile {
         path: KEY_ASC.into(),
         content: input.keyring_armored.clone().into_bytes(),
         content_type: "application/pgp-keys".into(),
         immutable: false,
         signed: Vec::new(),
-    });
-    files.push(IndexFile {
+    })?;
+    sink(IndexFile {
         path: KEY_GPG.into(),
         content: input.keyring.clone(),
         content_type: "application/pgp-keys".into(),
         immutable: false,
         signed: Vec::new(),
-    });
-    Ok(files)
+    })
 }
 
 /// The `Release` file.
@@ -301,7 +340,18 @@ mod tests {
             generated: "2026-10-31T12:00:00Z".into(),
             keyring: vec![1, 2, 3],
             keyring_armored: "-----BEGIN PGP PUBLIC KEY BLOCK-----\n".into(),
+            max_bytes: 1 << 30,
         }
+    }
+
+    /// Every file [`render`] hands over, in order.
+    fn collect(info: &ReleaseInfo<'_>, input: &IndexInput) -> Result<Vec<IndexFile>, FormatError> {
+        let mut files = Vec::new();
+        render(info, input, &mut |file| {
+            files.push(file);
+            Ok(())
+        })?;
+        Ok(files)
     }
 
     fn file<'a>(files: &'a [IndexFile], path: &str) -> &'a IndexFile {
@@ -318,7 +368,7 @@ mod tests {
 
     #[test]
     fn packages_list_every_version_under_its_component_and_architecture() {
-        let files = render(
+        let files = collect(
             &INFO,
             &input(vec![
                 package(
@@ -402,7 +452,7 @@ mod tests {
 
     #[test]
     fn compressed_copies_hold_the_same_list() {
-        let files = render(
+        let files = collect(
             &INFO,
             &input(vec![package(
                 "Package: hello\nVersion: 1.0\nArchitecture: amd64\nDescription: hi\n",
@@ -430,7 +480,7 @@ mod tests {
 
     #[test]
     fn an_empty_repository_has_an_empty_index() {
-        let files = render(&INFO, &input(Vec::new())).unwrap();
+        let files = collect(&INFO, &input(Vec::new())).unwrap();
         assert!(file(&files, "dists/bookworm/main/binary-all/Packages")
             .content
             .is_empty());
@@ -444,7 +494,7 @@ mod tests {
 
     #[test]
     fn the_same_packages_give_the_same_files() {
-        let one = render(
+        let one = collect(
             &INFO,
             &input(vec![package(
                 "Package: a1\nVersion: 1\nArchitecture: amd64\n",
@@ -457,12 +507,107 @@ mod tests {
             1,
         )]);
         later.generated = "2027-01-01T00:00:00Z".into();
-        let two = render(&INFO, &later).unwrap();
+        let two = collect(&INFO, &later).unwrap();
         for (a, b) in one.iter().zip(&two) {
             assert_eq!(a.path, b.path);
             if !a.path.ends_with("/Release") {
                 assert_eq!(a.content, b.content, "{}", a.path);
             }
         }
+    }
+
+    /// A package of `arch` whose `Description` makes its control data
+    /// `bytes` long, about.
+    fn large(name: &str, arch: &str, bytes: usize) -> IndexedPackage {
+        package(
+            &format!(
+                "Package: {name}\nVersion: 1\nArchitecture: {arch}\nDescription: big\n {}\n",
+                "x".repeat(bytes)
+            ),
+            1,
+        )
+    }
+
+    #[test]
+    fn an_index_over_the_byte_cap_fails_before_anything_is_compressed() {
+        // 20 `all` packages of 60 KiB and one amd64 package: the `all`
+        // packages are listed under binary-all and binary-amd64, so the
+        // lists hold 2 × 20 × 60 KiB, stored twice: some 4.7 MiB.
+        let mut packages: Vec<_> = (0..20)
+            .map(|i| large(&format!("p{i:02}"), "all", 60 * 1024))
+            .collect();
+        packages.push(package("Package: zz\nVersion: 1\nArchitecture: amd64\n", 1));
+        let mut capped = input(packages);
+        capped.max_bytes = 4 * 1024 * 1024;
+        let mut handed = 0;
+        let err = render(&INFO, &capped, &mut |_| {
+            handed += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("more than the 4194304"), "{err}");
+        // Refused before the first list was made, compressed and handed
+        // over.
+        assert_eq!(handed, 0);
+        // Within the cap it is made.
+        capped.max_bytes = 5 * 1024 * 1024;
+        assert!(collect(&INFO, &capped).is_ok());
+    }
+
+    #[test]
+    fn lists_are_handed_over_one_at_a_time() {
+        // The sink sees each list's files before the next list is made,
+        // and its error stops the rendering.
+        let packages = vec![
+            package("Package: aa\nVersion: 1\nArchitecture: amd64\n", 1),
+            package("Package: bb\nVersion: 1\nArchitecture: arm64\n", 1),
+        ];
+        let mut paths = Vec::new();
+        let err = render(&INFO, &input(packages), &mut |file| {
+            paths.push(file.path);
+            if paths.len() == 6 {
+                return Err(FormatError::Internal("full".into()));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            FormatError::Internal("full".into()).to_string()
+        );
+        assert_eq!(paths.len(), 6);
+        assert!(
+            paths.iter().all(|p| p.contains("/main/binary-amd64/")),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_stored_over_the_cap_is_left_out() {
+        // Stored when a control file could be 1 MiB (before #797): not
+        // listed, and the index is made of the others.
+        let files = collect(
+            &INFO,
+            &input(vec![
+                large("huge", "all", MAX_LISTED_CONTROL_BYTES),
+                package("Package: small\nVersion: 1\nArchitecture: amd64\n", 1),
+            ]),
+        )
+        .unwrap();
+        let amd64 = &file(&files, "dists/bookworm/main/binary-amd64/Packages").content;
+        let amd64 = String::from_utf8(amd64.clone()).unwrap();
+        assert!(amd64.starts_with("Package: small\n"), "{amd64}");
+        assert!(!amd64.contains("huge"));
+        let release =
+            String::from_utf8(file(&files, "dists/bookworm/Release").content.clone()).unwrap();
+        assert!(release.contains("Architectures: amd64\n"), "{release}");
+        // One at the upload cap is listed.
+        let files = collect(
+            &INFO,
+            &input(vec![large("fits", "all", MAX_CONTROL_BYTES - 100)]),
+        )
+        .unwrap();
+        let all = &file(&files, "dists/bookworm/main/binary-all/Packages").content;
+        assert!(all.starts_with(b"Package: fits\n"));
     }
 }

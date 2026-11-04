@@ -145,7 +145,12 @@ exhaust the server's memory. A package is refused with `400` when its
 control member inflates to more than 8 MiB before the `control` file ends,
 or when its compression declares more than dpkg-deb's levels up to `-z19`
 do: an xz dictionary over 64 MiB, a zstd window over 8 MiB
-([zstd levels 20 to 22](#limitations)). Imports read packages the same way.
+([zstd levels 20 to 22](#limitations)), and when its `control` file is
+larger than 64 KiB (Debian's largest are a few KiB): an index lists each
+package's control data once per architecture. Imports read packages the same
+way. A package stored with a larger `control` file before this limit (a
+build of 2.2.0's development line) is left out of the indexes; it stays in
+the pool until it is deleted.
 
 `DELETE` of a package's pool file deletes the version (delete permission):
 

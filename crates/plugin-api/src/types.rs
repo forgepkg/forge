@@ -1506,6 +1506,9 @@ pub struct IndexInput {
     pub keyring: Vec<u8>,
     /// The same keys, ASCII-armored in one block.
     pub keyring_armored: String,
+    /// The most bytes the index's files may hold together. The host stops
+    /// storing an index once its files hold more.
+    pub max_bytes: u64,
 }
 
 /// One version of an [`IndexInput`].
