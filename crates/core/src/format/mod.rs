@@ -4,11 +4,23 @@
 //! **object-safe**: no generic methods, no `Self`-typed returns. Parsing reads
 //! from a `&mut dyn ReadSeek` (formats such as ZIP-based NuGet packages need to
 //! seek), keeping the trait usable both with files and in-memory cursors.
+//!
+//! Every format is a crate under `crates/formats/<id>/` implementing
+//! [`FormatSpec`](forge_format_api::FormatSpec) (crate `forge-format-api`):
+//! its identity rules, its package parser and its client protocol.
+//! [`SpecFormat`] adapts one to `Format`, so hosted publishing, reads, groups
+//! and retention work for it unchanged, and [`descriptor::check`] checks
+//! what the formats say about themselves.
+
+pub mod descriptor;
+mod spec;
+
+pub use spec::{SpecFormat, UploadFormat};
 
 use std::cmp::Ordering;
 
-pub use forge_plugin_api::VersionClass;
-use forge_plugin_api::{FetchResult, Remote, UpstreamOp, UpstreamStep};
+pub use forge_format_api::VersionClass;
+use forge_format_api::{FetchResult, Remote, UpstreamOp, UpstreamStep};
 
 use crate::domain::{FormatError, ParsedUpload};
 
@@ -66,8 +78,9 @@ pub trait Format: Send + Sync {
 
     /// [`Self::parse_upload`] for a package staged on disk at `path` (what
     /// the hosted publish path parses). The default opens the file and reads
-    /// it through `parse_upload`; a format that needs the file itself (a
-    /// format plugin lends it to its sandbox) overrides it.
+    /// it through `parse_upload`; a format that needs the file itself
+    /// ([`SpecFormat`], through `FormatSpec::parse_package_file`) overrides
+    /// it.
     fn parse_upload_file(&self, path: &std::path::Path) -> Result<ParsedUpload, FormatError> {
         let mut file = std::fs::File::open(path)?;
         self.parse_upload(&mut file)
@@ -94,7 +107,7 @@ pub trait Format: Send + Sync {
     /// Retention: the class of a **normalized** version (release, prerelease
     /// or snapshot). The default is SemVer's rule: a version with a `-` is a
     /// prerelease (build metadata is gone once normalized), any other a
-    /// release. See [`forge_plugin_api::FormatPlugin::version_class`].
+    /// release. See [`forge_format_api::FormatSpec::version_class`].
     fn version_class(&self, version: &str) -> VersionClass {
         if version.contains('-') {
             VersionClass::Prerelease
@@ -105,7 +118,7 @@ pub trait Format: Send + Sync {
 
     /// Retention: the partition of package `id`'s versions within which the
     /// keep-N rules count; `None` (the default) keeps the whole package one
-    /// partition. See [`forge_plugin_api::FormatPlugin::retention_partition`].
+    /// partition. See [`forge_format_api::FormatSpec::retention_partition`].
     fn retention_partition(&self, id: &str, version: &str) -> Option<String> {
         let _ = (id, version);
         None
@@ -145,9 +158,9 @@ pub trait Format: Send + Sync {
 
     /// The fields of [`Self::manifest_summary`] of which a hosted repository
     /// holds a bounded number of distinct values
-    /// ([`forge_plugin_api::FormatPlugin::summary_caps`]): a publish or an
+    /// ([`forge_format_api::FormatSpec::summary_caps`]): a publish or an
     /// import that would add a value past one is refused. None by default.
-    fn summary_caps(&self) -> &'static [forge_plugin_api::SummaryCap] {
+    fn summary_caps(&self) -> &'static [forge_format_api::SummaryCap] {
         &[]
     }
 
@@ -205,7 +218,7 @@ pub trait Format: Send + Sync {
     }
 
     /// One step of the upstream side of a proxy repository
-    /// ([`forge_plugin_api::FormatPlugin::upstream`]): what to fetch from
+    /// ([`forge_format_api::FormatSpec::upstream`]): what to fetch from
     /// `remote` for `op`, or what came of it. The proxy read path
     /// ([`crate::repo::proxy::ProxyRepo`]) performs the fetches and calls
     /// again with everything fetched so far. The default has no upstream: a

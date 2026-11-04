@@ -268,23 +268,23 @@ password: `docker login localhost:8421 -u admin@example.com`, then
 `docker push localhost:8421/docker-hosted/team/app:1`. See
 [docs/docker.md](docs/docker.md).
 
-Raw repositories (`"format":"raw"`, the built-in plugin `crates/formats/raw`)
+Raw repositories (`"format":"raw"`, the format crate `crates/formats/raw`)
 hold files under arbitrary paths, served under `/repository/`: `curl -u
 admin@example.com:<token> --upload-file x.tgz
 localhost:8421/repository/binaries/tools/x.tgz`, a proxy of any HTTP(S) base URL
 (`"remote_url":"https://github.com/<owner>/<repo>/releases/download/"`), and
 groups. See [docs/raw.md](docs/raw.md).
 
-### Repositories of other formats (format plugins)
+### Repositories of other formats
 
-Every format is a format plugin, a crate in
+Every format is a crate in
 [`crates/formats/`](./crates/formats) linked into the server (see
 [docs/format-plugins.md](./docs/format-plugins.md)): Docker / OCI, NuGet, npm,
 raw and apt. A new format goes in `crates/formats/<id>` too, never in a
 `crates/format-<id>` crate or the server. Docker / OCI is an images format,
-served under `/v2` over the server's image store. A repository of a plugin
-format is created with `"format": "<id>"` (hosted, proxy or group, the kinds
-the format's descriptor lists: apt has no groups) and served under
+served under `/v2` over the server's image store. A repository of a format
+is created with `"format": "<id>"` (hosted, proxy or group, the kinds the
+format's descriptor lists: apt has no groups) and served under
 `/repository/<name>/`. Helm charts are pushed to docker repositories, see
 [docs/docker.md](docs/docker.md#helm-charts).
 
@@ -1146,7 +1146,7 @@ URLs to local test servers are on purpose, and an alert for each would only
 be dismissed by hand. The configuration's `paths-ignore` leaves out the test
 directories (`**/tests`, `crates/e2e`, `web/e2e`), the web UI's
 `*.test.ts(x)` and test runner configuration, the `testing` helpers of
-`crates/plugin` and `crates/plugin-api`, and `fixtures/`. The unit tests
+`crates/format-api`, and `fixtures/`. The unit tests
 inside the Rust source files (`#[cfg(test)] mod tests`) cannot be left out by
 path; the Rust extractor compiles the code with `cfg(test)` off instead
 (`CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES=-test`), as a release build

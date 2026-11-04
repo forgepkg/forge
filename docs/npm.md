@@ -11,7 +11,7 @@ logins. Repositories of `format: "npm"` are served at
 - **group**: one registry URL over several members, which keeps your scopes
   internal and passes `npm audit` on to the public registry.
 
-npm is a format plugin built into Forge ([`crates/formats/npm`](../crates/formats/npm),
+npm is a format crate built into Forge ([`crates/formats/npm`](../crates/formats/npm),
 [format-plugins.md](format-plugins.md)): tarballs are blobs in the
 content-addressed store, and repositories, access levels, package selectors,
 retention and the web UI are the same as for every other format.

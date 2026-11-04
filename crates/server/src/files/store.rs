@@ -1,7 +1,7 @@
 //! Changing the files of a hosted repository: receiving a multipart form
 //! (the `form` query), storing files from the request body or the form's
-//! parts (`store`), and deleting a file (`remove`), for the format's plugin
-//! and for the web UI.
+//! parts (`store`), and deleting a file (`remove`), for the format and for
+//! the web UI.
 //!
 //! An upload is streamed to the staging directory under the repository's
 //! upload limit, hashed on the way (SHA-256 and SHA-512 by the CAS, SHA-1
@@ -23,7 +23,7 @@ use forge_core::authz::Level;
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::{DeploymentPolicy, RepoKind, Repository};
 use forge_db::raw_dao::{self, NewRawFile, Redeploy, StoreOutcome};
-use forge_plugin::api::files;
+use forge_format_api::files;
 use forge_storage::{CasError, StagedBlob, StoredBlob};
 use futures_util::{Stream, TryStreamExt};
 use md5::Md5;

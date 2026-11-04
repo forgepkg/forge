@@ -2,8 +2,8 @@
 //!
 //! A proxy repository mirrors the upstream named by `repository.remote_url`.
 //! What the upstream speaks is its format's business: the format's upstream
-//! protocol ([`Format::upstream`], a format plugin's
-//! [`forge_plugin_api::FormatPlugin::upstream`]) says which documents to fetch
+//! protocol ([`Format::upstream`], a format's
+//! [`forge_format_api::FormatSpec::upstream`]) says which documents to fetch
 //! for an operation and reads them; this module performs every request,
 //! content-addresses package bytes through the [`Cas`], and records a
 //! `proxy_cached_version` row so future reads are served locally. Everything
@@ -27,8 +27,8 @@
 //!   `remote_url` or to an origin an absolute URL names in a document fetched
 //!   from the upstream for the same conversation, or while resolving its
 //!   index ([`crate::net::origins`]). Anything else is not sent: a format
-//!   plugin may be code from elsewhere, and must not turn the proxy into a
-//!   way to read the services around Forge (#233).
+//!   may be code from elsewhere, and must not turn the proxy into a way to
+//!   read the services around Forge (#233).
 //! * **NO advisory locks, no DB transaction across network I/O** — first-time
 //!   fetch singleflight is a plain row lock:
 //!   [`proxy_dao::insert_unconfirmed_cached_version`] (INSERT … ON CONFLICT DO NOTHING) to
@@ -156,7 +156,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use forge_plugin_api as api;
+use forge_format_api as api;
 use forge_telemetry::proxy::{DocumentSource, Kind as LookupKind, Lookup, Outcome};
 use tracing::Instrument;
 
@@ -655,7 +655,7 @@ impl ProxyRepo {
     /// far, until the format answers. `index` is the resolved upstream index
     /// (`None` while resolving it). Bounded to [`MAX_UPSTREAM_ROUNDS`] rounds
     /// and [`MAX_UPSTREAM_FETCHES`] fetches; the format runs off the async
-    /// workers, as a format plugin may take its time.
+    /// workers, as a format may take its time.
     ///
     /// The documents fetched are kept up to [`CONVERSATION_BUDGET_DOCUMENTS`]
     /// × `proxy.max_metadata_bytes` in all: a document past that is dropped

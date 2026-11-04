@@ -367,7 +367,7 @@ pub fn snapshot(state: &AppState) -> live::Snapshot {
 /// extension); this is what a request is counted under without one.
 fn surface_of(path: &str) -> Surface {
     let under = |prefix| is_under(path, prefix);
-    if under(forge_plugin::api::IMAGES_MOUNT) {
+    if under(forge_format_api::IMAGES_MOUNT) {
         Surface::Oci
     } else if under("/repository") {
         Surface::Repository

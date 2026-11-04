@@ -136,9 +136,9 @@ use forge_crypto::PlaintextSecret;
 use forge_db::import_dao::{self, ImportItem, NewItem, RepositoryImport};
 use forge_db::model::{DeploymentPolicy, Repository};
 use forge_db::{component_dao, raw_dao, repository_dao, secret_dao, tag_dao, user_dao};
-use forge_plugin::api::files;
-use forge_plugin::api::images::ImageError;
-use forge_plugin::api::VersionMetadata;
+use forge_format_api::files;
+use forge_format_api::images::ImageError;
+use forge_format_api::VersionMetadata;
 use forge_storage::StagedBlob;
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
@@ -1923,7 +1923,7 @@ impl Run<'_> {
             .target
             .as_deref()
             .ok_or("the source names no version for this dist-tag")?;
-        if !crate::plugins::valid_tag(tag) {
+        if !crate::formats::valid_tag(tag) {
             return Err(format!("{tag:?} is no dist-tag Forge stores"));
         }
         let tags = tag_dao::tags(pool, ctx.repo.id, &item.name)

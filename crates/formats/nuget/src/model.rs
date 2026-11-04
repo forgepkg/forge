@@ -1,7 +1,7 @@
 //! NuGet's limits, errors and parsed-package types.
 //!
 //! They mirror the format-neutral types Forge stores, and convert into the
-//! plugin contract's at the [`forge_plugin_api::FormatPlugin`] boundary.
+//! format contract's at the [`forge_format_api::FormatSpec`] boundary.
 
 use thiserror::Error;
 
@@ -68,9 +68,9 @@ pub enum FormatError {
     Io(#[from] std::io::Error),
 }
 
-impl From<FormatError> for forge_plugin_api::FormatError {
+impl From<FormatError> for forge_format_api::FormatError {
     fn from(e: FormatError) -> Self {
-        use forge_plugin_api::FormatError as E;
+        use forge_format_api::FormatError as E;
         match e {
             FormatError::InvalidPackage(m) => E::InvalidPackage(m),
             FormatError::MissingManifest(m) => E::MissingManifest(m),
@@ -83,14 +83,14 @@ impl From<FormatError> for forge_plugin_api::FormatError {
     }
 }
 
-impl From<DependencyGroup> for forge_plugin_api::DependencyGroup {
+impl From<DependencyGroup> for forge_format_api::DependencyGroup {
     fn from(g: DependencyGroup) -> Self {
-        forge_plugin_api::DependencyGroup {
+        forge_format_api::DependencyGroup {
             target: g.target_framework,
             dependencies: g
                 .dependencies
                 .into_iter()
-                .map(|d| forge_plugin_api::Dependency {
+                .map(|d| forge_format_api::Dependency {
                     id: d.id,
                     range: d.range,
                 })
@@ -99,9 +99,9 @@ impl From<DependencyGroup> for forge_plugin_api::DependencyGroup {
     }
 }
 
-impl From<ParsedNupkg> for forge_plugin_api::ParsedPackage {
+impl From<ParsedNupkg> for forge_format_api::ParsedPackage {
     fn from(p: ParsedNupkg) -> Self {
-        forge_plugin_api::ParsedPackage {
+        forge_format_api::ParsedPackage {
             id: p.id,
             original_id: p.original_id,
             version: p.version,

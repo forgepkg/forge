@@ -1,4 +1,4 @@
-//! The host side of the plugin contract, through a small native test plugin
+//! The host side of the format contract, through a small test format
 //! (`probe`) that serves the shared repository path and reports what the host answers:
 //! kinds, asset names, first-part uploads, ranged downloads, the
 //! queries (`packages-of`, search options, publish times, summaries,
@@ -11,8 +11,8 @@ use std::io::Read;
 use std::sync::Arc;
 
 use common::{start_with, unique, ServerOpts, TestServer};
-use forge_plugin::api::{
-    Action, Answer, Assets, ChangeRequest, Descriptor, FormatError, FormatPlugin, Loaded,
+use forge_format_api::{
+    Action, Answer, Assets, ChangeRequest, Descriptor, FormatError, FormatSpec, Loaded,
     PackageInfo, PackageRef, PackageSource, PackageVersions, ParsedPackage, PublishRequest, Query,
     Repository, RepositoryKind, Request, Response, SearchQuery, Storage, Upload, UpstreamToken,
 };
@@ -33,7 +33,7 @@ const PROBE: Descriptor = Descriptor {
     },
     upstream_token: UpstreamToken::None,
     options: &[],
-    prereleases: forge_plugin::api::Prereleases::Dash,
+    prereleases: forge_format_api::Prereleases::Dash,
     indexes: false,
 };
 
@@ -58,7 +58,7 @@ fn package_info_json(p: &PackageInfo) -> Value {
     })
 }
 
-impl FormatPlugin for Probe {
+impl FormatSpec for Probe {
     fn descriptor(&self) -> &'static Descriptor {
         &PROBE
     }
@@ -204,7 +204,7 @@ async fn start_probe(extra_toml: Option<String>) -> TestServer {
         common::pool().await,
         ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
-            extra_plugins: vec![Arc::new(Probe)],
+            extra_specs: vec![Arc::new(Probe)],
             extra_toml,
             ..Default::default()
         },
@@ -340,7 +340,7 @@ async fn every_non_docker_format_is_served_under_the_repository_prefix() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(resp.text().await.unwrap(), "repository is not served here");
 
-    // Only the kinds the plugin names.
+    // Only the kinds the format names.
     let resp = create_repo(
         &srv,
         json!({ "name": format!("g{}", unique()), "kind": "group", "format": "probe" }),
@@ -377,9 +377,10 @@ async fn every_non_docker_format_is_served_under_the_repository_prefix() {
     assert!(nuget.get("mount").is_none());
 }
 
-/// A repository of a format the server does not have (its plugin removed
-/// since) answers 503 under a plugin's mount, and so does an administrator's
-/// delete of one of its versions: it is never read as another format.
+/// A repository of a format the server does not have (its format crate
+/// removed since) answers 503 under a format's mount, and so does an
+/// administrator's delete of one of its versions: it is never read as another
+/// format.
 #[tokio::test]
 async fn a_repository_whose_format_is_missing_is_unavailable() {
     let srv = start_probe(None).await;
@@ -450,7 +451,7 @@ async fn uploads_take_the_first_part_and_assets_their_names() {
     assert_eq!(resp.headers()["content-type"], "application/x-probe");
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"Demo 1.0.0\nbody");
 
-    // Stored under the plugin's asset names.
+    // Stored under the format's asset names.
     let paths: Vec<String> = sqlx::query_scalar(
         "SELECT a.path FROM asset a JOIN component c ON c.id = a.component_id \
          JOIN repository r ON r.id = c.repository_id WHERE r.name = $1 ORDER BY a.path",
@@ -734,12 +735,12 @@ async fn mutations_outside_the_selector_are_unknown() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// The probe is a valid built-in plugin; nothing in it relies on the server.
+/// The probe is a valid format; nothing in it relies on the server.
 #[test]
-fn the_probe_is_a_plugin() {
-    let plugin: Arc<dyn FormatPlugin> = Arc::new(Probe);
+fn the_probe_is_a_valid_format() {
+    let spec: Arc<dyn FormatSpec> = Arc::new(Probe);
     assert_eq!(
-        forge_plugin::descriptor::check(&[plugin.descriptor()]),
+        forge_core::format::descriptor::check(&[spec.descriptor()]),
         Ok(())
     );
 }

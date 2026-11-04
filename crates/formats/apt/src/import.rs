@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 
-use forge_plugin_api::files;
+use forge_format_api::files;
 use sha2::{Digest, Sha256};
 
 use crate::control::{known_architecture, valid_component, valid_package_name, Paragraph};

@@ -22,12 +22,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use forge_format_npm::proxy::FULL_ACCEPT;
-use forge_format_npm::{version, Npm};
-use forge_plugin_api::testing::converse;
-use forge_plugin_api::{
+use forge_format_api::testing::converse;
+use forge_format_api::{
     Fetch, Fetched, PackageRef, PackageVersions, Remote, UpstreamAnswer, UpstreamOp,
 };
+use forge_format_npm::proxy::FULL_ACCEPT;
+use forge_format_npm::{version, Npm};
 
 struct Counting;
 

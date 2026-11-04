@@ -1,4 +1,4 @@
-//! The upstream side of npm proxies ([`FormatPlugin::upstream`]): reading
+//! The upstream side of npm proxies ([`FormatSpec::upstream`]): reading
 //! another registry's packuments, tarball locations and search.
 //!
 //! A package's listing, its tags, its tarballs and its versions' summaries
@@ -18,11 +18,11 @@
 //! from the version's own document (`{remote}/{name}/{version}`), without a
 //! README.
 //!
-//! [`FormatPlugin::upstream`]: forge_plugin_api::FormatPlugin::upstream
+//! [`FormatSpec::upstream`]: forge_format_api::FormatSpec::upstream
 
 use std::collections::HashSet;
 
-use forge_plugin_api::{
+use forge_format_api::{
     Fetch, FetchResult, Fetched, Freshness, PackageLocation, PackageMetadata, PackageRef, Remote,
     SearchQuery, Tag, UpstreamAnswer, UpstreamHit, UpstreamOp, UpstreamSearch, UpstreamStep,
     VersionMetadata,
@@ -430,8 +430,8 @@ fn search(remote: &Remote, query: &SearchQuery, fetched: &[FetchResult]) -> Upst
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_plugin_api::testing::converse;
-    use forge_plugin_api::FormatPlugin;
+    use forge_format_api::testing::converse;
+    use forge_format_api::FormatSpec;
     use serde_json::json;
 
     fn remote() -> Remote {
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn dates_versions_for_the_package_delay() {
-        let (answer, _) = run(UpstreamOp::Dating(forge_plugin_api::PackageVersions {
+        let (answer, _) = run(UpstreamOp::Dating(forge_format_api::PackageVersions {
             id: "@acme/ui".into(),
             versions: vec!["1.1.0".into()],
         }));
@@ -597,7 +597,7 @@ mod tests {
         let conversed = converse(
             &crate::Npm::default(),
             &remote(),
-            &UpstreamOp::Dating(forge_plugin_api::PackageVersions {
+            &UpstreamOp::Dating(forge_format_api::PackageVersions {
                 id: "@acme/ui".into(),
                 versions: vec!["1.0.0".into(), "1.1.0".into()],
             }),
@@ -626,7 +626,7 @@ mod tests {
         let conversed = converse(
             &crate::Npm::default(),
             &remote(),
-            &UpstreamOp::Dating(forge_plugin_api::PackageVersions {
+            &UpstreamOp::Dating(forge_format_api::PackageVersions {
                 id: "@acme/ui".into(),
                 versions: vec!["1.0.0".into()],
             }),

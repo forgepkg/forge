@@ -1,14 +1,13 @@
 //! `GET /admin/formats` — the package formats this server can create
-//! repositories of: the format plugins (Docker / OCI, NuGet, npm, raw files,
-//! apt),
-//! each as its descriptor describes it.
+//! repositories of (Docker / OCI, NuGet, npm, raw files, apt), each as its
+//! descriptor describes it.
 
 use axum::extract::State;
 use axum::response::{IntoResponse, Json, Response};
 use std::sync::Arc;
 
-use forge_plugin::api::Storage;
-use forge_plugin::FormatPlugin;
+use forge_format_api::FormatSpec;
+use forge_format_api::Storage;
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -62,12 +61,12 @@ pub struct OptionView {
 pub async fn list(State(state): State<AppState>) -> Response {
     let kinds = |id: &str| state.formats.kinds(id).unwrap_or_default();
     let ceiling = state.config.max_repository_upload_bytes();
-    let view = |plugin: &Arc<dyn FormatPlugin>| {
-        let descriptor = plugin.descriptor();
+    let view = |spec: &Arc<dyn FormatSpec>| {
+        let descriptor = spec.descriptor();
         FormatView {
-            id: plugin.id().to_string(),
+            id: spec.id().to_string(),
             name: descriptor.name.to_string(),
-            kinds: kinds(plugin.id()),
+            kinds: kinds(spec.id()),
             storage: descriptor.storage.as_str(),
             description: descriptor.description.to_string(),
             default_max_upload_bytes: state.config.default_upload_limit(descriptor.storage),
@@ -88,8 +87,8 @@ pub async fn list(State(state): State<AppState>) -> Response {
             signed_indexes: descriptor.indexes,
         }
     };
-    let mut plugins: Vec<_> = state.formats.plugins().collect();
-    plugins.sort_by_key(|p| {
+    let mut specs: Vec<_> = state.formats.specs().collect();
+    specs.sort_by_key(|p| {
         let group = match p.descriptor().storage {
             _ if p.id() == "nuget" => 0,
             Storage::Images => 1,
@@ -97,6 +96,6 @@ pub async fn list(State(state): State<AppState>) -> Response {
         };
         (group, p.id())
     });
-    let formats: Vec<FormatView> = plugins.into_iter().map(view).collect();
+    let formats: Vec<FormatView> = specs.into_iter().map(view).collect();
     Json(formats).into_response()
 }

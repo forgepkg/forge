@@ -1,13 +1,13 @@
 //! The raw protocol against canned answers: what each request asks of the
 //! host, round by round, and what it answers.
 
-use forge_format_raw::Raw;
-use forge_plugin_api::testing::{repository, serve};
-use forge_plugin_api::{
+use forge_format_api::testing::{repository, serve};
+use forge_format_api::{
     Action, Answer, DirectoryEntry, DirectoryPage, DirectoryQuery, FileInfo, FileSource,
     FormContent, FormFile, FormPart, NewFile, Query, RepositoryKind, Request, StoreStatus,
     StoredFile,
 };
+use forge_format_raw::Raw;
 
 fn file(path: &str) -> FileInfo {
     FileInfo {
@@ -23,7 +23,7 @@ fn file(path: &str) -> FileInfo {
     }
 }
 
-fn hosted() -> forge_plugin_api::Repository {
+fn hosted() -> forge_format_api::Repository {
     repository(RepositoryKind::Hosted)
 }
 

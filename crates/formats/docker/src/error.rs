@@ -2,8 +2,8 @@
 //! `{"errors":[{"code","message","detail"}]}`, for the errors of the
 //! protocol and for what the host refused or failed ([`ImageError`]).
 
-use forge_plugin_api::images::{ImageError, Permission};
-use forge_plugin_api::Response;
+use forge_format_api::images::{ImageError, Permission};
+use forge_format_api::Response;
 use serde_json::{json, Value};
 
 /// The error codes of the distribution spec (plus Docker's `UNAVAILABLE`).

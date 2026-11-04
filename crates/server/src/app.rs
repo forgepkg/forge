@@ -123,7 +123,7 @@ pub fn principal_layer(state: &AppState) -> anyhow::Result<PrincipalLayer> {
 /// * `/browse/...` — read-side browse / search (signed-in users only; per-repo
 ///   read authz enforced inside the handlers).
 /// * `/repository/{repo}/...` — repositories of every non-Docker format,
-///   each served by its format's plugin ([`crate::plugins`]).
+///   each served by its format ([`crate::formats`]).
 /// * everything else — the SPA, whose admin screens live under `/manage/*`
 ///   (see [`crate::web_ui`]).
 ///
@@ -162,9 +162,9 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     // The registry of the images format (Docker / OCI) under its mount,
     // `/v2`: clients always talk to `/v2/` at the host root; the registry
     // resolves repositories from the name (or the host) itself.
-    let images = state.formats.images_plugin();
+    let images = state.formats.images_spec();
     if images.is_some() {
-        let mount = forge_plugin::api::IMAGES_MOUNT;
+        let mount = forge_format_api::IMAGES_MOUNT;
         app = app
             .route(mount, any(crate::registry::registry))
             .route(&format!("{mount}/"), any(crate::registry::registry))
@@ -176,11 +176,11 @@ pub fn build_router(state: AppState, layer: PrincipalLayer) -> Router {
     // Every non-Docker repository shares this prefix. `any` covers
     // GET/HEAD/PUT/POST/DELETE; the dispatcher authorizes per method.
     app = app
-        .route("/repository/{repo}", any(crate::plugins::dispatch))
+        .route("/repository/{repo}", any(crate::formats::dispatch))
         // A wildcard matches no empty rest: a files format's root listing
         // needs its own route.
-        .route("/repository/{repo}/", any(crate::plugins::dispatch))
-        .route("/repository/{repo}/{*rest}", any(crate::plugins::dispatch));
+        .route("/repository/{repo}/", any(crate::formats::dispatch))
+        .route("/repository/{repo}/{*rest}", any(crate::formats::dispatch));
 
     // Static SPA fallback, installed LAST so the API routers above always win
     // and only genuine UI paths fall through to `index.html`. The admin UI
@@ -295,7 +295,7 @@ async fn response_policy(
     hsts: bool,
     feeds: std::sync::Arc<Vec<String>>,
     base_urls: Arc<crate::base_urls::BaseUrls>,
-    images: Option<std::sync::Arc<dyn forge_plugin::FormatPlugin>>,
+    images: Option<std::sync::Arc<dyn forge_format_api::FormatSpec>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -305,7 +305,7 @@ async fn response_policy(
     let feed = feeds.iter().any(|mount| under(mount));
     let registry = images
         .as_ref()
-        .filter(|_| under(forge_plugin::api::IMAGES_MOUNT));
+        .filter(|_| under(forge_format_api::IMAGES_MOUNT));
     // The registry's challenge names the host the request addressed when
     // it is an alias, as the registry's own do.
     let registry_base = registry.map(|_| {
@@ -356,7 +356,7 @@ async fn response_policy(
 /// one stored before the alias was configured (or by an instance without
 /// it).
 pub async fn check_alias_hosts(state: &AppState) -> anyhow::Result<()> {
-    let Some(images) = state.formats.images_plugin() else {
+    let Some(images) = state.formats.images_spec() else {
         return Ok(());
     };
     for alias in state.base_urls.aliases() {

@@ -17,11 +17,11 @@ use forge_core::authz::{Level, PackageFilter};
 use forge_core::repo::{PackageMutation, PublishAuthorizationContext, WriteError};
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, LinkOutcome, NewManifest, TagWrite, UploadRow};
-use forge_plugin::api::images::{
+use forge_format_api::images::{
     BlobInfo, ChunkRange, ImageError, ParsedManifest, Reference, Started, StoredManifest,
     UploadState, MAX_MANIFEST_BYTES,
 };
-use forge_plugin::api::FormatError;
+use forge_format_api::FormatError;
 use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
@@ -449,7 +449,7 @@ impl Registry {
         manifest: &[u8],
         content_type: Option<&str>,
     ) -> ImgResult<ParsedManifest> {
-        self.plugin()
+        self.spec()
             .parse_manifest(manifest, content_type)
             .map_err(|e| match e {
                 FormatError::Internal(m) => Failure::internal("manifest parse", m),
@@ -704,7 +704,7 @@ impl Registry {
         media_type: &str,
         config: &[u8],
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let part = self.plugin().config_summary(media_type, config)?;
+        let part = self.spec().config_summary(media_type, config)?;
         match serde_json::from_str(&part) {
             Ok(serde_json::Value::Object(part)) => Some(part),
             _ => {

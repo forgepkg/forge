@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use forge_core::auth::Principal;
 use forge_core::authz::Level;
 use forge_db::model::RepoKind;
-use forge_plugin::api::images::ImageError;
+use forge_format_api::images::ImageError;
 
 use super::dispatch::{mutation_credential, Caller, Site};
 use super::token::{self, Access, Claims, TokenPrincipal};
@@ -137,7 +137,7 @@ impl Registry {
         name: &str,
         requested: &[String],
     ) -> Vec<String> {
-        if self.plugin().validate_id(name).is_err() {
+        if self.spec().validate_id(name).is_err() {
             return Vec::new();
         }
         let Ok(Some(target)) = self.resolve(site, name).await else {

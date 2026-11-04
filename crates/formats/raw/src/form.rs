@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use forge_plugin_api::files;
-use forge_plugin_api::{
+use forge_format_api::files;
+use forge_format_api::{
     Action, Answer, FileSource, FormContent, FormPart, Loaded, NewFile, Query, Response,
     StoreStatus, StoredFile,
 };
@@ -113,7 +113,7 @@ fn stored(files: &[StoredFile]) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_plugin_api::FormFile;
+    use forge_format_api::FormFile;
 
     fn file(field: &str, name: &str) -> FormPart {
         FormPart {

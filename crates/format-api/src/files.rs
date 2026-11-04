@@ -10,8 +10,8 @@
 //! path that needs normalizing is refused, so there is exactly one spelling
 //! of every stored path.
 //!
-//! The host refuses every path a plugin names that breaks these rules
-//! ([`validate_path`], [`validate_directory`]); a plugin parses its requests
+//! The host refuses every path a format names that breaks these rules
+//! ([`validate_path`], [`validate_directory`]); a format parses its requests
 //! with [`parse_request`] to refuse them with the reason.
 
 use std::fmt;

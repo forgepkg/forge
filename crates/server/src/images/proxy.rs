@@ -30,9 +30,9 @@ use forge_core::net::upstream::{Origin, RequestClass, UpstreamHttp};
 use forge_core::repo::proxy::{upstream_credentials, Credentials};
 use forge_db::model::Repository;
 use forge_db::oci_dao::{self, LinkOutcome};
-use forge_plugin::api::images::ImageError;
-use forge_plugin::api::images::{ImageUrl, ManifestInfo, Reference, TagPage, MAX_MANIFEST_BYTES};
-use forge_plugin::api::{
+use forge_format_api::images::ImageError;
+use forge_format_api::images::{ImageUrl, ManifestInfo, Reference, TagPage, MAX_MANIFEST_BYTES};
+use forge_format_api::{
     FetchResult, Fetched, FormatError, Remote, UpstreamAnswer, UpstreamOp, UpstreamStep,
 };
 use forge_storage::{BlobRef, StagedBlob};
@@ -458,7 +458,7 @@ impl Upstream {
         let mut fetched: Vec<FetchResult> = Vec::new();
         for _ in 0..MAX_UPSTREAM_ROUNDS {
             let step = reg
-                .plugin()
+                .spec()
                 .upstream(&remote, op, &fetched)
                 .map_err(|e| format_failure("upstream", e))?;
             let wanted = match step {
@@ -565,7 +565,7 @@ impl Registry {
             index: None,
             options: Vec::new(),
         };
-        match self.plugin().upstream(&remote, op, &[]) {
+        match self.spec().upstream(&remote, op, &[]) {
             Ok(UpstreamStep::Done(answer)) => Ok(answer),
             Ok(UpstreamStep::Fetch(_)) => Err(Failure::internal(
                 "upstream",

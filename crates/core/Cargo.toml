@@ -13,9 +13,10 @@ forge-cache = { path = "../cache" }
 # Secret encryption at rest: the proxy upstream fetch decrypts the
 # upstream password through the envelope service (the single sanctioned site).
 forge-crypto = { path = "../crypto" }
-# The format-plugin contract: the upstream conversation of proxy repositories
-# (`Format::upstream`) speaks its types. Nothing but std.
-forge-plugin-api = { path = "../plugin-api" }
+# The contract every format implements (`FormatSpec`): the upstream
+# conversation of proxy repositories (`Format::upstream`) speaks its types, and
+# `format::SpecFormat` adapts a format to `Format`. Nothing but std.
+forge-format-api = { path = "../format-api" }
 forge-telemetry = { path = "../telemetry" }
 
 tokio = { workspace = true }
@@ -73,10 +74,8 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "net", "test-util"] }
-# NuGet, the format most integration tests use: the built-in plugin and its
-# Format (a dev-only cycle through forge-plugin, which Cargo permits).
+# NuGet, the format most integration tests use.
 forge-format-nuget = { path = "../formats/nuget" }
-forge-plugin = { path = "../plugin" }
 argon2 = { workspace = true, features = ["password-hash"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 testcontainers = "0.27"

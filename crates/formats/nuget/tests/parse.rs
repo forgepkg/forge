@@ -5,8 +5,8 @@
 use std::fs::File;
 use std::path::PathBuf;
 
+use forge_format_api::{FormatError, FormatSpec};
 use forge_format_nuget::{Nuget, NupkgLimits};
-use forge_plugin_api::{FormatError, FormatPlugin};
 
 fn fixture(name: &str) -> File {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -1,17 +1,17 @@
 //! The upstream side of NuGet proxies, without a server: each operation run
-//! through `forge_plugin_api::testing::converse` against canned upstream
+//! through `forge_format_api::testing::converse` against canned upstream
 //! documents. The host's proxy read path (`forge-core`'s `proxy_read` tests)
 //! covers what it does with the answers.
 
 use std::collections::BTreeMap;
 
-use forge_format_nuget::upstream::Resources;
-use forge_format_nuget::Nuget;
-use forge_plugin_api::testing::{converse, Conversed};
-use forge_plugin_api::{
+use forge_format_api::testing::{converse, Conversed};
+use forge_format_api::{
     Fetch, Fetched, Freshness, PackageRef, PackageVersions, Remote, SearchQuery, UpstreamAnswer,
     UpstreamOp,
 };
+use forge_format_nuget::upstream::Resources;
+use forge_format_nuget::Nuget;
 use serde_json::{json, Value};
 
 const FEED: &str = "https://up.example/v3/index.json";

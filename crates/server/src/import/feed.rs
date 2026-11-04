@@ -23,7 +23,7 @@ use forge_core::format::Format;
 use forge_core::net::origins::{named_origins, UpstreamOrigins};
 use forge_core::net::upstream::{Origin, RequestClass, UpstreamAuth, UpstreamError, UpstreamHttp};
 use forge_crypto::{ExposeSecret, PlaintextSecret};
-use forge_plugin::api::{
+use forge_format_api::{
     FetchResult, Fetched, PackageRef, PackageVersions, Remote, UpstreamAnswer, UpstreamOp,
     UpstreamStep, VersionMetadata,
 };

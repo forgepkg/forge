@@ -5,11 +5,11 @@
 //! The host has resolved the name, authorized the request and picked where
 //! a change lands; the request's path is the endpoint after the name.
 
-use forge_plugin_api::images::{
+use forge_format_api::images::{
     ChunkRange, ImageAnswer, ImageError, ImageName, ImageQuery, ManifestInfo, Mount, Reference,
     Started, UploadState,
 };
-use forge_plugin_api::{Action, Answer, Loaded, Query, Request, Response};
+use forge_format_api::{Action, Answer, Loaded, Query, Request, Response};
 use serde_json::{json, Value};
 
 use crate::digest::{Digest, DigestError};

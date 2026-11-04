@@ -37,11 +37,11 @@ use forge_core::net::upstream::RequestClass;
 use forge_core::repo::proxy::Credentials;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::oci_dao::{self, LinkOutcome, TagWrite};
-use forge_plugin::api::images::{
+use forge_format_api::images::{
     CatalogPage, ImageError, ManifestBlob, ManifestInfo, ParsedManifest, Reference, TagPage,
     MAX_MANIFEST_BYTES,
 };
-use forge_plugin::api::{UpstreamAnswer, UpstreamOp};
+use forge_format_api::{UpstreamAnswer, UpstreamOp};
 use reqwest::Method;
 
 use super::digest::ContentDigest;
@@ -459,7 +459,7 @@ impl Registry {
                 "images are imported into a hosted docker repository",
             ));
         }
-        if self.plugin().validate_id(image).is_err() {
+        if self.spec().validate_id(image).is_err() {
             return Err(Failure::new(ImageError::NameInvalid {
                 name: image.to_string(),
                 hint: None,
@@ -468,7 +468,7 @@ impl Registry {
         if !self.rbac_allows(principal, repo, image, Level::Write).await {
             return Err(Failure::new(ImageError::Denied {
                 name: image.to_string(),
-                permission: forge_plugin::api::images::Permission::Write,
+                permission: forge_format_api::images::Permission::Write,
             })
             .with_text(format!("the import may not push the image {image:?}")));
         }

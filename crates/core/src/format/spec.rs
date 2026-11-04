@@ -1,60 +1,60 @@
-//! [`forge_core::Format`] for a format plugin.
+//! [`Format`] for a [`FormatSpec`].
 
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
 
-use forge_core::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
+use crate::domain::{Dependency, DependencyGroup, FormatError, ParsedUpload};
 use std::sync::OnceLock;
 
-use forge_core::format::{Format, ReadSeek};
-use forge_plugin_api::{self as api, Assets, FormatPlugin, Storage, UpstreamToken};
+use crate::format::{Format, ReadSeek};
+use forge_format_api::{self as api, Assets, FormatSpec, Storage, UpstreamToken};
 
-/// The longest version the host takes from a format plugin, in bytes: a
-/// version to normalize as given, its normalized form, and a parsed
-/// package's version as written and normalized. Versions are stored in the
+/// The longest version the host takes from a format, in bytes: a version to
+/// normalize as given, its normalized form, and a parsed package's version
+/// as written and normalized. Versions are stored in the
 /// `UNIQUE (repository_id, name, version)` indexes of `component` and
 /// `proxy_cached_version`, and PostgreSQL refuses a B-tree index entry
-/// larger than about 2,700 bytes: a plugin without a limit of its own let a
+/// larger than about 2,700 bytes: a format without a limit of its own let a
 /// multi-kilobyte version through to that insert, so a push answered 500
 /// instead of 400, and so did a proxy asked for such a version. 256 is above
-/// NuGet's own limit (64 characters) and,
-/// with [`MAX_ID_LENGTH`], keeps an entry far below PostgreSQL's.
+/// NuGet's own limit (64 characters) and, with [`MAX_ID_LENGTH`], keeps an
+/// entry far below PostgreSQL's.
 const MAX_VERSION_LENGTH: usize = 256;
 
-/// The longest package id the host takes from a format plugin, in bytes:
-/// an id to validate, and a parsed package's id as written and canonical.
-/// Ids share the indexes of [`MAX_VERSION_LENGTH`]. 512 is above NuGet's
-/// own limit (100 characters, at most 400 bytes in UTF-8).
+/// The longest package id the host takes from a format, in bytes: an id to
+/// validate, and a parsed package's id as written and canonical. Ids share
+/// the indexes of [`MAX_VERSION_LENGTH`]. 512 is above NuGet's own limit
+/// (100 characters, at most 400 bytes in UTF-8).
 const MAX_ID_LENGTH: usize = 512;
 
-/// A format plugin as a [`Format`]: what the hosted write path, the read
+/// A [`FormatSpec`] as a [`Format`]: what the hosted write path, the read
 /// ops, the proxy read path and retention work with.
 #[derive(Clone)]
-pub struct PluginFormat {
+pub struct SpecFormat {
     id: &'static str,
-    plugin: Arc<dyn FormatPlugin>,
+    spec: Arc<dyn FormatSpec>,
     assets: Assets,
     storage: Storage,
     upstream_token: UpstreamToken,
 }
 
-impl PluginFormat {
-    /// Adapt `plugin`.
-    pub fn new(plugin: Arc<dyn FormatPlugin>) -> Self {
-        let descriptor = plugin.descriptor();
-        PluginFormat {
+impl SpecFormat {
+    /// Adapt `spec`.
+    pub fn new(spec: Arc<dyn FormatSpec>) -> Self {
+        let descriptor = spec.descriptor();
+        SpecFormat {
             id: descriptor.id,
             assets: descriptor.assets,
             storage: descriptor.storage,
             upstream_token: descriptor.upstream_token,
-            plugin,
+            spec,
         }
     }
 
-    /// The format of one publish through the plugin's protocol: the package
+    /// The format of one publish through the format's protocol: the package
     /// is parsed with the document it came in, when there is one
-    /// ([`FormatPlugin::parse_upload`]; the host sets
+    /// ([`FormatSpec::parse_upload`]; the host sets
     /// [`UploadFormat::document`] once the body is read, before the staged
     /// package is parsed), must have the canonical id `expected_id`, when
     /// one is given, and its identity is recorded in
@@ -75,9 +75,9 @@ impl PluginFormat {
     }
 }
 
-/// See [`PluginFormat::upload`].
+/// See [`SpecFormat::upload`].
 pub struct UploadFormat {
-    format: PluginFormat,
+    format: SpecFormat,
     /// The rest of the document the package came in, for an
     /// [`api::Upload::Document`].
     pub document: Option<Arc<OnceLock<Vec<u8>>>>,
@@ -120,9 +120,9 @@ impl Format for UploadFormat {
                     document,
                     publisher: self.publisher.as_deref(),
                 };
-                self.format.plugin.parse_upload(&upload, &mut file)
+                self.format.spec.parse_upload(&upload, &mut file)
             }
-            None => self.format.plugin.parse_package(&mut file),
+            None => self.format.spec.parse_package(&mut file),
         }
         .map_err(format_error)
         .and_then(parsed_upload)?;
@@ -210,7 +210,7 @@ fn check_version(version: &str) -> Result<(), FormatError> {
     Ok(())
 }
 
-/// A package the plugin parsed, as the host stores it, unless its id or
+/// A package the format parsed, as the host stores it, unless its id or
 /// version is longer than the host takes ([`MAX_ID_LENGTH`],
 /// [`MAX_VERSION_LENGTH`]): a push of it is refused (400).
 fn parsed_upload(parsed: api::ParsedPackage) -> Result<ParsedUpload, FormatError> {
@@ -243,7 +243,7 @@ fn parsed_upload(parsed: api::ParsedPackage) -> Result<ParsedUpload, FormatError
     })
 }
 
-impl Format for PluginFormat {
+impl Format for SpecFormat {
     fn id(&self) -> &'static str {
         self.id
     }
@@ -274,55 +274,55 @@ impl Format for PluginFormat {
 
     fn parse_upload(&self, mut file: &mut dyn ReadSeek) -> Result<ParsedUpload, FormatError> {
         file.rewind()?;
-        self.plugin
+        self.spec
             .parse_package(&mut file)
             .map_err(format_error)
             .and_then(parsed_upload)
     }
 
     fn parse_upload_file(&self, path: &Path) -> Result<ParsedUpload, FormatError> {
-        self.plugin
+        self.spec
             .parse_package_file(path)
             .map_err(format_error)
             .and_then(parsed_upload)
     }
 
-    /// The plugin's normalized form of `raw`, refused when either is longer
+    /// The format's normalized form of `raw`, refused when either is longer
     /// than [`MAX_VERSION_LENGTH`] (a read naming it answers 404).
     fn normalize_version(&self, raw: &str) -> Result<String, FormatError> {
-        // Before the plugin, so an oversized version never reaches it.
+        // Before the format, so an oversized version never reaches it.
         check_version(raw)?;
-        let normalized = self.plugin.normalize_version(raw).map_err(format_error)?;
+        let normalized = self.spec.normalize_version(raw).map_err(format_error)?;
         check_version(&normalized)?;
         Ok(normalized)
     }
 
     fn compare_versions(&self, a: &str, b: &str) -> Ordering {
-        self.plugin.compare_versions(a, b)
+        self.spec.compare_versions(a, b)
     }
 
     fn has_prereleases(&self) -> bool {
-        self.plugin.descriptor().prereleases != api::Prereleases::None
+        self.spec.descriptor().prereleases != api::Prereleases::None
     }
 
     fn lower_id(&self, id: &str) -> String {
-        self.plugin.canonical_id(id)
+        self.spec.canonical_id(id)
     }
 
-    fn version_class(&self, version: &str) -> forge_core::format::VersionClass {
-        self.plugin.version_class(version)
+    fn version_class(&self, version: &str) -> crate::format::VersionClass {
+        self.spec.version_class(version)
     }
 
     fn retention_partition(&self, id: &str, version: &str) -> Option<String> {
-        self.plugin.retention_partition(id, version)
+        self.spec.retention_partition(id, version)
     }
 
-    /// Whether the plugin takes `id`, which is never longer than
+    /// Whether the format takes `id`, which is never longer than
     /// [`MAX_ID_LENGTH`].
     fn validate_id(&self, id: &str) -> Result<(), FormatError> {
-        // Before the plugin, so an oversized id never reaches it.
+        // Before the format, so an oversized id never reaches it.
         check_id(id)?;
-        self.plugin.validate_id(id).map_err(format_error)
+        self.spec.validate_id(id).map_err(format_error)
     }
 
     fn upstream(
@@ -331,7 +331,7 @@ impl Format for PluginFormat {
         op: &api::UpstreamOp,
         fetched: &[api::FetchResult],
     ) -> Result<api::UpstreamStep, FormatError> {
-        self.plugin
+        self.spec
             .upstream(remote, op, fetched)
             .map_err(format_error)
     }
@@ -341,20 +341,20 @@ impl Format for PluginFormat {
     }
 
     fn readme(&self, manifest: &[u8]) -> Option<String> {
-        self.plugin.readme(manifest)
+        self.spec.readme(manifest)
     }
 
     fn reserved_prefix(&self, prefix: &str) -> Result<String, FormatError> {
-        self.plugin.reserved_prefix(prefix).map_err(format_error)
+        self.spec.reserved_prefix(prefix).map_err(format_error)
     }
 
     fn manifest_summary(&self, manifest: &[u8]) -> Option<serde_json::Value> {
-        let text = self.plugin.manifest_summary(manifest)?;
+        let text = self.spec.manifest_summary(manifest)?;
         match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(summary @ serde_json::Value::Object(_)) => Some(summary),
             _ => {
                 tracing::warn!(
-                    plugin = self.id,
+                    format = self.id,
                     "manifest-summary returned something other than a JSON object; not stored"
                 );
                 None
@@ -363,7 +363,7 @@ impl Format for PluginFormat {
     }
 
     fn summary_caps(&self) -> &'static [api::SummaryCap] {
-        self.plugin.summary_caps()
+        self.spec.summary_caps()
     }
 }
 
@@ -388,11 +388,11 @@ mod tests {
         assets: Assets::DEFAULT,
         upstream_token: UpstreamToken::None,
         options: &[],
-        prereleases: forge_plugin_api::Prereleases::Dash,
+        prereleases: forge_format_api::Prereleases::Dash,
         indexes: false,
     };
 
-    impl FormatPlugin for Unlimited {
+    impl FormatSpec for Unlimited {
         fn descriptor(&self) -> &'static api::Descriptor {
             &UNLIMITED
         }
@@ -455,8 +455,8 @@ mod tests {
     }
 
     /// [`Unlimited`] as the host sees it.
-    fn unlimited(normalized: Option<&str>, parsed: api::ParsedPackage) -> PluginFormat {
-        PluginFormat::new(Arc::new(Unlimited {
+    fn unlimited(normalized: Option<&str>, parsed: api::ParsedPackage) -> SpecFormat {
+        SpecFormat::new(Arc::new(Unlimited {
             normalized: normalized.map(str::to_string),
             parsed,
         }))
@@ -528,11 +528,11 @@ mod tests {
         }
     }
 
-    /// A plugin with retention hooks of its own: Maven-like snapshots,
+    /// A format with retention hooks of its own: Maven-like snapshots,
     /// counted per base version.
     struct Snapshots;
 
-    impl FormatPlugin for Snapshots {
+    impl FormatSpec for Snapshots {
         fn descriptor(&self) -> &'static api::Descriptor {
             &UNLIMITED
         }
@@ -565,14 +565,14 @@ mod tests {
 
     #[test]
     fn retention_hooks_reach_the_host() {
-        use forge_core::format::VersionClass;
+        use crate::format::VersionClass;
         // The defaults: SemVer's prereleases, one partition per package.
         let plain = unlimited(None, package("demo", "1.0.0"));
         assert_eq!(plain.version_class("1.0.0"), VersionClass::Release);
         assert_eq!(plain.version_class("1.0.0-ci.1"), VersionClass::Prerelease);
         assert_eq!(plain.retention_partition("demo", "1.0.0-ci.1"), None);
-        // A plugin's own.
-        let snapshots = PluginFormat::new(Arc::new(Snapshots));
+        // A format's own.
+        let snapshots = SpecFormat::new(Arc::new(Snapshots));
         assert_eq!(snapshots.version_class("33.0.0-jre"), VersionClass::Release);
         assert_eq!(
             snapshots.version_class("1.0-SNAPSHOT"),

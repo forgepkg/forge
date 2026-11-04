@@ -5,8 +5,8 @@
 //! against it.
 
 use base64::Engine as _;
-use forge_plugin_api::files;
-use forge_plugin_api::{FileInfo, Repository, Request, Response};
+use forge_format_api::files;
+use forge_format_api::{FileInfo, Repository, Request, Response};
 
 use crate::listing::http_date;
 
@@ -136,7 +136,7 @@ pub fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_plugin_api::RepositoryKind;
+    use forge_format_api::RepositoryKind;
 
     fn file() -> FileInfo {
         FileInfo {

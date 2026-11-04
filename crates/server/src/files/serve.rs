@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use forge_db::model::Repository;
 use forge_db::raw_dao::{self, RawFile};
-use forge_plugin::api::files;
+use forge_format_api::files;
 use forge_storage::BlobRef;
 
 use crate::feed::{byte_range, ByteRange};

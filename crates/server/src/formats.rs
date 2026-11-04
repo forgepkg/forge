@@ -1,13 +1,13 @@
-//! Format plugins: the built-in ones, and serving the repositories of their
-//! formats under `/repository/{repo}/...` (see `docs/format-plugins.md`).
+//! Formats: those this server has, and serving their repositories under
+//! `/repository/{repo}/...` (see `docs/format-plugins.md`).
 //!
 //! The dispatcher resolves the repository, authenticates the caller (an
 //! `Authorization: Bearer` API token too, as npm sends it), refuses an
-//! offline repository, and lets the format's plugin decide what the request
-//! is ([`FormatPlugin::handle`]). It then checks the answer against what
-//! the caller may do and does everything that touches data itself:
+//! offline repository, and lets the format decide what the request is
+//! ([`FormatSpec::handle`]). It then checks the answer against what the
+//! caller may do and does everything that touches data itself:
 //!
-//! * **Queries** the plugin asks for run through the same read ops as every
+//! * **Queries** the format asks for run through the same read ops as every
 //!   other read ([`AppState::read_ops_for`]): package selectors, group
 //!   members the caller cannot see, prefer-hosted and reserved prefixes all
 //!   apply, and an id the format does not accept is unknown. A files
@@ -26,15 +26,15 @@
 //!   requests are authorized by their method up front (GET and HEAD read,
 //!   PUT and POST write, DELETE delete), and receiving, storing and deleting
 //!   files go through the file store's write path.
-//! * **Bodies** are read when the plugin asks ([`Action::ReadBody`]), bounded,
+//! * **Bodies** are read when the format asks ([`Action::ReadBody`]), bounded,
 //!   for a caller with the permission their use needs.
 //! * **Logins** ([`Action::Auth`]) are the host's ([`crate::cli_auth`]).
 //! * **Forwards** ([`Action::Forward`]) go to the repository's upstream, or
 //!   a group's first proxy member, with its credentials.
-//! * **Responses** the plugin renders keep only the headers in
+//! * **Responses** the format renders keep only the headers in
 //!   [`PASSED_RESPONSE_HEADERS`] (no cookies, no CORS, no redirects or links
 //!   off this repository) and get the feed's hardening headers.
-//! * **URLs** the plugin renders start with the repository's absolute URL
+//! * **URLs** the format renders start with the repository's absolute URL
 //!   ([`repository_url_for`]): on the alias base URL the request's `Host`
 //!   names (`server.alias_base_urls`), else on `server.public_base_url`.
 
@@ -61,10 +61,9 @@ use forge_core::repo::{
 use forge_db::model::{DeploymentPolicy, Repository};
 use forge_db::raw_dao::RawFile;
 use forge_db::{component_dao, repository_dao, tag_dao, user_dao};
-use forge_plugin::api::{
+use forge_format_api::{
     self as protocol, Action, Answer, AuthRequest, BodyRequest, BodyUse, Change, ChangeSet,
-    FormatPlugin, Forward, Loaded, PackageInfo, PackageRef, PublishRequest, Query, Unpacked,
-    Upload,
+    FormatSpec, Forward, Loaded, PackageInfo, PackageRef, PublishRequest, Query, Unpacked, Upload,
 };
 use futures_util::{StreamExt, TryStreamExt};
 use tokio_util::io::StreamReader;
@@ -87,13 +86,13 @@ pub const MAX_QUERIES: usize = 2048;
 /// Queries answered at once.
 const CONCURRENT_QUERIES: usize = 16;
 
-/// The largest body a plugin may ask for ([`Action::ReadBody`]).
+/// The largest body a format may ask for ([`Action::ReadBody`]).
 pub const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The largest body of a login ([`BodyUse::Login`]).
 pub const MAX_LOGIN_BODY_BYTES: u64 = 64 * 1024;
 
-/// Request headers a plugin sees. Never credentials or cookies.
+/// Request headers a format sees. Never credentials or cookies.
 pub const PASSED_REQUEST_HEADERS: &[&str] = &[
     "accept",
     "accept-language",
@@ -104,7 +103,7 @@ pub const PASSED_REQUEST_HEADERS: &[&str] = &[
     "user-agent",
 ];
 
-/// Response headers a plugin may set. `location` and `link` only within its
+/// Response headers a format may set. `location` and `link` only within its
 /// repository.
 pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
     "allow",
@@ -120,14 +119,14 @@ pub const PASSED_RESPONSE_HEADERS: &[&str] = &[
     "vary",
 ];
 
-/// The format plugins built into this server: crates under
-/// `crates/formats/<id>/`, linked in and always installed (apt, Docker /
-/// OCI, NuGet, npm, raw). NuGet reads archives under `nuget_limits` (`[nuget]`),
-/// npm requests under `npm_limits` (`[npm]`).
+/// The formats built into this server: crates under `crates/formats/<id>/`,
+/// linked in and always installed (apt, Docker / OCI, NuGet, npm, raw).
+/// NuGet reads archives under `nuget_limits` (`[nuget]`), npm requests under
+/// `npm_limits` (`[npm]`).
 pub fn builtin(
     nuget_limits: forge_format_nuget::NupkgLimits,
     npm_limits: forge_format_npm::NpmLimits,
-) -> Vec<Arc<dyn FormatPlugin>> {
+) -> Vec<Arc<dyn FormatSpec>> {
     vec![
         Arc::new(forge_format_apt::Apt),
         Arc::new(forge_format_docker::Docker),
@@ -141,37 +140,37 @@ pub fn builtin(
 pub async fn dispatch(State(state): State<AppState>, req: Request<Body>) -> Response {
     let head = req.method() == Method::HEAD;
     let mut response = dispatch_request(state, req).await;
-    let plugin = response.extensions_mut().remove::<ServedBy>().map(|s| s.0);
-    if let Some(plugin) = plugin {
+    let spec = response.extensions_mut().remove::<ServedBy>().map(|s| s.0);
+    if let Some(spec) = spec {
         if !head {
-            response = in_format(plugin.as_ref(), response).await;
+            response = in_format(spec.as_ref(), response).await;
         }
         // Counted under the repository's format ([`crate::telemetry::track`]).
         response
             .extensions_mut()
-            .insert(forge_telemetry::http::plugin_surface(plugin.id()));
+            .insert(forge_telemetry::http::plugin_surface(spec.id()));
     }
     crate::feed::harden_response_headers(response.headers_mut());
     response
 }
 
-/// The plugin that served a request, once its repository is known.
+/// The format that served a request, once its repository is known.
 #[derive(Clone)]
-struct ServedBy(Arc<dyn FormatPlugin>);
+struct ServedBy(Arc<dyn FormatSpec>);
 
-/// Marks a response the plugin (or the upstream it forwarded to) wrote.
+/// Marks a response the format (or the upstream it forwarded to) wrote.
 #[derive(Clone, Copy)]
-struct PluginWritten;
+struct FormatWritten;
 
 /// The longest host error [`in_format`] rewrites.
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 /// A host error in the shape the format's clients read errors in
-/// ([`FormatPlugin::error_response`]), keeping its status and headers.
-async fn in_format(plugin: &dyn FormatPlugin, response: Response) -> Response {
+/// ([`FormatSpec::error_response`]), keeping its status and headers.
+async fn in_format(spec: &dyn FormatSpec, response: Response) -> Response {
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error())
-        || response.extensions().get::<PluginWritten>().is_some()
+        || response.extensions().get::<FormatWritten>().is_some()
         || response.extensions().get::<AuthzDenied>().is_some()
     {
         return response;
@@ -181,7 +180,7 @@ async fn in_format(plugin: &dyn FormatPlugin, response: Response) -> Response {
         return (status, "internal error").into_response();
     };
     let message = String::from_utf8_lossy(&message);
-    let Some(rendered) = plugin.error_response(status.as_u16(), message.trim()) else {
+    let Some(rendered) = spec.error_response(status.as_u16(), message.trim()) else {
         return Response::from_parts(parts, Body::from(message.into_owned()));
     };
     let content_type = rendered
@@ -279,7 +278,7 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
         }
     };
 
-    let Some(plugin) = state.formats.plugin(&repo.format) else {
+    let Some(spec) = state.formats.spec(&repo.format) else {
         return if state.formats.is_installed(&repo.format) {
             // A format without a protocol (a test's own) is not served here.
             (StatusCode::NOT_FOUND, "repository is not served here").into_response()
@@ -291,21 +290,21 @@ async fn dispatch_request(state: AppState, req: Request<Body>) -> Response {
                 .into_response()
         };
     };
-    if plugin.descriptor().storage == protocol::Storage::Images {
+    if spec.descriptor().storage == protocol::Storage::Images {
         return (StatusCode::NOT_FOUND, "repository is not served here").into_response();
     }
-    let mut response = serve(&state, req, principal, &repo, plugin.clone(), rest).await;
-    response.extensions_mut().insert(ServedBy(plugin));
+    let mut response = serve(&state, req, principal, &repo, spec.clone(), rest).await;
+    response.extensions_mut().insert(ServedBy(spec));
     response
 }
 
-/// Serve `req` from `repo`, whose format `plugin` is.
+/// Serve `req` from `repo`, whose format's spec is `spec`.
 async fn serve(
     state: &AppState,
     req: Request<Body>,
     principal: Principal,
     repo: &Repository,
-    plugin: Arc<dyn FormatPlugin>,
+    spec: Arc<dyn FormatSpec>,
     rest: &str,
 ) -> Response {
     let method = req.method().clone();
@@ -355,7 +354,7 @@ async fn serve(
             RepoKind::Group => protocol::RepositoryKind::Group,
         },
         // On the alias host the request addressed, if any: every URL the
-        // plugin renders, and the redirects it may return, stay there.
+        // format renders, and the redirects it may return, stay there.
         base_url: repository_url_for(state, crate::base_urls::request_authority(&req), &repo.name),
         inline: stores_files && repo.inline_content(),
         options: repo.format_options(),
@@ -385,7 +384,7 @@ async fn serve(
         method: method.clone(),
         client_ip: crate::auth::login_client_ip(state, peer, req.headers()),
         headers: req.headers().clone(),
-        plugin: plugin.clone(),
+        spec: spec.clone(),
         format,
         level,
         stores_files,
@@ -397,8 +396,7 @@ async fn serve(
     };
     let handled = {
         let (target, request) = (ctx.target.clone(), request.clone());
-        ctx.call(move |plugin| plugin.handle(&target, &request))
-            .await
+        ctx.call(move |spec| spec.handle(&target, &request)).await
     };
     let response = match handled {
         Ok(action) => ctx.perform(action, request).await,
@@ -419,7 +417,7 @@ async fn serve(
     response
 }
 
-/// One request's resolved repository, caller and plugin.
+/// One request's resolved repository, caller and format.
 struct Ctx<'a> {
     state: &'a AppState,
     repo: &'a Repository,
@@ -429,12 +427,12 @@ struct Ctx<'a> {
     client_ip: std::net::IpAddr,
     /// The request's headers, for a download's `Range`.
     headers: HeaderMap,
-    plugin: Arc<dyn FormatPlugin>,
+    spec: Arc<dyn FormatSpec>,
     format: Arc<dyn Format>,
     /// The level the request's method is for; a files format's request
     /// was authorized for it.
     level: Level,
-    /// Whether the format's repositories hold files (its plugin asks for
+    /// Whether the format's repositories hold files (the format asks for
     /// files, not packages).
     stores_files: bool,
     /// The package read ops; `None` for a files format.
@@ -442,7 +440,7 @@ struct Ctx<'a> {
     target: protocol::Repository,
     /// The request, until a publish, a body or a file query reads it.
     body: Mutex<Option<Request<Body>>>,
-    /// The file parts of the form the plugin had received, by their index
+    /// The file parts of the form the format had received, by their index
     /// among its parts, until a store takes them.
     form: Mutex<Option<Vec<Option<Ingested>>>>,
     /// The files queries found, by path, for serving one of them.
@@ -450,8 +448,8 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    fn implementation(&self) -> Arc<dyn FormatPlugin> {
-        self.plugin.clone()
+    fn implementation(&self) -> Arc<dyn FormatSpec> {
+        self.spec.clone()
     }
 
     fn head(&self) -> bool {
@@ -463,16 +461,16 @@ impl Ctx<'_> {
         !matches!(self.method, Method::GET | Method::HEAD)
     }
 
-    /// Run a protocol call of the plugin off the async workers: rendering a
-    /// large listing takes a while. A plugin that panics answers 500.
+    /// Run a protocol call of the format off the async workers: rendering a
+    /// large listing takes a while. A format that panics answers 500.
     async fn call<R: Send + 'static>(
         &self,
-        f: impl FnOnce(&dyn FormatPlugin) -> R + Send + 'static,
+        f: impl FnOnce(&dyn FormatSpec) -> R + Send + 'static,
     ) -> Result<R, Response> {
-        let plugin = self.implementation();
-        tokio::task::spawn_blocking(move || f(plugin.as_ref()))
+        let spec = self.implementation();
+        tokio::task::spawn_blocking(move || f(spec.as_ref()))
             .await
-            .map_err(|e| plugin_failed(self.repo, &e))
+            .map_err(|e| format_failed(self.repo, &e))
     }
 
     /// Whether the caller has `level` on `repo`.
@@ -503,13 +501,13 @@ impl Ctx<'_> {
             Action::ReadBody(wanted) => self.read_body(wanted, request).await,
             Action::Publish(publish) => match self.take_body() {
                 Some(req) => self.publish(publish, request, req).await,
-                None => self.plugin_misused("a publish after the body was read"),
+                None => self.format_misused("a publish after the body was read"),
             },
             other => self.act(other, &request, false).await,
         }
     }
 
-    /// An action of a files format's plugin: a response, or a file to serve.
+    /// An action of a files format: a response, or a file to serve.
     async fn act_files(&self, action: Action) -> Response {
         match action {
             Action::Respond(response) => self.respond(response),
@@ -519,8 +517,8 @@ impl Ctx<'_> {
                 }
                 self.serve_file(&path).await
             }
-            Action::Load(_) => self.plugin_misused("a load as an action"),
-            _ => self.plugin_misused("an action of the other storage"),
+            Action::Load(_) => self.format_misused("a load as an action"),
+            _ => self.format_misused("an action of the other storage"),
         }
     }
 
@@ -532,11 +530,11 @@ impl Ctx<'_> {
             .take()
     }
 
-    /// The plugin asked for something the contract does not allow: a bug in
-    /// the plugin, answered with a server error.
-    fn plugin_misused(&self, what: &str) -> Response {
-        tracing::error!(repo = %self.repo.name, format = %self.repo.format, "format plugin asked for {what}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "format plugin failed").into_response()
+    /// The format asked for something the contract does not allow: a bug in
+    /// the format, answered with a server error.
+    fn format_misused(&self, what: &str) -> Response {
+        tracing::error!(repo = %self.repo.name, format = %self.repo.format, "format asked for {what}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "format failed").into_response()
     }
 
     /// Everything but a body or a publish, which need the request itself.
@@ -544,7 +542,7 @@ impl Ctx<'_> {
     /// login or a plain response may follow.
     async fn act(&self, action: Action, request: &protocol::Request, login_body: bool) -> Response {
         if login_body && !matches!(action, Action::Auth(_) | Action::Respond(_)) {
-            return plugin_failed(self.repo, &"a login body led to another action");
+            return format_failed(self.repo, &"a login body led to another action");
         }
         match action {
             Action::Auth(auth) => self.auth(auth, request).await,
@@ -585,7 +583,7 @@ impl Ctx<'_> {
             }
             Action::Change(set) => self.changes(set).await,
             Action::ReadBody(_) | Action::Publish(_) => {
-                plugin_failed(self.repo, &"a body was asked for twice")
+                format_failed(self.repo, &"a body was asked for twice")
             }
             // A file the host keeps for the repository: an index, a
             // proxy's copy of an upstream file.
@@ -600,7 +598,7 @@ impl Ctx<'_> {
             }
             // Images are the registry's (`crate::images`).
             Action::ServeBlob { .. } | Action::ServeManifest { .. } => {
-                self.plugin_misused("an image action")
+                self.format_misused("an image action")
             }
         }
     }
@@ -618,7 +616,7 @@ impl Ctx<'_> {
         Some((id, version))
     }
 
-    /// Load data and let the plugin render it, round by round.
+    /// Load data and let the format render it, round by round.
     async fn render(&self, mut queries: Vec<Query>, request: &protocol::Request) -> Response {
         let mut data: Vec<Loaded> = Vec::new();
         for _ in 0..MAX_ROUNDS {
@@ -645,8 +643,8 @@ impl Ctx<'_> {
             );
             let (target, req) = (self.target.clone(), request.clone());
             let rendered = self
-                .call(move |plugin| {
-                    let rendered = plugin.render(&target, &req, &data);
+                .call(move |spec| {
+                    let rendered = spec.render(&target, &req, &data);
                     (rendered, data)
                 })
                 .await;
@@ -663,7 +661,7 @@ impl Ctx<'_> {
         tracing::warn!(
             repo = %self.repo.name,
             format = %self.repo.format,
-            "format plugin asked for more data than one request may load"
+            "format asked for more data than one request may load"
         );
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -678,7 +676,7 @@ impl Ctx<'_> {
     fn check_round(&self, queries: &[Query]) -> Result<(), Response> {
         // Images are the registry's (`crate::images`).
         if queries.iter().any(Query::is_images) {
-            return Err(self.plugin_misused("an image query"));
+            return Err(self.format_misused("an image query"));
         }
         let other_storage = |q: &Query| {
             if self.stores_files {
@@ -688,15 +686,15 @@ impl Ctx<'_> {
             }
         };
         if queries.iter().any(other_storage) {
-            return Err(self.plugin_misused("a query of the other storage"));
+            return Err(self.format_misused("a query of the other storage"));
         }
         if queries.iter().any(|q| matches!(q, Query::Index(_)))
             && !crate::indexes::keeps_indexes(self.state, self.repo)
         {
-            return Err(self.plugin_misused("an index of a repository that keeps none"));
+            return Err(self.format_misused("an index of a repository that keeps none"));
         }
         if queries.len() > 1 && queries.iter().any(Query::is_change) {
-            return Err(self.plugin_misused("a change with other queries in its round"));
+            return Err(self.format_misused("a change with other queries in its round"));
         }
         Ok(())
     }
@@ -711,7 +709,7 @@ impl Ctx<'_> {
             return self.answer_files(query).await;
         }
         let Some(ops) = &self.ops else {
-            return Err(self.plugin_misused("packages of a files format"));
+            return Err(self.format_misused("packages of a files format"));
         };
         self.answer_packages(ops.as_ref(), query)
             .await
@@ -727,8 +725,8 @@ impl Ctx<'_> {
         let failed = |e: FileError| e.into_response();
         match query {
             Query::File(path) | Query::FetchFile(path) => {
-                if forge_plugin::api::files::validate_path(path).is_err() {
-                    return Err(self.plugin_misused("a file at an invalid path"));
+                if forge_format_api::files::validate_path(path).is_err() {
+                    return Err(self.format_misused("a file at an invalid path"));
                 }
                 let fetch = matches!(query, Query::FetchFile(_));
                 let found = files
@@ -744,8 +742,8 @@ impl Ctx<'_> {
                 Ok(Answer::File(found.as_ref().map(file_info)))
             }
             Query::Directory(wanted) => {
-                if forge_plugin::api::files::validate_directory(&wanted.directory).is_err() {
-                    return Err(self.plugin_misused("an invalid directory"));
+                if forge_format_api::files::validate_directory(&wanted.directory).is_err() {
+                    return Err(self.format_misused("an invalid directory"));
                 }
                 let page = files
                     .list(
@@ -763,7 +761,7 @@ impl Ctx<'_> {
                     return Err(refused("receiving a form"));
                 }
                 let Some(req) = self.take_body() else {
-                    return Err(self.plugin_misused("a form after the body was read"));
+                    return Err(self.format_misused("a form after the body was read"));
                 };
                 let parts =
                     crate::files::store::receive_form(&files, self.repo, req, Via::Protocol)
@@ -811,13 +809,13 @@ impl Ctx<'_> {
                         protocol::FileSource::Body => match self.take_body() {
                             Some(req) => Content::Body(req),
                             None => {
-                                return Err(self.plugin_misused("a store of a body already read"))
+                                return Err(self.format_misused("a store of a body already read"))
                             }
                         },
                         protocol::FileSource::Part(index) => match self.take_part(index) {
                             Some(ingested) => Content::Staged(ingested),
                             None => {
-                                return Err(self.plugin_misused(
+                                return Err(self.format_misused(
                                     "a store of a form part that is not a file it may store",
                                 ))
                             }
@@ -857,7 +855,7 @@ impl Ctx<'_> {
                     .map_err(failed)?;
                 Ok(Answer::Removed(removed))
             }
-            _ => Err(self.plugin_misused("a package query of a files format")),
+            _ => Err(self.format_misused("a package query of a files format")),
         }
     }
 
@@ -865,16 +863,16 @@ impl Ctx<'_> {
     /// keeps for the repository: a hosted repository's index (brought up to
     /// date first for `index`), a proxy's copy of an upstream file (fetched
     /// for `fetch-file`). The caller's package selector decides on the
-    /// package the plugin says the file belongs to.
+    /// package the format says the file belongs to.
     async fn answer_kept_files(&self, query: &Query) -> Result<Answer, Response> {
         let (path, fetch) = match query {
             Query::File(path) => (path, false),
             Query::FetchFile(path) => (path, true),
             Query::Index(path) => (path, false),
-            _ => return Err(self.plugin_misused("a files query of a package format")),
+            _ => return Err(self.format_misused("a files query of a package format")),
         };
-        if forge_plugin::api::files::validate_path(path).is_err() {
-            return Err(self.plugin_misused("a file at an invalid path"));
+        if forge_format_api::files::validate_path(path).is_err() {
+            return Err(self.format_misused("a file at an invalid path"));
         }
         let found = if let Query::Index(_) = query {
             crate::indexes::file(self.state, self.repo, path)
@@ -900,7 +898,7 @@ impl Ctx<'_> {
         Ok(Answer::File(found.as_ref().map(file_info)))
     }
 
-    /// The staged file part `index` of the form the plugin had received,
+    /// The staged file part `index` of the form the format had received,
     /// taken (a part is stored once).
     fn take_part(&self, index: u32) -> Option<Ingested> {
         self.form
@@ -923,8 +921,8 @@ impl Ctx<'_> {
         let file = match found {
             Some(file) => file,
             None => {
-                if forge_plugin::api::files::validate_path(path).is_err() {
-                    return self.plugin_misused("a file at an invalid path");
+                if forge_format_api::files::validate_path(path).is_err() {
+                    return self.format_misused("a file at an invalid path");
                 }
                 let files = Files {
                     state: self.state,
@@ -1092,7 +1090,7 @@ impl Ctx<'_> {
             return (StatusCode::NOT_FOUND, "package not found").into_response();
         };
         let Some(ops) = &self.ops else {
-            return self.plugin_misused("a package download of a files format");
+            return self.format_misused("a package download of a files format");
         };
         // A HEAD (a probe, a mirror tool) is not a download.
         let resolved = if self.head() {
@@ -1108,7 +1106,7 @@ impl Ctx<'_> {
         crate::feed::serve_package(self.state, &location, &self.headers, self.head()).await
     }
 
-    /// A version's metadata as the plugin sees it.
+    /// A version's metadata as the format sees it.
     fn package_info(&self, entry: RegistrationEntry) -> PackageInfo {
         PackageInfo {
             summary: self.summary(entry.manifest_summary, entry.nuspec_bytes.as_deref()),
@@ -1266,7 +1264,7 @@ impl Ctx<'_> {
             Ok(target) => target,
             Err(response) => return response,
         };
-        let format = forge_plugin::PluginFormat::new(self.plugin.clone());
+        let format = forge_core::format::SpecFormat::new(self.spec.clone());
         let expected_id = publish.id.as_deref().and_then(|id| self.id(id));
         if publish.id.is_some() && expected_id.is_none() {
             return (StatusCode::BAD_REQUEST, "invalid package id").into_response();
@@ -1316,24 +1314,24 @@ impl Ctx<'_> {
         }
     }
 
-    /// An [`Upload::Document`]: the body streams through the plugin's
-    /// [`FormatPlugin::unpack_upload`] (off the async workers) while the
+    /// An [`Upload::Document`]: the body streams through the format's
+    /// [`FormatSpec::unpack_upload`] (off the async workers) while the
     /// package it writes out is staged and stored; the document it returns
     /// reaches the parser before the package does. A body without a package
-    /// is handed back to the plugin as the request's body.
+    /// is handed back to the format as the request's body.
     #[allow(clippy::too_many_arguments)]
     async fn publish_document(
         &self,
         publish: PublishRequest,
         request: protocol::Request,
         req: Request<Body>,
-        upload: Arc<forge_plugin::UploadFormat>,
+        upload: Arc<forge_core::format::UploadFormat>,
         writer: HostedWriteAdapter,
         target: &Repository,
         limit: u64,
     ) -> Response {
         let Some(document) = upload.document.clone() else {
-            return plugin_failed(self.repo, &"a document upload without its document");
+            return format_failed(self.repo, &"a document upload without its document");
         };
         let (body_tx, body_rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
         let (package_tx, package_rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
@@ -1347,11 +1345,11 @@ impl Ctx<'_> {
                 }
             }
         });
-        let plugin = self.implementation();
+        let spec = self.implementation();
         let unpack = tokio::task::spawn_blocking(move || {
             let mut body = ChannelReader::new(body_rx);
             let mut package = ChannelWriter { tx: package_tx };
-            let unpacked = plugin.unpack_upload(&mut body, &mut package);
+            let unpacked = spec.unpack_upload(&mut body, &mut package);
             match &unpacked {
                 // Before the package stream ends, so that the parser has it.
                 Ok(Unpacked::Package { document: doc }) => {
@@ -1376,7 +1374,7 @@ impl Ctx<'_> {
         pump.abort();
         let unpacked = match unpacked {
             Ok(unpacked) => unpacked,
-            Err(e) => return plugin_failed(self.repo, &e),
+            Err(e) => return format_failed(self.repo, &e),
         };
         match unpacked {
             Err(e) => match stored {
@@ -1386,7 +1384,7 @@ impl Ctx<'_> {
                 _ => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
             },
             Ok(Unpacked::Document(body)) => {
-                // No package: another kind of document, which the plugin
+                // No package: another kind of document, which the format
                 // reads as the request's body (write was required already).
                 let request = protocol::Request {
                     body: Some(body),
@@ -1394,8 +1392,7 @@ impl Ctx<'_> {
                 };
                 let handled = {
                     let (target, request) = (self.target.clone(), request.clone());
-                    self.call(move |plugin| plugin.handle(&target, &request))
-                        .await
+                    self.call(move |spec| spec.handle(&target, &request)).await
                 };
                 match handled {
                     Ok(action) => self.act(action, &request, false).await,
@@ -1407,13 +1404,13 @@ impl Ctx<'_> {
                     return write_error(e);
                 }
                 let Some((id, version)) = upload.parsed.get().cloned() else {
-                    return plugin_failed(self.repo, &"stored without its identity");
+                    return format_failed(self.repo, &"stored without its identity");
                 };
                 let stored = PackageRef { id, version };
                 let changes = {
                     let stored = stored.clone();
                     match self
-                        .call(move |plugin| plugin.published(&document, &stored))
+                        .call(move |spec| spec.published(&document, &stored))
                         .await
                     {
                         Ok(changes) => changes,
@@ -1436,14 +1433,14 @@ impl Ctx<'_> {
         }
     }
 
-    /// Read the request body, as `wanted` says, and ask the plugin again
+    /// Read the request body, as `wanted` says, and ask the format again
     /// with it.
     async fn read_body(&self, wanted: BodyRequest, request: protocol::Request) -> Response {
         if request.body.is_some() {
-            return plugin_failed(self.repo, &"a body was asked for twice");
+            return format_failed(self.repo, &"a body was asked for twice");
         }
         let Some(req) = self.take_body() else {
-            return self.plugin_misused("a body after it was read");
+            return self.format_misused("a body after it was read");
         };
         let limit = match wanted.used_for {
             BodyUse::Login => wanted.limit.min(MAX_LOGIN_BODY_BYTES),
@@ -1500,7 +1497,7 @@ impl Ctx<'_> {
                     )
                         .into_response()
                 }
-                Err(e) => return plugin_failed(self.repo, &e),
+                Err(e) => return format_failed(self.repo, &e),
             }
         } else {
             raw.to_vec()
@@ -1511,8 +1508,7 @@ impl Ctx<'_> {
         };
         let handled = {
             let (target, request) = (self.target.clone(), request.clone());
-            self.call(move |plugin| plugin.handle(&target, &request))
-                .await
+            self.call(move |spec| spec.handle(&target, &request)).await
         };
         match handled {
             Ok(action) => {
@@ -1524,7 +1520,7 @@ impl Ctx<'_> {
     }
 
     /// A login, a logout or `whoami` ([`crate::cli_auth`]), answered by the
-    /// plugin.
+    /// format.
     async fn auth(&self, auth: AuthRequest, request: &protocol::Request) -> Response {
         match crate::cli_auth::perform(
             self.state,
@@ -1538,7 +1534,7 @@ impl Ctx<'_> {
             Ok(outcome) => {
                 let (target, request) = (self.target.clone(), request.clone());
                 match self
-                    .call(move |plugin| plugin.auth_response(&target, &request, &outcome))
+                    .call(move |spec| spec.auth_response(&target, &request, &outcome))
                     .await
                 {
                     Ok(response) => self.respond(response),
@@ -1751,7 +1747,7 @@ impl Ctx<'_> {
     /// Send `forward` on to the upstream, with the proxy's credentials (to
     /// its origin only), and answer with what the upstream said. With
     /// reserved prefixes or the caller's selectors on the way, the body goes
-    /// without the packages they keep inside ([`FormatPlugin::forward_body`]),
+    /// without the packages they keep inside ([`FormatSpec::forward_body`]),
     /// or not at all.
     async fn forward(&self, forward: Forward) -> Response {
         let (source, withheld) = match self.forward_source(self.repo, 0).await {
@@ -1769,7 +1765,7 @@ impl Ctx<'_> {
             return offline_response();
         }
         if !forward.path.starts_with('/') {
-            return plugin_failed(self.repo, &"a forward's path does not start with '/'");
+            return format_failed(self.repo, &"a forward's path does not start with '/'");
         }
         let Some(remote) = source.remote_url.as_deref() else {
             return (
@@ -1784,7 +1780,7 @@ impl Ctx<'_> {
             forward.body
         } else {
             let filtered = self
-                .call(move |plugin| plugin.forward_body(&forward, &|name| withheld.hides(name)))
+                .call(move |spec| spec.forward_body(&forward, &|name| withheld.hides(name)))
                 .await;
             match filtered {
                 Ok(Some(body)) => body,
@@ -1888,14 +1884,14 @@ impl Ctx<'_> {
         }
     }
 
-    /// A response the plugin rendered, with only the headers it may set.
+    /// A response the format rendered, with only the headers it may set.
     fn respond(&self, response: protocol::Response) -> Response {
         let Some(status) = StatusCode::from_u16(response.status)
             .ok()
             .filter(|s| !s.is_informational())
         else {
-            tracing::warn!(repo = %self.repo.name, status = response.status, "format plugin answered an invalid status");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "format plugin failed").into_response();
+            tracing::warn!(repo = %self.repo.name, status = response.status, "format answered an invalid status");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "format failed").into_response();
         };
         let mut out = Response::new(Body::empty());
         *out.status_mut() = status;
@@ -1928,7 +1924,7 @@ impl Ctx<'_> {
         if !self.head() {
             *out.body_mut() = Body::from(response.body);
         }
-        out.extensions_mut().insert(PluginWritten);
+        out.extensions_mut().insert(FormatWritten);
         out
     }
 
@@ -2010,7 +2006,7 @@ pub(crate) fn valid_tag(tag: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// The request body, as [`FormatPlugin::unpack_upload`] reads it: chunks
+/// The request body, as [`FormatSpec::unpack_upload`] reads it: chunks
 /// sent from the async side.
 struct ChannelReader {
     rx: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>,
@@ -2042,7 +2038,7 @@ impl Read for ChannelReader {
     }
 }
 
-/// The package [`FormatPlugin::unpack_upload`] writes, sent to the staging
+/// The package [`FormatSpec::unpack_upload`] writes, sent to the staging
 /// on the async side.
 struct ChannelWriter {
     tx: tokio::sync::mpsc::Sender<std::io::Result<Bytes>>,
@@ -2146,7 +2142,7 @@ fn multipart_reader(
     Ok(Box::new(StreamReader::new(stream)))
 }
 
-/// A stored file as the plugin sees it.
+/// A stored file as the format sees it.
 fn file_info(file: &RawFile) -> protocol::FileInfo {
     let time =
         |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
@@ -2163,7 +2159,7 @@ fn file_info(file: &RawFile) -> protocol::FileInfo {
     }
 }
 
-/// A page of a directory as the plugin sees it.
+/// A page of a directory as the format sees it.
 fn directory_page(page: crate::files::listing::Page) -> protocol::DirectoryPage {
     use crate::files::listing::EntryKind;
     protocol::DirectoryPage {
@@ -2187,7 +2183,7 @@ pub fn repository_url(state: &AppState, name: &str) -> String {
 }
 
 /// The absolute URL of repository `name` as a request that addressed
-/// `authority` is served it, the base its plugin builds URLs on: on the alias
+/// `authority` is served it, the base its format builds URLs on: on the alias
 /// the request's `Host` names, else on `server.public_base_url`
 /// ([`crate::base_urls`]).
 pub fn repository_url_for(state: &AppState, authority: Option<&str>, name: &str) -> String {
@@ -2241,7 +2237,7 @@ fn links_within(value: &str, repo: &str, base_url: &str) -> bool {
     targets > 0
 }
 
-/// A plugin returned an action the request's method was not authorized for
+/// A format returned an action the request's method was not authorized for
 /// (a download for a POST, a publish for a GET).
 fn refused(what: &str) -> Response {
     (
@@ -2251,9 +2247,9 @@ fn refused(what: &str) -> Response {
         .into_response()
 }
 
-fn plugin_failed(repo: &Repository, e: &dyn std::fmt::Display) -> Response {
-    tracing::error!(repo = %repo.name, format = %repo.format, error = %e, "format plugin failed");
-    (StatusCode::INTERNAL_SERVER_ERROR, "format plugin failed").into_response()
+fn format_failed(repo: &Repository, e: &dyn std::fmt::Display) -> Response {
+    tracing::error!(repo = %repo.name, format = %repo.format, error = %e, "format failed");
+    (StatusCode::INTERNAL_SERVER_ERROR, "format failed").into_response()
 }
 
 /// An index that could not be made, as the answer to the request.
@@ -2313,7 +2309,7 @@ pub(crate) fn repo_error(e: RepoError) -> Response {
         )
             .into_response(),
         RepoError::Db(_) | RepoError::Storage(_) => {
-            tracing::error!(error = %e, "plugin repository read failed");
+            tracing::error!(error = %e, "repository read failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
@@ -2352,15 +2348,15 @@ mod tests {
     /// asset names.
     #[test]
     fn the_builtin_formats_describe_themselves_well() {
-        let plugins = builtin(Default::default(), Default::default());
-        let descriptors: Vec<_> = plugins.iter().map(|p| p.descriptor()).collect();
-        assert_eq!(forge_plugin::descriptor::check(&descriptors), Ok(()));
-        let ids: Vec<_> = plugins.iter().map(|p| p.id()).collect();
+        let specs = builtin(Default::default(), Default::default());
+        let descriptors: Vec<_> = specs.iter().map(|p| p.descriptor()).collect();
+        assert_eq!(forge_core::format::descriptor::check(&descriptors), Ok(()));
+        let ids: Vec<_> = specs.iter().map(|p| p.id()).collect();
         assert_eq!(ids, ["apt", "docker", "nuget", "npm", "raw"]);
         // Only npm sends a proxy's token as a Bearer token.
-        let bearer: Vec<_> = plugins
+        let bearer: Vec<_> = specs
             .iter()
-            .filter(|p| p.descriptor().upstream_token == forge_plugin::api::UpstreamToken::Bearer)
+            .filter(|p| p.descriptor().upstream_token == forge_format_api::UpstreamToken::Bearer)
             .map(|p| p.id())
             .collect();
         assert_eq!(bearer, ["npm"]);
@@ -2370,41 +2366,41 @@ mod tests {
         // and invalid asset names.
         let nuget = forge_format_nuget::DESCRIPTOR;
         for id in ["NuGet", "n", "v2"] {
-            let renamed = forge_plugin::Descriptor { id, ..nuget };
+            let renamed = forge_format_api::Descriptor { id, ..nuget };
             assert!(
-                forge_plugin::descriptor::check(&[&renamed]).is_err(),
+                forge_core::format::descriptor::check(&[&renamed]).is_err(),
                 "{id:?}"
             );
         }
-        let twin = forge_plugin::Descriptor {
+        let twin = forge_format_api::Descriptor {
             id: "nuget",
             ..forge_format_raw::DESCRIPTOR
         };
         let mut with_twin = descriptors.clone();
         with_twin.push(&twin);
-        assert!(forge_plugin::descriptor::check(&with_twin).is_err());
-        let docker_twin = forge_plugin::Descriptor {
+        assert!(forge_core::format::descriptor::check(&with_twin).is_err());
+        let docker_twin = forge_format_api::Descriptor {
             id: "docker",
             ..nuget
         };
         let mut with_twin = descriptors.clone();
         with_twin.push(&docker_twin);
-        assert!(forge_plugin::descriptor::check(&with_twin).is_err());
-        let second_images = forge_plugin::Descriptor {
+        assert!(forge_core::format::descriptor::check(&with_twin).is_err());
+        let second_images = forge_format_api::Descriptor {
             id: "oci",
             ..forge_format_docker::DESCRIPTOR
         };
         let mut with_second = descriptors.clone();
         with_second.push(&second_images);
-        assert!(forge_plugin::descriptor::check(&with_second).is_err());
-        let bad_assets = forge_plugin::Descriptor {
-            assets: forge_plugin::api::Assets {
+        assert!(forge_core::format::descriptor::check(&with_second).is_err());
+        let bad_assets = forge_format_api::Descriptor {
+            assets: forge_format_api::Assets {
                 package: "../package.nupkg",
                 ..nuget.assets
             },
             ..nuget
         };
-        assert!(forge_plugin::descriptor::check(&[&bad_assets]).is_err());
+        assert!(forge_core::format::descriptor::check(&[&bad_assets]).is_err());
     }
 
     #[test]

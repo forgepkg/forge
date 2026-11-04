@@ -3,7 +3,7 @@
 //!
 //! The host answers `/v2/` (the version check), `/v2/token` (the token
 //! service, [`super::auth`]) and `/v2/_catalog` (refused) itself. Any other
-//! path goes to the format ([`FormatPlugin::image_path`]), which splits off
+//! path goes to the format ([`FormatSpec::image_path`]), which splits off
 //! the name the client wrote and says what the request needs; the host
 //! resolves the name (by path, `<repository>/<image>`, or on a repository's
 //! own host, `config.host`), authorizes it (RBAC and package selectors on
@@ -13,7 +13,7 @@
 //! with the image queries this module answers from the store and the
 //! actions it performs (serving a blob or a manifest). What the host
 //! refuses, the format answers in its words
-//! ([`FormatPlugin::image_error`]), with the host's challenge.
+//! ([`FormatSpec::image_error`]), with the host's challenge.
 //!
 //! Every answer carries `Docker-Distribution-API-Version` and the
 //! registry's hardening; a response the format renders keeps only the
@@ -30,11 +30,11 @@ use forge_core::auth::Principal;
 use forge_core::authz::Level;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::{oci_dao, repository_dao};
-use forge_plugin::api::images::{
+use forge_format_api::images::{
     ImageAnswer, ImageError, ImageName, ImagePath, ImageQuery, Permission, Reference,
 };
-use forge_plugin::api::{self as protocol, Action, Answer, Loaded, Query};
-use forge_plugin::FormatPlugin;
+use forge_format_api::FormatSpec;
+use forge_format_api::{self as protocol, Action, Answer, Loaded, Query};
 
 use super::digest::ContentDigest;
 use super::pull::{BlobHit, ManifestHit};
@@ -83,7 +83,7 @@ impl Registry {
     /// What the host refused or failed, as the format answers it, with the
     /// host's own headers (a challenge).
     pub fn failure_response(&self, failure: Failure) -> Response {
-        let mut response = self.respond(self.plugin().image_error(&failure.error));
+        let mut response = self.respond(self.spec().image_error(&failure.error));
         for (name, value) in failure.headers {
             response.headers_mut().insert(name, value);
         }
@@ -96,7 +96,7 @@ impl Registry {
     }
 
     async fn route(&self, principal: Principal, req: Request<Body>) -> ImgResult<Response> {
-        let mount = forge_plugin::api::IMAGES_MOUNT;
+        let mount = forge_format_api::IMAGES_MOUNT;
         let rest = req
             .uri()
             .path()
@@ -106,7 +106,7 @@ impl Registry {
         // The host's own endpoints; anything else is the format's to split.
         let path = match rest.as_str() {
             "" | "/" | "/token" | "/_catalog" => None,
-            _ => Some(self.plugin().image_path(req.method().as_str(), &rest)?),
+            _ => Some(self.spec().image_path(req.method().as_str(), &rest)?),
         };
         let site = self.site(request_host(&req)).await?;
         let caller = self.caller(principal, req.headers(), &site).await?;
@@ -663,10 +663,10 @@ impl Conversation<'_> {
     /// that panics answers 500.
     async fn call<R: Send + 'static>(
         &self,
-        f: impl FnOnce(&dyn FormatPlugin) -> R + Send + 'static,
+        f: impl FnOnce(&dyn FormatSpec) -> R + Send + 'static,
     ) -> Result<R, Response> {
-        let plugin = Arc::clone(&self.reg.inner.plugin);
-        tokio::task::spawn_blocking(move || f(plugin.as_ref()))
+        let spec = Arc::clone(&self.reg.inner.spec);
+        tokio::task::spawn_blocking(move || f(spec.as_ref()))
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "images format failed");
@@ -678,8 +678,7 @@ impl Conversation<'_> {
     async fn run(&self, request: protocol::Request) -> Response {
         let handled = {
             let (target, request) = (self.target(), request.clone());
-            self.call(move |plugin| plugin.handle(&target, &request))
-                .await
+            self.call(move |spec| spec.handle(&target, &request)).await
         };
         let mut action = match handled {
             Ok(action) => action,
@@ -708,8 +707,8 @@ impl Conversation<'_> {
             }
             let (target, req) = (self.target(), request.clone());
             let rendered = self
-                .call(move |plugin| {
-                    let rendered = plugin.render(&target, &req, &data);
+                .call(move |spec| {
+                    let rendered = spec.render(&target, &req, &data);
                     (rendered, data)
                 })
                 .await;
@@ -742,7 +741,7 @@ impl Conversation<'_> {
             base_url: format!(
                 "{}{}",
                 self.ctx.site.base_url,
-                forge_plugin::api::IMAGES_MOUNT
+                forge_format_api::IMAGES_MOUNT
             ),
             inline: false,
             options: Vec::new(),

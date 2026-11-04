@@ -5,10 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Docker / OCI registries for Forge, as a format plugin"
+description = "Docker / OCI registries for Forge, a format crate built into the server"
 
 [dependencies]
-forge-plugin-api = { path = "../../plugin-api" }
+forge-format-api = { path = "../../format-api" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -19,6 +19,6 @@ url = { workspace = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 [dev-dependencies]
-forge-plugin-api = { path = "../../plugin-api", features = ["testing"] }
+forge-format-api = { path = "../../format-api", features = ["testing"] }
 sha2 = { workspace = true }
 hex = { workspace = true }

@@ -34,7 +34,7 @@ use forge_core::repo::{
 use forge_core::retention::FormatResolver;
 use forge_core::session::SessionService;
 use forge_db::model::{RepoKind, Repository};
-use forge_plugin::FormatPlugin;
+use forge_format_api::FormatSpec;
 use forge_storage::{BlobRef, BlobStore, Cas, S3Error};
 use sqlx::PgPool;
 
@@ -55,8 +55,8 @@ pub struct AppState {
     /// Authorization decision service: every read/write/admin gate routes
     /// through this.
     pub authz: Authz,
-    /// Package-format registry, keyed by `Format::id()`: the format plugins
-    /// (NuGet).
+    /// Package-format registry, keyed by `Format::id()`: apt, Docker / OCI,
+    /// NuGet, npm and raw.
     pub formats: Arc<FormatRegistry>,
     /// Parsed server configuration.
     pub config: Arc<Config>,
@@ -160,8 +160,8 @@ impl Instance {
 }
 
 /// Format registry: maps a format id (the `repository.format` column) to its
-/// plugin and the plugin's [`Format`]: the built-in format plugins
-/// ([`crate::plugins::builtin`]: apt, Docker / OCI, NuGet, npm, raw).
+/// [`FormatSpec`] and the spec's [`Format`]: the formats
+/// ([`crate::formats::builtin`]: apt, Docker / OCI, NuGet, npm, raw).
 ///
 /// A files format (raw) has a [`Format`] whose [`Format::stores_files`] says
 /// so: its repositories hold files in the file store ([`crate::files`]). An
@@ -173,40 +173,39 @@ impl Instance {
 pub struct FormatRegistry {
     /// Every format's [`Format`], by format id.
     formats: BTreeMap<String, Arc<dyn Format>>,
-    /// Every format's plugin, by format id: its client protocol.
-    plugins: BTreeMap<String, Arc<dyn FormatPlugin>>,
+    /// Every format's [`FormatSpec`], by format id: its client protocol.
+    specs: BTreeMap<String, Arc<dyn FormatSpec>>,
 }
 
 impl FormatRegistry {
-    /// A registry holding the built-in format plugins, NuGet reading
-    /// archives and upstream manifests under `nuget_limits`, npm requests
-    /// under `npm_limits`.
+    /// A registry holding the formats, NuGet reading archives and upstream
+    /// manifests under `nuget_limits`, npm requests under `npm_limits`.
     pub fn new(
         nuget_limits: forge_format_nuget::NupkgLimits,
         npm_limits: forge_format_npm::NpmLimits,
     ) -> Self {
         let mut registry = FormatRegistry {
             formats: BTreeMap::new(),
-            plugins: BTreeMap::new(),
+            specs: BTreeMap::new(),
         };
-        for plugin in crate::plugins::builtin(nuget_limits, npm_limits) {
+        for spec in crate::formats::builtin(nuget_limits, npm_limits) {
             registry = registry
-                .with_plugin(plugin)
+                .with_spec(spec)
                 .expect("built-in format ids are distinct");
         }
         registry
     }
 
-    /// Add a format plugin: its [`Format`] and its client protocol. Its id
-    /// must be free: a plugin never replaces another format.
-    pub fn with_plugin(mut self, plugin: Arc<dyn FormatPlugin>) -> Result<Self, String> {
-        let id = plugin.id();
+    /// Add a format: its [`Format`] and its client protocol. Its id must be
+    /// free: a format never replaces another.
+    pub fn with_spec(mut self, spec: Arc<dyn FormatSpec>) -> Result<Self, String> {
+        let id = spec.id();
         if self.is_installed(id) {
             return Err(format!("format {id:?} is built into this server"));
         }
-        let format = Arc::new(forge_plugin::PluginFormat::new(plugin.clone()));
+        let format = Arc::new(forge_core::format::SpecFormat::new(spec.clone()));
         self.formats.insert(id.to_string(), format);
-        self.plugins.insert(id.to_string(), plugin);
+        self.specs.insert(id.to_string(), spec);
         Ok(self)
     }
 
@@ -215,14 +214,14 @@ impl FormatRegistry {
         self.formats.get(id).cloned()
     }
 
-    /// The plugin serving format `id`, if installed.
-    pub fn plugin(&self, id: &str) -> Option<Arc<dyn FormatPlugin>> {
-        self.plugins.get(id).cloned()
+    /// The [`FormatSpec`] serving format `id`, if installed.
+    pub fn spec(&self, id: &str) -> Option<Arc<dyn FormatSpec>> {
+        self.specs.get(id).cloned()
     }
 
-    /// The format plugins, by format id.
-    pub fn plugins(&self) -> impl Iterator<Item = &Arc<dyn FormatPlugin>> {
-        self.plugins.values()
+    /// The formats' specs, by format id.
+    pub fn specs(&self) -> impl Iterator<Item = &Arc<dyn FormatSpec>> {
+        self.specs.values()
     }
 
     /// Whether format `id` is installed.
@@ -245,10 +244,10 @@ impl FormatRegistry {
     /// The images format, served under its mount by the registry
     /// ([`crate::images`]): the first, by id, whose repositories hold
     /// images. The built-in formats have one, Docker.
-    pub fn images_plugin(&self) -> Option<Arc<dyn FormatPlugin>> {
-        self.plugins
+    pub fn images_spec(&self) -> Option<Arc<dyn FormatSpec>> {
+        self.specs
             .values()
-            .find(|p| p.descriptor().storage == forge_plugin::api::Storage::Images)
+            .find(|p| p.descriptor().storage == forge_format_api::Storage::Images)
             .cloned()
     }
 
@@ -261,10 +260,9 @@ impl FormatRegistry {
     /// installed: what its descriptor names (all three for every built-in
     /// format but apt, which has no groups).
     pub fn kinds(&self, id: &str) -> Option<Vec<&'static str>> {
-        let plugin = self.plugins.get(id)?;
+        let spec = self.specs.get(id)?;
         Some(
-            plugin
-                .descriptor()
+            spec.descriptor()
                 .kinds
                 .iter()
                 .map(|kind| kind.as_str())
@@ -441,9 +439,9 @@ impl AppState {
     /// The registry of the images format (Docker / OCI), wired to this
     /// state.
     pub fn registry(&self) -> crate::images::Registry {
-        let plugin = self
+        let spec = self
             .formats
-            .images_plugin()
+            .images_spec()
             .expect("the images format is built in");
         crate::images::Registry::new(crate::images::RegistryParts {
             pool: self.pool.clone(),
@@ -459,7 +457,7 @@ impl AppState {
                 max_blob_bytes: self.config.docker_max_blob_bytes(),
                 default_max_upload_bytes: self
                     .config
-                    .default_upload_limit(forge_plugin::api::Storage::Images),
+                    .default_upload_limit(forge_format_api::Storage::Images),
                 token_ttl_seconds: self.config.docker.token_ttl_seconds,
                 delete_grace: self.config.outbox.grace(),
                 max_group_depth: self.config.groups.max_nesting_depth.max(0) as u32,
@@ -474,18 +472,18 @@ impl AppState {
                 realms: self.realms.clone(),
                 pool: self.pool.clone(),
             })),
-            plugin,
+            spec,
         })
     }
 
-    /// Install further format plugins next to the built-in formats (the
-    /// tests' own). A plugin whose format id is taken (a built-in plugin, or
-    /// another plugin) is an error.
-    pub fn with_plugins(mut self, plugins: Vec<Arc<dyn FormatPlugin>>) -> Result<Self, String> {
+    /// Install further formats next to the built-in ones (the tests' own).
+    /// A format whose id is taken (by a built-in format, or another of
+    /// `specs`) is an error.
+    pub fn with_specs(mut self, specs: Vec<Arc<dyn FormatSpec>>) -> Result<Self, String> {
         let mut registry =
             FormatRegistry::new(self.config.nuget.limits(), self.config.npm.limits());
-        for plugin in plugins {
-            registry = registry.with_plugin(plugin)?;
+        for spec in specs {
+            registry = registry.with_spec(spec)?;
         }
         self.formats = Arc::new(registry);
         Ok(self)
@@ -501,9 +499,9 @@ impl AppState {
 
     /// What repositories of format `id` hold (packages when it is not
     /// installed).
-    pub fn storage(&self, id: &str) -> forge_plugin::api::Storage {
+    pub fn storage(&self, id: &str) -> forge_format_api::Storage {
         self.formats
-            .plugin(id)
+            .spec(id)
             .map(|p| p.descriptor().storage)
             .unwrap_or_default()
     }
@@ -743,27 +741,27 @@ impl MemberOpsFactory for MemberFactory {
 mod tests {
     use super::*;
 
-    /// A plugin that takes the id of another format.
-    struct Twin(&'static forge_plugin::Descriptor);
+    /// A format that takes the id of another.
+    struct Twin(&'static forge_format_api::Descriptor);
 
-    impl FormatPlugin for Twin {
-        fn descriptor(&self) -> &'static forge_plugin::Descriptor {
+    impl FormatSpec for Twin {
+        fn descriptor(&self) -> &'static forge_format_api::Descriptor {
             self.0
         }
         fn handle(
             &self,
-            _: &forge_plugin::api::Repository,
-            _: &forge_plugin::api::Request,
-        ) -> forge_plugin::api::Action {
-            forge_plugin::api::Action::Respond(forge_plugin::api::Response::text(404, "none"))
+            _: &forge_format_api::Repository,
+            _: &forge_format_api::Request,
+        ) -> forge_format_api::Action {
+            forge_format_api::Action::Respond(forge_format_api::Response::text(404, "none"))
         }
         fn render(
             &self,
-            _: &forge_plugin::api::Repository,
-            _: &forge_plugin::api::Request,
-            _: &[forge_plugin::api::Loaded],
-        ) -> forge_plugin::api::Action {
-            forge_plugin::api::Action::Respond(forge_plugin::api::Response::text(404, "none"))
+            _: &forge_format_api::Repository,
+            _: &forge_format_api::Request,
+            _: &[forge_format_api::Loaded],
+        ) -> forge_format_api::Action {
+            forge_format_api::Action::Respond(forge_format_api::Response::text(404, "none"))
         }
     }
 
@@ -778,7 +776,7 @@ mod tests {
         // indexes; it has no groups.
         assert!(!registry.stores_files("apt"));
         assert_eq!(registry.kinds("apt"), Some(vec!["hosted", "proxy"]));
-        // Raw is a built-in plugin whose repositories hold files, Docker one
+        // Raw is a format whose repositories hold files, Docker one
         // whose repositories hold images, served by the registry.
         assert!(registry.get("raw").is_some());
         assert!(registry.stores_files("raw"));
@@ -786,7 +784,7 @@ mod tests {
         assert!(registry.stores_images("docker"));
         assert!(!registry.stores_images("raw"));
         assert!(!registry.stores_files("docker"));
-        assert_eq!(registry.images_plugin().map(|p| p.id()), Some("docker"));
+        assert_eq!(registry.images_spec().map(|p| p.id()), Some("docker"));
         assert_eq!(
             registry.kinds("raw"),
             Some(vec!["hosted", "proxy", "group"])
@@ -799,12 +797,12 @@ mod tests {
             registry.kinds("nuget"),
             Some(vec!["hosted", "proxy", "group"])
         );
-        // npm is a built-in plugin.
+        // npm is a format too.
         assert_eq!(
             registry.kinds("npm"),
             Some(vec!["hosted", "proxy", "group"])
         );
-        assert!(registry.plugin("npm").is_some());
+        assert!(registry.spec("npm").is_some());
         assert!(!registry.stores_files("npm"));
         assert_eq!(registry.kinds("helm"), None);
         assert_eq!(registry.kinds("maven"), None);
@@ -812,15 +810,15 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_cannot_take_dockers_or_a_builtin_plugins_id() {
+    fn a_format_cannot_take_another_formats_id() {
         for id in ["apt", "docker", "nuget", "npm", "raw"] {
             let registry = FormatRegistry::new(Default::default(), Default::default());
-            let descriptor = Box::leak(Box::new(forge_plugin::Descriptor {
+            let descriptor = Box::leak(Box::new(forge_format_api::Descriptor {
                 id,
                 ..forge_format_nuget::DESCRIPTOR
             }));
             let err = registry
-                .with_plugin(Arc::new(Twin(descriptor)))
+                .with_spec(Arc::new(Twin(descriptor)))
                 .err()
                 .expect("refused");
             assert!(err.contains("built into this server"), "{err}");

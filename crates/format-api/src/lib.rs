@@ -1,10 +1,10 @@
-//! `forge-plugin-api`: the contract of a Forge format plugin.
+//! `forge-format-api`: the contract of a Forge format.
 //!
-//! A format plugin teaches Forge one more package format: its identity rules
+//! A format crate teaches Forge one more package format: its identity rules
 //! (ids, versions), how to read a package, and its client protocol. Forge
 //! keeps everything else — storage, metadata, authentication and
 //! authorization, hosted/group semantics, retention, the streaming of
-//! package bytes — so a plugin is small and never sees a credential, a
+//! package bytes — so a format is small and never sees a credential, a
 //! storage key, or a whole package in memory.
 //!
 //! A format stores package versions, files under paths (raw), or images
@@ -13,12 +13,12 @@
 //! those methods and implements the protocol over the host's file store
 //! ([`Query::File`] … [`Query::Remove`], [`Action::ServeFile`]). An images
 //! format implements it over the host's image store ([`images`]): it splits
-//! request paths ([`FormatPlugin::image_path`]), reads manifests
-//! ([`FormatPlugin::parse_manifest`]) and answers in its own words what the
-//! host refused ([`FormatPlugin::image_error`]).
+//! request paths ([`FormatSpec::image_path`]), reads manifests
+//! ([`FormatSpec::parse_manifest`]) and answers in its own words what the
+//! host refused ([`FormatSpec::image_error`]).
 //!
-//! A plugin is a crate under `crates/formats/<id>/` implementing
-//! [`FormatPlugin`], describing itself with a [`Descriptor`], linked into
+//! A format is a crate under `crates/formats/<id>/` implementing
+//! [`FormatSpec`], describing itself with a [`Descriptor`], linked into
 //! the server and called directly (apt, Docker, NuGet, npm, raw).
 
 pub mod files;
@@ -36,7 +36,7 @@ pub use types::*;
 
 use images::{ArtifactFiles, ImageError, ImagePath, ParsedManifest};
 
-/// A package the host staged, lent to [`FormatPlugin::parse_package`].
+/// A package the host staged, lent to [`FormatSpec::parse_package`].
 pub trait PackageSource: Read + Seek {}
 
 impl<T: Read + Seek + ?Sized> PackageSource for T {}
@@ -53,7 +53,7 @@ impl<T: Read + Seek + ?Sized> PackageSource for T {}
 /// A package format implements the rules and [`Self::parse_package`]. A
 /// files format has neither ids nor versions nor packages: it keeps their
 /// defaults, which refuse every id, version and package.
-pub trait FormatPlugin: Send + Sync + 'static {
+pub trait FormatSpec: Send + Sync + 'static {
     /// What the format says about itself: its id, name, repository kinds,
     /// storage and asset names. A `'static` value the crate defines next to
     /// its implementation (`pub const DESCRIPTOR`).
@@ -183,7 +183,7 @@ pub trait FormatPlugin: Send + Sync + 'static {
     /// An [`Upload::Document`]: read the request `body`, write the package it
     /// carries to `package`, and return the rest of the document — or say
     /// there is no package in it. Runs off the async workers; the host bounds
-    /// the package by the repository's upload limit, the plugin the document.
+    /// the package by the repository's upload limit, the format the document.
     fn unpack_upload(
         &self,
         body: &mut dyn Read,
@@ -262,14 +262,14 @@ pub trait FormatPlugin: Send + Sync + 'static {
 
     /// The upstream side of the format's proxy repositories: what to fetch
     /// from `remote` for `op`, and what came of it. `fetched` holds every
-    /// fetch of earlier rounds with its result, so a plugin stays stateless.
+    /// fetch of earlier rounds with its result, so a format stays stateless.
     ///
     /// The host does the rest of what a proxy is: it sends every request
     /// (only to origins the upstream points at, see [`Fetch`]; credentials
     /// only to the upstream's own origin; bounded in size and time, cached
     /// as [`Fetch::freshness`] says), downloads and verifies packages, and
     /// keeps the package delay, the not-found markers and the offline mode.
-    /// Only a plugin whose descriptor lists the `proxy` kind is asked;
+    /// Only a format whose descriptor lists the `proxy` kind is asked;
     /// the default says so.
     fn upstream(
         &self,

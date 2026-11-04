@@ -1,0 +1,13 @@
+[package]
+name = "forge-format-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The contract a Forge format implements: FormatSpec and its types"
+
+# Nothing but std.
+[features]
+# `testing`: run a format's protocol against canned answers, without a server.
+testing = []

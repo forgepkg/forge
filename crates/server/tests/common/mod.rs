@@ -411,8 +411,8 @@ pub struct ServerOpts {
     /// When set, this raw TOML is appended last (a section of its own, such
     /// as `[docker]`).
     pub extra_toml: Option<String>,
-    /// Format plugins installed next to the built-in ones, as if built in.
-    pub extra_plugins: Vec<std::sync::Arc<dyn forge_plugin::FormatPlugin>>,
+    /// Formats installed next to the built-in ones, as if built in.
+    pub extra_specs: Vec<std::sync::Arc<dyn forge_format_api::FormatSpec>>,
     /// When set, this raw TOML replaces the static keys at the end of the
     /// `[s3]` section (e.g. `credentials = "web_identity"` and its
     /// `[s3.web_identity]` table), and the object store is built from the
@@ -432,7 +432,7 @@ impl Default for ServerOpts {
             server_extra: None,
             auth_extra: None,
             extra_toml: None,
-            extra_plugins: Vec::new(),
+            extra_specs: Vec::new(),
             s3_credentials: None,
         }
     }
@@ -494,8 +494,8 @@ pub async fn start_with(pool: PgPool, opts: ServerOpts) -> TestServer {
         .expect("registry token key");
     let state = AppState::new(pool.clone(), store, cache, config, envelope)
         .with_registry_keys(registry_keys)
-        .with_plugins(opts.extra_plugins.clone())
-        .expect("install format plugins");
+        .with_specs(opts.extra_specs.clone())
+        .expect("install formats");
     let layer = principal_layer(&state).expect("principal layer");
 
     let workers = if opts.spawn_workers {

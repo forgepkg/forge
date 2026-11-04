@@ -1,6 +1,6 @@
 //! `forge-core`: format-agnostic domain logic for Forge.
 //!
-//! This crate sits above [`forge_db`] and below the format plugins
+//! This crate sits above [`forge_db`] and below the format crates
 //! (`crates/formats/*`) and the server. It defines:
 //!
 //! * [`domain`] — neutral types ([`domain::ParsedUpload`]) produced by parsing

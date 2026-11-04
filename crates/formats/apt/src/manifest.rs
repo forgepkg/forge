@@ -3,7 +3,7 @@
 //! (so that making an index reads no package and no manifest) and what the
 //! web UI shows.
 
-use forge_plugin_api::{Dependency, DependencyGroup, FormatError};
+use forge_format_api::{Dependency, DependencyGroup, FormatError};
 use serde::{Deserialize, Serialize};
 
 use crate::control::{self, Paragraph};
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn the_component_is_capped() {
-        use forge_plugin_api::FormatPlugin;
+        use forge_format_api::FormatSpec;
         // The host reads the capped field out of the stored summary.
         let caps = crate::Apt.summary_caps();
         assert_eq!(caps.len(), 1);

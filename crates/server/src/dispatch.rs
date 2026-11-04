@@ -1,5 +1,5 @@
 //! Authorization and write plumbing shared by every format's feed, served by
-//! [`crate::plugins`] under `/repository/{repo}`.
+//! [`crate::formats`] under `/repository/{repo}`.
 //!
 //! ## Authorization
 //! Resolution runs **before** a format sees the request:

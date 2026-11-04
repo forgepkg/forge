@@ -29,7 +29,7 @@ use forge_db::model::{
 };
 use forge_db::repository_dao::{self, NewRepository, RepositoryUpdate};
 use forge_db::{component_dao, oci_dao, raw_dao};
-use forge_plugin::api::Storage;
+use forge_format_api::Storage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -725,9 +725,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
         "hosted" | "proxy" | "group" => body.kind.clone(),
         other => return bad_request(format!("invalid kind {other:?}")),
     };
-    // The format must be installed: Docker, raw or a format plugin (NuGet;
-    // `GET /admin/formats`), and support
-    // the kind. It is fixed for the repository's lifetime.
+    // The format must be one this server has (`GET /admin/formats`)
+    // and support the kind. It is fixed for the repository's lifetime.
     let Some(kinds) = state.formats.kinds(&body.format) else {
         let available: Vec<&str> = state.formats.ids().collect();
         return bad_request(format!(
@@ -735,8 +734,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
             body.format
         ));
     };
-    // Docker serves every kind; a plugin format serves the kinds its plugin
-    // names (NuGet's all three).
+    // Docker serves every kind; any other format the kinds it names (NuGet's
+    // all three).
     if !kinds.contains(&kind.as_str()) {
         return bad_request(format!(
             "{kind} repositories are not available for format {:?}",
@@ -746,8 +745,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
     let storage = state.storage(&body.format);
     let images = storage == Storage::Images;
     let files = storage == Storage::Files;
-    // A package format plugin's (NuGet's, npm's): package versions.
-    let package = storage == Storage::Packages && state.formats.plugin(&body.format).is_some();
+    // A package format's (NuGet's, npm's): package versions.
+    let package = storage == Storage::Packages && state.formats.spec(&body.format).is_some();
     let parsed_kind = RepoKind::from(kind.as_str());
     let docker_config = match docker_options(
         &state,
@@ -983,8 +982,8 @@ pub async fn create(State(state): State<AppState>, Json(body): Json<CreateRepo>)
 fn keeps_signed_indexes(state: &AppState, format: &str) -> bool {
     state
         .formats
-        .plugin(format)
-        .is_some_and(|plugin| plugin.descriptor().indexes)
+        .spec(format)
+        .is_some_and(|spec| spec.descriptor().indexes)
 }
 
 /// The repositories of `format` when they have no package delay (docker,
@@ -1028,10 +1027,10 @@ async fn delay_overrides_for(
 }
 
 /// The settings of a format's own of a repository of `format` and `kind`
-/// (`config.options`): `given` checked by the format's plugin (a switch:
-/// `true` or `false`, which clears it) and merged into `existing` (a `None`
-/// value clears one), every option the kind requires set. Returns the
-/// options to store.
+/// (`config.options`): `given` checked by the format (a switch: `true` or
+/// `false`, which clears it) and merged into `existing` (a `None` value
+/// clears one), every option the kind requires set. Returns the options to
+/// store.
 #[allow(clippy::result_large_err)]
 fn format_options(
     state: &AppState,
@@ -1040,15 +1039,12 @@ fn format_options(
     existing: &serde_json::Map<String, serde_json::Value>,
     given: Option<BTreeMap<String, Option<String>>>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, Response> {
-    let plugin = state.formats.plugin(format);
-    let declared = plugin
-        .as_ref()
-        .map(|p| p.descriptor().options)
-        .unwrap_or(&[]);
+    let spec = state.formats.spec(format);
+    let declared = spec.as_ref().map(|p| p.descriptor().options).unwrap_or(&[]);
     let api_kind = match kind {
-        RepoKind::Hosted => forge_plugin::api::RepositoryKind::Hosted,
-        RepoKind::Proxy => forge_plugin::api::RepositoryKind::Proxy,
-        RepoKind::Group => forge_plugin::api::RepositoryKind::Group,
+        RepoKind::Hosted => forge_format_api::RepositoryKind::Hosted,
+        RepoKind::Proxy => forge_format_api::RepositoryKind::Proxy,
+        RepoKind::Group => forge_format_api::RepositoryKind::Group,
     };
     let mut options = existing.clone();
     for (name, value) in given.unwrap_or_default() {
@@ -1067,13 +1063,13 @@ fn format_options(
             None => {
                 options.remove(&name);
             }
-            // A switch is on (`true`) or off (not kept); its plugin is not asked.
-            Some(value) if option.input == forge_plugin::api::OptionInput::Switch => {
+            // A switch is on (`true`) or off (not kept); the format is not asked.
+            Some(value) if option.input == forge_format_api::OptionInput::Switch => {
                 match value.trim() {
-                    forge_plugin::api::SWITCH_ON => {
+                    forge_format_api::SWITCH_ON => {
                         options.insert(
                             name,
-                            serde_json::Value::String(forge_plugin::api::SWITCH_ON.into()),
+                            serde_json::Value::String(forge_format_api::SWITCH_ON.into()),
                         );
                     }
                     "false" => {
@@ -1088,8 +1084,8 @@ fn format_options(
                 }
             }
             Some(value) => {
-                let checked = match &plugin {
-                    Some(plugin) => plugin.check_option(api_kind, &name, &value),
+                let checked = match &spec {
+                    Some(spec) => spec.check_option(api_kind, &name, &value),
                     None => Ok(value),
                 };
                 match checked {
@@ -1452,7 +1448,7 @@ pub async fn update(
         );
     }
     let files = storage == Storage::Files;
-    let package = storage == Storage::Packages && state.formats.plugin(&existing.format).is_some();
+    let package = storage == Storage::Packages && state.formats.spec(&existing.format).is_some();
     let stored_config = existing.config.as_object().cloned().unwrap_or_default();
     let config = match docker_options(
         &state,

@@ -6,10 +6,10 @@ have no package manager of their own (the
 [pdfium binaries](https://github.com/bblanchon/pdfium-binaries), for
 example), installers, firmware images, test fixtures, tool downloads.
 
-Files live in repositories of `format: "raw"`, a format plugin built into
+Files live in repositories of `format: "raw"`, a format crate built into
 Forge like NuGet ([`crates/formats/raw`](../crates/formats/raw);
 `GET /admin/formats` lists it), served at
-`https://<host>/repository/<repository>/<path>`. The plugin
+`https://<host>/repository/<repository>/<path>`. The crate
 speaks the protocol below; the host's file store keeps the files
 ([format-plugins.md](format-plugins.md#files-formats)). They come in the
 usual three kinds:

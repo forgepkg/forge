@@ -1,5 +1,5 @@
 //! Directory pages of the file store (the `directory` query): what a
-//! directory holds, a page at a time, for the format's plugin to render.
+//! directory holds, a page at a time, for the format to render.
 //!
 //! A page holds at most `limit` entries (default 100, at most 1000) after
 //! the entry named by `after`, in byte order of their names, a
@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use forge_core::authz::PackageFilter;
 use forge_db::model::{RepoKind, Repository};
 use forge_db::raw_dao::{self, RawFile};
-use forge_plugin::api::files;
+use forge_format_api::files;
 
 use super::{FileError, Files};
 

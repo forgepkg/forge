@@ -134,7 +134,7 @@ pub async fn serve_package(
     }
     match blobs.open(location, range).await {
         Ok(stream) => (status, headers, Body::from_stream(stream)).into_response(),
-        Err(e) => crate::plugins::repo_error(e),
+        Err(e) => crate::formats::repo_error(e),
     }
 }
 

@@ -1,8 +1,8 @@
-//! apt (Debian/Ubuntu) repositories for Forge, as a built-in format plugin:
-//! what `apt-get` reads under `/repository/<repository>/`, and the uploads
-//! of `.deb` packages, like Nexus' apt-hosted and apt-proxy repositories.
+//! apt (Debian/Ubuntu) repositories for Forge, as a format: what `apt-get`
+//! reads under `/repository/<repository>/`, and the uploads of `.deb`
+//! packages, like Nexus' apt-hosted and apt-proxy repositories.
 //!
-//! [`Apt`] implements [`FormatPlugin`]:
+//! [`Apt`] implements [`FormatSpec`]:
 //!
 //! * **Identity.** A package is one architecture of a binary package: its
 //!   id is `<name>:<architecture>` (`hello:amd64`), its version the Debian
@@ -30,9 +30,9 @@ pub mod version;
 
 use std::cmp::Ordering;
 
-use forge_plugin_api::{
+use forge_format_api::{
     Action, Answer, Assets, ChangeRequest, Descriptor, FetchResult, FilePackage, FormatError,
-    FormatOption, FormatPlugin, IndexFile, IndexInput, ListedFile, Loaded, OptionInput, PackageRef,
+    FormatOption, FormatSpec, IndexFile, IndexInput, ListedFile, Loaded, OptionInput, PackageRef,
     PackageSource, ParsedPackage, Prereleases, PublishRequest, Query, Remote, Repository,
     RepositoryKind, Request, Response, Storage, SummaryCap, Upload, UpstreamAnswer, UpstreamOp,
     UpstreamStep, UpstreamToken, VersionClass,
@@ -79,7 +79,7 @@ pub const DESCRIPTOR: Descriptor = Descriptor {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Apt;
 
-impl FormatPlugin for Apt {
+impl FormatSpec for Apt {
     fn descriptor(&self) -> &'static Descriptor {
         &DESCRIPTOR
     }
