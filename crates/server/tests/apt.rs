@@ -346,6 +346,30 @@ async fn hosted_repositories_publish_signed_indexes() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     assert!(text.contains("more than 256 fields"), "{text}");
+    // So is a control file whose relationship fields apt cannot read: one
+    // such paragraph would make apt refuse the whole index (#814).
+    for (field, value) in [
+        ("Depends", "libc6 libssl3"),
+        ("Depends", "a,,b"),
+        ("Breaks", "foo (<< 1"),
+        ("Provides", "foo bar"),
+        ("Pre-Depends", "libc6 libssl3"),
+        ("Recommends", "a,,b"),
+        ("Suggests", "foo (<< 1"),
+        ("Enhances", "foo bar"),
+        ("Conflicts", "libc6 libssl3"),
+        ("Replaces", "a,,b"),
+        ("Built-Using", "foo bar"),
+        ("Depends", "libc6:am$d64"),
+    ] {
+        let (status, text) = apt
+            .post(&deb_of(&format!(
+                "Package: broken\nVersion: 1\nArchitecture: all\n{field}: {value}\n"
+            )))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {value}: {text}");
+        assert!(text.contains(field), "{field}: {value}: {text}");
+    }
 
     // InRelease is Release, signed with the repository's key.
     let keys = keys(&srv, &name).await;

@@ -131,6 +131,14 @@ unless the repository's deployment policy allows redeploying, a file that is
 not a binary package `400`. Trusted publishing works as for every format
 ([trusted-publishing.md](trusted-publishing.md)).
 
+A package whose relationship fields (`Depends`, `Pre-Depends`,
+`Recommends`, `Suggests`, `Enhances`, `Breaks`, `Conflicts`, `Replaces`,
+`Provides`, `Built-Using`) do not parse with dpkg's grammar is refused with
+`400`, uploaded or imported: apt refuses a whole `Packages` index when one of
+its paragraphs holds such a field, so one package would break `apt-get
+update` on every client of the repository. `dpkg-deb --build` checks these
+fields; `dpkg-deb --nocheck`, fpm, nfpm and hand-made packages may not.
+
 However a package is made, reading its `control` file holds some 16 MiB at
 most (zstd), far less for gzip and xz, so that uploads at once cannot
 exhaust the server's memory. A package is refused with `400` when its

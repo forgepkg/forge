@@ -477,6 +477,192 @@ pub fn component_of(section: Option<&str>) -> Result<String, ControlError> {
     }
 }
 
+/// The relationship fields of a binary package (Debian Policy 7.1, 7.8):
+/// the fields `check_relations` reads with dpkg's grammar.
+pub const RELATIONSHIP_FIELDS: [&str; 10] = [
+    "Depends",
+    "Pre-Depends",
+    "Recommends",
+    "Suggests",
+    "Enhances",
+    "Breaks",
+    "Conflicts",
+    "Replaces",
+    "Provides",
+    "Built-Using",
+];
+
+/// Check the value of relationship field `field` (one of
+/// [`RELATIONSHIP_FIELDS`]) against dpkg's grammar: comma-separated
+/// clauses of `|`-separated alternatives, each
+/// `name[:arch] [(op version)] [[arch …]] [<profile …> …]`.
+///
+/// apt refuses a whole `Packages` index when one paragraph's relationship
+/// field does not parse, so a package whose fields do not is refused.
+/// Like dpkg: an empty value is no relation; an empty clause (`a,,b`, a
+/// trailing comma) is refused; `<` and `>` are read as the obsolete `<=`
+/// and `>=`, and a version without an operator as `=`; `Conflicts`,
+/// `Breaks`, `Replaces` and `Provides` hold no alternatives, and
+/// `Provides` no version but an exact one. The architecture restrictions
+/// and build profiles of source packages are accepted, as apt reads them.
+pub fn check_relations(field: &str, value: &str) -> Result<(), ControlError> {
+    let fail = |message: String| error(format!("{field}: {message}"));
+    if value.trim().is_empty() {
+        return Ok(());
+    }
+    let no_alternatives = ["Conflicts", "Breaks", "Replaces", "Provides"]
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(field));
+    let exact_only = field.eq_ignore_ascii_case("Provides");
+    for clause in value.split(',') {
+        if clause.trim().is_empty() {
+            return fail(format!(
+                "an empty relation in {:?} (two commas, or a comma at an end)",
+                value.split_whitespace().collect::<Vec<_>>().join(" ")
+            ));
+        }
+        let alternatives: Vec<&str> = clause.split('|').collect();
+        if alternatives.len() > 1 && no_alternatives {
+            return fail(format!(
+                "alternatives ('|') are not allowed: {:?}",
+                clause.trim()
+            ));
+        }
+        for relation in alternatives {
+            check_relation(relation, exact_only).map_err(|e| {
+                ControlError(format!(
+                    "{field}: {e} in {:?}",
+                    relation.split_whitespace().collect::<Vec<_>>().join(" ")
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// The characters that end a name or an architecture in a relation.
+fn ends_word(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ':' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | '|')
+}
+
+/// Split `text` (trimmed at its start) at the first character `ends`
+/// says ends its leading word.
+fn word(text: &str, ends: impl Fn(char) -> bool) -> (&str, &str) {
+    let text = text.trim_start();
+    let end = text.find(ends).unwrap_or(text.len());
+    (&text[..end], text[end..].trim_start())
+}
+
+/// Whether `name` is a package name as dpkg reads one in a relation: a
+/// letter or a digit, then letters, digits and `- + . _`.
+fn valid_relation_name(name: &str) -> bool {
+    name.len() <= MAX_NAME_BYTES
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.' | b'_'))
+}
+
+/// Whether `arch` is an architecture name or wildcard as dpkg reads one:
+/// a letter or a digit, then letters, digits and `-` (`amd64`,
+/// `linux-any`).
+fn valid_arch_word(arch: &str) -> bool {
+    arch.len() <= MAX_WORD_BYTES
+        && arch.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && arch.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Check one alternative: `name[:arch] [(op version)] [[arch …]]
+/// [<profile …> …]`.
+fn check_relation(relation: &str, exact_only: bool) -> Result<(), String> {
+    let (name, mut rest) = word(relation, ends_word);
+    if name.is_empty() {
+        return Err("a package name is missing".into());
+    }
+    if !valid_relation_name(name) {
+        return Err(format!("{name:?} is not a package name"));
+    }
+    if let Some(after) = rest.strip_prefix(':') {
+        let (arch, after) = word(after, ends_word);
+        if !valid_arch_word(arch) || arch == "all" || arch == "source" {
+            return Err(format!("{arch:?} is not an architecture qualifier"));
+        }
+        rest = after;
+    }
+    if let Some(after) = rest.strip_prefix('(') {
+        let Some((inside, after)) = after.split_once(')') else {
+            return Err("a version constraint is not closed with ')'".into());
+        };
+        let inside = inside.trim_start();
+        let op_len = ["<<", "<=", ">=", ">>", "=", "<", ">"]
+            .iter()
+            .find(|op| inside.starts_with(**op))
+            .map_or(0, |op| op.len());
+        let (op, version) = (&inside[..op_len], inside[op_len..].trim());
+        if exact_only && !(op.is_empty() || op == "=") {
+            return Err(format!(
+                "only an exact version (=) may be provided, not {op:?}"
+            ));
+        }
+        if version.is_empty() {
+            return Err("a version constraint holds no version".into());
+        }
+        if version.contains(|c: char| c.is_whitespace() || matches!(c, '(' | '<' | '>' | '=')) {
+            return Err(format!("{version:?} is not a version"));
+        }
+        crate::version::Version::parse(version).map_err(|e| format!("not a version: {e}"))?;
+        rest = after.trim_start();
+    }
+    if let Some(after) = rest.strip_prefix('[') {
+        let Some((inside, after)) = after.split_once(']') else {
+            return Err("an architecture restriction is not closed with ']'".into());
+        };
+        let arches: Vec<&str> = inside.split_whitespace().collect();
+        if arches.is_empty() {
+            return Err("an architecture restriction names no architecture".into());
+        }
+        // All negated or none (Debian Policy 7.1).
+        let negated = arches.iter().filter(|a| a.starts_with('!')).count();
+        if negated != 0 && negated != arches.len() {
+            return Err("an architecture restriction mixes negated and plain names".into());
+        }
+        for arch in arches {
+            let bare = arch.strip_prefix('!').unwrap_or(arch);
+            if !valid_arch_word(bare) {
+                return Err(format!("{arch:?} is not an architecture"));
+            }
+        }
+        rest = after.trim_start();
+    }
+    while let Some(after) = rest.strip_prefix('<') {
+        let Some((inside, after)) = after.split_once('>') else {
+            return Err("a build profile restriction is not closed with '>'".into());
+        };
+        let profiles: Vec<&str> = inside.split_whitespace().collect();
+        if profiles.is_empty() {
+            return Err("a build profile restriction names no profile".into());
+        }
+        for profile in profiles {
+            let bare = profile.strip_prefix('!').unwrap_or(profile);
+            let valid = bare.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && bare.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+')
+                });
+            if !valid {
+                return Err(format!("{profile:?} is not a build profile"));
+            }
+        }
+        rest = after.trim_start();
+    }
+    if !rest.is_empty() {
+        return Err(format!(
+            "{:?} follows the relation (a comma missing?)",
+            rest.split_whitespace().collect::<Vec<_>>().join(" ")
+        ));
+    }
+    Ok(())
+}
+
 /// The relations of a `Depends`-like field: each comma-separated clause,
 /// as `(package, version constraint)` of its first alternative, the
 /// alternatives kept in the name (`foo | bar`).
@@ -731,5 +917,105 @@ mod tests {
                 ("baz".into(), None),
             ]
         );
+    }
+
+    /// Relationship fields of Debian and Ubuntu packages, as their control
+    /// files write them.
+    const REAL_RELATIONS: &[(&str, &str)] = &[
+        (
+            "Depends",
+            "libc6 (>= 2.34), libssl3 (>= 3.0.0), zlib1g (>= 1:1.1.4)",
+        ),
+        (
+            "Depends",
+            "libc6 (>= 2.34),\n libssl3 (>= 3.0.0),\n zlib1g (>= 1:1.1.4)",
+        ),
+        ("Depends", "debconf (>= 0.5) | debconf-2.0, adduser"),
+        ("Depends", "python3:any (>= 3.6), perl:any, gcc:native"),
+        (
+            "Depends",
+            "libstdc++6 (>= 13.1), libgcc-s1 (>= 3.0), libqt5core5a (>= 5.15.1), qtbase-abi-5-15-8",
+        ),
+        (
+            "Depends",
+            "vim-common (= 2:9.0.1378-2), vim-runtime (= 2:9.0.1378-2), libacl1 (>= 2.2.23)",
+        ),
+        (
+            "Depends",
+            "foo [!amd64 !i386], bar [linux-any] <!nocheck>, baz <!nocheck> <stage1 !cross>",
+        ),
+        (
+            "Depends",
+            "pkg (>=1.0), old (<< 2), older (< 3), newer (> 4), exact (1.0)",
+        ),
+        ("Depends", ""),
+        (
+            "Pre-Depends",
+            "init-system-helpers (>= 1.54~), dpkg (>= 1.17.14)",
+        ),
+        ("Pre-Depends", "python3-minimal (= 3.11.2-1+b1)"),
+        ("Recommends", "ca-certificates, xdg-user-dirs | xdg-utils"),
+        ("Suggests", "ctags, vim-doc, vim-scripts"),
+        ("Enhances", "apache2 | nginx, python3"),
+        (
+            "Breaks",
+            "hurd (<< 1:0.9.git20220301-2), ioquake3 (<< 1.36+u20200211.f2c61c1~dfsg-2~),\n \
+             libtirpc1 (<< 0.2.3), locales (<< 2.36), openssh-server (<< 1:8.2p1-4)",
+        ),
+        ("Conflicts", "mail-transport-agent, python3-foo:any"),
+        ("Replaces", "mail-transport-agent, vim-common (<< 2:9.0)"),
+        ("Provides", "mail-transport-agent, default-mta"),
+        ("Provides", "libgcc1 (= 1:12.2.0-14), python3-profiler"),
+        (
+            "Built-Using",
+            "gcc-12 (= 12.2.0-14), glibc (= 2.36-9+deb12u4)",
+        ),
+    ];
+
+    #[test]
+    fn real_relationship_fields_are_read() {
+        for (field, value) in REAL_RELATIONS {
+            assert_eq!(check_relations(field, value), Ok(()), "{field}: {value}");
+        }
+    }
+
+    #[test]
+    fn malformed_relationship_fields_are_refused() {
+        for value in [
+            "libc6 libssl3",
+            "a,,b",
+            "a, b,",
+            ",a",
+            "foo (<< 1",
+            "foo bar",
+            "foo:am$d64",
+            "foo:",
+            "foo:all",
+            "foo (<< )",
+            "foo (>> x)",
+            "foo (>= 1.0 2.0)",
+            "foo (<<< 1)",
+            "foo [amd64",
+            "foo []",
+            "foo [amd64 !i386]",
+            "foo <!nocheck",
+            "foo <!No_Check>",
+            "foo |",
+            "| foo",
+            "Foo$bar",
+            "foo (= ${binary:Version})",
+            "foo) bar",
+        ] {
+            for field in RELATIONSHIP_FIELDS {
+                let err = check_relations(field, value).unwrap_err().to_string();
+                assert!(err.starts_with(field), "{field}: {value}: {err}");
+            }
+        }
+        for field in ["Conflicts", "Breaks", "Replaces", "Provides"] {
+            assert!(check_relations(field, "a | b").is_err(), "{field}");
+        }
+        for value in ["foo (>= 1)", "foo (<< 1)"] {
+            assert!(check_relations("Provides", value).is_err(), "{value}");
+        }
     }
 }
