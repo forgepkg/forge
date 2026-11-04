@@ -8,7 +8,8 @@
 //!
 //! The server crate owns the full `OidcConfig` (TOML/env). To avoid a
 //! `core → server` dependency inversion, the server maps the claim-relevant
-//! fields into this [`ClaimMapping`] when it builds the [`super::OidcProvider`].
+//! fields into this [`ClaimMapping`] when it builds its OIDC runtime
+//! (`OidcRuntime::build`).
 //! The mapping logic and its tests then live entirely in `core`.
 
 use super::jwks::IdTokenClaims;

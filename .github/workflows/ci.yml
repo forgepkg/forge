@@ -127,13 +127,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/ci-changes.sh
 
-  # ── Formatting, the changelog fragments, the docs' links, xtask's tests ────
-  # The fragment and link checks and the tests build only xtask, which has no
-  # dependencies. On a pull request the fragment check sees the merge with
-  # the base, so a fragment under a milestone that was released after the
-  # pull request was written fails. xtask's tests run in `test` as well; here
-  # they also run for a change to the files they read outside xtask (the
-  # release group), which leaves the rest of the Rust jobs out.
+  # ── Formatting, changelog fragments, docs' links, unused code, xtask tests ──
+  # The fragment, link and unused-code checks and the tests build only xtask,
+  # which has no dependencies. On a pull request the fragment check sees the
+  # merge with the base, so a fragment under a milestone that was released
+  # after the pull request was written fails. xtask's tests run in `test` as
+  # well; here they also run for a change to the files they read outside
+  # xtask (the release group), which leaves the rest of the Rust jobs out.
   # No job waits for this one (`needs: [fmt]`): a job behind `needs` joins
   # the runner queue only once fmt is done, so when the runners are busy the
   # long jobs would queue twice (#337).
@@ -158,13 +158,18 @@ jobs:
       # to a renamed file).
       - name: Documentation links (docs/SUMMARY.md)
         run: cargo xtask docs --check
+      # What rustc and clippy cannot see is unused: a pub item nothing else
+      # names, a dependency its crate never imports, a dev-dependency that
+      # repeats a dependency, a workspace dependency no member inherits.
+      - name: Unused code and dependencies (cargo xtask unused)
+        run: cargo xtask unused
       - name: cargo test -p xtask
         run: cargo test -p xtask
 
-  # ── Clippy, and the sqlx offline-cache drift guard ─────────────────────────
-  # Both are check builds; the drift guard runs here rather than in `test`,
-  # whose build it shares nothing with (--all-features), to keep it off the
-  # longest job's path.
+  # ── Clippy, the sqlx offline-cache drift guard, the API docs' links ────────
+  # All are check builds; the drift guard and the docs run here rather than in
+  # `test`, whose build they share nothing with (--all-features), to keep them
+  # off the longest job's path.
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -220,6 +225,11 @@ jobs:
         env:
           SQLX_OFFLINE: ""
         run: cargo sqlx prepare --check --workspace -- --all-targets --all-features
+      # rustdoc with its warnings denied: a doc link to a renamed or removed
+      # item fails. After the drift guard, whose check build of every feature
+      # leaves only the crates' docs to build.
+      - name: API docs (cargo xtask doc-check)
+        run: cargo xtask doc-check
 
   # ── Dependency advisories (RustSec) ────────────────────────────────────────
   # Fails on any known vulnerability in Cargo.lock. Accepted advisories, each
@@ -446,6 +456,9 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Typecheck (tsc --noEmit)
         run: pnpm run tsc
+      # Files, exports and dependencies nothing uses (web/knip.jsonc).
+      - name: Unused code (knip)
+        run: pnpm run knip
       - name: Unit tests (Vitest)
         run: pnpm run test
       - name: Production build (vite build -> web/dist)

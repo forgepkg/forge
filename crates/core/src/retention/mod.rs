@@ -2,7 +2,7 @@
 //!
 //! This module is the **format-agnostic** core of retention: it defines the
 //! serde [`RetentionPolicy`] stored in `repository.retention_policy` (with
-//! [`validate_policy`]) and a **pure** evaluator ([`evaluate`] / [`evaluate_proxy`])
+//! [`validate_policy`]) and a **pure** evaluator ([`evaluate()`] / [`evaluate_proxy`])
 //! that, given a policy and a component/proxy snapshot, computes the set of
 //! versions to delete or unlist. Versions are ordered through the
 //! [`crate::format::Format`] seam, never by importing a concrete format.

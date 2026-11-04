@@ -13,7 +13,8 @@
 //! * version visibility, group member resolution, listed/prerelease filtering,
 //!   and proxy **package-delay** gating all come for free from
 //!   [`AppState::read_ops_for`] (the package detail's
-//!   [`AppState::cached_read_ops_for`]) + [`RepoReadOps`] — the same ops the
+//!   [`AppState::cached_read_ops_for`]) +
+//!   [`RepoReadOps`](forge_core::repo::RepoReadOps) — the same ops the
 //!   repository dispatcher uses, so browse can never surface a version the
 //!   protocol would hide.
 //!
@@ -251,7 +252,8 @@ pub struct BrowseResult {
 /// `GET /browse/packages` — cross-repository search.
 ///
 /// Iterates every repository the principal may read (honoring
-/// `anonymous_read`), runs [`RepoReadOps::search`] on each, merges the hits,
+/// `anonymous_read`), runs
+/// [`RepoReadOps::search`](forge_core::repo::RepoReadOps::search) on each, merges the hits,
 /// then sorts + paginates the merged set. A `repo` filter restricts to a single
 /// repository, which then pages in its backend. `total` is the sum of the
 /// backends' `total_hits` (already filtered by the caller's package selector).

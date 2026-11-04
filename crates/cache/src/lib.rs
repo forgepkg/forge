@@ -36,7 +36,7 @@
 //! ## TTL approach
 //!
 //! moka's own per-entry TTL (via an `Expiry`) governs L1. We *also* stamp each
-//! stored entry with an absolute `expires_at` [`Instant`] and treat an entry
+//! stored entry with an absolute `expires_at` [`Instant`](std::time::Instant) and treat an entry
 //! whose deadline has passed as a **miss** on read. Belt-and-suspenders: it
 //! makes expiry deterministic for tests (which can't depend on moka's
 //! background eviction timing) while moka's expiry bounds memory.

@@ -3,7 +3,7 @@
 //! The shape:
 //! a policy is a list of **rules**; a component is acted on if **any** rule
 //! selects it (union), but `keep_last_n` / `keep_n_most_downloaded` protections
-//! always win (a protected version is never deleted — see [`crate::retention::evaluate`]).
+//! always win (a protected version is never deleted — see [`crate::retention::evaluate()`]).
 //! Each rule's protections are computed over the versions that rule's own
 //! filters admit (see [`Criteria`]); the protected sets are then unioned.
 //!

@@ -1,0 +1,14 @@
+// knip: files, exports and dependencies nothing uses (`pnpm run knip`, CI's
+// web job). Its plugins find the entry files in index.html and the Vite,
+// Vitest and Playwright configs.
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  // The TanStack Router plugin loads the route tree from src/routes.ts by
+  // its path (vite.config.ts).
+  "entry": ["src/routes.ts"],
+  // The stylesheets too, for the packages they import (`@import
+  // 'tailwindcss'`).
+  "project": ["src/**/*.{ts,tsx,css}", "e2e/**/*.ts"],
+  // An export the module itself uses is no dead code, only a wider scope.
+  "ignoreExportsUsedInFile": true
+}

@@ -138,6 +138,7 @@ URLs before handing off to Vite.
 cargo xtask web-test           # Vitest + React Testing Library (unit/component)
 cargo xtask web-e2e            # Playwright e2e (needs Docker; builds the UI first)
 cd web && pnpm run tsc         # typecheck
+cd web && pnpm run knip        # files, exports and dependencies nothing uses
 cd web && pnpm run e2e:install # one-time: download the Playwright browser
 ```
 
@@ -793,6 +794,45 @@ dependencies that are slow without it, `rsa` and `argon2` (`Cargo.toml`,
 `[profile.dev.package.*]`): the mock IdPs generate RSA keys, and every test
 server hashes its bootstrap admin password.
 
+## Unused code and stale doc links
+
+rustc warns about a private function nothing calls, but not about a `pub`
+one, which another crate might call; neither Cargo nor `tsc` says when a
+dependency is no longer imported; and a doc comment that links an item
+renamed or removed since still compiles. Three checks catch what they leave,
+and CI runs all three:
+
+- **`cargo xtask unused`** (the `fmt` job) fails on a `pub` item (a function,
+  type, trait, constant or static) whose name appears nowhere else in the
+  workspace's Rust sources; a dependency its crate's sources never name
+  (`name::…`, `use name`); a dev-dependency that repeats one of its crate's
+  dependencies without adding a feature; and an entry of
+  `[workspace.dependencies]` that no member inherits. It searches the sources
+  as text and errs towards silence: a name that also appears elsewhere (in a
+  comment, a string, as a local) counts as used. Delete what it reports. A dependency the code needs without naming it (one
+  that only turns on a feature of another) goes, with the reason, into its
+  crate's `Cargo.toml`:
+
+  ```toml
+  [package.metadata.unused]
+  # <why the code needs it without naming it>
+  ignore = ["<name>"]
+  ```
+
+- **`cd web && pnpm run knip`** (the `web` job) fails on a file of `web/`
+  nothing imports, an export no other module imports, and a package of
+  `package.json` nothing imports ([knip](https://knip.dev), configured in
+  `web/knip.jsonc`). An export only its own module uses is left alone.
+
+- **`cargo xtask doc-check`** (the `clippy` job) builds the crates' API docs
+  (`cargo doc --workspace --all-features --no-deps --document-private-items`)
+  with rustdoc's warnings denied, so a doc link (`` [`name`] ``) to an item
+  that is gone fails, as does an ambiguous one. Links from public to private
+  items are allowed, since the private items are documented too.
+
+None of them knows whether a comment's prose is still true: that stays with
+the review.
+
 ## Resetting & troubleshooting
 
 - `cargo xtask down` stops the containers but **keeps** the Postgres volume. To
@@ -819,7 +859,8 @@ server hashes its bootstrap admin password.
 
 `up` · `down` · `dev` · `run` · `seed` · `test` · `e2e` · `check` · `fmt` ·
 `clippy` · `build` · `migrate` · `prepare` (regenerate sqlx offline data) ·
-`prepare-check` · `psql` · `logs` · `ps` · `clean`.
+`prepare-check` · `unused` · `doc-check` (both: see [Unused code and stale doc
+links](#unused-code-and-stale-doc-links)) · `psql` · `logs` · `ps` · `clean`.
 
 Web UI: `web` (build) · `web-install` · `web-dev` (Vite HMR) · `web-test`
 (Vitest) · `web-e2e` (Playwright).

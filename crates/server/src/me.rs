@@ -1,9 +1,10 @@
 //! `GET /admin/me` — the authenticated principal's identity + capability flags.
 //!
-//! This endpoint is mounted **outside** the admin module's [`require_admin`]
-//! gate: it is reachable by any *authenticated* user (admin or not) so the SPA
-//! can decide which navigation/management screens to show. It still requires an
-//! authenticated principal — an anonymous or unauthenticated caller gets `401`.
+//! This endpoint is mounted **outside** the admin module's
+//! [`require_admin`](crate::admin::require_admin) gate: it is reachable by any
+//! *authenticated* user (admin or not) so the SPA can decide which
+//! navigation/management screens to show. It still requires an authenticated
+//! principal — an anonymous or unauthenticated caller gets `401`.
 //!
 //! ## Capabilities
 //! `is_admin` and the capability list come from the **effective RBAC** verdict

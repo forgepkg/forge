@@ -2,7 +2,7 @@
 //!
 //! The [`Authz`](crate::auth::authz::Authz) seam answers `can_read` /
 //! `can_write` / `can_delete` from a principal's resolved
-//! [`EffectiveSet`](super::EffectiveSet). Computing that set is a DB round trip
+//! [`EffectiveSet`]. Computing that set is a DB round trip
 //! (`user_role → repository_privilege`), far too costly to run on every
 //! download/restore request. This module sits in front of that load with
 //! [`forge_cache::Cache`] — **in-process only**

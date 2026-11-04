@@ -475,7 +475,7 @@ pub struct SearchParams {
     pub include_semver2: bool,
     /// Let a proxy forward the search to its upstream's search service, so
     /// packages it has not cached yet are found too (see
-    /// [`proxy`](crate::repo::proxy)). The NuGet search route sets it; the
+    /// [`proxy`]). The NuGet search route sets it; the
     /// browse UI, which lists what Forge holds, does not. Defaults to `true`.
     pub include_upstream: bool,
 }

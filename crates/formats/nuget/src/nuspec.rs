@@ -1,4 +1,5 @@
-//! `.nupkg` (zip) and `.nuspec` (XML) parsing into a [`ParsedNupkg`].
+//! `.nupkg` (zip) and `.nuspec` (XML) parsing into a
+//! [`ParsedNupkg`](crate::model::ParsedNupkg).
 //!
 //! A `.nupkg` is an OPC zip. We locate the single top-level `*.nuspec`
 //! manifest, read it under strict zip-bomb limits, and parse it
@@ -7,7 +8,7 @@
 //!
 //! Only the manifest is decompressed; the `<id>`, `<version>`, and
 //! `<dependencies>` groups are extracted. The raw manifest bytes are carried in
-//! [`ParsedNupkg::nuspec_bytes`] so the server can store and re-serve them.
+//! [`ParsedNupkg::nuspec_bytes`](crate::model::ParsedNupkg::nuspec_bytes) so the server can store and re-serve them.
 
 use std::io::{BufReader, Read, SeekFrom};
 
@@ -20,7 +21,7 @@ use crate::model::{
 };
 use crate::version;
 
-/// Parse a `.nupkg` from a seekable reader into a [`ParsedNupkg`].
+/// Parse a `.nupkg` from a seekable reader into a [`ParsedNupkg`](ParsedUpload).
 pub fn parse_nupkg(
     file: &mut dyn ReadSeek,
     limits: &NupkgLimits,

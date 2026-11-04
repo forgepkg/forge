@@ -1,7 +1,7 @@
 //! Docker / OCI registries for Forge, as a format plugin: the
 //! distribution-spec v1.1 API under `/v2`, over the host's image store.
 //!
-//! * [`path`], [`digest`], [`reference`]: the protocol's paths and the
+//! * [`path`], [`digest`], [`reference`](mod@reference): the protocol's paths and the
 //!   grammar of its names, references and digests;
 //! * [`manifest`]: Docker v2 schema 2 manifests and manifest lists, OCI
 //!   image manifests and indexes, artifacts with `artifactType` and
