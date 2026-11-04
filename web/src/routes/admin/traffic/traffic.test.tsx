@@ -61,6 +61,8 @@ const overview: TrafficOverview = {
       last_day: '2026-10-30',
     },
   ],
+  other_clients: { requests: 334, bytes: 2 * 1024 ** 2, clients: 2 },
+  estimated: false,
   recording,
 }
 
@@ -178,6 +180,10 @@ describe('admin traffic screens', () => {
     expect(within(row).getByRole('link', { name: '2001:db8:1:2::/64' })).toBeInTheDocument()
     expect(within(row).getByText('Germany')).toBeInTheDocument()
     expect(within(row).getByText('npm-proxy, No repository (web UI, APIs, sign-in)')).toBeInTheDocument()
+    const other = within(clients).getAllByRole('row')[2]
+    expect(within(other).getByText('Other networks (2)')).toBeInTheDocument()
+    expect(within(other).getByText('334')).toBeInTheDocument()
+    expect(screen.queryByText(/counts of clients are estimates/)).toBeNull()
     expect(screen.getAllByText(/GeoLite Data created by MaxMind/).length).toBeGreaterThan(0)
     expect(screen.getByRole('img', { name: /Requests by day: 1,234 in all/ })).toBeInTheDocument()
   })
@@ -209,6 +215,22 @@ describe('admin traffic screens', () => {
     await waitFor(() => expect(sent('/admin/traffic').some((q) => q.get('repository') === '-')).toBe(true))
     await user.click(screen.getByRole('button', { name: 'Clear all' }))
     await waitFor(() => expect(router.state.location.search).not.toHaveProperty('country'))
+  })
+
+  it('says when a range holds more client networks than are summed exactly', async () => {
+    mockApi({
+      overview: {
+        ...overview,
+        totals: { ...overview.totals, clients: 250_000 },
+        other_clients: { requests: 0, bytes: 0, clients: 0 },
+        estimated: true,
+      },
+    })
+    await renderApp('/manage/traffic')
+    expect(await screen.findByText('≈ 250,000')).toBeInTheDocument()
+    expect(screen.getByText(/counts of clients are estimates/)).toBeInTheDocument()
+    const clients = screen.getByRole('table', { name: 'Top clients' })
+    expect(within(clients).getAllByRole('row')).toHaveLength(2)
   })
 
   it('shows the days as a table on request', async () => {
