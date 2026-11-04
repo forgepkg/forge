@@ -275,6 +275,33 @@ struct Stored {
     immutable: bool,
 }
 
+/// A file in the object store, to be recorded with the generation.
+struct Ingested {
+    path: String,
+    content_type: String,
+    immutable: bool,
+    stored: forge_storage::StoredBlob,
+    sha1: String,
+    md5: String,
+}
+
+/// Store `file`'s content (outside the transaction) and drop it.
+async fn ingest(cas: &forge_storage::Cas, file: Stored) -> Result<Ingested, IndexError> {
+    let staged = cas
+        .stage(&file.content[..], file.content.len() as u64)
+        .await
+        .map_err(cas_error)?;
+    let stored = cas.commit(staged).await.map_err(cas_error)?;
+    Ok(Ingested {
+        sha1: hex::encode(Sha1::digest(&file.content)),
+        md5: hex::encode(md5::Md5::digest(&file.content)),
+        path: file.path,
+        content_type: file.content_type,
+        immutable: file.immutable,
+        stored,
+    })
+}
+
 /// Make and store a generation. `false` when the repository changed while
 /// it was made (nothing was stored).
 async fn generate(
@@ -326,6 +353,7 @@ async fn generate(
         generated: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         keyring,
         keyring_armored,
+        max_bytes: MAX_INDEX_BYTES as u64,
     };
     let target = protocol::Repository {
         name: repo.name.clone(),
@@ -335,28 +363,38 @@ async fn generate(
         options: repo.format_options(),
     };
     let implementation = plugin.clone();
-    let files = tokio::task::spawn_blocking(move || -> Result<Vec<Stored>, IndexError> {
-        let made = implementation
-            .index(&target, &input)
-            .map_err(|e| IndexError::Internal(format!("the format made no index: {e}")))?;
-        sign_and_check(made, &keys)
+    let cas = state.cas.clone();
+    let runtime = tokio::runtime::Handle::current();
+    // Each file is signed, checked and stored as the format hands it over,
+    // then dropped: what is held at once is one file, not the index (#797).
+    let files = tokio::task::spawn_blocking(move || -> Result<Vec<Ingested>, IndexError> {
+        let mut bounds = Bounds::default();
+        let mut ingested = Vec::new();
+        // What failed in the host, kept to be returned as it is (an
+        // unavailable object store stays one).
+        let mut failed: Option<IndexError> = None;
+        let made = implementation.index(&target, &input, &mut |file| {
+            let store = || -> Result<(), IndexError> {
+                for file in sign(file, &keys)? {
+                    bounds.add(&file)?;
+                    ingested.push(runtime.block_on(ingest(&cas, file))?);
+                }
+                Ok(())
+            };
+            store().map_err(|e| {
+                let message = e.to_string();
+                failed = Some(e);
+                protocol::FormatError::Internal(message)
+            })
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        made.map_err(|e| IndexError::Internal(format!("the format made no index: {e}")))?;
+        Ok(ingested)
     })
     .await
     .map_err(|e| IndexError::Internal(format!("index: {e}")))??;
-
-    // The content first, outside the transaction.
-    let mut ingested = Vec::with_capacity(files.len());
-    for file in &files {
-        let staged = state
-            .cas
-            .stage(&file.content[..], file.content.len() as u64)
-            .await
-            .map_err(cas_error)?;
-        let stored = state.cas.commit(staged).await.map_err(cas_error)?;
-        let sha1 = hex::encode(Sha1::digest(&file.content));
-        let md5 = hex::encode(md5::Md5::digest(&file.content));
-        ingested.push((stored, sha1, md5));
-    }
 
     let grace = state.config.outbox.grace();
     let mut tx = forge_db::begin(&state.pool).await?;
@@ -377,7 +415,8 @@ async fn generate(
     if versions_now != versions_digest || keys_now != keys_then {
         return Ok(false);
     }
-    for (file, (stored, sha1, md5)) in files.iter().zip(&ingested) {
+    for file in &files {
+        let stored = &file.stored;
         raw_dao::store(
             &mut tx,
             repo.id,
@@ -387,8 +426,8 @@ async fn generate(
                 size: i64::try_from(stored.size).unwrap_or(i64::MAX),
                 content_type: &file.content_type,
                 sha512_base64: &stored.sha512_base64,
-                sha1,
-                md5,
+                sha1: &file.sha1,
+                md5: &file.md5,
                 upstream_etag: None,
                 upstream_last_modified: None,
                 checked: true,
@@ -422,49 +461,54 @@ fn cas_error(e: forge_storage::CasError) -> IndexError {
     }
 }
 
-/// Check what the plugin made (valid, distinct paths; bounded) and add the
-/// signed copies.
-fn sign_and_check(made: Vec<protocol::IndexFile>, keys: &[Key]) -> Result<Vec<Stored>, IndexError> {
-    let bad = |what: String| IndexError::Internal(format!("the format's index: {what}"));
-    let mut out = Vec::with_capacity(made.len() + 2);
-    for file in made {
-        for copy in &file.signed {
-            let content = match copy.signature {
-                SignatureKind::Cleartext => {
-                    let text = std::str::from_utf8(&file.content).map_err(|_| {
-                        bad(format!("{} is signed as text but is not UTF-8", file.path))
-                    })?;
-                    signing::sign_cleartext(keys, text)?
-                }
-                SignatureKind::Detached => signing::sign_detached(keys, &file.content)?,
-            };
-            out.push(Stored {
-                path: copy.path.clone(),
-                content: content.into_bytes(),
-                content_type: match copy.signature {
-                    SignatureKind::Cleartext => "text/plain; charset=utf-8".into(),
-                    SignatureKind::Detached => "application/pgp-signature".into(),
-                },
-                immutable: false,
-            });
-        }
+fn bad(what: String) -> IndexError {
+    IndexError::Internal(format!("the format's index: {what}"))
+}
+
+/// A file the plugin made and the signed copies it names, the copies first.
+fn sign(file: protocol::IndexFile, keys: &[Key]) -> Result<Vec<Stored>, IndexError> {
+    let mut out = Vec::with_capacity(file.signed.len() + 1);
+    for copy in &file.signed {
+        let content = match copy.signature {
+            SignatureKind::Cleartext => {
+                let text = std::str::from_utf8(&file.content).map_err(|_| {
+                    bad(format!("{} is signed as text but is not UTF-8", file.path))
+                })?;
+                signing::sign_cleartext(keys, text)?
+            }
+            SignatureKind::Detached => signing::sign_detached(keys, &file.content)?,
+        };
         out.push(Stored {
-            path: file.path,
-            content: file.content,
-            content_type: file.content_type,
-            immutable: file.immutable,
+            path: copy.path.clone(),
+            content: content.into_bytes(),
+            content_type: match copy.signature {
+                SignatureKind::Cleartext => "text/plain; charset=utf-8".into(),
+                SignatureKind::Detached => "application/pgp-signature".into(),
+            },
+            immutable: false,
         });
     }
-    if out.len() > MAX_INDEX_FILES {
-        return Err(bad(format!("more than {MAX_INDEX_FILES} files")));
-    }
-    let mut seen = HashSet::new();
-    let mut total = 0usize;
-    for file in &out {
+    out.push(Stored {
+        path: file.path,
+        content: file.content,
+        content_type: file.content_type,
+        immutable: file.immutable,
+    });
+    Ok(out)
+}
+
+/// What an index's files held so far: each is checked (a valid path, not
+/// seen before; a valid content type) as it comes, and the index is
+/// refused once its files are too many or too large together.
+#[derive(Default)]
+struct Bounds {
+    paths: HashSet<String>,
+    bytes: usize,
+}
+
+impl Bounds {
+    fn add(&mut self, file: &Stored) -> Result<(), IndexError> {
         files::validate_path(&file.path).map_err(|e| bad(format!("{:?}: {e}", file.path)))?;
-        if !seen.insert(file.path.as_str()) {
-            return Err(bad(format!("{:?} twice", file.path)));
-        }
         let essence = file.content_type.split(';').next().unwrap_or("").trim();
         let content_type_ok = file.content_type.len() <= 127
             && file
@@ -480,10 +524,16 @@ fn sign_and_check(made: Vec<protocol::IndexFile>, keys: &[Key]) -> Result<Vec<St
                 file.path, file.content_type
             )));
         }
-        total += file.content.len();
+        if self.paths.len() >= MAX_INDEX_FILES {
+            return Err(bad(format!("more than {MAX_INDEX_FILES} files")));
+        }
+        if !self.paths.insert(file.path.clone()) {
+            return Err(bad(format!("{:?} twice", file.path)));
+        }
+        self.bytes = self.bytes.saturating_add(file.content.len());
+        if self.bytes > MAX_INDEX_BYTES {
+            return Err(bad(format!("larger than {MAX_INDEX_BYTES} bytes")));
+        }
+        Ok(())
     }
-    if total > MAX_INDEX_BYTES {
-        return Err(bad(format!("larger than {MAX_INDEX_BYTES} bytes")));
-    }
-    Ok(out)
 }

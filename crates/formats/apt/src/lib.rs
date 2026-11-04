@@ -162,7 +162,12 @@ impl FormatPlugin for Apt {
         }
     }
 
-    fn index(&self, repo: &Repository, input: &IndexInput) -> Result<Vec<IndexFile>, FormatError> {
+    fn index(
+        &self,
+        repo: &Repository,
+        input: &IndexInput,
+        sink: &mut dyn FnMut(IndexFile) -> Result<(), FormatError>,
+    ) -> Result<(), FormatError> {
         let distribution = repo
             .option(DISTRIBUTION)
             .ok_or_else(|| FormatError::Internal("the repository has no distribution".into()))?;
@@ -172,6 +177,7 @@ impl FormatPlugin for Apt {
                 label: &repo.name,
             },
             input,
+            sink,
         )
     }
 

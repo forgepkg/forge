@@ -370,6 +370,16 @@ async fn hosted_repositories_publish_signed_indexes() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {value}: {text}");
         assert!(text.contains(field), "{field}: {value}: {text}");
     }
+    // And a control file over 64 KiB (#797): its stanza would be listed
+    // once per architecture of every index generation.
+    let (status, text) = apt
+        .post(&deb_of(&format!(
+            "Package: wordy\nVersion: 1\nArchitecture: all\nDescription: w\n {}\n",
+            "w".repeat(64 * 1024)
+        )))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("larger than 64 KiB"), "{text}");
 
     // InRelease is Release, signed with the repository's key.
     let keys = keys(&srv, &name).await;
