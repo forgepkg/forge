@@ -4,8 +4,7 @@ A self-hosted **NuGet package registry, npm registry, Docker / OCI registry,
 apt repository and raw file repository** written in Rust. It speaks the NuGet **V3**
 protocol, the **npm registry** protocol (npm, pnpm, Yarn, Bun) and the **OCI Distribution Spec**
 v1.1 (Docker, Podman, containerd, crane, Helm, cosign), and supports the
-three repository types you expect from an enterprise registry (more package
-formats come as **format plugins**, see below):
+three repository types you expect from an enterprise registry. For NuGet:
 
 - **hosted** — push and restore your own `.nupkg` packages.
 - **proxy** — cache packages on demand from an upstream NuGet V3 feed —
@@ -29,7 +28,8 @@ repositories, with ranges, checksum sidecars and proxies of any HTTP(S)
 download URL such as GitHub release assets — see
 **[docs/raw.md](./docs/raw.md)**; and for Debian and Ubuntu packages, apt
 repositories whose indexes Forge signs with keys of their own, and proxies of
-Debian and Ubuntu mirrors — see **[docs/apt.md](./docs/apt.md)**.
+Debian and Ubuntu mirrors (apt has no groups) — see
+**[docs/apt.md](./docs/apt.md)**.
 
 Storage is **content-addressed (CAS)** on top of any **S3-compatible** object
 store; package metadata lives in **PostgreSQL**. Access control is **fine-grained
@@ -37,15 +37,17 @@ RBAC** (users, nested groups, roles, package/content selectors). Authentication
 is organized into ordered, web-managed **auth realms** — local passwords,
 **OIDC / Microsoft Entra** browser login, and credential-forwarding against an
 existing registry — with an identifier-first login flow. CI jobs can publish
-without stored API keys through Forge's **direct-token OIDC trusted-publishing**
-flow for GitHub Actions, GitLab CI, and compatible workload issuers; its bearer
-token, cache, and audit limitations are documented below.
+without stored API keys through **trusted publishing**: a job of GitHub
+Actions, GitLab CI or another OIDC workload issuer exchanges its identity
+token for a short-lived API key
+([docs/trusted-publishing.md](docs/trusted-publishing.md), which also covers
+its limitations).
 A **retention** engine reaps cold versions and garbage-collects dereferenced
-blobs. **Format plugins** (preview), crates built into the server, add
-further package formats that reuse all of the above
-([docs/format-plugins.md](docs/format-plugins.md)). The admin + browse UI is
-a **TanStack Router SPA** served by the same Rust process on a single origin —
-there is no Node server in production.
+blobs. Every format is a **format plugin**: a crate built into the server
+that speaks the format's protocol, while the server keeps all of the above
+the same for every format ([docs/format-plugins.md](docs/format-plugins.md)).
+The admin + browse UI is a **TanStack Router SPA** served by the same Rust
+process on a single origin — there is no Node server in production.
 
 ## Architecture
 
@@ -56,9 +58,12 @@ A Cargo workspace of small crates plus the web SPA:
 | `db` | `forge-db` | PostgreSQL data access (sqlx), row models, DAOs. |
 | `storage` | `forge-storage` | CAS over S3, blob outbox / GC reconciler. |
 | `cache` | `forge-cache` | In-process L1 + optional Redis L2 with cross-instance invalidation (no Postgres advisory locks). |
+| `crypto` | `forge-crypto` | Secret encryption at rest: the envelope encryption of stored secrets (proxy passwords, realm secrets, signing keys) under a root key. |
+| `telemetry` | `forge-telemetry` | OpenTelemetry metrics and the `tracing` spans that become traces. |
+| `traffic` | `forge-traffic` | Traffic statistics: requests per repository and client network per day, kept as Parquet files in the object store. |
 | `core` | `forge-core` | Domain logic: repo dispatch, auth chain, authz/RBAC, sessions, OIDC, retention. |
 | `plugin-api` | `forge-plugin-api` | The format-plugin contract: the `FormatPlugin` trait and its types. |
-| `plugin` | `forge-plugin` | The host side of format plugins: an installed plugin and its adapter to the repository machinery. |
+| `plugin` | `forge-plugin` | The host side of format plugins: the adapter of a plugin to the repository machinery, and the checks of its descriptor. |
 | `formats/<id>` | `forge-format-*` | Format plugins, built into the server: `apt`, `docker` (the distribution-spec `/v2` API, manifests, upstream registries), `nuget`, `npm`, `raw`. |
 | `server` | `forge-server` | Axum HTTP server: the format plugins' feeds under `/repository/{repo}` (except Docker at `/v2`), the file store of files formats, the image store and registry tokens of images formats, `/admin` + `/auth` REST, background workers, static SPA serving. |
 | `e2e` | `forge-e2e` | End-to-end suite (testcontainers + mock upstream/IdP). |
@@ -205,6 +210,8 @@ The guides below are also a site, with navigation and search:
   (**[deploy/helm/forge](./deploy/helm/forge/README.md)**, on GitHub Packages
   as [`oci://ghcr.io/forgepkg/charts/forge`](https://github.com/forgepkg/forge/pkgs/container/charts%2Fforge)), or kustomize
   manifests (**[deploy/kubernetes](./deploy/kubernetes/README.md)**).
+  Monitoring: an OpenTelemetry Collector configuration, a Grafana dashboard
+  and alerting rules (**[deploy/monitoring](./deploy/monitoring/README.md)**).
 - **[CHANGELOG.md](./CHANGELOG.md)** — release notes, upgrade notes and known
   limitations; **[SECURITY.md](./SECURITY.md)** — how to report a
   vulnerability.
@@ -233,10 +240,14 @@ The guides below are also a site, with navigation and search:
 - **[Retention](./docs/retention.md)** — the retention rules of each kind
   of repository with examples, cron schedules in a time zone with a time
   limit per run, and size budgets.
+- **[Package delay](./docs/package-delay.md)** — a NuGet or npm proxy's
+  dependency cooldown for new upstream releases, other delays for some
+  packages, and releasing one version early.
 - **[Trusted publishing](./docs/trusted-publishing.md)** — configure short-lived
   workload identity for GitHub Actions, GitLab CI, and compatible OIDC issuers,
-  and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`)
-  that publishes NuGet packages and pushes container images (`docker push`,
+  and exchange a job's OIDC token for a short-lived API key (`POST /api/v2/token`,
+  or npm's own exchange) that publishes NuGet and npm packages and pushes
+  container images (`dotnet nuget push`, `npm publish`, `docker push`,
   `dotnet publish`).
 - **[GitLab CI with workload identity](./docs/gitlab-ci.md)** — step by step:
   every job of a GitLab project restores from Forge's NuGet feeds, and only
@@ -246,8 +257,9 @@ The guides below are also a site, with navigation and search:
   pipelines that cannot use workload identity: a read token and a release
   token of service accounts in GitLab's CI/CD variables, and how both
   methods run side by side.
-- **[Format plugins](./docs/format-plugins.md)** — further package formats,
-  built into the server: design, operation, and writing one.
+- **[Format plugins](./docs/format-plugins.md)** — how every format is
+  built: the `FormatPlugin` contract, what the server does for each format,
+  and adding a new one.
 - **[Importing repositories](./docs/import.md)** — copy a hosted repository
   of Nexus, Artifactory, Verdaccio, a registry or another Forge (NuGet, npm,
   Docker, raw, apt) into Forge through the format's own protocol: dry run,

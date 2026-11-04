@@ -5,7 +5,7 @@
 # another version, and the image tag defaults to `appVersion`.
 apiVersion: v2
 name: forge
-description: Self-hosted NuGet, Docker / OCI and Helm registry (hosted, proxy and group repositories)
+description: Self-hosted NuGet, npm, Docker / OCI (Helm charts included), apt and raw file registry (hosted, proxy and group repositories)
 type: application
 version: 2.1.0
 appVersion: "2.1.0"
@@ -15,9 +15,11 @@ sources:
   - https://github.com/forgepkg/forge
 keywords:
   - nuget
+  - npm
   - docker
   - oci
   - helm
+  - apt
   - registry
   - package-registry
 annotations:

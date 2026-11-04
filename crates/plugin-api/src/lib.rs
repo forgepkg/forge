@@ -19,7 +19,7 @@
 //!
 //! A plugin is a crate under `crates/formats/<id>/` implementing
 //! [`FormatPlugin`], describing itself with a [`Descriptor`], linked into
-//! the server and called directly (NuGet, raw).
+//! the server and called directly (apt, Docker, NuGet, npm, raw).
 
 pub mod files;
 pub mod images;
@@ -54,10 +54,15 @@ impl<T: Read + Seek + ?Sized> PackageSource for T {}
 /// files format has neither ids nor versions nor packages: it keeps their
 /// defaults, which refuse every id, version and package.
 pub trait FormatPlugin: Send + Sync + 'static {
-    /// What the format says about itself: its id, name, version, repository
-    /// kinds, storage and asset names. A `'static` value the
-    /// crate defines next to its implementation (`pub const DESCRIPTOR`).
+    /// What the format says about itself: its id, name, repository kinds,
+    /// storage and asset names. A `'static` value the crate defines next to
+    /// its implementation (`pub const DESCRIPTOR`).
     fn descriptor(&self) -> &'static Descriptor;
+
+    /// The format id, the descriptor's.
+    fn id(&self) -> &'static str {
+        self.descriptor().id
+    }
 
     /// The canonical form of a package id, used for lookups and uniqueness
     /// (e.g. lowercased). The default keeps the id as it is.
@@ -130,6 +135,15 @@ pub trait FormatPlugin: Send + Sync + 'static {
         let mut file = std::fs::File::open(path)
             .map_err(|e| FormatError::Internal(format!("open the staged package: {e}")))?;
         self.parse_package(&mut file)
+    }
+
+    /// The fields of [`Self::manifest_summary`] of which a hosted repository
+    /// holds a bounded number of distinct values ([`SummaryCap`]). The host
+    /// refuses (400) a publish or an import of a version whose summary would
+    /// add a value past a cap, so whatever the repository's indexes make of
+    /// those values stays bounded. The default has none.
+    fn summary_caps(&self) -> &'static [SummaryCap] {
+        &[]
     }
 
     /// A JSON object summarizing `manifest`, stored with the version so that
@@ -316,13 +330,16 @@ pub trait FormatPlugin: Send + Sync + 'static {
         Err(FormatError::Internal("this format keeps no indexes".into()))
     }
 
-    /// A package format: the package (canonical id) the file the host keeps
-    /// at `path` belongs to, which package selectors decide on (a proxy's
-    /// copy of a package); `None` for a file of no package (an index), which
-    /// every reader of the repository may read. The default: none.
-    fn file_package(&self, path: &str) -> Option<String> {
+    /// A package format: the package the file the host keeps at `path`
+    /// belongs to, which package selectors decide on: a proxy's copy of a
+    /// package names it ([`FilePackage::Package`], its canonical id); a
+    /// file of no package (an index) is every reader's
+    /// ([`FilePackage::None`]); a package's file whose package the path does
+    /// not name is only a reader's whom every package is visible to
+    /// ([`FilePackage::Unknown`]). The default: none.
+    fn file_package(&self, path: &str) -> FilePackage {
         let _ = path;
-        None
+        FilePackage::None
     }
 
     /// Images formats: the response to a request the host refused, or to

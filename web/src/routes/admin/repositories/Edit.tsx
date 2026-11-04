@@ -26,6 +26,7 @@ import {
 } from '~/components/ui'
 import { ErrorState } from '~/components/ErrorState'
 import { ProxyCachePanel } from '~/components/ProxyCachePanel'
+import { CachedFilesPanel } from '~/components/CachedFilesPanel'
 import { DelayReleasesPanel } from '~/components/DelayReleasesPanel'
 import { useSelectors } from '~/queries/useRbac'
 import { SigningKeysPanel } from '~/components/SigningKeysPanel'
@@ -174,6 +175,9 @@ function EditRepository() {
           <>
             {current.kind === 'proxy' && (
               <ProxyCachePanel key={current.name} repo={current} />
+            )}
+            {current.kind === 'proxy' && current.format === 'apt' && (
+              <CachedFilesPanel key={current.name} repo={current} />
             )}
             {delayed && <DelayReleasesPanel key={current.name} repo={current} />}
             <AnonymousAccessPanel repo={current} />

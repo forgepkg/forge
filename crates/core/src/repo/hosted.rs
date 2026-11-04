@@ -742,6 +742,27 @@ impl HostedWrite {
         })
     }
 
+    /// Whether version `version` of `id` is listed: `None` when the
+    /// repository does not hold it. An import compares it with what the
+    /// source lists.
+    pub async fn package_listed(
+        &self,
+        repository_id: i64,
+        id: &str,
+        version: &str,
+    ) -> Result<Option<bool>, WriteError> {
+        let Ok(version) = self.format.normalize_version(version) else {
+            return Ok(None);
+        };
+        let lower = self.format.lower_id(id);
+        Ok(
+            component_dao::find_component(&self.pool, repository_id, &lower, &version)
+                .await
+                .map_err(RepoError::from)?
+                .map(|comp| comp.listed),
+        )
+    }
+
     /// The SHA-512 (base64) of the package file of `id` `version`, if the
     /// repository holds that version and the digest was recorded: an import
     /// compares it with what the source lists.
@@ -855,6 +876,16 @@ impl HostedWrite {
             ))
         };
 
+        // What the version's summary will be: an import adds what the source
+        // says of it (apt's component).
+        let mut manifest_summary = manifest_summary;
+        if let (Some(serde_json::Value::Object(summary)), Some(fields)) = (
+            manifest_summary.as_mut(),
+            import.and_then(|options| options.summary_fields.as_ref()),
+        ) {
+            summary.extend(fields.clone());
+        }
+
         // An import of a package the source named otherwise stores nothing.
         if let Some((id, version)) = import.and_then(|options| options.expected.as_ref()) {
             let same_version = self
@@ -885,6 +916,21 @@ impl HostedWrite {
             (self.publish_policy.as_ref(), publish_context.as_ref())
         {
             policy.authorize(context).await?;
+        }
+
+        // A version past one of the format's caps is refused before anything
+        // reaches S3 (and an import's plan says so); the check in the
+        // transaction below stays the authority.
+        {
+            let mut conn = self.pool.acquire().await.map_err(RepoError::from)?;
+            self.check_summary_caps(
+                &mut conn,
+                repo_row.id,
+                &parsed,
+                manifest_summary.as_ref(),
+                false,
+            )
+            .await?;
         }
 
         // A duplicate without redeploy is answered before anything reaches
@@ -956,6 +1002,14 @@ impl HostedWrite {
         let mut retried = false;
         let (mut tx, component_id, replaced, outcome) = loop {
             let mut tx = forge_db::begin(&self.pool).await.map_err(RepoError::from)?;
+            self.check_summary_caps(
+                &mut tx,
+                repo_row.id,
+                &parsed,
+                manifest_summary.as_ref(),
+                true,
+            )
+            .await?;
 
             // Read the duplicate-check *inside* the transaction so it serializes
             // with the subsequent insert/redeploy write against concurrent pushes
@@ -1064,13 +1118,6 @@ impl HostedWrite {
             }
         };
 
-        let mut manifest_summary = manifest_summary;
-        if let (Some(serde_json::Value::Object(summary)), Some(fields)) = (
-            manifest_summary.as_mut(),
-            import.and_then(|options| options.summary_fields.as_ref()),
-        ) {
-            summary.extend(fields.clone());
-        }
         if let (Some(id), Some(summary)) = (component_id, manifest_summary.as_ref()) {
             component_dao::set_manifest_summary(&mut *tx, id, summary)
                 .await
@@ -1128,6 +1175,69 @@ impl HostedWrite {
         self.cache.invalidate_package(repo, &parsed.id).await;
 
         done(outcome)
+    }
+
+    /// Refuse a version whose summary would add a value to the repository
+    /// past one of the format's caps ([`Format::summary_caps`]: apt's
+    /// components), naming the cap. A value the repository's other versions
+    /// hold already (the one a redeploy replaces left out) passes. With
+    /// `lock`, in the publish transaction, a new value is counted under the
+    /// repository's value lock
+    /// ([`repository_dao::lock_repository_values`]), so that two publishes
+    /// of new values never both take the last place.
+    async fn check_summary_caps(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        repository_id: i64,
+        parsed: &crate::domain::ParsedUpload,
+        summary: Option<&serde_json::Value>,
+        lock: bool,
+    ) -> Result<(), WriteError> {
+        for cap in self.format.summary_caps() {
+            let Some(value) = summary
+                .and_then(|s| s.get(cap.field))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let mut values = component_dao::summary_values(
+                &mut *conn,
+                repository_id,
+                cap.field,
+                value,
+                &parsed.id,
+                &parsed.version,
+            )
+            .await
+            .map_err(RepoError::from)?;
+            if !values.0 && lock {
+                repository_dao::lock_repository_values(&mut *conn, repository_id)
+                    .await
+                    .map_err(RepoError::from)?;
+                values = component_dao::summary_values(
+                    &mut *conn,
+                    repository_id,
+                    cap.field,
+                    value,
+                    &parsed.id,
+                    &parsed.version,
+                )
+                .await
+                .map_err(RepoError::from)?;
+            }
+            let (present, count) = values;
+            if !present && usize::try_from(count).unwrap_or(usize::MAX) >= cap.max {
+                return Err(WriteError::InvalidPackage(
+                    crate::domain::FormatError::InvalidPackage(format!(
+                        "the repository holds {count} {what}, the most it may hold ({max}): \
+                         {value:?} would be one more",
+                        what = cap.what,
+                        max = cap.max,
+                    )),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Insert a brand-new component + `.nupkg`/`.nuspec` assets, increfing both

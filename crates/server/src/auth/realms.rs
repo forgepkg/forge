@@ -39,8 +39,8 @@ use forge_cache::Cache;
 use forge_core::auth::local_password::DEFAULT_QUEUE_TIMEOUT;
 use forge_core::auth::{
     AuthProvider, CapturedPasswordProvider, Chain, ChainSource, ChainUnavailable, CredKeyPepper,
-    ForwardLimits, LocalPasswordProvider, PasswordHashLimiter, UpstreamBasicProvider,
-    ValidatedCredentialCache,
+    ForwardLimits, ForwardingRealmGuard, LocalPasswordProvider, PasswordHashLimiter,
+    UpstreamBasicProvider, ValidatedCredentialCache,
 };
 use forge_core::net::ssrf;
 use forge_core::oidc::{AssertionClaims, ClientAuth};
@@ -652,9 +652,10 @@ pub struct RealmSnapshot {
     pub chain: Option<Arc<Chain>>,
     /// The chain of the passwords clients send (HTTP Basic on the feeds and
     /// `/v2/token`, `npm login --auth-type=legacy`): the realms that accept
-    /// them (`accept_client_passwords`), and a local realm that does not as a
-    /// reject-only guard of its names
-    /// ([`LocalPasswordProvider::reject_only`]). `None` when no realm accepts
+    /// them (`accept_client_passwords`), and each realm that does not as a
+    /// reject-only guard of its names: the local realm's
+    /// ([`LocalPasswordProvider::reject_only`]), a credential-forwarding
+    /// realm's ([`ForwardingRealmGuard`]). `None` when no realm accepts
     /// passwords from clients: the path is off, and a client signs in with a
     /// token.
     pub client_chain: Option<Arc<Chain>>,
@@ -888,8 +889,8 @@ impl RealmAuth {
         let realms = auth_realm_dao::list_realms(&self.pool).await?;
 
         // The credential-forwarding providers built, in order, each with
-        // whether its realm accepts passwords from clients.
-        let mut forwarding: Vec<(Arc<dyn AuthProvider>, bool)> = Vec::new();
+        // whether its realm accepts passwords from clients, and the realm's id.
+        let mut forwarding: Vec<(Arc<dyn AuthProvider>, bool, i64)> = Vec::new();
         let mut oidc: Option<OidcRealmRuntime> = None;
         let mut workload: Vec<super::wif::WorkloadIdentityRealm> = Vec::new();
         let mut workload_configured_issuers: Vec<String> = Vec::new();
@@ -918,7 +919,7 @@ impl RealmAuth {
                     )))
                 }
                 KIND_CRED_FORWARD => match self.build_cred_forward(realm, &config) {
-                    Ok(built) => forwarding.push(built),
+                    Ok((provider, accepts)) => forwarding.push((provider, accepts, realm.id)),
                     // One malformed row must not take down the other realms;
                     // its own logins fail (closed) until an admin fixes it.
                     Err(e) => {
@@ -975,25 +976,37 @@ impl RealmAuth {
             }
         }
 
-        let chain = self.password_chain(local_at.map(|(at, _)| (at, true)), &forwarding);
-        // The clients' chain: the realms that accept their passwords, and a
-        // local realm that does not as a guard of its names. Without any
+        // The browser login's chain: every realm checks its passwords.
+        let browser_forwarding: Vec<(Arc<dyn AuthProvider>, bool)> = forwarding
+            .iter()
+            .map(|(provider, _, _)| (provider.clone(), true))
+            .collect();
+        let chain = self.password_chain(local_at.map(|(at, _)| (at, true)), &browser_forwarding);
+        // The clients' chain: the realms that accept their passwords, and
+        // each realm that does not as a reject-only guard of its names, in
+        // its place, so that its accounts' passwords stop there and never
+        // reach the upstream of a credential-forwarding realm behind it
+        // (#647 for the local realm, #756 for a forwarding one). Without any
         // realm that accepts them, the path is off.
         let accepted = local_at.is_some_and(|(_, accepts)| accepts)
-            || forwarding.iter().any(|(_, accepts)| *accepts);
-        let client_forwarding: Vec<(Arc<dyn AuthProvider>, bool)> = forwarding
-            .iter()
-            .filter(|(_, accepts)| *accepts)
-            .cloned()
-            .collect();
+            || forwarding.iter().any(|(_, accepts, _)| *accepts);
         let client_chain = if accepted {
-            // The local provider keeps its place among the forwarding
-            // providers that stay.
-            let client_local = local_at.map(|(at, accepts)| {
-                let ahead = forwarding[..at].iter().filter(|(_, a)| *a).count();
-                (ahead, accepts)
-            });
-            self.password_chain(client_local, &client_forwarding)
+            let client_forwarding: Vec<(Arc<dyn AuthProvider>, bool)> = forwarding
+                .iter()
+                .map(|(provider, accepts, realm_id)| {
+                    if *accepts {
+                        (provider.clone(), true)
+                    } else {
+                        let guard: Arc<dyn AuthProvider> = Arc::new(ForwardingRealmGuard::new(
+                            provider.id(),
+                            *realm_id,
+                            self.pool.clone(),
+                        ));
+                        (guard, false)
+                    }
+                })
+                .collect();
+            self.password_chain(local_at, &client_forwarding)
         } else {
             None
         };
@@ -1020,10 +1033,12 @@ impl RealmAuth {
         })
     }
 
-    /// A password chain of the `forwarding` providers, with the local provider
-    /// inserted after the first `at` of them when `local` is `Some((at,
-    /// verifies))` (checking passwords, or [`LocalPasswordProvider::reject_only`]).
-    /// `None` when it holds no provider.
+    /// A password chain of the `forwarding` providers, each with whether it
+    /// asks an upstream (a [`ForwardingRealmGuard`] does not), with the local
+    /// provider inserted after the first `at` of them when `local` is
+    /// `Some((at, verifies))` (checking passwords, or
+    /// [`LocalPasswordProvider::reject_only`]). `None` when it holds no
+    /// provider.
     fn password_chain(
         &self,
         local: Option<(usize, bool)>,
@@ -1038,13 +1053,14 @@ impl RealmAuth {
             // not own go upstream next, and the local provider need not
             // equalize their timing with a dummy hash. Decided from the
             // providers actually built: a forwarding realm that is skipped
-            // (fail closed) makes no upstream call, so the local provider must
-            // pay the dummy hash itself.
+            // (fail closed) makes no upstream call, and neither does a
+            // realm's guard, so the local provider must pay the dummy hash
+            // itself.
             let provider = LocalPasswordProvider::with_limiter(
                 self.pool.clone(),
                 self.password_limiter.clone(),
             )
-            .forwarding_follows(at < forwarding.len());
+            .forwarding_follows(forwarding[at..].iter().any(|(_, asks)| *asks));
             let provider = if verifies {
                 provider
             } else {

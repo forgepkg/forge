@@ -176,16 +176,18 @@ impl Telemetry {
         let mut layers: Vec<BoxedLayer> = Vec::new();
         if let Some(tracer) = &self.tracer {
             layers.push(Box::new(
-                tracing_opentelemetry::layer()
-                    .with_tracer(tracer.tracer("forge"))
-                    .with_tracked_inactivity(false)
-                    .with_location(false)
-                    .with_threads(false)
-                    .with_target(false)
-                    .with_filter(
-                        tracing_subscriber::filter::Targets::new()
-                            .with_target(forge_telemetry::TARGET, tracing::Level::INFO),
-                    ),
+                WithoutProbes(
+                    tracing_opentelemetry::layer()
+                        .with_tracer(tracer.tracer("forge"))
+                        .with_tracked_inactivity(false)
+                        .with_location(false)
+                        .with_threads(false)
+                        .with_target(false),
+                )
+                .with_filter(
+                    tracing_subscriber::filter::Targets::new()
+                        .with_target(forge_telemetry::TARGET, tracing::Level::INFO),
+                ),
             ));
         }
         if let Some(logger) = &self.logger {
@@ -426,14 +428,12 @@ impl Extractor for HeaderExtractor<'_> {
 
 /// The server span of `req`, a child of the trace its `traceparent` names,
 /// with its path as [`recorded_path`] records it.
-/// A health probe's is never exported, nor is what it does (the readiness
-/// checks): they would bury the traces worth reading.
+/// A health probe's is [`PROBE_SPAN`], which is never exported, nor is what
+/// it does (the readiness checks, [`WithoutProbes`]): they would bury the
+/// traces worth reading.
 fn request_span(req: &Request, surface: Surface, route: Option<&str>) -> tracing::Span {
     if surface == Surface::Health {
-        let span = tracing::info_span!(target: forge_telemetry::TARGET, "health probe");
-        // Fails only without the trace export, when the span goes nowhere.
-        let _ = span.set_parent(unsampled());
-        return span;
+        return tracing::info_span!(target: forge_telemetry::TARGET, PROBE_SPAN);
     }
     let method = forge_telemetry::http::method(req.method().as_str());
     let path = recorded_path(req.uri().path());
@@ -465,18 +465,171 @@ fn request_span(req: &Request, surface: Surface, route: Option<&str>) -> tracing
     span
 }
 
-/// A context whose spans the (parent-based) sampler drops: a trace no one
-/// sampled.
-fn unsampled() -> opentelemetry::Context {
-    use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId};
-    let ids = uuid::Uuid::new_v4().as_u128();
-    opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
-        TraceId::from(ids),
-        SpanId::from(ids as u64 | 1),
-        TraceFlags::default(),
-        true,
-        Default::default(),
-    ))
+/// The name of a health probe's span.
+const PROBE_SPAN: &str = "health probe";
+
+/// A span the trace export leaves out: a health probe's ([`PROBE_SPAN`]) or
+/// one beneath it.
+struct Unexported;
+
+/// The trace export's layer, without the spans of health probes and the
+/// spans beneath them, whatever the sampler: the export never hears of
+/// them. Dropping only the probe's span would make its children roots,
+/// which a sampler that is not parent-based samples.
+struct WithoutProbes<L>(L);
+
+impl<L> WithoutProbes<L> {
+    /// Whether the span `id` is left out.
+    fn unexported<S>(
+        id: &tracing::span::Id,
+        ctx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        ctx.span(id)
+            .is_some_and(|span| span.extensions().get::<Unexported>().is_some())
+    }
+}
+
+impl<S, L> Layer<S> for WithoutProbes<L>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    L: Layer<S>,
+{
+    fn on_register_dispatch(&self, subscriber: &tracing::Dispatch) {
+        self.0.on_register_dispatch(subscriber);
+    }
+
+    fn on_layer(&mut self, subscriber: &mut S) {
+        self.0.on_layer(subscriber);
+    }
+
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        self.0.register_callsite(metadata)
+    }
+
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        self.0.enabled(metadata, ctx)
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        self.0.max_level_hint()
+    }
+
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        // The parent as the export finds it.
+        let parent = if let Some(parent) = attrs.parent() {
+            ctx.span(parent)
+        } else if attrs.is_contextual() {
+            ctx.lookup_current()
+        } else {
+            None
+        };
+        let beneath_a_probe =
+            parent.is_some_and(|parent| parent.extensions().get::<Unexported>().is_some());
+        if beneath_a_probe || attrs.metadata().name() == PROBE_SPAN {
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().replace(Unexported);
+            }
+            return;
+        }
+        self.0.on_new_span(attrs, id, ctx);
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !Self::unexported(id, &ctx) {
+            self.0.on_record(id, values, ctx);
+        }
+    }
+
+    fn on_follows_from(
+        &self,
+        id: &tracing::span::Id,
+        follows: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !Self::unexported(id, &ctx) && !Self::unexported(follows, &ctx) {
+            self.0.on_follows_from(id, follows, ctx);
+        }
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        self.0.event_enabled(event, ctx)
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let in_probe = event
+            .parent()
+            .map(|parent| Self::unexported(parent, &ctx))
+            .unwrap_or_else(|| {
+                event.is_contextual()
+                    && ctx
+                        .lookup_current()
+                        .is_some_and(|span| span.extensions().get::<Unexported>().is_some())
+            });
+        if !in_probe {
+            self.0.on_event(event, ctx);
+        }
+    }
+
+    fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if !Self::unexported(id, &ctx) {
+            self.0.on_enter(id, ctx);
+        }
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if !Self::unexported(id, &ctx) {
+            self.0.on_exit(id, ctx);
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if !Self::unexported(&id, &ctx) {
+            self.0.on_close(id, ctx);
+        }
+    }
+
+    fn on_id_change(
+        &self,
+        old: &tracing::span::Id,
+        new: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        self.0.on_id_change(old, new, ctx);
+    }
+
+    // `OpenTelemetrySpanExt` finds the export's layer by downcasting.
+    unsafe fn downcast_raw(&self, id: std::any::TypeId) -> Option<*const ()> {
+        if id == std::any::TypeId::of::<Self>() {
+            Some(self as *const Self as *const ())
+        } else {
+            // SAFETY: the inner layer answers for its own types.
+            unsafe { self.0.downcast_raw(id) }
+        }
+    }
 }
 
 /// Middleware of the main listener: the request's server span and its

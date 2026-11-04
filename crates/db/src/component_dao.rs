@@ -575,6 +575,45 @@ where
     Ok(())
 }
 
+/// The distinct values of the string field `field` of the manifest
+/// summaries of `repository_id`'s versions, leaving out version `name`
+/// `version` (one a redeploy replaces): whether `value` is among them, and
+/// how many there are. A publish checks a format's caps on them
+/// (`forge_plugin_api::SummaryCap`).
+pub async fn summary_values<'e, E>(
+    executor: E,
+    repository_id: i64,
+    field: &str,
+    value: &str,
+    name: &str,
+    version: &str,
+) -> sqlx::Result<(bool, i64)>
+where
+    E: PgExecutor<'e>,
+{
+    // A runtime query: the field is a parameter, which the offline data of
+    // the macros checks no better.
+    let (present, count): (Option<bool>, i64) = sqlx::query_as(
+        r#"
+        SELECT bool_or(v = $3), COUNT(DISTINCT v)
+        FROM (
+            SELECT manifest_summary->>$2 AS v
+            FROM component
+            WHERE repository_id = $1 AND NOT (name = $4 AND version = $5)
+        ) AS summary
+        WHERE v IS NOT NULL
+        "#,
+    )
+    .bind(repository_id)
+    .bind(field)
+    .bind(value)
+    .bind(name)
+    .bind(version)
+    .fetch_one(executor)
+    .await?;
+    Ok((present.unwrap_or(false), count))
+}
+
 /// Give an imported component the times its source recorded: `published_at`
 /// becomes its creation time, and `downloaded_at` its (and its package
 /// asset's, at `package_path`) last download unless Forge saw a later one.

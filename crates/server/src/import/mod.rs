@@ -67,7 +67,10 @@
 //!      other;
 //!    * what the source says is kept: a NuGet version's publish time becomes
 //!      its creation time (nuget.org's `1900-01-01` for an unlisted version
-//!      is no publish time). The protocols carry no last download, so an
+//!      is no publish time), and a version its registration lists as
+//!      unlisted is unlisted in Forge (one the source unlists or relists
+//!      later follows it on the next run, unless a listing changed in Forge
+//!      makes it a conflict). The protocols carry no last download, so an
 //!      imported version counts as downloaded at its import, and no push
 //!      time for a tag, so a tag is created at its import;
 //!    * a `.deb` (apt) is downloaded from the import's URL and its
@@ -128,7 +131,7 @@ use forge_core::auth::principal::{AuthMethod, Principal};
 use forge_core::authz::{Level, PackageFilter};
 use forge_core::repo::hosted::HostedWrite;
 use forge_core::repo::proxy::Credentials;
-use forge_core::repo::{ImportOptions, ImportOutcome, RepoKind, WriteError};
+use forge_core::repo::{DeleteOutcome, ImportOptions, ImportOutcome, RepoKind, WriteError};
 use forge_crypto::PlaintextSecret;
 use forge_db::import_dao::{self, ImportItem, NewItem, RepositoryImport};
 use forge_db::model::{DeploymentPolicy, Repository};
@@ -519,9 +522,15 @@ struct Ctx {
 }
 
 /// What the source says of an item beyond its name and version (an item's
-/// `source`). An item an import stored before reads as none of it.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// `source`). An item an import stored before reads as none of it (and as
+/// listed).
+#[derive(Debug, Serialize, Deserialize)]
 struct ItemSource {
+    /// NuGet: the registration lists the version (nuget.org's `1900-01-01`
+    /// publish time reads as unlisted). True where the registration does
+    /// not say, and for every other format.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    listed: bool,
     /// The package's SHA-512, base64, where the feed lists it (raw: where
     /// Nexus lists it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -554,9 +563,10 @@ struct ItemSource {
     /// Raw: the content type the source lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
-    /// Raw and apt: why the item fails without being copied (a path Forge
-    /// refuses; an index entry that names no `.deb` below the repository, a
-    /// component Forge does not publish).
+    /// Why the item fails without being copied (raw: a path Forge refuses;
+    /// apt: an index entry that names no `.deb` below the repository, a
+    /// component Forge does not publish; any format: a name the source
+    /// failed on while the scan read it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     /// apt: where the package is, below the import's URL (its index's
@@ -568,6 +578,36 @@ struct ItemSource {
     /// Raw: a named file the source did not have when it was scanned.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     missing: bool,
+}
+
+impl Default for ItemSource {
+    fn default() -> Self {
+        ItemSource {
+            listed: true,
+            sha512: None,
+            integrity: None,
+            shasum: None,
+            tarball: None,
+            deprecated: None,
+            target: None,
+            sha256: None,
+            sha1: None,
+            sidecar: false,
+            content_type: None,
+            error: None,
+            filename: None,
+            component: None,
+            missing: false,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// A version, tag or file the scan found.
@@ -612,6 +652,19 @@ impl Found {
     /// fails, so the import reports it.
     fn missing(name: &str) -> Found {
         Found::component(name, String::new(), None, ItemSource::default())
+    }
+
+    /// A name the source failed on while the scan read it: an item that
+    /// fails with `error`, so the import reports it and goes on.
+    fn failed(target: &Target, name: &str, error: String) -> Found {
+        let source = ItemSource {
+            error: Some(error),
+            ..ItemSource::default()
+        };
+        match target {
+            Target::Files { .. } => file_item(name, source),
+            _ => Found::component(name, String::new(), None, source),
+        }
     }
 }
 
@@ -867,8 +920,20 @@ impl Run<'_> {
     async fn retrying<'f, T>(
         &self,
         what: &str,
-        mut read: impl FnMut() -> BoxFuture<'f, Result<T, SourceError>> + Send,
+        read: impl FnMut() -> BoxFuture<'f, Result<T, SourceError>> + Send,
     ) -> Result<T, End> {
+        self.retried(what, read)
+            .await
+            .map_err(|e| End::Failed(format!("{what}: {e}")))
+    }
+
+    /// A read of the source, retried with a backoff while its failure may
+    /// pass; the last failure once it does not.
+    async fn retried<'f, T>(
+        &self,
+        what: &str,
+        mut read: impl FnMut() -> BoxFuture<'f, Result<T, SourceError>> + Send,
+    ) -> Result<T, SourceError> {
         let mut attempt = 0;
         loop {
             attempt += 1;
@@ -878,7 +943,7 @@ impl Run<'_> {
                     tracing::warn!(import = self.import.id, error = %e, attempt, "{what} failed; retrying");
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                 }
-                Err(e) => return Err(End::Failed(format!("{what}: {e}"))),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -1231,7 +1296,11 @@ impl Run<'_> {
 
     /// The versions of the package ids `names`, or the tags of the images
     /// `names`, in their order. A name the source does not have is left
-    /// out, or, when the import `named` it, found as missing.
+    /// out, or, when the import `named` it, found as missing. A name the
+    /// source refuses or fails on (401, 403, 500, after the retries of a
+    /// failure that may pass) is found as an item that fails with the
+    /// reason, and the others are still read: one name does not fail the
+    /// scan. Only a source that cannot be reached at all fails the page.
     async fn expand(
         &self,
         ctx: &Ctx,
@@ -1242,13 +1311,48 @@ impl Run<'_> {
         // The reads are made up front: futures do nothing until polled.
         let reads: Vec<_> = names
             .iter()
-            .map(|name| self.expand_one(ctx, name, named, concurrency))
+            .map(|name| self.expand_read(ctx, name, named, concurrency))
             .collect();
         let pages: Vec<Vec<Found>> = futures_util::stream::iter(reads)
             .buffered(concurrency)
             .try_collect()
             .await?;
         Ok(pages.into_iter().flatten().collect())
+    }
+
+    /// [`Run::expand_one`], retried; a failure on `name` that is not the
+    /// source being unreachable is found as an item that fails.
+    async fn expand_read(
+        &self,
+        ctx: &Ctx,
+        name: &str,
+        named: bool,
+        concurrency: usize,
+    ) -> Result<Vec<Found>, SourceError> {
+        self.read_name(&ctx.target, name, || {
+            self.expand_one(ctx, name, named, concurrency).boxed()
+        })
+        .await
+    }
+
+    /// `read` of the name `name`, retried; a failure that is not the source
+    /// being unreachable is found as an item that fails.
+    async fn read_name<'f>(
+        &self,
+        target: &Target,
+        name: &str,
+        read: impl FnMut() -> BoxFuture<'f, Result<Vec<Found>, SourceError>> + Send,
+    ) -> Result<Vec<Found>, SourceError> {
+        let what = format!("reading {name:?} at the source");
+        match self.retried(&what, read).await {
+            Ok(found) => Ok(found),
+            Err(e @ SourceError::Unreachable(_)) => Err(e),
+            Err(e) => {
+                tracing::warn!(import = self.import.id, name, error = %e, "import: the source fails on a name");
+                let error = format!("reading it at the source failed: {e}");
+                Ok(vec![Found::failed(target, name, error)])
+            }
+        }
     }
 
     /// The versions of the package id `name`, the tags of the image `name`,
@@ -1280,7 +1384,11 @@ impl Run<'_> {
                 }
                 let reads: Vec<_> = packages
                     .iter()
-                    .map(|package| npm_package(registry, package, true))
+                    .map(|package| {
+                        self.read_name(&ctx.target, package, || {
+                            npm_package(registry, package, true).boxed()
+                        })
+                    })
                     .collect();
                 let found: Vec<Vec<Found>> = futures_util::stream::iter(reads)
                     .buffered(concurrency)
@@ -1395,6 +1503,14 @@ impl Run<'_> {
         let copied = match &ctx.target {
             // A file's item has no version.
             Target::Files { source } => self.copy_file(ctx, source, &item).await,
+            // A name the source failed on while the scan read it fails as
+            // its item, and does not count towards the failures in a row
+            // that stop an import.
+            Target::Packages { .. } | Target::Npm { .. } | Target::Images { .. }
+                if item.version.is_empty() && source.error.is_some() =>
+            {
+                Ok(copied("failed", source.error.clone(), 0))
+            }
             Target::Apt {
                 source: from,
                 writer,
@@ -1415,8 +1531,16 @@ impl Run<'_> {
                 Err("the source has no tag of this image".to_string())
             }
             Target::Packages { feed, writer } => {
-                self.copy_package(ctx, PackageSource::Feed(feed), writer, &item, &source)
-                    .await
+                let copied = self
+                    .copy_package(ctx, PackageSource::Feed(feed), writer, &item, &source)
+                    .await;
+                match copied {
+                    Ok(copied) => {
+                        self.carry_listing(ctx, writer, &item, &source, copied)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Target::Npm { filter, .. } if item.kind == "tag" => {
                 self.copy_dist_tag(ctx, filter, &item, &source).await
@@ -1691,6 +1815,94 @@ impl Run<'_> {
         .await
         .map_err(db)?;
         Ok(copied(state, Some(detail.unwrap_or(said)), bytes))
+    }
+
+    /// NuGet: bring a copied version's listing along (`outcome`: what became
+    /// of its bytes). A version the source unlists is unlisted in Forge. A
+    /// version Forge holds with these bytes takes the source's listing where
+    /// Forge lists it, or where an earlier import gave it what Forge has; a
+    /// listing set in Forge otherwise is a conflict (followed with
+    /// `overwrite`).
+    async fn carry_listing(
+        &self,
+        ctx: &Ctx,
+        writer: &HostedWrite,
+        item: &ImportItem,
+        source: &ItemSource,
+        outcome: Copied,
+    ) -> Result<Copied, String> {
+        let Copied::Item {
+            state,
+            detail,
+            bytes,
+        } = outcome
+        else {
+            return Ok(outcome);
+        };
+        let unchanged = || {
+            Ok(Copied::Item {
+                state,
+                detail: detail.clone(),
+                bytes,
+            })
+        };
+        // A version that stays out of Forge (a conflict skipped) keeps
+        // Forge's listing; one a dry run plans is not there yet.
+        if !matches!(state, "imported" | "replaced" | "identical") {
+            return unchanged();
+        }
+        let Some(current) = writer
+            .package_listed(ctx.repo.id, &item.name, &item.version)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return unchanged();
+        };
+        let wanted = source.listed;
+        if current == wanted {
+            return unchanged();
+        }
+        // A version just created or replaced takes the source's listing; one
+        // Forge held takes it where Forge's is the default (listed) or the
+        // one an earlier import gave it.
+        let own = match self.earlier(ctx, item).await? {
+            Some(earlier) => earlier.listed == current,
+            None => current,
+        };
+        let overwrite = self.import.on_conflict == "overwrite";
+        if !(own || overwrite || matches!(state, "imported" | "replaced")) {
+            let conflict = if current {
+                "Forge lists this version; the source unlists it"
+            } else {
+                "Forge unlists this version; the source lists it"
+            };
+            return Ok(copied("conflict", Some(conflict.into()), bytes));
+        }
+        let said = if wanted { "relisted" } else { "unlisted" };
+        if self.import.dry_run {
+            return Ok(copied(state, Some(format!("would be {said}")), bytes));
+        }
+        let done = if wanted {
+            writer
+                .relist(&ctx.repo.name, &item.name, &item.version)
+                .await
+        } else {
+            writer
+                .delete_component(&ctx.repo.name, &item.name, &item.version, false)
+                .await
+        }
+        .map_err(|e| e.to_string())?;
+        if done == DeleteOutcome::NotFound {
+            return Err(format!(
+                "the package selectors of the administrator who started the import do not \
+                 allow this version to be {said}"
+            ));
+        }
+        Ok(copied(
+            state,
+            Some(detail.unwrap_or_else(|| said.to_string())),
+            bytes,
+        ))
     }
 
     /// npm: set a dist-tag (`item.version`) of the package `item.name` to
@@ -2283,6 +2495,9 @@ async fn package_versions(feed: &Feed, id: &str, named: bool) -> Result<Vec<Foun
                 meta.and_then(|m| published_at(m.published.as_deref())),
                 ItemSource {
                     sha512: meta.and_then(|m| m.sha512.clone()),
+                    // A version the registration does not have (or one
+                    // that cannot be read) counts as listed.
+                    listed: meta.is_none_or(|m| m.listed),
                     ..ItemSource::default()
                 },
             )
@@ -2795,6 +3010,7 @@ mod tests {
         });
         let source: ItemSource = serde_json::from_value(legacy).unwrap();
         assert_eq!(source.sha512, None);
+        assert!(source.listed);
     }
 
     #[test]
@@ -2807,6 +3023,18 @@ mod tests {
             serde_json::to_value(&nuget).unwrap(),
             serde_json::json!({"sha512": "abc"})
         );
+        let unlisted = ItemSource {
+            sha512: Some("abc".into()),
+            listed: false,
+            ..ItemSource::default()
+        };
+        let stored = serde_json::to_value(&unlisted).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::json!({"listed": false, "sha512": "abc"})
+        );
+        let read: ItemSource = serde_json::from_value(stored).unwrap();
+        assert!(!read.listed);
         let tag = ItemSource {
             target: Some("1.0.0".into()),
             ..ItemSource::default()

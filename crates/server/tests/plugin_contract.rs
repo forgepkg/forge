@@ -16,14 +16,12 @@ use forge_plugin::api::{
     PackageInfo, PackageRef, PackageSource, PackageVersions, ParsedPackage, PublishRequest, Query,
     Repository, RepositoryKind, Request, Response, SearchQuery, Storage, Upload, UpstreamToken,
 };
-use forge_plugin::Plugin;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 const PROBE: Descriptor = Descriptor {
     id: "probe",
     name: "Probe",
-    version: "0.0.1",
     description: "Reports what the host answers.",
     kinds: &[RepositoryKind::Hosted],
     storage: Storage::Packages,
@@ -206,7 +204,7 @@ async fn start_probe(extra_toml: Option<String>) -> TestServer {
         common::pool().await,
         ServerOpts {
             bootstrap_admin: Some((format!("admin{}@example.com", unique()), "adminpw".into())),
-            extra_plugins: vec![Plugin::builtin(Probe)],
+            extra_plugins: vec![Arc::new(Probe)],
             extra_toml,
             ..Default::default()
         },
@@ -739,10 +737,9 @@ async fn mutations_outside_the_selector_are_unknown() {
 /// The probe is a valid built-in plugin; nothing in it relies on the server.
 #[test]
 fn the_probe_is_a_plugin() {
-    let plugin = Plugin::builtin(Probe);
+    let plugin: Arc<dyn FormatPlugin> = Arc::new(Probe);
     assert_eq!(
         forge_plugin::descriptor::check(&[plugin.descriptor()]),
         Ok(())
     );
-    let _: Arc<dyn FormatPlugin> = plugin.implementation().clone();
 }

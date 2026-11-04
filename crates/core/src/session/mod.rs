@@ -156,9 +156,14 @@ impl SessionService {
             return Ok(None);
         }
         let hash = sha256_hex(cookie_secret);
+        // `SessionError` keeps the text alone: note a pool timeout here, the
+        // session source's first acquire on a browser request.
         let Some(session) = session_dao::find_valid_by_hash(&self.pool, &hash)
             .await
-            .map_err(|e| SessionError::Db(e.to_string()))?
+            .map_err(|e| {
+                forge_db::observe_error(&e);
+                SessionError::Db(e.to_string())
+            })?
         else {
             return Ok(None);
         };

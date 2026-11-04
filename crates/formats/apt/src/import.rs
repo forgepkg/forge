@@ -19,11 +19,19 @@ use std::io::{BufRead, BufReader, Read};
 use forge_plugin_api::files;
 use sha2::{Digest, Sha256};
 
-use crate::control::{valid_architecture, valid_component, valid_package_name, Paragraph};
+use crate::control::{known_architecture, valid_component, valid_package_name, Paragraph};
 use crate::version;
 
 /// The most a `Packages` index may inflate to.
 pub const MAX_INDEX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The most memory the entries of a `Packages` index may take
+/// ([`read_packages`]): the list's allocation and every entry's strings.
+/// An entry takes far more than its text (`Package:a` and a blank line, 11
+/// bytes, take about 160), so [`MAX_INDEX_BYTES`] alone does not bound it.
+/// Debian's largest index (main, amd64: about 65,000 entries) takes about
+/// 30 MiB.
+pub const MAX_ENTRIES_BYTES: usize = 256 * 1024 * 1024;
 
 /// What a `Release` says.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -293,6 +301,16 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// What its strings take on the heap, besides the entry itself.
+    pub fn heap_bytes(&self) -> usize {
+        self.package.capacity()
+            + self.version.capacity()
+            + self.architecture.capacity()
+            + self.filename.capacity()
+            + self.sha256.as_ref().map_or(0, String::capacity)
+            + self.sha512.as_ref().map_or(0, String::capacity)
+    }
+
     /// The package id Forge stores it under (`hello:amd64`).
     pub fn id(&self) -> String {
         crate::layout::package_id(&self.package, &self.architecture)
@@ -315,8 +333,11 @@ impl Entry {
         if let Err(e) = version::Version::parse(&self.version) {
             return Some(format!("{:?} is not a Debian version: {e}", self.version));
         }
-        if !valid_architecture(&self.architecture) {
-            return Some(format!("{:?} is not an architecture", self.architecture));
+        if !known_architecture(&self.architecture) {
+            return Some(format!(
+                "{:?} is not an architecture dpkg knows",
+                self.architecture
+            ));
         }
         if self.filename.is_empty() {
             return Some("the index names no Filename for it".into());
@@ -373,11 +394,19 @@ pub fn inflate<'a>(bytes: &'a [u8]) -> Box<dyn Read + 'a> {
 
 /// Every entry of a `Packages` index (inflated), in its order. Only the
 /// fields an import reads are kept; a paragraph without a `Package` field
-/// is none. An index with control characters, a line that is no field, or
-/// more than [`MAX_INDEX_BYTES`] is refused.
+/// is none. An index with control characters, a line that is no field,
+/// more than [`MAX_INDEX_BYTES`], or entries that take more than
+/// [`MAX_ENTRIES_BYTES`] is refused.
 pub fn read_packages(index: impl Read) -> Result<Vec<Entry>, String> {
+    read_packages_within(index, MAX_ENTRIES_BYTES)
+}
+
+/// [`read_packages`], its entries taking at most `budget` bytes.
+fn read_packages_within(index: impl Read, budget: usize) -> Result<Vec<Entry>, String> {
     let mut reader = BufReader::new(index);
-    let mut entries = Vec::new();
+    let mut entries: Vec<Entry> = Vec::new();
+    // What the entries' strings take.
+    let mut heap: usize = 0;
     let mut current: Option<Entry> = None;
     let mut seen = false;
     let mut read: u64 = 0;
@@ -407,6 +436,27 @@ pub fn read_packages(index: impl Read) -> Result<Vec<Entry>, String> {
         if end || text.trim().is_empty() {
             if let Some(entry) = current.take() {
                 if seen {
+                    // The list grows as `Vec` grows it (doubling), the old
+                    // allocation held beside the new while it is copied.
+                    let slot = std::mem::size_of::<Entry>();
+                    let list = if entries.len() == entries.capacity() {
+                        let grown = (entries.capacity() * 2).max(4);
+                        entries.capacity() * slot + grown * slot
+                    } else {
+                        entries.capacity() * slot
+                    };
+                    heap += entry.heap_bytes();
+                    if list.saturating_add(heap) > budget {
+                        return Err(format!(
+                            "its entries take more than {} MiB of memory (after {} of them): \
+                             Forge reads no index that large",
+                            budget / (1024 * 1024),
+                            entries.len()
+                        ));
+                    }
+                    if entries.len() == entries.capacity() {
+                        entries.reserve_exact(entries.capacity().max(4));
+                    }
                     entries.push(entry);
                 }
             }
@@ -748,5 +798,20 @@ mod tests {
         assert_eq!(read_packages(&b""[..]).unwrap(), Vec::new());
         // A paragraph without Package is none.
         assert_eq!(read_packages(&b"Version: 1\n\n"[..]).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn entries_past_the_budget_are_refused() {
+        const MIB: usize = 1024 * 1024;
+        let index = "Package:a\n\n".repeat(100_000);
+        // About 160 bytes each, the list's growth among them.
+        let err = read_packages_within(index.as_bytes(), MIB).unwrap_err();
+        assert!(err.contains("more than 1 MiB of memory"), "{err}");
+        assert_eq!(
+            read_packages_within(index.as_bytes(), 64 * MIB)
+                .unwrap()
+                .len(),
+            100_000
+        );
     }
 }

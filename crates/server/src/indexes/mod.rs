@@ -38,7 +38,7 @@ use forge_db::raw_dao::{self, NewRawFile, RawFile, Redeploy};
 use forge_db::signing_key_dao::{self, NewSigningKey, SigningKeyRow};
 use forge_db::{index_dao, repository_dao};
 use forge_plugin::api::{self as protocol, files, SignatureKind};
-use forge_plugin::Plugin;
+use forge_plugin::FormatPlugin;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 
@@ -48,6 +48,10 @@ use signing::{Key, KeyInfo, SigningError};
 /// Bumped when the host signs or stores indexes differently, so that every
 /// repository's index is made again.
 const HOST_GENERATION: &str = "1";
+
+/// Forge's version, which the formats share: a release, which may make a
+/// format's indexes otherwise, makes every repository's index again.
+const FORGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long a content-addressed index file outlives the last generation
 /// that named it.
@@ -212,19 +216,14 @@ pub async fn file(
 }
 
 /// What a generation is made of, digested.
-fn fingerprint(
-    plugin: &Plugin,
-    repo: &Repository,
-    versions: &str,
-    keys: &[SigningKeyRow],
-) -> String {
+fn fingerprint(repo: &Repository, versions: &str, keys: &[SigningKeyRow]) -> String {
     let mut digest = Sha256::new();
     let mut part = |s: &str| {
         digest.update(s.as_bytes());
         digest.update([0x1f]);
     };
     part(HOST_GENERATION);
-    part(plugin.descriptor().version);
+    part(FORGE_VERSION);
     part(&repo.name);
     part(versions);
     for (name, value) in repo.format_options() {
@@ -255,7 +254,7 @@ pub async fn ensure_current(state: &AppState, repo: &Repository) -> Result<(), I
     for _ in 0..3 {
         let keys = keys(state, repo).await?;
         let versions = index_dao::versions_digest(&state.pool, repo.id, package_path).await?;
-        let fingerprint = fingerprint(&plugin, repo, &versions, &keys);
+        let fingerprint = fingerprint(repo, &versions, &keys);
         if index_dao::current(&state.pool, repo.id).await?.as_deref() == Some(&fingerprint) {
             return Ok(());
         }
@@ -281,7 +280,7 @@ struct Stored {
 async fn generate(
     state: &AppState,
     repo: &Repository,
-    plugin: &Arc<Plugin>,
+    plugin: &Arc<dyn FormatPlugin>,
     rows: &[SigningKeyRow],
     versions_digest: &str,
     fingerprint: &str,
@@ -335,7 +334,7 @@ async fn generate(
         inline: false,
         options: repo.format_options(),
     };
-    let implementation = plugin.implementation().clone();
+    let implementation = plugin.clone();
     let files = tokio::task::spawn_blocking(move || -> Result<Vec<Stored>, IndexError> {
         let made = implementation
             .index(&target, &input)

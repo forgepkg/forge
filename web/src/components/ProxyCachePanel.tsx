@@ -23,6 +23,7 @@ export function ProxyCachePanel({ repo }: { repo: RepoView }) {
   const [pkg, setPkg] = useState('')
   const docker = repo.format === 'docker'
   const raw = repo.format === 'raw'
+  const apt = repo.format === 'apt'
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -46,7 +47,9 @@ export function ProxyCachePanel({ repo }: { repo: RepoView }) {
               : 'The proxy keeps the upstream’s listings and documents for every instance and serves them without asking for the metadata TTL, and remembers a package the upstream did not have for the not-found TTL.'}{' '}
           {raw
             ? 'Invalidate the cache to ask the upstream again, for example after a file changed there. Cached files stay, and are re-validated on their next download.'
-            : 'Invalidate the cache to ask the upstream again, for example after a package was published there. Downloaded packages stay cached.'}
+            : apt
+              ? 'Invalidate the whole cache to ask the upstream again for every cached file: the indexes, and the packages and by-hash copies kept for good, which are fetched again and checked anew on their next download.'
+              : 'Invalidate the cache to ask the upstream again, for example after a package was published there. Downloaded packages stay cached.'}
         </>
       }
     >
@@ -73,7 +76,7 @@ export function ProxyCachePanel({ repo }: { repo: RepoView }) {
             ? `${plural(done.tags_expired, 'tag is', 'tags are')} re-validated on the next pull.`
             : raw
               ? `${plural(done.files_expired ?? 0, 'cached file is', 'cached files are')} re-validated on the next download; “not found” answers are forgotten.`
-              : `${plural(done.not_found_cleared, '“not found” answer', '“not found” answers')} forgotten, ${plural(done.documents_dropped, 'stored upstream document', 'stored upstream documents')} deleted; listings are fetched again.`}
+              : `${plural(done.not_found_cleared, '“not found” answer', '“not found” answers')} forgotten, ${plural(done.documents_dropped, 'stored upstream document', 'stored upstream documents')} deleted; listings are fetched again.${done.files_expired ? ` ${plural(done.files_expired, 'cached file is', 'cached files are')} re-validated on the next download.` : ''}`}
         </Notice>
       )}
       {invalidate.isError && (

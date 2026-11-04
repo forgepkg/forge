@@ -1,7 +1,6 @@
 [package]
 name = "forge-format-docker"
-# The plugin's own version, its descriptor's.
-version = "1.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

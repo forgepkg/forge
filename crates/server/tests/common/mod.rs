@@ -412,7 +412,7 @@ pub struct ServerOpts {
     /// as `[docker]`).
     pub extra_toml: Option<String>,
     /// Format plugins installed next to the built-in ones, as if built in.
-    pub extra_plugins: Vec<std::sync::Arc<forge_plugin::Plugin>>,
+    pub extra_plugins: Vec<std::sync::Arc<dyn forge_plugin::FormatPlugin>>,
     /// When set, this raw TOML replaces the static keys at the end of the
     /// `[s3]` section (e.g. `credentials = "web_identity"` and its
     /// `[s3.web_identity]` table), and the object store is built from the

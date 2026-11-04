@@ -1088,8 +1088,7 @@ fn format_options(
                 }
             }
             Some(value) => {
-                let implementation = plugin.as_ref().map(|p| p.implementation().clone());
-                let checked = match implementation {
+                let checked = match &plugin {
                     Some(plugin) => plugin.check_option(api_kind, &name, &value),
                     None => Ok(value),
                 };

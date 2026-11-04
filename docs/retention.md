@@ -266,6 +266,8 @@ an hour at most per night:
 A proxy repository's rules say `"scope": "proxy_cached"` and evict cached
 versions: their bytes are deleted, the version stays listed, and its next
 pull fetches it from the upstream again. Proxy versions are never unlisted.
+An apt proxy is the exception: retention does not evict its cached files
+yet, whatever its policy says ([apt.md](apt.md#limitations)).
 
 | Trigger | Evicts a cached version |
 | --- | --- |
@@ -306,7 +308,8 @@ in Docker repositories and follow the [image rules](#image-rules). apt
 ([apt.md](apt.md)) has no prereleases (a `-` starts the Debian revision, so
 every version is a release), orders versions as dpkg does, and counts per
 package and architecture: its package ids are `<name>:<architecture>`.
-Maven brings its own rules when it arrives: its `-SNAPSHOT` builds are
+No format Forge has today makes snapshots, so `release_type: snapshots`
+matches nothing yet. Maven would bring its own rules: its `-SNAPSHOT` builds are
 snapshots counted per snapshot version (the newest N builds of each), its
 releases per `groupId:artifactId`, and `prerelease_superseded_for_days`
 removes a version's snapshots once its release exists.

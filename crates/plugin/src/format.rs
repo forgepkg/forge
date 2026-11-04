@@ -10,8 +10,6 @@ use std::sync::OnceLock;
 use forge_core::format::{Format, ReadSeek};
 use forge_plugin_api::{self as api, Assets, FormatPlugin, Storage, UpstreamToken};
 
-use crate::Plugin;
-
 /// The longest version the host takes from a format plugin, in bytes: a
 /// version to normalize as given, its normalized form, and a parsed
 /// package's version as written and normalized. Versions are stored in the
@@ -43,13 +41,14 @@ pub struct PluginFormat {
 
 impl PluginFormat {
     /// Adapt `plugin`.
-    pub fn new(plugin: &Plugin) -> Self {
+    pub fn new(plugin: Arc<dyn FormatPlugin>) -> Self {
+        let descriptor = plugin.descriptor();
         PluginFormat {
-            id: plugin.id(),
-            plugin: plugin.implementation().clone(),
-            assets: plugin.descriptor().assets,
-            storage: plugin.descriptor().storage,
-            upstream_token: plugin.descriptor().upstream_token,
+            id: descriptor.id,
+            assets: descriptor.assets,
+            storage: descriptor.storage,
+            upstream_token: descriptor.upstream_token,
+            plugin,
         }
     }
 
@@ -162,6 +161,10 @@ impl Format for UploadFormat {
 
     fn manifest_summary(&self, manifest: &[u8]) -> Option<serde_json::Value> {
         self.format.manifest_summary(manifest)
+    }
+
+    fn summary_caps(&self) -> &'static [api::SummaryCap] {
+        self.format.summary_caps()
     }
 }
 
@@ -358,6 +361,10 @@ impl Format for PluginFormat {
             }
         }
     }
+
+    fn summary_caps(&self) -> &'static [api::SummaryCap] {
+        self.plugin.summary_caps()
+    }
 }
 
 #[cfg(test)]
@@ -375,7 +382,6 @@ mod tests {
     const UNLIMITED: api::Descriptor = api::Descriptor {
         id: "unlimited",
         name: "Unlimited",
-        version: "0.1.0",
         description: "Every id, every version.",
         kinds: &[api::RepositoryKind::Hosted, api::RepositoryKind::Group],
         storage: Storage::Packages,
@@ -450,11 +456,10 @@ mod tests {
 
     /// [`Unlimited`] as the host sees it.
     fn unlimited(normalized: Option<&str>, parsed: api::ParsedPackage) -> PluginFormat {
-        let plugin = Plugin::builtin(Unlimited {
+        PluginFormat::new(Arc::new(Unlimited {
             normalized: normalized.map(str::to_string),
             parsed,
-        });
-        PluginFormat::new(&plugin)
+        }))
     }
 
     #[test]
@@ -567,7 +572,7 @@ mod tests {
         assert_eq!(plain.version_class("1.0.0-ci.1"), VersionClass::Prerelease);
         assert_eq!(plain.retention_partition("demo", "1.0.0-ci.1"), None);
         // A plugin's own.
-        let snapshots = PluginFormat::new(&Plugin::builtin(Snapshots));
+        let snapshots = PluginFormat::new(Arc::new(Snapshots));
         assert_eq!(snapshots.version_class("33.0.0-jre"), VersionClass::Release);
         assert_eq!(
             snapshots.version_class("1.0-SNAPSHOT"),

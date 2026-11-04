@@ -2189,6 +2189,8 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "jsonwebtoken",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "rand 0.10.3",
  "reqwest",
  "rsa",
@@ -2293,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "forge-format-apt"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -2310,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "forge-format-docker"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "flate2",
  "forge-plugin-api",
@@ -2324,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "forge-format-npm"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -2341,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "forge-format-nuget"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "crc32fast",
  "flate2",
@@ -2355,7 +2357,7 @@ dependencies = [
 
 [[package]]
 name = "forge-format-raw"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.23.1",
  "forge-plugin-api",

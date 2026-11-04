@@ -85,7 +85,7 @@ each with the level **read**:
 A group serves a caller only the members that caller may read, so grant
 `read` on the group **and** on each member it should serve from. Leave
 **All repositories** alone unless every job of the project may read every
-repository: a role's grants reach every format, npm, Docker and raw
+repository: a role's grants reach every format, npm, Docker, apt and raw
 repositories as well as NuGet.
 
 The role needs no `write`: the trusted publisher in step 4 adds it for the

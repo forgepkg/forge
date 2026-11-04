@@ -57,8 +57,11 @@ pub async fn begin(pool: &PgPool) -> sqlx::Result<sqlx::Transaction<'static, sql
 }
 
 /// Note a database error in the metrics: a pool acquire that timed out
-/// counts in `forge_db_pool_acquire_timeouts_total`. Called where the
-/// request paths turn a `sqlx::Error` into their own.
+/// counts in `db.client.connection.timeouts` (Prometheus
+/// `db_client_connection_timeouts_total`, which the
+/// `ForgeDatabasePoolExhausted` alert watches). Called where the request
+/// paths turn a `sqlx::Error` into their own, the principal lookups
+/// included.
 pub fn observe_error(error: &sqlx::Error) {
     if matches!(error, sqlx::Error::PoolTimedOut) {
         forge_telemetry::db::acquire_timeout();

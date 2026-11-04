@@ -57,6 +57,13 @@ package of `Section: contrib/net` is in `contrib`, any other in `main`. Its
 **architectures** are those of its packages; an `all` package is listed
 under every one of them (and under `binary-all`).
 
+Every component adds a `Packages` list of every architecture to the
+indexes, so both are bounded: an `Architecture` is `all` or one dpkg
+knows (`dpkg-architecture -L`: `amd64`, `arm64`, `musl-linux-amd64`, …),
+and a repository holds at most **8 components**. A package of another
+architecture, or of a ninth component, is refused with `400` (an import
+reports it as failed); the repository's indexes stay as they are.
+
 An [import](import.md#apt) fills a hosted repository from another apt
 repository (Nexus, a static repository, another Forge): every `.deb` its
 `Release` lists, checked against the size and SHA-256 its index gives, in
@@ -123,6 +130,14 @@ not at all). An upload answers `201`; a version that exists answers `409`
 unless the repository's deployment policy allows redeploying, a file that is
 not a binary package `400`. Trusted publishing works as for every format
 ([trusted-publishing.md](trusted-publishing.md)).
+
+A package whose relationship fields (`Depends`, `Pre-Depends`,
+`Recommends`, `Suggests`, `Enhances`, `Breaks`, `Conflicts`, `Replaces`,
+`Provides`, `Built-Using`) do not parse with dpkg's grammar is refused with
+`400`, uploaded or imported: apt refuses a whole `Packages` index when one of
+its paragraphs holds such a field, so one package would break `apt-get
+update` on every client of the repository. `dpkg-deb --build` checks these
+fields; `dpkg-deb --nocheck`, fpm, nfpm and hand-made packages may not.
 
 However a package is made, reading its `control` file holds some 16 MiB at
 most (zstd), far less for gzip and xz, so that uploads at once cannot
@@ -230,19 +245,30 @@ deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] https://forge.exa
 
 - `InRelease`, `Release` and the other indexes are re-validated with the
   upstream once the repository's metadata TTL (`metadata_ttl_seconds`, 10
-  minutes by default) has passed; `by-hash/` copies and pool files never
-  change, and are cached on their first download for good.
+  minutes by default) has passed.
 - A pool file is checked against the size and SHA-256 the upstream's
   `Packages` index of its component and architecture gives it (the
   distribution's `Packages.gz`, else `.xz`, else the plain one), when the
   index lists it: a file that does not match is not cached, and answers
-  `502`. A `by-hash` copy is checked against its hash.
+  `502`. A `by-hash` copy (`MD5Sum`, `SHA1`, `SHA256` or `SHA512`) is
+  checked against the digest its path names, the same way.
+- A file so checked never changes, and is cached on its first download for
+  good. One that could not be checked (no index lists it, as Ubuntu's
+  `_all` packages, which no `binary-all` index lists; or the index could
+  not be fetched) is re-validated once the metadata TTL has passed, as an
+  index is. The `Packages` index itself is not checked against `InRelease`;
+  apt checks every file against the signed indexes.
 - While the upstream is down, what is cached is served; a file the
   upstream did not have is remembered for the not-found TTL. Upstream
   credentials are optional (`upstream_username`, `upstream_password`).
 - *Invalidate cache* on the repository's page (or
-  `POST /admin/repositories/{name}/proxy-cache/invalidate`) has the cached
-  indexes re-validated on their next download.
+  `POST /admin/repositories/{name}/proxy-cache/invalidate`) has every
+  cached file re-validated on its next download. A file kept for good is
+  fetched from the upstream again and checked anew, and replaced when it is
+  not the file the upstream has; the cached copy is served while the
+  upstream is down. *Delete cached file* on the same page (or
+  `DELETE /admin/repositories/{name}/files?path=<path>`, a path ending in
+  `/` for a directory) evicts a file at once.
 
 There is no package delay for apt proxies: the indexes are the upstream's,
 signed, and cannot leave a version out.
@@ -273,6 +299,10 @@ ordered by Debian version; the indexes follow on their next request.
   downloaded until it is deleted.
 - **Ed25519 keys only.** RSA and NIST-curve keys are refused: the OpenPGP
   library's code for them is not constant-time.
+- **8 components, dpkg's architectures.** A hosted repository holds at
+  most 8 components, and packages of `all` and of the architectures dpkg
+  knows ([Hosted repositories](#hosted-repositories)), so that its indexes
+  stay within the 10,000 files an index may hold.
 - **Source packages** (`.dsc`, `Sources`) are not hosted; a proxy serves its
   upstream's.
 - **zstd levels 20 to 22.** dpkg-deb compresses the control member like the

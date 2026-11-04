@@ -26,6 +26,7 @@ import {
   fetchTrustedPublishers,
   formatKeys,
   invalidateProxyCache,
+  deleteCachedFiles,
   releaseFromDelay,
   removeMember,
   repoKeys,
@@ -85,7 +86,7 @@ export function useFormats() {
   return useQuery<FormatView[], ApiError>({
     queryKey: formatKeys.list(),
     queryFn: ({ signal }) => fetchFormats(signal),
-    // Formats change only when the server restarts with other plugins.
+    // Formats change only with another version of the server.
     staleTime: 5 * 60 * 1000,
   })
 }
@@ -152,6 +153,13 @@ export function useDeleteRepository() {
 export function useInvalidateProxyCache(name: string) {
   return useMutation<ProxyCacheInvalidated, ApiError, InvalidateProxyCache>({
     mutationFn: (body) => invalidateProxyCache(name, body),
+  })
+}
+
+/** Evict a file (or a directory: a path ending in `/`) a proxy cached. */
+export function useDeleteCachedFiles(name: string) {
+  return useMutation<{ deleted: number }, ApiError, string>({
+    mutationFn: (path) => deleteCachedFiles(name, path),
   })
 }
 

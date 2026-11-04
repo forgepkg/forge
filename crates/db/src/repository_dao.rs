@@ -650,6 +650,24 @@ where
     Ok(row.is_some())
 }
 
+/// Lock a repository row `FOR NO KEY UPDATE` inside the caller's
+/// transaction: publishes that add a new value of a capped summary field
+/// (`component_dao::summary_values`) take it before they count the values,
+/// so that two of them never both pass the cap. It does not conflict with
+/// the `FOR KEY SHARE` lock of every `component` insert, so other publishes
+/// do not wait for it. Returns `false` when the row does not exist.
+pub async fn lock_repository_values<'e, E>(executor: E, id: i64) -> sqlx::Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM repository WHERE id = $1 FOR NO KEY UPDATE")
+            .bind(id)
+            .fetch_optional(executor)
+            .await?;
+    Ok(row.is_some())
+}
+
 /// Delete a repository by id. Returns whether a row was deleted.
 ///
 /// Every dependent row cascades via `ON DELETE CASCADE` — `group_member` rows
